@@ -1,0 +1,55 @@
+name: Import tested implementation
+on:
+  push:
+    branches: [build/bootstrap-asset-engine]
+    paths: ['.bootstrap/**']
+permissions:
+  contents: write
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify source archive and check out the destination branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .bootstrap/source.part* > /tmp/implementation.tar.xz
+          echo '490f6daa241dfd94d20e9efaa831ba18231f57850f51208902b3bfa2d9e6efa8  /tmp/implementation.tar.xz' | sha256sum --check
+          git fetch origin feat/asset-engine-ui
+          test "$(git rev-parse origin/feat/asset-engine-ui)" = f0ff2bf668374e583364f5239a950bcab6c07cf2
+          git checkout -b implementation-delivery origin/feat/asset-engine-ui
+          python3 - <<'PY'
+          from pathlib import PurePosixPath
+          import tarfile
+          with tarfile.open('/tmp/implementation.tar.xz', 'r:xz') as archive:
+              members = archive.getmembers()
+              assert len(members) <= 100
+              for member in members:
+                  path = PurePosixPath(member.name)
+                  assert member.isfile() and not path.is_absolute() and '..' not in path.parts
+                  assert path.parts[0] not in {'.git', '.github', '.bootstrap'}
+                  assert member.size <= 1000000
+              archive.extractall('.', members=members, filter='data')
+          PY
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.12.10'
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Resolve and lock dependencies
+        run: |
+          uv lock
+          npm --prefix ui install --package-lock-only --ignore-scripts
+      - name: Commit implementation to its feature branch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .
+          git commit -m 'feat: implement asset engine, transactional incrementality, and live console'
+          git push origin HEAD:refs/heads/feat/asset-engine-ui
