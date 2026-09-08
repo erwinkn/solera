@@ -1,0 +1,75 @@
+name: Deliver verified source
+on:
+  push:
+    branches: [build/bootstrap-asset-engine]
+    paths: ['.github/workflows/deliver-source.yml']
+permissions:
+  contents: write
+jobs:
+  deliver:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Retrieve and verify immutable source objects
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, json, os, urllib.request
+          from pathlib import Path
+          parts = [
+              '6c155bf02403160011145063c28580b7320a2b66',
+              'fae88efbca0c7a4766ea4ed72a027aa7344f6979',
+              '485257a8fc939771184eed8ad432b8f96b552165',
+              '4a9b1c7d75740bc4c50cb976d0c2c617cc8c3c8f',
+          ]
+          archive = bytearray()
+          for sha in parts:
+              url = f'https://api.github.com/repos/{os.environ["GITHUB_REPOSITORY"]}/git/blobs/{sha}'
+              request = urllib.request.Request(url, headers={'Authorization': f'Bearer {os.environ["GH_TOKEN"]}', 'Accept': 'application/vnd.github+json'})
+              with urllib.request.urlopen(request) as response:
+                  blob = json.load(response)
+              archive.extend(base64.b64decode(blob['content']))
+          assert hashlib.sha256(archive).hexdigest() == '490f6daa241dfd94d20e9efaa831ba18231f57850f51208902b3bfa2d9e6efa8'
+          Path('/tmp/implementation.tar.xz').write_bytes(archive)
+          PY
+      - name: Extract on implementation branch
+        run: |
+          set -euo pipefail
+          git fetch origin feat/asset-engine-ui
+          git checkout -b implementation-delivery origin/feat/asset-engine-ui
+          test ! -d src/data_orchestrator
+          python3 - <<'PY'
+          from pathlib import PurePosixPath
+          import tarfile
+          with tarfile.open('/tmp/implementation.tar.xz', 'r:xz') as archive:
+              members = archive.getmembers()
+              assert len(members) <= 100
+              for member in members:
+                  path = PurePosixPath(member.name)
+                  assert member.isfile() and not path.is_absolute() and '..' not in path.parts
+                  assert path.parts[0] not in {'.git', '.github', '.bootstrap'}
+                  assert member.size <= 1000000
+              archive.extractall('.', members=members, filter='data')
+          PY
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.12.10'
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Lock dependencies and publish the implementation
+        run: |
+          set -euo pipefail
+          uv lock
+          npm --prefix ui install --package-lock-only --ignore-scripts
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .
+          git commit -m 'feat: implement asset engine, transactional incrementality, and live console'
+          git push origin HEAD:refs/heads/feat/asset-engine-ui
