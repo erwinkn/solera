@@ -23,9 +23,9 @@ jobs:
           from pathlib import Path
           parts = [
               '6c155bf02403160011145063c28580b7320a2b66',
-              'fae88efbca0c7a4766ea4ed72a027aa7344f6979',
-              '485257a8fc939771184eed8ad432b8f96b552165',
-              '4a9b1c7d75740bc4c50cb976d0c2c617cc8c3c8f',
+              '03bf88239cef38f3785c0b61e127c2528160f8f5',
+              'acb2bd6bd0f0f5947fccccec828b826379033ae8',
+              'b09cbd2a97514023437cb3e24339912ab51bb3e9',
           ]
           archive = bytearray()
           for sha in parts:
@@ -33,7 +33,9 @@ jobs:
               request = urllib.request.Request(url, headers={'Authorization': f'Bearer {os.environ["GH_TOKEN"]}', 'Accept': 'application/vnd.github+json'})
               with urllib.request.urlopen(request) as response:
                   blob = json.load(response)
-              archive.extend(base64.b64decode(blob['content']))
+              content = base64.b64decode(blob['content'])
+              assert hashlib.sha1(f'blob {len(content)}\0'.encode() + content).hexdigest() == sha
+              archive.extend(content)
           assert hashlib.sha256(archive).hexdigest() == '490f6daa241dfd94d20e9efaa831ba18231f57850f51208902b3bfa2d9e6efa8'
           Path('/tmp/implementation.tar.xz').write_bytes(archive)
           PY
@@ -73,3 +75,8 @@ jobs:
           git add .
           git commit -m 'feat: implement asset engine, transactional incrementality, and live console'
           git push origin HEAD:refs/heads/feat/asset-engine-ui
+      - uses: actions/upload-artifact@v4
+        with:
+          name: recovered-implementation
+          path: /tmp/implementation.tar.xz
+          retention-days: 7
