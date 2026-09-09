@@ -1,0 +1,13 @@
+[
+  {"id":"batch-001","revision":"1","samples":[
+    {"id":"S-1001","site":"Nevada","assays":{"CaO":42.8,"SiO2":18.4,"Al2O3":7.2}},
+    {"id":"S-1002","site":"Nevada","assays":{"CaO":38.1,"SiO2":22.6,"Al2O3":8.3}}
+  ]},
+  {"id":"batch-002","revision":"1","samples":[
+    {"id":"S-2001","site":"California","assays":{"CaO":46.2,"SiO2":16.1}},
+    {"id":"S-2002","site":"California","assays":{"CaO":41.7,"SiO2":19.8,"Al2O3":6.5}}
+  ]},
+  {"id":"batch-003","revision":"1","samples":[
+    {"id":"S-3001","site":"Arizona","assays":{"CaO":39.5,"SiO2":21.3,"Al2O3":8.9}}
+  ]}
+]

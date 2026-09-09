@@ -1,0 +1,69 @@
+/* Readable secondary text on white and tinted surfaces. */
+:root {
+  --muted: #61707b;
+}
+.brand small,
+.workspace-label,
+.nav-item,
+.version-label,
+.version-label code,
+.sidebar-footer p,
+.breadcrumbs,
+.connection,
+.eyebrow,
+.page-heading p,
+.catalog-summary,
+.search-input,
+.search-input input::placeholder,
+.search-input kbd,
+.segmented button,
+th,
+.asset-name small,
+.strategy,
+.badge,
+.table-footer,
+.node-meta,
+.drawer-intro p,
+.properties dt,
+.inset-note,
+.commit-item summary small,
+.field,
+.asset-picker small,
+.checkbox-label,
+.empty,
+.loading,
+.cell-note,
+.selection-label,
+.progress-cell,
+.back-link,
+.run-facts small,
+.task-identity small,
+.event time,
+.event-kind,
+.event pre,
+.event-detail,
+.code-managed,
+.automation-title p,
+.automation-details,
+.automation-details small,
+.login > p {
+  color: #61707b;
+}
+.badge.materialized,
+.badge.succeeded {
+  color: #2c715e;
+}
+.badge.running {
+  color: #386eab;
+}
+.badge.failed,
+.badge.blocked {
+  color: #a34b46;
+}
+.badge.stale,
+.paused-label {
+  color: #856126;
+}
+.badge.skipped {
+  color: #596f66;
+}

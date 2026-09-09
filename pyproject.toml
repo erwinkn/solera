@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "data-orchestrator"
+version = "0.1.0a1"
+description = "An asset-first incremental materialization engine"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+dependencies = ["fastapi>=0.115,<1", "uvicorn>=0.34,<1", "psycopg[binary]>=3.2,<4", "croniter>=6,<7"]
+
+[project.scripts]
+dorc = "data_orchestrator.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "httpx>=0.28,<1", "ruff>=0.11,<1", "mypy>=1.15,<2", "types-croniter>=6,<7"]
+
+[tool.hatch.build]
+artifacts = ["src/data_orchestrator/web/**"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/data_orchestrator"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+check_untyped_defs = true
+no_implicit_optional = true
+warn_unused_ignores = true
