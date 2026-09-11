@@ -25,7 +25,7 @@ def source_files(ctx: AssetContext):
 )
 def parse_files(ctx: AssetContext, files):
     """Replace every row owned by a changed file, including empty results and deletions."""
-    selected = [row for row in files if row["id"] in ctx.changes["upserted_keys"]]
+    selected = [row for row in files if str(row["id"]) in ctx.changes["upserted_keys"]]
     keys = ctx.changes["upserted_keys"] + ctx.changes["deleted_keys"]
     samples = [{"source_file_id": row["id"], "name": row["sample"]} for row in selected]
     measurements = [

@@ -68,3 +68,9 @@ SlateDB handles its metadata WAL, replay, SSTs, compaction, and metadata garbage
 - https://developmentseed.org/obstore/latest/api/store/local/ — LocalStore.
 - https://developmentseed.org/obstore/latest/api/put/ — conditional put operations.
 - https://cursor.com/blog/git-at-any-scale — motivating separation of durable object state and fast local representations.
+
+## Review regressions
+
+Incomplete-inventory flags are propagated through every output reference, including ordinary snapshot transformations; a downstream keyed consumer must not turn a partial scan into deletions. A no-change skip also requires complete inputs. Manifest protocol files are separate from user stdout. Subprocess log pipes have bounded buffers and an 8 MiB aggregate limit; exceeding it terminates the process group. Registration rejects ambiguous input/resource/context bindings and unsupported signatures.
+
+Engine lifecycle is one-shot: after `stop`, construct a new Engine and call `initialize` before resuming work. That startup reconciles persisted active attempts; a process interrupted at an uncertain commit must not blindly release its scope.

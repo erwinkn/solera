@@ -440,6 +440,7 @@ class Engine:
             and not changes["upserted_keys"]
             and not changes["deleted_keys"]
             and all(h and h.get("scope_complete") for h in claim["baseline"].values())
+            and all(info["ref"]["complete"] for info in claim["input_refs"].values())
         )
         return {
             "spec": spec,
@@ -456,16 +457,18 @@ class Engine:
         if set(result["outputs"]) != set(producer["outputs"]):
             raise ValueError("Output set differs from the registered producer")
         refs, receipts = {}, {}
+        inputs_complete = all(info["ref"]["complete"] for info in claim["input_refs"].values())
         for asset, write in result["outputs"].items():
             baseline = claim["baseline"][asset]
             old = await self.state.load(baseline["ref"]) if baseline and claim["mode"] != "recompute" else []
-            kind, complete = write["kind"], True
+            kind, complete = write["kind"], inputs_complete
             if kind == "Replace":
                 value = write["value"]
             elif kind == "Inventory":
                 value, complete = write["rows"], write["complete"]
                 if not isinstance(value, list) or not isinstance(complete, bool):
                     raise ValueError("Inventory requires rows and a boolean completeness flag")
+                complete = complete and inputs_complete
             else:
                 if not isinstance(old, list) or not isinstance(write["rows"], list):
                     raise ValueError("Row mutations require JSON row lists")

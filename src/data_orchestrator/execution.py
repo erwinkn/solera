@@ -24,10 +24,19 @@ class LocalSubprocess:
     async def _run(self, *args):
         # Defense in depth only. Trusted user code still shares the host identity;
         # this is process isolation, not a security sandbox.
-        env = {k: v for k, v in os.environ.items() if not k.startswith(("AWS_", "DORC_API_TOKEN", "GITHUB_", "GH_TOKEN", "RAILWAY_TOKEN"))}
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith(("AWS_", "DORC_API_TOKEN", "GITHUB_", "GH_TOKEN", "RAILWAY_TOKEN"))
+        }
         process = await asyncio.create_subprocess_exec(
-            sys.executable, "-m", "data_orchestrator.worker", *args,
-            env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            sys.executable,
+            "-m",
+            "data_orchestrator.worker",
+            *args,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
         )
         tails = [bytearray(), bytearray()]
@@ -42,7 +51,11 @@ class LocalSubprocess:
                 if total > self.log_limit:
                     raise RuntimeError(f"Worker log output exceeded {self.log_limit} bytes")
 
-        tasks = [asyncio.create_task(drain(process.stdout, tails[0])), asyncio.create_task(drain(process.stderr, tails[1])), asyncio.create_task(process.wait())]
+        tasks = [
+            asyncio.create_task(drain(process.stdout, tails[0])),
+            asyncio.create_task(drain(process.stderr, tails[1])),
+            asyncio.create_task(process.wait()),
+        ]
         try:
             await asyncio.wait_for(asyncio.gather(*tasks), self.timeout)
         except BaseException:

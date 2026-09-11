@@ -32,3 +32,11 @@ A second deployment runs the probe under a new namespace. For application persis
 The probe writes under new `probe-*` namespaces and retains them for inspection. Stop the probe and remove only its namespace prefixes to clean up. Removing the real workspace prefix destroys its durable state. Keep automations disabled on an idle demo to avoid unnecessary runs.
 
 Real-provider results must be reported separately from the local filesystem and Moto emulator tests. A bucket creation action returning `staged` or `applying` is not proof that the bucket exists or its credentials resolve. The deployment must complete authenticated reads/writes against the provider before the experiment is described as validated.
+
+## Attempted validation — September 11, 2026
+
+The dedicated `data-orchestrator-s3-test` Railway project was created and the application built, but bucket provisioning did not complete: the environment returned no buckets and bucket references resolved without a bucket name. The application correctly failed before S3 tests. **No real Railway S3 validation or public demo is claimed.** Local filesystem and HTTP S3-emulator results are separate.
+
+Cleanup of the failed `orchestrator-s3-test` service is staged but requires two-factor approval in the Railway dashboard. The API cannot complete it. Project: `87381f11-c1f0-4cac-a0d5-e872be0b8ada`; environment: `production`. The user must approve that staged removal; the service is not reported as deleted. No bucket was provisioned.
+
+For a future new Railway bucket, inspect its actual addressing mode: new buckets may use virtual-hosted style, requiring `AWS_VIRTUAL_HOSTED_STYLE_REQUEST=true`. Do not assume path-style compatibility or substitute a filesystem deployment for a provider test.

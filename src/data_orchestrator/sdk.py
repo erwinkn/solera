@@ -129,6 +129,31 @@ class Project:
                     p: p for p in inspect.signature(a.fn).parameters if p != "ctx" and p not in self.resources
                 }
             )
+            parameters = inspect.signature(a.fn).parameters
+            if any(
+                p.kind
+                in (
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.VAR_POSITIONAL,
+                    inspect.Parameter.VAR_KEYWORD,
+                )
+                for p in parameters.values()
+            ):
+                raise ValueError("Asset parameters must be explicitly named and keyword-bindable")
+            if any(name not in parameters for name in inputs):
+                raise ValueError("Inputs must reference producer parameters")
+            if "ctx" in inputs or "ctx" in self.resources:
+                raise ValueError("ctx is reserved for AssetContext")
+            if set(inputs) & set(self.resources):
+                raise ValueError("Input and resource parameter names must not collide")
+            if any(
+                name != "ctx"
+                and name not in inputs
+                and name not in self.resources
+                and p.default is inspect.Parameter.empty
+                for name, p in parameters.items()
+            ):
+                raise ValueError("Every required producer parameter must have an input or resource binding")
             if a.incremental and (a.incremental.input not in inputs or a.incremental.batch_size < 1):
                 raise ValueError("ByKey must reference an input and have a positive batch size")
             source_file = inspect.getsourcefile(a.fn)

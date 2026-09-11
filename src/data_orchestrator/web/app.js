@@ -1,6 +1,6 @@
 const $ = (s) => document.querySelector(s);
 const el = (tag, text, cls) => { const n = document.createElement(tag); if (text !== undefined) n.textContent = text; if (cls) n.className = cls; return n; };
-let state, view = 'assets', filter = '', selectedRun, partition = '', refreshing = false, requestKey, requestBody;
+let state, view = 'assets', filter = '', selectedRun, partition = '', refreshing = false, requestKey, requestBody, selectionEpoch = 0;
 let token = sessionStorage.getItem('dorc-token') || '';
 const time = (value) => value ? new Date(value * 1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '—';
 const tag = (value) => el('span', value.replaceAll('_', ' '), `tag ${value}`);
@@ -28,7 +28,7 @@ function render() {
     if(!state.runs.length)root.append(empty('No materializations yet','Start with sample_quality to exercise incremental, multi-output processing.'));
     else root.append(table(['Request','Targets','Status','Created'],state.runs.map(r=>[button(r.id.slice(0,8),()=>showRun(r.id),'asset-name'),r.targets.join(', '),tag(r.status),time(r.created_at)])));
   } else if(view==='automations') {
-    root.append(table(['Automation','Targets','Interval','State'],state.automations.map(a=>[a.name,a.targets.join(', '),`${a.every_seconds}s`,button(a.enabled?'Enabled — pause':'Paused — enable',async()=>{try{await api('/automations/'+encodeURIComponent(a.name),{method:'POST',body:JSON.stringify({enabled:!a.enabled})});await refresh()}catch(e){error(e.message)}})])));
+    root.append(table(['Automation','Targets','Interval','State'],state.automations.map(a=>[a.name,a.targets.join(', '),`${a.every_seconds}s`,button(a.enabled?'Enabled — pause':'Paused — enable',async()=>{try{await api('/automations/'+encodeURIComponent(a.name),{method:'POST',body:JSON.stringify({enabled:!state.automations.find(current=>current.name===a.name).enabled})});await refresh()}catch(e){error(e.message)}})])));
     root.append(el('p','Missed interval ticks are coalesced. Accepting requests and advancing the automation cursor is one durable transaction.','notice'));
   } else {
     const grid=el('dl',undefined,'storage-grid');const entries=[['State engine',state.storage.engine+' 0.16'],['Object store',state.storage.scheme==='file'?'Local filesystem':state.storage.scheme.toUpperCase()],['Namespace',state.storage.namespace],['Last local acknowledgement',String(state.storage.sequence)],['Publication','Object-store durability awaited before acknowledgement'],['Coordinator','One active writer; replacement fences the old writer'],['Definition',state.revision.slice(0,16)]];
@@ -41,20 +41,20 @@ function renderAssets() {
  root.replaceChildren(table(['Asset','Group','Update model','Published'],assets.map(a=>{const name=el('div');name.append(button(a.name,()=>showAsset(a.name),'asset-name'),el('span',a.inputs.length?`${a.inputs.length} upstream asset${a.inputs.length>1?'s':''}`:'Source asset','sub'));return [name,a.group,tag(a.incremental?'keyed incremental':a.partitions?'daily partitions':'snapshot'),a.heads.length?el('div',`${a.heads.length} scope${a.heads.length>1?'s':''} · ${time(Math.max(...a.heads.map(h=>h.updated_at)))}`):tag('not_materialized')]})));
 }
 async function showAsset(name, selectedPartition) {
- selectedRun=null;const asset=state.assets.find(a=>a.name===name);partition=selectedPartition??asset.heads[0]?.partition??'';
+ const epoch=++selectionEpoch;selectedRun=null;const asset=state.assets.find(a=>a.name===name);partition=selectedPartition??asset.heads[0]?.partition??'';
  try {
-  const data=await api('/assets/'+encodeURIComponent(name)+'?partition='+encodeURIComponent(partition));$('#drawer-title').textContent=name;const root=$('#drawer-content');root.replaceChildren(el('p',asset.description));
+  const data=await api('/assets/'+encodeURIComponent(name)+'?partition='+encodeURIComponent(partition));if(epoch!==selectionEpoch)return;$('#drawer-title').textContent=name;const root=$('#drawer-content');root.replaceChildren(el('p',asset.description));
   if(asset.partitions&&asset.heads.length){const select=el('select',undefined,'partition-select');select.setAttribute('aria-label','Partition');asset.heads.forEach(h=>{const option=el('option',h.partition);option.value=h.partition;select.append(option)});select.value=partition;select.addEventListener('change',()=>showAsset(name,select.value));root.append(select)}
   root.append(button('Materialize this asset',()=>openRequest(name),'primary'));
   if(!data.head)root.append(empty('Not materialized','Create a materialization to publish this asset.'));
-  else {root.append(el('h3','Data preview · first 100 rows'));if(Array.isArray(data.preview)&&data.preview.length&&typeof data.preview[0]==='object'&&data.preview[0]!==null){const columns=[...new Set(data.preview.flatMap(Object.keys))];const preview=table(columns,data.preview.map(r=>columns.map(c=>typeof r[c]==='object'?JSON.stringify(r[c]):String(r[c]??''))));preview.classList.add('data-table');root.append(preview)}else root.append(el('pre',JSON.stringify(data.preview,null,2)));json('Checkpoint',data.checkpoint,root);json('Immutable output',data.head,root);json('Materialization commit',data.commit,root)}
+  else {root.append(el('h3','Data preview · first 100 rows'));if(Array.isArray(data.preview)&&data.preview.length&&data.preview.every(row=>row!==null&&typeof row==='object'&&!Array.isArray(row))){const columns=[...new Set(data.preview.flatMap(Object.keys))];const preview=table(columns,data.preview.map(r=>columns.map(c=>typeof r[c]==='object'?JSON.stringify(r[c]):String(r[c]??''))));preview.classList.add('data-table');root.append(preview)}else root.append(el('pre',JSON.stringify(data.preview,null,2)));json('Checkpoint',data.checkpoint,root);json('Immutable output',data.head,root);json('Materialization commit',data.commit,root)}
   if(!$('#drawer').open)$('#drawer').showModal();
  }catch(e){error(e.message)}
 }
-async function runAction(id, action){try{await api('/runs/'+id+'/'+action,{method:'POST'});await showRun(id)}catch(e){error(e.message)}}
+async function runAction(id, action){try{await api('/runs/'+id+'/'+action,{method:'POST'});if(selectedRun===id&&$('#drawer').open)await showRun(id,true)}catch(e){error(e.message)}}
 async function showRun(id, silent=false) {
- selectedRun=id;
- try{const detail=await api('/runs/'+id);if(selectedRun!==id)return;$('#drawer-title').textContent='Run '+id.slice(0,8);const root=$('#drawer-content');root.replaceChildren(tag(detail.request.status),el('p',detail.request.targets.join(', ')+' · '+time(detail.request.created_at)));
+ const epoch=silent?selectionEpoch:++selectionEpoch;selectedRun=id;
+ try{const detail=await api('/runs/'+id);if(selectedRun!==id||epoch!==selectionEpoch)return;$('#drawer-title').textContent='Run '+id.slice(0,8);const root=$('#drawer-content');root.replaceChildren(tag(detail.request.status),el('p',detail.request.targets.join(', ')+' · '+time(detail.request.created_at)));
  const actions=el('div',undefined,'actions');if(!['failed','succeeded','canceled'].includes(detail.request.status)){actions.append(button('Cancel request',()=>runAction(id,'cancel')),button(detail.request.paused?'Resume':'Pause',()=>runAction(id,detail.request.paused?'resume':'pause')))}if(detail.request.status==='failed')actions.append(button('Retry failed work',()=>runAction(id,'retry')));root.append(actions,table(['Producer','Partition','Status','Generation'],detail.tasks.map(t=>[t.producer,t.partition||'—',tag(t.status),String(t.generation)])),el('h3','Events'));
  detail.events.forEach(event=>{const n=el('div',undefined,'event');n.append(el('time',time(event.at)),tag(event.kind),el('p',event.message));if(event.data)n.append(el('pre',JSON.stringify(event.data,null,2)));root.append(n)});
  Object.entries(detail.attempts).forEach(([task,attempts])=>attempts.filter(a=>a.logs||a.error).forEach(a=>json('Attempt '+task.slice(0,8)+' / '+a.generation,a.logs||a.error,root)));
@@ -68,6 +68,6 @@ $('#login-form').addEventListener('submit',async(event)=>{event.preventDefault()
 $('#signout').addEventListener('click',()=>{sessionStorage.removeItem('dorc-token');location.reload()});
 document.querySelectorAll('nav button').forEach(b=>b.addEventListener('click',()=>setView(b.dataset.view)));
 document.querySelectorAll('.close-dialog').forEach(b=>b.addEventListener('click',()=>b.closest('dialog').close()));
-$('#drawer').addEventListener('close',()=>{selectedRun=null});$('#materialize').addEventListener('click',()=>openRequest());
+$('#drawer').addEventListener('close',()=>{selectedRun=null;selectionEpoch++});$('#materialize').addEventListener('click',()=>openRequest());
 async function refresh(){if(refreshing||$('#login').open)return;refreshing=true;try{state=await api('/state');$('#connection').textContent='Connected · '+state.storage.scheme;error('');if(!document.activeElement?.matches('input,select,textarea,[contenteditable=true]')&&!$('#request-dialog').open)render();if(selectedRun&&$('#drawer').open)await showRun(selectedRun,true)}catch(e){$('#connection').textContent='Disconnected';if(e.message!=='Authentication required')error(e.message)}finally{refreshing=false}}
 await refresh();setInterval(refresh,2000);

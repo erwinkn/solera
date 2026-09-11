@@ -9,7 +9,7 @@ This is a standalone implementation on `feat/s3-state-backend`. The earlier `fea
 Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/). On supported platforms, SlateDB's Python wheel includes the native engine.
 
 ```bash
-uv sync
+uv sync --locked
 uv run dorc serve --insecure
 # http://127.0.0.1:8000
 ```
@@ -94,7 +94,7 @@ def measurements(ctx: AssetContext, files):
     affected = changed + ctx.changes["deleted_keys"]
     rows = [
         {"source_file": f["id"], **record}
-        for f in files if f["id"] in changed
+        for f in files if str(f["id"]) in changed
         for record in f["records"]
     ]
     return ReplaceKeys("source_file", affected, rows)
@@ -114,7 +114,7 @@ A multi-output producer executes as a unit. `fill_missing` reuses only complete 
 
 ```bash
 uv run pytest -q -m 'not live'
-cd ui && npm install && npx playwright install chromium && npm test
+cd ui && npm ci && npx playwright install chromium && npm test
 ```
 
 The Python suite uses real SlateDB on filesystem storage, including abrupt process death and writer takeover. It also starts Moto as an HTTP S3 emulator and runs the remote conformance test. Synthetic fault injection separately verifies acknowledgement timing and ambiguous-outcome behavior. The live-provider test is opt-in:
@@ -123,7 +123,7 @@ The Python suite uses real SlateDB on filesystem storage, including abrupt proce
 DORC_TEST_S3_URL=s3://isolated-test-bucket/prefix uv run pytest -q -m live
 ```
 
-GitHub Actions verifies Python contracts, browser behavior on desktop/mobile, wheel contents, and a Docker end-to-end run. `uv.lock` and the browser lock are uploaded with test artifacts until they are committed. The two storage engines are explicitly version-pinned.
+GitHub Actions verifies Python contracts, browser behavior on desktop/mobile, wheel contents, and a Docker end-to-end run. `uv.lock` and the browser package lock are committed. CI uses locked installs; the storage engines are explicitly version-pinned.
 
 ## Boundaries
 
