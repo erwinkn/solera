@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import signal
@@ -21,14 +22,27 @@ class LocalSubprocess:
     async def _run(self, *args):
         # Defense in depth only: subprocesses are not a security sandbox. This
         # trusted-project alpha does not isolate the host filesystem or identity.
-        env = {k: v for k, v in os.environ.items() if not k.startswith(("AWS_", "DORC_API_TOKEN", "GITHUB_", "GH_TOKEN", "RAILWAY_TOKEN"))}
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith(("AWS_", "DORC_API_TOKEN", "GITHUB_", "GH_TOKEN", "RAILWAY_TOKEN"))
+        }
         with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
-            process = await asyncio.create_subprocess_exec(sys.executable, "-m", "data_orchestrator.worker", *args, env=env, stdout=output, stderr=errors, start_new_session=True)
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-m",
+                "data_orchestrator.worker",
+                *args,
+                env=env,
+                stdout=output,
+                stderr=errors,
+                start_new_session=True,
+            )
             try:
                 await asyncio.wait_for(process.wait(), self.timeout)
             except BaseException:
                 if process.returncode is None:
-                    with __import__('contextlib').suppress(ProcessLookupError):
+                    with contextlib.suppress(ProcessLookupError):
                         os.killpg(process.pid, signal.SIGKILL)
                 await process.wait()
                 raise

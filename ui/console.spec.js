@@ -11,7 +11,7 @@ test('catalog, filtering, storage, and responsive layout', async({page}, testInf
   await page.getByLabel('Filter assets').fill('sample_quality');
   await expect(page.locator('.asset-list tbody tr')).toHaveCount(1);
   await page.getByLabel('Filter assets').fill('');
-  await expect(page.locator('.asset-list tbody tr')).toHaveCount(8);
+  await expect(page.locator('.asset-list tbody tr')).toHaveCount(7);
   await page.screenshot({path:testInfo.outputPath('catalog.png'),fullPage:true});
   await page.getByRole('button',{name:'Storage',exact:true}).click();
   await expect(page.getByText('Local filesystem',{exact:true})).toBeVisible();

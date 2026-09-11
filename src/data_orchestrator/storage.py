@@ -41,7 +41,9 @@ class Transaction:
 
     async def scan(self, prefix: str, limit: int | None = None):
         raw = prefix.encode()
-        it = await self.native.scan(KeyRange(start=raw, start_inclusive=True, end=raw + b"\xff", end_inclusive=False))
+        it = await self.native.scan(
+            KeyRange(start=raw, start_inclusive=True, end=raw + b"\xff", end_inclusive=False)
+        )
         values = []
         while limit is None or len(values) < limit:
             item = await it.next()
@@ -135,7 +137,9 @@ class SlateState:
                 if committing:
                     self.poisoned = True
                     if isinstance(error, Exception):
-                        raise Unavailable("Commit outcome is uncertain; restart and resolve its receipt") from error
+                        raise Unavailable(
+                            "Commit outcome is uncertain; restart and resolve its receipt"
+                        ) from error
                 else:
                     await native.rollback()
                 raise
@@ -158,7 +162,13 @@ class SlateState:
             await obstore.put_async(self.objects, key, data, mode="create", use_multipart=False)
         except AlreadyExistsError:
             await self.load({"key": key, "sha256": checksum})
-        return {"key": key, "sha256": checksum, "bytes": len(data), "rows": len(value) if isinstance(value, list) else None, "complete": complete}
+        return {
+            "key": key,
+            "sha256": checksum,
+            "bytes": len(data),
+            "rows": len(value) if isinstance(value, list) else None,
+            "complete": complete,
+        }
 
     async def load(self, ref):
         expected = f"sha256/{ref['sha256']}.json"

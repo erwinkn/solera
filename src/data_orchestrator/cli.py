@@ -23,15 +23,28 @@ def main():
         parser.error("--insecure is limited to loopback listeners; set DORC_API_TOKEN for remote access")
     if args.command == "serve":
         import uvicorn
+
         from .api import create_app
-        uvicorn.run(create_app(state_url=args.state_url, namespace=args.namespace, project=args.project, insecure=args.insecure), host=args.host, port=args.port)
-    elif args.command == 'selftest':
+
+        uvicorn.run(
+            create_app(
+                state_url=args.state_url,
+                namespace=args.namespace,
+                project=args.project,
+                insecure=args.insecure,
+            ),
+            host=args.host,
+            port=args.port,
+        )
+    elif args.command == "selftest":
         from .selftest import selftest
+
         print(json.dumps(asyncio.run(selftest(args.state_url)), indent=2), flush=True)
     else:
         from .engine import Engine
         from .execution import LocalSubprocess
         from .storage import SlateState
+
         async def execute():
             backend = LocalSubprocess(args.project)
             manifest = await backend.manifest()
@@ -54,6 +67,7 @@ def main():
                     await asyncio.sleep(0.1)
             finally:
                 await state.close()
+
         asyncio.run(execute())
 
 

@@ -36,7 +36,9 @@ def head_key(asset, partition):
 
 
 class Engine:
-    def __init__(self, state, manifest, backend, *, lease_seconds=60, concurrency=4, clock=time.time, retry_delay=1):
+    def __init__(
+        self, state, manifest, backend, *, lease_seconds=60, concurrency=4, clock=time.time, retry_delay=1
+    ):
         if lease_seconds < 1 or concurrency < 1:
             raise ValueError("Lease duration and concurrency must be positive")
         self.state, self.manifest, self.backend = state, manifest, backend
@@ -50,15 +52,22 @@ class Engine:
         async with self.state.transaction() as tx:
             await tx.put(f"definition/{self.manifest['revision']}", self.manifest)
             await tx.put("system/current", self.manifest["revision"])
-            names = {a['name'] for a in self.manifest['automations']}
+            names = {a["name"] for a in self.manifest["automations"]}
             for key, old in await tx.scan("automation/"):
-                if old['name'] not in names:
+                if old["name"] not in names:
                     await tx.delete(key)
             for automation in self.manifest["automations"]:
                 key = f"automation/{esc(automation['name'])}"
                 previous = await tx.get(key)
                 record = dict(automation)
-                record.update({"enabled": previous["enabled"] if previous else automation["enabled"], "next_at": previous["next_at"] if previous else self.clock() + automation["every_seconds"]})
+                record.update(
+                    {
+                        "enabled": previous["enabled"] if previous else automation["enabled"],
+                        "next_at": previous["next_at"]
+                        if previous
+                        else self.clock() + automation["every_seconds"],
+                    }
+                )
                 await tx.put(key, record)
             # Opening a new native writer fences the previous one. Its active
             # attempt generations must still be revoked in our domain state.
@@ -67,15 +76,26 @@ class Engine:
                 task = await tx.get(f"task/{task_id}")
                 if task and task["status"] == "running":
                     await self._release(tx, task)
-                    await tx.put(f"attempt/{task_id}/{task['generation']:010d}", {"generation": task['generation'], "status": "abandoned", "error": "Coordinator replaced"})
+                    await tx.put(
+                        f"attempt/{task_id}/{task['generation']:010d}",
+                        {
+                            "generation": task["generation"],
+                            "status": "abandoned",
+                            "error": "Coordinator replaced",
+                        },
+                    )
                     task["generation"] += 1
                     if task["attempt_count"] >= task["max_attempts"]:
-                        task.update(status="failed", error="Repeated coordinator interruptions; retry manually")
+                        task.update(
+                            status="failed", error="Repeated coordinator interruptions; retry manually"
+                        )
                         await tx.put(f"task/{task_id}", task)
                     else:
                         await self._queue(tx, task)
                     affected.add(task["run_id"])
-                    await self._event(tx, task["run_id"], "recovered", "Recovered an interrupted attempt", task_id)
+                    await self._event(
+                        tx, task["run_id"], "recovered", "Recovered an interrupted attempt", task_id
+                    )
             for run_id in affected:
                 await self._advance(tx, run_id)
 
@@ -111,6 +131,7 @@ class Engine:
                 deps[arg] = {"identity": dep, "asset": asset, "partition": parent_partition}
             planned[identity] = {"identity": identity, "producer": name, "partition": partition, "deps": deps}
             return identity
+
         for asset in targets:
             for partition in partitions or [""]:
                 visit(owners[asset], partition)
@@ -118,7 +139,9 @@ class Engine:
             raise ValueError("Request exceeds the alpha's 5,000-task limit")
         return list(planned.values())
 
-    async def submit(self, targets, *, partitions=None, mode="incremental", config=None, command_id=None, cause="manual"):
+    async def submit(
+        self, targets, *, partitions=None, mode="incremental", config=None, command_id=None, cause="manual"
+    ):
         partitions, config = partitions or [], config or {}
         plan = self._plan(targets, partitions)
         if mode not in {"incremental", "recompute", "fill_missing"}:
@@ -126,7 +149,13 @@ class Engine:
         command_id = command_id or str(uuid.uuid4())
         if not isinstance(command_id, str) or not 1 <= len(command_id) <= 200:
             raise ValueError("Invalid idempotency key")
-        body = {"targets": targets, "partitions": partitions, "mode": mode, "config": config, "revision": self.manifest["revision"]}
+        body = {
+            "targets": targets,
+            "partitions": partitions,
+            "mode": mode,
+            "config": config,
+            "revision": self.manifest["revision"],
+        }
         async with self.state.transaction() as tx:
             return await self._submit(tx, plan, body, command_id, cause)
 
@@ -140,9 +169,32 @@ class Engine:
             return await tx.get(f"run/{previous['id']}")
         run_id, now = str(uuid.uuid4()), self.clock()
         ids = {p["identity"]: str(uuid.uuid5(uuid.UUID(run_id), p["identity"])) for p in plan}
-        run = {"id": run_id, **body, "cause": cause, "created_at": now, "updated_at": now, "status": "queued", "paused": False, "tasks": list(ids.values())}
+        run = {
+            "id": run_id,
+            **body,
+            "cause": cause,
+            "created_at": now,
+            "updated_at": now,
+            "status": "queued",
+            "paused": False,
+            "tasks": list(ids.values()),
+        }
         for p in plan:
-            task = {"id": ids[p["identity"]], "run_id": run_id, "producer": p["producer"], "partition": p["partition"], "scope": p["identity"], "deps": {arg: {**dep, "task": ids[dep["identity"]]} for arg, dep in p["deps"].items()}, "status": "waiting", "generation": 0, "attempt_count": 0, "max_attempts": 3, "result": {}, "revision": body["revision"], "mode": body["mode"]}
+            task = {
+                "id": ids[p["identity"]],
+                "run_id": run_id,
+                "producer": p["producer"],
+                "partition": p["partition"],
+                "scope": p["identity"],
+                "deps": {arg: {**dep, "task": ids[dep["identity"]]} for arg, dep in p["deps"].items()},
+                "status": "waiting",
+                "generation": 0,
+                "attempt_count": 0,
+                "max_attempts": 3,
+                "result": {},
+                "revision": body["revision"],
+                "mode": body["mode"],
+            }
             if not task["deps"]:
                 await self._queue(tx, task)
             else:
@@ -155,7 +207,17 @@ class Engine:
 
     async def _event(self, tx, run_id, kind, message, task_id=None, data=None):
         event_id = f"{int(self.clock() * 1000000):020d}-{uuid.uuid4().hex}"
-        await tx.put(f"event/{run_id}/{event_id}", {"id": event_id, "at": self.clock(), "kind": kind, "message": message, "task_id": task_id, "data": data})
+        await tx.put(
+            f"event/{run_id}/{event_id}",
+            {
+                "id": event_id,
+                "at": self.clock(),
+                "kind": kind,
+                "message": message,
+                "task_id": task_id,
+                "data": data,
+            },
+        )
 
     async def _queue(self, tx, task, delay=0):
         task["status"] = "queued"
@@ -214,7 +276,10 @@ class Engine:
                     continue
                 producer = self.manifest["producers"][task["producer"]]
                 baseline = {a: await tx.get(head_key(a, task["partition"])) for a in producer["outputs"]}
-                reusable = all(h and h.get('scope_complete') and h.get('state_version') == producer['version'] for h in baseline.values())
+                reusable = all(
+                    h and h.get("scope_complete") and h.get("state_version") == producer["version"]
+                    for h in baseline.values()
+                )
                 if task["mode"] == "fill_missing" and reusable:
                     task["status"], task["result"] = "skipped", {a: h["ref"] for a, h in baseline.items()}
                     await tx.delete(queue_key)
@@ -227,12 +292,25 @@ class Engine:
                     if upstream["status"] not in SUCCESS:
                         raise RuntimeError("Ready index references an unsatisfied dependency")
                     inputs[arg] = {**dep, "ref": upstream["result"][dep["asset"]]}
-                task.update({"status": "running", "generation": task["generation"] + 1, "attempt_count": task["attempt_count"] + 1, "input_refs": inputs, "baseline": baseline, "lease_until": self.clock() + self.lease_seconds, "started_at": self.clock()})
+                task.update(
+                    {
+                        "status": "running",
+                        "generation": task["generation"] + 1,
+                        "attempt_count": task["attempt_count"] + 1,
+                        "input_refs": inputs,
+                        "baseline": baseline,
+                        "lease_until": self.clock() + self.lease_seconds,
+                        "started_at": self.clock(),
+                    }
+                )
                 await tx.delete(queue_key)
                 await tx.put(f"task/{task_id}", task)
                 await tx.put(f"active/{task_id}", task_id)
                 await tx.put(f"scope/{task['scope']}", {"task": task_id, "generation": task["generation"]})
-                await tx.put(f"attempt/{task_id}/{task['generation']:010d}", {"generation": task["generation"], "status": "running", "started_at": self.clock()})
+                await tx.put(
+                    f"attempt/{task_id}/{task['generation']:010d}",
+                    {"generation": task["generation"], "status": "running", "started_at": self.clock()},
+                )
                 await self._advance(tx, task["run_id"])
                 return task
         return None
@@ -240,7 +318,13 @@ class Engine:
     async def _owned(self, tx, claim):
         task = await tx.get(f"task/{claim['id']}")
         owner = await tx.get(f"scope/{claim['scope']}")
-        if not task or task["status"] != "running" or task["generation"] != claim["generation"] or task["lease_until"] <= self.clock() or owner != {"task": claim["id"], "generation": claim["generation"]}:
+        if (
+            not task
+            or task["status"] != "running"
+            or task["generation"] != claim["generation"]
+            or task["lease_until"] <= self.clock()
+            or owner != {"task": claim["id"], "generation": claim["generation"]}
+        ):
             raise LostOwnership("Attempt no longer owns its publication scope")
         return task
 
@@ -262,15 +346,24 @@ class Engine:
                 task = await tx.get(f"task/{task_id}")
                 if task["status"] == "running" and task["lease_until"] <= self.clock():
                     await self._release(tx, task)
-                    await tx.put(f"attempt/{task_id}/{task['generation']:010d}", {"generation": task['generation'], "status": "abandoned", "error": "Lease expired"})
+                    await tx.put(
+                        f"attempt/{task_id}/{task['generation']:010d}",
+                        {"generation": task["generation"], "status": "abandoned", "error": "Lease expired"},
+                    )
                     task["generation"] += 1
                     if task["attempt_count"] >= task["max_attempts"]:
                         task.update(status="failed", error="Lease repeatedly expired; retry manually")
                         await tx.put(f"task/{task_id}", task)
                     else:
                         await self._queue(tx, task)
-                    await self._event(tx, task["run_id"], "lease_expired", "Attempt expired; publication rights revoked", task_id)
-                    await self._advance(tx, task['run_id'])
+                    await self._event(
+                        tx,
+                        task["run_id"],
+                        "lease_expired",
+                        "Attempt expired; publication rights revoked",
+                        task_id,
+                    )
+                    await self._advance(tx, task["run_id"])
 
     async def prepare(self, claim):
         producer = self.manifest["producers"][claim["producer"]]
@@ -278,7 +371,10 @@ class Engine:
         async with self.state.transaction() as tx:
             await self._owned(tx, claim)
             await self._validate_inputs(tx, claim)
-            checkpoint = await tx.get(f"checkpoint/{claim['scope']}", {"generation": 0, "cursor": None, "state_version": producer["version"]})
+            checkpoint = await tx.get(
+                f"checkpoint/{claim['scope']}",
+                {"generation": 0, "cursor": None, "state_version": producer["version"]},
+            )
             if checkpoint["state_version"] != producer["version"] and claim["mode"] != "recompute":
                 raise Conflict("Incremental state version changed; a recompute is required")
             items = dict(await tx.scan(f"item/{claim['scope']}/")) if producer["incremental"] else {}
@@ -286,7 +382,14 @@ class Engine:
         changes = {"upserted_keys": [], "deleted_keys": []}
         revisions, more = {}, False
         by_key = producer["incremental"]
-        interpretation = digest([producer['code_hash'], producer['version'], run['config'], {k: v['ref'] for k, v in claim['input_refs'].items() if not by_key or k != by_key['input']}])
+        interpretation = digest(
+            [
+                producer["code_hash"],
+                producer["version"],
+                run["config"],
+                {k: v["ref"] for k, v in claim["input_refs"].items() if not by_key or k != by_key["input"]},
+            ]
+        )
         if by_key:
             rows = values[by_key["input"]]
             if not isinstance(rows, list):
@@ -301,20 +404,52 @@ class Engine:
             complete = claim["input_refs"][by_key["input"]]["ref"]["complete"]
             if claim["mode"] == "recompute" and not complete:
                 raise Conflict("Cannot rebuild an asset from an incomplete inventory")
-            upserts = sorted(k for k, v in current.items() if claim["mode"] == "recompute" or k not in previous or previous[k]["revision"] != v or previous[k].get('interpretation') != interpretation)
+            upserts = sorted(
+                k
+                for k, v in current.items()
+                if claim["mode"] == "recompute"
+                or k not in previous
+                or previous[k]["revision"] != v
+                or previous[k].get("interpretation") != interpretation
+            )
             deletes = sorted(previous.keys() - current.keys()) if complete else []
             work = [(k, False) for k in upserts] + [(k, True) for k in deletes]
             # A rebuild replaces the full scope once. Normal incremental work is
             # bounded and independently committed; prior batches survive failure.
-            selected = work if claim["mode"] == "recompute" else work[:by_key["batch_size"]]
+            selected = work if claim["mode"] == "recompute" else work[: by_key["batch_size"]]
             more = len(selected) < len(work)
             for key, deleted in selected:
                 changes["deleted_keys" if deleted else "upserted_keys"].append(key)
                 if not deleted:
                     revisions[key] = current[key]
-        spec = {"revision": claim["revision"], "producer": claim["producer"], "inputs": values, "context": {"partition": claim["partition"], "cursor": None if claim["mode"] == "recompute" else checkpoint["cursor"], "changes": changes, "run_id": claim["run_id"], "config": run["config"]}}
-        no_changes = bool(by_key and claim["mode"] != "recompute" and not changes["upserted_keys"] and not changes["deleted_keys"] and all(h and h.get('scope_complete') for h in claim["baseline"].values()))
-        return {"spec": spec, "checkpoint": checkpoint, "changes": changes, "revisions": revisions, "interpretation": interpretation, "more": more, "skip": no_changes}
+        spec = {
+            "revision": claim["revision"],
+            "producer": claim["producer"],
+            "inputs": values,
+            "context": {
+                "partition": claim["partition"],
+                "cursor": None if claim["mode"] == "recompute" else checkpoint["cursor"],
+                "changes": changes,
+                "run_id": claim["run_id"],
+                "config": run["config"],
+            },
+        }
+        no_changes = bool(
+            by_key
+            and claim["mode"] != "recompute"
+            and not changes["upserted_keys"]
+            and not changes["deleted_keys"]
+            and all(h and h.get("scope_complete") for h in claim["baseline"].values())
+        )
+        return {
+            "spec": spec,
+            "checkpoint": checkpoint,
+            "changes": changes,
+            "revisions": revisions,
+            "interpretation": interpretation,
+            "more": more,
+            "skip": no_changes,
+        }
 
     async def stage_result(self, claim, result):
         producer = self.manifest["producers"][claim["producer"]]
@@ -343,8 +478,10 @@ class Engine:
                     columns = write["keys"]
                     if not columns or len(set(columns)) != len(columns):
                         raise ValueError("Upsert requires unique primary-key columns")
+
                     def key(row, columns=columns):
                         return digest([row[c] for c in columns])
+
                     mapped = {key(row): row for row in old}
                     for deletion in write["deletes"]:
                         if len(deletion) != len(columns):
@@ -365,7 +502,9 @@ class Engine:
                     if previous and previous != fingerprint:
                         raise Conflict("Append batch ID reused with a different payload")
                     if claim["mode"] == "recompute":
-                        raise Conflict("Append assets cannot use recompute; use a new partition or a Replace asset")
+                        raise Conflict(
+                            "Append assets cannot use recompute; use a new partition or a Replace asset"
+                        )
                     value = old if previous else old + write["rows"]
                     receipts[receipt_key] = fingerprint
                 else:
@@ -375,7 +514,18 @@ class Engine:
 
     async def commit(self, claim, prepared, result, refs, receipts, logs=""):
         commit_id = digest([claim["id"], claim["generation"]])
-        fingerprint = digest([refs, receipts, result.get('cursor'), prepared['checkpoint'], prepared['revisions'], prepared['changes'], prepared['interpretation'], prepared['more']])
+        fingerprint = digest(
+            [
+                refs,
+                receipts,
+                result.get("cursor"),
+                prepared["checkpoint"],
+                prepared["revisions"],
+                prepared["changes"],
+                prepared["interpretation"],
+                prepared["more"],
+            ]
+        )
         async with self.state.transaction() as tx:
             previous = await tx.get(f"commit/{commit_id}")
             if previous:
@@ -391,13 +541,46 @@ class Engine:
             if cp["generation"] != prepared["checkpoint"]["generation"]:
                 raise Conflict("Checkpoint advanced after this attempt was prepared")
             producer = self.manifest["producers"][claim["producer"]]
-            checkpoint = {"generation": cp["generation"] + 1, "cursor": result.get("cursor"), "state_version": producer["version"], "commit_id": commit_id}
-            changed = [a for a, ref in refs.items() if not claim["baseline"][a] or claim["baseline"][a]["ref"] != ref]
-            record = {"id": commit_id, "fingerprint": fingerprint, "run_id": claim["run_id"], "task_id": claim["id"], "producer": claim["producer"], "partition": claim["partition"], "generation": claim["generation"], "created_at": self.clock(), "inputs": claim["input_refs"], "outputs": refs, "checkpoint": checkpoint, "changed": changed}
+            checkpoint = {
+                "generation": cp["generation"] + 1,
+                "cursor": result.get("cursor"),
+                "state_version": producer["version"],
+                "commit_id": commit_id,
+            }
+            changed = [
+                a for a, ref in refs.items() if not claim["baseline"][a] or claim["baseline"][a]["ref"] != ref
+            ]
+            record = {
+                "id": commit_id,
+                "fingerprint": fingerprint,
+                "run_id": claim["run_id"],
+                "task_id": claim["id"],
+                "producer": claim["producer"],
+                "partition": claim["partition"],
+                "generation": claim["generation"],
+                "created_at": self.clock(),
+                "inputs": claim["input_refs"],
+                "outputs": refs,
+                "checkpoint": checkpoint,
+                "changed": changed,
+            }
             await tx.put(f"commit/{commit_id}", record)
-            scope_complete = not prepared['more'] and all(info['ref']['complete'] for info in claim['input_refs'].values())
+            scope_complete = not prepared["more"] and all(
+                info["ref"]["complete"] for info in claim["input_refs"].values()
+            )
             for asset, ref in refs.items():
-                await tx.put(head_key(asset, claim["partition"]), {"ref": ref, "commit_id": commit_id, "updated_at": self.clock(), "producer": claim["producer"], "partition": claim["partition"], "scope_complete": scope_complete and ref['complete'], "state_version": producer['version']})
+                await tx.put(
+                    head_key(asset, claim["partition"]),
+                    {
+                        "ref": ref,
+                        "commit_id": commit_id,
+                        "updated_at": self.clock(),
+                        "producer": claim["producer"],
+                        "partition": claim["partition"],
+                        "scope_complete": scope_complete and ref["complete"],
+                        "state_version": producer["version"],
+                    },
+                )
             prefix = f"item/{claim['scope']}/"
             if claim["mode"] == "recompute":
                 for key, _ in await tx.scan(prefix):
@@ -405,15 +588,29 @@ class Engine:
             for key in prepared["changes"]["deleted_keys"]:
                 await tx.delete(prefix + esc(key))
             for key, revision in prepared["revisions"].items():
-                await tx.put(prefix + esc(key), {"key": key, "revision": revision, "interpretation": prepared['interpretation']})
+                await tx.put(
+                    prefix + esc(key),
+                    {"key": key, "revision": revision, "interpretation": prepared["interpretation"]},
+                )
             for key, receipt in receipts.items():
                 existing = await tx.get(key)
                 if existing and existing != receipt:
                     raise Conflict("Append receipt conflict")
                 await tx.put(key, receipt)
             await tx.put(f"checkpoint/{claim['scope']}", checkpoint)
-            await tx.put(f"outbox/{commit_id}", {"commit_id": commit_id, "changed": changed, "created_at": self.clock()})
-            await tx.put(f"attempt/{claim['id']}/{claim['generation']:010d}", {"generation": claim["generation"], "status": "succeeded", "commit_id": commit_id, "logs": logs[-65536:]})
+            await tx.put(
+                f"outbox/{commit_id}",
+                {"commit_id": commit_id, "changed": changed, "created_at": self.clock()},
+            )
+            await tx.put(
+                f"attempt/{claim['id']}/{claim['generation']:010d}",
+                {
+                    "generation": claim["generation"],
+                    "status": "succeeded",
+                    "commit_id": commit_id,
+                    "logs": logs[-65536:],
+                },
+            )
             task["result"], task["error"], task["attempt_count"] = refs, None, 0
             await self._release(tx, task)
             if prepared["more"]:
@@ -421,7 +618,20 @@ class Engine:
             else:
                 task["status"] = "succeeded"
                 await tx.put(f"task/{task['id']}", task)
-            await self._event(tx, task["run_id"], "materialized", f"Committed {', '.join(refs)}", task["id"], {"commit_id": commit_id, "changed": changed, "processed_keys": len(prepared["revisions"]), "deleted_keys": len(prepared["changes"]["deleted_keys"]), "more": prepared["more"]})
+            await self._event(
+                tx,
+                task["run_id"],
+                "materialized",
+                f"Committed {', '.join(refs)}",
+                task["id"],
+                {
+                    "commit_id": commit_id,
+                    "changed": changed,
+                    "processed_keys": len(prepared["revisions"]),
+                    "deleted_keys": len(prepared["changes"]["deleted_keys"]),
+                    "more": prepared["more"],
+                },
+            )
             await self._advance(tx, task["run_id"])
             return record
 
@@ -432,7 +642,10 @@ class Engine:
             task["status"], task["result"] = "skipped", {a: h["ref"] for a, h in claim["baseline"].items()}
             await self._release(tx, task)
             await tx.put(f"task/{task['id']}", task)
-            await tx.put(f"attempt/{claim['id']}/{claim['generation']:010d}", {"generation": claim['generation'], "status": "skipped"})
+            await tx.put(
+                f"attempt/{claim['id']}/{claim['generation']:010d}",
+                {"generation": claim["generation"], "status": "skipped"},
+            )
             await self._event(tx, task["run_id"], "unchanged", "No new source revisions", task["id"])
             await self._advance(tx, task["run_id"])
 
@@ -444,7 +657,10 @@ class Engine:
                 return
             task["error"] = str(error)[-65536:]
             await self._release(tx, task)
-            await tx.put(f"attempt/{claim['id']}/{claim['generation']:010d}", {"generation": claim["generation"], "status": "failed", "error": task["error"]})
+            await tx.put(
+                f"attempt/{claim['id']}/{claim['generation']:010d}",
+                {"generation": claim["generation"], "status": "failed", "error": task["error"]},
+            )
             if task["attempt_count"] < task["max_attempts"] and not isinstance(error, Conflict):
                 await self._queue(tx, task, self.retry_delay)
             else:
@@ -458,6 +674,7 @@ class Engine:
             while True:
                 await asyncio.sleep(self.lease_seconds / 3)
                 await self.renew(claim)
+
         renewal = asyncio.create_task(heartbeat())
         try:
             prepared = await self.prepare(claim)
@@ -503,7 +720,9 @@ class Engine:
                     await self._release(tx, task)
                     task["status"], task["generation"] = "canceled", task["generation"] + 1
                     await tx.put(f"task/{task_id}", task)
-            await self._event(tx, run_id, "canceled", "Publication rights revoked; committed outputs retained")
+            await self._event(
+                tx, run_id, "canceled", "Publication rights revoked; committed outputs retained"
+            )
             return run
 
     async def pause(self, run_id, paused=True):
@@ -511,9 +730,9 @@ class Engine:
             run = await tx.get(f"run/{run_id}")
             if not run:
                 raise KeyError(run_id)
-            if run['status'] in {'succeeded', 'failed', 'canceled'}:
-                raise Conflict('Only active requests can be paused or resumed')
-            run['paused'] = paused
+            if run["status"] in {"succeeded", "failed", "canceled"}:
+                raise Conflict("Only active requests can be paused or resumed")
+            run["paused"] = paused
             await tx.put(f"run/{run_id}", run)
             await self._advance(tx, run_id)
             return await tx.get(f"run/{run_id}")
@@ -532,7 +751,7 @@ class Engine:
                 if task["status"] in {"failed", "blocked"}:
                     task.update(status="waiting", attempt_count=0, error=None)
                     await tx.put(f"task/{task_id}", task)
-            run["status"], run['paused'] = "running", False
+            run["status"], run["paused"] = "running", False
             await tx.put(f"run/{run_id}", run)
             await self._advance(tx, run_id)
             await self._event(tx, run_id, "repair", "Retrying failed work; committed batches retained")
@@ -543,8 +762,20 @@ class Engine:
             for key, a in await tx.scan("automation/"):
                 if not a["enabled"] or a["next_at"] > self.clock():
                     continue
-                body = {"targets": a["targets"], "partitions": [], "mode": "incremental", "config": {}, "revision": self.manifest["revision"]}
-                await self._submit(tx, self._plan(a["targets"], []), body, f"automation:{a['name']}:{a['next_at']}", f"automation:{a['name']}")
+                body = {
+                    "targets": a["targets"],
+                    "partitions": [],
+                    "mode": "incremental",
+                    "config": {},
+                    "revision": self.manifest["revision"],
+                }
+                await self._submit(
+                    tx,
+                    self._plan(a["targets"], []),
+                    body,
+                    f"automation:{a['name']}:{a['next_at']}",
+                    f"automation:{a['name']}",
+                )
                 a["last_at"], a["next_at"] = self.clock(), self.clock() + a["every_seconds"]
                 await tx.put(key, a)
 
@@ -578,7 +809,15 @@ class Engine:
             for name, producer_name in self.manifest["owners"].items():
                 p = self.manifest["producers"][producer_name]
                 heads = [h for _, h in await tx.scan(f"head/{esc(name)}/")]
-                result.append({"name": name, **{k: p[k] for k in ("group", "description", "partitions", "version", "incremental")}, "producer": producer_name, "inputs": list(p["inputs"].values()), "heads": heads})
+                result.append(
+                    {
+                        "name": name,
+                        **{k: p[k] for k in ("group", "description", "partitions", "version", "incremental")},
+                        "producer": producer_name,
+                        "inputs": list(p["inputs"].values()),
+                        "heads": heads,
+                    }
+                )
             return result
 
     async def asset_detail(self, name, partition=""):
@@ -590,7 +829,12 @@ class Engine:
             checkpoint = await tx.get(f"checkpoint/{scope(producer, partition)}")
             commit = await tx.get(f"commit/{head['commit_id']}") if head else None
         data = await self.state.load(head["ref"]) if head else None
-        return {"head": head, "checkpoint": checkpoint, "commit": commit, "preview": data[:100] if isinstance(data, list) else data}
+        return {
+            "head": head,
+            "checkpoint": checkpoint,
+            "commit": commit,
+            "preview": data[:100] if isinstance(data, list) else data,
+        }
 
     async def start(self):
         async def loop():
@@ -613,6 +857,7 @@ class Engine:
             except Exception as error:
                 self.last_error = str(error)
                 self.state.poisoned = True
+
         if self.runner:
             raise RuntimeError("Engine is already running")
         self.runner = asyncio.create_task(loop())

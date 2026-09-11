@@ -4,15 +4,18 @@ import hashlib
 import inspect
 import json
 import re
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,127}$")
 
 
 def digest(value: Any) -> str:
-    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    ).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -88,9 +91,12 @@ class Asset:
     group: str
 
 
-def asset(fn=None, *, outputs=None, inputs=None, incremental=None, partitions=None, version="1", group="default"):
+def asset(
+    fn=None, *, outputs=None, inputs=None, incremental=None, partitions=None, version="1", group="default"
+):
     def wrap(f):
         return Asset(f, tuple(outputs or (f.__name__,)), inputs, incremental, partitions, str(version), group)
+
     return wrap(fn) if fn is not None else wrap
 
 
@@ -116,18 +122,27 @@ class Project:
                 if not NAME.fullmatch(out) or out in owners or out in self.resources:
                     raise ValueError(f"Invalid or duplicate output: {out}")
                 owners[out] = name
-            inputs = a.inputs if a.inputs is not None else {
-                p: p for p in inspect.signature(a.fn).parameters if p != "ctx" and p not in self.resources
-            }
+            inputs = (
+                a.inputs
+                if a.inputs is not None
+                else {
+                    p: p for p in inspect.signature(a.fn).parameters if p != "ctx" and p not in self.resources
+                }
+            )
             if a.incremental and (a.incremental.input not in inputs or a.incremental.batch_size < 1):
                 raise ValueError("ByKey must reference an input and have a positive batch size")
             source_file = inspect.getsourcefile(a.fn)
             code = Path(source_file).read_text() if source_file else inspect.getsource(a.fn)
             producers[name] = {
-                "name": name, "outputs": list(a.outputs), "inputs": inputs,
+                "name": name,
+                "outputs": list(a.outputs),
+                "inputs": inputs,
                 "incremental": asdict(a.incremental) if a.incremental else None,
-                "partitions": a.partitions, "version": a.version, "group": a.group,
-                "description": inspect.getdoc(a.fn) or "", "code_hash": digest(code),
+                "partitions": a.partitions,
+                "version": a.version,
+                "group": a.group,
+                "description": inspect.getdoc(a.fn) or "",
+                "code_hash": digest(code),
             }
             self.producers[name] = a
         visiting, visited = set(), set()
@@ -147,6 +162,7 @@ class Project:
                 visit(parent)
             visiting.remove(name)
             visited.add(name)
+
         for name in producers:
             visit(name)
         automation_names = set()
@@ -156,7 +172,11 @@ class Project:
             automation_names.add(a.name)
             if not a.targets or any(x not in owners or producers[owners[x]]["partitions"] for x in a.targets):
                 raise ValueError("Interval automations currently select unpartitioned assets")
-        body = {"producers": producers, "owners": owners, "automations": [asdict(a) for a in self.automations]}
+        body = {
+            "producers": producers,
+            "owners": owners,
+            "automations": [asdict(a) for a in self.automations],
+        }
         return {**body, "revision": digest(body)}
 
 

@@ -58,7 +58,9 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
             if owned:
                 await runtime.state.close()
 
-    app = FastAPI(title="Data Orchestrator", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    app = FastAPI(
+        title="Data Orchestrator", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None
+    )
 
     @app.middleware("http")
     async def authenticate(request: Request, call_next):
@@ -69,7 +71,9 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
-        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'"
+        )
         response.headers["Cache-Control"] = "no-store" if request.url.path.startswith("/api/") else "no-cache"
         return response
 
@@ -93,7 +97,10 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
     async def health(request: Request):
         runtime = request.app.state.engine
         healthy = not runtime.state.poisoned and not runtime.last_error
-        return JSONResponse({"status": "ok" if healthy else "unavailable", "backend": "slatedb"}, status_code=200 if healthy else 503)
+        return JSONResponse(
+            {"status": "ok" if healthy else "unavailable", "backend": "slatedb"},
+            status_code=200 if healthy else 503,
+        )
 
     @app.get("/api/state")
     async def state(request: Request):
@@ -101,7 +108,19 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
         catalog = await runtime.catalog()
         runs = await runtime.list_runs()
         automations = [a for _, a in await runtime.state.scan("automation/")]
-        return {"assets": catalog, "runs": runs, "automations": automations, "storage": {"engine": "SlateDB", "scheme": urlsplit(runtime.state.url).scheme, "namespace": runtime.state.namespace, "sequence": runtime.state.last_sequence, "experimental": True}, "revision": runtime.manifest["revision"]}
+        return {
+            "assets": catalog,
+            "runs": runs,
+            "automations": automations,
+            "storage": {
+                "engine": "SlateDB",
+                "scheme": urlsplit(runtime.state.url).scheme,
+                "namespace": runtime.state.namespace,
+                "sequence": runtime.state.last_sequence,
+                "experimental": True,
+            },
+            "revision": runtime.manifest["revision"],
+        }
 
     @app.post("/api/runs", status_code=201)
     async def submit(body: RunInput, request: Request, idempotency_key: str | None = Header(default=None)):
