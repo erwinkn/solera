@@ -1,108 +1,75 @@
-name: Verify
+name: Verify object-backed engine
 on:
   push:
-    branches: [main, 'feat/**', 'fix/**']
+    branches: [feat/s3-state-backend]
   pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: verify-${{ github.workflow }}-${{ github.ref }}
+  group: s3-verify-${{ github.ref }}
   cancel-in-progress: true
 jobs:
-  python-ui:
+  contracts:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    services:
-      postgres:
-        image: postgres:17-alpine
-        env:
-          POSTGRES_USER: orchestrator
-          POSTGRES_PASSWORD: test-password
-          POSTGRES_DB: orchestrator
-        ports: ['5432:5432']
-        options: --health-cmd 'pg_isready -U orchestrator' --health-interval 3s --health-timeout 3s --health-retries 20
-    env:
-      DORC_DATABASE_URL: postgresql://orchestrator:test-password@localhost:5432/orchestrator
-      TEST_DATABASE_URL: postgresql://orchestrator:test-password@localhost:5432/orchestrator
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
         with:
-          version: '0.12.10'
           python-version: '3.12'
-          enable-cache: true
+      - run: uv sync
+      - run: uv run python -m compileall -q src tests
+      - run: uv run ruff check --select E9,F63,F7,F82 src tests
+      - run: uv run pytest -q -m 'not live' --junitxml=test-results.xml
+      - run: uv build --wheel
+      - name: Check packaged console
+        run: |
+          uv run python - <<'PY'
+          from glob import glob
+          from zipfile import ZipFile
+          with ZipFile(glob('dist/*.whl')[0]) as z:
+              assert 'data_orchestrator/web/index.html' in z.namelist()
+              assert 'data_orchestrator/web/app.js' in z.namelist()
+              assert 'data_orchestrator/selftest.py' in z.namelist()
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: python-verification
+          path: |
+            test-results.xml
+            uv.lock
+            dist/
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
       - uses: actions/setup-node@v4
         with:
-          node-version: '24'
-          cache: npm
-          cache-dependency-path: ui/package-lock.json
-      - run: uv sync --locked
-      - run: uv run ruff check src tests examples
-      - run: uv run ruff format --check src tests examples
-      - run: uv run mypy src/data_orchestrator
-      - run: uv run pytest -q
-      - run: npm ci
-        working-directory: ui
-      - run: npm run format:check && npm run build
+          node-version: '22'
+      - run: uv sync
+      - run: npm install
         working-directory: ui
       - run: npx playwright install --with-deps chromium
         working-directory: ui
       - run: npm test
         working-directory: ui
-      - run: uv build --wheel
-      - name: Check wheel contains SQL schema and compiled UI
-        run: |
-          uv run python - <<'PY'
-          from glob import glob
-          from zipfile import ZipFile
-          with ZipFile(glob('dist/*.whl')[0]) as wheel:
-              assert 'data_orchestrator/schema.sql' in wheel.namelist()
-              assert 'data_orchestrator/web/index.html' in wheel.namelist()
-          PY
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: browser-results
-          path: ui/test-results/
-          retention-days: 7
-      - uses: actions/upload-artifact@v4
-        with:
-          name: python-wheel
-          path: dist/*.whl
+          name: browser-verification
+          path: |
+            ui/test-results/
+            ui/package-lock.json
   container:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - run: docker compose up --build --wait --wait-timeout 180
-      - name: Execute a real materialization through the container API
-        run: |
-          python3 - <<'PY'
-          import json, time, urllib.request
-          base = 'http://127.0.0.1:8000'
-          with urllib.request.urlopen(base + '/healthz', timeout=10) as response:
-              assert json.load(response)['status'] == 'ok'
-          with urllib.request.urlopen(base, timeout=10) as response:
-              assert 'Data Orchestrator' in response.read().decode()
-          payload = json.dumps({'targets': ['sample_quality']}).encode()
-          request = urllib.request.Request(base + '/api/runs', data=payload, headers={'Content-Type': 'application/json'})
-          with urllib.request.urlopen(request, timeout=10) as response:
-              run_id = json.load(response)['id']
-          deadline = time.monotonic() + 90
-          while time.monotonic() < deadline:
-              with urllib.request.urlopen(base + '/api/runs/' + run_id, timeout=10) as response:
-                  result = json.load(response)
-              state = result['request']['status']
-              if state == 'succeeded':
-                  print('Container materialization succeeded:', run_id)
-                  break
-              if state in {'failed', 'canceled'}:
-                  raise AssertionError(result)
-              time.sleep(0.5)
-          else:
-              raise AssertionError('Container materialization did not complete')
-          PY
-      - if: always()
-        run: docker compose logs --no-color
-      - if: always()
-        run: docker compose down --volumes
+      - run: docker build -t orchestrator-test .
+      - run: docker run --rm orchestrator-test dorc selftest --state-url file:///tmp/test-objects

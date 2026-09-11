@@ -1,0 +1,16 @@
+services:
+  orchestrator:
+    build: .
+    ports: ['127.0.0.1:8000:8000']
+    environment:
+      DORC_STATE_URL: file:///home/app/state
+      DORC_API_TOKEN: ${DORC_API_TOKEN:?Set a local API token before starting Compose}
+    volumes:
+      - objects:/home/app/state
+    healthcheck:
+      test: ['CMD', 'python', '-c', "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+volumes:
+  objects:
