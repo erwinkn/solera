@@ -1,4 +1,4 @@
-name: Refine and verify experimental source
+name: Final review and verified publication
 on:
   push:
     branches: [feat/s3-state-backend]
@@ -6,10 +6,10 @@ on:
 permissions:
   contents: write
 jobs:
-  refine:
+  verify:
     if: github.repository == 'erwinkn/data-orchestrator' && github.ref == 'refs/heads/feat/s3-state-backend'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -19,60 +19,38 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Apply narrow regression fixes
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          def replace(path, old, new):
-              path = Path(path)
-              text = path.read_text()
-              assert text.count(old) == 1, (str(path), old)
-              path.write_text(text.replace(old, new))
-          replace('src/data_orchestrator/selftest.py',
-              "expected = {k: version[k] for k in ('e_tag', 'version')}",
-              "expected = {k: version[k] for k in ('e_tag', 'version') if version.get(k) is not None}\n    check(bool(expected.get('e_tag')), 'Backend did not return an ETag')")
-          replace('ui/console.spec.js', 'toHaveCount(8)', 'toHaveCount(7)')
-          replace('src/data_orchestrator/execution.py', 'import asyncio\n', 'import asyncio\nimport contextlib\n')
-          replace('src/data_orchestrator/execution.py', "__import__('contextlib').suppress", 'contextlib.suppress')
-          replace('src/data_orchestrator/web/app.js',
-              "if(!$('#content').contains(document.activeElement)&&!$('#request-dialog').open)render();",
-              "if(!document.activeElement?.matches('input,select,textarea,[contenteditable=true]')&&!$('#request-dialog').open)render();")
-          replace('Dockerfile',
-              'RUN pip install --no-cache-dir . && useradd --create-home --uid 10001 app',
-              'RUN pip install --no-cache-dir . && useradd --create-home --uid 10001 app && mkdir -p /home/app/state && chown app:app /home/app/state')
-          PY
-      - run: uv sync
+      - run: python3 scripts/review_patch.py
+      - run: uv sync --locked
       - run: uv run ruff check --fix src tests && uv run ruff format src tests
       - run: uv run pytest -q -m 'not live' --junitxml=test-results.xml
-      - run: npm install --save-dev --save-exact @playwright/test@latest && npm audit --audit-level=high
+      - run: npm ci && npm audit --audit-level=high
         working-directory: ui
       - run: npx playwright install --with-deps chromium
         working-directory: ui
       - run: npm test
         working-directory: ui
       - run: uv build --wheel
-      - name: Verify container and filesystem volume
+      - name: Verify Docker and fresh filesystem volume
         env:
           DORC_API_TOKEN: test-ci-local-only
         run: |
           docker compose up --build --wait --wait-timeout 180
-          docker compose exec -T orchestrator dorc selftest --state-url file:///tmp/selftest-objects
+          docker compose exec -T orchestrator dorc selftest --state-url file:///tmp/review-selftest
           docker compose down --volumes
-      - name: Commit verified source and dependency locks
+      - name: Publish verified refinements and remove one-time workflow
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add src tests uv.lock ui/console.spec.js ui/package.json ui/package-lock.json Dockerfile
-          git commit -m 'fix: verify S3 contract and responsive controls; lock and format tested implementation'
+          git rm .github/workflows/refine-source.yml scripts/review_patch.py
+          git add src tests README.md docs
+          git commit -m 'fix: preserve transitive inventory completeness and harden worker protocol; verify regressions'
           git push origin HEAD:refs/heads/feat/s3-state-backend
           git rev-parse HEAD
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: refined-verification
+          name: final-review-verification
           path: |
             test-results.xml
             ui/test-results/
             dist/
-            uv.lock
-            ui/package-lock.json

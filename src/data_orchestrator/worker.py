@@ -1,5 +1,4 @@
 """User code runs here, never in the API process."""
-
 from __future__ import annotations
 
 import asyncio
@@ -26,7 +25,7 @@ async def main():
     mode, entrypoint, *paths = sys.argv[1:]
     project = load_project(entrypoint)
     if mode == "manifest":
-        print(json.dumps(project.manifest))
+        Path(paths[0]).write_text(json.dumps(project.manifest, allow_nan=False))
         return
     spec = json.loads(Path(paths[0]).read_text())
     if project.manifest["revision"] != spec["revision"]:
@@ -34,9 +33,13 @@ async def main():
     producer = project.producers[spec["producer"]]
     args = dict(spec["inputs"])
     if "ctx" in inspect.signature(producer.fn).parameters:
+        if "ctx" in args:
+            raise ValueError("ctx is reserved for AssetContext")
         args["ctx"] = AssetContext(**spec["context"])
     for name, value in project.resources.items():
         if name in inspect.signature(producer.fn).parameters:
+            if name in args:
+                raise ValueError(f"Input and resource conflict: {name}")
             args[name] = value
     result = producer.fn(**args)
     if inspect.isawaitable(result):
