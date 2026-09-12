@@ -4,7 +4,7 @@ Use a dedicated project and a **private Storage Bucket**, not a Railway disk vol
 
 ## Configuration
 
-Deploy `erwinkn/data-orchestrator` from `feat/s3-state-backend`. The included Dockerfile serves the console from the Python wheel. No Node runtime, database service, or persistent application volume is needed for S3 mode.
+Deploy `erwinkn/data-orchestrator` from `feat/s3-state-backend`. `railway.toml` selects the Nixpacks builder: it detects `uv.lock`, runs `uv sync --no-dev --frozen`, and starts `dorc serve --host 0.0.0.0` (the CLI reads `$PORT`). The console bundle is committed under `src/data_orchestrator/web`, so no Node runtime, Dockerfile, database service, or persistent application volume is needed for S3 mode.
 
 Set these environment variables with Railway's reference picker (verify the actual bucket reference names; do not invent them):
 
@@ -23,7 +23,7 @@ Set these environment variables with Railway's reference picker (verify the actu
 
 Keep exactly one replica. Overlapping deployment startup intentionally replaces the previous writer. Do not scale this coordinator horizontally or attach multiple write processes to the same namespace. Services should fail closed rather than run repeated competing takeovers.
 
-The container waits for `dorc selftest` to pass before starting the API when `DORC_SELFTEST=1`. It prints only synthetic test results, namespace, and elapsed time, never credentials. If the endpoint ignores preconditions, transactions fail, or the old writer can publish after takeover, startup fails. Health is exposed at `/healthz`; the UI is `/` and requires the API token for data/actions.
+`dorc serve` runs `dorc selftest` before starting the API when `DORC_SELFTEST=1`; a failed probe exits non-zero so the deployment fails. It prints only synthetic test results, namespace, and elapsed time, never credentials. If the endpoint ignores preconditions, transactions fail, or the old writer can publish after takeover, startup fails. Health is exposed at `/healthz`; the UI is `/` and requires the API token for data/actions.
 
 A second deployment runs the probe under a new namespace. For application persistence verification, materialize an asset in `demo`, redeploy with the same bucket/namespace and no local volume, then inspect the prior run and output in the console. Do not infer persistence merely from a green container healthcheck.
 

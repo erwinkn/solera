@@ -110,13 +110,13 @@ For `ByKey`, successful batches acknowledge only their selected source revisions
 
 A multi-output producer executes as a unit. `fill_missing` reuses only complete published scopes; it is not a freshness check. A paused run starts no further attempts, but already running attempts may finish. Cancellation fences publication, not arbitrary external side effects. Repair retries failed work and retains already committed batches.
 
-Automations take one of three triggers: `Every(seconds)`, `Cron(expression, timezone)`, or `OnCommit(assets)`. Commit triggers materialize their targets against the newly committed inputs inside the same transaction as the publication, and never re-run upstream producers; a commit that changes nothing fires nothing. Asset functions can emit structured entries with `ctx.log("message", **fields)`, shown alongside captured stdout on each attempt.
+Automations take one of three triggers: `Every(seconds)`, `Cron(expression, timezone)`, or `OnCommit(assets)`. Commit triggers mark the automation pending inside the publication transaction; the coordinator then submits the run once every pinned target input resolves, so mid-batch commits coalesce and triggers never fire against still-running upstream work. Triggered runs never re-run upstream producers; a commit that changes nothing fires nothing. Asset functions can emit structured entries with `ctx.log("message", **fields)`, shown alongside captured stdout on each attempt.
 
 ## Tests
 
 ```bash
 uv run pytest -q -m 'not live'
-cd ui && npm ci && npx playwright install chromium && npm test
+cd ui && pnpm install --frozen-lockfile && pnpm exec playwright install chromium && pnpm test
 ```
 
 The Python suite uses real SlateDB on filesystem storage, including abrupt process death and writer takeover. It also starts Moto as an HTTP S3 emulator and runs the remote conformance test. Synthetic fault injection separately verifies acknowledgement timing and ambiguous-outcome behavior. The live-provider test is opt-in:
@@ -125,7 +125,7 @@ The Python suite uses real SlateDB on filesystem storage, including abrupt proce
 DORC_TEST_S3_URL=s3://isolated-test-bucket/prefix uv run pytest -q -m live
 ```
 
-GitHub Actions verifies Python contracts, browser behavior on desktop/mobile, wheel contents, and a Docker end-to-end run. `uv.lock` and the browser package lock are committed. CI uses locked installs; the storage engines are explicitly version-pinned.
+GitHub Actions verifies Python contracts, browser behavior on desktop/mobile, wheel contents, and a native end-to-end probe (`dorc selftest`). `uv.lock` and `pnpm-lock.yaml` are committed, as is the built console under `src/data_orchestrator/web` so deployments need no Node runtime. CI uses locked installs; the storage engines are explicitly version-pinned.
 
 ## Boundaries
 

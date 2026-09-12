@@ -19,6 +19,16 @@ jobs:
         with:
           version: '0.12.13'
           python-version: '3.12'
+      - uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile && pnpm typecheck && pnpm build
+        working-directory: ui
       - run: uv sync --locked
       - run: uv run ruff check src tests && uv run ruff format --check src tests
       - run: uv run pytest -q -m 'not live' --junitxml=test-results.xml
@@ -29,9 +39,13 @@ jobs:
           from glob import glob
           from zipfile import ZipFile
           with ZipFile(glob('dist/*.whl')[0]) as z:
-              for name in ['web/index.html', 'web/app.js', 'web/style.css', 'selftest.py']:
-                  assert 'data_orchestrator/' + name in z.namelist()
+              names = z.namelist()
+              assert 'data_orchestrator/web/index.html' in names
+              assert 'data_orchestrator/selftest.py' in names
+              assert any(n.startswith('data_orchestrator/web/assets/') and n.endswith('.js') for n in names), 'no bundled JS in wheel'
+              assert any(n.startswith('data_orchestrator/web/assets/') and n.endswith('.css') for n in names), 'no bundled CSS in wheel'
           PY
+          uv run dorc selftest --state-url file:///tmp/ci-native-probe
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -48,31 +62,23 @@ jobs:
         with:
           version: '0.12.13'
           python-version: '3.12'
+      - uses: pnpm/action-setup@v4
+        with:
+          run_install: false
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: npm
-          cache-dependency-path: ui/package-lock.json
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
       - run: uv sync --locked
-      - run: npm ci && npm audit --audit-level=high
+      - run: pnpm install --frozen-lockfile && pnpm audit --audit-level=high
         working-directory: ui
-      - run: npx playwright install --with-deps chromium
+      - run: pnpm exec playwright install --with-deps chromium
         working-directory: ui
-      - run: npm test
+      - run: pnpm test
         working-directory: ui
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: browser-verification
           path: ui/test-results/
-  container:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    env:
-      DORC_API_TOKEN: local-ci-token-not-for-deployment
-    steps:
-      - uses: actions/checkout@v4
-      - run: docker compose up --build --wait --wait-timeout 180
-      - run: docker compose exec -T orchestrator dorc selftest --state-url file:///tmp/container-probe
-      - if: always()
-        run: docker compose logs --no-color && docker compose down --volumes

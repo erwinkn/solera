@@ -62,6 +62,8 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
         title="Data Orchestrator", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None
     )
 
+    web = Path(__file__).parent / "web"
+
     @app.middleware("http")
     async def authenticate(request: Request, call_next):
         if request.url.path.startswith("/api/") and token:
@@ -71,8 +73,12 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
+        # The prerendered console shell relies on framework-injected inline
+        # hydration scripts, so inline script/style execution stays allowed.
+        # Everything remains same-origin: no external scripts, styles, or frames.
         response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'"
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+            "connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'"
         )
         response.headers["Cache-Control"] = "no-store" if request.url.path.startswith("/api/") else "no-cache"
         return response
@@ -158,11 +164,20 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
     async def run_automation(name: str, request: Request):
         return await request.app.state.engine.run_automation(name)
 
-    web = Path(__file__).parent / "web"
     app.mount("/static", StaticFiles(directory=web), name="static")
 
     @app.get("/")
     async def index():
+        return FileResponse(web / "index.html")
+
+    @app.get("/{path:path}")
+    async def console(path: str):
+        # Client-side routes (assets, runs, automations, storage) share the shell.
+        target = web / path
+        if path and ".." not in path and target.is_file():
+            return FileResponse(target)
+        if path.startswith("api/") or "." in Path(path).name:
+            raise KeyError(path)
         return FileResponse(web / "index.html")
 
     return app

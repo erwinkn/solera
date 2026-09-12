@@ -24,6 +24,10 @@ def main():
     if args.insecure and args.host not in {"127.0.0.1", "localhost", "::1"}:
         parser.error("--insecure is limited to loopback listeners; set DORC_API_TOKEN for remote access")
     if args.command == "serve":
+        if os.getenv("DORC_SELFTEST") == "1":
+            from .selftest import selftest
+
+            print(json.dumps(asyncio.run(selftest(args.state_url)), indent=2), flush=True)
         import uvicorn
 
         from .api import create_app
