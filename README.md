@@ -24,13 +24,20 @@ source_files -> samples + measurements -> sample_summary -> sample_quality
 daily_observations -> daily_report  (daily partitions)
 ```
 
-The console provides an asset catalog, dependency overview, data previews, committed output references, checkpoints, runs, attempts/logs, backfill requests, pause/resume/cancel/repair controls, interval/cron/changed-output automations, and backend diagnostics. It is a small static JS/CSS application served from the Python wheel, with no CDN or frontend build required. Node is used only for browser tests.
+The console provides an asset catalog, dependency overview, data previews, committed output references, checkpoints, runs, attempts/logs, backfill requests, pause/resume/cancel/repair controls, interval/cron/changed-output automations, and backend diagnostics. It is a Vite/TanStack single-page app served from the Python package; the built bundle is committed, so no Node runtime is needed to run it — only to rebuild (`cd ui && pnpm build`) or test.
 
 ```bash
 uv run dorc run sample_quality
 uv run dorc run daily_report --partition 2026-01-01 --partition 2026-01-02
 uv run dorc manifest --project data_orchestrator.demo:project
 uv run dorc selftest --state-url file:///tmp/orchestrator-test-objects
+```
+
+`--project` accepts `module:attribute` or a file path, Dagster-style — [`example/lab.py`](example/lab.py) is a self-contained weather-station pipeline you can run directly:
+
+```bash
+uv run dorc serve --insecure --project example/lab.py
+uv run dorc run climate_report --project example/lab.py
 ```
 
 **One coordinator per namespace.** Running `dorc run` while `dorc serve` uses the same namespace replaces/fences that server's writer. Use the UI/API to submit work to a running server, or give the CLI a different namespace.
@@ -102,7 +109,7 @@ def measurements(ctx: AssetContext, files):
 project = Project([source_files, measurements])
 ```
 
-Save as `my_project.py` and run `uv run dorc serve --insecure --project my_project:project` from that directory.
+Save as `my_project.py` and run `uv run dorc serve --insecure --project my_project.py` from that directory — the attribute defaults to `project` (or a single `Project` instance is auto-detected); `file.py:attribute` selects another name, and a bare module name also defaults to `project`.
 
 An ordinary return value replaces a snapshot. Explicit operations are `Replace`, `Inventory`, `ReplaceKeys`, `Upsert`, and `AppendBatch`. `Batch(outputs={...}, cursor=...)` returns multiple output mutations and the next user-managed cursor together. Checkpoints are scoped by producer and partition.
 

@@ -12,9 +12,36 @@ from pathlib import Path
 from .sdk import AssetContext, Project, normalize_result
 
 
+def _load_module(path: Path):
+    sys.path.insert(0, str(path.parent))
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def load_project(entrypoint):
-    module, attribute = entrypoint.split(":", 1)
-    project = getattr(importlib.import_module(module), attribute)
+    target, separator, attribute = entrypoint.rpartition(":")
+    if target.endswith(".py") or (not separator and entrypoint.endswith(".py")):
+        path = Path(target or entrypoint).resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"Project file not found: {path}")
+        module = _load_module(path)
+        if separator:
+            project = getattr(module, attribute)
+        else:
+            project = getattr(module, "project", None)
+            if project is None:
+                candidates = [value for value in vars(module).values() if isinstance(value, Project)]
+                if len(candidates) != 1:
+                    raise TypeError("Project file must define a `project` or use file.py:attribute")
+                project = candidates[0]
+    else:
+        project = getattr(
+            importlib.import_module(target if separator else entrypoint),
+            attribute if separator else "project",
+        )
     if callable(project):
         project = project()
     if not isinstance(project, Project):
