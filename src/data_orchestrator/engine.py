@@ -6,6 +6,9 @@ import datetime as dt
 import time
 import uuid
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
+
+from croniter import croniter
 
 from .sdk import digest
 from .storage import Unavailable
@@ -63,11 +66,15 @@ class Engine:
                 record.update(
                     {
                         "enabled": previous["enabled"] if previous else automation["enabled"],
-                        "next_at": previous["next_at"]
-                        if previous
-                        else self.clock() + automation["every_seconds"],
+                        "last_at": previous.get("last_at") if previous else None,
+                        "last_request": previous.get("last_request") if previous else None,
                     }
                 )
+                same_trigger = previous and previous.get("trigger") == record["trigger"]
+                record["next_at"] = (previous.get("next_at") if same_trigger else None) or self._next_fire(
+                    record
+                )
+                record["pending"] = previous.get("pending") if same_trigger else None
                 await tx.put(key, record)
             # Opening a new native writer fences the previous one. Its active
             # attempt generations must still be revoked in our domain state.
@@ -98,6 +105,16 @@ class Engine:
                     )
             for run_id in affected:
                 await self._advance(tx, run_id)
+
+    def _next_fire(self, automation):
+        trigger = automation["trigger"]
+        if trigger["kind"] == "commit":
+            return None
+        if trigger["kind"] == "cron":
+            zone = ZoneInfo(trigger["timezone"])
+            start = dt.datetime.fromtimestamp(self.clock(), zone)
+            return croniter(trigger["expression"], start).get_next(dt.datetime).timestamp()
+        return self.clock() + trigger["seconds"]
 
     def _plan(self, targets, partitions):
         if not targets or len(set(targets)) != len(targets):
@@ -137,6 +154,29 @@ class Engine:
                 visit(owners[asset], partition)
         if len(planned) > 5000:
             raise ValueError("Request exceeds the alpha's 5,000-task limit")
+        return list(planned.values())
+
+    def _plan_trigger(self, targets):
+        # Commit-triggered requests pin currently committed heads instead of
+        # re-running upstream work: re-committing watched assets inside a
+        # triggered run would re-fire its own automation.
+        owners, producers = self.manifest["owners"], self.manifest["producers"]
+        planned = {}
+        for asset in targets:
+            name = owners[asset]
+            identity = scope(name, "")
+            if identity in planned:
+                continue
+            planned[identity] = {
+                "identity": identity,
+                "producer": name,
+                "partition": "",
+                "deps": {},
+                "pinned_inputs": {
+                    arg: {"asset": source, "partition": ""}
+                    for arg, source in producers[name]["inputs"].items()
+                },
+            }
         return list(planned.values())
 
     async def submit(
@@ -194,6 +234,7 @@ class Engine:
                 "result": {},
                 "revision": body["revision"],
                 "mode": body["mode"],
+                "pinned_inputs": p.get("pinned_inputs"),
             }
             if not task["deps"]:
                 await self._queue(tx, task)
@@ -287,11 +328,28 @@ class Engine:
                     await self._advance(tx, task["run_id"])
                     continue
                 inputs = {}
-                for arg, dep in task["deps"].items():
-                    upstream = await tx.get(f"task/{dep['task']}")
-                    if upstream["status"] not in SUCCESS:
-                        raise RuntimeError("Ready index references an unsatisfied dependency")
-                    inputs[arg] = {**dep, "ref": upstream["result"][dep["asset"]]}
+                if task.get("pinned_inputs") is not None:
+                    missing = []
+                    for arg, dep in task["pinned_inputs"].items():
+                        head = await tx.get(head_key(dep["asset"], dep["partition"]))
+                        if not head:
+                            missing.append(dep["asset"])
+                        else:
+                            inputs[arg] = {**dep, "ref": head["ref"]}
+                    if missing:
+                        task["status"] = "failed"
+                        task["error"] = f"Pinned inputs have no committed output: {', '.join(missing)}"
+                        await tx.delete(queue_key)
+                        await tx.put(f"task/{task_id}", task)
+                        await self._event(tx, task["run_id"], "failed", task["error"], task_id)
+                        await self._advance(tx, task["run_id"])
+                        continue
+                else:
+                    for arg, dep in task["deps"].items():
+                        upstream = await tx.get(f"task/{dep['task']}")
+                        if upstream["status"] not in SUCCESS:
+                            raise RuntimeError("Ready index references an unsatisfied dependency")
+                        inputs[arg] = {**dep, "ref": upstream["result"][dep["asset"]]}
                 task.update(
                     {
                         "status": "running",
@@ -612,8 +670,10 @@ class Engine:
                     "status": "succeeded",
                     "commit_id": commit_id,
                     "logs": logs[-65536:],
+                    "log_entries": result.get("log_entries") or [],
                 },
             )
+            await self._mark_triggers(tx, changed, commit_id, task["run_id"])
             task["result"], task["error"], task["attempt_count"] = refs, None, 0
             await self._release(tx, task)
             if prepared["more"]:
@@ -637,6 +697,29 @@ class Engine:
             )
             await self._advance(tx, task["run_id"])
             return record
+
+    async def _mark_triggers(self, tx, changed, commit_id, run_id):
+        # Commits pend matching automations in the same transaction; the
+        # evaluation loop delivers them once every pinned input has a head.
+        if not changed:
+            return
+        for key, a in await tx.scan("automation/"):
+            trigger = a["trigger"]
+            if not a["enabled"] or trigger["kind"] != "commit":
+                continue
+            if not set(changed) & set(trigger["assets"]):
+                continue
+            a["pending"] = commit_id
+            await tx.put(key, a)
+            await self._event(tx, run_id, "automation", f"Commit pended automation '{a['name']}'")
+
+    async def _trigger_plan(self, tx, targets):
+        plan = self._plan_trigger(targets)
+        for p in plan:
+            for dep in p["pinned_inputs"].values():
+                if not await tx.get(head_key(dep["asset"], dep["partition"])):
+                    return None
+        return plan
 
     async def _skip(self, claim):
         async with self.state.transaction() as tx:
@@ -763,8 +846,19 @@ class Engine:
     async def evaluate_automations(self):
         async with self.state.transaction() as tx:
             for key, a in await tx.scan("automation/"):
-                if not a["enabled"] or a["next_at"] > self.clock():
+                if not a["enabled"]:
                     continue
+                if a["trigger"]["kind"] == "commit":
+                    pending = a.get("pending")
+                    plan = pending and await self._trigger_plan(tx, a["targets"])
+                    if not plan:
+                        continue
+                    tick_key = f"automation:{a['name']}:{pending}"
+                else:
+                    if a["next_at"] is None or a["next_at"] > self.clock():
+                        continue
+                    plan = self._plan(a["targets"], [])
+                    tick_key = f"automation:{a['name']}:{a['next_at']}"
                 body = {
                     "targets": a["targets"],
                     "partitions": [],
@@ -772,15 +866,33 @@ class Engine:
                     "config": {},
                     "revision": self.manifest["revision"],
                 }
-                await self._submit(
-                    tx,
-                    self._plan(a["targets"], []),
-                    body,
-                    f"automation:{a['name']}:{a['next_at']}",
-                    f"automation:{a['name']}",
-                )
-                a["last_at"], a["next_at"] = self.clock(), self.clock() + a["every_seconds"]
+                run = await self._submit(tx, plan, body, tick_key, f"automation:{a['name']}")
+                a["last_at"], a["last_request"], a["pending"] = self.clock(), run["id"], None
+                if a["trigger"]["kind"] != "commit":
+                    a["next_at"] = self._next_fire(a)
                 await tx.put(key, a)
+
+    async def run_automation(self, name):
+        async with self.state.transaction() as tx:
+            key = f"automation/{esc(name)}"
+            a = await tx.get(key)
+            if not a:
+                raise KeyError(name)
+            body = {
+                "targets": a["targets"],
+                "partitions": [],
+                "mode": "incremental",
+                "config": {},
+                "revision": self.manifest["revision"],
+            }
+            if a["trigger"]["kind"] == "commit":
+                plan = self._plan_trigger(a["targets"])
+            else:
+                plan = self._plan(a["targets"], [])
+            run = await self._submit(tx, plan, body, str(uuid.uuid4()), f"manual:{name}")
+            a["last_at"], a["last_request"] = self.clock(), run["id"]
+            await tx.put(key, a)
+            return run
 
     async def set_automation(self, name, enabled):
         async with self.state.transaction() as tx:
@@ -789,6 +901,8 @@ class Engine:
             if not value:
                 raise KeyError(name)
             value["enabled"] = enabled
+            if not enabled:
+                value["pending"] = None
             await tx.put(key, value)
             return value
 

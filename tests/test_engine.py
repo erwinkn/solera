@@ -9,7 +9,10 @@ from data_orchestrator import (
     Automation,
     Batch,
     ByKey,
+    Cron,
+    Every,
     Inventory,
+    OnCommit,
     Project,
     ReplaceKeys,
     Upsert,
@@ -367,7 +370,8 @@ async def test_automation_request_and_cursor_are_atomic(make_engine, state, monk
 
     now = [1000.0]
     engine = await make_engine(
-        Project([source], automations=[Automation("tick", ("source",), 60, True)]), clock=lambda: now[0]
+        Project([source], automations=[Automation("tick", ("source",), Every(60), True)]),
+        clock=lambda: now[0],
     )
     now[0] += 61
     original = Transaction.put
@@ -391,3 +395,186 @@ async def test_automation_request_and_cursor_are_atomic(make_engine, state, monk
 async def test_scope_encoding_is_unambiguous():
     assert scope("asset", "") != scope("asset", "_")
     assert scope("asset", "a/b") != scope("asset/a", "b")
+
+
+async def test_commit_trigger_runs_targets_against_committed_heads(make_engine, state):
+    @asset
+    def source():
+        return [{"v": 1}]
+
+    @asset(inputs={"rows": "source"})
+    def mid(rows):
+        return [{"v": r["v"] * 2} for r in rows]
+
+    @asset
+    def report(mid):
+        return {"rows": len(mid)}
+
+    project = Project(
+        [source, mid, report],
+        automations=[
+            Automation("on_mid", ("report",), OnCommit(("mid",)), True),
+            Automation("quiet", ("report",), OnCommit(("source",))),
+        ],
+    )
+    engine = await make_engine(project)
+    detail = await finish(engine, await engine.submit(["report"]))
+    assert detail["request"]["status"] == "succeeded"
+    # The commit pended the enabled automation; the disabled one never pends.
+    assert (await state.get("automation/on_mid"))["pending"]
+    assert not (await state.get("automation/quiet"))["pending"]
+    await engine.evaluate_automations()
+    triggered = [r for r in await engine.list_runs() if r["cause"] == "automation:on_mid"]
+    assert len(triggered) == 1
+    assert not [r for r in await engine.list_runs() if r["cause"] == "automation:quiet"]
+    assert (await state.get("automation/on_mid"))["pending"] is None
+    detail = await finish(engine, triggered[0])
+    assert detail["request"]["status"] == "succeeded"
+    assert [t["producer"] for t in detail["tasks"]] == ["report"]
+    assert detail["tasks"][0]["pinned_inputs"] == {"mid": {"asset": "mid", "partition": ""}}
+    record = await state.get("automation/on_mid")
+    assert record["last_request"] == triggered[0]["id"]
+    # An identical commit changes no references and does not re-pend the trigger.
+    await finish(engine, await engine.submit(["report"]))
+    assert not (await state.get("automation/on_mid"))["pending"]
+    await engine.evaluate_automations()
+    assert len([r for r in await engine.list_runs() if r["cause"] == "automation:on_mid"]) == 1
+
+
+async def test_commit_trigger_run_now_pins_current_heads(make_engine):
+    @asset
+    def source():
+        return [{"v": 1}]
+
+    @asset
+    def report(source):
+        return len(source)
+
+    engine = await make_engine(
+        Project(
+            [source, report],
+            automations=[Automation("on_source", ("report",), OnCommit(("source",)), True)],
+        )
+    )
+    detail = await finish(engine, await engine.submit(["source"]))
+    assert detail["request"]["status"] == "succeeded"
+    run = await engine.run_automation("on_source")
+    assert run["cause"] == "manual:on_source"
+    detail = await finish(engine, run)
+    assert detail["request"]["status"] == "succeeded"
+    assert [t["producer"] for t in detail["tasks"]] == ["report"]
+
+
+async def test_pending_commit_trigger_waits_for_target_inputs(make_engine, state):
+    @asset
+    def watched():
+        return [1]
+
+    @asset
+    def other():
+        return [2]
+
+    @asset
+    def report(watched, other):
+        return len(watched) + len(other)
+
+    engine = await make_engine(
+        Project(
+            [watched, other, report],
+            automations=[Automation("on_watched", ("report",), OnCommit(("watched",)), True)],
+        )
+    )
+    await finish(engine, await engine.submit(["watched"]))
+    assert (await state.get("automation/on_watched"))["pending"]
+    await engine.evaluate_automations()
+    assert not [r for r in await engine.list_runs() if r["cause"].startswith("automation:")]
+    await finish(engine, await engine.submit(["other"]))
+    await engine.evaluate_automations()
+    runs = [r for r in await engine.list_runs() if r["cause"] == "automation:on_watched"]
+    assert len(runs) == 1
+    detail = await finish(engine, runs[0])
+    assert detail["request"]["status"] == "succeeded"
+
+
+async def test_pinned_run_fails_when_input_is_uncommitted(make_engine):
+    @asset
+    def source():
+        return [{"v": 1}]
+
+    @asset
+    def report(source):
+        return len(source)
+
+    engine = await make_engine(
+        Project(
+            [source, report],
+            automations=[Automation("on_source", ("report",), OnCommit(("source",)), True)],
+        )
+    )
+    run = await engine.run_automation("on_source")
+    detail = await finish(engine, run)
+    assert detail["request"]["status"] == "failed"
+    assert "no committed output" in detail["tasks"][0]["error"]
+
+
+async def test_cron_automation_schedules_and_ticks(make_engine, state):
+    @asset
+    def source():
+        return 1
+
+    engine = await make_engine(
+        Project([source], automations=[Automation("nightly", ("source",), Cron("0 6 * * *", "UTC"), True)])
+    )
+    record = await state.get("automation/nightly")
+    assert record["next_at"] > engine.clock()
+    await engine.evaluate_automations()
+    assert await engine.list_runs() == []
+    record["next_at"] = 0
+    async with state.transaction() as tx:
+        await tx.put("automation/nightly", record)
+    await engine.evaluate_automations()
+    runs = await engine.list_runs()
+    assert len(runs) == 1 and runs[0]["cause"] == "automation:nightly"
+    record = await state.get("automation/nightly")
+    assert record["next_at"] > engine.clock() and record["last_request"] == runs[0]["id"]
+
+
+async def test_automation_trigger_validation():
+    @asset
+    def source():
+        return 1
+
+    @asset
+    def report(source):
+        return source
+
+    @asset(outputs=("a_out", "b_out"))
+    def multi():
+        return Batch({"a_out": 1, "b_out": 2})
+
+    with pytest.raises(ValueError, match="own producers"):
+        Project([source, report], automations=[Automation("x", ("report",), OnCommit(("report",)))])
+    with pytest.raises(ValueError, match="own producers"):
+        Project([multi], automations=[Automation("x", ("a_out",), OnCommit(("b_out",)))])
+    with pytest.raises(ValueError, match="known assets"):
+        Project([source], automations=[Automation("x", ("source",), OnCommit(("missing",)))])
+    with pytest.raises(ValueError, match="Invalid cron"):
+        Cron("definitely not cron")
+    with pytest.raises(ValueError, match="timezone"):
+        Cron("0 6 * * *", "Not/AZone")
+    with pytest.raises(ValueError, match="Interval"):
+        Every(0)
+
+
+async def test_structured_log_entries_reach_the_attempt(make_engine):
+    @asset
+    def source(ctx):
+        ctx.log("Extraction complete", rows=3)
+        return [1]
+
+    engine = await make_engine(Project([source]))
+    detail = await finish(engine, await engine.submit(["source"]))
+    attempts = next(iter(detail["attempts"].values()))
+    succeeded = next(a for a in attempts if a["status"] == "succeeded")
+    assert succeeded["log_entries"][0]["message"] == "Extraction complete"
+    assert succeeded["log_entries"][0]["fields"] == {"rows": 3}

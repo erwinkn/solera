@@ -8,7 +8,13 @@ version = "0.2.0a1"
 description = "An experimental asset engine with object-storage-only durable state"
 requires-python = ">=3.12"
 license = "Apache-2.0"
-dependencies = ["slatedb==0.16.0", "obstore==0.11.1", "fastapi>=0.115,<1", "uvicorn>=0.34,<1"]
+dependencies = [
+    "slatedb==0.16.0",
+    "obstore==0.11.1",
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.34,<1",
+    "croniter>=6,<7",
+]
 
 [project.scripts]
 dorc = "data_orchestrator.cli:main"

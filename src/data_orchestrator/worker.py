@@ -33,10 +33,12 @@ async def main():
         raise RuntimeError("Code revision changed; register the new project before executing")
     producer = project.producers[spec["producer"]]
     args = dict(spec["inputs"])
+    ctx = None
     if "ctx" in inspect.signature(producer.fn).parameters:
         if "ctx" in args:
             raise ValueError("ctx is reserved for AssetContext")
-        args["ctx"] = AssetContext(**spec["context"])
+        ctx = AssetContext(**spec["context"])
+        args["ctx"] = ctx
     for name, value in project.resources.items():
         if name in inspect.signature(producer.fn).parameters:
             if name in args:
@@ -45,7 +47,10 @@ async def main():
     result = producer.fn(**args)
     if inspect.isawaitable(result):
         result = await result
-    Path(paths[1]).write_text(json.dumps(normalize_result(result, list(producer.outputs)), allow_nan=False))
+    payload = normalize_result(result, list(producer.outputs))
+    if ctx is not None:
+        payload["log_entries"] = ctx._records
+    Path(paths[1]).write_text(json.dumps(payload, allow_nan=False))
 
 
 if __name__ == "__main__":

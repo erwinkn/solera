@@ -4,10 +4,14 @@ import hashlib
 import inspect
 import json
 import re
+import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from croniter import croniter
 
 NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,127}$")
 
@@ -70,14 +74,62 @@ class AssetContext:
     changes: dict[str, Any]
     run_id: str
     config: dict[str, Any]
+    _records: list[dict[str, Any]] = field(default_factory=list, repr=False)
+
+    def log(self, message: str, **fields: Any) -> None:
+        entry = {"at": time.time(), "message": str(message), "fields": fields}
+        json.dumps(entry, allow_nan=False)
+        if len(self._records) < 1000:
+            self._records.append(entry)
+
+
+@dataclass(frozen=True)
+class Every:
+    seconds: int
+
+    def __post_init__(self) -> None:
+        if self.seconds < 1:
+            raise ValueError("Interval must be positive")
+
+
+@dataclass(frozen=True)
+class Cron:
+    expression: str
+    timezone: str = "UTC"
+
+    def __post_init__(self) -> None:
+        try:
+            croniter(self.expression)
+        except Exception as error:
+            raise ValueError(f"Invalid cron expression: {self.expression}") from error
+        try:
+            ZoneInfo(self.timezone)
+        except (ZoneInfoNotFoundError, ValueError) as error:
+            raise ValueError(f"Unknown cron timezone: {self.timezone}") from error
+
+
+@dataclass(frozen=True)
+class OnCommit:
+    assets: tuple[str, ...]
 
 
 @dataclass(frozen=True)
 class Automation:
     name: str
     targets: tuple[str, ...]
-    every_seconds: int = 300
+    trigger: Every | Cron | OnCommit = field(default_factory=lambda: Every(300))
     enabled: bool = False
+
+    def manifest(self) -> dict[str, Any]:
+        kind = {Every: "interval", Cron: "cron", OnCommit: "commit"}.get(type(self.trigger))
+        if kind is None:
+            raise ValueError("Unknown automation trigger")
+        return {
+            "name": self.name,
+            "targets": list(self.targets),
+            "enabled": self.enabled,
+            "trigger": {"kind": kind, **asdict(self.trigger)},
+        }
 
 
 @dataclass
@@ -192,15 +244,22 @@ class Project:
             visit(name)
         automation_names = set()
         for a in self.automations:
-            if not NAME.fullmatch(a.name) or a.name in automation_names or a.every_seconds < 1:
+            if not NAME.fullmatch(a.name) or a.name in automation_names:
                 raise ValueError("Invalid or duplicate automation")
             automation_names.add(a.name)
             if not a.targets or any(x not in owners or producers[owners[x]]["partitions"] for x in a.targets):
-                raise ValueError("Interval automations currently select unpartitioned assets")
+                raise ValueError("Automations currently select unpartitioned assets")
+            if not isinstance(a.trigger, (Every, Cron, OnCommit)):
+                raise ValueError("Unknown automation trigger")
+            if isinstance(a.trigger, OnCommit):
+                if not a.trigger.assets or set(a.trigger.assets) - owners.keys():
+                    raise ValueError("Commit triggers must reference known assets")
+                if {owners[x] for x in a.trigger.assets} & {owners[x] for x in a.targets}:
+                    raise ValueError("An automation cannot trigger its own producers")
         body = {
             "producers": producers,
             "owners": owners,
-            "automations": [asdict(a) for a in self.automations],
+            "automations": [a.manifest() for a in self.automations],
         }
         return {**body, "revision": digest(body)}
 

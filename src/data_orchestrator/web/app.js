@@ -28,8 +28,13 @@ function render() {
     if(!state.runs.length)root.append(empty('No materializations yet','Start with sample_quality to exercise incremental, multi-output processing.'));
     else root.append(table(['Request','Targets','Status','Created'],state.runs.map(r=>[button(r.id.slice(0,8),()=>showRun(r.id),'asset-name'),r.targets.join(', '),tag(r.status),time(r.created_at)])));
   } else if(view==='automations') {
-    root.append(table(['Automation','Targets','Interval','State'],state.automations.map(a=>[a.name,a.targets.join(', '),`${a.every_seconds}s`,button(a.enabled?'Enabled — pause':'Paused — enable',async()=>{try{await api('/automations/'+encodeURIComponent(a.name),{method:'POST',body:JSON.stringify({enabled:!state.automations.find(current=>current.name===a.name).enabled})});await refresh()}catch(e){error(e.message)}})])));
-    root.append(el('p','Missed interval ticks are coalesced. Accepting requests and advancing the automation cursor is one durable transaction.','notice'));
+    const describe=(a)=>{const t=a.trigger||{};const next=a.enabled&&a.next_at?' · next '+time(a.next_at):'';if(t.kind==='commit')return'On commit of '+t.assets.join(', ')+(a.pending?' · pending':'');if(t.kind==='cron')return`Cron ${t.expression} · ${t.timezone}${next}`;return`Every ${t.seconds}s${next}`};
+    root.append(table(['Automation','Targets','Trigger','State',''],state.automations.map(a=>{
+      const toggle=button(a.enabled?'Enabled — pause':'Paused — enable',async()=>{try{await api('/automations/'+encodeURIComponent(a.name),{method:'POST',body:JSON.stringify({enabled:!state.automations.find(current=>current.name===a.name).enabled})});await refresh()}catch(e){error(e.message)}});
+      const run=button('Run now',async()=>{try{const r=await api('/automations/'+encodeURIComponent(a.name)+'/run',{method:'POST'});setView('runs');await refresh();await showRun(r.id)}catch(e){error(e.message)}});
+      return [a.name,a.targets.join(', '),describe(a),toggle,run];
+    })));
+    root.append(el('p','Missed interval and cron ticks are coalesced. Commit automations run their targets against committed inputs when watched assets publish new output.','notice'));
   } else {
     const grid=el('dl',undefined,'storage-grid');const entries=[['State engine',state.storage.engine+' 0.16'],['Object store',state.storage.scheme==='file'?'Local filesystem':state.storage.scheme.toUpperCase()],['Namespace',state.storage.namespace],['Last local acknowledgement',String(state.storage.sequence)],['Publication','Object-store durability awaited before acknowledgement'],['Coordinator','One active writer; replacement fences the old writer'],['Definition',state.revision.slice(0,16)]];
     entries.forEach(([k,v])=>grid.append(el('dt',k),el('dd',v)));root.append(grid,el('p','Experimental backend. SlateDB owns the log, compaction, recovery, and writer fencing. Data files are immutable; output references, checkpoints, task completion, and change notifications commit together.','notice'),el('h3','Current boundaries'),el('p','JSON snapshots and local subprocess execution. No cross-destination transactions, historical code bundles, or artifact garbage collection. External side effects may repeat after a crash. The filesystem mode is a development backend, not a multi-host object store.'));
@@ -57,7 +62,10 @@ async function showRun(id, silent=false) {
  try{const detail=await api('/runs/'+id);if(selectedRun!==id||epoch!==selectionEpoch)return;$('#drawer-title').textContent='Run '+id.slice(0,8);const root=$('#drawer-content');root.replaceChildren(tag(detail.request.status),el('p',detail.request.targets.join(', ')+' · '+time(detail.request.created_at)));
  const actions=el('div',undefined,'actions');if(!['failed','succeeded','canceled'].includes(detail.request.status)){actions.append(button('Cancel request',()=>runAction(id,'cancel')),button(detail.request.paused?'Resume':'Pause',()=>runAction(id,detail.request.paused?'resume':'pause')))}if(detail.request.status==='failed')actions.append(button('Retry failed work',()=>runAction(id,'retry')));root.append(actions,table(['Producer','Partition','Status','Generation'],detail.tasks.map(t=>[t.producer,t.partition||'—',tag(t.status),String(t.generation)])),el('h3','Events'));
  detail.events.forEach(event=>{const n=el('div',undefined,'event');n.append(el('time',time(event.at)),tag(event.kind),el('p',event.message));if(event.data)n.append(el('pre',JSON.stringify(event.data,null,2)));root.append(n)});
- Object.entries(detail.attempts).forEach(([task,attempts])=>attempts.filter(a=>a.logs||a.error).forEach(a=>json('Attempt '+task.slice(0,8)+' / '+a.generation,a.logs||a.error,root)));
+ Object.entries(detail.attempts).forEach(([task,attempts])=>attempts.forEach(a=>{
+  (a.log_entries||[]).forEach(e=>{const n=el('div',undefined,'event');n.append(el('time',time(e.at)),tag('log'),el('p',e.message));if(e.fields&&Object.keys(e.fields).length)n.append(el('pre',JSON.stringify(e.fields)));root.append(n)});
+  if(a.logs||a.error)json('Attempt '+task.slice(0,8)+' / '+a.generation,a.logs||a.error,root);
+ }));
  if(!silent&&!$('#drawer').open)$('#drawer').showModal();
  }catch(e){error(e.message)}
 }

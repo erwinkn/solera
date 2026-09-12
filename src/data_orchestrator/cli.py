@@ -18,6 +18,8 @@ def main():
     parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8000")))
     parser.add_argument("--insecure", action="store_true", help="Disable auth on a loopback listener only")
     parser.add_argument("--partition", action="append", default=[])
+    parser.add_argument("--mode", default="incremental", choices=["incremental", "fill_missing", "recompute"])
+    parser.add_argument("--config", default="{}", help="Request configuration as a JSON object")
     args = parser.parse_args()
     if args.insecure and args.host not in {"127.0.0.1", "localhost", "::1"}:
         parser.error("--insecure is limited to loopback listeners; set DORC_API_TOKEN for remote access")
@@ -55,7 +57,12 @@ def main():
             try:
                 runtime = Engine(state, manifest, backend)
                 await runtime.initialize()
-                run = await runtime.submit(args.targets, partitions=args.partition)
+                config = json.loads(args.config)
+                if not isinstance(config, dict):
+                    parser.error("--config must be a JSON object")
+                run = await runtime.submit(
+                    args.targets, partitions=args.partition, mode=args.mode, config=config
+                )
                 while True:
                     await runtime.execute_next()
                     detail = await runtime.run_detail(run["id"])

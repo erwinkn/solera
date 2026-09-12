@@ -45,10 +45,14 @@ test('bounded backfill form submits real daily work', async({page})=>{
 test('automation controls and validation', async({page})=>{
   await login(page);
   await page.getByRole('button',{name:'Automations',exact:true}).click();
-  await page.getByRole('button',{name:'Paused — enable',exact:true}).click();
-  await expect(page.getByRole('button',{name:'Enabled — pause',exact:true})).toBeVisible();
-  await page.getByRole('button',{name:'Enabled — pause',exact:true}).click();
-  await expect(page.getByRole('button',{name:'Paused — enable',exact:true})).toBeVisible();
+  const row=page.locator('tbody tr',{hasText:'refresh_laboratory'});
+  await row.getByRole('button',{name:'Paused — enable',exact:true}).click();
+  await expect(row.getByRole('button',{name:'Enabled — pause',exact:true})).toBeVisible();
+  await row.getByRole('button',{name:'Enabled — pause',exact:true}).click();
+  await expect(row.getByRole('button',{name:'Paused — enable',exact:true})).toBeVisible();
+  await row.getByRole('button',{name:'Run now',exact:true}).click();
+  await expect(page.locator('#drawer-content')).toBeVisible();
+  await page.locator('#drawer').getByRole('button',{name:'Close',exact:true}).click();
   await page.getByRole('button',{name:'Materialize',exact:true}).click();
   await page.getByRole('button',{name:'Start materialization',exact:true}).click();
   await expect(page.locator('#request-error')).toHaveText('Select at least one asset');

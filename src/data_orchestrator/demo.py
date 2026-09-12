@@ -1,6 +1,18 @@
 """Runnable, deterministic examples. No external credentials are required."""
 
-from . import AssetContext, Automation, Batch, ByKey, Inventory, Project, ReplaceKeys, asset
+from . import (
+    AssetContext,
+    Automation,
+    Batch,
+    ByKey,
+    Cron,
+    Every,
+    Inventory,
+    OnCommit,
+    Project,
+    ReplaceKeys,
+    asset,
+)
 
 
 @asset(group="Laboratory")
@@ -33,7 +45,7 @@ def parse_files(ctx: AssetContext, files):
         for row in selected
         if row.get("calcium") is not None
     ]
-    print(f"Processing {len(selected)} revisions and {len(ctx.changes['deleted_keys'])} deletions")
+    ctx.log("Parsed file revisions", upserted=len(selected), deleted=len(ctx.changes["deleted_keys"]))
     return Batch(
         {
             "samples": ReplaceKeys("source_file_id", keys, samples),
@@ -76,5 +88,9 @@ def daily_report(ctx: AssetContext, daily_observations):
 
 project = Project(
     [source_files, parse_files, sample_summary, sample_quality, daily_observations, daily_report],
-    automations=[Automation("refresh_laboratory", ("sample_quality",), every_seconds=300)],
+    automations=[
+        Automation("refresh_laboratory", ("sample_quality",), Every(300)),
+        Automation("nightly_laboratory", ("sample_quality",), Cron("0 6 * * *", "UTC")),
+        Automation("on_measurements", ("sample_quality",), OnCommit(("measurements",))),
+    ],
 )

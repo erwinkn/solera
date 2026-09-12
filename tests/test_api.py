@@ -4,7 +4,7 @@ import sys
 import httpx
 import pytest
 
-from data_orchestrator import Project, asset
+from data_orchestrator import Automation, Every, Project, asset
 from data_orchestrator.api import create_app
 from data_orchestrator.execution import LocalSubprocess
 
@@ -49,6 +49,31 @@ async def test_authentication_validation_and_live_api(make_engine):
             engine.state.poisoned = True
             assert (await client.get("/healthz")).status_code == 503
             engine.state.poisoned = False
+
+
+async def test_run_automation_endpoint(make_engine):
+    @asset
+    def demo():
+        return [{"value": 7}]
+
+    engine = await make_engine(Project([demo], automations=[Automation("auto", ("demo",), Every(3600))]))
+    app = create_app(engine=engine, token="secret-token")
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            client.headers["Authorization"] = "Bearer secret-token"
+            assert (await client.post("/api/automations/missing/run")).status_code == 404
+            response = await client.post("/api/automations/auto/run")
+            assert response.status_code == 202
+            run_id = response.json()["id"]
+            for _ in range(100):
+                detail = (await client.get("/api/runs/" + run_id)).json()
+                if detail["request"]["status"] == "succeeded":
+                    break
+                await asyncio.sleep(0.03)
+            assert detail["request"]["status"] == "succeeded"
+            assert detail["request"]["cause"] == "manual:auto"
 
 
 async def test_api_requires_explicit_authentication_choice():

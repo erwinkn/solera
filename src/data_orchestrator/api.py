@@ -154,6 +154,10 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
     async def automation(name: str, body: AutomationInput, request: Request):
         return await request.app.state.engine.set_automation(name, body.enabled)
 
+    @app.post("/api/automations/{name}/run", status_code=202)
+    async def run_automation(name: str, request: Request):
+        return await request.app.state.engine.run_automation(name)
+
     web = Path(__file__).parent / "web"
     app.mount("/static", StaticFiles(directory=web), name="static")
 

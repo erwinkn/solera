@@ -22,8 +22,10 @@ class InlineBackend:
             raise RuntimeError("Injected transform failure")
         producer = self.project.producers[spec["producer"]]
         args = dict(spec["inputs"])
+        ctx = None
         if "ctx" in inspect.signature(producer.fn).parameters:
-            args["ctx"] = AssetContext(**spec["context"])
+            ctx = AssetContext(**spec["context"])
+            args["ctx"] = ctx
         args.update(
             {
                 k: v
@@ -34,7 +36,10 @@ class InlineBackend:
         value = producer.fn(**args)
         if inspect.isawaitable(value):
             value = await value
-        return normalize_result(value, list(producer.outputs)), "test output"
+        payload = normalize_result(value, list(producer.outputs))
+        if ctx is not None:
+            payload["log_entries"] = ctx._records
+        return payload, "test output"
 
 
 @pytest.fixture

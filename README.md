@@ -24,7 +24,7 @@ source_files -> samples + measurements -> sample_summary -> sample_quality
 daily_observations -> daily_report  (daily partitions)
 ```
 
-The console provides an asset catalog, dependency overview, data previews, committed output references, checkpoints, runs, attempts/logs, backfill requests, pause/resume/cancel/repair controls, interval automations, and backend diagnostics. It is a small static JS/CSS application served from the Python wheel, with no CDN or frontend build required. Node is used only for browser tests.
+The console provides an asset catalog, dependency overview, data previews, committed output references, checkpoints, runs, attempts/logs, backfill requests, pause/resume/cancel/repair controls, interval/cron/changed-output automations, and backend diagnostics. It is a small static JS/CSS application served from the Python wheel, with no CDN or frontend build required. Node is used only for browser tests.
 
 ```bash
 uv run dorc run sample_quality
@@ -110,6 +110,8 @@ For `ByKey`, successful batches acknowledge only their selected source revisions
 
 A multi-output producer executes as a unit. `fill_missing` reuses only complete published scopes; it is not a freshness check. A paused run starts no further attempts, but already running attempts may finish. Cancellation fences publication, not arbitrary external side effects. Repair retries failed work and retains already committed batches.
 
+Automations take one of three triggers: `Every(seconds)`, `Cron(expression, timezone)`, or `OnCommit(assets)`. Commit triggers materialize their targets against the newly committed inputs inside the same transaction as the publication, and never re-run upstream producers; a commit that changes nothing fires nothing. Asset functions can emit structured entries with `ctx.log("message", **fields)`, shown alongside captured stdout on each attempt.
+
 ## Tests
 
 ```bash
@@ -127,7 +129,7 @@ GitHub Actions verifies Python contracts, browser behavior on desktop/mobile, wh
 
 ## Boundaries
 
-This is a feasibility implementation, not a claim of production readiness or benchmarked scalability. It deliberately serializes metadata transitions through remote acknowledgement. Inventory diffs and JSON snapshot rewrites are in-memory; queue/catalog/history scans need pagination and better indexing at larger scale. Limits are 64 MiB per JSON output, 1,000 partitions and 5,000 planned tasks per request. There is no Parquet/S3 table adapter, external-destination transaction recovery, distributed execution backend, arbitrary partition mapping, cron/event trigger, retained historical code image, artifact garbage collector, or zero-downtime multi-replica writer election. The durable outbox exists; an external event consumer is not implemented.
+This is a feasibility implementation, not a claim of production readiness or benchmarked scalability. It deliberately serializes metadata transitions through remote acknowledgement. Inventory diffs and JSON snapshot rewrites are in-memory; queue/catalog/history scans need pagination and better indexing at larger scale. Limits are 64 MiB per JSON output, 1,000 partitions and 5,000 planned tasks per request. There is no Parquet/S3 table adapter, external-destination transaction recovery, distributed execution backend, arbitrary partition mapping, retained historical code image, artifact garbage collector, or zero-downtime multi-replica writer election. The durable outbox exists; an external event consumer is not implemented.
 
 Read [the design and safety invariants](docs/architecture.md) before extending the backend. OpenAPI/UI endpoints are trusted-team surfaces, not a hardened multi-tenant service.
 

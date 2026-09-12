@@ -25,7 +25,7 @@ This conservative lock sacrifices write batching and throughput. It is an explic
 - `command/`, `run/`, `runs/`: idempotency receipts, requests, time index.
 - `task/`, `attempt/`, `ready/`, `active/`, `scope/`: scheduling and ownership.
 - `head/`, `commit/`, `checkpoint/`, `item/`, `append/`: output versions and incremental state.
-- `event/`, `automation/`, `outbox/`: audit events and automation decisions.
+- `event/`, `automation/`, `outbox/`: audit events and automation decisions. Commit triggers are pended on the `automation/` record inside the publication transaction and delivered by the coordinator's evaluation loop once every pinned target input resolves; triggered runs never re-execute upstream producers.
 
 Keys are separate indexed records, not one huge JSON workspace blob. Some current query paths still scan full prefixes; this is not yet a high-cardinality scheduler benchmark.
 
