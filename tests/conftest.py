@@ -1,11 +1,10 @@
 import inspect
 
 import pytest
-
 from data_orchestrator import AssetContext
-from data_orchestrator.engine import Engine
 from data_orchestrator.sdk import normalize_result
-from data_orchestrator.storage import SlateState
+from dorc.engine import Engine
+from dorc.storage import SlateState
 
 
 class InlineBackend:

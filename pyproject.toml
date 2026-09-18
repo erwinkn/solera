@@ -1,29 +1,26 @@
-[build-system]
-requires = ["hatchling>=1.27,<2"]
-build-backend = "hatchling.build"
-
 [project]
-name = "data-orchestrator"
+name = "data-orchestrator-workspace"
 version = "0.2.0a1"
-description = "An experimental asset engine with object-storage-only durable state"
+description = "Workspace root for the data-orchestrator monorepo"
 requires-python = ">=3.12"
-license = "Apache-2.0"
 dependencies = [
-    "slatedb==0.16.0",
-    "obstore==0.11.1",
-    "fastapi>=0.115,<1",
-    "uvicorn>=0.34,<1",
-    "croniter>=6,<7",
+    "data-orchestrator-server",
+    "data-orchestrator-worker",
 ]
 
-[project.scripts]
-dorc = "data_orchestrator.cli:main"
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["packages/sdk", "apps/worker", "apps/server"]
+
+[tool.uv.sources]
+data-orchestrator-server = { workspace = true }
+data-orchestrator-worker = { workspace = true }
+data-orchestrator = { workspace = true }
 
 [dependency-groups]
 dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "httpx>=0.28,<1", "ruff>=0.12,<1", "moto[server,s3]>=5,<6", "boto3>=1.36,<2"]
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/data_orchestrator"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -7,11 +7,10 @@ import uuid
 
 import pytest
 from conftest import finish
-
-from data_orchestrator.engine import Engine
-from data_orchestrator.execution import LocalSubprocess
-from data_orchestrator.selftest import selftest
-from data_orchestrator.storage import SlateState, Unavailable
+from dorc.engine import Engine
+from dorc.execution import LocalSubprocess
+from dorc.selftest import selftest
+from dorc.storage import SlateState, Unavailable
 
 
 async def test_transaction_rollback_and_reopen(tmp_path):
@@ -155,11 +154,11 @@ async def test_killed_process_recovers_accepted_request(tmp_path):
     url = tmp_path.as_uri()
     script = """
 import asyncio, os, sys
-from data_orchestrator.storage import SlateState
-from data_orchestrator.execution import LocalSubprocess
-from data_orchestrator.engine import Engine
+from dorc.storage import SlateState
+from dorc.execution import LocalSubprocess
+from dorc.engine import Engine
 async def main():
-    backend = LocalSubprocess('data_orchestrator.demo:project')
+    backend = LocalSubprocess('dorc.demo:project')
     state = await SlateState.open(sys.argv[1], flush_interval='1ms')
     engine = Engine(state, await backend.manifest(), backend)
     await engine.initialize()
@@ -174,7 +173,7 @@ asyncio.run(main())
     assert result.returncode == 0, result.stderr.decode()
     state = await SlateState.open(url, flush_interval="1ms")
     try:
-        backend = LocalSubprocess("data_orchestrator.demo:project")
+        backend = LocalSubprocess("dorc.demo:project")
         engine = Engine(state, await backend.manifest(), backend)
         await engine.initialize()
         run = await engine.submit(["sample_quality"], command_id="crash-request")

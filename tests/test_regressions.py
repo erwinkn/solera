@@ -4,10 +4,9 @@ import textwrap
 
 import pytest
 from conftest import finish
-
 from data_orchestrator import ByKey, Inventory, Project, ReplaceKeys, asset
-from data_orchestrator.engine import Engine
-from data_orchestrator.execution import LocalSubprocess
+from dorc.engine import Engine
+from dorc.execution import LocalSubprocess
 
 
 @pytest.mark.parametrize("case", ["unknown", "collision", "reserved", "missing", "variadic", "positional"])
@@ -153,7 +152,7 @@ async def test_subprocess_log_flood_is_bounded(tmp_path, monkeypatch):
 
 
 async def test_numeric_demo_inventory_keys_are_processed(state):
-    backend = LocalSubprocess("data_orchestrator.demo:project")
+    backend = LocalSubprocess("dorc.demo:project")
     engine = Engine(state, await backend.manifest(), backend)
     await engine.initialize()
     run = await engine.submit(

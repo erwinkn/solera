@@ -32,7 +32,7 @@ class LocalSubprocess:
         process = await asyncio.create_subprocess_exec(
             sys.executable,
             "-m",
-            "data_orchestrator.worker",
+            "dorc_worker",
             *args,
             env=env,
             stdout=asyncio.subprocess.PIPE,

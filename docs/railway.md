@@ -4,7 +4,7 @@ Use a dedicated project and a **private Storage Bucket**, not a Railway disk vol
 
 ## Configuration
 
-Deploy `erwinkn/data-orchestrator` from `feat/s3-state-backend`. `railway.toml` selects the Nixpacks builder: it detects `uv.lock`, runs `uv sync --no-dev --frozen`, and starts `dorc serve --host 0.0.0.0` (the CLI reads `$PORT`). The console bundle is committed under `src/data_orchestrator/web`, so no Node runtime, Dockerfile, database service, or persistent application volume is needed for S3 mode.
+Deploy `erwinkn/data-orchestrator` from `feat/s3-state-backend`. `railway.toml` selects the Nixpacks builder: it detects `uv.lock`, runs `uv sync --no-dev --frozen`, and starts `dorc serve --host 0.0.0.0` (the CLI reads `$PORT`). The console bundle is committed under `apps/server/src/dorc/web`, so no Node runtime, Dockerfile, database service, or persistent application volume is needed for S3 mode.
 
 Set these environment variables with Railway's reference picker (verify the actual bucket reference names; do not invent them):
 

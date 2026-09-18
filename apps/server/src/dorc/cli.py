@@ -11,7 +11,7 @@ def main():
     parser = argparse.ArgumentParser(description="Asset orchestration on object storage")
     parser.add_argument("command", choices=["serve", "manifest", "run", "selftest"])
     parser.add_argument("targets", nargs="*")
-    parser.add_argument("--project", default=os.getenv("DORC_PROJECT", "data_orchestrator.demo:project"))
+    parser.add_argument("--project", default=os.getenv("DORC_PROJECT", "dorc.demo:project"))
     parser.add_argument("--state-url", default=os.getenv("DORC_STATE_URL", Path(".dorc").resolve().as_uri()))
     parser.add_argument("--namespace", default=os.getenv("DORC_NAMESPACE", "default"))
     parser.add_argument("--host", default="127.0.0.1")

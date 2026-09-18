@@ -20,7 +20,7 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: "pnpm run build && cd .. && uv run dorc serve",
+    command: "pnpm run build && cd ../.. && uv run dorc serve",
     url: "http://127.0.0.1:8000/healthz",
     timeout: 120000,
     reuseExistingServer: !process.env.CI,

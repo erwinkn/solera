@@ -3,10 +3,9 @@ import sys
 
 import httpx
 import pytest
-
 from data_orchestrator import Automation, Every, Project, asset
-from data_orchestrator.api import create_app
-from data_orchestrator.execution import LocalSubprocess
+from dorc.api import create_app
+from dorc.execution import LocalSubprocess
 
 
 async def test_authentication_validation_and_live_api(make_engine):
@@ -84,7 +83,7 @@ async def test_api_requires_explicit_authentication_choice():
 
 
 async def test_subprocess_rejects_wrong_revision():
-    backend = LocalSubprocess("data_orchestrator.demo:project")
+    backend = LocalSubprocess("dorc.demo:project")
     with pytest.raises(RuntimeError, match="Code revision changed"):
         await backend.execute({"revision": "wrong", "producer": "source_files", "inputs": {}, "context": {}})
 
@@ -93,7 +92,7 @@ async def test_public_insecure_cli_is_rejected():
     process = await asyncio.create_subprocess_exec(
         sys.executable,
         "-m",
-        "data_orchestrator.cli",
+        "dorc.cli",
         "serve",
         "--host",
         "0.0.0.0",

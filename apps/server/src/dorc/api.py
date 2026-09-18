@@ -30,7 +30,7 @@ class AutomationInput(BaseModel):
 def create_app(*, state_url=None, namespace=None, project=None, token=None, insecure=False, engine=None):
     state_url = state_url or os.getenv("DORC_STATE_URL", Path(".dorc").resolve().as_uri())
     namespace = namespace or os.getenv("DORC_NAMESPACE", "default")
-    project = project or os.getenv("DORC_PROJECT", "data_orchestrator.demo:project")
+    project = project or os.getenv("DORC_PROJECT", "dorc.demo:project")
     token = token or os.getenv("DORC_API_TOKEN")
 
     @asynccontextmanager

@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "data-orchestrator-server"
+version = "0.2.0a1"
+description = "Control plane: API, engine, storage, and console for the data orchestrator"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+dependencies = [
+    "data-orchestrator",
+    "data-orchestrator-worker",
+    "slatedb==0.16.0",
+    "obstore==0.11.1",
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.34,<1",
+    "croniter>=6,<7",
+]
+
+[project.scripts]
+dorc = "dorc.cli:main"
+
+[tool.uv.sources]
+data-orchestrator = { workspace = true }
+data-orchestrator-worker = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dorc"]

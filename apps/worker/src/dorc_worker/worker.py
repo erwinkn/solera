@@ -9,7 +9,7 @@ import json
 import sys
 from pathlib import Path
 
-from .sdk import AssetContext, Project, normalize_result
+from data_orchestrator.sdk import AssetContext, Project, normalize_result
 
 
 def _load_module(path: Path):

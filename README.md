@@ -8,6 +8,8 @@ This is a standalone implementation on `feat/s3-state-backend`. The earlier `fea
 
 Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/). On supported platforms, SlateDB's Python wheel includes the native engine.
 
+The repo is a monorepo: `packages/sdk` ships the `data_orchestrator` asset SDK that project files import; `apps/server` ships the `dorc` control plane (API, engine, storage, `dorc` CLI); `apps/worker` ships `dorc_worker`, the task-execution package the server spawns locally and the base for remote workers; `apps/console` is the pnpm/Vite web app. `uv sync` installs the whole uv workspace.
+
 ```bash
 uv sync --locked
 uv run dorc serve --insecure
@@ -24,12 +26,12 @@ source_files -> samples + measurements -> sample_summary -> sample_quality
 daily_observations -> daily_report  (daily partitions)
 ```
 
-The console provides an asset catalog, dependency overview, data previews, committed output references, checkpoints, runs, attempts/logs, backfill requests, pause/resume/cancel/repair controls, interval/cron/changed-output automations, and backend diagnostics. It is a Vite/TanStack single-page app served from the Python package; the built bundle is committed, so no Node runtime is needed to run it — only to rebuild (`cd ui && pnpm build`) or test.
+The console provides an asset catalog, dependency overview, data previews, committed output references, checkpoints, runs, attempts/logs, backfill requests, pause/resume/cancel/repair controls, interval/cron/changed-output automations, and backend diagnostics. It is a Vite/TanStack single-page app served from the Python package; the built bundle is committed, so no Node runtime is needed to run it — only to rebuild (`pnpm -C apps/console build`) or test.
 
 ```bash
 uv run dorc run sample_quality
 uv run dorc run daily_report --partition 2026-01-01 --partition 2026-01-02
-uv run dorc manifest --project data_orchestrator.demo:project
+uv run dorc manifest --project dorc.demo:project
 uv run dorc selftest --state-url file:///tmp/orchestrator-test-objects
 ```
 
@@ -123,7 +125,7 @@ Automations take one of three triggers: `Every(seconds)`, `Cron(expression, time
 
 ```bash
 uv run pytest -q -m 'not live'
-cd ui && pnpm install --frozen-lockfile && pnpm exec playwright install chromium && pnpm test
+pnpm install --frozen-lockfile && pnpm -C apps/console exec playwright install chromium && pnpm -C apps/console test
 ```
 
 The Python suite uses real SlateDB on filesystem storage, including abrupt process death and writer takeover. It also starts Moto as an HTTP S3 emulator and runs the remote conformance test. Synthetic fault injection separately verifies acknowledgement timing and ambiguous-outcome behavior. The live-provider test is opt-in:
@@ -132,7 +134,7 @@ The Python suite uses real SlateDB on filesystem storage, including abrupt proce
 DORC_TEST_S3_URL=s3://isolated-test-bucket/prefix uv run pytest -q -m live
 ```
 
-GitHub Actions verifies Python contracts, browser behavior on desktop/mobile, wheel contents, and a native end-to-end probe (`dorc selftest`). `uv.lock` and `pnpm-lock.yaml` are committed, as is the built console under `src/data_orchestrator/web` so deployments need no Node runtime. CI uses locked installs; the storage engines are explicitly version-pinned.
+GitHub Actions verifies Python contracts, browser behavior on desktop/mobile, wheel contents, and a native end-to-end probe (`dorc selftest`). `uv.lock` and `pnpm-lock.yaml` are committed, as is the built console under `apps/server/src/dorc/web` so deployments need no Node runtime. CI uses locked installs; the storage engines are explicitly version-pinned.
 
 ## Boundaries
 

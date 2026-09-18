@@ -3,7 +3,6 @@ import copy
 
 import pytest
 from conftest import finish
-
 from data_orchestrator import (
     AppendBatch,
     Automation,
@@ -18,8 +17,8 @@ from data_orchestrator import (
     Upsert,
     asset,
 )
-from data_orchestrator.engine import Conflict, LostOwnership, head_key, scope
-from data_orchestrator.storage import Transaction
+from dorc.engine import Conflict, LostOwnership, head_key, scope
+from dorc.storage import Transaction
 
 
 def keyed_project():

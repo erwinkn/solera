@@ -1,6 +1,6 @@
 """Runnable, deterministic examples. No external credentials are required."""
 
-from . import (
+from data_orchestrator import (
     AssetContext,
     Automation,
     Batch,

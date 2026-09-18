@@ -1,8 +1,7 @@
 import pytest
-
 from data_orchestrator import Project
-from data_orchestrator.execution import LocalSubprocess
-from data_orchestrator.worker import load_project
+from dorc.execution import LocalSubprocess
+from dorc_worker.worker import load_project
 
 SOURCE = """
 from data_orchestrator import asset, Project
@@ -16,13 +15,13 @@ project = Project([answer])
 
 
 def test_module_entrypoint():
-    project = load_project("data_orchestrator.demo:project")
+    project = load_project("dorc.demo:project")
     assert isinstance(project, Project)
     assert "sample_quality" in project.manifest["producers"]
 
 
 def test_bare_module_defaults_to_project_attribute():
-    project = load_project("data_orchestrator.demo")
+    project = load_project("dorc.demo")
     assert isinstance(project, Project)
 
 
