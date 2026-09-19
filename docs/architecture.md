@@ -59,11 +59,12 @@ Three processes:
 
 ```python
 @asset(
-    outputs=Output("qaqc_samples", store="postgres", schema="qaqc",
-                   primary_key=["sample_id"], partition_column="site"),
-    partitions=sites,                 # an asset producing a PartitionSet (§7)
-    inputs={"qaqc_files": ByKey()},   # an incremental edge (§5)
-    automations=AutoRefresh(),        # OnChange over inputs + deps (§9)
+    outputs=Output(
+        "qaqc_samples", store="postgres", schema="qaqc", primary_key=["sample_id"], partition_column="site"
+    ),
+    partitions=sites,  # an asset producing a PartitionSet (§7)
+    inputs={"qaqc_files": ByKey()},  # an incremental edge (§5)
+    automations=AutoRefresh(),  # OnChange over inputs + deps (§9)
 )
 async def qaqc_samples(ctx, qaqc_files: pd.DataFrame, sharepoint): ...
 ```
@@ -128,12 +129,12 @@ records lineage and cursor and fires nothing.
 ```python
 @dataclass(frozen=True)
 class Ref:
-    output: str       # output name — lineage
-    store: str        # store registry key
-    handle: Any       # store-defined coordinates, JSON
-    version: str      # deterministic change token
-    partition: str    # scope this ref is the head for
-    meta: dict        # engine-defined: {"keys": {"object", "count"}, "external": bool}
+    output: str  # output name — lineage
+    store: str  # store registry key
+    handle: Any  # store-defined coordinates, JSON
+    version: str  # deterministic change token
+    partition: str  # scope this ref is the head for
+    meta: dict  # engine-defined: {"keys": {"object", "count"}, "external": bool}
 ```
 
 - **JSON only.** Refs live in state, specs and results. Handles are dicts of
@@ -250,14 +251,14 @@ earlier versions.
 ## 5. Inputs
 
 ```python
-inputs={
-    "qaqc_files":  ByKey(batch_size=100),       # incremental edge, same-named output
-    "site_health": AllPartitions(),             # collapse upstream-only dimensions
-    "feed":        "station_feed",              # rename, same as In("station_feed")
-    "x":           ByKey("some_output"),        # rename + incremental
-    "matrix":      In(meta={"owner": "lab"}),   # whole value, with edge metadata
+inputs = {
+    "qaqc_files": ByKey(batch_size=100),  # incremental edge, same-named output
+    "site_health": AllPartitions(),  # collapse upstream-only dimensions
+    "feed": "station_feed",  # rename, same as In("station_feed")
+    "x": ByKey("some_output"),  # rename + incremental
+    "matrix": In(meta={"owner": "lab"}),  # whole value, with edge metadata
 }
-deps=["usgs_3dep_tiles"]                        # pinned, watched, not loaded
+deps = ["usgs_3dep_tiles"]  # pinned, watched, not loaded
 ```
 
 Every value is an `In` or a `str` (sugar for `In(output)`). `In(output=None,
@@ -296,10 +297,10 @@ so pinning and fingerprinting are uniform.
 The **commit API** advances a source without moving data:
 
 ```python
-client.commit("pmpt_project_matrix", version="2026-09-18T21:57Z")        # unkeyed: new revision
-client.commit("sharepoint_files", keys={"f1": "v3", "f2": "v1"})              # keyed: full map
-client.commit("sharepoint_files", upsert={"f1": "v4"}, remove=["f0"])         # keyed: patch
-client.commit("uploads", upsert=["u-91"], remove=["u-12"])                    # PartitionSet: patch the set
+client.commit("pmpt_project_matrix", version="2026-09-18T21:57Z")  # unkeyed: new revision
+client.commit("sharepoint_files", keys={"f1": "v3", "f2": "v1"})  # keyed: full map
+client.commit("sharepoint_files", upsert={"f1": "v4"}, remove=["f0"])  # keyed: patch
+client.commit("uploads", upsert=["u-91"], remove=["u-12"])  # PartitionSet: patch the set
 # POST /api/projects/{p}/sources/{name}/commit
 ```
 
@@ -349,8 +350,8 @@ a recompute.
 A partition declaration is one **dimension** or a dict of named dimensions:
 
 ```python
-partitions=sites                                   # one dimension
-partitions={"site": sites, "day": TimePartitions(start="2024-01-01", every="1d")}
+partitions = sites  # one dimension
+partitions = {"site": sites, "day": TimePartitions(start="2024-01-01", every="1d")}
 ```
 
 | Dimension | Keys | State |
@@ -426,9 +427,18 @@ A commit installs heads, `input_refs`, the cursor, per-edge key state and a
 ## 9. Automations
 
 ```python
-Automation(name=None, targets=None, trigger=..., enabled=True,
-           partitions=None, mode="incremental", upstream=False, config=None, keys=None)
-AutoRefresh()                     # Automation(trigger=OnChange()) over inputs + deps
+Automation(
+    name=None,
+    targets=None,
+    trigger=...,
+    enabled=True,
+    partitions=None,
+    mode="incremental",
+    upstream=False,
+    config=None,
+    keys=None,
+)
+AutoRefresh()  # Automation(trigger=OnChange()) over inputs + deps
 ```
 
 A trigger says **when**; the automation says **what run** to submit, in
@@ -515,12 +525,14 @@ run = await placement.launch(Stage(attempt, objects_url))
 deadline = now() + timeout
 while (exit := await placement.wait(run, lease_interval)) is None:
     if now() > deadline:
-        await placement.cancel(run); await placement.wait(run, grace)
+        await placement.cancel(run)
+        await placement.wait(run, grace)
         return fail("timeout", retryable=True)
     try:
-        await attempts.renew(attempt)            # raises LostOwnership when fenced or canceled
+        await attempts.renew(attempt)  # raises LostOwnership when fenced or canceled
     except LostOwnership:
-        await placement.cancel(run); await placement.wait(run, grace)
+        await placement.cancel(run)
+        await placement.wait(run, grace)
         return
 result = await objects.get(f"results/{attempt}.json")
 if result is None:
@@ -607,9 +619,12 @@ whose placement fits; `POST /api/tasks/{id}/renew`; `POST
 
 ```python
 project = Project(
-    assets=[...], sources=[...],
+    assets=[...],
+    sources=[...],
     stores={"postgres": PostgresStore(dsn="env:DATABASE_URL")},
-    executors=[...], resources={...}, automations=[...],
+    executors=[...],
+    resources={...},
+    automations=[...],
 )
 # or Project.from_package("brimstone.assets", ...)
 ```

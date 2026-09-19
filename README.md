@@ -88,14 +88,25 @@ An emulator passing these checks is **not proof** that a different provider has 
 
 ```python
 from data_orchestrator import (
-    AssetContext, Batch, ByKey, Inventory, Project, ReplaceKeys, asset,
+    AssetContext,
+    Batch,
+    ByKey,
+    Inventory,
+    Project,
+    ReplaceKeys,
+    asset,
 )
+
 
 @asset
 def source_files():
-    return Inventory([
-        {"id": "a.csv", "revision": "2", "records": [{"value": 42}]},
-    ], complete=True)
+    return Inventory(
+        [
+            {"id": "a.csv", "revision": "2", "records": [{"value": 42}]},
+        ],
+        complete=True,
+    )
+
 
 @asset(inputs={"files": "source_files"}, incremental=ByKey("files"))
 def measurements(ctx: AssetContext, files):
@@ -103,10 +114,12 @@ def measurements(ctx: AssetContext, files):
     affected = changed + ctx.changes["deleted_keys"]
     rows = [
         {"source_file": f["id"], **record}
-        for f in files if str(f["id"]) in changed
+        for f in files
+        if str(f["id"]) in changed
         for record in f["records"]
     ]
     return ReplaceKeys("source_file", affected, rows)
+
 
 project = Project([source_files, measurements])
 ```

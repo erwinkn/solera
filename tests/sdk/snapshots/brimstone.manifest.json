@@ -1,0 +1,1469 @@
+{
+  "assets": {
+    "fleet_dashboard": {
+      "automations": [
+        "fleet_dashboard.onchange.0"
+      ],
+      "code_hash": "88f918db5305684bacd5c6cba3d06a2ebe4310b35bd900932998ad38a2415dbe",
+      "deps": [],
+      "doc": "Partitioned upstream, unpartitioned consumer: the site dimension is collapsed.",
+      "inputs": {
+        "site_health": {
+          "kind": "all_partitions",
+          "meta": null,
+          "output": "site_health"
+        }
+      },
+      "on_version_change": "fail",
+      "outputs": [
+        {
+          "config": {
+            "schema": "ops"
+          },
+          "key": null,
+          "mode": null,
+          "name": "fleet_dashboard",
+          "partition_set": false,
+          "revision": null,
+          "store": "postgres"
+        }
+      ],
+      "partitions": null,
+      "placement": {
+        "environment": {},
+        "kind": "Local",
+        "placement": {}
+      },
+      "retries": {
+        "backoff": "exponential",
+        "delay": 1.0,
+        "n": 3
+      },
+      "timeout": 3600,
+      "types": {
+        "params": {
+          "site_health": {
+            "args": [
+              {
+                "class": "builtins.str"
+              },
+              {
+                "class": "data_orchestrator.sdk.TableRef"
+              }
+            ],
+            "generic": "dict"
+          }
+        },
+        "return": {
+          "class": "pandas.core.frame.DataFrame"
+        }
+      },
+      "version": "1"
+    },
+    "graph_delta": {
+      "automations": [
+        "graph_delta.every.0"
+      ],
+      "code_hash": "88f918db5305684bacd5c6cba3d06a2ebe4310b35bd900932998ad38a2415dbe",
+      "deps": [],
+      "doc": "Poll a site's Graph delta feed; the delta token is the cursor.",
+      "inputs": {},
+      "on_version_change": "fail",
+      "outputs": [
+        {
+          "config": {
+            "partition_column": "site",
+            "schema": "sharepoint"
+          },
+          "key": null,
+          "mode": "append",
+          "name": "change_events",
+          "partition_set": false,
+          "revision": null,
+          "store": "postgres"
+        },
+        {
+          "config": {},
+          "key": "file_id",
+          "mode": null,
+          "name": "qaqc_files",
+          "partition_set": false,
+          "revision": "version",
+          "store": "json"
+        }
+      ],
+      "partitions": {
+        "dims": {
+          "sites": {
+            "kind": "set",
+            "output": "sites"
+          }
+        }
+      },
+      "placement": {
+        "environment": {},
+        "kind": "Local",
+        "placement": {}
+      },
+      "retries": {
+        "backoff": "exponential",
+        "delay": 1.0,
+        "n": 3
+      },
+      "timeout": 3600,
+      "types": {
+        "params": {
+          "graph": {
+            "class": "brimstone.GraphClient"
+          }
+        },
+        "return": null
+      },
+      "version": "1"
+    },
+    "hillshade": {
+      "automations": [
+        "hillshade.every.0"
+      ],
+      "code_hash": "88f918db5305684bacd5c6cba3d06a2ebe4310b35bd900932998ad38a2415dbe",
+      "deps": [
+        "usgs_3dep_tiles"
+      ],
+      "doc": "Two dimensions; deps= gives lineage and change-watching for a resource-read source.",
+      "inputs": {},
+      "on_version_change": "fail",
+      "outputs": [
+        {
+          "config": {},
+          "key": null,
+          "mode": null,
+          "name": "hillshade",
+          "partition_set": false,
+          "revision": null,
+          "store": "blob"
+        }
+      ],
+      "partitions": {
+        "dims": {
+          "day": {
+            "end": null,
+            "end_offset": null,
+            "every": "1d",
+            "format": "%Y-%m-%d",
+            "kind": "time",
+            "start": "2024-01-01",
+            "timezone": "UTC"
+          },
+          "site": {
+            "kind": "set",
+            "output": "sites"
+          }
+        }
+      },
+      "placement": {
+        "environment": {},
+        "kind": "Local",
+        "placement": {}
+      },
+      "retries": {
+        "backoff": "exponential",
+        "delay": 1.0,
+        "n": 3
+      },
+      "timeout": 3600,
+      "types": {
+        "params": {
+          "dem": {
+            "class": "brimstone.DemClient"
+          }
+        },
+        "return": {
+          "class": "builtins.bytes"
+        }
+      },
+      "version": "1"
+    },
+    "leach": {
+      "automations": [],
+      "code_hash": "88f918db5305684bacd5c6cba3d06a2ebe4310b35bd900932998ad38a2415dbe",
+      "deps": [],
+      "doc": "The resource tier lives on the asset; no job indirection.",
+      "inputs": {
+        "leach_crosswalk": {
+          "kind": "in",
+          "meta": null,
+          "output": "leach_crosswalk"
+        },
+        "pmpt_project_matrix": {
+          "kind": "in",
+          "meta": null,
+          "output": "pmpt_project_matrix"
+        },
+        "project_team_map": {
+          "kind": "in",
+          "meta": null,
+          "output": "project_team_map"
+        },
+        "sample_id_crosswalk": {
+          "kind": "in",
+          "meta": null,
+          "output": "sample_id_crosswalk"
+        },
+        "xrd_profex": {
+          "kind": "in",
+          "meta": null,
+          "output": "xrd_profex"
+        },
+        "xrf": {
+          "kind": "in",
+          "meta": null,
+          "output": "xrf"
+        }
+      },
+      "on_version_change": "fail",
+      "outputs": [
+        {
+          "config": {
+            "schema": "leaching"
+          },
+          "key": null,
+          "mode": null,
+          "name": "leach_kinetics",
+          "partition_set": false,
+          "revision": null,
+          "store": "postgres"
+        },
+        {
+          "config": {
+            "schema": "datasmart"
+          },
+          "key": null,
+          "mode": null,
+          "name": "leach_invalid_sample_id_log",
+          "partition_set": false,
+          "revision": null,
+          "store": "postgres"
+        }
+      ],
+      "partitions": null,
+      "placement": {
+        "environment": {
+          "cluster": "lab",
+          "region": "us-east-1"
+        },
+        "kind": "AWSECS",
+        "placement": {
+          "cpu": 4,
+          "memory": 30000000000
+        }
+      },
+      "retries": {
+        "backoff": "exponential",
+        "delay": 0.2,
+        "n": 3
+      },
+      "timeout": 3600,
+      "types": {
+        "params": {
+          "leach_crosswalk": {
+            "class": "pandas.core.frame.DataFrame"
+          },
+          "pmpt_project_matrix": {
+            "class": "pandas.core.frame.DataFrame"
+          },
+          "project_team_map": {
+            "class": "pandas.core.frame.DataFrame"
+          },
+          "sample_id_crosswalk": {
+            "class": "pandas.core.frame.DataFrame"
+          },
+          "xrd_profex": {
+            "class": "pandas.core.frame.DataFrame"
+          },
+          "xrf": {
+            "class": "pandas.core.frame.DataFrame"
+          }
+        },
+        "return": null
+      },
+      "version": "1"
+    },
+    "manual_upload": {
+      "automations": [
+        "manual_upload.every.0"
+      ],
+      "code_hash": "88f918db5305684bacd5c6cba3d06a2ebe4310b35bd900932998ad38a2415dbe",
+      "deps": [],
+      "doc": "Upload keys are registered externally by the uploads service.",
+      "inputs": {},
+      "on_version_change": "fail",
+      "outputs": [
+        {
+          "config": {
+            "partition_column": "upload_id",
+            "schema": "uploads"
+          },
+          "key": null,
+          "mode": null,
+          "name": "manual_upload",
+          "partition_set": false,
+          "revision": null,
+          "store": "postgres"
+        }
+      ],
+      "partitions": {
+        "dims": {
+          "uploads": {
+            "kind": "set",
+            "output": "uploads"
+          }
+        }
+      },
+      "placement": {
+        "environment": {
+          "name": "ingest"
+        },
+        "kind": "Pool",
+        "placement": {
+          "cpu": 1,
+          "memory": 4000000000
+        }
+      },
+      "retries": {
+        "backoff": "exponential",
+        "delay": 1.0,
+        "n": 3
+      },
+      "timeout": 3600,
+      "types": {
+        "params": {
+          "sharepoint": {
+            "class": "brimstone.SharePointClient"
+          }
+        },
+        "return": {
+          "class": "pandas.core.frame.DataFrame"
+        }
+      },
+      "version": "1"
+    },
+    "psa_mean_data": {
+      "automations": [
+        "psa_mean_data.onchange.0"
+      ],
+      "code_hash": "88f918db5305684bacd5c6cba3d06a2ebe4310b35bd900932998ad38a2415dbe",
+      "deps": [],
+      "doc": "",
+      "inputs": {
+        "psa_data": {
+          "kind": "in",
+          "meta": null,
+          "output": "psa_data"
+        },
+        "psa_samples": {
+          "kind": "in",
+          "meta": null,
+          "output": "psa_samples"
+        }
+      },
+      "on_version_change": "fail",
+      "outputs": [
+        {
+          "config": {
+            "columns": {
+              "diameter": "float not null",
+              "q": "float not null",
+              "q_cleaned": "float",
+              "sample_id": "string not null",
+              "undersize": "float not null",
+              "undersize_cleaned": "float"
+            },
+            "primary_key": [
+              "sample_id",
+              "diameter"
+            ],
+            "schema": "analytical"
+          },
+          "key": null,
+          "mode": null,
+          "name": "psa_mean_data",
+          "partition_set": false,
+          "revision": null,
+          "store": "postgres"
+        }
+      ],
+      "partitions": null,
+      "placement": {
+        "environment": {},
+        "kind": "Local",
+        "placement": {}
+      },
+      "retries": {
+        "backoff": "exponential",
+        "delay": 1.0,
+        "n": 3
+      },
+      "timeout": 3600,
+      "types": {
+        "params": {
+          "psa_data": {
+            "class": "pandas.core.frame.DataFrame"
+          },
+          "psa_samples": {
+            "class": "pandas.core.frame.DataFrame"
+          }
+        },
+        "return": {
+          "class": "pandas.core.frame.DataFrame"
+        }
+      },
+      "version": "1"
+    },
+    "qaqc_samples": {
+      "automations": [
+        "qaqc_samples.onchange.0"
+      ],
+      "code_hash": "88f918db5305684bacd5c6cba3d06a2ebe4310b35bd900932998ad38a2415dbe",
+      "deps": [],
+      "doc": "qaqc_files arrives filtered to the file_ids whose version changed for this site.",
+      "inputs": {
+        "qaqc_files": {
+          "batch_size": 100,
+          "kind": "bykey",
+          "meta": null,
+          "output": "qaqc_files"
+        }
+      },
+      "on_version_change": "fail",
+      "outputs": [
+        {
+          "config": {
+            "indexes": [
+              [
+                "file_id"
+              ]
+            ],
+            "partition_column": "site",
+            "primary_key": [
+              "sample_id"
+            ],
+            "schema": "qaqc"
+          },
+          "key": null,
+          "mode": null,
+          "name": "qaqc_samples",
+          "partition_set": false,
+          "revision": null,
+          "store": "postgres"
+        }
+      ],
+      "partitions": {
+        "dims": {
+          "sites": {
+            "kind": "set",
+            "output": "sites"
+          }
+        }
+      },
+      "placement": {
+        "environment": {},
+        "kind": "Local",
+        "placement": {}
+      },
+      "retries": {
+        "backoff": "exponential",
+        "delay": 1.0,
+        "n": 3
+      },
+      "timeout": 3600,
+      "types": {
+        "params": {
+          "qaqc_files": {
+            "args": [
+              {
+                "class": "builtins.dict"
+              }
+            ],
+            "generic": "list"
+          },
+          "sharepoint": {
+            "class": "brimstone.SharePointClient"
+          }
+        },
+        "return": null
+      },
+      "version": "2"
+    },
+    "region_rollup": {
+      "automations": [
+        "region_rollup.onchange.0"
+      ],
+      "code_hash": "88f918db5305684bacd5c6cba3d06a2ebe4310b35bd900932998ad38a2415dbe",
+      "deps": [],
+      "doc": "Static partitions over a site-partitioned input.",
+      "inputs": {
+        "qaqc_samples": {
+          "kind": "all_partitions",
+          "meta": null,
+          "output": "qaqc_samples"
+        }
+      },
+      "on_version_change": "fail",
+      "outputs": [
+        {
+          "config": {
+            "partition_column": "region",
+            "schema": "ops"
+          },
+          "key": null,
+          "mode": null,
+          "name": "region_rollup",
+          "partition_set": false,
+          "revision": null,
+          "store": "postgres"
+        }
+      ],
+      "partitions": {
+        "dims": {
+          "_": {
+            "keys": [
+              "east",
+              "west"
+            ],
+            "kind": "static"
+          }
+        }
+      },
+      "placement": {
+        "environment": {},
+        "kind": "Local",
+        "placement": {}
+      },
+      "retries": {
+        "backoff": "exponential",
+        "delay": 1.0,
+        "n": 3
+      },
+      "timeout": 3600,
+      "types": {
+        "params": {
+          "qaqc_samples": {
+            "args": [
+              {
+                "class": "builtins.str"
+              },
+              {
+                "class": "data_orchestrator.sdk.TableRef"
+              }
+            ],
+            "generic": "dict"
+          }
+        },
+        "return": {
+          "class": "pandas.core.frame.DataFrame"
+        }
+      },
+      "version": "1"
+    },
+    "site_health": {
+      "automations": [
+        "site_health.onchange.0"
+      ],
+      "code_hash": "88f918db5305684bacd5c6cba3d06a2ebe4310b35bd900932998ad38a2415dbe",
+      "deps": [],
+      "doc": "In-database: a TableRef in, a statement out; no row enters the harness.\nThe store materializes the SELECT into ops.site_health for this site.",
+      "inputs": {
+        "change_events": {
+          "kind": "in",
+          "meta": null,
+          "output": "change_events"
+        }
+      },
+      "on_version_change": "fail",
+      "outputs": [
+        {
+          "config": {
+            "partition_column": "site",
+            "schema": "ops"
+          },
+          "key": null,
+          "mode": null,
+          "name": "site_health",
+          "partition_set": false,
+          "revision": null,
+          "store": "postgres"
+        }
+      ],
+      "partitions": {
+        "dims": {
+          "sites": {
+            "kind": "set",
+            "output": "sites"
+          }
+        }
+      },
+      "placement": {
+        "environment": {},
+        "kind": "Local",
+        "placement": {}
+      },
+      "retries": {
+        "backoff": "exponential",
+        "delay": 1.0,
+        "n": 3
+      },
+      "timeout": 3600,
+      "types": {
+        "params": {
+          "change_events": {
+            "class": "data_orchestrator.sdk.TableRef"
+          }
+        },
+        "return": {
+          "class": "data_orchestrator.stores.Sql"
+        }
+      },
+      "version": "1"
+    },
+    "sites": {
+      "automations": [
+        "sites.cron.0"
+      ],
+      "code_hash": "88f918db5305684bacd5c6cba3d06a2ebe4310b35bd900932998ad38a2415dbe",
+      "deps": [],
+      "doc": "Refresh the SharePoint site list daily; new sites surface as missing work.",
+      "inputs": {},
+      "on_version_change": "fail",
+      "outputs": [
+        {
+          "config": {},
+          "key": "<elements>",
+          "mode": null,
+          "name": "sites",
+          "partition_set": true,
+          "revision": null,
+          "store": "json"
+        }
+      ],
+      "partitions": null,
+      "placement": {
+        "environment": {},
+        "kind": "Local",
+        "placement": {}
+      },
+      "retries": {
+        "backoff": "exponential",
+        "delay": 1.0,
+        "n": 3
+      },
+      "timeout": 3600,
+      "types": {
+        "params": {
+          "graph": {
+            "class": "brimstone.GraphClient"
+          }
+        },
+        "return": {
+          "args": [
+            {
+              "class": "builtins.str"
+            }
+          ],
+          "generic": "list"
+        }
+      },
+      "version": "1"
+    },
+    "weekly_report": {
+      "automations": [
+        "weekly_report.cron.0"
+      ],
+      "code_hash": "88f918db5305684bacd5c6cba3d06a2ebe4310b35bd900932998ad38a2415dbe",
+      "deps": [],
+      "doc": "A job: inputs, placement and automations like an asset, no outputs.",
+      "inputs": {
+        "fleet_dashboard": {
+          "kind": "in",
+          "meta": null,
+          "output": "fleet_dashboard"
+        }
+      },
+      "on_version_change": "fail",
+      "outputs": [],
+      "partitions": null,
+      "placement": {
+        "environment": {},
+        "kind": "Local",
+        "placement": {}
+      },
+      "retries": {
+        "backoff": "exponential",
+        "delay": 1.0,
+        "n": 3
+      },
+      "timeout": 3600,
+      "types": {
+        "params": {
+          "fleet_dashboard": {
+            "class": "data_orchestrator.sdk.TableRef"
+          },
+          "mailer": {
+            "class": "brimstone.Mailer"
+          }
+        },
+        "return": {
+          "class": "builtins.NoneType"
+        }
+      },
+      "version": "1"
+    }
+  },
+  "automations": {
+    "fleet_dashboard.onchange.0": {
+      "config": null,
+      "enabled": true,
+      "keys": null,
+      "mode": "incremental",
+      "name": "fleet_dashboard.onchange.0",
+      "partitions": null,
+      "targets": [
+        "fleet_dashboard"
+      ],
+      "trigger": {
+        "kind": "onchange",
+        "outputs": []
+      },
+      "upstream": false,
+      "watched": [
+        "site_health"
+      ]
+    },
+    "graph_delta.every.0": {
+      "config": null,
+      "enabled": true,
+      "keys": null,
+      "mode": "incremental",
+      "name": "graph_delta.every.0",
+      "partitions": null,
+      "targets": [
+        "graph_delta"
+      ],
+      "trigger": {
+        "kind": "every",
+        "seconds": 30
+      },
+      "upstream": false,
+      "watched": []
+    },
+    "hillshade.every.0": {
+      "config": null,
+      "enabled": true,
+      "keys": null,
+      "mode": "incremental",
+      "name": "hillshade.every.0",
+      "partitions": null,
+      "targets": [
+        "hillshade"
+      ],
+      "trigger": {
+        "kind": "every",
+        "seconds": 3600
+      },
+      "upstream": false,
+      "watched": []
+    },
+    "manual_upload.every.0": {
+      "config": null,
+      "enabled": true,
+      "keys": null,
+      "mode": "incremental",
+      "name": "manual_upload.every.0",
+      "partitions": "missing",
+      "targets": [
+        "manual_upload"
+      ],
+      "trigger": {
+        "kind": "every",
+        "seconds": 60
+      },
+      "upstream": false,
+      "watched": []
+    },
+    "psa_mean_data.onchange.0": {
+      "config": null,
+      "enabled": true,
+      "keys": null,
+      "mode": "incremental",
+      "name": "psa_mean_data.onchange.0",
+      "partitions": null,
+      "targets": [
+        "psa_mean_data"
+      ],
+      "trigger": {
+        "kind": "onchange",
+        "outputs": []
+      },
+      "upstream": false,
+      "watched": [
+        "psa_data",
+        "psa_samples"
+      ]
+    },
+    "qaqc_samples.onchange.0": {
+      "config": null,
+      "enabled": true,
+      "keys": null,
+      "mode": "incremental",
+      "name": "qaqc_samples.onchange.0",
+      "partitions": null,
+      "targets": [
+        "qaqc_samples"
+      ],
+      "trigger": {
+        "kind": "onchange",
+        "outputs": []
+      },
+      "upstream": false,
+      "watched": [
+        "qaqc_files"
+      ]
+    },
+    "refresh-lab": {
+      "config": null,
+      "enabled": true,
+      "keys": null,
+      "mode": "incremental",
+      "name": "refresh-lab",
+      "partitions": null,
+      "targets": [
+        "leach",
+        "psa_mean_data"
+      ],
+      "trigger": {
+        "expression": "0 8 * * *",
+        "kind": "cron",
+        "timezone": "UTC"
+      },
+      "upstream": false,
+      "watched": []
+    },
+    "region_rollup.onchange.0": {
+      "config": null,
+      "enabled": true,
+      "keys": null,
+      "mode": "incremental",
+      "name": "region_rollup.onchange.0",
+      "partitions": null,
+      "targets": [
+        "region_rollup"
+      ],
+      "trigger": {
+        "kind": "onchange",
+        "outputs": []
+      },
+      "upstream": false,
+      "watched": [
+        "qaqc_samples"
+      ]
+    },
+    "site_health.onchange.0": {
+      "config": null,
+      "enabled": true,
+      "keys": null,
+      "mode": "incremental",
+      "name": "site_health.onchange.0",
+      "partitions": null,
+      "targets": [
+        "site_health"
+      ],
+      "trigger": {
+        "kind": "onchange",
+        "outputs": []
+      },
+      "upstream": false,
+      "watched": [
+        "change_events"
+      ]
+    },
+    "sites.cron.0": {
+      "config": null,
+      "enabled": true,
+      "keys": null,
+      "mode": "incremental",
+      "name": "sites.cron.0",
+      "partitions": null,
+      "targets": [
+        "sites"
+      ],
+      "trigger": {
+        "expression": "0 6 * * *",
+        "kind": "cron",
+        "timezone": "UTC"
+      },
+      "upstream": false,
+      "watched": []
+    },
+    "weekly_report.cron.0": {
+      "config": null,
+      "enabled": true,
+      "keys": null,
+      "mode": "incremental",
+      "name": "weekly_report.cron.0",
+      "partitions": null,
+      "targets": [
+        "weekly_report"
+      ],
+      "trigger": {
+        "expression": "0 7 * * 1",
+        "kind": "cron",
+        "timezone": "UTC"
+      },
+      "upstream": false,
+      "watched": []
+    }
+  },
+  "executors": [
+    "AWSECS",
+    "Local",
+    "Pool"
+  ],
+  "name": "default",
+  "outputs": {
+    "change_events": {
+      "asset": "graph_delta",
+      "config": {
+        "partition_column": "site",
+        "schema": "sharepoint"
+      },
+      "key": null,
+      "mode": "append",
+      "name": "change_events",
+      "partition_set": false,
+      "revision": null,
+      "source": false,
+      "store": "postgres"
+    },
+    "fleet_dashboard": {
+      "asset": "fleet_dashboard",
+      "config": {
+        "schema": "ops"
+      },
+      "key": null,
+      "mode": null,
+      "name": "fleet_dashboard",
+      "partition_set": false,
+      "revision": null,
+      "source": false,
+      "store": "postgres"
+    },
+    "hillshade": {
+      "asset": "hillshade",
+      "config": {},
+      "key": null,
+      "mode": null,
+      "name": "hillshade",
+      "partition_set": false,
+      "revision": null,
+      "source": false,
+      "store": "blob"
+    },
+    "leach_crosswalk": {
+      "asset": null,
+      "config": {
+        "schema": "datasmart"
+      },
+      "dims": null,
+      "key": null,
+      "mode": null,
+      "name": "leach_crosswalk",
+      "partition_set": false,
+      "revision": null,
+      "source": true,
+      "store": "postgres"
+    },
+    "leach_invalid_sample_id_log": {
+      "asset": "leach",
+      "config": {
+        "schema": "datasmart"
+      },
+      "key": null,
+      "mode": null,
+      "name": "leach_invalid_sample_id_log",
+      "partition_set": false,
+      "revision": null,
+      "source": false,
+      "store": "postgres"
+    },
+    "leach_kinetics": {
+      "asset": "leach",
+      "config": {
+        "schema": "leaching"
+      },
+      "key": null,
+      "mode": null,
+      "name": "leach_kinetics",
+      "partition_set": false,
+      "revision": null,
+      "source": false,
+      "store": "postgres"
+    },
+    "manual_upload": {
+      "asset": "manual_upload",
+      "config": {
+        "partition_column": "upload_id",
+        "schema": "uploads"
+      },
+      "key": null,
+      "mode": null,
+      "name": "manual_upload",
+      "partition_set": false,
+      "revision": null,
+      "source": false,
+      "store": "postgres"
+    },
+    "pmpt_project_matrix": {
+      "asset": null,
+      "config": {
+        "schema": "datasmart"
+      },
+      "dims": null,
+      "key": null,
+      "mode": null,
+      "name": "pmpt_project_matrix",
+      "partition_set": false,
+      "revision": null,
+      "source": true,
+      "store": "postgres"
+    },
+    "project_team_map": {
+      "asset": null,
+      "config": {
+        "schema": "datasmart"
+      },
+      "dims": null,
+      "key": null,
+      "mode": null,
+      "name": "project_team_map",
+      "partition_set": false,
+      "revision": null,
+      "source": true,
+      "store": "postgres"
+    },
+    "psa_data": {
+      "asset": null,
+      "config": {
+        "schema": "datasmart"
+      },
+      "dims": null,
+      "key": null,
+      "mode": null,
+      "name": "psa_data",
+      "partition_set": false,
+      "revision": null,
+      "source": true,
+      "store": "postgres"
+    },
+    "psa_mean_data": {
+      "asset": "psa_mean_data",
+      "config": {
+        "columns": {
+          "diameter": "float not null",
+          "q": "float not null",
+          "q_cleaned": "float",
+          "sample_id": "string not null",
+          "undersize": "float not null",
+          "undersize_cleaned": "float"
+        },
+        "primary_key": [
+          "sample_id",
+          "diameter"
+        ],
+        "schema": "analytical"
+      },
+      "key": null,
+      "mode": null,
+      "name": "psa_mean_data",
+      "partition_set": false,
+      "revision": null,
+      "source": false,
+      "store": "postgres"
+    },
+    "psa_samples": {
+      "asset": null,
+      "config": {
+        "schema": "datasmart"
+      },
+      "dims": null,
+      "key": null,
+      "mode": null,
+      "name": "psa_samples",
+      "partition_set": false,
+      "revision": null,
+      "source": true,
+      "store": "postgres"
+    },
+    "qaqc_files": {
+      "asset": "graph_delta",
+      "config": {},
+      "key": "file_id",
+      "mode": null,
+      "name": "qaqc_files",
+      "partition_set": false,
+      "revision": "version",
+      "source": false,
+      "store": "json"
+    },
+    "qaqc_samples": {
+      "asset": "qaqc_samples",
+      "config": {
+        "indexes": [
+          [
+            "file_id"
+          ]
+        ],
+        "partition_column": "site",
+        "primary_key": [
+          "sample_id"
+        ],
+        "schema": "qaqc"
+      },
+      "key": null,
+      "mode": null,
+      "name": "qaqc_samples",
+      "partition_set": false,
+      "revision": null,
+      "source": false,
+      "store": "postgres"
+    },
+    "region_rollup": {
+      "asset": "region_rollup",
+      "config": {
+        "partition_column": "region",
+        "schema": "ops"
+      },
+      "key": null,
+      "mode": null,
+      "name": "region_rollup",
+      "partition_set": false,
+      "revision": null,
+      "source": false,
+      "store": "postgres"
+    },
+    "sample_id_crosswalk": {
+      "asset": null,
+      "config": {
+        "schema": "datasmart"
+      },
+      "dims": null,
+      "key": null,
+      "mode": null,
+      "name": "sample_id_crosswalk",
+      "partition_set": false,
+      "revision": null,
+      "source": true,
+      "store": "postgres"
+    },
+    "site_health": {
+      "asset": "site_health",
+      "config": {
+        "partition_column": "site",
+        "schema": "ops"
+      },
+      "key": null,
+      "mode": null,
+      "name": "site_health",
+      "partition_set": false,
+      "revision": null,
+      "source": false,
+      "store": "postgres"
+    },
+    "sites": {
+      "asset": "sites",
+      "config": {},
+      "key": "<elements>",
+      "mode": null,
+      "name": "sites",
+      "partition_set": true,
+      "revision": null,
+      "source": false,
+      "store": "json"
+    },
+    "uploads": {
+      "asset": null,
+      "config": {
+        "name": "uploads"
+      },
+      "dims": null,
+      "key": "<elements>",
+      "mode": null,
+      "name": "uploads",
+      "partition_set": true,
+      "revision": null,
+      "source": true,
+      "store": "json"
+    },
+    "usgs_3dep_tiles": {
+      "asset": null,
+      "config": {},
+      "dims": null,
+      "key": null,
+      "mode": null,
+      "name": "usgs_3dep_tiles",
+      "partition_set": false,
+      "revision": null,
+      "source": true,
+      "store": "json"
+    },
+    "xrd_profex": {
+      "asset": null,
+      "config": {
+        "schema": "datasmart"
+      },
+      "dims": null,
+      "key": null,
+      "mode": null,
+      "name": "xrd_profex",
+      "partition_set": false,
+      "revision": null,
+      "source": true,
+      "store": "postgres"
+    },
+    "xrf": {
+      "asset": null,
+      "config": {
+        "schema": "datasmart"
+      },
+      "dims": null,
+      "key": null,
+      "mode": null,
+      "name": "xrf",
+      "partition_set": false,
+      "revision": null,
+      "source": true,
+      "store": "postgres"
+    }
+  },
+  "revision": "824187b952eaf886f0457ad9e69244b82435ffdff3aa21fde4655361986650f7",
+  "sources": {
+    "leach_crosswalk": {
+      "handle": {
+        "schema": "datasmart"
+      },
+      "head": {
+        "handle": {
+          "name": "leach_crosswalk",
+          "schema": "datasmart"
+        },
+        "meta": {
+          "external": true
+        },
+        "output": "leach_crosswalk",
+        "partition": "",
+        "store": "postgres",
+        "version": "0dda741882dc3a6cf751a5d04df95f53bba49e722c47321efa8fb08c23e348ab"
+      },
+      "key": null,
+      "name": "leach_crosswalk",
+      "store": "postgres"
+    },
+    "pmpt_project_matrix": {
+      "handle": {
+        "schema": "datasmart"
+      },
+      "head": {
+        "handle": {
+          "name": "pmpt_project_matrix",
+          "schema": "datasmart"
+        },
+        "meta": {
+          "external": true
+        },
+        "output": "pmpt_project_matrix",
+        "partition": "",
+        "store": "postgres",
+        "version": "0dda741882dc3a6cf751a5d04df95f53bba49e722c47321efa8fb08c23e348ab"
+      },
+      "key": null,
+      "name": "pmpt_project_matrix",
+      "store": "postgres"
+    },
+    "project_team_map": {
+      "handle": {
+        "schema": "datasmart"
+      },
+      "head": {
+        "handle": {
+          "name": "project_team_map",
+          "schema": "datasmart"
+        },
+        "meta": {
+          "external": true
+        },
+        "output": "project_team_map",
+        "partition": "",
+        "store": "postgres",
+        "version": "0dda741882dc3a6cf751a5d04df95f53bba49e722c47321efa8fb08c23e348ab"
+      },
+      "key": null,
+      "name": "project_team_map",
+      "store": "postgres"
+    },
+    "psa_data": {
+      "handle": {
+        "schema": "datasmart"
+      },
+      "head": {
+        "handle": {
+          "name": "psa_data",
+          "schema": "datasmart"
+        },
+        "meta": {
+          "external": true
+        },
+        "output": "psa_data",
+        "partition": "",
+        "store": "postgres",
+        "version": "0dda741882dc3a6cf751a5d04df95f53bba49e722c47321efa8fb08c23e348ab"
+      },
+      "key": null,
+      "name": "psa_data",
+      "store": "postgres"
+    },
+    "psa_samples": {
+      "handle": {
+        "schema": "datasmart"
+      },
+      "head": {
+        "handle": {
+          "name": "psa_samples",
+          "schema": "datasmart"
+        },
+        "meta": {
+          "external": true
+        },
+        "output": "psa_samples",
+        "partition": "",
+        "store": "postgres",
+        "version": "0dda741882dc3a6cf751a5d04df95f53bba49e722c47321efa8fb08c23e348ab"
+      },
+      "key": null,
+      "name": "psa_samples",
+      "store": "postgres"
+    },
+    "sample_id_crosswalk": {
+      "handle": {
+        "schema": "datasmart"
+      },
+      "head": {
+        "handle": {
+          "name": "sample_id_crosswalk",
+          "schema": "datasmart"
+        },
+        "meta": {
+          "external": true
+        },
+        "output": "sample_id_crosswalk",
+        "partition": "",
+        "store": "postgres",
+        "version": "0dda741882dc3a6cf751a5d04df95f53bba49e722c47321efa8fb08c23e348ab"
+      },
+      "key": null,
+      "name": "sample_id_crosswalk",
+      "store": "postgres"
+    },
+    "uploads": {
+      "handle": {
+        "name": "uploads"
+      },
+      "head": {
+        "handle": {
+          "name": "uploads"
+        },
+        "meta": {
+          "external": true
+        },
+        "output": "uploads",
+        "partition": "",
+        "store": "json",
+        "version": "2b4f69fbd4e1417a60a9620682862564271d76afde65cd42ea69a5313ead1fcb"
+      },
+      "key": "<elements>",
+      "name": "uploads",
+      "store": "json"
+    },
+    "usgs_3dep_tiles": {
+      "handle": {},
+      "head": {
+        "handle": {
+          "name": "usgs_3dep_tiles"
+        },
+        "meta": {
+          "external": true
+        },
+        "output": "usgs_3dep_tiles",
+        "partition": "",
+        "store": "json",
+        "version": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+      },
+      "key": null,
+      "name": "usgs_3dep_tiles",
+      "store": "json"
+    },
+    "xrd_profex": {
+      "handle": {
+        "schema": "datasmart"
+      },
+      "head": {
+        "handle": {
+          "name": "xrd_profex",
+          "schema": "datasmart"
+        },
+        "meta": {
+          "external": true
+        },
+        "output": "xrd_profex",
+        "partition": "",
+        "store": "postgres",
+        "version": "0dda741882dc3a6cf751a5d04df95f53bba49e722c47321efa8fb08c23e348ab"
+      },
+      "key": null,
+      "name": "xrd_profex",
+      "store": "postgres"
+    },
+    "xrf": {
+      "handle": {
+        "schema": "datasmart"
+      },
+      "head": {
+        "handle": {
+          "name": "xrf",
+          "schema": "datasmart"
+        },
+        "meta": {
+          "external": true
+        },
+        "output": "xrf",
+        "partition": "",
+        "store": "postgres",
+        "version": "0dda741882dc3a6cf751a5d04df95f53bba49e722c47321efa8fb08c23e348ab"
+      },
+      "key": null,
+      "name": "xrf",
+      "store": "postgres"
+    }
+  },
+  "stores": {
+    "blob": {
+      "ref": "blob",
+      "version": "1"
+    },
+    "json": {
+      "ref": "json",
+      "version": "1"
+    },
+    "postgres": {
+      "ref": "table",
+      "version": "1"
+    }
+  }
+}

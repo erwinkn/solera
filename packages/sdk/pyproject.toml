@@ -12,5 +12,11 @@ dependencies = [
     "croniter>=6,<7",
 ]
 
+[project.optional-dependencies]
+postgres = [
+    "pandas>=2.2,<3",
+    "psycopg[binary]>=3.2,<4",
+]
+
 [tool.hatch.build.targets.wheel]
-packages = ["src/data_orchestrator"]
+packages = ["src/data_orchestrator", "src/dorc_postgres"]
