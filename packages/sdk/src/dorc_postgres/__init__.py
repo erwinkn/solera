@@ -26,6 +26,7 @@ from data_orchestrator.stores import (
 
 MARKER_TABLE = "public.dorc_markers"
 BATCH_COLUMN = "_batch"
+SEQ_COLUMN = "_seq"
 
 
 def _ident(name: str) -> str:
@@ -100,13 +101,16 @@ class PostgresStore:
             columns.setdefault(partition_col, "text")
         if output.mode == "append":
             columns.setdefault(BATCH_COLUMN, "integer")
+            columns.setdefault(SEQ_COLUMN, "integer")
         if not columns:
             columns = {"value": "jsonb"}
-        pk = list(output.config.get("primary_key") or [])
-        if partition_col and partition_col not in pk:
+        pk = list(output.config.get("primary_key") or ([output.key] if output.key else []))
+        if partition_col and partition_col not in pk and (pk or output.mode == "append"):
             pk = [*pk, partition_col]
-        if output.mode == "append" and BATCH_COLUMN not in pk:
-            pk = [*pk, BATCH_COLUMN]
+        if output.mode == "append":
+            for c in (BATCH_COLUMN, SEQ_COLUMN):
+                if c not in pk:
+                    pk = [*pk, c]
         defs = [f"{_ident(c)} {_sql_type(t)}" for c, t in columns.items()]
         if pk:
             defs.append(f"PRIMARY KEY ({', '.join(_ident(c) for c in pk)})")
@@ -184,6 +188,8 @@ class PostgresStore:
                 if version is None:
                     return Written(prior, prior_keys)
             else:
+                if output.mode == "append":
+                    raise WriteError(f"{output.name}: an append output only accepts Patch writes")
                 version, keys = self._apply_replace(cur, output, write, scope, table, slice_where)
 
             self._set_marker(cur, output.name, scope.partition, version, batch)
@@ -237,8 +243,9 @@ class PostgresStore:
                 raise WriteError(f"{output.name}: remove is not allowed on an append output")
             batch = max([int(b) for b in prior_keys], default=-1) + 1
             partition_col = output.config.get("partition_column")
-            for row in rows:
+            for i, row in enumerate(rows):
                 row[BATCH_COLUMN] = batch
+                row[SEQ_COLUMN] = i
                 if partition_col:
                     row[partition_col] = scope.partition
             # Idempotent on (scope, batch): replace this batch's rows.
@@ -262,7 +269,7 @@ class PostgresStore:
             key_col = output.key or "key"
             cur.execute(
                 f"DELETE FROM {table} WHERE {self._where_sql(slice_where)} AND {_ident(key_col)}::text = ANY(%s)",
-                (sorted(remove),),
+                ([slice_where[k] for k in sorted(slice_where)] + [sorted(remove)]),
             )
         patch_map = key_map(output, rows)
         keys = {k: v for k, v in prior_keys.items() if k not in remove}
@@ -272,7 +279,7 @@ class PostgresStore:
         if keys:
             cur.execute(
                 f"DELETE FROM {table} WHERE {self._where_sql(slice_where)} AND NOT ({_ident(output.key)}::text = ANY(%s))",
-                (sorted(keys),),
+                ([slice_where[k] for k in sorted(slice_where)] + [sorted(keys)]),
             )
         else:
             self._delete_slice(cur, table, slice_where)
@@ -315,8 +322,15 @@ class PostgresStore:
             ).fetchone()
             if not exists:
                 raise WriteError(f"{output.name}: Sql statement must leave {table} in place")
+        keys = None
+        if output.key:
+            rows = cur.execute(
+                f"SELECT * FROM {table} WHERE {self._where_sql(slice_where)}",
+                [slice_where[k] for k in sorted(slice_where)],
+            ).fetchall()
+            keys = key_map(output, rows)
         version = digest([prior.version if prior else "", digest(write.stmt)])
-        return version, None, None
+        return version, keys, None
 
     # -- reads ----------------------------------------------------------------
 
@@ -351,6 +365,9 @@ class PostgresStore:
             if clauses:
                 sql += " WHERE " + " AND ".join(clauses)
             rows = cur.execute(sql, params).fetchall()
+            if handle.get("batch") is not None:
+                internal = {BATCH_COLUMN, SEQ_COLUMN}
+                rows = [{k: v for k, v in r.items() if k not in internal} for r in rows]
         return _materialize(rows, t)
 
     # -- row helpers ----------------------------------------------------------
@@ -378,12 +395,10 @@ class PostgresStore:
     def _upsert(self, cur, table, output, rows: list[dict]):
         if not rows:
             return
-        pk = list(output.config.get("primary_key") or [])
+        pk = list(output.config.get("primary_key") or [output.key])
         partition_col = output.config.get("partition_column")
         if partition_col and partition_col not in pk:
             pk = [*pk, partition_col]
-        if not pk:
-            raise WriteError(f"{output.name}: a keyed Patch on Postgres requires primary_key")
         columns = sorted({c for r in rows for c in r})
         update = [c for c in columns if c not in pk]
         conflict = (

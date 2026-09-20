@@ -110,7 +110,7 @@ async def test_append_snapshot_at_pinned_version(store):
     second = await store.store(
         Patch([{"e": 2}]), first.ref, scope(out, partition="s1", prior_keys=first.keys)
     )
-    assert first.keys == {"0": digest([{"e": 1, "_batch": 0, "site": "s1"}])}
+    assert first.keys == {"0": digest([{"e": 1, "_batch": 0, "_seq": 0, "site": "s1"}])}
     at_first = await store.load(first.ref, list[dict], None)
     assert [r["e"] for r in at_first] == [1]
     at_second = await store.load(second.ref, list[dict], None)

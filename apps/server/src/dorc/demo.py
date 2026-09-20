@@ -46,10 +46,10 @@ ALL_SITES = ["alpha", "bravo", "charlie", "delta"]
 
 
 class SiteRegistry:
-    """A pretend SharePoint site list; gains a site every two minutes."""
+    """A pretend SharePoint site list; gains one site on every call."""
 
-    def list_sites(self) -> list[str]:
-        n = 2 + int(time.time() // 120) % (len(ALL_SITES) - 1)
+    def list_sites(self, seen: int) -> list[str]:
+        n = min(2 + seen, len(ALL_SITES))
         return ALL_SITES[:n]
 
 
@@ -58,11 +58,13 @@ class FeedClient:
 
     `delta(site, since)` returns (events, token); the token is the cursor.
     Polling inside the same five-second tick returns identical events, so a
-    re-run commits the same version and wakes nothing downstream.
+    re-run commits the same version and wakes nothing downstream. Run config
+    `feed_tick_seconds` stretches the tick — handy for slowing the feed down
+    while exploring the console.
     """
 
-    def delta(self, site: str, since: str | None) -> tuple[list[dict], str]:
-        tick = int(time.time() // 5)
+    def delta(self, site: str, since: str | None, tick_seconds: float = 5) -> tuple[list[dict], str]:
+        tick = int(time.time() // tick_seconds)
         if since is not None and int(since) >= tick:
             return [], since
         events = [
@@ -70,6 +72,7 @@ class FeedClient:
                 "file_id": f"{site}-file-{i}",
                 "version": f"t{tick}",
                 "path": f"/sites/{site}/qaqc/f{i}.xlsx",
+                "status": "warn" if i % 3 == 0 else "ok",
             }
             for i in range(4)
         ]
@@ -104,9 +107,13 @@ ingest = Pool("ingest")
 
 
 @asset(outputs=PartitionSet(), automations=Automation(trigger=Cron("* * * * *")))
-def sites(registry: SiteRegistry) -> list[str]:
-    """The site list is a partition set; new sites surface as missing work."""
-    return registry.list_sites()
+def sites(ctx, registry: SiteRegistry):
+    """The site list is a partition set; each run may surface a new site.
+
+    The cursor keeps the simulated count, so the list grows on every run —
+    a new key arrives as missing work downstream (§7)."""
+    seen = int(ctx.cursor or 0)
+    return Result(outputs={"sites": registry.list_sites(seen)}, cursor=str(seen + 1))
 
 
 uploads = PartitionSet("uploads")
@@ -121,21 +128,25 @@ uploads = PartitionSet("uploads")
 @asset(
     outputs=(
         Output("site_events", store=RELATIONAL, mode="append", partition_column="site"),
-        Output("site_files", store=RELATIONAL, key="file_id", revision="version"),
+        Output("site_files", store=RELATIONAL, key="file_id", revision="version", partition_column="site"),
     ),
     partitions={"site": sites},
     automations=Automation(trigger=Every(10)),
 )
 def site_feed(ctx, feed: FeedClient):
     """Poll one site's feed; the delta token persists as ctx.cursor."""
-    events, token = feed.delta(ctx.partition, ctx.cursor)
+    events, token = feed.delta(
+        ctx.partition, ctx.cursor, tick_seconds=float(ctx.config.get("feed_tick_seconds", 5))
+    )
     kept = {e["file_id"] for e in events}
     prior_ids = {f"{ctx.partition}-file-{i}" for i in range(4)}
     ctx.log("polled", site=ctx.partition, events=len(events))
     return Result(
         outputs={
             "site_events": Patch(events),
-            "site_files": Patch(events, remove=sorted(prior_ids - kept)),
+            # An empty delta means "nothing changed", not "everything gone" —
+            # removals only apply once the feed reports the current file set.
+            "site_files": Patch(events, remove=sorted(prior_ids - kept) if events else []),
         },
         cursor=token,
     )
@@ -148,7 +159,7 @@ def site_feed(ctx, feed: FeedClient):
 
 
 @asset(
-    outputs=Output("file_index", store=RELATIONAL, key="file_id"),
+    outputs=Output("file_index", store=RELATIONAL, key="file_id", partition_column="site"),
     partitions={"site": sites},
     inputs={"site_files": ByKey(batch_size=2)},
     version="2",
@@ -209,6 +220,24 @@ def fleet_index(ctx, file_index: dict[str, list[dict]]):
     return rollup
 
 
+if DATABASE:
+
+    @asset(
+        outputs=Output("fleet_status", store="postgres", schema="ops", key="site"),
+        inputs={"site_events": AllPartitions()},
+        automations=AutoRefresh(),
+    )
+    def fleet_status(ctx, site_events: dict[str, TableRef]):
+        """AllPartitions over TableRefs: the pins stay refs, the SELECT runs
+        inside Postgres against each site's slice (§4, §7)."""
+        union = " UNION ALL ".join(
+            f"SELECT '{ref.where.get('site', site)}' AS site, count(*)::int AS events "
+            f"FROM {ref.table} WHERE {ref.where_sql()}"
+            for site, ref in sorted(site_events.items())
+        )
+        return Sql(union or "SELECT NULL::text AS site, 0::int AS events WHERE false")
+
+
 # ---------------------------------------------------------------------------
 # In-database SQL over a TableRef — Postgres only; with JsonStore the asset
 # still runs and logs that it skipped (§4).
@@ -224,7 +253,7 @@ if DATABASE:
     def site_status(ctx, site_events: TableRef) -> Sql:
         """A SELECT materialized inside Postgres; no row enters the harness."""
         return Sql(
-            f"SELECT status, count(*) AS n FROM {site_events.table} WHERE {site_events.where} GROUP BY status"
+            f"SELECT status, count(*) AS n FROM {site_events.table} WHERE {site_events.where_sql()} GROUP BY status"
         )
 
 else:
@@ -277,6 +306,7 @@ project = Project(
         site_digest,
         fleet_index,
         site_status,
+        *([fleet_status] if DATABASE else []),
         manual_ingest,
         weekly_digest,
     ],

@@ -751,6 +751,28 @@ async def test_every_skips_active_scope(state):
         assert len([r for r in runs if r and r.get("automation") == "polled.every.0"]) == 1
 
 
+async def test_every_skips_queued_scope(state):
+    """§9: a tick is skipped for a scope that is queued but not yet running —
+    otherwise repeated fires pile duplicate tasks onto the dispatch queue."""
+
+    @asset(automations=Every(1))
+    def polled():
+        return []
+
+    project = Project(assets=[polled])
+    engine = make_engine(state, project)
+    await engine.initialize()
+    # A paused run leaves its task queued: pending work without a live lock.
+    run = await engine.submit(["polled"])
+    await engine.pause(run["id"])
+    before = await engine.run_automation("polled.every.0")
+    assert before["last_run"] is None  # the fire submitted nothing
+    await engine.pause(run["id"], False)
+    await engine.run_until(run["id"], 10)
+    after = await engine.run_automation("polled.every.0")
+    assert after["last_run"] is not None
+
+
 async def test_missing_on_schedule_picks_up_new_keys(state):
     """§9: partitions='missing' on a schedule picks up new partition-set keys
     and failed first runs without an operator."""

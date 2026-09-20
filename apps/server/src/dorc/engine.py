@@ -61,6 +61,9 @@ class Engine:
         ctx = PlacementContext(state, state.objects_url, project, self.clock)
         self.registry = registry or Registry(ctx, extra=placements)
         self.inflight: dict[str, asyncio.Task] = {}
+        # Attempts consuming a local execution slot. Pool waiters only poll
+        # state — they run no local work and must not starve dispatch (§10).
+        self.engine_inflight: set[str] = set()
         self.env_inflight: dict[str, int] = {}
         self.runner: asyncio.Task | None = None
         self.last_error = None
@@ -213,11 +216,12 @@ class Engine:
                     kept = []
                     for scope in assets[name]:
                         lock = await tx.lock(name, scope)
-                        if lock is None or lock["lease_until"] <= self.clock():
+                        live = lock is not None and lock["lease_until"] > self.clock()
+                        if not live and not await tx.pending(name, scope):
                             kept.append(scope)
                     assets[name] = kept
                 if not any(assets.values()):
-                    return None  # §9: the tick is skipped — every scope is running
+                    return None  # §9: the tick is skipped — every scope is in flight
             run_id = uuid.uuid4().hex
             run = {
                 "id": run_id,
@@ -259,6 +263,7 @@ class Engine:
                         task["status"] = "waiting"
             for task in tasks.values():
                 await tx.put_task(task)
+                await tx.put_pending(task)
                 if task["status"] == "queued":
                     await tx.enqueue(task["id"], task["ready_at"])
             run["tasks"] = sorted(tasks)
@@ -451,6 +456,7 @@ class Engine:
     async def _dispatch_due(self):
         dispatched = []
         dispatched_env: dict[str, int] = {}
+        dispatched_engine = 0
         async with self.state.transaction() as tx:
             now_ms = self.clock() * 1000
             for key, task_id in await tx.queued():
@@ -465,9 +471,13 @@ class Engine:
                     await tx.enqueue(task_id, task["ready_at"])
                     continue
                 placement = self._placement(task)
-                env_key = self.registry.env_key(self.manifest["assets"][task["asset"]]["placement"])
+                spec = self.manifest["assets"][task["asset"]]["placement"]
+                env_key = self.registry.env_key(spec)
                 limit = getattr(placement, "max_concurrent", None)
-                if len(self.inflight) + len(dispatched) >= self.concurrency or (
+                if (
+                    spec["kind"] != "Pool"
+                    and len(self.engine_inflight) + dispatched_engine >= self.concurrency
+                ) or (
                     limit is not None
                     and self.env_inflight.get(env_key, 0) + dispatched_env.get(env_key, 0) >= limit
                 ):
@@ -495,6 +505,8 @@ class Engine:
                 await tx.put_task(task)
                 dispatched.append((task, claim["id"], prepared, placement, None))
                 dispatched_env[env_key] = dispatched_env.get(env_key, 0) + 1
+                if spec["kind"] != "Pool":
+                    dispatched_engine += 1
         for task, attempt, prepared, placement, error in dispatched:
             if error is not None:
                 message, retryable = error
@@ -544,7 +556,10 @@ class Engine:
         # A bound partition set pins its ref in lineage (§7).
         for dim in self._dims(task["asset"]).values():
             if dim["kind"] == "set" and dim["output"] not in {e["output"] for _, e in edges}:
-                edges.append((dim["output"], {"kind": "dep", "output": dim["output"]}))
+                # The set pins into lineage and plans upstream, but it is the
+                # dimension — not interpretation — so it stays out of the
+                # fingerprint: adding a key must not invalidate existing ones.
+                edges.append((dim["output"], {"kind": "dep", "output": dim["output"], "set_dim": True}))
         # Pass 1: pin every non-ByKey edge; their refs enter the fingerprint (§6).
         inputs, pinned = {}, {}
         bykey = []
@@ -562,7 +577,8 @@ class Engine:
                 for s in await self._spread(tx, asset, scope, up_dims):
                     refs[s] = await self._pin_at(tx, output, s)
                 inputs[param] = {"refs": refs}
-                pinned[param] = refs
+                if not edge.get("set_dim"):
+                    pinned[param] = refs
                 continue
             if edge["kind"] == "bykey":
                 bykey.append((param, edge, up_dims))
@@ -726,9 +742,12 @@ class Engine:
         if prepared["cursor"] is not None:
             spec["cursor"] = prepared["cursor"]
         env_key = self.registry.env_key(spec["execution"])
+        is_pool = spec["execution"]["kind"] == "Pool"
+        if not is_pool:
+            self.engine_inflight.add(attempt)
         try:
             await self.state.put_object(f"specs/{attempt}.json", json.dumps(spec).encode())
-            if spec["execution"]["kind"] == "Pool":
+            if is_pool:
                 await self.state.stage_pool_task(task, prepared, spec)
             try:
                 handle = await placement.launch({"attempt": attempt, "objects": self.state.objects_url})
@@ -742,6 +761,7 @@ class Engine:
                 )
             await self._wait_loop(task, attempt, prepared, placement, handle)
         finally:
+            self.engine_inflight.discard(attempt)
             self.env_inflight[env_key] = max(0, self.env_inflight.get(env_key, 1) - 1)
 
     async def _wait_loop(self, task, attempt, prepared, placement, handle):
@@ -1037,12 +1057,14 @@ class Engine:
                 if task["status"] in {"queued", "waiting"}:
                     task["status"] = "canceled"
                     await tx.put_task(task)
+                    await tx.del_pending(task)
                 elif task["status"] == "running":
                     # Fence the attempt: its next renew raises LostOwnership and
                     # the placement loop cancels the run (§8).
                     await tx.del_lock(task["asset"], task["scope"])
                     task["status"] = "canceled"
                     await tx.put_task(task)
+                    await tx.del_pending(task)
             await tx.put_run(run)
             return run
 
@@ -1068,6 +1090,7 @@ class Engine:
                     task["ready_at"] = self.clock()
                     await tx.enqueue(task["id"], task["ready_at"])
                     await tx.put_task(task)
+                    await tx.put_pending(task)
             run["status"] = "running"
             run["paused"] = False
             await tx.put_run(run)

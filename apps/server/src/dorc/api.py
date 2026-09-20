@@ -10,7 +10,7 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Header, Query, Request
+from fastapi import FastAPI, Header, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -259,10 +259,10 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
                 status = (
                     "retired"
                     if scope not in current
-                    else "running"
-                    if scope in active
                     else "complete"
                     if head and head["complete"]
+                    else "running"
+                    if scope in active
                     else "failed"
                     if scope in failed
                     else "missing"
@@ -431,7 +431,7 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
             lease_seconds=float(body.get("lease_seconds") or 30),
         )
         if task is None:
-            return JSONResponse(status_code=204, content=None)
+            return Response(status_code=204)
         return {
             "task": task["attempt"],
             "stage": {"attempt": task["attempt"], "objects": state.objects_url},

@@ -151,6 +151,18 @@ class Tx:
     async def put_task(self, task: dict):
         await self.t.put(f"task/{esc(task['id'])}", task)
 
+    # pending/{asset}/{scope}/{task} indexes in-flight work per scope: set at
+    # submit, cleared when the task reaches a terminal status. Automation
+    # ticks skip scopes that are already pending, not only locked (§9).
+    async def put_pending(self, task: dict):
+        await self.t.put(f"pending/{esc(task['asset'])}/{esc(task['scope'])}/{esc(task['id'])}", task["id"])
+
+    async def del_pending(self, task: dict):
+        await self.t.delete(f"pending/{esc(task['asset'])}/{esc(task['scope'])}/{esc(task['id'])}")
+
+    async def pending(self, asset: str, scope: str) -> bool:
+        return bool(await self.t.scan(f"pending/{esc(asset)}/{esc(scope)}/", 1))
+
     # -- attempts --------------------------------------------------------------------
     async def attempt(self, task_id: str, generation: int):
         return await self.t.get(f"attempt/{esc(task_id)}/{generation:010d}")
@@ -517,6 +529,7 @@ class State:
                 task["result"] = outputs
                 task["error"] = None
                 await tx.put_task(task)
+                await tx.del_pending(task)
             await self.advance_run(tx, task["run"])
             return record
 
@@ -535,6 +548,7 @@ class State:
             if any(s in {"failed", "blocked", "canceled"} for s in dep_status):
                 task["status"] = "blocked"
                 await tx.put_task(task)
+                await tx.del_pending(task)
             elif all(s in done for s in dep_status):
                 task["status"] = "queued"
                 task["ready_at"] = self.clock()
@@ -577,6 +591,7 @@ class State:
                 await tx.enqueue(task["id"], task["ready_at"])
             else:
                 task["status"] = "failed"
+                await tx.del_pending(task)
             await tx.put_task(task)
             await self.advance_run(tx, task["run"])
 
@@ -604,6 +619,7 @@ class State:
             task["status"] = "skipped"
             task["result"] = {name: (head or {}).get("ref") for name, head in (baseline or {}).items()}
             await tx.put_task(task)
+            await tx.del_pending(task)
             await self.advance_run(tx, task["run"])
 
     # -- pool tasks and workers (§10) ------------------------------------------

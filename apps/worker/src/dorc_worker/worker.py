@@ -348,7 +348,7 @@ async def run_pool(pool: str, server: str, token: str | None = None):
     import httpx
 
     headers = {"Authorization": f"Bearer {token}"} if token else {}
-    async with httpx.AsyncClient(server, headers=headers, timeout=30) as client:
+    async with httpx.AsyncClient(base_url=server, headers=headers, timeout=30) as client:
         capacity = {"cpu": os.cpu_count(), "memory": None, "gpu": None}
         registered = (
             await client.post(
@@ -359,7 +359,15 @@ async def run_pool(pool: str, server: str, token: str | None = None):
         worker_id = registered["worker"]
         print(f"[pool] worker {worker_id} registered in pool {pool!r}", flush=True)
         while True:
-            response = await client.post("/api/tasks/claim", json={"worker": worker_id, "capacity": capacity})
+            try:
+                response = await client.post(
+                    "/api/tasks/claim", json={"worker": worker_id, "capacity": capacity}
+                )
+            except httpx.HTTPError:
+                # The server may be briefly unreachable (engine tick pressure,
+                # restart) — a pool worker polls forever rather than dying.
+                await asyncio.sleep(1.0)
+                continue
             if response.status_code == 204:
                 await asyncio.sleep(1.0)
                 continue
