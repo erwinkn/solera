@@ -170,6 +170,56 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
     async def run_automation(name: str, request: Request):
         return await request.app.state.engine.run_automation(name)
 
+    # -- worker pool pull path (§10) ---------------------------------------------
+
+    @app.post("/api/workers/register", status_code=201)
+    async def register_worker(request: Request):
+        body = await request.json()
+        import uuid
+
+        worker_id = uuid.uuid4().hex
+        state = request.app.state.engine.state
+        await state.register_worker(worker_id, body.get("pools") or [], body.get("capacity") or {})
+        return {"worker": worker_id}
+
+    @app.post("/api/tasks/claim")
+    async def claim_task(request: Request):
+        body = await request.json()
+        state = request.app.state.engine.state
+        worker = await state.get_worker(body["worker"])
+        if worker is None:
+            raise KeyError(body["worker"])
+        task = await state.claim_pool_task(
+            body["worker"],
+            worker["pools"],
+            body.get("capacity") or {},
+            lease_seconds=float(body.get("lease_seconds") or 30),
+        )
+        if task is None:
+            return JSONResponse(status_code=204, content=None)
+        return {
+            "task": task["attempt"],
+            "stage": {"attempt": task["attempt"], "objects": state.objects_url},
+            "lease_seconds": 30,
+        }
+
+    @app.post("/api/tasks/{task_id}/renew")
+    async def renew_task(task_id: str, request: Request):
+        body = await request.json()
+        state = request.app.state.engine.state
+        await state.heartbeat_pool_task(body["worker"], task_id, lease_seconds=30)
+        return {"ok": True}
+
+    @app.post("/api/tasks/{task_id}/complete")
+    async def complete_task(task_id: str, request: Request):
+        body = await request.json()
+        state = request.app.state.engine.state
+        task = await state.get_pool_task(task_id)
+        if task is None or task["claimed_by"] != body["worker"]:
+            raise Conflict(f"pool task {task_id} is not claimed by {body['worker']}")
+        await state.release_pool_task(body["worker"], task_id)
+        return {"ok": True}
+
     app.mount("/static", StaticFiles(directory=web), name="static")
 
     @app.get("/")

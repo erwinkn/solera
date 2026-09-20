@@ -32,7 +32,7 @@ from data_orchestrator.sdk import (
     is_ref_type,
     split_partition,
 )
-from data_orchestrator.stores import Keys, Scope, StoreError
+from data_orchestrator.stores import Keys, Scope, StoreError, resolve_env
 
 
 def _load_module(path: Path):
@@ -307,6 +307,9 @@ async def run_attempt(objects_url: str, attempt: str, entrypoint: str | Project)
         )
         return 1
     asset = project.assets[spec["asset"]]
+    for store in project.stores.values():
+        if hasattr(store, "bind_objects"):
+            store.bind_objects(objects)
     shipper = LogShipper(objects, attempt)
     try:
         args, changes = await _resolve_inputs(spec, project, asset, objects)
@@ -316,7 +319,7 @@ async def run_attempt(objects_url: str, attempt: str, entrypoint: str | Project)
             args["ctx"] = ctx
         for name, resource in project.resources.items():
             if name in signature.parameters:
-                args[name] = resource
+                args[name] = resolve_env(resource)  # env: secrets resolve in the harness (§5)
         value = asset.fn(**args)
         if inspect.isawaitable(value):
             value = await value
@@ -347,11 +350,16 @@ async def _pool_worker(pool: str, server: str, token: str | None):
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     async with httpx.AsyncClient(server, headers=headers, timeout=30) as client:
         capacity = {"cpu": os.cpu_count(), "memory": None, "gpu": None}
-        registered = (await client.post("/api/workers/register", json={"pool": pool, **capacity})).json()
+        registered = (
+            await client.post(
+                "/api/workers/register",
+                json={"pools": [pool], "capacity": capacity},
+            )
+        ).json()
         worker_id = registered["worker"]
         print(f"[pool] worker {worker_id} registered in pool {pool!r}", flush=True)
         while True:
-            response = await client.post("/api/tasks/claim", json={"worker": worker_id})
+            response = await client.post("/api/tasks/claim", json={"worker": worker_id, "capacity": capacity})
             if response.status_code == 204:
                 await asyncio.sleep(1.0)
                 continue

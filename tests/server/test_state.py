@@ -325,21 +325,31 @@ async def test_pool_claim_lease_and_expiry(state, clock):
     queued for another worker."""
     task = await make_task(state)
     attempt = await claim(state, task)
-    spec = {"kind": "Pool", "environment": {}, "placement": {"pool": "ingest"}}
+    spec = {
+        "execution": {
+            "kind": "Pool",
+            "environment": {"name": "ingest"},
+            "placement": {"cpu": 2},
+        }
+    }
     await state.stage_pool_task({**task, "generation": 1}, prepared(), spec)
-    claimed = await state.claim_pool_task("w1", ["ingest"], lease_seconds=1)
+    big = {"cpu": 4, "memory": 10**9, "gpu": None}
+    small = {"cpu": 1, "memory": 10**9, "gpu": None}
+    # a worker that doesn't fit the task's needs never sees it
+    assert await state.claim_pool_task("w0", ["ingest"], small, lease_seconds=1) is None
+    claimed = await state.claim_pool_task("w1", ["ingest"], big, lease_seconds=1)
     assert claimed["attempt"] == attempt and claimed["claimed_by"] == "w1"
-    assert await state.claim_pool_task("w2", ["ingest"], lease_seconds=1) is None
-    assert await state.claim_pool_task("w3", ["other"], lease_seconds=1) is None
+    assert await state.claim_pool_task("w2", ["ingest"], big, lease_seconds=1) is None
+    assert await state.claim_pool_task("w3", ["other"], big, lease_seconds=1) is None
 
     clock[0] += 2
     await state.sweep_pool_leases()
-    reclaimed = await state.claim_pool_task("w2", ["ingest"], lease_seconds=60)
+    reclaimed = await state.claim_pool_task("w2", ["ingest"], big, lease_seconds=60)
     assert reclaimed["claimed_by"] == "w2"
     with pytest.raises(LostOwnership):
         await state.heartbeat_pool_task("w1", attempt, 60)
     await state.release_pool_task("w2", attempt)
-    assert await state.claim_pool_task("w1", ["ingest"], 60) is None
+    assert await state.claim_pool_task("w1", ["ingest"], big, 60) is None
 
 
 async def test_automation_state_survives_reregistration(state):

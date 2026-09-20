@@ -80,13 +80,18 @@ class Store(Protocol):
 
 
 def resolve_env(value: Any) -> Any:
-    """`env:NAME` indirection for store/resource config, resolved in the harness."""
+    """`env:NAME` indirection for store/resource config, resolved in the harness.
+    Dicts and lists are walked; anything else passes through."""
 
     if isinstance(value, str) and value.startswith("env:"):
         name = value[4:]
         if name not in os.environ:
             raise StoreError(f"Environment variable {name} is not set")
         return os.environ[name]
+    if isinstance(value, dict):
+        return {k: resolve_env(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(resolve_env(v) for v in value)
     return value
 
 

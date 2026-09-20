@@ -391,13 +391,12 @@ class State:
         async with self.transaction() as tx:
             task = await self._owned_task(tx, attempt_id)
 
-            # Pinned inputs must still be the committed heads (§8); external
-            # source refs are pinned into lineage but hold no head.
+            # Pinned inputs must still be the committed heads (§8); source heads
+            # are seeded at initialize and replaced by source commits, so an
+            # external pin that moved is caught like any other.
             for name, pin in prepared["inputs"].items():
                 refs = pin["refs"].values() if "refs" in pin else [pin["ref"]]
                 for ref in refs:
-                    if (ref.get("meta") or {}).get("external"):
-                        continue
                     head = await tx.head(ref["output"], ref["partition"])
                     if head is None or head["ref"]["version"] != ref["version"]:
                         raise Conflict(
@@ -619,13 +618,19 @@ class State:
         """A queued task placed on Pool(...) becomes claimable pool work (§10)."""
 
         attempt_id = f"{task['id']}/{task['generation']}"
+        placement = spec["execution"]
         record = {
             "attempt": attempt_id,
             "task": task["id"],
             "run": task["run"],
             "asset": task["asset"],
             "scope": task["scope"],
-            "pool": spec["placement"]["pool"],
+            "pool": placement["environment"]["name"],
+            "needs": {
+                k: placement["placement"][k]
+                for k in ("cpu", "memory", "gpu")
+                if placement["placement"].get(k) is not None
+            },
             "spec": spec,
             "prepared": prepared,
             "status": "queued",
@@ -637,14 +642,18 @@ class State:
             await tx.put_pool_task(attempt_id, record)
         return record
 
-    async def claim_pool_task(self, worker_id: str, pools: list[str], lease_seconds: float):
-        """Oldest unclaimed (or expired) pool task in the worker's pools (§10)."""
+    async def claim_pool_task(self, worker_id: str, pools: list[str], capacity: dict, lease_seconds: float):
+        """Oldest unclaimed (or expired) pool task in the worker's pools that
+        fits the worker's cpu/memory/gpu capacity (§10)."""
 
         async with self.transaction() as tx:
             for _, task in await tx.pool_tasks():
                 if task["status"] != "queued" or task["pool"] not in pools:
                     continue
                 if task["lease_until"] is not None and task["lease_until"] > self.clock():
+                    continue
+                needs = task.get("needs") or {}
+                if any(capacity.get(dim) is None or capacity[dim] < want for dim, want in needs.items()):
                     continue
                 task["status"] = "claimed"
                 task["claimed_by"] = worker_id
@@ -657,6 +666,14 @@ class State:
     async def get_pool_task(self, attempt_id: str):
         async with self.transaction() as tx:
             return await tx.pool_task(attempt_id)
+
+    async def get_worker(self, worker_id: str):
+        async with self.transaction() as tx:
+            return await tx.worker(worker_id)
+
+    async def list_workers(self):
+        async with self.transaction() as tx:
+            return await tx.workers()
 
     async def heartbeat_pool_task(self, worker_id: str, attempt_id: str, lease_seconds: float):
         async with self.transaction() as tx:
