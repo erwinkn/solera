@@ -525,7 +525,7 @@ class Retry:
     backoff: str = "exponential"
 
     def __post_init__(self):
-        if self.n < 1 or self.delay < 0 or self.backoff not in ("exponential", "none"):
+        if self.n < 0 or self.delay < 0 or self.backoff not in ("exponential", "none"):
             raise RegistrationError(f"Invalid retry policy: {self}")
 
     def wait(self, attempt: int) -> float:
@@ -600,9 +600,11 @@ class Asset:
         if on_version_change not in ("fail", "recompute"):
             raise RegistrationError(f"{self.name}: on_version_change must be 'fail' or 'recompute'")
         self.on_version_change = on_version_change
-        if isinstance(automations, Automation):
+        if isinstance(automations, Automation) or automations.__class__ in (Every, Cron, OnChange):
             automations = (automations,)
-        self.automations = tuple(automations)
+        self.automations = tuple(
+            a if isinstance(a, Automation) else Automation(trigger=a) for a in automations
+        )
 
     def __call__(self, *args, **kwargs):
         return self.fn(*args, **kwargs)

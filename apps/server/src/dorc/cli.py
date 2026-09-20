@@ -48,34 +48,31 @@ def main():
         print(json.dumps(asyncio.run(selftest(args.state_url)), indent=2), flush=True)
     else:
         from .engine import Engine
-        from .execution import LocalSubprocess
+        from .placements.local import load_manifest
+        from .state import State
         from .storage import SlateState
 
         async def execute():
-            backend = LocalSubprocess(args.project)
-            manifest = await backend.manifest()
+            manifest = await load_manifest(args.project)
             if args.command == "manifest":
                 print(json.dumps(manifest, indent=2))
                 return
-            state = await SlateState.open(args.state_url, args.namespace)
+            slate = await SlateState.open(args.state_url, args.namespace)
+            state = State(slate)
             try:
-                runtime = Engine(state, manifest, backend)
+                runtime = Engine(state, manifest, project=args.project)
                 await runtime.initialize()
                 config = json.loads(args.config)
                 if not isinstance(config, dict):
                     parser.error("--config must be a JSON object")
-                run = await runtime.submit(
-                    args.targets, partitions=args.partition, mode=args.mode, config=config
-                )
-                while True:
-                    await runtime.execute_next()
-                    detail = await runtime.run_detail(run["id"])
-                    if detail["request"]["status"] in {"succeeded", "failed", "canceled"}:
-                        print(json.dumps(detail, indent=2))
-                        if detail["request"]["status"] != "succeeded":
-                            raise SystemExit(1)
-                        return
-                    await asyncio.sleep(0.1)
+                mode, partitions = args.mode, args.partition or "latest"
+                if mode == "fill_missing":
+                    mode, partitions = "incremental", "missing"
+                run = await runtime.submit(args.targets, partitions=partitions, mode=mode, config=config)
+                detail = await runtime.run_until(run["id"])
+                print(json.dumps(detail, indent=2))
+                if detail["request"]["status"] != "succeeded":
+                    raise SystemExit(1)
             finally:
                 await state.close()
 

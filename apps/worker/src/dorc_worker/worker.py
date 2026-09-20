@@ -234,6 +234,8 @@ async def _store_outputs(spec, project, asset, objects, result_value):
 
     if isinstance(result_value, Result):
         values, cursor = result_value.outputs, result_value.cursor
+    elif not decls:
+        values, cursor = {}, UNSET  # a job: no outputs, return value ignored
     elif len(decls) == 1:
         values, cursor = {next(iter(decls)): result_value}, UNSET
     elif isinstance(result_value, dict) and set(result_value) <= set(decls):
@@ -270,7 +272,7 @@ async def _store_outputs(spec, project, asset, objects, result_value):
     return refs, cursor
 
 
-async def run_attempt(objects_url: str, attempt: str, entrypoint: str):
+async def run_attempt(objects_url: str, attempt: str, entrypoint: str | Project):
     objects = _objects(objects_url)
     spec_data = await _get(objects, f"specs/{attempt}.json")
     if spec_data is None:
@@ -292,7 +294,7 @@ async def run_attempt(objects_url: str, attempt: str, entrypoint: str):
         await _put(objects, result_key, json.dumps(payload, allow_nan=False).encode())
 
     try:
-        project = load_project(entrypoint)
+        project = entrypoint if isinstance(entrypoint, Project) else load_project(entrypoint)
     except Exception as error:
         await fail(error, False)
         return 1

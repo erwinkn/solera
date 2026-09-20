@@ -12,7 +12,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .engine import Conflict, Engine
-from .execution import LocalSubprocess
+from .placements.local import load_manifest
+from .state import State
 from .storage import SlateState, Unavailable
 
 
@@ -40,14 +41,19 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
         owned = engine is None
         runtime = engine
         if owned:
-            backend = LocalSubprocess(project)
-            manifest = await backend.manifest()
-            state = await SlateState.open(state_url, namespace)
-            runtime = Engine(state, manifest, backend, concurrency=int(os.getenv("DORC_CONCURRENCY", "4")))
+            manifest = await load_manifest(project)
+            slate = await SlateState.open(state_url, namespace)
+            state = State(slate)
+            runtime = Engine(
+                state,
+                manifest,
+                project=project,
+                concurrency=int(os.getenv("DORC_CONCURRENCY", "4")),
+            )
             try:
                 await runtime.initialize()
             except BaseException:
-                await state.close()
+                await slate.close()
                 raise
         app.state.engine = runtime
         await runtime.start()

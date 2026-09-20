@@ -49,7 +49,14 @@ class LostOwnership(Exception):
 
 
 class Conflict(Exception):
-    """A commit precondition failed (moved head, stale generation)."""
+    """A commit precondition failed (moved head, stale generation).
+
+    retryable=True for races (a head moved under the attempt); False for
+    violations no retry can fix (undeclared output, missing prior head)."""
+
+    def __init__(self, message: str, retryable: bool = True):
+        super().__init__(message)
+        self.retryable = retryable
 
 
 class Tx:
@@ -225,6 +232,14 @@ class State:
     def transaction(self) -> Tx:
         return _TxCtx(self)
 
+    async def get(self, key: str, default=None):
+        async with self.transaction() as tx:
+            return await tx.get(key, default)
+
+    async def scan(self, prefix: str, limit=None):
+        async with self.transaction() as tx:
+            return await tx.scan(prefix, limit)
+
     # -- project registration ---------------------------------------------------
 
     async def initialize(self, manifest: dict, revision: str):
@@ -236,7 +251,7 @@ class State:
         async with self.transaction() as tx:
             await tx.put(f"manifest/{esc(revision)}", manifest)
             await tx.put("sys/revision", revision)
-            await tx.put("sys/project", manifest["project"])
+            await tx.put("sys/project", manifest.get("project") or manifest.get("name"))
             for auto in manifest["automations"].values():
                 existing = await tx.automation(auto["name"])
                 record = {
@@ -315,7 +330,7 @@ class State:
         info = await self._lock_of(tx, attempt_id)
         if info is None:
             raise LostOwnership(attempt_id)
-        asset, scope, _ = info
+        asset, scope = info
         lock = await tx.lock(asset, scope)
         if lock is None or lock["attempt"] != attempt_id:
             raise LostOwnership(attempt_id)
@@ -376,10 +391,13 @@ class State:
         async with self.transaction() as tx:
             task = await self._owned_task(tx, attempt_id)
 
-            # Pinned inputs must still be the committed heads (§8).
+            # Pinned inputs must still be the committed heads (§8); external
+            # source refs are pinned into lineage but hold no head.
             for name, pin in prepared["inputs"].items():
                 refs = pin["refs"].values() if "refs" in pin else [pin["ref"]]
                 for ref in refs:
+                    if (ref.get("meta") or {}).get("external"):
+                        continue
                     head = await tx.head(ref["output"], ref["partition"])
                     if head is None or head["ref"]["version"] != ref["version"]:
                         raise Conflict(
@@ -392,15 +410,23 @@ class State:
 
             outputs = result.get("outputs") or {}
             asset = manifest["assets"][task["asset"]]
-            declared = {o["name"] for o in asset["outputs"]}
+            declared = {o["name"]: o for o in asset["outputs"]}
             for name, ref in outputs.items():
                 if name not in declared:
-                    raise Conflict(f"result names undeclared output {name!r}")
+                    raise Conflict(f"result names undeclared output {name!r}", retryable=False)
                 if ref["partition"] != task["scope"]:
-                    raise Conflict(f"output {name}: ref scope {ref['partition']!r} != {task['scope']!r}")
-            for name in declared - set(outputs):
+                    raise Conflict(
+                        f"output {name}: ref scope {ref['partition']!r} != {task['scope']!r}",
+                        retryable=False,
+                    )
+                decl = declared[name]
+                if (
+                    decl.get("key") is not None or decl.get("partition_set") or decl.get("mode") == "append"
+                ) and not (ref.get("meta") or {}).get("keys"):
+                    raise Conflict(f"keyed output {name}: ref carries no key map", retryable=False)
+            for name in set(declared) - set(outputs):
                 if prepared["baseline"].get(name) is None:
-                    raise Conflict(f"omitted output {name} has no head to keep (§2)")
+                    raise Conflict(f"omitted output {name} has no head to keep (§2)", retryable=False)
 
             changed = sorted(
                 name
@@ -437,6 +463,10 @@ class State:
                 )
             if result.get("cursor", UNSET) is not UNSET:
                 await tx.put_cursor(task["asset"], task["scope"], result["cursor"])
+            elif prepared.get("recompute"):
+                # Recompute withholds the cursor from the producer and clears the
+                # committed one (§8: no prior, no cursor, key state cleared).
+                await tx.put_cursor(task["asset"], task["scope"], None)
 
             # Per-edge key state: committed revisions + fingerprints (§6).
             for edge, update in (prepared.get("key_updates") or {}).items():
@@ -623,6 +653,10 @@ class State:
                 await tx.put_pool_task(task["attempt"], task)
                 return task
         return None
+
+    async def get_pool_task(self, attempt_id: str):
+        async with self.transaction() as tx:
+            return await tx.pool_task(attempt_id)
 
     async def heartbeat_pool_task(self, worker_id: str, attempt_id: str, lease_seconds: float):
         async with self.transaction() as tx:
