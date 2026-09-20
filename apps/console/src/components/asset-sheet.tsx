@@ -1,291 +1,355 @@
-import { useState } from "react";
-import { ArrowRight, LayoutGrid, Play } from "lucide-react";
+import { Play } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import {
   Sheet,
   SheetContent,
+  SheetDescription,
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { useQuery } from "@/lib/api";
-import { useWorkspace } from "@/lib/workspace";
-import type { AssetDetail, CatalogAsset } from "@/lib/types";
-import { time } from "@/lib/format";
+import { Switch } from "@/components/ui/switch";
 import {
-  Empty,
-  ErrorNotice,
-  JsonBlock,
-  Loading,
-  Properties,
-  StatusBadge,
-} from "./common";
-import { DataPreview } from "./data-preview";
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import { ErrorNotice } from "@/components/common";
+import { request, useAction, useQuery } from "@/lib/api";
+import { time } from "@/lib/format";
+import { useWorkspace } from "@/lib/workspace";
+import { cn } from "cn";
+import type {
+  AssetDetail,
+  CatalogAsset,
+  Head,
+  PartitionScope,
+} from "@/lib/types";
 
-export function assetStatus(asset: CatalogAsset) {
-  if (!asset.heads.length) return "not_materialized";
-  if (asset.heads.some((head) => head.state_version !== asset.version))
-    return "stale";
-  if (asset.heads.some((head) => !head.scope_complete)) return "partial";
-  return "materialized";
+export function upstreamNames(
+  asset: Pick<CatalogAsset, "inputs" | "deps" | "partitions">,
+  ownerOf: (output: string) => string | null,
+): string[] {
+  const names = new Set<string>();
+  for (const edge of Object.values(asset.inputs)) {
+    const owner = ownerOf(edge.output);
+    if (owner) names.add(owner);
+  }
+  for (const dep of asset.deps) {
+    const owner = ownerOf(dep);
+    if (owner) names.add(owner);
+  }
+  for (const dim of Object.values(asset.partitions?.dims ?? {})) {
+    if (dim.kind === "set" && dim.output) {
+      const owner = ownerOf(dim.output);
+      if (owner) names.add(owner);
+    }
+  }
+  return [...names];
 }
 
-export function updateModel(asset: CatalogAsset) {
-  if (asset.incremental) return "Keyed incremental";
-  if (asset.partitions) return "Daily partitions";
-  return "Snapshot";
+export function assetStatus(asset: CatalogAsset) {
+  const heads = Object.values(asset.heads).flatMap((scopes) =>
+    Object.values(scopes),
+  );
+  if (!heads.length) return "not_materialized";
+  if (heads.some((head) => head.version !== asset.version)) return "stale";
+  if (heads.every((head) => head.complete)) return "materialized";
+  return "partial";
+}
+
+const SCOPE_TONE: Record<string, string> = {
+  complete: "bg-emerald-500/80 border-emerald-600/30 text-emerald-950",
+  missing: "bg-amber-500/15 border-amber-600/30 text-amber-800",
+  retired: "bg-muted border-border text-muted-foreground line-through",
+  running: "bg-sky-500/20 border-sky-600/30 text-sky-800 animate-pulse",
+  failed: "bg-red-500/15 border-red-600/30 text-red-800",
+};
+
+function scopeKey(dims: string[], parts: Record<string, string>) {
+  if (dims.length === 1) return parts[dims[0]];
+  return dims
+    .slice()
+    .sort()
+    .map((name) => `${name}=${encodeURIComponent(parts[name])}`)
+    .join(",");
+}
+
+function PartitionGrid({
+  asset,
+  detail,
+  scopes,
+  onPick,
+}: {
+  asset: CatalogAsset;
+  detail: AssetDetail | null;
+  scopes: PartitionScope[];
+  onPick: (scope: string) => void;
+}) {
+  const { select } = useWorkspace();
+  const dims = Object.keys(asset.partitions?.dims ?? {});
+  const byScope = new Map(scopes.map((s) => [s.scope, s]));
+  if (!dims.length) {
+    const head = Object.values(asset.heads)[0]?.[""];
+    return (
+      <div className="flex items-center gap-2 text-sm text-muted-foreground">
+        <span
+          className={cn(
+            "rounded-md border px-2 py-0.5 text-xs",
+            SCOPE_TONE[
+              head?.complete ? "complete" : head ? "failed" : "missing"
+            ],
+          )}
+        >
+          unpartitioned
+        </span>
+        {head && <span>v{String(head.version).slice(0, 12)}</span>}
+      </div>
+    );
+  }
+  const keys = detail?.current_keys ?? [];
+  const cells: { scope: string; label: string; cell: PartitionScope }[] = [];
+  const missingCell = (scope: string): PartitionScope => ({
+    scope,
+    status: "missing",
+  });
+  if (dims.length === 1) {
+    for (const key of keys[0] ?? []) {
+      const scope = scopeKey(dims, { [dims[0]]: key });
+      cells.push({
+        scope,
+        label: key,
+        cell: byScope.get(scope) ?? missingCell(scope),
+      });
+    }
+    for (const s of scopes)
+      if (!cells.some((c) => c.scope === s.scope))
+        cells.push({ scope: s.scope, label: s.scope, cell: s });
+  } else {
+    const [first, second, ...rest] = keys;
+    for (const row of first ?? [])
+      for (const col of second ?? []) {
+        const parts: Record<string, string> = {
+          [dims[0]]: row,
+          [dims[1]]: col,
+        };
+        rest.forEach((dimKeys, i) => {
+          parts[dims[i + 2]] = dimKeys[0] ?? "";
+        });
+        const scope = scopeKey(dims, parts);
+        cells.push({
+          scope,
+          label: `${row} × ${col}`,
+          cell: byScope.get(scope) ?? missingCell(scope),
+        });
+      }
+  }
+  const headsByScope = new Map<string, Head>();
+  if (detail) {
+    for (const pairs of Object.values(detail.heads))
+      for (const [scope, head] of pairs) headsByScope.set(scope, head);
+  } else {
+    for (const heads of Object.values(asset.heads))
+      for (const [scope, head] of Object.entries(heads))
+        headsByScope.set(scope, head);
+  }
+  return (
+    <div className="flex flex-col gap-2">
+      <div
+        className="flex flex-wrap gap-1.5"
+        role="list"
+        aria-label="Partitions"
+      >
+        {cells.map(({ scope, label, cell }) => {
+          const head = headsByScope.get(scope);
+          const keyCount = (
+            head?.ref.meta as Record<string, { count?: number }> | undefined
+          )?.keys?.count;
+          const attemptRun = cell.last_attempt?.split("/")[0];
+          return (
+            <span key={scope} role="listitem" className="inline-flex">
+              <button
+                data-scope={scope}
+                data-status={cell.status}
+                title={`${scope} · ${cell.status}${cell.last_outcome ? ` · last ${cell.last_outcome}` : ""}${keyCount != null ? ` · ${keyCount} keys` : ""}`}
+                className={cn(
+                  "rounded-md border px-2 py-1 font-mono text-xs transition-transform hover:scale-105",
+                  SCOPE_TONE[cell.status],
+                )}
+                onClick={() => onPick(scope)}
+              >
+                {label}
+                {keyCount != null && (
+                  <span className="ml-1 opacity-70">{keyCount}</span>
+                )}
+              </button>
+              {attemptRun && (
+                <button
+                  aria-label={`Open last attempt for ${scope}`}
+                  title={`last attempt ${cell.last_attempt}`}
+                  className="ml-0.5 rounded-sm px-0.5 text-muted-foreground hover:text-foreground"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    select({ kind: "run", id: attemptRun });
+                  }}
+                >
+                  <Play className="size-3" />
+                </button>
+              )}
+            </span>
+          );
+        })}
+        {!cells.length && (
+          <span className="text-xs text-muted-foreground">
+            No partition keys committed yet.
+          </span>
+        )}
+      </div>
+      <p className="text-xs text-muted-foreground">
+        {dims.join(" × ")} ·{" "}
+        {cells.filter((c) => c.cell.status === "complete").length}/
+        {cells.length} complete
+        {detail?.cursor != null && " · cursor present"}
+      </p>
+    </div>
+  );
 }
 
 export function AssetSheet() {
-  const { selection, select } = useWorkspace();
-  const open = selection?.kind === "asset";
+  const { selection, select, base, assets, openMaterialize, refresh } =
+    useWorkspace();
+  const action = useAction();
+  const name = selection?.kind === "asset" ? selection.name : null;
+  const asset = assets.find((a) => a.name === name) ?? null;
+  const detail = useQuery<AssetDetail>(
+    base && name ? `${base}/assets/${name}` : null,
+    2000,
+  );
+  const partitions = useQuery<{ partitions: PartitionScope[] }>(
+    base && name && asset?.partitions ? `${base}/partitions/${name}` : null,
+    2000,
+  );
+  if (!asset) {
+    return (
+      <Sheet open={!!name} onOpenChange={(open) => !open && select(null)}>
+        <SheetContent />
+      </Sheet>
+    );
+  }
   return (
-    <Sheet
-      open={open}
-      modal={false}
-      onOpenChange={(next) => {
-        if (!next) select(null);
-      }}
-    >
-      <SheetContent
-        side="right"
-        hideOverlay
-        className="w-full overflow-y-auto sm:max-w-xl"
-      >
-        {open && <AssetDetailView key={selection.name} name={selection.name} />}
+    <Sheet open={!!name} onOpenChange={(open) => !open && select(null)}>
+      <SheetContent className="w-full overflow-y-auto sm:max-w-2xl">
+        <SheetHeader>
+          <SheetTitle className="font-mono">{asset.name}</SheetTitle>
+          <SheetDescription>{asset.doc ?? "Asset"}</SheetDescription>
+        </SheetHeader>
+        <div className="flex flex-col gap-6 px-4 pb-8">
+          {action.error && <ErrorNotice message={action.error} />}
+          <section className="flex flex-col gap-2">
+            <h3 className="text-[0.65rem] font-medium tracking-wider text-muted-foreground uppercase">
+              Outputs
+            </h3>
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Name</TableHead>
+                  <TableHead>Store</TableHead>
+                  <TableHead>Key</TableHead>
+                  <TableHead>Mode</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {asset.outputs.map((output) => (
+                  <TableRow key={output.name}>
+                    <TableCell className="font-mono text-xs">
+                      {output.name}
+                    </TableCell>
+                    <TableCell>{output.store}</TableCell>
+                    <TableCell className="font-mono text-xs">
+                      {output.key ??
+                        (output.partition_set ? "<elements>" : "—")}
+                      {output.revision ? ` @${output.revision}` : ""}
+                    </TableCell>
+                    <TableCell>{output.mode ?? "replace"}</TableCell>
+                  </TableRow>
+                ))}
+                {!asset.outputs.length && (
+                  <TableRow>
+                    <TableCell colSpan={4} className="text-muted-foreground">
+                      A job — no declared outputs.
+                    </TableCell>
+                  </TableRow>
+                )}
+              </TableBody>
+            </Table>
+          </section>
+          <section className="flex flex-col gap-2">
+            <h3 className="text-[0.65rem] font-medium tracking-wider text-muted-foreground uppercase">
+              Partitions
+            </h3>
+            <PartitionGrid
+              asset={asset}
+              detail={detail.data}
+              scopes={partitions.data?.partitions ?? []}
+              onPick={(scope) => openMaterialize([asset.name], [scope])}
+            />
+          </section>
+          <section className="flex flex-col gap-2">
+            <h3 className="text-[0.65rem] font-medium tracking-wider text-muted-foreground uppercase">
+              Placement
+            </h3>
+            <p className="font-mono text-xs">
+              {asset.placement.kind}{" "}
+              {Object.entries(asset.placement.placement)
+                .map(([k, v]) => `${k}=${v}`)
+                .join(" ")}
+            </p>
+          </section>
+          <section className="flex flex-col gap-2">
+            <h3 className="text-[0.65rem] font-medium tracking-wider text-muted-foreground uppercase">
+              Automations
+            </h3>
+            {(detail.data?.automations ?? []).length ? (
+              (detail.data?.automations ?? []).map((auto) => (
+                <div
+                  key={auto.name}
+                  className="flex items-center gap-3 rounded-lg border px-3 py-2"
+                  data-automation={auto.name}
+                >
+                  <span className="min-w-0 flex-1">
+                    <span className="block font-mono text-xs">{auto.name}</span>
+                    <span className="block text-xs text-muted-foreground">
+                      {auto.trigger.kind}
+                      {auto.last_at ? ` · fired ${time(auto.last_at)}` : ""}
+                    </span>
+                  </span>
+                  <Switch
+                    aria-label={`Enable ${auto.name}`}
+                    checked={auto.enabled}
+                    onCheckedChange={(enabled) =>
+                      action.run(async () => {
+                        await request(
+                          `${base}/automations/${auto.name}/${enabled ? "enable" : "disable"}`,
+                          { body: {} },
+                        );
+                        detail.refresh();
+                        refresh();
+                      })
+                    }
+                  />
+                </div>
+              ))
+            ) : (
+              <p className="text-xs text-muted-foreground">None declared.</p>
+            )}
+          </section>
+          <Button onClick={() => openMaterialize([asset.name])}>
+            <Play /> Materialize
+          </Button>
+        </div>
       </SheetContent>
     </Sheet>
-  );
-}
-
-function AssetDetailView({ name }: { name: string }) {
-  const { state, select, openMaterialize } = useWorkspace();
-  const asset = state?.assets.find((entry) => entry.name === name);
-  const [partition, setPartition] = useState(
-    () => asset?.heads[0]?.partition ?? "",
-  );
-  const query = useQuery<AssetDetail>(
-    `/assets/${encodeURIComponent(name)}?partition=${encodeURIComponent(partition)}`,
-  );
-  const detail = query.data;
-  return (
-    <>
-      <SheetHeader>
-        <SheetTitle className="font-mono">{name}</SheetTitle>
-      </SheetHeader>
-      <div className="flex flex-col gap-4 px-4 pb-6">
-        {query.error && <ErrorNotice message={query.error.message} />}
-        {!detail ? (
-          <Loading label="Loading asset…" />
-        ) : (
-          <>
-            <div className="flex items-center justify-between gap-3">
-              {asset && <StatusBadge status={assetStatus(asset)} />}
-              <Button
-                size="sm"
-                onClick={() => {
-                  select(null);
-                  openMaterialize([name]);
-                }}
-              >
-                <Play />
-                Materialize
-              </Button>
-            </div>
-            <p className="text-sm text-muted-foreground">
-              {asset?.description ||
-                "No description provided in the asset definition."}
-            </p>
-            {asset?.partitions && asset.heads.length > 0 && (
-              <div className="grid w-56 gap-1.5">
-                <Select
-                  value={partition}
-                  onValueChange={(value) => setPartition(value as string)}
-                >
-                  <SelectTrigger aria-label="Partition" className="w-full">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {asset.heads.map((head) => (
-                      <SelectItem key={head.partition} value={head.partition}>
-                        {head.partition}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-            )}
-            <Tabs defaultValue="overview">
-              <TabsList>
-                <TabsTrigger value="overview">Overview</TabsTrigger>
-                <TabsTrigger value="data">Data</TabsTrigger>
-              </TabsList>
-              <TabsContent
-                value="overview"
-                className="flex flex-col gap-4 pt-3"
-              >
-                {asset && (
-                  <>
-                    <section>
-                      <h3 className="mb-2 text-sm font-medium">Definition</h3>
-                      <Properties
-                        entries={[
-                          [
-                            "Producer",
-                            <code key="p" className="font-mono text-xs">
-                              {asset.producer}
-                            </code>,
-                          ],
-                          ["Update model", updateModel(asset)],
-                          ["Group", asset.group],
-                          [
-                            "Data version",
-                            <code key="v" className="font-mono text-xs">
-                              {asset.version?.slice(0, 16) ||
-                                "Not materialized"}
-                            </code>,
-                          ],
-                        ]}
-                      />
-                    </section>
-                    {asset.incremental && (
-                      <p className="rounded-lg bg-muted/50 px-3 py-2 text-xs text-muted-foreground">
-                        Tracks <code>{asset.incremental.key}</code> by{" "}
-                        <code>{asset.incremental.revision}</code>, committing up
-                        to {asset.incremental.batch_size} source changes per
-                        batch.
-                      </p>
-                    )}
-                    <section>
-                      <h3 className="mb-2 text-sm font-medium">Dependencies</h3>
-                      <div className="flex flex-col gap-1">
-                        {asset.inputs.length ? (
-                          asset.inputs.map((input) => (
-                            <button
-                              key={input}
-                              className="flex items-center gap-2 rounded-lg border px-3 py-2 text-left font-mono text-xs transition-colors hover:bg-muted"
-                              onClick={() =>
-                                select({ kind: "asset", name: input })
-                              }
-                            >
-                              <LayoutGrid className="size-3.5 shrink-0 text-muted-foreground" />
-                              <span className="min-w-0 flex-1 truncate">
-                                {input}
-                              </span>
-                              <ArrowRight className="size-3.5 shrink-0 text-muted-foreground" />
-                            </button>
-                          ))
-                        ) : (
-                          <p className="text-sm text-muted-foreground">
-                            Source asset · no upstream dependencies
-                          </p>
-                        )}
-                      </div>
-                    </section>
-                    <section>
-                      <h3 className="mb-2 text-sm font-medium">Downstream</h3>
-                      <div className="flex flex-col gap-1">
-                        {state?.assets
-                          .filter((entry) => entry.inputs.includes(name))
-                          .map((entry) => (
-                            <button
-                              key={entry.name}
-                              className="flex items-center gap-2 rounded-lg border px-3 py-2 text-left font-mono text-xs transition-colors hover:bg-muted"
-                              onClick={() =>
-                                select({ kind: "asset", name: entry.name })
-                              }
-                            >
-                              <LayoutGrid className="size-3.5 shrink-0 text-muted-foreground" />
-                              <span className="min-w-0 flex-1 truncate">
-                                {entry.name}
-                              </span>
-                              <ArrowRight className="size-3.5 shrink-0 text-muted-foreground" />
-                            </button>
-                          ))}
-                        {!state?.assets.some((entry) =>
-                          entry.inputs.includes(name),
-                        ) && (
-                          <p className="text-sm text-muted-foreground">
-                            No downstream assets
-                          </p>
-                        )}
-                      </div>
-                    </section>
-                    {asset.partitions && asset.heads.length > 0 && (
-                      <section>
-                        <h3 className="mb-2 text-sm font-medium">
-                          Materialized partitions{" "}
-                          <span className="text-muted-foreground">
-                            {asset.heads.length}
-                          </span>
-                        </h3>
-                        <div className="flex flex-wrap gap-1.5">
-                          {asset.heads.map((head) => (
-                            <button
-                              key={head.partition}
-                              title={`${head.partition} · ${time(head.updated_at)}`}
-                              aria-label={`Inspect partition ${head.partition}`}
-                              className="rounded-md border px-2 py-1 font-mono text-xs transition-colors hover:bg-muted"
-                              onClick={() => setPartition(head.partition)}
-                            >
-                              {head.partition.slice(5)}
-                            </button>
-                          ))}
-                        </div>
-                      </section>
-                    )}
-                  </>
-                )}
-                {detail.checkpoint && (
-                  <section>
-                    <h3 className="mb-2 text-sm font-medium">
-                      Incremental checkpoint
-                    </h3>
-                    <JsonBlock value={detail.checkpoint} />
-                  </section>
-                )}
-              </TabsContent>
-              <TabsContent value="data" className="flex flex-col gap-4 pt-3">
-                {!detail.head ? (
-                  <Empty title="No committed data">
-                    Materialize this asset to inspect its output.
-                  </Empty>
-                ) : (
-                  <>
-                    <section>
-                      <h3 className="mb-2 text-sm font-medium">
-                        Data preview · first 100 rows
-                      </h3>
-                      <DataPreview value={detail.preview} />
-                    </section>
-                    <section>
-                      <h3 className="mb-2 text-sm font-medium">
-                        Immutable output
-                      </h3>
-                      <JsonBlock value={detail.head} />
-                    </section>
-                    {detail.commit && (
-                      <section>
-                        <h3 className="mb-2 text-sm font-medium">
-                          Materialization commit
-                        </h3>
-                        <JsonBlock value={detail.commit} />
-                      </section>
-                    )}
-                  </>
-                )}
-              </TabsContent>
-            </Tabs>
-          </>
-        )}
-      </div>
-    </>
   );
 }

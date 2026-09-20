@@ -12,7 +12,9 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as AssetsRouteImport } from './routes/assets'
 import { Route as AutomationsRouteImport } from './routes/automations'
+import { Route as ExecutorsRouteImport } from './routes/executors'
 import { Route as RunsRouteImport } from './routes/runs'
+import { Route as SourcesRouteImport } from './routes/sources'
 import { Route as StorageRouteImport } from './routes/storage'
 
 const IndexRoute = IndexRouteImport.update({
@@ -30,9 +32,19 @@ const AutomationsRoute = AutomationsRouteImport.update({
   path: '/automations',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ExecutorsRoute = ExecutorsRouteImport.update({
+  id: '/executors',
+  path: '/executors',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const RunsRoute = RunsRouteImport.update({
   id: '/runs',
   path: '/runs',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const SourcesRoute = SourcesRouteImport.update({
+  id: '/sources',
+  path: '/sources',
   getParentRoute: () => rootRouteImport,
 } as any)
 const StorageRoute = StorageRouteImport.update({
@@ -45,14 +57,18 @@ export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/assets': typeof AssetsRoute
   '/automations': typeof AutomationsRoute
+  '/executors': typeof ExecutorsRoute
   '/runs': typeof RunsRoute
+  '/sources': typeof SourcesRoute
   '/storage': typeof StorageRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/assets': typeof AssetsRoute
   '/automations': typeof AutomationsRoute
+  '/executors': typeof ExecutorsRoute
   '/runs': typeof RunsRoute
+  '/sources': typeof SourcesRoute
   '/storage': typeof StorageRoute
 }
 export interface FileRoutesById {
@@ -60,22 +76,48 @@ export interface FileRoutesById {
   '/': typeof IndexRoute
   '/assets': typeof AssetsRoute
   '/automations': typeof AutomationsRoute
+  '/executors': typeof ExecutorsRoute
   '/runs': typeof RunsRoute
+  '/sources': typeof SourcesRoute
   '/storage': typeof StorageRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/assets' | '/automations' | '/runs' | '/storage'
+  fullPaths:
+    | '/'
+    | '/assets'
+    | '/automations'
+    | '/executors'
+    | '/runs'
+    | '/sources'
+    | '/storage'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/assets' | '/automations' | '/runs' | '/storage'
-  id: '__root__' | '/' | '/assets' | '/automations' | '/runs' | '/storage'
+  to:
+    | '/'
+    | '/assets'
+    | '/automations'
+    | '/executors'
+    | '/runs'
+    | '/sources'
+    | '/storage'
+  id:
+    | '__root__'
+    | '/'
+    | '/assets'
+    | '/automations'
+    | '/executors'
+    | '/runs'
+    | '/sources'
+    | '/storage'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   AssetsRoute: typeof AssetsRoute
   AutomationsRoute: typeof AutomationsRoute
+  ExecutorsRoute: typeof ExecutorsRoute
   RunsRoute: typeof RunsRoute
+  SourcesRoute: typeof SourcesRoute
   StorageRoute: typeof StorageRoute
 }
 
@@ -102,11 +144,25 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AutomationsRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/executors': {
+      id: '/executors'
+      path: '/executors'
+      fullPath: '/executors'
+      preLoaderRoute: typeof ExecutorsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/runs': {
       id: '/runs'
       path: '/runs'
       fullPath: '/runs'
       preLoaderRoute: typeof RunsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/sources': {
+      id: '/sources'
+      path: '/sources'
+      fullPath: '/sources'
+      preLoaderRoute: typeof SourcesRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/storage': {
@@ -123,7 +179,9 @@ const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AssetsRoute: AssetsRoute,
   AutomationsRoute: AutomationsRoute,
+  ExecutorsRoute: ExecutorsRoute,
   RunsRoute: RunsRoute,
+  SourcesRoute: SourcesRoute,
   StorageRoute: StorageRoute,
 }
 export const routeTree = rootRouteImport

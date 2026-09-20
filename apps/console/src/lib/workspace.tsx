@@ -7,13 +7,20 @@ import {
 } from "react";
 import type { ReactNode } from "react";
 import { useQuery } from "./api";
-import type { StateResponse } from "./types";
+import type { CatalogAsset, Diagnostics, Run } from "./types";
 
 export type Selection =
-  { kind: "asset"; name: string } | { kind: "run"; id: string } | null;
+  | { kind: "asset"; name: string }
+  | { kind: "run"; id: string }
+  | { kind: "source"; name: string }
+  | null;
 
 interface Workspace {
-  state: StateResponse | null;
+  diagnostics: Diagnostics | null;
+  /** `/projects/{name}` — the API prefix for every project-scoped call. */
+  base: string | null;
+  assets: CatalogAsset[];
+  runs: Run[];
   error: Error | null;
   refresh: () => void;
   selection: Selection;
@@ -21,46 +28,75 @@ interface Workspace {
   checked: string[];
   setChecked: (next: string[] | ((current: string[]) => string[])) => void;
   materializeTargets: string[] | null;
-  openMaterialize: (targets?: string[]) => void;
+  materializeScopes: string[];
+  openMaterialize: (targets?: string[], scopes?: string[]) => void;
   closeMaterialize: () => void;
 }
 
 const WorkspaceContext = createContext<Workspace | null>(null);
 
 export function WorkspaceProvider({ children }: { children: ReactNode }) {
-  const query = useQuery<StateResponse>("/state", 2000);
+  const diagnostics = useQuery<Diagnostics>("/diagnostics", 10000);
+  const base = diagnostics.data
+    ? `/projects/${diagnostics.data.project}`
+    : null;
+  const catalog = useQuery<{ assets: CatalogAsset[] }>(
+    base ? `${base}/assets` : null,
+    2000,
+  );
+  const runs = useQuery<{ runs: Run[] }>(base ? `${base}/runs` : null, 1500);
   const [selection, setSelection] = useState<Selection>(null);
   const [checked, setChecked] = useState<string[]>([]);
   const [materializeTargets, setMaterializeTargets] = useState<string[] | null>(
     null,
   );
+  const [materializeScopes, setMaterializeScopes] = useState<string[]>([]);
   const select = useCallback((next: Selection) => setSelection(next), []);
-  const openMaterialize = useCallback((targets?: string[]) => {
-    setSelection(null);
-    setMaterializeTargets(targets ?? []);
-  }, []);
+  const openMaterialize = useCallback(
+    (targets?: string[], scopes?: string[]) => {
+      setSelection(null);
+      setMaterializeTargets(targets ?? []);
+      setMaterializeScopes(scopes ?? []);
+    },
+    [],
+  );
   const closeMaterialize = useCallback(() => setMaterializeTargets(null), []);
+  const refresh = useCallback(() => {
+    diagnostics.refresh();
+    catalog.refresh();
+    runs.refresh();
+  }, [diagnostics.refresh, catalog.refresh, runs.refresh]);
   const value = useMemo<Workspace>(
     () => ({
-      state: query.data,
-      error: query.error,
-      refresh: query.refresh,
+      diagnostics: diagnostics.data ?? null,
+      base,
+      assets: catalog.data?.assets ?? [],
+      runs: runs.data?.runs ?? [],
+      error: diagnostics.error ?? catalog.error ?? runs.error,
+      refresh,
       selection,
       select,
       checked,
       setChecked,
       materializeTargets,
+      materializeScopes,
       openMaterialize,
       closeMaterialize,
     }),
     [
-      query.data,
-      query.error,
-      query.refresh,
+      diagnostics.data,
+      diagnostics.error,
+      base,
+      catalog.data,
+      catalog.error,
+      runs.data,
+      runs.error,
+      refresh,
       selection,
       select,
       checked,
       materializeTargets,
+      materializeScopes,
       openMaterialize,
       closeMaterialize,
     ],

@@ -1,302 +1,244 @@
-import { Pause, Play, RefreshCw, X } from "lucide-react";
+import { useState } from "react";
+import { Ban, Pause, Play, RotateCcw } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Sheet,
   SheetContent,
+  SheetDescription,
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet";
-import { request, useAction, useQuery } from "@/lib/api";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Empty, ErrorNotice, StatusBadge } from "@/components/common";
+import { request, useAction, useQuery, useQueryText } from "@/lib/api";
 import { duration, time } from "@/lib/format";
-import type { RunDetail, TaskRecord } from "@/lib/types";
 import { useWorkspace } from "@/lib/workspace";
-import {
-  ErrorNotice,
-  JsonBlock,
-  Loading,
-  Properties,
-  StatusBadge,
-} from "./common";
+import type { Attempt, RunDetail, Task } from "@/lib/types";
 
-export function RunSheet() {
-  const { selection, select } = useWorkspace();
-  const open = selection?.kind === "run";
+function JsonView({ path }: { path: string }) {
+  const { data, error } = useQuery<unknown>(path, 30000);
+  if (error)
+    return <ErrorNotice message={`${error.message} (not committed yet?)`} />;
   return (
-    <Sheet
-      open={open}
-      modal={false}
-      onOpenChange={(next) => {
-        if (!next) select(null);
-      }}
+    <pre className="max-h-64 overflow-auto rounded-lg bg-muted p-3 font-mono text-xs">
+      {data == null ? "…" : JSON.stringify(data, null, 2)}
+    </pre>
+  );
+}
+
+function LogView({ path }: { path: string }) {
+  // The endpoint streams newline-delimited log chunks; poll it for a tail.
+  const { data } = useQueryText(path, 1000);
+  return (
+    <pre
+      aria-label="Attempt logs"
+      className="max-h-64 min-h-16 overflow-auto rounded-lg bg-zinc-950 p-3 font-mono text-xs text-zinc-100"
     >
-      <SheetContent
-        side="right"
-        hideOverlay
-        className="w-full overflow-y-auto sm:max-w-2xl"
-      >
-        {open && <RunDetailView key={selection.id} id={selection.id} />}
-      </SheetContent>
-    </Sheet>
+      {data ? data : "No log lines yet."}
+    </pre>
   );
 }
 
-function RunDetailView({ id }: { id: string }) {
-  const { refresh } = useWorkspace();
-  const query = useQuery<RunDetail>(`/runs/${id}`);
-  const action = useAction();
-  const detail = query.data?.request.id === id ? query.data : null;
-
-  async function control(operation: string) {
-    await action.run(() => request(`/runs/${id}/${operation}`));
-    query.refresh();
-    refresh();
-  }
-
-  return (
-    <>
-      <SheetHeader>
-        <SheetTitle>
-          Run <span className="font-mono">{id.slice(0, 8)}</span>
-        </SheetTitle>
-      </SheetHeader>
-      <div className="flex flex-col gap-4 px-4 pb-6">
-        {query.error && <ErrorNotice message={query.error.message} />}
-        {action.error && <ErrorNotice message={action.error} />}
-        {!detail ? (
-          <Loading label="Loading run…" />
-        ) : (
-          <RunContent
-            detail={detail}
-            control={control}
-            pending={action.pending}
-          />
-        )}
-      </div>
-    </>
-  );
-}
-
-function RunContent({
-  detail,
-  control,
-  pending,
+function AttemptRow({
+  base,
+  task,
+  attempt,
 }: {
-  detail: RunDetail;
-  control: (operation: string) => Promise<void>;
-  pending: boolean;
+  base: string;
+  task: Task;
+  attempt: Attempt;
 }) {
-  const run = detail.request;
-  const active = ["running", "queued", "paused"].includes(run.status);
+  const attemptId = attempt.id ?? `${task.id}/${attempt.generation}`;
+  const encoded = attemptId.split("/").map(encodeURIComponent).join("/");
   return (
-    <>
-      <div className="flex flex-wrap items-center gap-2">
-        <StatusBadge status={run.paused && active ? "paused" : run.status} />
-        <span className="text-sm text-muted-foreground">
-          {run.targets.join(", ")} · {time(run.created_at)}
-        </span>
-      </div>
-      <div className="flex flex-wrap gap-2">
-        {active && (
-          <>
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={pending}
-              onClick={() => control(run.paused ? "resume" : "pause")}
-            >
-              {run.paused ? <Play /> : <Pause />}
-              {run.paused ? "Resume" : "Pause"}
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              className="text-destructive"
-              disabled={pending}
-              onClick={() => {
-                if (
-                  window.confirm(
-                    "Cancel unpublished work? Already committed outputs are retained.",
-                  )
-                )
-                  void control("cancel");
-              }}
-            >
-              <X />
-              Cancel request
-            </Button>
-          </>
-        )}
-        {run.status === "failed" && (
-          <Button size="sm" disabled={pending} onClick={() => control("retry")}>
-            <RefreshCw />
-            Retry failed work
-          </Button>
-        )}
-      </div>
-      {run.paused && active && (
-        <p className="rounded-lg bg-muted/50 px-3 py-2 text-xs text-muted-foreground">
-          This request is paused. Running tasks may finish; new tasks will not
-          start until it is resumed.
-        </p>
-      )}
-      <Properties
-        entries={[
-          ["Cause", run.cause.replaceAll("_", " ")],
-          ["Mode", run.mode.replaceAll("_", " ")],
-          ["Requested", time(run.created_at)],
-          ["Duration", duration(run.created_at, run.updated_at)],
-          [
-            "Partitions",
-            run.partitions.length
-              ? `${run.partitions.length} (${run.partitions[0]} … ${run.partitions[run.partitions.length - 1]})`
-              : "Whole scope",
-          ],
-        ]}
-      />
-      <section>
-        <h3 className="mb-2 text-sm font-medium">
-          Tasks{" "}
-          <span className="font-normal text-muted-foreground">
-            {detail.tasks.length}
-          </span>
-        </h3>
-        <div className="flex flex-col gap-2">
-          {detail.tasks.map((task) => (
-            <TaskRow key={task.id} task={task} detail={detail} />
-          ))}
-        </div>
-      </section>
-      <section>
-        <h3 className="mb-2 text-sm font-medium">
-          Events{" "}
-          <span className="font-normal text-muted-foreground">
-            {detail.events.length} · live
-          </span>
-        </h3>
-        <div className="flex flex-col gap-2">
-          {detail.events.map((event) => (
-            <div
-              key={event.id}
-              className="rounded-lg border px-3 py-2 text-sm"
-              data-event-kind={event.kind}
-            >
-              <div className="flex items-center gap-2">
-                <time className="text-xs text-muted-foreground tabular-nums">
-                  {time(event.at)}
-                </time>
-                <span className="rounded-full bg-muted px-2 py-0.5 text-xs">
-                  {event.kind.replaceAll("_", " ")}
-                </span>
-              </div>
-              <p className="mt-1">{event.message}</p>
-              {event.data != null && (
-                <div className="mt-1">
-                  <JsonBlock value={event.data} />
-                </div>
-              )}
-            </div>
-          ))}
-          {!detail.events.length && (
-            <p className="text-sm text-muted-foreground">
-              Waiting for execution events…
-            </p>
-          )}
-        </div>
-      </section>
-    </>
-  );
-}
-
-function TaskRow({ task, detail }: { task: TaskRecord; detail: RunDetail }) {
-  const attempts = detail.attempts[task.id] ?? [];
-  return (
-    <details className="group rounded-lg border">
+    <details className="rounded-lg border" data-attempt={attemptId}>
       <summary className="flex cursor-pointer items-center gap-2 px-3 py-2 text-sm">
-        <code className="min-w-0 flex-1 truncate font-mono text-xs font-medium">
-          {task.producer}
-        </code>
-        {task.partition && (
-          <span className="text-xs text-muted-foreground">
-            {task.partition}
-          </span>
-        )}
-        <span className="text-xs text-muted-foreground">
-          gen {task.generation}
+        <StatusBadge status={attempt.status} />
+        <span className="font-mono text-xs">attempt {attempt.generation}</span>
+        <span className="ml-auto text-xs text-muted-foreground">
+          {time(attempt.started_at)} ·{" "}
+          {duration(attempt.started_at, attempt.finished_at)}
         </span>
-        <StatusBadge status={task.status} />
       </summary>
       <div className="flex flex-col gap-3 border-t px-3 py-3">
-        {task.error && (
-          <pre className="overflow-x-auto rounded-lg border border-red-600/30 bg-red-500/10 p-3 text-xs text-red-700 whitespace-pre-wrap">
-            {task.error}
-          </pre>
+        {attempt.error && (
+          <ErrorNotice
+            message={`${attempt.error.type}: ${attempt.error.message}`}
+          />
         )}
-        {task.pinned_inputs && Object.keys(task.pinned_inputs).length > 0 && (
-          <div>
-            <h4 className="mb-1 text-xs font-medium text-muted-foreground">
-              Pinned inputs
-            </h4>
-            <JsonBlock
-              value={Object.fromEntries(
-                Object.entries(task.pinned_inputs).map(([arg, dep]) => [
-                  arg,
-                  `${dep.asset}${dep.partition ? ` @ ${dep.partition}` : ""}`,
-                ]),
-              )}
-            />
-          </div>
-        )}
-        {attempts.map((attempt) => (
-          <div key={attempt.generation} className="flex flex-col gap-2">
-            <div className="flex items-center gap-2 text-xs">
-              <span className="font-medium">
-                Attempt {attempt.generation + 1}
-              </span>
-              <span className="text-muted-foreground">{attempt.status}</span>
-              {attempt.commit_id && (
-                <code className="font-mono text-muted-foreground">
-                  {attempt.commit_id.slice(0, 10)}
-                </code>
-              )}
-            </div>
-            {(attempt.log_entries ?? []).map((entry, index) => (
-              <div
-                key={index}
-                className="rounded-lg border px-3 py-2 text-sm"
-                data-log-entry
-              >
-                <div className="flex items-center gap-2">
-                  <time className="text-xs text-muted-foreground tabular-nums">
-                    {time(entry.at)}
-                  </time>
-                  <span className="rounded-full bg-muted px-2 py-0.5 text-xs">
-                    log
-                  </span>
-                </div>
-                <p className="mt-1">{entry.message}</p>
-                {entry.fields && Object.keys(entry.fields).length > 0 && (
-                  <div className="mt-1">
-                    <JsonBlock value={entry.fields} />
-                  </div>
-                )}
-              </div>
-            ))}
-            {attempt.error && (
-              <pre className="overflow-x-auto rounded-lg border border-red-600/30 bg-red-500/10 p-3 text-xs text-red-700 whitespace-pre-wrap">
-                {attempt.error}
-              </pre>
-            )}
-            {attempt.logs && (
-              <pre className="max-h-64 overflow-x-auto rounded-lg bg-muted/40 p-3 font-mono text-xs whitespace-pre-wrap">
-                {attempt.logs}
-              </pre>
-            )}
-          </div>
-        ))}
-        {!attempts.length && (
-          <p className="text-xs text-muted-foreground">No attempts yet.</p>
-        )}
+        <Tabs defaultValue="logs">
+          <TabsList>
+            <TabsTrigger value="logs">Logs</TabsTrigger>
+            <TabsTrigger value="spec">Spec</TabsTrigger>
+            <TabsTrigger value="result">Result</TabsTrigger>
+          </TabsList>
+          <TabsContent value="logs">
+            <LogView path={`${base}/attempts/${encoded}/logs`} />
+          </TabsContent>
+          <TabsContent value="spec">
+            <JsonView path={`${base}/attempts/${encoded}/spec`} />
+          </TabsContent>
+          <TabsContent value="result">
+            <JsonView path={`${base}/attempts/${encoded}/result`} />
+          </TabsContent>
+        </Tabs>
       </div>
     </details>
+  );
+}
+
+export function RunSheet() {
+  const { selection, select, base, refresh } = useWorkspace();
+  const action = useAction();
+  const [confirmCancel, setConfirmCancel] = useState(false);
+  const runId = selection?.kind === "run" ? selection.id : null;
+  const detail = useQuery<RunDetail>(
+    base && runId ? `${base}/runs/${runId}` : null,
+    1500,
+  );
+  const run = detail.data?.request;
+  const live = run && !["succeeded", "failed", "canceled"].includes(run.status);
+  return (
+    <Sheet open={!!runId} onOpenChange={(open) => !open && select(null)}>
+      <SheetContent className="w-full overflow-y-auto sm:max-w-3xl">
+        <SheetHeader>
+          <SheetTitle className="font-mono text-sm">
+            run {runId?.slice(0, 12)}
+          </SheetTitle>
+          <SheetDescription>
+            {run ? (
+              <>
+                {run.targets.join(", ")} · {run.mode} ·{" "}
+                {Array.isArray(run.partitions)
+                  ? `${run.partitions.length} scope${run.partitions.length === 1 ? "" : "s"}`
+                  : run.partitions}
+                {run.automation ? ` · ${run.automation}` : ""}
+              </>
+            ) : (
+              "…"
+            )}
+          </SheetDescription>
+        </SheetHeader>
+        <div className="flex flex-col gap-4 px-4 pb-8">
+          {action.error && <ErrorNotice message={action.error} />}
+          {run && (
+            <div className="flex flex-wrap items-center gap-2">
+              <StatusBadge
+                status={run.paused && live ? "paused" : run.status}
+              />
+              <span className="text-xs text-muted-foreground">
+                {run.tasks.length} task{run.tasks.length === 1 ? "" : "s"}
+              </span>
+              <span className="ml-auto flex gap-1.5">
+                {live && (
+                  <>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() =>
+                        action.run(async () => {
+                          await request(
+                            `${base}/runs/${run.id}/${run.paused ? "resume" : "pause"}`,
+                            { body: {} },
+                          );
+                          detail.refresh();
+                          refresh();
+                        })
+                      }
+                    >
+                      {run.paused ? <Play /> : <Pause />}
+                      {run.paused ? "Resume" : "Pause"}
+                    </Button>
+                    {confirmCancel ? (
+                      <Button
+                        variant="destructive"
+                        size="sm"
+                        onClick={() =>
+                          action.run(async () => {
+                            await request(`${base}/runs/${run.id}/cancel`, {
+                              body: {},
+                            });
+                            setConfirmCancel(false);
+                            detail.refresh();
+                            refresh();
+                          })
+                        }
+                      >
+                        <Ban /> Confirm cancel
+                      </Button>
+                    ) : (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => setConfirmCancel(true)}
+                      >
+                        <Ban /> Cancel
+                      </Button>
+                    )}
+                  </>
+                )}
+                {!live && run.status === "failed" && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() =>
+                      action.run(async () => {
+                        await request(`${base}/runs/${run.id}/retry`, {
+                          body: {},
+                        });
+                        detail.refresh();
+                        refresh();
+                      })
+                    }
+                  >
+                    <RotateCcw /> Retry failed
+                  </Button>
+                )}
+              </span>
+            </div>
+          )}
+          {(detail.data?.tasks ?? []).map((task) => (
+            <section key={task.id} className="flex flex-col gap-2">
+              <div className="flex items-center gap-2">
+                <span className="font-mono text-sm font-medium">
+                  {task.asset}
+                </span>
+                {task.scope && (
+                  <Badge variant="outline" className="font-mono text-xs">
+                    {task.scope}
+                  </Badge>
+                )}
+                <StatusBadge status={task.status} />
+                {task.error && (
+                  <span className="text-xs text-red-700">{task.error}</span>
+                )}
+              </div>
+              <div className="flex flex-col gap-2 pl-4">
+                {(detail.data?.attempts[task.id] ?? []).map((attempt) => (
+                  <AttemptRow
+                    key={attempt.generation}
+                    base={base!}
+                    task={task}
+                    attempt={attempt}
+                  />
+                ))}
+                {!(detail.data?.attempts[task.id] ?? []).length &&
+                  task.status !== "succeeded" && (
+                    <p className="text-xs text-muted-foreground">
+                      {task.status === "waiting"
+                        ? "Waiting on upstream tasks."
+                        : "No attempts yet."}
+                    </p>
+                  )}
+              </div>
+            </section>
+          ))}
+          {detail.data && !detail.data.tasks.length && (
+            <Empty title="No tasks">The request produced no work.</Empty>
+          )}
+        </div>
+      </SheetContent>
+    </Sheet>
   );
 }
