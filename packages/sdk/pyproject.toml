@@ -3,9 +3,9 @@ requires = ["hatchling>=1.27,<2"]
 build-backend = "hatchling.build"
 
 [project]
-name = "data-orchestrator"
-version = "0.2.0a1"
-description = "Asset SDK and project runtime for the data orchestrator"
+name = "cursus"
+version = "0.0.1"
+description = "Asset SDK and project runtime for cursus"
 requires-python = ">=3.12"
 license = "Apache-2.0"
 dependencies = [
@@ -13,4 +13,4 @@ dependencies = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/data_orchestrator"]
+packages = ["src/cursus"]

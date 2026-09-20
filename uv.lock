@@ -4,10 +4,10 @@ requires-python = ">=3.12"
 
 [manifest]
 members = [
-    "data-orchestrator",
-    "data-orchestrator-server",
-    "data-orchestrator-worker",
-    "data-orchestrator-workspace",
+    "cursus",
+    "cursus-server",
+    "cursus-worker",
+    "cursus-workspace",
 ]
 
 [[package]]
@@ -432,8 +432,8 @@ wheels = [
 ]
 
 [[package]]
-name = "data-orchestrator"
-version = "0.2.0a1"
+name = "cursus"
+version = "0.0.1"
 source = { editable = "packages/sdk" }
 dependencies = [
     { name = "croniter" },
@@ -443,13 +443,13 @@ dependencies = [
 requires-dist = [{ name = "croniter", specifier = ">=6,<7" }]
 
 [[package]]
-name = "data-orchestrator-server"
-version = "0.2.0a1"
+name = "cursus-server"
+version = "0.0.1"
 source = { editable = "apps/server" }
 dependencies = [
     { name = "croniter" },
-    { name = "data-orchestrator" },
-    { name = "data-orchestrator-worker" },
+    { name = "cursus" },
+    { name = "cursus-worker" },
     { name = "fastapi" },
     { name = "obstore" },
     { name = "slatedb" },
@@ -459,8 +459,8 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "croniter", specifier = ">=6,<7" },
-    { name = "data-orchestrator", editable = "packages/sdk" },
-    { name = "data-orchestrator-worker", editable = "apps/worker" },
+    { name = "cursus", editable = "packages/sdk" },
+    { name = "cursus-worker", editable = "apps/worker" },
     { name = "fastapi", specifier = ">=0.115,<1" },
     { name = "obstore", specifier = "==0.11.1" },
     { name = "slatedb", specifier = "==0.16.0" },
@@ -468,27 +468,27 @@ requires-dist = [
 ]
 
 [[package]]
-name = "data-orchestrator-worker"
-version = "0.2.0a1"
+name = "cursus-worker"
+version = "0.0.1"
 source = { editable = "apps/worker" }
 dependencies = [
-    { name = "data-orchestrator" },
+    { name = "cursus" },
     { name = "httpx" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "data-orchestrator", editable = "packages/sdk" },
+    { name = "cursus", editable = "packages/sdk" },
     { name = "httpx", specifier = ">=0.28,<1" },
 ]
 
 [[package]]
-name = "data-orchestrator-workspace"
-version = "0.2.0a1"
+name = "cursus-workspace"
+version = "0.0.1"
 source = { virtual = "." }
 dependencies = [
-    { name = "data-orchestrator-server" },
-    { name = "data-orchestrator-worker" },
+    { name = "cursus-server" },
+    { name = "cursus-worker" },
 ]
 
 [package.dev-dependencies]
@@ -503,8 +503,8 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "data-orchestrator-server", editable = "apps/server" },
-    { name = "data-orchestrator-worker", editable = "apps/worker" },
+    { name = "cursus-server", editable = "apps/server" },
+    { name = "cursus-worker", editable = "apps/worker" },
 ]
 
 [package.metadata.requires-dev]

@@ -20,14 +20,14 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: "pnpm run build && cd ../.. && uv run dorc serve",
+    command: "pnpm run build && cd ../.. && uv run cursus serve",
     url: "http://127.0.0.1:8000/healthz",
     timeout: 120000,
     reuseExistingServer: !process.env.CI,
     env: {
-      DORC_API_TOKEN: "test-browser-token",
-      DORC_STATE_URL: "file:///tmp/dorc-browser-test",
-      DORC_NAMESPACE: "browser",
+      CURSUS_API_TOKEN: "test-browser-token",
+      CURSUS_STATE_URL: "file:///tmp/cursus-browser-test",
+      CURSUS_NAMESPACE: "browser",
     },
   },
 });

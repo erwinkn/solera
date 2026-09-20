@@ -27,12 +27,12 @@ class LocalSubprocess:
         env = {
             k: v
             for k, v in os.environ.items()
-            if not k.startswith(("AWS_", "DORC_API_TOKEN", "GITHUB_", "GH_TOKEN", "RAILWAY_TOKEN"))
+            if not k.startswith(("AWS_", "CURSUS_API_TOKEN", "GITHUB_", "GH_TOKEN", "RAILWAY_TOKEN"))
         }
         process = await asyncio.create_subprocess_exec(
             sys.executable,
             "-m",
-            "dorc_worker",
+            "cursus_worker",
             *args,
             env=env,
             stdout=asyncio.subprocess.PIPE,
@@ -76,7 +76,7 @@ class LocalSubprocess:
     async def manifest(self):
         # A separate protocol file keeps arbitrary project import/initialization
         # messages on stdout from corrupting the manifest.
-        with tempfile.TemporaryDirectory(prefix="dorc-manifest-") as directory:
+        with tempfile.TemporaryDirectory(prefix="cursus-manifest-") as directory:
             result = Path(directory) / "manifest.json"
             await self._run("manifest", self.project, str(result))
             if result.stat().st_size > 4 * 1024 * 1024:
@@ -84,7 +84,7 @@ class LocalSubprocess:
             return json.loads(result.read_text())
 
     async def execute(self, spec):
-        with tempfile.TemporaryDirectory(prefix="dorc-attempt-") as directory:
+        with tempfile.TemporaryDirectory(prefix="cursus-attempt-") as directory:
             source, result = Path(directory) / "input.json", Path(directory) / "output.json"
             source.write_text(json.dumps(spec, allow_nan=False))
             logs = await self._run("run", self.project, str(source), str(result))

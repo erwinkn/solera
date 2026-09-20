@@ -1,11 +1,11 @@
 [project]
-name = "data-orchestrator-workspace"
-version = "0.2.0a1"
-description = "Workspace root for the data-orchestrator monorepo"
+name = "cursus-workspace"
+version = "0.0.1"
+description = "Workspace root for the cursus monorepo"
 requires-python = ">=3.12"
 dependencies = [
-    "data-orchestrator-server",
-    "data-orchestrator-worker",
+    "cursus-server",
+    "cursus-worker",
 ]
 
 [tool.uv]
@@ -15,9 +15,9 @@ package = false
 members = ["packages/sdk", "apps/worker", "apps/server"]
 
 [tool.uv.sources]
-data-orchestrator-server = { workspace = true }
-data-orchestrator-worker = { workspace = true }
-data-orchestrator = { workspace = true }
+cursus-server = { workspace = true }
+cursus-worker = { workspace = true }
+cursus = { workspace = true }
 
 [dependency-groups]
 dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "httpx>=0.28,<1", "ruff>=0.12,<1", "moto[server,s3]>=5,<6", "boto3>=1.36,<2"]

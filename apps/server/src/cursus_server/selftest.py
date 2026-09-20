@@ -70,7 +70,7 @@ async def conditional_probe(objects):
 async def selftest(url):
     started = time.monotonic()
     namespace = "probe-" + uuid.uuid4().hex
-    backend = LocalSubprocess("dorc.demo:project")
+    backend = LocalSubprocess("cursus_server.demo:project")
     manifest = await backend.manifest()
     state = await SlateState.open(url, namespace)
     checks = []

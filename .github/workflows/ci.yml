@@ -31,20 +31,20 @@ jobs:
       - run: uv sync --locked
       - run: uv run ruff check apps packages tests && uv run ruff format --check apps packages tests
       - run: uv run pytest -q -m 'not live' --junitxml=test-results.xml
-      - run: uv build --package data-orchestrator-server --wheel
+      - run: uv build --package cursus-server --wheel
       - name: Verify packaged console and native probe
         run: |
           uv run python - <<'PY'
           from glob import glob
           from zipfile import ZipFile
-          with ZipFile(glob('dist/data_orchestrator_server*.whl')[0]) as z:
+          with ZipFile(glob('dist/cursus_server*.whl')[0]) as z:
               names = z.namelist()
-              assert 'dorc/web/index.html' in names
-              assert 'dorc/selftest.py' in names
-              assert any(n.startswith('dorc/web/assets/') and n.endswith('.js') for n in names), 'no bundled JS in wheel'
-              assert any(n.startswith('dorc/web/assets/') and n.endswith('.css') for n in names), 'no bundled CSS in wheel'
+              assert 'cursus_server/web/index.html' in names
+              assert 'cursus_server/selftest.py' in names
+              assert any(n.startswith('cursus_server/web/assets/') and n.endswith('.js') for n in names), 'no bundled JS in wheel'
+              assert any(n.startswith('cursus_server/web/assets/') and n.endswith('.css') for n in names), 'no bundled CSS in wheel'
           PY
-          uv run dorc selftest --state-url file:///tmp/ci-native-probe
+          uv run cursus selftest --state-url file:///tmp/ci-native-probe
       - uses: actions/upload-artifact@v4
         if: always()
         with:

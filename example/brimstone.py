@@ -14,8 +14,8 @@ from __future__ import annotations
 import os
 
 import pandas as pd
-from data_orchestrator.executors import AWSECS, Pool
-from data_orchestrator.sdk import (
+from cursus.executors import AWSECS, Pool
+from cursus.sdk import (
     AllPartitions,
     Automation,
     AutoRefresh,
@@ -34,8 +34,8 @@ from data_orchestrator.sdk import (
     asset,
     job,
 )
-from data_orchestrator.stores import BlobStore, Patch, Sql
-from dorc_postgres import PostgresStore
+from cursus.stores import BlobStore, Patch, Sql
+from cursus_postgres import PostgresStore
 
 # ---------------------------------------------------------------------------
 # Resources: ordinary client objects, injected by parameter name. `env:`

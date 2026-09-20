@@ -42,12 +42,12 @@ export function Login() {
         <form
           onSubmit={async (event) => {
             event.preventDefault();
-            sessionStorage.setItem("dorc-token", value);
+            sessionStorage.setItem("cursus-token", value);
             const result = await action.run(async () => {
               try {
                 return await request("/state");
               } catch (failure) {
-                sessionStorage.removeItem("dorc-token");
+                sessionStorage.removeItem("cursus-token");
                 throw failure;
               }
             });
@@ -60,7 +60,7 @@ export function Login() {
             </div>
             <CardTitle className="text-lg">Connect to your workspace</CardTitle>
             <CardDescription>
-              Enter the API token configured for this Data Orchestrator
+              Enter the API token configured for Cursus
               instance.
             </CardDescription>
           </CardHeader>
@@ -105,7 +105,7 @@ function ConnectionDot({ offline }: { offline: boolean }) {
 export function AppShell({ children }: { children: ReactNode }) {
   const { state, error, refresh, checked, openMaterialize } = useWorkspace();
   const unauthorized = error instanceof ApiError && error.status === 401;
-  if (unauthorized || (!state && !sessionStorage.getItem("dorc-token")))
+  if (unauthorized || (!state && !sessionStorage.getItem("cursus-token")))
     return <Login />;
   return (
     <div className="flex h-dvh flex-col md:flex-row">
@@ -113,14 +113,14 @@ export function AppShell({ children }: { children: ReactNode }) {
         <div className="flex items-center justify-between gap-3 md:block">
           <Link
             to="/assets"
-            aria-label="Data Orchestrator home"
+            aria-label="Cursus home"
             className="flex items-center gap-2.5 font-heading font-medium"
           >
             <span className="flex size-8 items-center justify-center rounded-lg bg-primary text-primary-foreground">
               <Workflow className="size-4" />
             </span>
             <span className="leading-tight">
-              Data Orchestrator
+              Cursus
               <span className="block text-[0.65rem] font-normal tracking-wider text-muted-foreground uppercase">
                 Experimental
               </span>
@@ -181,14 +181,14 @@ export function AppShell({ children }: { children: ReactNode }) {
                   ? `Connected · ${state.storage.scheme}`
                   : "Connecting"}
             </span>
-            {sessionStorage.getItem("dorc-token") && (
+            {sessionStorage.getItem("cursus-token") && (
               <Button
                 variant="ghost"
                 size="icon-sm"
                 aria-label="Disconnect"
                 className="ml-auto"
                 onClick={() => {
-                  sessionStorage.removeItem("dorc-token");
+                  sessionStorage.removeItem("cursus-token");
                   refresh();
                 }}
               >

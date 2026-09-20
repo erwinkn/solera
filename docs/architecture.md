@@ -1,6 +1,6 @@
-# dorc — architecture
+# cursus — architecture
 
-dorc is an asset-first orchestrator. An **asset** is a function that produces
+cursus is an asset-first orchestrator. An **asset** is a function that produces
 **outputs**. A **store** writes and reads them. A **commit** records which
 outputs changed. Everything else — partitions, incrementality, automations,
 placement — is a small amount of engine state around those three things.
@@ -311,7 +311,7 @@ revision; `remove` deletes it.
 A keyed source, or a `PartitionSet` listed under `sources=`, is consumable
 `ByKey` and usable as a partition set (§7) exactly like a keyed output, so a
 system that *pushes* can feed the graph directly. Systems that must be *polled* belong in the graph: a cursor asset
-(§6) is the platform-native sensor and needs no service outside dorc.
+(§6) is the platform-native sensor and needs no service outside cursus.
 
 ## 6. Incrementality
 
@@ -579,7 +579,7 @@ the harness died. The engine validates the attempt id, that every ref names
 a known output and this scope, and that a keyed output carries its
 key map, then commits against its own record of the pins.
 
-**Harness** (`python -m dorc_worker run --objects URL --attempt ID`; the
+**Harness** (`python -m cursus_worker run --objects URL --attempt ID`; the
 project entrypoint comes from the environment): fetch spec → refuse on
 revision mismatch (a failed result, not a crash) → resolve `env:` → load
 inputs per annotation → build `ctx` → run the producer → `store()` each

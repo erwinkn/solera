@@ -11,9 +11,11 @@ def main():
     parser = argparse.ArgumentParser(description="Asset orchestration on object storage")
     parser.add_argument("command", choices=["serve", "manifest", "run", "selftest"])
     parser.add_argument("targets", nargs="*")
-    parser.add_argument("--project", default=os.getenv("DORC_PROJECT", "dorc.demo:project"))
-    parser.add_argument("--state-url", default=os.getenv("DORC_STATE_URL", Path(".dorc").resolve().as_uri()))
-    parser.add_argument("--namespace", default=os.getenv("DORC_NAMESPACE", "default"))
+    parser.add_argument("--project", default=os.getenv("CURSUS_PROJECT", "cursus_server.demo:project"))
+    parser.add_argument(
+        "--state-url", default=os.getenv("CURSUS_STATE_URL", Path(".cursus").resolve().as_uri())
+    )
+    parser.add_argument("--namespace", default=os.getenv("CURSUS_NAMESPACE", "default"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8000")))
     parser.add_argument("--insecure", action="store_true", help="Disable auth on a loopback listener only")
@@ -22,9 +24,9 @@ def main():
     parser.add_argument("--config", default="{}", help="Request configuration as a JSON object")
     args = parser.parse_args()
     if args.insecure and args.host not in {"127.0.0.1", "localhost", "::1"}:
-        parser.error("--insecure is limited to loopback listeners; set DORC_API_TOKEN for remote access")
+        parser.error("--insecure is limited to loopback listeners; set CURSUS_API_TOKEN for remote access")
     if args.command == "serve":
-        if os.getenv("DORC_SELFTEST") == "1":
+        if os.getenv("CURSUS_SELFTEST") == "1":
             from .selftest import selftest
 
             print(json.dumps(asyncio.run(selftest(args.state_url)), indent=2), flush=True)

@@ -4,9 +4,9 @@ import textwrap
 
 import pytest
 from conftest import finish
-from data_orchestrator import ByKey, Inventory, Project, ReplaceKeys, asset
-from dorc.engine import Engine
-from dorc.execution import LocalSubprocess
+from cursus import ByKey, Inventory, Project, ReplaceKeys, asset
+from cursus_server.engine import Engine
+from cursus_server.execution import LocalSubprocess
 
 
 @pytest.mark.parametrize("case", ["unknown", "collision", "reserved", "missing", "variadic", "positional"])
@@ -111,7 +111,7 @@ async def test_noisy_project_import_does_not_corrupt_manifest(tmp_path, monkeypa
     (tmp_path / "noisy_project.py").write_text(
         textwrap.dedent("""
         print('Initializing a noisy project')
-        from data_orchestrator import Project, asset
+        from cursus import Project, asset
         @asset
         def value():
             print('Transform log')
@@ -133,7 +133,7 @@ async def test_noisy_project_import_does_not_corrupt_manifest(tmp_path, monkeypa
 async def test_subprocess_log_flood_is_bounded(tmp_path, monkeypatch):
     (tmp_path / "loud_project.py").write_text(
         textwrap.dedent("""
-        from data_orchestrator import Project, asset
+        from cursus import Project, asset
         @asset
         def loud():
             while True:
@@ -152,7 +152,7 @@ async def test_subprocess_log_flood_is_bounded(tmp_path, monkeypatch):
 
 
 async def test_numeric_demo_inventory_keys_are_processed(state):
-    backend = LocalSubprocess("dorc.demo:project")
+    backend = LocalSubprocess("cursus_server.demo:project")
     engine = Engine(state, await backend.manifest(), backend)
     await engine.initialize()
     run = await engine.submit(

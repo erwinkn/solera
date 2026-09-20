@@ -1,10 +1,10 @@
 services:
-  orchestrator:
+  cursus:
     build: .
     ports: ['127.0.0.1:8000:8000']
     environment:
-      DORC_STATE_URL: file:///home/app/state
-      DORC_API_TOKEN: ${DORC_API_TOKEN:?Set a local API token before starting Compose}
+      CURSUS_STATE_URL: file:///home/app/state
+      CURSUS_API_TOKEN: ${CURSUS_API_TOKEN:?Set a local API token before starting Compose}
     volumes:
       - objects:/home/app/state
     healthcheck:

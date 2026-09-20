@@ -1,6 +1,6 @@
 .git
 .venv
-.dorc
+.cursus
 __pycache__
 .env
 node_modules

@@ -1,16 +1,16 @@
 """Example project: a small weather-station pipeline.
 
-Point dorc at this file — the CLI resolves a filesystem path (optionally
+Point cursus at this file — the CLI resolves a filesystem path (optionally
 followed by `:attribute`) as well as the `module:attribute` form:
 
-    dorc serve --project example/lab.py
-    dorc run daily_metrics --project example/lab.py --partition 2026-01-01
+    cursus serve --project example/lab.py
+    cursus run daily_metrics --project example/lab.py --partition 2026-01-01
 
-The console served by `dorc serve` reflects whatever project is loaded, so
+The console served by `cursus serve` reflects whatever project is loaded, so
 the catalog, automations, and run controls all apply here unchanged.
 """
 
-from data_orchestrator import (
+from cursus import (
     AssetContext,
     Automation,
     Batch,
@@ -28,7 +28,7 @@ from data_orchestrator import (
 @asset(group="Stations")
 def station_feed(ctx: AssetContext):
     """The keyed source of truth. `ctx.config` can override it per run, e.g.
-    `dorc run station_feed --config '{"readings": [...]}'`."""
+    `cursus run station_feed --config '{"readings": [...]}'`."""
     return Inventory(
         ctx.config.get(
             "readings",
@@ -89,7 +89,7 @@ def climate_report(readings, station_health):
 @asset(partitions="daily", group="Operations")
 def daily_metrics(ctx: AssetContext, readings):
     """One independent scope per day — backfill a range from the materialize
-    dialog or `dorc run daily_metrics --partition 2026-01-01`."""
+    dialog or `cursus run daily_metrics --partition 2026-01-01`."""
     day = int(ctx.partition[-2:])
     return [
         {

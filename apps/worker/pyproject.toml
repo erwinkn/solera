@@ -3,18 +3,18 @@ requires = ["hatchling>=1.27,<2"]
 build-backend = "hatchling.build"
 
 [project]
-name = "data-orchestrator-worker"
-version = "0.2.0a1"
+name = "cursus-worker"
+version = "0.0.1"
 description = "Worker service: task execution core and control-plane agent"
 requires-python = ">=3.12"
 license = "Apache-2.0"
 dependencies = [
-    "data-orchestrator",
+    "cursus",
     "httpx>=0.28,<1",
 ]
 
 [tool.uv.sources]
-data-orchestrator = { workspace = true }
+cursus = { workspace = true }
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/dorc_worker"]
+packages = ["src/cursus_worker"]

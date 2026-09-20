@@ -1,4 +1,4 @@
-# Data Orchestrator — object-backed experiment
+# Cursus — object-backed experiment
 
 An asset-first Python engine and browser console whose only required durable storage is an object store. **Experimental alpha, not production-ready.** This branch uses SlateDB 0.16 for transactional metadata and `obstore` 0.11 for immutable JSON outputs. No PostgreSQL, Redis, or local metadata database is required.
 
@@ -8,15 +8,15 @@ This is a standalone implementation on `feat/s3-state-backend`. The earlier `fea
 
 Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/). On supported platforms, SlateDB's Python wheel includes the native engine.
 
-The repo is a monorepo: `packages/sdk` ships the `data_orchestrator` asset SDK that project files import; `apps/server` ships the `dorc` control plane (API, engine, storage, `dorc` CLI); `apps/worker` ships `dorc_worker`, the task-execution package the server spawns locally and the base for remote workers; `apps/console` is the pnpm/Vite web app. `uv sync` installs the whole uv workspace.
+The repo is a monorepo: `packages/sdk` ships the `cursus` asset SDK that project files import; `apps/server` ships the `cursus` control plane (API, engine, storage, `cursus` CLI); `apps/worker` ships `cursus_worker`, the task-execution package the server spawns locally and the base for remote workers; `apps/console` is the pnpm/Vite web app. `uv sync` installs the whole uv workspace.
 
 ```bash
 uv sync --locked
-uv run dorc serve --insecure
+uv run cursus serve --insecure
 # http://127.0.0.1:8000
 ```
 
-The default `file:///.../.dorc` store uses the same object-store interfaces as S3, backed by ordinary files. No emulator is needed for day-to-day development. This is persistent local **object storage**, not a remote backup of a local database. Do not delete it expecting recovery from elsewhere.
+The default `file:///.../.cursus` store uses the same object-store interfaces as S3, backed by ordinary files. No emulator is needed for day-to-day development. This is persistent local **object storage**, not a remote backup of a local database. Do not delete it expecting recovery from elsewhere.
 
 Select `sample_quality` in the Materialize dialog. This executes:
 
@@ -29,34 +29,34 @@ daily_observations -> daily_report  (daily partitions)
 The console provides an asset catalog, dependency overview, data previews, committed output references, checkpoints, runs, attempts/logs, backfill requests, pause/resume/cancel/repair controls, interval/cron/changed-output automations, and backend diagnostics. It is a Vite/TanStack single-page app served from the Python package; the built bundle is committed, so no Node runtime is needed to run it — only to rebuild (`pnpm -C apps/console build`) or test.
 
 ```bash
-uv run dorc run sample_quality
-uv run dorc run daily_report --partition 2026-01-01 --partition 2026-01-02
-uv run dorc manifest --project dorc.demo:project
-uv run dorc selftest --state-url file:///tmp/orchestrator-test-objects
+uv run cursus run sample_quality
+uv run cursus run daily_report --partition 2026-01-01 --partition 2026-01-02
+uv run cursus manifest --project cursus_server.demo:project
+uv run cursus selftest --state-url file:///tmp/cursus-test-objects
 ```
 
 `--project` accepts `module:attribute` or a file path, Dagster-style — [`example/lab.py`](example/lab.py) is a self-contained weather-station pipeline you can run directly:
 
 ```bash
-uv run dorc serve --insecure --project example/lab.py
-uv run dorc run climate_report --project example/lab.py
+uv run cursus serve --insecure --project example/lab.py
+uv run cursus run climate_report --project example/lab.py
 ```
 
-**One coordinator per namespace.** Running `dorc run` while `dorc serve` uses the same namespace replaces/fences that server's writer. Use the UI/API to submit work to a running server, or give the CLI a different namespace.
+**One coordinator per namespace.** Running `cursus run` while `cursus serve` uses the same namespace replaces/fences that server's writer. Use the UI/API to submit work to a running server, or give the CLI a different namespace.
 
 ## S3 and compatible services
 
 Provision a private bucket, then configure both native clients using environment variables:
 
 ```bash
-export DORC_STATE_URL=s3://your-private-bucket/orchestrator
-export DORC_NAMESPACE=development
+export CURSUS_STATE_URL=s3://your-private-bucket/orchestrator
+export CURSUS_NAMESPACE=development
 export AWS_ACCESS_KEY_ID=...
 export AWS_SECRET_ACCESS_KEY=...
 export AWS_REGION=us-east-1
 export AWS_CONDITIONAL_PUT=etag
-export DORC_API_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
-uv run dorc serve
+export CURSUS_API_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+uv run cursus serve
 ```
 
 For a custom S3 endpoint:
@@ -70,14 +70,14 @@ export AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false
 
 `AWS_ENDPOINT` is the Rust object-store client's setting, not just boto3's `AWS_ENDPOINT_URL`. The server never accepts credentials in a storage URL. Workers have these environment variables stripped, but they are trusted code with the same host identity: **subprocesses are not security sandboxes**.
 
-Use HTTPS in front of any remote listener and set a strong `DORC_API_TOKEN`. `--insecure` is restricted to loopback in the CLI. The UI keeps the token in tab-scoped session storage. This is shared trusted-team authentication, not RBAC or tenancy isolation.
+Use HTTPS in front of any remote listener and set a strong `CURSUS_API_TOKEN`. `--insecure` is restricted to loopback in the CLI. The UI keeps the token in tab-scoped session storage. This is shared trusted-team authentication, not RBAC or tenancy isolation.
 
 ### Backend conformance
 
 Before using a new S3-compatible service:
 
 ```bash
-uv run dorc selftest --state-url "$DORC_STATE_URL"
+uv run cursus selftest --state-url "$CURSUS_STATE_URL"
 ```
 
 This explicitly writes synthetic data into a fresh `probe-UUID` namespace. It checks create-if-absent and racing conditional updates on S3, a real subprocess pipeline, multi-output commits, unchanged-input skips, deletions and empty replacements, a backfill, reopening without coordinator state, durable command receipts, and native writer takeover. Test objects remain in that isolated namespace for inspection; remove only that prefix after all test processes are stopped. No existing workspace is deleted.
@@ -87,7 +87,7 @@ An emulator passing these checks is **not proof** that a different provider has 
 ## Authoring
 
 ```python
-from data_orchestrator import (
+from cursus import (
     AssetContext, Batch, ByKey, Inventory, Project, ReplaceKeys, asset,
 )
 
@@ -111,7 +111,7 @@ def measurements(ctx: AssetContext, files):
 project = Project([source_files, measurements])
 ```
 
-Save as `my_project.py` and run `uv run dorc serve --insecure --project my_project.py` from that directory — the attribute defaults to `project` (or a single `Project` instance is auto-detected); `file.py:attribute` selects another name, and a bare module name also defaults to `project`.
+Save as `my_project.py` and run `uv run cursus serve --insecure --project my_project.py` from that directory — the attribute defaults to `project` (or a single `Project` instance is auto-detected); `file.py:attribute` selects another name, and a bare module name also defaults to `project`.
 
 An ordinary return value replaces a snapshot. Explicit operations are `Replace`, `Inventory`, `ReplaceKeys`, `Upsert`, and `AppendBatch`. `Batch(outputs={...}, cursor=...)` returns multiple output mutations and the next user-managed cursor together. Checkpoints are scoped by producer and partition.
 
@@ -131,10 +131,10 @@ pnpm install --frozen-lockfile && pnpm -C apps/console exec playwright install c
 The Python suite uses real SlateDB on filesystem storage, including abrupt process death and writer takeover. It also starts Moto as an HTTP S3 emulator and runs the remote conformance test. Synthetic fault injection separately verifies acknowledgement timing and ambiguous-outcome behavior. The live-provider test is opt-in:
 
 ```bash
-DORC_TEST_S3_URL=s3://isolated-test-bucket/prefix uv run pytest -q -m live
+CURSUS_TEST_S3_URL=s3://isolated-test-bucket/prefix uv run pytest -q -m live
 ```
 
-GitHub Actions verifies Python contracts, browser behavior on desktop/mobile, wheel contents, and a native end-to-end probe (`dorc selftest`). `uv.lock` and `pnpm-lock.yaml` are committed, as is the built console under `apps/server/src/dorc/web` so deployments need no Node runtime. CI uses locked installs; the storage engines are explicitly version-pinned.
+GitHub Actions verifies Python contracts, browser behavior on desktop/mobile, wheel contents, and a native end-to-end probe (`cursus selftest`). `uv.lock` and `pnpm-lock.yaml` are committed, as is the built console under `apps/server/src/cursus_server/web` so deployments need no Node runtime. CI uses locked installs; the storage engines are explicitly version-pinned.
 
 ## Boundaries
 

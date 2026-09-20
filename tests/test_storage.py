@@ -7,10 +7,10 @@ import uuid
 
 import pytest
 from conftest import finish
-from dorc.engine import Engine
-from dorc.execution import LocalSubprocess
-from dorc.selftest import selftest
-from dorc.storage import SlateState, Unavailable
+from cursus_server.engine import Engine
+from cursus_server.execution import LocalSubprocess
+from cursus_server.selftest import selftest
+from cursus_server.storage import SlateState, Unavailable
 
 
 async def test_transaction_rollback_and_reopen(tmp_path):
@@ -154,11 +154,11 @@ async def test_killed_process_recovers_accepted_request(tmp_path):
     url = tmp_path.as_uri()
     script = """
 import asyncio, os, sys
-from dorc.storage import SlateState
-from dorc.execution import LocalSubprocess
-from dorc.engine import Engine
+from cursus_server.storage import SlateState
+from cursus_server.execution import LocalSubprocess
+from cursus_server.engine import Engine
 async def main():
-    backend = LocalSubprocess('dorc.demo:project')
+    backend = LocalSubprocess('cursus_server.demo:project')
     state = await SlateState.open(sys.argv[1], flush_interval='1ms')
     engine = Engine(state, await backend.manifest(), backend)
     await engine.initialize()
@@ -173,7 +173,7 @@ asyncio.run(main())
     assert result.returncode == 0, result.stderr.decode()
     state = await SlateState.open(url, flush_interval="1ms")
     try:
-        backend = LocalSubprocess("dorc.demo:project")
+        backend = LocalSubprocess("cursus_server.demo:project")
         engine = Engine(state, await backend.manifest(), backend)
         await engine.initialize()
         run = await engine.submit(["sample_quality"], command_id="crash-request")
@@ -213,7 +213,7 @@ async def test_s3_http_emulator_contract(tmp_path, monkeypatch):
     }
     for k, v in settings.items():
         monkeypatch.setenv(k, v)
-    bucket = "orchestrator-" + uuid.uuid4().hex
+    bucket = "cursus-" + uuid.uuid4().hex
     boto3.client("s3", endpoint_url=endpoint, region_name="us-east-1").create_bucket(Bucket=bucket)
     try:
         result = await selftest("s3://" + bucket + "/contracts")
@@ -225,9 +225,9 @@ async def test_s3_http_emulator_contract(tmp_path, monkeypatch):
 
 @pytest.mark.live
 async def test_live_s3_contract():
-    url = os.getenv("DORC_TEST_S3_URL")
+    url = os.getenv("CURSUS_TEST_S3_URL")
     if not url:
-        pytest.skip("Set DORC_TEST_S3_URL to explicitly authorize a real-bucket test")
+        pytest.skip("Set CURSUS_TEST_S3_URL to explicitly authorize a real-bucket test")
     assert url.startswith("s3://")
     result = await selftest(url)
     assert result["status"] == "passed"

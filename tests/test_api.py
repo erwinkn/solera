@@ -3,9 +3,9 @@ import sys
 
 import httpx
 import pytest
-from data_orchestrator import Automation, Every, Project, asset
-from dorc.api import create_app
-from dorc.execution import LocalSubprocess
+from cursus import Automation, Every, Project, asset
+from cursus_server.api import create_app
+from cursus_server.execution import LocalSubprocess
 
 
 async def test_authentication_validation_and_live_api(make_engine):
@@ -77,13 +77,13 @@ async def test_run_automation_endpoint(make_engine):
 
 async def test_api_requires_explicit_authentication_choice():
     app = create_app()
-    with pytest.raises(ValueError, match="DORC_API_TOKEN"):
+    with pytest.raises(ValueError, match="CURSUS_API_TOKEN"):
         async with app.router.lifespan_context(app):
             pass
 
 
 async def test_subprocess_rejects_wrong_revision():
-    backend = LocalSubprocess("dorc.demo:project")
+    backend = LocalSubprocess("cursus_server.demo:project")
     with pytest.raises(RuntimeError, match="Code revision changed"):
         await backend.execute({"revision": "wrong", "producer": "source_files", "inputs": {}, "context": {}})
 
@@ -92,7 +92,7 @@ async def test_public_insecure_cli_is_rejected():
     process = await asyncio.create_subprocess_exec(
         sys.executable,
         "-m",
-        "dorc.cli",
+        "cursus_server.cli",
         "serve",
         "--host",
         "0.0.0.0",

@@ -1,9 +1,9 @@
-# dorc — implementation plan
+# cursus — implementation plan
 
 `docs/architecture.md` is normative. `example/brimstone.py` is the reference
 project and must register without error at every gate from Phase 1 on.
-This plan turns the current experimental code (`apps/server/src/dorc`,
-`apps/worker/src/dorc_worker`, `packages/sdk/src/data_orchestrator`,
+This plan turns the current experimental code (`apps/server/src/cursus_server`,
+`apps/worker/src/cursus_worker`, `packages/sdk/src/cursus`,
 `apps/console`) into a working implementation of that document. Where
 existing code disagrees with the document, the document wins and the code
 is replaced, including its tests. Do not keep old concepts (`Inventory`,
@@ -14,16 +14,16 @@ to the new ones.
 
 - **Keep** the infrastructure that already works: SlateDB for transactional
   state, `obstore` for objects (`file://` and `s3://`), FastAPI + uvicorn,
-  the `dorc` CLI entry point, the TanStack/shadcn console, `uv` and `pnpm`
-  workspaces, `--insecure` loopback rule, `DORC_*` environment variables,
-  `dorc selftest`.
+  the `cursus` CLI entry point, the TanStack/shadcn console, `uv` and `pnpm`
+  workspaces, `--insecure` loopback rule, `CURSUS_*` environment variables,
+  `cursus selftest`.
 - **Every phase ends with a gate.** A gate is green when all of these pass
   from a clean checkout:
 
   ```bash
   uv run ruff check . && uv run ruff format --check .
   uv run pytest -q                       # unit + integration, file:// backend
-  uv run dorc manifest --project example/brimstone.py   # registers cleanly
+  uv run cursus manifest --project example/brimstone.py   # registers cleanly
   ```
 
   Phases 6 and 7 add `pnpm -C apps/console typecheck` and `pnpm -C
@@ -33,7 +33,7 @@ to the new ones.
   has observable behaviour gets a test that names the section in its
   docstring, e.g. `"""§6: a version bump reprocesses every key."""`.
 - **Postgres is optional in CI, required for the demo.** Tests that need it
-  are marked `postgres` and skip unless `DORC_TEST_DATABASE_URL` is set.
+  are marked `postgres` and skip unless `CURSUS_TEST_DATABASE_URL` is set.
   `compose.yml` gets a `postgres` service so the demo and the marked tests
   can run locally.
 - **Object store is always real.** Tests use `tmp_path.as_uri()` (file://)
@@ -45,7 +45,7 @@ to the new ones.
 
 ## Phase 1 — SDK: declarations, manifest, stores
 
-Package `packages/sdk/src/data_orchestrator`. Everything a project file
+Package `packages/sdk/src/cursus`. Everything a project file
 imports. No engine code.
 
 Deliverables:
@@ -69,7 +69,7 @@ Deliverables:
   supports bare values and `Patch` on `list[dict]` including
   `mode="append"` batches), `BlobStore` (`bytes` / `Path`), `PostgresStore`
   (`DataFrame`, `GeoDataFrame` optional, `list[dict]`, `Patch`, `Sql`,
-  `partition_column` slicing, version marker table `dorc_markers(output,
+  `partition_column` slicing, version marker table `cursus_markers(output,
   partition, version, batch)`, append batches via a `_batch` column).
 - Manifest builder (§11): assets, outputs, inputs with edge kinds and
   `meta`, deps, partitions, placement, retries, timeout, version, code
@@ -105,12 +105,12 @@ Tests (`tests/sdk/`):
 - Version recipe (§3): bare → `H(payload)`; `Patch` → `H(prior ‖ H(op))`;
   empty `Patch` → prior unchanged.
 
-Gate 1: standard gate. `dorc manifest --project example/brimstone.py`
+Gate 1: standard gate. `cursus manifest --project example/brimstone.py`
 prints the manifest.
 
 ## Phase 2 — Server state
 
-Package `apps/server/src/dorc/state.py` (replaces `storage.py`'s domain
+Package `apps/server/src/cursus_server/state.py` (replaces `storage.py`'s domain
 layer; keep the SlateDB/obstore plumbing).
 
 Deliverables, all keyed under the namespace and written through SlateDB
@@ -143,7 +143,7 @@ Gate 2: standard gate.
 
 ## Phase 3 — Engine
 
-`apps/server/src/dorc/engine.py` rewritten around §6–§9.
+`apps/server/src/cursus_server/engine.py` rewritten around §6–§9.
 
 Deliverables:
 
@@ -215,23 +215,23 @@ Gate 3: standard gate. Engine tests run under two seconds each.
 
 ## Phase 4 — Harness and placements
 
-`apps/worker/src/dorc_worker` and `apps/server/src/dorc/placements/`.
+`apps/worker/src/cursus_worker` and `apps/server/src/cursus_server/placements/`.
 
 Deliverables:
 
-- `python -m dorc_worker run --objects URL --attempt ID` per §10: fetch
+- `python -m cursus_worker run --objects URL --attempt ID` per §10: fetch
   spec, refuse on revision mismatch as a failed result, resolve `env:`
   indirection, load inputs per annotation (`ctx.load` for refs), build
   `ctx`, run the producer (sync or async), `store()` each returned output,
   stage key maps, write the result last in one PUT, stream logs to
-  `logs/{attempt}/{seq}.jsonl`. Project entrypoint from `DORC_PROJECT`.
+  `logs/{attempt}/{seq}.jsonl`. Project entrypoint from `CURSUS_PROJECT`.
   `manifest` mode.
 - `Local` placement: subprocess with env allow-list, handle `{pid,
   started_at}`, mismatch = lost, SIGTERM then SIGKILL.
 - `Pool` placement and worker endpoints: `POST /api/workers/register`,
   `POST /api/tasks/claim`, `POST /api/tasks/{id}/renew`, `POST
   /api/tasks/{id}/complete`; claim fit by `cpu`/`memory`/`gpu`; expired
-  claims swept in the eval loop; `python -m dorc_worker pool --pool NAME
+  claims swept in the eval loop; `python -m cursus_worker pool --pool NAME
   --server URL` loops claim → run → complete.
 - `AWSECS`, `K8sJob`, `Modal`: implemented against their SDKs behind
   optional extras, unit-tested with stubbed clients, not exercised in the
@@ -256,7 +256,7 @@ subprocess.
 
 ## Phase 5 — API and CLI
 
-`apps/server/src/dorc/api.py`, `cli.py`.
+`apps/server/src/cursus_server/api.py`, `cli.py`.
 
 Deliverables (all under `/api/projects/{p}` unless noted, token auth as
 today):
@@ -274,14 +274,14 @@ today):
 - `GET environments` (kinds, `max_concurrent`, in-flight), `GET workers`,
   worker/task endpoints from Phase 4.
 - `GET healthz`, `GET diagnostics` (backend, namespace, revision).
-- CLI: `dorc serve`, `dorc manifest`, `dorc run TARGET… [--partition K]…
+- CLI: `cursus serve`, `cursus manifest`, `cursus run TARGET… [--partition K]…
   [--partitions latest|missing|all] [--recompute] [--upstream] [--config
-  JSON] [--keys EDGE=full|k1,k2]`, `dorc runs`, `dorc run-show ID`,
-  `dorc logs ATTEMPT`, `dorc automations [enable|disable|run-now NAME]`,
-  `dorc commit SOURCE [--version V | --keys JSON | --upsert JSON --remove
-  K…]`, `dorc worker pool NAME`, `dorc selftest`. Every command talks to a
-  running server when `DORC_SERVER_URL` is set, else runs an in-process
-  engine against `DORC_STATE_URL` (one coordinator per namespace rule
+  JSON] [--keys EDGE=full|k1,k2]`, `cursus runs`, `cursus run-show ID`,
+  `cursus logs ATTEMPT`, `cursus automations [enable|disable|run-now NAME]`,
+  `cursus commit SOURCE [--version V | --keys JSON | --upsert JSON --remove
+  K…]`, `cursus worker pool NAME`, `cursus selftest`. Every command talks to a
+  running server when `CURSUS_SERVER_URL` is set, else runs an in-process
+  engine against `CURSUS_STATE_URL` (one coordinator per namespace rule
   stays).
 
 Tests (`tests/server/test_api.py`, `tests/server/test_cli.py`): every
@@ -325,20 +325,20 @@ of an attempt; cancel a run. Desktop and mobile projects as configured.
 
 Gate 6: standard gate plus `pnpm -C apps/console typecheck`, `pnpm -C
 apps/console format:check`, `pnpm -C apps/console test`. Rebuild the
-bundle (`pnpm -C apps/console build`) and commit `apps/server/src/dorc/web`.
+bundle (`pnpm -C apps/console build`) and commit `apps/server/src/cursus_server/web`.
 
 ## Phase 7 — Runnable demo
 
-`apps/server/src/dorc/demo.py` rewritten as a self-contained project that
+`apps/server/src/cursus_server/demo.py` rewritten as a self-contained project that
 exercises everything in the doc with in-process fakes, so it runs with
-`uv run dorc serve --insecure` and nothing else, and uses Postgres when
+`uv run cursus serve --insecure` and nothing else, and uses Postgres when
 `DATABASE_URL` is set (compose service).
 
 The demo project must contain, and the README must name, all of:
 
 - a `PartitionSet` asset on a `Cron` (simulated site list that grows on
   each run), and an external `PartitionSet` under `sources=` fed by
-  `dorc commit`;
+  `cursus commit`;
 - a per-site cursor asset with an append output and a keyed inventory
   output (`Patch` both ways), on `Every(10)`, backed by a fake feed
   resource that emits new events every few seconds and repeats identical
@@ -355,14 +355,14 @@ The demo project must contain, and the README must name, all of:
 - a `@job` on a weekly `Cron` and a standalone `Automation` over two
   targets;
 - `Local` placement for everything except one asset on `Pool("ingest")`,
-  with README instructions to start `dorc worker pool ingest` in a second
+  with README instructions to start `cursus worker pool ingest` in a second
   terminal and watch the task get claimed;
 - `partitions="missing"` on a schedule for the external set.
 
 Deliverables:
 
 - `tests/test_demo_e2e.py`: starts the server on a temp `file://` store,
-  submits `dorc run` for the rollup with `--upstream`, commits the
+  submits `cursus run` for the rollup with `--upstream`, commits the
   external set, starts a pool worker, and asserts within a bounded wait
   that every asset has a complete head for `latest`, that a second tick
   of the cursor asset with identical feed content changes nothing, that

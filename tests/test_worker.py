@@ -1,10 +1,10 @@
 import pytest
-from data_orchestrator import Project
-from dorc.execution import LocalSubprocess
-from dorc_worker.worker import load_project
+from cursus import Project
+from cursus_server.execution import LocalSubprocess
+from cursus_worker.worker import load_project
 
 SOURCE = """
-from data_orchestrator import asset, Project
+from cursus import asset, Project
 
 @asset
 def answer():
@@ -15,13 +15,13 @@ project = Project([answer])
 
 
 def test_module_entrypoint():
-    project = load_project("dorc.demo:project")
+    project = load_project("cursus_server.demo:project")
     assert isinstance(project, Project)
     assert "sample_quality" in project.manifest["producers"]
 
 
 def test_bare_module_defaults_to_project_attribute():
-    project = load_project("dorc.demo")
+    project = load_project("cursus_server.demo")
     assert isinstance(project, Project)
 
 

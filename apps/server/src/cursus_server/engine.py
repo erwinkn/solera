@@ -9,7 +9,7 @@ from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from croniter import croniter
-from data_orchestrator.sdk import digest
+from cursus.sdk import digest
 
 from .storage import Unavailable
 

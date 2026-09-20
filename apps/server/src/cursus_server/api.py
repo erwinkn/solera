@@ -28,22 +28,22 @@ class AutomationInput(BaseModel):
 
 
 def create_app(*, state_url=None, namespace=None, project=None, token=None, insecure=False, engine=None):
-    state_url = state_url or os.getenv("DORC_STATE_URL", Path(".dorc").resolve().as_uri())
-    namespace = namespace or os.getenv("DORC_NAMESPACE", "default")
-    project = project or os.getenv("DORC_PROJECT", "dorc.demo:project")
-    token = token or os.getenv("DORC_API_TOKEN")
+    state_url = state_url or os.getenv("CURSUS_STATE_URL", Path(".cursus").resolve().as_uri())
+    namespace = namespace or os.getenv("CURSUS_NAMESPACE", "default")
+    project = project or os.getenv("CURSUS_PROJECT", "cursus_server.demo:project")
+    token = token or os.getenv("CURSUS_API_TOKEN")
 
     @asynccontextmanager
     async def lifespan(app):
         if not token and not insecure:
-            raise ValueError("Set DORC_API_TOKEN, or explicitly enable insecure local development")
+            raise ValueError("Set CURSUS_API_TOKEN, or explicitly enable insecure local development")
         owned = engine is None
         runtime = engine
         if owned:
             backend = LocalSubprocess(project)
             manifest = await backend.manifest()
             state = await SlateState.open(state_url, namespace)
-            runtime = Engine(state, manifest, backend, concurrency=int(os.getenv("DORC_CONCURRENCY", "4")))
+            runtime = Engine(state, manifest, backend, concurrency=int(os.getenv("CURSUS_CONCURRENCY", "4")))
             try:
                 await runtime.initialize()
             except BaseException:
@@ -58,9 +58,7 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
             if owned:
                 await runtime.state.close()
 
-    app = FastAPI(
-        title="Data Orchestrator", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None
-    )
+    app = FastAPI(title="Cursus", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
     web = Path(__file__).parent / "web"
 
