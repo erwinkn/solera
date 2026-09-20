@@ -212,6 +212,30 @@ It wires `DATABASE_URL` to the compose Postgres and keeps object state on a
 named volume — swap `CURSUS_STATE_URL` for `s3://…` in `compose.yml` to run the
 same stack on S3.
 
+## Migrations
+
+Schema changes are declared on the output, not implied by the store. An
+`Output` carries `migrations=(Migration(name, payload), …)` in order; the
+payload is a SQL string or a callable taking a cursor. Registration rejects
+migrations on a store without `migrate` (JsonStore has none), duplicate
+names, and payloads that fail `can_store`.
+
+PostgresStore keeps a `cursus_migrations(output, name, at)` ledger and runs
+each pending migration plus its ledger row in one transaction under an
+advisory lock keyed on the output, so concurrent workers apply each exactly
+once. BlobStore records applied names in `_migrations.json` under the
+output's prefix. A table that already exists must match the declaration —
+drift fails non-retryably instead of triggering a silent `ALTER`. The
+harness migrates before the first write in an attempt, and the output's
+head carries the last applied name as `schema`.
+
+Apply pending migrations without running the pipeline:
+
+```bash
+uv run cursus migrate                 # every output that declares migrations
+uv run cursus migrate site_events     # named outputs only
+```
+
 ## S3 and compatible services
 
 Point the control plane at a private bucket:
@@ -249,6 +273,7 @@ cursus run TARGET... [--partitions latest|all|missing] [--partition KEY]
            [--upstream] [--recompute] [--keys EDGE=k1,k2] [--config JSON]
 cursus runs / run-show RUN_ID / logs ATTEMPT_ID
 cursus automations [enable|disable|run-now NAME]
+cursus migrate [OUTPUT...]                   apply pending output migrations locally
 cursus commit SOURCE [--version V] [--keys JSON] [--upsert JSON] [--remove K]
 cursus worker pool NAME [--server URL]       claim and run pool tasks
 cursus selftest                              storage conformance probe

@@ -19,6 +19,7 @@ from cursus.sdk import (
     ByKey,
     Cron,
     Every,
+    Migration,
     OnDeploy,
     Output,
     PartitionSet,
@@ -35,6 +36,25 @@ from cursus_postgres import PostgresStore
 
 DATABASE = bool(os.getenv("DATABASE_URL"))
 RELATIONAL = "postgres" if DATABASE else None  # None → default JsonStore
+
+
+def migration_log(output_name: str):
+    """A callable migration payload (§4): note the output in a side table so a
+    `cursus migrate` or first write leaves a visible trace on a fresh database."""
+
+    def apply(cur):
+        cur.execute("CREATE TABLE IF NOT EXISTS demo_migrations (output text, name text)")
+        cur.execute("INSERT INTO demo_migrations VALUES (%s, 'baseline')", (output_name,))
+
+    return apply
+
+
+def postgres_migrations(output_name: str, payload=None):
+    """Every Postgres output carries one migration; the JsonStore path declares
+    none — a store without `migrate` would reject them at registration."""
+    if not DATABASE:
+        return ()
+    return (Migration("baseline", payload or migration_log(output_name)),)
 
 
 # ---------------------------------------------------------------------------
@@ -128,8 +148,21 @@ uploads = PartitionSet("uploads")
 
 @asset(
     outputs=(
-        Output("site_events", store=RELATIONAL, mode="append", partition_column="site"),
-        Output("site_files", store=RELATIONAL, key="file_id", revision="version", partition_column="site"),
+        Output(
+            "site_events",
+            store=RELATIONAL,
+            mode="append",
+            partition_column="site",
+            migrations=postgres_migrations("site_events"),
+        ),
+        Output(
+            "site_files",
+            store=RELATIONAL,
+            key="file_id",
+            revision="version",
+            partition_column="site",
+            migrations=postgres_migrations("site_files"),
+        ),
     ),
     partitions={"site": sites},
     automations=Automation(trigger=Every(10)),
@@ -160,7 +193,13 @@ def site_feed(ctx, feed: FeedClient):
 
 
 @asset(
-    outputs=Output("file_index", store=RELATIONAL, key="file_id", partition_column="site"),
+    outputs=Output(
+        "file_index",
+        store=RELATIONAL,
+        key="file_id",
+        partition_column="site",
+        migrations=postgres_migrations("file_index"),
+    ),
     partitions={"site": sites},
     inputs={"site_files": ByKey(batch_size=2)},
     version="2",
@@ -224,7 +263,13 @@ def fleet_index(ctx, file_index: dict[str, list[dict]]):
 if DATABASE:
 
     @asset(
-        outputs=Output("fleet_status", store="postgres", schema="ops", key="site"),
+        outputs=Output(
+            "fleet_status",
+            store="postgres",
+            schema="ops",
+            key="site",
+            migrations=postgres_migrations("fleet_status", "CREATE SCHEMA IF NOT EXISTS ops"),
+        ),
         inputs={"site_events": AllPartitions()},
         automations=AutoRefresh(),
     )
@@ -247,7 +292,13 @@ if DATABASE:
 if DATABASE:
 
     @asset(
-        outputs=Output("site_status", store="postgres", schema="ops", partition_column="site"),
+        outputs=Output(
+            "site_status",
+            store="postgres",
+            schema="ops",
+            partition_column="site",
+            migrations=postgres_migrations("site_status", "CREATE SCHEMA IF NOT EXISTS ops"),
+        ),
         partitions={"site": sites},
         automations=AutoRefresh(),
     )

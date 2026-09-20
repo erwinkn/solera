@@ -209,3 +209,123 @@ def test_demo_end_to_end(demo):
         assert upserted <= current_keys[scope]
         assert deleted <= prior_keys.get(scope, set()) - current_keys[scope]
         assert upserted or deleted
+
+
+@pytest.mark.postgres
+def test_demo_postgres_migrations_and_ondeploy(tmp_path):
+    """§8 gate: with DATABASE_URL the demo's relational outputs land in
+    PostgresStore — each declares one migration, `cursus migrate` applies
+    them into the cursus_migrations ledger, written heads carry the applied
+    migration as `schema`, and the OnDeploy job fires once on boot.
+
+    The server runs as a real `cursus serve` subprocess so the module-level
+    DATABASE flag in the demo project evaluates against the test DSN.
+    """
+
+    import os
+    import shutil
+    import subprocess
+
+    dsn = os.environ.get("CURSUS_TEST_DATABASE_URL")
+    if not dsn:
+        pytest.skip("CURSUS_TEST_DATABASE_URL is not set")
+    import psycopg
+
+    cursus = shutil.which("cursus")
+    assert cursus, "the cursus console script is not on PATH"
+
+    # Clean slate: drop every table the demo owns plus the store ledgers.
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute("DROP SCHEMA IF EXISTS ops CASCADE")
+        for name in (
+            "site_events",
+            "site_files",
+            "file_index",
+            "demo_migrations",
+            "cursus_migrations",
+            "cursus_markers",
+        ):
+            conn.execute(f'DROP TABLE IF EXISTS "{name}"')
+
+    state_url = (tmp_path / "state").as_uri()
+    env = {
+        **os.environ,
+        "DATABASE_URL": dsn,
+        "CURSUS_STATE_URL": state_url,
+        "CURSUS_NAMESPACE": "pg-e2e",
+        "CURSUS_PROJECT": PROJECT,
+    }
+
+    # `cursus migrate` applies every declared migration before anything runs.
+    migrated = subprocess.run([cursus, "migrate"], env=env, capture_output=True, text=True, timeout=60)
+    assert migrated.returncode == 0, migrated.stderr
+    with psycopg.connect(dsn) as conn:
+        applied = set(conn.execute("SELECT output, name FROM cursus_migrations").fetchall())
+    expected = {o for o in ("site_events", "site_files", "file_index", "fleet_status", "site_status")}
+    assert {o for o, name in applied if name == "baseline"} == expected
+    with psycopg.connect(dsn) as conn:
+        logged = {r[0] for r in conn.execute("SELECT output FROM demo_migrations").fetchall()}
+    assert {"site_events", "site_files", "file_index"} <= logged
+
+    # Boot the real server; the OnDeploy job fires once for the revision.
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    proc = subprocess.Popen(
+        [cursus, "serve", "--insecure", "--port", str(port)],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    base_url = f"http://127.0.0.1:{port}"
+    try:
+        for _ in range(400):
+            try:
+                if httpx.get(f"{base_url}/healthz", timeout=1).status_code == 200:
+                    break
+            except Exception:
+                time.sleep(0.05)
+        else:
+            raise RuntimeError("server did not start")
+        client = httpx.Client(base_url=base_url, timeout=15)
+        base = "/api/projects/demo"
+
+        def deploy_fired():
+            autos = client.get(f"{base}/automations").json()["automations"]
+            auto = next((a for a in autos if a.get("targets") == ["deploy_notice"]), None)
+            return bool(auto and auto.get("last_revision"))
+
+        assert wait(deploy_fired, timeout=30), "the OnDeploy job did not fire on boot"
+
+        # Populate the sites partition set first so downstream runs plan
+        # real scopes, then drive file_index (pulls sites + site_feed via
+        # upstream). Each head's ref carries the last applied migration as
+        # schema (§4).
+        def run_done(run_id):
+            status = client.get(f"{base}/runs/{run_id}").json()["request"]["status"]
+            return status in {"succeeded", "failed", "canceled"}
+
+        def submit(targets, partitions="latest", upstream=True):
+            response = client.post(
+                f"{base}/runs",
+                json={"targets": targets, "partitions": partitions, "upstream": upstream},
+            )
+            assert response.status_code in (200, 201), response.text
+            return response.json()["id"]
+
+        sites_run = submit(["sites"], upstream=False)
+        assert wait(lambda: run_done(sites_run))
+        assert client.get(f"{base}/runs/{sites_run}").json()["request"]["status"] == "succeeded"
+
+        run_id = submit(["file_index"], partitions="all")
+        assert wait(lambda: run_done(run_id))
+        status = client.get(f"{base}/runs/{run_id}").json()["request"]["status"]
+        assert status == "succeeded"
+        for output in ("site_events", "site_files", "file_index"):
+            heads = client.get(f"{base}/outputs/{output}/heads").json()["heads"]
+            assert heads, output
+            assert all(h["ref"]["handle"].get("schema") == "baseline" for h in heads)
+    finally:
+        proc.terminate()
+        proc.wait(timeout=15)
