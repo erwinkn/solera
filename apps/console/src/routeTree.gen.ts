@@ -8,170 +8,170 @@
 // You should NOT make any changes in this file as it will be overwritten.
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
-import { Route as rootRouteImport } from './routes/__root'
-import { Route as IndexRouteImport } from './routes/index'
-import { Route as AssetsRouteImport } from './routes/assets'
-import { Route as AutomationsRouteImport } from './routes/automations'
-import { Route as ExecutorsRouteImport } from './routes/executors'
-import { Route as RunsRouteImport } from './routes/runs'
-import { Route as SourcesRouteImport } from './routes/sources'
-import { Route as StorageRouteImport } from './routes/storage'
+import { Route as rootRouteImport } from "./routes/__root";
+import { Route as IndexRouteImport } from "./routes/index";
+import { Route as AssetsRouteImport } from "./routes/assets";
+import { Route as AutomationsRouteImport } from "./routes/automations";
+import { Route as ExecutorsRouteImport } from "./routes/executors";
+import { Route as RunsRouteImport } from "./routes/runs";
+import { Route as SourcesRouteImport } from "./routes/sources";
+import { Route as StorageRouteImport } from "./routes/storage";
 
 const IndexRoute = IndexRouteImport.update({
-  id: '/',
-  path: '/',
+  id: "/",
+  path: "/",
   getParentRoute: () => rootRouteImport,
-} as any)
+} as any);
 const AssetsRoute = AssetsRouteImport.update({
-  id: '/assets',
-  path: '/assets',
+  id: "/assets",
+  path: "/assets",
   getParentRoute: () => rootRouteImport,
-} as any)
+} as any);
 const AutomationsRoute = AutomationsRouteImport.update({
-  id: '/automations',
-  path: '/automations',
+  id: "/automations",
+  path: "/automations",
   getParentRoute: () => rootRouteImport,
-} as any)
+} as any);
 const ExecutorsRoute = ExecutorsRouteImport.update({
-  id: '/executors',
-  path: '/executors',
+  id: "/executors",
+  path: "/executors",
   getParentRoute: () => rootRouteImport,
-} as any)
+} as any);
 const RunsRoute = RunsRouteImport.update({
-  id: '/runs',
-  path: '/runs',
+  id: "/runs",
+  path: "/runs",
   getParentRoute: () => rootRouteImport,
-} as any)
+} as any);
 const SourcesRoute = SourcesRouteImport.update({
-  id: '/sources',
-  path: '/sources',
+  id: "/sources",
+  path: "/sources",
   getParentRoute: () => rootRouteImport,
-} as any)
+} as any);
 const StorageRoute = StorageRouteImport.update({
-  id: '/storage',
-  path: '/storage',
+  id: "/storage",
+  path: "/storage",
   getParentRoute: () => rootRouteImport,
-} as any)
+} as any);
 
 export interface FileRoutesByFullPath {
-  '/': typeof IndexRoute
-  '/assets': typeof AssetsRoute
-  '/automations': typeof AutomationsRoute
-  '/executors': typeof ExecutorsRoute
-  '/runs': typeof RunsRoute
-  '/sources': typeof SourcesRoute
-  '/storage': typeof StorageRoute
+  "/": typeof IndexRoute;
+  "/assets": typeof AssetsRoute;
+  "/automations": typeof AutomationsRoute;
+  "/executors": typeof ExecutorsRoute;
+  "/runs": typeof RunsRoute;
+  "/sources": typeof SourcesRoute;
+  "/storage": typeof StorageRoute;
 }
 export interface FileRoutesByTo {
-  '/': typeof IndexRoute
-  '/assets': typeof AssetsRoute
-  '/automations': typeof AutomationsRoute
-  '/executors': typeof ExecutorsRoute
-  '/runs': typeof RunsRoute
-  '/sources': typeof SourcesRoute
-  '/storage': typeof StorageRoute
+  "/": typeof IndexRoute;
+  "/assets": typeof AssetsRoute;
+  "/automations": typeof AutomationsRoute;
+  "/executors": typeof ExecutorsRoute;
+  "/runs": typeof RunsRoute;
+  "/sources": typeof SourcesRoute;
+  "/storage": typeof StorageRoute;
 }
 export interface FileRoutesById {
-  __root__: typeof rootRouteImport
-  '/': typeof IndexRoute
-  '/assets': typeof AssetsRoute
-  '/automations': typeof AutomationsRoute
-  '/executors': typeof ExecutorsRoute
-  '/runs': typeof RunsRoute
-  '/sources': typeof SourcesRoute
-  '/storage': typeof StorageRoute
+  __root__: typeof rootRouteImport;
+  "/": typeof IndexRoute;
+  "/assets": typeof AssetsRoute;
+  "/automations": typeof AutomationsRoute;
+  "/executors": typeof ExecutorsRoute;
+  "/runs": typeof RunsRoute;
+  "/sources": typeof SourcesRoute;
+  "/storage": typeof StorageRoute;
 }
 export interface FileRouteTypes {
-  fileRoutesByFullPath: FileRoutesByFullPath
+  fileRoutesByFullPath: FileRoutesByFullPath;
   fullPaths:
-    | '/'
-    | '/assets'
-    | '/automations'
-    | '/executors'
-    | '/runs'
-    | '/sources'
-    | '/storage'
-  fileRoutesByTo: FileRoutesByTo
+    | "/"
+    | "/assets"
+    | "/automations"
+    | "/executors"
+    | "/runs"
+    | "/sources"
+    | "/storage";
+  fileRoutesByTo: FileRoutesByTo;
   to:
-    | '/'
-    | '/assets'
-    | '/automations'
-    | '/executors'
-    | '/runs'
-    | '/sources'
-    | '/storage'
+    | "/"
+    | "/assets"
+    | "/automations"
+    | "/executors"
+    | "/runs"
+    | "/sources"
+    | "/storage";
   id:
-    | '__root__'
-    | '/'
-    | '/assets'
-    | '/automations'
-    | '/executors'
-    | '/runs'
-    | '/sources'
-    | '/storage'
-  fileRoutesById: FileRoutesById
+    | "__root__"
+    | "/"
+    | "/assets"
+    | "/automations"
+    | "/executors"
+    | "/runs"
+    | "/sources"
+    | "/storage";
+  fileRoutesById: FileRoutesById;
 }
 export interface RootRouteChildren {
-  IndexRoute: typeof IndexRoute
-  AssetsRoute: typeof AssetsRoute
-  AutomationsRoute: typeof AutomationsRoute
-  ExecutorsRoute: typeof ExecutorsRoute
-  RunsRoute: typeof RunsRoute
-  SourcesRoute: typeof SourcesRoute
-  StorageRoute: typeof StorageRoute
+  IndexRoute: typeof IndexRoute;
+  AssetsRoute: typeof AssetsRoute;
+  AutomationsRoute: typeof AutomationsRoute;
+  ExecutorsRoute: typeof ExecutorsRoute;
+  RunsRoute: typeof RunsRoute;
+  SourcesRoute: typeof SourcesRoute;
+  StorageRoute: typeof StorageRoute;
 }
 
-declare module '@tanstack/react-router' {
+declare module "@tanstack/react-router" {
   interface FileRoutesByPath {
-    '/': {
-      id: '/'
-      path: '/'
-      fullPath: '/'
-      preLoaderRoute: typeof IndexRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/assets': {
-      id: '/assets'
-      path: '/assets'
-      fullPath: '/assets'
-      preLoaderRoute: typeof AssetsRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/automations': {
-      id: '/automations'
-      path: '/automations'
-      fullPath: '/automations'
-      preLoaderRoute: typeof AutomationsRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/executors': {
-      id: '/executors'
-      path: '/executors'
-      fullPath: '/executors'
-      preLoaderRoute: typeof ExecutorsRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/runs': {
-      id: '/runs'
-      path: '/runs'
-      fullPath: '/runs'
-      preLoaderRoute: typeof RunsRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/sources': {
-      id: '/sources'
-      path: '/sources'
-      fullPath: '/sources'
-      preLoaderRoute: typeof SourcesRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/storage': {
-      id: '/storage'
-      path: '/storage'
-      fullPath: '/storage'
-      preLoaderRoute: typeof StorageRouteImport
-      parentRoute: typeof rootRouteImport
-    }
+    "/": {
+      id: "/";
+      path: "/";
+      fullPath: "/";
+      preLoaderRoute: typeof IndexRouteImport;
+      parentRoute: typeof rootRouteImport;
+    };
+    "/assets": {
+      id: "/assets";
+      path: "/assets";
+      fullPath: "/assets";
+      preLoaderRoute: typeof AssetsRouteImport;
+      parentRoute: typeof rootRouteImport;
+    };
+    "/automations": {
+      id: "/automations";
+      path: "/automations";
+      fullPath: "/automations";
+      preLoaderRoute: typeof AutomationsRouteImport;
+      parentRoute: typeof rootRouteImport;
+    };
+    "/executors": {
+      id: "/executors";
+      path: "/executors";
+      fullPath: "/executors";
+      preLoaderRoute: typeof ExecutorsRouteImport;
+      parentRoute: typeof rootRouteImport;
+    };
+    "/runs": {
+      id: "/runs";
+      path: "/runs";
+      fullPath: "/runs";
+      preLoaderRoute: typeof RunsRouteImport;
+      parentRoute: typeof rootRouteImport;
+    };
+    "/sources": {
+      id: "/sources";
+      path: "/sources";
+      fullPath: "/sources";
+      preLoaderRoute: typeof SourcesRouteImport;
+      parentRoute: typeof rootRouteImport;
+    };
+    "/storage": {
+      id: "/storage";
+      path: "/storage";
+      fullPath: "/storage";
+      preLoaderRoute: typeof StorageRouteImport;
+      parentRoute: typeof rootRouteImport;
+    };
   }
 }
 
@@ -183,16 +183,16 @@ const rootRouteChildren: RootRouteChildren = {
   RunsRoute: RunsRoute,
   SourcesRoute: SourcesRoute,
   StorageRoute: StorageRoute,
-}
+};
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
-  ._addFileTypes<FileRouteTypes>()
+  ._addFileTypes<FileRouteTypes>();
 
-import type { getRouter } from './router.tsx'
-import type { createStart } from '@tanstack/react-start'
-declare module '@tanstack/react-start' {
+import type { getRouter } from "./router.tsx";
+import type { createStart } from "@tanstack/react-start";
+declare module "@tanstack/react-start" {
   interface Register {
-    ssr: true
-    router: Awaited<ReturnType<typeof getRouter>>
+    ssr: true;
+    router: Awaited<ReturnType<typeof getRouter>>;
   }
 }

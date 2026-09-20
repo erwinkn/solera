@@ -117,7 +117,7 @@ export interface Manifest {
 }
 
 export interface Trigger {
-  kind: "every" | "cron" | "onchange";
+  kind: "every" | "cron" | "onchange" | "ondeploy";
   seconds?: number;
   expression?: string;
   timezone?: string;
@@ -140,6 +140,7 @@ export interface AutomationDecl {
 export interface AutomationRecord extends AutomationDecl {
   last_at: number | null;
   last_run: string | null;
+  last_revision: string | null;
   pending: {
     commit: string;
     asset: string | null;

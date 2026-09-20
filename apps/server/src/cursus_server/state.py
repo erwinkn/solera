@@ -270,6 +270,7 @@ class State:
                     **auto,
                     "last_at": None,
                     "last_run": None,
+                    "last_revision": None,
                     "pending": [],
                 }
                 if existing is not None:
@@ -277,6 +278,7 @@ class State:
                     if existing["trigger"] == auto["trigger"]:
                         record["last_at"] = existing.get("last_at")
                         record["last_run"] = existing.get("last_run")
+                        record["last_revision"] = existing.get("last_revision")
                         record["pending"] = existing.get("pending", [])
                 await tx.put_automation(auto["name"], record)
 

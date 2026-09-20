@@ -19,6 +19,7 @@ from cursus.sdk import (
     ByKey,
     Cron,
     Every,
+    OnDeploy,
     Output,
     PartitionSet,
     Project,
@@ -298,6 +299,13 @@ def weekly_digest(ctx, fleet_index: list, mailer: Mailer):
     mailer.send("ops@example.com", "Weekly digest", "\n".join(lines))
 
 
+@job(automations=Automation(trigger=OnDeploy()))
+def deploy_notice(ctx):
+    """§9: fires once per served project revision — watch it run on boot."""
+
+    ctx.log("project deployed", run=ctx.run_id)
+
+
 project = Project(
     assets=[
         sites,
@@ -309,6 +317,7 @@ project = Project(
         *([fleet_status] if DATABASE else []),
         manual_ingest,
         weekly_digest,
+        deploy_notice,
     ],
     sources=[
         Source("roadmap"),  # lineage-only: read via resources, pinned via deps=

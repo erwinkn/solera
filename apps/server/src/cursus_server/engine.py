@@ -942,9 +942,15 @@ class Engine:
                     auto["pending"] = []
                     auto["last_at"] = now
                     await tx.put_automation(auto["name"], auto)
+                elif trigger["kind"] == "ondeploy":
+                    revision = self.manifest["revision"]
+                    if auto.get("last_revision") != revision:
+                        fired.append((auto, {"__ondeploy__": revision}))
         for auto, selection in fired:
             if isinstance(selection, dict) and "__pending__" in selection:
                 await self._fire_onchange(auto, selection["__pending__"])
+            elif isinstance(selection, dict) and "__ondeploy__" in selection:
+                await self._fire_ondeploy(auto, selection["__ondeploy__"])
             else:
                 await self._fire(auto, selection)
 
@@ -969,6 +975,33 @@ class Engine:
             record = await tx.automation(auto["name"])
             if record:
                 record["last_run"] = run["id"]
+                await tx.put_automation(auto["name"], record)
+
+    async def _fire_ondeploy(self, auto, revision):
+        """§9: fire once for the served revision, then record it. A submit
+        error leaves last_revision unset so the next tick retries."""
+
+        try:
+            run = await self.submit(
+                auto["targets"],
+                partitions=auto.get("partitions") or "latest",
+                mode=auto.get("mode") or "incremental",
+                upstream=auto.get("upstream") or False,
+                config=auto.get("config"),
+                keys=auto.get("keys"),
+                automation=auto["name"],
+                skip_active=True,
+            )
+        except Exception as error:
+            self.last_error = f"automation {auto['name']}: {error}"
+            return
+        async with self.state.transaction() as tx:
+            record = await tx.automation(auto["name"])
+            if record:
+                record["last_revision"] = revision
+                record["last_at"] = self.clock()
+                if run is not None:
+                    record["last_run"] = run["id"]
                 await tx.put_automation(auto["name"], record)
 
     async def _fire_onchange(self, auto, pending):

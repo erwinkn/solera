@@ -21,6 +21,7 @@ function triggerLabel(automation: AutomationRecord) {
     return trigger.outputs?.length
       ? `On change of ${trigger.outputs.join(", ")}`
       : "On change of inputs";
+  if (trigger.kind === "ondeploy") return "On deploy";
   return `Every ${describeInterval(trigger.seconds ?? 0)}`;
 }
 
@@ -92,6 +93,12 @@ function AutomationsPage() {
                       ? `fired ${time(automation.last_at)}`
                       : "never fired"}
                   </Badge>
+                  {automation.trigger.kind === "ondeploy" &&
+                    automation.last_revision && (
+                      <Badge variant="outline" className="font-mono">
+                        rev {automation.last_revision.slice(0, 8)}
+                      </Badge>
+                    )}
                   {!!automation.pending.length && (
                     <Badge variant="outline" className="text-sky-700">
                       {automation.pending.length} pending

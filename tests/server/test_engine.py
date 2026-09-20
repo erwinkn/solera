@@ -15,6 +15,7 @@ from cursus.sdk import (
     In,
     JsonRef,
     OnChange,
+    OnDeploy,
     Output,
     PartitionSet,
     Project,
@@ -1066,3 +1067,81 @@ async def test_migration_changes_fingerprint_and_marks_handle(state):
     heads = await state.scan("head/")
     rolled_head = next(r for k, r in heads if k.startswith("head/rolled/"))
     assert rolled_head["ref"]["handle"]["schema"] == "m1"
+
+
+async def test_ondeploy_fires_once_per_revision(state):
+    """§9: OnDeploy fires when the served revision differs from
+    last_revision, then records it; further ticks stay quiet."""
+    calls = []
+
+    @job(automations=Automation(trigger=OnDeploy()))
+    def deployed():
+        calls.append(1)
+
+    project = Project(assets=[deployed])
+    engine = make_engine(state, project)
+    await engine.initialize()
+    await engine.tick()
+    auto = (await state.scan("automation/deployed.ondeploy.0"))[0][1]
+    await engine.run_until(auto["last_run"], 30)
+    assert calls == [1]
+    auto = (await state.scan("automation/deployed.ondeploy.0"))[0][1]
+    assert auto["last_revision"] == project.manifest["revision"]
+
+    for _ in range(3):
+        await engine.tick()
+    auto = (await state.scan("automation/deployed.ondeploy.0"))[0][1]
+    assert calls == [1]
+    assert auto["last_revision"] == project.manifest["revision"]
+
+
+async def test_ondeploy_silent_on_restart_same_revision(state):
+    """§9: a re-registration of the same revision does not refire."""
+    calls = []
+
+    @job(automations=Automation(trigger=OnDeploy()))
+    def deployed():
+        calls.append(1)
+
+    project = Project(assets=[deployed])
+    engine = make_engine(state, project)
+    await engine.initialize()
+    await engine.tick()
+    auto = (await state.scan("automation/deployed.ondeploy.0"))[0][1]
+    await engine.run_until(auto["last_run"], 30)
+    assert calls == [1]
+
+    engine2 = make_engine(state, project)  # same manifest, same revision
+    await engine2.initialize()
+    await engine2.tick()
+    auto = (await state.scan("automation/deployed.ondeploy.0"))[0][1]
+    assert auto["last_revision"] == project.manifest["revision"]
+    assert calls == [1]
+
+
+async def test_ondeploy_two_registrations_fire_latest_once(state):
+    """§9: two registrations before a tick fire once, for the latest
+    revision only."""
+    calls = []
+
+    @job(automations=Automation(trigger=OnDeploy()))
+    def deployed():
+        calls.append(1)
+
+    project_a = Project(assets=[deployed])
+    await make_engine(state, project_a).initialize()
+
+    @job(automations=Automation(trigger=OnDeploy()), version="2")
+    def deployed():  # noqa: F811 — redeployed with a new revision
+        calls.append(1)
+
+    project_b = Project(assets=[deployed])
+    assert project_b.manifest["revision"] != project_a.manifest["revision"]
+    engine = make_engine(state, project_b)
+    await engine.initialize()
+    await engine.tick()
+    auto = (await state.scan("automation/deployed.ondeploy.0"))[0][1]
+    await engine.run_until(auto["last_run"], 30)
+    assert calls == [1]
+    auto = (await state.scan("automation/deployed.ondeploy.0"))[0][1]
+    assert auto["last_revision"] == project_b.manifest["revision"]
