@@ -70,10 +70,10 @@ test("theme toggle switches light and dark", async ({ page }) => {
   // Two theme toggles exist (sidebar on desktop, header on mobile); the visible
   // one depends on the viewport.
   const dark = page
-    .getByRole("tab", { name: "Dark" })
+    .getByRole("radio", { name: "Dark" })
     .filter({ visible: true });
   const light = page
-    .getByRole("tab", { name: "Light" })
+    .getByRole("radio", { name: "Light" })
     .filter({ visible: true });
   await dark.click();
   await expect(page.locator("html")).toHaveClass(/dark/);
@@ -83,7 +83,7 @@ test("theme toggle switches light and dark", async ({ page }) => {
 
 test("lineage graph shows sources and edge kinds", async ({ page }) => {
   await login(page);
-  await page.getByRole("tab", { name: "Graph" }).click();
+  await page.getByRole("radio", { name: "Graph" }).click();
   const graph = page.getByLabel("Asset lineage graph");
   await expect(graph).toBeVisible();
   // Sources render as nodes alongside assets.
@@ -96,6 +96,10 @@ test("lineage graph shows sources and edge kinds", async ({ page }) => {
   // The edge-kind legend names every consumption kind.
   for (const kind of ["whole", "ByKey", "AllPartitions", "dep"])
     await expect(page.getByText(kind, { exact: true })).toBeVisible();
+  // Clicking a source node opens its card on the Sources page.
+  await graph.getByRole("button", { name: "Inspect uploads" }).click();
+  await expect(page).toHaveURL(/\/sources#source-uploads$/);
+  await expect(page.locator('[data-source="uploads"]')).toBeInViewport();
 });
 
 test("materialize latest from the dialog and watch the run", async ({
@@ -118,8 +122,8 @@ test("pick individual cells from the partition grid", async ({ page }) => {
   });
   await asset.locator("[data-scope]").first().click();
   const dialog = page.getByRole("dialog", { name: "Materialize" });
-  await expect(dialog.getByRole("tab", { name: "pick" })).toHaveAttribute(
-    "aria-selected",
+  await expect(dialog.getByRole("radio", { name: "pick" })).toHaveAttribute(
+    "aria-checked",
     "true",
   );
   await expect(dialog.getByText(/Pick cells — \d+ selected/)).toBeVisible();

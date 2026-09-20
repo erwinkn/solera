@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import {
   Braces,
   Calendar,
@@ -71,6 +71,8 @@ const NODE_DOT: Record<string, string> = {
 type EdgeKind = "whole" | "bykey" | "all_partitions" | "dep";
 
 interface GraphNode {
+  // IDs are namespaced by kind: a source and an asset may share a name.
+  id: string;
   name: string;
   kind: "asset" | "source";
   asset?: CatalogAsset;
@@ -150,38 +152,42 @@ function Graph({
   sources: SourceDecl[];
 }) {
   const { select } = useWorkspace();
+  const navigate = useNavigate();
 
   const { nodes, edges, positions, width, height } = useMemo(() => {
     const nodes: GraphNode[] = [
       ...sources.map<GraphNode>((s) => ({
+        id: `source:${s.name}`,
         name: s.name,
         kind: "source",
         source: s,
       })),
       ...assets.map<GraphNode>((a) => ({
+        id: `asset:${a.name}`,
         name: a.name,
         kind: "asset",
         asset: a,
       })),
     ];
-    const byName = new Map(nodes.map((n) => [n.name, n]));
+    const byId = new Map(nodes.map((n) => [n.id, n]));
 
-    // output name -> owning node (asset that declares it, or a source)
+    // output name -> owning node id (asset that declares it, or a source)
     const ownerOf = new Map<string, string>();
-    for (const s of sources) ownerOf.set(s.name, s.name);
+    for (const s of sources) ownerOf.set(s.name, `source:${s.name}`);
     for (const a of assets)
-      for (const o of a.outputs) ownerOf.set(o.name, a.name);
+      for (const o of a.outputs) ownerOf.set(o.name, `asset:${a.name}`);
 
     const edges: GraphEdge[] = [];
     const seen = new Set<string>();
     const push = (from: string, to: string, kind: EdgeKind) => {
-      if (!byName.has(from) || from === to) return;
+      if (!byId.has(from) || from === to) return;
       const key = `${from}|${to}|${kind}`;
       if (seen.has(key)) return;
       seen.add(key);
       edges.push({ from, to, kind });
     };
     for (const a of assets) {
+      const to = `asset:${a.name}`;
       for (const edge of Object.values(a.inputs)) {
         const owner = ownerOf.get(edge.output);
         if (!owner) continue;
@@ -191,42 +197,42 @@ function Graph({
             : edge.kind === "all_partitions"
               ? "all_partitions"
               : "whole";
-        push(owner, a.name, kind);
+        push(owner, to, kind);
       }
       for (const dep of a.deps) {
         const owner = ownerOf.get(dep);
-        if (owner) push(owner, a.name, "dep");
+        if (owner) push(owner, to, "dep");
       }
       for (const dim of Object.values(a.partitions?.dims ?? {})) {
         if (dim.kind === "set" && dim.output) {
           const owner = ownerOf.get(dim.output);
-          if (owner) push(owner, a.name, "dep");
+          if (owner) push(owner, to, "dep");
         }
       }
     }
 
     // Longest-path layering for left-to-right columns.
     const upstreamOf = new Map<string, string[]>();
-    for (const n of nodes) upstreamOf.set(n.name, []);
+    for (const n of nodes) upstreamOf.set(n.id, []);
     for (const e of edges) upstreamOf.get(e.to)!.push(e.from);
     const level = new Map<string, number>();
-    const depth = (name: string, stack = new Set<string>()): number => {
-      if (level.has(name)) return level.get(name)!;
-      if (stack.has(name)) return 0;
-      stack.add(name);
+    const depth = (id: string, stack = new Set<string>()): number => {
+      if (level.has(id)) return level.get(id)!;
+      if (stack.has(id)) return 0;
+      stack.add(id);
       const value = Math.max(
         0,
-        ...(upstreamOf.get(name) ?? []).map((u) => depth(u, stack) + 1),
+        ...(upstreamOf.get(id) ?? []).map((u) => depth(u, stack) + 1),
       );
-      stack.delete(name);
-      level.set(name, value);
+      stack.delete(id);
+      level.set(id, value);
       return value;
     };
-    for (const n of nodes) depth(n.name);
+    for (const n of nodes) depth(n.id);
 
     const columns = new Map<number, GraphNode[]>();
     for (const n of nodes) {
-      const l = level.get(n.name)!;
+      const l = level.get(n.id)!;
       columns.set(l, [...(columns.get(l) ?? []), n]);
     }
     const NODE_W = 176;
@@ -244,7 +250,7 @@ function Graph({
       const colHeight = items.length * (NODE_H + ROW_GAP) - ROW_GAP;
       const top = (height - colHeight) / 2;
       items.forEach((n, i) =>
-        positions.set(n.name, {
+        positions.set(n.id, {
           x: 24 + l * (NODE_W + COL_GAP),
           y: top + i * (NODE_H + ROW_GAP),
         }),
@@ -313,7 +319,7 @@ function Graph({
           })}
         </svg>
         {nodes.map((node) => {
-          const pos = positions.get(node.name)!;
+          const pos = positions.get(node.id)!;
           const status =
             node.kind === "source" ? "materialized" : assetStatus(node.asset!);
           const Icon = node.kind === "source" ? Inbox : assetIcon(node.asset!);
@@ -331,7 +337,7 @@ function Graph({
                 : node.asset!.placement.kind;
           return (
             <button
-              key={node.name}
+              key={node.id}
               className={cn(
                 "absolute flex flex-col justify-center gap-1.5 rounded-xl border bg-popover px-3 text-left shadow-xs transition hover:-translate-y-px hover:border-primary/40 hover:shadow-sm focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
                 node.kind === "source" && "border-dashed",
@@ -339,7 +345,10 @@ function Graph({
               style={{ left: pos.x, top: pos.y, width: NODE_W, height: NODE_H }}
               onClick={() =>
                 node.kind === "source"
-                  ? select({ kind: "source", name: node.name })
+                  ? navigate({
+                      to: "/sources",
+                      hash: `source-${node.name}`,
+                    })
                   : select({ kind: "asset", name: node.name })
               }
               aria-label={`Inspect ${node.name}`}

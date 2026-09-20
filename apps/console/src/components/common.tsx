@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useRef, type KeyboardEvent, type ReactNode } from "react";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "cn";
 import type { AssetStatus, RunStatus, TaskStatus } from "@/lib/types";
@@ -148,7 +148,9 @@ export interface SegmentOption<T extends string> {
 }
 
 /** A compact segmented control — the workhorse for latest/missing/all/pick,
-    incremental/recompute, table/graph, and the light/dark theme switch. */
+    incremental/recompute, table/graph, and the light/dark theme switch.
+    Radio-group semantics: one tabbable option, arrows/Home/End move and
+    select. */
 export function Segmented<T extends string>({
   value,
   onChange,
@@ -162,25 +164,45 @@ export function Segmented<T extends string>({
   ariaLabel: string;
   className?: string;
 }) {
+  const refs = useRef<(HTMLButtonElement | null)[]>([]);
+  function onKeyDown(event: KeyboardEvent, index: number) {
+    const last = options.length - 1;
+    let next: number | null = null;
+    if (event.key === "ArrowRight" || event.key === "ArrowDown")
+      next = index === last ? 0 : index + 1;
+    else if (event.key === "ArrowLeft" || event.key === "ArrowUp")
+      next = index === 0 ? last : index - 1;
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = last;
+    if (next === null || next === index) return;
+    event.preventDefault();
+    onChange(options[next].value);
+    refs.current[next]?.focus();
+  }
   return (
     <div
-      role="tablist"
+      role="radiogroup"
       aria-label={ariaLabel}
       className={cn(
         "flex items-center gap-0.5 rounded-lg bg-muted p-0.5",
         className,
       )}
     >
-      {options.map((option) => {
+      {options.map((option, index) => {
         const active = option.value === value;
         return (
           <button
             key={option.value}
+            ref={(el) => {
+              refs.current[index] = el;
+            }}
             type="button"
-            role="tab"
-            aria-selected={active}
+            role="radio"
+            aria-checked={active}
+            tabIndex={active ? 0 : -1}
             data-active={active || undefined}
             onClick={() => onChange(option.value)}
+            onKeyDown={(event) => onKeyDown(event, index)}
             className={cn(
               "flex flex-1 items-center justify-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium whitespace-nowrap transition-colors",
               active

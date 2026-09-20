@@ -65,7 +65,7 @@ export function assetStatus(asset: CatalogAsset) {
 }
 
 // Grid cells are filled by status so a scope's state reads without a legend.
-const CELL_TONE: Record<string, string> = {
+export const CELL_TONE: Record<string, string> = {
   complete:
     "border-emerald-600/30 bg-emerald-500/15 text-emerald-700 dark:border-emerald-400/25 dark:bg-emerald-400/12 dark:text-emerald-300",
   missing:
@@ -167,41 +167,47 @@ function Cell({
 }) {
   const { select } = useWorkspace();
   const attemptRun = cell.last_attempt?.split("/")[0];
-  // A visible attempt link where it matters — failed and running scopes — while
-  // complete cells stay quiet (count, or a check). ⌘/Ctrl-click opens any.
-  const showAttempt =
-    attemptRun && (cell.status === "failed" || cell.status === "running");
   return (
-    <button
+    <span
       data-scope={scope}
       data-status={cell.status}
-      title={`${scope} · ${cell.status}${cell.last_outcome ? ` · last ${cell.last_outcome}` : ""}${keyCount != null ? ` · ${keyCount} keys` : ""}${attemptRun ? "\n⌘/Ctrl-click → last attempt" : ""}`}
       className={cn(
-        "flex min-w-0 items-center justify-center gap-1 rounded-md border px-2 py-1.5 font-mono text-[0.7rem] transition hover:brightness-105 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
+        "flex min-w-0 items-stretch rounded-md border font-mono text-[0.7rem] transition",
         CELL_TONE[cell.status] ?? CELL_TONE.missing,
       )}
-      onClick={(event) => {
-        if (attemptRun && (event.metaKey || event.ctrlKey)) {
-          select({ kind: "run", id: attemptRun });
-          return;
-        }
-        onPick(scope);
-      }}
     >
-      {label && <span className="truncate">{label}</span>}
-      {keyCount != null ? (
-        <span className="shrink-0 tabular-nums">{keyCount}</span>
-      ) : (
-        !label &&
-        cell.status === "complete" && <Check className="size-3 shrink-0" />
+      <button
+        type="button"
+        title={`${scope} · ${cell.status}${cell.last_outcome ? ` · last ${cell.last_outcome}` : ""}${keyCount != null ? ` · ${keyCount} keys` : ""}`}
+        className="flex min-w-0 flex-1 items-center justify-center gap-1 rounded-l-md px-2 py-1.5 hover:brightness-105 focus-visible:z-10 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+        onClick={(event) => {
+          if (attemptRun && (event.metaKey || event.ctrlKey)) {
+            select({ kind: "run", id: attemptRun });
+            return;
+          }
+          onPick(scope);
+        }}
+      >
+        {label && <span className="truncate">{label}</span>}
+        {keyCount != null ? (
+          <span className="shrink-0 tabular-nums">{keyCount}</span>
+        ) : (
+          !label &&
+          cell.status === "complete" && <Check className="size-3 shrink-0" />
+        )}
+      </button>
+      {attemptRun && (
+        <button
+          type="button"
+          aria-label={`Open last attempt for ${label || scope || "scope"}`}
+          title={`Open last attempt\n${attemptRun}`}
+          className="flex shrink-0 items-center rounded-r-md px-1.5 opacity-50 hover:opacity-100 focus-visible:z-10 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+          onClick={() => select({ kind: "run", id: attemptRun })}
+        >
+          <Play className="size-2.5" />
+        </button>
       )}
-      {showAttempt && (
-        <Play
-          className="size-2.5 shrink-0 opacity-60"
-          aria-label="open last attempt"
-        />
-      )}
-    </button>
+    </span>
   );
 }
 
@@ -539,8 +545,8 @@ export function AssetSheet() {
               onPick={(scope) => openMaterialize([asset.name], [scope])}
             />
             <p className="text-[0.7rem] text-muted-foreground">
-              Click a cell to materialize it · ⌘/Ctrl-click a cell with a last
-              attempt to open it.
+              Click a cell to materialize it · the play icon (or ⌘/Ctrl-click)
+              opens its last attempt.
             </p>
           </section>
 

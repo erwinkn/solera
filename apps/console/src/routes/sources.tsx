@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, useLocation } from "@tanstack/react-router";
 import { GitCommitVertical, Inbox } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -8,6 +8,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Empty, ErrorNotice, PageHeader } from "@/components/common";
 import { request, useAction, useQuery } from "@/lib/api";
 import { useWorkspace } from "@/lib/workspace";
+import { cn } from "cn";
 import type { Manifest, SourceDecl } from "@/lib/types";
 
 export const Route = createFileRoute("/sources")({
@@ -160,6 +161,9 @@ function CommitForm({
 function SourcesPage() {
   const { base, diagnostics } = useWorkspace();
   const manifest = useQuery<Manifest>(base ? `${base}/manifest` : null, 30000);
+  // Lineage-graph source nodes link here with a `#source-<name>` hash; the
+  // router scrolls the matching card into view, so highlight it as well.
+  const hash = useLocation({ select: (location) => location.hash });
   if (!diagnostics) return null;
   const sources = Object.values(manifest.data?.sources ?? {});
   return (
@@ -176,8 +180,13 @@ function SourcesPage() {
           {sources.map((source) => (
             <div
               key={source.name}
+              id={`source-${source.name}`}
               data-source={source.name}
-              className="flex flex-col gap-3 rounded-xl border bg-card p-4"
+              className={cn(
+                "flex flex-col gap-3 rounded-xl border bg-card p-4",
+                hash === `source-${source.name}` &&
+                  "border-primary ring-1 ring-primary",
+              )}
             >
               <div className="flex items-center gap-2">
                 <Inbox className="size-4 text-primary" />

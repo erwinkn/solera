@@ -147,11 +147,12 @@ export function RunSheet() {
   const live = run && !["succeeded", "failed", "canceled"].includes(run.status);
   const tasks = detail.data?.tasks ?? [];
 
-  async function act(path: string) {
+  async function act(path: string, onSuccess?: () => void) {
     await action.run(async () => {
       await request(`${base}/runs/${run!.id}/${path}`, { body: {} });
       detail.refresh();
       refresh();
+      onSuccess?.();
     });
   }
 
@@ -208,7 +209,7 @@ export function RunSheet() {
                         variant="destructive"
                         size="sm"
                         onClick={() =>
-                          act("cancel").then(() => setConfirmCancel(false))
+                          act("cancel", () => setConfirmCancel(false))
                         }
                       >
                         <Ban /> Confirm cancel

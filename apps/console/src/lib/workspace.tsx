@@ -10,10 +10,7 @@ import { useQuery } from "./api";
 import type { CatalogAsset, Diagnostics, Run } from "./types";
 
 export type Selection =
-  | { kind: "asset"; name: string }
-  | { kind: "run"; id: string }
-  | { kind: "source"; name: string }
-  | null;
+  { kind: "asset"; name: string } | { kind: "run"; id: string } | null;
 
 interface Workspace {
   diagnostics: Diagnostics | null;

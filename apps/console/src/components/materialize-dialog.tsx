@@ -14,6 +14,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
+import { CELL_TONE } from "@/components/asset-sheet";
 import { ErrorNotice, Segmented } from "@/components/common";
 import { request, useAction, useQuery } from "@/lib/api";
 import { useWorkspace } from "@/lib/workspace";
@@ -24,22 +25,16 @@ type PartitionMode = "latest" | "missing" | "all" | "pick";
 
 // When exactly one partitioned target is chosen, pick individual scopes off its
 // grid — the same cell colours as the asset sheet, toggled into the selection.
+// Retired scopes can't be materialized, so they render disabled.
 function ScopePicker({
-  base,
-  target,
+  scopes,
   selected,
   onToggle,
 }: {
-  base: string;
-  target: string;
+  scopes: PartitionScope[];
   selected: Set<string>;
   onToggle: (scope: string) => void;
 }) {
-  const { data } = useQuery<{ partitions: PartitionScope[] }>(
-    `${base}/partitions/${target}`,
-    4000,
-  );
-  const scopes = data?.partitions ?? [];
   if (!scopes.length)
     return (
       <p className="text-xs text-muted-foreground">
@@ -50,6 +45,7 @@ function ScopePicker({
     <div className="flex max-h-32 flex-wrap gap-1.5 overflow-y-auto rounded-lg border p-2">
       {scopes.map((scope) => {
         const on = selected.has(scope.scope);
+        const retired = scope.status === "retired";
         return (
           <button
             key={scope.scope}
@@ -57,12 +53,16 @@ function ScopePicker({
             data-scope={scope.scope}
             data-status={scope.status}
             aria-pressed={on}
+            disabled={retired}
+            title={retired ? "Retired scopes can't be materialized" : undefined}
             onClick={() => onToggle(scope.scope)}
             className={cn(
               "rounded-md border px-2 py-1 font-mono text-[0.7rem] transition",
-              on
-                ? "border-primary bg-primary/10 text-primary"
-                : "border-border text-muted-foreground hover:border-primary/40",
+              CELL_TONE[scope.status] ?? CELL_TONE.missing,
+              on && "ring-2 ring-primary ring-offset-1 ring-offset-background",
+              retired
+                ? "cursor-not-allowed opacity-60"
+                : "hover:brightness-105",
             )}
           >
             {scope.scope}
@@ -120,8 +120,36 @@ export function MaterializeDialog() {
     return [...edges];
   }, [selectedAssets]);
 
-  // The grid picker needs a single partitioned target to key off.
-  const pickTarget = selectedAssets.find((a) => a.partitions)?.name ?? null;
+  // The grid picker only works when exactly one partitioned target is
+  // selected — with several targets its scopes would not match them all.
+  const pickTarget =
+    selectedAssets.length === 1 && selectedAssets[0].partitions
+      ? selectedAssets[0].name
+      : null;
+
+  const scopeList = useQuery<{ partitions: PartitionScope[] }>(
+    partitions === "pick" && pickTarget && base
+      ? `${base}/partitions/${pickTarget}`
+      : null,
+    4000,
+  );
+  const pickScopes = useMemo(
+    () => scopeList.data?.partitions ?? [],
+    [scopeList.data],
+  );
+
+  // Retired scopes can't be materialized — drop any that sneak into picked
+  // (e.g. seeded from a grid cell click) once the scope list loads.
+  useEffect(() => {
+    const retired = new Set(
+      pickScopes.filter((s) => s.status === "retired").map((s) => s.scope),
+    );
+    if (retired.size)
+      setPicked((current) => {
+        const next = new Set([...current].filter((s) => !retired.has(s)));
+        return next.size === current.size ? current : next;
+      });
+  }, [pickScopes]);
 
   const filteredAssets = assets.filter((a) =>
     a.name.toLowerCase().includes(search.toLowerCase()),
@@ -172,7 +200,17 @@ export function MaterializeDialog() {
       }
     }
     setFormError(null);
-    const partitionSelection = partitions === "pick" ? [...picked] : partitions;
+    const retired = new Set(
+      pickScopes.filter((s) => s.status === "retired").map((s) => s.scope),
+    );
+    const partitionSelection =
+      partitions === "pick"
+        ? [...picked].filter((s) => !retired.has(s))
+        : partitions;
+    if (partitions === "pick" && !partitionSelection.length) {
+      setFormError("Pick at least one materializable scope.");
+      return;
+    }
     const run = await action.run(() =>
       request<Run>(`${base}/runs`, {
         body: {
@@ -297,8 +335,7 @@ export function MaterializeDialog() {
               </Label>
               {pickTarget && base ? (
                 <ScopePicker
-                  base={base}
-                  target={pickTarget}
+                  scopes={pickScopes}
                   selected={picked}
                   onToggle={togglePick}
                 />
