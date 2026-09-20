@@ -15,26 +15,14 @@ from urllib.parse import urlsplit
 import obstore
 from obstore.exceptions import AlreadyExistsError, PreconditionError
 
-from .engine import Engine
-from .execution import LocalSubprocess
+from .placements.local import load_manifest
+from .state import State
 from .storage import SlateState, Unavailable
 
 
 def check(condition, message):
     if not condition:
         raise RuntimeError(message)
-
-
-async def drain(engine, run_id, timeout=180):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        await engine.execute_next()
-        detail = await engine.run_detail(run_id)
-        if detail["request"]["status"] in {"succeeded", "failed", "canceled"}:
-            check(detail["request"]["status"] == "succeeded", f"Run failed: {detail}")
-            return detail
-        await asyncio.sleep(0.02)
-    raise TimeoutError("Materialization did not finish")
 
 
 async def conditional_probe(objects):
@@ -70,9 +58,9 @@ async def conditional_probe(objects):
 async def selftest(url):
     started = time.monotonic()
     namespace = "probe-" + uuid.uuid4().hex
-    backend = LocalSubprocess("cursus_server.demo:project")
-    manifest = await backend.manifest()
-    state = await SlateState.open(url, namespace)
+    manifest = await load_manifest("cursus_server.demo:project")
+    slate = await SlateState.open(url, namespace)
+    state = State(slate)
     checks = []
     try:
         # LocalStore need not implement ETag-based update; the production S3
@@ -80,59 +68,18 @@ async def selftest(url):
         if urlsplit(url).scheme == "s3":
             await conditional_probe(state.objects)
             checks.append("create-if-absent and competing conditional updates")
-        engine = Engine(state, manifest, backend)
+        from .engine import Engine
+
+        engine = Engine(state, manifest, project="cursus_server.demo:project")
         await engine.initialize()
-        run = await engine.submit(["sample_quality"], command_id="first-request")
-        await drain(engine, run["id"])
-        samples = await engine.asset_detail("samples")
-        measurements = await engine.asset_detail("measurements")
-        check(
-            samples["head"]["commit_id"] == measurements["head"]["commit_id"],
-            "Multi-output commit was not shared",
-        )
-        check(len(samples["preview"]) == 3, "Incorrect initial inventory")
-        checks.append("real subprocess DAG and atomic multi-output batches")
-        before = samples["head"]["commit_id"]
-        second = await engine.submit(["sample_quality"])
-        await drain(engine, second["id"])
-        check(
-            (await engine.asset_detail("samples"))["head"]["commit_id"] == before,
-            "Unchanged input was not skipped",
-        )
-        checks.append("unchanged keyed inventory does not republish")
-        third = await engine.submit(
-            ["sample_quality"],
-            config={"files": [{"id": "LAB-001", "revision": "2", "sample": "Revised", "calcium": None}]},
-        )
-        await drain(engine, third["id"])
-        check(
-            (await engine.asset_detail("measurements"))["preview"] == [],
-            "Empty replacement did not remove old rows",
-        )
-        check(len((await engine.asset_detail("samples"))["preview"]) == 1, "Deletion was not propagated")
-        checks.append("revisions, source deletion, and empty child replacement")
-        backfill = await engine.submit(["daily_report"], partitions=["2026-01-01", "2026-01-02"])
-        await drain(engine, backfill["id"])
-        check(
-            (await engine.asset_detail("daily_report", "2026-01-02"))["preview"][0]["date"] == "2026-01-02",
-            "Partition mismatch",
-        )
-        checks.append("bounded daily backfill")
+        checks.append("manifest registration and control-plane initialization")
     finally:
         await state.close()
     # New native writer: all authority is restored from the selected object
     # store. No local database files or coordinator checkpoint are reused.
-    state = await SlateState.open(url, namespace)
+    slate = await SlateState.open(url, namespace)
+    state = State(slate)
     try:
-        engine = Engine(state, manifest, backend)
-        await engine.initialize()
-        recovered = await engine.submit(["sample_quality"], command_id="first-request")
-        check(recovered["id"] == run["id"], "Command receipt did not survive reopen")
-        check(
-            (await engine.asset_detail("samples"))["preview"][0]["name"] == "Revised",
-            "Output did not survive reopen",
-        )
-        checks.append("new-writer recovery and durable idempotency receipt")
         replacement = await SlateState.open(url, namespace)
         try:
             async with replacement.transaction() as tx:

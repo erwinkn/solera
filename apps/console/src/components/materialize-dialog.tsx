@@ -1,5 +1,4 @@
-import { useMemo, useRef, useState } from "react";
-import { Play } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -20,227 +19,239 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { ErrorNotice } from "@/components/common";
 import { request, useAction } from "@/lib/api";
 import { useWorkspace } from "@/lib/workspace";
-import { ErrorNotice } from "./common";
-
-const modes = [
-  { value: "incremental", label: "Incremental — process changes" },
-  { value: "fill_missing", label: "Fill missing — retain complete scopes" },
-  { value: "recompute", label: "Recompute — rebuild selected scopes" },
-];
+import type { Run } from "@/lib/types";
 
 export function MaterializeDialog() {
-  const { state, materializeTargets, closeMaterialize, select, refresh } =
-    useWorkspace();
-  const open = materializeTargets !== null && !!state;
-  return (
-    <Dialog
-      open={open}
-      onOpenChange={(next) => {
-        if (!next) closeMaterialize();
-      }}
-    >
-      <DialogContent className="sm:max-w-lg" showCloseButton>
-        {open && (
-          <MaterializeForm
-            key={materializeTargets.join(",")}
-            initial={materializeTargets}
-            done={(runId) => {
-              closeMaterialize();
-              refresh();
-              select({ kind: "run", id: runId });
-            }}
-          />
-        )}
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-function MaterializeForm({
-  initial,
-  done,
-}: {
-  initial: string[];
-  done: (runId: string) => void;
-}) {
-  const { state, closeMaterialize } = useWorkspace();
-  const assets = state?.assets ?? [];
-  const [selected, setSelected] = useState<string[]>(initial);
+  const {
+    materializeTargets,
+    materializeScopes,
+    closeMaterialize,
+    assets,
+    base,
+    select,
+  } = useWorkspace();
+  const open = materializeTargets !== null;
+  const [targets, setTargets] = useState<string[]>([]);
+  const [partitions, setPartitions] = useState("latest");
+  const [scopeList, setScopeList] = useState("");
   const [mode, setMode] = useState("incremental");
-  const [from, setFrom] = useState("");
-  const [to, setTo] = useState("");
-  const [configText, setConfigText] = useState("{}");
-  const [formError, setFormError] = useState<string | null>(null);
+  const [upstream, setUpstream] = useState(false);
+  const [config, setConfig] = useState("{}");
+  const [keys, setKeys] = useState("");
+  const [configError, setConfigError] = useState<string | null>(null);
   const action = useAction();
-  // One idempotency key per distinct request body — a retry after a failed
-  // submit replays safely, while any edit mints a fresh key.
-  const idempotency = useRef<{ body: string; key: string } | null>(null);
-  const partitioned = useMemo(
-    () =>
-      selected.some(
-        (name) => assets.find((asset) => asset.name === name)?.partitions,
-      ),
-    [assets, selected],
-  );
 
-  function toggle(name: string, checked: boolean) {
-    setSelected((current) =>
-      checked ? [...current, name] : current.filter((value) => value !== name),
+  useEffect(() => {
+    if (open) {
+      setTargets(materializeTargets ?? []);
+      setPartitions(materializeScopes.length ? "explicit" : "latest");
+      setScopeList(materializeScopes.join(", "));
+      setMode("incremental");
+      setUpstream(false);
+      setConfig("{}");
+      setKeys("");
+      setConfigError(null);
+    }
+  }, [open, materializeTargets, materializeScopes]);
+
+  const bykeyEdges = useMemo(() => {
+    const edges = new Set<string>();
+    for (const name of targets)
+      for (const edge of Object.values(
+        assets.find((a) => a.name === name)?.inputs ?? {},
+      ))
+        if (edge.kind === "bykey") edges.add(edge.output);
+    return [...edges];
+  }, [targets, assets]);
+
+  function toggle(name: string, on: boolean) {
+    setTargets((current) =>
+      on ? [...current, name] : current.filter((t) => t !== name),
     );
   }
 
   async function submit() {
-    setFormError(null);
+    let parsedConfig: Record<string, unknown>;
     try {
-      if (!selected.length) throw new Error("Select at least one asset");
-      const partitions: string[] = [];
-      if (partitioned) {
-        if (!from || !to || from > to)
-          throw new Error("Choose a valid inclusive date range");
-        for (
-          let day = new Date(`${from}T00:00:00Z`),
-            last = new Date(`${to}T00:00:00Z`);
-          day <= last;
-          day.setUTCDate(day.getUTCDate() + 1)
-        ) {
-          partitions.push(day.toISOString().slice(0, 10));
-          if (partitions.length > 1000)
-            throw new Error("Maximum 1,000 partitions");
+      parsedConfig = JSON.parse(config || "{}");
+      if (typeof parsedConfig !== "object" || parsedConfig === null)
+        throw new Error("not an object");
+      setConfigError(null);
+    } catch {
+      setConfigError("Config must be a JSON object");
+      return;
+    }
+    let parsedKeys: Record<string, string | string[]> | undefined;
+    if (keys.trim()) {
+      parsedKeys = {};
+      for (const line of keys.split("\n")) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        const [edge, value] = trimmed.split("=", 2);
+        if (!edge || !value) {
+          setConfigError(
+            `Keys line must be EDGE=full or EDGE=k1,k2: ${trimmed}`,
+          );
+          return;
         }
+        parsedKeys[edge.trim()] =
+          value.trim() === "full"
+            ? "full"
+            : value
+                .split(",")
+                .map((k) => k.trim())
+                .filter(Boolean);
       }
-      const config: unknown = JSON.parse(configText);
-      if (!config || Array.isArray(config) || typeof config !== "object")
-        throw new Error("Configuration must be a JSON object");
-      const body = JSON.stringify({
-        targets: selected,
-        partitions,
-        mode,
-        config,
-      });
-      if (idempotency.current?.body !== body)
-        idempotency.current = { body, key: crypto.randomUUID() };
-      const run = await action.run(() =>
-        request<{ id: string }>("/runs", {
-          body: JSON.parse(body),
-          headers: { "Idempotency-Key": idempotency.current!.key },
-        }),
-      );
-      if (run) done(run.id);
-    } catch (failure) {
-      setFormError(
-        failure instanceof Error ? failure.message : String(failure),
-      );
+    }
+    const partitionSelection =
+      partitions === "explicit"
+        ? scopeList
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : partitions;
+    const run = await action.run(() =>
+      request<Run>(`${base}/runs`, {
+        body: {
+          targets,
+          partitions: partitionSelection,
+          mode,
+          upstream,
+          config: parsedConfig,
+          keys: parsedKeys ?? null,
+        },
+      }),
+    );
+    if (run) {
+      closeMaterialize();
+      if (run.id) select({ kind: "run", id: run.id });
     }
   }
 
   return (
-    <>
-      <DialogHeader>
-        <DialogTitle>Materialize assets</DialogTitle>
-        <DialogDescription>
-          Upstream dependencies are included automatically. Each producer
-          publishes its outputs together.
-        </DialogDescription>
-      </DialogHeader>
-      <div className="flex max-h-[60vh] flex-col gap-4 overflow-y-auto">
-        <fieldset>
-          <legend className="mb-2 text-sm font-medium">
-            Targets{" "}
-            <span className="text-muted-foreground">{selected.length}</span>
-          </legend>
-          <div className="grid max-h-44 grid-cols-1 gap-1 overflow-y-auto rounded-lg border p-2 sm:grid-cols-2">
-            {assets.map((asset) => (
-              <Label
-                key={asset.name}
-                className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 font-normal hover:bg-muted"
-              >
-                <Checkbox
-                  aria-label={asset.name}
-                  checked={selected.includes(asset.name)}
-                  onCheckedChange={(checked) =>
-                    toggle(asset.name, checked === true)
-                  }
-                />
-                <span className="min-w-0 flex-1 truncate font-mono text-xs">
-                  {asset.name}
-                </span>
-                <span className="text-xs text-muted-foreground">
-                  {asset.group}
-                </span>
-              </Label>
-            ))}
-          </div>
-        </fieldset>
-        <div className="grid gap-1.5">
-          <Label>Mode</Label>
-          <Select
-            value={mode}
-            onValueChange={(value) => setMode(value as string)}
-          >
-            <SelectTrigger className="w-full" aria-label="Mode">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {modes.map((option) => (
-                <SelectItem key={option.value} value={option.value}>
-                  {option.label}
-                </SelectItem>
+    <Dialog open={open} onOpenChange={(o) => !o && closeMaterialize()}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>Materialize assets</DialogTitle>
+          <DialogDescription>
+            One task per asset and partition scope; upstream work is planned
+            when requested.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="flex max-h-[60dvh] flex-col gap-4 overflow-y-auto py-2">
+          {action.error && <ErrorNotice message={action.error} />}
+          {configError && <ErrorNotice message={configError} />}
+          <div className="flex flex-col gap-2">
+            <Label>Targets</Label>
+            <div className="grid max-h-40 grid-cols-1 gap-1 overflow-y-auto rounded-lg border p-2 sm:grid-cols-2">
+              {assets.map((asset) => (
+                <label
+                  key={asset.name}
+                  className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1 text-sm hover:bg-muted"
+                >
+                  <Checkbox
+                    aria-label={asset.name}
+                    checked={targets.includes(asset.name)}
+                    onCheckedChange={(v) => toggle(asset.name, v === true)}
+                  />
+                  <span className="truncate font-mono text-xs">
+                    {asset.name}
+                  </span>
+                </label>
               ))}
-            </SelectContent>
-          </Select>
-        </div>
-        {partitioned && (
-          <div className="grid gap-1.5">
-            <div className="grid grid-cols-2 gap-3">
-              <div className="grid gap-1.5">
-                <Label htmlFor="from-date">From</Label>
-                <Input
-                  id="from-date"
-                  type="date"
-                  value={from}
-                  onChange={(event) => setFrom(event.target.value)}
-                />
-              </div>
-              <div className="grid gap-1.5">
-                <Label htmlFor="to-date">Through</Label>
-                <Input
-                  id="to-date"
-                  type="date"
-                  value={to}
-                  onChange={(event) => setTo(event.target.value)}
-                />
-              </div>
             </div>
-            <p className="text-xs text-muted-foreground">
-              Inclusive daily partitions. Maximum 1,000.
-            </p>
           </div>
-        )}
-        <div className="grid gap-1.5">
-          <Label htmlFor="run-config">Request configuration (JSON)</Label>
-          <Textarea
-            id="run-config"
-            rows={3}
-            className="font-mono text-xs"
-            value={configText}
-            onChange={(event) => setConfigText(event.target.value)}
-          />
+          <div className="grid grid-cols-2 gap-3">
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="md-partitions">Partitions</Label>
+              <Select
+                value={partitions}
+                onValueChange={(v) => setPartitions(v ?? "latest")}
+              >
+                <SelectTrigger id="md-partitions">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="latest">latest</SelectItem>
+                  <SelectItem value="missing">missing</SelectItem>
+                  <SelectItem value="all">all</SelectItem>
+                  <SelectItem value="explicit">pick scopes…</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="md-mode">Mode</Label>
+              <Select
+                value={mode}
+                onValueChange={(v) => setMode(v ?? "incremental")}
+              >
+                <SelectTrigger id="md-mode">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="incremental">incremental</SelectItem>
+                  <SelectItem value="recompute">recompute</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+          {partitions === "explicit" && (
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="md-scopes">Scopes (comma-separated)</Label>
+              <Input
+                id="md-scopes"
+                placeholder="alpha, bravo"
+                value={scopeList}
+                onChange={(e) => setScopeList(e.target.value)}
+              />
+            </div>
+          )}
+          <label className="flex items-center gap-2 text-sm">
+            <Checkbox
+              aria-label="Include upstream"
+              checked={upstream}
+              onCheckedChange={(v) => setUpstream(v === true)}
+            />
+            Materialize upstream first
+          </label>
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor="md-config">Run config (JSON)</Label>
+            <Textarea
+              id="md-config"
+              rows={2}
+              className="font-mono text-xs"
+              value={config}
+              onChange={(e) => setConfig(e.target.value)}
+            />
+          </div>
+          {!!bykeyEdges.length && (
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="md-keys">
+                ByKey overrides — one per line: EDGE=full or EDGE=k1,k2
+              </Label>
+              <Textarea
+                id="md-keys"
+                rows={2}
+                className="font-mono text-xs"
+                placeholder={bykeyEdges.map((e) => `${e}=full`).join("\n")}
+                value={keys}
+                onChange={(e) => setKeys(e.target.value)}
+              />
+            </div>
+          )}
         </div>
-        {(formError || action.error) && (
-          <ErrorNotice message={formError ?? action.error!} />
-        )}
-      </div>
-      <DialogFooter showCloseButton={false}>
-        <Button variant="outline" onClick={closeMaterialize}>
-          Cancel
-        </Button>
-        <Button onClick={submit} disabled={action.pending}>
-          <Play />
-          {action.pending ? "Submitting…" : "Start materialization"}
-        </Button>
-      </DialogFooter>
-    </>
+        <DialogFooter>
+          <Button variant="outline" onClick={closeMaterialize}>
+            Cancel
+          </Button>
+          <Button onClick={submit} disabled={action.pending || !targets.length}>
+            {action.pending ? "Starting…" : "Start materialization"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }

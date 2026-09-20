@@ -1,4 +1,12 @@
 import { createFileRoute } from "@tanstack/react-router";
+import { Database, FolderTree } from "lucide-react";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
 import { useWorkspace } from "@/lib/workspace";
 
 export const Route = createFileRoute("/storage")({
@@ -6,53 +14,69 @@ export const Route = createFileRoute("/storage")({
 });
 
 function StoragePage() {
-  const { state } = useWorkspace();
-  if (!state) return null;
-  const entries: [string, string][] = [
-    ["State engine", `${state.storage.engine} 0.16`],
-    [
-      "Object store",
-      state.storage.scheme === "file"
-        ? "Local filesystem"
-        : state.storage.scheme.toUpperCase(),
-    ],
-    ["Namespace", state.storage.namespace],
-    ["Last local acknowledgement", String(state.storage.sequence)],
-    ["Publication", "Object-store durability awaited before acknowledgement"],
-    ["Coordinator", "One active writer; replacement fences the old writer"],
-    ["Definition", state.revision.slice(0, 16)],
-  ];
+  const { diagnostics } = useWorkspace();
+  if (!diagnostics) return null;
   return (
     <section className="flex flex-col gap-4">
       <div>
         <div className="text-[0.65rem] font-medium tracking-wider text-muted-foreground uppercase">
-          Workspace
+          State
         </div>
         <h1 className="font-heading text-xl font-medium">Storage</h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          Object storage is the source of truth. Local caches are disposable.
+          Durable state and object storage backing this deployment.
         </p>
       </div>
-      <dl className="grid gap-x-6 gap-y-3 rounded-xl border bg-card p-4 sm:grid-cols-2">
-        {entries.map(([key, value]) => (
-          <div key={key}>
-            <dt className="text-xs text-muted-foreground">{key}</dt>
-            <dd className="mt-0.5 text-sm">{value}</dd>
-          </div>
-        ))}
-      </dl>
-      <p className="rounded-lg bg-muted/50 px-3 py-2 text-xs text-muted-foreground">
-        Experimental backend. SlateDB owns the log, compaction, recovery, and
-        writer fencing. Data files are immutable; output references,
-        checkpoints, task completion, and change notifications commit together.
-      </p>
-      <h2 className="mt-2 text-sm font-medium">Current boundaries</h2>
-      <p className="text-sm text-muted-foreground">
-        JSON snapshots and local subprocess execution. No cross-destination
-        transactions, historical code bundles, or artifact garbage collection.
-        External side effects may repeat after a crash. The filesystem mode is a
-        development backend, not a multi-host object store.
-      </p>
+      <div className="grid gap-4 md:grid-cols-2">
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 font-mono text-sm">
+              <Database className="size-4" />
+              Durable state
+            </CardTitle>
+            <CardDescription>Heads, cursors, tasks, leases</CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-2 text-sm">
+            <div className="flex justify-between gap-4">
+              <span className="text-muted-foreground">Backend</span>
+              <span className="font-mono text-xs">{diagnostics.backend}</span>
+            </div>
+            <div className="flex justify-between gap-4">
+              <span className="text-muted-foreground">URL</span>
+              <span className="truncate font-mono text-xs">
+                {diagnostics.state}
+              </span>
+            </div>
+            <div className="flex justify-between gap-4">
+              <span className="text-muted-foreground">Postgres store</span>
+              <span className="font-mono text-xs">
+                {diagnostics.postgres ? "available" : "not configured"}
+              </span>
+            </div>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 font-mono text-sm">
+              <FolderTree className="size-4" />
+              Objects
+            </CardTitle>
+            <CardDescription>Attempt specs, results, and logs</CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-2 text-sm">
+            <div className="flex justify-between gap-4">
+              <span className="text-muted-foreground">URL</span>
+              <span className="truncate font-mono text-xs">
+                {diagnostics.objects}
+              </span>
+            </div>
+            <div className="flex justify-between gap-4">
+              <span className="text-muted-foreground">Project</span>
+              <span className="font-mono text-xs">{diagnostics.project}</span>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
     </section>
   );
 }

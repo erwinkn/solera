@@ -393,12 +393,12 @@ the CLI command or console page used to verify it.
 ## Phase 8 — Integrate on `main`, migrations, `OnDeploy`, per-scope outcomes
 
 Context. PR #3 (branch
-`bb/implement-dorc-architecture-plan-docs-implementa-thr_9uw5mdrpwk`,
+`bb/implement-cursus-architecture-plan-docs-implementa-thr_9uw5mdrpwk`,
 seven phase commits, all gates green) implements Phases 1–7 under the old
-`dorc` naming and targets `feat/s3-state-backend`. Meanwhile `main` renamed
-the project to **cursus** (`dda6b06`: `data_orchestrator` → `cursus`,
-`dorc` → `cursus_server`, `dorc_worker` → `cursus_worker`, `dorc` CLI →
-`cursus`, `DORC_*` → `CURSUS_*`, `.dorc` → `.cursus`, `@cursus/ui`) and
+`cursus` naming and targets `feat/s3-state-backend`. Meanwhile `main` renamed
+the project to **cursus** (`dda6b06`: `cursus` → `cursus`,
+`cursus` → `cursus_server`, `cursus_worker` → `cursus_worker`, `cursus` CLI →
+`cursus`, `CURSUS_*` → `CURSUS_*`, `.cursus` → `.cursus`, `@cursus/ui`) and
 collapsed the three distributions into one root `cursus` package
 (`8c4d062`). `main` does **not** contain the implementation.
 
@@ -406,7 +406,7 @@ collapsed the three distributions into one root `cursus` package
 
 - Rebase or merge the seven phase commits onto `main`, applying the rename
   to every new file: package paths, imports, CLI name, env vars, compose
-  service, README, Playwright config, test fixtures, the `dorc_postgres`
+  service, README, Playwright config, test fixtures, the `cursus_postgres`
   package (→ `cursus_postgres`, which `example/brimstone.py` already
   imports), the console session key and API client. Keep the single-root
   distribution from `8c4d062`: no per-component `pyproject.toml`.
@@ -414,7 +414,7 @@ collapsed the three distributions into one root `cursus` package
 - Gate 8a: the full Phase 7 gate on `main` naming: ruff, `pytest`
   (file:// and `postgres`-marked against compose), `tests/test_demo_e2e.py`,
   `cursus manifest --project example/brimstone.py`, console typecheck,
-  format check and Playwright; `grep -rIl "dorc\|data_orchestrator\|DORC_"`
+  format check and Playwright; `grep -rIl "cursus\|cursus\|CURSUS_"`
   over the tree returns nothing outside git history.
 
 ### 8b. Migrations on outputs (§2, §3, §4, §6, §11)

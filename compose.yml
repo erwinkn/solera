@@ -1,10 +1,23 @@
 services:
+  postgres:
+    image: postgres:17
+    ports: ['127.0.0.1:5432:5432']
+    environment:
+      POSTGRES_USER: cursus
+      POSTGRES_PASSWORD: cursus
+      POSTGRES_DB: cursus
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U cursus']
+      interval: 3s
+      timeout: 3s
+      retries: 20
   cursus:
     build: .
     ports: ['127.0.0.1:8000:8000']
     environment:
       CURSUS_STATE_URL: file:///home/app/state
       CURSUS_API_TOKEN: ${CURSUS_API_TOKEN:?Set a local API token before starting Compose}
+      DATABASE_URL: postgresql://cursus:cursus@postgres:5432/cursus
     volumes:
       - objects:/home/app/state
     healthcheck:

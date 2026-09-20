@@ -13,7 +13,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { assetStatus, updateModel } from "@/components/asset-sheet";
+import { assetStatus, upstreamNames } from "@/components/asset-sheet";
 import { Empty, StatusBadge } from "@/components/common";
 import { time } from "@/lib/format";
 import { useWorkspace } from "@/lib/workspace";
@@ -24,18 +24,36 @@ export const Route = createFileRoute("/assets")({
   component: AssetsPage,
 });
 
+function placementLabel(asset: CatalogAsset) {
+  const p = asset.placement;
+  const options = Object.entries(p.placement)
+    .map(([k, v]) => `${k}=${v}`)
+    .join(" ");
+  return p.kind + (options ? ` · ${options}` : "");
+}
+
+function ownerMap(assets: CatalogAsset[]) {
+  const owners = new Map<string, string>();
+  for (const asset of assets)
+    for (const output of asset.outputs) owners.set(output.name, asset.name);
+  return (output: string) => owners.get(output) ?? null;
+}
+
 function Graph({ assets }: { assets: CatalogAsset[] }) {
   const { select } = useWorkspace();
   const byName = new Map(assets.map((asset) => [asset.name, asset]));
+  const ownerOf = ownerMap(assets);
+  const upstream = new Map(
+    assets.map((asset) => [asset.name, upstreamNames(asset, ownerOf)]),
+  );
   const levels = new Map<string, number>();
   function depth(name: string): number {
     if (levels.has(name)) return levels.get(name)!;
     const value = Math.max(
       0,
-      ...(byName
-        .get(name)
-        ?.inputs.filter((input) => byName.has(input))
-        .map((input) => depth(input) + 1) || []),
+      ...(upstream.get(name) ?? [])
+        .filter((input) => byName.has(input))
+        .map((input) => depth(input) + 1),
     );
     levels.set(name, value);
     return value;
@@ -92,7 +110,7 @@ function Graph({ assets }: { assets: CatalogAsset[] }) {
             </marker>
           </defs>
           {assets.flatMap((asset) =>
-            asset.inputs
+            (upstream.get(asset.name) ?? [])
               .filter((input) => positions.has(input))
               .map((input) => {
                 const from = positions.get(input)!;
@@ -133,7 +151,7 @@ function Graph({ assets }: { assets: CatalogAsset[] }) {
               </strong>
             </span>
             <span className="flex items-center justify-between text-xs text-muted-foreground">
-              <span>{updateModel(asset)}</span>
+              <span>{placementLabel(asset)}</span>
               <span
                 className={cn(
                   "size-2 rounded-full",
@@ -149,13 +167,13 @@ function Graph({ assets }: { assets: CatalogAsset[] }) {
 }
 
 function AssetsPage() {
-  const { state, select, openMaterialize, checked, setChecked } =
+  const { assets, select, openMaterialize, checked, setChecked, diagnostics } =
     useWorkspace();
   const [search, setSearch] = useState("");
   const [view, setView] = useState("table");
   const input = useRef<HTMLInputElement>(null);
-  const assets = (state?.assets ?? []).filter((asset) =>
-    `${asset.name} ${asset.description}`
+  const filtered = assets.filter((asset) =>
+    `${asset.name} ${asset.doc ?? ""}`
       .toLowerCase()
       .includes(search.toLowerCase()),
   );
@@ -175,11 +193,24 @@ function AssetsPage() {
     window.addEventListener("keydown", shortcut);
     return () => window.removeEventListener("keydown", shortcut);
   }, []);
-  if (!state) return null;
+  if (!diagnostics) return null;
   function toggle(name: string, on: boolean) {
     setChecked((current) =>
       on ? [...current, name] : current.filter((v) => v !== name),
     );
+  }
+  const ownerOf = ownerMap(assets);
+  function headCount(asset: CatalogAsset) {
+    return Object.values(asset.heads).reduce(
+      (n, scopes) => n + Object.keys(scopes).length,
+      0,
+    );
+  }
+  function updatedAt(asset: CatalogAsset) {
+    const times = Object.values(asset.heads).flatMap((scopes) =>
+      Object.values(scopes).map((head) => head.at),
+    );
+    return times.length ? Math.max(...times) : null;
   }
   return (
     <section className="flex flex-col gap-4">
@@ -218,13 +249,12 @@ function AssetsPage() {
           </TabsList>
         </Tabs>
         <span className="text-xs text-muted-foreground">
-          {assets.length} assets ·{" "}
-          {new Set(assets.map((asset) => asset.group)).size} groups
+          {filtered.length} assets
         </span>
       </div>
       {view === "graph" ? (
-        <Graph assets={assets} />
-      ) : !assets.length ? (
+        <Graph assets={filtered} />
+      ) : !filtered.length ? (
         <Empty title="No matching assets">
           Adjust the filter to see assets in this workspace.
         </Empty>
@@ -237,8 +267,8 @@ function AssetsPage() {
                   <Checkbox
                     aria-label="Select all listed assets"
                     checked={
-                      !!assets.length &&
-                      assets.every((asset) => checked.includes(asset.name))
+                      !!filtered.length &&
+                      filtered.every((asset) => checked.includes(asset.name))
                     }
                     onCheckedChange={(value) =>
                       setChecked(
@@ -246,12 +276,12 @@ function AssetsPage() {
                           ? Array.from(
                               new Set([
                                 ...checked,
-                                ...assets.map((asset) => asset.name),
+                                ...filtered.map((asset) => asset.name),
                               ]),
                             )
                           : checked.filter(
                               (name) =>
-                                !assets.some((asset) => asset.name === name),
+                                !filtered.some((asset) => asset.name === name),
                             ),
                       )
                     }
@@ -259,13 +289,14 @@ function AssetsPage() {
                 </TableHead>
                 <TableHead>Asset</TableHead>
                 <TableHead>Status</TableHead>
-                <TableHead>Update model</TableHead>
+                <TableHead>Partitions</TableHead>
+                <TableHead>Placement</TableHead>
                 <TableHead>Published</TableHead>
                 <TableHead className="w-10" />
               </TableRow>
             </TableHeader>
             <TableBody>
-              {assets.map((asset) => (
+              {filtered.map((asset) => (
                 <TableRow key={asset.name}>
                   <TableCell>
                     <Checkbox
@@ -290,9 +321,9 @@ function AssetsPage() {
                           {asset.name}
                         </span>
                         <span className="block text-xs text-muted-foreground">
-                          {asset.inputs.length
-                            ? `${asset.inputs.length} upstream asset${asset.inputs.length > 1 ? "s" : ""}`
-                            : "Source asset"}
+                          {upstreamNames(asset, ownerOf).length
+                            ? `${upstreamNames(asset, ownerOf).length} upstream`
+                            : "No inputs"}
                         </span>
                       </span>
                     </button>
@@ -301,11 +332,16 @@ function AssetsPage() {
                     <StatusBadge status={assetStatus(asset)} />
                   </TableCell>
                   <TableCell className="text-muted-foreground">
-                    {updateModel(asset)}
+                    {asset.partitions
+                      ? Object.keys(asset.partitions.dims).join(" × ")
+                      : "—"}
+                  </TableCell>
+                  <TableCell className="font-mono text-xs text-muted-foreground">
+                    {placementLabel(asset)}
                   </TableCell>
                   <TableCell className="text-muted-foreground">
-                    {asset.heads.length
-                      ? `${asset.heads.length} scope${asset.heads.length > 1 ? "s" : ""} · ${time(Math.max(...asset.heads.map((h) => h.updated_at)))}`
+                    {headCount(asset)
+                      ? `${headCount(asset)} scope${headCount(asset) > 1 ? "s" : ""} · ${time(updatedAt(asset))}`
                       : "—"}
                   </TableCell>
                   <TableCell>
@@ -327,10 +363,10 @@ function AssetsPage() {
       )}
       <div className="flex items-center justify-between text-xs text-muted-foreground">
         <span>
-          {assets.length} of {state.assets.length} assets
+          {filtered.length} of {assets.length} assets
         </span>
         <span>
-          Definition <code>{state.revision.slice(0, 10)}</code>
+          Definition <code>{diagnostics.revision.slice(0, 10)}</code>
         </span>
       </div>
     </section>

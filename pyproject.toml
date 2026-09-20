@@ -18,6 +18,12 @@ dependencies = [
     "uvicorn>=0.34,<1",
 ]
 
+[project.optional-dependencies]
+postgres = [
+    "pandas>=2.2,<3",
+    "psycopg[binary]>=3.2,<4",
+]
+
 [project.scripts]
 cursus = "cursus_server.cli:main"
 
@@ -33,6 +39,7 @@ package = true
 [tool.hatch.build.targets.wheel]
 packages = [
     "packages/sdk/src/cursus",
+    "packages/sdk/src/cursus_postgres",
     "apps/server/src/cursus_server",
     "apps/worker/src/cursus_worker",
 ]
@@ -40,18 +47,23 @@ packages = [
 [tool.hatch.build.targets.sdist]
 include = [
     "packages/sdk/src/cursus",
+    "packages/sdk/src/cursus_postgres",
     "apps/server/src/cursus_server",
     "apps/worker/src/cursus_worker",
     "README.md",
 ]
 
 [dependency-groups]
-dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "httpx>=0.28,<1", "ruff>=0.12,<1", "moto[server,s3]>=5,<6", "boto3>=1.36,<2"]
+dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "httpx>=0.28,<1", "ruff>=0.12,<1", "moto[server,s3]>=5,<6", "boto3>=1.36,<2", "pandas>=2.2,<3", "psycopg[binary]>=3.2,<4"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-markers = ["s3: requires an S3-compatible HTTP endpoint", "live: requires an explicitly supplied isolated test bucket"]
+markers = [
+    "s3: requires an S3-compatible HTTP endpoint",
+    "live: requires an explicitly supplied isolated test bucket",
+    "postgres: requires CURSUS_TEST_DATABASE_URL (docker compose up postgres)",
+]
 
 [tool.ruff]
 line-length = 110

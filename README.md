@@ -1,52 +1,220 @@
-# Cursus — object-backed experiment
+# cursus — asset-first data orchestration
 
-An asset-first Python engine and browser console whose only required durable storage is an object store. **Experimental alpha, not production-ready.** This branch uses SlateDB 0.16 for transactional metadata and `obstore` 0.11 for immutable JSON outputs. No PostgreSQL, Redis, or local metadata database is required.
+A Python data orchestrator: assets declare outputs, partitions, inputs, and
+placement; a durable control plane plans and executes runs; every committed
+output is an immutable ref. The control plane keeps all state in SlateDB on
+object storage (files, S3, or compatible services) — **no external service is
+required for local operation**. Relational outputs can optionally live in
+shared Postgres tables when `DATABASE_URL` is set.
 
-This is a standalone implementation on `feat/s3-state-backend`. The earlier `feat/asset-engine-ui` branch contained only CI scaffolding when this experiment resumed; there is no PostgreSQL migration or drop-in backend switch in this branch. `main` is not changed.
+**Experimental alpha — not production-ready.**
 
-## Local development
+## Layout
 
-Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/). On supported platforms, SlateDB's Python wheel includes the native engine.
+- `packages/sdk` — `cursus`, the asset SDK project files import
+  (`@asset`, `Output`, `Patch`, `Sql`, `PartitionSet`, `ByKey`,
+  `AllPartitions`, `TimePartitions`, triggers, placements). `cursus_postgres`
+  ships `PostgresStore`.
+- `apps/server` — `cursus_server`: the control plane (state layer, engine,
+  FastAPI, CLI) and the built console under `cursus_server/web`.
+- `apps/worker` — `cursus_worker`: the task harness that executes attempts in
+  subprocesses and pool workers.
+- `apps/console` — the pnpm/Vite/TanStack console source. The built bundle is
+  committed, so running the server needs no Node.
+- `apps/server/src/cursus_server/demo.py` — the self-contained demo project
+  (`uv run cursus serve --insecure` loads it by default).
+- `example/brimstone.py` — a second reference project.
 
-The repo is a monorepo of source trees that ship as **one** PyPI distribution, `cursus`: `packages/sdk` holds the `cursus` asset SDK that project files import; `apps/server` holds the `cursus_server` control plane (API, engine, storage, `cursus` CLI); `apps/worker` holds `cursus_worker`, the task-execution package the server spawns locally and the base for remote workers; `apps/console` is the pnpm/Vite web app whose committed bundle is embedded in the wheel. The root `pyproject.toml` bundles all three trees, so `uv sync` installs a single editable `cursus` package and `uv build` produces one wheel.
+## Quick start
+
+Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync --locked
 uv run cursus serve --insecure
-# http://127.0.0.1:8000
+# console + API at http://127.0.0.1:8000
 ```
 
-The default `file:///.../.cursus` store uses the same object-store interfaces as S3, backed by ordinary files. No emulator is needed for day-to-day development. This is persistent local **object storage**, not a remote backup of a local database. Do not delete it expecting recovery from elsewhere.
+State lands in `./.cursus` — a `file://` object store using the same client
+interfaces as S3. `--insecure` disables token auth and is restricted to
+loopback; set `CURSUS_API_TOKEN` for anything else.
 
-Select `sample_quality` in the Materialize dialog. This executes:
+## The demo project
 
-```text
-source_files -> samples + measurements -> sample_summary -> sample_quality
+The default project is designed to make every architecture feature visible:
 
-daily_observations -> daily_report  (daily partitions)
-```
+| asset | shows |
+| --- | --- |
+| `sites` | a `PartitionSet` on a `Cron` — the site list grows one site per run (cursor-driven) and caps at four |
+| `uploads` | an external `PartitionSet` source fed by `cursus commit` |
+| `site_feed` | per-site cursor asset on `Every(10)`: `site_events` (append) + `site_files` (keyed inventory), `Patch` both ways |
+| `file_index` | `ByKey(batch_size=2)` consumer — watch `more` continuation; declared `version="2"` |
+| `site_digest` | `site × day` two-dimensional asset (`TimePartitions`), `deps=` on the `roadmap` source, `BlobStore` output |
+| `fleet_index` | `AllPartitions` fan-in: `dict[str, list[dict]]` on JsonStore, `dict[str, TableRef]` on Postgres |
+| `site_status` | `Sql` asset over a `TableRef` (Postgres); on JsonStore it logs that it skipped |
+| `fleet_status` | Postgres-only `AllPartitions` consumer over `TableRef`s — the SELECT runs in-database |
+| `manual_ingest` | the one non-`Local` asset: `Pool("ingest")`, on an `Every(30)` schedule with `partitions="missing"` |
+| `weekly_digest` | a `@job` on a weekly `Cron` — inputs and placement, no outputs |
+| `refresh-index` | a standalone `Automation` targeting `site_feed` + `file_index` |
 
-The console provides an asset catalog, dependency overview, data previews, committed output references, checkpoints, runs, attempts/logs, backfill requests, pause/resume/cancel/repair controls, interval/cron/changed-output automations, and backend diagnostics. It is a Vite/TanStack single-page app served from the Python package; the built bundle is committed, so no Node runtime is needed to run it — only to rebuild (`pnpm -C apps/console build`) or test.
+The feed fake emits a new batch per site every few seconds, and repeated polls
+inside the same tick return identical content — an unchanged commit wakes
+nothing downstream. Run config `feed_tick_seconds` stretches the tick:
+`--config '{"feed_tick_seconds": 300}'`.
+
+## Walkthrough
+
+Everything below works against the running server. Set
+`CURSUS_SERVER_URL=http://127.0.0.1:8000` so the CLI talks to it; unset, the
+same commands drive an in-process engine against `CURSUS_STATE_URL`.
 
 ```bash
-uv run cursus run sample_quality
-uv run cursus run daily_report --partition 2026-01-01 --partition 2026-01-02
-uv run cursus manifest --project cursus_server.demo:project
-uv run cursus selftest --state-url file:///tmp/cursus-test-objects
+export CURSUS_SERVER_URL=http://127.0.0.1:8000
 ```
 
-`--project` accepts `module:attribute` or a file path, Dagster-style — [`example/lab.py`](example/lab.py) is a self-contained weather-station pipeline you can run directly:
+### 1. The growing partition set
 
 ```bash
-uv run cursus serve --insecure --project example/lab.py
-uv run cursus run climate_report --project example/lab.py
+uv run cursus run sites        # run it a few times — one site appears per run
 ```
 
-**One coordinator per namespace.** Running `cursus run` while `cursus serve` uses the same namespace replaces/fences that server's writer. Use the UI/API to submit work to a running server, or give the CLI a different namespace.
+Console: **Assets → sites** shows the partition-set head; the keys endpoint
+(`GET /api/projects/demo/outputs/sites/keys`) grows `alpha → delta`.
+The `sites.cron.0` automation keeps it fresh on its own once the server is up.
+
+### 2. Commit external partition keys
+
+```bash
+uv run cursus commit uploads --upsert '["u-1", "u-2"]'
+```
+
+**Sources** in the console lists `uploads` with its committed keys. These keys
+are work for `manual_ingest` (below) — the `Every(30)` schedule with
+`partitions="missing"` plans every key that lacks a complete head, so just
+committing is enough once a pool worker is running.
+
+### 3. The per-site cursor asset
+
+```bash
+uv run cursus run site_feed --partitions all --upstream
+```
+
+Each site scope writes a `site_events` append batch and a `site_files` keyed
+patch, and stores the feed token as its cursor. **Runs** shows the run; click a
+task to see its attempt spec — `inputs.site_files` carries the pinned ref and
+per-key revisions.
+
+Run it again inside the same feed tick: the feed returns identical events,
+the committed versions are unchanged, and `file_index` is not woken — that is
+the "no change wakes nothing" corollary. To see a changed pass, wait one tick
+(or shrink it) and let `site_feed.every.0` fire, or `run-now` it.
+
+### 4. ByKey with `more` continuation
+
+```bash
+uv run cursus run file_index --partitions all --upstream
+```
+
+`site_files` holds four files per site; `ByKey(batch_size=2)` delivers them in
+two batches — the run detail shows the first attempt completing with
+`more: true` and a follow-up attempt finishing the remaining keys.
+
+`file_index` declares `version="2"`. To demonstrate a version bump, edit it to
+`"3"` in `apps/server/src/cursus_server/demo.py` and re-run — the interpretation
+fingerprint changes and every key reprocesses. To process selected keys only:
+`uv run cursus run file_index --keys 'site_files=alpha-file-0,alpha-file-1'`.
+
+### 5. Two dimensions: site × day
+
+```bash
+uv run cursus run site_digest --partitions all --upstream
+```
+
+`site_digest` is partitioned by `site` and a daily `TimePartitions` dim, so
+its scopes look like `day=2026-09-01,site=alpha` (explicit multi-dim keys use
+that canonical comma form with `--partition`). Its `deps=["roadmap"]` pins the
+plain source in lineage without loading it. The output is bytes in the
+`BlobStore` — check the head's ref on the asset page.
+
+### 6. AllPartitions fan-in
+
+```bash
+uv run cursus run fleet_index --upstream
+```
+
+`fleet_index` receives `file_index` as `dict[str, ...]` keyed by site —
+committed heads at pin time, never a barrier on missing keys. With JsonStore
+the values are `list[dict]`; with Postgres they are `TableRef`s.
+
+### 7. SQL inside Postgres
+
+With `DATABASE_URL` set (next section), `site_status` materializes
+`SELECT status, count(*) ... GROUP BY status` into `ops.site_status` and
+`fleet_status` unions a per-site count across `site_events` slices — neither
+row set enters the harness. Without Postgres, `site_status` still runs and
+logs `DATABASE_URL unset — site_status skipped (needs Postgres)` — visible in
+the attempt log.
+
+### 8. The job and the standalone automation
+
+```bash
+uv run cursus automations                        # list all nine
+uv run cursus automations run-now refresh-index  # fires site_feed + file_index
+uv run cursus run weekly_digest                  # sends the fake mail
+```
+
+**Automations** in the console shows trigger, last fire, and an enable/disable
+toggle per automation; `weekly_digest.cron.0` runs Mondays at 07:00.
+
+### 9. The pool worker
+
+`manual_ingest` is placed on `Pool("ingest")` — submitted work waits queued
+until an external worker claims it. In a second terminal:
+
+```bash
+export CURSUS_SERVER_URL=http://127.0.0.1:8000
+export CURSUS_PROJECT=cursus_server.demo:project   # the entrypoint the worker executes
+uv run cursus worker pool ingest
+```
+
+Commit a couple of uploads (step 2), then `uv run cursus run manual_ingest
+--partitions all`. Watch the worker log `[pool] claimed …` / `[pool] completed
+…`, and the **Executors** page shows the registered worker and its claimed
+task. Pool tasks carry `cpu`/`memory`/`gpu` needs and are only offered to
+workers whose capacity fits.
+
+## Postgres
+
+The demo runs entirely on JsonStore by default. To move the relational
+outputs (`site_events`, `site_files`, `file_index`, `site_status`,
+`fleet_status`) into shared Postgres tables:
+
+```bash
+docker compose up postgres
+export DATABASE_URL=postgresql://cursus:cursus@127.0.0.1:5432/cursus
+uv run cursus serve --insecure
+```
+
+Partitioned outputs share one physical table per output, sliced by their
+`partition_column`; append outputs get a `_batch`/`_seq` snapshot pair so a
+pinned `TableRef` keeps reading the version it was committed at. Writes are
+fenced by a per-partition version marker — a stale attempt's rows can never
+become visible. `Sql` assets materialize straight into `{schema}.{table}`.
+
+The Compose file also has a full `cursus` service:
+
+```bash
+CURSUS_API_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')" \
+  docker compose up --build
+```
+
+It wires `DATABASE_URL` to the compose Postgres and keeps object state on a
+named volume — swap `CURSUS_STATE_URL` for `s3://…` in `compose.yml` to run the
+same stack on S3.
 
 ## S3 and compatible services
 
-Provision a private bucket, then configure both native clients using environment variables:
+Point the control plane at a private bucket:
 
 ```bash
 export CURSUS_STATE_URL=s3://your-private-bucket/orchestrator
@@ -59,103 +227,93 @@ export CURSUS_API_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsaf
 uv run cursus serve
 ```
 
-For a custom S3 endpoint:
-
-```bash
-export AWS_ENDPOINT=https://your-s3-endpoint
-export AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false
-# Only for an HTTP emulator, never an unencrypted production connection:
-# export AWS_ALLOW_HTTP=true
-```
-
-`AWS_ENDPOINT` is the Rust object-store client's setting, not just boto3's `AWS_ENDPOINT_URL`. The server never accepts credentials in a storage URL. Workers have these environment variables stripped, but they are trusted code with the same host identity: **subprocesses are not security sandboxes**.
-
-Use HTTPS in front of any remote listener and set a strong `CURSUS_API_TOKEN`. `--insecure` is restricted to loopback in the CLI. The UI keeps the token in tab-scoped session storage. This is shared trusted-team authentication, not RBAC or tenancy isolation.
-
-### Backend conformance
-
-Before using a new S3-compatible service:
+For a custom S3 endpoint, `AWS_ENDPOINT` (the Rust object-store client's
+setting) plus `AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false`; `AWS_ALLOW_HTTP=true`
+only for a local HTTP emulator. Before trusting a new S3-compatible service,
+run the conformance probe, which writes into a fresh isolated namespace:
 
 ```bash
 uv run cursus selftest --state-url "$CURSUS_STATE_URL"
 ```
 
-This explicitly writes synthetic data into a fresh `probe-UUID` namespace. It checks create-if-absent and racing conditional updates on S3, a real subprocess pipeline, multi-output commits, unchanged-input skips, deletions and empty replacements, a backfill, reopening without coordinator state, durable command receipts, and native writer takeover. Test objects remain in that isolated namespace for inspection; remove only that prefix after all test processes are stopped. No existing workspace is deleted.
+**One coordinator per namespace.** A second writer on the same namespace
+fences the first. Give ad-hoc CLI runs a distinct `--namespace`, or submit
+through the server instead.
 
-An emulator passing these checks is **not proof** that a different provider has equivalent semantics. See [Railway deployment](docs/railway.md).
+## CLI
+
+```text
+cursus serve [--project SPEC] [--insecure]   API + console (default project: the demo)
+cursus manifest --project SPEC               print the project manifest
+cursus run TARGET... [--partitions latest|all|missing] [--partition KEY]
+           [--upstream] [--recompute] [--keys EDGE=k1,k2] [--config JSON]
+cursus runs / run-show RUN_ID / logs ATTEMPT_ID
+cursus automations [enable|disable|run-now NAME]
+cursus commit SOURCE [--version V] [--keys JSON] [--upsert JSON] [--remove K]
+cursus worker pool NAME [--server URL]       claim and run pool tasks
+cursus selftest                              storage conformance probe
+```
+
+`--project` accepts `module:attribute`, a `file.py` path, or `file.py:attr`;
+it also reads `CURSUS_PROJECT`. With `CURSUS_SERVER_URL` set every command talks
+to the server (token from `CURSUS_API_TOKEN`); without it they drive a local
+engine against `CURSUS_STATE_URL`/`--state-url` (`--namespace` selects the
+namespace). `cursus worker pool` additionally needs `CURSUS_PROJECT` so claimed
+attempts can load the project.
 
 ## Authoring
 
 ```python
-from cursus import (
-    AssetContext, Batch, ByKey, Inventory, Project, ReplaceKeys, asset,
+from cursus.sdk import Output, PartitionSet, Project, TimePartitions, asset
+from cursus.stores import Patch
+
+sites = PartitionSet("sites")
+
+
+@asset(outputs=Output("files", key="file_id", revision="version"), partitions={"site": sites})
+def site_files(ctx):
+    # Patch both ways: rows upsert by key, remove deletes keys.
+    return Patch(rows, remove=gone)
+
+
+@asset(
+    outputs=Output("digests", key="file_id"),
+    partitions={"site": sites, "day": TimePartitions(start="2026-01-01", every="1d")},
 )
+def daily_digests(ctx, site_files): ...
 
-@asset
-def source_files():
-    return Inventory([
-        {"id": "a.csv", "revision": "2", "records": [{"value": 42}]},
-    ], complete=True)
 
-@asset(inputs={"files": "source_files"}, incremental=ByKey("files"))
-def measurements(ctx: AssetContext, files):
-    changed = ctx.changes["upserted_keys"]
-    affected = changed + ctx.changes["deleted_keys"]
-    rows = [
-        {"source_file": f["id"], **record}
-        for f in files if str(f["id"]) in changed
-        for record in f["records"]
-    ]
-    return ReplaceKeys("source_file", affected, rows)
-
-project = Project([source_files, measurements])
+project = Project(assets=[site_files, daily_digests], sources=[sites], name="mine")
 ```
 
-Save as `my_project.py` and run `uv run cursus serve --insecure --project my_project.py` from that directory — the attribute defaults to `project` (or a single `Project` instance is auto-detected); `file.py:attribute` selects another name, and a bare module name also defaults to `project`.
-
-An ordinary return value replaces a snapshot. Explicit operations are `Replace`, `Inventory`, `ReplaceKeys`, `Upsert`, and `AppendBatch`. `Batch(outputs={...}, cursor=...)` returns multiple output mutations and the next user-managed cursor together. Checkpoints are scoped by producer and partition.
-
-For `ByKey`, successful batches acknowledge only their selected source revisions. Incomplete inventories never imply deletions. Changing request configuration, producer code, or non-keyed dependencies conservatively reprocesses keyed items. A changed explicit `version` requires `mode="recompute"`; use it for incompatible state/schema changes. Resource and helper-module changes are not automatically fingerprinted: bump the asset version when they change semantics. An incomplete source inventory cannot be used for recompute. Recompute processes the full bounded scope at once rather than incrementally replacing an incomplete scope.
-
-A multi-output producer executes as a unit. `fill_missing` reuses only complete published scopes; it is not a freshness check. A paused run starts no further attempts, but already running attempts may finish. Cancellation fences publication, not arbitrary external side effects. Repair retries failed work and retains already committed batches.
-
-Automations take one of three triggers: `Every(seconds)`, `Cron(expression, timezone)`, or `OnCommit(assets)`. Commit triggers mark the automation pending inside the publication transaction; the coordinator then submits the run once every pinned target input resolves, so mid-batch commits coalesce and triggers never fire against still-running upstream work. Triggered runs never re-run upstream producers; a commit that changes nothing fires nothing. Asset functions can emit structured entries with `ctx.log("message", **fields)`, shown alongside captured stdout on each attempt.
+Save as `my_project.py` and `uv run cursus serve --insecure --project
+my_project.py` (the attribute defaults to `project`). Cursors, resources,
+`ByKey`/`AllPartitions` inputs, placements, triggers, and the Postgres stores
+are documented in [docs/architecture.md](docs/architecture.md);
+`apps/server/src/cursus_server/demo.py` exercises all of them.
 
 ## Tests
 
 ```bash
-uv run pytest -q -m 'not live'
+uv run pytest -q            # includes tests/test_demo_e2e.py (server + pool worker, temp file:// store)
+CURSUS_TEST_DATABASE_URL=postgresql://cursus:cursus@127.0.0.1:5432/cursus uv run pytest -q -m postgres
 pnpm install --frozen-lockfile && pnpm -C apps/console exec playwright install chromium && pnpm -C apps/console test
 ```
 
-The Python suite uses real SlateDB on filesystem storage, including abrupt process death and writer takeover. It also starts Moto as an HTTP S3 emulator and runs the remote conformance test. Synthetic fault injection separately verifies acknowledgement timing and ambiguous-outcome behavior. The live-provider test is opt-in:
-
-```bash
-CURSUS_TEST_S3_URL=s3://isolated-test-bucket/prefix uv run pytest -q -m live
-```
-
-GitHub Actions verifies Python contracts, browser behavior on desktop/mobile, wheel contents, and a native end-to-end probe (`cursus selftest`). `uv.lock` and `pnpm-lock.yaml` are committed, as is the built console under `apps/server/src/cursus_server/web` so deployments need no Node runtime. CI uses locked installs; the storage engines are explicitly version-pinned.
+CI runs the Python suite, the Playwright suite on desktop and mobile, and a
+wheel-contents check. `uv.lock` and `pnpm-lock.yaml` are committed; installs
+are locked.
 
 ## Boundaries
 
-This is a feasibility implementation, not a claim of production readiness or benchmarked scalability. It deliberately serializes metadata transitions through remote acknowledgement. Inventory diffs and JSON snapshot rewrites are in-memory; queue/catalog/history scans need pagination and better indexing at larger scale. Limits are 64 MiB per JSON output, 1,000 partitions and 5,000 planned tasks per request. There is no Parquet/S3 table adapter, external-destination transaction recovery, distributed execution backend, arbitrary partition mapping, retained historical code image, artifact garbage collector, or zero-downtime multi-replica writer election. The durable outbox exists; an external event consumer is not implemented.
-
-Read [the design and safety invariants](docs/architecture.md) before extending the backend. OpenAPI/UI endpoints are trusted-team surfaces, not a hardened multi-tenant service.
-
-## Releasing
-
-The single `cursus` distribution is published to PyPI by [`.github/workflows/publish.yml`](.github/workflows/publish.yml) using [Trusted Publishing](https://docs.pypi.org/trusted-publishers/) — no long-lived token is stored. One pending publisher is registered against this repository, the `publish.yml` workflow, and the `pypi` environment.
-
-To cut a release, bump the version in the root `pyproject.toml`, commit, and push a tag; the workflow builds the distribution in one job and publishes it from a second, protected job:
-
-```bash
-uv version 0.0.2
-git commit -am 'release: 0.0.2'
-git tag v0.0.2 && git push origin main v0.0.2
-```
-
-It can also be run on demand from the Actions tab (`workflow_dispatch`).
+This is a feasibility implementation, not a claim of production readiness.
+Metadata transitions serialize through conditional object-store writes;
+catalog/history scans are unpaginated. Remote placements (AWS ECS, Kubernetes
+jobs, Modal) exist behind `CURSUS_*` configuration but see far less exercise
+than `Local`/`Pool`. There is no artifact garbage collector, retained
+historical code image, or multi-replica writer election. Read
+[docs/architecture.md](docs/architecture.md) before extending the backend.
 
 ## License
 
-Apache-2.0. The repository's visibility is unchanged.
+Apache-2.0.

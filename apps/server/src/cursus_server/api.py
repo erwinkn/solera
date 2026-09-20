@@ -1,30 +1,39 @@
+"""The cursus API (§5, §8-§10): project-scoped reads and run control under
+`/api/projects/{p}`, the worker pull path under `/api`, token auth."""
+
 from __future__ import annotations
 
 import hmac
+import json
 import os
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from urllib.parse import urlsplit
 
-from fastapi import FastAPI, Header, Query, Request
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, Header, Query, Request, Response
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .engine import Conflict, Engine
-from .execution import LocalSubprocess
+from .placements.local import load_manifest
+from .state import LostOwnership, State
 from .storage import SlateState, Unavailable
 
 
 class RunInput(BaseModel):
     targets: list[str] = Field(min_length=1, max_length=100)
-    partitions: list[str] = Field(default_factory=list, max_length=1000)
+    partitions: str | list[str] = "latest"
     mode: str = "incremental"
+    upstream: bool = False
     config: dict = Field(default_factory=dict)
+    keys: dict | None = None
 
 
-class AutomationInput(BaseModel):
-    enabled: bool
+class SourceCommitInput(BaseModel):
+    version: str | None = None
+    keys: dict | list | None = None
+    upsert: dict | list | None = None
+    remove: list[str] = Field(default_factory=list, max_length=100000)
 
 
 def create_app(*, state_url=None, namespace=None, project=None, token=None, insecure=False, engine=None):
@@ -40,14 +49,19 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
         owned = engine is None
         runtime = engine
         if owned:
-            backend = LocalSubprocess(project)
-            manifest = await backend.manifest()
-            state = await SlateState.open(state_url, namespace)
-            runtime = Engine(state, manifest, backend, concurrency=int(os.getenv("CURSUS_CONCURRENCY", "4")))
+            manifest = await load_manifest(project)
+            slate = await SlateState.open(state_url, namespace)
+            state = State(slate)
+            runtime = Engine(
+                state,
+                manifest,
+                project=project,
+                concurrency=int(os.getenv("CURSUS_CONCURRENCY", "4")),
+            )
             try:
                 await runtime.initialize()
             except BaseException:
-                await state.close()
+                await slate.close()
                 raise
         app.state.engine = runtime
         await runtime.start()
@@ -58,7 +72,9 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
             if owned:
                 await runtime.state.close()
 
-    app = FastAPI(title="Cursus", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    app = FastAPI(
+        title="Data Orchestrator", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None
+    )
 
     web = Path(__file__).parent / "web"
 
@@ -97,72 +113,350 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
     async def unavailable(request, error):
         return JSONResponse({"detail": str(error)}, status_code=503)
 
+    @app.exception_handler(LostOwnership)
+    async def fenced(request, error):
+        return JSONResponse({"detail": str(error)}, status_code=409)
+
+    def engine_of(request: Request) -> Engine:
+        return request.app.state.engine
+
+    async def project_engine(request: Request, p: str) -> Engine:
+        runtime = engine_of(request)
+        if p != runtime.manifest["name"]:
+            raise KeyError(p)
+        return runtime
+
     @app.get("/healthz")
     async def health(request: Request):
-        runtime = request.app.state.engine
+        runtime = engine_of(request)
         healthy = not runtime.state.poisoned and not runtime.last_error
         return JSONResponse(
             {"status": "ok" if healthy else "unavailable", "backend": "slatedb"},
             status_code=200 if healthy else 503,
         )
 
-    @app.get("/api/state")
-    async def state(request: Request):
-        runtime = request.app.state.engine
-        catalog = await runtime.catalog()
-        runs = await runtime.list_runs()
-        automations = [a for _, a in await runtime.state.scan("automation/")]
+    @app.get("/api/diagnostics")
+    async def diagnostics(request: Request):
+        runtime = engine_of(request)
         return {
-            "assets": catalog,
-            "runs": runs,
-            "automations": automations,
-            "storage": {
-                "engine": "SlateDB",
-                "scheme": urlsplit(runtime.state.url).scheme,
-                "namespace": runtime.state.namespace,
-                "sequence": runtime.state.last_sequence,
-                "experimental": True,
-            },
+            "backend": "slatedb",
+            "state": runtime.state.url,
+            "objects": runtime.state.objects_url,
+            "namespace": runtime.state.namespace,
+            "project": runtime.manifest["name"],
             "revision": runtime.manifest["revision"],
+            "inflight": len(runtime.inflight),
+            "postgres": bool(os.environ.get("DATABASE_URL")),
+            "last_error": runtime.last_error,
         }
 
-    @app.post("/api/runs", status_code=201)
-    async def submit(body: RunInput, request: Request, idempotency_key: str | None = Header(default=None)):
-        return await request.app.state.engine.submit(**body.model_dump(), command_id=idempotency_key)
+    # -- project reads ---------------------------------------------------------
 
-    @app.get("/api/runs/{run_id}")
-    async def run(run_id: str, request: Request):
-        return await request.app.state.engine.run_detail(run_id)
+    @app.get("/api/projects/{p}/manifest")
+    async def manifest(p: str, request: Request):
+        runtime = await project_engine(request, p)
+        return runtime.manifest
 
-    @app.post("/api/runs/{run_id}/cancel")
-    async def cancel(run_id: str, request: Request):
-        return await request.app.state.engine.cancel(run_id)
+    @app.get("/api/projects/{p}/assets")
+    async def assets(p: str, request: Request):
+        runtime = await project_engine(request, p)
+        return {"assets": await runtime.catalog()}
 
-    @app.post("/api/runs/{run_id}/retry")
-    async def retry(run_id: str, request: Request):
-        return await request.app.state.engine.retry(run_id)
+    @app.get("/api/projects/{p}/assets/{name}")
+    async def asset_detail(p: str, name: str, request: Request):
+        runtime = await project_engine(request, p)
+        if name not in runtime.manifest["assets"]:
+            raise KeyError(name)
+        detail = await runtime.asset_detail(name)
+        detail["automations"] = [
+            a for _, a in await runtime.state.scan("automation/") if name in a.get("targets", [])
+        ]
+        return detail
 
-    @app.post("/api/runs/{run_id}/pause")
-    async def pause(run_id: str, request: Request):
-        return await request.app.state.engine.pause(run_id)
+    @app.get("/api/projects/{p}/outputs/{name}/heads")
+    async def output_heads(p: str, name: str, request: Request):
+        runtime = await project_engine(request, p)
+        if name not in runtime.manifest["outputs"]:
+            raise KeyError(name)
+        out = []
+        async with runtime.state.transaction() as tx:
+            for scope, head in await tx.heads(name):
+                owner = head.get("asset")
+                cursor = owner is not None and (await tx.cursor(owner, scope)) is not None
+                out.append(
+                    {
+                        "scope": scope,
+                        "ref": head["ref"],
+                        "version": head.get("version"),
+                        "key_count": (head["ref"].get("meta") or {}).get("keys", {}).get("count"),
+                        "complete": head["complete"],
+                        "cursor": cursor,
+                        "at": head["at"],
+                        "commit": head["commit"],
+                    }
+                )
+        return {"output": name, "heads": out}
 
-    @app.post("/api/runs/{run_id}/resume")
-    async def resume(run_id: str, request: Request):
-        return await request.app.state.engine.pause(run_id, False)
+    @app.get("/api/projects/{p}/outputs/{name}/keys")
+    async def output_keys(
+        p: str,
+        name: str,
+        request: Request,
+        scope: str = Query(default=""),
+        offset: int = Query(default=0, ge=0),
+        limit: int = Query(default=1000, ge=1, le=100000),
+    ):
+        runtime = await project_engine(request, p)
+        async with runtime.state.transaction() as tx:
+            head = await tx.head(name, scope)
+        if head is None:
+            raise KeyError(f"{name}/{scope}")
+        keys = await runtime.state.fetch_key_map(head["ref"].get("meta", {}).get("keys")) or {}
+        items = sorted(keys.items())
+        return {
+            "output": name,
+            "scope": scope,
+            "total": len(items),
+            "keys": dict(items[offset : offset + limit]),
+        }
 
-    @app.get("/api/assets/{name}")
-    async def asset_detail(name: str, request: Request, partition: str = Query(default="", max_length=10)):
-        return await request.app.state.engine.asset_detail(name, partition)
+    @app.get("/api/projects/{p}/partitions/{name}")
+    async def partitions(p: str, name: str, request: Request):
+        runtime = await project_engine(request, p)
+        try:
+            asset = runtime._asset_of(name)
+        except ValueError:
+            raise KeyError(name) from None
+        dims = runtime._dims(asset)
+        if not dims:
+            raise ValueError(f"{asset} is unpartitioned")
+        async with runtime.state.transaction() as tx:
+            keys = await runtime._dim_keys(tx, dims)
+            from itertools import product
 
-    @app.post("/api/automations/{name}")
-    async def automation(name: str, body: AutomationInput, request: Request):
-        return await request.app.state.engine.set_automation(name, body.enabled)
+            from cursus.sdk import canonical_partition
 
-    @app.post("/api/automations/{name}/run", status_code=202)
-    async def run_automation(name: str, request: Request):
-        return await request.app.state.engine.run_automation(name)
+            current = {
+                canonical_partition(dims, dict(zip(dims, combo, strict=True))) for combo in product(*keys)
+            }
+            outputs = runtime.manifest["assets"][asset]["outputs"]
+            scopes = {}
+            for output in outputs:
+                for scope, head in await tx.heads(output["name"]):
+                    scopes[scope] = head
+            active = {}
+            failed = set()
+            for _, task in await tx.scan("task/"):
+                if task["asset"] != asset:
+                    continue
+                if task["status"] in {"queued", "waiting", "running"}:
+                    active[task["scope"]] = task["status"]
+                elif task["status"] == "failed":
+                    failed.add(task["scope"])
+            out = []
+            for scope in sorted(current | set(scopes)):
+                head = scopes.get(scope)
+                status = (
+                    "retired"
+                    if scope not in current
+                    else "complete"
+                    if head and head["complete"]
+                    else "running"
+                    if scope in active
+                    else "failed"
+                    if scope in failed
+                    else "missing"
+                )
+                out.append({"scope": scope, "status": status})
+        return {"asset": asset, "partitions": out}
 
-    app.mount("/static", StaticFiles(directory=web), name="static")
+    # -- runs -------------------------------------------------------------------
+
+    @app.post("/api/projects/{p}/runs", status_code=201)
+    async def submit_run(
+        p: str, body: RunInput, request: Request, idempotency_key: str | None = Header(default=None)
+    ):
+        runtime = await project_engine(request, p)
+        run = await runtime.submit(**body.model_dump(), command_id=idempotency_key)
+        return run or {"status": "skipped-active"}
+
+    @app.get("/api/projects/{p}/runs")
+    async def runs(p: str, request: Request, limit: int = Query(default=50, ge=1, le=500)):
+        runtime = await project_engine(request, p)
+        return {"runs": await runtime.list_runs(limit)}
+
+    @app.get("/api/projects/{p}/runs/{run_id}")
+    async def run_detail(p: str, run_id: str, request: Request):
+        runtime = await project_engine(request, p)
+        return await runtime.run_detail(run_id)
+
+    @app.post("/api/projects/{p}/runs/{run_id}/cancel")
+    async def cancel_run(p: str, run_id: str, request: Request):
+        runtime = await project_engine(request, p)
+        return await runtime.cancel(run_id)
+
+    @app.post("/api/projects/{p}/runs/{run_id}/retry")
+    async def retry_run(p: str, run_id: str, request: Request):
+        runtime = await project_engine(request, p)
+        return await runtime.retry(run_id)
+
+    @app.post("/api/projects/{p}/runs/{run_id}/pause")
+    async def pause_run(p: str, run_id: str, request: Request):
+        runtime = await project_engine(request, p)
+        return await runtime.pause(run_id)
+
+    @app.post("/api/projects/{p}/runs/{run_id}/resume")
+    async def resume_run(p: str, run_id: str, request: Request):
+        runtime = await project_engine(request, p)
+        return await runtime.pause(run_id, False)
+
+    # -- attempts ----------------------------------------------------------------
+
+    @app.get("/api/projects/{p}/attempts/{attempt_id:path}/logs")
+    async def attempt_logs(p: str, attempt_id: str, request: Request):
+        runtime = await project_engine(request, p)
+        prefix = f"logs/{attempt_id}/"
+
+        async def stream():
+            for key in await runtime.state.list_objects(prefix):
+                data = await runtime.state.get_object(key)
+                if data:
+                    yield data
+
+        return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+    @app.get("/api/projects/{p}/attempts/{attempt_id:path}/spec")
+    async def attempt_spec(p: str, attempt_id: str, request: Request):
+        runtime = await project_engine(request, p)
+        data = await runtime.state.get_object(f"specs/{attempt_id}.json")
+        if data is None:
+            raise KeyError(attempt_id)
+        return json.loads(data)
+
+    @app.get("/api/projects/{p}/attempts/{attempt_id:path}/result")
+    async def attempt_result(p: str, attempt_id: str, request: Request):
+        runtime = await project_engine(request, p)
+        data = await runtime.state.get_object(f"results/{attempt_id}.json")
+        if data is None:
+            raise KeyError(attempt_id)
+        return json.loads(data)
+
+    # -- automations -------------------------------------------------------------
+
+    @app.get("/api/projects/{p}/automations")
+    async def automations(p: str, request: Request):
+        runtime = await project_engine(request, p)
+        return {"automations": [a for _, a in await runtime.state.scan("automation/")]}
+
+    @app.post("/api/projects/{p}/automations/{name}/enable")
+    async def automation_enable(p: str, name: str, request: Request):
+        runtime = await project_engine(request, p)
+        return await runtime.set_automation(name, True)
+
+    @app.post("/api/projects/{p}/automations/{name}/disable")
+    async def automation_disable(p: str, name: str, request: Request):
+        runtime = await project_engine(request, p)
+        return await runtime.set_automation(name, False)
+
+    @app.post("/api/projects/{p}/automations/{name}/run-now", status_code=202)
+    async def automation_run_now(p: str, name: str, request: Request):
+        runtime = await project_engine(request, p)
+        return await runtime.run_automation(name)
+
+    # -- sources -------------------------------------------------------------------
+
+    @app.post("/api/projects/{p}/sources/{name}/commit")
+    async def source_commit(p: str, name: str, body: SourceCommitInput, request: Request):
+        runtime = await project_engine(request, p)
+        return await runtime.commit_source(
+            name,
+            version=body.version,
+            keys=body.keys,
+            upsert=body.upsert,
+            remove=body.remove,
+        )
+
+    # -- environments + workers -----------------------------------------------------
+
+    @app.get("/api/projects/{p}/environments")
+    async def environments(p: str, request: Request):
+        runtime = await project_engine(request, p)
+        seen = {}
+        for info in runtime.manifest["assets"].values():
+            spec = info["placement"]
+            key = runtime.registry.env_key(spec)
+            placement = runtime.registry.build(spec)
+            seen[key] = {
+                "key": key,
+                "kind": spec["kind"],
+                "environment": spec["environment"],
+                "max_concurrent": getattr(placement, "max_concurrent", None),
+                "in_flight": runtime.env_inflight.get(key, 0),
+            }
+        return {"environments": list(seen.values())}
+
+    @app.get("/api/projects/{p}/workers")
+    async def workers(p: str, request: Request):
+        runtime = await project_engine(request, p)
+        async with runtime.state.transaction() as tx:
+            claimed = {}
+            for _, task in await tx.pool_tasks():
+                if task["status"] == "claimed" and task["claimed_by"]:
+                    claimed[task["claimed_by"]] = task["attempt"]
+        return {
+            "workers": [{**w, "task": claimed.get(w["id"])} for _, w in await runtime.state.list_workers()]
+        }
+
+    # -- worker pull path (§10) -------------------------------------------------------
+
+    @app.post("/api/workers/register", status_code=201)
+    async def register_worker(request: Request):
+        body = await request.json()
+        state = engine_of(request).state
+        worker_id = uuid.uuid4().hex
+        await state.register_worker(worker_id, body.get("pools") or [], body.get("capacity") or {})
+        return {"worker": worker_id}
+
+    @app.post("/api/tasks/claim")
+    async def claim_task(request: Request):
+        body = await request.json()
+        state = engine_of(request).state
+        worker = await state.get_worker(body["worker"])
+        if worker is None:
+            raise KeyError(body["worker"])
+        task = await state.claim_pool_task(
+            body["worker"],
+            worker["pools"],
+            body.get("capacity") or {},
+            lease_seconds=float(body.get("lease_seconds") or 30),
+        )
+        if task is None:
+            return Response(status_code=204)
+        return {
+            "task": task["attempt"],
+            "stage": {"attempt": task["attempt"], "objects": state.objects_url},
+            "lease_seconds": 30,
+        }
+
+    @app.post("/api/tasks/{task_id:path}/renew")
+    async def renew_task(task_id: str, request: Request):
+        body = await request.json()
+        await engine_of(request).state.heartbeat_pool_task(body["worker"], task_id, lease_seconds=30)
+        return {"ok": True}
+
+    @app.post("/api/tasks/{task_id:path}/complete")
+    async def complete_task(task_id: str, request: Request):
+        body = await request.json()
+        state = engine_of(request).state
+        task = await state.get_pool_task(task_id)
+        if task is None or task["claimed_by"] != body["worker"]:
+            raise Conflict(f"pool task {task_id} is not claimed by {body['worker']}")
+        await state.release_pool_task(body["worker"], task_id)
+        return {"ok": True}
+
+    # -- console -----------------------------------------------------------------------
+    # The SPA builds with base=/static/, so client routes like /static/assets
+    # collide with the bundle path: serve real files, fall back to index.html.
 
     @app.get("/")
     async def index():
@@ -170,11 +464,16 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
 
     @app.get("/{path:path}")
     async def console(path: str):
-        # Client-side routes (assets, runs, automations, storage) share the shell.
-        target = web / path
-        if path and ".." not in path and target.is_file():
+        if path.startswith("api/"):
+            raise KeyError(path)
+        # The SPA builds with base=/static/: bundle files live under
+        # web/assets/…, while client routes (/static/assets, /static/runs) are
+        # pathnames that happen to share the prefix — files win, then the SPA.
+        bundle = path[7:] if path.startswith("static/") else path
+        target = (web / bundle).resolve()
+        if target.is_file() and web.resolve() in target.parents:
             return FileResponse(target)
-        if path.startswith("api/") or "." in Path(path).name:
+        if "." in Path(path).name:
             raise KeyError(path)
         return FileResponse(web / "index.html")
 

@@ -82,15 +82,18 @@ class SlateState:
             root.mkdir(parents=True, exist_ok=True)
             native, db_path = ObjectStore.resolve("file:///"), str(root / "metadata")
             objects = LocalStore(root / "objects", mkdir=True)
+            objects_url = (root / "objects").as_uri()
         elif u.scheme == "s3" and u.netloc:
             prefix = u.path.strip("/")
             if ".." in prefix.split("/"):
                 raise ValueError("Invalid object prefix")
             base = "/".join(filter(None, (prefix, namespace)))
             native, db_path = ObjectStore.resolve(f"s3://{u.netloc}"), f"{base}/metadata"
-            objects = obstore.store.from_url(f"s3://{u.netloc}/{base}/objects")
+            objects_url = f"s3://{u.netloc}/{base}/objects"
+            objects = obstore.store.from_url(objects_url)
         elif u.scheme == "memory":
             native, db_path, objects = ObjectStore.resolve("memory:///"), namespace, MemoryStore()
+            objects_url = "memory:///"
         else:
             raise ValueError("Use file:///absolute/path, s3://bucket/prefix, or memory:///")
         builder = DbBuilder(db_path, native)
@@ -100,6 +103,7 @@ class SlateState:
         settings.set("l0_sst_size_bytes", str(8 * 1024 * 1024))
         builder.with_settings(settings)
         state = cls(await builder.build(), objects, url, namespace)
+        state.objects_url = objects_url
         try:
             async with state.transaction() as tx:
                 schema = await tx.get("system/schema")
