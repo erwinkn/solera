@@ -2,14 +2,6 @@ version = 1
 revision = 3
 requires-python = ">=3.12"
 
-[manifest]
-members = [
-    "cursus",
-    "cursus-server",
-    "cursus-worker",
-    "cursus-workspace",
-]
-
 [[package]]
 name = "annotated-doc"
 version = "0.0.5"
@@ -434,61 +426,14 @@ wheels = [
 [[package]]
 name = "cursus"
 version = "0.0.1"
-source = { editable = "packages/sdk" }
+source = { editable = "." }
 dependencies = [
     { name = "croniter" },
-]
-
-[package.metadata]
-requires-dist = [{ name = "croniter", specifier = ">=6,<7" }]
-
-[[package]]
-name = "cursus-server"
-version = "0.0.1"
-source = { editable = "apps/server" }
-dependencies = [
-    { name = "croniter" },
-    { name = "cursus" },
-    { name = "cursus-worker" },
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "obstore" },
     { name = "slatedb" },
     { name = "uvicorn" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "croniter", specifier = ">=6,<7" },
-    { name = "cursus", editable = "packages/sdk" },
-    { name = "cursus-worker", editable = "apps/worker" },
-    { name = "fastapi", specifier = ">=0.115,<1" },
-    { name = "obstore", specifier = "==0.11.1" },
-    { name = "slatedb", specifier = "==0.16.0" },
-    { name = "uvicorn", specifier = ">=0.34,<1" },
-]
-
-[[package]]
-name = "cursus-worker"
-version = "0.0.1"
-source = { editable = "apps/worker" }
-dependencies = [
-    { name = "cursus" },
-    { name = "httpx" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "cursus", editable = "packages/sdk" },
-    { name = "httpx", specifier = ">=0.28,<1" },
-]
-
-[[package]]
-name = "cursus-workspace"
-version = "0.0.1"
-source = { virtual = "." }
-dependencies = [
-    { name = "cursus-server" },
-    { name = "cursus-worker" },
 ]
 
 [package.dev-dependencies]
@@ -503,8 +448,12 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cursus-server", editable = "apps/server" },
-    { name = "cursus-worker", editable = "apps/worker" },
+    { name = "croniter", specifier = ">=6,<7" },
+    { name = "fastapi", specifier = ">=0.115,<1" },
+    { name = "httpx", specifier = ">=0.28,<1" },
+    { name = "obstore", specifier = "==0.11.1" },
+    { name = "slatedb", specifier = "==0.16.0" },
+    { name = "uvicorn", specifier = ">=0.34,<1" },
 ]
 
 [package.metadata.requires-dev]

@@ -31,14 +31,16 @@ jobs:
       - run: uv sync --locked
       - run: uv run ruff check apps packages tests && uv run ruff format --check apps packages tests
       - run: uv run pytest -q -m 'not live' --junitxml=test-results.xml
-      - run: uv build --package cursus-server --wheel
+      - run: uv build --wheel
       - name: Verify packaged console and native probe
         run: |
           uv run python - <<'PY'
           from glob import glob
           from zipfile import ZipFile
-          with ZipFile(glob('dist/cursus_server*.whl')[0]) as z:
+          with ZipFile(glob('dist/cursus-*.whl')[0]) as z:
               names = z.namelist()
+              assert 'cursus/__init__.py' in names
+              assert 'cursus_worker/__main__.py' in names
               assert 'cursus_server/web/index.html' in names
               assert 'cursus_server/selftest.py' in names
               assert any(n.startswith('cursus_server/web/assets/') and n.endswith('.js') for n in names), 'no bundled JS in wheel'

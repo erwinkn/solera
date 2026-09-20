@@ -8,7 +8,7 @@ This is a standalone implementation on `feat/s3-state-backend`. The earlier `fea
 
 Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/). On supported platforms, SlateDB's Python wheel includes the native engine.
 
-The repo is a monorepo: `packages/sdk` ships the `cursus` asset SDK that project files import; `apps/server` ships the `cursus` control plane (API, engine, storage, `cursus` CLI); `apps/worker` ships `cursus_worker`, the task-execution package the server spawns locally and the base for remote workers; `apps/console` is the pnpm/Vite web app. `uv sync` installs the whole uv workspace.
+The repo is a monorepo of source trees that ship as **one** PyPI distribution, `cursus`: `packages/sdk` holds the `cursus` asset SDK that project files import; `apps/server` holds the `cursus_server` control plane (API, engine, storage, `cursus` CLI); `apps/worker` holds `cursus_worker`, the task-execution package the server spawns locally and the base for remote workers; `apps/console` is the pnpm/Vite web app whose committed bundle is embedded in the wheel. The root `pyproject.toml` bundles all three trees, so `uv sync` installs a single editable `cursus` package and `uv build` produces one wheel.
 
 ```bash
 uv sync --locked
@@ -144,12 +144,12 @@ Read [the design and safety invariants](docs/architecture.md) before extending t
 
 ## Releasing
 
-The `cursus`, `cursus-worker`, and `cursus-server` distributions are published to PyPI by [`.github/workflows/publish.yml`](.github/workflows/publish.yml) using [Trusted Publishing](https://docs.pypi.org/trusted-publishers/) — no long-lived token is stored. Each project has a pending/trusted publisher registered against this repository and the `publish.yml` workflow with environment `pypi`; one OIDC exchange mints a short-lived token scoped to all three projects at once.
+The single `cursus` distribution is published to PyPI by [`.github/workflows/publish.yml`](.github/workflows/publish.yml) using [Trusted Publishing](https://docs.pypi.org/trusted-publishers/) — no long-lived token is stored. One pending publisher is registered against this repository, the `publish.yml` workflow, and the `pypi` environment.
 
-To cut a release, bump the version in the three `pyproject.toml` files, commit, and push a tag; the workflow builds the distributions in one job and publishes them from a second, protected job:
+To cut a release, bump the version in the root `pyproject.toml`, commit, and push a tag; the workflow builds the distribution in one job and publishes it from a second, protected job:
 
 ```bash
-uv version --package cursus 0.0.2   # ...and cursus-worker, cursus-server
+uv version 0.0.2
 git commit -am 'release: 0.0.2'
 git tag v0.0.2 && git push origin main v0.0.2
 ```

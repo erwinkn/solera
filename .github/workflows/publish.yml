@@ -1,13 +1,12 @@
 name: Publish to PyPI
 
-# Publishes cursus, cursus-worker, and cursus-server with Trusted Publishing.
-# No API token is stored: the publish job exchanges a GitHub OIDC token for a
-# short-lived PyPI token that is scoped to every project with a matching
-# Trusted Publisher (all three share this repository, workflow, and environment).
+# Publishes the single `cursus` distribution with Trusted Publishing. It bundles
+# the SDK, worker, and server source trees. No API token is stored: the publish
+# job exchanges a GitHub OIDC token for a short-lived PyPI token.
 #
-# PyPI-side setup (once, per project):
+# PyPI-side setup (once):
 #   https://pypi.org/manage/account/publishing/
-#     PyPI Project Name: cursus | cursus-server | cursus-worker
+#     PyPI Project Name: cursus
 #     Owner:             erwinkn
 #     Repository name:   cursus
 #     Workflow name:     publish.yml
@@ -34,12 +33,10 @@ jobs:
         with:
           version: "0.12.13"
           python-version: "3.12"
-      - name: Build all workspace distributions
+      - name: Build the cursus distribution
         run: |
           rm -rf dist
-          uv build --package cursus
-          uv build --package cursus-worker
-          uv build --package cursus-server
+          uv build
       - uses: actions/upload-artifact@v4
         with:
           name: dist

@@ -1,23 +1,49 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
 [project]
-name = "cursus-workspace"
+name = "cursus"
 version = "0.0.1"
-description = "Workspace root for the cursus monorepo"
+description = "Asset-first orchestration on object storage: SDK, worker, and control plane"
+readme = "README.md"
 requires-python = ">=3.12"
+license = "Apache-2.0"
 dependencies = [
-    "cursus-server",
-    "cursus-worker",
+    "croniter>=6,<7",
+    "httpx>=0.28,<1",
+    "slatedb==0.16.0",
+    "obstore==0.11.1",
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.34,<1",
 ]
 
+[project.scripts]
+cursus = "cursus_server.cli:main"
+
+[project.urls]
+Repository = "https://github.com/erwinkn/cursus"
+
 [tool.uv]
-package = false
+package = true
 
-[tool.uv.workspace]
-members = ["packages/sdk", "apps/worker", "apps/server"]
+# One distribution ("cursus") bundles the three source trees: the asset SDK
+# (`cursus`), the worker (`cursus_worker`), and the control plane with its
+# committed console bundle (`cursus_server`).
+[tool.hatch.build.targets.wheel]
+packages = [
+    "packages/sdk/src/cursus",
+    "apps/server/src/cursus_server",
+    "apps/worker/src/cursus_worker",
+]
 
-[tool.uv.sources]
-cursus-server = { workspace = true }
-cursus-worker = { workspace = true }
-cursus = { workspace = true }
+[tool.hatch.build.targets.sdist]
+include = [
+    "packages/sdk/src/cursus",
+    "apps/server/src/cursus_server",
+    "apps/worker/src/cursus_worker",
+    "README.md",
+]
 
 [dependency-groups]
 dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "httpx>=0.28,<1", "ruff>=0.12,<1", "moto[server,s3]>=5,<6", "boto3>=1.36,<2"]
