@@ -1092,13 +1092,18 @@ class Engine:
                     task["status"] = "canceled"
                     await tx.put_task(task)
                     await tx.del_pending(task)
+                    await tx.put_scope_outcome(task["asset"], task["scope"], "canceled")
                 elif task["status"] == "running":
                     # Fence the attempt: its next renew raises LostOwnership and
                     # the placement loop cancels the run (§8).
+                    lock = await tx.lock(task["asset"], task["scope"])
                     await tx.del_lock(task["asset"], task["scope"])
                     task["status"] = "canceled"
                     await tx.put_task(task)
                     await tx.del_pending(task)
+                    await tx.put_scope_outcome(
+                        task["asset"], task["scope"], "canceled", (lock or {}).get("attempt")
+                    )
             await tx.put_run(run)
             return run
 
@@ -1163,12 +1168,14 @@ class Engine:
                     keys[param] = await tx.key_state(asset, param, scope)
             dims = self._dims(asset)
             current = await self._dim_keys(tx, dims) if dims else []
+            outcomes = await tx.scope_outcomes(asset)
         return {
             "asset": info,
             "heads": heads,
             "cursor": cursor,
             "key_state": keys,
             "current_keys": current,
+            "scopes": outcomes,
         }
 
     async def catalog(self):

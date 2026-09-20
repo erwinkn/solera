@@ -244,30 +244,32 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
             for output in outputs:
                 for scope, head in await tx.heads(output["name"]):
                     scopes[scope] = head
-            active = {}
-            failed = set()
-            for _, task in await tx.scan("task/"):
-                if task["asset"] != asset:
-                    continue
-                if task["status"] in {"queued", "waiting", "running"}:
-                    active[task["scope"]] = task["status"]
-                elif task["status"] == "failed":
-                    failed.add(task["scope"])
+            # Per-scope outcomes + the pending index — never a task/ scan (§8).
+            outcomes = await tx.scope_outcomes(asset)
+            running = await tx.pending_scopes(asset)
             out = []
-            for scope in sorted(current | set(scopes)):
+            for scope in sorted(current | set(scopes) | set(outcomes)):
                 head = scopes.get(scope)
+                record = outcomes.get(scope) or {}
                 status = (
                     "retired"
                     if scope not in current
                     else "complete"
                     if head and head["complete"]
                     else "running"
-                    if scope in active
+                    if scope in running
                     else "failed"
-                    if scope in failed
+                    if record.get("last_outcome") in {"failed", "canceled", "blocked"}
                     else "missing"
                 )
-                out.append({"scope": scope, "status": status})
+                out.append(
+                    {
+                        "scope": scope,
+                        "status": status,
+                        "last_outcome": record.get("last_outcome"),
+                        "last_attempt": record.get("last_attempt"),
+                    }
+                )
         return {"asset": asset, "partitions": out}
 
     # -- runs -------------------------------------------------------------------

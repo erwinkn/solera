@@ -201,9 +201,17 @@ export interface RunDetail {
   attempts: Record<string, Attempt[]>;
 }
 
+export interface ScopeOutcome {
+  last_outcome: string | null;
+  last_attempt: string | null;
+  at: number;
+}
+
 export interface PartitionScope {
   scope: string;
   status: ScopeStatus;
+  last_outcome?: string | null;
+  last_attempt?: string | null;
 }
 
 export interface OutputHead {
@@ -223,6 +231,7 @@ export interface AssetDetail {
   cursor: Json;
   key_state: Record<string, Record<string, Json>>;
   current_keys: string[][];
+  scopes: Record<string, ScopeOutcome>;
   automations: AutomationRecord[];
 }
 

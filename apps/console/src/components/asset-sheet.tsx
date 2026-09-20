@@ -88,8 +88,9 @@ function PartitionGrid({
   scopes: PartitionScope[];
   onPick: (scope: string) => void;
 }) {
+  const { select } = useWorkspace();
   const dims = Object.keys(asset.partitions?.dims ?? {});
-  const byStatus = new Map(scopes.map((s) => [s.scope, s.status]));
+  const byScope = new Map(scopes.map((s) => [s.scope, s]));
   if (!dims.length) {
     const head = Object.values(asset.heads)[0]?.[""];
     return (
@@ -109,19 +110,23 @@ function PartitionGrid({
     );
   }
   const keys = detail?.current_keys ?? [];
-  const cells: { scope: string; label: string; status: string }[] = [];
+  const cells: { scope: string; label: string; cell: PartitionScope }[] = [];
+  const missingCell = (scope: string): PartitionScope => ({
+    scope,
+    status: "missing",
+  });
   if (dims.length === 1) {
     for (const key of keys[0] ?? []) {
       const scope = scopeKey(dims, { [dims[0]]: key });
       cells.push({
         scope,
         label: key,
-        status: byStatus.get(scope) ?? "missing",
+        cell: byScope.get(scope) ?? missingCell(scope),
       });
     }
     for (const s of scopes)
       if (!cells.some((c) => c.scope === s.scope))
-        cells.push({ scope: s.scope, label: s.scope, status: s.status });
+        cells.push({ scope: s.scope, label: s.scope, cell: s });
   } else {
     const [first, second, ...rest] = keys;
     for (const row of first ?? [])
@@ -137,7 +142,7 @@ function PartitionGrid({
         cells.push({
           scope,
           label: `${row} × ${col}`,
-          status: byStatus.get(scope) ?? "missing",
+          cell: byScope.get(scope) ?? missingCell(scope),
         });
       }
   }
@@ -157,29 +162,43 @@ function PartitionGrid({
         role="list"
         aria-label="Partitions"
       >
-        {cells.map((cell) => {
-          const head = headsByScope.get(cell.scope);
+        {cells.map(({ scope, label, cell }) => {
+          const head = headsByScope.get(scope);
           const keyCount = (
             head?.ref.meta as Record<string, { count?: number }> | undefined
           )?.keys?.count;
+          const attemptRun = cell.last_attempt?.split("/")[0];
           return (
-            <button
-              key={cell.scope}
-              role="listitem"
-              data-scope={cell.scope}
-              data-status={cell.status}
-              title={`${cell.scope} · ${cell.status}${keyCount != null ? ` · ${keyCount} keys` : ""}`}
-              className={cn(
-                "rounded-md border px-2 py-1 font-mono text-xs transition-transform hover:scale-105",
-                SCOPE_TONE[cell.status],
+            <span key={scope} role="listitem" className="inline-flex">
+              <button
+                data-scope={scope}
+                data-status={cell.status}
+                title={`${scope} · ${cell.status}${cell.last_outcome ? ` · last ${cell.last_outcome}` : ""}${keyCount != null ? ` · ${keyCount} keys` : ""}`}
+                className={cn(
+                  "rounded-md border px-2 py-1 font-mono text-xs transition-transform hover:scale-105",
+                  SCOPE_TONE[cell.status],
+                )}
+                onClick={() => onPick(scope)}
+              >
+                {label}
+                {keyCount != null && (
+                  <span className="ml-1 opacity-70">{keyCount}</span>
+                )}
+              </button>
+              {attemptRun && (
+                <button
+                  aria-label={`Open last attempt for ${scope}`}
+                  title={`last attempt ${cell.last_attempt}`}
+                  className="ml-0.5 rounded-sm px-0.5 text-muted-foreground hover:text-foreground"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    select({ kind: "run", id: attemptRun });
+                  }}
+                >
+                  <Play className="size-3" />
+                </button>
               )}
-              onClick={() => onPick(cell.scope)}
-            >
-              {cell.label}
-              {keyCount != null && (
-                <span className="ml-1 opacity-70">{keyCount}</span>
-              )}
-            </button>
+            </span>
           );
         })}
         {!cells.length && (
@@ -190,8 +209,8 @@ function PartitionGrid({
       </div>
       <p className="text-xs text-muted-foreground">
         {dims.join(" × ")} ·{" "}
-        {cells.filter((c) => c.status === "complete").length}/{cells.length}{" "}
-        complete
+        {cells.filter((c) => c.cell.status === "complete").length}/
+        {cells.length} complete
         {detail?.cursor != null && " · cursor present"}
       </p>
     </div>

@@ -12,7 +12,9 @@ from cursus.sdk import (
     Every,
     OnChange,
     Output,
+    PartitionSet,
     Project,
+    Retry,
     Source,
     StaticPartitions,
     asset,
@@ -39,12 +41,28 @@ def build_project():
     def daily(ctx):
         return {"day": ctx.partition}
 
+    sites = PartitionSet("sites")
+
+    @asset(partitions={"site": sites})
+    def by_site(ctx):
+        return {"site": ctx.partition}
+
+    @asset(partitions={"days": StaticPartitions(["2026-09-18", "2026-09-19"])}, retries=Retry(n=0))
+    def flaky(ctx):
+        if ctx.config.get("fail"):
+            raise RuntimeError("boom")
+        return {"day": ctx.partition}
+
     @asset(executor=Pool("gpu")(cpu=1), automations=Every(3600))
     def trained():
         return {"weights": 1}
 
     upload = Source("uploads", key="id")
-    return Project(assets=[feed, total, daily, trained], sources=[upload], name="example")
+    return Project(
+        assets=[feed, total, daily, by_site, flaky, trained],
+        sources=[upload, sites],
+        name="example",
+    )
 
 
 @pytest.fixture
@@ -113,7 +131,14 @@ async def test_manifest_assets_and_detail(client, base):
     manifest = (await client.get(f"{base}/manifest")).json()
     assert manifest["name"] == "example"
     assets = (await client.get(f"{base}/assets")).json()["assets"]
-    assert {a["name"] for a in assets} == {"feed", "total", "daily", "trained"}
+    assert {a["name"] for a in assets} == {
+        "feed",
+        "total",
+        "daily",
+        "by_site",
+        "flaky",
+        "trained",
+    }
 
     detail = (await client.get(f"{base}/assets/daily")).json()
     assert detail["asset"]["partitions"]["dims"]["days"]["kind"] == "static"
@@ -288,3 +313,70 @@ async def test_console_shell_served(client):
     assert index.status_code == 200 and "text/html" in index.headers["content-type"]
     route = await client.get("/runs/abc")
     assert route.status_code == 200
+
+
+async def test_partitions_read_scope_records_not_task_history(client, base, engine, monkeypatch):
+    """§8: the partitions endpoint answers complete, missing, running,
+    failed and retired from heads + scope records + the pending index —
+    and never scans task/."""
+    from cursus_server.storage import Transaction
+
+    scanned = []
+    original_scan = Transaction.scan
+
+    async def spy(self, prefix, limit=None):
+        scanned.append(prefix)
+        return await original_scan(self, prefix, limit)
+
+    # complete (a succeeded scope) and missing (a key never run)
+    await engine.run_until((await engine.submit(["daily"], partitions=["2026-09-18"]))["id"])
+    # failed: a scope whose task finished failed
+    detail = await engine.run_until(
+        (await engine.submit(["flaky"], partitions=["2026-09-18"], config={"fail": True}))["id"]
+    )
+    assert detail["request"]["status"] == "failed"
+    # retired: commit sites a+b, complete a, then retract a
+    await engine.commit_source("sites", upsert=["a", "b"])
+    await engine.run_until((await engine.submit(["by_site"], partitions=["a"]))["id"])
+    await engine.commit_source("sites", remove=["a"])
+    # running: submitted and pending but never dispatched — submit after the
+    # last run_until, which would dispatch everything queued
+    await engine.submit(["daily"], partitions=["2026-09-19"], mode="recompute")
+    await engine.submit(["by_site"], partitions=["b"])
+
+    monkeypatch.setattr(Transaction, "scan", spy)
+    daily = (await client.get(f"{base}/partitions/daily")).json()["partitions"]
+    flaky = (await client.get(f"{base}/partitions/flaky")).json()["partitions"]
+    by_site = (await client.get(f"{base}/partitions/by_site")).json()["partitions"]
+    monkeypatch.undo()
+
+    assert {p["scope"]: p["status"] for p in daily} == {
+        "2026-09-18": "complete",
+        "2026-09-19": "running",
+    }
+    assert {p["scope"]: p["status"] for p in flaky} == {
+        "2026-09-18": "failed",
+        "2026-09-19": "missing",
+    }
+    flaky_done = next(p for p in flaky if p["scope"] == "2026-09-18")
+    assert flaky_done["last_outcome"] == "failed" and flaky_done["last_attempt"]
+    complete = next(p for p in daily if p["scope"] == "2026-09-18")
+    assert complete["last_outcome"] == "succeeded" and complete["last_attempt"]
+    assert {p["scope"]: p["status"] for p in by_site} == {"a": "retired", "b": "running"}
+    assert not [p for p in scanned if p.startswith("task/")]
+
+
+async def test_failed_scope_reports_complete_after_success(client, base, engine):
+    """§8: a scope that failed and later succeeded reports complete — the
+    scope record is the last outcome, not a task-history scan."""
+
+    await engine.run_until(
+        (await engine.submit(["flaky"], partitions=["2026-09-19"], config={"fail": True}))["id"]
+    )
+    parts = (await client.get(f"{base}/partitions/flaky")).json()["partitions"]
+    assert {p["scope"]: p["status"] for p in parts}["2026-09-19"] == "failed"
+
+    await engine.run_until((await engine.submit(["flaky"], partitions=["2026-09-19"]))["id"])
+    parts = (await client.get(f"{base}/partitions/flaky")).json()["partitions"]
+    done = next(p for p in parts if p["scope"] == "2026-09-19")
+    assert done["status"] == "complete" and done["last_outcome"] == "succeeded"

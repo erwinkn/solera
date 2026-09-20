@@ -163,6 +163,32 @@ class Tx:
     async def pending(self, asset: str, scope: str) -> bool:
         return bool(await self.t.scan(f"pending/{esc(asset)}/{esc(scope)}/", 1))
 
+    async def pending_scopes(self, asset: str) -> set[str]:
+        prefix = f"pending/{esc(asset)}/"
+        return {unesc(k[len(prefix) :].split("/", 1)[0]) for k, _ in await self.t.scan(prefix)}
+
+    # -- per-scope outcomes (§8) -------------------------------------------------------
+    # scope/{asset}/{scope} is the last terminal outcome of the scope's task;
+    # "running" is never written here — the pending index owns that.
+
+    async def scope_outcome(self, asset: str, scope: str):
+        return await self.t.get(f"scope/{esc(asset)}/{esc(scope)}")
+
+    async def scope_outcomes(self, asset: str) -> dict[str, dict]:
+        prefix = f"scope/{esc(asset)}/"
+        return {unesc(k[len(prefix) :]): v for k, v in await self.t.scan(prefix)}
+
+    async def put_scope_outcome(self, asset: str, scope: str, outcome: str, attempt: str | None = None):
+        prior = await self.scope_outcome(asset, scope)
+        await self.t.put(
+            f"scope/{esc(asset)}/{esc(scope)}",
+            {
+                "last_outcome": outcome,
+                "last_attempt": attempt or (prior or {}).get("last_attempt"),
+                "at": self.clock(),
+            },
+        )
+
     # -- attempts --------------------------------------------------------------------
     async def attempt(self, task_id: str, generation: int):
         return await self.t.get(f"attempt/{esc(task_id)}/{generation:010d}")
@@ -532,6 +558,7 @@ class State:
                 task["error"] = None
                 await tx.put_task(task)
                 await tx.del_pending(task)
+                await tx.put_scope_outcome(task["asset"], task["scope"], "succeeded", attempt_id)
             await self.advance_run(tx, task["run"])
             return record
 
@@ -551,6 +578,7 @@ class State:
                 task["status"] = "blocked"
                 await tx.put_task(task)
                 await tx.del_pending(task)
+                await tx.put_scope_outcome(task["asset"], task["scope"], "blocked")
             elif all(s in done for s in dep_status):
                 task["status"] = "queued"
                 task["ready_at"] = self.clock()
@@ -594,6 +622,7 @@ class State:
             else:
                 task["status"] = "failed"
                 await tx.del_pending(task)
+                await tx.put_scope_outcome(task["asset"], task["scope"], "failed", attempt_id)
             await tx.put_task(task)
             await self.advance_run(tx, task["run"])
 
@@ -622,6 +651,7 @@ class State:
             task["result"] = {name: (head or {}).get("ref") for name, head in (baseline or {}).items()}
             await tx.put_task(task)
             await tx.del_pending(task)
+            await tx.put_scope_outcome(task["asset"], task["scope"], "skipped", attempt_id)
             await self.advance_run(tx, task["run"])
 
     # -- pool tasks and workers (§10) ------------------------------------------
