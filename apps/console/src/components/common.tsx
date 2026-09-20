@@ -19,35 +19,55 @@ const labels: Record<string, string> = {
   failed: "Failed",
   blocked: "Blocked",
   canceled: "Canceled",
+  complete: "Complete",
+  missing: "Missing",
+  retired: "Retired",
 };
 
+// One colour language across every surface. Each tone reads in light and dark.
+const EMERALD =
+  "border-emerald-600/30 bg-emerald-500/10 text-emerald-700 dark:border-emerald-400/25 dark:bg-emerald-400/10 dark:text-emerald-300";
+const SKY =
+  "border-sky-600/30 bg-sky-500/10 text-sky-700 dark:border-sky-400/25 dark:bg-sky-400/10 dark:text-sky-300";
+const AMBER =
+  "border-amber-600/30 bg-amber-500/10 text-amber-700 dark:border-amber-400/25 dark:bg-amber-400/10 dark:text-amber-300";
+const RED =
+  "border-red-600/30 bg-red-500/10 text-red-700 dark:border-red-400/25 dark:bg-red-400/10 dark:text-red-300";
+const ZINC = "border-border bg-muted/40 text-muted-foreground";
+
 const tones: Record<string, string> = {
-  not_materialized: "border-border text-muted-foreground",
-  materialized: "border-emerald-600/30 bg-emerald-500/10 text-emerald-700",
-  stale: "border-amber-600/30 bg-amber-500/10 text-amber-700",
-  partial: "border-amber-600/30 bg-amber-500/10 text-amber-700",
-  queued: "border-border text-muted-foreground",
-  waiting: "border-border text-muted-foreground",
-  running: "border-sky-600/30 bg-sky-500/10 text-sky-700",
-  paused: "border-amber-600/30 bg-amber-500/10 text-amber-700",
-  succeeded: "border-emerald-600/30 bg-emerald-500/10 text-emerald-700",
-  skipped: "border-border text-muted-foreground",
-  failed: "border-red-600/30 bg-red-500/10 text-red-700",
-  blocked: "border-red-600/30 bg-red-500/10 text-red-700",
-  canceled: "border-border text-muted-foreground",
+  not_materialized: ZINC,
+  materialized: EMERALD,
+  complete: EMERALD,
+  succeeded: EMERALD,
+  stale: AMBER,
+  partial: AMBER,
+  missing: AMBER,
+  paused: AMBER,
+  queued: ZINC,
+  waiting: ZINC,
+  running: SKY,
+  skipped: ZINC,
+  retired: ZINC,
+  failed: RED,
+  blocked: RED,
+  canceled: ZINC,
 };
 
 const dots: Record<string, string> = {
   not_materialized: "bg-muted-foreground/50",
-  materialized: "bg-emerald-600",
+  materialized: "bg-emerald-500",
+  complete: "bg-emerald-500",
+  succeeded: "bg-emerald-500",
   stale: "bg-amber-500",
   partial: "bg-amber-500",
+  missing: "bg-amber-500",
+  paused: "bg-amber-500",
   queued: "bg-muted-foreground/50",
   waiting: "bg-muted-foreground/50",
   running: "bg-sky-500 animate-pulse",
-  paused: "bg-amber-500",
-  succeeded: "bg-emerald-600",
   skipped: "bg-muted-foreground/50",
+  retired: "bg-muted-foreground/40",
   failed: "bg-red-500",
   blocked: "bg-red-500",
   canceled: "bg-muted-foreground/50",
@@ -64,11 +84,116 @@ export function StatusBadge({
     <Badge
       variant="outline"
       data-status={status}
-      className={cn("gap-1.5 font-medium", tones[status], className)}
+      className={cn("gap-1.5 font-medium", tones[status] ?? ZINC, className)}
     >
       <span className={cn("size-1.5 rounded-full", dots[status])} />
       {labels[status] ?? status.replaceAll("_", " ")}
     </Badge>
+  );
+}
+
+/** A small uppercase overline used above titles and section headings. */
+export function Eyebrow({
+  children,
+  className,
+}: {
+  children: ReactNode;
+  className?: string;
+}) {
+  return (
+    <div
+      className={cn(
+        "text-[0.65rem] font-semibold tracking-[0.09em] text-muted-foreground uppercase",
+        className,
+      )}
+    >
+      {children}
+    </div>
+  );
+}
+
+/** The page header block: eyebrow + title + optional description, with room
+    for aside content (stat clusters, actions) on the right. */
+export function PageHeader({
+  eyebrow,
+  title,
+  description,
+  aside,
+}: {
+  eyebrow: string;
+  title: string;
+  description?: string;
+  aside?: ReactNode;
+}) {
+  return (
+    <div className="flex flex-wrap items-end justify-between gap-3">
+      <div className="flex flex-col gap-1">
+        <Eyebrow>{eyebrow}</Eyebrow>
+        <h1 className="font-heading text-xl font-semibold tracking-tight">
+          {title}
+        </h1>
+        {description && (
+          <p className="text-sm text-muted-foreground">{description}</p>
+        )}
+      </div>
+      {aside}
+    </div>
+  );
+}
+
+export interface SegmentOption<T extends string> {
+  value: T;
+  label: string;
+  icon?: ReactNode;
+}
+
+/** A compact segmented control — the workhorse for latest/missing/all/pick,
+    incremental/recompute, table/graph, and the light/dark theme switch. */
+export function Segmented<T extends string>({
+  value,
+  onChange,
+  options,
+  ariaLabel,
+  className,
+}: {
+  value: T;
+  onChange: (value: T) => void;
+  options: SegmentOption<T>[];
+  ariaLabel: string;
+  className?: string;
+}) {
+  return (
+    <div
+      role="tablist"
+      aria-label={ariaLabel}
+      className={cn(
+        "flex items-center gap-0.5 rounded-lg bg-muted p-0.5",
+        className,
+      )}
+    >
+      {options.map((option) => {
+        const active = option.value === value;
+        return (
+          <button
+            key={option.value}
+            type="button"
+            role="tab"
+            aria-selected={active}
+            data-active={active || undefined}
+            onClick={() => onChange(option.value)}
+            className={cn(
+              "flex flex-1 items-center justify-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium whitespace-nowrap transition-colors",
+              active
+                ? "bg-background text-foreground shadow-xs"
+                : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            {option.icon}
+            {option.label}
+          </button>
+        );
+      })}
+    </div>
   );
 }
 
@@ -96,7 +221,7 @@ export function ErrorNotice({ message }: { message: string }) {
   return (
     <div
       role="alert"
-      className="rounded-lg border border-red-600/30 bg-red-500/10 px-3 py-2 text-sm text-red-700"
+      className="rounded-lg border border-red-600/30 bg-red-500/10 px-3 py-2 text-sm text-red-700 dark:border-red-400/25 dark:bg-red-400/10 dark:text-red-300"
     >
       {message}
     </div>
