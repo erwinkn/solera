@@ -1,30 +1,47 @@
-import { Link, createFileRoute } from "@tanstack/react-router";
-import { Bot, Cpu } from "lucide-react";
-import { Badge } from "@/components/ui/badge";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
-import { Empty } from "@/components/common";
+import { createFileRoute } from "@tanstack/react-router";
+import { Bot, Cpu, Layers, MonitorSmartphone } from "lucide-react";
+import { Empty, Eyebrow, PageHeader } from "@/components/common";
 import { useQuery } from "@/lib/api";
 import { time } from "@/lib/format";
 import { useWorkspace } from "@/lib/workspace";
+import { cn } from "cn";
 import type { EnvironmentInfo, PoolWorker } from "@/lib/types";
 
 export const Route = createFileRoute("/executors")({
   component: ExecutorsPage,
 });
 
+function bytes(value: number | null | undefined) {
+  if (value == null) return null;
+  const gb = value / 1024 ** 3;
+  return gb >= 1
+    ? `${gb.toFixed(gb < 10 ? 1 : 0)} GB`
+    : `${Math.round(value / 1024 ** 2)} MB`;
+}
+
 function capacityLabel(meta: PoolWorker["meta"]) {
   const parts = [
     meta.cpu != null ? `${meta.cpu} cpu` : null,
-    meta.memory != null ? `${meta.memory} memory` : null,
+    bytes(meta.memory),
     meta.gpu != null ? `${meta.gpu} gpu` : null,
   ].filter(Boolean);
   return parts.length ? parts.join(" · ") : "unbounded";
+}
+
+function envIcon(kind: string) {
+  if (kind === "Pool") return Layers;
+  if (kind === "Local") return MonitorSmartphone;
+  return Cpu;
+}
+
+// The API keys environments by a serialized spec; show the human form instead.
+function envLabel(env: EnvironmentInfo) {
+  const environment = env.environment as Record<string, unknown>;
+  const detail =
+    (environment?.name as string) ??
+    (environment?.cluster as string) ??
+    (environment?.app as string);
+  return detail ? `${env.kind}(${detail})` : env.kind;
 }
 
 function ExecutorsPage() {
@@ -38,103 +55,133 @@ function ExecutorsPage() {
     3000,
   );
   if (!diagnostics) return null;
+  const envs = environments.data?.environments ?? [];
+  const pool = workers.data?.workers ?? [];
   return (
-    <section className="flex flex-col gap-4">
-      <div>
-        <div className="text-[0.65rem] font-medium tracking-wider text-muted-foreground uppercase">
-          Execution
-        </div>
-        <h1 className="font-heading text-xl font-medium">Executors</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Environments declare where tasks run and how many run concurrently.
-        </p>
-      </div>
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-        {(environments.data?.environments ?? []).map((env) => (
-          <Card key={env.key} data-environment={env.key}>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2 font-mono text-sm">
-                <Cpu className="size-4" />
-                {env.key}
-              </CardTitle>
-              <CardDescription>
-                kind {env.kind}
-                {env.max_concurrent != null
-                  ? ` · concurrency ${env.max_concurrent}`
-                  : " · unbounded concurrency"}
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="flex flex-col gap-2 text-sm">
-              <div className="flex justify-between">
-                <span className="text-muted-foreground">In flight</span>
-                <Badge
-                  variant="outline"
-                  className={
-                    env.max_concurrent != null &&
-                    env.in_flight >= env.max_concurrent
-                      ? "text-sky-700"
-                      : ""
-                  }
-                >
-                  {env.in_flight}
-                  {env.max_concurrent != null ? ` / ${env.max_concurrent}` : ""}
-                </Badge>
+    <section className="flex flex-col gap-5">
+      <PageHeader
+        eyebrow="Execution"
+        title="Executors"
+        description="Environments declare where tasks run and how many run concurrently."
+      />
+      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+        {envs.map((env) => {
+          const Icon = envIcon(env.kind);
+          const saturated =
+            env.max_concurrent != null && env.in_flight >= env.max_concurrent;
+          return (
+            <div
+              key={env.key}
+              data-environment={env.key}
+              className="flex flex-col gap-3 rounded-xl border bg-card p-4"
+            >
+              <div className="flex items-center gap-2">
+                <Icon className="size-4 text-muted-foreground" />
+                <span className="font-mono text-sm font-semibold">
+                  {envLabel(env)}
+                </span>
               </div>
-            </CardContent>
-          </Card>
-        ))}
-      </div>
-      <div>
-        <h2 className="font-heading text-lg font-medium">Pool workers</h2>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Workers that registered with{" "}
-          <code className="text-xs">cursus worker pool &lt;name&gt;</code>.
-        </p>
-      </div>
-      {!workers.data?.workers.length ? (
-        <Empty title="No pool workers connected">
-          Start one with `cursus worker pool ingest` to pick up pool-placed
-          tasks.
-        </Empty>
-      ) : (
-        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-          {workers.data.workers.map((worker) => (
-            <Card key={worker.id} data-worker={worker.id}>
-              <CardHeader>
-                <CardTitle className="flex items-center gap-2 font-mono text-sm">
-                  <Bot className="size-4" />
-                  {worker.id.slice(0, 12)}
-                </CardTitle>
-                <CardDescription>
-                  pools {worker.pools.join(", ")} · {capacityLabel(worker.meta)}
-                </CardDescription>
-              </CardHeader>
-              <CardContent className="flex flex-col gap-2 text-sm">
-                <div className="flex justify-between">
-                  <span className="text-muted-foreground">Last heartbeat</span>
-                  <span>{time(worker.seen_at)}</span>
+              <div className="flex items-end justify-between">
+                <div className="flex flex-col">
+                  <span className="text-2xl font-semibold tabular-nums">
+                    {env.in_flight}
+                    {env.max_concurrent != null && (
+                      <span className="text-base text-muted-foreground">
+                        {" "}
+                        / {env.max_concurrent}
+                      </span>
+                    )}
+                  </span>
+                  <span className="text-xs text-muted-foreground">
+                    in flight
+                  </span>
                 </div>
-                {worker.task && (
+                <span
+                  className={cn(
+                    "rounded-full px-2 py-0.5 text-xs font-medium",
+                    saturated
+                      ? "bg-sky-500/15 text-sky-700 dark:text-sky-300"
+                      : "text-muted-foreground",
+                  )}
+                >
+                  {env.max_concurrent != null
+                    ? saturated
+                      ? "saturated"
+                      : `max ${env.max_concurrent}`
+                    : "unbounded"}
+                </span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="flex flex-col gap-3">
+        <div className="flex flex-col gap-0.5">
+          <Eyebrow>Pool workers</Eyebrow>
+          <p className="text-sm text-muted-foreground">
+            Registered with{" "}
+            <code className="font-mono text-xs">
+              cursus worker pool &lt;name&gt;
+            </code>
+            .
+          </p>
+        </div>
+        {!pool.length ? (
+          <Empty title="No pool workers connected">
+            Start one with{" "}
+            <code className="font-mono text-xs">cursus worker pool ingest</code>{" "}
+            to pick up pool-placed tasks.
+          </Empty>
+        ) : (
+          <div className="grid gap-3 sm:grid-cols-2">
+            {pool.map((worker) => (
+              <div
+                key={worker.id}
+                data-worker={worker.id}
+                className="flex items-center gap-3 rounded-xl border bg-card p-3.5"
+              >
+                <span
+                  className={cn(
+                    "flex size-9 shrink-0 items-center justify-center rounded-lg",
+                    worker.task
+                      ? "bg-sky-500/15 text-sky-600 dark:text-sky-400"
+                      : "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400",
+                  )}
+                >
+                  <Bot className="size-4.5" />
+                </span>
+                <div className="min-w-0 flex-1">
+                  <div className="font-mono text-xs font-medium">
+                    worker {worker.id.slice(0, 12)}
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    pools {worker.pools.join(", ")} ·{" "}
+                    {capacityLabel(worker.meta)}
+                  </div>
+                  <div className="text-[0.7rem] text-muted-foreground">
+                    seen {time(worker.seen_at)}
+                  </div>
+                </div>
+                {worker.task ? (
                   <button
-                    className="flex justify-between rounded-md bg-sky-50 px-2 py-1 text-left text-xs text-sky-800 hover:underline dark:bg-sky-950 dark:text-sky-200"
+                    className="flex items-center gap-1.5 rounded-md bg-sky-500/10 px-2 py-1 font-mono text-xs text-sky-700 hover:underline dark:text-sky-300"
                     onClick={() =>
                       select({ kind: "run", id: worker.task!.split("/")[0] })
                     }
+                    title={worker.task}
                   >
-                    <span>Current task</span>
-                    <span className="font-mono">
-                      {worker.task.split("/").slice(1).join("/")}
-                    </span>
+                    <span className="size-1.5 animate-pulse rounded-full bg-sky-500" />
+                    {worker.task.split("/").slice(1).join("/")}
                   </button>
+                ) : (
+                  <span className="text-xs text-muted-foreground">idle</span>
                 )}
-              </CardContent>
-            </Card>
-          ))}
-        </div>
-      )}
-      <Link to="/storage" className="text-sm text-primary hover:underline">
-        Storage diagnostics →
-      </Link>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
     </section>
   );
 }
