@@ -775,6 +775,7 @@ class Project:
                 "key": source.key,
                 "revision": None,
                 "mode": None,
+                "migrations": [],
                 "config": source.handle,
                 "partition_set": source.key == "<elements>",
                 "dims": None,
@@ -799,6 +800,7 @@ class Project:
                     "key": output.key,
                     "revision": output.revision,
                     "mode": output.mode,
+                    "migrations": [m.name for m in output.migrations],
                     "config": output.config,
                     "partition_set": output.is_partition_set,
                     "output": output,
@@ -933,6 +935,31 @@ class Project:
                         f"{name}: store {record['store']} cannot store output {output.name} "
                         f"(type {t}, config {output.config})"
                     )
+                if output.migrations:
+                    names = []
+                    for migration in output.migrations:
+                        if not isinstance(migration, Migration):
+                            raise RegistrationError(
+                                f"{name}: migrations entries must be Migration(), "
+                                f"got {migration!r} on {output.name}"
+                            )
+                        names.append(migration.name)
+                    if len(set(names)) != len(names):
+                        raise RegistrationError(
+                            f"{name}: duplicate migration name on output {output.name} (§4)"
+                        )
+                    if not callable(getattr(store, "migrate", None)):
+                        raise RegistrationError(
+                            f"{name}: output {output.name} declares migrations but store "
+                            f"{record['store']!r} has no migrate (§4)"
+                        )
+                    for migration in output.migrations:
+                        payload_t = Callable if callable(migration.payload) else type(migration.payload)
+                        if not store.can_store(payload_t, output):
+                            raise RegistrationError(
+                                f"{name}: migration {migration.name!r} payload "
+                                f"({payload_t}) fails can_store on store {record['store']!r} (§4)"
+                            )
                 if (
                     partitioned
                     and getattr(store, "shared_table", False)

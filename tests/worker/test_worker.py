@@ -181,3 +181,68 @@ project = Project(assets=[whoami], resources={"vault": {"token": "env:TEST_SECRE
         head = await tx.head("whoami", "")
         body = await state.get_object(head["ref"]["handle"]["object"])
         assert json.loads(body) == [{"secret": "s3cr3t"}]
+
+
+MIGRATING_PROJECT = """
+import os
+from collections.abc import Callable
+from cursus.sdk import Migration, Output, Project, asset
+from cursus.stores import JsonStore
+
+class MigStore(JsonStore):
+    def can_store(self, t, output):
+        return t is Callable or super().can_store(t, output)
+
+    async def migrate(self, output, migrations):
+        with open(os.environ["MIGRATE_LOG"], "a") as f:
+            f.write("migrate\\n")
+        for m in migrations:
+            m.payload(None, "")
+        return [m.name for m in migrations]
+
+    async def store(self, write, prior, scope):
+        with open(os.environ["MIGRATE_LOG"], "a") as f:
+            f.write("store\\n")
+        return await super().store(write, prior, scope)
+
+@asset(outputs=Output("migrated", store="mig",
+                      migrations=[Migration("m1", lambda objects, prefix: None)]))
+def producer():
+    return {"v": 1}
+
+project = Project(assets=[producer], stores={"mig": MigStore()})
+"""
+
+
+async def test_migrate_runs_before_first_write(state, tmp_path, monkeypatch):
+    """§4/§10: in a real subprocess attempt, migrate() precedes the first
+    store() and the head's handle carries the last applied name as `schema`."""
+    log = tmp_path / "calls.log"
+    monkeypatch.setenv("MIGRATE_LOG", str(log))
+    entrypoint = write_project(tmp_path, MIGRATING_PROJECT)
+    engine = make_engine(state, entrypoint, lease_seconds=30)
+    await engine.initialize()
+    detail = await engine.run_until((await engine.submit(["producer"]))["id"], 60)
+    assert detail["request"]["status"] == "succeeded"
+    assert log.read_text().splitlines() == ["migrate", "store"]
+    async with state.transaction() as tx:
+        head = await tx.head("migrated", "")
+        assert head["ref"]["handle"]["schema"] == "m1"
+
+
+async def test_failed_migration_is_not_retryable(state, tmp_path, monkeypatch):
+    """§4/§10: a migration failure is a failed result with retryable=false."""
+    monkeypatch.setenv("MIGRATE_LOG", str(tmp_path / "calls.log"))
+    entrypoint = write_project(
+        tmp_path,
+        MIGRATING_PROJECT.replace("lambda objects, prefix: None", "lambda objects, prefix: 1 / 0"),
+    )
+    engine = make_engine(state, entrypoint, lease_seconds=30)
+    await engine.initialize()
+    detail = await engine.run_until((await engine.submit(["producer"]))["id"], 60)
+    assert detail["request"]["status"] == "failed"
+    attempt = f"{detail['tasks'][0]['id']}/1"
+    result = json.loads(await state.get_object(f"results/{attempt}.json"))
+    assert result["status"] == "failed"
+    assert result["error"]["retryable"] is False
+    assert "migration failed" in result["error"]["message"]

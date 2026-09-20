@@ -25,6 +25,7 @@ from cursus.stores import (
 )
 
 MARKER_TABLE = "public.cursus_markers"
+LEDGER_TABLE = "public.cursus_migrations"
 BATCH_COLUMN = "_batch"
 SEQ_COLUMN = "_seq"
 
@@ -88,22 +89,17 @@ class PostgresStore:
         table = output.config.get("table", output.name)
         return _qname(schema, table), schema, table
 
-    def _ensure(self, cur, output: Output, rows: list[dict] | None = None):
-        table, schema, table_name = self._table(output)
-        cur.execute(f"CREATE SCHEMA IF NOT EXISTS {_ident(schema)}")
+    def _declared_shape(self, output: Output) -> tuple[dict, list]:
+        """The columns and primary key the declaration pins down (§4). Row-inferred
+        columns are creation-only and never part of the drift check."""
+
         columns = dict(output.config.get("columns") or {})
         partition_col = output.config.get("partition_column")
-        if rows:
-            for row in rows:
-                for column, value in row.items():
-                    columns.setdefault(column, _column_type(value))
         if partition_col:
             columns.setdefault(partition_col, "text")
         if output.mode == "append":
             columns.setdefault(BATCH_COLUMN, "integer")
             columns.setdefault(SEQ_COLUMN, "integer")
-        if not columns:
-            columns = {"value": "jsonb"}
         pk = list(output.config.get("primary_key") or ([output.key] if output.key else []))
         if partition_col and partition_col not in pk and (pk or output.mode == "append"):
             pk = [*pk, partition_col]
@@ -111,21 +107,27 @@ class PostgresStore:
             for c in (BATCH_COLUMN, SEQ_COLUMN):
                 if c not in pk:
                     pk = [*pk, c]
-        defs = [f"{_ident(c)} {_sql_type(t)}" for c, t in columns.items()]
+        return columns, pk
+
+    def _ensure(self, cur, output: Output, rows: list[dict] | None = None):
+        table, schema, table_name = self._table(output)
+        cur.execute(f"CREATE SCHEMA IF NOT EXISTS {_ident(schema)}")
+        declared, pk = self._declared_shape(output)
+        columns = dict(declared)
+        if rows:
+            for row in rows:
+                for column, value in row.items():
+                    columns.setdefault(column, _column_type(value))
+        existed = cur.execute(
+            "SELECT 1 FROM information_schema.tables WHERE table_schema = %s AND table_name = %s",
+            (schema, table_name),
+        ).fetchone()
+        defs = [f"{_ident(c)} {_sql_type(t)}" for c, t in (columns or {"value": "jsonb"}).items()]
         if pk:
             defs.append(f"PRIMARY KEY ({', '.join(_ident(c) for c in pk)})")
         cur.execute(f"CREATE TABLE IF NOT EXISTS {table} ({', '.join(defs)})")
-        existing = {
-            r["column_name"]
-            for r in cur.execute(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_schema = %s AND table_name = %s",
-                (schema, table_name),
-            )
-        }
-        for column, decl in columns.items():
-            if column not in existing:
-                cur.execute(f"ALTER TABLE {table} ADD COLUMN {_ident(column)} {_sql_type(decl)}")
+        if existed:
+            self._check_drift(cur, output, table, schema, table_name, columns, pk)
         for index in output.config.get("indexes") or []:
             cols = ", ".join(_ident(c) for c in index)
             cur.execute(
@@ -138,6 +140,47 @@ class PostgresStore:
                 pass  # grants are deployment sugar; a missing role is not fatal
         self._ensure_markers(cur)
         return table
+
+    def _check_drift(self, cur, output: Output, table, schema, table_name, declared, pk):
+        """A pre-existing table must already match the declaration; evolving
+        shape is a migration's job, never a silent ALTER (§4)."""
+
+        if not declared and not pk:
+            return
+        live_columns = {
+            r["column_name"]
+            for r in cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = %s AND table_name = %s",
+                (schema, table_name),
+            )
+        }
+        live_pk = [
+            r["column_name"]
+            for r in cur.execute(
+                "SELECT kcu.column_name FROM information_schema.table_constraints tc "
+                "JOIN information_schema.key_column_usage kcu "
+                "ON tc.constraint_name = kcu.constraint_name "
+                "AND tc.constraint_schema = kcu.constraint_schema "
+                "AND tc.table_schema = kcu.table_schema "
+                "AND tc.table_name = kcu.table_name "
+                "WHERE tc.constraint_type = 'PRIMARY KEY' "
+                "AND tc.table_schema = %s AND tc.table_name = %s "
+                "ORDER BY kcu.ordinal_position",
+                (schema, table_name),
+            )
+        ]
+        drift = []
+        missing = [c for c in declared if c not in live_columns]
+        if missing:
+            drift.append(f"missing columns {missing}")
+        if set(live_pk) != set(pk):
+            drift.append(f"primary key {live_pk or 'none'} != declared {pk or 'none'}")
+        if drift:
+            raise StoreError(
+                f"{output.name}: live table {table} does not match the declaration "
+                f"({'; '.join(drift)}); reconcile it with a Migration"
+            )
 
     def _ensure_markers(self, cur):
         cur.execute(
@@ -331,6 +374,49 @@ class PostgresStore:
             keys = key_map(output, rows)
         version = digest([prior.version if prior else "", digest(write.stmt)])
         return version, keys, None
+
+    # -- migrations (§4) --------------------------------------------------------
+
+    def _ensure_ledger(self, cur):
+        cur.execute(
+            f"CREATE TABLE IF NOT EXISTS {LEDGER_TABLE} ("
+            "output text NOT NULL, name text NOT NULL, "
+            "at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (output, name))"
+        )
+
+    async def migrate(self, output: Output, migrations) -> list[str]:
+        """Apply pending migrations in declared order; each migration and its
+        ledger row commit in one transaction under an advisory lock keyed on
+        the output, so concurrent attempts apply each exactly once (§4)."""
+
+        with self._connect() as conn, conn.cursor() as cur:
+            self._ensure_ledger(cur)
+        applied = []
+        for migration in migrations:
+            with self._connect() as conn, conn.cursor() as cur:
+                cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (output.name,))
+                done = cur.execute(
+                    f"SELECT 1 FROM {LEDGER_TABLE} WHERE output = %s AND name = %s",
+                    (output.name, migration.name),
+                ).fetchone()
+                if done:
+                    applied.append(migration.name)
+                    continue
+                if isinstance(migration.payload, str):
+                    cur.execute(migration.payload)
+                elif callable(migration.payload):
+                    migration.payload(cur)
+                else:
+                    raise StoreError(
+                        f"{output.name}: migration {migration.name!r} payload must be "
+                        "a SQL string or a callable taking a cursor"
+                    )
+                cur.execute(
+                    f"INSERT INTO {LEDGER_TABLE} (output, name) VALUES (%s, %s)",
+                    (output.name, migration.name),
+                )
+                applied.append(migration.name)
+        return applied
 
     # -- reads ----------------------------------------------------------------
 

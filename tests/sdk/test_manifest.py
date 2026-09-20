@@ -12,6 +12,7 @@ from cursus.sdk import (
     Cron,
     Every,
     In,
+    Migration,
     OnChange,
     Output,
     Project,
@@ -350,3 +351,64 @@ def test_source_synthesized_head():
     assert head["meta"]["external"] is True
     assert head["handle"]["region"] == "us"
     assert head["version"]
+
+
+def test_migrations_in_manifest():
+    """§2/§11: the manifest records the ordered migration names per output."""
+
+    @asset(
+        outputs=Output(
+            "docs",
+            store="blobs",
+            migrations=[
+                Migration("a_seed", lambda objects, prefix: None),
+                Migration("b_fix", lambda o, p: None),
+            ],
+        )
+    )
+    def producer() -> bytes:
+        return b""
+
+    project = Project(assets=[producer], stores={"blobs": BlobStore()})
+    out = project.manifest["outputs"]["docs"]
+    assert out["migrations"] == ["a_seed", "b_fix"]
+
+
+def test_migrations_require_a_migrating_store():
+    """§4/§11: migrations= on a store without migrate is a registration error."""
+
+    @asset(outputs=Output("x", migrations=[Migration("m", "SELECT 1")]))
+    def bad():
+        return []
+
+    with pytest.raises(RegistrationError, match="no migrate"):
+        Project(assets=[bad])
+
+
+def test_duplicate_migration_names_rejected():
+    """§4/§11: a migration name may not repeat within one output."""
+    from cursus_postgres import PostgresStore
+
+    @asset(
+        outputs=Output(
+            "x",
+            store="pg",
+            migrations=[Migration("same", "SELECT 1"), Migration("same", "SELECT 2")],
+        )
+    )
+    def bad():
+        return []
+
+    with pytest.raises(RegistrationError, match="duplicate migration"):
+        Project(assets=[bad], stores={"pg": PostgresStore("env:DATABASE_URL")})
+
+
+def test_migration_payload_must_pass_can_store():
+    """§4/§11: a payload the store cannot store is a registration error."""
+
+    @asset(outputs=Output("x", store="blobs", migrations=[Migration("m", "SELECT 1")]))
+    def bad() -> bytes:
+        return b""
+
+    with pytest.raises(RegistrationError, match="can_store"):
+        Project(assets=[bad], stores={"blobs": BlobStore()})

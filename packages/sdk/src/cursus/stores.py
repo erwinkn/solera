@@ -7,7 +7,7 @@ import json
 import os
 import tempfile
 import typing
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -340,6 +340,7 @@ class BlobStore:
     def __init__(self, url: str | None = None):
         self.url = url
         self._objects = None
+        self._migrate_lock = None
 
     def bind_objects(self, objects) -> None:
         if self.url is None:
@@ -363,7 +364,50 @@ class BlobStore:
     def can_store(self, t, output) -> bool:
         if output.key or output.mode or output.is_partition_set:
             return False
-        return t is None or t in (bytes, Path)
+        return t is None or t in (bytes, Path, Callable)
+
+    async def migrate(self, output: Output, migrations) -> list[str]:
+        """Apply pending callable migrations over the output's blob prefix,
+        recording each in `_migrations.json` next to the data (§4)."""
+
+        import asyncio
+
+        import obstore
+        from obstore.exceptions import NotFoundError
+
+        objects = self._resolve()
+        prefix = f"blobs/{output.name}/"
+        ledger_path = prefix + "_migrations.json"
+        if self._migrate_lock is None:
+            self._migrate_lock = asyncio.Lock()
+        async with self._migrate_lock:
+            try:
+                result = await obstore.get_async(objects, ledger_path)
+                ledger = json.loads(bytes(await result.bytes_async()))
+            except (NotFoundError, FileNotFoundError):
+                ledger = {"applied": []}
+            applied = {entry["name"] for entry in ledger["applied"]}
+            for migration in migrations:
+                if migration.name in applied:
+                    continue
+                if not callable(migration.payload):
+                    raise StoreError(
+                        f"{output.name}: BlobStore migration {migration.name!r} requires a callable payload"
+                    )
+                value = migration.payload(objects, prefix)
+                if inspect.isawaitable(value):
+                    await value
+                ledger["applied"].append({"name": migration.name, "at": self._now()})
+                applied.add(migration.name)
+                body = json.dumps(ledger, sort_keys=True, allow_nan=False).encode()
+                await obstore.put_async(objects, ledger_path, body, mode="overwrite", use_multipart=False)
+            return [m.name for m in migrations if m.name in applied]
+
+    @staticmethod
+    def _now() -> str:
+        import datetime as dt
+
+        return dt.datetime.now(dt.UTC).isoformat()
 
     async def store(self, write, prior: Ref | None, scope: Scope) -> Written:
         import obstore

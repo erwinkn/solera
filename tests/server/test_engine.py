@@ -25,6 +25,7 @@ from cursus.sdk import (
     asset,
     job,
 )
+from cursus.stores import JsonStore
 from cursus_server.engine import Engine
 from cursus_server.placements.inline import InlinePlacement
 from cursus_server.state import State
@@ -995,3 +996,73 @@ async def test_job_commits_lineage_only(state):
         job_commit = [c for _, c in commits if c["asset"] == "vacuum"]
         assert job_commit and job_commit[0]["outputs"] == {}
         assert job_commit[0]["input_refs"]["feed"]["ref"]["output"] == "feed"
+
+
+class MigratingJsonStore(JsonStore):
+    """A JsonStore with a migration ledger: lets keyed outputs declare
+    migrations on the file:// test store (§4)."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def can_store(self, t, output):
+        from collections.abc import Callable
+
+        return t is Callable or super().can_store(t, output)
+
+    async def migrate(self, output, migrations):
+        self.calls.append(output.name)
+        return [m.name for m in migrations]
+
+
+async def test_migration_changes_fingerprint_and_marks_handle(state):
+    """§6/§4: adding a migration to an asset's output changes the
+    interpretation fingerprint so every key reprocesses, and the new head's
+    handle carries the last applied migration as `schema`."""
+    from cursus.sdk import Migration
+
+    seen = []
+    store = MigratingJsonStore()
+
+    @asset(outputs=Output("files", key="id"))
+    def files():
+        return [{"id": "a", "v": 1}, {"id": "b", "v": 1}]
+
+    @asset(inputs={"files": ByKey()}, outputs=Output("rolled", store="mig"))
+    def consumer(ctx, files: list):
+        seen.append(sorted(r["id"] for r in files))
+        return {"n": len(files)}
+
+    project = Project(assets=[files, consumer], stores={"mig": store})
+    engine = make_engine(state, project)
+    await engine.initialize()
+    await drive(engine, await engine.submit(["consumer"], upstream=True))
+    assert seen == [["a", "b"]]
+    assert store.calls == []  # no migrations declared yet
+
+    detail = await drive(engine, await engine.submit(["consumer"], upstream=True))
+    assert task_statuses(detail)["consumer"] == "skipped"
+
+    @asset(outputs=Output("files", key="id"))
+    def files():  # noqa: F811 — unchanged upstream
+        return [{"id": "a", "v": 1}, {"id": "b", "v": 1}]
+
+    @asset(
+        inputs={"files": ByKey()},
+        outputs=Output("rolled", store="mig", migrations=[Migration("m1", lambda o, p: None)]),
+    )
+    def consumer(ctx, files: list):  # noqa: F811 — same asset, one migration added
+        seen.append(sorted(r["id"] for r in files))
+        return {"n": len(files)}
+
+    project2 = Project(assets=[files, consumer], stores={"mig": store})
+    engine2 = make_engine(state, project2)
+    await engine2.initialize()
+    await drive(engine2, await engine2.submit(["consumer"], upstream=True))
+    assert seen == [["a", "b"], ["a", "b"]]  # fingerprint changed: all keys again
+    assert store.calls == ["rolled"]  # migrate ran before the write
+
+    heads = await state.scan("head/")
+    rolled_head = next(r for k, r in heads if k.startswith("head/rolled/"))
+    assert rolled_head["ref"]["handle"]["schema"] == "m1"

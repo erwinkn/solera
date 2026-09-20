@@ -968,6 +968,7 @@
         "schema": "sharepoint"
       },
       "key": null,
+      "migrations": [],
       "mode": "append",
       "name": "change_events",
       "partition_set": false,
@@ -981,6 +982,7 @@
         "schema": "ops"
       },
       "key": null,
+      "migrations": [],
       "mode": null,
       "name": "fleet_dashboard",
       "partition_set": false,
@@ -992,6 +994,7 @@
       "asset": "hillshade",
       "config": {},
       "key": null,
+      "migrations": [],
       "mode": null,
       "name": "hillshade",
       "partition_set": false,
@@ -1006,6 +1009,7 @@
       },
       "dims": null,
       "key": null,
+      "migrations": [],
       "mode": null,
       "name": "leach_crosswalk",
       "partition_set": false,
@@ -1019,6 +1023,7 @@
         "schema": "datasmart"
       },
       "key": null,
+      "migrations": [],
       "mode": null,
       "name": "leach_invalid_sample_id_log",
       "partition_set": false,
@@ -1032,6 +1037,7 @@
         "schema": "leaching"
       },
       "key": null,
+      "migrations": [],
       "mode": null,
       "name": "leach_kinetics",
       "partition_set": false,
@@ -1046,6 +1052,7 @@
         "schema": "uploads"
       },
       "key": null,
+      "migrations": [],
       "mode": null,
       "name": "manual_upload",
       "partition_set": false,
@@ -1060,6 +1067,7 @@
       },
       "dims": null,
       "key": null,
+      "migrations": [],
       "mode": null,
       "name": "pmpt_project_matrix",
       "partition_set": false,
@@ -1074,6 +1082,7 @@
       },
       "dims": null,
       "key": null,
+      "migrations": [],
       "mode": null,
       "name": "project_team_map",
       "partition_set": false,
@@ -1088,6 +1097,7 @@
       },
       "dims": null,
       "key": null,
+      "migrations": [],
       "mode": null,
       "name": "psa_data",
       "partition_set": false,
@@ -1113,6 +1123,7 @@
         "schema": "analytical"
       },
       "key": null,
+      "migrations": [],
       "mode": null,
       "name": "psa_mean_data",
       "partition_set": false,
@@ -1127,6 +1138,7 @@
       },
       "dims": null,
       "key": null,
+      "migrations": [],
       "mode": null,
       "name": "psa_samples",
       "partition_set": false,
@@ -1138,6 +1150,7 @@
       "asset": "graph_delta",
       "config": {},
       "key": "file_id",
+      "migrations": [],
       "mode": null,
       "name": "qaqc_files",
       "partition_set": false,
@@ -1160,6 +1173,10 @@
         "schema": "qaqc"
       },
       "key": null,
+      "migrations": [
+        "0001_analyst",
+        "0002_measured_tz"
+      ],
       "mode": null,
       "name": "qaqc_samples",
       "partition_set": false,
@@ -1174,6 +1191,7 @@
         "schema": "ops"
       },
       "key": null,
+      "migrations": [],
       "mode": null,
       "name": "region_rollup",
       "partition_set": false,
@@ -1188,6 +1206,7 @@
       },
       "dims": null,
       "key": null,
+      "migrations": [],
       "mode": null,
       "name": "sample_id_crosswalk",
       "partition_set": false,
@@ -1202,6 +1221,7 @@
         "schema": "ops"
       },
       "key": null,
+      "migrations": [],
       "mode": null,
       "name": "site_health",
       "partition_set": false,
@@ -1213,6 +1233,7 @@
       "asset": "sites",
       "config": {},
       "key": "<elements>",
+      "migrations": [],
       "mode": null,
       "name": "sites",
       "partition_set": true,
@@ -1227,6 +1248,7 @@
       },
       "dims": null,
       "key": "<elements>",
+      "migrations": [],
       "mode": null,
       "name": "uploads",
       "partition_set": true,
@@ -1239,6 +1261,7 @@
       "config": {},
       "dims": null,
       "key": null,
+      "migrations": [],
       "mode": null,
       "name": "usgs_3dep_tiles",
       "partition_set": false,
@@ -1253,6 +1276,7 @@
       },
       "dims": null,
       "key": null,
+      "migrations": [],
       "mode": null,
       "name": "xrd_profex",
       "partition_set": false,
@@ -1267,6 +1291,7 @@
       },
       "dims": null,
       "key": null,
+      "migrations": [],
       "mode": null,
       "name": "xrf",
       "partition_set": false,
@@ -1275,7 +1300,7 @@
       "store": "postgres"
     }
   },
-  "revision": "fcd9b8344047be4fb6a4a3e0295f5194ffea6e6f022b4739dd33842e84d25865",
+  "revision": "1165b560bafdbdd5f3a3c81403269ac377b5108cb7fba719737c6e4851796658",
   "sources": {
     "leach_crosswalk": {
       "handle": {

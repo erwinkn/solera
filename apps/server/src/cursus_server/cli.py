@@ -112,6 +112,11 @@ def main():
     automations.add_argument("action", nargs="?", choices=["enable", "disable", "run-now"])
     automations.add_argument("name", nargs="?")
 
+    migrate = commands.add_parser(
+        "migrate", help="Apply pending output migrations locally (§4)", parents=[common]
+    )
+    migrate.add_argument("outputs", nargs="*", help="Outputs to migrate (default: all declaring)")
+
     commit = commands.add_parser("commit", help="Advance a source (§5)", parents=[common])
     commit.add_argument("source")
     commit.add_argument("--version")
@@ -179,10 +184,62 @@ async def _dispatch(args, parser):
         await run_pool(args.name, args.server.rstrip("/"), token=os.getenv("CURSUS_API_TOKEN"))
         return
 
+    if args.command == "migrate":
+        await _migrate(args, parser)
+        return
+
     if _server_url():
         await _remote(args, parser)
     else:
         await _local(args, parser)
+
+
+async def _migrate(args, parser):
+    """Apply declared migrations through the local harness path (§4): load the
+    project, bind its stores to the namespace's object store, migrate."""
+
+    import obstore
+    from cursus_worker.worker import load_project
+
+    from .state import State
+    from .storage import SlateState
+
+    slate = await SlateState.open(args.state_url, args.namespace)
+    try:
+        state = State(slate)
+        entrypoint = args.project
+        if not entrypoint:
+            async with state.transaction() as tx:
+                entrypoint = await tx.get("sys/entrypoint")
+        if not entrypoint:
+            parser.error("cursus migrate needs --project or a previously registered project")
+        project = load_project(entrypoint)
+        objects = obstore.store.from_url(state.objects_url)
+        migrating = {
+            output.name: output
+            for asset in project.assets.values()
+            for output in asset.outputs
+            if output.migrations
+        }
+        if args.outputs:
+            for name in args.outputs:
+                if name not in migrating:
+                    parser.error(f"{name}: no such output declares migrations")
+            selected = [migrating[name] for name in dict.fromkeys(args.outputs)]
+        else:
+            selected = list(migrating.values())
+        for output in selected:
+            record = project.manifest["outputs"][output.name]
+            store = project.stores[record["store"]]
+            if hasattr(store, "bind_objects"):
+                store.bind_objects(objects)
+            applied = await store.migrate(output, output.migrations)
+            for name in applied:
+                print(f"{output.name}: applied {name}")
+            if not applied:
+                print(f"{output.name}: up to date")
+    finally:
+        await slate.close()
 
 
 def _parse_keys(specs):

@@ -6,7 +6,7 @@ import uuid
 
 import pytest
 from cursus.sdk import Output, digest
-from cursus.stores import Keys, Patch, Sql, StaleRead, StoreConflict, WriteError
+from cursus.stores import Keys, Patch, Sql, StaleRead, StoreConflict, StoreError, WriteError
 
 from tests.conftest import scope
 
@@ -135,3 +135,110 @@ async def test_dataframe_round_trip(store):
     written = await store.store(frame, None, scope(out))
     loaded = await store.load(written.ref, pd.DataFrame, None)
     assert list(loaded["id"]) == ["a"]
+
+
+def _ledger(store, output_name):
+    with store._connect() as conn, conn.cursor() as cur:
+        rows = cur.execute(
+            "SELECT name FROM public.cursus_migrations WHERE output = %s ORDER BY at, name",
+            (output_name,),
+        ).fetchall()
+        return [r["name"] for r in rows]
+
+
+async def test_migrations_apply_in_order_and_record(store):
+    """§4: pending migrations apply in declared order and land in the
+    cursus_migrations ledger."""
+    from cursus.sdk import Migration
+
+    out = output()
+    table = out.name
+    out.migrations = (
+        Migration("m1", f'CREATE TABLE IF NOT EXISTS "{table}_m1" (id text)'),
+        Migration("m2", lambda cur: cur.execute(f'CREATE TABLE "{table}_m2" (id text)')),
+    )
+    applied = await store.migrate(out, out.migrations)
+    assert applied == ["m1", "m2"]
+    assert _ledger(store, out.name) == ["m1", "m2"]
+    second = await store.migrate(out, out.migrations)
+    assert second == ["m1", "m2"]  # ledger names; nothing re-applied
+
+
+async def test_concurrent_migrate_applies_each_once(store):
+    """§4: two concurrent migrate calls apply each migration exactly once
+    (advisory lock + ledger re-read inside it)."""
+    import asyncio
+
+    from cursus.sdk import Migration
+
+    out = output()
+    runs = f'"{out.name}_runs"'
+
+    def bump(cur):
+        cur.execute(f"CREATE TABLE IF NOT EXISTS {runs} (n int)")
+        cur.execute(f"INSERT INTO {runs} VALUES (1)")
+        cur.execute("SELECT pg_sleep(0.05)")  # widen the lock window
+
+    migrations = [Migration("once", bump)]
+    await asyncio.gather(
+        asyncio.to_thread(asyncio.run, store.migrate(out, migrations)),
+        asyncio.to_thread(asyncio.run, store.migrate(out, migrations)),
+    )
+    with store._connect() as conn, conn.cursor() as cur:
+        n = cur.execute(f"SELECT count(*) AS c FROM {runs}").fetchone()["c"]
+    assert n == 1
+    assert _ledger(store, out.name) == ["once"]
+
+
+async def test_failed_migration_leaves_no_ledger_row(store):
+    """§4: a failing migration rolls back its work and writes no ledger row."""
+    from cursus.sdk import Migration
+
+    out = output()
+    table = f'"{out.name}_ghost"'
+
+    def boom(cur):
+        cur.execute(f"CREATE TABLE {table} (id text)")
+        raise RuntimeError("nope")
+
+    with pytest.raises(RuntimeError, match="nope"):
+        await store.migrate(out, [Migration("bad", boom)])
+    with store._connect() as conn, conn.cursor() as cur:
+        ghost = cur.execute(
+            "SELECT 1 FROM information_schema.tables WHERE table_name = %s",
+            (f"{out.name}_ghost",),
+        ).fetchone()
+    assert ghost is None
+    assert _ledger(store, out.name) == []
+
+
+async def test_schema_drift_fails_the_write(store):
+    """§4: a live table whose shape differs from the declaration fails the
+    write non-retryably and names the difference."""
+
+    out = output(key="id", primary_key=["id"])
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute(f'CREATE TABLE "{out.name}" (id text, v text, PRIMARY KEY (v))')
+    with pytest.raises(StoreError, match="does not match the declaration"):
+        await store.store([{"id": "a", "v": "1"}], None, scope(out))
+    assert StoreError.retryable is False
+
+
+async def test_migration_can_reconcile_drift(store):
+    """§4: a migration that brings the live table in line lets the write pass."""
+    from cursus.sdk import Migration
+
+    out = output(key="id", primary_key=["id"])
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute(f'CREATE TABLE "{out.name}" (id text, v text, PRIMARY KEY (v))')
+    with pytest.raises(StoreError, match="does not match"):
+        await store.store([{"id": "a", "v": "1"}], None, scope(out))
+    out.migrations = (
+        Migration(
+            "fix_pk",
+            f'ALTER TABLE "{out.name}" DROP CONSTRAINT "{out.name}_pkey", ADD PRIMARY KEY (id)',
+        ),
+    )
+    assert await store.migrate(out, out.migrations) == ["fix_pk"]
+    written = await store.store([{"id": "a", "v": "1"}], None, scope(out))
+    assert written.ref.version

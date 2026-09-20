@@ -720,6 +720,7 @@ class Engine:
             {
                 "version": asset["version"],
                 "stores": sorted(f"{name}@{self.manifest['stores'][name]['version']}" for name in stores),
+                "migrations": {o["name"]: o["migrations"] for o in asset["outputs"] if o.get("migrations")},
                 "config": run.get("config") or {},
                 "refs": pinned,
             }

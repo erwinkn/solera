@@ -193,3 +193,48 @@ def test_serve_insecure_guard(capsys, monkeypatch):
     monkeypatch.setattr(sys, "argv", ["cursus", "serve", "--host", "0.0.0.0", "--insecure"])
     with pytest.raises(SystemExit):
         main()
+
+
+MIGRATE_PROJECT = """
+from cursus.sdk import Migration, Output, Project, asset
+from cursus.stores import BlobStore
+
+
+def seed(objects, prefix):
+    import obstore
+
+    obstore.put(objects, prefix + "seeded.txt", b"1")
+
+
+@asset(outputs=Output("docs", store="blobs", migrations=[Migration("seed", seed)]))
+def docs():
+    return b"x"
+
+
+project = Project(assets=[docs], stores={"blobs": BlobStore()}, name="migdemo")
+"""
+
+
+def test_migrate_command_applies_and_is_idempotent(project_file, state_url, capsys, monkeypatch, tmp_path):
+    """§4: `cursus migrate` applies pending migrations for all migrating
+    outputs through the local path, prints the applied names, and a second
+    run applies nothing."""
+    import json as jsonlib
+
+    import obstore
+
+    path = tmp_path / "migdemo.py"
+    path.write_text(MIGRATE_PROJECT)
+    monkeypatch.delenv("CURSUS_SERVER_URL", raising=False)
+
+    out = cli(monkeypatch, capsys, "--state-url", state_url, "migrate", "--project", str(path))
+    assert "docs: applied seed" in out
+
+    objects = obstore.store.from_url(f"{state_url}/default/objects")
+    ledger = jsonlib.loads(bytes(obstore.get(objects, "blobs/docs/_migrations.json").bytes()))
+    assert [e["name"] for e in ledger["applied"]] == ["seed"]
+
+    out = cli(monkeypatch, capsys, "--state-url", state_url, "migrate", "--project", str(path))
+    assert "docs: applied seed" in out  # ledger names; nothing re-applied
+    ledger = jsonlib.loads(bytes(obstore.get(objects, "blobs/docs/_migrations.json").bytes()))
+    assert len(ledger["applied"]) == 1

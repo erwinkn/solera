@@ -252,6 +252,20 @@ async def _store_outputs(spec, project, asset, objects, result_value):
         store = project.stores[store_name]
         if hasattr(store, "bind_objects"):
             store.bind_objects(objects)
+        schema = None
+        if output.migrations:
+            migrate = getattr(store, "migrate", None)
+            if not callable(migrate):
+                raise StoreError(
+                    f"{output.name}: store {store_name!r} has no migrate for declared migrations"
+                )
+            try:
+                applied = await migrate(output, output.migrations)
+            except StoreError:
+                raise
+            except Exception as error:
+                raise StoreError(f"{output.name}: migration failed: {error}") from error
+            schema = applied[-1] if applied else output.migrations[-1].name
         prior = priors.get(name)
         prior_keys = await _key_map(objects, prior) if prior is not None else None
         scope = Scope(output=output, partition=spec["partition"], prior_keys=prior_keys)
@@ -259,6 +273,8 @@ async def _store_outputs(spec, project, asset, objects, result_value):
         if written.ref is None:
             continue
         ref = dataclasses.replace(written.ref, store=store_name)
+        if schema is not None:
+            ref = dataclasses.replace(ref, handle={**(ref.handle or {}), "schema": schema})
         if written.keys is not None:
             body = json.dumps(written.keys, sort_keys=True, allow_nan=False).encode()
             import hashlib
