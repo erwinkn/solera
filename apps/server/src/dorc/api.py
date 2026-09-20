@@ -12,7 +12,6 @@ from pathlib import Path
 
 from fastapi import FastAPI, Header, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .engine import Conflict, Engine
@@ -147,6 +146,7 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
             "project": runtime.manifest["name"],
             "revision": runtime.manifest["revision"],
             "inflight": len(runtime.inflight),
+            "postgres": bool(os.environ.get("DATABASE_URL")),
             "last_error": runtime.last_error,
         }
 
@@ -244,13 +244,28 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
             for output in outputs:
                 for scope, head in await tx.heads(output["name"]):
                     scopes[scope] = head
+            active = {}
+            failed = set()
+            for _, task in await tx.scan("task/"):
+                if task["asset"] != asset:
+                    continue
+                if task["status"] in {"queued", "waiting", "running"}:
+                    active[task["scope"]] = task["status"]
+                elif task["status"] == "failed":
+                    failed.add(task["scope"])
             out = []
             for scope in sorted(current | set(scopes)):
                 head = scopes.get(scope)
                 status = (
                     "retired"
                     if scope not in current
-                    else ("complete" if head and head["complete"] else "missing")
+                    else "running"
+                    if scope in active
+                    else "complete"
+                    if head and head["complete"]
+                    else "failed"
+                    if scope in failed
+                    else "missing"
                 )
                 out.append({"scope": scope, "status": status})
         return {"asset": asset, "partitions": out}
@@ -372,6 +387,7 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
             key = runtime.registry.env_key(spec)
             placement = runtime.registry.build(spec)
             seen[key] = {
+                "key": key,
                 "kind": spec["kind"],
                 "environment": spec["environment"],
                 "max_concurrent": getattr(placement, "max_concurrent", None),
@@ -382,7 +398,14 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
     @app.get("/api/projects/{p}/workers")
     async def workers(p: str, request: Request):
         runtime = await project_engine(request, p)
-        return {"workers": [w for _, w in await runtime.state.list_workers()]}
+        async with runtime.state.transaction() as tx:
+            claimed = {}
+            for _, task in await tx.pool_tasks():
+                if task["status"] == "claimed" and task["claimed_by"]:
+                    claimed[task["claimed_by"]] = task["attempt"]
+        return {
+            "workers": [{**w, "task": claimed.get(w["id"])} for _, w in await runtime.state.list_workers()]
+        }
 
     # -- worker pull path (§10) -------------------------------------------------------
 
@@ -432,8 +455,8 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
         return {"ok": True}
 
     # -- console -----------------------------------------------------------------------
-
-    app.mount("/static", StaticFiles(directory=web), name="static")
+    # The SPA builds with base=/static/, so client routes like /static/assets
+    # collide with the bundle path: serve real files, fall back to index.html.
 
     @app.get("/")
     async def index():
@@ -441,11 +464,16 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
 
     @app.get("/{path:path}")
     async def console(path: str):
-        # Client-side routes (assets, runs, automations, storage) share the shell.
-        target = web / path
-        if path and ".." not in path and target.is_file():
+        if path.startswith("api/"):
+            raise KeyError(path)
+        # The SPA builds with base=/static/: bundle files live under
+        # web/assets/…, while client routes (/static/assets, /static/runs) are
+        # pathnames that happen to share the prefix — files win, then the SPA.
+        bundle = path[7:] if path.startswith("static/") else path
+        target = (web / bundle).resolve()
+        if target.is_file() and web.resolve() in target.parents:
             return FileResponse(target)
-        if path.startswith("api/") or "." in Path(path).name:
+        if "." in Path(path).name:
             raise KeyError(path)
         return FileResponse(web / "index.html")
 

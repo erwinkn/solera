@@ -18,9 +18,8 @@ export const Route = createFileRoute("/runs")({
 });
 
 function RunsPage() {
-  const { state, select, refresh } = useWorkspace();
-  if (!state) return null;
-  const runs = state.runs;
+  const { runs, select, refresh, diagnostics } = useWorkspace();
+  if (!diagnostics) return null;
   return (
     <section className="flex flex-col gap-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -30,7 +29,7 @@ function RunsPage() {
           </div>
           <h1 className="font-heading text-xl font-medium">Runs</h1>
           <p className="mt-1 text-sm text-muted-foreground">
-            Durable requests, attempts, and materialization history.
+            Durable requests, tasks, attempts, and materialization history.
           </p>
         </div>
         <Button variant="outline" onClick={refresh}>
@@ -40,15 +39,14 @@ function RunsPage() {
       </div>
       {!runs.length ? (
         <Empty
-          title="No materializations yet"
+          title="No runs yet"
           action={
             <Button variant="outline" render={<Link to="/assets" />}>
               Browse assets
             </Button>
           }
         >
-          Start with sample_quality to exercise incremental, multi-output
-          processing.
+          Materialize an asset to create the first run.
         </Empty>
       ) : (
         <div className="overflow-x-auto rounded-xl border">
@@ -64,7 +62,7 @@ function RunsPage() {
             </TableHeader>
             <TableBody>
               {runs.map((run) => (
-                <TableRow key={run.id}>
+                <TableRow key={run.id} data-run={run.id}>
                   <TableCell>
                     <button
                       className="flex items-center gap-1 font-mono text-xs font-medium text-primary hover:underline"
@@ -74,7 +72,7 @@ function RunsPage() {
                       <ArrowRight className="size-3" />
                     </button>
                     <span className="block text-xs text-muted-foreground">
-                      {run.cause.replaceAll("_", " ")}
+                      {run.automation ?? "manual"}
                     </span>
                   </TableCell>
                   <TableCell>
@@ -99,9 +97,9 @@ function RunsPage() {
                         : `${run.targets.length} assets`}
                     </span>
                     <span className="block text-xs text-muted-foreground">
-                      {run.partitions.length
-                        ? `${run.partitions.length} partition${run.partitions.length === 1 ? "" : "s"}`
-                        : run.mode.replace("_", " ")}
+                      {Array.isArray(run.partitions)
+                        ? `${run.partitions.length} scope${run.partitions.length === 1 ? "" : "s"}`
+                        : `${run.partitions} · ${run.mode}`}
                     </span>
                   </TableCell>
                   <TableCell className="text-muted-foreground">
@@ -116,9 +114,6 @@ function RunsPage() {
           </Table>
         </div>
       )}
-      <div className="text-xs text-muted-foreground">
-        Showing latest {runs.length} runs
-      </div>
     </section>
   );
 }

@@ -2,7 +2,9 @@ import { useState } from "react";
 import type { ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
 import {
+  Cpu,
   Database,
+  Inbox,
   LayoutGrid,
   LogOut,
   Play,
@@ -29,6 +31,8 @@ const navigation = [
   { to: "/assets", label: "Assets", icon: LayoutGrid },
   { to: "/runs", label: "Runs", icon: Play },
   { to: "/automations", label: "Automations", icon: Zap },
+  { to: "/sources", label: "Sources", icon: Inbox },
+  { to: "/executors", label: "Executors", icon: Cpu },
   { to: "/storage", label: "Storage", icon: Database },
 ] as const;
 
@@ -45,7 +49,7 @@ export function Login() {
             sessionStorage.setItem("dorc-token", value);
             const result = await action.run(async () => {
               try {
-                return await request("/state");
+                return await request("/diagnostics");
               } catch (failure) {
                 sessionStorage.removeItem("dorc-token");
                 throw failure;
@@ -103,10 +107,21 @@ function ConnectionDot({ offline }: { offline: boolean }) {
 }
 
 export function AppShell({ children }: { children: ReactNode }) {
-  const { state, error, refresh, checked, openMaterialize } = useWorkspace();
+  const {
+    diagnostics,
+    assets,
+    runs,
+    error,
+    refresh,
+    checked,
+    openMaterialize,
+  } = useWorkspace();
   const unauthorized = error instanceof ApiError && error.status === 401;
-  if (unauthorized || (!state && !sessionStorage.getItem("dorc-token")))
+  if (unauthorized || (!diagnostics && !sessionStorage.getItem("dorc-token")))
     return <Login />;
+  const activeRuns = runs.filter((run) =>
+    ["running", "queued"].includes(run.status),
+  ).length;
   return (
     <div className="flex h-dvh flex-col md:flex-row">
       <aside className="flex shrink-0 flex-col gap-3 border-b bg-sidebar px-4 py-3 md:w-60 md:border-r md:border-b-0 md:py-5">
@@ -122,7 +137,7 @@ export function AppShell({ children }: { children: ReactNode }) {
             <span className="leading-tight">
               Data Orchestrator
               <span className="block text-[0.65rem] font-normal tracking-wider text-muted-foreground uppercase">
-                Experimental
+                {diagnostics?.project ?? "…"}
               </span>
             </span>
           </Link>
@@ -134,7 +149,7 @@ export function AppShell({ children }: { children: ReactNode }) {
         <div className="hidden text-[0.65rem] font-medium tracking-wider text-muted-foreground md:block">
           WORKSPACE
           <div className="mt-1 font-mono text-xs font-normal tracking-normal text-foreground">
-            {state?.storage.namespace ?? "default"}
+            {diagnostics?.namespace ?? "default"}
           </div>
         </div>
         <nav
@@ -151,23 +166,16 @@ export function AppShell({ children }: { children: ReactNode }) {
             >
               <item.icon className="size-4" />
               <span>{item.label}</span>
-              {item.to === "/assets" && state && (
+              {item.to === "/assets" && !!assets.length && (
                 <span className="ml-auto text-xs text-muted-foreground">
-                  {state.assets.length}
+                  {assets.length}
                 </span>
               )}
-              {item.to === "/runs" &&
-                !!state?.runs.filter((run) =>
-                  ["running", "queued", "paused"].includes(run.status),
-                ).length && (
-                  <span className="ml-auto rounded-full bg-sky-500/15 px-1.5 text-xs font-medium text-sky-700">
-                    {
-                      state.runs.filter((run) =>
-                        ["running", "queued", "paused"].includes(run.status),
-                      ).length
-                    }
-                  </span>
-                )}
+              {item.to === "/runs" && !!activeRuns && (
+                <span className="ml-auto rounded-full bg-sky-500/15 px-1.5 text-xs font-medium text-sky-700">
+                  {activeRuns}
+                </span>
+              )}
             </Link>
           ))}
         </nav>
@@ -177,8 +185,8 @@ export function AppShell({ children }: { children: ReactNode }) {
             <span>
               {error
                 ? "Connection interrupted"
-                : state
-                  ? `Connected · ${state.storage.scheme}`
+                : diagnostics
+                  ? `Connected · ${new URL(diagnostics.state).protocol.replace(":", "")}`
                   : "Connecting"}
             </span>
             {sessionStorage.getItem("dorc-token") && (
@@ -215,7 +223,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           {error && !unauthorized && (
             <div className="mb-4">
               <ErrorNotice
-                message={`${error.message}${state ? " · Displaying last received state." : ""}`}
+                message={`${error.message}${diagnostics ? " · Displaying last received state." : ""}`}
               />
             </div>
           )}
