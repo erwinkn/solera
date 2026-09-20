@@ -54,6 +54,7 @@ class Engine:
         if lease_seconds < 1 or concurrency < 1:
             raise ValueError("Lease duration and concurrency must be positive")
         self.state, self.manifest = state, manifest
+        self.project = project
         self.clock = clock or time.time
         self.lease_seconds, self.concurrency = lease_seconds, concurrency
         self.eval_interval = eval_interval
@@ -69,6 +70,10 @@ class Engine:
 
     async def initialize(self):
         await self.state.initialize(self.manifest, self.manifest["revision"])
+        if self.project:
+            async with self.state.transaction() as tx:
+                # The worker entrypoint spec for Local/pool launches.
+                await tx.put("sys/entrypoint", self.project)
         async with self.state.transaction() as tx:
             for name, source in self.manifest["sources"].items():
                 if await tx.head(name, "") is None:
@@ -140,7 +145,10 @@ class Engine:
             await self.tick()
             run = await self._run(run_id)
             if run and run["status"] in TERMINAL:
-                await asyncio.gather(*list(self.inflight.values()), return_exceptions=True)
+                # Wait only on this run's attempts — unrelated pool-placed runs
+                # may hold inflight waiters until a worker claims them.
+                mine = [t for a, t in self.inflight.items() if a.startswith(f"{run_id}/")]
+                await asyncio.gather(*mine, return_exceptions=True)
                 return await self.run_detail(run_id)
             await asyncio.sleep(0.05)
         raise TimeoutError(f"run {run_id} did not finish within {timeout}s")
@@ -190,6 +198,16 @@ class Engine:
                         seen.add((owner, up_scope))
                         assets.setdefault(owner, []).append(up_scope)
                         queue.append((owner, up_scope))
+            if keys:
+                bykey_outputs = {
+                    e["output"]
+                    for name in assets
+                    for e in self.manifest["assets"][name]["inputs"].values()
+                    if e["kind"] == "bykey"
+                }
+                unknown = set(keys) - bykey_outputs
+                if unknown:
+                    raise ValueError(f"keys= names no ByKey edge: {sorted(unknown)}")
             if skip_active:
                 for name in list(assets):
                     kept = []
@@ -800,7 +818,7 @@ class Engine:
 
         source = self.manifest["sources"].get(name)
         if source is None:
-            raise ValueError(f"Unknown source: {name!r}")
+            raise KeyError(name)
         async with self.state.transaction() as tx:
             head = await tx.head(name, "")
             keyed = source.get("key") is not None
@@ -1104,8 +1122,12 @@ class Engine:
             _, output, scope = key.split("/", 2)
             by_output.setdefault(output, {})[scope] = head
         assets = []
-        for _name, info in self.manifest["assets"].items():
+        for name, info in self.manifest["assets"].items():
             assets.append(
-                {**info, "heads": {o["name"]: by_output.get(o["name"], {}) for o in info["outputs"]}}
+                {
+                    **info,
+                    "name": name,
+                    "heads": {o["name"]: by_output.get(o["name"], {}) for o in info["outputs"]},
+                }
             )
         return assets

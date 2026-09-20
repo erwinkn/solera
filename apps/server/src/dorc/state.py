@@ -764,6 +764,12 @@ class State:
             return None
         return bytes(await result.bytes_async())
 
+    async def list_objects(self, prefix: str) -> list[str]:
+        out = []
+        async for batch in obstore.list(self.objects, prefix=prefix):
+            out.extend(meta["path"] for meta in batch)
+        return sorted(out)
+
     @property
     def poisoned(self):
         return self.store.poisoned

@@ -342,7 +342,7 @@ async def run_attempt(objects_url: str, attempt: str, entrypoint: str | Project)
     return 1
 
 
-async def _pool_worker(pool: str, server: str, token: str | None):
+async def run_pool(pool: str, server: str, token: str | None = None):
     """Pull path: register, claim, run the stage, complete (§10)."""
 
     import httpx
@@ -404,6 +404,6 @@ async def main():
         raise SystemExit(code)
     if mode == "pool":
         options = dict(zip(rest[::2], rest[1::2], strict=True))
-        await _pool_worker(options["--pool"], options["--server"].rstrip("/"), options.get("--token"))
+        await run_pool(options["--pool"], options["--server"].rstrip("/"), options.get("--token"))
         return
     raise SystemExit(f"unknown mode: {mode}")
