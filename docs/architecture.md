@@ -84,7 +84,7 @@ Resources (`Project(resources={...})`) bind by parameter name. `ctx` is
 reserved and optional.
 
 **`Output(name=None, store=None, key=None, revision=None, mode=None,
-**config)`** declares a slot: registry key (defaults to the function name
+migrations=(), **config)`** declares a slot: registry key (defaults to the function name
 when the asset has one output), store (default `JsonStore`), and
 store-specific config validated by `can_store` at registration.
 
@@ -93,6 +93,7 @@ store-specific config validated by `can_store` at registration.
 | `key` | Column identifying what was materialized. Declared once, here; consumers never name columns. Independent of `primary_key` (storage identity). |
 | `revision` | Column that changes when a key's content changes. Absent: `revision = H(row)`. |
 | `mode="append"` | A keyed output whose keys are engine-numbered **batches**: each `Patch` is one new key, a load is the snapshot of every batch at the pinned version (§3), and a `ByKey` consumer receives only new batches. Cannot declare its own `key`. |
+| `migrations` | Ordered `Migration(name, payload)` list owned by this output. The store applies pending ones before its first write to the output in an attempt (§4). Payload type is store-defined (`can_store`). The applied set travels in the handle (§3) and the declared list is in the fingerprint (§6). |
 | `**config` | Store-specific: `schema`, `primary_key`, `columns`, `indexes`, `partition_column`, … |
 
 **`PartitionSet(name=None)`** is an `Output` whose value *is* a list of
@@ -142,7 +143,8 @@ class Ref:
   `TableRef.where`, `TableRef.sql()`.
 - **Self-contained.** A historical ref resolves without current store
   config: everything `load` needs (table, partition slice, key and revision
-  columns, newest batch) is in the handle. Credentials never appear; `env:`
+  columns, newest batch, the last applied migration as `schema`) is in the
+  handle. Credentials never appear; `env:`
   indirection only.
 - **By reference.** Annotating an input with a `Ref` subclass hands the
   producer the pinned ref instead of loading it. With `Sql` this is the
@@ -205,6 +207,7 @@ class Store(Protocol):
     def can_store(self, t: type | None, output: Output) -> bool: ...
     async def store(self, write: Any, prior: Ref | None, scope: Scope) -> Written: ...
     async def load(self, ref: Ref, t: type, selection: Keys | None) -> Any: ...
+    async def migrate(self, output: Output, migrations: Sequence[Migration]) -> list[str]: ...  # optional
 
 Scope   = (output: Output, partition: str, prior_keys: Mapping[str, str] | None)
 Written = (ref: Ref, keys: Mapping[str, str] | None)
@@ -217,6 +220,20 @@ Keys    = (revisions: Mapping[str, str])
 | `can_store(t, output)` | Registration. Can you take values of type `t` for this `Output` declaration, and extract its declared key from them? `t` is `None` when the producer is unannotated. |
 | `store(write, prior, scope)` | Apply the write; return the new ref (version per §3) and, when the output declares a key, the scope's **complete** `key → revision` map, merged with `scope.prior_keys` for partial writes. Duplicate keys are a write error. For `partition_column` outputs, stamp the column with `scope.partition` and reject rows that disagree. |
 | `load(ref, t, selection)` | Materialize `t`; under `Keys`, only the selected keys, at their pinned revisions where the data model allows. Refs with `meta.external` were not written by the store and skip the marker check. |
+| `migrate(output, migrations)` | Optional. Apply, in declared order, every migration not yet in the store's own ledger for this output; return the applied names. Must be safe under concurrent attempts of one output (partitions share tables): take a store-level lock and re-read the ledger inside it. Where the backend is transactional, a migration and its ledger row commit together. A store without `migrate` rejects `migrations=` at registration. |
+
+### Migrations
+
+`Migration(name, payload)` is schema, not data: DDL for a table store, a
+callable over its prefix for a blob store; JsonStore has nothing to
+migrate and rejects the argument. The ledger of applied names lives next
+to the data (`cursus_migrations(output, name, at)` in Postgres), never in
+engine state, so the store is the only source of truth about its own
+shape. The harness calls `migrate` before the first `store()` to an output
+in an attempt, so a write can never precede its own migration; `cursus
+migrate [OUTPUT…]` applies eagerly through a `Local` harness for deploys
+that should fail fast. A migration that needs data from other outputs is
+an asset with inputs, not a migration.
 
 ### Writes
 
@@ -331,10 +348,11 @@ Work is batched by `batch_size`: each batch commits with its key state;
 `more` re-queues the task; `scope_complete := not more` on the head.
 
 The **interpretation fingerprint** `H(version, store versions of the
-asset's input and output stores, run config, refs of non-ByKey inputs and
-deps)` is stored per processed key. A key is reprocessed when its revision
-or the fingerprint changes, so a `version` bump or a change to any whole
-input reprocesses every key. Code changes alone do not: the code hash
+asset's input and output stores, migration names of the asset's outputs,
+run config, refs of non-ByKey inputs and deps)` is stored per processed
+key. A key is reprocessed when its revision or the fingerprint changes, so
+a `version` bump, a new migration, or a change to any whole input
+reprocesses every key. Code changes alone do not: the code hash
 bumps the project revision, not the fingerprint.
 
 A head written before the key was declared has no key map: "no keys
@@ -422,6 +440,10 @@ since the claim. A stale generation cannot commit (**fencing**). Outcomes:
 
 A commit installs heads, `input_refs`, the cursor, per-edge key state and a
 `changed` list, and pends `OnChange` automations in the same transaction.
+Every terminal task outcome also records `{last_outcome, last_attempt, at}`
+on the `(asset, scope)` record, and queued or running tasks are indexed per
+scope. Views such as the partition grid read those two things; nothing
+scans task history.
 
 ## 9. Automations
 
@@ -448,10 +470,13 @@ the run's own vocabulary (§8): `partitions`, `mode`, `upstream`, `config`,
 | `Every(seconds)` | on an interval, with a floor; a tick is skipped for any scope still running |
 | `Cron(expr, timezone="UTC")` | on schedule; same skip rule |
 | `OnChange(*outputs)` | when a listed output's head changes; no args = every input and dep of the target. May not name an output of the target itself |
+| `OnDeploy()` | once per new project revision (§11), for the latest revision only: the automation records the revision it last fired for, so a restart on the same revision is silent and back-to-back deploys fire once. Default `partitions="latest"` |
 
 `partitions="missing"` on a schedule is how new keys of a partition set
 and failed first runs get picked up without an operator:
-`Automation(trigger=Every(60), partitions="missing")`.
+`Automation(trigger=Every(60), partitions="missing")`. `OnDeploy()` on an
+asset whose outputs declare migrations applies them as part of the deploy;
+on a job it is a post-deploy hook.
 
 Automation runs plan targets only, pinned to current heads; every pinned
 input must have a head (sources synthesize theirs). Toggles are keyed by
@@ -615,7 +640,7 @@ project = Project(
 ```
 
 The manifest records assets (`outputs` with `{name, store, key, revision,
-mode, config}`, `inputs`, `deps`, `partitions`, `placement`, `retries`,
+mode, migrations, config}`, `inputs`, `deps`, `partitions`, `placement`, `retries`,
 `timeout`, `version`, code hash, load types via `typing.get_type_hints`),
 sources, automations, store names with their `Store.version`, executor
 names, and the project revision.
@@ -638,6 +663,8 @@ Registration errors:
 - `Automation()` has no trigger; a standalone automation has no name or
   targets; automation names collide;
 - an `OnChange` names an output of its own target;
+- an output declares `migrations=` on a store without `migrate`, a
+  migration name repeats, or a payload fails `can_store`;
 - a placement's kind is not registered.
 
 A bare `DataFrame` to a `primary_key` output is replace, not a `Patch`.

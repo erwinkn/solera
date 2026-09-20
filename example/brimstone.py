@@ -22,6 +22,8 @@ from cursus.sdk import (
     ByKey,
     Cron,
     Every,
+    Migration,
+    OnDeploy,
     Output,
     PartitionSet,
     Project,
@@ -89,7 +91,8 @@ ingest = Pool("ingest")
 
 @asset(
     outputs=PartitionSet(),  # name defaults to the function name
-    automations=Automation(trigger=Cron("0 6 * * *")),
+    # Daily, and once per deploy so a fresh revision starts from a current list.
+    automations=[Automation(trigger=Cron("0 6 * * *")), Automation(trigger=OnDeploy())],
 )
 def sites(graph: GraphClient) -> list[str]:
     """Refresh the SharePoint site list daily; new sites surface as missing work."""
@@ -149,6 +152,15 @@ def graph_delta(ctx, graph: GraphClient):
         primary_key=["sample_id"],
         partition_column="site",
         indexes=[["file_id"]],
+        # Schema owned by the output: the store applies pending ones before
+        # its first write, keeps the ledger in Postgres, and a new entry
+        # reprocesses every key (it enters the interpretation fingerprint).
+        migrations=[
+            Migration("0001_analyst", "ALTER TABLE qaqc.qaqc_samples ADD COLUMN IF NOT EXISTS analyst text"),
+            Migration(
+                "0002_measured_tz", "ALTER TABLE qaqc.qaqc_samples ALTER COLUMN measured TYPE timestamptz"
+            ),
+        ],
     ),
     partitions=sites,
     inputs={"qaqc_files": ByKey()},

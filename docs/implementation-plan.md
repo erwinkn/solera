@@ -389,3 +389,119 @@ the CLI command or console page used to verify it.
   implementation, each called out in the PR with the reason; the plan
   author reviews those.
 - No TODOs left that reference this plan; open questions go in the PR.
+
+## Phase 8 — Integrate on `main`, migrations, `OnDeploy`, per-scope outcomes
+
+Context. PR #3 (branch
+`bb/implement-dorc-architecture-plan-docs-implementa-thr_9uw5mdrpwk`,
+seven phase commits, all gates green) implements Phases 1–7 under the old
+`dorc` naming and targets `feat/s3-state-backend`. Meanwhile `main` renamed
+the project to **cursus** (`dda6b06`: `data_orchestrator` → `cursus`,
+`dorc` → `cursus_server`, `dorc_worker` → `cursus_worker`, `dorc` CLI →
+`cursus`, `DORC_*` → `CURSUS_*`, `.dorc` → `.cursus`, `@cursus/ui`) and
+collapsed the three distributions into one root `cursus` package
+(`8c4d062`). `main` does **not** contain the implementation.
+
+### 8a. Land the implementation on `main`
+
+- Rebase or merge the seven phase commits onto `main`, applying the rename
+  to every new file: package paths, imports, CLI name, env vars, compose
+  service, README, Playwright config, test fixtures, the `dorc_postgres`
+  package (→ `cursus_postgres`, which `example/brimstone.py` already
+  imports), the console session key and API client. Keep the single-root
+  distribution from `8c4d062`: no per-component `pyproject.toml`.
+- Retarget PR #3 to `main` (or open a fresh PR and close #3 with a link).
+- Gate 8a: the full Phase 7 gate on `main` naming: ruff, `pytest`
+  (file:// and `postgres`-marked against compose), `tests/test_demo_e2e.py`,
+  `cursus manifest --project example/brimstone.py`, console typecheck,
+  format check and Playwright; `grep -rIl "dorc\|data_orchestrator\|DORC_"`
+  over the tree returns nothing outside git history.
+
+### 8b. Migrations on outputs (§2, §3, §4, §6, §11)
+
+- SDK: `Migration(name, payload)`; `Output(migrations=())`; manifest
+  records the ordered names per output; registration errors for a store
+  without `migrate`, duplicate names, and a payload failing `can_store`.
+- Store protocol: optional `migrate(output, migrations) -> list[str]`.
+  `PostgresStore` implements it with a `cursus_migrations(output, name,
+  at)` ledger, a `pg_advisory_xact_lock` keyed on the output, and each
+  migration plus its ledger row in one transaction. Payloads: SQL string
+  or `Callable[[cursor], None]`. `BlobStore` implements it with a
+  `_migrations.json` ledger object under the output prefix and callable
+  payloads; `JsonStore` has no `migrate` and therefore rejects the
+  argument.
+- `PostgresStore` table creation becomes create-if-missing only: drop the
+  `ALTER TABLE ADD COLUMN` path from `_ensure`. Before a write, compare the
+  live table against the declared config (`primary_key`, `partition_column`,
+  declared `columns`) and fail non-retryably with a message naming the
+  difference. Type inference from rows stays for creation only.
+- Harness: before the first `store()` to an output in an attempt, call
+  `migrate` when the output declares migrations; the last applied name
+  goes into the handle as `schema`. Failure is a failed result with
+  `retryable=false`.
+- Engine: the interpretation fingerprint includes the migration names of
+  the asset's outputs.
+- CLI: `cursus migrate [OUTPUT…]` runs `migrate` for the named outputs (all
+  migrating outputs by default) through a `Local` harness and prints the
+  applied names.
+
+Tests:
+
+- `tests/sdk/test_manifest.py`: migrations in the manifest; the three
+  registration errors.
+- `tests/sdk/test_postgres.py` (marker `postgres`): pending migrations
+  applied in order and recorded; second call applies nothing; two
+  concurrent `migrate` calls apply each migration once; a failing
+  migration leaves no ledger row; live-table drift (PK differs from the
+  declaration) fails the write with the drift message; a migration that
+  brings the table in line lets the write pass.
+- `tests/sdk/test_blobstore.py`: ledger object round-trip, callable
+  payload applied once.
+- `tests/server/test_engine.py`: adding a migration changes the
+  fingerprint and reprocesses every key; the handle of the new head
+  carries `schema`.
+- `tests/worker/test_worker.py`: `migrate` runs before the first write in
+  a real subprocess attempt; a failing migration yields a non-retryable
+  failed result.
+- `tests/server/test_cli.py`: `cursus migrate` prints applied names and
+  is idempotent.
+
+### 8c. `OnDeploy()` (§9)
+
+- SDK trigger; automation state gains `last_revision`; the eval loop fires
+  each `OnDeploy` automation once when the served project revision
+  differs from `last_revision`, then records it. Skip-if-active applies.
+- Console: automations page shows `OnDeploy` with the revision last fired
+  for.
+
+Tests: fires once per new revision; silent on restart with the same
+revision; two registrations before a tick fire once for the latest; the
+demo project gets an `OnDeploy` job so `tests/test_demo_e2e.py` sees it
+fire on boot.
+
+### 8d. Per-scope outcomes instead of task-history scans (§8)
+
+- State: `scope/{asset}/{scope}` record with `{last_outcome, last_attempt,
+  at}`, written in the transaction that finalizes a task (succeeded,
+  skipped, failed, canceled). The `pending/{asset}/{scope}/{task}` index
+  already exists; keep it as the only source for "running".
+- `GET /api/projects/{p}/partitions/{name}` reads heads, the scope
+  records and the pending index; remove the `task/` scan. Same for any
+  other endpoint or console view that scans `task/` (audit with
+  `grep -rn 'scan("task/'`).
+- `GET assets/{name}` and the console partition grid show `last_outcome`
+  and `last_attempt` per cell, linking to the attempt.
+
+Tests: `tests/server/test_api.py` asserts the endpoint's statuses for
+complete, missing, running, failed and retired scopes using only the
+state written by the engine, with a check that no `task/` scan occurs
+(instrument `tx.scan` in the test); a scope that failed and later
+succeeded reports `complete`.
+
+### Gate 8
+
+Gate 8a plus every test above, the console gates, and `tests/test_demo_e2e.py`
+extended with: the demo's Postgres outputs declare one migration each and the
+e2e run (Postgres variant) shows them applied; the `OnDeploy` job fires on
+boot. README gains a "Migrations" section and `cursus migrate` in the CLI
+table. One PR against `main`, gate output in the description.
