@@ -142,6 +142,20 @@ This is a feasibility implementation, not a claim of production readiness or ben
 
 Read [the design and safety invariants](docs/architecture.md) before extending the backend. OpenAPI/UI endpoints are trusted-team surfaces, not a hardened multi-tenant service.
 
+## Releasing
+
+The `cursus`, `cursus-worker`, and `cursus-server` distributions are published to PyPI by [`.github/workflows/publish.yml`](.github/workflows/publish.yml) using [Trusted Publishing](https://docs.pypi.org/trusted-publishers/) — no long-lived token is stored. Each project has a pending/trusted publisher registered against this repository and the `publish.yml` workflow with environment `pypi`; one OIDC exchange mints a short-lived token scoped to all three projects at once.
+
+To cut a release, bump the version in the three `pyproject.toml` files, commit, and push a tag; the workflow builds the distributions in one job and publishes them from a second, protected job:
+
+```bash
+uv version --package cursus 0.0.2   # ...and cursus-worker, cursus-server
+git commit -am 'release: 0.0.2'
+git tag v0.0.2 && git push origin main v0.0.2
+```
+
+It can also be run on demand from the Actions tab (`workflow_dispatch`).
+
 ## License
 
 Apache-2.0. The repository's visibility is unchanged.
