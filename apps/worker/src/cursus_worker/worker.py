@@ -200,20 +200,16 @@ async def _resolve_inputs(spec, project, asset, objects):
                     rows=args[param], batches=range(lo, hi + 1), full=full
                 )
             else:
+                # Keyed upstream: the pin carries the delivered key slice —
+                # whole on a one-take reset, chunked on a drain.
                 upserted = ch.get("upserted") or {}
                 deleted = ch.get("deleted") or []
-                args[param] = await store.load(ref, t, None if full else Keys(upserted))
-                if full:
-                    # The delivered keys are whatever the head holds now.
-                    key_col = (project.manifest["outputs"][edge["output"]] or {}).get("key")
-                    ups = tuple(
-                        str(r[key_col]) if isinstance(r, dict) and key_col != "<elements>" else str(r)
-                        for r in args[param]
-                    )
-                else:
-                    ups = tuple(sorted(upserted))
+                args[param] = await store.load(ref, t, Keys(upserted))
                 changes[param] = Changes(
-                    rows=args[param], deleted=tuple(deleted), full=full, upserted=ups
+                    rows=args[param],
+                    deleted=tuple(deleted),
+                    full=full,
+                    upserted=tuple(sorted(upserted)),
                 )
             continue
         if t is not None and is_ref_type(t):

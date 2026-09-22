@@ -25,6 +25,7 @@ import type {
   AssetDetail,
   CatalogAsset,
   Head,
+  Json,
   PartitionScope,
 } from "@/lib/types";
 
@@ -165,8 +166,8 @@ function PartitionGrid({
         {cells.map(({ scope, label, cell }) => {
           const head = headsByScope.get(scope);
           const keyCount = (
-            head?.ref.meta as Record<string, { count?: number }> | undefined
-          )?.keys?.count;
+            head?.ref.meta as Record<string, Json[]> | undefined
+          )?.partitions?.length;
           const attemptRun = cell.last_attempt?.split("/")[0];
           return (
             <span key={scope} role="listitem" className="inline-flex">
@@ -272,7 +273,9 @@ export function AssetSheet() {
                         (output.partition_set ? "<elements>" : "—")}
                       {output.revision ? ` @${output.revision}` : ""}
                     </TableCell>
-                    <TableCell>{output.mode ?? "replace"}</TableCell>
+                    <TableCell>
+                      {output.incremental ? "incremental" : "replace"}
+                    </TableCell>
                   </TableRow>
                 ))}
                 {!asset.outputs.length && (

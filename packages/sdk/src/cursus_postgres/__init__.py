@@ -236,12 +236,15 @@ class PostgresStore:
         return {r["key"]: r["rev"] for r in cur.execute(sql, params).fetchall()}
 
     def _put_key_revs(self, cur, output_name: str, partition: str, revs: dict):
-        for key, rev in revs.items():
-            cur.execute(
-                f"INSERT INTO {KEYMAP_TABLE} (output, partition, key, rev) VALUES (%s,%s,%s,%s) "
-                "ON CONFLICT (output, partition, key) DO UPDATE SET rev = EXCLUDED.rev",
-                (output_name, partition, str(key), str(rev)),
-            )
+        if not revs:
+            return
+        pairs = [(str(k), str(v)) for k, v in revs.items()]
+        cur.execute(
+            f"INSERT INTO {KEYMAP_TABLE} (output, partition, key, rev) "
+            "SELECT %s, %s, k, r FROM unnest(%s::text[], %s::text[]) AS u(k, r) "
+            "ON CONFLICT (output, partition, key) DO UPDATE SET rev = EXCLUDED.rev",
+            (output_name, partition, [p[0] for p in pairs], [p[1] for p in pairs]),
+        )
 
     def _del_key_revs(self, cur, output_name: str, partition: str, keys=None):
         if keys is None:

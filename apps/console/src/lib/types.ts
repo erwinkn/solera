@@ -55,13 +55,13 @@ export interface OutputDecl {
   store: string;
   key: string | null;
   revision: string | null;
-  mode: string | null;
+  incremental: boolean;
   config: Record<string, Json>;
   partition_set: boolean;
 }
 
 export interface Edge {
-  kind: "in" | "bykey" | "all_partitions" | "dep";
+  kind: "in" | "incremental" | "all_partitions" | "dep";
   output: string;
   param?: string;
   batch_size?: number;
@@ -219,17 +219,25 @@ export interface OutputHead {
   ref: Ref;
   version: string | null;
   key_count: number | null;
+  delta: { object: string; batch: number; rows: number } | null;
   complete: boolean;
   cursor: boolean;
   at: number;
   commit: string | null;
 }
 
+export interface Watermark {
+  batch: number;
+  offset: number;
+  fingerprint: string;
+  more?: boolean;
+}
+
 export interface AssetDetail {
   asset: Omit<CatalogAsset, "name" | "heads">;
   heads: Record<string, [string, Head][]>;
   cursor: Json;
-  key_state: Record<string, Record<string, Json>>;
+  watermarks: Record<string, Watermark | null>;
   current_keys: string[][];
   scopes: Record<string, ScopeOutcome>;
   automations: AutomationRecord[];

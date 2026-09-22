@@ -24,5 +24,5 @@ def json_store(objects):
     return store
 
 
-def scope(output: Output, partition: str = "", prior_keys=None) -> Scope:
-    return Scope(output=output, partition=partition, prior_keys=prior_keys)
+def scope(output: Output, partition: str = "", baseline=None, batch=None) -> Scope:
+    return Scope(output=output, partition=partition, baseline=baseline, batch=batch)

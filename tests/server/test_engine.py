@@ -9,10 +9,10 @@ from cursus.executors import Environment
 from cursus.sdk import (
     AllPartitions,
     Automation,
-    ByKey,
     Cron,
     Every,
     In,
+    Incremental,
     JsonRef,
     OnChange,
     OnDeploy,
@@ -140,7 +140,7 @@ async def test_result_cursor_and_omitted_output(state):
             return Result(outputs={"a": [1], "b": [2]}, cursor="c1")
         if calls["n"] == 2:
             return Result(outputs={"a": [3]}, cursor="c2")
-        return Result(outputs={"a": [4]})  # recompute run: no cursor set
+        return Result(outputs={"a": [4]})  # full run: no cursor set
 
     project = Project(assets=[pair])
     engine = make_engine(state, project)
@@ -152,9 +152,9 @@ async def test_result_cursor_and_omitted_output(state):
         head_b = await tx.head("b", "")
         assert head_b is not None  # kept from the first commit
         assert await tx.cursor("pair", "") == "c2"
-    await drive(engine, await engine.submit(["pair"], mode="recompute"))
+    await drive(engine, await engine.submit(["pair"], mode="full"))
     async with state.transaction() as tx:
-        assert await tx.cursor("pair", "") is None  # recompute clears the cursor
+        assert await tx.cursor("pair", "") is None  # full clears the cursor
 
 
 async def test_omitted_output_without_head_fails(state):
@@ -198,9 +198,9 @@ async def test_rename_and_meta_edges(state):
     assert seen["feed"] == [{"id": "a", "v": 1}, {"id": "b", "v": 2}]
 
 
-async def test_bykey_filters_input_and_changes(state):
-    """§5/§6: under ByKey the parameter arrives filtered to upserted keys and
-    ctx.changes carries upserted + deleted."""
+async def test_incremental_filters_input_and_changes(state):
+    """§5/§6: under Incremental the parameter arrives filtered to upserted
+    keys and ctx.changes carries upserted + deleted."""
     seen = {}
     content = {"rows": [{"id": "a", "v": 1}, {"id": "b", "v": 1}, {"id": "c", "v": 1}]}
 
@@ -208,7 +208,7 @@ async def test_bykey_filters_input_and_changes(state):
     def files():
         return content["rows"]
 
-    @asset(inputs={"files": ByKey()})
+    @asset(inputs={"files": Incremental()})
     def consumer(ctx, files: list):
         seen["rows"] = list(files)
         seen["upserted"] = list(ctx.changes["files"].upserted)
@@ -219,7 +219,7 @@ async def test_bykey_filters_input_and_changes(state):
     engine = make_engine(state, project)
     await engine.initialize()
     await drive(engine, await engine.submit(["consumer"], upstream=True))
-    assert seen["upserted"] == ["a", "b", "c"]  # §6: first write upserts everything
+    assert seen["upserted"] == ["a", "b", "c"]  # §6: first delivery upserts everything
     assert {r["id"] for r in seen["rows"]} == {"a", "b", "c"}
 
     # Second run, no changes → skipped, nothing loaded.
@@ -242,17 +242,18 @@ async def test_bykey_filters_input_and_changes(state):
 
 
 async def test_config_change_reprocesses_everything(state):
-    """§6: run config is part of the interpretation fingerprint — changing it
-    reprocesses every key."""
+    """§6/§2.2: run config is part of the interpretation fingerprint —
+    changing it forces full=True on the edge and reprocesses every key."""
     seen = {}
 
     @asset(outputs=Output("files", key="id"))
     def files():
         return [{"id": "a", "v": 1}]
 
-    @asset(inputs={"files": ByKey()})
+    @asset(inputs={"files": Incremental()})
     def consumer(ctx, files: list):
         seen.setdefault("batches", []).append([r["id"] for r in files])
+        seen.setdefault("full", []).append(ctx.changes["files"].full)
         return []
 
     project = Project(assets=[files, consumer])
@@ -261,12 +262,45 @@ async def test_config_change_reprocesses_everything(state):
     await drive(engine, await engine.submit(["consumer"], upstream=True))
     await drive(engine, await engine.submit(["consumer"], upstream=True, config={"threshold": 2}))
     assert seen["batches"] == [["a"], ["a"]]
+    assert seen["full"] == [True, True]  # first delivery + fingerprint reset
 
 
-async def test_version_bump_fails_then_recompute_recovers(state):
+async def test_full_run_resets_watermark(state):
+    """§2.2: a `full` run resets the edge watermark — the consumer re-reads
+    the whole head (not a diff) and the watermark lands past the head batch."""
+    seen = []
+
+    @asset(outputs=Output("files", key="id"))
+    def files():
+        return [{"id": "a", "v": 1}, {"id": "b", "v": 1}]
+
+    @asset(inputs={"files": Incremental()})
+    def consumer(ctx, files: list):
+        seen.append((sorted(r["id"] for r in files), ctx.changes["files"].full))
+        return [{"n": len(files)}]
+
+    project = Project(assets=[files, consumer])
+    engine = make_engine(state, project)
+    await engine.initialize()
+    await drive(engine, await engine.submit(["consumer"], upstream=True))
+    async with state.transaction() as tx:
+        first = await tx.watermark("consumer", "files", "")
+        assert first == {"batch": 1, "offset": 0, "fingerprint": first["fingerprint"], "more": False}
+    detail = await drive(engine, await engine.submit(["consumer"], mode="full"))
+    assert task_statuses(detail)["consumer"] == "succeeded"  # never skipped on full
+    async with state.transaction() as tx:
+        second = await tx.watermark("consumer", "files", "")
+        assert second["batch"] == first["batch"]  # back at head+1
+        assert second["offset"] == 0
+        assert second["more"] is False
+    # Both deliveries were full-head reads.
+    assert seen == [(["a", "b"], True), (["a", "b"], True)]
+
+
+async def test_version_bump_fails_then_full_recovers(state):
     """§6: a version mismatch between committed and declared fails an
-    incremental attempt non-retryably; on_version_change='recompute' turns the
-    next attempt of the scope into a recompute."""
+    incremental attempt non-retryably; on_version_change='full' turns the
+    next attempt of the scope into a full run."""
     count = {"n": 0}
 
     @asset(version="1")
@@ -290,9 +324,9 @@ async def test_version_bump_fails_then_recompute_recovers(state):
     detail = await drive(engine2, await engine2.submit(["versioned"]))
     assert status_of(detail) == "failed"
     task = detail["tasks"][0]
-    assert "recompute required" in task["error"]
+    assert "full run is required" in task["error"]
 
-    @asset(version="2", on_version_change="recompute")
+    @asset(version="2", on_version_change="full")
     def versioned():  # noqa: F811
         count["n"] += 1
         return [count["n"]]
@@ -304,7 +338,7 @@ async def test_version_bump_fails_then_recompute_recovers(state):
     assert status_of(detail) == "succeeded"
 
 
-async def test_bykey_batching_and_more(state):
+async def test_incremental_batching_and_more(state):
     """§6: work is batched by batch_size; `more` re-queues the task;
     scope_complete lands on the head only with the last batch."""
     batches = []
@@ -313,7 +347,7 @@ async def test_bykey_batching_and_more(state):
     def files():
         return [{"id": f"k{i}", "v": 1} for i in range(5)]
 
-    @asset(inputs={"files": ByKey(batch_size=2)})
+    @asset(inputs={"files": Incremental(batch_size=2)})
     def consumer(ctx, files: list):
         batches.append([r["id"] for r in files])
         return []
@@ -333,15 +367,15 @@ async def test_bykey_batching_and_more(state):
 
 
 async def test_run_keys_override(state):
-    """§8: `keys=` explicit list merges into key state; 'full' treats every key
-    as upserted and state-minus-map as deleted."""
+    """§8: `keys=` explicit list is a one-off selection that never moves the
+    watermark; 'full' drains the folded key map as a reset."""
     seen = []
 
     @asset(outputs=Output("files", key="id"))
     def files():
         return [{"id": "a", "v": 1}, {"id": "b", "v": 1}]
 
-    @asset(inputs={"files": ByKey()})
+    @asset(inputs={"files": Incremental()})
     def consumer(ctx, files: list):
         seen.append(sorted(r["id"] for r in files))
         return []
@@ -562,7 +596,7 @@ async def test_upstream_false_never_replans(state):
         calls["n"] += 1
         return [{"id": "a", "v": calls["n"]}]
 
-    @asset(inputs={"feed": ByKey()})
+    @asset(inputs={"feed": Incremental()})
     def consumer(feed: list):
         return [{"n": len(feed)}]
 
@@ -955,7 +989,7 @@ async def test_identical_poll_wakes_nothing(state):
     def feed():
         return [{"id": "a", "v": 1}]
 
-    @asset(inputs={"feed": ByKey()}, automations=OnChange())
+    @asset(inputs={"feed": Incremental()}, automations=OnChange())
     def consumer(feed: list):
         fired.append(True)
         return []
@@ -1030,7 +1064,7 @@ async def test_migration_changes_fingerprint_and_marks_handle(state):
     def files():
         return [{"id": "a", "v": 1}, {"id": "b", "v": 1}]
 
-    @asset(inputs={"files": ByKey()}, outputs=Output("rolled", store="mig"))
+    @asset(inputs={"files": Incremental()}, outputs=Output("rolled", store="mig"))
     def consumer(ctx, files: list):
         seen.append(sorted(r["id"] for r in files))
         return {"n": len(files)}
@@ -1050,7 +1084,7 @@ async def test_migration_changes_fingerprint_and_marks_handle(state):
         return [{"id": "a", "v": 1}, {"id": "b", "v": 1}]
 
     @asset(
-        inputs={"files": ByKey()},
+        inputs={"files": Incremental()},
         outputs=Output("rolled", store="mig", migrations=[Migration("m1", lambda o, p: None)]),
     )
     def consumer(ctx, files: list):  # noqa: F811 — same asset, one migration added

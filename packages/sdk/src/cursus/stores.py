@@ -114,15 +114,17 @@ def delta_path(output: str, partition: str, batch: int) -> str:
     return f"deltas/{output}/{quote(partition or '_', safe='')}/{batch:012d}.json"
 
 
-def next_batch(ref: Ref | None) -> int:
-    """The delta batch a write after `ref` lands at."""
+def next_batch(ref) -> int:
+    """The delta batch a write after `ref` lands at. Accepts a Ref or its
+    JSON dict form (heads live as dicts in state)."""
 
     if ref is None:
         return 0
-    delta = (ref.meta or {}).get("delta")
+    meta = (ref.meta if isinstance(ref, Ref) else ref.get("meta")) or {}
+    delta = meta.get("delta")
     if delta is not None:
         return int(delta["batch"]) + 1
-    handle = ref.handle or {}
+    handle = (ref.handle if isinstance(ref, Ref) else ref.get("handle")) or {}
     if "batches" in handle:
         return int(handle["batches"][1]) + 1
     return 0
@@ -315,7 +317,10 @@ class JsonStore:
         added = sorted(set(payload) - {str(e) for e in base_elements})
         removed = sorted({str(e) for e in base_elements} - set(payload))
         if not added and not removed:
-            return Written(baseline if baseline is not None else prior)
+            if baseline is None and prior is None:
+                pass  # a first write still establishes a head
+            else:
+                return Written(baseline if baseline is not None else prior)
         path = f"data/{output.name}/{version}.json"
         await self._put(objects, path, payload)
         ref = self._ref(output, scope, {"object": path, "mode": "set", "key": output.key}, version)
@@ -343,7 +348,11 @@ class JsonStore:
         if prior is not None and version == prior.version:
             return Written(prior)
         first, last = await self._append_window(objects, output, scope, prior)
-        batch = scope.batch if scope.batch is not None else last + 1
+        batch = (
+            scope.batch
+            if scope.batch is not None
+            else max(last + 1, next_batch(scope.baseline or prior))
+        )
         payload = {"rows": rows}
         if prior is None:
             payload["reset"] = True
@@ -386,7 +395,11 @@ class JsonStore:
         upserted = {k: r for k, r in new_revs.items() if base_revs.get(k) != r}
         deleted = sorted(set(base_revs) - set(new_revs))
         if not upserted and not deleted:
-            return Written(prior or scope.baseline)
+            if prior is None and scope.baseline is None:
+                # A first write still establishes a head (possibly empty).
+                upserted, deleted = {}, []
+            else:
+                return Written(prior or scope.baseline)
         if patch:
             version = digest(
                 [

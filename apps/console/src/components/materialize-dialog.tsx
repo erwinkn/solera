@@ -57,13 +57,13 @@ export function MaterializeDialog() {
     }
   }, [open, materializeTargets, materializeScopes]);
 
-  const bykeyEdges = useMemo(() => {
+  const incrementalEdges = useMemo(() => {
     const edges = new Set<string>();
     for (const name of targets)
       for (const edge of Object.values(
         assets.find((a) => a.name === name)?.inputs ?? {},
       ))
-        if (edge.kind === "bykey") edges.add(edge.output);
+        if (edge.kind === "incremental") edges.add(edge.output);
     return [...edges];
   }, [targets, assets]);
 
@@ -193,7 +193,7 @@ export function MaterializeDialog() {
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="incremental">incremental</SelectItem>
-                  <SelectItem value="recompute">recompute</SelectItem>
+                  <SelectItem value="full">full</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -227,16 +227,16 @@ export function MaterializeDialog() {
               onChange={(e) => setConfig(e.target.value)}
             />
           </div>
-          {!!bykeyEdges.length && (
+          {!!incrementalEdges.length && (
             <div className="flex flex-col gap-1.5">
               <Label htmlFor="md-keys">
-                ByKey overrides — one per line: EDGE=full or EDGE=k1,k2
+                Incremental overrides — one per line: EDGE=full or EDGE=k1,k2
               </Label>
               <Textarea
                 id="md-keys"
                 rows={2}
                 className="font-mono text-xs"
-                placeholder={bykeyEdges.map((e) => `${e}=full`).join("\n")}
+                placeholder={incrementalEdges.map((e) => `${e}=full`).join("\n")}
                 value={keys}
                 onChange={(e) => setKeys(e.target.value)}
               />

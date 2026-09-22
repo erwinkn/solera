@@ -413,6 +413,12 @@ class Engine:
         meta = head["ref"].get("meta") or {}
         if meta.get("partitions") is not None:
             return [str(e) for e in meta["partitions"]]
+        legacy = meta.get("keys") or {}
+        if legacy.get("object"):
+            # Pre-delta head: the element list lives in a staged keys object.
+            data = await self.state.get_object(legacy["object"])
+            if data is not None:
+                return sorted(str(k) for k in json.loads(data))
         if meta.get("delta"):
             keys = await self.state.delta_key_map(
                 head["ref"]["output"], head["ref"].get("partition", ""), meta["delta"]["batch"]
@@ -708,11 +714,14 @@ class Engine:
         """Plan one Incremental edge: the pending delta items after the edge's
         watermark, capped at `batch_size` (§2.2).
 
-        watermark = {"batch", "offset", "fingerprint"}: items of batches below
-        `batch` are delivered, plus the first `offset` items of `batch`. A
-        missing watermark, a fingerprint change, or a `full` run resets the
-        edge to a whole-head delivery. Returns (pin, watermark_update, empty);
-        the update carries `more` while pending items remain after the take."""
+        watermark = {"batch", "offset", "fingerprint"}: every item of batches
+        below `batch` is delivered, plus the first `offset` items of `batch`
+        (each delta's own upserted|deleted keys sorted). `batch=-1` marks a
+        reset drain: `offset` keys of the folded live map are delivered. A
+        missing watermark, a fingerprint change, a `full` run, or a keys=
+        'full' override starts (or restarts) the drain. Returns (pin,
+        watermark_update, empty); the update carries `more` while pending
+        items remain after the take."""
 
         decl = self.manifest["outputs"][edge["output"]]
         keyed = decl.get("key") is not None
@@ -721,7 +730,14 @@ class Engine:
         up_scope = ref.get("partition") or ""
         override = (run.get("keys") or {}).get(edge["output"])
         wm = await tx.watermark(task["asset"], param, task["scope"])
-        reset = full or wm is None or wm.get("fingerprint") != fingerprint or override == "full"
+        draining = wm is not None and wm["batch"] == -1
+        reset = (
+            full
+            or wm is None
+            or draining
+            or wm.get("fingerprint") != fingerprint
+            or override == "full"
+        )
 
         # A keys= override is a one-off selection — it never moves the watermark.
         if isinstance(override, dict) and "keys" in override and not reset:
@@ -732,36 +748,83 @@ class Engine:
             }
             return pin, None, not keys
 
-        if reset:
-            changes = {"full": True}
-            if keyed:
-                changes["upserted"], changes["deleted"] = {}, []
-            else:
-                changes["batches"] = [0, head_batch]
-            pin = {"ref": ref, "changes": changes}
-            update = {"batch": head_batch + 1, "offset": 0, "fingerprint": fingerprint, "more": False}
-            return pin, update, head_batch < 0
+        if reset and keyed:
+            # Fold the whole log: the live map, plus every key the log ever
+            # deleted (the consumer may hold them; removes are idempotent).
+            live, ever_deleted = {}, set()
+            for b in range(0, head_batch + 1):
+                d = await self.state.delta(edge["output"], up_scope, b)
+                if d is None:
+                    continue
+                if d.get("reset"):
+                    live.clear()
+                for k in d.get("deleted") or []:
+                    live.pop(str(k), None)
+                    ever_deleted.add(str(k))
+                live.update({str(k): str(v) for k, v in (d.get("upserted") or {}).items()})
+            offset = wm["offset"] if draining else 0
+            ordered = sorted(live)
+            take = ordered[offset : offset + batch_size]
+            deleted = [] if draining else sorted(ever_deleted - set(live))
+            done = offset + len(take) >= len(ordered)
+            pin = {
+                "ref": ref,
+                "changes": {
+                    "upserted": {k: live[k] for k in take},
+                    "deleted": deleted,
+                    "full": True,
+                },
+            }
+            update = {
+                "batch": head_batch + 1 if done else -1,
+                "offset": 0 if done else offset + len(take),
+                "fingerprint": fingerprint,
+                "more": not done,
+            }
+            return pin, update, not take and not deleted
 
-        # wm.batch is the first not-fully-delivered batch: offset items of it
-        # are already consumed, batches below it are fully delivered.
+        if reset:  # batch-mode: pending is the batch range after the last reset
+            deltas = []
+            for b in range(0, head_batch + 1):
+                d = await self.state.delta(edge["output"], up_scope, b)
+                if d is not None:
+                    deltas.append(d)
+            resets = [i for i, d in enumerate(deltas) if d.get("reset")]
+            if resets:
+                deltas = deltas[resets[-1] :]
+            pending = [d["batch"] for d in deltas]
+            take = pending[:batch_size]
+            pin = {
+                "ref": ref,
+                "changes": {
+                    "batches": [take[0], take[-1]] if take else [0, -1],
+                    "full": True,
+                },
+            }
+            update = {
+                "batch": (take[-1] + 1) if take else head_batch + 1,
+                "offset": 0,
+                "fingerprint": fingerprint,
+                "more": len(pending) > len(take),
+            }
+            return pin, update, not take
+
+        # Incremental: pending items sit in deltas [wm.batch .. head_batch],
+        # skipping the first wm.offset items of wm.batch.
         deltas = []
         gap = False
-        for b in range(max(0, wm["batch"]), head_batch + 1):
+        for b in range(wm["batch"], head_batch + 1):
             d = await self.state.delta(edge["output"], up_scope, b)
             if d is None:
                 gap = True
                 break
             deltas.append(d)
         if gap:
-            # The log was pruned under the watermark — restart from the head.
-            changes = {"full": True}
-            if keyed:
-                changes["upserted"], changes["deleted"] = {}, []
-            else:
-                changes["batches"] = [0, head_batch]
-            pin = {"ref": ref, "changes": changes}
-            update = {"batch": head_batch + 1, "offset": 0, "fingerprint": fingerprint, "more": False}
-            return pin, update, head_batch < 0
+            # The log was pruned under the watermark — restart the drain (§2.2).
+            wm = None
+            return await self._incremental_plan(
+                tx, task, asset, param, edge, ref, fingerprint, run, full=True
+            )
 
         if not keyed:
             # Batch-mode upstream: every pending batch is one item; a reset
@@ -771,14 +834,13 @@ class Engine:
                 deltas = deltas[resets[-1] :]
             pending = [d["batch"] for d in deltas]
             take = pending[:batch_size]
-            more = len(pending) > len(take)
             changes = {"batches": [take[0], take[-1]] if take else [0, -1], "full": False}
             pin = {"ref": ref, "changes": changes}
             update = {
                 "batch": (take[-1] + 1) if take else wm["batch"],
                 "offset": 0,
                 "fingerprint": fingerprint,
-                "more": more,
+                "more": len(pending) > len(take),
             }
             return pin, update, not take
 
@@ -801,12 +863,9 @@ class Engine:
             if kind == "del":
                 delivered_del.append(key)
             else:
-                delivered_ups[key] = ""
-        # Revisions ride along in the delta; fill them in for the pin.
-        for d in deltas:
-            for k, r in (d.get("upserted") or {}).items():
-                if k in delivered_ups:
-                    delivered_ups[k] = str(r)
+                delivered_ups[key] = str(
+                    (self._delta_upsert(deltas, b) or {}).get(key, "")
+                )
         pin = {
             "ref": ref,
             "changes": {"upserted": delivered_ups, "deleted": delivered_del, "full": False},
@@ -818,6 +877,13 @@ class Engine:
             position = {"batch": wm["batch"], "offset": wm["offset"]}
         update = {**position, "fingerprint": fingerprint, "more": bool(rest)}
         return pin, update, not take
+
+    @staticmethod
+    def _delta_upsert(deltas, batch):
+        for d in deltas:
+            if d["batch"] == batch:
+                return d.get("upserted") or {}
+        return {}
 
     def _fingerprint(self, asset, run, pinned):
         """H(version, store versions of input+output stores, run config,

@@ -163,8 +163,8 @@ def test_demo_end_to_end(demo):
     assert wait(lambda: run_done(poll_run)) and run_status(poll_run) == "succeeded"
     assert {h["scope"]: h["ref"]["version"] for h in heads("site_files")} == site_files
 
-    # The ByKey consumer over unchanged upstream state skips every scope —
-    # it processed only the (empty) change set.
+    # The Incremental consumer over unchanged upstream state skips every
+    # scope — the delta log holds nothing past its watermark.
     again = submit(["file_index"], partitions=sorted(site_files), upstream=False)
     assert wait(lambda: run_done(again)) and run_status(again) == "succeeded"
     detail = client.get(f"{base}/runs/{again}").json()
@@ -175,7 +175,7 @@ def test_demo_end_to_end(demo):
         h["scope"]: h["commit"] for h in heads("file_index") if h["scope"] in file_index_heads
     } == file_index_heads
 
-    # -- the changed-keys pass (§6, ByKey) ----------------------------------
+    # -- the changed-keys pass (§6, Incremental) -----------------------------
     # Once the tick advances every file's revision bumps; the consumer must
     # process exactly the changed keys (and any deletions), in batches of
     # batch_size=2 — four files per site means `more` continuation.

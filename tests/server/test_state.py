@@ -101,15 +101,15 @@ def prepared(inputs=None, baseline=None, **kw):
     return {
         "inputs": inputs or {},
         "baseline": baseline or {},
-        "key_updates": {},
+        "watermark_updates": {},
         "scope_complete": True,
         **kw,
     }
 
 
 async def test_commit_installs_everything_atomically(state):
-    """§8: a commit installs heads, the commit record, cursor, key state and
-    pending OnChange automations in one transaction."""
+    """§8: a commit installs heads, the commit record, cursor, edge watermarks
+    and pending OnChange automations in one transaction."""
     upstream = await make_task(state, asset="rollup")
     await state.commit_attempt(
         manifest(),
@@ -124,7 +124,7 @@ async def test_commit_installs_everything_atomically(state):
         attempt,
         prepared(
             inputs={"upstream": {"ref": ref("summary", "v0")}},
-            key_updates={"upstream": {"upserted": {"k1": {"r": "a", "f": "fp"}}}},
+            watermark_updates={"upstream": {"batch": 3, "offset": 0, "fingerprint": "fp"}},
         ),
         {"outputs": {"events": ref("events", "v1")}, "cursor": {"seen": 3}},
     )
@@ -133,7 +133,11 @@ async def test_commit_installs_everything_atomically(state):
         assert head["ref"]["version"] == "v1" and head["commit"] == record["id"]
         assert head["complete"] is True
         assert await tx.cursor("poll", "") == {"seen": 3}
-        assert await tx.key_state("poll", "upstream", "") == {"k1": {"r": "a", "f": "fp"}}
+        assert await tx.watermark("poll", "upstream", "") == {
+            "batch": 3,
+            "offset": 0,
+            "fingerprint": "fp",
+        }
         commit = await tx.commit_record(record["id"])
         assert commit["changed"] == ["events"]
         assert commit["input_refs"]["upstream"]["ref"]["version"] == "v0"
@@ -147,7 +151,7 @@ async def test_commit_installs_everything_atomically(state):
 
 async def test_commit_failure_leaves_nothing(state, monkeypatch):
     """§8: a failure mid-transaction commits nothing — no head, no cursor,
-    no key state, no pending automation."""
+    no watermark, no pending automation."""
 
     async def boom(self, *args):
         raise RuntimeError("injected")
@@ -159,12 +163,12 @@ async def test_commit_failure_leaves_nothing(state, monkeypatch):
         await state.commit_attempt(
             manifest(),
             attempt,
-            prepared(key_updates={"e": {"upserted": {"k": {"r": "a", "f": "f"}}}}),
+            prepared(watermark_updates={"e": {"batch": 1, "offset": 0, "fingerprint": "f"}}),
             {"outputs": {"events": ref("events", "v1")}, "cursor": 1},
         )
     async with state.transaction() as tx:
         assert await tx.head("events", "") is None
-        assert await tx.key_state("poll", "e", "") == {}
+        assert await tx.watermark("poll", "e", "") is None
         assert await tx.cursor("poll", "") is None
         assert (await tx.automation("rollup.onchange.0"))["pending"] == []
         assert (await tx.task(task["id"]))["status"] == "running"  # still owns the scope
@@ -286,17 +290,27 @@ async def test_omitted_output_without_head_errors(state):
         await state.commit_attempt(manifest(), attempt, prepared(), {"outputs": {}})
 
 
-async def test_key_map_round_trip(state):
-    """§6: key maps are hash-addressed objects; staging is idempotent and the
-    map round-trips with its key count in meta."""
-    keys = {"a": "rev-1", "b": "rev-2"}
-    info = await state.stage_key_map(keys)
-    assert info["object"].startswith("keys/") and info["object"].endswith(".json")
-    assert info["count"] == 2
-    again = await state.stage_key_map(keys)
-    assert again["object"] == info["object"]  # content-addressed: same body, same key
-    assert await state.fetch_key_map(info) == keys
-    assert await state.fetch_key_map({"object": "keys/missing.json"}) is None
+async def test_delta_log_round_trip(state):
+    """§2.1/§2.2: delta objects land under deltas/ and fold into the live key
+    map; a reset delta supersedes everything before it."""
+    from cursus.stores import delta_path
+
+    await state.put_object(
+        delta_path("events", "", 0),
+        b'{"batch": 0, "rows": 2, "upserted": {"a": "r1", "b": "r2"}}',
+    )
+    await state.put_object(
+        delta_path("events", "", 1),
+        b'{"batch": 1, "rows": 2, "upserted": {"a": "r3"}, "deleted": ["b"]}',
+    )
+    assert (await state.delta("events", "", 1))["batch"] == 1
+    assert await state.delta("events", "", 9) is None
+    assert await state.delta_key_map("events", "", 1) == {"a": "r3"}
+    await state.put_object(
+        delta_path("events", "", 2),
+        b'{"batch": 2, "rows": 1, "upserted": {"c": "r1"}, "reset": true}',
+    )
+    assert await state.delta_key_map("events", "", 2) == {"c": "r1"}
 
 
 async def test_restart_recovers_active_attempts(tmp_path, clock):

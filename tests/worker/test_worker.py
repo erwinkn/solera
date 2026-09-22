@@ -38,13 +38,13 @@ async def test_local_subprocess_end_to_end(state, tmp_path):
     entrypoint = write_project(
         tmp_path,
         """
-from cursus.sdk import ByKey, Output, Project, asset
+from cursus.sdk import Incremental, Output, Project, asset
 
 @asset(outputs=Output("feed", key="id"))
 def feed():
     return [{"id": "a", "v": 1}, {"id": "b", "v": 1}]
 
-@asset(inputs={"feed": ByKey()})
+@asset(inputs={"feed": Incremental()})
 def consumer(ctx, feed: list):
     ctx.log("consumed", n=len(feed))
     return [{"n": len(feed), "keys": sorted(r["id"] for r in feed)}]
@@ -59,11 +59,11 @@ project = Project(assets=[feed, consumer])
 
     task = [t for t in detail["tasks"] if t["asset"] == "consumer"][0]
     attempt = f"{task['id']}/1"
-    # the key map is staged and referenced from the committed ref
+    # the delta object is written and referenced from the committed ref
     async with state.transaction() as tx:
         head = await tx.head("feed", "")
-        assert head["ref"]["meta"]["keys"]["count"] == 2
-        assert head["ref"]["meta"]["keys"]["object"].startswith("keys/")
+        assert head["ref"]["meta"]["delta"]["rows"] == 2
+        assert head["ref"]["meta"]["delta"]["object"].startswith("deltas/")
         # the result object is the commit request
         result = json.loads(await state.get_object(f"results/{attempt}.json"))
         assert result["status"] == "succeeded"

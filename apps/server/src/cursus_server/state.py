@@ -455,6 +455,13 @@ class State:
                     )
                 decl = declared[name]
                 meta = ref.get("meta") or {}
+                baseline_ref = (prepared["baseline"].get(name) or {}).get("ref")
+                unchanged = baseline_ref is not None and baseline_ref["version"] == ref["version"]
+                if unchanged:
+                    # Identical content keeps the head as-is — no new delta or
+                    # partitions list is written (and a legacy head may carry
+                    # neither).
+                    continue
                 if decl.get("incremental") and not meta.get("delta"):
                     raise Conflict(f"incremental output {name}: ref carries no delta", retryable=False)
                 if decl.get("partition_set") and meta.get("partitions") is None:

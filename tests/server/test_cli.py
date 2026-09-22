@@ -107,8 +107,8 @@ def test_local_run_and_reads(project_file, state_url, capsys, monkeypatch):
     assert committed["ref"]["version"]
 
 
-def test_local_recompute_and_partitions(project_file, state_url, capsys, monkeypatch):
-    """--recompute and --partition feed the §8 run vocabulary."""
+def test_local_full_and_partitions(project_file, state_url, capsys, monkeypatch):
+    """--full and --partition feed the §8 run vocabulary."""
 
     monkeypatch.delenv("CURSUS_SERVER_URL", raising=False)
     detail = cli(
@@ -120,10 +120,10 @@ def test_local_recompute_and_partitions(project_file, state_url, capsys, monkeyp
         "--project",
         project_file,
         "feed",
-        "--recompute",
+        "--full",
     )
     assert detail["request"]["status"] == "succeeded"
-    assert detail["request"]["mode"] == "recompute"
+    assert detail["request"]["mode"] == "full"
 
 
 @pytest.fixture

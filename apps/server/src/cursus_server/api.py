@@ -184,12 +184,20 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
                 owner = head.get("asset")
                 cursor = owner is not None and (await tx.cursor(owner, scope)) is not None
                 meta = head["ref"].get("meta") or {}
+                if meta.get("partitions") is not None:
+                    key_count = len(meta["partitions"])
+                elif meta.get("delta"):
+                    key_count = len(
+                        await runtime.state.delta_key_map(name, scope, int(meta["delta"]["batch"]))
+                    )
+                else:
+                    key_count = None
                 out.append(
                     {
                         "scope": scope,
                         "ref": head["ref"],
                         "version": head.get("version"),
-                        "key_count": len(meta["partitions"]) if meta.get("partitions") else None,
+                        "key_count": key_count,
                         "delta": meta.get("delta"),
                         "complete": head["complete"],
                         "cursor": cursor,

@@ -8,10 +8,10 @@ import pytest
 from cursus.executors import Environment
 from cursus.sdk import (
     Automation,
-    ByKey,
     Cron,
     Every,
     In,
+    Incremental,
     Migration,
     OnChange,
     Output,
@@ -61,7 +61,7 @@ def test_brimstone_revision_changes_on_change():
 
 
 def test_input_value_must_be_edge_or_str():
-    """§11: an inputs= value that is not str/In/ByKey/AllPartitions is an error."""
+    """§11: an inputs= value that is not str/In/Incremental/AllPartitions is an error."""
 
     @asset(inputs={"x": 42})
     def bad(x):
@@ -99,8 +99,8 @@ def test_upstream_only_dimension_requires_all_partitions():
         Project(assets=[up, down])
 
 
-def test_bykey_rejects_upstream_only_dimensions():
-    """§11: a ByKey edge cannot have upstream-only dimensions."""
+def test_incremental_rejects_upstream_only_dimensions():
+    """§11: an Incremental edge cannot have upstream-only dimensions."""
 
     upstream_partitions = StaticPartitions(["a", "b"])
 
@@ -108,7 +108,7 @@ def test_bykey_rejects_upstream_only_dimensions():
     def up():
         return []
 
-    @asset(partitions={"day": StaticPartitions(["x"])}, inputs={"up": ByKey()})
+    @asset(partitions={"day": StaticPartitions(["x"])}, inputs={"up": Incremental()})
     def down(up: list):
         return up
 
@@ -116,14 +116,14 @@ def test_bykey_rejects_upstream_only_dimensions():
         Project(assets=[up, down])
 
 
-def test_bykey_rejects_ref_annotation():
-    """§11: a ByKey edge cannot be ref-annotated."""
+def test_incremental_rejects_ref_annotation():
+    """§11: an Incremental edge cannot be ref-annotated."""
 
     @asset(outputs=Output("up", key="id"))
     def up():
         return []
 
-    @asset(inputs={"up": ByKey()})
+    @asset(inputs={"up": Incremental()})
     def down(up: TableRef):
         return up
 
@@ -131,45 +131,47 @@ def test_bykey_rejects_ref_annotation():
         Project(assets=[up, down])
 
 
-def test_bykey_requires_upstream_key():
-    """§11: a ByKey edge's upstream output must declare a key."""
+def test_incremental_requires_incremental_upstream():
+    """§11: an Incremental edge's upstream output must be incremental."""
 
     @asset
     def up():
         return []
 
-    @asset(inputs={"up": ByKey()})
+    @asset(inputs={"up": Incremental()})
     def down(up: list):
         return up
 
-    with pytest.raises(RegistrationError, match="no key"):
+    with pytest.raises(RegistrationError, match="not incremental"):
         Project(assets=[up, down])
 
 
-def test_bykey_requires_keys_capable_store():
-    """§11: the upstream store must serve a Keys selection."""
+def test_incremental_requires_selection_capable_store():
+    """§11: the upstream store must serve the edge's selection type."""
 
-    class NoKeys(JsonStore):
+    class NoSelection(JsonStore):
         def can_load(self, t, selection):
             return selection is None and super().can_load(t, None)
 
-    @asset(outputs=Output("up", store="nokeys", key="id"))
+    @asset(outputs=Output("up", store="nosel", key="id"))
     def up() -> list[dict]:
         return []
 
-    @asset(inputs={"up": ByKey()})
+    @asset(inputs={"up": Incremental()})
     def down(up: list[dict]):
         return up
 
     with pytest.raises(RegistrationError, match="cannot load"):
-        Project(assets=[up, down], stores={"nokeys": NoKeys()})
+        Project(assets=[up, down], stores={"nosel": NoSelection()})
 
 
-def test_append_output_cannot_declare_key():
-    """§2/§11: a keyed output cannot be mode='append'."""
+def test_output_mode_is_removed():
+    """§2/§11: Output(mode=) is gone; incremental= replaces it."""
 
-    with pytest.raises(RegistrationError, match="append"):
+    with pytest.raises(RegistrationError, match="mode="):
         Output("x", key="id", mode="append")
+    with pytest.raises(RegistrationError, match="key= implies"):
+        Output("x", key="id", incremental=False)
 
 
 def test_store_must_accept_output_type():

@@ -8,8 +8,8 @@ import pytest
 from cursus.executors import Pool
 from cursus.sdk import (
     Automation,
-    ByKey,
     Every,
+    Incremental,
     OnChange,
     Output,
     PartitionSet,
@@ -33,7 +33,7 @@ def build_project():
     def feed():
         return feed_keys["rows"]
 
-    @asset(inputs={"feed": ByKey()}, automations=Automation(trigger=OnChange("feed")))
+    @asset(inputs={"feed": Incremental()}, automations=Automation(trigger=OnChange("feed")))
     def total(feed: list):
         return {"n": sum(v["v"] for v in feed)}
 
@@ -178,8 +178,8 @@ async def test_run_validation_conflict(client, base):
 
 
 async def test_heads_keys_and_partitions(client, base, engine):
-    """Heads expose ref/version/keys/complete; keys pages the map; partitions
-    report current/missing/retired status (§2, §7)."""
+    """Heads expose ref/version/key_count/complete; keys pages the folded
+    delta map; partitions report current/missing/retired status (§2, §7)."""
 
     await engine.run_until((await engine.submit(["feed"]))["id"])
     await engine.run_until((await engine.submit(["daily"], partitions=["2026-09-18"]))["id"])
@@ -341,7 +341,7 @@ async def test_partitions_read_scope_records_not_task_history(client, base, engi
     await engine.commit_source("sites", remove=["a"])
     # running: submitted and pending but never dispatched — submit after the
     # last run_until, which would dispatch everything queued
-    await engine.submit(["daily"], partitions=["2026-09-19"], mode="recompute")
+    await engine.submit(["daily"], partitions=["2026-09-19"], mode="full")
     await engine.submit(["by_site"], partitions=["b"])
 
     monkeypatch.setattr(Transaction, "scan", spy)

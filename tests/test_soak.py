@@ -66,7 +66,7 @@ async def test_soak(tmp_path, monkeypatch):
         assert detail["request"]["status"] == "succeeded"
     async with state.transaction() as tx:
         head = await tx.head("sites", "")
-    keys = await state.fetch_key_map(head["ref"]["meta"]["keys"])
+    keys = head["ref"]["meta"]["partitions"]
     assert len(keys) == 4, keys
 
     samples = []  # (committed runs, data bytes)
@@ -109,3 +109,11 @@ async def test_soak(tmp_path, monkeypatch):
         "batch writes must not rewrite history"
     )
     assert wal_peak <= 64, f"wal object count unbounded after GC: {wal_peak}"
+
+    # Phase B gate (§7): the harness writes deltas/, never keys/, and the
+    # delta log grows one small object per committed incremental batch.
+    delta_objects = _count(objects_root, "deltas")
+    key_objects = _count(objects_root, "keys")
+    print(f"soak: deltas/ {delta_objects} objects, keys/ {key_objects}")
+    assert key_objects == 0, "the keys/ prefix must not exist (§2.1)"
+    assert delta_objects >= BATCHES, "one delta object per committed batch"
