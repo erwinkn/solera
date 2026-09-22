@@ -3,6 +3,7 @@ through InlinePlacement against the real file:// object store."""
 
 import asyncio
 import json
+import time
 
 import pytest
 from cursus.executors import Environment
@@ -21,9 +22,11 @@ from cursus.sdk import (
     Project,
     Ref,
     Result,
+    Retention,
     Retry,
     StaticPartitions,
     asset,
+    digest,
     job,
 )
 from cursus.stores import JsonStore
@@ -84,11 +87,11 @@ async def state(tmp_path):
 
 def make_engine(state, project, placements=None, **kw):
     kw.setdefault("eval_interval", 0.05)
+    kw.setdefault("clock", state.clock)
     return Engine(
         state,
         project.manifest,
         placements=placements or inline(project),
-        clock=state.clock,
         **kw,
     )
 
@@ -1187,3 +1190,156 @@ async def test_ondeploy_two_registrations_fire_latest_once(state):
     assert calls == [1]
     auto = dict(await state.automations())["deployed.ondeploy.0"]
     assert auto["last_revision"] == project_b.manifest["revision"]
+
+
+# ---------------------------------------------------------------------------
+# §5 — retention
+# ---------------------------------------------------------------------------
+
+
+async def test_retention_sweep_bounds_attempts_and_prunes_deltas(state):
+    """§5: Retention(runs=2) bounds attempt records per (asset, scope), drops
+    their specs/results objects, prunes the delta prefix behind a compacted
+    reset delta, and keeps the head-referenced commit. A live watermark's
+    position is never deleted under it."""
+    content = {"rows": [{"id": "a", "v": 0}, {"id": "b", "v": 0}]}
+    consumed = []
+
+    @asset(outputs=Output("files", key="id"))
+    def files():
+        return content["rows"]
+
+    @asset(inputs={"files": Incremental()})
+    def consumer(ctx, files: list):
+        consumed.append([r["id"] for r in files])
+        return [{"n": len(files)}]
+
+    project = Project(assets=[files, consumer], retention=Retention(runs=2))
+    engine = make_engine(state, project)
+    await engine.initialize()
+
+    for i in range(5):
+        content["rows"] = [{"id": "a", "v": i}, {"id": "b", "v": i}]
+        await drive(engine, await engine.submit(["consumer"], upstream=True))
+
+    async with state.transaction() as tx:
+        before = [r for _, r in await tx.scan("attempt/") if r["task"].split("/")[1].startswith("files")]
+        assert len(before) == 5
+        commits_before = len(await tx.commits())
+        wm = await tx.watermark("consumer", "files", "")
+        head = await tx.head("files", "")
+        head_commit = head["commit"]
+
+    result = await engine.retention_sweep()
+
+    async with state.transaction() as tx:
+        after = [r for _, r in await tx.scan("attempt/") if r["task"].split("/")[1].startswith("files")]
+        # Newest `runs` attempts per (asset, scope) survive; older ones are gone.
+        assert len(after) == 2, [r["id"] for r in after]
+        newest = sorted((r.get("finished_at") or 0) for r in before)[-2:]
+        assert sorted(r.get("finished_at") or 0 for r in after) == newest
+        # The head's commit is never deleted.
+        assert await tx.commit_record(head_commit) is not None
+        # Watermark intact — the consumer was never pruned under.
+        assert await tx.watermark("consumer", "files", "") == wm
+
+    # Deltas pruned below the floor and compacted: the surviving log still
+    # folds to the live key map.
+    deltas = await state.list_objects("deltas/files/")
+    assert len(deltas) < 5
+    keys = await state.delta_key_map("files", "", head["ref"]["meta"]["delta"]["batch"])
+    assert keys == {"a": str(digest({"id": "a", "v": 4})), "b": str(digest({"id": "b", "v": 4}))}
+    assert result["attempts"] >= 3 and result["commits"] >= 1 and result["objects"] >= 1
+    assert result["bumped"] == []
+    assert commits_before > 2
+
+    # The consumer still plans incrementally — a no-change run skips.
+    detail = await drive(engine, await engine.submit(["consumer"], upstream=True))
+    assert task_statuses(detail)["consumer"] == "skipped"
+
+
+async def test_retention_sweep_bumps_a_consumer_under_a_gap(state):
+    """§5: a watermark pointing at a delta that no longer exists is dropped —
+    the consumer's next plan drains full instead of reading across a gap."""
+    consumed = []
+    content = {"rows": [{"id": "a", "v": 0}]}
+
+    @asset(outputs=Output("files", key="id"))
+    def files():
+        return content["rows"]
+
+    @asset(inputs={"files": Incremental()})
+    def consumer(ctx, files: list):
+        consumed.append((sorted(r["id"] for r in files), ctx.changes["files"].full))
+        return [{"n": len(files)}]
+
+    project = Project(assets=[files, consumer], retention=Retention(runs=1))
+    engine = make_engine(state, project)
+    await engine.initialize()
+    await drive(engine, await engine.submit(["consumer"], upstream=True))
+    content["rows"] = [{"id": "a", "v": 1}, {"id": "b", "v": 1}]
+    await drive(engine, await engine.submit(["files"]))  # consumer not run: wm lags
+
+    async with state.transaction() as tx:
+        wm = await tx.watermark("consumer", "files", "")
+    # Force the gap externally (e.g. an operator deleted objects): the
+    # consumer's next batch is gone.
+    await state.delete_objects([f"deltas/files/_/{wm['batch']:012d}.json"])
+    result = await engine.retention_sweep()
+    assert result["bumped"] == ["consumer/files/"]
+    async with state.transaction() as tx:
+        assert await tx.watermark("consumer", "files", "") is None
+
+    await drive(engine, await engine.submit(["consumer"], upstream=True))
+    # A full re-drain of the surviving log: the externally-deleted delta's
+    # key is unrecoverable — the consumer gets the fold that remains.
+    assert consumed[-1] == (["a"], True)
+
+
+async def test_retention_sweep_respects_age_and_consumer_floor(state):
+    """§5: an attempt must be both past `runs` and older than `days` to be
+    swept, and a lagging consumer's watermark pins the delta-log horizon."""
+    content = {"rows": [{"id": "a", "v": 0}]}
+
+    @asset(outputs=Output("files", key="id"))
+    def files():
+        return content["rows"]
+
+    @asset(inputs={"files": Incremental()})
+    def consumer(files: list):
+        return [{"n": len(files)}]
+
+    project = Project(assets=[files, consumer], retention=Retention(days=1, runs=2))
+    engine = make_engine(state, project)
+    await engine.initialize()
+
+    # files commits delta 0; consumer drains it (watermark -> batch 1) and then
+    # lags while files commits deltas 1..4 on its own.
+    await drive(engine, await engine.submit(["consumer"], upstream=True))
+    for i in range(1, 5):
+        content["rows"] = [{"id": "a", "v": i}]
+        await drive(engine, await engine.submit(["files"]))
+
+    # runs=2 alone deletes nothing — nothing is a day old yet.
+    result = await engine.retention_sweep()
+    assert result["attempts"] == 0 and result["commits"] == 0 and result["objects"] == 0
+    async with state.transaction() as tx:
+        assert len(await tx.scan("attempt/")) == 6
+
+    # Two days on: everything is aged. Per-asset `runs` keeps the newest 2.
+    result = await engine.retention_sweep(now=time.time() + 2 * 86400)
+    async with state.transaction() as tx:
+        attempts = [r for _, r in await tx.scan("attempt/")]
+        files_left = [r for r in attempts if r["task"].split("/")[1].startswith("files")]
+        consumer_left = [r for r in attempts if r["task"].split("/")[1].startswith("consumer")]
+        assert len(files_left) == 2 and len(consumer_left) == 1
+        # The consumer's watermark was never pruned under.
+        assert (await tx.watermark("consumer", "files", ""))["batch"] == 1
+
+    # The watermark pins the floor at batch 1: only delta 0 is compacted — the
+    # consumer can still read batches 1..4.
+    metas = await state.list_object_meta("deltas/files/_/")
+    assert sorted(m["path"].rsplit("/", 1)[1] for m in metas) == [f"{b:012d}.json" for b in range(5)]
+    base = await state.delta("files", "", 0)
+    assert base["reset"] is True and base["batch"] == 0
+    assert result["attempts"] == 3 and result["bumped"] == []

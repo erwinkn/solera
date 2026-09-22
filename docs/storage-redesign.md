@@ -263,17 +263,36 @@ Per-asset policy, project default, engine-enforced:
 Project(..., retention=Retention(days=30))
 ```
 
-A periodic sweep (same cadence as GC) deletes, per asset:
+A periodic sweep (same cadence as GC; `Engine.retention_interval`,
+defaulting to `gc_interval`) deletes, per asset:
 
 - attempts, and their `specs/`, `results/`, `logs/` objects, older than
-  the policy **and** beyond the run count;
+  the policy **and** beyond the run count — counted per `(asset, scope)`
+  (the newest `runs` attempts for each scope are kept);
 - `deltas/` and `data/` batch objects older than the policy **and** below
   the minimum live consumer watermark **and** not referenced by any live
   head or by a retained commit;
-- `commit/` records outside the policy.
+- `commit/` records outside the policy — counted per producing asset
+  (source commits use the project default) and never below an automation's
+  `commit_watermark`.
 
 Never delete anything referenced by a head. Never delete a delta a live
-watermark still needs — bump the consumer to `full` instead, and log it.
+watermark still needs — bump the consumer to `full` instead, and log it:
+the sweep drops the watermark record, and the next plan re-drains.
+
+Pruning a keyed delta log's prefix first writes one **compacted reset
+delta** at the prune horizon carrying the folded live map plus the
+tombstone set of the deleted prefix — a fold over the surviving log yields
+the same `(live, ever_deleted)` as the unpruned log, so reset drains and
+`delta_key_map` stay correct. For unkeyed outputs the horizon delta is a
+`reset` marker: pruned batch payloads in `data/` are simply gone, and a
+consumer reading across the horizon sees truncated history — which is what
+retention means. Keyed `data/` batches prune below the live fold window
+(the snapshot plus the batches after it); batch-mode `data/` windows are
+the head's content and stay referenced.
+
+`cursus retention sweep` runs one pass locally; on a server the periodic
+tick runs it.
 
 ## 6. Non-goals for this pass
 

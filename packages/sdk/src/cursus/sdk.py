@@ -570,6 +570,30 @@ class Retry:
         return {"n": self.n, "delay": self.delay, "backoff": self.backoff}
 
 
+@dataclass(frozen=True)
+class Retention:
+    """History bound (§5 of the storage redesign): a periodic sweep deletes an
+    asset's attempt records — with their `specs/`, `results/` and `logs/`
+    objects — its delta and data batch objects, and its commit records once
+    they are older than `days` AND beyond the newest `runs`. A live head, a
+    delta a live consumer watermark still needs, and a commit a live head
+    references are never deleted."""
+
+    days: float | None = None
+    runs: int | None = None
+
+    def __post_init__(self):
+        if self.days is None and self.runs is None:
+            raise RegistrationError("Retention() needs days and/or runs")
+        if self.days is not None and self.days <= 0:
+            raise RegistrationError(f"Invalid retention days: {self.days}")
+        if self.runs is not None and self.runs < 1:
+            raise RegistrationError(f"Invalid retention runs: {self.runs}")
+
+    def spec(self) -> dict:
+        return {"days": self.days, "runs": self.runs}
+
+
 # ---------------------------------------------------------------------------
 # Partition key encoding (§7)
 # ---------------------------------------------------------------------------
@@ -616,6 +640,7 @@ class Asset:
         timeout: float = 3600,
         version: str = "1",
         on_version_change: str = "fail",
+        retention: Retention | None = None,
         automations: Any = (),
     ):
         self.fn = fn
@@ -635,6 +660,7 @@ class Asset:
         if on_version_change not in ("fail", "full"):
             raise RegistrationError(f"{self.name}: on_version_change must be 'fail' or 'full'")
         self.on_version_change = on_version_change
+        self.retention = retention
         if isinstance(automations, Automation) or automations.__class__ in (Every, Cron, OnChange, OnDeploy):
             automations = (automations,)
         self.automations = tuple(
@@ -708,11 +734,13 @@ class Project:
         executors: list | None = None,
         resources: dict[str, Any] | None = None,
         automations: list[Automation] | None = None,
+        retention: Retention | None = None,
         name: str = "default",
     ):
         from .stores import JsonStore
 
         self.name = name
+        self.retention = retention
         self.assets: dict[str, Asset] = {}
         self.stores = {DEFAULT_STORE: JsonStore(), **(stores or {})}
         self.executors = list(executors or [])
@@ -1094,6 +1122,7 @@ class Project:
                 "timeout": asset.timeout,
                 "version": asset.version,
                 "on_version_change": asset.on_version_change,
+                "retention": asset.retention.spec() if asset.retention else None,
                 "code_hash": _code_hash(asset.fn),
                 "doc": inspect.getdoc(asset.fn) or "",
                 "types": {
@@ -1133,6 +1162,7 @@ class Project:
                 | {a["placement"]["kind"] for a in manifest_assets.values()}
             ),
             "automations": automation_records,
+            "retention": self.retention.spec() if self.retention else None,
         }
         return {**body, "revision": digest(body)}
 

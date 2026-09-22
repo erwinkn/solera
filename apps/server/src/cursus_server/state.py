@@ -184,6 +184,10 @@ class Tx:
         await self.t.put(f"watermark/{esc(asset)}/{esc(edge)}/{esc(scope)}", record)
         self._w("watermarks", (asset, edge, scope), record)
 
+    async def del_watermark(self, asset, edge, scope):
+        await self.t.delete(f"watermark/{esc(asset)}/{esc(edge)}/{esc(scope)}")
+        self._w("watermarks", (asset, edge, scope), _DEL)
+
     # -- commits ------------------------------------------------------------------
     # commit/{seq:020d}: the sequence is durable in sys/commit_seq, allocated
     # inside the commit's own transaction so a rolled-back tx leaves no gap.
@@ -1378,6 +1382,18 @@ class State:
         async for batch in obstore.list(self.objects, prefix=prefix):
             out.extend(meta["path"] for meta in batch)
         return sorted(out)
+
+    async def list_object_meta(self, prefix: str) -> list[dict]:
+        """(path, last_modified) pairs — retention sweeps need object ages (§5)."""
+
+        out = []
+        async for batch in obstore.list(self.objects, prefix=prefix):
+            out.extend(dict(meta) for meta in batch)
+        return sorted(out, key=lambda m: m["path"])
+
+    async def delete_objects(self, keys: list[str]):
+        if keys:
+            await obstore.delete_async(self.objects, keys)
 
     @property
     def poisoned(self):

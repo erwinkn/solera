@@ -12,8 +12,11 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
+import logging
+import re
 import uuid
 from itertools import product
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from croniter import croniter
@@ -21,12 +24,36 @@ from cursus.sdk import TimePartitions, canonical_partition, digest, split_partit
 from cursus.stores import delta_path, next_batch
 
 from .placements import PlacementContext, Registry
-from .state import BAD_OUTCOME, TERMINAL_TASK, Conflict, LostOwnership, State, Tx
+from .state import (
+    BAD_OUTCOME,
+    LIVE_ATTEMPT,
+    TERMINAL_TASK,
+    Conflict,
+    LostOwnership,
+    State,
+    Tx,
+    unesc,
+)
+
+log = logging.getLogger(__name__)
 
 SUCCESS = {"succeeded", "skipped"}
 TERMINAL = SUCCESS | {"failed", "blocked", "canceled"}
 LEASE_SECONDS = 60.0
 GRACE_SECONDS = 5.0
+
+
+def _obj_scope(scope: str) -> str:
+    """The object-path segment for a scope — matches stores.py's `_` escape."""
+    return quote(scope or "_", safe="")
+
+
+def _object_batch(path: str) -> int | None:
+    """The batch number in `…/b{NNN}.json`, `…/s{NNN}.json` or a bare
+    `…/{NNN}.json` delta path; None for anything else."""
+
+    match = re.search(r"(?:^|[bs])(\d+)\.json$", path.rsplit("/", 1)[-1])
+    return int(match.group(1)) if match else None
 
 
 class Retryable(RuntimeError):
@@ -51,6 +78,7 @@ class Engine:
         clock=None,
         eval_interval: float = 0.5,
         gc_interval: float = 300.0,
+        retention_interval: float | None = None,
     ):
         import time
 
@@ -63,6 +91,9 @@ class Engine:
         self.eval_interval = eval_interval
         self.gc_interval = gc_interval
         self._gc_at = self.clock() + self.gc_interval
+        # §5: retention sweeps run on the GC cadence unless overridden.
+        self.retention_interval = gc_interval if retention_interval is None else retention_interval
+        self._retention_at = self.clock() + self.retention_interval
         ctx = PlacementContext(state, state.objects_url, project, self.clock)
         self.registry = registry or Registry(ctx, extra=placements)
         self.inflight: dict[str, asyncio.Task] = {}
@@ -131,13 +162,15 @@ class Engine:
             await asyncio.sleep(self.eval_interval)
 
     async def tick(self):
-        """One evaluation pass: lease sweeps, dispatch, automations, storage GC."""
+        """One evaluation pass: lease sweeps, dispatch, automations, storage GC,
+        and the retention sweep when a policy exists."""
 
         await self.state.sweep_scope_leases()
         await self.state.sweep_pool_leases()
         await self._dispatch_due()
         await self._automation_tick()
         await self._gc_due()
+        await self._retention_due()
 
     async def _gc_due(self):
         """One SlateDB GC pass per `gc_interval` — bounds WAL/manifest/compacted
@@ -149,6 +182,29 @@ class Engine:
         gc_once = getattr(self.state.store, "gc_once", None)
         if gc_once is not None:
             await gc_once()
+
+    async def _retention_due(self):
+        """One retention sweep per `retention_interval` when the project
+        declares a policy (§5)."""
+
+        if self.clock() < self._retention_at:
+            return
+        self._retention_at = self.clock() + self.retention_interval
+        if not self._retention_policies()[0]:
+            return
+        await self.retention_sweep()
+
+    def _retention_policies(self):
+        """asset name -> {"days", "runs"} — the asset's policy, else the
+        project default; absent both means no sweep for that asset."""
+
+        default = self.manifest.get("retention")
+        policies = {}
+        for name, asset in self.manifest["assets"].items():
+            policy = asset.get("retention") or default
+            if policy:
+                policies[name] = policy
+        return policies, default
 
     async def run_until(self, run_id: str, timeout: float = 120.0):
         """Tick until the run reaches a terminal status (CLI and tests)."""
@@ -1270,6 +1326,302 @@ class Engine:
         await self._fire(auto, auto.get("partitions") or "latest")
         async with self.state.transaction() as tx:
             return await tx.automation(name)
+
+    # -- retention (§5) ---------------------------------------------------------------
+    # A sweep deletes, per policy (asset's own, else the project default):
+    # attempt records and their specs/results/logs objects past `runs` and
+    # `days`; delta and data batch objects below the minimum live consumer
+    # watermark that no live head or retained commit references; and commit
+    # records past the policy that every automation has consumed. Pruning a
+    # delta log's prefix writes one compacted reset delta at the prune
+    # horizon first, so folds of the surviving log are unchanged.
+
+    async def retention_sweep(self, *, now: float | None = None) -> dict:
+        now = self.clock() if now is None else now
+        policies, default = self._retention_policies()
+        summary = {"attempts": 0, "commits": 0, "objects": 0, "bumped": []}
+        if not policies and default is None:
+            return summary
+
+        def aged(policy, at):
+            days = policy.get("days")
+            return days is None or at < now - days * 86400
+
+        def beyond(policy, rank):
+            runs = policy.get("runs")
+            return runs is None or rank >= runs
+
+        # -- collect the durable picture in one read transaction ---------------
+        async with self.state.transaction() as tx:
+            heads = await tx.all_heads()
+            watermarks = await tx.scan("watermark/")
+            autos = [rec for _, rec in await tx.automations()]
+            attempts = await tx.scan("attempt/")
+            commits = await tx.scan("commit/")
+
+        # Live heads pin commit ids, delta batches and data windows.
+        head_commits = {rec["commit"] for _, rec in heads if rec.get("commit")}
+        head_delta = set()  # (output, scope, batch) — the head's own delta
+        head_data = {}  # (output, scope) -> set of live data batch numbers
+        head_batches = {}  # (output, scope) -> head delta batch number
+        for _, rec in heads:
+            ref = rec.get("ref") or {}
+            meta = ref.get("meta") or {}
+            scope = ref.get("partition") or ""
+            output = ref.get("output")
+            if output is None:
+                continue
+            if meta.get("delta"):
+                head_batches[(output, scope)] = int(meta["delta"]["batch"])
+                head_delta.add((output, scope, int(meta["delta"]["batch"])))
+            head_data[(output, scope)] = self._data_window(ref)
+
+        # The commit sweep runs first so surviving commits pin batch objects.
+        auto_floor = min(
+            (int(a.get("commit_watermark") or 0) for a in autos),
+            default=None,
+        )
+        commit_drops, surviving_commits = [], []
+        by_owner = {}
+        for key, rec in commits:
+            suffix = key.split("/", 1)[1]
+            if not suffix.isdigit():
+                continue  # a pre-sequence commit id — not a monotonic record
+            owner = rec.get("asset") or (f"source:{rec['source']}" if rec.get("source") else None)
+            by_owner.setdefault(owner, []).append((int(suffix), key, rec))
+        for owner, rows in by_owner.items():
+            policy = policies.get(owner) or default
+            if not policy:
+                surviving_commits += [rec for _, _, rec in rows]
+                continue
+            rows.sort(key=lambda r: r[0], reverse=True)
+            for rank, (seq, key, rec) in enumerate(rows):
+                eligible = beyond(policy, rank) and aged(policy, rec.get("at") or 0)
+                if (
+                    eligible
+                    and rec.get("id") not in head_commits
+                    and (auto_floor is None or seq <= auto_floor)
+                ):
+                    commit_drops.append(key)
+                else:
+                    surviving_commits.append(rec)
+
+        # Batch-object pins from surviving commit refs (outputs + input pins).
+        keep_delta = set(head_delta)
+        keep_data = {k: set(v) for k, v in head_data.items()}
+        for rec in surviving_commits:
+            for ref in self._commit_refs(rec):
+                meta = ref.get("meta") or {}
+                scope = ref.get("partition") or ""
+                output = ref.get("output")
+                if output is None:
+                    continue
+                if meta.get("delta"):
+                    keep_delta.add((output, scope, int(meta["delta"]["batch"])))
+                keep_data.setdefault((output, scope), set()).update(self._data_window(ref))
+
+        # -- deltas and data batches ----------------------------------------------
+        consumers = self._incremental_consumers()
+        wm_rows = {}  # raw key -> (asset, edge, scope, record)
+        for key, rec in watermarks:
+            asset, edge, scope = (unesc(part) for part in key.split("/", 3)[1:])
+            wm_rows[key] = (asset, edge, scope, rec)
+        wm_at = {(a, e, s): r for key, (a, e, s, r) in wm_rows.items()}
+        object_drops = []
+        for output, decl in self.manifest["outputs"].items():
+            policy = policies.get(decl.get("asset")) or default
+            if not policy or not decl.get("incremental"):
+                continue
+            scopes = {scope for (o, scope) in head_batches if o == output}
+            scopes |= {s for (a, e, s) in wm_at if (a, e) in consumers.get(output, ())}
+            for scope in scopes:
+                floor = min(
+                    (
+                        rec["batch"]
+                        for a, e in consumers.get(output, ())
+                        if (rec := wm_at.get((a, e, scope))) is not None
+                    ),
+                    default=None,
+                )
+                if floor is None:
+                    floor = head_batches.get((output, scope), -1) + 1
+                object_drops += await self._sweep_delta_log(
+                    output, scope, decl, floor, keep_delta, policy, now
+                )
+                object_drops += await self._sweep_data_window(
+                    output, scope, floor, keep_data.get((output, scope), set()), policy, now
+                )
+
+        # -- attempts ---------------------------------------------------------------
+        drop_keys, object_keys = [], []
+        specs = {m["path"] for m in await self.state.list_object_meta("specs/")}
+        results = {m["path"] for m in await self.state.list_object_meta("results/")}
+        logs = [m["path"] for m in await self.state.list_object_meta("logs/")]
+        by_scope = {}
+        for key, rec in attempts:
+            task_id = unesc(key.split("/")[1])
+            _, _, rest = task_id.partition("/")
+            asset, _, scope = rest.partition(":")
+            by_scope.setdefault((asset, scope), []).append((key, rec))
+        for (asset, _scope), rows in by_scope.items():
+            policy = policies.get(asset)
+            if not policy:
+                continue
+            rows.sort(
+                key=lambda kr: kr[1].get("finished_at") or kr[1].get("started_at") or 0,
+                reverse=True,
+            )
+            for rank, (key, rec) in enumerate(rows):
+                if rec.get("status") in LIVE_ATTEMPT:
+                    continue
+                if not beyond(policy, rank) or not aged(
+                    policy, rec.get("finished_at") or rec.get("started_at") or 0
+                ):
+                    continue
+                drop_keys.append(key)
+                aid = rec["id"]
+                if f"specs/{aid}.json" in specs:
+                    object_keys.append(f"specs/{aid}.json")
+                if f"results/{aid}.json" in results:
+                    object_keys.append(f"results/{aid}.json")
+                object_keys += [p for p in logs if p.startswith(f"logs/{aid}/")]
+
+        # -- apply -------------------------------------------------------------------
+        dropped = set(object_drops)
+        async with self.state.transaction() as tx:
+            for key in drop_keys + commit_drops:
+                await tx.delete(key)
+            bumped = []
+            for _key, (a, e, scope, rec) in wm_rows.items():
+                # A watermark pointing at a pruned delta can never catch up —
+                # drop it so the next plan drains full instead (§5).
+                if rec["batch"] < 0:
+                    continue
+                for output, edges in consumers.items():
+                    if (a, e) not in edges:
+                        continue
+                    head = head_batches.get((output, scope))
+                    if head is None or rec["batch"] > head:
+                        continue
+                    path = delta_path(output, scope, rec["batch"])
+                    if path in dropped or await self.state.delta(output, scope, rec["batch"]) is None:
+                        await tx.del_watermark(a, e, scope)
+                        bumped.append(f"{a}/{e}/{scope}")
+                        log.warning(
+                            "retention: watermark %s/%s/%s pruned under it; the consumer will re-drain full",
+                            a,
+                            e,
+                            scope,
+                        )
+        summary["attempts"] = len(drop_keys)
+        summary["commits"] = len(commit_drops)
+        summary["bumped"] = bumped
+        await self.state.delete_objects(object_keys + object_drops)
+        summary["objects"] = len(object_keys) + len(object_drops)
+        return summary
+
+    @staticmethod
+    def _data_window(ref: dict) -> set:
+        """Data batch numbers a ref's live fold needs: the snapshot and the
+        batches after it — or the whole window without one (§5)."""
+
+        handle = ref.get("handle") or {}
+        if "batches" not in handle:
+            return set()
+        first, last = int(handle["batches"][0]), int(handle["batches"][1])
+        snap = handle.get("snapshot")
+        if isinstance(snap, int) and first <= snap <= last:
+            # The fold loads s{snap} then applies b{snap+1..last}.
+            return {("s", snap)} | {("b", b) for b in range(snap + 1, last + 1)}
+        return {("b", b) for b in range(first, last + 1)} | (
+            {("s", snap)} if isinstance(snap, int) else set()
+        )
+
+    @staticmethod
+    def _commit_refs(commit: dict) -> list:
+        """Every ref a commit record pins: its outputs plus its input pins."""
+
+        refs = list((commit.get("outputs") or {}).values())
+        for pin in (commit.get("input_refs") or {}).values():
+            if "refs" in pin:
+                refs += list(pin["refs"].values())
+            elif pin.get("ref"):
+                refs.append(pin["ref"])
+        return [r for r in refs if isinstance(r, dict)]
+
+    def _incremental_consumers(self) -> dict:
+        """output -> {(asset, edge)} — which watermark rows track that output."""
+
+        consumers = {}
+        for asset, rec in self.manifest["assets"].items():
+            for param, edge in (rec.get("inputs") or {}).items():
+                if edge.get("kind") == "incremental":
+                    consumers.setdefault(edge["output"], set()).add((asset, param))
+        return consumers
+
+    async def _sweep_delta_log(self, output, scope, decl, floor, keep_delta, policy, now):
+        """Prune `deltas/{output}/{scope}` below `floor`, writing a compacted
+        reset delta at the prune horizon so folds are unchanged (§5)."""
+
+        cutoff = policy.get("days")
+        metas = await self.state.list_object_meta(f"deltas/{output}/{_obj_scope(scope)}/")
+        candidates = []
+        for meta in metas:
+            batch = _object_batch(meta["path"])
+            if batch is None or batch >= floor or (output, scope, batch) in keep_delta:
+                continue
+            if cutoff is not None and meta["last_modified"].timestamp() >= now - cutoff * 86400:
+                continue
+            candidates.append(batch)
+        if not candidates:
+            return []
+        horizon = max(candidates)
+        if decl.get("key") is not None:
+            live, ever_deleted = {}, set()
+            for b in range(0, horizon + 1):
+                delta = await self.state.delta(output, scope, b)
+                if delta is None:
+                    continue
+                for k in delta.get("deleted") or []:
+                    live.pop(str(k), None)
+                    ever_deleted.add(str(k))
+                live.update({str(k): str(v) for k, v in (delta.get("upserted") or {}).items()})
+            base = {
+                "batch": horizon,
+                "reset": True,
+                "rows": len(live),
+                "upserted": live,
+                "deleted": sorted(ever_deleted - set(live)),
+            }
+        else:
+            # Batch-mode deltas are markers; a reset marker at the horizon
+            # supersedes the pruned prefix.
+            base = {"batch": horizon, "reset": True, "rows": 0}
+        await self.state.put_object(
+            delta_path(output, scope, horizon),
+            json.dumps(base, sort_keys=True, allow_nan=False).encode(),
+        )
+        return [
+            meta["path"] for meta in metas if (b := _object_batch(meta["path"])) is not None and b < horizon
+        ]
+
+    async def _sweep_data_window(self, output, scope, floor, needed, policy, now):
+        """Delete `data/{output}/{scope}/{b,s}{batch}` objects below `floor`
+        that no live head or retained commit's fold needs (§5)."""
+
+        cutoff = policy.get("days")
+        metas = await self.state.list_object_meta(f"data/{output}/{_obj_scope(scope)}/")
+        drops = []
+        for meta in metas:
+            name = meta["path"].rsplit("/", 1)[1]
+            kind = name[0] if name[:1] in ("b", "s") else None
+            batch = _object_batch(meta["path"])
+            if kind is None or batch is None or batch >= floor or (kind, batch) in needed:
+                continue
+            if cutoff is not None and meta["last_modified"].timestamp() >= now - cutoff * 86400:
+                continue
+            drops.append(meta["path"])
+        return drops
 
     # -- run control ------------------------------------------------------------------
 

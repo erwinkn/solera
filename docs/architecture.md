@@ -452,6 +452,19 @@ on the `(asset, scope)` record, and queued or running tasks are indexed per
 scope. Views such as the partition grid read those two things; nothing
 scans task history.
 
+**Retention.** `@asset(retention=Retention(days=…, runs=…))` bounds an
+asset's history; `Project(retention=…)` sets the default. A periodic sweep
+(`Engine.retention_interval`, defaulting to the GC cadence) deletes attempt
+records past both bounds together with their `specs/`, `results/` and
+`logs/` objects, `deltas/` and `data/` batch objects older than the policy
+and below every live consumer watermark that no head or retained commit
+references, and `commit/` records outside the policy that every automation
+has consumed. A pruned keyed delta prefix leaves one compacted `reset`
+delta at the horizon so folds of the surviving log are unchanged; a
+watermark pointing at a missing delta is dropped and the consumer re-drains
+`full`. Heads are never deleted. `cursus retention sweep` runs one pass
+locally.
+
 ## 9. Automations
 
 ```python

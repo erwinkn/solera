@@ -132,6 +132,11 @@ def main():
 
     commands.add_parser("selftest", help="Check state and object storage connectivity")
 
+    retention = commands.add_parser(
+        "retention", help="Sweep retained history per asset/project policy (§5)", parents=[common]
+    )
+    retention.add_argument("action", choices=["sweep"])
+
     gc = commands.add_parser("gc", help="Run one SlateDB garbage-collection pass (§4.4)")
     gc.add_argument(
         "--min-age-ms",
@@ -203,6 +208,17 @@ async def _dispatch(args, parser):
 
         await gc_once(args.state_url, args.namespace, min_age_ms=args.min_age_ms, dry_run=args.dry_run)
         print(json.dumps({"gc": "ok", "dry_run": args.dry_run}))
+        return
+
+    if args.command == "retention":
+        # Local only: the sweep reads the manifest and drives state directly.
+        if _server_url():
+            parser.error("cursus retention runs locally (no remote endpoint)")
+        runtime = await _local_engine(args)
+        try:
+            print(json.dumps(await runtime.retention_sweep(), indent=2))
+        finally:
+            await runtime.state.close()
         return
 
     if _server_url():
