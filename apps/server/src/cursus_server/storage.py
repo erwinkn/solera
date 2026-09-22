@@ -38,6 +38,10 @@ class Transaction:
     def __init__(self, native):
         self.native = native
         self.dirty = False
+        # Runs inside the writer lock after the durable commit lands (or after
+        # the rollback of a memory-only transaction). Used by the domain layer
+        # to apply committed writes to the in-memory model (§4.2).
+        self.post_commit = None
 
     async def get(self, key: str, default=None):
         value = await self.native.get(key.encode())
@@ -51,10 +55,15 @@ class Transaction:
         self.dirty = True
         await self.native.delete(key.encode())
 
-    async def scan(self, prefix: str, limit: int | None = None):
+    async def scan(self, prefix: str, limit: int | None = None, after: str | None = None):
         raw = prefix.encode()
         it = await self.native.scan(
-            KeyRange(start=raw, start_inclusive=True, end=raw + b"\xff", end_inclusive=False)
+            KeyRange(
+                start=raw if after is None else after.encode(),
+                start_inclusive=after is None,
+                end=raw + b"\xff",
+                end_inclusive=False,
+            )
         )
         values = []
         while limit is None or len(values) < limit:
@@ -134,6 +143,8 @@ class SlateState:
                         self.last_sequence = handle.seqnum()
                 else:
                     await native.rollback()
+                if tx.post_commit is not None:
+                    tx.post_commit()
             except BaseException as error:
                 if committing:
                     self.poisoned = True

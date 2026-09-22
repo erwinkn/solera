@@ -1,5 +1,5 @@
 """Pool placement (§10): the pull path. `launch` is a no-op — the engine stages
-the claimable task under `pool/` when it dispatches; `wait` reports when the
+the claimable task in memory when it dispatches; `wait` reports when the
 result object appears, the task is completed, or the claim lease expired."""
 
 from __future__ import annotations

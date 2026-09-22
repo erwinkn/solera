@@ -21,7 +21,7 @@ from cursus.sdk import TimePartitions, canonical_partition, digest, split_partit
 from cursus.stores import delta_path, next_batch
 
 from .placements import PlacementContext, Registry
-from .state import Conflict, LostOwnership, State, Tx
+from .state import BAD_OUTCOME, TERMINAL_TASK, Conflict, LostOwnership, State, Tx
 
 SUCCESS = {"succeeded", "skipped"}
 TERMINAL = SUCCESS | {"failed", "blocked", "canceled"}
@@ -66,6 +66,8 @@ class Engine:
         ctx = PlacementContext(state, state.objects_url, project, self.clock)
         self.registry = registry or Registry(ctx, extra=placements)
         self.inflight: dict[str, asyncio.Task] = {}
+        # Live placement handles per attempt — the in-memory active set (§4.2).
+        self.handles: dict[str, dict] = {}
         # Attempts consuming a local execution slot. Pool waiters only poll
         # state — they run no local work and must not starve dispatch (§10).
         self.engine_inflight: set[str] = set()
@@ -99,19 +101,10 @@ class Engine:
                     )
 
     async def start(self):
-        """Resume in-flight attempts at `wait` (§10) and start the eval loop."""
+        """Start the eval loop. In-flight work from before a restart was
+        already fenced and requeued by State's open (§4.3) — the dispatch
+        path relaunches it from scratch."""
 
-        async with self.state.transaction() as tx:
-            for _, active in await tx.actives():
-                attempt = active["attempt"]
-                task = await tx.task(active["task"])
-                if task is None or task["status"] != "running":
-                    continue
-                lock = await tx.lock(task["asset"], task["scope"])
-                if lock is None or lock["attempt"] != attempt:
-                    continue
-                placement = self._placement(task)
-                self._launch_waiter(task, attempt, active["prepared"], placement, active["handle"])
         self._stopping = False
         self.runner = asyncio.create_task(self._loop())
 
@@ -200,7 +193,7 @@ class Engine:
             raise ValueError("config must be a JSON object")
         async with self.state.transaction() as tx:
             if command_id:
-                existing = await tx.get(f"command/{command_id}")
+                existing = await tx.get(f"sys/command/{command_id}")
                 if existing:
                     return await tx.run(existing)
             assets = {}
@@ -233,7 +226,7 @@ class Engine:
                     kept = []
                     for scope in assets[name]:
                         lock = await tx.lock(name, scope)
-                        live = lock is not None and lock["lease_until"] > self.clock()
+                        live = lock is not None and await tx.lease_until(lock) > self.clock()
                         if not live and not await tx.pending(name, scope):
                             kept.append(scope)
                     assets[name] = kept
@@ -283,11 +276,19 @@ class Engine:
                 await tx.put_pending(task)
                 if task["status"] == "queued":
                     await tx.enqueue(task["id"], task["ready_at"])
+                else:
+                    # waiting: seed the dependents index + unfinished counters
+                    # (§4.2) — completions decrement, never rescan the run.
+                    await tx.set_unfinished(
+                        task["id"], {"left": len(task["deps"]), "bad": 0, "deps": task["deps"]}
+                    )
+                    for dep in task["deps"]:
+                        await tx.add_dependent(dep, task["id"])
+            await tx.set_run_stats(run_id, {"left": len(tasks), "bad": 0})
             run["tasks"] = sorted(tasks)
             await tx.put_run(run)
-            await tx.index_run(run)
             if command_id:
-                await tx.put(f"command/{command_id}", run_id)
+                await tx.put(f"sys/command/{command_id}", run_id)
             await self.state.advance_run(tx, run_id)
             return run
 
@@ -496,10 +497,10 @@ class Engine:
         dispatched_engine = 0
         async with self.state.transaction() as tx:
             now_ms = self.clock() * 1000
-            for key, task_id in await tx.queued():
-                if int(key.split("/")[1]) > now_ms:
+            for task_id, when_ms in await tx.queued():
+                if when_ms > now_ms:
                     break
-                await tx.delete(key)
+                await tx.dequeue(task_id)
                 task = await tx.task(task_id)
                 if task is None or task["status"] != "queued":
                     continue
@@ -936,12 +937,11 @@ class Engine:
             except Exception as error:
                 await self.state.fail_attempt(attempt, f"launch: {error}", retryable=True)
                 return
-            async with self.state.transaction() as tx:
-                await tx.put_active(
-                    attempt,
-                    {"attempt": attempt, "task": task["id"], "handle": handle, "prepared": prepared},
-                )
-            await self._wait_loop(task, attempt, prepared, placement, handle)
+            self.handles[attempt] = handle
+            try:
+                await self._wait_loop(task, attempt, prepared, placement, handle)
+            finally:
+                self.handles.pop(attempt, None)
         finally:
             self.engine_inflight.discard(attempt)
             self.env_inflight[env_key] = max(0, self.env_inflight.get(env_key, 1) - 1)
@@ -1004,14 +1004,6 @@ class Engine:
             await placement.cancel(handle)
         with contextlib.suppress(Exception):
             await asyncio.wait_for(placement.wait(handle, GRACE_SECONDS), GRACE_SECONDS + 1)
-
-    def _launch_waiter(self, task, attempt, prepared, placement, handle):
-        async def resumed():
-            await self._wait_loop(task, attempt, prepared, placement, handle)
-
-        asyncio_task = asyncio.create_task(resumed())
-        self.inflight[attempt] = asyncio_task
-        asyncio_task.add_done_callback(lambda _t, a=attempt: self.inflight.pop(a, None))
 
     # -- sources commit API (§5) ------------------------------------------------------
 
@@ -1084,9 +1076,7 @@ class Engine:
                 }
                 meta["partitions"] = sorted(new_map)
             ref["meta"] = meta
-            commit_id = uuid.uuid4().hex
             record = {
-                "id": commit_id,
                 "attempt": None,
                 "task": None,
                 "run": None,
@@ -1098,7 +1088,7 @@ class Engine:
                 "changed": [name],
                 "source": name,
             }
-            await tx.put_commit(commit_id, record)
+            commit_id = await tx.put_commit(record)
             await tx.put_head(
                 name,
                 "",
@@ -1111,13 +1101,6 @@ class Engine:
                     "version": None,
                 },
             )
-            for _, auto in await tx.automations():
-                watched = set(auto.get("watched") or [])
-                if auto["enabled"] and auto["trigger"]["kind"] == "onchange" and name in watched:
-                    auto.setdefault("pending", []).append(
-                        {"commit": commit_id, "asset": None, "scope": "", "outputs": [name]}
-                    )
-                    await tx.put_automation(auto["name"], auto)
             return {"changed": True, "ref": ref, "commit": commit_id}
 
     # -- automations (§9) ------------------------------------------------------------
@@ -1145,18 +1128,19 @@ class Engine:
                         fired.append((auto, auto.get("partitions") or "latest"))
                         auto["last_at"] = now
                         await tx.put_automation(auto["name"], auto)
-                elif trigger["kind"] == "onchange" and auto.get("pending"):
-                    fired.append((auto, {"__pending__": auto["pending"]}))
-                    auto["pending"] = []
-                    auto["last_at"] = now
-                    await tx.put_automation(auto["name"], auto)
+                elif trigger["kind"] == "onchange":
+                    # Consume the commit log after the automation's watermark
+                    # (§4.3) — no durable pending[] array.
+                    events, high = await self.state.automation_events(tx, auto)
+                    if events:
+                        fired.append((auto, {"__pending__": events, "__wm__": high}))
                 elif trigger["kind"] == "ondeploy":
                     revision = self.manifest["revision"]
                     if auto.get("last_revision") != revision:
                         fired.append((auto, {"__ondeploy__": revision}))
         for auto, selection in fired:
             if isinstance(selection, dict) and "__pending__" in selection:
-                await self._fire_onchange(auto, selection["__pending__"])
+                await self._fire_onchange(auto, selection["__pending__"], selection["__wm__"])
             elif isinstance(selection, dict) and "__ondeploy__" in selection:
                 await self._fire_ondeploy(auto, selection["__ondeploy__"])
             else:
@@ -1212,8 +1196,9 @@ class Engine:
                     record["last_run"] = run["id"]
                 await tx.put_automation(auto["name"], record)
 
-    async def _fire_onchange(self, auto, pending):
-        """Project each changed upstream scope to the target's scopes (§7, §9)."""
+    async def _fire_onchange(self, auto, pending, watermark):
+        """Project each changed upstream scope to the target's scopes (§7, §9),
+        then advance the commit watermark past the consumed events (§4.3)."""
 
         per_asset = {}
         for event in pending:
@@ -1238,6 +1223,7 @@ class Engine:
                     merged = dict(pinned)
                     merged.update(dict(zip(missing_dims, combo, strict=True)))
                     per_asset.setdefault(target, set()).add(canonical_partition(t_dims, merged))
+        last_run = None
         for target, scopes in per_asset.items():
             if not scopes:
                 continue
@@ -1253,13 +1239,19 @@ class Engine:
                     skip_active=True,
                 )
                 if run is not None:
-                    async with self.state.transaction() as tx:
-                        record = await tx.automation(auto["name"])
-                        if record:
-                            record["last_run"] = run["id"]
-                            await tx.put_automation(auto["name"], record)
+                    last_run = run["id"]
             except Exception as error:
                 self.last_error = f"automation {auto['name']}: {error}"
+                return  # leave the watermark: the batch replays next tick
+        async with self.state.transaction() as tx:
+            record = await tx.automation(auto["name"])
+            if record:
+                record["commit_watermark"] = max(record.get("commit_watermark") or 0, watermark)
+                record["last_at"] = self.clock()
+                if last_run is not None:
+                    record["last_run"] = last_run
+                await tx.put_automation(auto["name"], record)
+            await tx.set_auto_pending(auto["name"], [])
 
     async def set_automation(self, name: str, enabled: bool):
         async with self.state.transaction() as tx:
@@ -1294,24 +1286,22 @@ class Engine:
             run["updated_at"] = self.clock()
             for task_id in run["tasks"]:
                 task = await tx.task(task_id)
-                if task is None:
+                if task is None or task["status"] in TERMINAL_TASK:
                     continue
-                if task["status"] in {"queued", "waiting"}:
-                    task["status"] = "canceled"
-                    await tx.put_task(task)
-                    await tx.del_pending(task)
-                    await tx.put_scope_outcome(task["asset"], task["scope"], "canceled")
-                elif task["status"] == "running":
+                lock = await tx.lock(task["asset"], task["scope"])
+                attempt_id = (lock or {}).get("attempt")
+                if task["status"] in {"running", "claimable"}:
                     # Fence the attempt: its next renew raises LostOwnership and
                     # the placement loop cancels the run (§8).
-                    lock = await tx.lock(task["asset"], task["scope"])
                     await tx.del_lock(task["asset"], task["scope"])
-                    task["status"] = "canceled"
-                    await tx.put_task(task)
-                    await tx.del_pending(task)
-                    await tx.put_scope_outcome(
-                        task["asset"], task["scope"], "canceled", (lock or {}).get("attempt")
-                    )
+                    if attempt_id:
+                        await tx.clear_lease(attempt_id)
+                        await tx.del_pool_task(attempt_id)
+                task["status"] = "canceled"
+                await tx.dequeue(task_id)
+                await tx.put_task(task)
+                await tx.del_pending(task)
+                await tx.put_scope_outcome(task["asset"], task["scope"], "canceled", attempt_id)
             await tx.put_run(run)
             return run
 
@@ -1333,7 +1323,7 @@ class Engine:
                 task = await tx.task(task_id)
                 if task and task["status"] in {"failed", "blocked"}:
                     task["status"] = "queued"
-                    task["error"] = None
+                    task.pop("error", None)
                     task["ready_at"] = self.clock()
                     await tx.enqueue(task["id"], task["ready_at"])
                     await tx.put_task(task)
@@ -1341,6 +1331,31 @@ class Engine:
             run["status"] = "running"
             run["paused"] = False
             await tx.put_run(run)
+            # Rebuild the counters/indexes for the reactivated run — it may
+            # have been evicted from the working set at its terminal state.
+            tasks = [await tx.task(tid) for tid in run["tasks"]]
+            await tx.set_run_stats(
+                run_id,
+                {
+                    "left": sum(1 for t in tasks if t and t["status"] not in TERMINAL_TASK),
+                    "bad": sum(1 for t in tasks if t and t["status"] in BAD_OUTCOME),
+                },
+            )
+            for task in tasks:
+                if task is None or task["status"] != "waiting":
+                    continue
+                left = bad = 0
+                for dep in task.get("deps") or []:
+                    dep_task = await tx.task(dep)
+                    status = dep_task["status"] if dep_task else "failed"
+                    if status in TERMINAL_TASK:
+                        bad += status in BAD_OUTCOME
+                    else:
+                        left += 1
+                        await tx.add_dependent(dep, task["id"])
+                await tx.set_unfinished(
+                    task["id"], {"left": left, "bad": bad, "deps": task.get("deps") or []}
+                )
             await self.state.advance_run(tx, run_id)
             return run
 
@@ -1360,6 +1375,12 @@ class Engine:
             for task in tasks:
                 if task:
                     attempts[task["id"]] = [a for _, a in await tx.attempts(task["id"])]
+                    # Task records carry no result/error (§4.1) — the API
+                    # surfaces the latest attempt's so console reads keep working.
+                    latest = attempts[task["id"]][-1] if attempts[task["id"]] else None
+                    if latest:
+                        task.setdefault("error", latest.get("error"))
+                        task.setdefault("result", latest.get("result"))
             return {"request": run, "tasks": tasks, "attempts": attempts}
 
     async def asset_detail(self, name: str, scope=""):

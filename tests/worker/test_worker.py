@@ -136,11 +136,9 @@ project = Project(assets=[slow])
     # Wait for the subprocess to be mid-flight, then SIGKILL it — a real crash.
     pid = None
     for _ in range(100):
-        async with state.transaction() as tx:
-            actives = await tx.actives()
-            if actives:
-                pid = actives[0][1]["handle"]["pid"]
-                break
+        if engine.handles:
+            pid = next(iter(engine.handles.values()))["pid"]
+            break
         await asyncio.sleep(0.05)
     assert pid
     flag_ready = False

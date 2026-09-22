@@ -731,10 +731,11 @@ async def test_onchange_fans_out_by_projection(state):
     engine = make_engine(state, project)
     await engine.initialize()
     await drive(engine, await engine.submit(["sites"]))
-    await engine.tick()  # automation eval picks up the pending event
+    await engine.tick()  # automation eval consumes the commit after its watermark
     async with state.transaction() as tx:
         auto = await tx.automation("per_site.onchange.0")
-        assert auto["pending"] == [] and auto["last_run"]
+        assert auto["commit_watermark"] > 0 and auto["last_run"]
+        assert (await state.automation_events(tx, auto))[0] == []
     await engine.run_until(auto["last_run"], 10)
     assert sorted(seen) == ["s1", "s2"]
 
@@ -883,9 +884,9 @@ async def test_harness_exit_without_result_fails_retryably(state):
     assert "without a result" in detail["tasks"][0]["error"]
 
 
-async def test_restart_resumes_at_wait(tmp_path):
-    """§10: after an engine restart, active attempts with handles resume at
-    wait — not abandoned, not relaunched."""
+async def test_restart_requeues_and_relaunches_inflight(tmp_path):
+    """§4.3/§10: after an engine restart, an in-flight attempt is fenced and
+    the task requeued exactly once — dispatch relaunches it from scratch."""
     launches = []
     release = {"go": False}
 
@@ -932,6 +933,7 @@ async def test_restart_resumes_at_wait(tmp_path):
     await engine.tick()
     await asyncio.sleep(0.3)
     assert launches  # attempt is mid-flight
+    task_id = launches[0].rpartition("/")[0]
     # Crash the engine: cancel in-flight asyncio tasks and reopen the state,
     # like a process restart would.
     for t in engine.inflight.values():
@@ -941,6 +943,11 @@ async def test_restart_resumes_at_wait(tmp_path):
     await state.close()
 
     state2 = State(await SlateState.open(url, "test"))
+    async with state2.transaction() as tx:
+        # §4.3: open fenced the attempt and requeued the task exactly once.
+        assert (await tx.attempt(task_id, 1))["status"] == "expired"
+        assert (await tx.task(task_id))["status"] == "queued"
+        assert [tid for tid, _ in await tx.queued()].count(task_id) == 1
     engine2 = make_engine(state2, project, placements={"Fake": lambda e, o, c: Slow(c)}, lease_seconds=30)
     await engine2.initialize()
     await engine2.start()
@@ -949,7 +956,8 @@ async def test_restart_resumes_at_wait(tmp_path):
     await engine2.stop()
     await state2.close()
     assert status_of(detail) == "succeeded"
-    assert len(launches) == 1  # resumed at wait; launch not repeated
+    assert len(launches) == 2  # the fenced attempt relaunched under generation 2
+    assert launches[1].endswith("/2")
 
 
 async def test_max_concurrent(state):
@@ -1003,7 +1011,7 @@ async def test_identical_poll_wakes_nothing(state):
     await drive(engine, await engine.submit(["feed"]))  # identical content
     async with state.transaction() as tx:
         auto = await tx.automation("consumer.onchange.0")
-        assert auto["pending"] == []
+        assert (await state.automation_events(tx, auto))[0] == []
     fired.clear()
     await engine.tick()
     assert fired == []  # nothing woke: identical content is not a change
@@ -1116,15 +1124,15 @@ async def test_ondeploy_fires_once_per_revision(state):
     engine = make_engine(state, project)
     await engine.initialize()
     await engine.tick()
-    auto = (await state.scan("automation/deployed.ondeploy.0"))[0][1]
+    auto = dict(await state.automations())["deployed.ondeploy.0"]
     await engine.run_until(auto["last_run"], 30)
     assert calls == [1]
-    auto = (await state.scan("automation/deployed.ondeploy.0"))[0][1]
+    auto = dict(await state.automations())["deployed.ondeploy.0"]
     assert auto["last_revision"] == project.manifest["revision"]
 
     for _ in range(3):
         await engine.tick()
-    auto = (await state.scan("automation/deployed.ondeploy.0"))[0][1]
+    auto = dict(await state.automations())["deployed.ondeploy.0"]
     assert calls == [1]
     assert auto["last_revision"] == project.manifest["revision"]
 
@@ -1141,14 +1149,14 @@ async def test_ondeploy_silent_on_restart_same_revision(state):
     engine = make_engine(state, project)
     await engine.initialize()
     await engine.tick()
-    auto = (await state.scan("automation/deployed.ondeploy.0"))[0][1]
+    auto = dict(await state.automations())["deployed.ondeploy.0"]
     await engine.run_until(auto["last_run"], 30)
     assert calls == [1]
 
     engine2 = make_engine(state, project)  # same manifest, same revision
     await engine2.initialize()
     await engine2.tick()
-    auto = (await state.scan("automation/deployed.ondeploy.0"))[0][1]
+    auto = dict(await state.automations())["deployed.ondeploy.0"]
     assert auto["last_revision"] == project.manifest["revision"]
     assert calls == [1]
 
@@ -1174,8 +1182,8 @@ async def test_ondeploy_two_registrations_fire_latest_once(state):
     engine = make_engine(state, project_b)
     await engine.initialize()
     await engine.tick()
-    auto = (await state.scan("automation/deployed.ondeploy.0"))[0][1]
+    auto = dict(await state.automations())["deployed.ondeploy.0"]
     await engine.run_until(auto["last_run"], 30)
     assert calls == [1]
-    auto = (await state.scan("automation/deployed.ondeploy.0"))[0][1]
+    auto = dict(await state.automations())["deployed.ondeploy.0"]
     assert auto["last_revision"] == project_b.manifest["revision"]

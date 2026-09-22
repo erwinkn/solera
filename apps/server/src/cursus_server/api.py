@@ -169,7 +169,7 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
             raise KeyError(name)
         detail = await runtime.asset_detail(name)
         detail["automations"] = [
-            a for _, a in await runtime.state.scan("automation/") if name in a.get("targets", [])
+            a for _, a in await runtime.state.automations() if name in a.get("targets", [])
         ]
         return detail
 
@@ -226,6 +226,10 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
             keys = {str(e): "1" for e in meta["partitions"]}
         elif meta.get("delta"):
             keys = await runtime.state.delta_key_map(name, scope, int(meta["delta"]["batch"]))
+        elif (meta.get("keys") or {}).get("object"):
+            # Pre-delta head: the element map lives in a staged keys object.
+            data = await runtime.state.get_object(meta["keys"]["object"])
+            keys = {str(k): "" for k in json.loads(data)} if data else {}
         else:
             keys = {}
         items = sorted(keys.items())
@@ -364,7 +368,7 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
     @app.get("/api/projects/{p}/automations")
     async def automations(p: str, request: Request):
         runtime = await project_engine(request, p)
-        return {"automations": [a for _, a in await runtime.state.scan("automation/")]}
+        return {"automations": [a for _, a in await runtime.state.automations()]}
 
     @app.post("/api/projects/{p}/automations/{name}/enable")
     async def automation_enable(p: str, name: str, request: Request):

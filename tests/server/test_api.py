@@ -324,9 +324,9 @@ async def test_partitions_read_scope_records_not_task_history(client, base, engi
     scanned = []
     original_scan = Transaction.scan
 
-    async def spy(self, prefix, limit=None):
+    async def spy(self, prefix, limit=None, after=None):
         scanned.append(prefix)
-        return await original_scan(self, prefix, limit)
+        return await original_scan(self, prefix, limit, after=after)
 
     # complete (a succeeded scope) and missing (a key never run)
     await engine.run_until((await engine.submit(["daily"], partitions=["2026-09-18"]))["id"])

@@ -7,6 +7,7 @@ export type RunStatus =
 export type TaskStatus =
   | "waiting"
   | "queued"
+  | "claimable"
   | "running"
   | "succeeded"
   | "skipped"
@@ -141,12 +142,7 @@ export interface AutomationRecord extends AutomationDecl {
   last_at: number | null;
   last_run: string | null;
   last_revision: string | null;
-  pending: {
-    commit: string;
-    asset: string | null;
-    scope: string;
-    outputs: string[];
-  }[];
+  commit_watermark: number;
 }
 
 export interface Run {
@@ -186,7 +182,6 @@ export interface Attempt {
   started_at: number;
   finished_at?: number;
   commit?: string;
-  lease_until?: number;
   error?: {
     type: string;
     message: string;

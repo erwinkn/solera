@@ -571,10 +571,9 @@ if result is None:
 commit_or_fail(result)
 ```
 
-On restart, `active/` attempts with a handle are resumed at `wait`, not
-abandoned. `Local` handles carry `{pid, started_at}` and treat a mismatch
-as lost. The engine counts in-flight attempts per environment against
-`max_concurrent`.
+On restart every lease is expired: in-flight attempts are fenced and their
+tasks requeue and relaunch from scratch — nothing resumes at `wait`. The
+engine counts in-flight attempts per environment against `max_concurrent`.
 
 ### Worker protocol
 

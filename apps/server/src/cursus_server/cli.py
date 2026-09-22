@@ -365,7 +365,7 @@ async def _local(args, parser):
                     sys.stdout.write(data.decode())
         elif args.command == "automations":
             if not args.action:
-                autos = [a for _, a in await runtime.state.scan("automation/")]
+                autos = [a for _, a in await runtime.state.automations()]
                 print(json.dumps(autos, indent=2))
             else:
                 if not args.name:

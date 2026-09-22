@@ -99,9 +99,9 @@ function AutomationsPage() {
                         rev {automation.last_revision.slice(0, 8)}
                       </Badge>
                     )}
-                  {!!automation.pending.length && (
-                    <Badge variant="outline" className="text-sky-700">
-                      {automation.pending.length} pending
+                  {automation.trigger.kind === "onchange" && (
+                    <Badge variant="outline" className="font-mono">
+                      @{automation.commit_watermark}
                     </Badge>
                   )}
                   <Switch

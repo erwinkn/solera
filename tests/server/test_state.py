@@ -83,8 +83,10 @@ async def make_task(state, asset="poll", scope="", run_id=None):
         }
         run["tasks"].append(task["id"])
         await tx.put_run(run)
-        await tx.index_run(run)
         await tx.put_task(task)
+        await tx.put_pending(task)
+        await tx.enqueue(task["id"], task["ready_at"])
+        await tx.set_run_stats(run_id, {"left": len(run["tasks"]), "bad": 0})
         return task
 
 
@@ -108,8 +110,9 @@ def prepared(inputs=None, baseline=None, **kw):
 
 
 async def test_commit_installs_everything_atomically(state):
-    """§8: a commit installs heads, the commit record, cursor, edge watermarks
-    and pending OnChange automations in one transaction."""
+    """§8: a commit installs heads, the commit record, cursor and edge
+    watermarks in one transaction; OnChange automations consume the record
+    from the commit log via their watermark (§4.3)."""
     upstream = await make_task(state, asset="rollup")
     await state.commit_attempt(
         manifest(),
@@ -143,10 +146,34 @@ async def test_commit_installs_everything_atomically(state):
         assert commit["input_refs"]["upstream"]["ref"]["version"] == "v0"
         assert (await tx.attempt(task["id"], 1))["status"] == "succeeded"
         auto = await tx.automation("rollup.onchange.0")
-        assert auto["pending"] == [
+        assert "pending" not in auto
+        events, high = await state.automation_events(tx, auto)
+        # The automation watches `events`; the unrelated `summary` commit is
+        # in the log but not an event for it.
+        assert events == [
             {"commit": record["id"], "asset": "poll", "scope": "", "outputs": ["events"]}
         ]
+        assert high == int(record["id"])
         assert (await tx.task(task["id"]))["status"] == "succeeded"
+
+
+async def test_commits_list_newest_first(state):
+    """§4.1: commit/{seq:020d} ids are monotonic and listings are newest-first."""
+    ids = []
+    for i in range(3):
+        task = await make_task(state, run_id=f"run-{i}")
+        record = await state.commit_attempt(
+            manifest(),
+            await claim(state, task),
+            prepared(),
+            {"outputs": {"events": ref("events", f"v{i}")}},
+        )
+        ids.append(record["id"])
+    assert ids == sorted(ids)  # monotonic sequence keys
+    async with state.transaction() as tx:
+        listed = await tx.commits()
+        assert [k.split("/", 1)[1] for k, _ in listed] == list(reversed(ids))
+        assert [r["id"] for _, r in listed] == list(reversed(ids))
 
 
 async def test_commit_failure_leaves_nothing(state, monkeypatch):
@@ -170,7 +197,8 @@ async def test_commit_failure_leaves_nothing(state, monkeypatch):
         assert await tx.head("events", "") is None
         assert await tx.watermark("poll", "e", "") is None
         assert await tx.cursor("poll", "") is None
-        assert (await tx.automation("rollup.onchange.0"))["pending"] == []
+        auto = await tx.automation("rollup.onchange.0")
+        assert (await state.automation_events(tx, auto))[0] == []
         assert (await tx.task(task["id"]))["status"] == "running"  # still owns the scope
         assert await tx.commits() == []
 
@@ -184,7 +212,8 @@ async def test_identical_content_is_not_a_change(state):
     )
     async with state.transaction() as tx:
         auto = await tx.automation("rollup.onchange.0")
-        auto["pending"] = []
+        _, high = await state.automation_events(tx, auto)
+        auto["commit_watermark"] = high
         await tx.put_automation(auto["name"], auto)
     second = await make_task(state)
     record = await state.commit_attempt(
@@ -195,7 +224,8 @@ async def test_identical_content_is_not_a_change(state):
     )
     assert record["changed"] == []
     async with state.transaction() as tx:
-        assert (await tx.automation("rollup.onchange.0"))["pending"] == []
+        auto = await tx.automation("rollup.onchange.0")
+        assert (await state.automation_events(tx, auto))[0] == []
 
 
 async def _head(state, output, scope):
@@ -315,24 +345,55 @@ async def test_delta_log_round_trip(state):
     assert await state.delta_key_map("events", "", 2) == {"c": "r1"}
 
 
-async def test_restart_recovers_active_attempts(tmp_path, clock):
-    """§8/§10: after reopening the state, in-flight attempts are still found
-    with their handles so the placement loop can resume at wait."""
+async def test_restart_requeues_inflight_attempts(tmp_path, clock):
+    """§4.3: on open every lock is expired — the attempt is fenced and the
+    task requeued exactly once; no durable queue/lease survives."""
     url = tmp_path.as_uri()
     first = State(await SlateState.open(url, "test"), clock=lambda: clock[0])
     await first.initialize(manifest(), "rev1")
     task = await make_task(first)
     attempt = await claim(first, task)
-    async with first.transaction() as tx:
-        await tx.put_active(attempt, {"attempt": attempt, "handle": {"pid": 1234}})
     await first.close()
 
     reopened = State(await SlateState.open(url, "test"), clock=lambda: clock[0])
     async with reopened.transaction() as tx:
-        actives = await tx.actives()
-        assert [v for _, v in actives] == [{"attempt": attempt, "handle": {"pid": 1234}}]
-        assert (await tx.attempt(task["id"], 1))["status"] == "claimed"
-        assert (await tx.lock(task["asset"], task["scope"]))["attempt"] == attempt
+        assert await tx.lock(task["asset"], task["scope"]) is None
+        assert (await tx.attempt(task["id"], 1))["status"] == "expired"
+        task = await tx.task(task["id"])
+        assert task["status"] == "queued"
+        queued = await tx.queued()
+        assert [tid for tid, _ in queued].count(task["id"]) == 1  # exactly once
+    await reopened.close()
+
+
+async def test_restart_requeues_pool_claim(tmp_path, clock):
+    """§4.3/§10: a pool-claimed attempt is memory — after a restart the claim
+    is gone and the task requeues; the old claim can never renew or commit."""
+    url = tmp_path.as_uri()
+    first = State(await SlateState.open(url, "test"), clock=lambda: clock[0])
+    await first.initialize(manifest(), "rev1")
+    task = await make_task(first)
+    attempt = await claim(first, task)
+    spec = {
+        "execution": {"kind": "Pool", "environment": {"name": "ingest"}, "placement": {}}
+    }
+    await first.stage_pool_task({**task, "generation": 1}, prepared(), spec)
+    claimed = await first.claim_pool_task(
+        "w1", ["ingest"], {"cpu": 1, "memory": 10**9, "gpu": None}, lease_seconds=60
+    )
+    assert claimed["attempt"] == attempt
+    await first.close()
+
+    reopened = State(await SlateState.open(url, "test"), clock=lambda: clock[0])
+    async with reopened.transaction() as tx:
+        assert await tx.pool_task(attempt) is None  # memory-only claim
+        assert (await tx.attempt(task["id"], 1))["status"] == "expired"
+        assert (await tx.task(task["id"]))["status"] == "queued"
+    with pytest.raises(LostOwnership):
+        await reopened.heartbeat_pool_task("w1", attempt, 60)
+    async with reopened.transaction() as tx:
+        with pytest.raises(LostOwnership):
+            await reopened.renew(tx, attempt, 60)
     await reopened.close()
 
 
@@ -368,22 +429,94 @@ async def test_pool_claim_lease_and_expiry(state, clock):
     assert await state.claim_pool_task("w1", ["ingest"], big, 60) is None
 
 
+async def test_advance_run_is_constant_read_per_completion(state, monkeypatch):
+    """§4.2: finishing one task of a 10,000-task run reads a bounded number
+    of durable records — dependents index + counters, never a task/ scan."""
+    from cursus_server import storage
+
+    run_id = "big-run"
+    async with state.transaction() as tx:
+        run = {
+            "id": run_id,
+            "status": "running",
+            "tasks": [],
+            "created_at": state.clock(),
+            "updated_at": state.clock(),
+        }
+        for i in range(10_000):
+            task = {
+                "id": f"{run_id}/poll:{i}",
+                "run": run_id,
+                "asset": "poll",
+                "scope": str(i),
+                "status": "queued",
+                "deps": [],
+                "generation": 0,
+                "attempt_count": 0,
+                "max_attempts": 1,
+                "ready_at": state.clock(),
+            }
+            run["tasks"].append(task["id"])
+            await tx.put_task(task)
+            await tx.put_pending(task)
+            await tx.enqueue(task["id"], task["ready_at"])
+        await tx.set_run_stats(run_id, {"left": len(run["tasks"]), "bad": 0})
+        await tx.put_run(run)
+
+    reads = {"get": 0, "scan": 0}
+    orig_get = storage.Transaction.get
+    orig_scan = storage.Transaction.scan
+
+    async def counted_get(self, *args, **kw):
+        reads["get"] += 1
+        return await orig_get(self, *args, **kw)
+
+    async def counted_scan(self, *args, **kw):
+        reads["scan"] += 1
+        return await orig_scan(self, *args, **kw)
+
+    monkeypatch.setattr(storage.Transaction, "get", counted_get)
+    monkeypatch.setattr(storage.Transaction, "scan", counted_scan)
+
+    async with state.transaction() as tx:
+        task = await tx.task(f"{run_id}/poll:0")
+        await state.claim(tx, task, LEASE)
+        task["status"] = "running"
+        await tx.put_task(task)
+    await state.commit_attempt(
+        manifest(),
+        f"{run_id}/poll:0/1",
+        prepared(),
+        {"outputs": {"events": ref("events", "v1", scope="0")}},
+    )
+    async with state.transaction() as tx:
+        assert (await tx.task(f"{run_id}/poll:0"))["status"] == "succeeded"
+        assert (await tx.run(run_id))["status"] == "running"  # 9,999 left
+    assert reads["scan"] == 0
+    assert reads["get"] < 30
+
+
 async def test_automation_state_survives_reregistration(state):
-    """§9: toggles and pending events survive a manifest reload; a changed
-    trigger resets them."""
+    """§9/§4.3: toggles and the commit watermark survive a manifest reload; a
+    changed trigger restarts consumption at the log's current end."""
+    task = await make_task(state)
+    await state.commit_attempt(
+        manifest(), await claim(state, task), prepared(), {"outputs": {"events": ref("events", "v1")}}
+    )
     async with state.transaction() as tx:
         auto = await tx.automation("rollup.onchange.0")
-        assert auto["enabled"] is True
+        assert auto["enabled"] is True and "pending" not in auto
         auto["enabled"] = False
-        auto["pending"] = [{"commit": "c1"}]
+        auto["commit_watermark"] = 1  # consumed the first commit
         await tx.put_automation(auto["name"], auto)
     await state.initialize(manifest(), "rev1")
     async with state.transaction() as tx:
         auto = await tx.automation("rollup.onchange.0")
-        assert auto["enabled"] is False and auto["pending"] == [{"commit": "c1"}]
+        assert auto["enabled"] is False and auto["commit_watermark"] == 1
     changed = manifest()
     changed["automations"]["rollup.onchange.0"]["trigger"] = {"kind": "every", "seconds": 60}
     await state.initialize(changed, "rev2")
     async with state.transaction() as tx:
         auto = await tx.automation("rollup.onchange.0")
-        assert auto["enabled"] is False and auto["pending"] == []
+        assert auto["enabled"] is False
+        assert auto["commit_watermark"] == state._commit_seq

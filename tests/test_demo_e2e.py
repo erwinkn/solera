@@ -152,6 +152,12 @@ def test_demo_end_to_end(demo):
     # byte-identical, `changed` comes back empty. (`ref.version` is the
     # committed data version; `version` on the head record is the declared
     # asset version and never changes.)
+    #
+    # The concurrent runs above commit site_files deltas that can land after
+    # a sibling run's last file_index drain — real work the watermark must
+    # not skip. Drain the log first so every watermark sits at head.
+    drain = submit(["file_index"], partitions="all", upstream=False)
+    assert wait(lambda: run_done(drain)) and run_status(drain) == "succeeded"
     site_files = {h["scope"]: h["ref"]["version"] for h in heads("site_files")}
     file_index_heads = {h["scope"]: h["commit"] for h in heads("file_index")}
     poll_run = submit(
