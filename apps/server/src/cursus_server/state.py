@@ -1,4 +1,4 @@
-"""Domain state over SlateDB (§1): heads, cursors, key state, commits,
+"""Domain state over SlateDB (§1): heads, cursors, edge watermarks, commits,
 automations, runs/tasks/attempts with per-scope fencing, workers and pools.
 
 Key layout (all under the SlateDB namespace):
@@ -7,7 +7,7 @@ Key layout (all under the SlateDB namespace):
     manifest/{revision}
     head/{output}/{scope}         -> committed ref + metadata
     cursor/{asset}/{scope}        -> producer cursor (§6)
-    keystate/{asset}/{edge}/{scope}/{key} -> {r: revision, f: fingerprint}
+    watermark/{asset}/{edge}/{scope} -> {batch, offset, fingerprint} (§2.2)
     commit/{id}                   -> commit record
     automation/{name}             -> {enabled, next_at, last_at, last_run, pending}
     run/{id}, runindex/{rev-ts}/{id}
@@ -17,12 +17,11 @@ Key layout (all under the SlateDB namespace):
     lock/{asset}/{scope}          -> scope fencing {attempt, generation, lease_until}
     queue/{ready_ms}/{task}       -> dispatch index
     pool/{attempt}                -> claimable pool task (§10)
-    worker/{id}                   -> registered external worker
+    worker/{id}                 -> registered external worker
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 from urllib.parse import quote
 
@@ -94,20 +93,16 @@ class Tx:
         else:
             await self.t.put(f"cursor/{esc(asset)}/{esc(scope)}", value)
 
-    # -- per-edge key state -----------------------------------------------------
-    async def key_state(self, asset: str, edge: str, scope: str) -> dict[str, dict]:
-        prefix = f"keystate/{esc(asset)}/{esc(edge)}/{esc(scope)}/"
-        return {unesc(k[len(prefix) :]): v for k, v in await self.t.scan(prefix)}
+    # -- per-edge watermarks (§2.2) ----------------------------------------------
+    # watermark = {batch, offset, fingerprint}: all items of delta batches < batch
+    # are delivered, plus the first `offset` items of batch `batch`. A missing or
+    # fingerprint-mismatched watermark resets the edge to a full delivery.
 
-    async def put_key_state(self, asset, edge, scope, key, record):
-        await self.t.put(f"keystate/{esc(asset)}/{esc(edge)}/{esc(scope)}/{esc(key)}", record)
+    async def watermark(self, asset: str, edge: str, scope: str):
+        return await self.t.get(f"watermark/{esc(asset)}/{esc(edge)}/{esc(scope)}")
 
-    async def del_key_state(self, asset, edge, scope, key):
-        await self.t.delete(f"keystate/{esc(asset)}/{esc(edge)}/{esc(scope)}/{esc(key)}")
-
-    async def clear_key_state(self, asset, edge, scope):
-        for key, _ in await self.t.scan(f"keystate/{esc(asset)}/{esc(edge)}/{esc(scope)}/"):
-            await self.t.delete(key)
+    async def put_watermark(self, asset, edge, scope, record):
+        await self.t.put(f"watermark/{esc(asset)}/{esc(edge)}/{esc(scope)}", record)
 
     # -- commits -----------------------------------------------------------------
     async def commit_record(self, commit_id: str):
@@ -459,10 +454,14 @@ class State:
                         retryable=False,
                     )
                 decl = declared[name]
-                if (
-                    decl.get("key") is not None or decl.get("partition_set") or decl.get("mode") == "append"
-                ) and not (ref.get("meta") or {}).get("keys"):
-                    raise Conflict(f"keyed output {name}: ref carries no key map", retryable=False)
+                meta = ref.get("meta") or {}
+                if decl.get("incremental") and not meta.get("delta"):
+                    raise Conflict(f"incremental output {name}: ref carries no delta", retryable=False)
+                if decl.get("partition_set") and meta.get("partitions") is None:
+                    raise Conflict(
+                        f"partition-set output {name}: ref carries no partitions list",
+                        retryable=False,
+                    )
             for name in set(declared) - set(outputs):
                 if prepared["baseline"].get(name) is None:
                     raise Conflict(f"omitted output {name} has no head to keep (§2)", retryable=False)
@@ -502,19 +501,14 @@ class State:
                 )
             if result.get("cursor", UNSET) is not UNSET:
                 await tx.put_cursor(task["asset"], task["scope"], result["cursor"])
-            elif prepared.get("recompute"):
-                # Recompute withholds the cursor from the producer and clears the
-                # committed one (§8: no prior, no cursor, key state cleared).
+            elif prepared.get("full"):
+                # A full run withholds the cursor from the producer and clears
+                # the committed one (§8: no prior, no cursor, watermarks reset).
                 await tx.put_cursor(task["asset"], task["scope"], None)
 
-            # Per-edge key state: committed revisions + fingerprints (§6).
-            for edge, update in (prepared.get("key_updates") or {}).items():
-                if update.get("clear"):
-                    await tx.clear_key_state(task["asset"], edge, task["scope"])
-                for key in update.get("deleted", []):
-                    await tx.del_key_state(task["asset"], edge, task["scope"], key)
-                for key, value in update.get("upserted", {}).items():
-                    await tx.put_key_state(task["asset"], edge, task["scope"], key, value)
+            # Per-edge watermarks: the delivered position in each delta log (§2.2).
+            for edge, update in (prepared.get("watermark_updates") or {}).items():
+                await tx.put_watermark(task["asset"], edge, task["scope"], update)
 
             # OnChange automations pend in the same transaction (§9).
             if changed:
@@ -626,14 +620,17 @@ class State:
             await tx.put_task(task)
             await self.advance_run(tx, task["run"])
 
-    async def skip_attempt(self, attempt_id: str, baseline: dict):
-        """§8: every ByKey diff was empty and heads are complete — nothing launched."""
+    async def skip_attempt(self, attempt_id: str, baseline: dict, watermark_updates=None):
+        """§8: every Incremental plan was empty and heads are complete — nothing
+        launched. The watermarks still advance over dead deltas (§2.2)."""
 
         async with self.transaction() as tx:
             try:
                 task = await self._owned_task(tx, attempt_id)
             except LostOwnership:
                 return
+            for edge, update in (watermark_updates or {}).items():
+                await tx.put_watermark(task["asset"], edge, task["scope"], update)
             await tx.put_attempt(
                 task["id"],
                 task["generation"],
@@ -781,24 +778,32 @@ class State:
 
     # -- object helpers --------------------------------------------------------
 
-    async def stage_key_map(self, keys: dict) -> dict:
-        """Key maps live as objects: `keys/{sha256}.json` (§6)."""
+    async def delta(self, output: str, scope: str, batch: int) -> dict | None:
+        """One delta object, or None when the batch was never written or is
+        already pruned (§2.1)."""
 
-        body = json.dumps(keys, sort_keys=True, allow_nan=False).encode()
-        sha = hashlib.sha256(body).hexdigest()
-        await obstore.put_async(self.objects, f"keys/{sha}.json", body, mode="overwrite", use_multipart=False)
-        return {"object": f"keys/{sha}.json", "count": len(keys)}
+        from cursus.stores import delta_path
 
-    async def fetch_key_map(self, info: dict | None) -> dict | None:
-        if not info:
-            return None
-        from obstore.exceptions import NotFoundError
+        data = await self.get_object(delta_path(output, scope, batch))
+        return json.loads(data) if data is not None else None
 
-        try:
-            result = await obstore.get_async(self.objects, info["object"])
-        except (NotFoundError, FileNotFoundError):
-            return None
-        return json.loads(bytes(await result.bytes_async()))
+    async def delta_key_map(self, output: str, scope: str, hi: int) -> dict[str, str]:
+        """The live key map of a keyed incremental output at delta `hi`,
+        folded from `deltas/{output}/{scope}/…` (§2.1). A `reset` delta
+        supersedes everything before it; missing objects are treated as
+        never-written — a real gap forces a full reset at plan."""
+
+        keys: dict[str, str] = {}
+        for b in range(0, int(hi) + 1):
+            delta = await self.delta(output, scope, b)
+            if delta is None:
+                continue
+            if delta.get("reset"):
+                keys.clear()
+            for key in delta.get("deleted") or []:
+                keys.pop(str(key), None)
+            keys.update({str(k): str(v) for k, v in (delta.get("upserted") or {}).items()})
+        return keys
 
     async def put_object(self, key: str, value: bytes):
         await obstore.put_async(self.objects, key, value, mode="overwrite", use_multipart=False)

@@ -1,6 +1,7 @@
 """The engine (§6–§10): control-plane only. It plans runs into per-(asset,
-scope) tasks, resolves inputs to pinned heads, diffs ByKey edges, dispatches
-attempts through placements, and commits results through State.
+scope) tasks, resolves inputs to pinned heads, plans Incremental edges over
+per-edge watermarks, dispatches attempts through placements, and commits
+results through State.
 
 Structure lives in the manifest, state lives in the spec, effects live in the
 result — the engine never interprets a payload.
@@ -17,6 +18,7 @@ from zoneinfo import ZoneInfo
 
 from croniter import croniter
 from cursus.sdk import TimePartitions, canonical_partition, digest, split_partition
+from cursus.stores import delta_path, next_batch
 
 from .placements import PlacementContext, Registry
 from .state import Conflict, LostOwnership, State, Tx
@@ -32,7 +34,7 @@ class Retryable(RuntimeError):
 
 
 class NonRetryable(RuntimeError):
-    """A dispatch-time failure no retry will fix (§8: recompute required, …)."""
+    """A dispatch-time failure no retry will fix (§8: full run required, …)."""
 
 
 class Engine:
@@ -191,7 +193,7 @@ class Engine:
             targets = [targets]
         if not targets:
             raise ValueError("A run needs at least one target")
-        if mode not in {"incremental", "recompute"}:
+        if mode not in {"incremental", "full"}:
             raise ValueError(f"Unknown mode: {mode!r}")
         config = config or {}
         if not isinstance(config, dict):
@@ -217,15 +219,15 @@ class Engine:
                         assets.setdefault(owner, []).append(up_scope)
                         queue.append((owner, up_scope))
             if keys:
-                bykey_outputs = {
+                incremental_outputs = {
                     e["output"]
                     for name in assets
                     for e in self.manifest["assets"][name]["inputs"].values()
-                    if e["kind"] == "bykey"
+                    if e["kind"] == "incremental"
                 }
-                unknown = set(keys) - bykey_outputs
+                unknown = set(keys) - incremental_outputs
                 if unknown:
-                    raise ValueError(f"keys= names no ByKey edge: {sorted(unknown)}")
+                    raise ValueError(f"keys= names no Incremental edge: {sorted(unknown)}")
             if skip_active:
                 for name in list(assets):
                     kept = []
@@ -398,11 +400,25 @@ class Engine:
                 out.append(self._time(dim).keys(self._now()))
             else:
                 head = await tx.head(dim["output"], "")
-                keys = None
-                if head and head["ref"]["meta"].get("keys"):
-                    keys = await self.state.fetch_key_map(head["ref"]["meta"]["keys"])
+                keys = await self._head_keys(head)
                 out.append(sorted(keys) if keys else [])
         return out
+
+    async def _head_keys(self, head) -> list[str] | None:
+        """A set-dim output's current element list: `meta.partitions` on a
+        partition-set/source head, else a fold of the delta log (§2.1, §7)."""
+
+        if head is None:
+            return None
+        meta = head["ref"].get("meta") or {}
+        if meta.get("partitions") is not None:
+            return [str(e) for e in meta["partitions"]]
+        if meta.get("delta"):
+            keys = await self.state.delta_key_map(
+                head["ref"]["output"], head["ref"].get("partition", ""), meta["delta"]["batch"]
+            )
+            return sorted(keys)
+        return []
 
     def _time(self, dim: dict) -> TimePartitions:
         return TimePartitions(
@@ -528,7 +544,9 @@ class Engine:
                 await self.state.fail_attempt(attempt, message, retryable=retryable)
                 continue
             if prepared.get("skip"):
-                await self.state.skip_attempt(attempt, prepared["baseline"])
+                await self.state.skip_attempt(
+                    attempt, prepared["baseline"], prepared.get("watermark_updates")
+                )
                 continue
             env_key = self.registry.env_key(self.manifest["assets"][task["asset"]]["placement"])
             self.env_inflight[env_key] = self.env_inflight.get(env_key, 0) + 1
@@ -540,30 +558,30 @@ class Engine:
         spec = self.manifest["assets"][task["asset"]]["placement"]
         return self.registry.build(spec)
 
-    # -- input resolution + ByKey diffs (§5, §6, §8) --------------------------------
+    # -- input resolution + Incremental plans (§5, §6, §8) --------------------------
 
     async def _prepare(self, tx: Tx, task: dict, run: dict) -> dict:
-        """Pin heads at attempt start; diff ByKey edges; decide skip (§8)."""
+        """Pin heads at attempt start; plan Incremental edges; decide skip (§8)."""
 
         asset = self.manifest["assets"][task["asset"]]
         scope = task["scope"]
-        recompute = run["mode"] == "recompute"
+        full = run["mode"] == "full"
         baseline = {}
         for output in asset["outputs"]:
             head = await tx.head(output["name"], scope)
             baseline[output["name"]] = head
             if (
-                not recompute
+                not full
                 and head is not None
                 and head.get("version") is not None
                 and head["version"] != asset["version"]
             ):
-                if asset.get("on_version_change") == "recompute":
-                    recompute = True
+                if asset.get("on_version_change") == "full":
+                    full = True
                 else:
                     raise NonRetryable(
                         f"{task['asset']}: committed version {head['version']} != declared "
-                        f"{asset['version']}: recompute required"
+                        f"{asset['version']}: a full run is required"
                     )
         edges = list(asset["inputs"].items())
         for dep in asset["deps"]:
@@ -575,9 +593,9 @@ class Engine:
                 # dimension — not interpretation — so it stays out of the
                 # fingerprint: adding a key must not invalidate existing ones.
                 edges.append((dim["output"], {"kind": "dep", "output": dim["output"], "set_dim": True}))
-        # Pass 1: pin every non-ByKey edge; their refs enter the fingerprint (§6).
+        # Pass 1: pin every non-Incremental edge; their refs enter the fingerprint (§6).
         inputs, pinned = {}, {}
-        bykey = []
+        incremental = []
         for param, edge in edges:
             output = edge["output"]
             owner = self.manifest["outputs"][output].get("asset")
@@ -595,45 +613,51 @@ class Engine:
                 if not edge.get("set_dim"):
                     pinned[param] = refs
                 continue
-            if edge["kind"] == "bykey":
-                bykey.append((param, edge, up_dims))
+            if edge["kind"] == "incremental":
+                incremental.append((param, edge, up_dims))
                 continue
             inputs[param] = {"ref": await self._pin(tx, output, up_dims, asset, scope)}
             pinned[param] = inputs[param]["ref"]
         fingerprint = self._fingerprint(asset, run, pinned)
-        # Pass 2: ByKey diffs against the fingerprinted interpretation (§6).
-        key_updates, all_empty = {}, True
-        for param, edge, up_dims in bykey:
+        # Pass 2: Incremental plans against the fingerprinted interpretation (§2.2).
+        watermark_updates, all_empty = {}, True
+        for param, edge, up_dims in incremental:
             ref = await self._pin(tx, edge["output"], up_dims, asset, scope)
-            pin, update, empty = await self._bykey_diff(
-                tx, task, asset, param, edge, ref, fingerprint, run, recompute
+            pin, update, empty = await self._incremental_plan(
+                tx, task, asset, param, edge, ref, fingerprint, run, full
             )
             inputs[param] = pin
-            key_updates[param] = update
+            if update is not None:
+                watermark_updates[param] = update
             all_empty = all_empty and empty
-        more = any(u.get("more") for u in key_updates.values())
-        skip = bool(bykey) and all_empty and not more and not recompute
+        more = any(u.get("more") for u in watermark_updates.values())
+        skip = bool(incremental) and all_empty and not more and not full
         if skip:
             for output in asset["outputs"]:
                 head = baseline[output["name"]]
                 if head is None or not head["complete"]:
                     skip = False
                     break
-        prior = (
-            {} if recompute else {name: head["ref"] for name, head in baseline.items() if head is not None}
-        )
-        cursor = None if recompute else await tx.cursor(task["asset"], scope)
+        prior = {name: head["ref"] for name, head in baseline.items() if head is not None}
+        cursor = await tx.cursor(task["asset"], scope)
+        if full:
+            prior, cursor = {}, None
         return {
             "inputs": inputs,
             "baseline": baseline,
-            "key_updates": key_updates,
+            "watermark_updates": watermark_updates,
             "more": more,
             "scope_complete": not more,
-            "recompute": recompute,
+            "full": full,
             "skip": skip,
             "prior": prior,
             "cursor": cursor,
             "fingerprint": fingerprint,
+            "batches": {
+                o["name"]: next_batch(baseline[o["name"]]["ref"] if baseline[o["name"]] else None)
+                for o in asset["outputs"]
+                if o.get("incremental")
+            },
         }
 
     async def _pin(self, tx: Tx, output: str, up_dims: dict, asset: dict, scope: str):
@@ -680,49 +704,125 @@ class Engine:
                 refs[canonical_partition(collapsed, collapsed_parts)] = head["ref"]
         return refs
 
-    async def _bykey_diff(self, tx, task, asset, param, edge, ref, fingerprint, run, recompute):
-        """Diff the upstream key map against per-edge key state (§6)."""
+    async def _incremental_plan(self, tx, task, asset, param, edge, ref, fingerprint, run, full):
+        """Plan one Incremental edge: the pending delta items after the edge's
+        watermark, capped at `batch_size` (§2.2).
 
-        upstream = await self.state.fetch_key_map(ref["meta"].get("keys")) or {}
+        watermark = {"batch", "offset", "fingerprint"}: items of batches below
+        `batch` are delivered, plus the first `offset` items of `batch`. A
+        missing watermark, a fingerprint change, or a `full` run resets the
+        edge to a whole-head delivery. Returns (pin, watermark_update, empty);
+        the update carries `more` while pending items remain after the take."""
+
+        decl = self.manifest["outputs"][edge["output"]]
+        keyed = decl.get("key") is not None
+        batch_size = int(edge.get("batch_size") or 100)
+        head_batch = int(((ref.get("meta") or {}).get("delta") or {}).get("batch", -1))
+        up_scope = ref.get("partition") or ""
         override = (run.get("keys") or {}).get(edge["output"])
-        state = await tx.key_state(task["asset"], param, task["scope"])
-        if override == "full" or recompute:
-            upserted = dict(upstream)
-            deleted = [k for k in state if k not in upstream]
-        elif isinstance(override, dict) and "keys" in override:
-            wanted = set(override["keys"])
-            upserted = {k: upstream.get(k, state.get(k, {}).get("r", "")) for k in wanted}
-            deleted = []
-        else:
-            upserted = {
-                k: r
-                for k, r in upstream.items()
-                if state.get(k, {}).get("r") != r or state.get(k, {}).get("f") != fingerprint
+        wm = await tx.watermark(task["asset"], param, task["scope"])
+        reset = full or wm is None or wm.get("fingerprint") != fingerprint or override == "full"
+
+        # A keys= override is a one-off selection — it never moves the watermark.
+        if isinstance(override, dict) and "keys" in override and not reset:
+            keys = [str(k) for k in override["keys"]]
+            pin = {
+                "ref": ref,
+                "changes": {"upserted": {k: "" for k in keys}, "deleted": [], "full": False},
             }
-            deleted = [k for k in state if k not in upstream]
-        ordered = dict(sorted(upserted.items()))
-        batch_size = edge.get("batch_size") or 100
-        batch = dict(list(ordered.items())[:batch_size])
-        more = len(ordered) > batch_size
+            return pin, None, not keys
+
+        if reset:
+            changes = {"full": True}
+            if keyed:
+                changes["upserted"], changes["deleted"] = {}, []
+            else:
+                changes["batches"] = [0, head_batch]
+            pin = {"ref": ref, "changes": changes}
+            update = {"batch": head_batch + 1, "offset": 0, "fingerprint": fingerprint, "more": False}
+            return pin, update, head_batch < 0
+
+        # wm.batch is the first not-fully-delivered batch: offset items of it
+        # are already consumed, batches below it are fully delivered.
+        deltas = []
+        gap = False
+        for b in range(max(0, wm["batch"]), head_batch + 1):
+            d = await self.state.delta(edge["output"], up_scope, b)
+            if d is None:
+                gap = True
+                break
+            deltas.append(d)
+        if gap:
+            # The log was pruned under the watermark — restart from the head.
+            changes = {"full": True}
+            if keyed:
+                changes["upserted"], changes["deleted"] = {}, []
+            else:
+                changes["batches"] = [0, head_batch]
+            pin = {"ref": ref, "changes": changes}
+            update = {"batch": head_batch + 1, "offset": 0, "fingerprint": fingerprint, "more": False}
+            return pin, update, head_batch < 0
+
+        if not keyed:
+            # Batch-mode upstream: every pending batch is one item; a reset
+            # batch supersedes everything before it.
+            resets = [i for i, d in enumerate(deltas) if d.get("reset")]
+            if resets:
+                deltas = deltas[resets[-1] :]
+            pending = [d["batch"] for d in deltas]
+            take = pending[:batch_size]
+            more = len(pending) > len(take)
+            changes = {"batches": [take[0], take[-1]] if take else [0, -1], "full": False}
+            pin = {"ref": ref, "changes": changes}
+            update = {
+                "batch": (take[-1] + 1) if take else wm["batch"],
+                "offset": 0,
+                "fingerprint": fingerprint,
+                "more": more,
+            }
+            return pin, update, not take
+
+        latest = {}
+        for d in deltas:
+            if d.get("reset"):
+                # A reset supersedes every pending item before it; the keys it
+                # dropped ride along in its own `deleted` list.
+                latest.clear()
+            upserted = d.get("upserted") or {}
+            deleted = set(d.get("deleted") or [])
+            for i, key in enumerate(sorted(set(upserted) | deleted)):
+                if d["batch"] == wm["batch"] and i < wm["offset"]:
+                    continue
+                latest[key] = (d["batch"], i, "del" if key in deleted else "upsert")
+        pending = sorted(latest.items(), key=lambda kv: kv[1])
+        take, rest = pending[:batch_size], pending[batch_size:]
+        delivered_ups, delivered_del = {}, []
+        for key, (b, i, kind) in take:
+            if kind == "del":
+                delivered_del.append(key)
+            else:
+                delivered_ups[key] = ""
+        # Revisions ride along in the delta; fill them in for the pin.
+        for d in deltas:
+            for k, r in (d.get("upserted") or {}).items():
+                if k in delivered_ups:
+                    delivered_ups[k] = str(r)
         pin = {
             "ref": ref,
-            "changes": {
-                "upserted": batch,
-                "deleted": deleted,
-                "full": override == "full" or recompute,
-            },
+            "changes": {"upserted": delivered_ups, "deleted": delivered_del, "full": False},
         }
-        update = {
-            "clear": recompute,
-            "upserted": {k: {"r": r, "f": fingerprint} for k, r in batch.items()},
-            "deleted": deleted,
-            "more": more,
-        }
-        return pin, update, not ordered and not deleted
+        if take:
+            b_last, i_last, _ = take[-1][1]
+            position = {"batch": b_last, "offset": i_last + 1}
+        else:
+            position = {"batch": wm["batch"], "offset": wm["offset"]}
+        update = {**position, "fingerprint": fingerprint, "more": bool(rest)}
+        return pin, update, not take
 
     def _fingerprint(self, asset, run, pinned):
         """H(version, store versions of input+output stores, run config,
-        refs of non-ByKey inputs and deps) — per-key interpretation state (§6)."""
+        refs of non-Incremental inputs and deps) — per-key interpretation
+        state; a change resets the edge's watermark (§2.2, §6)."""
 
         stores = set()
         for output in asset["outputs"]:
@@ -752,6 +852,10 @@ class Engine:
             "partition": task["scope"],
             "run": {"id": task["run"], "config": run.get("config") or {}},
             "prior": prepared["prior"],
+            "baseline": {
+                name: head["ref"] for name, head in prepared["baseline"].items() if head is not None
+            },
+            "batches": prepared["batches"],
             "inputs": prepared["inputs"],
             "execution": self.manifest["assets"][task["asset"]]["placement"],
         }
@@ -850,7 +954,10 @@ class Engine:
     # -- sources commit API (§5) ------------------------------------------------------
 
     async def commit_source(self, name: str, *, version=None, keys=None, upsert=None, remove=None):
-        """Advance a source without moving data; an identical map is not a change."""
+        """Advance a source without moving data (§2.3): a keyed source commit
+        diffs the supplied map against the delta log's fold and writes the
+        same delta object a store would; `meta.partitions` carries the
+        committed element list. An identical map is not a change."""
 
         source = self.manifest["sources"].get(name)
         if source is None:
@@ -860,9 +967,13 @@ class Engine:
             keyed = source.get("key") is not None
             if not keyed and (keys is not None or upsert is not None or remove is not None):
                 raise ValueError(f"Source {name!r} is unkeyed; pass version=")
-            current = {}
-            if head and head["ref"]["meta"].get("keys"):
-                current = await self.state.fetch_key_map(head["ref"]["meta"]["keys"]) or {}
+            prior_delta = (((head or {}).get("ref") or {}).get("meta") or {}).get("delta")
+            batch = int(prior_delta["batch"]) + 1 if prior_delta else 0
+            current = (
+                await self.state.delta_key_map(name, "", int(prior_delta["batch"]))
+                if prior_delta
+                else {}
+            )
             if keyed:
                 if keys is not None:
                     if source.get("key") == "<elements>" and not isinstance(keys, dict):
@@ -889,7 +1000,27 @@ class Engine:
             meta = dict(ref.get("meta") or {})
             meta["external"] = True
             if keyed:
-                meta["keys"] = await self.state.stage_key_map(new_map)
+                upserted = {k: r for k, r in new_map.items() if current.get(k) != r}
+                deleted = sorted(set(current) - set(new_map))
+                delta = {
+                    "batch": batch,
+                    "rows": len(upserted) + len(deleted),
+                    "upserted": upserted,
+                }
+                if deleted:
+                    delta["deleted"] = deleted
+                if keys is not None:
+                    delta["reset"] = True  # a full-map commit supersedes the log
+                path = delta_path(name, "", batch)
+                await self.state.put_object(
+                    path, json.dumps(delta, sort_keys=True, allow_nan=False).encode()
+                )
+                meta["delta"] = {
+                    "object": path,
+                    "batch": batch,
+                    "rows": delta["rows"],
+                }
+                meta["partitions"] = sorted(new_map)
             ref["meta"] = meta
             commit_id = uuid.uuid4().hex
             record = {
@@ -1177,10 +1308,10 @@ class Engine:
             for output in info["outputs"]:
                 heads[output["name"]] = await tx.heads(output["name"])
             cursor = await tx.cursor(asset, scope)
-            keys = {}
+            watermarks = {}
             for param, edge in info["inputs"].items():
-                if edge["kind"] == "bykey":
-                    keys[param] = await tx.key_state(asset, param, scope)
+                if edge["kind"] == "incremental":
+                    watermarks[param] = await tx.watermark(asset, param, scope)
             dims = self._dims(asset)
             current = await self._dim_keys(tx, dims) if dims else []
             outcomes = await tx.scope_outcomes(asset)
@@ -1188,7 +1319,7 @@ class Engine:
             "asset": info,
             "heads": heads,
             "cursor": cursor,
-            "key_state": keys,
+            "watermarks": watermarks,
             "current_keys": current,
             "scopes": outcomes,
         }

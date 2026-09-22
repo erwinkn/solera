@@ -6,11 +6,11 @@ from .sdk import (
     Automation,
     AutoRefresh,
     BlobRef,
-    ByKey,
     Changes,
     Cron,
     Every,
     In,
+    Incremental,
     JsonRef,
     Migration,
     OnChange,
@@ -33,7 +33,9 @@ from .sdk import (
     split_partition,
 )
 from .stores import (
+    Batches,
     BlobStore,
+    Delta,
     JsonStore,
     Keys,
     Patch,
@@ -45,6 +47,8 @@ from .stores import (
     StoreError,
     WriteError,
     Written,
+    delta_path,
+    next_batch,
 )
 
 __all__ = [
@@ -53,13 +57,15 @@ __all__ = [
     "Asset",
     "Automation",
     "AutoRefresh",
+    "Batches",
     "BlobRef",
     "BlobStore",
-    "ByKey",
     "Changes",
     "Cron",
+    "Delta",
     "Every",
     "In",
+    "Incremental",
     "JsonRef",
     "JsonStore",
     "K8sJob",
@@ -94,7 +100,9 @@ __all__ = [
     "Written",
     "asset",
     "canonical_partition",
+    "delta_path",
     "digest",
     "job",
+    "next_batch",
     "split_partition",
 ]

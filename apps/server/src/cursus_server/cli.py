@@ -95,7 +95,7 @@ def main():
     run.add_argument("targets", nargs="+")
     run.add_argument("--partition", action="append", default=[])
     run.add_argument("--partitions", choices=["latest", "all", "missing"])
-    run.add_argument("--recompute", action="store_true")
+    run.add_argument("--full", action="store_true", help="Full run: reset watermarks, no prior (§8)")
     run.add_argument("--upstream", action="store_true")
     run.add_argument("--config", default="{}", help="Run configuration as a JSON object")
     run.add_argument("--keys", action="append", default=[], help="EDGE=full or EDGE=k1,k2")
@@ -287,7 +287,7 @@ async def _remote(args, parser):
             body = {
                 "targets": args.targets,
                 "partitions": partitions,
-                "mode": "recompute" if args.recompute else "incremental",
+                "mode": "full" if args.full else "incremental",
                 "upstream": args.upstream,
                 "config": config,
                 "keys": _parse_keys(args.keys),
@@ -342,7 +342,7 @@ async def _local(args, parser):
             run = await runtime.submit(
                 args.targets,
                 partitions=partitions,
-                mode="recompute" if args.recompute else "incremental",
+                mode="full" if args.full else "incremental",
                 upstream=args.upstream,
                 config=config,
                 keys=_parse_keys(args.keys),

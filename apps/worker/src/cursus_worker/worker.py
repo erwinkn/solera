@@ -3,7 +3,7 @@
 `python -m cursus_worker run --objects URL --attempt ID`:
 fetch spec -> refuse on revision mismatch -> resolve `env:` -> load inputs per
 annotation -> build ctx -> run the producer -> store() each returned output,
-stage key maps -> write the result last, in one PUT.
+write delta objects -> write the result last, in one PUT.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from cursus.sdk import (
     is_ref_type,
     split_partition,
 )
-from cursus.stores import Keys, Scope, StoreError, resolve_env
+from cursus.stores import Batches, Keys, Scope, StoreError, delta_path, resolve_env
 
 
 def _load_module(path: Path):
@@ -163,14 +163,6 @@ class LogShipper:
         self.entries.clear()
 
 
-async def _key_map(objects, ref: Ref) -> dict[str, str] | None:
-    info = (ref.meta or {}).get("keys")
-    if not info:
-        return None
-    data = await _get(objects, info["object"])
-    return json.loads(data) if data else None
-
-
 async def _resolve_inputs(spec, project, asset, objects):
     """Load each pin by annotation; build call args + ctx.changes (§5, §10)."""
 
@@ -198,14 +190,31 @@ async def _resolve_inputs(spec, project, asset, objects):
             continue
         ref = Ref.from_json(pin["ref"])
         store = project.stores[ref.store]
-        if "changes" in pin:  # ByKey: selection + ctx.changes
-            upserted = pin["changes"].get("upserted") or {}
-            deleted = pin["changes"].get("deleted") or []
-            changes[param] = Changes(upserted=sorted(upserted), deleted=list(deleted))
-            if pin["changes"].get("full"):
-                args[param] = await store.load(ref, t, None)
+        if "changes" in pin:  # Incremental: selection + ctx.changes (§5.1)
+            ch = pin["changes"]
+            full = bool(ch.get("full"))
+            if "batches" in ch:
+                lo, hi = (int(v) for v in ch["batches"])
+                args[param] = await store.load(ref, t, Batches(lo, hi))
+                changes[param] = Changes(
+                    rows=args[param], batches=range(lo, hi + 1), full=full
+                )
             else:
-                args[param] = await store.load(ref, t, Keys(upserted))
+                upserted = ch.get("upserted") or {}
+                deleted = ch.get("deleted") or []
+                args[param] = await store.load(ref, t, None if full else Keys(upserted))
+                if full:
+                    # The delivered keys are whatever the head holds now.
+                    key_col = (project.manifest["outputs"][edge["output"]] or {}).get("key")
+                    ups = tuple(
+                        str(r[key_col]) if isinstance(r, dict) and key_col != "<elements>" else str(r)
+                        for r in args[param]
+                    )
+                else:
+                    ups = tuple(sorted(upserted))
+                changes[param] = Changes(
+                    rows=args[param], deleted=tuple(deleted), full=full, upserted=ups
+                )
             continue
         if t is not None and is_ref_type(t):
             args[param] = ref
@@ -225,12 +234,14 @@ def _dict_inner(t):
 
 
 async def _store_outputs(spec, project, asset, objects, result_value):
-    """store() each returned output and stage key maps (§4, §6)."""
+    """store() each returned output and write its delta object (§2.1, §4)."""
 
     manifest_asset = project.manifest["assets"][asset.name]
     declared = {o["name"]: o for o in manifest_asset["outputs"]}
     decls = {o.name or asset.name: o for o in asset.outputs}
     priors = {name: Ref.from_json(r) for name, r in (spec.get("prior") or {}).items()}
+    baselines = {name: Ref.from_json(r) for name, r in (spec.get("baseline") or {}).items()}
+    batches = spec.get("batches") or {}
 
     if isinstance(result_value, Result):
         values, cursor = result_value.outputs, result_value.cursor
@@ -267,22 +278,35 @@ async def _store_outputs(spec, project, asset, objects, result_value):
                 raise StoreError(f"{output.name}: migration failed: {error}") from error
             schema = applied[-1] if applied else output.migrations[-1].name
         prior = priors.get(name)
-        prior_keys = await _key_map(objects, prior) if prior is not None else None
-        scope = Scope(output=output, partition=spec["partition"], prior_keys=prior_keys)
+        scope = Scope(
+            output=output,
+            partition=spec["partition"],
+            batch=batches.get(name),
+            baseline=baselines.get(name),
+        )
         written = await store.store(value, prior, scope)
         if written.ref is None:
             continue
         ref = dataclasses.replace(written.ref, store=store_name)
         if schema is not None:
             ref = dataclasses.replace(ref, handle={**(ref.handle or {}), "schema": schema})
-        if written.keys is not None:
-            body = json.dumps(written.keys, sort_keys=True, allow_nan=False).encode()
-            import hashlib
-
-            sha = hashlib.sha256(body).hexdigest()
-            await _put(objects, f"keys/{sha}.json", body)
+        if written.delta is not None:
+            path = delta_path(output.name, spec["partition"], written.delta.batch)
+            await _put(
+                objects,
+                path,
+                json.dumps(written.delta.to_json(), sort_keys=True, allow_nan=False).encode(),
+            )
             ref = dataclasses.replace(
-                ref, meta={**ref.meta, "keys": {"object": f"keys/{sha}.json", "count": len(written.keys)}}
+                ref,
+                meta={
+                    **ref.meta,
+                    "delta": {
+                        "object": path,
+                        "batch": written.delta.batch,
+                        "rows": written.delta.rows,
+                    },
+                },
             )
         refs[name] = ref.to_json()
     return refs, cursor

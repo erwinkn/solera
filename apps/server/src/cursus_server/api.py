@@ -183,12 +183,14 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
             for scope, head in await tx.heads(name):
                 owner = head.get("asset")
                 cursor = owner is not None and (await tx.cursor(owner, scope)) is not None
+                meta = head["ref"].get("meta") or {}
                 out.append(
                     {
                         "scope": scope,
                         "ref": head["ref"],
                         "version": head.get("version"),
-                        "key_count": (head["ref"].get("meta") or {}).get("keys", {}).get("count"),
+                        "key_count": len(meta["partitions"]) if meta.get("partitions") else None,
+                        "delta": meta.get("delta"),
                         "complete": head["complete"],
                         "cursor": cursor,
                         "at": head["at"],
@@ -211,7 +213,13 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
             head = await tx.head(name, scope)
         if head is None:
             raise KeyError(f"{name}/{scope}")
-        keys = await runtime.state.fetch_key_map(head["ref"].get("meta", {}).get("keys")) or {}
+        meta = head["ref"].get("meta") or {}
+        if meta.get("partitions") is not None:
+            keys = {str(e): "1" for e in meta["partitions"]}
+        elif meta.get("delta"):
+            keys = await runtime.state.delta_key_map(name, scope, int(meta["delta"]["batch"]))
+        else:
+            keys = {}
         items = sorted(keys.items())
         return {
             "output": name,
