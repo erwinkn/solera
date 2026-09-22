@@ -83,7 +83,8 @@ class Delta:
     """The output-diff one incremental commit produced (§2.1). `upserted` is a
     `key -> revision` map for keyed outputs, `None` when the store reports only
     a row count. `reset` marks a batch whose write superseded all prior
-    content (a full run or a keyed replacement)."""
+    content (a full run or a keyed replacement); its `deleted` lists every
+    key the write dropped, so folds apply deltas forward without clearing."""
 
     batch: int
     rows: int = 0

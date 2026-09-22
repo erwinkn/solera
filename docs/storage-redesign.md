@@ -108,8 +108,13 @@ deltas/{output}/{scope}/{batch:012d}.json
 - The harness writes the delta object and records
   `ref.meta["delta"] = {"object": path, "batch": N, "rows": n}`.
   `ref.meta["keys"]` and `keys/{sha}.json` are **deleted**.
-- Unchanged content produces an empty delta and the same version; nothing
-  downstream fires (rule preserved).
+- A `full` run or a keyed replace write marks its delta `"reset": true` —
+  informational: the delta is still a pure diff whose `deleted` lists every
+  key the write dropped, so folds apply forward without clearing and a
+  replace re-delivers only changed keys.
+- Unchanged content returns the prior ref unchanged — no delta object is
+  written, the commit is a keep-head no-op, and nothing downstream fires
+  (rule preserved; an empty delta object would needlessly advance the log).
 
 ### 2.2 Watermarks
 
@@ -171,6 +176,18 @@ class Store(Protocol):
   (`primary_key` present → upsert; absent → append with `__batch/__seq`),
   not from `mode`.
 - **`BlobStore`** — refuses `incremental`.
+
+Implementation notes (accepted deviations):
+
+- `Scope` also carries `baseline: Ref | None` — the committed head the store
+  diffs against. During a `full` run `prior` is withheld but the baseline is
+  still needed to compute the delta; without it a full rewrite could not
+  emit a `reset` delta carrying the complete key map.
+- `PostgresStore` keeps a `cursus_keys (output, partition, key, rev)` table:
+  the logical key map. `RETURNING ... IS DISTINCT FROM` alone cannot express
+  deletes or a full-replace reset, so the upsert transaction diffs against
+  `cursus_keys` (one batched `unnest` upsert, never per-key) and sweeps rows
+  absent from a reset write.
 
 ## 4. Control plane: trimmed state and an in-memory engine
 

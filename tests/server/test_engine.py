@@ -130,7 +130,7 @@ async def test_bare_return_and_commit(state):
 
 async def test_result_cursor_and_omitted_output(state):
     """§2: Result(outputs, cursor) — an omitted output keeps its prior head;
-    cursor persists and clears on recompute."""
+    cursor persists and clears on a `full` run."""
     calls = {"n": 0}
 
     @asset(outputs=(Output("a"), Output("b")))

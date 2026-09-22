@@ -756,8 +756,6 @@ class Engine:
                 d = await self.state.delta(edge["output"], up_scope, b)
                 if d is None:
                     continue
-                if d.get("reset"):
-                    live.clear()
                 for k in d.get("deleted") or []:
                     live.pop(str(k), None)
                     ever_deleted.add(str(k))
@@ -846,10 +844,8 @@ class Engine:
 
         latest = {}
         for d in deltas:
-            if d.get("reset"):
-                # A reset supersedes every pending item before it; the keys it
-                # dropped ride along in its own `deleted` list.
-                latest.clear()
+            # Pure diffs, last writer wins: a reset batch's `deleted` already
+            # lists every key it dropped.
             upserted = d.get("upserted") or {}
             deleted = set(d.get("deleted") or [])
             for i, key in enumerate(sorted(set(upserted) | deleted)):

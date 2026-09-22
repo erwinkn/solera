@@ -292,7 +292,7 @@ async def test_omitted_output_without_head_errors(state):
 
 async def test_delta_log_round_trip(state):
     """§2.1/§2.2: delta objects land under deltas/ and fold into the live key
-    map; a reset delta supersedes everything before it."""
+    map — pure diffs, removes cancel upserts, last writer wins."""
     from cursus.stores import delta_path
 
     await state.put_object(
@@ -306,9 +306,11 @@ async def test_delta_log_round_trip(state):
     assert (await state.delta("events", "", 1))["batch"] == 1
     assert await state.delta("events", "", 9) is None
     assert await state.delta_key_map("events", "", 1) == {"a": "r3"}
+    # A replace write's delta: `reset` marks the supersede; every key it
+    # dropped is in `deleted`, so the forward fold stays correct.
     await state.put_object(
         delta_path("events", "", 2),
-        b'{"batch": 2, "rows": 1, "upserted": {"c": "r1"}, "reset": true}',
+        b'{"batch": 2, "rows": 2, "upserted": {"c": "r1"}, "deleted": ["a"], "reset": true}',
     )
     assert await state.delta_key_map("events", "", 2) == {"c": "r1"}
 

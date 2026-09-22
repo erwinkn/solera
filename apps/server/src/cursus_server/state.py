@@ -796,8 +796,8 @@ class State:
 
     async def delta_key_map(self, output: str, scope: str, hi: int) -> dict[str, str]:
         """The live key map of a keyed incremental output at delta `hi`,
-        folded from `deltas/{output}/{scope}/…` (§2.1). A `reset` delta
-        supersedes everything before it; missing objects are treated as
+        folded from `deltas/{output}/{scope}/…` (§2.1). Deltas are pure
+        diffs applied forward; missing objects are treated as
         never-written — a real gap forces a full reset at plan."""
 
         keys: dict[str, str] = {}
@@ -805,8 +805,8 @@ class State:
             delta = await self.delta(output, scope, b)
             if delta is None:
                 continue
-            if delta.get("reset"):
-                keys.clear()
+            # Deltas are pure diffs: apply forward, removes cancel upserts. A
+            # reset delta's `deleted` already lists every key it dropped.
             for key in delta.get("deleted") or []:
                 keys.pop(str(key), None)
             keys.update({str(k): str(v) for k, v in (delta.get("upserted") or {}).items()})

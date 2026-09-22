@@ -117,3 +117,10 @@ async def test_soak(tmp_path, monkeypatch):
     print(f"soak: deltas/ {delta_objects} objects, keys/ {key_objects}")
     assert key_objects == 0, "the keys/ prefix must not exist (§2.1)"
     assert delta_objects >= BATCHES, "one delta object per committed batch"
+
+    # An incremental head records its latest delta in meta.delta (§2.1).
+    async with state.transaction() as tx:
+        head = await tx.head("site_events", "alpha")
+    delta_meta = head["ref"]["meta"].get("delta")
+    assert delta_meta and delta_meta["object"].startswith("deltas/site_events/")
+    assert delta_meta["batch"] == BATCHES - 1
