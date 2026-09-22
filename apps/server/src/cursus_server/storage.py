@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import re
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -11,7 +12,18 @@ from urllib.parse import unquote, urlsplit
 import obstore
 from obstore.exceptions import AlreadyExistsError
 from obstore.store import LocalStore, MemoryStore
-from slatedb.uniffi import DbBuilder, IsolationLevel, KeyRange, ObjectStore, Settings
+from slatedb.uniffi import (
+    AdminBuilder,
+    DbBuilder,
+    FlushOptions,
+    FlushType,
+    GarbageCollectorDirectoryOptions,
+    GarbageCollectorOptions,
+    IsolationLevel,
+    KeyRange,
+    ObjectStore,
+    Settings,
+)
 
 
 class Unavailable(RuntimeError):
@@ -67,43 +79,28 @@ class SlateState:
         self.lock = asyncio.Lock()
         self.poisoned = False
         self.last_sequence = 0
+        self.objects_url = None
+        self.db_path = None
+        self.native = None
 
     @classmethod
-    async def open(cls, url: str, namespace="default", *, flush_interval="100ms"):
-        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", namespace):
-            raise ValueError("Namespace must contain 1–64 letters, digits, underscores or hyphens")
-        u = urlsplit(url)
-        if u.query or u.fragment or u.username or u.password:
-            raise ValueError("Credentials and query parameters do not belong in storage URLs")
-        if u.scheme == "file":
-            if u.netloc not in ("", "localhost") or not u.path.startswith("/"):
-                raise ValueError("File storage requires an absolute local path")
-            root = Path(unquote(u.path)).resolve() / namespace
-            root.mkdir(parents=True, exist_ok=True)
-            native, db_path = ObjectStore.resolve("file:///"), str(root / "metadata")
-            objects = LocalStore(root / "objects", mkdir=True)
-            objects_url = (root / "objects").as_uri()
-        elif u.scheme == "s3" and u.netloc:
-            prefix = u.path.strip("/")
-            if ".." in prefix.split("/"):
-                raise ValueError("Invalid object prefix")
-            base = "/".join(filter(None, (prefix, namespace)))
-            native, db_path = ObjectStore.resolve(f"s3://{u.netloc}"), f"{base}/metadata"
-            objects_url = f"s3://{u.netloc}/{base}/objects"
-            objects = obstore.store.from_url(objects_url)
-        elif u.scheme == "memory":
-            native, db_path, objects = ObjectStore.resolve("memory:///"), namespace, MemoryStore()
-            objects_url = "memory:///"
-        else:
-            raise ValueError("Use file:///absolute/path, s3://bucket/prefix, or memory:///")
+    async def open(cls, url: str, namespace="default", *, flush_interval=None):
+        native, db_path, objects, objects_url = _resolve(url, namespace, create=True)
         builder = DbBuilder(db_path, native)
         settings = Settings.default()
+        # §4.4 of the storage redesign: `await_durable` resolves on the flush
+        # tick, so the interval doubles as durable-commit latency; 1 s caps WAL
+        # object creation at ~1/s under the single-writer model. Tests and the
+        # soak gate set CURSUS_SLATE_FLUSH_INTERVAL lower to keep wall time
+        # reasonable. `l0_sst_size_bytes` bounds restart replay.
+        flush_interval = flush_interval or os.environ.get("CURSUS_SLATE_FLUSH_INTERVAL", "1s")
         settings.set("flush_interval", json.dumps(flush_interval))
         settings.set("max_unflushed_bytes", str(32 * 1024 * 1024))
-        settings.set("l0_sst_size_bytes", str(8 * 1024 * 1024))
+        settings.set("l0_sst_size_bytes", str(1024 * 1024))
         builder.with_settings(settings)
         state = cls(await builder.build(), objects, url, namespace)
         state.objects_url = objects_url
+        state.db_path, state.native = db_path, native
         try:
             async with state.transaction() as tx:
                 schema = await tx.get("system/schema")
@@ -184,5 +181,78 @@ class SlateState:
             raise ValueError("Artifact checksum mismatch")
         return json.loads(data)
 
+    async def gc_once(self, *, min_age_ms: int = 300_000, dry_run: bool = False):
+        """Flush the memtable so sealed WAL SSTs become collectible, then run
+        one SlateDB garbage-collection pass over manifests, WAL, compacted
+        SSTs and compaction state — safe alongside the open writer (§4.4)."""
+
+        if self.db_path is None:
+            return
+        if not dry_run:
+            # WAL SSTs stay referenced until their contents reach L0; the L0
+            # flush thresholds (max_wal_flushes_before_l0_flush,
+            # max_unflushed_bytes) are sized for far heavier write load, so a
+            # durable-commit-heavy engine needs the explicit flush.
+            await self.db.flush_with_options(FlushOptions(flush_type=FlushType.MEM_TABLE))
+        admin = AdminBuilder(self.db_path, self.native).build()
+        await admin.run_gc_once(_gc_options(min_age_ms, dry_run))
+
     async def close(self):
         await self.db.shutdown()
+
+
+def _resolve(url: str, namespace: str, *, create: bool):
+    """(native ObjectStore, db_path, objects, objects_url) for a state URL."""
+
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", namespace):
+        raise ValueError("Namespace must contain 1–64 letters, digits, underscores or hyphens")
+    u = urlsplit(url)
+    if u.query or u.fragment or u.username or u.password:
+        raise ValueError("Credentials and query parameters do not belong in storage URLs")
+    if u.scheme == "file":
+        if u.netloc not in ("", "localhost") or not u.path.startswith("/"):
+            raise ValueError("File storage requires an absolute local path")
+        root = Path(unquote(u.path)).resolve() / namespace
+        if create:
+            root.mkdir(parents=True, exist_ok=True)
+        return (
+            ObjectStore.resolve("file:///"),
+            str(root / "metadata"),
+            LocalStore(root / "objects", mkdir=create),
+            (root / "objects").as_uri(),
+        )
+    if u.scheme == "s3" and u.netloc:
+        prefix = u.path.strip("/")
+        if ".." in prefix.split("/"):
+            raise ValueError("Invalid object prefix")
+        base = "/".join(filter(None, (prefix, namespace)))
+        objects_url = f"s3://{u.netloc}/{base}/objects"
+        return (
+            ObjectStore.resolve(f"s3://{u.netloc}"),
+            f"{base}/metadata",
+            obstore.store.from_url(objects_url),
+            objects_url,
+        )
+    if u.scheme == "memory":
+        return ObjectStore.resolve("memory:///"), namespace, MemoryStore(), "memory:///"
+    raise ValueError("Use file:///absolute/path, s3://bucket/prefix, or memory:///")
+
+
+def _gc_options(min_age_ms: int, dry_run: bool) -> GarbageCollectorOptions:
+    def directory():
+        return GarbageCollectorDirectoryOptions(min_age_ms=min_age_ms, dry_run=dry_run)
+
+    return GarbageCollectorOptions(
+        manifest_options=directory(),
+        wal_options=directory(),
+        compacted_options=directory(),
+        compactions_options=directory(),
+    )
+
+
+async def gc_once(url: str, namespace: str, *, min_age_ms: int = 300_000, dry_run: bool = False):
+    """One-shot GC without opening a writer — the `cursus gc` path (§4.4)."""
+
+    native, db_path, _, _ = _resolve(url, namespace, create=True)
+    admin = AdminBuilder(db_path, native).build()
+    await admin.run_gc_once(_gc_options(min_age_ms, dry_run))

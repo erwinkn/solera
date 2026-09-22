@@ -11,6 +11,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
+from urllib.parse import quote
 
 from .sdk import BlobRef, JsonRef, Output, Ref, digest, is_ref_type
 
@@ -148,14 +149,27 @@ def key_map(output: Output, rows: list[dict]) -> dict[str, str]:
 
 
 class JsonStore:
-    """Default store: one content-addressed JSON object per write (§4)."""
+    """Default store (§4): one object per batch for keyed/append outputs, one
+    content-addressed object per version for values and partition sets.
+
+    Object layout under the attempt's `objects` namespace:
+
+        data/{output}/{version}.json                value + partition-set payloads
+        data/{output}/{esc(scope)}/b{batch}.json    one batch: {"rows": …} for an
+                                                    append output, {"upsert": …,
+                                                    "remove": …} for a keyed one
+        data/{output}/{esc(scope)}/s{batch}.json    keyed snapshot {"rows": …},
+                                                    written every `snapshot_every`
+                                                    batches so loads fold a tail
+    """
 
     version = "1"
     ref_type = JsonRef
     shared_table = False
 
-    def __init__(self):
+    def __init__(self, snapshot_every: int = 64):
         self._objects = None
+        self.snapshot_every = max(1, int(snapshot_every))
 
     def bind_objects(self, objects) -> None:
         """The harness hands the attempt's object store to stores without a URL."""
@@ -181,48 +195,19 @@ class JsonStore:
         return True  # unkeyed: any JSON value
 
     async def store(self, write, prior: Ref | None, scope: Scope) -> Written:
-        import obstore
-
         objects = self._require_objects()
         output = scope.output
-        prior_payload = None
         prior_keys = dict(scope.prior_keys or {})
-        if prior is not None and isinstance(write, Patch):
-            prior_payload = await self._read(objects, prior)
+        if prior is not None and prior.meta.get("external"):
+            raise WriteError(f"{output.name}: cannot write an external source ref")
 
         if isinstance(write, Patch):
             if output.key is None and not output.is_partition_set and output.mode != "append":
                 raise WriteError(f"{output.name}: Patch requires a keyed or append output")
             remove = {str(k) for k in write.remove}
-            rows = _rows(write.rows, output.name) if not output.is_partition_set else write.rows
-            if output.mode == "append":
-                if remove:
-                    raise WriteError(f"{output.name}: remove is not allowed on an append output")
-                batches = dict((prior_payload or {}).get("batches", {}))
-                batch = str(max([int(b) for b in batches], default=-1) + 1)
-                if not rows:
-                    return Written(prior, prior_keys)
-                batches[batch] = rows
-                payload = {"batches": batches}
-                keys = {**prior_keys, batch: digest(rows)}
-            else:
-                old_rows = prior_payload if isinstance(prior_payload, list) else []
-                if output.is_partition_set:
-                    elements = [str(e) for e in (write.rows or [])]
-                    new_rows = [e for e in old_rows if str(e) not in remove and str(e) not in elements]
-                    new_rows += elements
-                    payload = new_rows
-                    keys = {str(e): "1" for e in new_rows}
-                else:
-                    patch_keys = {str(r[output.key]) for r in rows}
-                    if len(patch_keys) != len(rows):
-                        raise WriteError(f"{output.name}: duplicate key in Patch")
-                    new_rows = [r for r in old_rows if str(r[output.key]) not in patch_keys | remove]
-                    new_rows += rows
-                    payload = new_rows
-                    keys = {k: v for k, v in prior_keys.items() if k not in remove}
-                    keys.update(key_map(output, rows))
-                    keys = {k: v for k, v in keys.items() if k not in remove}
+            rows = write.rows if output.is_partition_set else _rows(write.rows, output.name)
+            if output.mode == "append" and remove:
+                raise WriteError(f"{output.name}: remove is not allowed on an append output")
             if not rows and not remove:
                 if prior is None:
                     raise WriteError(f"{output.name}: empty Patch with no prior head")
@@ -230,46 +215,129 @@ class JsonStore:
             version = digest(
                 [prior.version if prior else "", digest({"rows": _canonical(rows), "remove": sorted(remove)})]
             )
-        else:
+            if prior is not None and version == prior.version:
+                return Written(prior, prior_keys)
+            if output.mode == "append":
+                first, last = await self._append_window(objects, output, scope, prior)
+                batch = last + 1
+                await self._put(objects, self._batch_path(output, scope, batch), {"rows": rows})
+                keys = {**prior_keys, str(batch): digest(_canonical(rows))}
+                handle = {"mode": "append", "prefix": self._prefix(output, scope), "batches": [first, batch]}
+                return Written(self._ref(output, scope, handle, version), keys)
             if output.is_partition_set:
-                payload = [str(e) for e in (write or [])]
+                old = await self._legacy_rows(objects, prior)
+                elements = [str(e) for e in (rows or [])]
+                payload = [e for e in old if str(e) not in remove and str(e) not in elements] + elements
                 keys = {str(e): "1" for e in payload}
-            elif output.key is not None:
-                payload = _rows(write, output.name)
-                keys = key_map(output, payload)
-            elif output.mode == "append":
-                raise WriteError(f"{output.name}: an append output only accepts Patch writes")
+                path = f"data/{output.name}/{version}.json"
+                await self._put(objects, path, payload)
+                return Written(
+                    self._ref(output, scope, {"object": path, "mode": "set", "key": output.key}, version),
+                    keys,
+                )
+            patch_keys = {str(r[output.key]) for r in rows}
+            if len(patch_keys) != len(rows):
+                raise WriteError(f"{output.name}: duplicate key in Patch")
+            first, last, snap, legacy = await self._keyed_window(objects, output, scope, prior)
+            batch = last + 1
+            prefix = self._prefix(output, scope)
+            if legacy is not None:
+                # A pre-batch-layout head: fold the old payload into one reset
+                # batch and continue per-batch from here.
+                merged = [r for r in legacy if str(r.get(output.key)) not in patch_keys | remove] + rows
+                await self._put(
+                    objects,
+                    self._batch_path(output, scope, batch),
+                    {"reset": True, "upsert": merged, "remove": []},
+                )
+                first = batch
             else:
-                payload, keys = write, None
-            version = digest(_canonical(payload))
-
-        if prior is not None and prior.meta.get("external"):
-            raise WriteError(f"{output.name}: cannot write an external source ref")
-        body = json.dumps(payload, sort_keys=True, allow_nan=False).encode()
-        path = f"data/{output.name}/{version}.json"
-        await obstore.put_async(objects, path, body, mode="overwrite", use_multipart=False)
-        ref = JsonRef(
-            output=output.name,
-            store="",
-            handle={
-                "object": path,
-                "mode": output.mode
-                or ("set" if output.is_partition_set else "keyed" if output.key else "value"),
+                await self._put(
+                    objects,
+                    self._batch_path(output, scope, batch),
+                    {"upsert": rows, "remove": sorted(remove)},
+                )
+            snap = await self._maybe_snapshot(objects, prefix, output.key, first, batch, snap)
+            keys = {k: v for k, v in prior_keys.items() if k not in remove}
+            keys.update(key_map(output, rows))
+            keys = {k: v for k, v in keys.items() if k not in remove}
+            handle = {
+                "mode": "keyed",
                 "key": output.key,
-            },
-            version=version,
-            partition=scope.partition,
-        )
+                "prefix": prefix,
+                "batches": [first, batch],
+                "snapshot": snap,
+            }
+            return Written(self._ref(output, scope, handle, version), keys)
+
+        if output.is_partition_set:
+            payload = [str(e) for e in (write or [])]
+            keys = {str(e): "1" for e in payload}
+            version = digest(_canonical(payload))
+            if prior is not None and version == prior.version:
+                return Written(prior, prior_keys)
+            path = f"data/{output.name}/{version}.json"
+            await self._put(objects, path, payload)
+            return Written(
+                self._ref(output, scope, {"object": path, "mode": "set", "key": output.key}, version), keys
+            )
+        if output.key is not None:
+            rows = _rows(write, output.name)
+            version = digest(_canonical(rows))
+            if prior is not None and version == prior.version:
+                return Written(prior, prior_keys)
+            _, last, _, _ = await self._keyed_window(objects, output, scope, prior)
+            batch = last + 1
+            await self._put(
+                objects,
+                self._batch_path(output, scope, batch),
+                {"reset": True, "upsert": rows, "remove": []},
+            )
+            handle = {
+                "mode": "keyed",
+                "key": output.key,
+                "prefix": self._prefix(output, scope),
+                "batches": [batch, batch],
+                "snapshot": -1,
+            }
+            return Written(self._ref(output, scope, handle, version), key_map(output, rows))
+        if output.mode == "append":
+            raise WriteError(f"{output.name}: an append output only accepts Patch writes")
+        payload, keys = write, None
+        version = digest(_canonical(payload))
+        path = f"data/{output.name}/{version}.json"
+        await self._put(objects, path, payload)
         return Written(
-            ref, keys if (output.key or output.is_partition_set or output.mode == "append") else None
+            self._ref(output, scope, {"object": path, "mode": "value", "key": None}, version), keys
         )
 
     async def load(self, ref: Ref, t, selection: Keys | None) -> Any:
         if is_ref_type(t):
             return ref
         objects = self._require_objects()
+        handle = ref.handle or {}
+        mode = handle.get("mode")
+        if mode == "append" and "batches" in handle:
+            first, last = handle["batches"]
+            rows = []
+            for b in range(int(first), int(last) + 1):
+                if selection is not None and str(b) not in selection.revisions:
+                    continue
+                batch = await self._get(objects, f"{handle['prefix']}b{b:012d}.json")
+                rows += (batch or {}).get("rows", [])
+            return self._materialize(rows, t)
+        if mode == "keyed" and "batches" in handle:
+            first, last = handle["batches"]
+            state = await self._fold(
+                objects, handle["prefix"], handle.get("key"), int(first), int(last), handle.get("snapshot")
+            )
+            rows = list(state.values())
+            if selection is not None:
+                rows = [r for r in rows if str(r.get(handle.get("key"))) in selection.revisions]
+            return self._materialize(rows, t)
+        # Single-object payloads: values, partition sets, and handles written
+        # before the per-batch layout.
         payload = await self._read(objects, ref)
-        mode = (ref.handle or {}).get("mode")
         if mode == "set":
             elements = payload or []
             if selection is not None:
@@ -291,6 +359,95 @@ class JsonStore:
             raise StoreError(f"{ref.output}: unkeyed output cannot serve a Keys selection")
         return self._materialize(payload, t)
 
+    # -- batch layout ---------------------------------------------------------
+
+    @staticmethod
+    def _prefix(output, scope) -> str:
+        # `_` is the unscoped directory — object paths cannot hold an empty segment.
+        return f"data/{output.name}/{quote(scope.partition or '_', safe='')}/"
+
+    def _batch_path(self, output, scope, batch: int) -> str:
+        return f"{self._prefix(output, scope)}b{batch:012d}.json"
+
+    def _snap_path(self, prefix: str, batch: int) -> str:
+        return f"{prefix}s{batch:012d}.json"
+
+    async def _append_window(self, objects, output, scope, prior) -> tuple[int, int]:
+        """(first, last) batch covered by `prior`; a legacy single-object head
+        is migrated into per-batch objects once."""
+
+        if prior is None:
+            return 0, -1
+        handle = prior.handle or {}
+        if "batches" in handle:
+            return int(handle["batches"][0]), int(handle["batches"][1])
+        payload = await self._read(objects, prior)
+        batches = (payload or {}).get("batches", {})
+        for b, rows in sorted(batches.items(), key=lambda kv: int(kv[0])):
+            await self._put(objects, self._batch_path(output, scope, int(b)), {"rows": rows})
+        if not batches:
+            return 0, -1
+        return min(int(b) for b in batches), max(int(b) for b in batches)
+
+    async def _keyed_window(self, objects, output, scope, prior):
+        """(first, last, snapshot, legacy_rows|None): the prior ref's batch
+        window, plus its row list when it predates the batch layout."""
+
+        if prior is None:
+            return 0, -1, -1, None
+        handle = prior.handle or {}
+        if "batches" in handle:
+            return (
+                int(handle["batches"][0]),
+                int(handle["batches"][1]),
+                handle.get("snapshot", -1),
+                None,
+            )
+        payload = await self._read(objects, prior)
+        return 0, -1, -1, payload if isinstance(payload, list) else []
+
+    async def _legacy_rows(self, objects, prior) -> list:
+        if prior is None:
+            return []
+        payload = await self._read(objects, prior)
+        return payload if isinstance(payload, list) else []
+
+    async def _maybe_snapshot(self, objects, prefix, key_col, first, last, snap) -> int:
+        """Fold the batch window into `s{last}.json` when it is due; returns the
+        snapshot batch number to record in the ref handle."""
+
+        base = snap if isinstance(snap, int) and first <= snap else first - 1
+        if last - base < self.snapshot_every:
+            return snap if isinstance(snap, int) and first <= snap else -1
+        state = await self._fold(objects, prefix, key_col, first, last, snap)
+        await self._put(objects, self._snap_path(prefix, last), {"rows": list(state.values())})
+        return last
+
+    async def _fold(self, objects, prefix, key_col, first, last, snap) -> dict:
+        """Replays batches [first..last] over the snapshot at `snap` (if any);
+        last writer wins per key, removes apply, `reset` batches start over.
+        Missing objects are skipped — retention may have pruned them."""
+
+        state: dict[str, dict] = {}
+        start = first
+        if isinstance(snap, int) and first <= snap <= last:
+            base = await self._get(objects, self._snap_path(prefix, snap))
+            if base is not None:
+                for row in base.get("rows", []):
+                    state[str(row[key_col])] = row
+                start = snap + 1
+        for b in range(start, last + 1):
+            batch = await self._get(objects, f"{prefix}b{b:012d}.json")
+            if batch is None:
+                continue
+            if batch.get("reset"):
+                state.clear()
+            for row in batch.get("upsert", []):
+                state[str(row[key_col])] = row
+            for key in batch.get("remove", []):
+                state.pop(str(key), None)
+        return state
+
     def _filter_rows(self, rows, ref, selection):
         key_col = (ref.handle or {}).get("key")
         if key_col is None:
@@ -307,6 +464,31 @@ class JsonStore:
         if t in (list, dict, str, int, float, bool) or _is_list_of_dicts(t):
             return payload
         return payload
+
+    def _ref(self, output, scope, handle, version) -> JsonRef:
+        return JsonRef(
+            output=output.name,
+            store="",
+            handle=handle,
+            version=version,
+            partition=scope.partition,
+        )
+
+    async def _put(self, objects, path: str, payload):
+        import obstore
+
+        body = json.dumps(payload, sort_keys=True, allow_nan=False).encode()
+        await obstore.put_async(objects, path, body, mode="overwrite", use_multipart=False)
+
+    async def _get(self, objects, path: str):
+        import obstore
+        from obstore.exceptions import NotFoundError
+
+        try:
+            result = await obstore.get_async(objects, path)
+        except (NotFoundError, FileNotFoundError):
+            return None
+        return json.loads(bytes(await result.bytes_async()))
 
     async def _read(self, objects, ref: Ref):
         import obstore

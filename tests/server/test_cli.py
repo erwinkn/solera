@@ -185,6 +185,17 @@ def test_remote_run_and_reads(server, project_file, capsys, monkeypatch):
     assert isinstance(autos, list)
 
 
+def test_gc_command(state_url, capsys, monkeypatch):
+    """`cursus gc` runs a one-shot SlateDB GC pass against the state store —
+    always local, and safe on a namespace nothing has written yet (§4.4)."""
+
+    monkeypatch.delenv("CURSUS_SERVER_URL", raising=False)
+    out = cli(monkeypatch, capsys, "--state-url", state_url, "gc")
+    assert out == {"gc": "ok", "dry_run": False}
+    out = cli(monkeypatch, capsys, "--state-url", state_url, "gc", "--dry-run", "--min-age-ms", "0")
+    assert out["dry_run"] is True
+
+
 def test_serve_insecure_guard(capsys, monkeypatch):
     """--insecure is a loopback-only escape hatch."""
 

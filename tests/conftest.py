@@ -1,7 +1,13 @@
+import os
+
 import pytest
 from cursus.sdk import Output
 from cursus.stores import JsonStore, Scope
 from obstore.store import LocalStore
+
+# Durable-commit latency equals the WAL flush interval; the suite commits far
+# too often for the 1 s deployment default.
+os.environ.setdefault("CURSUS_SLATE_FLUSH_INTERVAL", "10ms")
 
 
 @pytest.fixture

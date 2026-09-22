@@ -48,6 +48,7 @@ class Engine:
         concurrency: int = 4,
         clock=None,
         eval_interval: float = 0.5,
+        gc_interval: float = 300.0,
     ):
         import time
 
@@ -58,6 +59,8 @@ class Engine:
         self.clock = clock or time.time
         self.lease_seconds, self.concurrency = lease_seconds, concurrency
         self.eval_interval = eval_interval
+        self.gc_interval = gc_interval
+        self._gc_at = self.clock() + self.gc_interval
         ctx = PlacementContext(state, state.objects_url, project, self.clock)
         self.registry = registry or Registry(ctx, extra=placements)
         self.inflight: dict[str, asyncio.Task] = {}
@@ -133,12 +136,24 @@ class Engine:
             await asyncio.sleep(self.eval_interval)
 
     async def tick(self):
-        """One evaluation pass: lease sweeps, dispatch, automation eval."""
+        """One evaluation pass: lease sweeps, dispatch, automations, storage GC."""
 
         await self.state.sweep_scope_leases()
         await self.state.sweep_pool_leases()
         await self._dispatch_due()
         await self._automation_tick()
+        await self._gc_due()
+
+    async def _gc_due(self):
+        """One SlateDB GC pass per `gc_interval` — bounds WAL/manifest/compacted
+        objects under long-running file:// deployments (§4.4)."""
+
+        if self.clock() < self._gc_at:
+            return
+        self._gc_at = self.clock() + self.gc_interval
+        gc_once = getattr(self.state.store, "gc_once", None)
+        if gc_once is not None:
+            await gc_once()
 
     async def run_until(self, run_id: str, timeout: float = 120.0):
         """Tick until the run reaches a terminal status (CLI and tests)."""

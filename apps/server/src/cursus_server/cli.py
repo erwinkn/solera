@@ -132,6 +132,15 @@ def main():
 
     commands.add_parser("selftest", help="Check state and object storage connectivity")
 
+    gc = commands.add_parser("gc", help="Run one SlateDB garbage-collection pass (§4.4)")
+    gc.add_argument(
+        "--min-age-ms",
+        type=int,
+        default=300_000,
+        help="Only collect objects older than this (default: 5 minutes)",
+    )
+    gc.add_argument("--dry-run", action="store_true", help="Report what would be collected")
+
     args = parser.parse_args()
 
     if args.command == "serve":
@@ -186,6 +195,14 @@ async def _dispatch(args, parser):
 
     if args.command == "migrate":
         await _migrate(args, parser)
+        return
+
+    if args.command == "gc":
+        # Always local: GC runs against the state store itself, no server needed.
+        from .storage import gc_once
+
+        await gc_once(args.state_url, args.namespace, min_age_ms=args.min_age_ms, dry_run=args.dry_run)
+        print(json.dumps({"gc": "ok", "dry_run": args.dry_run}))
         return
 
     if _server_url():
