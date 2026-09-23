@@ -65,13 +65,19 @@ project = Project(assets=[feed, consumer])
     [delta] = index.files
     assert await state.get_object(index.path(delta.name)) is not None
     assert delta.name.startswith("000000000000-") and delta.entries == 2
-    # the result object is the commit request, and reports what was delivered
-    result = json.loads(await state.get_object(f"results/{attempt}.json"))
+    # the attempt file holds the spec, the result (the commit request, with
+    # what was delivered) and the index of its gzip log
+    record = await state.attempt_record(detail["request"]["id"], attempt)
+    assert record["spec"]["asset"] == "consumer"
+    result = record["result"]
     assert result["status"] == "succeeded"
     assert result["delivered"]["feed"] == {"after": None, "upserted": ["a", "b"], "deleted": []}
-    # ctx.log streamed a chunk
-    log = await state.get_object(f"logs/{attempt}/000000.jsonl")
+    assert record["log"]["lines"] == 1 and len(record["log"]["blocks"]) == 1
+    log = await state.attempt_log(detail["request"]["id"], attempt)
     assert json.loads(log.splitlines()[0])["message"] == "consumed"
+    # the chunks shipped while it ran were joined into one log
+    names = [p.rsplit("/", 1)[-1] for p in await state.list_objects(f"runs/{detail['request']['id']}/")]
+    assert f"{attempt}.log" in names and not any(".log." in n for n in names)
 
 
 async def test_revision_mismatch_writes_failed_result(state, tmp_path):
@@ -105,7 +111,7 @@ project = Project(assets=[job])
     detail = await engine.run_until((await engine.submit(["job"]))["id"], 60)
     assert detail["request"]["status"] == "failed"
     attempt = detail["attempts"][detail["tasks"][0]["id"]][0]["id"]
-    result = json.loads(await state.get_object(f"results/{attempt}.json"))
+    result = (await state.attempt_record(detail["request"]["id"], attempt))["result"]
     assert result["status"] == "failed" and "revision mismatch" in result["error"]["message"]
 
 
@@ -239,7 +245,7 @@ async def test_failed_migration_is_not_retryable(state, tmp_path, monkeypatch):
     detail = await engine.run_until((await engine.submit(["producer"]))["id"], 60)
     assert detail["request"]["status"] == "failed"
     attempt = detail["attempts"][detail["tasks"][0]["id"]][0]["id"]
-    result = json.loads(await state.get_object(f"results/{attempt}.json"))
+    result = (await state.attempt_record(detail["request"]["id"], attempt))["result"]
     assert result["status"] == "failed"
     assert result["error"]["retryable"] is False
     assert "migration failed" in result["error"]["message"]

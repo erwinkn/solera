@@ -198,21 +198,43 @@ async def test_heads_keys_and_partitions(client, base, engine):
 
 
 async def test_attempt_logs_spec_result(client, base, engine):
-    """Attempt artifacts are readable through the API (§9)."""
+    """Attempt artifacts are readable through the API (§8)."""
 
     run = await engine.submit(["feed"])
     detail = await engine.run_until(run["id"])
     task = detail["tasks"][0]
-    attempt = detail["attempts"][task["id"]][-1]
-    attempt_id = attempt["id"]
+    attempt_id = detail["attempts"][task["id"]][-1]["id"]
+    path = f"{base}/runs/{run['id']}/attempts/{attempt_id}"
 
-    spec = (await client.get(f"{base}/attempts/{attempt_id}/spec")).json()
+    spec = (await client.get(f"{path}/spec")).json()
     assert spec["asset"] == "feed"
-    result = (await client.get(f"{base}/attempts/{attempt_id}/result")).json()
-    assert "outputs" in result
-    logs = await client.get(f"{base}/attempts/{attempt_id}/logs")
+    result = (await client.get(f"{path}/result")).json()
+    assert "outputs" in result and result["log"]["truncated"] is False
+    logs = await client.get(f"{path}/logs", params={"tail": 10})
     assert logs.status_code == 200
-    assert (await client.get(f"{base}/attempts/nope/spec")).status_code == 404
+    assert (await client.get(f"{base}/runs/{run['id']}/attempts/nope/spec")).status_code == 404
+
+
+async def test_delete_and_prune_runs(client, base, engine):
+    """§11: finished runs can be deleted one by one or pruned; active runs cannot."""
+
+    finished = []
+    for _ in range(3):
+        run = await engine.submit(["feed"], mode="full")
+        await engine.run_until(run["id"])
+        finished.append(run["id"])
+    await engine.tick()  # archive
+    gone = await client.delete(f"{base}/runs/{finished[0]}")
+    assert gone.status_code == 200
+    assert (await client.get(f"{base}/runs/{finished[0]}")).status_code == 404
+    dry = (await client.post(f"{base}/runs:prune", json={"asset": "feed", "keep": 1, "dry_run": True})).json()
+    assert dry == {"deleted": [finished[1]], "dry_run": True}
+    assert (await client.get(f"{base}/runs/{finished[1]}")).status_code == 200
+    pruned = (await client.post(f"{base}/runs:prune", json={"asset": "feed", "keep": 1})).json()
+    assert pruned["deleted"] == [finished[1]]
+    assert (await client.get(f"{base}/runs/{finished[2]}")).status_code == 200
+    active = await engine.submit(["daily"], partitions=["2026-09-18"])
+    assert (await client.delete(f"{base}/runs/{active['id']}")).status_code == 409
 
 
 async def test_automations_enable_disable_run_now(client, base, engine):

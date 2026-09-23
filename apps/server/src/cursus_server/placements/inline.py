@@ -18,7 +18,9 @@ class InlinePlacement:
     async def launch(self, stage: dict) -> dict:
         from cursus_worker.worker import run_attempt
 
-        task = asyncio.create_task(run_attempt(stage["objects"], stage["attempt"], self.project))
+        task = asyncio.create_task(
+            run_attempt(stage["objects"], stage["attempt"], self.project, run=stage["run"])
+        )
         self._tasks[stage["attempt"]] = task
         return {"id": stage["attempt"]}
 

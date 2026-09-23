@@ -24,7 +24,7 @@ from itertools import product
 from zoneinfo import ZoneInfo
 
 from croniter import croniter
-from cursus.ids import ulid
+from cursus.ids import ulid, ulid_time
 from cursus.keys.index import IndexState, KeyIndex, Options, key_bytes, key_str
 from cursus.keys.io import ObjectIO, key_cache
 from cursus.sdk import TimePartitions, canonical_partition, digest, split_partition
@@ -65,6 +65,7 @@ class Engine:
         key_options: Options | None = None,
         recount_interval: float = 3600.0,
         maintenance_concurrency: int = 2,
+        retention_interval: float = 60.0,
     ):
         import time
 
@@ -100,6 +101,13 @@ class Engine:
         self._recounted: dict[tuple, float] = {}
         self._checked: dict[tuple, IndexState] = {}
         self._io: ObjectIO | None = None
+        # Retention (§11), memory only: archived run ids oldest first (listed
+        # once, then kept up to date) and the assets each one ran.
+        self.retention_interval = retention_interval
+        self._swept = -math.inf
+        self._run_index: list[str] | None = None
+        self._run_assets_indexed: set[str] = set()
+        self._run_assets: dict[str, list[str]] = {}
         self._set_dims = {
             dim["output"]
             for a in manifest["assets"].values()
@@ -175,6 +183,7 @@ class Engine:
         await self._automation_tick()
         await self._archive_due()
         await self._maintain_indexes()
+        await self._retention_sweep()
 
     async def run_until(self, run_id: str, timeout: float = 120.0):
         """Tick until the run reaches a terminal status (CLI and tests)."""
@@ -188,7 +197,9 @@ class Engine:
                 # may hold inflight waiters until a worker claims them.
                 mine = [t for r, t in self.inflight.values() if r == run_id]
                 await asyncio.gather(*mine, return_exceptions=True)
-                return await self.run_detail(run_id)
+                detail = await self.run_detail(run_id)
+                await self._archive_due()  # a one-shot caller (the CLI) leaves nothing behind
+                return detail
             await asyncio.sleep(0.05)
         raise TimeoutError(f"run {run_id} did not finish within {timeout}s")
 
@@ -743,6 +754,8 @@ class Engine:
         for output in asset["outputs"]:
             name, head = output["name"], baseline[output["name"]]
             info = {"exists": head is not None}
+            if head is not None:
+                info["head"] = head["ref"]
             if name == task["asset"] and asset.get("aliases"):
                 info["aliases"] = list(asset["aliases"])
             if output.get("incremental"):
@@ -922,11 +935,19 @@ class Engine:
         }
         if prepared["cursor"] is not None:
             spec["cursor"] = prepared["cursor"]
-        await self.state.put_object(f"specs/{attempt}.json", json.dumps(spec).encode())
+        before = self._horizon(task["asset"])
+        if before is not None and math.isfinite(before):
+            spec["retention"] = {"before": before}
+        # The attempt file (§8): created here with the spec; the harness
+        # rewrites it once, with the spec, its result and its log index.
+        path = f"{self.state.attempt_path(task['run'], attempt)}.json"
+        await self.state.create_object(path, json.dumps({"spec": spec}).encode())
         if spec["execution"]["kind"] == "Pool":
             self._stage_pool(task, attempt, spec)
         try:
-            handle = await placement.launch({"attempt": attempt, "objects": self.state.objects_url})
+            handle = await placement.launch(
+                {"attempt": attempt, "run": task["run"], "objects": self.state.objects_url}
+            )
         except Exception as error:
             await self.fail_attempt(attempt, f"launch: {error}", retryable=True)
             return
@@ -972,11 +993,11 @@ class Engine:
             except LostOwnership:
                 await self._cancel(placement, handle)
                 return
-        result_data = await self.state.get_object(f"results/{attempt}.json")
-        if result_data is None:
+        record = await self.state.attempt_record(task["run"], attempt)
+        result = (record or {}).get("result")
+        if result is None:
             await self.fail_attempt(attempt, f"harness exited without a result: {exit_}", retryable=True)
             return
-        result = json.loads(result_data)
         if result.get("status") == "failed":
             error = result.get("error") or {}
             await self.fail_attempt(
@@ -1543,7 +1564,8 @@ class Engine:
 
     async def _archive_due(self):
         """Write finished runs to `runs/{run}/run.json` and drop them from memory,
-        once none of their attempts is still in flight here."""
+        once none of their attempts is still in flight here. A run in which
+        every task was skipped launched and wrote nothing: it is not written."""
 
         busy = {run_id for run_id, _ in self.inflight.values()}
         for run_id in sorted(self.m.archivable):
@@ -1552,7 +1574,104 @@ class Engine:
             run = self.m.runs.get(run_id)
             if run is None or any(tid in self.m.claims for tid in run["tasks"]):
                 continue
-            await self.state.archive(run_id)
+            tasks = run["tasks"].values()
+            committed = {t["asset"] for t in tasks if t["status"] == "succeeded"}
+            quiet = all(
+                t["status"] == "skipped" and all(a["outcome"] == "skipped" for a in t["attempts"])
+                for t in tasks
+            )
+            await self.state.archive(run_id, committed=committed, write=not quiet)
+            if not quiet:
+                self._run_assets[run_id] = sorted({t["asset"] for t in tasks})
+                if self._run_index is not None and run_id not in self._run_assets_indexed:
+                    self._run_index.append(run_id)
+                    self._run_assets_indexed.add(run_id)
+
+    # -- retention (§11) ---------------------------------------------------------------
+
+    def _horizon(self, asset: str | None) -> float | None:
+        """Runs and data versions of `asset` older than this may go; `None`
+        keeps everything. With both `days` and `runs`, whichever keeps more."""
+
+        policy = self.m.policy(asset)
+        if policy is None:
+            return None
+        bounds = []
+        if policy.get("days"):
+            bounds.append(self.clock() - float(policy["days"]) * 86400)
+        if policy.get("runs"):
+            newest = self.m.retention.get(asset) or []
+            bounds.append(ulid_time(newest[0]) if len(newest) >= int(policy["runs"]) else -math.inf)
+        return min(bounds)
+
+    async def _assets_of(self, run_id: str) -> list[str] | None:
+        if run_id not in self._run_assets:
+            run = await self.state.archived(run_id)
+            if run is None:
+                return None
+            self._run_assets[run_id] = sorted({t["asset"] for t in run.get("tasks", {}).values()})
+        return self._run_assets[run_id]
+
+    async def _retention_sweep(self):
+        """Delete finished runs every asset they ran has let go of (§11): a
+        run is kept while any of its assets keeps it, or keeps everything."""
+
+        now = self.clock()
+        if now - self._swept < self.retention_interval:
+            return
+        self._swept = now
+        horizons = {name: self._horizon(name) for name in self.manifest["assets"]}
+        finite = [h for h in horizons.values() if h is not None]
+        default = self._horizon(None)
+        if not finite and default is None:
+            return
+        latest = max(finite + ([default] if default is not None else []))
+        if self._run_index is None:
+            self._run_index = [r for r in await self.state.archived_ids() if r not in self.m.runs]
+            self._run_assets_indexed = set(self._run_index)
+        doomed = []
+        for run_id in self._run_index:
+            if ulid_time(run_id) >= latest:
+                break  # sorted: nothing newer can be past any horizon
+            if run_id in self.m.runs:
+                continue
+            assets = await self._assets_of(run_id)
+            bounds = [horizons.get(a) for a in assets] if assets else [default]
+            if all(h is not None and ulid_time(run_id) < h for h in bounds):
+                doomed.append(run_id)
+        for run_id in doomed:
+            await self.delete_run(run_id)
+
+    async def delete_run(self, run_id: str) -> None:
+        """Delete a finished run: its record, attempt files and logs. Current
+        state never depends on runs, so only a run in progress is refused."""
+
+        if run_id in self.m.runs:
+            raise Conflict(f"run {run_id} is still active", retryable=False)
+        await self.state.delete_run(run_id)
+        self._run_assets.pop(run_id, None)
+        if run_id in self._run_assets_indexed:
+            self._run_index.remove(run_id)
+            self._run_assets_indexed.discard(run_id)
+
+    async def prune(self, *, before=None, asset=None, keep=None, dry_run=False) -> dict:
+        """Delete finished runs created before `before` (epoch seconds), of
+        `asset` if given, except the `keep` newest of them."""
+
+        matching = []
+        for run_id in await self.state.archived_ids():
+            if run_id in self.m.runs:
+                continue
+            if asset is not None and asset not in (await self._assets_of(run_id) or ()):
+                continue
+            matching.append(run_id)
+        if keep:
+            matching = matching[: -int(keep)]
+        doomed = [r for r in matching if before is None or ulid_time(r) < float(before)]
+        if not dry_run:
+            for run_id in doomed:
+                await self.delete_run(run_id)
+        return {"deleted": doomed, "dry_run": bool(dry_run)}
 
     # -- read models -------------------------------------------------------------------
 
@@ -1610,10 +1729,10 @@ class Engine:
         return out
 
     async def list_runs(self, limit=50):
-        runs = list(self.m.runs.values())
+        runs = list(self.m.runs.values()) + list(self.state.recent.values())
         needed = limit - len(runs)
         if needed > 0:
-            active = set(self.m.runs)
+            active = set(self.m.runs) | set(self.state.recent)
             archived = [r for r in await self.state.archived_ids() if r not in active]
             for run_id in reversed(archived[-needed:]):
                 run = await self.state.archived(run_id)

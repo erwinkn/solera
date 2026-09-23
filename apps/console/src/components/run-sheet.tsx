@@ -28,7 +28,7 @@ function JsonView({ path }: { path: string }) {
 }
 
 function LogView({ path }: { path: string }) {
-  // The endpoint streams newline-delimited log chunks; poll it for a tail.
+  // The endpoint returns the log's last lines as JSON lines; poll it for a tail.
   const { data } = useQueryText(path, 1000);
   return (
     <pre
@@ -50,7 +50,7 @@ function AttemptRow({
   attempt: Attempt;
 }) {
   const attemptId = attempt.id ?? `${task.id}/${attempt.generation}`;
-  const encoded = attemptId.split("/").map(encodeURIComponent).join("/");
+  const path = `${base}/runs/${encodeURIComponent(task.run)}/attempts/${encodeURIComponent(attemptId)}`;
   return (
     <details className="rounded-lg border" data-attempt={attemptId}>
       <summary className="flex cursor-pointer items-center gap-2 px-3 py-2 text-sm">
@@ -74,13 +74,13 @@ function AttemptRow({
             <TabsTrigger value="result">Result</TabsTrigger>
           </TabsList>
           <TabsContent value="logs">
-            <LogView path={`${base}/attempts/${encoded}/logs`} />
+            <LogView path={`${path}/logs?tail=500`} />
           </TabsContent>
           <TabsContent value="spec">
-            <JsonView path={`${base}/attempts/${encoded}/spec`} />
+            <JsonView path={`${path}/spec`} />
           </TabsContent>
           <TabsContent value="result">
-            <JsonView path={`${base}/attempts/${encoded}/result`} />
+            <JsonView path={`${path}/result`} />
           </TabsContent>
         </Tabs>
       </div>

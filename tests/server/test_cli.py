@@ -89,7 +89,13 @@ def test_local_run_and_reads(project_file, state_url, capsys, monkeypatch):
 
     task = shown["tasks"][0]
     attempt = shown["attempts"][task["id"]][-1]
-    cli(monkeypatch, capsys, "--state-url", state_url, "logs", attempt["id"])
+    cli(monkeypatch, capsys, "--state-url", state_url, "logs", run_id, attempt["id"], "--tail", "5")
+
+    dry = cli(monkeypatch, capsys, "--state-url", state_url, "runs", "prune", "--asset", "feed", "--dry-run")
+    assert dry == {"deleted": [run_id], "dry_run": True}
+    deleted = cli(monkeypatch, capsys, "--state-url", state_url, "runs", "delete", run_id)
+    assert deleted == {"deleted": [run_id]}
+    assert run_id not in {r["id"] for r in cli(monkeypatch, capsys, "--state-url", state_url, "runs")}
 
     autos = cli(monkeypatch, capsys, "--state-url", state_url, "automations")
     assert isinstance(autos, list)

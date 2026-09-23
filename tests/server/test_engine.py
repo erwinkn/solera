@@ -88,8 +88,8 @@ def head(state, output, scope=""):
 async def spec_of(state, output, scope=""):
     """The spec of the attempt behind a head: what it read (lineage)."""
 
-    attempt = head(state, output, scope)["attempt"]
-    return json.loads(await state.get_object(f"specs/{attempt}.json"))
+    h = head(state, output, scope)
+    return (await state.attempt_record(h["run"], h["attempt"]))["spec"]
 
 
 def make_engine(state, project, placements=None, **kw):
@@ -621,7 +621,7 @@ async def test_fencing_concurrent_claim(state):
             await asyncio.sleep(0.5)
             from cursus_worker.worker import run_attempt
 
-            return await run_attempt(stage["objects"], stage["attempt"], self.project)
+            return await run_attempt(stage["objects"], stage["attempt"], self.project, run=stage["run"])
 
     @asset
     def slow():
@@ -882,29 +882,31 @@ async def test_restart_requeues_and_relaunches_inflight(tmp_path):
     class Slow(FakePlacement):
         async def launch(self, stage):
             launches.append(stage["attempt"])
-            return {"id": stage["attempt"]}
+            return {"id": stage["attempt"], "run": stage["run"]}
 
         async def wait(self, run, timeout):
             if not release["go"]:
                 return None
-            # the harness finishes by writing its result object
+            # the harness finishes by rewriting its attempt file with the result
             await self.ctx.state.put_object(
-                f"results/{run['id']}.json",
+                f"runs/{run['run']}/{run['id']}.json",
                 json.dumps(
                     {
-                        "attempt": run["id"],
-                        "status": "succeeded",
-                        "outputs": {
-                            "resumable": {
-                                "ref": {
-                                    "output": "resumable",
-                                    "store": "json",
-                                    "handle": {"object": "x.json"},
-                                    "version": "v1",
-                                    "partition": "",
-                                    "meta": {},
+                        "spec": {},
+                        "result": {
+                            "status": "succeeded",
+                            "outputs": {
+                                "resumable": {
+                                    "ref": {
+                                        "output": "resumable",
+                                        "store": "json",
+                                        "handle": {"object": "x.json"},
+                                        "version": "v1",
+                                        "partition": "",
+                                        "meta": {},
+                                    }
                                 }
-                            }
+                            },
                         },
                     }
                 ).encode(),
@@ -1023,7 +1025,7 @@ async def test_job_commits_lineage_only(state):
     task = next(t for t in detail["tasks"] if t["asset"] == "vacuum")
     [attempt] = detail["attempts"][task["id"]]
     assert attempt["status"] == "succeeded" and not attempt.get("result")  # no outputs, no heads
-    spec = json.loads(await state.get_object(f"specs/{attempt['id']}.json"))
+    spec = (await state.attempt_record(detail["request"]["id"], attempt["id"]))["spec"]
     assert spec["inputs"]["feed"]["ref"]["output"] == "feed"  # lineage is the spec
 
 

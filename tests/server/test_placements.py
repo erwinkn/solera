@@ -58,7 +58,7 @@ async def test_pool_task_lifecycle(state):
     assert engine.claim_pool_task("w2", ["ingest"], {"cpu": 4}, lease_seconds=30) is None
 
     # the worker runs the stage and completes; the engine's wait sees the result
-    code = await run_attempt(state.objects_url, attempt, project)
+    code = await run_attempt(state.objects_url, attempt, project, run=record["run"])
     assert code == 0
     engine.release_pool_task("w1", attempt)
     detail = await engine.run_until(run["id"], 10)
@@ -163,7 +163,7 @@ async def test_awsecs_launch_wait_cancel(state, monkeypatch):
     ecs = FakeEcs()
     stub_boto3(monkeypatch, ecs)
     placement = AWSECS({"cluster": "lab", "region": "us-east-1"}, {"cpu": 4, "memory": 30 * 10**9}, None)
-    handle = await placement.launch({"attempt": "a1", "objects": "s3://bkt/ns/objects"})
+    handle = await placement.launch({"attempt": "a1", "run": "r1", "objects": "s3://bkt/ns/objects"})
     task = ecs.tasks[handle["task_arn"]]
     override = task["kw"]["overrides"]["containerOverrides"][0]
     assert override["command"][-3:] == ["--attempt", "a1"] or "a1" in override["command"]
@@ -235,7 +235,7 @@ async def test_k8sjob_launch_wait_lost(state, monkeypatch):
     batch = FakeBatchApi()
     stub_kubernetes(monkeypatch, batch)
     placement = K8sJob({"cluster": "c", "namespace": "ns"}, {"cpu": 2}, None)
-    handle = await placement.launch({"attempt": "a/1", "objects": "s3://x"})
+    handle = await placement.launch({"attempt": "a/1", "run": "r", "objects": "s3://x"})
     job = batch.jobs[handle["job"]]
     args = job.spec.template.spec.containers[0].args
     assert "a/1" in args and "s3://x" in args
@@ -275,9 +275,9 @@ async def test_modal_launch_wait_lost(state, monkeypatch):
     class Function:
         @staticmethod
         def from_name(app, name):
-            def spawn(attempt, objects):
+            def spawn(attempt, run, objects):
                 call = FakeCall(uuid.uuid4().hex)
-                calls[call.object_id] = (call, {"attempt": attempt, "objects": objects})
+                calls[call.object_id] = (call, {"attempt": attempt, "run": run, "objects": objects})
                 return call
 
             return types.SimpleNamespace(spawn=spawn)
@@ -296,8 +296,8 @@ async def test_modal_launch_wait_lost(state, monkeypatch):
     monkeypatch.setitem(sys.modules, "modal", modal)
 
     placement = Modal({"app": "cursus"}, {"gpu": "A10G"}, None)
-    handle = await placement.launch({"attempt": "a9", "objects": "s3://o"})
-    assert calls[handle["call_id"]][1] == {"attempt": "a9", "objects": "s3://o"}
+    handle = await placement.launch({"attempt": "a9", "run": "r9", "objects": "s3://o"})
+    assert calls[handle["call_id"]][1] == {"attempt": "a9", "run": "r9", "objects": "s3://o"}
 
     assert await placement.wait(handle, 0.2) is None  # still running
     calls[handle["call_id"]][0].finished = True

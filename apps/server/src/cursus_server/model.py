@@ -76,6 +76,7 @@ class Model:
                 "watermarks": _nest(self.watermarks, 3),
                 "outcomes": _nest(self.outcomes, 2),
                 "automations": self.automations,
+                "retention": self.retention,
                 "runs": self.runs,
                 "receipts": list(self.receipts.items()),
             }
@@ -97,6 +98,8 @@ class Model:
         self.watermarks: dict[tuple, dict] = _flatten(snap.get("watermarks"), 3)
         self.outcomes: dict[tuple, dict] = _flatten(snap.get("outcomes"), 2)
         self.automations: dict[str, dict] = snap.get("automations") or {}
+        # asset -> the newest `runs` run ids that committed to it, oldest first (§11)
+        self.retention: dict[str, list[str]] = snap.get("retention") or {}
         self.runs: dict[str, dict] = snap.get("runs") or {}
         self.receipts: dict[str, str] = dict(snap.get("receipts") or [])
         # memory only
@@ -331,6 +334,9 @@ class Model:
                 wm["output"] = output_map[wm["output"]]
         for auto in self.automations.values():
             auto["pending"] = [[asset_map.get(a, a), s] for a, s in auto.get("pending") or []]
+        for old, new in asset_map.items():
+            if old in self.retention and new not in self.retention:
+                self.retention[new] = self.retention.pop(old)
         return renamed
 
     def _on_RunSubmitted(self, e):
@@ -604,7 +610,23 @@ class Model:
         consumed = e.get("consumed") or []
         auto["pending"] = [p for p in auto["pending"] if p not in consumed]
 
+    def policy(self, asset: str | None) -> dict | None:
+        """The retention policy that applies to an asset: its own, else the
+        project's; `None` keeps everything (§11)."""
+
+        manifest = self.manifest or {}
+        own = ((manifest.get("assets") or {}).get(asset) or {}).get("retention") if asset else None
+        policy = own or manifest.get("retention")
+        if not policy or policy.get("forever"):
+            return None
+        return policy
+
     def _on_RunArchived(self, e):
         if e["run"] in self.runs:
             self._unindex_run(e["run"])
             del self.runs[e["run"]]
+        for asset in e.get("committed") or ():
+            keep = (self.policy(asset) or {}).get("runs")
+            if keep:
+                runs = sorted({*self.retention.get(asset, ()), e["run"]})
+                self.retention[asset] = runs[-int(keep) :]

@@ -17,13 +17,13 @@ feed tick produces a new batch every iteration without wall-clock sleeps.
 """
 
 import importlib
-import json
 import os
 import time
 from collections import Counter
 from pathlib import Path
 
 import obstore
+from cursus.ids import ulid_time
 from cursus.sdk import Ref
 from cursus_server.engine import Engine
 from cursus_server.placements.inline import InlinePlacement
@@ -175,11 +175,11 @@ async def test_soak(tmp_path, monkeypatch):
     planned = 0
     for task in detail["tasks"]:
         for attempt in detail["attempts"].get(task["id"], []):
-            raw = await state.get_object(f"specs/{attempt['id']}.json")
-            if raw is None:
+            record = await state.attempt_record(detail["request"]["id"], attempt["id"])
+            if record is None:
                 continue
             planned += 1
-            assert json.loads(raw)["inputs"]["site_files"]["changes"]["full"] is False
+            assert record["spec"]["inputs"]["site_files"]["changes"]["full"] is False
     assert planned, "file_index planned no incremental attempts"
 
     # Every head loads through its store, including after a restart.
@@ -195,4 +195,115 @@ async def test_soak(tmp_path, monkeypatch):
         if "object" not in handle and "batches" not in handle:
             continue  # lineage-only source heads carry no object payload
         await project.stores[ref.store].load(ref, None, None)
+    await state.close()
+
+
+async def test_soak_with_retention(tmp_path, monkeypatch):
+    """J4 gate (docs/object-store-state.md §11): the demo under
+    `Retention(days=1)`, its 10-second poller driven by a fake clock that
+    steps ten minutes a run, so a day passes every 144 runs. Once the first
+    day has gone by, `data/` and `runs/` stop growing: every run past the
+    horizon is deleted, and every data version before it expires — while
+    each head still loads, and a consumer added afterwards gets everything."""
+
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    clock = [1_700_000_000.0]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+
+    import cursus_server.demo as demo
+    from cursus.sdk import Incremental, Project, Retention, asset
+
+    importlib.reload(demo)
+    base = demo.project
+    project = Project(
+        assets=list(base.assets.values()),
+        sources=list(base.sources.values()),
+        stores=base.stores,
+        executors=base.executors,
+        resources=base.resources,
+        automations=base.automations,
+        retention=Retention(days=1),
+        name=base.name,
+    )
+    state = await State.open(
+        (tmp_path / "state").as_uri(), "retained", clock=lambda: clock[0], flush_interval=0.001
+    )
+    engine = Engine(
+        state,
+        project.manifest,
+        placements={"Local": lambda env, opt, ctx: InlinePlacement(ctx, project)},
+        clock=lambda: clock[0],
+        retention_interval=0,
+    )
+    await engine.initialize()
+    for name in list(state.model.automations):
+        await engine.set_automation(name, False)
+    root = tmp_path / "state" / "retained"
+    for _ in range(4):
+        await engine.run_until((await engine.submit(["sites"]))["id"], timeout=1e9)
+
+    runs_total = max(300, BATCHES // 2)
+    samples = []  # (run, data bytes, data objects, run directories)
+    for i in range(runs_total):
+        clock[0] += 600
+        detail = await engine.run_until(
+            (await engine.submit(["site_feed"], partitions="all"))["id"], timeout=1e9
+        )
+        assert detail["request"]["status"] == "succeeded", detail["request"]["id"]
+        if i % 20 == 10:
+            run = await engine.submit(["file_index"], partitions="all")
+            assert (await engine.run_until(run["id"], timeout=1e9))["request"]["status"] == "succeeded"
+        await engine.tick()
+        if (i + 1) % 25 == 0:
+            run_dirs = len(await state.archived_ids())
+            samples.append((i + 1, _bytes(root, "data"), _count(root, "data"), run_dirs))
+
+    print(f"\nretention soak: {runs_total} runs, samples (run, data B, data objects, run dirs): {samples}")
+    steady = [s for s in samples if s[0] >= 200]  # well past the first day (144 runs)
+    assert steady, "the soak must run past the retention horizon"
+    for column in (1, 2, 3):
+        first, peak = steady[0][column], max(s[column] for s in steady)
+        assert peak <= 1.2 * first + 50, (column, [s[column] for s in steady])
+    # Runs older than a day are gone; the newest day's are all there.
+    oldest = min(ulid_time(r) for r in await state.archived_ids())
+    assert oldest >= clock[0] - 86400 - 1200
+
+    # Every head still loads.
+    for head in state.model.heads.values():
+        ref = Ref.from_json(head["ref"])
+        if "object" in (ref.handle or {}) or "batches" in (ref.handle or {}):
+            await project.stores[ref.store].load(ref, None, None)
+
+    # A consumer added after a day of expiry receives the full head.
+    seen = {}
+
+    @asset(partitions={"site": demo.sites}, inputs={"site_files": Incremental(batch_size=100)})
+    def late_reader(ctx, site_files: list):
+        seen[ctx.partition] = (ctx.changes["site_files"].full, sorted(r["file_id"] for r in site_files))
+        return []
+
+    later = Project(
+        assets=[*project.assets.values(), late_reader],
+        sources=list(project.sources.values()),
+        stores=project.stores,
+        executors=project.executors,
+        resources=project.resources,
+        retention=Retention(days=1),
+        name=project.name,
+    )
+    engine = Engine(
+        state,
+        later.manifest,
+        placements={"Local": lambda env, opt, ctx: InlinePlacement(ctx, later)},
+        clock=lambda: clock[0],
+    )
+    await engine.initialize()
+    detail = await engine.run_until(
+        (await engine.submit(["late_reader"], partitions="all"))["id"], timeout=1e9
+    )
+    assert detail["request"]["status"] == "succeeded"
+    for site in ("alpha", "bravo", "charlie", "delta"):
+        full, keys = seen[site]
+        listed = await engine.list_keys("site_files", site)
+        assert full and keys == sorted(listed["keys"])
     await state.close()

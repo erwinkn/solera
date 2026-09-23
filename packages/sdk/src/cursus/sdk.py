@@ -572,26 +572,32 @@ class Retry:
 
 @dataclass(frozen=True)
 class Retention:
-    """History bound (§5 of the storage redesign): a periodic sweep deletes an
-    asset's attempt records — with their `specs/`, `results/` and `logs/`
-    objects — its delta and data batch objects, and its commit records once
-    they are older than `days` AND beyond the newest `runs`. A live head, a
-    delta a live consumer watermark still needs, and a commit a live head
-    references are never deleted."""
+    """How long an asset's history is kept (docs/object-store-state.md §11).
+
+    `days`: runs and data versions older than that go. `runs`: keep the runs
+    of the newest `runs` commits (and the data they wrote). Both: whichever
+    keeps more. `forever=True` keeps everything, overriding a project default.
+    Current state — heads, key indexes, cursors, watermarks — never expires,
+    and neither does a run still in progress."""
 
     days: float | None = None
     runs: int | None = None
+    forever: bool = False
 
     def __post_init__(self):
+        if self.forever:
+            if self.days is not None or self.runs is not None:
+                raise RegistrationError("Retention(forever=True) takes no days or runs")
+            return
         if self.days is None and self.runs is None:
-            raise RegistrationError("Retention() needs days and/or runs")
+            raise RegistrationError("Retention() needs days, runs or forever=True")
         if self.days is not None and self.days <= 0:
             raise RegistrationError(f"Invalid retention days: {self.days}")
         if self.runs is not None and self.runs < 1:
             raise RegistrationError(f"Invalid retention runs: {self.runs}")
 
     def spec(self) -> dict:
-        return {"days": self.days, "runs": self.runs}
+        return {"days": self.days, "runs": self.runs, "forever": self.forever}
 
 
 _SIZE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([KMGT]?)B?\s*$", re.IGNORECASE)

@@ -6,8 +6,9 @@ Everything lives under `{root}/{namespace}/`:
 
     control/      the journal and checkpoints (journal.py)
     keys/         key index files (cursus.keys, §6)
-    runs/{run}/   finished runs (run.json) and attempt files
-    specs/ results/ logs/ data/ blobs/   attempt I/O and store data
+    runs/{run}/   run.json once finished; per attempt `{attempt}.json` (spec,
+                  then spec + result + log index) and `{attempt}.log`
+    data/ blobs/  store data
 
 `emit()` applies events to the model at once — so the engine checks a
 precondition and changes state in one synchronous step, with nothing
@@ -19,6 +20,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from collections import OrderedDict
 from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
 
@@ -28,6 +30,8 @@ from obstore.store import LocalStore, MemoryStore
 
 from .journal import Fenced, Journal
 from .model import Model
+
+RECENT_RUNS = 500  # finished runs that wrote nothing, kept in memory for the console
 
 
 class Unavailable(RuntimeError):
@@ -92,6 +96,7 @@ class State:
         self.objects = store
         self.url, self.namespace, self.objects_url = url, namespace, objects_url
         self.journal, self.model, self.clock = journal, model, clock
+        self.recent: OrderedDict[str, dict] = OrderedDict()
 
     @classmethod
     async def open(
@@ -144,27 +149,39 @@ class State:
     async def close(self) -> None:
         await self.journal.close()
 
-    # -- finished runs -----------------------------------------------------------------
+    # -- runs and attempts (§7, §8) -------------------------------------------------
 
     def _run_path(self, run_id: str) -> str:
         return f"runs/{esc(run_id)}/run.json"
 
-    async def archive(self, run_id: str) -> None:
-        """Write a finished run to `runs/{run}/run.json`, then drop it from memory."""
+    def attempt_path(self, run_id: str, attempt: str) -> str:
+        return f"runs/{esc(run_id)}/{esc(attempt)}"
+
+    async def archive(self, run_id: str, *, committed=(), write: bool = True) -> None:
+        """Write a finished run to `runs/{run}/run.json`, then drop it from
+        memory. A run that wrote nothing (every task skipped) is not written:
+        it stays in the recent list only."""
 
         run = self.model.runs.get(run_id)
         if run is None:
             return
-        data = json.dumps(run, sort_keys=True, allow_nan=False).encode()
-        await obstore.put_async(self.objects, self._run_path(run_id), data, mode="overwrite")
-        await self.emit({"type": "RunArchived", "run": run_id})
+        if write:
+            data = json.dumps(run, sort_keys=True, allow_nan=False).encode()
+            await obstore.put_async(self.objects, self._run_path(run_id), data, mode="overwrite")
+        else:
+            self.recent[run_id] = run
+            while len(self.recent) > RECENT_RUNS:
+                self.recent.popitem(last=False)
+        await self.emit({"type": "RunArchived", "run": run_id, "committed": sorted(committed)})
 
     async def archived(self, run_id: str) -> dict | None:
+        if run_id in self.recent:
+            return self.recent[run_id]
         data = await self.get_object(self._run_path(run_id))
         return json.loads(data) if data is not None else None
 
     async def archived_ids(self) -> list[str]:
-        """Every archived run id (ULIDs sort by creation time)."""
+        """Every run with a directory under `runs/` (ULIDs sort by creation time)."""
 
         out = []
         result = await obstore.list_with_delimiter_async(self.objects, "runs/")
@@ -172,10 +189,66 @@ class State:
             out.append(unesc(prefix.rstrip("/").rsplit("/", 1)[-1]))
         return sorted(out)
 
+    async def delete_run(self, run_id: str) -> None:
+        """Delete a run's record, attempt files and logs."""
+
+        from cursus.stores import remove_empty_dirs
+
+        self.recent.pop(run_id, None)
+        await self.delete_objects(await self.list_objects(f"runs/{esc(run_id)}/"))
+        remove_empty_dirs(self.objects, [f"runs/{esc(run_id)}"])
+
+    async def attempt_record(self, run_id: str, attempt: str) -> dict | None:
+        data = await self.get_object(f"{self.attempt_path(run_id, attempt)}.json")
+        return json.loads(data) if data is not None else None
+
+    async def attempt_finished(self, run_id: str, attempt: str) -> bool:
+        record = await self.attempt_record(run_id, attempt)
+        return record is not None and "result" in record
+
+    async def attempt_log(self, run_id: str, attempt: str, tail: int | None = None) -> bytes:
+        """An attempt's log as JSON lines: the joined log, reading only the
+        blocks the last `tail` lines are in, or the chunks shipped so far
+        while it runs (§8)."""
+
+        import gzip
+
+        base = self.attempt_path(run_id, attempt)
+        record = await self.attempt_record(run_id, attempt)
+        index = (record or {}).get("log")
+        if index is not None:
+            if not index["blocks"]:
+                return b""
+            start = 0
+            if tail is not None:
+                lines = 0
+                for offset, count, _ in reversed(index["blocks"]):
+                    start, lines = offset, lines + count
+                    if lines >= tail:
+                        break
+            data = bytes(
+                await obstore.get_range_async(self.objects, f"{base}.log", start=start, end=index["bytes"])
+            )
+            text = gzip.decompress(data)
+        else:
+            name = f"{esc(attempt)}.log."
+            chunks = [
+                p
+                for p in await self.list_objects(f"runs/{esc(run_id)}/")
+                if p.rsplit("/", 1)[-1].startswith(name)
+            ]
+            text = b"".join([gzip.decompress(await self.get_object(p) or b"") for p in sorted(chunks)])
+        if tail is not None:
+            text = b"".join(text.splitlines(keepends=True)[-tail:])
+        return text
+
     # -- objects ---------------------------------------------------------------------------
 
     async def put_object(self, key: str, value: bytes):
         await obstore.put_async(self.objects, key, value, mode="overwrite", use_multipart=False)
+
+    async def create_object(self, key: str, value: bytes):
+        await obstore.put_async(self.objects, key, value, mode="create", use_multipart=False)
 
     async def get_object(self, key: str) -> bytes | None:
         try:

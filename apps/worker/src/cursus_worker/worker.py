@@ -1,17 +1,19 @@
 """User code runs here, never in the API process (§10 worker protocol).
 
-`python -m cursus_worker run --objects URL --attempt ID`:
-fetch spec -> refuse on revision mismatch -> resolve `env:` -> load inputs per
+`python -m cursus_worker run --objects URL --run RUN --attempt ID`:
+read the spec from the attempt file -> refuse on revision mismatch -> resolve `env:` -> load inputs per
 annotation (Incremental edges through the upstream key index) -> build ctx ->
 run the producer -> for each returned output, work out what changed against
-its key index, store() it unless nothing did, write the delta file -> write
-the result last, in one PUT.
+its key index, expire what retention no longer needs, store() it unless
+nothing did, write the delta file -> rewrite the attempt file with the spec,
+the result and the log index, in one PUT.
 """
 
 from __future__ import annotations
 
 import asyncio
 import dataclasses
+import gzip
 import importlib
 import importlib.util
 import inspect
@@ -148,8 +150,8 @@ class Ctx:
             return next(iter(windows.values()))
         return windows or None
 
-    def log(self, message: str, **fields):
-        entry = {"at": time.time(), "message": str(message), "fields": fields}
+    def log(self, message: str, level: str = "info", **fields):
+        entry = {"at": time.time(), "level": level, "message": str(message), "fields": fields}
         json.dumps(entry, allow_nan=False)
         self._shipper.append(entry)
 
@@ -158,24 +160,82 @@ class Ctx:
         return await store.load(ref, t, None)
 
 
-class LogShipper:
-    """Streams ctx.log lines to logs/{attempt}/{seq}.jsonl chunks."""
+LOG_FLUSH_SECONDS = 2.0
+LOG_FLUSH_BYTES = 256 * 1024
+LOG_CAP = 100 * 2**20  # compressed bytes per attempt
 
-    def __init__(self, objects, attempt: str):
-        self.objects, self.attempt = objects, attempt
-        self.entries: list[dict] = []
-        self.seq = 0
+
+class LogShipper:
+    """`ctx.log` lines as gzip-compressed JSON lines (docs/object-store-state.md §8).
+
+    While the attempt runs, each flush — every 2 s or 256 KB — writes one
+    gzip member as `{attempt}.log.{n}`, so the console can tail it. At the
+    end the members are joined into `{attempt}.log` (concatenated gzip
+    members are one valid gzip file) and the chunks deleted; `index()` lists
+    `[byte offset, lines, first timestamp]` per member for range reads. Past
+    `LOG_CAP` a truncation marker is written and shipping stops."""
+
+    def __init__(self, objects, base: str):
+        self.objects, self.base = objects, base
+        self.pending: list[tuple[float, str]] = []
+        self.pending_bytes = 0
+        self.members: list[bytes] = []
+        self.blocks: list[list] = []
+        self.size = self.lines = 0
+        self.truncated = False
+        self._lock = asyncio.Lock()
 
     def append(self, entry):
-        self.entries.append(entry)
+        if self.truncated:
+            return
+        line = json.dumps(entry, allow_nan=False) + "\n"
+        self.pending.append((entry["at"], line))
+        self.pending_bytes += len(line)
+        if self.pending_bytes >= LOG_FLUSH_BYTES:
+            try:
+                asyncio.get_running_loop().create_task(self.flush())
+            except RuntimeError:
+                pass  # logging from a thread: the next periodic flush ships it
 
     async def flush(self):
-        if not self.entries:
-            return
-        body = "".join(json.dumps(e, allow_nan=False) + "\n" for e in self.entries).encode()
-        await _put(self.objects, f"logs/{self.attempt}/{self.seq:06d}.jsonl", body)
-        self.seq += 1
-        self.entries.clear()
+        async with self._lock:
+            if not self.pending or self.truncated:
+                return
+            lines, self.pending, self.pending_bytes = self.pending, [], 0
+            member = gzip.compress("".join(line for _, line in lines).encode(), compresslevel=6, mtime=0)
+            if self.size + len(member) > LOG_CAP:
+                self.truncated = True
+                marker = {
+                    "at": lines[0][0],
+                    "level": "warning",
+                    "message": f"log truncated: the attempt's log reached {LOG_CAP} bytes",
+                    "fields": {},
+                }
+                lines = [(marker["at"], json.dumps(marker) + "\n")]
+                member = gzip.compress(lines[0][1].encode(), mtime=0)
+            await _put(self.objects, f"{self.base}.log.{len(self.members):06d}", member)
+            self.blocks.append([self.size, len(lines), lines[0][0]])
+            self.members.append(member)
+            self.size += len(member)
+            self.lines += len(lines)
+
+    async def periodically(self):
+        while True:
+            await asyncio.sleep(LOG_FLUSH_SECONDS)
+            await self.flush()
+
+    async def finish(self) -> dict:
+        """Join the chunks into the attempt's log; returns its index."""
+
+        await self.flush()
+        if self.members:
+            import obstore
+
+            await _put(self.objects, f"{self.base}.log", b"".join(self.members))
+            await obstore.delete_async(
+                self.objects, [f"{self.base}.log.{n:06d}" for n in range(len(self.members))]
+            )
+        return {"blocks": self.blocks, "lines": self.lines, "bytes": self.size, "truncated": self.truncated}
 
 
 async def _resolve_inputs(spec, project, asset, keys_io):
@@ -308,6 +368,12 @@ async def _store_outputs(spec, project, asset, objects, keys_io, result_value):
             schema = applied[-1] if applied else output.migrations[-1].name
         info = pinned.get(name) or {}
         prior = priors.get(name)
+        before = (spec.get("retention") or {}).get("before")
+        committed = Ref.from_json(info["head"]) if info.get("head") else None
+        if before is not None and committed is not None and callable(getattr(store, "expire", None)):
+            # Retention reaches data here (§11): whatever no version written
+            # after `before` needs goes, and the committed head stays loadable.
+            await store.expire(committed, before)
         scope = Scope(
             output=output,
             partition=spec["partition"],
@@ -377,26 +443,38 @@ def _key_io(objects, objects_url: str, project: Project) -> ObjectIO:
     return ObjectIO(objects, cache=key_cache(project.manifest.get("key_cache"), objects_url))
 
 
-async def run_attempt(objects_url: str, attempt: str, entrypoint: str | Project):
+async def run_attempt(objects_url: str, attempt: str, entrypoint: str | Project, *, run: str):
+    """Run one attempt. The engine created `runs/{run}/{attempt}.json` holding
+    the spec; the harness rewrites it once, at the end, with the spec, the
+    result and the log index (docs/object-store-state.md §8)."""
+
     objects = _objects(objects_url)
-    spec_data = await _get(objects, f"specs/{attempt}.json")
-    if spec_data is None:
-        raise StoreError(f"No spec at specs/{attempt}.json")
-    spec = json.loads(spec_data)
-    result_key = f"results/{attempt}.json"
+    base = f"runs/{run}/{attempt}"
+    record = await _get(objects, f"{base}.json")
+    if record is None:
+        raise StoreError(f"No attempt file at {base}.json")
+    spec = json.loads(record)["spec"]
+    shipper = LogShipper(objects, base)
+    flusher = asyncio.create_task(shipper.periodically())
+
+    async def finish(result: dict):
+        flusher.cancel()
+        log = await shipper.finish()
+        body = {"spec": spec, "result": result, "log": log}
+        await _put(objects, f"{base}.json", json.dumps(body, allow_nan=False).encode())
 
     async def fail(error: BaseException, retryable: bool):
-        payload = {
-            "attempt": attempt,
-            "status": "failed",
-            "error": {
-                "type": type(error).__name__,
-                "message": str(error),
-                "traceback": "".join(traceback.format_exception(error))[-32000:],
-                "retryable": retryable,
-            },
-        }
-        await _put(objects, result_key, json.dumps(payload, allow_nan=False).encode())
+        await finish(
+            {
+                "status": "failed",
+                "error": {
+                    "type": type(error).__name__,
+                    "message": str(error),
+                    "traceback": "".join(traceback.format_exception(error))[-32000:],
+                    "retryable": retryable,
+                },
+            }
+        )
 
     try:
         project = entrypoint if isinstance(entrypoint, Project) else load_project(entrypoint)
@@ -415,7 +493,6 @@ async def run_attempt(objects_url: str, attempt: str, entrypoint: str | Project)
     for store in project.stores.values():
         if hasattr(store, "bind_objects"):
             store.bind_objects(objects)
-    shipper = LogShipper(objects, attempt)
     try:
         keys_io = _key_io(objects, objects_url, project)
         args, changes, delivered = await _resolve_inputs(spec, project, asset, keys_io)
@@ -430,21 +507,17 @@ async def run_attempt(objects_url: str, attempt: str, entrypoint: str | Project)
         if inspect.isawaitable(value):
             value = await value
         outputs, cursor = await _store_outputs(spec, project, asset, objects, keys_io, value)
-        await shipper.flush()
-        payload = {"attempt": attempt, "status": "succeeded", "outputs": outputs, "delivered": delivered}
+        result = {"status": "succeeded", "outputs": outputs, "delivered": delivered}
         if cursor is not UNSET:
-            payload["cursor"] = cursor
-        await _put(objects, result_key, json.dumps(payload, allow_nan=False).encode())
+            result["cursor"] = cursor
+        await finish(result)
         return 0
     except StoreError as error:
         await fail(error, getattr(error, "retryable", False))
     except Exception as error:
         await fail(error, True)
     finally:
-        try:
-            await shipper.flush()
-        except Exception:
-            pass
+        flusher.cancel()
     return 1
 
 
@@ -493,7 +566,9 @@ async def run_pool(pool: str, server: str, token: str | None = None):
 
             renewal = asyncio.create_task(renew())
             try:
-                await run_attempt(stage["objects"], stage["attempt"], os.environ["CURSUS_PROJECT"])
+                await run_attempt(
+                    stage["objects"], stage["attempt"], os.environ["CURSUS_PROJECT"], run=stage["run"]
+                )
                 await client.post(f"/api/tasks/{task_id}/complete", json={"worker": worker_id})
                 print(f"[pool] completed {task_id}", flush=True)
             finally:
@@ -512,9 +587,11 @@ async def main():
         Path(out).write_text(json.dumps(project.manifest, allow_nan=False))
         return
     if mode == "run":
-        # cursus_worker run --objects URL --attempt ID (CURSUS_PROJECT env entrypoint)
+        # cursus_worker run --objects URL --attempt ID --run RUN (CURSUS_PROJECT env entrypoint)
         options = dict(zip(rest[::2], rest[1::2], strict=True))
-        code = await run_attempt(options["--objects"], options["--attempt"], os.environ["CURSUS_PROJECT"])
+        code = await run_attempt(
+            options["--objects"], options["--attempt"], os.environ["CURSUS_PROJECT"], run=options["--run"]
+        )
         raise SystemExit(code)
     if mode == "pool":
         options = dict(zip(rest[::2], rest[1::2], strict=True))

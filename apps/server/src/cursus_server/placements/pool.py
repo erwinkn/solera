@@ -14,19 +14,19 @@ class PoolPlacement:
         self.ctx, self.name = ctx, name
 
     async def launch(self, stage: dict) -> dict:
-        return {"task": stage["attempt"], "pool": self.name}
+        return {"task": stage["attempt"], "run": stage["run"], "pool": self.name}
 
     async def wait(self, run: dict, timeout: float) -> dict | None:
         state = self.ctx.state
         deadline = self.ctx.clock() + timeout
         attempt = run["task"]
         while True:
-            if await state.get_object(f"results/{attempt}.json") is not None:
+            if await state.attempt_finished(run["run"], attempt):
                 return {"code": 0, "reason": None, "meta": {}}
             record = state.model.pool.get(attempt)
             if record is None:
                 # complete() removed the claim without a result we can see.
-                if await state.get_object(f"results/{attempt}.json") is not None:
+                if await state.attempt_finished(run["run"], attempt):
                     return {"code": 0, "reason": None, "meta": {}}
                 return {"code": None, "reason": "lost", "meta": {}}
             if record["status"] == "claimed" and record["lease_until"] <= self.ctx.clock():

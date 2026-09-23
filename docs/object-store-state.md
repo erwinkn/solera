@@ -1,6 +1,6 @@
 # Object-store state: data model
 
-Status: **draft for review.** Replaces the SlateDB persistence and the
+Status: **implemented** (K0, J1–J4), except where a section says otherwise. Replaces the SlateDB persistence and the
 retention design in `storage-redesign.md` §4–§5. Keeps `Incremental`
 edges, per-batch deltas and watermarks from PR #7, and the in-memory
 engine model from PR #8.
@@ -36,8 +36,8 @@ Everything lives under `{root}/{namespace}/`.
 | Key index file | `keys/{output}/{scope}/{name}.kx` | harness (delta files), compaction | create-only | no longer in the index and no consumer needs it (§6) |
 | Run record | `runs/{run}/run.json` | engine | written once, when the run ends | retention (§11) |
 | Attempt file | `runs/{run}/{attempt}.json` | engine creates it with the spec; the harness overwrites it with spec + result + log index | two writes, one writer each | with its run |
-| Attempt log | `runs/{run}/{attempt}.log` (chunks `{attempt}.log.{n}` while running) | harness | chunks write-once; joined at the end | with its run |
-| Output data | store-defined (JsonStore: `data/…`) | the store, inside the harness | store-defined | `store.expire` (§9) |
+| Attempt log | `runs/{run}/{attempt}.log` (chunks `{attempt}.log.{n:06d}` while running) | harness | chunks write-once; joined at the end | with its run |
+| Output data | store-defined (JsonStore: `data/{output}/{scope}/…`, named after the writing attempt) | the store, inside the harness | store-defined | `store.expire` (§9) |
 
 **Growth.** `control/` is bounded: at most two checkpoints plus the
 journal since the older one, and a checkpoint is written whenever that
@@ -325,7 +325,8 @@ still in the checkpoint and gets archived again (the write is idempotent).
 ```
 
 A source commit is recorded as a run with no tasks: its `run.json` holds
-`{"source", "head", "keys"}`.
+`{"source", "head", "keys"}`. *(Not built yet: today a source commit is
+recorded only by its `SourceCommitted` event.)*
 
 A run where every task was skipped launched nothing and wrote nothing, so
 it is **not archived**; it only appears in the console's in-memory recent
@@ -363,12 +364,12 @@ of the outputs it writes and the incremental inputs it reads).
     "cursor": null,
     "error": null
   },
-  "log": {"blocks": [[0, 412, 1790074791.2], [3911, 388, 1790074793.2]], "lines": 800, "truncated": false}
+  "log": {"blocks": [[0, 412, 1790074791.2], [3911, 388, 1790074793.2]], "lines": 800, "bytes": 7702, "truncated": false}
 }
 ```
 
 **The attempt log** is gzip-compressed JSON lines, one line per
-`ctx.log` call: `{"at", "level", "msg", "fields"}`.
+`ctx.log(message, level="info", **fields)` call: `{"at", "level", "message", "fields"}`.
 
 - While running, the harness flushes every 2 s or 256 KB, whichever comes
   first. Each flush writes one gzip block as `{attempt}.log.{n}`; the
@@ -393,14 +394,22 @@ class Store(Protocol):
 ```
 
 - `Scope` carries the engine-assigned `batch`, the `attempt` id and the
-  output's `aliases`. Stores put the attempt id in object names and write
-  them create-only.
+  output's `aliases`. Stores put the attempt id in object names, so no
+  attempt overwrites another's objects. JsonStore writes
+  `data/{output}/{scope}/{batch // 1000}/b{batch}-{attempt}.json` (and
+  `s…` snapshots, `v{attempt}.json` for values); when attempts wrote the
+  same batch, the newest attempt's object is the committed one — a later
+  attempt only gets that batch number while it is still uncommitted.
 - `Written.keys` is only for writes the harness never sees as rows
   (§6); for everything else the harness computes keys itself.
-- `expire` is how data retention reaches the store (§11). JsonStore works
-  out what to delete from its own object names (batch, attempt id — which
-  sorts by time — and a reset marker). Postgres keeps no old versions and
-  does nothing. The head always stays loadable.
+- `expire` is optional; it is how data retention reaches the store (§11).
+  The harness calls it with the committed head before writing that output.
+  JsonStore dates each object by the attempt id in its name (a ULID) and
+  deletes what no version written after `before` needs: older values, keyed
+  batches below the snapshot the oldest retained version folds from, event
+  log batches written before `before` (an event log's content is the batches
+  it retains), and objects of attempts that never committed. Postgres keeps
+  no old versions and has no `expire`. The head always stays loadable.
 
 ## 10. Lifecycles
 
@@ -446,16 +455,20 @@ key indexes stand on their own; a head keeps its `run` and `attempt`
 references even after that run is deleted ("produced 45 days ago, run
 expired"). The only runs that cannot be deleted are active ones.
 
-**Run records.** For each asset with a finite policy, the engine keeps the
-run ids that committed to it, oldest first (`State.retention`), bounded by
-the policy. Its **horizon** is `now − days`, or the time of the `runs`-th
-newest run. A run is deleted — `DELETE runs/{run}/` — once it is older
-than the horizon of every asset it committed to. A run that committed to
-a "forever" asset is kept.
+**Run records.** For each asset with a `runs` policy, the engine keeps the
+ids of the newest `runs` runs in which it succeeded (`State.retention`).
+An asset's **horizon** is `now − days`, or the time of the `runs`-th newest
+of those runs; with both, the earlier (whichever keeps more). Every
+`retention_interval` (60 s) the engine deletes — `DELETE runs/{run}/` —
+each finished run older than the horizon of every asset it ran. A run of
+an asset that keeps everything is kept. The engine lists `runs/` once when
+it starts and keeps that list in memory.
 
-**Data versions.** After each sweep, every output of an asset with a
-finite policy gets `store.expire(head, before=horizon)`, per partition.
-Every version written after the horizon still loads; the head always does.
+**Data versions.** An attempt of an asset with a finite policy carries
+its horizon in its spec (`retention.before`); before writing an output, the
+harness calls `store.expire(head, before)` with the committed head. Every
+version written after the horizon still loads; the head always does,
+whatever becomes of the attempt's own commit.
 
 **Manual deletion** goes through the same path and skips only active runs:
 

@@ -36,6 +36,8 @@ class AWSECS:
             stage["objects"],
             "--attempt",
             stage["attempt"],
+            "--run",
+            stage["run"],
         ]
         override: dict = {"name": "worker", "command": command}
         if self.options.get("cpu") is not None:
@@ -121,7 +123,7 @@ class K8sJob:
         container = kclient.V1Container(
             name="worker",
             image=self.options.get("image") or "cursus-worker",
-            args=["run", "--objects", stage["objects"], "--attempt", stage["attempt"]],
+            args=["run", "--objects", stage["objects"], "--attempt", stage["attempt"], "--run", stage["run"]],
             resources=kclient.V1ResourceRequirements(limits=resources) if resources else None,
         )
         spec = kclient.V1JobSpec(
@@ -187,7 +189,9 @@ class Modal:
 
     async def launch(self, stage: dict) -> dict:
         function = self._function()
-        call = await asyncio.to_thread(function.spawn, attempt=stage["attempt"], objects=stage["objects"])
+        call = await asyncio.to_thread(
+            function.spawn, attempt=stage["attempt"], run=stage["run"], objects=stage["objects"]
+        )
         return {"call_id": call.object_id}
 
     async def wait(self, run: dict, timeout: float) -> dict | None:

@@ -458,17 +458,17 @@ scope. Views such as the partition grid read those two things; nothing
 scans task history.
 
 **Retention.** `@asset(retention=Retention(days=…, runs=…))` bounds an
-asset's history; `Project(retention=…)` sets the default. A periodic sweep
-(`Engine.retention_interval`, defaulting to the GC cadence) deletes attempt
-records past both bounds together with their `specs/`, `results/` and
-`logs/` objects, `deltas/` and `data/` batch objects older than the policy
-and below every live consumer watermark that no head or retained commit
-references, and `commit/` records outside the policy that every automation
-has consumed. A pruned keyed delta prefix leaves one compacted `reset`
-delta at the horizon so folds of the surviving log are unchanged; a
-watermark pointing at a missing delta is dropped and the consumer re-drains
-`full`. Heads are never deleted. `cursus retention sweep` runs one pass
-locally.
+asset's history; `Project(retention=…)` sets the default and
+`Retention(forever=True)` opts out of it (object-store-state.md §11). Current
+state — heads, key indexes, cursors, watermarks — never depends on runs and
+never expires. Every `retention_interval` (60 s) the engine deletes finished
+runs (`runs/{run}/`: the run record, attempt files and logs) that every asset
+they ran has let go of; only runs in progress are protected. Data expires in
+the harness: an attempt of an asset with a finite policy carries the horizon
+in its spec, and before writing an output the harness calls
+`store.expire(head, before)` with the committed head, which stays loadable.
+`cursus runs delete RUN` and `cursus runs prune [--before] [--asset] [--keep]
+[--dry-run]` (and `DELETE /runs/{run}`, `POST /runs:prune`) delete runs by hand.
 
 ## 9. Automations
 
@@ -559,18 +559,20 @@ class Placement(Protocol):
 
 | Method | Contract |
 |---|---|
-| `launch` | Start the harness, handing it the two `stage` strings (container override, argv, function argument); the harness reaches `objects` with the environment's own auth. The spec is already at `specs/{attempt}.json`. Raising = attempt failed, retryable. |
+| `launch` | Start the harness, handing it the three `stage` strings — `attempt`, `run`, `objects` — (container override, argv, function argument); the harness reaches `objects` with the environment's own auth. The spec is already in the attempt file. Raising = attempt failed, retryable. |
 | `wait` | Block at most `timeout`; `None` while running, else `Exit`. Idempotent, safe after termination; a vanished run is `Exit(None, "lost")`. |
 | `cancel` | Best-effort, idempotent, never raises for a finished run. |
 
-Object keys are conventional under `objects`: `specs/{attempt}.json`,
-`results/{attempt}.json`, `logs/{attempt}/{seq}.jsonl`.
+Object keys are conventional under `objects`: the attempt file
+`runs/{run}/{attempt}.json` — the spec, then spec + result + log index —
+and its gzip log `runs/{run}/{attempt}.log` (`.log.{n}` chunks while it runs);
+see object-store-state.md §8.
 
 **Engine loop**, per attempt:
 
 ```python
-await objects.put(f"specs/{attempt}.json", spec)
-run = await placement.launch(Stage(attempt, objects_url))
+await objects.create(f"runs/{run_id}/{attempt}.json", {"spec": spec})
+run = await placement.launch(Stage(attempt, run_id, objects_url))
 deadline = now() + timeout
 while (exit := await placement.wait(run, lease_interval)) is None:
     if now() > deadline:
@@ -583,7 +585,7 @@ while (exit := await placement.wait(run, lease_interval)) is None:
         await placement.cancel(run)
         await placement.wait(run, grace)
         return
-result = await objects.get(f"results/{attempt}.json")
+result = (await objects.get(f"runs/{run_id}/{attempt}.json")).get("result")
 if result is None:
     return fail(f"harness exited without a result: {exit}", retryable=True)
 commit_or_fail(result)
@@ -608,10 +610,11 @@ code.
   "run":       {"id": "r7", "config": {}},
   "cursor":    "token-41",
   "prior":     {"qaqc_samples": Ref},
-  "baseline":  {"qaqc_samples": Ref},
-  "batches":   {"qaqc_samples": 7},
+  "outputs":   {"qaqc_samples": {"exists": true, "head": Ref, "batch": 7, "index": KeyIndex}},
+  "retention": {"before": 1790000000.0},
   "inputs": {
-    "qaqc_files":      {"ref": Ref, "changes": {"upserted": {"f1": "v3"}, "deleted": ["f0"], "full": false}},
+    "qaqc_files":      {"ref": Ref, "index": KeyIndex,
+                        "changes": {"from": 12, "to": 14, "after": null, "full": false, "limit": 100}},
     "site_events":     {"ref": Ref, "changes": {"batches": [4, 6], "full": false}},
     "site_health":     {"refs": {"Richmond": Ref, "Perth": Ref}},
     "psa_samples":     {"ref": Ref},
@@ -621,20 +624,25 @@ code.
 ```
 
 - `inputs` holds every pin by input name, including `deps`; the manifest
-  says which bind parameters. `changes` is the delivered selection —
-  `upserted` is the `Keys` selection and `ctx.changes[...].upserted` at
-  once, `batches` the `[lo, hi]` `Batches` range for an unkeyed upstream;
-  `full` marks a reset delivery.
-- `prior` is the committed head per output; `baseline` is the committed head
-  the store diffs against and `batches` the engine-assigned batch number per
-  incremental output. A `full` run is expressed by withholding `prior` and
-  `cursor` (`baseline` stays); there is no `mode` field.
+  says which bind parameters. `changes` is what to deliver — for a keyed
+  upstream a window of its pinned key index (the delta log `from`–`to`, or
+  the whole index when `full`), read `limit` keys at a time from `after`; for
+  an unkeyed one the `[lo, hi]` `Batches` range; a run's `keys=` override
+  names its keys outright. `full` marks a reset delivery.
+- `prior` is the committed head per output; `outputs` pins each output's
+  committed head, its engine-assigned batch number and, when keyed, its key
+  index. A `full` run is expressed by withholding `prior` and `cursor`
+  (`outputs` stays); there is no `mode` field. `retention.before` is the
+  horizon for `store.expire` (§8 Retention).
 - Store names, output config, annotations, placement and time windows are
   derived from the manifest and the key.
 
 ```json
-{"attempt": "t1/3", "status": "succeeded", "outputs": {"qaqc_samples": Ref}, "cursor": "token-42"}
-{"attempt": "t1/3", "status": "failed",
+{"status": "succeeded",
+ "outputs": {"qaqc_samples": {"ref": Ref, "keys": {"files": [FileInfo], "added": 1, "removed": 0, "exact": true}}},
+ "delivered": {"qaqc_files": {"after": null, "upserted": ["f1"], "deleted": ["f0"]}},
+ "cursor": "token-42"}
+{"status": "failed",
  "error": {"type": "ValueError", "message": "…", "traceback": "…", "retryable": true}}
 ```
 

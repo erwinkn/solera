@@ -149,3 +149,64 @@ async def test_jsonref_round_trip():
     written = await store.store([{"id": "a"}], None, scope(out))
     restored = Ref.from_json(written.ref.to_json())
     assert type(restored).__name__ == "JsonRef"
+
+
+def at(output, t, batch=None, partition=""):
+    """A write scope whose attempt id dates its objects at time `t`."""
+
+    from cursus.ids import ulid
+    from cursus.stores import Scope
+
+    return Scope(output=output, partition=partition, batch=batch, attempt=ulid(t))
+
+
+async def _paths(objects, prefix):
+    import obstore
+
+    out = []
+    async for chunk in obstore.list(objects, prefix=prefix):
+        out += [m["path"] for m in chunk]
+    return sorted(out)
+
+
+async def test_expire_keeps_every_version_after_the_horizon(json_store, objects):
+    """§9/§11: keyed batches below the snapshot the oldest retained version
+    folds from are deleted; every version after `before` still loads."""
+
+    store = JsonStore(snapshot_every=4)
+    store.bind_objects(objects)
+    out = Output("t", key="id", revision="v")
+    refs = []
+    for b in range(12):
+        prior = refs[-1] if refs else None
+        refs.append((await store.store(Patch([{"id": f"k{b}", "v": "1"}]), prior, at(out, 1000 + b, b))).ref)
+    await store.expire(refs[-1], before=1009)  # versions 9, 10, 11 must still load
+    names = [p.rsplit("/", 1)[-1][:13] for p in await _paths(objects, "data/t/")]
+    assert names == [f"b{b:012d}" for b in range(7, 12)] + ["s000000000007", "s000000000011"]
+    for b in (9, 10, 11):
+        assert len(await store.load(refs[b], list[dict], None)) == b + 1
+
+
+async def test_expire_drops_old_batches_of_an_event_log(json_store, objects):
+    out = Output("t", incremental=True)
+    ref = None
+    for b in range(5):
+        ref = (await json_store.store(Patch([{"e": b}]), ref, at(out, 1000 + b, b))).ref
+    await json_store.expire(ref, before=1003)
+    assert await json_store.load(ref, list[dict], None) == [{"e": 3}, {"e": 4}]
+
+
+async def test_expire_values_and_uncommitted_attempts(json_store, objects):
+    out = Output("t")
+    first = (await json_store.store({"v": 1}, None, at(out, 1000))).ref
+    second = (await json_store.store({"v": 2}, first, at(out, 2000))).ref
+    await json_store.expire(second, before=1500)
+    assert await _paths(objects, "data/t/") == [second.handle["object"]]
+    # Two attempts wrote batch 0; the newer one is committed. The older is
+    # dropped once it is past the horizon.
+    log = Output("log", incremental=True)
+    await json_store.store(Patch([{"e": "lost"}]), None, at(log, 1000, 0))
+    kept = (await json_store.store(Patch([{"e": "won"}]), None, at(log, 1001, 0))).ref
+    assert await json_store.load(kept, list[dict], None) == [{"e": "won"}]
+    await json_store.expire(kept, before=1000.5)
+    assert len(await _paths(objects, "data/log/")) == 1

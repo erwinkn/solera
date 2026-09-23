@@ -99,6 +99,9 @@ class Store(Protocol):
     async def store(self, write: Any, prior: Ref | None, scope: Scope) -> Written: ...
     async def load(self, ref: Ref, t: type, selection: Keys | Batches | None) -> Any: ...
 
+    # Optional: `async def expire(self, head: Ref, before: float) -> None` deletes
+    # what no version written after `before` needs; the head stays loadable (§9).
+
 
 def resolve_env(value: Any) -> Any:
     """`env:NAME` indirection for store/resource config, resolved in the harness.
@@ -168,20 +171,82 @@ def key_map(output: Output, rows: list[dict]) -> dict[str, str]:
     return result
 
 
+def _attempt_of(scope: Scope) -> str:
+    from .ids import ulid
+
+    return scope.attempt or ulid()
+
+
+def _parse(path: str) -> tuple[str, int, str] | None:
+    """`(kind, batch, attempt)` of a batch or snapshot object name
+    `{b|s}{batch:012d}-{attempt}.json`; `("v", -1, attempt)` for `v{attempt}.json`."""
+
+    name = path.rsplit("/", 1)[-1]
+    if not name.endswith(".json"):
+        return None
+    if name[:1] in ("b", "s") and len(name) > 19 and name[13] == "-":
+        try:
+            return name[0], int(name[1:13]), name[14:-5]
+        except ValueError:
+            return None
+    if name[:1] == "v":
+        return "v", -1, name[1:-5]
+    return None
+
+
+def remove_empty_dirs(objects, prefixes) -> None:
+    """A local filesystem store keeps directories its objects left behind and
+    lists them; object stores have no directories. Remove the empty ones."""
+
+    root = getattr(objects, "prefix", None)
+    if type(objects).__name__ != "LocalStore" or root is None:
+        return
+    for prefix in sorted(set(prefixes), key=len, reverse=True):
+        path = os.path.join(str(root), prefix.strip("/"))
+        while os.path.normpath(path) != os.path.normpath(str(root)):
+            try:
+                os.rmdir(path)
+            except OSError:
+                break
+            path = os.path.dirname(path)
+
+
+def _batch_path(prefix: str, kind: str, batch: int, attempt: str) -> str:
+    return f"{prefix}{batch // 1000:09d}/{kind}{batch:012d}-{attempt}.json"
+
+
+def _written_at(attempt: str) -> float | None:
+    from .ids import ulid_time
+
+    try:
+        return ulid_time(attempt)
+    except ValueError:
+        return None
+
+
 class JsonStore:
     """Default store (§4): one object per batch for incremental outputs, one
-    content-addressed object per version for values and partition sets.
+    object per version for values and partition sets.
 
-    Object layout under the attempt's `objects` namespace:
+    Object layout under the attempt's `objects` namespace, `{esc(scope)}`
+    being `_` for the unpartitioned scope:
 
-        data/{output}/{version}.json                value + partition-set payloads
-        data/{output}/{esc(scope)}/b{batch}.json    one batch: {"rows": …} for an
-                                                    unkeyed incremental output,
-                                                    {"upsert"/"reset", "remove": …}
-                                                    for a keyed one
-        data/{output}/{esc(scope)}/s{batch}.json    keyed snapshot {"rows": …},
-                                                    written every `snapshot_every`
-                                                    batches so loads fold a tail
+        data/{output}/{esc(scope)}/v{attempt}.json          a value or partition-set version
+        data/{output}/{esc(scope)}/{k}/b{batch}-{attempt}.json
+                                one batch: {"rows": …} for an unkeyed incremental
+                                output, {"upsert"/"reset", "remove": …} for a keyed one
+        data/{output}/{esc(scope)}/{k}/s{batch}-{attempt}.json
+                                keyed snapshot {"rows": …}, every `snapshot_every`
+                                batches, so loads fold a bounded tail
+
+    `{k}` is `batch // 1000`: a load lists only the directories its batches
+    are in, and `expire` walks the oldest ones first.
+
+    Every object is named after the attempt that wrote it, so no attempt ever
+    overwrites another's objects. When attempts wrote the same batch (a retry
+    after a failed commit), the newest attempt's object is the committed one:
+    later attempts only get that batch number while it is still uncommitted.
+    The attempt id also dates each object, which is how `expire` decides.
 
     The store never works out what changed: the harness does, against the
     output's key index, and skips writes that change nothing (§6).
@@ -218,6 +283,8 @@ class JsonStore:
             return t is None or _is_list_of_dicts(t) or _is_dataframe_type(t) or t is list
         return True  # unkeyed value: any JSON value
 
+    # -- writes ---------------------------------------------------------------
+
     async def store(self, write, prior: Ref | None, scope: Scope) -> Written:
         objects = self._require_objects()
         output = scope.output
@@ -244,14 +311,21 @@ class JsonStore:
             )
         if output.incremental:
             raise WriteError(f"{output.name}: an unkeyed incremental output only accepts Patch writes")
-        payload = write
+        return await self._store_version(objects, output, scope, prior, write, "value")
+
+    async def _store_version(self, objects, output, scope, prior, payload, mode) -> Written:
+        """One object per version; rewriting the prior version writes nothing."""
+
         version = digest(_canonical(payload))
-        path = f"data/{output.name}/{version}.json"
+        if prior is not None and version == prior.version:
+            return Written(prior)
+        path = f"{self._prefix(output, scope)}v{_attempt_of(scope)}.json"
         await self._put(objects, path, payload)
-        return Written(self._ref(output, scope, {"object": path, "mode": "value", "key": None}, version))
+        key = output.key if mode == "set" else None
+        return Written(self._ref(output, scope, {"object": path, "mode": mode, "key": key}, version))
 
     async def _store_set(self, objects, output, scope, prior, rows, remove, *, patch) -> Written:
-        """Partition-set write: one content-addressed payload per version."""
+        """Partition-set write: the element list, one object per version."""
 
         elements = [str(e) for e in rows]
         if patch and prior is not None:
@@ -259,12 +333,7 @@ class JsonStore:
             payload = [e for e in old if e not in remove and e not in elements] + elements
         else:
             payload = elements
-        version = digest(_canonical(payload))
-        if prior is not None and version == prior.version:
-            return Written(prior)
-        path = f"data/{output.name}/{version}.json"
-        await self._put(objects, path, payload)
-        return Written(self._ref(output, scope, {"object": path, "mode": "set", "key": output.key}, version))
+        return await self._store_version(objects, output, scope, prior, payload, "set")
 
     async def _store_batch(self, objects, output, scope, prior, rows, remove) -> Written:
         """Unkeyed incremental write: one `{"rows": …}` object per batch. With
@@ -280,7 +349,7 @@ class JsonStore:
         first = int(prior.handle["batches"][0]) if prior is not None else batch
         if prior is None:
             payload["reset"] = True
-        await self._put(objects, f"{prefix}b{batch:012d}.json", payload)
+        await self._put(objects, _batch_path(prefix, "b", batch, _attempt_of(scope)), payload)
         version = digest([prior.version if prior else "", digest({"rows": _canonical(rows)})])
         handle = {"mode": "batches", "prefix": prefix, "batches": [first, batch]}
         return Written(self._ref(output, scope, handle, version))
@@ -293,6 +362,7 @@ class JsonStore:
         key_map(output, rows)  # validates the key column and duplicate keys
         batch = self._batch(scope, prior)
         prefix = self._prefix(output, scope, prior)
+        attempt = _attempt_of(scope)
         extend = patch and prior is not None and "batches" in (prior.handle or {})
         if extend:
             payload = {"upsert": rows, "remove": sorted(remove)}
@@ -302,15 +372,19 @@ class JsonStore:
             payload = {"reset": True, "upsert": rows, "remove": []}
             first = batch
             version = digest(_canonical(rows))
-        await self._put(objects, f"{prefix}b{batch:012d}.json", payload)
+        await self._put(objects, _batch_path(prefix, "b", batch, attempt), payload)
         snap = (prior.handle or {}).get("snapshot", -1) if extend else -1
-        snap = await self._maybe_snapshot(objects, prefix, output.key, first, batch, snap)
+        base = snap if snap >= first else first - 1
+        if batch - base >= self.snapshot_every:
+            state = await self._fold(objects, prefix, output.key, first, batch, snap)
+            await self._put(objects, _batch_path(prefix, "s", batch, attempt), {"rows": list(state.values())})
+            snap = batch
         handle = {
             "mode": "keyed",
             "key": output.key,
             "prefix": prefix,
             "batches": [first, batch],
-            "snapshot": snap,
+            "snapshot": snap if snap >= first else -1,
         }
         return Written(self._ref(output, scope, handle, version))
 
@@ -321,13 +395,15 @@ class JsonStore:
         batches = (prior.handle or {}).get("batches") if prior is not None else None
         return int(batches[1]) + 1 if batches else 0
 
+    # -- reads ------------------------------------------------------------------
+
     async def load(self, ref: Ref, t, selection: Keys | Batches | None) -> Any:
         if is_ref_type(t):
             return ref
         objects = self._require_objects()
         handle = ref.handle or {}
         mode = handle.get("mode")
-        if mode == "batches" and "batches" in handle:
+        if mode == "batches":
             if isinstance(selection, Batches):
                 first, last = selection.lo, selection.hi
             elif selection is None:
@@ -335,15 +411,12 @@ class JsonStore:
             else:
                 raise StoreError(f"{ref.output}: an unkeyed incremental output takes Batches")
             rows = []
-            for b in range(int(first), int(last) + 1):
-                batch = await self._get(objects, f"{handle['prefix']}b{b:012d}.json")
-                if batch is None:
-                    continue
+            for batch in await self._batch_objects(objects, handle["prefix"], int(first), int(last)):
                 if batch.get("reset"):
                     rows = []
                 rows += batch.get("rows", [])
             return self._materialize(rows, t)
-        if mode == "keyed" and "batches" in handle:
+        if mode == "keyed":
             if isinstance(selection, Batches):
                 raise StoreError(f"{ref.output}: a keyed output takes Keys, not Batches")
             first, last = handle["batches"]
@@ -354,7 +427,6 @@ class JsonStore:
             if selection is not None:
                 rows = [r for r in rows if str(r.get(handle.get("key"))) in selection.revisions]
             return self._materialize(rows, t)
-        # Single-object payloads: values and partition sets.
         payload = await self._read(objects, ref)
         if mode == "set":
             elements = payload or []
@@ -365,53 +437,20 @@ class JsonStore:
             raise StoreError(f"{ref.output}: unkeyed output cannot serve a selection")
         return self._materialize(payload, t)
 
-    # -- batch layout ---------------------------------------------------------
-
-    @staticmethod
-    def _prefix(output, scope, prior=None) -> str:
-        """The scope's batch directory: the prior window's, so a renamed output
-        keeps extending its batches where they are (§2)."""
-
-        if prior is not None and "prefix" in (prior.handle or {}):
-            return prior.handle["prefix"]
-        # `_` is the unscoped directory — object paths cannot hold an empty segment.
-        return f"data/{output.name}/{quote(scope.partition or '_', safe='')}/"
-
-    def _snap_path(self, prefix: str, batch: int) -> str:
-        return f"{prefix}s{batch:012d}.json"
-
-    async def _payload(self, objects, ref) -> list:
-        payload = await self._read(objects, ref)
-        return payload if isinstance(payload, list) else []
-
-    async def _maybe_snapshot(self, objects, prefix, key_col, first, last, snap) -> int:
-        """Fold the batch window into `s{last}.json` when it is due; returns the
-        snapshot batch number to record in the ref handle."""
-
-        base = snap if isinstance(snap, int) and first <= snap else first - 1
-        if last - base < self.snapshot_every:
-            return snap if isinstance(snap, int) and first <= snap else -1
-        state = await self._fold(objects, prefix, key_col, first, last, snap)
-        await self._put(objects, self._snap_path(prefix, last), {"rows": list(state.values())})
-        return last
-
     async def _fold(self, objects, prefix, key_col, first, last, snap) -> dict:
-        """Replays batches [first..last] over the snapshot at `snap` (if any);
-        last writer wins per key, removes apply, `reset` batches start over.
-        Missing objects are skipped — retention may have pruned them."""
+        """The keyed content at batch `last`: the snapshot at `snap` (if any),
+        then batches up to `last`; last writer wins per key, removes apply,
+        `reset` batches start over. Missing batches — expired — are skipped."""
 
         state: dict[str, dict] = {}
         start = first
         if isinstance(snap, int) and first <= snap <= last:
-            base = await self._get(objects, self._snap_path(prefix, snap))
-            if base is not None:
-                for row in base.get("rows", []):
+            found = await self._winners(objects, prefix, "s", snap, snap)
+            if snap in found:
+                for row in (await self._get(objects, found[snap]) or {}).get("rows", []):
                     state[str(row[key_col])] = row
                 start = snap + 1
-        for b in range(start, last + 1):
-            batch = await self._get(objects, f"{prefix}b{b:012d}.json")
-            if batch is None:
-                continue
+        for batch in await self._batch_objects(objects, prefix, start, last):
             if batch.get("reset"):
                 state.clear()
             for row in batch.get("upsert", []):
@@ -420,6 +459,133 @@ class JsonStore:
                 state.pop(str(key), None)
         return state
 
+    async def _batch_objects(self, objects, prefix, first, last) -> list[dict]:
+        """The committed batch objects in `[first, last]`, in order, fetched in parallel."""
+
+        import asyncio
+
+        if last < first:
+            return []
+        found = await self._winners(objects, prefix, "b", first, last)
+        limit = asyncio.Semaphore(32)
+
+        async def get(path):
+            async with limit:
+                return await self._get(objects, path)
+
+        batches = await asyncio.gather(*(get(found[b]) for b in sorted(found)))
+        return [b for b in batches if b is not None]
+
+    async def _winners(self, objects, prefix, kind, first, last) -> dict[int, str]:
+        """Per batch in `[first, last]`, the object the newest attempt wrote."""
+
+        import asyncio
+
+        listed = await asyncio.gather(
+            *(self._list(objects, f"{prefix}{k:09d}/") for k in range(first // 1000, last // 1000 + 1))
+        )
+        best: dict[int, tuple[str, str]] = {}
+        for path in (p for paths in listed for p in paths):
+            parsed = _parse(path)
+            if parsed is None or parsed[0] != kind:
+                continue
+            _, batch, attempt = parsed
+            if first <= batch <= last and (batch not in best or attempt > best[batch][0]):
+                best[batch] = (attempt, path)
+        return {b: path for b, (_, path) in best.items()}
+
+    # -- retention (§9, §11) ------------------------------------------------------
+
+    async def expire(self, head: Ref, before: float) -> None:
+        """Delete what no version written after `before` needs; the head always
+        stays loadable.
+
+        Values: every older version object but the head's. Keyed batches:
+        everything below the newest snapshot a version after `before` folds
+        from. Unkeyed batches: the batches written before `before` — an event
+        log's content is the batches it retains. Objects of attempts that
+        never committed go once they are older than `before`."""
+
+        import obstore
+
+        objects = self._require_objects()
+        handle = head.handle or {}
+        mode = handle.get("mode")
+        doomed = []
+        if mode in ("value", "set"):
+            folder = handle["object"].rsplit("/", 1)[0] + "/"
+            for path in await self._list(objects, folder):
+                parsed = _parse(path)
+                at = _written_at(parsed[2]) if parsed else None
+                if path != handle["object"] and at is not None and at < before:
+                    doomed.append(path)
+        elif mode in ("keyed", "batches"):
+            first, last = (int(v) for v in handle["batches"])
+            prefix = handle["prefix"]
+            listing = await obstore.list_with_delimiter_async(objects, prefix)
+            folders = sorted(p.rstrip("/") + "/" for p in listing["common_prefixes"])
+            # Oldest directories first, up to the one holding the first batch
+            # written after `before`: everything older is below it.
+            winners: dict[tuple[str, int], tuple[str, str]] = {}
+            horizon = None
+            for folder in folders:
+                for path in sorted(await self._list(objects, folder)):
+                    parsed = _parse(path)
+                    if parsed is None or parsed[0] == "v":
+                        continue
+                    kind, batch, attempt = parsed
+                    current = winners.get((kind, batch))
+                    if current is None or attempt > current[0]:
+                        if current is not None and (_written_at(current[0]) or before) < before:
+                            doomed.append(current[1])  # an attempt that never committed
+                        winners[(kind, batch)] = (attempt, path)
+                    elif (_written_at(attempt) or before) < before:
+                        doomed.append(path)
+                recent = [
+                    b
+                    for (kind, b), (attempt, _) in winners.items()
+                    if kind == "b" and b <= last and (_written_at(attempt) or 0) >= before
+                ]
+                if recent:
+                    horizon = min(recent)
+                    break
+            horizon = last if horizon is None else horizon
+            if mode == "batches":
+                keep = horizon
+            else:
+                snaps = [b for kind, b in winners if kind == "s"]
+                inside = [b for b in snaps if first <= b <= horizon] if first <= horizon else []
+                older = [b for b in snaps if b <= horizon]
+                keep = max(inside) if inside else first if first <= horizon else max(older, default=0)
+            doomed += [path for (_, b), (_, path) in winners.items() if b < keep]
+        for i in range(0, len(doomed), 1000):
+            await obstore.delete_async(objects, doomed[i : i + 1000])
+        remove_empty_dirs(objects, [p.rsplit("/", 1)[0] for p in doomed])
+
+    async def _list(self, objects, prefix: str) -> list[str]:
+        import obstore
+
+        out = []
+        async for chunk in obstore.list(objects, prefix=prefix):
+            out.extend(meta["path"] for meta in chunk)
+        return out
+
+    # -- helpers ----------------------------------------------------------------
+
+    @staticmethod
+    def _prefix(output, scope, prior=None) -> str:
+        """The scope's directory: the prior window's, so a renamed output keeps
+        extending its batches where they are (§2)."""
+
+        if prior is not None and "prefix" in (prior.handle or {}):
+            return prior.handle["prefix"]
+        # `_` is the unscoped directory — object paths cannot hold an empty segment.
+        return f"data/{output.name}/{quote(scope.partition or '_', safe='')}/"
+
+    async def _payload(self, objects, ref) -> list:
+        payload = await self._read(objects, ref)
+        return payload if isinstance(payload, list) else []
+
     def _materialize(self, payload, t):
         if t is None or t is inspect.Parameter.empty:
             return payload
@@ -427,8 +593,6 @@ class JsonStore:
             import pandas as pd
 
             return pd.DataFrame(payload if isinstance(payload, list) else [payload])
-        if t in (list, dict, str, int, float, bool) or _is_list_of_dicts(t):
-            return payload
         return payload
 
     def _ref(self, output, scope, handle, version) -> JsonRef:
@@ -558,6 +722,8 @@ class BlobStore:
         return dt.datetime.now(dt.UTC).isoformat()
 
     async def store(self, write, prior: Ref | None, scope: Scope) -> Written:
+        import hashlib
+
         import obstore
 
         objects = self._resolve()
@@ -569,8 +735,11 @@ class BlobStore:
             raise WriteError(
                 f"{scope.output.name}: BlobStore accepts bytes or Path, not {type(write).__name__}"
             )
-        version = digest({"blob": True, "sha": __import__("hashlib").sha256(data).hexdigest()})
-        path = f"blobs/{scope.output.name}/{version}.bin"
+        version = digest({"blob": True, "sha": hashlib.sha256(data).hexdigest()})
+        if prior is not None and prior.version == version:
+            return Written(prior)
+        folder = f"blobs/{scope.output.name}/{quote(scope.partition or '_', safe='')}/"
+        path = f"{folder}v{_attempt_of(scope)}.bin"
         await obstore.put_async(objects, path, data, mode="overwrite", use_multipart=False)
         return Written(
             BlobRef(
@@ -579,9 +748,26 @@ class BlobStore:
                 handle={"object": path, "bytes": len(data)},
                 version=version,
                 partition=scope.partition,
-            ),
-            None,
+            )
         )
+
+    async def expire(self, head: Ref, before: float) -> None:
+        """Delete every older version but the head's (§9, §11)."""
+
+        import obstore
+
+        objects = self._resolve()
+        keep = head.handle["object"]
+        folder = keep.rsplit("/", 1)[0] + "/"
+        doomed = []
+        async for chunk in obstore.list(objects, prefix=folder):
+            for meta in chunk:
+                name = meta["path"].rsplit("/", 1)[-1]
+                at = _written_at(name[1:-4]) if name.startswith("v") and name.endswith(".bin") else None
+                if meta["path"] != keep and at is not None and at < before:
+                    doomed.append(meta["path"])
+        for i in range(0, len(doomed), 1000):
+            await obstore.delete_async(objects, doomed[i : i + 1000])
 
     async def load(self, ref: Ref, t, selection: Keys | None) -> Any:
         import obstore

@@ -209,7 +209,7 @@ def test_demo_end_to_end(demo):
         for attempt in detail["attempts"][task["id"]]:
             if attempt["status"] != "succeeded":
                 continue
-            result = client.get(f"{base}/attempts/{attempt['id']}/result").json()
+            result = client.get(f"{base}/runs/{delta}/attempts/{attempt['id']}/result").json()
             page = result["delivered"]["site_files"]
             seen = delivered.setdefault(task["scope"], [set(), set()])
             seen[0] |= set(page["upserted"])

@@ -4,14 +4,13 @@
 from __future__ import annotations
 
 import hmac
-import json
 import os
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Header, Query, Request, Response
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from .engine import Conflict, Engine
@@ -26,6 +25,13 @@ class RunInput(BaseModel):
     upstream: bool = False
     config: dict = Field(default_factory=dict)
     keys: dict | None = None
+
+
+class PruneInput(BaseModel):
+    before: float | None = None
+    asset: str | None = None
+    keep: int | None = Field(default=None, ge=1)
+    dry_run: bool = False
 
 
 class SourceCommitInput(BaseModel):
@@ -298,34 +304,45 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
 
     # -- attempts ----------------------------------------------------------------
 
-    @app.get("/api/projects/{p}/attempts/{attempt_id:path}/logs")
-    async def attempt_logs(p: str, attempt_id: str, request: Request):
+    @app.delete("/api/projects/{p}/runs/{run_id}")
+    async def delete_run(p: str, run_id: str, request: Request):
         runtime = await project_engine(request, p)
-        prefix = f"logs/{attempt_id}/"
+        await runtime.delete_run(run_id)
+        return {"deleted": [run_id]}
 
-        async def stream():
-            for key in await runtime.state.list_objects(prefix):
-                data = await runtime.state.get_object(key)
-                if data:
-                    yield data
-
-        return StreamingResponse(stream(), media_type="application/x-ndjson")
-
-    @app.get("/api/projects/{p}/attempts/{attempt_id:path}/spec")
-    async def attempt_spec(p: str, attempt_id: str, request: Request):
+    @app.post("/api/projects/{p}/runs:prune")
+    async def prune_runs(p: str, body: PruneInput, request: Request):
         runtime = await project_engine(request, p)
-        data = await runtime.state.get_object(f"specs/{attempt_id}.json")
-        if data is None:
-            raise KeyError(attempt_id)
-        return json.loads(data)
+        return await runtime.prune(before=body.before, asset=body.asset, keep=body.keep, dry_run=body.dry_run)
 
-    @app.get("/api/projects/{p}/attempts/{attempt_id:path}/result")
-    async def attempt_result(p: str, attempt_id: str, request: Request):
+    # -- attempts (§8) --------------------------------------------------------------
+
+    async def _attempt(runtime, run_id: str, attempt: str) -> dict:
+        record = await runtime.state.attempt_record(run_id, attempt)
+        if record is None:
+            raise KeyError(f"{run_id}/{attempt}")
+        return record
+
+    @app.get("/api/projects/{p}/runs/{run_id}/attempts/{attempt}/logs")
+    async def attempt_logs(
+        p: str, run_id: str, attempt: str, request: Request, tail: int | None = Query(None, ge=1)
+    ):
         runtime = await project_engine(request, p)
-        data = await runtime.state.get_object(f"results/{attempt_id}.json")
-        if data is None:
-            raise KeyError(attempt_id)
-        return json.loads(data)
+        data = await runtime.state.attempt_log(run_id, attempt, tail)
+        return Response(data, media_type="application/x-ndjson")
+
+    @app.get("/api/projects/{p}/runs/{run_id}/attempts/{attempt}/spec")
+    async def attempt_spec(p: str, run_id: str, attempt: str, request: Request):
+        runtime = await project_engine(request, p)
+        return (await _attempt(runtime, run_id, attempt))["spec"]
+
+    @app.get("/api/projects/{p}/runs/{run_id}/attempts/{attempt}/result")
+    async def attempt_result(p: str, run_id: str, attempt: str, request: Request):
+        runtime = await project_engine(request, p)
+        record = await _attempt(runtime, run_id, attempt)
+        if "result" not in record:
+            raise KeyError(f"{run_id}/{attempt}: no result yet")
+        return {**record["result"], "log": record.get("log")}
 
     # -- automations -------------------------------------------------------------
 
@@ -417,7 +434,7 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
             return Response(status_code=204)
         return {
             "task": task["attempt"],
-            "stage": {"attempt": task["attempt"], "objects": runtime.state.objects_url},
+            "stage": {"attempt": task["attempt"], "run": task["run"], "objects": runtime.state.objects_url},
             "lease_seconds": 30,
         }
 

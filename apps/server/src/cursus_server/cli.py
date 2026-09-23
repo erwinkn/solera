@@ -94,13 +94,23 @@ def main():
     run.add_argument("--config", default="{}", help="Run configuration as a JSON object")
     run.add_argument("--keys", action="append", default=[], help="EDGE=full or EDGE=k1,k2")
 
-    commands.add_parser("runs", help="List runs", parents=[common])
+    runs = commands.add_parser("runs", help="List, delete or prune runs (§11)", parents=[common])
+    runs_sub = runs.add_subparsers(dest="runs_command")
+    runs_delete = runs_sub.add_parser("delete", help="Delete a finished run")
+    runs_delete.add_argument("run_id")
+    runs_prune = runs_sub.add_parser("prune", help="Delete finished runs")
+    runs_prune.add_argument("--before", help="Only runs created before this ISO date or time")
+    runs_prune.add_argument("--asset", help="Only runs of this asset")
+    runs_prune.add_argument("--keep", type=int, help="Keep the N newest matching runs")
+    runs_prune.add_argument("--dry-run", action="store_true")
 
     run_show = commands.add_parser("run-show", help="Show a run's tasks and attempts", parents=[common])
     run_show.add_argument("run_id")
 
     logs = commands.add_parser("logs", help="Print an attempt's log", parents=[common])
+    logs.add_argument("run_id")
     logs.add_argument("attempt_id")
+    logs.add_argument("--tail", type=int, help="Only the last N lines")
 
     automations = commands.add_parser("automations", help="List or control automations", parents=[common])
     automations.add_argument("action", nargs="?", choices=["enable", "disable", "run-now"])
@@ -241,6 +251,18 @@ def _parse_keys(specs):
     return out
 
 
+def _prune_payload(args):
+    import datetime as dt
+
+    before = None
+    if args.before:
+        moment = dt.datetime.fromisoformat(args.before)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=dt.UTC)
+        before = moment.timestamp()
+    return {"before": before, "asset": args.asset, "keep": args.keep, "dry_run": args.dry_run}
+
+
 def _commit_payload(args):
     keys = json.loads(args.keys) if args.keys else None
     upsert = json.loads(args.upsert) if args.upsert else None
@@ -274,6 +296,14 @@ async def _remote(args, parser):
             print(json.dumps(detail, indent=2))
             if detail["request"]["status"] != "succeeded":
                 raise SystemExit(1)
+        elif args.command == "runs" and args.runs_command == "delete":
+            response = await client.delete(f"{base}/runs/{args.run_id}")
+            response.raise_for_status()
+            print(json.dumps(response.json(), indent=2))
+        elif args.command == "runs" and args.runs_command == "prune":
+            response = await client.post(f"{base}/runs:prune", json=_prune_payload(args))
+            response.raise_for_status()
+            print(json.dumps(response.json(), indent=2))
         elif args.command == "runs":
             response = await client.get(f"{base}/runs")
             response.raise_for_status()
@@ -283,7 +313,10 @@ async def _remote(args, parser):
             response.raise_for_status()
             print(json.dumps(response.json(), indent=2))
         elif args.command == "logs":
-            response = await client.get(f"{base}/attempts/{args.attempt_id}/logs")
+            params = {"tail": args.tail} if args.tail else {}
+            response = await client.get(
+                f"{base}/runs/{args.run_id}/attempts/{args.attempt_id}/logs", params=params
+            )
             response.raise_for_status()
             sys.stdout.write(response.text)
         elif args.command == "automations":
@@ -326,15 +359,19 @@ async def _local(args, parser):
             print(json.dumps(detail, indent=2))
             if detail["request"]["status"] != "succeeded":
                 raise SystemExit(1)
+        elif args.command == "runs" and args.runs_command == "delete":
+            await runtime.delete_run(args.run_id)
+            print(json.dumps({"deleted": [args.run_id]}, indent=2))
+        elif args.command == "runs" and args.runs_command == "prune":
+            print(json.dumps(await runtime.prune(**_prune_payload(args)), indent=2))
         elif args.command == "runs":
             print(json.dumps(await runtime.list_runs(), indent=2))
         elif args.command == "run-show":
             print(json.dumps(await runtime.run_detail(args.run_id), indent=2))
         elif args.command == "logs":
-            for key in await runtime.state.list_objects(f"logs/{args.attempt_id}/"):
-                data = await runtime.state.get_object(key)
-                if data:
-                    sys.stdout.write(data.decode())
+            sys.stdout.write(
+                (await runtime.state.attempt_log(args.run_id, args.attempt_id, args.tail)).decode()
+            )
         elif args.command == "automations":
             if not args.action:
                 autos = list(runtime.m.automations.values())

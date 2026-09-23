@@ -272,7 +272,9 @@ cursus serve [--project SPEC] [--insecure]   API + console (default project: the
 cursus manifest --project SPEC               print the project manifest
 cursus run TARGET... [--partitions latest|all|missing] [--partition KEY]
            [--upstream] [--full] [--keys EDGE=k1,k2] [--config JSON]
-cursus runs / run-show RUN_ID / logs ATTEMPT_ID
+cursus runs / run-show RUN_ID / logs RUN_ID ATTEMPT_ID [--tail N]
+cursus runs delete RUN_ID                    delete a finished run
+cursus runs prune [--before DATE] [--asset A] [--keep N] [--dry-run]
 cursus automations [enable|disable|run-now NAME]
 cursus migrate [OUTPUT...]                   apply pending output migrations locally
 cursus commit SOURCE [--version V] [--keys JSON] [--upsert JSON] [--remove K]
