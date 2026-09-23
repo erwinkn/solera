@@ -95,7 +95,7 @@ class Tx:
     transaction; the overlay applies to memory only after the durable commit
     (or the clean rollback of a memory-only write) is acknowledged."""
 
-    def __init__(self, inner: Transaction, state: "State"):
+    def __init__(self, inner: Transaction, state: State):
         self.t = inner
         self.state = state
         self.clock = state.clock
@@ -347,9 +347,7 @@ class Tx:
         self._w("attempts", (task_id, generation), record)
 
     async def attempts(self, task_id: str):
-        merged = {
-            int(k.rsplit("/", 1)[-1]): v for k, v in await self.t.scan(f"attempt/{esc(task_id)}/")
-        }
+        merged = {int(k.rsplit("/", 1)[-1]): v for k, v in await self.t.scan(f"attempt/{esc(task_id)}/")}
         for (tid, gen), value in self._ov.get("attempts", {}).items():
             if tid == task_id:
                 if value is _DEL:
@@ -582,9 +580,7 @@ class State:
             self._automations[record["name"]] = record
         run_records = {unesc(k.split("/", 1)[1]): v for k, v in runs}
         task_records = {unesc(k.split("/", 1)[1]): v for k, v in tasks}
-        self._runs = {
-            rid: rec for rid, rec in run_records.items() if rec.get("status") not in TERMINAL_RUN
-        }
+        self._runs = {rid: rec for rid, rec in run_records.items() if rec.get("status") not in TERMINAL_RUN}
         self._run_order = {rid: rec.get("created_at") or 0 for rid, rec in run_records.items()}
         self._tasks = {
             tid: rec
@@ -787,9 +783,7 @@ class State:
                         record["last_at"] = existing.get("last_at")
                         record["last_run"] = existing.get("last_run")
                         record["last_revision"] = existing.get("last_revision")
-                        record["commit_watermark"] = existing.get(
-                            "commit_watermark", self._commit_seq
-                        )
+                        record["commit_watermark"] = existing.get("commit_watermark", self._commit_seq)
                 await tx.put_automation(auto["name"], record)
 
     async def manifest(self) -> dict:
@@ -922,11 +916,7 @@ class State:
 
         lock = await tx.lock(task["asset"], task["scope"])
         attempt_id = f"{task['id']}/{task['generation']}"
-        if (
-            lock is None
-            or lock["attempt"] != attempt_id
-            or await tx.lease_until(lock) <= self.clock()
-        ):
+        if lock is None or lock["attempt"] != attempt_id or await tx.lease_until(lock) <= self.clock():
             raise LostOwnership(attempt_id)
         return lock
 
@@ -940,11 +930,7 @@ class State:
         if task is None or task["status"] not in {"running", "claimable"}:
             raise LostOwnership(attempt_id)
         lock = await tx.lock(task["asset"], task["scope"])
-        if (
-            lock is None
-            or lock["attempt"] != attempt_id
-            or await tx.lease_until(lock) <= self.clock()
-        ):
+        if lock is None or lock["attempt"] != attempt_id or await tx.lease_until(lock) <= self.clock():
             raise LostOwnership(attempt_id)
         return task
 
@@ -1139,11 +1125,7 @@ class State:
                 stats["left"] += task["status"] not in TERMINAL_TASK
                 stats["bad"] += task["status"] in BAD_OUTCOME
         run["updated_at"] = self.clock()
-        run["status"] = (
-            ("succeeded" if not stats["bad"] else "failed")
-            if stats["left"] <= 0
-            else "running"
-        )
+        run["status"] = ("succeeded" if not stats["bad"] else "failed") if stats["left"] <= 0 else "running"
         await tx.put_run(run)
         if stats["left"] <= 0:
             await tx.set_run_stats(run_id, None)
@@ -1202,9 +1184,7 @@ class State:
                     "generation": task["generation"],
                     "status": "skipped",
                     "finished_at": self.clock(),
-                    "result": {
-                        name: (head or {}).get("ref") for name, head in (baseline or {}).items()
-                    },
+                    "result": {name: (head or {}).get("ref") for name, head in (baseline or {}).items()},
                 },
             )
             await self.release(tx, task)

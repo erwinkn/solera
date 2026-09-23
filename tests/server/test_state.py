@@ -150,9 +150,7 @@ async def test_commit_installs_everything_atomically(state):
         events, high = await state.automation_events(tx, auto)
         # The automation watches `events`; the unrelated `summary` commit is
         # in the log but not an event for it.
-        assert events == [
-            {"commit": record["id"], "asset": "poll", "scope": "", "outputs": ["events"]}
-        ]
+        assert events == [{"commit": record["id"], "asset": "poll", "scope": "", "outputs": ["events"]}]
         assert high == int(record["id"])
         assert (await tx.task(task["id"]))["status"] == "succeeded"
 
@@ -352,7 +350,7 @@ async def test_restart_requeues_inflight_attempts(tmp_path, clock):
     first = State(await SlateState.open(url, "test"), clock=lambda: clock[0])
     await first.initialize(manifest(), "rev1")
     task = await make_task(first)
-    attempt = await claim(first, task)
+    await claim(first, task)
     await first.close()
 
     reopened = State(await SlateState.open(url, "test"), clock=lambda: clock[0])
@@ -374,9 +372,7 @@ async def test_restart_requeues_pool_claim(tmp_path, clock):
     await first.initialize(manifest(), "rev1")
     task = await make_task(first)
     attempt = await claim(first, task)
-    spec = {
-        "execution": {"kind": "Pool", "environment": {"name": "ingest"}, "placement": {}}
-    }
+    spec = {"execution": {"kind": "Pool", "environment": {"name": "ingest"}, "placement": {}}}
     await first.stage_pool_task({**task, "generation": 1}, prepared(), spec)
     claimed = await first.claim_pool_task(
         "w1", ["ingest"], {"cpu": 1, "memory": 10**9, "gpu": None}, lease_seconds=60

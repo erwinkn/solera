@@ -276,9 +276,7 @@ class JsonStore:
             rows = _rows(write.rows, output.name)
             if output.key is None:
                 return await self._store_batch(objects, output, scope, prior, rows, remove)
-            return await self._store_keyed(
-                objects, output, scope, prior, rows, remove, patch=True
-            )
+            return await self._store_keyed(objects, output, scope, prior, rows, remove, patch=True)
         if output.is_partition_set:
             return await self._store_set(objects, output, scope, prior, write or [], set(), patch=False)
         if output.key is not None:
@@ -291,9 +289,7 @@ class JsonStore:
         version = digest(_canonical(payload))
         path = f"data/{output.name}/{version}.json"
         await self._put(objects, path, payload)
-        return Written(
-            self._ref(output, scope, {"object": path, "mode": "value", "key": None}, version)
-        )
+        return Written(self._ref(output, scope, {"object": path, "mode": "value", "key": None}, version))
 
     async def _store_set(self, objects, output, scope, prior, rows, remove, *, patch) -> Written:
         """Partition-set write: one content-addressed payload per version, the
@@ -349,11 +345,7 @@ class JsonStore:
         if prior is not None and version == prior.version:
             return Written(prior)
         first, last = await self._append_window(objects, output, scope, prior)
-        batch = (
-            scope.batch
-            if scope.batch is not None
-            else max(last + 1, next_batch(scope.baseline or prior))
-        )
+        batch = scope.batch if scope.batch is not None else max(last + 1, next_batch(scope.baseline or prior))
         payload = {"rows": rows}
         if prior is None:
             payload["reset"] = True

@@ -108,9 +108,7 @@ async def test_batch_snapshot_at_pinned_version(store):
 
     out = output(incremental=True, partition_column="site")
     first = await store.store(Patch([{"e": 1}]), None, scope(out, partition="s1"))
-    second = await store.store(
-        Patch([{"e": 2}]), first.ref, scope(out, partition="s1", baseline=first.ref)
-    )
+    second = await store.store(Patch([{"e": 2}]), first.ref, scope(out, partition="s1", baseline=first.ref))
     assert first.delta.batch == 0 and first.delta.reset
     assert second.delta.batch == 1
     at_first = await store.load(first.ref, list[dict], None)

@@ -196,9 +196,7 @@ async def _resolve_inputs(spec, project, asset, objects):
             if "batches" in ch:
                 lo, hi = (int(v) for v in ch["batches"])
                 args[param] = await store.load(ref, t, Batches(lo, hi))
-                changes[param] = Changes(
-                    rows=args[param], batches=range(lo, hi + 1), full=full
-                )
+                changes[param] = Changes(rows=args[param], batches=range(lo, hi + 1), full=full)
             else:
                 # Keyed upstream: the pin carries the delivered key slice —
                 # whole on a one-take reset, chunked on a drain.

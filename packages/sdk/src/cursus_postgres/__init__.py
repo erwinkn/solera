@@ -370,9 +370,7 @@ class PostgresStore:
         if output.key is None:
             # Batch mode: stamp the batch columns, replace this batch's rows.
             if remove:
-                raise WriteError(
-                    f"{output.name}: remove is not allowed on an unkeyed incremental output"
-                )
+                raise WriteError(f"{output.name}: remove is not allowed on an unkeyed incremental output")
             batch = self._assigned_batch(cur, output, scope)
             partition_col = output.config.get("partition_column")
             for i, row in enumerate(rows):
@@ -386,9 +384,7 @@ class PostgresStore:
             else:
                 self._delete_slice(cur, table, {**slice_where, BATCH_COLUMN: batch})
             self._insert(cur, table, rows)
-            version = digest(
-                [prior.version if prior else "", digest({"rows": _canon(rows), "remove": []})]
-            )
+            version = digest([prior.version if prior else "", digest({"rows": _canon(rows), "remove": []})])
             return version, Delta(batch=batch, rows=len(rows), reset=prior is None), batch
 
         partition_col = output.config.get("partition_column")
@@ -408,9 +404,7 @@ class PostgresStore:
             upserted = {k: r for k, r in patch_map.items() if live.get(k) != r}
             deleted = sorted(set(live) - set(patch_map))
         else:
-            live = self._key_revs(
-                cur, output.name, scope.partition, list(set(patch_map) | remove)
-            )
+            live = self._key_revs(cur, output.name, scope.partition, list(set(patch_map) | remove))
             upserted = {k: r for k, r in patch_map.items() if live.get(k) != r}
             deleted = sorted(k for k in remove if k in live)
         if not upserted and not deleted:

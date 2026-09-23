@@ -788,13 +788,7 @@ class Engine:
         override = (run.get("keys") or {}).get(edge["output"])
         wm = await tx.watermark(task["asset"], param, task["scope"])
         draining = wm is not None and wm["batch"] == -1
-        reset = (
-            full
-            or wm is None
-            or draining
-            or wm.get("fingerprint") != fingerprint
-            or override == "full"
-        )
+        reset = full or wm is None or draining or wm.get("fingerprint") != fingerprint or override == "full"
 
         # A keys= override is a one-off selection — it never moves the watermark.
         if isinstance(override, dict) and "keys" in override and not reset:
@@ -912,13 +906,11 @@ class Engine:
         pending = sorted(latest.items(), key=lambda kv: kv[1])
         take, rest = pending[:batch_size], pending[batch_size:]
         delivered_ups, delivered_del = {}, []
-        for key, (b, i, kind) in take:
+        for key, (b, _i, kind) in take:
             if kind == "del":
                 delivered_del.append(key)
             else:
-                delivered_ups[key] = str(
-                    (self._delta_upsert(deltas, b) or {}).get(key, "")
-                )
+                delivered_ups[key] = str((self._delta_upsert(deltas, b) or {}).get(key, ""))
         pin = {
             "ref": ref,
             "changes": {"upserted": delivered_ups, "deleted": delivered_del, "full": False},
@@ -1080,9 +1072,7 @@ class Engine:
             prior_delta = (((head or {}).get("ref") or {}).get("meta") or {}).get("delta")
             batch = int(prior_delta["batch"]) + 1 if prior_delta else 0
             current = (
-                await self.state.delta_key_map(name, "", int(prior_delta["batch"]))
-                if prior_delta
-                else {}
+                await self.state.delta_key_map(name, "", int(prior_delta["batch"])) if prior_delta else {}
             )
             if keyed:
                 if keys is not None:
@@ -1122,9 +1112,7 @@ class Engine:
                 if keys is not None:
                     delta["reset"] = True  # a full-map commit supersedes the log
                 path = delta_path(name, "", batch)
-                await self.state.put_object(
-                    path, json.dumps(delta, sort_keys=True, allow_nan=False).encode()
-                )
+                await self.state.put_object(path, json.dumps(delta, sort_keys=True, allow_nan=False).encode())
                 meta["delta"] = {
                     "object": path,
                     "batch": batch,

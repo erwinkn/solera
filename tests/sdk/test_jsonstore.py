@@ -47,9 +47,7 @@ async def test_patch_remove_drops_keys(json_store):
 
     out = Output("t", key="id", revision="v")
     first = await json_store.store(Patch([{"id": "a", "v": "1"}, {"id": "b", "v": "1"}]), None, scope(out))
-    second = await json_store.store(
-        Patch([], remove=["a"]), first.ref, scope(out, baseline=first.ref)
-    )
+    second = await json_store.store(Patch([], remove=["a"]), first.ref, scope(out, baseline=first.ref))
     assert second.delta.deleted == ("a",)
     assert second.delta.upserted == {}
     loaded = await json_store.load(second.ref, list[dict], None)
@@ -80,9 +78,7 @@ async def test_identical_keyed_content_emits_no_delta(json_store):
 
     out = Output("t", key="id", revision="v")
     first = await json_store.store([{"id": "a", "v": "1"}], None, scope(out))
-    again = await json_store.store(
-        [{"id": "a", "v": "1"}], None, scope(out, baseline=first.ref)
-    )
+    again = await json_store.store([{"id": "a", "v": "1"}], None, scope(out, baseline=first.ref))
     assert again.ref is first.ref
     assert again.delta is None
 
@@ -94,9 +90,7 @@ async def test_unkeyed_incremental_batches(json_store):
     out = Output("t", incremental=True)
     first = await json_store.store(Patch([{"e": 1}]), None, scope(out, batch=0))
     assert first.delta.batch == 0 and first.delta.rows == 1 and first.delta.reset
-    second = await json_store.store(
-        Patch([{"e": 2}]), first.ref, scope(out, batch=1, baseline=first.ref)
-    )
+    second = await json_store.store(Patch([{"e": 2}]), first.ref, scope(out, batch=1, baseline=first.ref))
     assert second.delta.batch == 1 and second.delta.rows == 1
     # A load at the first ref returns only its batch (snapshot at the version).
     at_first = await json_store.load(first.ref, list[dict], None)
