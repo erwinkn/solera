@@ -41,22 +41,27 @@ the file's codec (footer).
 ## Filters
 
 ```
-filters := filter(keys) filter(pairs)
+filters := filter(keys) filter(pairs) filter(tombstones)
 filter  := nbits varint, k u8, bits (ceil(nbits / 8) bytes)
 ```
 
-Two Bloom filters: one over every key in the file, one over every
-`(key, version)` pair of a non-deleted entry. Deleted entries add their key
-to the key filter only.
+Three Bloom filters: one over every key in the file, one over every
+`(key, version)` pair of a non-deleted entry, and one over every deleted
+key. Each is sized to its own item count.
 
-- Items: a key is `b"k" + key`; a pair is `b"p" + varint(len(key)) + key + version`.
-- Hash: `d = blake2b(item, digest_size=16)` (no key, no salt, no person);
-  `h1 = u64(d[0:8])`, `h2 = u64(d[8:16]) | 1`.
-- Bit `i` of `k` is `(h1 + i·h2) mod 2^64 mod nbits`, for `i` in `0..k`;
-  bit `b` lives in byte `b // 8`, at position `b % 8` (least significant
-  first).
-- Defaults: 14 bits per item, `k = 10`, `nbits` rounded up to a multiple of
-  64 (minimum 64).
+- Items: a key is `b"k" + key`; a pair is `b"p" + varint(len(key)) + key +
+  version`; a deleted key is `b"t" + key`.
+- Filters are **blocked**: `nbits` is a whole number of 512-bit (64-byte)
+  blocks, and all `k` bits of an item fall in one block — one cache line
+  per item.
+- Hash: `h = XXH3-128(item)` with seed 0, as a 128-bit integer;
+  `h1 = h mod 2^64` (the low half), `h2 = h >> 64` (the high half).
+- Block: `(h1 · (nbits / 512)) >> 64` (a 128-bit product).
+- Bits: with `a = h2 mod 2^32` and `b = (h2 >> 32) | 1`, bit `i` of `k` is
+  `block · 512 + (a + i·b) mod 512`, for `i` in `0..k`; bit `p` lives in
+  byte `p // 8`, at position `p % 8` (least significant first).
+- Defaults: 14 bits per item, `k = 10`, `nbits = 512 · max(1, ceil(items ·
+  14 / 512))`.
 
 ## Index
 
@@ -97,6 +102,6 @@ the version, the tail CRC, and each block's CRC before decoding it.
 
 ## Empty files
 
-A file with no entries has no blocks; its filters have `nbits = 64`, and
+A file with no entries has no blocks; each of its filters has `nbits = 512`, and
 its index has empty `min_key` and `max_key` and `blocks = 0`. Writers only
 produce one for an empty delta.

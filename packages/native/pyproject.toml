@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "cursus-native"
+version = "0.0.1"
+description = "Native acceleration for cursus: the .kx key index format"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+
+[tool.maturin]
+module-name = "cursus_native"
+features = ["extension-module"]

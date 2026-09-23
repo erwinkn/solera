@@ -8,3 +8,4 @@ dist/
 .env
 node_modules/
 apps/console/test-results/
+packages/native/target/
