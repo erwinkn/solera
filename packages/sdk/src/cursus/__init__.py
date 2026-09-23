@@ -12,6 +12,7 @@ from .sdk import (
     In,
     Incremental,
     JsonRef,
+    KeyCache,
     Migration,
     OnChange,
     OnDeploy,
@@ -36,7 +37,6 @@ from .sdk import (
 from .stores import (
     Batches,
     BlobStore,
-    Delta,
     JsonStore,
     Keys,
     Patch,
@@ -48,8 +48,6 @@ from .stores import (
     StoreError,
     WriteError,
     Written,
-    delta_path,
-    next_batch,
 )
 
 __all__ = [
@@ -63,13 +61,13 @@ __all__ = [
     "BlobStore",
     "Changes",
     "Cron",
-    "Delta",
     "Every",
     "In",
     "Incremental",
     "JsonRef",
     "JsonStore",
     "K8sJob",
+    "KeyCache",
     "Keys",
     "Local",
     "Migration",
@@ -102,9 +100,7 @@ __all__ = [
     "Written",
     "asset",
     "canonical_partition",
-    "delta_path",
     "digest",
     "job",
-    "next_batch",
     "split_partition",
 ]

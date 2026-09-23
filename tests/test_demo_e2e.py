@@ -201,17 +201,21 @@ def test_demo_end_to_end(demo):
     assert run_status(delta) == "succeeded"
     detail = client.get(f"{base}/runs/{delta}").json()
     current_keys = site_file_keys()
-    spec_changes = {}
+    delivered = {}
     for task in detail["tasks"]:
         if task["asset"] != "file_index":
             continue
         assert task["attempt_count"] >= 2, "batch_size=2 over 4 files must continue with more"
-        attempt_id = detail["attempts"][task["id"]][-1]["id"]
-        spec = client.get(f"{base}/attempts/{attempt_id}/spec").json()
-        spec_changes[task["scope"]] = spec["inputs"]["site_files"]["changes"]
-    assert spec_changes, "file_index should have run on the new tick"
-    for scope, changes in spec_changes.items():
-        upserted, deleted = set(changes["upserted"]), set(changes["deleted"])
+        for attempt in detail["attempts"][task["id"]]:
+            if attempt["status"] != "succeeded":
+                continue
+            result = client.get(f"{base}/attempts/{attempt['id']}/result").json()
+            page = result["delivered"]["site_files"]
+            seen = delivered.setdefault(task["scope"], [set(), set()])
+            seen[0] |= set(page["upserted"])
+            seen[1] |= set(page["deleted"])
+    assert delivered, "file_index should have run on the new tick"
+    for scope, (upserted, deleted) in delivered.items():
         assert upserted <= current_keys[scope]
         assert deleted <= prior_keys.get(scope, set()) - current_keys[scope]
         assert upserted or deleted

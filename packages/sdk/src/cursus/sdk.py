@@ -594,6 +594,35 @@ class Retention:
         return {"days": self.days, "runs": self.runs}
 
 
+_SIZE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([KMGT]?)B?\s*$", re.IGNORECASE)
+
+
+def _bytes(value: int | str) -> int:
+    if isinstance(value, int):
+        return value
+    match = _SIZE.fullmatch(str(value))
+    if not match:
+        raise RegistrationError(f"Invalid size: {value!r}")
+    return int(float(match[1]) * 1024 ** " KMGT".index((match[2] or " ").upper()))
+
+
+@dataclass(frozen=True)
+class KeyCache:
+    """A local disk cache of key index files (docs/object-store-state.md §6),
+    shared by the engine and attempts on its machine. Index files never
+    change, so a cached copy is never stale. `path=None`: next to `file://`
+    state, else a temporary directory."""
+
+    max_size: int | str = "8GB"
+    path: str | None = None
+
+    def spec(self) -> dict:
+        return {"max_bytes": _bytes(self.max_size), "path": self.path}
+
+
+DEFAULT_KEY_CACHE = KeyCache()
+
+
 # ---------------------------------------------------------------------------
 # Partition key encoding (§7)
 # ---------------------------------------------------------------------------
@@ -642,9 +671,11 @@ class Asset:
         on_version_change: str = "fail",
         retention: Retention | None = None,
         automations: Any = (),
+        aliases: tuple | list = (),
     ):
         self.fn = fn
         self.name = fn.__name__
+        self.aliases = tuple(str(a) for a in aliases)
         if outputs is None:
             outputs = (Output(fn.__name__),)
         elif isinstance(outputs, Output):
@@ -735,12 +766,14 @@ class Project:
         resources: dict[str, Any] | None = None,
         automations: list[Automation] | None = None,
         retention: Retention | None = None,
+        key_cache: KeyCache | None = DEFAULT_KEY_CACHE,
         name: str = "default",
     ):
         from .stores import JsonStore
 
         self.name = name
         self.retention = retention
+        self.key_cache = key_cache
         self.assets: dict[str, Asset] = {}
         self.stores = {DEFAULT_STORE: JsonStore(), **(stores or {})}
         self.executors = list(executors or [])
@@ -864,6 +897,18 @@ class Project:
             if not NAME.fullmatch(store_name):
                 raise RegistrationError(f"Invalid store name: {store_name!r}")
         outputs = self._output_table()
+        claimed = {}
+        for asset in self.assets.values():
+            for alias in asset.aliases:
+                if not NAME.fullmatch(alias) or alias == asset.name:
+                    raise RegistrationError(f"{asset.name}: invalid alias {alias!r}")
+                if alias in self.assets or alias in outputs:
+                    raise RegistrationError(f"{asset.name}: alias {alias!r} names a current asset or output")
+                if alias in claimed:
+                    raise RegistrationError(
+                        f"{asset.name}: alias {alias!r} is also claimed by {claimed[alias]}"
+                    )
+                claimed[alias] = asset.name
 
         # Resolve every asset's inputs/deps/partitions and validate edges.
         assets = {}
@@ -1123,6 +1168,7 @@ class Project:
                 "version": asset.version,
                 "on_version_change": asset.on_version_change,
                 "retention": asset.retention.spec() if asset.retention else None,
+                "aliases": list(asset.aliases),
                 "code_hash": _code_hash(asset.fn),
                 "doc": inspect.getdoc(asset.fn) or "",
                 "types": {
@@ -1163,6 +1209,7 @@ class Project:
             ),
             "automations": automation_records,
             "retention": self.retention.spec() if self.retention else None,
+            "key_cache": self.key_cache.spec() if self.key_cache else None,
         }
         return {**body, "revision": digest(body)}
 

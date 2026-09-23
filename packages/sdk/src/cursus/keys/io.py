@@ -67,6 +67,11 @@ class DiskCache:
             self._lru.move_to_end(name)
         return self._file(key)
 
+    def forget(self, key: str) -> None:
+        name = quote(key, safe="")
+        with self._lock:
+            self._size -= self._lru.pop(name, 0)
+
     def put(self, key: str, data: bytes) -> str:
         if len(data) > self.max_bytes:
             raise ValueError("object larger than the cache")
@@ -159,10 +164,14 @@ class ObjectIO:
         """Bytes `[start, end)` of an object of `size` bytes."""
 
         if self.cache is not None:
-            local = await self._cached(path, size)
-            with open(local, "rb") as f:
-                f.seek(start)
-                return f.read(end - start)
+            for _ in range(2):
+                local = await self._cached(path, size)
+                try:
+                    with open(local, "rb") as f:
+                        f.seek(start)
+                        return f.read(end - start)
+                except FileNotFoundError:
+                    self.cache.forget(path)  # evicted by another process sharing the cache
         if end - start > RANGE:
             parts = await asyncio.gather(
                 *(self._get(path, s, min(end, s + RANGE)) for s in range(start, end, RANGE))
@@ -187,3 +196,35 @@ class ObjectIO:
             async with self._sem:
                 await obstore.delete_async(self.store, paths)
                 self.metrics.deletes += len(paths)
+
+
+_caches: dict[str, DiskCache] = {}
+
+
+def key_cache(spec: dict | None, objects_url: str) -> DiskCache | None:
+    """The process-wide disk cache a project's `key_cache` setting names
+    (docs/object-store-state.md §6): `path=None` puts it next to `file://`
+    state, or in a temporary directory for remote state. Index files are
+    immutable and uniquely named, so every process on the machine can share it."""
+
+    if spec is None:
+        return None
+    path = spec.get("path")
+    if path is None:
+        from hashlib import sha256
+        from urllib.parse import unquote, urlsplit
+
+        u = urlsplit(objects_url)
+        if u.scheme == "file":
+            root = os.path.dirname(unquote(u.path).rstrip("/"))
+            path = os.path.join(root, ".key-cache", os.path.basename(unquote(u.path).rstrip("/")))
+        else:
+            digest = sha256(objects_url.encode()).hexdigest()[:16]
+            path = os.path.join(tempfile.gettempdir(), "cursus-key-cache", digest)
+    cache = _caches.get(path)
+    if cache is None:
+        try:
+            cache = _caches[path] = DiskCache(path, int(spec.get("max_bytes") or 8 * 2**30))
+        except OSError:
+            return None  # no writable data directory: run uncached
+    return cache

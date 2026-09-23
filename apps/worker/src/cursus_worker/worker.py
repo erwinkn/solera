@@ -2,8 +2,10 @@
 
 `python -m cursus_worker run --objects URL --attempt ID`:
 fetch spec -> refuse on revision mismatch -> resolve `env:` -> load inputs per
-annotation -> build ctx -> run the producer -> store() each returned output,
-write delta objects -> write the result last, in one PUT.
+annotation (Incremental edges through the upstream key index) -> build ctx ->
+run the producer -> for each returned output, work out what changed against
+its key index, store() it unless nothing did, write the delta file -> write
+the result last, in one PUT.
 """
 
 from __future__ import annotations
@@ -21,6 +23,8 @@ import traceback
 import typing
 from pathlib import Path
 
+from cursus.keys.index import DeltaFiles, IndexState, KeyIndex, key_bytes, key_str
+from cursus.keys.io import ObjectIO, key_cache
 from cursus.sdk import (
     UNSET,
     Asset,
@@ -32,7 +36,18 @@ from cursus.sdk import (
     is_ref_type,
     split_partition,
 )
-from cursus.stores import Batches, Keys, Scope, StoreError, delta_path, resolve_env
+from cursus.stores import (
+    Batches,
+    Keys,
+    Patch,
+    Scope,
+    Sql,
+    StoreError,
+    WriteError,
+    _rows,
+    key_map,
+    resolve_env,
+)
 
 
 def _load_module(path: Path):
@@ -163,13 +178,18 @@ class LogShipper:
         self.entries.clear()
 
 
-async def _resolve_inputs(spec, project, asset, objects):
-    """Load each pin by annotation; build call args + ctx.changes (§5, §10)."""
+async def _resolve_inputs(spec, project, asset, keys_io):
+    """Load each pin by annotation; build call args + ctx.changes (§5, §10).
+
+    An Incremental edge over a keyed upstream reads its page from the pinned
+    key index — the pending deltas in `[from, to]`, or the whole index for a
+    full delivery — and loads just those keys. `delivered` reports where the
+    page ended, for the engine's watermark (§6)."""
 
     manifest_asset = project.manifest["assets"][asset.name]
     edges = manifest_asset["inputs"]
     hints = typing.get_type_hints(asset.fn)
-    args, changes = {}, {}
+    args, changes, delivered = {}, {}, {}
     for name, pin in spec["inputs"].items():
         edge = edges.get(name)
         if edge is None:  # a dep pin: recorded, never bound
@@ -197,24 +217,35 @@ async def _resolve_inputs(spec, project, asset, objects):
                 lo, hi = (int(v) for v in ch["batches"])
                 args[param] = await store.load(ref, t, Batches(lo, hi))
                 changes[param] = Changes(rows=args[param], batches=range(lo, hi + 1), full=full)
+                continue
+            if "keys" in ch:  # a run's keys= override: a one-off selection
+                upserted, deleted, after = {str(k): "" for k in ch["keys"]}, (), None
             else:
-                # Keyed upstream: the pin carries the delivered key slice —
-                # whole on a one-take reset, chunked on a drain.
-                upserted = ch.get("upserted") or {}
-                deleted = ch.get("deleted") or []
-                args[param] = await store.load(ref, t, Keys(upserted))
-                changes[param] = Changes(
-                    rows=args[param],
-                    deleted=tuple(deleted),
-                    full=full,
-                    upserted=tuple(sorted(upserted)),
-                )
+                index = KeyIndex(keys_io, None, IndexState.from_json(pin["index"]))
+                start = key_bytes(ch["after"]) if ch.get("after") is not None else None
+                if full:
+                    keys, versions, nxt = await index.page(start, int(ch["limit"]))
+                    flags = bytes(len(keys))
+                else:
+                    keys, versions, flags, nxt = await index.pending(
+                        int(ch["from"]), int(ch["to"]), start, int(ch["limit"])
+                    )
+                upserted = {
+                    key_str(k): key_str(v) for k, v, d in zip(keys, versions, flags, strict=True) if not d
+                }
+                deleted = tuple(key_str(k) for k, d in zip(keys, flags, strict=True) if d)
+                after = key_str(nxt) if nxt is not None else None
+            args[param] = await store.load(ref, t, Keys(upserted))
+            changes[param] = Changes(
+                rows=args[param], deleted=deleted, full=full, upserted=tuple(sorted(upserted))
+            )
+            delivered[param] = {"after": after, "upserted": sorted(upserted), "deleted": list(deleted)}
             continue
         if t is not None and is_ref_type(t):
             args[param] = ref
         else:
             args[param] = await store.load(ref, t, None)
-    return args, changes
+    return args, changes, delivered
 
 
 def _dict_inner(t):
@@ -227,15 +258,19 @@ def _dict_inner(t):
     return None
 
 
-async def _store_outputs(spec, project, asset, objects, result_value):
-    """store() each returned output and write its delta object (§2.1, §4)."""
+async def _store_outputs(spec, project, asset, objects, keys_io, result_value):
+    """Store each returned output (§4, §6, §9).
+
+    A keyed output's write is compared with its key index as pinned in the
+    spec: a write that changes nothing is not stored at all and keeps the
+    head; otherwise the store writes it and the changed entries become the
+    batch's delta file. Returns `{name: entry}` and the cursor."""
 
     manifest_asset = project.manifest["assets"][asset.name]
     declared = {o["name"]: o for o in manifest_asset["outputs"]}
     decls = {o.name or asset.name: o for o in asset.outputs}
     priors = {name: Ref.from_json(r) for name, r in (spec.get("prior") or {}).items()}
-    baselines = {name: Ref.from_json(r) for name, r in (spec.get("baseline") or {}).items()}
-    batches = spec.get("batches") or {}
+    pinned = spec.get("outputs") or {}
 
     if isinstance(result_value, Result):
         values, cursor = result_value.outputs, result_value.cursor
@@ -248,7 +283,7 @@ async def _store_outputs(spec, project, asset, objects, result_value):
     else:
         raise StoreError(f"{asset.name}: multi-output assets must return Result(outputs={{...}})")
 
-    refs = {}
+    entries = {}
     for name, value in values.items():
         if name not in decls:
             raise StoreError(f"{asset.name}: returned undeclared output {name!r}")
@@ -271,39 +306,75 @@ async def _store_outputs(spec, project, asset, objects, result_value):
             except Exception as error:
                 raise StoreError(f"{output.name}: migration failed: {error}") from error
             schema = applied[-1] if applied else output.migrations[-1].name
+        info = pinned.get(name) or {}
         prior = priors.get(name)
         scope = Scope(
             output=output,
             partition=spec["partition"],
-            batch=batches.get(name),
-            baseline=baselines.get(name),
+            batch=info.get("batch"),
+            attempt=spec["attempt"],
+            aliases=tuple(info.get("aliases") or ()),
         )
-        written = await store.store(value, prior, scope)
+        entry = {}
+        if info.get("index") is not None:
+            index = KeyIndex(keys_io, None, IndexState.from_json(info["index"]))
+            written = None
+            if isinstance(value, Sql):
+                # Rows the harness never sees: the store reports the new key map.
+                written = await store.store(value, prior, scope)
+                if written.keys is None:
+                    raise StoreError(f"{output.name}: store {store_name!r} reported no keys for a Sql write")
+                new, removes, replace = dict(written.keys), [], True
+            else:
+                patch = isinstance(value, Patch)
+                rows = value.rows if patch else value
+                if output.is_partition_set:
+                    rows = list(rows or [])
+                else:
+                    rows = _rows(rows, output.name)
+                new = key_map(output, rows)
+                # With no prior (a first write, or a full run) a Patch is the whole content.
+                replace = not patch or prior is None
+                removes = [] if replace else [str(k) for k in value.remove if str(k) not in new]
+            delta = await index.changes(
+                [key_bytes(k) for k in new],
+                [key_bytes(v) for v in new.values()],
+                [key_bytes(k) for k in removes],
+                replace=replace,
+            )
+            if written is None:
+                if not len(delta) and info.get("exists"):
+                    entries[name] = {"unchanged": True}
+                    continue
+                written = await store.store(value, prior, scope)
+            files = (
+                await index.write(int(info["batch"]), spec["attempt"], delta)
+                if len(delta)
+                else DeltaFiles([], 0, 0, True)
+            )
+            entry["keys"] = files.to_json()
+            if output.is_partition_set:
+                if replace:
+                    elements = set(new)
+                else:
+                    elements = (set(info.get("elements") or ()) - set(removes)) | set(new)
+                entry["elements"] = sorted(elements)
+        else:
+            if isinstance(value, Sql) and output.incremental:
+                raise WriteError(f"{output.name}: Sql writes need a keyed output")
+            written = await store.store(value, prior, scope)
         if written.ref is None:
             continue
         ref = dataclasses.replace(written.ref, store=store_name)
         if schema is not None:
             ref = dataclasses.replace(ref, handle={**(ref.handle or {}), "schema": schema})
-        if written.delta is not None:
-            path = delta_path(output.name, spec["partition"], written.delta.batch)
-            await _put(
-                objects,
-                path,
-                json.dumps(written.delta.to_json(), sort_keys=True, allow_nan=False).encode(),
-            )
-            ref = dataclasses.replace(
-                ref,
-                meta={
-                    **ref.meta,
-                    "delta": {
-                        "object": path,
-                        "batch": written.delta.batch,
-                        "rows": written.delta.rows,
-                    },
-                },
-            )
-        refs[name] = ref.to_json()
-    return refs, cursor
+        entry["ref"] = ref.to_json()
+        entries[name] = entry
+    return entries, cursor
+
+
+def _key_io(objects, objects_url: str, project: Project) -> ObjectIO:
+    return ObjectIO(objects, cache=key_cache(project.manifest.get("key_cache"), objects_url))
 
 
 async def run_attempt(objects_url: str, attempt: str, entrypoint: str | Project):
@@ -346,7 +417,8 @@ async def run_attempt(objects_url: str, attempt: str, entrypoint: str | Project)
             store.bind_objects(objects)
     shipper = LogShipper(objects, attempt)
     try:
-        args, changes = await _resolve_inputs(spec, project, asset, objects)
+        keys_io = _key_io(objects, objects_url, project)
+        args, changes, delivered = await _resolve_inputs(spec, project, asset, keys_io)
         ctx = Ctx(spec, asset, project, objects, changes, shipper)
         signature = inspect.signature(asset.fn)
         if "ctx" in signature.parameters:
@@ -357,9 +429,9 @@ async def run_attempt(objects_url: str, attempt: str, entrypoint: str | Project)
         value = asset.fn(**args)
         if inspect.isawaitable(value):
             value = await value
-        refs, cursor = await _store_outputs(spec, project, asset, objects, value)
+        outputs, cursor = await _store_outputs(spec, project, asset, objects, keys_io, value)
         await shipper.flush()
-        payload = {"attempt": attempt, "status": "succeeded", "outputs": refs}
+        payload = {"attempt": attempt, "status": "succeeded", "outputs": outputs, "delivered": delivered}
         if cursor is not UNSET:
             payload["cursor"] = cursor
         await _put(objects, result_key, json.dumps(payload, allow_nan=False).encode())

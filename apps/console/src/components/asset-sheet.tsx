@@ -25,7 +25,6 @@ import type {
   AssetDetail,
   CatalogAsset,
   Head,
-  Json,
   PartitionScope,
 } from "@/lib/types";
 
@@ -165,9 +164,7 @@ function PartitionGrid({
       >
         {cells.map(({ scope, label, cell }) => {
           const head = headsByScope.get(scope);
-          const keyCount = (
-            head?.ref.meta as Record<string, Json[]> | undefined
-          )?.partitions?.length;
+          const keyCount = head?.count;
           const attemptRun = cell.last_attempt?.split("/")[0];
           return (
             <span key={scope} role="listitem" className="inline-flex">

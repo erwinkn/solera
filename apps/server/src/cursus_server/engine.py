@@ -19,13 +19,15 @@ import contextlib
 import datetime as dt
 import json
 import logging
+import math
 from itertools import product
 from zoneinfo import ZoneInfo
 
 from croniter import croniter
 from cursus.ids import ulid
+from cursus.keys.index import IndexState, KeyIndex, Options, key_bytes, key_str
+from cursus.keys.io import ObjectIO, key_cache
 from cursus.sdk import TimePartitions, canonical_partition, digest, split_partition
-from cursus.stores import delta_path, next_batch
 
 from .model import TERMINAL_RUN
 from .placements import PlacementContext, Registry
@@ -60,6 +62,9 @@ class Engine:
         concurrency: int = 4,
         clock=None,
         eval_interval: float = 0.5,
+        key_options: Options | None = None,
+        recount_interval: float = 3600.0,
+        maintenance_concurrency: int = 2,
     ):
         import time
 
@@ -84,6 +89,23 @@ class Engine:
         self.last_error = None
         self._stopping = False
         self._firing: set[str] = set()
+        # Key index upkeep (§6), all memory only: which delta log batches each
+        # in-flight attempt reads, indexes with compaction or a recount running,
+        # when each index was last recounted, and the state last checked.
+        self.key_options = key_options or Options()
+        self.recount_interval = recount_interval
+        self.maintenance_concurrency = maintenance_concurrency
+        self.reading: dict[str, list[tuple]] = {}
+        self.maintaining: dict[tuple, asyncio.Task] = {}
+        self._recounted: dict[tuple, float] = {}
+        self._checked: dict[tuple, IndexState] = {}
+        self._io: ObjectIO | None = None
+        self._set_dims = {
+            dim["output"]
+            for a in manifest["assets"].values()
+            for dim in ((a.get("partitions") or {}).get("dims") or {}).values()
+            if dim["kind"] == "set"
+        }
 
     @property
     def m(self):
@@ -130,6 +152,9 @@ class Engine:
         if self.inflight:
             await asyncio.gather(*(t for _, t in self.inflight.values()), return_exceptions=True)
             self.inflight.clear()
+        for job in list(self.maintaining.values()):
+            job.cancel()
+        await asyncio.gather(*self.maintaining.values(), return_exceptions=True)
 
     async def _loop(self):
         while not self._stopping:
@@ -149,6 +174,7 @@ class Engine:
         await self._dispatch_due()
         await self._automation_tick()
         await self._archive_due()
+        await self._maintain_indexes()
 
     async def run_until(self, run_id: str, timeout: float = 120.0):
         """Tick until the run reaches a terminal status (CLI and tests)."""
@@ -389,20 +415,11 @@ class Engine:
         return out
 
     async def _head_keys(self, head) -> list[str] | None:
-        """A set-dim output's current element list: `meta.partitions` on a
-        partition-set/source head, else a fold of the delta log (§2.1, §7)."""
+        """A set dimension's current keys: the element list its head carries (§7)."""
 
         if head is None:
             return None
-        meta = head["ref"].get("meta") or {}
-        if meta.get("partitions") is not None:
-            return [str(e) for e in meta["partitions"]]
-        if meta.get("delta"):
-            keys = await self.state.delta_key_map(
-                head["ref"]["output"], head["ref"].get("partition", ""), meta["delta"]["batch"]
-            )
-            return sorted(keys)
-        return []
+        return [str(e) for e in head.get("elements") or ()]
 
     def _time(self, dim: dict) -> TimePartitions:
         return TimePartitions(
@@ -593,7 +610,7 @@ class Engine:
                 return
             run = self.m.runs[task["run"]]
             try:
-                prepared = await self._prepare(task, run)
+                prepared = await self._prepare(task, run, attempt)
             except (Retryable, NonRetryable, Conflict) as error:
                 if self.m.claimed(attempt) is not None:
                     await self._finish(
@@ -607,9 +624,12 @@ class Engine:
             if self.m.claimed(attempt) is None:
                 return
             if prepared.get("skip"):
-                await self._finish(
-                    task, claim, "skipped", commit={"watermarks": prepared["watermark_updates"]}
-                )
+                watermarks = {
+                    param: plan["update"] if "update" in plan else self._watermark(plan, None)
+                    for param, plan in prepared["plans"].items()
+                    if plan is not None
+                }
+                await self._finish(task, claim, "skipped", commit={"watermarks": watermarks})
                 return
             await self._execute(task, run, attempt, prepared, placement)
         except LostOwnership:
@@ -622,13 +642,18 @@ class Engine:
                 with contextlib.suppress(Exception):
                     await self._finish(task, claim, "failed", error=f"engine: {error}", retryable=True)
         finally:
+            self.reading.pop(attempt, None)
             self.engine_inflight.discard(attempt)
             self.env_inflight[env_key] = max(0, self.env_inflight.get(env_key, 1) - 1)
 
     # -- input resolution + Incremental plans (§5, §6, §8) --------------------------
 
-    async def _prepare(self, task: dict, run: dict) -> dict:
-        """Pin heads at attempt start; plan Incremental edges; decide skip (§8)."""
+    async def _prepare(self, task: dict, run: dict, attempt: str | None = None) -> dict:
+        """Pin heads at attempt start; plan Incremental edges; decide skip (§8).
+
+        Each output the attempt may write is pinned with its batch number and,
+        when keyed, its key index: the harness works out the delta against
+        exactly that state (§6)."""
 
         asset = self.manifest["assets"][task["asset"]]
         scope = task["scope"]
@@ -687,15 +712,22 @@ class Engine:
             pinned[param] = inputs[param]["ref"]
         fingerprint = self._fingerprint(asset, run, pinned)
         # Pass 2: Incremental plans against the fingerprinted interpretation (§2.2).
-        watermark_updates, all_empty = {}, True
+        plans, all_empty = {}, True
         for param, edge, up_dims in incremental:
-            ref = self._pin(edge["output"], up_dims, asset, scope)
-            pin, update, empty = await self._incremental_plan(task, param, edge, ref, fingerprint, run, full)
+            up_scope = self._project(asset, scope, up_dims)
+            ref = self._pin_at(edge["output"], up_scope)
+            pin, plan, empty = self._incremental_plan(
+                task, param, edge, ref, up_scope, fingerprint, run, full
+            )
             inputs[param] = pin
-            if update is not None:
-                watermark_updates[param] = update
+            plans[param] = plan
             all_empty = all_empty and empty
-        more = any(u.get("more") for u in watermark_updates.values())
+        if attempt is not None:
+            # Keep the delta log this attempt reads until it finishes (§6).
+            self.reading[attempt] = [
+                (p["output"], p["up"], p["from"]) for p in plans.values() if p and "from" in p
+            ]
+        more = any(p.get("more") for p in plans.values() if p)
         skip = bool(incremental) and all_empty and not more and not full
         if skip:
             for output in asset["outputs"]:
@@ -707,22 +739,30 @@ class Engine:
         cursor = self.m.cursors.get((task["asset"], scope))
         if full:
             prior, cursor = {}, None
+        outputs = {}
+        for output in asset["outputs"]:
+            name, head = output["name"], baseline[output["name"]]
+            info = {"exists": head is not None}
+            if name == task["asset"] and asset.get("aliases"):
+                info["aliases"] = list(asset["aliases"])
+            if output.get("incremental"):
+                info["batch"] = int((head or {}).get("batch", -1)) + 1
+            if output.get("key") is not None:
+                info["index"] = self.m.index(name, scope).pinned().to_json()
+                if output.get("partition_set") or name in self._set_dims:
+                    info["elements"] = list((head or {}).get("elements") or ())
+            outputs[name] = info
         return {
             "inputs": inputs,
             "baseline": baseline,
-            "watermark_updates": watermark_updates,
+            "plans": plans,
             "more": more,
-            "scope_complete": not more,
             "full": full,
             "skip": skip,
             "prior": prior,
             "cursor": cursor,
             "fingerprint": fingerprint,
-            "batches": {
-                o["name"]: next_batch(baseline[o["name"]]["ref"] if baseline[o["name"]] else None)
-                for o in asset["outputs"]
-                if o.get("incremental")
-            },
+            "outputs": outputs,
         }
 
     def _pin(self, output: str, up_dims: dict, asset: dict, scope: str):
@@ -768,161 +808,81 @@ class Engine:
                 refs[canonical_partition(collapsed, collapsed_parts)] = head["ref"]
         return refs
 
-    async def _incremental_plan(self, task, param, edge, ref, fingerprint, run, full):
-        """Plan one Incremental edge: the pending delta items after the edge's
-        watermark, capped at `batch_size` (§2.2).
+    def _incremental_plan(self, task, param, edge, ref, up_scope, fingerprint, run, full):
+        """Plan one Incremental edge from its watermark (§6): returns the pin
+        for the spec, the plan the commit turns into the next watermark, and
+        whether nothing is pending.
 
-        watermark = {"batch", "offset", "fingerprint"}: every item of batches
-        below `batch` is delivered, plus the first `offset` items of `batch`
-        (each delta's own upserted|deleted keys sorted). `batch=-1` marks a
-        reset drain: `offset` keys of the folded live map are delivered. A
-        missing watermark, a fingerprint change, a `full` run, or a keys=
-        'full' override starts (or restarts) the drain. Returns (pin,
-        watermark_update, empty); the update carries `more` while pending
-        items remain after the take."""
+        A keyed upstream is read through its key index by the harness: the
+        delta log from `wm.batch` to the head, or — for a missing watermark, a
+        fingerprint change, a `full` run, a keys='full' override, or a log that
+        no longer holds the window — the whole index, restarting from the
+        head's next batch so changes made while draining arrive afterwards as
+        deltas. Either is delivered `batch_size` keys at a time; the harness
+        reports where it stopped (`after`), and a task with more to deliver is
+        queued again. A batch-mode upstream is planned here: the next
+        `batch_size` batches after the watermark, all since the last reset
+        (`base`) when starting over.
 
-        decl = self.manifest["outputs"][edge["output"]]
-        keyed = decl.get("key") is not None
-        batch_size = int(edge.get("batch_size") or 100)
-        head_batch = int(((ref.get("meta") or {}).get("delta") or {}).get("batch", -1))
-        up_scope = ref.get("partition") or ""
-        override = (run.get("keys") or {}).get(edge["output"])
+        Watermark: {"batch", "until"?, "after", "full", "fingerprint", "output", "up"}."""
+
+        output = edge["output"]
+        keyed = self.manifest["outputs"][output].get("key") is not None
+        limit = int(edge.get("batch_size") or 100)
+        head = self.m.heads.get((output, up_scope)) or {}
+        head_batch = int(head.get("batch", -1))
+        override = (run.get("keys") or {}).get(output)
         wm = self.m.watermarks.get((task["asset"], param, task["scope"]))
-        draining = wm is not None and wm["batch"] == -1
-        reset = full or wm is None or draining or wm.get("fingerprint") != fingerprint or override == "full"
+        reset = full or wm is None or wm.get("fingerprint") != fingerprint or override == "full"
+        base = {"output": output, "up": up_scope, "fingerprint": fingerprint}
 
         # A keys= override is a one-off selection — it never moves the watermark.
         if isinstance(override, dict) and "keys" in override and not reset:
-            keys = [str(k) for k in override["keys"]]
-            pin = {
-                "ref": ref,
-                "changes": {"upserted": {k: "" for k in keys}, "deleted": [], "full": False},
-            }
-            return pin, None, not keys
-
-        if reset and keyed:
-            # Fold the whole log: the live map, plus every key the log ever
-            # deleted (the consumer may hold them; removes are idempotent).
-            live, ever_deleted = {}, set()
-            for b in range(0, head_batch + 1):
-                d = await self.state.delta(edge["output"], up_scope, b)
-                if d is None:
-                    continue
-                for k in d.get("deleted") or []:
-                    live.pop(str(k), None)
-                    ever_deleted.add(str(k))
-                live.update({str(k): str(v) for k, v in (d.get("upserted") or {}).items()})
-            offset = wm["offset"] if draining else 0
-            ordered = sorted(live)
-            take = ordered[offset : offset + batch_size]
-            deleted = [] if draining else sorted(ever_deleted - set(live))
-            done = offset + len(take) >= len(ordered)
-            pin = {
-                "ref": ref,
-                "changes": {
-                    "upserted": {k: live[k] for k in take},
-                    "deleted": deleted,
-                    "full": True,
-                },
-            }
-            update = {
-                "batch": head_batch + 1 if done else -1,
-                "offset": 0 if done else offset + len(take),
-                "fingerprint": fingerprint,
-                "more": not done,
-            }
-            return pin, update, not take and not deleted
-
-        if reset:  # batch-mode: pending is the batch range after the last reset
-            deltas = []
-            for b in range(0, head_batch + 1):
-                d = await self.state.delta(edge["output"], up_scope, b)
-                if d is not None:
-                    deltas.append(d)
-            resets = [i for i, d in enumerate(deltas) if d.get("reset")]
-            if resets:
-                deltas = deltas[resets[-1] :]
-            pending = [d["batch"] for d in deltas]
-            take = pending[:batch_size]
-            pin = {
-                "ref": ref,
-                "changes": {
-                    "batches": [take[0], take[-1]] if take else [0, -1],
-                    "full": True,
-                },
-            }
-            update = {
-                "batch": (take[-1] + 1) if take else head_batch + 1,
-                "offset": 0,
-                "fingerprint": fingerprint,
-                "more": len(pending) > len(take),
-            }
-            return pin, update, not take
-
-        # Incremental: pending items sit in deltas [wm.batch .. head_batch],
-        # skipping the first wm.offset items of wm.batch.
-        deltas = []
-        for b in range(wm["batch"], head_batch + 1):
-            d = await self.state.delta(edge["output"], up_scope, b)
-            if d is None:
-                # The log was pruned under the watermark — restart the drain (§2.2).
-                return await self._incremental_plan(task, param, edge, ref, fingerprint, run, full=True)
-            deltas.append(d)
+            keys = sorted({str(k) for k in override["keys"]})
+            return {"ref": ref, "changes": {"keys": keys, "full": False}}, None, not keys
 
         if not keyed:
-            # Batch-mode upstream: every pending batch is one item; a reset
-            # batch supersedes everything before it.
-            resets = [i for i, d in enumerate(deltas) if d.get("reset")]
-            if resets:
-                deltas = deltas[resets[-1] :]
-            pending = [d["batch"] for d in deltas]
-            take = pending[:batch_size]
-            changes = {"batches": [take[0], take[-1]] if take else [0, -1], "full": False}
-            pin = {"ref": ref, "changes": changes}
-            update = {
-                "batch": (take[-1] + 1) if take else wm["batch"],
-                "offset": 0,
-                "fingerprint": fingerprint,
-                "more": len(pending) > len(take),
-            }
-            return pin, update, not take
+            first = int(head.get("base", 0))
+            reset = reset or int(wm["batch"]) < first
+            lo = first if reset else int(wm["batch"])
+            hi = min(head_batch, lo + limit - 1)
+            pin = {"ref": ref, "changes": {"batches": [lo, hi], "full": reset}}
+            update = {**base, "batch": max(lo, hi + 1), "after": None, "full": False}
+            return pin, {"update": update, "more": hi < head_batch}, hi < lo
 
-        latest = {}
-        for d in deltas:
-            # Pure diffs, last writer wins: a reset batch's `deleted` already
-            # lists every key it dropped.
-            upserted = d.get("upserted") or {}
-            deleted = set(d.get("deleted") or [])
-            for i, key in enumerate(sorted(set(upserted) | deleted)):
-                if d["batch"] == wm["batch"] and i < wm["offset"]:
-                    continue
-                latest[key] = (d["batch"], i, "del" if key in deleted else "upsert")
-        pending = sorted(latest.items(), key=lambda kv: kv[1])
-        take, rest = pending[:batch_size], pending[batch_size:]
-        delivered_ups, delivered_del = {}, []
-        for key, (b, _i, kind) in take:
-            if kind == "del":
-                delivered_del.append(key)
-            else:
-                delivered_ups[key] = str((self._delta_upsert(deltas, b) or {}).get(key, ""))
-        pin = {
-            "ref": ref,
-            "changes": {"upserted": delivered_ups, "deleted": delivered_del, "full": False},
-        }
-        if take:
-            b_last, i_last, _ = take[-1][1]
-            position = {"batch": b_last, "offset": i_last + 1}
+        index = self.m.index(output, up_scope)
+        empty = False
+        if reset:
+            window = {"full": True, "from": head_batch + 1, "after": None}
+            empty = index.count == 0 and not index.files
+        elif wm.get("full"):
+            window = {"full": True, "from": wm["batch"], "after": wm.get("after")}
+        elif wm.get("after") is not None:
+            window = {"full": False, "from": wm["batch"], "to": wm["until"], "after": wm["after"]}
         else:
-            position = {"batch": wm["batch"], "offset": wm["offset"]}
-        update = {**position, "fingerprint": fingerprint, "more": bool(rest)}
-        return pin, update, not take
+            window = {"full": False, "from": wm["batch"], "to": head_batch, "after": None}
+            empty = wm["batch"] > head_batch
+        if not window["full"] and not index.covers(window["from"], window["to"]):
+            # The log no longer holds this window: deliver everything again.
+            window = {"full": True, "from": head_batch + 1, "after": None}
+            empty = False
+        pinned = index.pinned() if window["full"] else index.pinned(window["from"], window["to"])
+        pin = {"ref": ref, "index": pinned.to_json(), "changes": {**window, "limit": limit}}
+        return pin, {**base, **window}, empty
 
     @staticmethod
-    def _delta_upsert(deltas, batch):
-        for d in deltas:
-            if d["batch"] == batch:
-                return d.get("upserted") or {}
-        return {}
+    def _watermark(plan: dict, after: str | None) -> dict:
+        """The watermark after delivering a keyed plan's page, which ended at
+        `after` (`None`: the window is done)."""
+
+        base = {k: plan[k] for k in ("output", "up", "fingerprint")}
+        if plan["full"]:
+            if after is None:
+                return {**base, "batch": plan["from"], "after": None, "full": False}
+            return {**base, "batch": plan["from"], "after": after, "full": True}
+        if after is None:
+            return {**base, "batch": max(plan["from"], plan["to"] + 1), "after": None, "full": False}
+        return {**base, "batch": plan["from"], "until": plan["to"], "after": after, "full": False}
 
     def _fingerprint(self, asset, run, pinned):
         """H(version, store versions of input+output stores, run config,
@@ -956,10 +916,7 @@ class Engine:
             "partition": task["scope"],
             "run": {"id": task["run"], "config": run.get("config") or {}},
             "prior": prepared["prior"],
-            "baseline": {
-                name: head["ref"] for name, head in prepared["baseline"].items() if head is not None
-            },
-            "batches": prepared["batches"],
+            "outputs": prepared["outputs"],
             "inputs": prepared["inputs"],
             "execution": self.manifest["assets"][task["asset"]]["placement"],
         }
@@ -978,6 +935,19 @@ class Engine:
             await self._wait_loop(task, attempt, prepared, placement, handle)
         finally:
             self.handles.pop(attempt, None)
+            if not prepared.get("committed"):
+                await self._discard(attempt, prepared)
+
+    async def _discard(self, attempt: str, prepared: dict):
+        """Delete the delta files an attempt wrote but never committed. They
+        are named after the attempt, so nothing else can hold them (§6)."""
+
+        for info in (prepared.get("outputs") or {}).values():
+            if info.get("index") is None:
+                continue
+            prefix = f"{info['index']['prefix']}{int(info['batch']):012d}-{attempt}"
+            with contextlib.suppress(Exception):
+                await self.state.delete_objects(await self.state.list_objects(prefix))
 
     async def _wait_loop(self, task, attempt, prepared, placement, handle):
         timeout_s = self.manifest["assets"][task["asset"]].get("timeout") or 3600
@@ -1051,13 +1021,11 @@ class Engine:
         if claim is None or claim["lease_until"] <= self.clock():
             raise LostOwnership(attempt)
         task = self.m.task(self.m.attempts[attempt])
-        # Pinned inputs must still be the committed heads (§8).
-        for name, pin in prepared["inputs"].items():
-            refs = pin["refs"].values() if "refs" in pin else [pin["ref"]]
-            for ref in refs:
-                head = self.m.heads.get((ref["output"], ref["partition"]))
-                if head is None or head["ref"]["version"] != ref["version"]:
-                    raise Conflict(f"input {name}: {ref['output']}/{ref['partition']} moved after pinning")
+        # Inputs may have moved since they were pinned: the attempt's output
+        # derives from what it read (the spec records it), its watermarks
+        # cover only the window it was given, and a moved input changes the
+        # next attempt's fingerprint. Refusing here would only strand a write
+        # a shared-table store has already made.
         # Output heads must be unchanged since the claim.
         for output, baseline in prepared["baseline"].items():
             if self.m.heads.get((output, task["scope"])) != baseline:
@@ -1065,44 +1033,66 @@ class Engine:
         outputs = result.get("outputs") or {}
         asset = self.manifest["assets"][task["asset"]]
         declared = {o["name"]: o for o in asset["outputs"]}
-        for name, ref in outputs.items():
+        # Where each keyed Incremental page ended decides the next watermark.
+        delivered = result.get("delivered") or {}
+        watermarks, more = {}, bool(prepared.get("more"))
+        for param, plan in (prepared.get("plans") or {}).items():
+            if plan is None:
+                continue
+            if "update" in plan:
+                watermarks[param] = plan["update"]
+                continue
+            if param not in delivered:
+                raise Conflict(f"input {param}: the result reports no delivery", retryable=False)
+            after = delivered[param].get("after")
+            watermarks[param] = self._watermark(plan, after)
+            more = more or after is not None
+        heads, keys = {}, {}
+        for name, entry in outputs.items():
             if name not in declared:
                 raise Conflict(f"result names undeclared output {name!r}", retryable=False)
-            if ref["partition"] != task["scope"]:
-                raise Conflict(
-                    f"output {name}: ref scope {ref['partition']!r} != {task['scope']!r}", retryable=False
-                )
-            decl = declared[name]
-            meta = ref.get("meta") or {}
-            baseline_ref = (prepared["baseline"].get(name) or {}).get("ref")
-            if baseline_ref is not None and baseline_ref["version"] == ref["version"]:
-                continue  # identical content keeps the head as it is
-            if decl.get("incremental") and not meta.get("delta"):
-                raise Conflict(f"incremental output {name}: ref carries no delta", retryable=False)
-            if decl.get("partition_set") and meta.get("partitions") is None:
-                raise Conflict(
-                    f"partition-set output {name}: ref carries no partitions list", retryable=False
-                )
+            decl, before = declared[name], prepared["baseline"].get(name)
+            info = (prepared.get("outputs") or {}).get(name) or {}
+            if entry.get("unchanged"):
+                if before is None:
+                    raise Conflict(f"output {name}: unchanged, but there is no head", retryable=False)
+                ref = before["ref"]
+            else:
+                ref = entry.get("ref")
+                if ref is None or ref["partition"] != task["scope"]:
+                    raise Conflict(f"output {name}: ref scope != {task['scope']!r}", retryable=False)
+            head = {"ref": ref, "complete": not more, "asset": task["asset"], "version": asset["version"]}
+            if decl.get("key") is not None:
+                delta = entry.get("keys")
+                if delta is None and not entry.get("unchanged"):
+                    raise Conflict(f"keyed output {name}: the result carries no key delta", retryable=False)
+                head["batch"] = int((before or {}).get("batch", -1))
+                if delta is not None:
+                    if delta["files"]:
+                        head["batch"] = int(info["batch"])
+                    keys[name] = {**delta, "batch": head["batch"]}
+                if "elements" in info:
+                    head["elements"] = entry.get("elements", info["elements"])
+            elif decl.get("incremental"):
+                if before is not None and before["ref"]["version"] == ref["version"]:
+                    head["batch"], head["base"] = before.get("batch", -1), before.get("base", 0)
+                else:
+                    # A write with no prior (a first write, or a full run) starts over.
+                    head["batch"] = int(info["batch"])
+                    head["base"] = head["batch"] if name not in prepared["prior"] else before.get("base", 0)
+            heads[name] = head
         for name in set(declared) - set(outputs):
             if prepared["baseline"].get(name) is None:
                 raise Conflict(f"omitted output {name} has no head to keep (§2)", retryable=False)
-        commit = {
-            "heads": {
-                name: {
-                    "ref": ref,
-                    "complete": prepared["scope_complete"],
-                    "asset": task["asset"],
-                    "version": asset["version"],
-                }
-                for name, ref in outputs.items()
-            },
-            "watermarks": dict(prepared.get("watermark_updates") or {}),
-        }
+        commit = {"heads": heads, "watermarks": watermarks}
+        if keys:
+            commit["keys"] = keys
         if result.get("cursor", UNSET) is not UNSET:
             commit["cursor"] = result["cursor"]
         elif prepared.get("full"):
             commit["cursor"] = None  # a full run clears the committed cursor (§8)
-        await self._finish(task, claim, "succeeded", commit=commit, more=bool(prepared.get("more")))
+        await self._finish(task, claim, "succeeded", commit=commit, more=more)
+        prepared["committed"] = True
         return {"run": task["run"], "attempt": attempt, "outputs": outputs}
 
     # -- pool work (§10, memory only) ----------------------------------------------------
@@ -1175,10 +1165,11 @@ class Engine:
     # -- sources commit API (§5) ------------------------------------------------------
 
     async def commit_source(self, name: str, *, version=None, keys=None, upsert=None, remove=None):
-        """Advance a source without moving data (§2.3): a keyed source commit
-        diffs the supplied map against the delta log's fold and writes the
-        same delta object a store would; `meta.partitions` carries the
-        committed element list. An identical map is not a change."""
+        """Advance a source without moving data (§2.3, §6). A keyed source
+        commit is checked against the source's key index like any write: a
+        full map (`keys=`) replaces its content, `upsert`/`remove` patch it,
+        and the changes become the commit's delta file. A commit that changes
+        nothing is not a change. An unkeyed source takes a `version=`."""
 
         source = self.manifest["sources"].get(name)
         if source is None:
@@ -1187,65 +1178,198 @@ class Engine:
         keyed = source.get("key") is not None
         if not keyed and (keys is not None or upsert is not None or remove is not None):
             raise ValueError(f"Source {name!r} is unkeyed; pass version=")
-        prior_delta = (((head or {}).get("ref") or {}).get("meta") or {}).get("delta")
-        batch = int(prior_delta["batch"]) + 1 if prior_delta else 0
-        current = await self.state.delta_key_map(name, "", int(prior_delta["batch"])) if prior_delta else {}
-        if keyed:
-            if keys is not None:
-                if source.get("key") == "<elements>" and not isinstance(keys, dict):
-                    new_map = {str(k): "1" for k in keys}
-                else:
-                    new_map = {str(k): str(v) for k, v in dict(keys).items()}
-            else:
-                new_map = dict(current)
-                items = upsert.items() if isinstance(upsert, dict) else ((k, "1") for k in upsert or [])
-                for k, v in items:
-                    new_map[str(k)] = str(v)
-                for k in remove or []:
-                    new_map.pop(str(k), None)
-            new_version = digest(new_map)
-        else:
+        ref = dict(head["ref"] if head is not None else source["head"])
+        record = {"ref": ref, "run": None, "attempt": None, "complete": True, "asset": None, "version": None}
+        event = {"type": "SourceCommitted", "source": name, "head": record}
+        batch = None
+        if not keyed:
             if version is None:
                 raise ValueError(f"Source {name!r} requires version=")
-            new_version = str(version)
-            new_map = current
-        if head is not None and head["ref"]["version"] == new_version and new_map == current:
-            return {"changed": False, "ref": head["ref"]}
-        ref = dict(source["head"])
-        ref["version"] = new_version
+            if head is not None and head["ref"]["version"] == str(version):
+                return {"changed": False, "ref": head["ref"]}
+            ref["version"] = str(version)
+        else:
+            if keys is not None:
+                items = keys.items() if isinstance(keys, dict) else ((k, "1") for k in keys)
+                new, removes, replace = {str(k): str(v) for k, v in items}, [], True
+            else:
+                items = upsert.items() if isinstance(upsert, dict) else ((k, "1") for k in upsert or [])
+                new = {str(k): str(v) for k, v in items}
+                removes, replace = [str(k) for k in remove or [] if str(k) not in new], False
+            index = KeyIndex(self._key_io(), None, self.m.index(name, "").pinned(), self.key_options)
+            delta = await index.changes(
+                [key_bytes(k) for k in new],
+                [key_bytes(v) for v in new.values()],
+                [key_bytes(k) for k in removes],
+                replace=replace,
+            )
+            if not len(delta):
+                return {"changed": False, "ref": ref}
+            batch = int((head or {}).get("batch", -1)) + 1
+            files = await index.write(batch, ulid(self.clock()), delta)
+            ref["version"] = digest([ref["version"], batch, [f.name for f in files.files]])
+            record["batch"] = batch
+            if source.get("key") == "<elements>" or name in self._set_dims:
+                before = set((head or {}).get("elements") or ())
+                record["elements"] = sorted(set(new) if replace else (before - set(removes)) | set(new))
+            event["keys"] = {**files.to_json(), "batch": batch}
         meta = dict(ref.get("meta") or {})
         meta["external"] = True
-        if keyed:
-            upserted = {k: r for k, r in new_map.items() if current.get(k) != r}
-            deleted = sorted(set(current) - set(new_map))
-            delta = {"batch": batch, "rows": len(upserted) + len(deleted), "upserted": upserted}
-            if deleted:
-                delta["deleted"] = deleted
-            if keys is not None:
-                delta["reset"] = True  # a full-map commit supersedes the log
-            path = delta_path(name, "", batch)
-            await self.state.put_object(path, json.dumps(delta, sort_keys=True, allow_nan=False).encode())
-            meta["delta"] = {"object": path, "batch": batch, "rows": delta["rows"]}
-            meta["partitions"] = sorted(new_map)
         ref["meta"] = meta
         if self.m.heads.get((name, "")) != head:
+            if "keys" in event:
+                await self.state.delete_objects([index.path(f["name"]) for f in event["keys"]["files"]])
             raise Conflict(f"source {name!r} moved while committing; retry")
+        event["at"] = self.clock()
+        await self.state.emit(event)
+        return {
+            "changed": True,
+            "ref": ref,
+            "commit": f"source/{name}/{batch if batch is not None else ref['version']}",
+        }
+
+    # -- key index upkeep (§6) --------------------------------------------------------
+
+    def _key_io(self) -> ObjectIO:
+        if self._io is None:
+            cache = key_cache(self.manifest.get("key_cache"), self.state.objects_url)
+            self._io = ObjectIO(self.state.objects, cache=cache)
+        return self._io
+
+    async def list_keys(self, output: str, scope: str = "", *, after=None, offset=0, limit=1000) -> dict:
+        """One page of an output's live keys, read from its key index."""
+
+        if (output, scope) not in self.m.heads:
+            raise KeyError(f"{output}/{scope}")
+        state = self.m.indexes.get((output, scope))
+        if state is None:
+            return {"total": 0, "exact": True, "keys": {}, "next": None}
+        index = KeyIndex(self._key_io(), None, state.pinned(), self.key_options)
+        start = key_bytes(after) if after is not None else None
+        keys, versions, nxt = await index.page(start, offset + limit)
+        return {
+            "total": state.count,
+            "exact": state.count_exact,
+            "keys": {key_str(k): key_str(v) for k, v in list(zip(keys, versions, strict=True))[offset:]},
+            "next": key_str(nxt) if nxt is not None else None,
+        }
+
+    async def _maintain_indexes(self):
+        """Truncate delta logs to what consumers still need, start compactions
+        and recounts, and delete index files nothing references any more."""
+
+        now = self.clock()
+        needed: dict[tuple, int] = {}
+        for wm in self.m.watermarks.values():
+            if "up" in wm:
+                key = (wm["output"], wm["up"])
+                needed[key] = min(needed.get(key, math.inf), int(wm["batch"]))
+        for reads in self.reading.values():
+            for output, up, first in reads:
+                needed[(output, up)] = min(needed.get((output, up), math.inf), int(first))
+        truncations = []
+        for (output, scope), index in self.m.indexes.items():
+            if not index.log:
+                continue
+            below = needed.get((output, scope), index.log[-1][0] + 1)
+            if index.log[0][0] < below:
+                truncations.append(
+                    {"type": "IndexTruncated", "output": output, "scope": scope, "below": below, "at": now}
+                )
+        if truncations:
+            await self.state.emit(*truncations)
+
+        for key, index in list(self.m.indexes.items()):
+            if len(self.maintaining) >= self.maintenance_concurrency:
+                break
+            if key in self.maintaining or self._checked.get(key) is index:
+                continue
+            plan = KeyIndex(None, None, index, self.key_options).plan_compaction()
+            if plan is not None:
+                self._start_maintenance(key, index, recount=False)
+            elif not index.count_exact:
+                if now - self._recounted.get(key, -math.inf) >= self.recount_interval:
+                    self._start_maintenance(key, index, recount=True)
+            else:
+                self._checked[key] = index
+
+        if self.m.garbage:
+            oldest = min((c["started_at"] for c in self.m.claims.values()), default=math.inf)
+            due = [path for path, at in self.m.garbage if at < oldest]
+            if due:
+                await self._delete_files(due)
+                await self.state.emit({"type": "GarbageDeleted", "paths": due})
+
+    async def _delete_files(self, paths: list[str]):
+        from obstore.exceptions import NotFoundError
+
+        try:
+            await self.state.delete_objects(paths)
+        except (NotFoundError, FileNotFoundError):
+            for path in paths:
+                with contextlib.suppress(NotFoundError, FileNotFoundError):
+                    await self.state.delete_objects([path])
+
+    def _start_maintenance(self, key: tuple, index: IndexState, *, recount: bool):
+        job = asyncio.create_task(self._maintenance(key, index, recount))
+        self.maintaining[key] = job
+        job.add_done_callback(lambda _t: self.maintaining.pop(key, None))
+
+    async def _maintenance(self, key: tuple, index: IndexState, recount: bool):
+        """One compaction or recount, run on a worker thread with its own event
+        loop so merging never blocks the engine (§6, engine work)."""
+
+        cache = key_cache(self.manifest.get("key_cache"), self.state.objects_url)
+        options, objects = self.key_options, self.state.objects
+
+        def work():
+            async def go():
+                keys = KeyIndex(ObjectIO(objects, cache=cache), None, index, options)
+                return await (keys.recount() if recount else keys.compact())
+
+            return asyncio.run(go())
+
+        try:
+            result = await asyncio.to_thread(work)
+        except Exception as error:
+            self.last_error = f"key index {key[0]}/{key[1]}: {type(error).__name__}: {error}"
+            log.exception("key index maintenance failed for %s", key)
+            self._recounted[key] = self.clock()
+            return
+        output, scope = key
+        current = self.m.indexes.get(key)
+        if recount:
+            self._recounted[key] = self.clock()
+            if current is index:  # no commit landed meanwhile, so the count is still current
+                await self.state.emit(
+                    {
+                        "type": "IndexCompacted",
+                        "output": output,
+                        "scope": scope,
+                        "added": [],
+                        "removed": [],
+                        "recount": result,
+                        "at": self.clock(),
+                    }
+                )
+            return
+        if result is None:
+            return
+        added, removed = result
+        if current is None or not set(removed) <= {f.name for f in current.files}:
+            created = [f.name for f in added if f.name not in removed]
+            await self._delete_files([index.path(n) for n in created])
+            return
         await self.state.emit(
             {
-                "type": "SourceCommitted",
-                "source": name,
-                "head": {
-                    "ref": ref,
-                    "run": None,
-                    "attempt": None,
-                    "complete": True,
-                    "asset": None,
-                    "version": None,
-                },
+                "type": "IndexCompacted",
+                "output": output,
+                "scope": scope,
+                "added": [f.to_json() for f in added],
+                "removed": removed,
                 "at": self.clock(),
             }
         )
-        return {"changed": True, "ref": ref, "commit": f"source/{name}/{batch}"}
 
     # -- automations (§9) ------------------------------------------------------------
 

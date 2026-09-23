@@ -156,21 +156,43 @@ async def test_an_expired_lease_requeues_and_fences_the_old_attempt(state, clock
     assert state.model.claims[task_id]["attempt"] != attempt
 
 
-async def test_moved_input_is_refused(state, clock):
-    engine = engine_on(state, clock, placement="hold")
+async def test_a_moved_input_still_commits(state, clock):
+    """An input that moves while an attempt runs does not void the attempt:
+    it delivered what it pinned, and the next run picks up the change."""
+
+    engine = engine_on(state, clock)
     await quiet(engine)
-    await settle(engine_on(state, clock), (await engine.submit(["files"]))["id"])
-    # A full run is never skipped, whatever the consumer already processed.
-    _, task_id, attempt = await held(engine, ["consumer"], mode="full")
-    pinned = dict(state.model.heads[("files", "")]["ref"])
-    # Another commit moves the input after the attempt pinned it.
-    state.model.heads[("files", "")] = {
-        **state.model.heads[("files", "")],
-        "ref": {**pinned, "version": "moved"},
-    }
-    prepared = {"inputs": {"files": {"ref": pinned}}, "baseline": {"consumer": None}, "scope_complete": True}
-    with pytest.raises(Conflict, match="moved after pinning"):
-        await engine.commit_attempt(attempt, prepared, {"outputs": {}})
+    rows = {"v": [{"id": "a"}, {"id": "b"}]}
+    delivered = []
+
+    @asset(outputs=Output("items", key="id"))
+    def items():
+        return rows["v"]
+
+    @asset(inputs={"items": Incremental()})
+    async def reader(ctx, items: list):
+        delivered.append(sorted(r["id"] for r in items))
+        if len(delivered) == 1:
+            # The upstream moves (and commits) while this attempt is still running.
+            rows["v"] = [{"id": "a"}, {"id": "b"}, {"id": "c"}]
+            await settle(engine2, (await engine2.submit(["items"]))["id"])
+            assert state.model.heads[("items", "")]["batch"] == 1
+        return []
+
+    project = Project(assets=[items, reader])
+    engine2 = Engine(
+        state,
+        project.manifest,
+        placements={"Local": lambda e, o, c: InlinePlacement(c, project)},
+        clock=clock,
+        eval_interval=0.01,
+    )
+    await engine2.initialize()
+    await settle(engine2, (await engine2.submit(["items"]))["id"])
+    first = await settle(engine2, (await engine2.submit(["reader"]))["id"])
+    assert first["request"]["status"] == "succeeded"
+    await settle(engine2, (await engine2.submit(["reader"]))["id"])
+    assert delivered == [["a", "b"], ["c"]]
 
 
 async def test_restart_forgets_claims_and_pool_claims(tmp_path, clock):

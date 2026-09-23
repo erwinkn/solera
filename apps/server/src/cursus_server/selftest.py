@@ -36,6 +36,30 @@ async def create_only_probe(objects):
     await obstore.delete_async(objects, key)
 
 
+async def key_index_probe(objects):
+    """Index files are written create-only and read back by range (§6)."""
+
+    from cursus.keys.index import IndexState, KeyIndex
+    from cursus.keys.io import ObjectIO
+
+    io = ObjectIO(objects)
+    state = IndexState(prefix="conformance/keys/")
+    index = KeyIndex(io, None, state)
+    files = await index.write(
+        0, uuid.uuid4().hex, await index.changes([b"a", b"b"], [b"1", b"1"], replace=True)
+    )
+    state = state.committed(0, files, keep_log=True)
+    try:
+        index = KeyIndex(io, None, state)
+        keys, versions, _ = await index.page(None, 10)
+        check(keys == [b"a", b"b"] and versions == [b"1", b"1"], "Key index page read back wrong")
+        check(len(await index.changes([b"b"], [b"2"])) == 1, "Key index delta read back wrong")
+        changes = await index.pending(0, 0, None, 10)
+        check(changes[0] == [b"a", b"b"], "Key index delta log read back wrong")
+    finally:
+        await io.delete([state.path(f.name) for f in state.files])
+
+
 async def selftest(url):
     started = time.monotonic()
     namespace = "probe-" + uuid.uuid4().hex
@@ -45,6 +69,8 @@ async def selftest(url):
     try:
         await create_only_probe(state.objects)
         checks.append("create-if-absent writes are enforced")
+        await key_index_probe(state.objects)
+        checks.append("key index files write and read back by range")
         from .engine import Engine
 
         engine = Engine(state, manifest, project="cursus_server.demo:project")

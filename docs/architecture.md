@@ -93,7 +93,7 @@ store-specific config validated by `can_store` at registration.
 |---|---|
 | `key` | Column identifying what was materialized. Declared once, here; consumers never name columns. Independent of `primary_key` (storage identity). |
 | `revision` | Column that changes when a key's content changes. Absent: `revision = H(row)`. |
-| `incremental` | The output commits per-batch deltas (§2 of the redesign): each write is one batch in a `deltas/` log and the ref carries `meta.delta`; `Incremental()` consumers diff against a watermark. `key=` implies it. Default false — a value output is one object per version. |
+| `incremental` | The output commits in engine-numbered batches: a keyed output's changes land in its key index (object-store-state.md §6), an unkeyed one's batches in its store; `Incremental()` consumers read what arrived after their watermark. `key=` implies it. Default false — a value output is one object per version. |
 | `migrations` | Ordered `Migration(name, payload)` list owned by this output. The store applies pending ones before its first write to the output in an attempt (§4). Payload type is store-defined (`can_store`). The applied set travels in the handle (§3) and the declared list is in the fingerprint (§6). |
 | `**config` | Store-specific: `schema`, `primary_key`, `columns`, `indexes`, `partition_column`, … |
 
@@ -186,9 +186,9 @@ replace slot. Use an incremental output, a content-addressed store, or a
 coarser schedule.
 
 **Keyed outputs** on a mutable store apply partial writes under the same
-marker check, then delete rows whose key is absent from the resulting map:
-rows left by an attempt that never committed are absent from
-`scope.baseline`'s key map by construction. An unkeyed incremental output is
+marker check; a write with no prior (a first write or a `full` run) replaces
+the slice. Stores keep no key maps: the engine's key index does (§6). An
+unkeyed incremental output is
 the case where data is a sequence of engine-numbered batches — `scope.batch`
 gives the next one and batches are never rewritten: `load(ref)` returns the
 batches `ref` was committed at, a true snapshot at the pinned version, always
@@ -342,16 +342,21 @@ and receives as `ctx.cursor` next time. Committed atomically with the
 outputs, so a rejected commit re-asks the same question. `graph_delta`
 stores the Graph delta token.
 
-**`Incremental`.** An incremental output commits one delta object per batch,
-`deltas/{output}/{scope}/{batch}.json`, and the ref records `meta.delta`
-(`{object, batch, rows}`); a keyed output's live `key → revision` map is the
-fold of the delta log (a `reset` delta supersedes everything before it). The
-engine keeps a per-edge **watermark** `{batch, offset, fingerprint, more}` —
-the consumer's delivered position in that log. Planning diffs the head's
-delta position against the watermark and hands the harness a `Keys(upserted)`
-or `Batches(lo, hi)` selection plus `deleted`. Work is batched by
-`batch_size`: each batch commits with its watermark update; `more` re-queues
-the task; `scope_complete := not more` on the head.
+**`Incremental`.** Every commit that changes an incremental output gets
+the next batch number (`head.batch`). A keyed output (or keyed source) has
+a **key index** — an engine-owned log-structured merge tree of `(key,
+version)` files (object-store-state.md §6): the harness compares each write
+with it, skips the store entirely when nothing changed, and otherwise writes
+the changed entries as the batch's delta file. An unkeyed output's batches
+are its store's; `head.base` is the first batch after its last reset. The
+engine keeps a per-edge **watermark** `{batch, until?, after, full,
+fingerprint, output, up}` — the consumer's position. For a keyed upstream
+the spec pins the index and a window — the delta log from `batch` to the
+head, or the whole index for a full delivery — and the harness reads one
+page of it (`batch_size` keys), loads those keys with `Keys(…)`, and reports
+where the page ended (`after`); for an unkeyed one the engine plans a
+`Batches(lo, hi)` range. Each page commits with its watermark update;
+`more` re-queues the task; `complete := not more` on the head.
 
 The **interpretation fingerprint** `H(version, store versions of the
 asset's input and output stores, migration names of the asset's outputs,
@@ -633,19 +638,24 @@ code.
  "error": {"type": "ValueError", "message": "…", "traceback": "…", "retryable": true}}
 ```
 
-The result is the attempt's commit request: refs for returned outputs
-(omitted = keep prior), `cursor` if set, or an error. `retryable=false` for
-store conflicts, revision mismatch and version-mismatch without a full run.
-No result means
+The result is the attempt's commit request: per returned output its ref
+(or `unchanged`), a keyed output's delta files (`keys`) and a partition
+set's `elements`; per keyed Incremental input the page it `delivered`;
+`cursor` if set; or an error. `retryable=false` for store conflicts,
+revision mismatch and version-mismatch without a full run. No result means
 the harness died. The engine validates the attempt id, that every ref names
-a known output and this scope, and that an incremental output whose ref
-changed carries `meta.delta`, then commits against its own record of the pins.
+a known output and this scope, and that a keyed output reports its delta,
+then commits against its own record of the pins. Inputs that moved since
+they were pinned do not void the commit: the attempt delivered the window
+it was given.
 
 **Harness** (`python -m cursus_worker run --objects URL --attempt ID`; the
 project entrypoint comes from the environment): fetch spec → refuse on
 revision mismatch (a failed result, not a crash) → resolve `env:` → load
-inputs per annotation → build `ctx` → run the producer → `store()` each
-returned output, write its delta object → write the result last, in one PUT.
+inputs per annotation (keyed Incremental edges through the upstream key
+index) → build `ctx` → run the producer → for each returned output, compare
+the write with its key index; `store()` it unless nothing changed and write
+the delta file → write the result last, in one PUT.
 Logs stream to chunked objects throughout. `manifest` mode runs through
 `Local` only, at server start.
 

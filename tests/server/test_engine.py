@@ -289,13 +289,18 @@ async def test_full_run_resets_watermark(state):
     await engine.initialize()
     await drive(engine, await engine.submit(["consumer"], upstream=True))
     first = state.model.watermarks[("consumer", "files", "")]
-    assert first == {"batch": 1, "offset": 0, "fingerprint": first["fingerprint"], "more": False}
+    assert first == {
+        "batch": 1,
+        "after": None,
+        "full": False,
+        "fingerprint": first["fingerprint"],
+        "output": "files",
+        "up": "",
+    }
     detail = await drive(engine, await engine.submit(["consumer"], mode="full"))
     assert task_statuses(detail)["consumer"] == "succeeded"  # never skipped on full
     second = state.model.watermarks[("consumer", "files", "")]
-    assert second["batch"] == first["batch"]  # back at head+1
-    assert second["offset"] == 0
-    assert second["more"] is False
+    assert second == first  # back at head+1, nothing left mid-way
     # Both deliveries were full-head reads.
     assert seen == [(["a", "b"], True), (["a", "b"], True)]
 
@@ -891,12 +896,14 @@ async def test_restart_requeues_and_relaunches_inflight(tmp_path):
                         "status": "succeeded",
                         "outputs": {
                             "resumable": {
-                                "output": "resumable",
-                                "store": "json",
-                                "handle": {"object": "x.json"},
-                                "version": "v1",
-                                "partition": "",
-                                "meta": {},
+                                "ref": {
+                                    "output": "resumable",
+                                    "store": "json",
+                                    "handle": {"object": "x.json"},
+                                    "version": "v1",
+                                    "partition": "",
+                                    "meta": {},
+                                }
                             }
                         },
                     }

@@ -101,8 +101,9 @@ waits for the flush that contains it.
      "attempt": "01J8ZC7R…", "outcome": "succeeded", "started_at": 1790074865.2, "finished_at": 1790074866.0,
      "commit": {
        "heads": {"site_events": {"…": "Head, §5"}, "site_files": {"…": "Head, §5"}},
-       "keys": {"site_files": {"file": "000000000057", "entries": 2, "added": 0, "removed": 0,
-                               "min": "alpha-file-1", "max": "alpha-file-3"}},
+       "keys": {"site_files": {"batch": 57, "added": 0, "removed": 0, "exact": true,
+                               "files": [{"name": "000000000057-01J8ZC7R…", "level": 0, "entries": 2,
+                                          "min": "alpha-file-1", "max": "alpha-file-3", "…": "…"}]}},
        "cursor": "5921",
        "watermarks": {}
      }},
@@ -123,8 +124,10 @@ status are derived inside `apply`; they are not events.
 | `RunSubmitted` | `run` (id, request, tasks) | adds an active run |
 | `RunControlled` | `run`, `action` (`cancel` \| `pause` \| `resume`) | |
 | `AttemptFinished` | `run`, `task`, `attempt`, `outcome` (`succeeded` \| `failed` \| `skipped` \| `expired`), `started_at`, `finished_at`, `error?`, `retryable?`, `commit?` | records the attempt; on commit, installs heads, cursor, watermarks, and each keyed output's new delta file |
-| `SourceCommitted` | `run`, `source`, `head`, `keys` | installs a source head and its delta file |
-| `IndexCompacted` | `output`, `scope`, `added` [file], `removed` [name] | swaps compacted files into a key index |
+| `SourceCommitted` | `source`, `head`, `keys?`, `at` | installs a source head and its delta file |
+| `IndexCompacted` | `output`, `scope`, `added` [file], `removed` [name], `recount?`, `at` | swaps compacted files into a key index; a recount replaces its count |
+| `IndexTruncated` | `output`, `scope`, `below`, `at` | drops delta log entries below `below` |
+| `GarbageDeleted` | `paths` | forgets index files that were deleted |
 | `AutomationChanged` | `name`, `enabled` | |
 | `AutomationFired` | `name`, `at`, `run` | clears its pending set |
 | `RunArchived` | `run` | drops a finished run from memory once `run.json` is written |
@@ -149,13 +152,14 @@ State
   automations  {name: AutomationState}
   retention    {asset: [run, …]}                   # finite policies only, oldest first (§11)
   runs         {run: Run}                          # active, or finished and not yet archived
+  garbage      [[path, at], …]                     # index files no index references any more
 ```
 
 | Type | Fields | Bounded by |
 |---|---|---|
-| `Head` | `ref` (from the store), `run`, `attempt` (may point at a deleted run), `batch`, `count`, `elements?` (partition sets), `complete`, `version` (declared asset version), `at` | outputs × partitions |
-| `KeyIndex` | `count`, `count_exact`, `files` [{`name`, `level`, `min`, `max`, `entries`, `size`, `tail`, `index`}], `log` [[`batch`, [file]], …] — see §6 | a few dozen files per index |
-| `Watermark` | `batch` (first batch not fully delivered; during a full drain, the head's batch + 1 when the drain began, so changes made while draining arrive afterwards as deltas), `after` (last key delivered inside `batch`, or during a full drain), `full` (a full drain is in progress), `fingerprint` | edges × partitions |
+| `Head` | `ref` (from the store), `run`, `attempt` (may point at a deleted run), `batch` (incremental outputs: the last batch that changed it, −1 before any), `base` (unkeyed incremental outputs: the first batch after the last reset), `count` (keyed: live keys), `elements?` (partition sets and set dimensions), `complete`, `version` (declared asset version), `asset`, `at` | outputs × partitions |
+| `KeyIndex` | `prefix` (where its files live — kept across renames), `count`, `count_exact`, `files` [{`name`, `level`, `min`, `max`, `entries`, `size`, `tail`, `index`}], `log` [[`batch`, [file]], …] — see §6 | a few dozen files per index |
+| `Watermark` | `batch` (first batch not fully delivered; during a full drain, the head's batch + 1 when the drain began, so changes made while draining arrive afterwards as deltas), `until` (the last batch of a delta window being delivered in pages), `after` (last key delivered inside the window or the full drain), `full` (a full drain is in progress), `fingerprint`, `output` and `up` (the upstream index it reads) | edges × partitions |
 | `Outcome` | `outcome`, `run`, `attempt`, `at` | assets × partitions |
 | `AutomationState` | `enabled`, `last_fired`, `last_run`, `last_revision`, `pending` (set of `[asset, scope]` for OnChange) | automations × partitions |
 | `Run` | `id`, `request` {targets, partitions, mode, config, keys, automation}, `status`, `paused`, `created_at`, `tasks` {task: `Task`} | in-flight work |
@@ -178,12 +182,13 @@ Example (abridged):
     "run": "01J8ZC7Q…", "attempt": "01J8ZC7R…",
     "batch": 57, "count": 4, "complete": true, "version": "1", "at": 1790074866.0}}},
   "indexes": {"site_files": {"alpha": {
-    "count": 4,
-    "files": [{"name": "c01J8ZE2…", "level": 1, "min": "alpha-file-0", "max": "alpha-file-3", "entries": 4, "bytes": 212},
-              {"name": "000000000057", "level": 0, "min": "alpha-file-1", "max": "alpha-file-3", "entries": 2, "bytes": 140}],
-    "log": [[56, "000000000056"], [57, "000000000057"]]}}},
+    "prefix": "keys/site_files/alpha/", "count": 4, "count_exact": true,
+    "files": [{"name": "c01J8ZE2…-0000", "level": 1, "min": "alpha-file-0", "max": "alpha-file-3", "entries": 4, "size": 212, "…": "…"},
+              {"name": "000000000057-01J8ZC7R…", "level": 0, "min": "alpha-file-1", "max": "alpha-file-3", "entries": 2, "size": 140, "…": "…"}],
+    "log": [[56, [{"name": "000000000056-01J8ZB…", "…": "…"}]], [57, [{"name": "000000000057-01J8ZC7R…", "…": "…"}]]]}}},
   "cursors": {"site_feed": {"alpha": "5921"}},
-  "watermarks": {"file_index": {"site_files": {"alpha": {"batch": 56, "after": null, "full": false, "fingerprint": "8d46…"}}}},
+  "watermarks": {"file_index": {"site_files": {"alpha": {"batch": 56, "after": null, "full": false, "fingerprint": "8d46…",
+                                                         "output": "site_files", "up": "alpha"}}}},
   "outcomes": {"file_index": {"alpha": {"outcome": "succeeded", "run": "01J8ZB3K…", "attempt": "01J8ZB3M…", "at": 1790074800.0}}},
   "automations": {"site_feed.every.0": {"enabled": true, "last_fired": 1790074866.1,
                   "last_run": "01J8ZC7S…", "last_revision": "c0ffee…", "pending": []}},
@@ -256,8 +261,8 @@ Levels small enough (≤ 32 MB) are always read whole.
 | Deliver pending deltas | harness, for an `Incremental` edge | Read the `log` files from the watermark to the head; chunk by `batch_size` in key order; ask the upstream store for those rows with `Keys(…)`. |
 | Full delivery | harness | Page through the merged view of all levels from `after`, `batch_size` keys at a time, and ask the store for them with `Keys(…)`. Per level, only the files covering the page are opened, and only their index parts are read. |
 | Compaction | the engine's machine by default (§6, *Engine work*) | When level 0 exceeds ~8 files, merge it with the overlapping level-1 files into new level-1 files, cascading down; commit with `IndexCompacted`. |
-| Truncate the log | engine | Drop `log` entries below the lowest consumer watermark; an output with no `Incremental` consumers keeps none. |
-| Delete files | engine | A file in neither `files` nor `log` is deleted. |
+| Truncate the log | engine | Drop `log` entries below the lowest consumer watermark and below every window an in-flight attempt was given (`IndexTruncated`); an output with no `Incremental` consumers keeps none. A consumer whose window the log no longer holds gets a full delivery. |
+| Delete files | engine | A file in neither `files` nor `log` joins `garbage`, and is deleted once every attempt that could have pinned it has finished (`GarbageDeleted`). A delta file of an attempt that never committed is deleted when the attempt ends. |
 
 Writes that never pass through the harness as rows — `Sql` materialized
 inside Postgres — are the one case where the store must report the written
@@ -268,11 +273,12 @@ for very large commits the client builds the file itself and commits a
 reference to it.
 
 **Engine work.** Compaction is the one heavy computation the engine
-itself starts. It runs locally on the engine's machine by default. A
-project-level setting offloads it to an executor instead:
+itself starts. It runs locally on the engine's machine, on a worker thread
+with its own event loop, at most `maintenance_concurrency` at a time. A
+project-level setting to offload it to an executor is planned, not built:
 
 ```python
-Project(..., engine_executor=ecs(cpu=2, memory="8GB"))   # default: local
+Project(..., engine_executor=ecs(cpu=2, memory="8GB"))   # not built yet; local today
 ```
 
 **Local disk cache.** Index files never change once written, so a cached
@@ -343,19 +349,17 @@ of the outputs it writes and the incremental inputs it reads).
   "spec": {
     "attempt": "01J8ZB3M…", "run": "01J8ZB3K…", "revision": "c0ffee…",
     "asset": "file_index", "scope": "alpha", "config": {}, "execution": {"kind": "Local"},
-    "inputs": {"site_files": {"ref": {"…": "…"}, "index": {"…": "KeyIndex"},
+    "inputs": {"site_files": {"ref": {"…": "…"}, "index": {"…": "KeyIndex: levels + log[56..57]"},
                "changes": {"from": 56, "to": 57, "after": null, "full": false, "limit": 2}}},
     "prior": {"file_index": {"…": "ref"}},
-    "indexes": {"file_index": {"…": "KeyIndex"}},
-    "cursor": null,
-    "batches": {"file_index": 12}
+    "outputs": {"file_index": {"exists": true, "batch": 12, "index": {"…": "KeyIndex: levels only"}}},
+    "cursor": null
   },
   "result": {
     "status": "succeeded",
-    "outputs": {"file_index": {"ref": {"…": "…"}, "count": 4, "elements": null,
-                "keys": {"file": "000000000012", "entries": 1, "added": 0, "removed": 0,
-                         "min": "alpha-file-2", "max": "alpha-file-2"}}},
-    "watermarks": {"site_files": {"batch": 58, "after": null, "full": false}},
+    "outputs": {"file_index": {"ref": {"…": "…"},
+                "keys": {"added": 0, "removed": 0, "exact": true, "files": [{"name": "000000000012-01J8ZB3M…", "…": "…"}]}}},
+    "delivered": {"site_files": {"after": null, "upserted": ["alpha-file-2"], "deleted": []}},
     "cursor": null,
     "error": null
   },
@@ -383,7 +387,7 @@ of the outputs it writes and the incremental inputs it reads).
 
 ```python
 class Store(Protocol):
-    async def store(self, write, prior, scope) -> Written   # Written(ref, count, elements?, keys?)
+    async def store(self, write, prior, scope) -> Written   # Written(ref, keys?)
     async def load(self, ref, t, selection) -> Any           # selection: None | Keys | Batches
     async def expire(self, head, before) -> None             # delete what no version written after `before` needs
 ```
@@ -475,8 +479,9 @@ POST   /api/projects/{p}/runs:prune   {"before", "asset", "keep", "dry_run"}
 | separate `spec.json`, `result.json`, per-flush log files | one attempt file; one gzip log per attempt, chunked only while running |
 | persisted locks, leases, queue, workers | memory only; rebuilt or re-registered |
 | claim events | unique attempt ids make unknown attempts harmless |
-| `ref.meta.delta` / `.keys` / `.partitions`, `head.base` | engine fields on `Head`: `batch`, `count`, `elements` |
-| watermark `offset` and `after_key` | one `after` field, plus `full` |
+| `ref.meta.delta` / `.keys` / `.partitions` | engine fields on `Head`: `batch`, `base`, `count`, `elements` |
+| watermark `offset` and `after_key` | one `after` field, plus `full` and `until` |
+| refusing a commit whose inputs moved after pinning | the commit stands: it delivered what it pinned |
 | automation commit watermark | a pending set of `(asset, scope)` |
 | per-automation retention, automation names in run ids | per-asset retention; run id = ULID |
 | pinned runs | nothing but active runs is protected; current state is independent of runs |

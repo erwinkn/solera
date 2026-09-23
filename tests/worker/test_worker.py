@@ -33,7 +33,7 @@ def make_engine(state, entrypoint, **kw):
 
 async def test_local_subprocess_end_to_end(state, tmp_path):
     """§10: submit → spec object → real subprocess → store → result → commit;
-    key map staged; ctx.log chunks are readable."""
+    the delta file lands in the key index; ctx.log chunks are readable."""
     entrypoint = write_project(
         tmp_path,
         """
@@ -58,13 +58,17 @@ project = Project(assets=[feed, consumer])
 
     task = [t for t in detail["tasks"] if t["asset"] == "consumer"][0]
     attempt = detail["attempts"][task["id"]][0]["id"]
-    # the delta object is written and referenced from the committed ref
+    # the harness wrote the batch's delta file into the output's key index
     head = state.model.heads[("feed", "")]
-    assert head["ref"]["meta"]["delta"]["rows"] == 2
-    assert head["ref"]["meta"]["delta"]["object"].startswith("deltas/")
-    # the result object is the commit request
+    assert head["count"] == 2 and head["batch"] == 0
+    index = state.model.indexes[("feed", "")]
+    [delta] = index.files
+    assert await state.get_object(index.path(delta.name)) is not None
+    assert delta.name.startswith("000000000000-") and delta.entries == 2
+    # the result object is the commit request, and reports what was delivered
     result = json.loads(await state.get_object(f"results/{attempt}.json"))
     assert result["status"] == "succeeded"
+    assert result["delivered"]["feed"] == {"after": None, "upserted": ["a", "b"], "deleted": []}
     # ctx.log streamed a chunk
     log = await state.get_object(f"logs/{attempt}/000000.jsonl")
     assert json.loads(log.splitlines()[0])["message"] == "consumed"

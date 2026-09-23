@@ -49,6 +49,9 @@ export interface Head {
   complete: boolean;
   asset: string | null;
   version: string | null;
+  batch?: number;
+  count?: number;
+  elements?: string[];
 }
 
 export interface OutputDecl {
@@ -142,7 +145,7 @@ export interface AutomationRecord extends AutomationDecl {
   last_at: number | null;
   last_run: string | null;
   last_revision: string | null;
-  commit_watermark: number;
+  pending: [string | null, string][];
 }
 
 export interface Run {
@@ -214,7 +217,7 @@ export interface OutputHead {
   ref: Ref;
   version: string | null;
   key_count: number | null;
-  delta: { object: string; batch: number; rows: number } | null;
+  batch: number | null;
   complete: boolean;
   cursor: boolean;
   at: number;
@@ -223,9 +226,12 @@ export interface OutputHead {
 
 export interface Watermark {
   batch: number;
-  offset: number;
+  until?: number;
+  after: string | null;
+  full: boolean;
   fingerprint: string;
-  more?: boolean;
+  output: string;
+  up: string;
 }
 
 export interface AssetDetail {

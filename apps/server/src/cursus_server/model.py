@@ -4,9 +4,10 @@ events that change it, and `apply`.
 The model is plain data changed only by `apply(event)`, so replaying the
 journal reproduces it exactly. It has three layers:
 
-- **Durable**: the project, heads, cursors, watermarks, per-scope outcomes,
-  automation state, active runs (tasks nested inside), and idempotency
-  receipts. `snapshot()` serializes exactly this, and `restore()` loads it.
+- **Durable**: the project, heads, key indexes, cursors, watermarks,
+  per-scope outcomes, automation state, active runs (tasks nested inside),
+  idempotency receipts, and index files awaiting deletion. `snapshot()`
+  serializes exactly this, and `restore()` loads it.
 - **Derived**: the ready queue, pending-per-scope, dependency counters and
   run roll-ups. Rebuilt by `restore()`, maintained by `apply()`.
 - **Memory only**: claims, locks and leases, pool claims, workers. Never
@@ -19,6 +20,8 @@ Events carry every timestamp they need; `apply` never reads a clock.
 from __future__ import annotations
 
 import copy
+
+from cursus.keys.index import DeltaFiles, FileInfo, IndexState, index_prefix
 
 TERMINAL_TASK = frozenset({"succeeded", "skipped", "failed", "blocked", "canceled"})
 TERMINAL_RUN = frozenset({"succeeded", "failed", "canceled"})
@@ -67,6 +70,8 @@ class Model:
                 "manifest": self.manifest,
                 "project": self.project,
                 "heads": _nest(self.heads, 2),
+                "indexes": _nest({k: v.to_json() for k, v in self.indexes.items()}, 2),
+                "garbage": self.garbage,
                 "cursors": _nest(self.cursors, 2),
                 "watermarks": _nest(self.watermarks, 3),
                 "outcomes": _nest(self.outcomes, 2),
@@ -84,6 +89,10 @@ class Model:
         self.manifest = snap.get("manifest")
         self.project = snap.get("project")
         self.heads: dict[tuple, dict] = _flatten(snap.get("heads"), 2)
+        self.indexes: dict[tuple, IndexState] = {
+            k: IndexState.from_json(v) for k, v in _flatten(snap.get("indexes"), 2).items()
+        }
+        self.garbage: list[list] = snap.get("garbage") or []  # [path, at]: unreferenced index files
         self.cursors: dict[tuple, object] = _flatten(snap.get("cursors"), 2)
         self.watermarks: dict[tuple, dict] = _flatten(snap.get("watermarks"), 3)
         self.outcomes: dict[tuple, dict] = _flatten(snap.get("outcomes"), 2)
@@ -99,7 +108,9 @@ class Model:
         self._reindex()
 
     def _reindex(self) -> None:
-        """Rebuild the derived indexes from the durable runs."""
+        """Rebuild the derived indexes from the durable runs and the manifest."""
+
+        self._consumed = self._consumed_outputs(self.manifest)
 
         self.task_run: dict[str, str] = {}
         self.queue: dict[str, float] = {}
@@ -154,6 +165,18 @@ class Model:
         self.run_left.pop(run_id, None)
         self.archivable.discard(run_id)
 
+    @staticmethod
+    def _consumed_outputs(manifest) -> set[str]:
+        """Outputs some asset reads through an Incremental edge: only their
+        indexes keep a delta log (§6)."""
+
+        return {
+            edge["output"]
+            for asset in ((manifest or {}).get("assets") or {}).values()
+            for edge in asset["inputs"].values()
+            if edge["kind"] == "incremental"
+        }
+
     # -- reads ---------------------------------------------------------------------------
 
     def task(self, task_id: str) -> dict | None:
@@ -165,6 +188,12 @@ class Model:
 
         claim = self.claims.get(task["id"])
         return claim["status"] if claim else task["status"]
+
+    def index(self, output: str, scope: str) -> IndexState:
+        """The output's key index, or an empty one where a new index would go."""
+
+        found = self.indexes.get((output, scope))
+        return found if found is not None else IndexState(prefix=index_prefix(output, scope))
 
     def heads_of(self, output: str) -> list[tuple[str, dict]]:
         return sorted((scope, head) for (o, scope), head in self.heads.items() if o == output)
@@ -231,9 +260,17 @@ class Model:
     def _on_ProjectRegistered(self, e):
         manifest = e["manifest"]
         self.revision, self.manifest, self.project = e["revision"], manifest, e.get("project")
+        self._consumed = self._consumed_outputs(manifest)
+        renamed = self._apply_aliases(manifest)
         automations = {}
         for name, auto in manifest["automations"].items():
             existing = self.automations.get(name)
+            if existing is None:
+                owner, _, rest = name.partition(".")
+                for old in renamed.get(owner, ()):
+                    existing = self.automations.get(f"{old}.{rest}")
+                    if existing is not None:
+                        break
             record = {**auto, "last_at": None, "last_run": None, "last_revision": None, "pending": []}
             if existing is not None:
                 record["enabled"] = existing["enabled"]
@@ -253,6 +290,48 @@ class Model:
                     "asset": None,
                     "version": None,
                 }
+
+    def _apply_aliases(self, manifest) -> dict[str, list[str]]:
+        """Move everything held under an asset's former names to its current
+        one (§2): cursors, watermarks, outcomes, pending automation entries,
+        and — for outputs named after the asset — heads and key indexes. An
+        index keeps its files where they are (its `prefix`). Returns
+        `{asset: [aliases]}` for the automations to follow."""
+
+        assets = {n: a for n, a in manifest["assets"].items() if a.get("aliases")}
+        renamed = {}
+        for name, info in assets.items():
+            renamed[name] = [a for a in info["aliases"] if a not in manifest["assets"]]
+        asset_map = {old: new for new, olds in renamed.items() for old in olds}
+        if not asset_map:
+            return renamed
+        outputs = manifest["outputs"]
+        output_map = {
+            old: new
+            for old, new in asset_map.items()
+            if old not in outputs and (outputs.get(new) or {}).get("asset") == new
+        }
+
+        def move(table: dict, rename, position: int):
+            for key in [k for k in table if k[position] in rename]:
+                target = (*key[:position], rename[key[position]], *key[position + 1 :])
+                if target not in table:
+                    table[target] = table.pop(key)
+
+        move(self.heads, output_map, 0)
+        move(self.indexes, output_map, 0)
+        move(self.cursors, asset_map, 0)
+        move(self.outcomes, asset_map, 0)
+        move(self.watermarks, asset_map, 0)
+        for head in self.heads.values():
+            if head.get("asset") in asset_map:
+                head["asset"] = asset_map[head["asset"]]
+        for wm in self.watermarks.values():
+            if wm.get("output") in output_map:
+                wm["output"] = output_map[wm["output"]]
+        for auto in self.automations.values():
+            auto["pending"] = [[asset_map.get(a, a), s] for a, s in auto.get("pending") or []]
+        return renamed
 
     def _on_RunSubmitted(self, e):
         run = e["run"]
@@ -376,6 +455,7 @@ class Model:
             if before is None or before["ref"].get("version") != head["ref"].get("version"):
                 changed.append(name)
             self.heads[(name, scope)] = {**head, "run": e["run"], "attempt": e["attempt"], "at": at}
+            self._commit_keys(name, scope, (commit.get("keys") or {}).get(name))
         if "cursor" in commit:
             if commit["cursor"] is None:
                 self.cursors.pop((asset, scope), None)
@@ -455,10 +535,55 @@ class Model:
         else:
             run["status"] = "running"
 
+    def _commit_keys(self, output: str, scope: str, keys: dict | None) -> None:
+        """Add a commit's delta files to the output's key index (§6): into the
+        levels, and into the delta log if anything reads it incrementally.
+        The head carries the index's live key count."""
+
+        if keys is not None:
+            index = self.index(output, scope)
+            if keys["files"]:
+                index = index.committed(
+                    keys["batch"], DeltaFiles.from_json(keys), keep_log=output in self._consumed
+                )
+            self.indexes[(output, scope)] = index
+        index = self.indexes.get((output, scope))
+        if index is not None:
+            self.heads[(output, scope)]["count"] = index.count
+
+    def _replace_index(self, key: tuple, index: IndexState, at: float) -> None:
+        """Swap in a new index state; files it no longer references await deletion."""
+
+        before = self.indexes[key]
+        self.indexes[key] = index
+        for name in sorted(before.referenced() - index.referenced()):
+            self.garbage.append([before.path(name), at])
+
+    def _on_IndexCompacted(self, e):
+        key = (e["output"], e["scope"])
+        if key not in self.indexes:
+            return
+        index = self.indexes[key].compacted(
+            [FileInfo.from_json(f) for f in e["added"]], e["removed"], recount=e.get("recount")
+        )
+        self._replace_index(key, index, e["at"])
+        if key in self.heads:
+            self.heads[key]["count"] = index.count
+
+    def _on_IndexTruncated(self, e):
+        key = (e["output"], e["scope"])
+        if key in self.indexes:
+            self._replace_index(key, self.indexes[key].truncated(e["below"]), e["at"])
+
+    def _on_GarbageDeleted(self, e):
+        gone = set(e["paths"])
+        self.garbage = [g for g in self.garbage if g[0] not in gone]
+
     def _on_SourceCommitted(self, e):
         before = self.heads.get((e["source"], ""))
         head = e["head"]
         self.heads[(e["source"], "")] = {**head, "at": e["at"]}
+        self._commit_keys(e["source"], "", e.get("keys"))
         if before is None or before["ref"].get("version") != head["ref"].get("version"):
             self._pend_onchange(None, "", [e["source"]])
 

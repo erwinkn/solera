@@ -33,34 +33,35 @@ async def test_bare_replace_and_versions(store):
 
     out = output(key="id", revision="v")
     first = await store.store([{"id": "a", "v": "1"}], None, scope(out))
-    second = await store.store([{"id": "a", "v": "1"}], first.ref, scope(out, baseline=first.ref))
+    second = await store.store([{"id": "a", "v": "1"}], first.ref, scope(out))
     assert first.ref.version == second.ref.version
     third = await store.store([{"id": "a", "v": "2"}], first.ref, scope(out))
     assert third.ref.version != first.ref.version
     assert await store.load(third.ref, list[dict], None) == [{"id": "a", "v": "2"}]
 
 
-async def test_patch_upsert_remove_and_orphan_sweep(store):
-    """§3/§4: Patch upserts keys, removes others, and deletes rows absent
-    from the resulting map (orphans left by uncommitted attempts)."""
+async def test_patch_upsert_and_remove(store):
+    """§3/§4: Patch upserts keys and removes others; with no prior it is the
+    whole content. The store reports no keys: the harness derives them."""
 
     out = output(key="id", revision="v", primary_key=["id"])
     first = await store.store(Patch([{"id": "a", "v": "1"}, {"id": "b", "v": "1"}]), None, scope(out))
-    assert first.delta.upserted == {"a": "1", "b": "1"}
+    assert first.keys is None
     second = await store.store(
         Patch([{"id": "b", "v": "2"}, {"id": "c", "v": "9"}], remove=["a"]),
         first.ref,
-        scope(out, baseline=first.ref),
+        scope(out),
     )
-    assert second.delta.upserted == {"b": "2", "c": "9"}
-    assert second.delta.deleted == ("a",)
-    assert sorted(r["id"] for r in await store.load(second.ref, list[dict], None)) == ["b", "c"]
+    rows = await store.load(second.ref, list[dict], None)
+    assert sorted((r["id"], r["v"]) for r in rows) == [("b", "2"), ("c", "9")]
     with pytest.raises(WriteError):
         await store.store(
             Patch([{"id": "x", "v": "1"}, {"id": "x", "v": "1"}]),
             second.ref,
-            scope(out, baseline=second.ref),
+            scope(out),
         )
+    reset = await store.store(Patch([{"id": "z", "v": "1"}]), None, scope(out))
+    assert [r["id"] for r in await store.load(reset.ref, list[dict], None)] == ["z"]
 
 
 async def test_marker_fences_store_and_load(store):
@@ -69,9 +70,9 @@ async def test_marker_fences_store_and_load(store):
 
     out = output(key="id", revision="v", primary_key=["id"])
     first = await store.store([{"id": "a", "v": "1"}], None, scope(out))
-    moved = await store.store([{"id": "a", "v": "2"}], first.ref, scope(out, baseline=first.ref))
+    moved = await store.store([{"id": "a", "v": "2"}], first.ref, scope(out))
     with pytest.raises(StoreConflict):
-        await store.store([{"id": "a", "v": "3"}], first.ref, scope(out, baseline=first.ref))
+        await store.store([{"id": "a", "v": "3"}], first.ref, scope(out))
     with pytest.raises(StaleRead):
         await store.load(first.ref, list[dict], None)
     assert (await store.load(moved.ref, list[dict], None))[0]["v"] == "2"
@@ -100,6 +101,35 @@ async def test_sql_materializes_select(store):
     assert derived.name in sql_ref.ref.table
     rows = await store.load(sql_ref.ref, list[dict], None)
     assert sorted(r["id"] for r in rows) == ["a", "b"]
+    assert sql_ref.keys is None  # unkeyed: nothing to report
+
+
+async def test_keyed_sql_reports_its_keys(store):
+    """§6/§9: the harness never sees rows a Sql write materializes, so the
+    store reports the slice's complete key map."""
+
+    source = output(key="id", revision="v", primary_key=["id"])
+    written = await store.store([{"id": "a", "v": "1"}, {"id": "b", "v": "2"}], None, scope(source))
+    derived = output(key="id", revision="v")
+    sql = await store.store(Sql(f"SELECT id, v FROM {written.ref.table}"), None, scope(derived))
+    assert sql.keys == {"a": "1", "b": "2"}
+
+
+async def test_aliases_rename_the_table(store):
+    """§2: an output renamed through its asset's aliases takes its table along."""
+
+    old = output(key="id", revision="v", primary_key=["id"])
+    first = await store.store([{"id": "a", "v": "1"}], None, scope(old))
+    new = output(key="id", revision="v", primary_key=["id"])
+    from cursus.stores import Scope
+
+    moved = await store.store(
+        Patch([{"id": "b", "v": "1"}]),
+        first.ref,
+        Scope(output=new, partition="", batch=1, attempt="t", aliases=(old.name,)),
+    )
+    assert new.name in moved.ref.table
+    assert sorted(r["id"] for r in await store.load(moved.ref, list[dict], None)) == ["a", "b"]
 
 
 async def test_batch_snapshot_at_pinned_version(store):
@@ -107,10 +137,9 @@ async def test_batch_snapshot_at_pinned_version(store):
     pinned batch, even after later writes."""
 
     out = output(incremental=True, partition_column="site")
-    first = await store.store(Patch([{"e": 1}]), None, scope(out, partition="s1"))
-    second = await store.store(Patch([{"e": 2}]), first.ref, scope(out, partition="s1", baseline=first.ref))
-    assert first.delta.batch == 0 and first.delta.reset
-    assert second.delta.batch == 1
+    first = await store.store(Patch([{"e": 1}]), None, scope(out, partition="s1", batch=0))
+    second = await store.store(Patch([{"e": 2}]), first.ref, scope(out, partition="s1", batch=1))
+    assert first.ref.handle["batch"] == 0 and second.ref.handle["batch"] == 1
     at_first = await store.load(first.ref, list[dict], None)
     assert [r["e"] for r in at_first] == [1]
     at_second = await store.load(second.ref, list[dict], None)

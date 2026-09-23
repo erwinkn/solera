@@ -101,8 +101,9 @@ uv run cursus run site_feed --partitions all --upstream
 
 Each site scope writes a `site_events` incremental batch and a `site_files` keyed
 patch, and stores the feed token as its cursor. **Runs** shows the run; click a
-task to see its attempt spec — `inputs.site_files` carries the pinned ref and the
-delta selection (batch range or key list).
+task to see its attempt spec — `inputs.site_files` carries the pinned ref, the
+pinned key index and the window to read (a delta-log range, or the whole index
+for a first delivery); the attempt's result records the keys it delivered.
 
 Run it again inside the same feed tick: the feed returns identical events,
 the committed versions are unchanged, and `file_index` is not woken — that is

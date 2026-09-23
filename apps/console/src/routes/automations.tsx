@@ -101,7 +101,7 @@ function AutomationsPage() {
                     )}
                   {automation.trigger.kind === "onchange" && (
                     <Badge variant="outline" className="font-mono">
-                      @{automation.commit_watermark}
+                      {automation.pending.length} pending
                     </Badge>
                   )}
                   <Switch

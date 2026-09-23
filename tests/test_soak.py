@@ -6,8 +6,10 @@ for >= 500 batches per site, and nothing may grow faster than the work does.
 - `control/` — the journal and checkpoints — stays bounded however many runs
   happen: at most two checkpoints, and the journal since the older one;
 - finished runs leave memory and land under `runs/`;
-- the delta log holds one object per incremental batch, and `keys/` never
-  appears.
+- `keys/` — the key indexes — stays bounded by live keys plus the delta log
+  a consumer still needs: compaction folds delta files together, the log is
+  truncated behind the consumer's watermark, and unreferenced files are
+  deleted.
 
 The real engine, JsonStore and LocalStore all run in-process; `time.time` is
 patched to the fake clock (advanced 6 s per run) so the demo's five-second
@@ -18,8 +20,10 @@ import importlib
 import json
 import os
 import time
+from collections import Counter
 from pathlib import Path
 
+import obstore
 from cursus.sdk import Ref
 from cursus_server.engine import Engine
 from cursus_server.placements.inline import InlinePlacement
@@ -39,8 +43,31 @@ def _count(root: Path, prefix: str) -> int:
     return sum(1 for p in base.rglob("*") if p.is_file()) if base.is_dir() else 0
 
 
+def _count_calls(monkeypatch) -> Counter:
+    """Count every object store request by kind, whoever makes it."""
+
+    calls = Counter()
+    for name in (
+        "get_async",
+        "get_range_async",
+        "put_async",
+        "delete_async",
+        "list",
+        "list_with_delimiter_async",
+    ):
+        original = getattr(obstore, name)
+
+        def counted(*args, _original=original, _name=name, **kwargs):
+            calls[_name] += 1
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(obstore, name, counted)
+    return calls
+
+
 async def test_soak(tmp_path, monkeypatch):
     monkeypatch.delenv("DATABASE_URL", raising=False)
+    calls = _count_calls(monkeypatch)
     clock = [1_700_000_000.0]
     monkeypatch.setattr(time, "time", lambda: clock[0])
 
@@ -68,9 +95,9 @@ async def test_soak(tmp_path, monkeypatch):
         run = await engine.submit(["sites"])
         detail = await engine.run_until(run["id"], timeout=1e9)
         assert detail["request"]["status"] == "succeeded"
-    assert len(state.model.heads[("sites", "")]["ref"]["meta"]["partitions"]) == 4
+    assert len(state.model.heads[("sites", "")]["elements"]) == 4
 
-    samples = []  # (committed runs, data bytes, control bytes)
+    samples = []  # (committed runs, data bytes, control bytes, keys bytes, object requests)
     checkpoints_peak = runs_in_memory_peak = 0
     submitted = 4
     for i in range(BATCHES):
@@ -86,24 +113,35 @@ async def test_soak(tmp_path, monkeypatch):
             detail = await engine.run_until(run["id"], timeout=1e9)
             submitted += 1
             assert detail["request"]["status"] == "succeeded", detail["request"]["id"]
+        # A flush acknowledges its events before it writes a due checkpoint and
+        # cleans up; wait for that, so the sample sees the steady state.
+        await state.journal.flush()
         checkpoints_peak = max(checkpoints_peak, _count(root, "control/checkpoints"))
         runs_in_memory_peak = max(runs_in_memory_peak, len(state.model.runs))
         if (i + 1) % SAMPLE_EVERY == 0 or i == BATCHES - 1:
-            samples.append((i + 1, _bytes(root, "data"), _bytes(root, "control")))
+            samples.append(
+                (i + 1, _bytes(root, "data"), _bytes(root, "control"), _bytes(root, "keys"), calls.total())
+            )
 
-    runs, sizes, control = [s[0] for s in samples], [s[1] for s in samples], [s[2] for s in samples]
+    runs, sizes = [s[0] for s in samples], [s[1] for s in samples]
+    control, keys = [s[2] for s in samples], [s[3] for s in samples]
+    requests = [(b[4] - a[4]) / (b[0] - a[0]) for a, b in zip(samples, samples[1:], strict=False)]
     early_rate = (sizes[1] - sizes[0]) / (runs[1] - runs[0])
     late_rate = (sizes[-1] - sizes[-2]) / (runs[-1] - runs[-2])
     print(
         f"\nsoak: {BATCHES} runs x 4 sites, data {sizes[0]} -> {sizes[-1]} B "
         f"(early {early_rate:.0f} -> late {late_rate:.0f} B/run), control {control[0]} -> {control[-1]} B "
-        f"(max {max(control)}), checkpoints peak {checkpoints_peak}, runs in memory peak {runs_in_memory_peak}"
+        f"(max {max(control)}), keys {keys[0]} -> {keys[-1]} B (max {max(keys)}), "
+        f"requests/run {requests[0]:.0f} -> {requests[-1]:.0f} (max {max(requests):.0f}), "
+        f"checkpoints peak {checkpoints_peak}, runs in memory peak {runs_in_memory_peak}"
     )
     assert sizes[-1] > sizes[0], "the soak must actually write data"
     assert late_rate <= max(2.0 * early_rate, early_rate + 16384), (
         f"data growth is superlinear ({early_rate:.0f} -> {late_rate:.0f} B/run) — "
         "batch writes must not rewrite history"
     )
+    # Object requests per run stay flat: nothing reads or rewrites history.
+    assert max(requests[len(requests) // 2 :]) <= 1.25 * max(requests[: len(requests) // 2]) + 5, requests
     # control/ is bounded by the state's size, not by how many runs happened.
     assert checkpoints_peak <= 2
     assert max(control[len(control) // 2 :]) <= 2 * max(control[: len(control) // 2]) + 256 * 1024, control
@@ -112,12 +150,23 @@ async def test_soak(tmp_path, monkeypatch):
     await engine.tick()
     assert len(await state.archived_ids()) == submitted
 
-    # The delta log: one object per committed batch, and no keys/ prefix.
-    assert _count(root, "keys") == 0, "the keys/ prefix must not exist (§2.1)"
-    assert _count(root, "deltas") >= BATCHES, "one delta object per committed batch"
-    delta_meta = state.model.heads[("site_events", "alpha")]["ref"]["meta"].get("delta")
-    assert delta_meta and delta_meta["object"].startswith("deltas/site_events/")
-    assert delta_meta["batch"] == BATCHES - 1
+    # keys/ is bounded by live keys and the log the consumer still needs.
+    assert max(keys[len(keys) // 2 :]) <= 2 * max(keys[: len(keys) // 2]) + 64 * 1024, keys
+    await engine.tick()  # the last garbage goes
+    for (output, scope), index in state.model.indexes.items():
+        assert len(index.files) <= 2 * engine.key_options.l0_max_files, (output, scope, len(index.files))
+        referenced = {index.path(n) for n in index.referenced()}
+        on_disk = {str(p.relative_to(root)) for p in (root / index.prefix).glob("*.kx")}
+        assert on_disk == referenced, (output, scope, sorted(on_disk - referenced)[:5])
+    assert _count(root, "deltas") == 0, "delta files live in the key index (§6)"
+    assert state.model.heads[("site_events", "alpha")]["batch"] == BATCHES - 1
+    # The index agrees with what the store holds.
+    for site in ("alpha", "bravo"):
+        ref = Ref.from_json(state.model.heads[("site_files", site)]["ref"])
+        rows = await project.stores[ref.store].load(ref, None, None)
+        listed = await engine.list_keys("site_files", site)
+        assert listed["total"] == len(rows) == state.model.heads[("site_files", site)]["count"]
+        assert listed["keys"] == {r["file_id"]: str(r["version"]) for r in rows}
 
     # A live consumer still plans incrementally, not as a full re-read.
     run = await engine.submit(["file_index"], partitions="all")

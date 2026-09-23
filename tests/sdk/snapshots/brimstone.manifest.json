@@ -1,6 +1,7 @@
 {
   "assets": {
     "fleet_dashboard": {
+      "aliases": [],
       "automations": [
         "fleet_dashboard.onchange.0"
       ],
@@ -63,6 +64,7 @@
       "version": "1"
     },
     "graph_delta": {
+      "aliases": [],
       "automations": [
         "graph_delta.every.0"
       ],
@@ -127,6 +129,7 @@
       "version": "1"
     },
     "hillshade": {
+      "aliases": [],
       "automations": [
         "hillshade.every.0"
       ],
@@ -191,6 +194,7 @@
       "version": "1"
     },
     "leach": {
+      "aliases": [],
       "automations": [],
       "code_hash": "4579c74a69ddfaed78870d13504629a8a7f0f723485b9b53d21f6c833a0eb631",
       "deps": [],
@@ -299,6 +303,7 @@
       "version": "1"
     },
     "manual_upload": {
+      "aliases": [],
       "automations": [
         "manual_upload.every.0"
       ],
@@ -360,6 +365,7 @@
       "version": "1"
     },
     "psa_mean_data": {
+      "aliases": [],
       "automations": [
         "psa_mean_data.onchange.0"
       ],
@@ -434,6 +440,7 @@
       "version": "1"
     },
     "qaqc_samples": {
+      "aliases": [],
       "automations": [
         "qaqc_samples.onchange.0"
       ],
@@ -514,6 +521,7 @@
       "version": "2"
     },
     "region_rollup": {
+      "aliases": [],
       "automations": [
         "region_rollup.onchange.0"
       ],
@@ -587,6 +595,7 @@
       "version": "1"
     },
     "site_health": {
+      "aliases": [],
       "automations": [
         "site_health.onchange.0"
       ],
@@ -649,6 +658,7 @@
       "version": "1"
     },
     "sites": {
+      "aliases": [],
       "automations": [
         "sites.cron.0",
         "sites.ondeploy.0"
@@ -701,6 +711,7 @@
       "version": "1"
     },
     "weekly_report": {
+      "aliases": [],
       "automations": [
         "weekly_report.cron.0"
       ],
@@ -970,6 +981,10 @@
     "Local",
     "Pool"
   ],
+  "key_cache": {
+    "max_bytes": 8589934592,
+    "path": null
+  },
   "name": "default",
   "outputs": {
     "change_events": {
@@ -1312,7 +1327,7 @@
     }
   },
   "retention": null,
-  "revision": "b9c815880bb290a47c12c311ce1f315c388bbfa2eae1f1147ec8ebdbb780e98b",
+  "revision": "5ec549795f7dd0653407db45fe52b2512034457a845a3a757da1a744af0bd68b",
   "sources": {
     "leach_crosswalk": {
       "handle": {

@@ -18,6 +18,7 @@ import asyncio
 import bisect
 import math
 from dataclasses import dataclass, field, replace
+from urllib.parse import quote
 
 from ..ids import ulid
 from . import (
@@ -41,12 +42,22 @@ from .io import RANGE, ObjectIO
 # -- engine-held state ---------------------------------------------------------------
 
 
-def _s(key: bytes) -> str:
+def key_str(key: bytes) -> str:
     return key.decode("utf-8", "surrogateescape")
 
 
-def _b(key: str) -> bytes:
+def key_bytes(key: str) -> bytes:
     return key.encode("utf-8", "surrogateescape")
+
+
+_s, _b = key_str, key_bytes
+
+
+def index_prefix(output: str, scope: str) -> str:
+    """Where a new index's files go: `keys/{output}/{scope}/` (`_` for the
+    unpartitioned scope). An index keeps its prefix when its output is renamed."""
+
+    return f"keys/{output}/{quote(scope or '_', safe='')}/"
 
 
 @dataclass(frozen=True)
@@ -106,9 +117,11 @@ class IndexState:
     count_exact: bool = True
     files: tuple[FileInfo, ...] = ()
     log: tuple[tuple[int, tuple[FileInfo, ...]], ...] = ()
+    prefix: str = ""  # where the files live (`index_prefix` when the index was created)
 
     def to_json(self) -> dict:
         return {
+            "prefix": self.prefix,
             "count": self.count,
             "count_exact": self.count_exact,
             "files": [f.to_json() for f in self.files],
@@ -124,7 +137,26 @@ class IndexState:
             d.get("count_exact", True),
             tuple(FileInfo.from_json(f) for f in d["files"]),
             tuple((b, tuple(FileInfo.from_json(f) for f in fs)) for b, fs in d["log"]),
+            d.get("prefix", ""),
         )
+
+    def path(self, name: str) -> str:
+        return f"{self.prefix}{name}.kx"
+
+    def pinned(self, log_from: int | None = None, log_to: int | None = None) -> IndexState:
+        """The part of the index one reader needs: the levels, and the log
+        entries in `[log_from, log_to]` (none when `log_from` is None)."""
+
+        if log_from is None:
+            return replace(self, log=())
+        hi = log_to if log_to is not None else math.inf
+        return replace(self, log=tuple(e for e in self.log if log_from <= e[0] <= hi))
+
+    def covers(self, first: int, last: int) -> bool:
+        """Whether the log still holds every batch in `[first, last]`."""
+
+        logged = {b for b, _ in self.log}
+        return all(b in logged for b in range(first, last + 1))
 
     # -- views ------------------------------------------------------------------------
 
@@ -166,6 +198,7 @@ class IndexState:
             count_exact=self.count_exact and delta.exact,
             files=self.files + placed,
             log=log,
+            prefix=self.prefix,
         )
 
     def compacted(
@@ -179,6 +212,7 @@ class IndexState:
             count_exact=True if recount is not None else self.count_exact,
             files=tuple(f for f in self.files if f.name not in gone) + tuple(added),
             log=self.log,
+            prefix=self.prefix,
         )
 
     def truncated(self, lowest_needed_batch: int | None) -> IndexState:
@@ -212,6 +246,18 @@ class DeltaFiles:
     added: int
     removed: int
     exact: bool
+
+    def to_json(self) -> dict:
+        return {
+            "files": [f.to_json() for f in self.files],
+            "added": self.added,
+            "removed": self.removed,
+            "exact": self.exact,
+        }
+
+    @classmethod
+    def from_json(cls, d: dict) -> DeltaFiles:
+        return cls([FileInfo.from_json(f) for f in d["files"]], d["added"], d["removed"], d["exact"])
 
 
 @dataclass
@@ -254,9 +300,9 @@ class _Parsed:
 class KeyIndex:
     """I/O over one index. `state` is the pinned `IndexState` to read."""
 
-    def __init__(self, io: ObjectIO, prefix: str, state: IndexState, options: Options | None = None):
+    def __init__(self, io: ObjectIO, prefix: str | None, state: IndexState, options: Options | None = None):
         self.io = io
-        self.prefix = prefix.rstrip("/") + "/"
+        self.prefix = (prefix if prefix is not None else state.prefix).rstrip("/") + "/"
         self.state = state
         self.o = options or Options()
         self._parsed: dict[str, _Parsed] = {}

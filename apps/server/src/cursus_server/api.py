@@ -178,20 +178,13 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
         for scope, head in runtime.m.heads_of(name):
             owner = head.get("asset")
             cursor = owner is not None and runtime.m.cursors.get((owner, scope)) is not None
-            meta = head["ref"].get("meta") or {}
-            if meta.get("partitions") is not None:
-                key_count = len(meta["partitions"])
-            elif meta.get("delta"):
-                key_count = len(await runtime.state.delta_key_map(name, scope, int(meta["delta"]["batch"])))
-            else:
-                key_count = None
             out.append(
                 {
                     "scope": scope,
                     "ref": head["ref"],
                     "version": head.get("version"),
-                    "key_count": key_count,
-                    "delta": meta.get("delta"),
+                    "key_count": head.get("count"),
+                    "batch": head.get("batch"),
                     "complete": head["complete"],
                     "cursor": cursor,
                     "at": head["at"],
@@ -206,31 +199,13 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
         name: str,
         request: Request,
         scope: str = Query(default=""),
-        offset: int = Query(default=0, ge=0),
+        after: str | None = Query(default=None),
+        offset: int = Query(default=0, ge=0, le=100000),
         limit: int = Query(default=1000, ge=1, le=100000),
     ):
         runtime = await project_engine(request, p)
-        head = runtime.m.heads.get((name, scope))
-        if head is None:
-            raise KeyError(f"{name}/{scope}")
-        meta = head["ref"].get("meta") or {}
-        if meta.get("partitions") is not None:
-            keys = {str(e): "1" for e in meta["partitions"]}
-        elif meta.get("delta"):
-            keys = await runtime.state.delta_key_map(name, scope, int(meta["delta"]["batch"]))
-        elif (meta.get("keys") or {}).get("object"):
-            # Pre-delta head: the element map lives in a staged keys object.
-            data = await runtime.state.get_object(meta["keys"]["object"])
-            keys = {str(k): "" for k in json.loads(data)} if data else {}
-        else:
-            keys = {}
-        items = sorted(keys.items())
-        return {
-            "output": name,
-            "scope": scope,
-            "total": len(items),
-            "keys": dict(items[offset : offset + limit]),
-        }
+        page = await runtime.list_keys(name, scope, after=after, offset=offset, limit=limit)
+        return {"output": name, "scope": scope, **page}
 
     @app.get("/api/projects/{p}/partitions/{name}")
     async def partitions(p: str, name: str, request: Request):

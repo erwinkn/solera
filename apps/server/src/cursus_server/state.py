@@ -5,8 +5,9 @@ the objects attempts, runs and data live in.
 Everything lives under `{root}/{namespace}/`:
 
     control/      the journal and checkpoints (journal.py)
+    keys/         key index files (cursus.keys, §6)
     runs/{run}/   finished runs (run.json) and attempt files
-    specs/ results/ logs/ deltas/ data/ blobs/   attempt I/O and store data
+    specs/ results/ logs/ data/ blobs/   attempt I/O and store data
 
 `emit()` applies events to the model at once — so the engine checks a
 precondition and changes state in one synchronous step, with nothing
@@ -198,24 +199,3 @@ class State:
     async def delete_objects(self, keys: list[str]):
         for i in range(0, len(keys), 1000):
             await obstore.delete_async(self.objects, keys[i : i + 1000])
-
-    # -- the delta log (until the key index replaces it) ---------------------------------
-
-    async def delta(self, output: str, scope: str, batch: int) -> dict | None:
-        from cursus.stores import delta_path
-
-        data = await self.get_object(delta_path(output, scope, batch))
-        return json.loads(data) if data is not None else None
-
-    async def delta_key_map(self, output: str, scope: str, hi: int) -> dict[str, str]:
-        """The live key map of a keyed incremental output at delta `hi`."""
-
-        keys: dict[str, str] = {}
-        for b in range(0, int(hi) + 1):
-            delta = await self.delta(output, scope, b)
-            if delta is None:
-                continue
-            for key in delta.get("deleted") or []:
-                keys.pop(str(key), None)
-            keys.update({str(k): str(v) for k, v in (delta.get("upserted") or {}).items()})
-        return keys
