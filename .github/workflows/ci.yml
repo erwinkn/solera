@@ -47,7 +47,7 @@ jobs:
               assert any(n.startswith('cursus_server/web/assets/') and n.endswith('.js') for n in names), 'no bundled JS in wheel'
               assert any(n.startswith('cursus_server/web/assets/') and n.endswith('.css') for n in names), 'no bundled CSS in wheel'
           PY
-          uv run cursus selftest --state-url file:///tmp/ci-native-probe
+          uv run cursus --state-url file:///tmp/ci-native-probe selftest
       - uses: actions/upload-artifact@v4
         if: always()
         with:
