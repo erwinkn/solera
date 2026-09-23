@@ -97,9 +97,11 @@ function RunsPage() {
                         : `${run.targets.length} assets`}
                     </span>
                     <span className="block text-xs text-muted-foreground">
-                      {Array.isArray(run.partitions)
-                        ? `${run.partitions.length} scope${run.partitions.length === 1 ? "" : "s"}`
-                        : `${run.partitions} · ${run.mode}`}
+                      {run.source
+                        ? `source commit · ${run.by ?? "api"}`
+                        : Array.isArray(run.partitions)
+                          ? `${run.partitions.length} scope${run.partitions.length === 1 ? "" : "s"}`
+                          : `${run.partitions} · ${run.mode}`}
                     </span>
                   </TableCell>
                   <TableCell className="text-muted-foreground">

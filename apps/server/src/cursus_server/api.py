@@ -25,6 +25,7 @@ class RunInput(BaseModel):
     upstream: bool = False
     config: dict = Field(default_factory=dict)
     keys: dict | None = None
+    by: str | None = Field(default=None, max_length=200)
 
 
 class PruneInput(BaseModel):
@@ -38,6 +39,7 @@ class SourceCommitInput(BaseModel):
     version: str | None = None
     keys: dict | list | None = None
     upsert: dict | list | None = None
+    by: str | None = Field(default=None, max_length=200)
     remove: list[str] = Field(default_factory=list, max_length=100000)
 
 
@@ -269,7 +271,9 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
         p: str, body: RunInput, request: Request, idempotency_key: str | None = Header(default=None)
     ):
         runtime = await project_engine(request, p)
-        run = await runtime.submit(**body.model_dump(), command_id=idempotency_key)
+        fields = body.model_dump()
+        fields["by"] = fields["by"] or "api"
+        run = await runtime.submit(**fields, command_id=idempotency_key)
         return run or {"status": "skipped-active"}
 
     @app.get("/api/projects/{p}/runs")
@@ -377,6 +381,7 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
             keys=body.keys,
             upsert=body.upsert,
             remove=body.remove,
+            by=body.by or "api",
         )
 
     # -- environments + workers -----------------------------------------------------

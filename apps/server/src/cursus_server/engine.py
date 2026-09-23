@@ -38,6 +38,7 @@ log = logging.getLogger(__name__)
 SUCCESS = {"succeeded", "skipped"}
 TERMINAL = SUCCESS | {"failed", "blocked", "canceled"}
 LEASE_SECONDS = 60.0
+SOURCE_KEYS_RECORDED = 1000  # a source commit's run lists changed keys up to this many, else counts
 GRACE_SECONDS = 5.0
 
 
@@ -216,8 +217,11 @@ class Engine:
         automation=None,
         command_id=None,
         skip_active=False,
+        by=None,
     ):
-        """A run request becomes one task per (asset, scope) (§8)."""
+        """A run request becomes one task per (asset, scope) (§8). `by` says
+        who asked (the API or CLI, or what the caller names); automation runs
+        carry `automation` instead."""
 
         if isinstance(targets, str):
             targets = [targets]
@@ -294,6 +298,7 @@ class Engine:
             "config": config,
             "keys": keys,
             "automation": automation,
+            "by": by,
             "status": "running",
             "paused": False,
             "created_at": now,
@@ -1185,12 +1190,18 @@ class Engine:
 
     # -- sources commit API (§5) ------------------------------------------------------
 
-    async def commit_source(self, name: str, *, version=None, keys=None, upsert=None, remove=None):
+    async def commit_source(
+        self, name: str, *, version=None, keys=None, upsert=None, remove=None, by: str | None = None
+    ):
         """Advance a source without moving data (§2.3, §6). A keyed source
         commit is checked against the source's key index like any write: a
         full map (`keys=`) replaces its content, `upsert`/`remove` patch it,
         and the changes become the commit's delta file. A commit that changes
-        nothing is not a change. An unkeyed source takes a `version=`."""
+        nothing is not a change. An unkeyed source takes a `version=`.
+
+        Every change is recorded as a run with no tasks (§7):
+        `{"id", "source", "by", "batch", "upserted", "deleted"}` — or `version`
+        for an unkeyed source. `by` says where the commit came from."""
 
         source = self.manifest["sources"].get(name)
         if source is None:
@@ -1200,15 +1211,25 @@ class Engine:
         if not keyed and (keys is not None or upsert is not None or remove is not None):
             raise ValueError(f"Source {name!r} is unkeyed; pass version=")
         ref = dict(head["ref"] if head is not None else source["head"])
-        record = {"ref": ref, "run": None, "attempt": None, "complete": True, "asset": None, "version": None}
+        run_id = ulid(self.clock())
+        record = {
+            "ref": ref,
+            "run": run_id,
+            "attempt": None,
+            "complete": True,
+            "asset": None,
+            "version": None,
+        }
         event = {"type": "SourceCommitted", "source": name, "head": record}
         batch = None
+        run = {"id": run_id, "source": name, "by": by}
         if not keyed:
             if version is None:
                 raise ValueError(f"Source {name!r} requires version=")
             if head is not None and head["ref"]["version"] == str(version):
                 return {"changed": False, "ref": head["ref"]}
             ref["version"] = str(version)
+            run["version"] = ref["version"]
         else:
             if keys is not None:
                 items = keys.items() if isinstance(keys, dict) else ((k, "1") for k in keys)
@@ -1234,6 +1255,10 @@ class Engine:
                 before = set((head or {}).get("elements") or ())
                 record["elements"] = sorted(set(new) if replace else (before - set(removes)) | set(new))
             event["keys"] = {**files.to_json(), "batch": batch}
+            run["batch"] = batch
+            for field, flag in (("upserted", 0), ("deleted", 1)):
+                changed = [key_str(k) for k, d in zip(delta.keys, delta.deleted, strict=True) if d == flag]
+                run[field] = changed if len(changed) <= SOURCE_KEYS_RECORDED else len(changed)
         meta = dict(ref.get("meta") or {})
         meta["external"] = True
         ref["meta"] = meta
@@ -1243,11 +1268,14 @@ class Engine:
             raise Conflict(f"source {name!r} moved while committing; retry")
         event["at"] = self.clock()
         await self.state.emit(event)
-        return {
-            "changed": True,
-            "ref": ref,
-            "commit": f"source/{name}/{batch if batch is not None else ref['version']}",
-        }
+        await self.state.put_object(
+            f"runs/{run_id}/run.json", json.dumps(run, sort_keys=True, allow_nan=False).encode()
+        )
+        self._run_assets[run_id] = []
+        if self._run_index is not None:
+            self._run_index.append(run_id)
+            self._run_assets_indexed.add(run_id)
+        return {"changed": True, "ref": ref, "run": run_id}
 
     # -- key index upkeep (§6) --------------------------------------------------------
 
@@ -1609,7 +1637,7 @@ class Engine:
             run = await self.state.archived(run_id)
             if run is None:
                 return None
-            self._run_assets[run_id] = sorted({t["asset"] for t in run.get("tasks", {}).values()})
+            self._run_assets[run_id] = sorted({t["asset"] for t in (run.get("tasks") or {}).values()})
         return self._run_assets[run_id]
 
     async def _retention_sweep(self):
@@ -1676,6 +1704,11 @@ class Engine:
     # -- read models -------------------------------------------------------------------
 
     def _run_view(self, run: dict) -> dict:
+        if "source" in run:
+            # A source commit: its record holds only what it adds (§7).
+            at = ulid_time(run["id"])
+            view = {"targets": [run["source"]], "partitions": "", "mode": "commit", "status": "succeeded"}
+            return {**view, **run, "paused": False, "created_at": at, "updated_at": at, "tasks": []}
         view = {k: v for k, v in run.items() if k != "tasks"}
         view["tasks"] = sorted(run["tasks"])
         return view
@@ -1738,8 +1771,10 @@ class Engine:
                 run = await self.state.archived(run_id)
                 if run is not None:
                     runs.append(run)
-        runs.sort(key=lambda r: (r["created_at"], r["id"]), reverse=True)
-        return [self._run_view(r) for r in runs[:limit]]
+        views = sorted(
+            (self._run_view(r) for r in runs), key=lambda r: (r["created_at"], r["id"]), reverse=True
+        )
+        return views[:limit]
 
     async def run_detail(self, run_id: str):
         run = self.m.runs.get(run_id)
@@ -1748,7 +1783,7 @@ class Engine:
             run = await self.state.archived(run_id)
             if run is None:
                 raise KeyError(run_id)
-        tasks = [run["tasks"][tid] for tid in sorted(run["tasks"])]
+        tasks = [run["tasks"][tid] for tid in sorted(run.get("tasks") or {})]
         return {
             "request": self._run_view(run),
             "tasks": [self._task_view(t, live) for t in tasks],

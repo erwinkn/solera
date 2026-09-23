@@ -324,9 +324,19 @@ still in the checkpoint and gets archived again (the write is idempotent).
 }
 ```
 
-A source commit is recorded as a run with no tasks: its `run.json` holds
-`{"source", "head", "keys"}`. *(Not built yet: today a source commit is
-recorded only by its `SourceCommitted` event.)*
+A source commit that changes something is recorded as a run with no
+tasks. Its `run.json` holds only what nothing else says:
+
+```json
+{"id": "01J9QX…", "source": "uploads", "by": "sharepoint-webhook", "batch": 12,
+ "upserted": ["u-7"], "deleted": []}
+```
+
+The time is the id's (a ULID). `by` is whatever the caller passed, else
+the channel (`api`, `cli`). `upserted` and `deleted` list the changed keys,
+or count them past 1,000. An unkeyed source records `version` instead. The
+source's head points at the run (`head.run`). Runs submitted by hand carry
+the same `by` in their request; automation runs name their `automation`.
 
 A run where every task was skipped launched nothing and wrote nothing, so
 it is **not archived**; it only appears in the console's in-memory recent
@@ -469,6 +479,20 @@ its horizon in its spec (`retention.before`); before writing an output, the
 harness calls `store.expire(head, before)` with the committed head. Every
 version written after the horizon still loads; the head always does,
 whatever becomes of the attempt's own commit.
+
+**Table stores don't version.** Retention reaches data through
+`store.expire`, and a store without one (Postgres) keeps its tables as they
+are. To bound an append-only table, schedule a job:
+
+```python
+@job(deps=["site_events"], automations=Automation(trigger=Every(3600)))
+def trim_site_events(db: Database):
+    db.execute("DELETE FROM site_events WHERE received_at < now() - interval '7 days'")
+```
+
+Only for unkeyed outputs: a keyed output's rows are tracked by its key
+index, so it removes keys through its own asset (`Patch(remove=[…])`),
+which tells every consumer.
 
 **Manual deletion** goes through the same path and skips only active runs:
 

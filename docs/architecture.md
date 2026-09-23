@@ -469,6 +469,9 @@ in its spec, and before writing an output the harness calls
 `store.expire(head, before)` with the committed head, which stays loadable.
 `cursus runs delete RUN` and `cursus runs prune [--before] [--asset] [--keep]
 [--dry-run]` (and `DELETE /runs/{run}`, `POST /runs:prune`) delete runs by hand.
+Postgres has no `expire`: bound an append-only table with a scheduled job
+that deletes old rows (object-store-state.md §11); a keyed table removes
+keys through its own asset, so its key index and consumers see it.
 
 ## 9. Automations
 

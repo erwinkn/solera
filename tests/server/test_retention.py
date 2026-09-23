@@ -67,6 +67,7 @@ async def test_keep_the_newest_runs(state, clock):
     for _ in range(4):
         clock.now += 60
         ids.append(await run(engine, ["kept"]))
+    clock.now += 60
     kept_forever = await run(engine, ["forever"], mode="full")
     clock.now += 2 * 86400  # past the project default too
     await engine.tick()
@@ -122,3 +123,40 @@ async def test_data_expires_with_its_asset(state, clock):
     # Written at +0.5, +1, +1.5, +2, +2.5 days; the last write expired what
     # was older than a day before it.
     assert [r["e"] for r in loaded] == [3, 4, 5]
+
+
+async def test_source_commits_are_recorded_as_runs(state, clock):
+    """§7: each source commit that changes something is a run with no tasks,
+    saying who committed and what changed; the default policy expires it."""
+
+    from cursus.sdk import Source
+
+    @asset(inputs={"uploads": Incremental()})
+    def ingest(uploads: list):
+        return []
+
+    project = Project(assets=[ingest], sources=[Source("uploads", key="id")], retention=Retention(days=1))
+    engine = engine_for(state, project, clock)
+    await engine.initialize()
+    first = await engine.commit_source("uploads", keys={"u-6": "1", "u-7": "1"}, by="sharepoint-webhook")
+    assert not (await engine.commit_source("uploads", upsert={"u-7": "1"}))["changed"]  # no change, no run
+    clock.now += 60
+    second = await engine.commit_source("uploads", keys={"u-7": "2"}, by="api")
+    record = await state.archived(second["run"])
+    assert record == {
+        "id": second["run"],
+        "source": "uploads",
+        "by": "api",
+        "batch": 1,
+        "upserted": ["u-7"],
+        "deleted": ["u-6"],
+    }
+    assert state.model.heads[("uploads", "")]["run"] == second["run"]
+    view = (await engine.run_detail(first["run"]))["request"]
+    assert view["by"] == "sharepoint-webhook" and view["status"] == "succeeded" and view["tasks"] == []
+    assert view["created_at"] == pytest.approx(clock.now - 60, abs=0.01)
+    listed = [r["id"] for r in await engine.list_runs()]
+    assert listed[:2] == [second["run"], first["run"]]
+    clock.now += 2 * 86400
+    await engine.tick()
+    assert await state.archived_ids() == []  # expired under the project default

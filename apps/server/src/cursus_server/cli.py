@@ -127,6 +127,7 @@ def main():
     commit.add_argument("--keys", help="Complete key map as JSON, or a JSON list for a partition set")
     commit.add_argument("--upsert", help="Key patch as JSON object (or JSON list for a partition set)")
     commit.add_argument("--remove", action="append", default=[])
+    commit.add_argument("--by", default="cli", help="Who is committing (recorded on the commit's run)")
 
     worker = commands.add_parser("worker", help="Run a pool worker (§10)")
     worker_sub = worker.add_subparsers(dest="worker_command", required=True)
@@ -266,7 +267,7 @@ def _prune_payload(args):
 def _commit_payload(args):
     keys = json.loads(args.keys) if args.keys else None
     upsert = json.loads(args.upsert) if args.upsert else None
-    return {"version": args.version, "keys": keys, "upsert": upsert, "remove": args.remove}
+    return {"version": args.version, "keys": keys, "upsert": upsert, "remove": args.remove, "by": args.by}
 
 
 async def _remote(args, parser):
@@ -285,6 +286,7 @@ async def _remote(args, parser):
                 "upstream": args.upstream,
                 "config": config,
                 "keys": _parse_keys(args.keys),
+                "by": "cli",
             }
             response = await client.post(f"{base}/runs", json=body)
             response.raise_for_status()
@@ -351,6 +353,7 @@ async def _local(args, parser):
                 upstream=args.upstream,
                 config=config,
                 keys=_parse_keys(args.keys),
+                by="cli",
             )
             if run is None:
                 print(json.dumps({"status": "skipped-active"}))

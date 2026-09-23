@@ -157,6 +157,8 @@ export interface Run {
   config: Record<string, Json>;
   keys: Record<string, string | string[]> | null;
   automation: string | null;
+  by?: string | null;
+  source?: string;
   status: RunStatus;
   paused: boolean;
   tasks: string[];
