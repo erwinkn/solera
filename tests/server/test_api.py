@@ -23,7 +23,6 @@ from cursus_server.api import create_app
 from cursus_server.engine import Engine
 from cursus_server.placements.inline import InlinePlacement
 from cursus_server.state import State
-from cursus_server.storage import SlateState
 
 
 def build_project():
@@ -68,8 +67,7 @@ def build_project():
 @pytest.fixture
 async def engine(tmp_path):
     project = build_project()
-    slate = await SlateState.open(tmp_path.as_uri(), "test")
-    state = State(slate)
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     runtime = Engine(
         state,
         project.manifest,
@@ -100,7 +98,7 @@ async def test_health_and_diagnostics(client, base):
 
     assert (await client.get("/healthz")).json()["status"] == "ok"
     diag = (await client.get("/api/diagnostics")).json()
-    assert diag["backend"] == "slatedb" and diag["project"] == "example"
+    assert diag["backend"] == "object-store" and diag["project"] == "example"
     assert diag["state"].startswith("file://")
 
 
@@ -206,7 +204,7 @@ async def test_attempt_logs_spec_result(client, base, engine):
     detail = await engine.run_until(run["id"])
     task = detail["tasks"][0]
     attempt = detail["attempts"][task["id"]][-1]
-    attempt_id = f"{task['id']}/{attempt['generation']}"
+    attempt_id = attempt["id"]
 
     spec = (await client.get(f"{base}/attempts/{attempt_id}/spec")).json()
     assert spec["asset"] == "feed"
@@ -282,12 +280,10 @@ async def test_worker_pull_path(client, base, engine):
     await engine.submit(["trained"])
     await engine.tick()
     for _ in range(200):  # staging happens inside the dispatched attempt task
-        async with engine.state.transaction() as tx:
-            staged = await tx.pool_tasks()
-        if staged:
+        if engine.m.pool:
             break
         await asyncio.sleep(0.02)
-    assert staged
+    assert engine.m.pool
 
     claimed = await client.post("/api/tasks/claim", json={"worker": worker, "capacity": {"cpu": 8, "gpu": 1}})
     assert claimed.status_code == 200
@@ -317,16 +313,15 @@ async def test_console_shell_served(client):
 
 async def test_partitions_read_scope_records_not_task_history(client, base, engine, monkeypatch):
     """§8: the partitions endpoint answers complete, missing, running,
-    failed and retired from heads + scope records + the pending index —
-    and never scans task/."""
-    from cursus_server.storage import Transaction
+    failed and retired from heads + scope outcomes + the pending index —
+    in memory, never reading a run's tasks or an archived run."""
 
-    scanned = []
-    original_scan = Transaction.scan
+    reads = []
+    original_archived = engine.state.archived
 
-    async def spy(self, prefix, limit=None, after=None):
-        scanned.append(prefix)
-        return await original_scan(self, prefix, limit, after=after)
+    async def spy(run_id):
+        reads.append(run_id)
+        return await original_archived(run_id)
 
     # complete (a succeeded scope) and missing (a key never run)
     await engine.run_until((await engine.submit(["daily"], partitions=["2026-09-18"]))["id"])
@@ -344,7 +339,7 @@ async def test_partitions_read_scope_records_not_task_history(client, base, engi
     await engine.submit(["daily"], partitions=["2026-09-19"], mode="full")
     await engine.submit(["by_site"], partitions=["b"])
 
-    monkeypatch.setattr(Transaction, "scan", spy)
+    monkeypatch.setattr(engine.state, "archived", spy)
     daily = (await client.get(f"{base}/partitions/daily")).json()["partitions"]
     flaky = (await client.get(f"{base}/partitions/flaky")).json()["partitions"]
     by_site = (await client.get(f"{base}/partitions/by_site")).json()["partitions"]
@@ -363,7 +358,7 @@ async def test_partitions_read_scope_records_not_task_history(client, base, engi
     complete = next(p for p in daily if p["scope"] == "2026-09-18")
     assert complete["last_outcome"] == "succeeded" and complete["last_attempt"]
     assert {p["scope"]: p["status"] for p in by_site} == {"a": "retired", "b": "running"}
-    assert not [p for p in scanned if p.startswith("task/")]
+    assert reads == []
 
 
 async def test_failed_scope_reports_complete_after_success(client, base, engine):

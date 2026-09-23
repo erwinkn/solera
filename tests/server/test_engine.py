@@ -3,7 +3,6 @@ through InlinePlacement against the real file:// object store."""
 
 import asyncio
 import json
-import time
 
 import pytest
 from cursus.executors import Environment
@@ -22,18 +21,15 @@ from cursus.sdk import (
     Project,
     Ref,
     Result,
-    Retention,
     Retry,
     StaticPartitions,
     asset,
-    digest,
     job,
 )
 from cursus.stores import JsonStore
 from cursus_server.engine import Engine
 from cursus_server.placements.inline import InlinePlacement
 from cursus_server.state import State
-from cursus_server.storage import SlateState
 
 
 class Fake(Environment):
@@ -80,9 +76,20 @@ def fake(project, **env_kw):
 
 @pytest.fixture
 async def state(tmp_path):
-    opened = State(await SlateState.open(tmp_path.as_uri(), "test"))
+    opened = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     yield opened
     await opened.close()
+
+
+def head(state, output, scope=""):
+    return state.model.heads.get((output, scope))
+
+
+async def spec_of(state, output, scope=""):
+    """The spec of the attempt behind a head: what it read (lineage)."""
+
+    attempt = head(state, output, scope)["attempt"]
+    return json.loads(await state.get_object(f"specs/{attempt}.json"))
 
 
 def make_engine(state, project, placements=None, **kw):
@@ -123,12 +130,10 @@ async def test_bare_return_and_commit(state):
     run = await engine.submit(["numbers"])
     detail = await drive(engine, run)
     assert status_of(detail) == "succeeded"
-    async with state.transaction() as tx:
-        head = await tx.head("numbers", "")
-        assert head["ref"]["output"] == "numbers" and head["ref"]["version"]
-        assert head["complete"] is True
-        commit = await tx.commit_record(head["commit"])
-        assert commit["changed"] == ["numbers"]
+    installed = head(state, "numbers")
+    assert installed["ref"]["output"] == "numbers" and installed["ref"]["version"]
+    assert installed["complete"] is True
+    assert installed["run"] == run["id"] and installed["attempt"]
 
 
 async def test_result_cursor_and_omitted_output(state):
@@ -150,14 +155,11 @@ async def test_result_cursor_and_omitted_output(state):
     await engine.initialize()
     await drive(engine, await engine.submit(["pair"]))
     await drive(engine, await engine.submit(["pair"]))
-    async with state.transaction() as tx:
-        assert (await tx.head("a", ""))["ref"]["version"] != ""
-        head_b = await tx.head("b", "")
-        assert head_b is not None  # kept from the first commit
-        assert await tx.cursor("pair", "") == "c2"
+    assert head(state, "a")["ref"]["version"] != ""
+    assert head(state, "b") is not None  # kept from the first commit
+    assert state.model.cursors.get(("pair", "")) == "c2"
     await drive(engine, await engine.submit(["pair"], mode="full"))
-    async with state.transaction() as tx:
-        assert await tx.cursor("pair", "") is None  # full clears the cursor
+    assert state.model.cursors.get(("pair", "")) is None  # full clears the cursor
 
 
 async def test_omitted_output_without_head_fails(state):
@@ -286,16 +288,14 @@ async def test_full_run_resets_watermark(state):
     engine = make_engine(state, project)
     await engine.initialize()
     await drive(engine, await engine.submit(["consumer"], upstream=True))
-    async with state.transaction() as tx:
-        first = await tx.watermark("consumer", "files", "")
-        assert first == {"batch": 1, "offset": 0, "fingerprint": first["fingerprint"], "more": False}
+    first = state.model.watermarks[("consumer", "files", "")]
+    assert first == {"batch": 1, "offset": 0, "fingerprint": first["fingerprint"], "more": False}
     detail = await drive(engine, await engine.submit(["consumer"], mode="full"))
     assert task_statuses(detail)["consumer"] == "succeeded"  # never skipped on full
-    async with state.transaction() as tx:
-        second = await tx.watermark("consumer", "files", "")
-        assert second["batch"] == first["batch"]  # back at head+1
-        assert second["offset"] == 0
-        assert second["more"] is False
+    second = state.model.watermarks[("consumer", "files", "")]
+    assert second["batch"] == first["batch"]  # back at head+1
+    assert second["offset"] == 0
+    assert second["more"] is False
     # Both deliveries were full-head reads.
     assert seen == [(["a", "b"], True), (["a", "b"], True)]
 
@@ -361,12 +361,9 @@ async def test_incremental_batching_and_more(state):
     detail = await drive(engine, await engine.submit(["consumer"], upstream=True))
     assert status_of(detail) == "succeeded"
     assert batches == [["k0", "k1"], ["k2", "k3"], ["k4"]]
-    async with state.transaction() as tx:
-        head = await tx.head("consumer", "")
-        assert head["complete"] is True
-        task = [t for t in detail["tasks"] if t["asset"] == "consumer"][0]
-        attempts = await tx.attempts(task["id"])
-        assert len(attempts) == 3  # three batches, three attempts
+    assert head(state, "consumer")["complete"] is True
+    task = [t for t in detail["tasks"] if t["asset"] == "consumer"][0]
+    assert len(detail["attempts"][task["id"]]) == 3  # three batches, three attempts
 
 
 async def test_run_keys_override(state):
@@ -413,10 +410,7 @@ async def test_deps_are_pinned_but_unbound(state):
     detail = await drive(engine, await engine.submit(["dependent"], upstream=True))
     assert status_of(detail) == "succeeded"
     assert called == [True]
-    async with state.transaction() as tx:
-        commit_key = (await tx.head("dependent", ""))["commit"]
-        commit = await tx.commit_record(commit_key)
-        assert commit["input_refs"]["dim"]["refs"][""]["output"] == "dim"
+    assert (await spec_of(state, "dependent"))["inputs"]["dim"]["refs"][""]["output"] == "dim"
 
 
 async def test_ref_annotated_input_receives_ref(state):
@@ -463,13 +457,9 @@ async def test_all_partitions_values(state):
     await drive(engine, await engine.submit(["sites"]))
     detail = await drive(engine, await engine.submit(["rollup"], upstream=True))
     assert status_of(detail) == "succeeded"
-    async with state.transaction() as tx:
-        head = await tx.head("rollup", "")
-        result = await state.get_object(head["ref"]["handle"]["object"])
-        import json
-
-        rows = json.loads(result)
-        assert rows == [{"n": 2, "sites": ["east", "west"]}]
+    result = await state.get_object(head(state, "rollup")["ref"]["handle"]["object"])
+    rows = json.loads(result)
+    assert rows == [{"n": 2, "sites": ["east", "west"]}]
 
 
 async def test_partition_selections(state):
@@ -585,8 +575,7 @@ async def test_retired_keys_leave_fanout(state):
     run = await engine.submit(["per_thing"], partitions="all")
     detail = await drive(engine, run)
     assert [t["scope"] for t in detail["tasks"]] == ["a"]
-    async with state.transaction() as tx:
-        assert (await tx.head("per_thing", "b")) is not None  # head persists
+    assert head(state, "per_thing", "b") is not None  # head persists
 
 
 async def test_upstream_false_never_replans(state):
@@ -710,9 +699,8 @@ async def test_every_and_cron_fire(state):
     engine = make_engine(state, project)
     await engine.initialize()
     await engine.tick()
-    async with state.transaction() as tx:
-        auto = await tx.automation("polled.every.0")
-        assert auto["last_at"] is not None and auto["last_run"]
+    auto = state.model.automations["polled.every.0"]
+    assert auto["last_at"] is not None and auto["last_run"]
     await engine.run_until(auto["last_run"], 10)
 
 
@@ -734,11 +722,9 @@ async def test_onchange_fans_out_by_projection(state):
     engine = make_engine(state, project)
     await engine.initialize()
     await drive(engine, await engine.submit(["sites"]))
-    await engine.tick()  # automation eval consumes the commit after its watermark
-    async with state.transaction() as tx:
-        auto = await tx.automation("per_site.onchange.0")
-        assert auto["commit_watermark"] > 0 and auto["last_run"]
-        assert (await state.automation_events(tx, auto))[0] == []
+    await engine.tick()  # automation eval consumes the pending change
+    auto = state.model.automations["per_site.onchange.0"]
+    assert auto["last_run"] and auto["pending"] == []
     await engine.run_until(auto["last_run"], 10)
     assert sorted(seen) == ["s1", "s2"]
 
@@ -757,11 +743,9 @@ async def test_automation_toggle_and_run_now(state):
     await engine.initialize()
     await engine.set_automation("polled.every.0", False)
     await engine.tick()
-    async with state.transaction() as tx:
-        assert (await tx.automation("polled.every.0"))["last_at"] is None
+    assert state.model.automations["polled.every.0"]["last_at"] is None
     await engine.run_automation("polled.every.0")
-    async with state.transaction() as tx:
-        run_id = (await tx.automation("polled.every.0"))["last_run"]
+    run_id = state.model.automations["polled.every.0"]["last_run"]
     await engine.run_until(run_id, 10)
     assert calls["n"] == 1
 
@@ -781,14 +765,10 @@ async def test_every_skips_active_scope(state):
     await engine.initialize()
     await engine.tick()  # fires, dispatches into forever-wait
     await asyncio.sleep(0.1)
-    async with state.transaction() as tx:
-        auto = await tx.automation("polled.every.0")
-        auto["last_at"] = 0  # make the interval due on the next tick
-        await tx.put_automation(auto["name"], auto)
+    state.model.automations["polled.every.0"]["last_at"] = 0  # make the interval due on the next tick
     await engine.tick()  # would fire again but the scope is active
-    async with state.transaction() as tx:
-        runs = await tx.runs(10)
-        assert len([r for r in runs if r and r.get("automation") == "polled.every.0"]) == 1
+    runs = await engine.list_runs(10)
+    assert len([r for r in runs if r.get("automation") == "polled.every.0"]) == 1
 
 
 async def test_every_skips_queued_scope(state):
@@ -888,8 +868,9 @@ async def test_harness_exit_without_result_fails_retryably(state):
 
 
 async def test_restart_requeues_and_relaunches_inflight(tmp_path):
-    """§4.3/§10: after an engine restart, an in-flight attempt is fenced and
-    the task requeued exactly once — dispatch relaunches it from scratch."""
+    """§4.3/§10: claims are never journaled, so after a restart an in-flight
+    attempt is simply gone: its task is queued exactly once, and dispatch
+    relaunches it under a fresh attempt id."""
     launches = []
     release = {"go": False}
 
@@ -929,28 +910,26 @@ async def test_restart_requeues_and_relaunches_inflight(tmp_path):
 
     project = Project(assets=[resumable], executors=[Fake()])
     url = tmp_path.as_uri()
-    state = State(await SlateState.open(url, "test"))
+    state = await State.open(url, "test", flush_interval=0.001)
     engine = make_engine(state, project, placements={"Fake": lambda e, o, c: Slow(c)}, lease_seconds=30)
     await engine.initialize()
     run = await engine.submit(["resumable"])
     await engine.tick()
     await asyncio.sleep(0.3)
     assert launches  # attempt is mid-flight
-    task_id = launches[0].rpartition("/")[0]
+    task_id = state.model.attempts[launches[0]]
     # Crash the engine: cancel in-flight asyncio tasks and reopen the state,
     # like a process restart would.
-    for t in engine.inflight.values():
+    for _, t in engine.inflight.values():
         t.cancel()
-    await asyncio.gather(*engine.inflight.values(), return_exceptions=True)
+    await asyncio.gather(*(t for _, t in engine.inflight.values()), return_exceptions=True)
     engine.inflight.clear()
     await state.close()
 
-    state2 = State(await SlateState.open(url, "test"))
-    async with state2.transaction() as tx:
-        # §4.3: open fenced the attempt and requeued the task exactly once.
-        assert (await tx.attempt(task_id, 1))["status"] == "expired"
-        assert (await tx.task(task_id))["status"] == "queued"
-        assert [tid for tid, _ in await tx.queued()].count(task_id) == 1
+    state2 = await State.open(url, "test", flush_interval=0.001)
+    task = state2.model.task(task_id)
+    assert task["status"] == "queued" and task["attempts"] == []  # the lost attempt left no trace
+    assert task_id in state2.model.queue and not state2.model.claims
     engine2 = make_engine(state2, project, placements={"Fake": lambda e, o, c: Slow(c)}, lease_seconds=30)
     await engine2.initialize()
     await engine2.start()
@@ -959,8 +938,7 @@ async def test_restart_requeues_and_relaunches_inflight(tmp_path):
     await engine2.stop()
     await state2.close()
     assert status_of(detail) == "succeeded"
-    assert len(launches) == 2  # the fenced attempt relaunched under generation 2
-    assert launches[1].endswith("/2")
+    assert len(launches) == 2 and launches[1] != launches[0]  # relaunched under a fresh attempt id
 
 
 async def test_max_concurrent(state):
@@ -1012,9 +990,7 @@ async def test_identical_poll_wakes_nothing(state):
     assert fired == [True]
     await engine.tick()  # drain the first pending event
     await drive(engine, await engine.submit(["feed"]))  # identical content
-    async with state.transaction() as tx:
-        auto = await tx.automation("consumer.onchange.0")
-        assert (await state.automation_events(tx, auto))[0] == []
+    assert state.model.automations["consumer.onchange.0"]["pending"] == []
     fired.clear()
     await engine.tick()
     assert fired == []  # nothing woke: identical content is not a change
@@ -1037,11 +1013,11 @@ async def test_job_commits_lineage_only(state):
     await engine.initialize()
     detail = await drive(engine, await engine.submit(["vacuum"], upstream=True))
     assert status_of(detail) == "succeeded"
-    async with state.transaction() as tx:
-        commits = await tx.commits()
-        job_commit = [c for _, c in commits if c["asset"] == "vacuum"]
-        assert job_commit and job_commit[0]["outputs"] == {}
-        assert job_commit[0]["input_refs"]["feed"]["ref"]["output"] == "feed"
+    task = next(t for t in detail["tasks"] if t["asset"] == "vacuum")
+    [attempt] = detail["attempts"][task["id"]]
+    assert attempt["status"] == "succeeded" and not attempt.get("result")  # no outputs, no heads
+    spec = json.loads(await state.get_object(f"specs/{attempt['id']}.json"))
+    assert spec["inputs"]["feed"]["ref"]["output"] == "feed"  # lineage is the spec
 
 
 class MigratingJsonStore(JsonStore):
@@ -1109,8 +1085,7 @@ async def test_migration_changes_fingerprint_and_marks_handle(state):
     assert seen == [["a", "b"], ["a", "b"]]  # fingerprint changed: all keys again
     assert store.calls == ["rolled"]  # migrate ran before the write
 
-    heads = await state.scan("head/")
-    rolled_head = next(r for k, r in heads if k.startswith("head/rolled/"))
+    rolled_head = head(state, "rolled")
     assert rolled_head["ref"]["handle"]["schema"] == "m1"
 
 
@@ -1127,15 +1102,15 @@ async def test_ondeploy_fires_once_per_revision(state):
     engine = make_engine(state, project)
     await engine.initialize()
     await engine.tick()
-    auto = dict(await state.automations())["deployed.ondeploy.0"]
+    auto = state.model.automations["deployed.ondeploy.0"]
     await engine.run_until(auto["last_run"], 30)
     assert calls == [1]
-    auto = dict(await state.automations())["deployed.ondeploy.0"]
+    auto = state.model.automations["deployed.ondeploy.0"]
     assert auto["last_revision"] == project.manifest["revision"]
 
     for _ in range(3):
         await engine.tick()
-    auto = dict(await state.automations())["deployed.ondeploy.0"]
+    auto = state.model.automations["deployed.ondeploy.0"]
     assert calls == [1]
     assert auto["last_revision"] == project.manifest["revision"]
 
@@ -1152,14 +1127,14 @@ async def test_ondeploy_silent_on_restart_same_revision(state):
     engine = make_engine(state, project)
     await engine.initialize()
     await engine.tick()
-    auto = dict(await state.automations())["deployed.ondeploy.0"]
+    auto = state.model.automations["deployed.ondeploy.0"]
     await engine.run_until(auto["last_run"], 30)
     assert calls == [1]
 
     engine2 = make_engine(state, project)  # same manifest, same revision
     await engine2.initialize()
     await engine2.tick()
-    auto = dict(await state.automations())["deployed.ondeploy.0"]
+    auto = state.model.automations["deployed.ondeploy.0"]
     assert auto["last_revision"] == project.manifest["revision"]
     assert calls == [1]
 
@@ -1185,161 +1160,8 @@ async def test_ondeploy_two_registrations_fire_latest_once(state):
     engine = make_engine(state, project_b)
     await engine.initialize()
     await engine.tick()
-    auto = dict(await state.automations())["deployed.ondeploy.0"]
+    auto = state.model.automations["deployed.ondeploy.0"]
     await engine.run_until(auto["last_run"], 30)
     assert calls == [1]
-    auto = dict(await state.automations())["deployed.ondeploy.0"]
+    auto = state.model.automations["deployed.ondeploy.0"]
     assert auto["last_revision"] == project_b.manifest["revision"]
-
-
-# ---------------------------------------------------------------------------
-# §5 — retention
-# ---------------------------------------------------------------------------
-
-
-async def test_retention_sweep_bounds_attempts_and_prunes_deltas(state):
-    """§5: Retention(runs=2) bounds attempt records per (asset, scope), drops
-    their specs/results objects, prunes the delta prefix behind a compacted
-    reset delta, and keeps the head-referenced commit. A live watermark's
-    position is never deleted under it."""
-    content = {"rows": [{"id": "a", "v": 0}, {"id": "b", "v": 0}]}
-    consumed = []
-
-    @asset(outputs=Output("files", key="id"))
-    def files():
-        return content["rows"]
-
-    @asset(inputs={"files": Incremental()})
-    def consumer(ctx, files: list):
-        consumed.append([r["id"] for r in files])
-        return [{"n": len(files)}]
-
-    project = Project(assets=[files, consumer], retention=Retention(runs=2))
-    engine = make_engine(state, project)
-    await engine.initialize()
-
-    for i in range(5):
-        content["rows"] = [{"id": "a", "v": i}, {"id": "b", "v": i}]
-        await drive(engine, await engine.submit(["consumer"], upstream=True))
-
-    async with state.transaction() as tx:
-        before = [r for _, r in await tx.scan("attempt/") if r["task"].split("/")[1].startswith("files")]
-        assert len(before) == 5
-        commits_before = len(await tx.commits())
-        wm = await tx.watermark("consumer", "files", "")
-        head = await tx.head("files", "")
-        head_commit = head["commit"]
-
-    result = await engine.retention_sweep()
-
-    async with state.transaction() as tx:
-        after = [r for _, r in await tx.scan("attempt/") if r["task"].split("/")[1].startswith("files")]
-        # Newest `runs` attempts per (asset, scope) survive; older ones are gone.
-        assert len(after) == 2, [r["id"] for r in after]
-        newest = sorted((r.get("finished_at") or 0) for r in before)[-2:]
-        assert sorted(r.get("finished_at") or 0 for r in after) == newest
-        # The head's commit is never deleted.
-        assert await tx.commit_record(head_commit) is not None
-        # Watermark intact — the consumer was never pruned under.
-        assert await tx.watermark("consumer", "files", "") == wm
-
-    # Deltas pruned below the floor and compacted: the surviving log still
-    # folds to the live key map.
-    deltas = await state.list_objects("deltas/files/")
-    assert len(deltas) < 5
-    keys = await state.delta_key_map("files", "", head["ref"]["meta"]["delta"]["batch"])
-    assert keys == {"a": str(digest({"id": "a", "v": 4})), "b": str(digest({"id": "b", "v": 4}))}
-    assert result["attempts"] >= 3 and result["commits"] >= 1 and result["objects"] >= 1
-    assert result["bumped"] == []
-    assert commits_before > 2
-
-    # The consumer still plans incrementally — a no-change run skips.
-    detail = await drive(engine, await engine.submit(["consumer"], upstream=True))
-    assert task_statuses(detail)["consumer"] == "skipped"
-
-
-async def test_retention_sweep_bumps_a_consumer_under_a_gap(state):
-    """§5: a watermark pointing at a delta that no longer exists is dropped —
-    the consumer's next plan drains full instead of reading across a gap."""
-    consumed = []
-    content = {"rows": [{"id": "a", "v": 0}]}
-
-    @asset(outputs=Output("files", key="id"))
-    def files():
-        return content["rows"]
-
-    @asset(inputs={"files": Incremental()})
-    def consumer(ctx, files: list):
-        consumed.append((sorted(r["id"] for r in files), ctx.changes["files"].full))
-        return [{"n": len(files)}]
-
-    project = Project(assets=[files, consumer], retention=Retention(runs=1))
-    engine = make_engine(state, project)
-    await engine.initialize()
-    await drive(engine, await engine.submit(["consumer"], upstream=True))
-    content["rows"] = [{"id": "a", "v": 1}, {"id": "b", "v": 1}]
-    await drive(engine, await engine.submit(["files"]))  # consumer not run: wm lags
-
-    async with state.transaction() as tx:
-        wm = await tx.watermark("consumer", "files", "")
-    # Force the gap externally (e.g. an operator deleted objects): the
-    # consumer's next batch is gone.
-    await state.delete_objects([f"deltas/files/_/{wm['batch']:012d}.json"])
-    result = await engine.retention_sweep()
-    assert result["bumped"] == ["consumer/files/"]
-    async with state.transaction() as tx:
-        assert await tx.watermark("consumer", "files", "") is None
-
-    await drive(engine, await engine.submit(["consumer"], upstream=True))
-    # A full re-drain of the surviving log: the externally-deleted delta's
-    # key is unrecoverable — the consumer gets the fold that remains.
-    assert consumed[-1] == (["a"], True)
-
-
-async def test_retention_sweep_respects_age_and_consumer_floor(state):
-    """§5: an attempt must be both past `runs` and older than `days` to be
-    swept, and a lagging consumer's watermark pins the delta-log horizon."""
-    content = {"rows": [{"id": "a", "v": 0}]}
-
-    @asset(outputs=Output("files", key="id"))
-    def files():
-        return content["rows"]
-
-    @asset(inputs={"files": Incremental()})
-    def consumer(files: list):
-        return [{"n": len(files)}]
-
-    project = Project(assets=[files, consumer], retention=Retention(days=1, runs=2))
-    engine = make_engine(state, project)
-    await engine.initialize()
-
-    # files commits delta 0; consumer drains it (watermark -> batch 1) and then
-    # lags while files commits deltas 1..4 on its own.
-    await drive(engine, await engine.submit(["consumer"], upstream=True))
-    for i in range(1, 5):
-        content["rows"] = [{"id": "a", "v": i}]
-        await drive(engine, await engine.submit(["files"]))
-
-    # runs=2 alone deletes nothing — nothing is a day old yet.
-    result = await engine.retention_sweep()
-    assert result["attempts"] == 0 and result["commits"] == 0 and result["objects"] == 0
-    async with state.transaction() as tx:
-        assert len(await tx.scan("attempt/")) == 6
-
-    # Two days on: everything is aged. Per-asset `runs` keeps the newest 2.
-    result = await engine.retention_sweep(now=time.time() + 2 * 86400)
-    async with state.transaction() as tx:
-        attempts = [r for _, r in await tx.scan("attempt/")]
-        files_left = [r for r in attempts if r["task"].split("/")[1].startswith("files")]
-        consumer_left = [r for r in attempts if r["task"].split("/")[1].startswith("consumer")]
-        assert len(files_left) == 2 and len(consumer_left) == 1
-        # The consumer's watermark was never pruned under.
-        assert (await tx.watermark("consumer", "files", ""))["batch"] == 1
-
-    # The watermark pins the floor at batch 1: only delta 0 is compacted — the
-    # consumer can still read batches 1..4.
-    metas = await state.list_object_meta("deltas/files/_/")
-    assert sorted(m["path"].rsplit("/", 1)[1] for m in metas) == [f"{b:012d}.json" for b in range(5)]
-    base = await state.delta("files", "", 0)
-    assert base["reset"] is True and base["batch"] == 0
-    assert result["attempts"] == 3 and result["bumped"] == []

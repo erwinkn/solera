@@ -607,7 +607,7 @@ class KeyIndex:
         chosen, bound = [], None
         for level in levels:
             got = 0
-            for i, f in enumerate(sorted(level, key=lambda f: f.min)):
+            for f in sorted(level, key=lambda f: f.min):
                 if after is not None and f.max <= after:
                     continue
                 if got > limit:

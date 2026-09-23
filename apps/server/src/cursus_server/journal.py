@@ -134,9 +134,13 @@ class Journal:
         snapshot: Callable[[], dict],
         *,
         start: bool = True,
+        writer: bool = True,
     ) -> OpenResult:
         """Load the newest readable checkpoint, replay the segments after it,
-        then fence: from here on this process is the only writer."""
+        then fence: from here on this process is the only writer.
+
+        `writer=False` opens read-only: nothing is fenced and appends fail —
+        for tools that inspect a namespace a server may be writing."""
 
         self._snapshot = snapshot
         self._checkpoints = await self._list("checkpoints")
@@ -154,6 +158,9 @@ class Journal:
             restore(None)
         self.seq = loaded or 0
         replayed = await self._replay(apply)
+        if not writer:
+            self.fenced = True  # read-only: every append fails
+            return OpenResult(seq=None, replayed=replayed, checkpoint=loaded)
         await self._fence(apply)
         if start:
             self._task = asyncio.create_task(self._run())
@@ -205,7 +212,8 @@ class Journal:
             self._buffer_bytes += len(_dumps(event))
         first = self._first_buffered is None
         if first:
-            self._first_buffered = self.clock()
+            # Flush timing is monotonic loop time; `clock` only stamps records.
+            self._first_buffered = loop.time()
         self._waiters.append(fut)
         if self._task is None:
             # No background flusher (tests, tools): flush on the next loop turn.
@@ -319,7 +327,7 @@ class Journal:
                 self._wake.clear()
                 await self._wake.wait()
                 continue
-            wait = self._first_buffered + self.flush_interval - self.clock()
+            wait = self._first_buffered + self.flush_interval - asyncio.get_running_loop().time()
             if wait > 0 and self._buffer_bytes < self.max_buffer:
                 self._wake.clear()
                 try:
@@ -345,7 +353,7 @@ class Journal:
             except (asyncio.CancelledError, Exception):
                 pass
             self._task = None
-        if self.fenced:
+        if self.fenced or self.writer is None:
             return
         await self.flush()
         if checkpoint and self._snapshot is not None and self._since_checkpoint:

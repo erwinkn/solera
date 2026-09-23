@@ -17,19 +17,21 @@ class PoolPlacement:
         return {"task": stage["attempt"], "pool": self.name}
 
     async def wait(self, run: dict, timeout: float) -> dict | None:
+        state = self.ctx.state
         deadline = self.ctx.clock() + timeout
         attempt = run["task"]
         while True:
-            if await self.ctx.state.get_object(f"results/{attempt}.json") is not None:
+            if await state.get_object(f"results/{attempt}.json") is not None:
                 return {"code": 0, "reason": None, "meta": {}}
-            record = await self.ctx.state.get_pool_task(attempt)
+            record = state.model.pool.get(attempt)
             if record is None:
                 # complete() removed the claim without a result we can see.
-                if await self.ctx.state.get_object(f"results/{attempt}.json") is not None:
+                if await state.get_object(f"results/{attempt}.json") is not None:
                     return {"code": 0, "reason": None, "meta": {}}
                 return {"code": None, "reason": "lost", "meta": {}}
             if record["status"] == "claimed" and record["lease_until"] <= self.ctx.clock():
-                await self.ctx.state.sweep_pool_leases()
+                # The worker's claim expired: offer the task to another worker.
+                record.update(status="queued", claimed_by=None, lease_until=None)
             remaining = deadline - self.ctx.clock()
             if remaining <= 0:
                 return None
@@ -37,6 +39,5 @@ class PoolPlacement:
 
     async def cancel(self, run: dict) -> None:
         # Best-effort: an unclaimed task is withdrawn; a claimed one is fenced by
-        # lease expiry and swept back to queued for a retry.
-        async with self.ctx.state.transaction() as tx:
-            await tx.del_pool_task(run["task"])
+        # its lost scope claim — the worker's result can no longer commit.
+        self.ctx.state.model.pool.pop(run["task"], None)

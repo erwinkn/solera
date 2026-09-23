@@ -1,7 +1,12 @@
 """The engine (§6–§10): control-plane only. It plans runs into per-(asset,
 scope) tasks, resolves inputs to pinned heads, plans Incremental edges over
 per-edge watermarks, dispatches attempts through placements, and commits
-results through State.
+their results.
+
+State lives in the model (model.py), changed only by events the engine emits
+(docs/object-store-state.md §4). A precondition check and the event that
+depends on it happen in one synchronous step, so no other coroutine can
+interleave between them. Claims, leases and pool work are memory only.
 
 Structure lives in the manifest, state lives in the spec, effects live in the
 result — the engine never interprets a payload.
@@ -10,30 +15,21 @@ result — the engine never interprets a payload.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime as dt
 import json
 import logging
-import re
-import uuid
 from itertools import product
-from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from croniter import croniter
+from cursus.ids import ulid
 from cursus.sdk import TimePartitions, canonical_partition, digest, split_partition
 from cursus.stores import delta_path, next_batch
 
+from .model import TERMINAL_RUN
 from .placements import PlacementContext, Registry
-from .state import (
-    BAD_OUTCOME,
-    LIVE_ATTEMPT,
-    TERMINAL_TASK,
-    Conflict,
-    LostOwnership,
-    State,
-    Tx,
-    unesc,
-)
+from .state import Conflict, LostOwnership, State
 
 log = logging.getLogger(__name__)
 
@@ -41,19 +37,6 @@ SUCCESS = {"succeeded", "skipped"}
 TERMINAL = SUCCESS | {"failed", "blocked", "canceled"}
 LEASE_SECONDS = 60.0
 GRACE_SECONDS = 5.0
-
-
-def _obj_scope(scope: str) -> str:
-    """The object-path segment for a scope — matches stores.py's `_` escape."""
-    return quote(scope or "_", safe="")
-
-
-def _object_batch(path: str) -> int | None:
-    """The batch number in `…/b{NNN}.json`, `…/s{NNN}.json` or a bare
-    `…/{NNN}.json` delta path; None for anything else."""
-
-    match = re.search(r"(?:^|[bs])(\d+)\.json$", path.rsplit("/", 1)[-1])
-    return int(match.group(1)) if match else None
 
 
 class Retryable(RuntimeError):
@@ -77,8 +60,6 @@ class Engine:
         concurrency: int = 4,
         clock=None,
         eval_interval: float = 0.5,
-        gc_interval: float = 300.0,
-        retention_interval: float | None = None,
     ):
         import time
 
@@ -89,52 +70,50 @@ class Engine:
         self.clock = clock or time.time
         self.lease_seconds, self.concurrency = lease_seconds, concurrency
         self.eval_interval = eval_interval
-        self.gc_interval = gc_interval
-        self._gc_at = self.clock() + self.gc_interval
-        # §5: retention sweeps run on the GC cadence unless overridden.
-        self.retention_interval = gc_interval if retention_interval is None else retention_interval
-        self._retention_at = self.clock() + self.retention_interval
         ctx = PlacementContext(state, state.objects_url, project, self.clock)
         self.registry = registry or Registry(ctx, extra=placements)
-        self.inflight: dict[str, asyncio.Task] = {}
-        # Live placement handles per attempt — the in-memory active set (§4.2).
+        # attempt id -> (run id, asyncio task): attempts this process is driving.
+        self.inflight: dict[str, tuple[str, asyncio.Task]] = {}
+        # Live placement handles per attempt.
         self.handles: dict[str, dict] = {}
-        # Attempts consuming a local execution slot. Pool waiters only poll
+        # Attempts consuming a local execution slot. Pool attempts only poll
         # state — they run no local work and must not starve dispatch (§10).
         self.engine_inflight: set[str] = set()
         self.env_inflight: dict[str, int] = {}
         self.runner: asyncio.Task | None = None
         self.last_error = None
         self._stopping = False
+        self._firing: set[str] = set()
+
+    @property
+    def m(self):
+        return self.state.model
 
     # -- lifecycle ---------------------------------------------------------------
 
     async def initialize(self):
-        await self.state.initialize(self.manifest, self.manifest["revision"])
-        if self.project:
-            async with self.state.transaction() as tx:
-                # The worker entrypoint spec for Local/pool launches.
-                await tx.put("sys/entrypoint", self.project)
-        async with self.state.transaction() as tx:
-            for name, source in self.manifest["sources"].items():
-                if await tx.head(name, "") is None:
-                    await tx.put_head(
-                        name,
-                        "",
-                        {
-                            "ref": source["head"],
-                            "commit": None,
-                            "at": self.clock(),
-                            "complete": True,
-                            "asset": None,
-                            "version": None,
-                        },
-                    )
+        """Register the served project (§11): a new manifest reconciles
+        automation state and seeds source heads."""
+
+        m = self.m
+        if (
+            m.revision != self.manifest["revision"]
+            or m.manifest != self.manifest
+            or m.project != self.project
+        ):
+            await self.state.emit(
+                {
+                    "type": "ProjectRegistered",
+                    "revision": self.manifest["revision"],
+                    "manifest": self.manifest,
+                    "project": self.project,
+                    "at": self.clock(),
+                }
+            )
 
     async def start(self):
-        """Start the eval loop. In-flight work from before a restart was
-        already fenced and requeued by State's open (§4.3) — the dispatch
-        path relaunches it from scratch."""
+        """Start the eval loop. Work in flight before a restart holds no claim
+        now — its tasks are queued again and the dispatch path relaunches them."""
 
         self._stopping = False
         self.runner = asyncio.create_task(self._loop())
@@ -149,7 +128,7 @@ class Engine:
                 pass
             self.runner = None
         if self.inflight:
-            await asyncio.gather(*self.inflight.values(), return_exceptions=True)
+            await asyncio.gather(*(t for _, t in self.inflight.values()), return_exceptions=True)
             self.inflight.clear()
 
     async def _loop(self):
@@ -159,52 +138,17 @@ class Engine:
                 self.last_error = None
             except Exception as error:
                 self.last_error = f"{type(error).__name__}: {error}"
+                log.exception("engine tick failed")
             await asyncio.sleep(self.eval_interval)
 
     async def tick(self):
-        """One evaluation pass: lease sweeps, dispatch, automations, storage GC,
-        and the retention sweep when a policy exists."""
+        """One evaluation pass: expired leases, dispatch, automations, archiving."""
 
-        await self.state.sweep_scope_leases()
-        await self.state.sweep_pool_leases()
+        await self._sweep_leases()
+        self._sweep_pool()
         await self._dispatch_due()
         await self._automation_tick()
-        await self._gc_due()
-        await self._retention_due()
-
-    async def _gc_due(self):
-        """One SlateDB GC pass per `gc_interval` — bounds WAL/manifest/compacted
-        objects under long-running file:// deployments (§4.4)."""
-
-        if self.clock() < self._gc_at:
-            return
-        self._gc_at = self.clock() + self.gc_interval
-        gc_once = getattr(self.state.store, "gc_once", None)
-        if gc_once is not None:
-            await gc_once()
-
-    async def _retention_due(self):
-        """One retention sweep per `retention_interval` when the project
-        declares a policy (§5)."""
-
-        if self.clock() < self._retention_at:
-            return
-        self._retention_at = self.clock() + self.retention_interval
-        if not self._retention_policies()[0]:
-            return
-        await self.retention_sweep()
-
-    def _retention_policies(self):
-        """asset name -> {"days", "runs"} — the asset's policy, else the
-        project default; absent both means no sweep for that asset."""
-
-        default = self.manifest.get("retention")
-        policies = {}
-        for name, asset in self.manifest["assets"].items():
-            policy = asset.get("retention") or default
-            if policy:
-                policies[name] = policy
-        return policies, default
+        await self._archive_due()
 
     async def run_until(self, run_id: str, timeout: float = 120.0):
         """Tick until the run reaches a terminal status (CLI and tests)."""
@@ -212,11 +156,11 @@ class Engine:
         deadline = self.clock() + timeout
         while self.clock() < deadline:
             await self.tick()
-            run = await self._run(run_id)
+            run = self.m.runs.get(run_id) or await self.state.archived(run_id)
             if run and run["status"] in TERMINAL:
                 # Wait only on this run's attempts — unrelated pool-placed runs
                 # may hold inflight waiters until a worker claims them.
-                mine = [t for a, t in self.inflight.items() if a.startswith(f"{run_id}/")]
+                mine = [t for r, t in self.inflight.values() if r == run_id]
                 await asyncio.gather(*mine, return_exceptions=True)
                 return await self.run_detail(run_id)
             await asyncio.sleep(0.05)
@@ -247,106 +191,90 @@ class Engine:
         config = config or {}
         if not isinstance(config, dict):
             raise ValueError("config must be a JSON object")
-        async with self.state.transaction() as tx:
-            if command_id:
-                existing = await tx.get(f"sys/command/{command_id}")
-                if existing:
-                    return await tx.run(existing)
-            assets = {}
-            for target in targets:
-                name = self._asset_of(target)
-                assets[name] = await self._scopes(tx, name, partitions)
-            if upstream:
-                queue = [(n, s) for n, scopes in assets.items() for s in scopes]
-                seen = set(queue)
-                while queue:
-                    name, scope = queue.pop()
-                    for owner, up_scope in await self._upstream_of(tx, name, scope):
-                        if owner is None or (owner, up_scope) in seen:
-                            continue
-                        seen.add((owner, up_scope))
-                        assets.setdefault(owner, []).append(up_scope)
-                        queue.append((owner, up_scope))
-            if keys:
-                incremental_outputs = {
-                    e["output"]
-                    for name in assets
-                    for e in self.manifest["assets"][name]["inputs"].values()
-                    if e["kind"] == "incremental"
-                }
-                unknown = set(keys) - incremental_outputs
-                if unknown:
-                    raise ValueError(f"keys= names no Incremental edge: {sorted(unknown)}")
-            if skip_active:
-                for name in list(assets):
-                    kept = []
-                    for scope in assets[name]:
-                        lock = await tx.lock(name, scope)
-                        live = lock is not None and await tx.lease_until(lock) > self.clock()
-                        if not live and not await tx.pending(name, scope):
-                            kept.append(scope)
-                    assets[name] = kept
-                if not any(assets.values()):
-                    return None  # §9: the tick is skipped — every scope is in flight
-            run_id = uuid.uuid4().hex
-            run = {
-                "id": run_id,
-                "targets": sorted(assets),
-                "partitions": partitions if isinstance(partitions, str) else list(partitions),
-                "mode": mode,
-                "upstream": bool(upstream),
-                "config": config,
-                "keys": keys,
-                "automation": automation,
-                "status": "queued",
-                "paused": False,
-                "tasks": [],
-                "created_at": self.clock(),
-                "updated_at": self.clock(),
+        m = self.m
+        if command_id and command_id in m.receipts:
+            return await self._run_view_of(m.receipts[command_id])
+        assets = {}
+        for target in targets:
+            name = self._asset_of(target)
+            assets[name] = await self._scopes(name, partitions)
+        if upstream:
+            queue = [(n, s) for n, scopes in assets.items() for s in scopes]
+            seen = set(queue)
+            while queue:
+                name, scope = queue.pop()
+                for owner, up_scope in await self._upstream_of(name, scope):
+                    if owner is None or (owner, up_scope) in seen:
+                        continue
+                    seen.add((owner, up_scope))
+                    assets.setdefault(owner, []).append(up_scope)
+                    queue.append((owner, up_scope))
+        if keys:
+            incremental_outputs = {
+                e["output"]
+                for name in assets
+                for e in self.manifest["assets"][name]["inputs"].values()
+                if e["kind"] == "incremental"
             }
-            tasks = {}
-            for name, scopes in assets.items():
-                for scope in sorted(set(scopes)):
-                    task_id = f"{run_id}/{name}:{scope}"
-                    tasks[task_id] = {
-                        "id": task_id,
-                        "run": run_id,
-                        "asset": name,
-                        "scope": scope,
-                        "status": "queued",
-                        "deps": [],
-                        "generation": 0,
-                        "attempt_count": 0,
-                        "max_attempts": 1 + self.manifest["assets"][name].get("retries", {}).get("n", 0),
-                        "retry": self.manifest["assets"][name].get("retries"),
-                        "ready_at": self.clock(),
-                    }
-            for task_id, task in tasks.items():
-                for owner, up_scope in await self._upstream_of(tx, task["asset"], task["scope"]):
-                    dep_id = f"{run_id}/{owner}:{up_scope}"
-                    if dep_id in tasks and dep_id != task_id:
-                        task["deps"].append(dep_id)
-                        task["status"] = "waiting"
-            for task in tasks.values():
-                await tx.put_task(task)
-                await tx.put_pending(task)
-                if task["status"] == "queued":
-                    await tx.enqueue(task["id"], task["ready_at"])
-                else:
-                    # waiting: seed the dependents index + unfinished counters
-                    # (§4.2) — completions decrement, never rescan the run.
-                    await tx.set_unfinished(
-                        task["id"], {"left": len(task["deps"]), "bad": 0, "deps": task["deps"]}
-                    )
-                    for dep in task["deps"]:
-                        await tx.add_dependent(dep, task["id"])
-            await tx.set_run_stats(run_id, {"left": len(tasks), "bad": 0})
-            run["tasks"] = sorted(tasks)
-            await tx.put_run(run)
-            if command_id:
-                await tx.put(f"sys/command/{command_id}", run_id)
-            await self.state.advance_run(tx, run_id)
-            return run
+            unknown = set(keys) - incremental_outputs
+            if unknown:
+                raise ValueError(f"keys= names no Incremental edge: {sorted(unknown)}")
+        if skip_active:
+            for name in list(assets):
+                assets[name] = [s for s in assets[name] if not self._scope_active(name, s)]
+            if not any(assets.values()):
+                return None  # §9: the tick is skipped — every scope is in flight
+        now = self.clock()
+        run_id = ulid(now)
+        tasks = {}
+        for name, scopes in assets.items():
+            for scope in sorted(set(scopes)):
+                task_id = f"{run_id}/{name}:{scope}"
+                tasks[task_id] = {
+                    "id": task_id,
+                    "run": run_id,
+                    "asset": name,
+                    "scope": scope,
+                    "status": "queued",
+                    "deps": [],
+                    "max_attempts": 1 + self.manifest["assets"][name].get("retries", {}).get("n", 0),
+                    "retry": self.manifest["assets"][name].get("retries"),
+                    "ready_at": now,
+                    "attempts": [],
+                }
+        for task_id, task in tasks.items():
+            for owner, up_scope in await self._upstream_of(task["asset"], task["scope"]):
+                dep_id = f"{run_id}/{owner}:{up_scope}"
+                if dep_id in tasks and dep_id != task_id:
+                    task["deps"].append(dep_id)
+                    task["status"] = "waiting"
+        run = {
+            "id": run_id,
+            "targets": sorted(assets),
+            "partitions": partitions if isinstance(partitions, str) else list(partitions),
+            "mode": mode,
+            "upstream": bool(upstream),
+            "config": config,
+            "keys": keys,
+            "automation": automation,
+            "status": "running",
+            "paused": False,
+            "created_at": now,
+            "updated_at": now,
+            "tasks": tasks,
+        }
+        if command_id and command_id in m.receipts:  # submitted while we planned
+            return await self._run_view_of(m.receipts[command_id])
+        await self.state.emit({"type": "RunSubmitted", "run": run, "command": command_id})
+        return self._run_view(m.runs.get(run_id) or run)
+
+    def _scope_active(self, asset: str, scope: str) -> bool:
+        attempt = self.m.locks.get((asset, scope))
+        if attempt is not None:
+            claim = self.m.claimed(attempt)
+            if claim is not None and claim["lease_until"] > self.clock():
+                return True
+        return self.m.is_pending(asset, scope)
 
     def _asset_of(self, name: str) -> str:
         if name in self.manifest["assets"]:
@@ -355,7 +283,7 @@ class Engine:
             return self.manifest["outputs"][name]["asset"]
         raise ValueError(f"Unknown asset or output: {name!r}")
 
-    async def _upstream_of(self, tx: Tx, asset: str, scope: str):
+    async def _upstream_of(self, asset: str, scope: str):
         """(owner_asset, upstream_scope) for every edge, dep, and partition-set
         dimension of (asset, scope) — a bound key set is a pinned dep (§7)."""
 
@@ -366,7 +294,7 @@ class Engine:
             owner = self.manifest["outputs"][edge["output"]].get("asset")
             up_dims = self._dims(owner) if owner else {}
             if edge["kind"] in {"all_partitions", "dep"} and owner is not None:
-                out.extend((owner, s) for s in await self._spread(tx, info, scope, up_dims))
+                out.extend((owner, s) for s in await self._spread(info, scope, up_dims))
                 continue
             out.append((owner, self._project(info, scope, up_dims)))
         for dim in self._dims(asset).values():
@@ -376,7 +304,7 @@ class Engine:
                     out.append((owner, ""))
         return out
 
-    async def _spread(self, tx: Tx, consumer: dict, consumer_scope: str, upstream_dims: dict):
+    async def _spread(self, consumer: dict, consumer_scope: str, upstream_dims: dict):
         """Every upstream scope visible at (consumer, consumer_scope): shared
         dims pin the consumer's key; upstream-only dims expand over the current
         key set (§7). Used by planning and by dep/AllPartitions pinning."""
@@ -394,20 +322,20 @@ class Engine:
                 free[name] = dim
         if not free:
             return [canonical_partition(upstream_dims, pinned)]
-        keys = await self._dim_keys(tx, free)
+        keys = await self._dim_keys(free)
         return [
             canonical_partition(upstream_dims, {**pinned, **dict(zip(free, combo, strict=True))})
             for combo in product(*keys)
         ]
 
-    async def _scopes(self, tx: Tx, asset: str, selection) -> list[str]:
+    async def _scopes(self, asset: str, selection) -> list[str]:
         """`partitions` selects keys from the current set (§7, §8)."""
 
         dims = self._dims(asset)
         if not dims:
             current = [""]
         else:
-            keys = await self._dim_keys(tx, dims)
+            keys = await self._dim_keys(dims)
             current = [
                 canonical_partition(dims, parts)
                 for parts in (dict(zip(dims, combo, strict=True)) for combo in product(*keys))
@@ -418,7 +346,7 @@ class Engine:
             if not dims:
                 return current
             chosen = []
-            keys = await self._dim_keys(tx, dims)
+            keys = await self._dim_keys(dims)
             for name, dim in dims.items():
                 if dim["kind"] == "time":
                     latest = self._time(dim).latest(self._now())
@@ -432,9 +360,9 @@ class Engine:
             ]
         if selection == "missing":
             missing = []
+            outputs = self.manifest["assets"][asset]["outputs"]
             for scope in current:
-                outputs = self.manifest["assets"][asset]["outputs"]
-                heads = [await tx.head(o["name"], scope) for o in outputs]
+                heads = [self.m.heads.get((o["name"], scope)) for o in outputs]
                 if not heads or any(h is None or not h["complete"] for h in heads):
                     missing.append(scope)
             return missing
@@ -448,7 +376,7 @@ class Engine:
             return str(key)
         return canonical_partition(dims, split_partition(dims, key))
 
-    async def _dim_keys(self, tx: Tx, dims: dict) -> list[list[str]]:
+    async def _dim_keys(self, dims: dict) -> list[list[str]]:
         out = []
         for dim in dims.values():
             if dim["kind"] == "static":
@@ -456,8 +384,7 @@ class Engine:
             elif dim["kind"] == "time":
                 out.append(self._time(dim).keys(self._now()))
             else:
-                head = await tx.head(dim["output"], "")
-                keys = await self._head_keys(head)
+                keys = await self._head_keys(self.m.heads.get((dim["output"], "")))
                 out.append(sorted(keys) if keys else [])
         return out
 
@@ -470,12 +397,6 @@ class Engine:
         meta = head["ref"].get("meta") or {}
         if meta.get("partitions") is not None:
             return [str(e) for e in meta["partitions"]]
-        legacy = meta.get("keys") or {}
-        if legacy.get("object"):
-            # Pre-delta head: the element list lives in a staged keys object.
-            data = await self.state.get_object(legacy["object"])
-            if data is not None:
-                return sorted(str(k) for k in json.loads(data))
         if meta.get("delta"):
             keys = await self.state.delta_key_map(
                 head["ref"]["output"], head["ref"].get("partition", ""), meta["delta"]["batch"]
@@ -545,85 +466,168 @@ class Engine:
     def _dims_of(self, asset: dict) -> dict:
         return (asset.get("partitions") or {}).get("dims") or {}
 
+    # -- leases (memory only, §4.3) ------------------------------------------------------
+
+    async def _sweep_leases(self):
+        """An attempt whose scope lease expired loses its claim; its task is
+        queued again (§8). A harness still running cannot commit any more."""
+
+        now = self.clock()
+        for task_id, claim in list(self.m.claims.items()):
+            if claim["lease_until"] > now:
+                continue
+            task = self.m.task(task_id)
+            if task is None:
+                continue
+            await self._finish(task, claim, "expired", error="lease expired")
+
+    def _sweep_pool(self):
+        """Expired pool claims return to queued so another worker can take them."""
+
+        now = self.clock()
+        for record in self.m.pool.values():
+            if (
+                record["status"] == "claimed"
+                and record["lease_until"] is not None
+                and record["lease_until"] <= now
+            ):
+                record["status"] = "queued"
+                record["claimed_by"] = None
+                record["lease_until"] = None
+
+    def _renew(self, attempt: str) -> float:
+        claim = self.m.claimed(attempt)
+        if claim is None:
+            raise LostOwnership(attempt)
+        claim["lease_until"] = self.clock() + self.lease_seconds
+        return claim["lease_until"]
+
+    async def _finish(
+        self,
+        task: dict,
+        claim: dict,
+        outcome: str,
+        *,
+        error=None,
+        retryable=False,
+        delay=0.0,
+        commit=None,
+        more=False,
+    ):
+        event = {
+            "type": "AttemptFinished",
+            "run": task["run"],
+            "task": task["id"],
+            "attempt": claim["attempt"],
+            "outcome": outcome,
+            "started_at": claim["started_at"],
+            "finished_at": self.clock(),
+        }
+        if error is not None:
+            event["error"] = str(error)[-8000:]
+            event["retryable"] = bool(retryable)
+            if delay:
+                event["delay"] = float(delay)
+        if commit is not None:
+            event["commit"] = commit
+        if more:
+            event["more"] = True
+        await self.state.emit(event)
+
+    async def fail_attempt(self, attempt: str, error: str, *, retryable: bool, delay: float = 0):
+        """Mark the running attempt failed; retryable failures requeue by policy."""
+
+        claim = self.m.claimed(attempt)
+        if claim is None:
+            return
+        task = self.m.task(self.m.attempts[attempt])
+        await self._finish(task, claim, "failed", error=error, retryable=retryable, delay=delay)
+
     # -- dispatch ---------------------------------------------------------------
 
     async def _dispatch_due(self):
-        dispatched = []
-        dispatched_env: dict[str, int] = {}
-        dispatched_engine = 0
-        async with self.state.transaction() as tx:
-            now_ms = self.clock() * 1000
-            for task_id, when_ms in await tx.queued():
-                if when_ms > now_ms:
-                    break
-                await tx.dequeue(task_id)
-                task = await tx.task(task_id)
-                if task is None or task["status"] != "queued":
-                    continue
-                run = await tx.run(task["run"])
-                if run is None or run["status"] == "canceled" or run.get("paused"):
-                    await tx.enqueue(task_id, task["ready_at"])
-                    continue
-                placement = self._placement(task)
-                spec = self.manifest["assets"][task["asset"]]["placement"]
-                env_key = self.registry.env_key(spec)
-                limit = getattr(placement, "max_concurrent", None)
-                if (
-                    spec["kind"] != "Pool"
-                    and len(self.engine_inflight) + dispatched_engine >= self.concurrency
-                ) or (
-                    limit is not None
-                    and self.env_inflight.get(env_key, 0) + dispatched_env.get(env_key, 0) >= limit
-                ):
-                    await tx.enqueue(task_id, self.clock() + 1)
-                    continue
-                try:
-                    claim = await self.state.claim(tx, task, self.lease_seconds)
-                except Conflict:
-                    await tx.enqueue(task_id, self.clock() + 2)
-                    continue
-                try:
-                    prepared = await self._prepare(tx, task, run)
-                except Retryable as error:
-                    task["status"] = "running"
-                    await tx.put_task(task)
-                    dispatched.append((task, claim["id"], None, None, (str(error), True)))
-                    continue
-                except NonRetryable as error:
-                    task["status"] = "running"
-                    await tx.put_task(task)
-                    dispatched.append((task, claim["id"], None, None, (str(error), False)))
-                    continue
-                task["status"] = "running"
-                task["started_at"] = self.clock()
-                await tx.put_task(task)
-                dispatched.append((task, claim["id"], prepared, placement, None))
-                dispatched_env[env_key] = dispatched_env.get(env_key, 0) + 1
-                if spec["kind"] != "Pool":
-                    dispatched_engine += 1
-        for task, attempt, prepared, placement, error in dispatched:
-            if error is not None:
-                message, retryable = error
-                await self.state.fail_attempt(attempt, message, retryable=retryable)
+        now = self.clock()
+        engine_used = len(self.engine_inflight)
+        env_used = dict(self.env_inflight)
+        for task_id in self.m.due(now):
+            task = self.m.task(task_id)
+            if task is None or task["status"] != "queued" or task_id in self.m.claims:
                 continue
-            if prepared.get("skip"):
-                await self.state.skip_attempt(
-                    attempt, prepared["baseline"], prepared.get("watermark_updates")
-                )
+            run = self.m.runs[self.m.task_run[task_id]]
+            if run["status"] == "canceled" or run.get("paused"):
                 continue
-            env_key = self.registry.env_key(self.manifest["assets"][task["asset"]]["placement"])
+            spec = self.manifest["assets"][task["asset"]]["placement"]
+            placement = self.registry.build(spec)
+            env_key = self.registry.env_key(spec)
+            limit = getattr(placement, "max_concurrent", None)
+            is_pool = spec["kind"] == "Pool"
+            if not is_pool and engine_used >= self.concurrency:
+                continue
+            if limit is not None and env_used.get(env_key, 0) >= limit:
+                continue
+            if self._scope_active_claim(task["asset"], task["scope"]):
+                continue
+            attempt = ulid(now)
+            self.m.claim(task_id, attempt, now, self.lease_seconds)
+            env_used[env_key] = env_used.get(env_key, 0) + 1
+            if not is_pool:
+                engine_used += 1
+                self.engine_inflight.add(attempt)
             self.env_inflight[env_key] = self.env_inflight.get(env_key, 0) + 1
-            asyncio_task = asyncio.create_task(self._execute(task, attempt, prepared, placement))
-            self.inflight[attempt] = asyncio_task
-            asyncio_task.add_done_callback(lambda _t, a=attempt: self.inflight.pop(a, None))
+            job = asyncio.create_task(self._attempt(task_id, attempt, placement, env_key))
+            self.inflight[attempt] = (task["run"], job)
+            job.add_done_callback(lambda _t, a=attempt: self.inflight.pop(a, None))
 
-    def _placement(self, task: dict):
-        spec = self.manifest["assets"][task["asset"]]["placement"]
-        return self.registry.build(spec)
+    def _scope_active_claim(self, asset: str, scope: str) -> bool:
+        attempt = self.m.locks.get((asset, scope))
+        return attempt is not None and self.m.claimed(attempt) is not None
+
+    async def _attempt(self, task_id: str, attempt: str, placement, env_key: str):
+        """One attempt, start to finish: prepare, skip or launch, wait, commit.
+        Every path ends in exactly one AttemptFinished (or a lost claim)."""
+
+        try:
+            task = self.m.task(task_id)
+            claim = self.m.claimed(attempt)
+            if task is None or claim is None:
+                return
+            run = self.m.runs[task["run"]]
+            try:
+                prepared = await self._prepare(task, run)
+            except (Retryable, NonRetryable, Conflict) as error:
+                if self.m.claimed(attempt) is not None:
+                    await self._finish(
+                        task,
+                        claim,
+                        "failed",
+                        error=error,
+                        retryable=not isinstance(error, NonRetryable) and getattr(error, "retryable", True),
+                    )
+                return
+            if self.m.claimed(attempt) is None:
+                return
+            if prepared.get("skip"):
+                await self._finish(
+                    task, claim, "skipped", commit={"watermarks": prepared["watermark_updates"]}
+                )
+                return
+            await self._execute(task, run, attempt, prepared, placement)
+        except LostOwnership:
+            return
+        except Exception as error:  # never leave a claim behind
+            log.exception("attempt %s failed unexpectedly", attempt)
+            claim = self.m.claimed(attempt)
+            task = self.m.task(task_id)
+            if claim is not None and task is not None:
+                with contextlib.suppress(Exception):
+                    await self._finish(task, claim, "failed", error=f"engine: {error}", retryable=True)
+        finally:
+            self.engine_inflight.discard(attempt)
+            self.env_inflight[env_key] = max(0, self.env_inflight.get(env_key, 1) - 1)
 
     # -- input resolution + Incremental plans (§5, §6, §8) --------------------------
 
-    async def _prepare(self, tx: Tx, task: dict, run: dict) -> dict:
+    async def _prepare(self, task: dict, run: dict) -> dict:
         """Pin heads at attempt start; plan Incremental edges; decide skip (§8)."""
 
         asset = self.manifest["assets"][task["asset"]]
@@ -631,7 +635,7 @@ class Engine:
         full = run["mode"] == "full"
         baseline = {}
         for output in asset["outputs"]:
-            head = await tx.head(output["name"], scope)
+            head = self.m.heads.get((output["name"], scope))
             baseline[output["name"]] = head
             if (
                 not full
@@ -664,14 +668,14 @@ class Engine:
             owner = self.manifest["outputs"][output].get("asset")
             up_dims = self._dims(owner)
             if edge["kind"] == "all_partitions":
-                refs = await self._all_partitions(tx, task, asset, up_dims, output)
+                refs = await self._all_partitions(task, asset, up_dims, output)
                 inputs[param] = {"refs": refs}
                 pinned[param] = refs
                 continue
             if edge["kind"] == "dep":
                 refs = {}
-                for s in await self._spread(tx, asset, scope, up_dims):
-                    refs[s] = await self._pin_at(tx, output, s)
+                for s in await self._spread(asset, scope, up_dims):
+                    refs[s] = self._pin_at(output, s)
                 inputs[param] = {"refs": refs}
                 if not edge.get("set_dim"):
                     pinned[param] = refs
@@ -679,16 +683,14 @@ class Engine:
             if edge["kind"] == "incremental":
                 incremental.append((param, edge, up_dims))
                 continue
-            inputs[param] = {"ref": await self._pin(tx, output, up_dims, asset, scope)}
+            inputs[param] = {"ref": self._pin(output, up_dims, asset, scope)}
             pinned[param] = inputs[param]["ref"]
         fingerprint = self._fingerprint(asset, run, pinned)
         # Pass 2: Incremental plans against the fingerprinted interpretation (§2.2).
         watermark_updates, all_empty = {}, True
         for param, edge, up_dims in incremental:
-            ref = await self._pin(tx, edge["output"], up_dims, asset, scope)
-            pin, update, empty = await self._incremental_plan(
-                tx, task, asset, param, edge, ref, fingerprint, run, full
-            )
+            ref = self._pin(edge["output"], up_dims, asset, scope)
+            pin, update, empty = await self._incremental_plan(task, param, edge, ref, fingerprint, run, full)
             inputs[param] = pin
             if update is not None:
                 watermark_updates[param] = update
@@ -702,7 +704,7 @@ class Engine:
                     skip = False
                     break
         prior = {name: head["ref"] for name, head in baseline.items() if head is not None}
-        cursor = await tx.cursor(task["asset"], scope)
+        cursor = self.m.cursors.get((task["asset"], scope))
         if full:
             prior, cursor = {}, None
         return {
@@ -723,15 +725,15 @@ class Engine:
             },
         }
 
-    async def _pin(self, tx: Tx, output: str, up_dims: dict, asset: dict, scope: str):
+    def _pin(self, output: str, up_dims: dict, asset: dict, scope: str):
         """Resolve one edge to its head ref; sources synthesize theirs (§5, §8)."""
 
-        return await self._pin_at(tx, output, self._project(asset, scope, up_dims))
+        return self._pin_at(output, self._project(asset, scope, up_dims))
 
-    async def _pin_at(self, tx: Tx, output: str, up_scope: str):
+    def _pin_at(self, output: str, up_scope: str):
         """Head ref for one upstream scope; sources synthesize theirs (§5, §8)."""
 
-        head = await tx.head(output, up_scope)
+        head = self.m.heads.get((output, up_scope))
         if head is None:
             source = self.manifest["sources"].get(output)
             if source is not None and up_scope == "":
@@ -739,7 +741,7 @@ class Engine:
             raise Retryable(f"input {output!r} has no head for scope {up_scope!r}")
         return head["ref"]
 
-    async def _all_partitions(self, tx, task, asset, up_dims, output) -> dict:
+    async def _all_partitions(self, task, asset, up_dims, output) -> dict:
         """AllPartitions pins every upstream key with a complete head (§7)."""
 
         parts = split_partition(self._dims_of(asset), task["scope"]) if self._dims_of(asset) else {}
@@ -749,9 +751,9 @@ class Engine:
             if not shared:
                 collapsed[name] = dim
         if not collapsed:
-            head = await tx.head(output, self._project(asset, task["scope"], up_dims))
+            head = self.m.heads.get((output, self._project(asset, task["scope"], up_dims)))
             return {"": head["ref"]} if head is not None and head["complete"] else {}
-        keys = await self._dim_keys(tx, collapsed)
+        keys = await self._dim_keys(collapsed)
         refs = {}
         for combo in product(*keys):
             collapsed_parts = dict(zip(collapsed, combo, strict=True))
@@ -761,13 +763,12 @@ class Engine:
                     for c_name, c_dim in self._dims_of(asset).items():
                         if self._same_dim(dim, c_dim):
                             full[name] = parts[c_name]
-            scope = canonical_partition(up_dims, full)
-            head = await tx.head(output, scope)
+            head = self.m.heads.get((output, canonical_partition(up_dims, full)))
             if head is not None and head["complete"]:
                 refs[canonical_partition(collapsed, collapsed_parts)] = head["ref"]
         return refs
 
-    async def _incremental_plan(self, tx, task, asset, param, edge, ref, fingerprint, run, full):
+    async def _incremental_plan(self, task, param, edge, ref, fingerprint, run, full):
         """Plan one Incremental edge: the pending delta items after the edge's
         watermark, capped at `batch_size` (§2.2).
 
@@ -786,7 +787,7 @@ class Engine:
         head_batch = int(((ref.get("meta") or {}).get("delta") or {}).get("batch", -1))
         up_scope = ref.get("partition") or ""
         override = (run.get("keys") or {}).get(edge["output"])
-        wm = await tx.watermark(task["asset"], param, task["scope"])
+        wm = self.m.watermarks.get((task["asset"], param, task["scope"]))
         draining = wm is not None and wm["batch"] == -1
         reset = full or wm is None or draining or wm.get("fingerprint") != fingerprint or override == "full"
 
@@ -861,19 +862,12 @@ class Engine:
         # Incremental: pending items sit in deltas [wm.batch .. head_batch],
         # skipping the first wm.offset items of wm.batch.
         deltas = []
-        gap = False
         for b in range(wm["batch"], head_batch + 1):
             d = await self.state.delta(edge["output"], up_scope, b)
             if d is None:
-                gap = True
-                break
+                # The log was pruned under the watermark — restart the drain (§2.2).
+                return await self._incremental_plan(task, param, edge, ref, fingerprint, run, full=True)
             deltas.append(d)
-        if gap:
-            # The log was pruned under the watermark — restart the drain (§2.2).
-            wm = None
-            return await self._incremental_plan(
-                tx, task, asset, param, edge, ref, fingerprint, run, full=True
-            )
 
         if not keyed:
             # Batch-mode upstream: every pending batch is one item; a reset
@@ -954,8 +948,7 @@ class Engine:
 
     # -- the placement loop (§10) ---------------------------------------------------
 
-    async def _execute(self, task, attempt, prepared, placement):
-        run = await self._run(task["run"]) or {}
+    async def _execute(self, task, run, attempt, prepared, placement):
         spec = {
             "attempt": attempt,
             "revision": self.manifest["revision"],
@@ -972,59 +965,51 @@ class Engine:
         }
         if prepared["cursor"] is not None:
             spec["cursor"] = prepared["cursor"]
-        env_key = self.registry.env_key(spec["execution"])
-        is_pool = spec["execution"]["kind"] == "Pool"
-        if not is_pool:
-            self.engine_inflight.add(attempt)
+        await self.state.put_object(f"specs/{attempt}.json", json.dumps(spec).encode())
+        if spec["execution"]["kind"] == "Pool":
+            self._stage_pool(task, attempt, spec)
         try:
-            await self.state.put_object(f"specs/{attempt}.json", json.dumps(spec).encode())
-            if is_pool:
-                await self.state.stage_pool_task(task, prepared, spec)
-            try:
-                handle = await placement.launch({"attempt": attempt, "objects": self.state.objects_url})
-            except Exception as error:
-                await self.state.fail_attempt(attempt, f"launch: {error}", retryable=True)
-                return
-            self.handles[attempt] = handle
-            try:
-                await self._wait_loop(task, attempt, prepared, placement, handle)
-            finally:
-                self.handles.pop(attempt, None)
+            handle = await placement.launch({"attempt": attempt, "objects": self.state.objects_url})
+        except Exception as error:
+            await self.fail_attempt(attempt, f"launch: {error}", retryable=True)
+            return
+        self.handles[attempt] = handle
+        try:
+            await self._wait_loop(task, attempt, prepared, placement, handle)
         finally:
-            self.engine_inflight.discard(attempt)
-            self.env_inflight[env_key] = max(0, self.env_inflight.get(env_key, 1) - 1)
+            self.handles.pop(attempt, None)
 
     async def _wait_loop(self, task, attempt, prepared, placement, handle):
         timeout_s = self.manifest["assets"][task["asset"]].get("timeout") or 3600
         deadline = self.clock() + timeout_s
         while True:
+            polled = self.clock()
             try:
                 exit_ = await placement.wait(handle, self.lease_seconds / 3)
             except Exception as error:
-                await self.state.fail_attempt(attempt, f"wait: {error}", retryable=True)
+                await self.fail_attempt(attempt, f"wait: {error}", retryable=True)
                 return
             if exit_ is not None:
                 break
+            # A placement that returns before its timeout must not spin the loop.
+            await asyncio.sleep(max(0.0, 0.05 - (self.clock() - polled)))
             if self.clock() > deadline:
                 await self._cancel(placement, handle)
-                await self.state.fail_attempt(attempt, "timeout", retryable=True)
+                await self.fail_attempt(attempt, "timeout", retryable=True)
                 return
             try:
-                async with self.state.transaction() as tx:
-                    await self.state.renew(tx, attempt, self.lease_seconds)
-            except (LostOwnership, Conflict):
+                self._renew(attempt)
+            except LostOwnership:
                 await self._cancel(placement, handle)
                 return
         result_data = await self.state.get_object(f"results/{attempt}.json")
         if result_data is None:
-            await self.state.fail_attempt(
-                attempt, f"harness exited without a result: {exit_}", retryable=True
-            )
+            await self.fail_attempt(attempt, f"harness exited without a result: {exit_}", retryable=True)
             return
         result = json.loads(result_data)
         if result.get("status") == "failed":
             error = result.get("error") or {}
-            await self.state.fail_attempt(
+            await self.fail_attempt(
                 attempt,
                 f"{error.get('type', 'Error')}: {error.get('message', '')}",
                 retryable=bool(error.get("retryable")),
@@ -1032,26 +1017,160 @@ class Engine:
             )
             return
         try:
-            await self.state.commit_attempt(self.manifest, attempt, prepared, result)
+            await self.commit_attempt(attempt, prepared, result)
         except LostOwnership:
             return
         except Conflict as error:
-            await self.state.fail_attempt(attempt, str(error), retryable=getattr(error, "retryable", True))
+            await self.fail_attempt(attempt, str(error), retryable=getattr(error, "retryable", True))
 
     def _retry_delay(self, task) -> float:
         retry = task.get("retry") or {}
         delay = float(retry.get("delay", 1.0))
         if retry.get("backoff") == "exponential":
-            delay *= 2 ** max(0, task.get("attempt_count", 1) - 1)
+            failures = sum(1 for a in task["attempts"] if a["outcome"] == "failed")
+            delay *= 2**failures
         return delay
 
     async def _cancel(self, placement, handle):
-        import contextlib
-
         with contextlib.suppress(Exception):
             await placement.cancel(handle)
         with contextlib.suppress(Exception):
             await asyncio.wait_for(placement.wait(handle, GRACE_SECONDS), GRACE_SECONDS + 1)
+
+    # -- the commit (§8) ---------------------------------------------------------------
+
+    async def commit_attempt(self, attempt: str, prepared: dict, result: dict) -> dict:
+        """Install an attempt's result: heads, cursor, edge watermarks (§8).
+
+        Every precondition is checked against the model, and the event emitted,
+        without an await in between."""
+
+        from cursus.sdk import UNSET
+
+        claim = self.m.claimed(attempt)
+        if claim is None or claim["lease_until"] <= self.clock():
+            raise LostOwnership(attempt)
+        task = self.m.task(self.m.attempts[attempt])
+        # Pinned inputs must still be the committed heads (§8).
+        for name, pin in prepared["inputs"].items():
+            refs = pin["refs"].values() if "refs" in pin else [pin["ref"]]
+            for ref in refs:
+                head = self.m.heads.get((ref["output"], ref["partition"]))
+                if head is None or head["ref"]["version"] != ref["version"]:
+                    raise Conflict(f"input {name}: {ref['output']}/{ref['partition']} moved after pinning")
+        # Output heads must be unchanged since the claim.
+        for output, baseline in prepared["baseline"].items():
+            if self.m.heads.get((output, task["scope"])) != baseline:
+                raise Conflict(f"output {output} head changed since this attempt was claimed")
+        outputs = result.get("outputs") or {}
+        asset = self.manifest["assets"][task["asset"]]
+        declared = {o["name"]: o for o in asset["outputs"]}
+        for name, ref in outputs.items():
+            if name not in declared:
+                raise Conflict(f"result names undeclared output {name!r}", retryable=False)
+            if ref["partition"] != task["scope"]:
+                raise Conflict(
+                    f"output {name}: ref scope {ref['partition']!r} != {task['scope']!r}", retryable=False
+                )
+            decl = declared[name]
+            meta = ref.get("meta") or {}
+            baseline_ref = (prepared["baseline"].get(name) or {}).get("ref")
+            if baseline_ref is not None and baseline_ref["version"] == ref["version"]:
+                continue  # identical content keeps the head as it is
+            if decl.get("incremental") and not meta.get("delta"):
+                raise Conflict(f"incremental output {name}: ref carries no delta", retryable=False)
+            if decl.get("partition_set") and meta.get("partitions") is None:
+                raise Conflict(
+                    f"partition-set output {name}: ref carries no partitions list", retryable=False
+                )
+        for name in set(declared) - set(outputs):
+            if prepared["baseline"].get(name) is None:
+                raise Conflict(f"omitted output {name} has no head to keep (§2)", retryable=False)
+        commit = {
+            "heads": {
+                name: {
+                    "ref": ref,
+                    "complete": prepared["scope_complete"],
+                    "asset": task["asset"],
+                    "version": asset["version"],
+                }
+                for name, ref in outputs.items()
+            },
+            "watermarks": dict(prepared.get("watermark_updates") or {}),
+        }
+        if result.get("cursor", UNSET) is not UNSET:
+            commit["cursor"] = result["cursor"]
+        elif prepared.get("full"):
+            commit["cursor"] = None  # a full run clears the committed cursor (§8)
+        await self._finish(task, claim, "succeeded", commit=commit, more=bool(prepared.get("more")))
+        return {"run": task["run"], "attempt": attempt, "outputs": outputs}
+
+    # -- pool work (§10, memory only) ----------------------------------------------------
+
+    def _stage_pool(self, task: dict, attempt: str, spec: dict):
+        placement = spec["execution"]
+        self.m.pool[attempt] = {
+            "attempt": attempt,
+            "task": task["id"],
+            "run": task["run"],
+            "asset": task["asset"],
+            "scope": task["scope"],
+            "pool": placement["environment"]["name"],
+            "needs": {
+                k: placement["placement"][k]
+                for k in ("cpu", "memory", "gpu")
+                if placement["placement"].get(k) is not None
+            },
+            "status": "queued",
+            "claimed_by": None,
+            "lease_until": None,
+            "created_at": self.clock(),
+        }
+        claim = self.m.claims.get(task["id"])
+        if claim is not None:
+            claim["status"] = "claimable"
+
+    def register_worker(self, worker_id: str, pools: list[str], meta: dict) -> dict:
+        record = {"id": worker_id, "pools": pools, "meta": meta, "seen_at": self.clock()}
+        self.m.workers[worker_id] = record
+        return record
+
+    def claim_pool_task(self, worker_id: str, pools: list[str], capacity: dict, lease_seconds: float):
+        """Oldest unclaimed (or expired) pool task in the worker's pools that
+        fits the worker's cpu/memory/gpu capacity (§10)."""
+
+        now = self.clock()
+        for record in sorted(self.m.pool.values(), key=lambda r: r["created_at"]):
+            if record["status"] != "queued" or record["pool"] not in pools:
+                continue
+            needs = record.get("needs") or {}
+            if any(capacity.get(dim) is None or capacity[dim] < want for dim, want in needs.items()):
+                continue
+            record.update(
+                status="claimed", claimed_by=worker_id, claimed_at=now, lease_until=now + lease_seconds
+            )
+            claim = self.m.claims.get(record["task"])
+            if claim is not None:
+                claim["status"] = "running"
+            return record
+        return None
+
+    def heartbeat_pool_task(self, worker_id: str, attempt: str, lease_seconds: float) -> float:
+        record = self.m.pool.get(attempt)
+        if (
+            record is None
+            or record["status"] != "claimed"
+            or record["claimed_by"] != worker_id
+            or record["lease_until"] <= self.clock()
+        ):
+            raise LostOwnership(attempt)
+        record["lease_until"] = self.clock() + lease_seconds
+        return record["lease_until"]
+
+    def release_pool_task(self, worker_id: str, attempt: str) -> None:
+        record = self.m.pool.get(attempt)
+        if record and record["claimed_by"] == worker_id:
+            del self.m.pool[attempt]
 
     # -- sources commit API (§5) ------------------------------------------------------
 
@@ -1064,206 +1183,164 @@ class Engine:
         source = self.manifest["sources"].get(name)
         if source is None:
             raise KeyError(name)
-        async with self.state.transaction() as tx:
-            head = await tx.head(name, "")
-            keyed = source.get("key") is not None
-            if not keyed and (keys is not None or upsert is not None or remove is not None):
-                raise ValueError(f"Source {name!r} is unkeyed; pass version=")
-            prior_delta = (((head or {}).get("ref") or {}).get("meta") or {}).get("delta")
-            batch = int(prior_delta["batch"]) + 1 if prior_delta else 0
-            current = (
-                await self.state.delta_key_map(name, "", int(prior_delta["batch"])) if prior_delta else {}
-            )
-            if keyed:
-                if keys is not None:
-                    if source.get("key") == "<elements>" and not isinstance(keys, dict):
-                        new_map = {str(k): "1" for k in keys}
-                    else:
-                        new_map = {str(k): str(v) for k, v in dict(keys).items()}
+        head = self.m.heads.get((name, ""))
+        keyed = source.get("key") is not None
+        if not keyed and (keys is not None or upsert is not None or remove is not None):
+            raise ValueError(f"Source {name!r} is unkeyed; pass version=")
+        prior_delta = (((head or {}).get("ref") or {}).get("meta") or {}).get("delta")
+        batch = int(prior_delta["batch"]) + 1 if prior_delta else 0
+        current = await self.state.delta_key_map(name, "", int(prior_delta["batch"])) if prior_delta else {}
+        if keyed:
+            if keys is not None:
+                if source.get("key") == "<elements>" and not isinstance(keys, dict):
+                    new_map = {str(k): "1" for k in keys}
                 else:
-                    new_map = dict(current)
-                    items = upsert.items() if isinstance(upsert, dict) else ((k, "1") for k in upsert or [])
-                    for k, v in items:
-                        new_map[str(k)] = str(v)
-                    for k in remove or []:
-                        new_map.pop(str(k), None)
-                new_version = digest(new_map)
+                    new_map = {str(k): str(v) for k, v in dict(keys).items()}
             else:
-                if version is None:
-                    raise ValueError(f"Source {name!r} requires version=")
-                new_version = str(version)
-                new_map = current
-            if head is not None and head["ref"]["version"] == new_version and new_map == current:
-                return {"changed": False, "ref": head["ref"]}
-            ref = dict(source["head"])
-            ref["version"] = new_version
-            meta = dict(ref.get("meta") or {})
-            meta["external"] = True
-            if keyed:
-                upserted = {k: r for k, r in new_map.items() if current.get(k) != r}
-                deleted = sorted(set(current) - set(new_map))
-                delta = {
-                    "batch": batch,
-                    "rows": len(upserted) + len(deleted),
-                    "upserted": upserted,
-                }
-                if deleted:
-                    delta["deleted"] = deleted
-                if keys is not None:
-                    delta["reset"] = True  # a full-map commit supersedes the log
-                path = delta_path(name, "", batch)
-                await self.state.put_object(path, json.dumps(delta, sort_keys=True, allow_nan=False).encode())
-                meta["delta"] = {
-                    "object": path,
-                    "batch": batch,
-                    "rows": delta["rows"],
-                }
-                meta["partitions"] = sorted(new_map)
-            ref["meta"] = meta
-            record = {
-                "attempt": None,
-                "task": None,
-                "run": None,
-                "asset": None,
-                "scope": "",
-                "at": self.clock(),
-                "input_refs": {},
-                "outputs": {name: ref},
-                "changed": [name],
+                new_map = dict(current)
+                items = upsert.items() if isinstance(upsert, dict) else ((k, "1") for k in upsert or [])
+                for k, v in items:
+                    new_map[str(k)] = str(v)
+                for k in remove or []:
+                    new_map.pop(str(k), None)
+            new_version = digest(new_map)
+        else:
+            if version is None:
+                raise ValueError(f"Source {name!r} requires version=")
+            new_version = str(version)
+            new_map = current
+        if head is not None and head["ref"]["version"] == new_version and new_map == current:
+            return {"changed": False, "ref": head["ref"]}
+        ref = dict(source["head"])
+        ref["version"] = new_version
+        meta = dict(ref.get("meta") or {})
+        meta["external"] = True
+        if keyed:
+            upserted = {k: r for k, r in new_map.items() if current.get(k) != r}
+            deleted = sorted(set(current) - set(new_map))
+            delta = {"batch": batch, "rows": len(upserted) + len(deleted), "upserted": upserted}
+            if deleted:
+                delta["deleted"] = deleted
+            if keys is not None:
+                delta["reset"] = True  # a full-map commit supersedes the log
+            path = delta_path(name, "", batch)
+            await self.state.put_object(path, json.dumps(delta, sort_keys=True, allow_nan=False).encode())
+            meta["delta"] = {"object": path, "batch": batch, "rows": delta["rows"]}
+            meta["partitions"] = sorted(new_map)
+        ref["meta"] = meta
+        if self.m.heads.get((name, "")) != head:
+            raise Conflict(f"source {name!r} moved while committing; retry")
+        await self.state.emit(
+            {
+                "type": "SourceCommitted",
                 "source": name,
-            }
-            commit_id = await tx.put_commit(record)
-            await tx.put_head(
-                name,
-                "",
-                {
+                "head": {
                     "ref": ref,
-                    "commit": commit_id,
-                    "at": self.clock(),
+                    "run": None,
+                    "attempt": None,
                     "complete": True,
                     "asset": None,
                     "version": None,
                 },
-            )
-            return {"changed": True, "ref": ref, "commit": commit_id}
+                "at": self.clock(),
+            }
+        )
+        return {"changed": True, "ref": ref, "commit": f"source/{name}/{batch}"}
 
     # -- automations (§9) ------------------------------------------------------------
 
     async def _automation_tick(self):
+        now = self.clock()
         fired = []
-        async with self.state.transaction() as tx:
-            now = self.clock()
-            for _, auto in await tx.automations():
-                if not auto["enabled"]:
-                    continue
-                trigger = auto["trigger"]
-                if trigger["kind"] == "every":
-                    due = auto["last_at"] is None or now >= auto["last_at"] + trigger["seconds"]
-                    if due:
-                        fired.append((auto, auto.get("partitions") or "latest"))
-                        auto["last_at"] = now
-                        await tx.put_automation(auto["name"], auto)
-                elif trigger["kind"] == "cron":
-                    zone = ZoneInfo(trigger.get("timezone") or "UTC")
-                    last = auto["last_at"] or 0
-                    base = dt.datetime.fromtimestamp(last, zone)
-                    nxt = croniter(trigger["expression"], base).get_next(dt.datetime)
-                    if nxt.timestamp() <= now:
-                        fired.append((auto, auto.get("partitions") or "latest"))
-                        auto["last_at"] = now
-                        await tx.put_automation(auto["name"], auto)
-                elif trigger["kind"] == "onchange":
-                    # Consume the commit log after the automation's watermark
-                    # (§4.3) — no durable pending[] array.
-                    events, high = await self.state.automation_events(tx, auto)
-                    if events:
-                        fired.append((auto, {"__pending__": events, "__wm__": high}))
-                elif trigger["kind"] == "ondeploy":
-                    revision = self.manifest["revision"]
-                    if auto.get("last_revision") != revision:
-                        fired.append((auto, {"__ondeploy__": revision}))
-        for auto, selection in fired:
-            if isinstance(selection, dict) and "__pending__" in selection:
-                await self._fire_onchange(auto, selection["__pending__"], selection["__wm__"])
-            elif isinstance(selection, dict) and "__ondeploy__" in selection:
-                await self._fire_ondeploy(auto, selection["__ondeploy__"])
-            else:
-                await self._fire(auto, selection)
+        for auto in list(self.m.automations.values()):
+            if not auto["enabled"] or auto["name"] in self._firing:
+                continue
+            trigger = auto["trigger"]
+            if trigger["kind"] == "every":
+                if auto["last_at"] is None or now >= auto["last_at"] + trigger["seconds"]:
+                    fired.append((auto, "schedule"))
+            elif trigger["kind"] == "cron":
+                zone = ZoneInfo(trigger.get("timezone") or "UTC")
+                base = dt.datetime.fromtimestamp(auto["last_at"] or 0, zone)
+                if croniter(trigger["expression"], base).get_next(dt.datetime).timestamp() <= now:
+                    fired.append((auto, "schedule"))
+            elif trigger["kind"] == "onchange":
+                if auto["pending"]:
+                    fired.append((auto, "onchange"))
+            elif trigger["kind"] == "ondeploy":
+                if auto.get("last_revision") != self.manifest["revision"]:
+                    fired.append((auto, "ondeploy"))
+        for auto, why in fired:
+            self._firing.add(auto["name"])
+            try:
+                if why == "onchange":
+                    await self._fire_onchange(auto)
+                elif why == "ondeploy":
+                    await self._fire_ondeploy(auto)
+                else:
+                    await self._fire(auto, auto.get("partitions") or "latest")
+            finally:
+                self._firing.discard(auto["name"])
+
+    async def _submit_for(self, auto, partitions, targets=None):
+        return await self.submit(
+            targets or auto["targets"],
+            partitions=partitions,
+            mode=auto.get("mode") or "incremental",
+            upstream=auto.get("upstream") or False,
+            config=auto.get("config"),
+            keys=auto.get("keys"),
+            automation=auto["name"],
+            skip_active=True,
+        )
 
     async def _fire(self, auto, partitions):
+        run = None
         try:
-            run = await self.submit(
-                auto["targets"],
-                partitions=partitions,
-                mode=auto.get("mode") or "incremental",
-                upstream=auto.get("upstream") or False,
-                config=auto.get("config"),
-                keys=auto.get("keys"),
-                automation=auto["name"],
-                skip_active=True,
-            )
+            run = await self._submit_for(auto, partitions)
         except Exception as error:
             self.last_error = f"automation {auto['name']}: {error}"
-            return
-        if run is None:
-            return
-        async with self.state.transaction() as tx:
-            record = await tx.automation(auto["name"])
-            if record:
-                record["last_run"] = run["id"]
-                await tx.put_automation(auto["name"], record)
+        await self.state.emit(
+            {"type": "AutomationFired", "name": auto["name"], "at": self.clock(), "run": run and run["id"]}
+        )
 
-    async def _fire_ondeploy(self, auto, revision):
+    async def _fire_ondeploy(self, auto):
         """§9: fire once for the served revision, then record it. A submit
         error leaves last_revision unset so the next tick retries."""
 
         try:
-            run = await self.submit(
-                auto["targets"],
-                partitions=auto.get("partitions") or "latest",
-                mode=auto.get("mode") or "incremental",
-                upstream=auto.get("upstream") or False,
-                config=auto.get("config"),
-                keys=auto.get("keys"),
-                automation=auto["name"],
-                skip_active=True,
-            )
+            run = await self._submit_for(auto, auto.get("partitions") or "latest")
         except Exception as error:
             self.last_error = f"automation {auto['name']}: {error}"
             return
-        async with self.state.transaction() as tx:
-            record = await tx.automation(auto["name"])
-            if record:
-                record["last_revision"] = revision
-                record["last_at"] = self.clock()
-                if run is not None:
-                    record["last_run"] = run["id"]
-                await tx.put_automation(auto["name"], record)
+        await self.state.emit(
+            {
+                "type": "AutomationFired",
+                "name": auto["name"],
+                "at": self.clock(),
+                "run": run and run["id"],
+                "revision": self.manifest["revision"],
+            }
+        )
 
-    async def _fire_onchange(self, auto, pending, watermark):
+    async def _fire_onchange(self, auto):
         """Project each changed upstream scope to the target's scopes (§7, §9),
-        then advance the commit watermark past the consumed events (§4.3)."""
+        then drop the consumed changes from the pending set."""
 
+        consumed = [list(p) for p in auto["pending"]]
         per_asset = {}
-        for event in pending:
-            producer = event["asset"]
-            if producer is None:
-                for target in auto["targets"]:
-                    per_asset.setdefault(target, set()).add("")
-                continue
+        for producer, scope in consumed:
             for target in auto["targets"]:
                 t_dims = self._dims(target)
-                if not t_dims:
+                if producer is None or not t_dims:
                     per_asset.setdefault(target, set()).add("")
                     continue
-                pinned = self._project_downstream(producer, event["scope"], target)
+                pinned = self._project_downstream(producer, scope, target)
                 # target-only dims expand over their current key sets
                 free = {n: d for n, d in t_dims.items() if n not in pinned}
-                async with self.state.transaction() as tx:
-                    dim_keys = await self._dim_keys(tx, free)
+                dim_keys = await self._dim_keys(free)
                 missing_dims = list(free)
-                combos = product(*dim_keys) if dim_keys else [()]
-                for combo in combos:
+                for combo in product(*dim_keys) if dim_keys else [()]:
                     merged = dict(pinned)
                     merged.update(dict(zip(missing_dims, combo, strict=True)))
                     per_asset.setdefault(target, set()).add(canonical_partition(t_dims, merged))
@@ -1272,495 +1349,209 @@ class Engine:
             if not scopes:
                 continue
             try:
-                run = await self.submit(
-                    [target],
-                    partitions=sorted(scopes),
-                    mode=auto.get("mode") or "incremental",
-                    upstream=auto.get("upstream") or False,
-                    config=auto.get("config"),
-                    keys=auto.get("keys"),
-                    automation=auto["name"],
-                    skip_active=True,
-                )
+                run = await self._submit_for(auto, sorted(scopes), targets=[target])
                 if run is not None:
                     last_run = run["id"]
             except Exception as error:
                 self.last_error = f"automation {auto['name']}: {error}"
-                return  # leave the watermark: the batch replays next tick
-        async with self.state.transaction() as tx:
-            record = await tx.automation(auto["name"])
-            if record:
-                record["commit_watermark"] = max(record.get("commit_watermark") or 0, watermark)
-                record["last_at"] = self.clock()
-                if last_run is not None:
-                    record["last_run"] = last_run
-                await tx.put_automation(auto["name"], record)
-            await tx.set_auto_pending(auto["name"], [])
+                return  # the changes stay pending: the next tick replays them
+        await self.state.emit(
+            {
+                "type": "AutomationFired",
+                "name": auto["name"],
+                "at": self.clock(),
+                "run": last_run,
+                "consumed": consumed,
+            }
+        )
 
     async def set_automation(self, name: str, enabled: bool):
-        async with self.state.transaction() as tx:
-            auto = await tx.automation(name)
-            if auto is None:
-                raise KeyError(name)
-            auto["enabled"] = bool(enabled)
-            await tx.put_automation(name, auto)
-            return auto
+        if name not in self.m.automations:
+            raise KeyError(name)
+        await self.state.emit({"type": "AutomationChanged", "name": name, "enabled": bool(enabled)})
+        return self.m.automations[name]
 
     async def run_automation(self, name: str):
-        async with self.state.transaction() as tx:
-            auto = await tx.automation(name)
-            if auto is None:
-                raise KeyError(name)
+        auto = self.m.automations.get(name)
+        if auto is None:
+            raise KeyError(name)
         await self._fire(auto, auto.get("partitions") or "latest")
-        async with self.state.transaction() as tx:
-            return await tx.automation(name)
-
-    # -- retention (§5) ---------------------------------------------------------------
-    # A sweep deletes, per policy (asset's own, else the project default):
-    # attempt records and their specs/results/logs objects past `runs` and
-    # `days`; delta and data batch objects below the minimum live consumer
-    # watermark that no live head or retained commit references; and commit
-    # records past the policy that every automation has consumed. Pruning a
-    # delta log's prefix writes one compacted reset delta at the prune
-    # horizon first, so folds of the surviving log are unchanged.
-
-    async def retention_sweep(self, *, now: float | None = None) -> dict:
-        now = self.clock() if now is None else now
-        policies, default = self._retention_policies()
-        summary = {"attempts": 0, "commits": 0, "objects": 0, "bumped": []}
-        if not policies and default is None:
-            return summary
-
-        def aged(policy, at):
-            days = policy.get("days")
-            return days is None or at < now - days * 86400
-
-        def beyond(policy, rank):
-            runs = policy.get("runs")
-            return runs is None or rank >= runs
-
-        # -- collect the durable picture in one read transaction ---------------
-        async with self.state.transaction() as tx:
-            heads = await tx.all_heads()
-            watermarks = await tx.scan("watermark/")
-            autos = [rec for _, rec in await tx.automations()]
-            attempts = await tx.scan("attempt/")
-            commits = await tx.scan("commit/")
-
-        # Live heads pin commit ids, delta batches and data windows.
-        head_commits = {rec["commit"] for _, rec in heads if rec.get("commit")}
-        head_delta = set()  # (output, scope, batch) — the head's own delta
-        head_data = {}  # (output, scope) -> set of live data batch numbers
-        head_batches = {}  # (output, scope) -> head delta batch number
-        for _, rec in heads:
-            ref = rec.get("ref") or {}
-            meta = ref.get("meta") or {}
-            scope = ref.get("partition") or ""
-            output = ref.get("output")
-            if output is None:
-                continue
-            if meta.get("delta"):
-                head_batches[(output, scope)] = int(meta["delta"]["batch"])
-                head_delta.add((output, scope, int(meta["delta"]["batch"])))
-            head_data[(output, scope)] = self._data_window(ref)
-
-        # The commit sweep runs first so surviving commits pin batch objects.
-        auto_floor = min(
-            (int(a.get("commit_watermark") or 0) for a in autos),
-            default=None,
-        )
-        commit_drops, surviving_commits = [], []
-        by_owner = {}
-        for key, rec in commits:
-            suffix = key.split("/", 1)[1]
-            if not suffix.isdigit():
-                continue  # a pre-sequence commit id — not a monotonic record
-            owner = rec.get("asset") or (f"source:{rec['source']}" if rec.get("source") else None)
-            by_owner.setdefault(owner, []).append((int(suffix), key, rec))
-        for owner, rows in by_owner.items():
-            policy = policies.get(owner) or default
-            if not policy:
-                surviving_commits += [rec for _, _, rec in rows]
-                continue
-            rows.sort(key=lambda r: r[0], reverse=True)
-            for rank, (seq, key, rec) in enumerate(rows):
-                eligible = beyond(policy, rank) and aged(policy, rec.get("at") or 0)
-                if (
-                    eligible
-                    and rec.get("id") not in head_commits
-                    and (auto_floor is None or seq <= auto_floor)
-                ):
-                    commit_drops.append(key)
-                else:
-                    surviving_commits.append(rec)
-
-        # Batch-object pins from surviving commit refs (outputs + input pins).
-        keep_delta = set(head_delta)
-        keep_data = {k: set(v) for k, v in head_data.items()}
-        for rec in surviving_commits:
-            for ref in self._commit_refs(rec):
-                meta = ref.get("meta") or {}
-                scope = ref.get("partition") or ""
-                output = ref.get("output")
-                if output is None:
-                    continue
-                if meta.get("delta"):
-                    keep_delta.add((output, scope, int(meta["delta"]["batch"])))
-                keep_data.setdefault((output, scope), set()).update(self._data_window(ref))
-
-        # -- deltas and data batches ----------------------------------------------
-        consumers = self._incremental_consumers()
-        wm_rows = {}  # raw key -> (asset, edge, scope, record)
-        for key, rec in watermarks:
-            asset, edge, scope = (unesc(part) for part in key.split("/", 3)[1:])
-            wm_rows[key] = (asset, edge, scope, rec)
-        wm_at = {(a, e, s): r for key, (a, e, s, r) in wm_rows.items()}
-        object_drops = []
-        for output, decl in self.manifest["outputs"].items():
-            policy = policies.get(decl.get("asset")) or default
-            if not policy or not decl.get("incremental"):
-                continue
-            scopes = {scope for (o, scope) in head_batches if o == output}
-            scopes |= {s for (a, e, s) in wm_at if (a, e) in consumers.get(output, ())}
-            for scope in scopes:
-                floor = min(
-                    (
-                        rec["batch"]
-                        for a, e in consumers.get(output, ())
-                        if (rec := wm_at.get((a, e, scope))) is not None
-                    ),
-                    default=None,
-                )
-                if floor is None:
-                    floor = head_batches.get((output, scope), -1) + 1
-                object_drops += await self._sweep_delta_log(
-                    output, scope, decl, floor, keep_delta, policy, now
-                )
-                object_drops += await self._sweep_data_window(
-                    output, scope, floor, keep_data.get((output, scope), set()), policy, now
-                )
-
-        # -- attempts ---------------------------------------------------------------
-        drop_keys, object_keys = [], []
-        specs = {m["path"] for m in await self.state.list_object_meta("specs/")}
-        results = {m["path"] for m in await self.state.list_object_meta("results/")}
-        logs = [m["path"] for m in await self.state.list_object_meta("logs/")]
-        by_scope = {}
-        for key, rec in attempts:
-            task_id = unesc(key.split("/")[1])
-            _, _, rest = task_id.partition("/")
-            asset, _, scope = rest.partition(":")
-            by_scope.setdefault((asset, scope), []).append((key, rec))
-        for (asset, _scope), rows in by_scope.items():
-            policy = policies.get(asset)
-            if not policy:
-                continue
-            rows.sort(
-                key=lambda kr: kr[1].get("finished_at") or kr[1].get("started_at") or 0,
-                reverse=True,
-            )
-            for rank, (key, rec) in enumerate(rows):
-                if rec.get("status") in LIVE_ATTEMPT:
-                    continue
-                if not beyond(policy, rank) or not aged(
-                    policy, rec.get("finished_at") or rec.get("started_at") or 0
-                ):
-                    continue
-                drop_keys.append(key)
-                aid = rec["id"]
-                if f"specs/{aid}.json" in specs:
-                    object_keys.append(f"specs/{aid}.json")
-                if f"results/{aid}.json" in results:
-                    object_keys.append(f"results/{aid}.json")
-                object_keys += [p for p in logs if p.startswith(f"logs/{aid}/")]
-
-        # -- apply -------------------------------------------------------------------
-        dropped = set(object_drops)
-        async with self.state.transaction() as tx:
-            for key in drop_keys + commit_drops:
-                await tx.delete(key)
-            bumped = []
-            for _key, (a, e, scope, rec) in wm_rows.items():
-                # A watermark pointing at a pruned delta can never catch up —
-                # drop it so the next plan drains full instead (§5).
-                if rec["batch"] < 0:
-                    continue
-                for output, edges in consumers.items():
-                    if (a, e) not in edges:
-                        continue
-                    head = head_batches.get((output, scope))
-                    if head is None or rec["batch"] > head:
-                        continue
-                    path = delta_path(output, scope, rec["batch"])
-                    if path in dropped or await self.state.delta(output, scope, rec["batch"]) is None:
-                        await tx.del_watermark(a, e, scope)
-                        bumped.append(f"{a}/{e}/{scope}")
-                        log.warning(
-                            "retention: watermark %s/%s/%s pruned under it; the consumer will re-drain full",
-                            a,
-                            e,
-                            scope,
-                        )
-        summary["attempts"] = len(drop_keys)
-        summary["commits"] = len(commit_drops)
-        summary["bumped"] = bumped
-        await self.state.delete_objects(object_keys + object_drops)
-        summary["objects"] = len(object_keys) + len(object_drops)
-        return summary
-
-    @staticmethod
-    def _data_window(ref: dict) -> set:
-        """Data batch numbers a ref's live fold needs: the snapshot and the
-        batches after it — or the whole window without one (§5)."""
-
-        handle = ref.get("handle") or {}
-        if "batches" not in handle:
-            return set()
-        first, last = int(handle["batches"][0]), int(handle["batches"][1])
-        snap = handle.get("snapshot")
-        if isinstance(snap, int) and first <= snap <= last:
-            # The fold loads s{snap} then applies b{snap+1..last}.
-            return {("s", snap)} | {("b", b) for b in range(snap + 1, last + 1)}
-        return {("b", b) for b in range(first, last + 1)} | (
-            {("s", snap)} if isinstance(snap, int) else set()
-        )
-
-    @staticmethod
-    def _commit_refs(commit: dict) -> list:
-        """Every ref a commit record pins: its outputs plus its input pins."""
-
-        refs = list((commit.get("outputs") or {}).values())
-        for pin in (commit.get("input_refs") or {}).values():
-            if "refs" in pin:
-                refs += list(pin["refs"].values())
-            elif pin.get("ref"):
-                refs.append(pin["ref"])
-        return [r for r in refs if isinstance(r, dict)]
-
-    def _incremental_consumers(self) -> dict:
-        """output -> {(asset, edge)} — which watermark rows track that output."""
-
-        consumers = {}
-        for asset, rec in self.manifest["assets"].items():
-            for param, edge in (rec.get("inputs") or {}).items():
-                if edge.get("kind") == "incremental":
-                    consumers.setdefault(edge["output"], set()).add((asset, param))
-        return consumers
-
-    async def _sweep_delta_log(self, output, scope, decl, floor, keep_delta, policy, now):
-        """Prune `deltas/{output}/{scope}` below `floor`, writing a compacted
-        reset delta at the prune horizon so folds are unchanged (§5)."""
-
-        cutoff = policy.get("days")
-        metas = await self.state.list_object_meta(f"deltas/{output}/{_obj_scope(scope)}/")
-        candidates = []
-        for meta in metas:
-            batch = _object_batch(meta["path"])
-            if batch is None or batch >= floor or (output, scope, batch) in keep_delta:
-                continue
-            if cutoff is not None and meta["last_modified"].timestamp() >= now - cutoff * 86400:
-                continue
-            candidates.append(batch)
-        if not candidates:
-            return []
-        horizon = max(candidates)
-        if decl.get("key") is not None:
-            live, ever_deleted = {}, set()
-            for b in range(0, horizon + 1):
-                delta = await self.state.delta(output, scope, b)
-                if delta is None:
-                    continue
-                for k in delta.get("deleted") or []:
-                    live.pop(str(k), None)
-                    ever_deleted.add(str(k))
-                live.update({str(k): str(v) for k, v in (delta.get("upserted") or {}).items()})
-            base = {
-                "batch": horizon,
-                "reset": True,
-                "rows": len(live),
-                "upserted": live,
-                "deleted": sorted(ever_deleted - set(live)),
-            }
-        else:
-            # Batch-mode deltas are markers; a reset marker at the horizon
-            # supersedes the pruned prefix.
-            base = {"batch": horizon, "reset": True, "rows": 0}
-        await self.state.put_object(
-            delta_path(output, scope, horizon),
-            json.dumps(base, sort_keys=True, allow_nan=False).encode(),
-        )
-        return [
-            meta["path"] for meta in metas if (b := _object_batch(meta["path"])) is not None and b < horizon
-        ]
-
-    async def _sweep_data_window(self, output, scope, floor, needed, policy, now):
-        """Delete `data/{output}/{scope}/{b,s}{batch}` objects below `floor`
-        that no live head or retained commit's fold needs (§5)."""
-
-        cutoff = policy.get("days")
-        metas = await self.state.list_object_meta(f"data/{output}/{_obj_scope(scope)}/")
-        drops = []
-        for meta in metas:
-            name = meta["path"].rsplit("/", 1)[1]
-            kind = name[0] if name[:1] in ("b", "s") else None
-            batch = _object_batch(meta["path"])
-            if kind is None or batch is None or batch >= floor or (kind, batch) in needed:
-                continue
-            if cutoff is not None and meta["last_modified"].timestamp() >= now - cutoff * 86400:
-                continue
-            drops.append(meta["path"])
-        return drops
+        return self.m.automations[name]
 
     # -- run control ------------------------------------------------------------------
 
-    async def _run(self, run_id):
-        async with self.state.transaction() as tx:
-            return await tx.run(run_id)
+    async def _control(self, run_id: str, action: str):
+        await self.state.emit({"type": "RunControlled", "run": run_id, "action": action, "at": self.clock()})
 
     async def cancel(self, run_id: str):
-        async with self.state.transaction() as tx:
-            run = await tx.run(run_id)
-            if run is None:
+        run = self.m.runs.get(run_id)
+        if run is None:
+            archived = await self.state.archived(run_id)
+            if archived is None:
                 raise KeyError(run_id)
-            run["status"] = "canceled"
-            run["updated_at"] = self.clock()
-            for task_id in run["tasks"]:
-                task = await tx.task(task_id)
-                if task is None or task["status"] in TERMINAL_TASK:
-                    continue
-                lock = await tx.lock(task["asset"], task["scope"])
-                attempt_id = (lock or {}).get("attempt")
-                if task["status"] in {"running", "claimable"}:
-                    # Fence the attempt: its next renew raises LostOwnership and
-                    # the placement loop cancels the run (§8).
-                    await tx.del_lock(task["asset"], task["scope"])
-                    if attempt_id:
-                        await tx.clear_lease(attempt_id)
-                        await tx.del_pool_task(attempt_id)
-                task["status"] = "canceled"
-                await tx.dequeue(task_id)
-                await tx.put_task(task)
-                await tx.del_pending(task)
-                await tx.put_scope_outcome(task["asset"], task["scope"], "canceled", attempt_id)
-            await tx.put_run(run)
-            return run
+            return self._run_view(archived)
+        if run["status"] not in TERMINAL_RUN:
+            # The claims go with the tasks: each attempt's next renew raises
+            # LostOwnership and its wait loop cancels the placement (§8).
+            await self._control(run_id, "cancel")
+        return self._run_view(self.m.runs.get(run_id) or run)
 
     async def pause(self, run_id: str, paused=True):
-        async with self.state.transaction() as tx:
-            run = await tx.run(run_id)
-            if run is None:
+        run = self.m.runs.get(run_id)
+        if run is None:
+            if await self.state.archived(run_id) is None:
                 raise KeyError(run_id)
-            run["paused"] = bool(paused)
-            await tx.put_run(run)
-            return run
+            raise Conflict(f"run {run_id} is finished")
+        await self._control(run_id, "pause" if paused else "resume")
+        return self._run_view(self.m.runs[run_id])
 
     async def retry(self, run_id: str):
-        async with self.state.transaction() as tx:
-            run = await tx.run(run_id)
-            if run is None:
+        run = self.m.runs.get(run_id)
+        if run is None:
+            archived = await self.state.archived(run_id)
+            if archived is None:
                 raise KeyError(run_id)
-            for task_id in run["tasks"]:
-                task = await tx.task(task_id)
-                if task and task["status"] in {"failed", "blocked"}:
-                    task["status"] = "queued"
-                    task.pop("error", None)
-                    task["ready_at"] = self.clock()
-                    await tx.enqueue(task["id"], task["ready_at"])
-                    await tx.put_task(task)
-                    await tx.put_pending(task)
-            run["status"] = "running"
-            run["paused"] = False
-            await tx.put_run(run)
-            # Rebuild the counters/indexes for the reactivated run — it may
-            # have been evicted from the working set at its terminal state.
-            tasks = [await tx.task(tid) for tid in run["tasks"]]
-            await tx.set_run_stats(
-                run_id,
-                {
-                    "left": sum(1 for t in tasks if t and t["status"] not in TERMINAL_TASK),
-                    "bad": sum(1 for t in tasks if t and t["status"] in BAD_OUTCOME),
-                },
-            )
-            for task in tasks:
-                if task is None or task["status"] != "waiting":
-                    continue
-                left = bad = 0
-                for dep in task.get("deps") or []:
-                    dep_task = await tx.task(dep)
-                    status = dep_task["status"] if dep_task else "failed"
-                    if status in TERMINAL_TASK:
-                        bad += status in BAD_OUTCOME
-                    else:
-                        left += 1
-                        await tx.add_dependent(dep, task["id"])
-                await tx.set_unfinished(
-                    task["id"], {"left": left, "bad": bad, "deps": task.get("deps") or []}
-                )
-            await self.state.advance_run(tx, run_id)
-            return run
+            await self.state.emit({"type": "RunReopened", "run": archived, "at": self.clock()})
+        await self._control(run_id, "retry")
+        return self._run_view(self.m.runs[run_id])
 
-    # -- read models (Phase 5 will shape these for the API) ----------------------------
+    # -- finished runs -------------------------------------------------------------------
+
+    async def _archive_due(self):
+        """Write finished runs to `runs/{run}/run.json` and drop them from memory,
+        once none of their attempts is still in flight here."""
+
+        busy = {run_id for run_id, _ in self.inflight.values()}
+        for run_id in sorted(self.m.archivable):
+            if run_id in busy:
+                continue
+            run = self.m.runs.get(run_id)
+            if run is None or any(tid in self.m.claims for tid in run["tasks"]):
+                continue
+            await self.state.archive(run_id)
+
+    # -- read models -------------------------------------------------------------------
+
+    def _run_view(self, run: dict) -> dict:
+        view = {k: v for k, v in run.items() if k != "tasks"}
+        view["tasks"] = sorted(run["tasks"])
+        return view
+
+    async def _run_view_of(self, run_id: str) -> dict:
+        run = self.m.runs.get(run_id) or await self.state.archived(run_id)
+        if run is None:
+            raise KeyError(run_id)
+        return self._run_view(run)
+
+    def _task_view(self, task: dict, live: bool) -> dict:
+        view = {k: v for k, v in task.items() if k != "attempts"}
+        claim = self.m.claims.get(task["id"]) if live else None
+        attempts = task["attempts"]
+        view["status"] = claim["status"] if claim else task["status"]
+        view["generation"] = view["attempt_count"] = len(attempts) + (1 if claim else 0)
+        latest = attempts[-1] if attempts else None
+        if latest:
+            view.setdefault("error", latest.get("error"))
+            view.setdefault("result", latest.get("outputs"))
+        return view
+
+    def _attempt_views(self, task: dict, live: bool) -> list[dict]:
+        out = []
+        for n, a in enumerate(task["attempts"], 1):
+            view = {
+                "id": a["id"],
+                "task": task["id"],
+                "generation": n,
+                "status": a["outcome"],
+                "started_at": a.get("started_at"),
+                "finished_at": a.get("finished_at"),
+            }
+            if a.get("error"):
+                view["error"] = a["error"]
+            if a.get("outputs"):
+                view["result"] = a["outputs"]
+                view["commit"] = f"{task['run']}/{a['id']}"
+            out.append(view)
+        claim = self.m.claims.get(task["id"]) if live else None
+        if claim:
+            out.append(
+                {
+                    "id": claim["attempt"],
+                    "task": task["id"],
+                    "generation": len(out) + 1,
+                    "status": claim["status"],
+                    "started_at": claim["started_at"],
+                }
+            )
+        return out
 
     async def list_runs(self, limit=50):
-        async with self.state.transaction() as tx:
-            return await tx.runs(limit)
+        runs = list(self.m.runs.values())
+        needed = limit - len(runs)
+        if needed > 0:
+            active = set(self.m.runs)
+            archived = [r for r in await self.state.archived_ids() if r not in active]
+            for run_id in reversed(archived[-needed:]):
+                run = await self.state.archived(run_id)
+                if run is not None:
+                    runs.append(run)
+        runs.sort(key=lambda r: (r["created_at"], r["id"]), reverse=True)
+        return [self._run_view(r) for r in runs[:limit]]
 
     async def run_detail(self, run_id: str):
-        async with self.state.transaction() as tx:
-            run = await tx.run(run_id)
+        run = self.m.runs.get(run_id)
+        live = run is not None
+        if run is None:
+            run = await self.state.archived(run_id)
             if run is None:
                 raise KeyError(run_id)
-            tasks = [await tx.task(tid) for tid in run["tasks"]]
-            attempts = {}
-            for task in tasks:
-                if task:
-                    attempts[task["id"]] = [a for _, a in await tx.attempts(task["id"])]
-                    # Task records carry no result/error (§4.1) — the API
-                    # surfaces the latest attempt's so console reads keep working.
-                    latest = attempts[task["id"]][-1] if attempts[task["id"]] else None
-                    if latest:
-                        task.setdefault("error", latest.get("error"))
-                        task.setdefault("result", latest.get("result"))
-            return {"request": run, "tasks": tasks, "attempts": attempts}
+        tasks = [run["tasks"][tid] for tid in sorted(run["tasks"])]
+        return {
+            "request": self._run_view(run),
+            "tasks": [self._task_view(t, live) for t in tasks],
+            "attempts": {t["id"]: self._attempt_views(t, live) for t in tasks},
+        }
+
+    def head_view(self, head: dict) -> dict:
+        view = dict(head)
+        view["commit"] = f"{head['run']}/{head['attempt']}" if head.get("attempt") else None
+        return view
+
+    def outcome_view(self, record: dict) -> dict:
+        return {
+            "last_outcome": record["outcome"],
+            "last_attempt": f"{record['run']}/{record['attempt']}" if record.get("attempt") else None,
+            "at": record["at"],
+        }
 
     async def asset_detail(self, name: str, scope=""):
         asset = self._asset_of(name)
         info = self.manifest["assets"][asset]
-        async with self.state.transaction() as tx:
-            heads = {}
-            for output in info["outputs"]:
-                heads[output["name"]] = await tx.heads(output["name"])
-            cursor = await tx.cursor(asset, scope)
-            watermarks = {}
-            for param, edge in info["inputs"].items():
-                if edge["kind"] == "incremental":
-                    watermarks[param] = await tx.watermark(asset, param, scope)
-            dims = self._dims(asset)
-            current = await self._dim_keys(tx, dims) if dims else []
-            outcomes = await tx.scope_outcomes(asset)
+        heads = {
+            o["name"]: [(s, self.head_view(h)) for s, h in self.m.heads_of(o["name"])]
+            for o in info["outputs"]
+        }
+        watermarks = {
+            param: self.m.watermarks.get((asset, param, scope))
+            for param, edge in info["inputs"].items()
+            if edge["kind"] == "incremental"
+        }
+        dims = self._dims(asset)
         return {
             "asset": info,
             "heads": heads,
-            "cursor": cursor,
+            "cursor": self.m.cursors.get((asset, scope)),
             "watermarks": watermarks,
-            "current_keys": current,
-            "scopes": outcomes,
+            "current_keys": await self._dim_keys(dims) if dims else [],
+            "scopes": {s: self.outcome_view(r) for s, r in self.m.outcomes_of(asset).items()},
         }
 
     async def catalog(self):
-        async with self.state.transaction() as tx:
-            heads = await tx.all_heads()
-        by_output = {}
-        for key, head in heads:
-            _, output, scope = key.split("/", 2)
-            by_output.setdefault(output, {})[scope] = head
         assets = []
         for name, info in self.manifest["assets"].items():
-            assets.append(
-                {
-                    **info,
-                    "name": name,
-                    "heads": {o["name"]: by_output.get(o["name"], {}) for o in info["outputs"]},
-                }
-            )
+            heads = {
+                o["name"]: {s: self.head_view(h) for s, h in self.m.heads_of(o["name"])}
+                for o in info["outputs"]
+            }
+            assets.append({**info, "name": name, "heads": heads})
         return assets

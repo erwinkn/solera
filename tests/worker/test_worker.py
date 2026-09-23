@@ -9,13 +9,12 @@ import signal
 import pytest
 from cursus_server.engine import Engine
 from cursus_server.state import State
-from cursus_server.storage import SlateState
 from cursus_worker.worker import load_project
 
 
 @pytest.fixture
 async def state(tmp_path):
-    opened = State(await SlateState.open((tmp_path / "state").as_uri(), "test"))
+    opened = await State.open((tmp_path / "state").as_uri(), "test", flush_interval=0.001)
     yield opened
     await opened.close()
 
@@ -58,18 +57,17 @@ project = Project(assets=[feed, consumer])
     assert detail["request"]["status"] == "succeeded"
 
     task = [t for t in detail["tasks"] if t["asset"] == "consumer"][0]
-    attempt = f"{task['id']}/1"
+    attempt = detail["attempts"][task["id"]][0]["id"]
     # the delta object is written and referenced from the committed ref
-    async with state.transaction() as tx:
-        head = await tx.head("feed", "")
-        assert head["ref"]["meta"]["delta"]["rows"] == 2
-        assert head["ref"]["meta"]["delta"]["object"].startswith("deltas/")
-        # the result object is the commit request
-        result = json.loads(await state.get_object(f"results/{attempt}.json"))
-        assert result["status"] == "succeeded"
-        # ctx.log streamed a chunk
-        log = await state.get_object(f"logs/{attempt}/000000.jsonl")
-        assert json.loads(log.splitlines()[0])["message"] == "consumed"
+    head = state.model.heads[("feed", "")]
+    assert head["ref"]["meta"]["delta"]["rows"] == 2
+    assert head["ref"]["meta"]["delta"]["object"].startswith("deltas/")
+    # the result object is the commit request
+    result = json.loads(await state.get_object(f"results/{attempt}.json"))
+    assert result["status"] == "succeeded"
+    # ctx.log streamed a chunk
+    log = await state.get_object(f"logs/{attempt}/000000.jsonl")
+    assert json.loads(log.splitlines()[0])["message"] == "consumed"
 
 
 async def test_revision_mismatch_writes_failed_result(state, tmp_path):
@@ -102,7 +100,7 @@ project = Project(assets=[job])
     )
     detail = await engine.run_until((await engine.submit(["job"]))["id"], 60)
     assert detail["request"]["status"] == "failed"
-    attempt = f"{detail['tasks'][0]['id']}/1"
+    attempt = detail["attempts"][detail["tasks"][0]["id"]][0]["id"]
     result = json.loads(await state.get_object(f"results/{attempt}.json"))
     assert result["status"] == "failed" and "revision mismatch" in result["error"]["message"]
 
@@ -175,10 +173,9 @@ project = Project(assets=[whoami], resources={"vault": {"token": "env:TEST_SECRE
     await engine.initialize()
     detail = await engine.run_until((await engine.submit(["whoami"]))["id"], 60)
     assert detail["request"]["status"] == "succeeded"
-    async with state.transaction() as tx:
-        head = await tx.head("whoami", "")
-        body = await state.get_object(head["ref"]["handle"]["object"])
-        assert json.loads(body) == [{"secret": "s3cr3t"}]
+    head = state.model.heads[("whoami", "")]
+    body = await state.get_object(head["ref"]["handle"]["object"])
+    assert json.loads(body) == [{"secret": "s3cr3t"}]
 
 
 MIGRATING_PROJECT = """
@@ -223,9 +220,7 @@ async def test_migrate_runs_before_first_write(state, tmp_path, monkeypatch):
     detail = await engine.run_until((await engine.submit(["producer"]))["id"], 60)
     assert detail["request"]["status"] == "succeeded"
     assert log.read_text().splitlines() == ["migrate", "store"]
-    async with state.transaction() as tx:
-        head = await tx.head("migrated", "")
-        assert head["ref"]["handle"]["schema"] == "m1"
+    assert state.model.heads[("migrated", "")]["ref"]["handle"]["schema"] == "m1"
 
 
 async def test_failed_migration_is_not_retryable(state, tmp_path, monkeypatch):
@@ -239,7 +234,7 @@ async def test_failed_migration_is_not_retryable(state, tmp_path, monkeypatch):
     await engine.initialize()
     detail = await engine.run_until((await engine.submit(["producer"]))["id"], 60)
     assert detail["request"]["status"] == "failed"
-    attempt = f"{detail['tasks'][0]['id']}/1"
+    attempt = detail["attempts"][detail["tasks"][0]["id"]][0]["id"]
     result = json.loads(await state.get_object(f"results/{attempt}.json"))
     assert result["status"] == "failed"
     assert result["error"]["retryable"] is False

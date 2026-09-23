@@ -39,27 +39,21 @@ async def _local_engine(args):
     from .engine import Engine
     from .placements.local import load_manifest
     from .state import State
-    from .storage import SlateState
 
-    slate = await SlateState.open(args.state_url, args.namespace)
-    state = State(slate)
+    state = await State.open(args.state_url, args.namespace)
     project = getattr(args, "project", None)
     try:
         if project:
             manifest = await load_manifest(project)
         else:
-            manifest = await state.manifest()
-            async with state.transaction() as tx:
-                project = await tx.get("sys/entrypoint")
-            project = project or manifest["name"]
-    except BaseException:
-        await slate.close()
-        raise
-    runtime = Engine(state, manifest, project=project)
-    try:
+            manifest = state.model.manifest
+            if manifest is None:
+                raise SystemExit("no project registered in this namespace; pass --project")
+            project = state.model.project or manifest["name"]
+        runtime = Engine(state, manifest, project=project)
         await runtime.initialize()
     except BaseException:
-        await slate.close()
+        await state.close()
         raise
     return runtime
 
@@ -132,20 +126,6 @@ def main():
 
     commands.add_parser("selftest", help="Check state and object storage connectivity")
 
-    retention = commands.add_parser(
-        "retention", help="Sweep retained history per asset/project policy (§5)", parents=[common]
-    )
-    retention.add_argument("action", choices=["sweep"])
-
-    gc = commands.add_parser("gc", help="Run one SlateDB garbage-collection pass (§4.4)")
-    gc.add_argument(
-        "--min-age-ms",
-        type=int,
-        default=300_000,
-        help="Only collect objects older than this (default: 5 minutes)",
-    )
-    gc.add_argument("--dry-run", action="store_true", help="Report what would be collected")
-
     args = parser.parse_args()
 
     if args.command == "serve":
@@ -202,25 +182,6 @@ async def _dispatch(args, parser):
         await _migrate(args, parser)
         return
 
-    if args.command == "gc":
-        # Always local: GC runs against the state store itself, no server needed.
-        from .storage import gc_once
-
-        await gc_once(args.state_url, args.namespace, min_age_ms=args.min_age_ms, dry_run=args.dry_run)
-        print(json.dumps({"gc": "ok", "dry_run": args.dry_run}))
-        return
-
-    if args.command == "retention":
-        # Local only: the sweep reads the manifest and drives state directly.
-        if _server_url():
-            parser.error("cursus retention runs locally (no remote endpoint)")
-        runtime = await _local_engine(args)
-        try:
-            print(json.dumps(await runtime.retention_sweep(), indent=2))
-        finally:
-            await runtime.state.close()
-        return
-
     if _server_url():
         await _remote(args, parser)
     else:
@@ -231,23 +192,18 @@ async def _migrate(args, parser):
     """Apply declared migrations through the local harness path (§4): load the
     project, bind its stores to the namespace's object store, migrate."""
 
-    import obstore
     from cursus_worker.worker import load_project
 
     from .state import State
-    from .storage import SlateState
 
-    slate = await SlateState.open(args.state_url, args.namespace)
+    # Read-only: a running server keeps its place as the namespace's writer.
+    state = await State.open(args.state_url, args.namespace, writer=False)
     try:
-        state = State(slate)
-        entrypoint = args.project
-        if not entrypoint:
-            async with state.transaction() as tx:
-                entrypoint = await tx.get("sys/entrypoint")
+        entrypoint = args.project or state.model.project
         if not entrypoint:
             parser.error("cursus migrate needs --project or a previously registered project")
         project = load_project(entrypoint)
-        objects = obstore.store.from_url(state.objects_url)
+        objects = state.objects
         migrating = {
             output.name: output
             for asset in project.assets.values()
@@ -272,7 +228,7 @@ async def _migrate(args, parser):
             if not applied:
                 print(f"{output.name}: up to date")
     finally:
-        await slate.close()
+        await state.close()
 
 
 def _parse_keys(specs):
@@ -381,7 +337,7 @@ async def _local(args, parser):
                     sys.stdout.write(data.decode())
         elif args.command == "automations":
             if not args.action:
-                autos = [a for _, a in await runtime.state.automations()]
+                autos = list(runtime.m.automations.values())
                 print(json.dumps(autos, indent=2))
             else:
                 if not args.name:

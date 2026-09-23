@@ -16,8 +16,7 @@ from pydantic import BaseModel, Field
 
 from .engine import Conflict, Engine
 from .placements.local import load_manifest
-from .state import LostOwnership, State
-from .storage import SlateState, Unavailable
+from .state import LostOwnership, State, Unavailable
 
 
 class RunInput(BaseModel):
@@ -50,8 +49,7 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
         runtime = engine
         if owned:
             manifest = await load_manifest(project)
-            slate = await SlateState.open(state_url, namespace)
-            state = State(slate)
+            state = await State.open(state_url, namespace)
             runtime = Engine(
                 state,
                 manifest,
@@ -61,7 +59,7 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
             try:
                 await runtime.initialize()
             except BaseException:
-                await slate.close()
+                await state.close()
                 raise
         app.state.engine = runtime
         await runtime.start()
@@ -131,7 +129,7 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
         runtime = engine_of(request)
         healthy = not runtime.state.poisoned and not runtime.last_error
         return JSONResponse(
-            {"status": "ok" if healthy else "unavailable", "backend": "slatedb"},
+            {"status": "ok" if healthy else "unavailable", "backend": "object-store"},
             status_code=200 if healthy else 503,
         )
 
@@ -139,7 +137,7 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
     async def diagnostics(request: Request):
         runtime = engine_of(request)
         return {
-            "backend": "slatedb",
+            "backend": "object-store",
             "state": runtime.state.url,
             "objects": runtime.state.objects_url,
             "namespace": runtime.state.namespace,
@@ -168,9 +166,7 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
         if name not in runtime.manifest["assets"]:
             raise KeyError(name)
         detail = await runtime.asset_detail(name)
-        detail["automations"] = [
-            a for _, a in await runtime.state.automations() if name in a.get("targets", [])
-        ]
+        detail["automations"] = [a for a in runtime.m.automations.values() if name in a.get("targets", [])]
         return detail
 
     @app.get("/api/projects/{p}/outputs/{name}/heads")
@@ -179,32 +175,29 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
         if name not in runtime.manifest["outputs"]:
             raise KeyError(name)
         out = []
-        async with runtime.state.transaction() as tx:
-            for scope, head in await tx.heads(name):
-                owner = head.get("asset")
-                cursor = owner is not None and (await tx.cursor(owner, scope)) is not None
-                meta = head["ref"].get("meta") or {}
-                if meta.get("partitions") is not None:
-                    key_count = len(meta["partitions"])
-                elif meta.get("delta"):
-                    key_count = len(
-                        await runtime.state.delta_key_map(name, scope, int(meta["delta"]["batch"]))
-                    )
-                else:
-                    key_count = None
-                out.append(
-                    {
-                        "scope": scope,
-                        "ref": head["ref"],
-                        "version": head.get("version"),
-                        "key_count": key_count,
-                        "delta": meta.get("delta"),
-                        "complete": head["complete"],
-                        "cursor": cursor,
-                        "at": head["at"],
-                        "commit": head["commit"],
-                    }
-                )
+        for scope, head in runtime.m.heads_of(name):
+            owner = head.get("asset")
+            cursor = owner is not None and runtime.m.cursors.get((owner, scope)) is not None
+            meta = head["ref"].get("meta") or {}
+            if meta.get("partitions") is not None:
+                key_count = len(meta["partitions"])
+            elif meta.get("delta"):
+                key_count = len(await runtime.state.delta_key_map(name, scope, int(meta["delta"]["batch"])))
+            else:
+                key_count = None
+            out.append(
+                {
+                    "scope": scope,
+                    "ref": head["ref"],
+                    "version": head.get("version"),
+                    "key_count": key_count,
+                    "delta": meta.get("delta"),
+                    "complete": head["complete"],
+                    "cursor": cursor,
+                    "at": head["at"],
+                    "commit": runtime.head_view(head)["commit"],
+                }
+            )
         return {"output": name, "heads": out}
 
     @app.get("/api/projects/{p}/outputs/{name}/keys")
@@ -217,8 +210,7 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
         limit: int = Query(default=1000, ge=1, le=100000),
     ):
         runtime = await project_engine(request, p)
-        async with runtime.state.transaction() as tx:
-            head = await tx.head(name, scope)
+        head = runtime.m.heads.get((name, scope))
         if head is None:
             raise KeyError(f"{name}/{scope}")
         meta = head["ref"].get("meta") or {}
@@ -250,46 +242,43 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
         dims = runtime._dims(asset)
         if not dims:
             raise ValueError(f"{asset} is unpartitioned")
-        async with runtime.state.transaction() as tx:
-            keys = await runtime._dim_keys(tx, dims)
-            from itertools import product
+        keys = await runtime._dim_keys(dims)
+        from itertools import product
 
-            from cursus.sdk import canonical_partition
+        from cursus.sdk import canonical_partition
 
-            current = {
-                canonical_partition(dims, dict(zip(dims, combo, strict=True))) for combo in product(*keys)
-            }
-            outputs = runtime.manifest["assets"][asset]["outputs"]
-            scopes = {}
-            for output in outputs:
-                for scope, head in await tx.heads(output["name"]):
-                    scopes[scope] = head
-            # Per-scope outcomes + the pending index — never a task/ scan (§8).
-            outcomes = await tx.scope_outcomes(asset)
-            running = await tx.pending_scopes(asset)
-            out = []
-            for scope in sorted(current | set(scopes) | set(outcomes)):
-                head = scopes.get(scope)
-                record = outcomes.get(scope) or {}
-                status = (
-                    "retired"
-                    if scope not in current
-                    else "complete"
-                    if head and head["complete"]
-                    else "running"
-                    if scope in running
-                    else "failed"
-                    if record.get("last_outcome") in {"failed", "canceled", "blocked"}
-                    else "missing"
-                )
-                out.append(
-                    {
-                        "scope": scope,
-                        "status": status,
-                        "last_outcome": record.get("last_outcome"),
-                        "last_attempt": record.get("last_attempt"),
-                    }
-                )
+        current = {canonical_partition(dims, dict(zip(dims, combo, strict=True))) for combo in product(*keys)}
+        outputs = runtime.manifest["assets"][asset]["outputs"]
+        scopes = {}
+        for output in outputs:
+            for scope, head in runtime.m.heads_of(output["name"]):
+                scopes[scope] = head
+        # Per-scope outcomes + the pending index — never a task scan (§8).
+        outcomes = {s: runtime.outcome_view(r) for s, r in runtime.m.outcomes_of(asset).items()}
+        running = runtime.m.pending_scopes(asset)
+        out = []
+        for scope in sorted(current | set(scopes) | set(outcomes)):
+            head = scopes.get(scope)
+            record = outcomes.get(scope) or {}
+            status = (
+                "retired"
+                if scope not in current
+                else "complete"
+                if head and head["complete"]
+                else "running"
+                if scope in running
+                else "failed"
+                if record.get("last_outcome") in {"failed", "canceled", "blocked"}
+                else "missing"
+            )
+            out.append(
+                {
+                    "scope": scope,
+                    "status": status,
+                    "last_outcome": record.get("last_outcome"),
+                    "last_attempt": record.get("last_attempt"),
+                }
+            )
         return {"asset": asset, "partitions": out}
 
     # -- runs -------------------------------------------------------------------
@@ -368,7 +357,7 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
     @app.get("/api/projects/{p}/automations")
     async def automations(p: str, request: Request):
         runtime = await project_engine(request, p)
-        return {"automations": [a for _, a in await runtime.state.automations()]}
+        return {"automations": list(runtime.m.automations.values())}
 
     @app.post("/api/projects/{p}/automations/{name}/enable")
     async def automation_enable(p: str, name: str, request: Request):
@@ -420,33 +409,30 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
     @app.get("/api/projects/{p}/workers")
     async def workers(p: str, request: Request):
         runtime = await project_engine(request, p)
-        async with runtime.state.transaction() as tx:
-            claimed = {}
-            for _, task in await tx.pool_tasks():
-                if task["status"] == "claimed" and task["claimed_by"]:
-                    claimed[task["claimed_by"]] = task["attempt"]
-        return {
-            "workers": [{**w, "task": claimed.get(w["id"])} for _, w in await runtime.state.list_workers()]
+        claimed = {
+            record["claimed_by"]: record["attempt"]
+            for record in runtime.m.pool.values()
+            if record["status"] == "claimed" and record["claimed_by"]
         }
+        return {"workers": [{**w, "task": claimed.get(w["id"])} for w in runtime.m.workers.values()]}
 
     # -- worker pull path (§10) -------------------------------------------------------
 
     @app.post("/api/workers/register", status_code=201)
     async def register_worker(request: Request):
         body = await request.json()
-        state = engine_of(request).state
         worker_id = uuid.uuid4().hex
-        await state.register_worker(worker_id, body.get("pools") or [], body.get("capacity") or {})
+        engine_of(request).register_worker(worker_id, body.get("pools") or [], body.get("capacity") or {})
         return {"worker": worker_id}
 
     @app.post("/api/tasks/claim")
     async def claim_task(request: Request):
         body = await request.json()
-        state = engine_of(request).state
-        worker = await state.get_worker(body["worker"])
+        runtime = engine_of(request)
+        worker = runtime.m.workers.get(body["worker"])
         if worker is None:
             raise KeyError(body["worker"])
-        task = await state.claim_pool_task(
+        task = runtime.claim_pool_task(
             body["worker"],
             worker["pools"],
             body.get("capacity") or {},
@@ -456,24 +442,24 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
             return Response(status_code=204)
         return {
             "task": task["attempt"],
-            "stage": {"attempt": task["attempt"], "objects": state.objects_url},
+            "stage": {"attempt": task["attempt"], "objects": runtime.state.objects_url},
             "lease_seconds": 30,
         }
 
     @app.post("/api/tasks/{task_id:path}/renew")
     async def renew_task(task_id: str, request: Request):
         body = await request.json()
-        await engine_of(request).state.heartbeat_pool_task(body["worker"], task_id, lease_seconds=30)
+        engine_of(request).heartbeat_pool_task(body["worker"], task_id, lease_seconds=30)
         return {"ok": True}
 
     @app.post("/api/tasks/{task_id:path}/complete")
     async def complete_task(task_id: str, request: Request):
         body = await request.json()
-        state = engine_of(request).state
-        task = await state.get_pool_task(task_id)
+        runtime = engine_of(request)
+        task = runtime.m.pool.get(task_id)
         if task is None or task["claimed_by"] != body["worker"]:
             raise Conflict(f"pool task {task_id} is not claimed by {body['worker']}")
-        await state.release_pool_task(body["worker"], task_id)
+        runtime.release_pool_task(body["worker"], task_id)
         return {"ok": True}
 
     # -- console -----------------------------------------------------------------------

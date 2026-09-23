@@ -6,18 +6,15 @@ not delete or rewrite any existing workspace. No credentials are printed.
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import time
 import uuid
 from urllib.parse import urlsplit
 
 import obstore
-from obstore.exceptions import AlreadyExistsError, PreconditionError
+from obstore.exceptions import AlreadyExistsError
 
 from .placements.local import load_manifest
-from .state import State
-from .storage import SlateState, Unavailable
+from .state import State, Unavailable
 
 
 def check(condition, message):
@@ -25,33 +22,17 @@ def check(condition, message):
         raise RuntimeError(message)
 
 
-async def conditional_probe(objects):
+async def create_only_probe(objects):
+    """The journal's fencing rests on create-only writes being enforced."""
+
     key = "conformance/" + uuid.uuid4().hex
-    version = await obstore.put_async(objects, key, b"first", mode="create", use_multipart=False)
+    await obstore.put_async(objects, key, b"first", mode="create", use_multipart=False)
     try:
         await obstore.put_async(objects, key, b"duplicate", mode="create", use_multipart=False)
     except AlreadyExistsError:
         pass
     else:
         raise RuntimeError("Backend ignored create-if-absent")
-    expected = {k: version[k] for k in ("e_tag", "version") if version.get(k) is not None}
-    check(bool(expected.get("e_tag")), "Backend did not return an ETag")
-    results = await asyncio.gather(
-        *[
-            obstore.put_async(objects, key, value, mode=expected, use_multipart=False)
-            for value in (b"winner-a", b"winner-b")
-        ],
-        return_exceptions=True,
-    )
-    check(
-        sum(not isinstance(r, BaseException) for r in results) == 1,
-        "Conditional-update race did not have exactly one winner",
-    )
-    failures = [r for r in results if isinstance(r, BaseException)]
-    check(
-        isinstance(failures[0], PreconditionError),
-        f"Unexpected conditional-update failure: {type(failures[0]).__name__}",
-    )
     await obstore.delete_async(objects, key)
 
 
@@ -59,15 +40,11 @@ async def selftest(url):
     started = time.monotonic()
     namespace = "probe-" + uuid.uuid4().hex
     manifest = await load_manifest("cursus_server.demo:project")
-    slate = await SlateState.open(url, namespace)
-    state = State(slate)
     checks = []
+    state = await State.open(url, namespace)
     try:
-        # LocalStore need not implement ETag-based update; the production S3
-        # conformance probe is mandatory for a remote run, never silently skipped.
-        if urlsplit(url).scheme == "s3":
-            await conditional_probe(state.objects)
-            checks.append("create-if-absent and competing conditional updates")
+        await create_only_probe(state.objects)
+        checks.append("create-if-absent writes are enforced")
         from .engine import Engine
 
         engine = Engine(state, manifest, project="cursus_server.demo:project")
@@ -75,30 +52,23 @@ async def selftest(url):
         checks.append("manifest registration and control-plane initialization")
     finally:
         await state.close()
-    # New native writer: all authority is restored from the selected object
-    # store. No local database files or coordinator checkpoint are reused.
-    slate = await SlateState.open(url, namespace)
-    state = State(slate)
+
+    # A new writer restores everything from the object store and fences the old one.
+    old = await State.open(url, namespace)
+    new = await State.open(url, namespace)
     try:
-        replacement = await SlateState.open(url, namespace)
+        check(new.model.revision == manifest["revision"], "Registration did not survive a restart")
+        await new.emit({"type": "AutomationChanged", "name": "__probe__", "enabled": True})
         try:
-            async with replacement.transaction() as tx:
-                await tx.put("probe/new-writer", True)
-            try:
-                async with asyncio.timeout(20):
-                    async with state.transaction() as tx:
-                        await tx.put("probe/stale-writer", True)
-            except (Unavailable, TimeoutError):
-                pass
-            else:
-                raise RuntimeError("Superseded native writer acknowledged a new write")
-            check(await replacement.get("probe/stale-writer") is None, "Stale write became durable")
-            checks.append("native writer takeover fences the old writer")
-        finally:
-            await replacement.close()
+            await old.emit({"type": "AutomationChanged", "name": "__probe__", "enabled": False})
+        except Unavailable:
+            pass
+        else:
+            raise RuntimeError("Superseded writer acknowledged a new write")
+        checks.append("state restores from the object store; a new writer fences the old one")
     finally:
-        with contextlib.suppress(Exception):
-            await state.close()
+        await new.close()
+        await old.close()
     return {
         "status": "passed",
         "scheme": urlsplit(url).scheme,
