@@ -207,3 +207,19 @@ async def test_disk_cache_serves_repeat_reads(tmp_path):
     await h.index().changes(ks[50:100], [b"v2"] * 50)
     assert h.io.metrics.gets == first == 0  # written through the cache on commit: never fetched
     assert h.io.metrics.cache_hits > 0
+
+
+async def test_pages_read_only_the_block_indexes_they_need():
+    """A page reads the index part of the few files covering it — never filters,
+    never files outside its key range."""
+
+    h = Harness(small_options())
+    ks = [key(i) for i in range(20000)]
+    await h.commit(ks, [b"v"] * len(ks))
+    assert len(h.state.files) >= 6
+    tails = sum(f.tail for f in h.state.files)
+    h.io.metrics.reset()
+    keys, _, nxt = await h.index().page(key(10000), 50)
+    assert keys == ks[10001:10051] and nxt == ks[10050]
+    assert h.io.metrics.gets <= 4
+    assert h.io.metrics.bytes_in < tails / 5

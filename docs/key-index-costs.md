@@ -68,6 +68,44 @@ filters' false-positive rate between compactions": a new key that a key
 filter wrongly reports as present is counted as an update until the next
 compaction recounts.
 
+## Measured (K0)
+
+The K0 prototype ran every operation below against an S3-compatible
+server (MinIO) with 30 ms injected per request, 80 MB/s per connection and
+64 requests in parallel; full numbers in `bench/keys/results.md`. The
+request counts are exact — they are what S3 would bill; wall times are
+only as good as the latency model.
+
+| At 100M keys | Model | Measured |
+|---|---|---|
+| Index size, incl. filters | 2.5 GB (23.5 B/entry) | 2.7 GB (27.2 B/entry; filters 3.5 B) |
+| 1K random keys changed, cold | 56 GETs, 0.8 s | **34 GETs, 0.5 s**, 351 MB read |
+| 1K written, half unchanged | 552 GETs | 542 GETs, 0.8 s |
+| 1K clustered keys changed | 12 GETs | 1 GET, 0.2 s |
+| 1K new keys inserted | — | 29 GETs, 0.5 s |
+| 100K random keys changed | 845 GETs, 1.6 s | 376 GETs, 1.3 s |
+| 1K random, disk cache warm | 10 GETs | 0 GETs, 0.2 s (CPU) |
+| Full-delivery page of 10K keys | 12 GETs | 2 GETs, 0.3 MB, 0.1 s |
+
+Scenario E (1K random changes every 10 s into 100M keys, cold) is
+therefore about **$11.50 a month** measured, against $13.67 modelled.
+
+Where the model was wrong:
+
+- **Entries are bigger than assumed**: 27–29 B with filters on random
+  12-digit ids, 39 B on UUIDs, but 3.5 B on sequential ids (prefix
+  compression). Sizes and transfer scale accordingly; request counts barely
+  move.
+- **CPU is much slower than assumed.** Native encoding runs at about 1.6M
+  entries/s (zlib level 1 is most of it), decoding at about 4.7M/s, merging
+  at about 1.4M/s; the model assumed 30M/s. Request costs are unaffected —
+  the work runs on the worker — but a full replacement of 10M keys takes
+  about 6 s (mostly sorting the written keys), and of 100M about a minute.
+  Parallel block compression is the obvious next optimization if that
+  matters.
+- **Pure Python** encodes at about 0.1M entries/s: fine for indexes up to
+  about 1M keys, and the reason the native extension exists.
+
 ## Per operation
 
 Columns are the number of keys in the index.

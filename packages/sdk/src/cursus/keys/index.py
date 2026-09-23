@@ -31,6 +31,7 @@ from . import (
     merge_files,
     merge_range,
     parse_footer,
+    parse_index,
     parse_tail,
     replace_diff,
     sort_entries,
@@ -57,6 +58,7 @@ class FileInfo:
     entries: int
     size: int
     tail: int  # bytes from the start of the filters to the end of the file
+    index: int  # bytes from the start of the block index to the end of the file
 
     def to_json(self) -> dict:
         return {
@@ -67,11 +69,14 @@ class FileInfo:
             "entries": self.entries,
             "size": self.size,
             "tail": self.tail,
+            "index": self.index,
         }
 
     @classmethod
     def from_json(cls, d: dict) -> FileInfo:
-        return cls(d["name"], d["level"], _b(d["min"]), _b(d["max"]), d["entries"], d["size"], d["tail"])
+        return cls(
+            d["name"], d["level"], _b(d["min"]), _b(d["max"]), d["entries"], d["size"], d["tail"], d["index"]
+        )
 
     @classmethod
     def describe(cls, name: str, level: int, data: bytes) -> FileInfo:
@@ -85,6 +90,7 @@ class FileInfo:
             footer["entries"],
             len(data),
             len(data) - footer["filters_offset"],
+            len(data) - footer["index_offset"],
         )
 
 
@@ -232,9 +238,10 @@ class Options:
 @dataclass
 class _Parsed:
     info: FileInfo
-    tail: dict
+    tail: dict  # parsed index, plus the filters when `filters`
     firsts: list[bytes] = field(default_factory=list)
     whole: bytes | None = None
+    filters: bool = True
 
     def block_of(self, key: bytes) -> int:
         """Index of the only block that could hold `key`, or -1."""
@@ -259,19 +266,26 @@ class KeyIndex:
 
     # -- file access ---------------------------------------------------------------------
 
-    async def _open(self, f: FileInfo, *, whole: bool = False) -> _Parsed:
+    async def _open(self, f: FileInfo, *, whole: bool = False, filters: bool = True) -> _Parsed:
+        """A parsed file: its block index, plus its filters when `filters`, plus
+        all its bytes when `whole`. Reads only what was not read before."""
+
         p = self._parsed.get(f.name)
-        if p is not None and (p.whole is not None or not whole):
+        if p is not None and (p.whole is not None or (not whole and (p.filters or not filters))):
             return p
         if whole or f.size <= 2 * f.tail:
             # Small files, and files that are mostly tail anyway: one read of everything.
             data = await self.io.read_whole(self.path(f.name), f.size)
             tail = parse_tail(data[f.size - f.tail :], f.size)
             p = _Parsed(f, tail, [b[0] for b in tail["blocks"]], data)
-        else:
+        elif filters:
             raw = await self.io.read(self.path(f.name), f.size - f.tail, f.size, f.size)
             tail = parse_tail(raw, f.size)
             p = _Parsed(f, tail, [b[0] for b in tail["blocks"]])
+        else:
+            raw = await self.io.read(self.path(f.name), f.size - f.index, f.size, f.size)
+            tail = parse_index(raw, f.size)
+            p = _Parsed(f, tail, [b[0] for b in tail["blocks"]], filters=False)
         self._parsed[f.name] = p
         return p
 
@@ -581,19 +595,34 @@ class KeyIndex:
 
     # -- scans: full delivery and pending deltas ----------------------------------------------
 
-    async def _scan(
-        self, files_newest_first: list[FileInfo], after: bytes | None, limit: int, drop_deleted: bool
-    ):
+    async def _scan(self, levels: list[list[FileInfo]], after: bytes | None, limit: int, drop_deleted: bool):
         """Up to `limit` entries of the merged view with keys > `after`, and the
-        cursor to continue from (`None` when the view is exhausted)."""
+        cursor to continue from (`None` when the view is exhausted).
 
-        parsed = await asyncio.gather(*(self._open(f) for f in files_newest_first))
-        runs, bound = [], None
+        `levels` are newest first; the files within one level never overlap.
+        Files are chosen from their metadata before anything is read — per
+        level, only those covering the next `limit` keys — and only their
+        block indexes are read, never their filters."""
+
+        chosen, bound = [], None
+        for level in levels:
+            got = 0
+            for i, f in enumerate(sorted(level, key=lambda f: f.min)):
+                if after is not None and f.max <= after:
+                    continue
+                if got > limit:
+                    # Everything below this file's first key is complete in the chosen ones.
+                    bound = f.min if bound is None else min(bound, f.min)
+                    break
+                chosen.append(f)
+                got += f.entries
+        parsed = await asyncio.gather(*(self._open(f, filters=False) for f in chosen))
+        runs = []
         codec = 1
         for p in parsed:
             codec = p.tail["codec"]
             blocks = p.tail["blocks"]
-            if not blocks or (after is not None and p.info.max <= after):
+            if not blocks:
                 runs.append([])
                 continue
             start = max(0, bisect.bisect_right(p.firsts, after) - 1) if after is not None else 0
@@ -629,8 +658,7 @@ class KeyIndex:
         """One page of the full delivery: live keys > `after`, their versions, and
         the next cursor (`None` when done)."""
 
-        files = [f for level in self.state.newest_first() for f in level]
-        keys, versions, _, nxt = await self._scan(files, after, limit, drop_deleted=True)
+        keys, versions, _, nxt = await self._scan(self.state.newest_first(), after, limit, drop_deleted=True)
         return keys, versions, nxt
 
     async def pending(self, first_batch: int, last_batch: int, after: bytes | None, limit: int):
@@ -641,8 +669,9 @@ class KeyIndex:
         missing = [b for b in range(first_batch, last_batch + 1) if b not in logged]
         if missing:
             raise LookupError(f"delta log no longer holds batches {missing[:5]}")
-        files = [f for b in range(last_batch, first_batch - 1, -1) for f in logged[b]]
-        return await self._scan(files, after, limit, drop_deleted=False)
+        # Each batch is a level of its own: its files (a split delta) never overlap.
+        levels = [list(logged[b]) for b in range(last_batch, first_batch - 1, -1)]
+        return await self._scan(levels, after, limit, drop_deleted=False)
 
     async def recount(self, page: int = 100_000) -> int:
         """Count live keys exactly by scanning the whole index."""

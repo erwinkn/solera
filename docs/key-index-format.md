@@ -41,8 +41,9 @@ the file's codec (footer).
 ## Filters
 
 ```
-filters := filter(keys) filter(pairs) filter(tombstones)
+filters := filter(keys) filter(pairs) filter(tombstones) crc32
 filter  := nbits varint, k u8, bits (ceil(nbits / 8) bytes)
+crc32   := u32, CRC-32 of the three filters' bytes
 ```
 
 Three Bloom filters: one over every key in the file, one over every
@@ -94,11 +95,14 @@ Fixed 48 bytes at the very end of the file:
 | 24 | 4 | filters length |
 | 28 | 8 | index offset |
 | 36 | 4 | index length |
-| 40 | 4 | CRC-32 of the filters and index bytes (`filters offset` up to the footer) |
+| 40 | 4 | CRC-32 of the (compressed) index bytes |
 | 44 | 4 | magic `CKX1` |
 
-`tail length = file size − filters offset`. Readers verify both magics,
-the version, the tail CRC, and each block's CRC before decoding it.
+`tail length = file size − filters offset`; `index part = file size −
+index offset`. A reader that needs only the block index (a scan) fetches
+the index part alone; one that needs the filters fetches the whole tail.
+Readers verify both magics, the version, the index CRC, the filters CRC
+when they read the filters, and each block's CRC before decoding it.
 
 ## Empty files
 

@@ -243,3 +243,16 @@ def test_replace_diff(writer, reader):
     assert existed == b"\x01\x01\x00\x00"
     assert removed == [b"b"]
     assert live == 3
+
+
+@pytest.mark.parametrize("impl", IMPLS)
+def test_detects_filter_corruption_and_reads_the_index_alone(impl):
+    keys, versions, deleted = entries(800)
+    data = bytearray(impl.encode_file(keys, versions, deleted, block_size=1024))
+    footer = _python.parse_footer(bytes(data[-48:]))
+    # The index part alone parses (and is checksummed) without the filters.
+    idx = _python.parse_index(bytes(data[footer["index_offset"] :]), len(data))
+    assert idx["min_key"] == keys[0] and "key_filter" not in idx
+    data[footer["filters_offset"] + 10] ^= 0xFF
+    with pytest.raises(_python.FormatError):
+        _python.parse_tail(bytes(data[footer["filters_offset"] :]), len(data))

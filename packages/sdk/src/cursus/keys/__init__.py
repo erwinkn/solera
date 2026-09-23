@@ -21,6 +21,7 @@ from ._python import (
     check_block,
     filter_nbits,
     parse_footer,
+    parse_index,
     parse_tail,
 )
 
@@ -67,6 +68,7 @@ __all__ = [
     "merge_files",
     "merge_range",
     "parse_footer",
+    "parse_index",
     "parse_tail",
     "replace_diff",
     "sort_entries",

@@ -228,6 +228,7 @@ def encode_file(
         put_varint(filters, nbits)
         filters.append(k)
         filters += bits
+    filters += struct.pack("<I", zlib.crc32(bytes(filters)))
 
     idx = bytearray()
     _put_bytes(idx, keys[0] if n else b"")
@@ -245,7 +246,7 @@ def encode_file(
     out += filters
     index_offset = len(out)
     out += idx_data
-    tail_crc = zlib.crc32(bytes(out[filters_offset:]))
+    index_crc = zlib.crc32(idx_data)
     out += FOOTER.pack(
         MAGIC,
         FORMAT_VERSION,
@@ -256,7 +257,7 @@ def encode_file(
         len(filters),
         index_offset,
         len(idx_data),
-        tail_crc,
+        index_crc,
         MAGIC,
     )
     return bytes(out)
@@ -298,34 +299,24 @@ def parse_footer(footer) -> dict:
         "filters_length": f_len,
         "index_offset": i_off,
         "index_length": i_len,
-        "tail_crc": crc,
+        "index_crc": crc,
     }
 
 
-def parse_tail(tail, file_size: int) -> dict:
-    """Parse a file's tail (filters + index + footer). `tail` must end at `file_size`."""
+def parse_index(part, file_size: int) -> dict:
+    """Parse a file's block index from its last bytes (the index and footer are
+    enough; `part` must end at `file_size`). Filters are not read."""
 
-    tail = memoryview(tail)
-    footer = parse_footer(tail[-FOOTER_SIZE:])
-    start = file_size - len(tail)
-    if footer["filters_offset"] < start:
-        raise FormatError("tail too short")
-    rel = footer["filters_offset"] - start
-    covered = tail[rel : len(tail) - FOOTER_SIZE]
-    if zlib.crc32(covered) != footer["tail_crc"]:
-        raise FormatError("tail checksum mismatch")
-    filters = tail[rel : rel + footer["filters_length"]]
-    pos = 0
-    parsed = []
-    for _ in range(3):
-        nbits, pos = get_varint(filters, pos)
-        k = filters[pos]
-        pos += 1
-        nbytes = nbits // 8
-        parsed.append((nbits, k, bytes(filters[pos : pos + nbytes])))
-        pos += nbytes
+    part = memoryview(part)
+    footer = parse_footer(part[-FOOTER_SIZE:])
+    start = file_size - len(part)
+    if footer["index_offset"] < start:
+        raise FormatError("index part too short")
     irel = footer["index_offset"] - start
-    idx = _decompress(tail[irel : irel + footer["index_length"]], footer["codec"])
+    raw = part[irel : irel + footer["index_length"]]
+    if zlib.crc32(raw) != footer["index_crc"]:
+        raise FormatError("index checksum mismatch")
+    idx = _decompress(raw, footer["codec"])
     pos = 0
     min_key, pos = _get_bytes(idx, pos)
     max_key, pos = _get_bytes(idx, pos)
@@ -339,16 +330,31 @@ def parse_tail(tail, file_size: int) -> dict:
         (crc,) = struct.unpack_from("<I", idx, pos)
         pos += 4
         blocks.append((first_key, off, size, cnt, crc))
-    return {
-        **footer,
-        "size": file_size,
-        "min_key": min_key,
-        "max_key": max_key,
-        "blocks": blocks,
-        "key_filter": parsed[0],
-        "pair_filter": parsed[1],
-        "tomb_filter": parsed[2],
-    }
+    return {**footer, "size": file_size, "min_key": min_key, "max_key": max_key, "blocks": blocks}
+
+
+def parse_tail(tail, file_size: int) -> dict:
+    """Parse a file's tail (filters + index + footer). `tail` must end at `file_size`."""
+
+    tail = memoryview(tail)
+    out = parse_index(tail, file_size)
+    start = file_size - len(tail)
+    if out["filters_offset"] < start:
+        raise FormatError("tail too short")
+    rel = out["filters_offset"] - start
+    filters = tail[rel : rel + out["filters_length"]]
+    if len(filters) < 4 or zlib.crc32(filters[:-4]) != struct.unpack("<I", filters[-4:])[0]:
+        raise FormatError("filters checksum mismatch")
+    pos = 0
+    parsed = []
+    for _ in range(3):
+        nbits, pos = get_varint(filters, pos)
+        k = filters[pos]
+        pos += 1
+        nbytes = nbits // 8
+        parsed.append((nbits, k, bytes(filters[pos : pos + nbytes])))
+        pos += nbytes
+    return {**out, "key_filter": parsed[0], "pair_filter": parsed[1], "tomb_filter": parsed[2]}
 
 
 def check_block(data, crc: int) -> None:

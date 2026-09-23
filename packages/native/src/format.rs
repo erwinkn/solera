@@ -349,6 +349,8 @@ pub fn encode_file(
         filters.push(o.k);
         filters.extend_from_slice(bits);
     }
+    let filters_crc = crc32fast::hash(&filters);
+    filters.extend_from_slice(&filters_crc.to_le_bytes());
 
     let mut idx = Vec::new();
     put_bytes(&mut idx, if n > 0 { keys[0] } else { b"" });
@@ -367,7 +369,7 @@ pub fn encode_file(
     out.extend_from_slice(&filters);
     let index_offset = out.len() as u64;
     out.extend_from_slice(&idx_data);
-    let tail_crc = crc32fast::hash(&out[filters_offset as usize..]);
+    let index_crc = crc32fast::hash(&idx_data);
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
     out.push(o.codec);
@@ -377,7 +379,7 @@ pub fn encode_file(
     out.extend_from_slice(&(filters.len() as u32).to_le_bytes());
     out.extend_from_slice(&index_offset.to_le_bytes());
     out.extend_from_slice(&(idx_data.len() as u32).to_le_bytes());
-    out.extend_from_slice(&tail_crc.to_le_bytes());
+    out.extend_from_slice(&index_crc.to_le_bytes());
     out.extend_from_slice(MAGIC);
     Ok(out)
 }
@@ -422,7 +424,7 @@ pub struct Footer {
     pub filters_length: u32,
     pub index_offset: u64,
     pub index_length: u32,
-    pub tail_crc: u32,
+    pub index_crc: u32,
 }
 
 fn u16_at(b: &[u8], at: usize) -> u16 {
@@ -453,7 +455,7 @@ pub fn parse_footer(f: &[u8]) -> Result<Footer> {
         filters_length: u32_at(f, 24),
         index_offset: u64_at(f, 28),
         index_length: u32_at(f, 36),
-        tail_crc: u32_at(f, 40),
+        index_crc: u32_at(f, 40),
     })
 }
 
@@ -470,14 +472,13 @@ pub fn file_blocks(data: &[u8]) -> Result<(u8, Vec<BlockMeta>)> {
     }
     let f = parse_footer(&data[data.len() - FOOTER_SIZE..])?;
     let tail_end = data.len() - FOOTER_SIZE;
-    let fo = f.filters_offset as usize;
-    if fo > tail_end || crc32fast::hash(&data[fo..tail_end]) != f.tail_crc {
-        return fmt_err("tail checksum mismatch");
-    }
     let io = f.index_offset as usize;
     let il = f.index_length as usize;
     if io + il > tail_end {
         return fmt_err("index out of bounds");
+    }
+    if crc32fast::hash(&data[io..io + il]) != f.index_crc {
+        return fmt_err("index checksum mismatch");
     }
     let idx = decompress(&data[io..io + il], f.codec)?;
     let mut pos = 0;

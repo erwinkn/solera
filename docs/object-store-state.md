@@ -154,7 +154,7 @@ State
 | Type | Fields | Bounded by |
 |---|---|---|
 | `Head` | `ref` (from the store), `run`, `attempt` (may point at a deleted run), `batch`, `count`, `elements?` (partition sets), `complete`, `version` (declared asset version), `at` | outputs × partitions |
-| `KeyIndex` | `count`, `files` [{`name`, `level`, `min`, `max`, `entries`, `bytes`, `tail`}], `log` [[`batch`, `name`], …] — see §6 | a few dozen files per index |
+| `KeyIndex` | `count`, `count_exact`, `files` [{`name`, `level`, `min`, `max`, `entries`, `size`, `tail`, `index`}], `log` [[`batch`, [file]], …] — see §6 | a few dozen files per index |
 | `Watermark` | `batch` (first batch not fully delivered; during a full drain, the head's batch + 1 when the drain began, so changes made while draining arrive afterwards as deltas), `after` (last key delivered inside `batch`, or during a full drain), `full` (a full drain is in progress), `fingerprint` | edges × partitions |
 | `Outcome` | `outcome`, `run`, `attempt`, `at` | assets × partitions |
 | `AutomationState` | `enabled`, `last_fired`, `last_run`, `last_revision`, `pending` (set of `[asset, scope]` for OnChange) | automations × partitions |
@@ -215,25 +215,30 @@ holds `(key, version, deleted)` entries sorted by key.
 **File layout.** `[data blocks][filters][block index][footer]`, byte
 format in `key-index-format.md`. Data blocks hold ~64 KB of entries
 before compression. Everything after the data blocks — filters, block
-index, footer — is the file's **tail**; the `KeyIndex` record stores each
-file's size and tail length, so a reader fetches the whole tail with one
-range read (or the whole file, when it is small), then range-reads only
-the blocks it needs.
+index, footer — is the file's **tail**; the index and footer alone are
+its **index part**. The `KeyIndex` record stores each file's size and both
+lengths, so a reader fetches exactly what it needs with one range read:
+the tail when it checks filters, the index part when it scans, the whole
+file when it is small — then range-reads only the blocks it needs.
 
-**Filters.** Each file carries a Bloom filter of its keys and one of its
-`(key, version)` pairs (14 bits per item, ~0.1% false positives). A
-written `(key, version)` that is definitely absent from every file whose
-key range could hold the key is a real change, and needs no block read:
-the key's current `(key, version)` is always present in some file. Only
-pairs reported "maybe present" — unchanged rewrites and false positives —
-get an exact lookup. The key filter tells new keys from existing ones and
-lets exact lookups skip files.
+**Filters.** Each file carries three blocked Bloom filters (14 bits per
+item, ~0.1% false positives): its keys, its live `(key, version)` pairs,
+and its deleted keys. A written `(key, version)` that no pair filter and
+no tombstone filter matches, across every file whose key range could hold
+the key, is a real change of a live key and needs no block read: the
+key's current `(key, version)` is always present in some file. A key no
+key filter matches is new. Everything else — unchanged rewrites, keys
+that may be deleted, false positives — gets an exact lookup.
 
-**Key count.** `KeyIndex.count` is exact after each compaction, which
-recounts. Between compactions it is exact when the commit's reads were
-exact, and otherwise off by at most the key filters' false-positive rate
-on inserted keys (a new key wrongly reported as present is counted as an
-update).
+**Key count.** `KeyIndex.count` is exact while every commit's reads are
+exact, which is always the case for indexes small enough to read whole.
+When a commit relies on the filters, a new key that some key filter
+falsely matches is counted as an update, so the count drifts low by about
+the filters' false-positive rate on inserted keys, and `count_exact`
+turns false. Compaction then schedules a **recount** — a full scan of the
+index's block indexes and blocks, about 150 reads at 100M keys — at most
+once per `recount_interval` (default 1 hour), which makes it exact again.
+Deltas themselves are always exact; only the count is approximate.
 
 **Read strategy.** Per level, the reader chooses between streaming the
 whole level, reading the touched blocks, and reading the file tails and
@@ -249,7 +254,7 @@ Levels small enough (≤ 32 MB) are always read whole.
 | Compute a delta | harness, at write time | Extract `(key, version)` from the written rows (declared `revision` column, else row digest). Check them against the index **as pinned in the spec**, with the filters and the read strategy above. Keep entries whose version changed, plus `deleted` entries for removed keys that may exist. A full replacement also compares against every existing key, which is inherent. Write the result as the batch's delta file. |
 | Commit | engine | Add the delta file to level 0 and to `log`; `count += added − removed`. The existing commit check — head unchanged since the attempt was claimed — guarantees the index didn't change underneath. |
 | Deliver pending deltas | harness, for an `Incremental` edge | Read the `log` files from the watermark to the head; chunk by `batch_size` in key order; ask the upstream store for those rows with `Keys(…)`. |
-| Full delivery | harness | Page through the merged view of all levels from `after`, `batch_size` keys at a time, and ask the store for them with `Keys(…)`. |
+| Full delivery | harness | Page through the merged view of all levels from `after`, `batch_size` keys at a time, and ask the store for them with `Keys(…)`. Per level, only the files covering the page are opened, and only their index parts are read. |
 | Compaction | the engine's machine by default (§6, *Engine work*) | When level 0 exceeds ~8 files, merge it with the overlapping level-1 files into new level-1 files, cascading down; commit with `IndexCompacted`. |
 | Truncate the log | engine | Drop `log` entries below the lowest consumer watermark; an output with no `Incremental` consumers keeps none. |
 | Delete files | engine | A file in neither `files` nor `log` is deleted. |
