@@ -1,4 +1,4 @@
-"""§10 end to end: the real `python -m cursus_worker` subprocess under a real
+"""§10 end to end: the real `python -m solera_worker` subprocess under a real
 Local placement against real file:// object storage."""
 
 import asyncio
@@ -7,9 +7,9 @@ import os
 import signal
 
 import pytest
-from cursus_server.engine import Engine
-from cursus_server.state import State
-from cursus_worker.worker import load_project
+from solera_server.engine import Engine
+from solera_server.state import State
+from solera_worker.worker import load_project
 
 
 @pytest.fixture
@@ -37,7 +37,7 @@ async def test_local_subprocess_end_to_end(state, tmp_path):
     entrypoint = write_project(
         tmp_path,
         """
-from cursus.sdk import Incremental, Output, Project, asset
+from solera.sdk import Incremental, Output, Project, asset
 
 @asset(outputs=Output("feed", key="id"))
 def feed():
@@ -85,7 +85,7 @@ async def test_revision_mismatch_writes_failed_result(state, tmp_path):
     entrypoint = write_project(
         tmp_path,
         """
-from cursus.sdk import Project, asset
+from solera.sdk import Project, asset
 
 @asset
 def job():
@@ -99,7 +99,7 @@ project = Project(assets=[job])
     # Rewrite the project so the subprocess computes a different revision.
     (tmp_path / "proj.py").write_text(
         """
-from cursus.sdk import Project, asset
+from solera.sdk import Project, asset
 
 @asset(version="changed")
 def job():
@@ -124,7 +124,7 @@ async def test_killed_harness_retries(state, tmp_path, monkeypatch):
         tmp_path,
         """
 import os, pathlib, time
-from cursus.sdk import Project, asset
+from solera.sdk import Project, asset
 
 @asset
 def slow():
@@ -170,7 +170,7 @@ async def test_env_indirection_resolves_in_harness(state, tmp_path, monkeypatch)
     entrypoint = write_project(
         tmp_path,
         """
-from cursus.sdk import Project, asset
+from solera.sdk import Project, asset
 
 @asset
 def whoami(vault):
@@ -191,8 +191,8 @@ project = Project(assets=[whoami], resources={"vault": {"token": "env:TEST_SECRE
 MIGRATING_PROJECT = """
 import os
 from collections.abc import Callable
-from cursus.sdk import Migration, Output, Project, asset
-from cursus.stores import JsonStore
+from solera.sdk import Migration, Output, Project, asset
+from solera.stores import JsonStore
 
 class MigStore(JsonStore):
     def can_store(self, t, output):

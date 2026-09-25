@@ -1,13 +1,13 @@
 [package]
-name = "cursus-native"
+name = "solera-native"
 version = "0.0.1"
 edition = "2021"
 license = "Apache-2.0"
-description = "Native acceleration for cursus: the .kx key index format"
+description = "Native acceleration for solera: the .kx key index format"
 publish = false
 
 [lib]
-name = "cursus_native"
+name = "solera_native"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]

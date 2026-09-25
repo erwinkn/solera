@@ -3,10 +3,10 @@ asset they ran lets go of them; data versions expire in the harness; current
 state never does. Runs in which every task was skipped are never written."""
 
 import pytest
-from cursus.sdk import Incremental, Output, Project, Retention, asset
-from cursus_server.engine import Engine
-from cursus_server.placements.inline import InlinePlacement
-from cursus_server.state import State
+from solera.sdk import Incremental, Output, Project, Retention, asset
+from solera_server.engine import Engine
+from solera_server.placements.inline import InlinePlacement
+from solera_server.state import State
 
 
 class Clock:
@@ -105,7 +105,7 @@ async def test_data_expires_with_its_asset(state, clock):
 
     @asset(outputs=Output("log", incremental=True), retention=Retention(days=1))
     def log():
-        from cursus.stores import Patch
+        from solera.stores import Patch
 
         rows["v"] += 1
         return Patch([{"e": rows["v"]}])
@@ -116,7 +116,7 @@ async def test_data_expires_with_its_asset(state, clock):
     for _ in range(5):
         clock.now += 43200  # half a day
         await run(engine, ["log"])
-    from cursus.sdk import Ref
+    from solera.sdk import Ref
 
     ref = Ref.from_json(state.model.heads[("log", "")]["ref"])
     loaded = await project.stores["json"].load(ref, list[dict], None)
@@ -129,7 +129,7 @@ async def test_source_commits_are_recorded_as_runs(state, clock):
     """§7: each source commit that changes something is a run with no tasks,
     saying who committed and what changed; the default policy expires it."""
 
-    from cursus.sdk import Source
+    from solera.sdk import Source
 
     @asset(inputs={"uploads": Incremental()})
     def ingest(uploads: list):

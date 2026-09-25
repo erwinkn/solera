@@ -8,12 +8,12 @@ import dataclasses
 import random
 
 import pytest
-from cursus.keys.index import Options
-from cursus.sdk import Incremental, Output, PartitionSet, Project, Ref, Source, asset
-from cursus.stores import JsonStore, Patch
-from cursus_server.engine import Engine
-from cursus_server.placements.inline import InlinePlacement
-from cursus_server.state import State
+from solera.keys.index import Options
+from solera.sdk import Incremental, Output, PartitionSet, Project, Ref, Source, asset
+from solera.stores import JsonStore, Patch
+from solera_server.engine import Engine
+from solera_server.placements.inline import InlinePlacement
+from solera_server.state import State
 
 
 @pytest.fixture

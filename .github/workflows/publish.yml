@@ -1,14 +1,14 @@
 name: Publish to PyPI
 
-# Publishes the single `cursus` distribution with Trusted Publishing. It bundles
+# Publishes the single `solera` distribution with Trusted Publishing. It bundles
 # the SDK, worker, and server source trees. No API token is stored: the publish
 # job exchanges a GitHub OIDC token for a short-lived PyPI token.
 #
 # PyPI-side setup (once):
 #   https://pypi.org/manage/account/publishing/
-#     PyPI Project Name: cursus
+#     PyPI Project Name: solera
 #     Owner:             erwinkn
-#     Repository name:   cursus
+#     Repository name:   solera
 #     Workflow name:     publish.yml
 #     Environment name:  pypi
 #
@@ -33,7 +33,7 @@ jobs:
         with:
           version: "0.12.13"
           python-version: "3.12"
-      - name: Build the cursus distribution
+      - name: Build the solera distribution
         run: |
           rm -rf dist
           uv build

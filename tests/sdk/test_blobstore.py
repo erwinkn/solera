@@ -5,8 +5,8 @@ import json
 
 import obstore
 import pytest
-from cursus.sdk import Migration, Output
-from cursus.stores import BlobStore, StoreError
+from solera.sdk import Migration, Output
+from solera.stores import BlobStore, StoreError
 
 from tests.conftest import scope
 
@@ -63,8 +63,8 @@ async def test_migration_payload_must_be_callable(blob_store):
 async def test_expire_keeps_the_head(blob_store):
     """§9: older blob versions go; the head stays."""
 
-    from cursus.ids import ulid
-    from cursus.stores import Scope
+    from solera.ids import ulid
+    from solera.stores import Scope
 
     out = Output("t", store="blobs")
     first = await blob_store.store(b"one", None, Scope(out, "", attempt=ulid(1000)))

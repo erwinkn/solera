@@ -3,7 +3,7 @@
 import datetime as dt
 
 import pytest
-from cursus.sdk import (
+from solera.sdk import (
     Project,
     RegistrationError,
     StaticPartitions,

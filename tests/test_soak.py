@@ -23,13 +23,13 @@ from collections import Counter
 from pathlib import Path
 
 import obstore
-from cursus.ids import ulid_time
-from cursus.sdk import Ref
-from cursus_server.engine import Engine
-from cursus_server.placements.inline import InlinePlacement
-from cursus_server.state import State
+from solera.ids import ulid_time
+from solera.sdk import Ref
+from solera_server.engine import Engine
+from solera_server.placements.inline import InlinePlacement
+from solera_server.state import State
 
-BATCHES = int(os.getenv("CURSUS_SOAK_BATCHES", "500"))
+BATCHES = int(os.getenv("SOLERA_SOAK_BATCHES", "500"))
 SAMPLE_EVERY = max(1, BATCHES // 10)
 
 
@@ -71,7 +71,7 @@ async def test_soak(tmp_path, monkeypatch):
     clock = [1_700_000_000.0]
     monkeypatch.setattr(time, "time", lambda: clock[0])
 
-    import cursus_server.demo as demo
+    import solera_server.demo as demo
 
     importlib.reload(demo)  # DATABASE=False regardless of earlier imports
     project = demo.project
@@ -210,8 +210,8 @@ async def test_soak_with_retention(tmp_path, monkeypatch):
     clock = [1_700_000_000.0]
     monkeypatch.setattr(time, "time", lambda: clock[0])
 
-    import cursus_server.demo as demo
-    from cursus.sdk import Incremental, Project, Retention, asset
+    import solera_server.demo as demo
+    from solera.sdk import Incremental, Project, Retention, asset
 
     importlib.reload(demo)
     base = demo.project

@@ -1,6 +1,6 @@
 .git
 .venv
-.cursus
+.solera
 __pycache__
 .env
 node_modules

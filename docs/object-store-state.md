@@ -200,7 +200,7 @@ Example (abridged):
 ## 6. Key index
 
 One per keyed output (or keyed external source) and partition. The format
-and operations live in an SDK library (`cursus.keys`) used by the harness,
+and operations live in an SDK library (`solera.keys`) used by the harness,
 by compaction, and by the server for key listings. The engine itself only
 holds each index's `KeyIndex` record.
 
@@ -497,8 +497,8 @@ which tells every consumer.
 **Manual deletion** goes through the same path and skips only active runs:
 
 ```
-cursus runs delete <run>
-cursus runs prune [--before DATE] [--asset NAME] [--keep N] [--dry-run]
+solera runs delete <run>
+solera runs prune [--before DATE] [--asset NAME] [--keep N] [--dry-run]
 DELETE /api/projects/{p}/runs/{run}
 POST   /api/projects/{p}/runs:prune   {"before", "asset", "keep", "dry_run"}
 ```
@@ -510,7 +510,7 @@ POST   /api/projects/{p}/runs:prune   {"before", "asset", "keep", "dry_run"}
 | `epochs/` claim objects | writer id = `seq` of its fence segment |
 | sharded, content-addressed checkpoints | one checkpoint object, written when the journal tail exceeds its size |
 | `spill/`, `deltas/`, deltas inside attempt results | delta files in the output's key index (§6) |
-| key maps held by stores (`cursus_keys`, JsonStore folds) and by the engine for sources | one engine-defined key index for every keyed output and source |
+| key maps held by stores (`solera_keys`, JsonStore folds) and by the engine for sources | one engine-defined key index for every keyed output and source |
 | `Page` in the store contract | full delivery pages through the key index and loads with `Keys` |
 | separate commit ids and records | commit = `(run, attempt)`; lineage inputs are in the attempt's `spec` |
 | separate `spec.json`, `result.json`, per-flush log files | one attempt file; one gzip log per attempt, chunked only while running |
@@ -542,7 +542,7 @@ Built on PR #8's branch.
 | Phase | Deliverable | Gate |
 |---|---|---|
 | K0 key index | format, pure-Python + Rust implementations, index operations, benchmark report | §13.1 numbers; each implementation reads the other's files and decodes identical content |
-| J1 journal | `cursus_server/journal.py`: flush, fencing, checkpoint, replay, cleanup | crash between `PUT` and ack; replaced-writer test; replaying the full journal equals checkpoint + tail; passes on `file://` and S3 |
+| J1 journal | `solera_server/journal.py`: flush, fencing, checkpoint, replay, cleanup | crash between `PUT` and ack; replaced-writer test; replaying the full journal equals checkpoint + tail; passes on `file://` and S3 |
 | J2 model | events + `apply`; engine and API on `State`; SlateDB removed | full suite; restart tests; a counting object store asserts 0 GETs on plan and API paths |
-| J3 key index | `cursus.keys` in the harness, delta files, local compaction + `engine_executor`, `key_cache`, full delivery through the index, sources on the index, aliases | 10k-batch soak: object operations per commit stay flat; `Keys`-only store contract |
+| J3 key index | `solera.keys` in the harness, delta files, local compaction + `engine_executor`, `key_cache`, full delivery through the index, sources on the index, aliases | 10k-batch soak: object operations per commit stay flat; `Keys`-only store contract |
 | J4 runs and retention | `runs/` layout, archive, per-asset retention, `store.expire`, CLI and API | soak with `Retention(days=1)` on a 10-second poller stays bounded; a consumer added after expiry receives the full head |

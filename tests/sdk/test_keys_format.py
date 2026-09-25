@@ -4,16 +4,16 @@ and each reading the other's files."""
 import random
 
 import pytest
-from cursus.keys import _python
+from solera.keys import _python
 
 try:
-    import cursus_native
+    import solera_native
 except ImportError:  # the extension is optional; the reference always runs
-    cursus_native = None
+    solera_native = None
 
 _MODULES = {"python": _python}
-if cursus_native is not None:
-    _MODULES["native"] = cursus_native
+if solera_native is not None:
+    _MODULES["native"] = solera_native
 IMPLS = [pytest.param(m, id=name) for name, m in _MODULES.items()]
 CROSS = [
     pytest.param(w, r, id=f"{wn}-writes-{rn}-reads")

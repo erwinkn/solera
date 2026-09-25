@@ -1,7 +1,7 @@
 import pytest
-from cursus.sdk import Output
-from cursus.stores import JsonStore, Scope
 from obstore.store import LocalStore
+from solera.sdk import Output
+from solera.stores import JsonStore, Scope
 
 
 @pytest.fixture

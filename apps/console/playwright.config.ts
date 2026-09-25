@@ -20,14 +20,14 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: "pnpm run build && cd ../.. && uv run cursus serve",
+    command: "pnpm run build && cd ../.. && uv run solera serve",
     url: "http://127.0.0.1:8000/healthz",
     timeout: 120000,
     reuseExistingServer: !process.env.CI,
     env: {
-      CURSUS_API_TOKEN: "test-browser-token",
-      CURSUS_STATE_URL: "file:///tmp/cursus-browser-test",
-      CURSUS_NAMESPACE: "browser",
+      SOLERA_API_TOKEN: "test-browser-token",
+      SOLERA_STATE_URL: "file:///tmp/solera-browser-test",
+      SOLERA_NAMESPACE: "browser",
     },
   },
 });

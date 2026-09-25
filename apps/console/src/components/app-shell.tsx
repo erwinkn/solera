@@ -43,14 +43,14 @@ function Brand({ project }: { project: string }) {
   return (
     <Link
       to="/assets"
-      aria-label="Cursus home"
+      aria-label="Solera home"
       className="flex items-center gap-2.5"
     >
       <span className="flex size-8 items-center justify-center rounded-lg bg-gradient-to-br from-indigo-500 to-violet-600 text-white shadow-sm">
         <Workflow className="size-4" />
       </span>
       <span className="leading-tight font-heading font-semibold">
-        Cursus
+        Solera
         <span className="block text-[0.6rem] font-medium tracking-[0.12em] text-muted-foreground uppercase">
           {project}
         </span>
@@ -84,12 +84,12 @@ export function Login() {
         <form
           onSubmit={async (event) => {
             event.preventDefault();
-            sessionStorage.setItem("cursus-token", value);
+            sessionStorage.setItem("solera-token", value);
             const result = await action.run(async () => {
               try {
                 return await request("/diagnostics");
               } catch (failure) {
-                sessionStorage.removeItem("cursus-token");
+                sessionStorage.removeItem("solera-token");
                 throw failure;
               }
             });
@@ -102,7 +102,7 @@ export function Login() {
             </div>
             <CardTitle className="text-lg">Connect to your workspace</CardTitle>
             <CardDescription>
-              Enter the API token configured for this Cursus instance.
+              Enter the API token configured for this Solera instance.
             </CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-3">
@@ -159,7 +159,7 @@ export function AppShell({ children }: { children: ReactNode }) {
     openMaterialize,
   } = useWorkspace();
   const unauthorized = error instanceof ApiError && error.status === 401;
-  if (unauthorized || (!diagnostics && !sessionStorage.getItem("cursus-token")))
+  if (unauthorized || (!diagnostics && !sessionStorage.getItem("solera-token")))
     return <Login />;
   const activeRuns = runs.filter((run) =>
     ["running", "queued"].includes(run.status),
@@ -220,14 +220,14 @@ export function AppShell({ children }: { children: ReactNode }) {
                   ? `Connected · ${new URL(diagnostics.state).protocol.replace(":", "")}`
                   : "Connecting"}
             </span>
-            {sessionStorage.getItem("cursus-token") && (
+            {sessionStorage.getItem("solera-token") && (
               <Button
                 variant="ghost"
                 size="icon-sm"
                 aria-label="Disconnect"
                 className="ml-auto"
                 onClick={() => {
-                  sessionStorage.removeItem("cursus-token");
+                  sessionStorage.removeItem("solera-token");
                   refresh();
                 }}
               >

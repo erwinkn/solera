@@ -5,8 +5,8 @@ import asyncio
 
 import httpx
 import pytest
-from cursus.executors import Pool
-from cursus.sdk import (
+from solera.executors import Pool
+from solera.sdk import (
     Automation,
     Every,
     Incremental,
@@ -19,10 +19,10 @@ from cursus.sdk import (
     StaticPartitions,
     asset,
 )
-from cursus_server.api import create_app
-from cursus_server.engine import Engine
-from cursus_server.placements.inline import InlinePlacement
-from cursus_server.state import State
+from solera_server.api import create_app
+from solera_server.engine import Engine
+from solera_server.placements.inline import InlinePlacement
+from solera_server.state import State
 
 
 def build_project():

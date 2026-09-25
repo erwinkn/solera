@@ -424,64 +424,6 @@ wheels = [
 ]
 
 [[package]]
-name = "cursus"
-version = "0.0.1"
-source = { editable = "." }
-dependencies = [
-    { name = "croniter" },
-    { name = "fastapi" },
-    { name = "httpx" },
-    { name = "obstore" },
-    { name = "uvicorn" },
-    { name = "xxhash" },
-]
-
-[package.optional-dependencies]
-postgres = [
-    { name = "pandas" },
-    { name = "psycopg", extra = ["binary"] },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "boto3" },
-    { name = "httpx" },
-    { name = "maturin" },
-    { name = "moto", extra = ["s3", "server"] },
-    { name = "pandas" },
-    { name = "psycopg", extra = ["binary"] },
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-    { name = "ruff" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "croniter", specifier = ">=6,<7" },
-    { name = "fastapi", specifier = ">=0.115,<1" },
-    { name = "httpx", specifier = ">=0.28,<1" },
-    { name = "obstore", specifier = "==0.11.1" },
-    { name = "pandas", marker = "extra == 'postgres'", specifier = ">=2.2,<3" },
-    { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.2,<4" },
-    { name = "uvicorn", specifier = ">=0.34,<1" },
-    { name = "xxhash", specifier = ">=3,<4" },
-]
-provides-extras = ["postgres"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "boto3", specifier = ">=1.36,<2" },
-    { name = "httpx", specifier = ">=0.28,<1" },
-    { name = "maturin", specifier = ">=1.7,<2" },
-    { name = "moto", extras = ["server", "s3"], specifier = ">=5,<6" },
-    { name = "pandas", specifier = ">=2.2,<3" },
-    { name = "psycopg", extras = ["binary"], specifier = ">=3.2,<4" },
-    { name = "pytest", specifier = ">=8,<10" },
-    { name = "pytest-asyncio", specifier = ">=1,<2" },
-    { name = "ruff", specifier = ">=0.12,<1" },
-]
-
-[[package]]
 name = "docker"
 version = "7.2.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1752,6 +1694,64 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/94/e7/b2c673351809dca68a0e064b6af791aa332cf192da575fd474ed7d6f16a2/six-1.17.0.tar.gz", hash = "sha256:ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81", size = 34031, upload-time = "2024-12-04T17:35:28.174Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl", hash = "sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274", size = 11050, upload-time = "2024-12-04T17:35:26.475Z" },
+]
+
+[[package]]
+name = "solera"
+version = "0.0.1"
+source = { editable = "." }
+dependencies = [
+    { name = "croniter" },
+    { name = "fastapi" },
+    { name = "httpx" },
+    { name = "obstore" },
+    { name = "uvicorn" },
+    { name = "xxhash" },
+]
+
+[package.optional-dependencies]
+postgres = [
+    { name = "pandas" },
+    { name = "psycopg", extra = ["binary"] },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "boto3" },
+    { name = "httpx" },
+    { name = "maturin" },
+    { name = "moto", extra = ["s3", "server"] },
+    { name = "pandas" },
+    { name = "psycopg", extra = ["binary"] },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "ruff" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "croniter", specifier = ">=6,<7" },
+    { name = "fastapi", specifier = ">=0.115,<1" },
+    { name = "httpx", specifier = ">=0.28,<1" },
+    { name = "obstore", specifier = "==0.11.1" },
+    { name = "pandas", marker = "extra == 'postgres'", specifier = ">=2.2,<3" },
+    { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.2,<4" },
+    { name = "uvicorn", specifier = ">=0.34,<1" },
+    { name = "xxhash", specifier = ">=3,<4" },
+]
+provides-extras = ["postgres"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "boto3", specifier = ">=1.36,<2" },
+    { name = "httpx", specifier = ">=0.28,<1" },
+    { name = "maturin", specifier = ">=1.7,<2" },
+    { name = "moto", extras = ["server", "s3"], specifier = ">=5,<6" },
+    { name = "pandas", specifier = ">=2.2,<3" },
+    { name = "psycopg", extras = ["binary"], specifier = ">=3.2,<4" },
+    { name = "pytest", specifier = ">=8,<10" },
+    { name = "pytest-asyncio", specifier = ">=1,<2" },
+    { name = "ruff", specifier = ">=0.12,<1" },
 ]
 
 [[package]]

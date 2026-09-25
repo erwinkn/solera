@@ -14,8 +14,8 @@ from __future__ import annotations
 import os
 
 import pandas as pd
-from cursus.executors import AWSECS, Pool
-from cursus.sdk import (
+from solera.executors import AWSECS, Pool
+from solera.sdk import (
     AllPartitions,
     Automation,
     AutoRefresh,
@@ -36,8 +36,8 @@ from cursus.sdk import (
     asset,
     job,
 )
-from cursus.stores import BlobStore, Patch, Sql
-from cursus_postgres import PostgresStore
+from solera.stores import BlobStore, Patch, Sql
+from solera_postgres import PostgresStore
 
 # ---------------------------------------------------------------------------
 # Resources: ordinary client objects, injected by parameter name. `env:`

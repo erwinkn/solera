@@ -1,6 +1,6 @@
 """The journal (docs/object-store-state.md §3, §10): replay, checkpoints,
 cleanup, and fencing between writers — on the local filesystem, in memory,
-and on an S3-compatible server when CURSUS_TEST_S3 is set."""
+and on an S3-compatible server when SOLERA_TEST_S3 is set."""
 
 import asyncio
 import json
@@ -10,8 +10,8 @@ import uuid
 
 import obstore
 import pytest
-from cursus_server.journal import Fenced, Journal, JournalCorrupt
 from obstore.store import LocalStore, MemoryStore
+from solera_server.journal import Fenced, Journal, JournalCorrupt
 
 
 class Counter:
@@ -35,7 +35,7 @@ class Counter:
 
 
 # An S3-compatible server to also run against, e.g. http://user:secret@127.0.0.1:9100/bucket
-S3_URL = os.getenv("CURSUS_TEST_S3")
+S3_URL = os.getenv("SOLERA_TEST_S3")
 
 
 @pytest.fixture(params=["local", "memory", "s3"])
@@ -45,7 +45,7 @@ def store(request, tmp_path):
     if request.param == "memory":
         return MemoryStore()
     if not S3_URL:
-        pytest.skip("set CURSUS_TEST_S3 to run against an S3-compatible server")
+        pytest.skip("set SOLERA_TEST_S3 to run against an S3-compatible server")
     from urllib.parse import urlsplit
 
     from obstore.store import S3Store

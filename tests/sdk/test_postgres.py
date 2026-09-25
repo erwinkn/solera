@@ -1,25 +1,25 @@
 """§3/§4: PostgresStore — markers, Patch, batch snapshots, partition slices,
-Sql writes. Skips unless CURSUS_TEST_DATABASE_URL points at a scratch database."""
+Sql writes. Skips unless SOLERA_TEST_DATABASE_URL points at a scratch database."""
 
 import os
 import uuid
 
 import pytest
-from cursus.sdk import Output
-from cursus.stores import Keys, Patch, Sql, StaleRead, StoreConflict, StoreError, WriteError
+from solera.sdk import Output
+from solera.stores import Keys, Patch, Sql, StaleRead, StoreConflict, StoreError, WriteError
 
 from tests.conftest import scope
 
 pytestmark = pytest.mark.postgres
 
-DSN = os.environ.get("CURSUS_TEST_DATABASE_URL")
+DSN = os.environ.get("SOLERA_TEST_DATABASE_URL")
 
 
 @pytest.fixture
 def store():
     if not DSN:
-        pytest.skip("CURSUS_TEST_DATABASE_URL is not set")
-    from cursus_postgres import PostgresStore
+        pytest.skip("SOLERA_TEST_DATABASE_URL is not set")
+    from solera_postgres import PostgresStore
 
     return PostgresStore(DSN)
 
@@ -121,7 +121,7 @@ async def test_aliases_rename_the_table(store):
     old = output(key="id", revision="v", primary_key=["id"])
     first = await store.store([{"id": "a", "v": "1"}], None, scope(old))
     new = output(key="id", revision="v", primary_key=["id"])
-    from cursus.stores import Scope
+    from solera.stores import Scope
 
     moved = await store.store(
         Patch([{"id": "b", "v": "1"}]),
@@ -169,7 +169,7 @@ async def test_dataframe_round_trip(store):
 def _ledger(store, output_name):
     with store._connect() as conn, conn.cursor() as cur:
         rows = cur.execute(
-            "SELECT name FROM public.cursus_migrations WHERE output = %s ORDER BY at, name",
+            "SELECT name FROM public.solera_migrations WHERE output = %s ORDER BY at, name",
             (output_name,),
         ).fetchall()
         return [r["name"] for r in rows]
@@ -177,8 +177,8 @@ def _ledger(store, output_name):
 
 async def test_migrations_apply_in_order_and_record(store):
     """§4: pending migrations apply in declared order and land in the
-    cursus_migrations ledger."""
-    from cursus.sdk import Migration
+    solera_migrations ledger."""
+    from solera.sdk import Migration
 
     out = output()
     table = out.name
@@ -198,7 +198,7 @@ async def test_concurrent_migrate_applies_each_once(store):
     (advisory lock + ledger re-read inside it)."""
     import asyncio
 
-    from cursus.sdk import Migration
+    from solera.sdk import Migration
 
     out = output()
     runs = f'"{out.name}_runs"'
@@ -221,7 +221,7 @@ async def test_concurrent_migrate_applies_each_once(store):
 
 async def test_failed_migration_leaves_no_ledger_row(store):
     """§4: a failing migration rolls back its work and writes no ledger row."""
-    from cursus.sdk import Migration
+    from solera.sdk import Migration
 
     out = output()
     table = f'"{out.name}_ghost"'
@@ -255,7 +255,7 @@ async def test_schema_drift_fails_the_write(store):
 
 async def test_migration_can_reconcile_drift(store):
     """§4: a migration that brings the live table in line lets the write pass."""
-    from cursus.sdk import Migration
+    from solera.sdk import Migration
 
     out = output(key="id", primary_key=["id"])
     with store._connect() as conn, conn.cursor() as cur:

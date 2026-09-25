@@ -1,6 +1,6 @@
 //! Encode and merge throughput without Python: `cargo run --release --example bench`.
 
-use cursus_native::format::{self, Options, CODEC_NONE, CODEC_ZLIB};
+use solera_native::format::{self, Options, CODEC_NONE, CODEC_ZLIB};
 use std::time::Instant;
 
 fn main() {

@@ -1,6 +1,6 @@
 //! The `.kx` key index format (docs/key-index-format.md), without any Python.
 //!
-//! Mirrors `cursus/keys/_python.py` function for function; the two must decode
+//! Mirrors `solera/keys/_python.py` function for function; the two must decode
 //! each other's files to identical content.
 
 use std::cmp::Reverse;

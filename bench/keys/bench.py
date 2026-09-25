@@ -20,23 +20,34 @@ import tempfile
 import time
 
 import boto3
-from cursus import keys as K
-from cursus.keys.index import FileInfo, IndexState, KeyIndex, Options
-from cursus.keys.io import DiskCache, ObjectIO
 from obstore.store import S3Store
+from solera import keys as K
+from solera.keys.index import FileInfo, IndexState, KeyIndex, Options
+from solera.keys.io import DiskCache, ObjectIO
 
-ENDPOINT, USER, SECRET, BUCKET = "http://127.0.0.1:9100", "cursus", "cursus-bench-secret", "cursus-bench"
+ENDPOINT, USER, SECRET, BUCKET = "http://127.0.0.1:9100", "solera", "solera-bench-secret", "solera-bench"
 GET_PRICE, PUT_PRICE = 0.40 / 1e6, 5.0 / 1e6
 
 
 def store():
-    return S3Store(BUCKET, endpoint=ENDPOINT, access_key_id=USER, secret_access_key=SECRET, region="us-east-1",
-                   client_options={"allow_http": True})
+    return S3Store(
+        BUCKET,
+        endpoint=ENDPOINT,
+        access_key_id=USER,
+        secret_access_key=SECRET,
+        region="us-east-1",
+        client_options={"allow_http": True},
+    )
 
 
 def reset_bucket(prefix: str):
-    s3 = boto3.client("s3", endpoint_url=ENDPOINT, aws_access_key_id=USER, aws_secret_access_key=SECRET,
-                      region_name="us-east-1")
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=ENDPOINT,
+        aws_access_key_id=USER,
+        aws_secret_access_key=SECRET,
+        region_name="us-east-1",
+    )
     try:
         s3.create_bucket(Bucket=BUCKET)
     except s3.exceptions.BucketAlreadyOwnedByYou:
@@ -111,8 +122,15 @@ async def measure(label, io: ObjectIO, fn):
     dt = time.perf_counter() - t
     m = io.metrics.snapshot()
     cost = m["gets"] * GET_PRICE + m["puts"] * PUT_PRICE
-    return {"op": label, "wall": dt, "gets": m["gets"], "puts": m["puts"], "mb_in": m["bytes_in"] / 1e6,
-            "cost": cost, "out": out}
+    return {
+        "op": label,
+        "wall": dt,
+        "gets": m["gets"],
+        "puts": m["puts"],
+        "mb_in": m["bytes_in"] / 1e6,
+        "cost": cost,
+        "out": out,
+    }
 
 
 async def run_size(n: int, args) -> list[dict]:
@@ -123,8 +141,15 @@ async def run_size(n: int, args) -> list[dict]:
     state, sample, build_s = await build(build_io, prefix, n, opts, sample_every=max(1, n // 200_000))
     size = sum(f.size for f in state.files)
     tails = sum(f.tail for f in state.files)
-    info = {"n": n, "build_s": build_s, "bytes": size, "files": len(state.files), "depth": state.depth,
-            "b_per_entry": size / n, "filter_b_per_entry": tails / n}
+    info = {
+        "n": n,
+        "build_s": build_s,
+        "bytes": size,
+        "files": len(state.files),
+        "depth": state.depth,
+        "b_per_entry": size / n,
+        "filter_b_per_entry": tails / n,
+    }
     rows = []
     rng = random.Random(2)
 
@@ -141,10 +166,15 @@ async def run_size(n: int, args) -> list[dict]:
         idx = KeyIndex(io, prefix, state, opts)
         return await idx.changes(keys, vers)
 
-    for label, k, share in (("100 random keys changed", 100, 0.0), ("1K random keys changed", 1000, 0.0),
-                            ("1K random keys, half unchanged", 1000, 0.5)):
+    for label, k, share in (
+        ("100 random keys changed", 100, 0.0),
+        ("1K random keys changed", 1000, 0.0),
+        ("1K random keys, half unchanged", 1000, 0.5),
+    ):
         io = cold()
-        rows.append(await measure(label, io, lambda io=io, k=k, share=share: changes(io, pick(k), same_share=share)))
+        rows.append(
+            await measure(label, io, lambda io=io, k=k, share=share: changes(io, pick(k), same_share=share))
+        )
 
     # Clustered: 1K consecutive existing ids from the sample's neighbourhood — re-read a
     # contiguous key run by paging, then change those keys.
@@ -175,22 +205,31 @@ async def run_size(n: int, args) -> list[dict]:
         rows.append(await measure("100K random keys changed", io, lambda io=io: changes(io, pick(100_000))))
 
     # Warm: a local disk cache that already holds every file.
-    cache_dir = tempfile.mkdtemp(prefix="cursus-bench-cache-")
+    cache_dir = tempfile.mkdtemp(prefix="solera-bench-cache-")
     try:
         cache = DiskCache(cache_dir, max_bytes=size * 2 + (1 << 30))
         io = ObjectIO(store(), latency=args.latency, bandwidth=args.bandwidth, cache=cache)
         await changes(io, pick(1000))  # warms the cache
         for f in state.files:
             await io.read_whole(f"{prefix}{f.name}.kx", f.size)
-        rows.append(await measure("1K random keys changed, disk cache warm", io, lambda io=io: changes(io, pick(1000))))
+        rows.append(
+            await measure(
+                "1K random keys changed, disk cache warm", io, lambda io=io: changes(io, pick(1000))
+            )
+        )
     finally:
         shutil.rmtree(cache_dir, ignore_errors=True)
 
     # A full-delivery page and a pending read.
     io = cold()
     after = key_of(sample[len(sample) // 3][0])
-    rows.append(await measure("full-delivery page of 10K keys", io,
-                              lambda io=io: KeyIndex(io, prefix, state, opts).page(after, 10_000)))
+    rows.append(
+        await measure(
+            "full-delivery page of 10K keys",
+            io,
+            lambda io=io: KeyIndex(io, prefix, state, opts).page(after, 10_000),
+        )
+    )
 
     # Commit a delta, then eight more, then compact level 0.
     io = cold()
@@ -229,8 +268,13 @@ async def run_size(n: int, args) -> list[dict]:
         for j in rng.sample(range(len(ks_all)), len(ks_all) // 100):
             vs_all[j] = b"changed-version!"
         io = cold()
-        rows.append(await measure("full replacement, 1% changed", io,
-                                  lambda io=io: KeyIndex(io, prefix, state, opts).changes(ks_all, vs_all, replace=True)))
+        rows.append(
+            await measure(
+                "full replacement, 1% changed",
+                io,
+                lambda io=io: KeyIndex(io, prefix, state, opts).changes(ks_all, vs_all, replace=True),
+            )
+        )
         del ks_all, vs_all
 
     reset_bucket(prefix)
@@ -238,13 +282,17 @@ async def run_size(n: int, args) -> list[dict]:
 
 
 def report(results, args):
-    print(f"\n### Key index benchmark ({K.IMPL}, {args.latency * 1000:.0f} ms per request, "
-          f"{args.bandwidth / 1e6:.0f} MB/s per connection, 64 in parallel)\n")
+    print(
+        f"\n### Key index benchmark ({K.IMPL}, {args.latency * 1000:.0f} ms per request, "
+        f"{args.bandwidth / 1e6:.0f} MB/s per connection, 64 in parallel)\n"
+    )
     print("| Keys | Build | Index size | Per entry (incl. filters) | Filters per entry | Files | Levels |")
     print("|---|---|---|---|---|---|---|")
     for info, _ in results:
-        print(f"| {info['n']:,} | {fmt_s(info['build_s'])} | {info['bytes'] / 1e6:,.1f} MB | "
-              f"{info['b_per_entry']:.1f} B | {info['filter_b_per_entry']:.2f} B | {info['files']} | {info['depth']} |")
+        print(
+            f"| {info['n']:,} | {fmt_s(info['build_s'])} | {info['bytes'] / 1e6:,.1f} MB | "
+            f"{info['b_per_entry']:.1f} B | {info['filter_b_per_entry']:.2f} B | {info['files']} | {info['depth']} |"
+        )
     ops = [r["op"] for r in results[0][1]]
     for extra in (r["op"] for _, rows in results for r in rows):
         if extra not in ops:
@@ -255,7 +303,11 @@ def report(results, args):
         cells = []
         for _, rows in results:
             r = next((x for x in rows if x["op"] == op), None)
-            cells.append("—" if r is None else f"{fmt_s(r['wall'])} · {r['gets']} GET {r['puts']} PUT · {r['mb_in']:.1f} MB")
+            cells.append(
+                "—"
+                if r is None
+                else f"{fmt_s(r['wall'])} · {r['gets']} GET {r['puts']} PUT · {r['mb_in']:.1f} MB"
+            )
         print(f"| {op} | " + " | ".join(cells) + " |")
 
 

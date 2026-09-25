@@ -19,7 +19,7 @@ export const Route = createRootRoute({
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
       { name: "theme-color", content: "#f8f9fa" },
-      { title: "Cursus" },
+      { title: "Solera" },
     ],
     links: [
       { rel: "stylesheet", href: appCss },

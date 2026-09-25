@@ -3,8 +3,8 @@ Patch, Keys and Batches loads. The store never works out what changed; the
 harness does, against the key index (tests/worker)."""
 
 import pytest
-from cursus.sdk import Output, PartitionSet, Ref, digest
-from cursus.stores import Batches, JsonStore, Keys, Patch, WriteError
+from solera.sdk import Output, PartitionSet, Ref, digest
+from solera.stores import Batches, JsonStore, Keys, Patch, WriteError
 
 from tests.conftest import scope
 
@@ -154,8 +154,8 @@ async def test_jsonref_round_trip():
 def at(output, t, batch=None, partition=""):
     """A write scope whose attempt id dates its objects at time `t`."""
 
-    from cursus.ids import ulid
-    from cursus.stores import Scope
+    from solera.ids import ulid
+    from solera.stores import Scope
 
     return Scope(output=output, partition=partition, batch=batch, attempt=ulid(t))
 

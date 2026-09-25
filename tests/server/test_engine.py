@@ -5,8 +5,8 @@ import asyncio
 import json
 
 import pytest
-from cursus.executors import Environment
-from cursus.sdk import (
+from solera.executors import Environment
+from solera.sdk import (
     AllPartitions,
     Automation,
     Cron,
@@ -26,10 +26,10 @@ from cursus.sdk import (
     asset,
     job,
 )
-from cursus.stores import JsonStore
-from cursus_server.engine import Engine
-from cursus_server.placements.inline import InlinePlacement
-from cursus_server.state import State
+from solera.stores import JsonStore
+from solera_server.engine import Engine
+from solera_server.placements.inline import InlinePlacement
+from solera_server.state import State
 
 
 class Fake(Environment):
@@ -619,7 +619,7 @@ async def test_fencing_concurrent_claim(state):
 
         async def _slow(self, stage):
             await asyncio.sleep(0.5)
-            from cursus_worker.worker import run_attempt
+            from solera_worker.worker import run_attempt
 
             return await run_attempt(stage["objects"], stage["attempt"], self.project, run=stage["run"])
 
@@ -1051,7 +1051,7 @@ async def test_migration_changes_fingerprint_and_marks_handle(state):
     """§6/§4: adding a migration to an asset's output changes the
     interpretation fingerprint so every key reprocesses, and the new head's
     handle carries the last applied migration as `schema`."""
-    from cursus.sdk import Migration
+    from solera.sdk import Migration
 
     seen = []
     store = MigratingJsonStore()

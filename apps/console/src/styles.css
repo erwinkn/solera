@@ -51,7 +51,7 @@
   --radius-4xl: calc(var(--radius) * 2.6);
 }
 
-/* Cursus operator console — a cool-neutral system with an indigo accent,
+/* Solera operator console — a cool-neutral system with an indigo accent,
    tuned for density and legibility, flipping cleanly between light and dark. */
 :root {
   --background: oklch(0.988 0.002 264);
