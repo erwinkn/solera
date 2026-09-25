@@ -7,7 +7,9 @@ import {
   Inbox,
   LayoutGrid,
   LogOut,
+  Moon,
   Play,
+  Sun,
   Workflow,
   Zap,
 } from "lucide-react";
@@ -23,9 +25,10 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { ApiError, request, useAction } from "@/lib/api";
+import { useTheme } from "@/lib/theme";
 import { useWorkspace } from "@/lib/workspace";
 import { cn } from "cn";
-import { ErrorNotice } from "./common";
+import { ErrorNotice, Segmented } from "./common";
 
 const navigation = [
   { to: "/assets", label: "Assets", icon: LayoutGrid },
@@ -35,6 +38,41 @@ const navigation = [
   { to: "/executors", label: "Executors", icon: Cpu },
   { to: "/storage", label: "Storage", icon: Database },
 ] as const;
+
+function Brand({ project }: { project: string }) {
+  return (
+    <Link
+      to="/assets"
+      aria-label="Cursus home"
+      className="flex items-center gap-2.5"
+    >
+      <span className="flex size-8 items-center justify-center rounded-lg bg-gradient-to-br from-indigo-500 to-violet-600 text-white shadow-sm">
+        <Workflow className="size-4" />
+      </span>
+      <span className="leading-tight font-heading font-semibold">
+        Cursus
+        <span className="block text-[0.6rem] font-medium tracking-[0.12em] text-muted-foreground uppercase">
+          {project}
+        </span>
+      </span>
+    </Link>
+  );
+}
+
+function ThemeToggle() {
+  const { theme, setTheme } = useTheme();
+  return (
+    <Segmented
+      ariaLabel="Theme"
+      value={theme}
+      onChange={setTheme}
+      options={[
+        { value: "light", label: "Light", icon: <Sun className="size-3.5" /> },
+        { value: "dark", label: "Dark", icon: <Moon className="size-3.5" /> },
+      ]}
+    />
+  );
+}
 
 export function Login() {
   const [value, setValue] = useState("");
@@ -59,12 +97,12 @@ export function Login() {
           }}
         >
           <CardHeader>
-            <div className="mb-2 flex size-9 items-center justify-center rounded-lg bg-primary text-primary-foreground">
+            <div className="mb-2 flex size-9 items-center justify-center rounded-lg bg-gradient-to-br from-indigo-500 to-violet-600 text-white">
               <Workflow className="size-5" />
             </div>
             <CardTitle className="text-lg">Connect to your workspace</CardTitle>
             <CardDescription>
-              Enter the API token configured for Cursus instance.
+              Enter the API token configured for this Cursus instance.
             </CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-3">
@@ -96,12 +134,17 @@ export function Login() {
 
 function ConnectionDot({ offline }: { offline: boolean }) {
   return (
-    <span
-      className={cn(
-        "size-2 rounded-full",
-        offline ? "bg-red-500" : "bg-emerald-500",
+    <span className="relative flex size-2">
+      {!offline && (
+        <span className="absolute inline-flex size-full animate-ping rounded-full bg-emerald-500/60" />
       )}
-    />
+      <span
+        className={cn(
+          "relative inline-flex size-2 rounded-full",
+          offline ? "bg-red-500" : "bg-emerald-500",
+        )}
+      />
+    </span>
   );
 }
 
@@ -123,31 +166,19 @@ export function AppShell({ children }: { children: ReactNode }) {
   ).length;
   return (
     <div className="flex h-dvh flex-col md:flex-row">
-      <aside className="flex shrink-0 flex-col gap-3 border-b bg-sidebar px-4 py-3 md:w-60 md:border-r md:border-b-0 md:py-5">
+      <aside className="flex shrink-0 flex-col gap-4 border-b bg-sidebar px-4 py-3 text-sidebar-foreground md:w-60 md:border-r md:border-b-0 md:py-5">
         <div className="flex items-center justify-between gap-3 md:block">
-          <Link
-            to="/assets"
-            aria-label="Cursus home"
-            className="flex items-center gap-2.5 font-heading font-medium"
-          >
-            <span className="flex size-8 items-center justify-center rounded-lg bg-primary text-primary-foreground">
-              <Workflow className="size-4" />
-            </span>
-            <span className="leading-tight">
-              Cursus
-              <span className="block text-[0.65rem] font-normal tracking-wider text-muted-foreground uppercase">
-                {diagnostics?.project ?? "…"}
-              </span>
-            </span>
-          </Link>
+          <Brand project={diagnostics?.project ?? "…"} />
           <div className="flex items-center gap-2 text-xs text-muted-foreground md:hidden">
             <ConnectionDot offline={!!error} />
             {error ? "Offline" : "Live"}
           </div>
         </div>
-        <div className="hidden text-[0.65rem] font-medium tracking-wider text-muted-foreground md:block">
-          WORKSPACE
-          <div className="mt-1 font-mono text-xs font-normal tracking-normal text-foreground">
+        <div className="hidden md:block">
+          <div className="text-[0.6rem] font-semibold tracking-[0.12em] text-muted-foreground uppercase">
+            Workspace
+          </div>
+          <div className="mt-0.5 font-mono text-xs text-foreground">
             {diagnostics?.namespace ?? "default"}
           </div>
         </div>
@@ -161,27 +192,28 @@ export function AppShell({ children }: { children: ReactNode }) {
               to={item.to}
               activeOptions={{ exact: true }}
               activeProps={{ "data-active": true }}
-              className="flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm whitespace-nowrap text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground data-active:bg-sidebar-accent data-active:font-medium data-active:text-foreground"
+              className="flex items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-sm whitespace-nowrap text-muted-foreground transition-colors hover:bg-sidebar-accent/60 hover:text-foreground data-active:bg-sidebar-accent data-active:font-medium data-active:text-sidebar-accent-foreground"
             >
-              <item.icon className="size-4" />
+              <item.icon className="size-4 shrink-0" />
               <span>{item.label}</span>
               {item.to === "/assets" && !!assets.length && (
-                <span className="ml-auto text-xs text-muted-foreground">
+                <span className="ml-auto text-xs text-muted-foreground tabular-nums">
                   {assets.length}
                 </span>
               )}
               {item.to === "/runs" && !!activeRuns && (
-                <span className="ml-auto rounded-full bg-sky-500/15 px-1.5 text-xs font-medium text-sky-700">
+                <span className="ml-auto rounded-full bg-sky-500/15 px-1.5 text-xs font-medium text-sky-700 tabular-nums dark:text-sky-300">
                   {activeRuns}
                 </span>
               )}
             </Link>
           ))}
         </nav>
-        <div className="mt-auto hidden gap-2 border-t pt-3 text-xs text-muted-foreground md:flex md:flex-col">
+        <div className="mt-auto hidden flex-col gap-3 border-t pt-3 text-xs text-muted-foreground md:flex">
+          <ThemeToggle />
           <div className="flex items-center gap-2">
             <ConnectionDot offline={!!error} />
-            <span>
+            <span className="min-w-0 truncate">
               {error
                 ? "Connection interrupted"
                 : diagnostics
@@ -203,13 +235,16 @@ export function AppShell({ children }: { children: ReactNode }) {
               </Button>
             )}
           </div>
-          <p>Self-hosted · Apache-2.0 · No cloud dependency</p>
         </div>
       </aside>
       <div className="flex min-w-0 flex-1 flex-col overflow-y-auto">
-        <header className="sticky top-0 z-10 flex items-center justify-end gap-2 border-b bg-background/80 px-4 py-2 backdrop-blur md:px-8">
+        <header className="sticky top-0 z-10 flex items-center gap-2 border-b bg-background/80 px-4 py-2 backdrop-blur md:px-8">
+          <div className="flex items-center gap-2 md:hidden">
+            <ThemeToggle />
+          </div>
           <Button
             size="sm"
+            className="ml-auto"
             onClick={() =>
               openMaterialize(checked.length ? checked : undefined)
             }

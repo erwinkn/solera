@@ -60,6 +60,8 @@ export interface OutputDecl {
   key: string | null;
   revision: string | null;
   incremental: boolean;
+  /** Ordered migration names declared on the output (§4). */
+  migrations?: string[];
   config: Record<string, Json>;
   partition_set: boolean;
 }

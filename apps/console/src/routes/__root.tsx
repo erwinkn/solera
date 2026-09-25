@@ -9,6 +9,7 @@ import { AppShell } from "@/components/app-shell";
 import { AssetSheet } from "@/components/asset-sheet";
 import { MaterializeDialog } from "@/components/materialize-dialog";
 import { RunSheet } from "@/components/run-sheet";
+import { ThemeProvider, themeBootScript } from "@/lib/theme";
 import { WorkspaceProvider } from "@/lib/workspace";
 import appCss from "../styles.css?url";
 
@@ -24,6 +25,8 @@ export const Route = createRootRoute({
       { rel: "stylesheet", href: appCss },
       { rel: "icon", type: "image/svg+xml", href: "/static/favicon.svg" },
     ],
+    // Apply the stored/system theme before first paint to avoid a flash.
+    scripts: [{ children: themeBootScript }],
   }),
   component: RootComponent,
 });
@@ -42,14 +45,14 @@ function Shell() {
   // The SPA shell prerenders without a DOM; ship a minimal frame there.
   if (typeof window === "undefined") return null;
   return (
-    <>
+    <ThemeProvider>
       <AppShell>
         <Outlet />
       </AppShell>
       <MaterializeDialog />
       <AssetSheet />
       <RunSheet />
-    </>
+    </ThemeProvider>
   );
 }
 

@@ -11,7 +11,7 @@ async function login(page: Page) {
     .fill("test-browser-token");
   await page.getByRole("button", { name: "Connect", exact: true }).click();
   await expect(
-    page.getByRole("heading", { name: "Asset catalog", exact: true }),
+    page.getByRole("heading", { name: "Assets", exact: true }),
   ).toBeVisible();
   await expect(page.getByLabel("Filter assets")).toBeVisible();
 }
@@ -25,10 +25,12 @@ async function materialize(
     .locator("header")
     .getByRole("button", { name: /Materialize/ })
     .click();
-  const dialog = page.getByRole("dialog", { name: "Materialize assets" });
+  const dialog = page.getByRole("dialog", { name: "Materialize" });
   await dialog.locator(`[role="checkbox"][aria-label="${asset}"]`).click();
   if (upstream)
-    await dialog.getByRole("checkbox", { name: "Include upstream" }).click();
+    await dialog
+      .getByRole("switch", { name: "Materialize upstream first" })
+      .click();
   await dialog
     .getByRole("button", { name: "Start materialization", exact: true })
     .click();
@@ -46,7 +48,7 @@ test("every page loads", async ({ page }) => {
     ["Sources", "Sources"],
     ["Executors", "Executors"],
     ["Storage", "Storage"],
-    ["Assets", "Asset catalog"],
+    ["Assets", "Assets"],
   ] as const) {
     await page
       .getByRole("navigation", { name: "Main navigation" })
@@ -63,6 +65,43 @@ test("every page loads", async ({ page }) => {
   }
 });
 
+test("theme toggle switches light and dark", async ({ page }) => {
+  await login(page);
+  // Two theme toggles exist (sidebar on desktop, header on mobile); the visible
+  // one depends on the viewport.
+  const dark = page
+    .getByRole("radio", { name: "Dark" })
+    .filter({ visible: true });
+  const light = page
+    .getByRole("radio", { name: "Light" })
+    .filter({ visible: true });
+  await dark.click();
+  await expect(page.locator("html")).toHaveClass(/dark/);
+  await light.click();
+  await expect(page.locator("html")).not.toHaveClass(/dark/);
+});
+
+test("lineage graph shows sources and edge kinds", async ({ page }) => {
+  await login(page);
+  await page.getByRole("radio", { name: "Graph" }).click();
+  const graph = page.getByLabel("Asset lineage graph");
+  await expect(graph).toBeVisible();
+  // Sources render as nodes alongside assets.
+  await expect(
+    graph.getByRole("button", { name: "Inspect uploads" }),
+  ).toBeVisible();
+  await expect(
+    graph.getByRole("button", { name: "Inspect site_feed" }),
+  ).toBeVisible();
+  // The edge-kind legend names every consumption kind.
+  for (const kind of ["whole", "Incremental", "AllPartitions", "dep"])
+    await expect(page.getByText(kind, { exact: true })).toBeVisible();
+  // Clicking a source node opens its card on the Sources page.
+  await graph.getByRole("button", { name: "Inspect uploads" }).click();
+  await expect(page).toHaveURL(/\/sources#source-uploads$/);
+  await expect(page.locator('[data-source="uploads"]')).toBeInViewport();
+});
+
 test("materialize latest from the dialog and watch the run", async ({
   page,
 }) => {
@@ -71,6 +110,23 @@ test("materialize latest from the dialog and watch the run", async ({
   await expect(sheet.locator('[data-status="succeeded"]').first()).toBeVisible({
     timeout: 60000,
   });
+});
+
+test("pick individual cells from the partition grid", async ({ page }) => {
+  await login(page);
+  // Open a partitioned asset and materialize one scope straight off the grid.
+  await page.getByRole("button", { name: "site_feed", exact: true }).click();
+  const asset = page.getByRole("dialog", { name: "site_feed" });
+  await expect(asset.locator("[data-scope]").first()).toBeVisible({
+    timeout: 30000,
+  });
+  await asset.locator("[data-scope]").first().click();
+  const dialog = page.getByRole("dialog", { name: "Materialize" });
+  await expect(dialog.getByRole("radio", { name: "pick" })).toHaveAttribute(
+    "aria-checked",
+    "true",
+  );
+  await expect(dialog.getByText(/Pick cells — \d+ selected/)).toBeVisible();
 });
 
 test("partition grid, attempt logs, upstream run", async ({ page }) => {
