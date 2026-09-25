@@ -1,5 +1,5 @@
-"""Phase 5 — the CLI. Commands run local (in-process engine on CURSUS_STATE_URL)
-and remote (CURSUS_SERVER_URL + CURSUS_API_TOKEN against a live server)."""
+"""Phase 5 — the CLI. Commands run local (in-process engine on SOLERA_STATE_URL)
+and remote (SOLERA_SERVER_URL + SOLERA_API_TOKEN against a live server)."""
 
 import json
 import socket
@@ -10,7 +10,7 @@ import time
 import pytest
 
 PROJECT_SRC = """
-from cursus.sdk import Output, Project, Source, asset
+from solera.sdk import Output, Project, Source, asset
 
 @asset(outputs=Output("feed", key="k"))
 def feed():
@@ -40,9 +40,9 @@ def state_url(tmp_path):
 def cli(monkeypatch, capsys, *argv):
     """Run the CLI as a subprocess-free invocation; returns parsed stdout."""
 
-    from cursus_server.cli import main
+    from solera_server.cli import main
 
-    monkeypatch.setattr(sys, "argv", ["cursus", *argv])
+    monkeypatch.setattr(sys, "argv", ["solera", *argv])
     try:
         main()
     except SystemExit as error:
@@ -58,16 +58,16 @@ def cli(monkeypatch, capsys, *argv):
 
 
 def test_manifest(project_file, capsys, monkeypatch):
-    """`cursus manifest --project` prints the manifest without a server."""
+    """`solera manifest --project` prints the manifest without a server."""
 
     out = cli(monkeypatch, capsys, "manifest", "--project", project_file)
     assert out["name"] == "clidemo" and "feed" in out["assets"]
 
 
 def test_local_run_and_reads(project_file, state_url, capsys, monkeypatch):
-    """Without CURSUS_SERVER_URL every command drives a local engine."""
+    """Without SOLERA_SERVER_URL every command drives a local engine."""
 
-    monkeypatch.delenv("CURSUS_SERVER_URL", raising=False)
+    monkeypatch.delenv("SOLERA_SERVER_URL", raising=False)
     detail = cli(
         monkeypatch,
         capsys,
@@ -116,7 +116,7 @@ def test_local_run_and_reads(project_file, state_url, capsys, monkeypatch):
 def test_local_full_and_partitions(project_file, state_url, capsys, monkeypatch):
     """--full and --partition feed the §8 run vocabulary."""
 
-    monkeypatch.delenv("CURSUS_SERVER_URL", raising=False)
+    monkeypatch.delenv("SOLERA_SERVER_URL", raising=False)
     detail = cli(
         monkeypatch,
         capsys,
@@ -137,9 +137,9 @@ def server(project_file, state_url, monkeypatch):
     """A real uvicorn server on a loopback port for remote-mode CLI tests."""
 
     import uvicorn
-    from cursus_server.api import create_app
+    from solera_server.api import create_app
 
-    monkeypatch.setenv("CURSUS_PROJECT", project_file)
+    monkeypatch.setenv("SOLERA_PROJECT", project_file)
     app = create_app(
         state_url=state_url,
         namespace="test",
@@ -170,10 +170,10 @@ def server(project_file, state_url, monkeypatch):
 
 
 def test_remote_run_and_reads(server, project_file, capsys, monkeypatch):
-    """With CURSUS_SERVER_URL set, commands hit the API (§8 run vocabulary)."""
+    """With SOLERA_SERVER_URL set, commands hit the API (§8 run vocabulary)."""
 
-    monkeypatch.setenv("CURSUS_SERVER_URL", server)
-    monkeypatch.delenv("CURSUS_API_TOKEN", raising=False)
+    monkeypatch.setenv("SOLERA_SERVER_URL", server)
+    monkeypatch.delenv("SOLERA_API_TOKEN", raising=False)
     detail = cli(monkeypatch, capsys, "run", "--project", project_file, "feed")
     assert detail["request"]["status"] == "succeeded"
     run_id = detail["request"]["id"]
@@ -194,16 +194,16 @@ def test_remote_run_and_reads(server, project_file, capsys, monkeypatch):
 def test_serve_insecure_guard(capsys, monkeypatch):
     """--insecure is a loopback-only escape hatch."""
 
-    from cursus_server.cli import main
+    from solera_server.cli import main
 
-    monkeypatch.setattr(sys, "argv", ["cursus", "serve", "--host", "0.0.0.0", "--insecure"])
+    monkeypatch.setattr(sys, "argv", ["solera", "serve", "--host", "0.0.0.0", "--insecure"])
     with pytest.raises(SystemExit):
         main()
 
 
 MIGRATE_PROJECT = """
-from cursus.sdk import Migration, Output, Project, asset
-from cursus.stores import BlobStore
+from solera.sdk import Migration, Output, Project, asset
+from solera.stores import BlobStore
 
 
 def seed(objects, prefix):
@@ -222,7 +222,7 @@ project = Project(assets=[docs], stores={"blobs": BlobStore()}, name="migdemo")
 
 
 def test_migrate_command_applies_and_is_idempotent(project_file, state_url, capsys, monkeypatch, tmp_path):
-    """§4: `cursus migrate` applies pending migrations for all migrating
+    """§4: `solera migrate` applies pending migrations for all migrating
     outputs through the local path, prints the applied names, and a second
     run applies nothing."""
     import json as jsonlib
@@ -231,7 +231,7 @@ def test_migrate_command_applies_and_is_idempotent(project_file, state_url, caps
 
     path = tmp_path / "migdemo.py"
     path.write_text(MIGRATE_PROJECT)
-    monkeypatch.delenv("CURSUS_SERVER_URL", raising=False)
+    monkeypatch.delenv("SOLERA_SERVER_URL", raising=False)
 
     out = cli(monkeypatch, capsys, "--state-url", state_url, "migrate", "--project", str(path))
     assert "docs: applied seed" in out

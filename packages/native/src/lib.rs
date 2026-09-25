@@ -1,7 +1,7 @@
-//! `cursus_native`: native implementation of the `.kx` key index format.
+//! `solera_native`: native implementation of the `.kx` key index format.
 //!
 //! Exposes the same functions, with the same signatures, as
-//! `cursus/keys/_python.py`. Keys, versions and file contents cross the
+//! `solera/keys/_python.py`. Keys, versions and file contents cross the
 //! boundary as `bytes`; flags as a `bytes` with one byte per entry.
 
 pub mod format;
@@ -242,7 +242,7 @@ fn replace_diff<'py>(
 }
 
 #[pymodule]
-fn cursus_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn solera_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encode_file, m)?)?;
     m.add_function(wrap_pyfunction!(decode_block, m)?)?;
     m.add_function(wrap_pyfunction!(bloom_check_keys, m)?)?;

@@ -3,7 +3,7 @@ requires = ["hatchling>=1.27,<2"]
 build-backend = "hatchling.build"
 
 [project]
-name = "cursus"
+name = "solera"
 version = "0.0.1"
 description = "Asset-first orchestration on object storage: SDK, worker, and control plane"
 readme = "README.md"
@@ -25,31 +25,31 @@ postgres = [
 ]
 
 [project.scripts]
-cursus = "cursus_server.cli:main"
+solera = "solera_server.cli:main"
 
 [project.urls]
-Repository = "https://github.com/erwinkn/cursus"
+Repository = "https://github.com/erwinkn/solera"
 
 [tool.uv]
 package = true
 
-# One distribution ("cursus") bundles the three source trees: the asset SDK
-# (`cursus`), the worker (`cursus_worker`), and the control plane with its
-# committed console bundle (`cursus_server`).
+# One distribution ("solera") bundles the three source trees: the asset SDK
+# (`solera`), the worker (`solera_worker`), and the control plane with its
+# committed console bundle (`solera_server`).
 [tool.hatch.build.targets.wheel]
 packages = [
-    "packages/sdk/src/cursus",
-    "packages/sdk/src/cursus_postgres",
-    "apps/server/src/cursus_server",
-    "apps/worker/src/cursus_worker",
+    "packages/sdk/src/solera",
+    "packages/sdk/src/solera_postgres",
+    "apps/server/src/solera_server",
+    "apps/worker/src/solera_worker",
 ]
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "packages/sdk/src/cursus",
-    "packages/sdk/src/cursus_postgres",
-    "apps/server/src/cursus_server",
-    "apps/worker/src/cursus_worker",
+    "packages/sdk/src/solera",
+    "packages/sdk/src/solera_postgres",
+    "apps/server/src/solera_server",
+    "apps/worker/src/solera_worker",
     "README.md",
 ]
 
@@ -62,7 +62,7 @@ testpaths = ["tests"]
 markers = [
     "s3: requires an S3-compatible HTTP endpoint",
     "live: requires an explicitly supplied isolated test bucket",
-    "postgres: requires CURSUS_TEST_DATABASE_URL (docker compose up postgres)",
+    "postgres: requires SOLERA_TEST_DATABASE_URL (docker compose up postgres)",
 ]
 
 [tool.ruff]

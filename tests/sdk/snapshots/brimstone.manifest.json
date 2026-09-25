@@ -5,7 +5,7 @@
       "automations": [
         "fleet_dashboard.onchange.0"
       ],
-      "code_hash": "4579c74a69ddfaed78870d13504629a8a7f0f723485b9b53d21f6c833a0eb631",
+      "code_hash": "197b274aaccee58f59fbbc9195d473a849f5b2ca3f7afd891ac0bfcfb35858d0",
       "deps": [],
       "doc": "Partitioned upstream, unpartitioned consumer: the site dimension is collapsed.",
       "inputs": {
@@ -51,7 +51,7 @@
                 "class": "builtins.str"
               },
               {
-                "class": "cursus.sdk.TableRef"
+                "class": "solera.sdk.TableRef"
               }
             ],
             "generic": "dict"
@@ -68,7 +68,7 @@
       "automations": [
         "graph_delta.every.0"
       ],
-      "code_hash": "4579c74a69ddfaed78870d13504629a8a7f0f723485b9b53d21f6c833a0eb631",
+      "code_hash": "197b274aaccee58f59fbbc9195d473a849f5b2ca3f7afd891ac0bfcfb35858d0",
       "deps": [],
       "doc": "Poll a site's Graph delta feed; the delta token is the cursor.",
       "inputs": {},
@@ -133,7 +133,7 @@
       "automations": [
         "hillshade.every.0"
       ],
-      "code_hash": "4579c74a69ddfaed78870d13504629a8a7f0f723485b9b53d21f6c833a0eb631",
+      "code_hash": "197b274aaccee58f59fbbc9195d473a849f5b2ca3f7afd891ac0bfcfb35858d0",
       "deps": [
         "usgs_3dep_tiles"
       ],
@@ -196,7 +196,7 @@
     "leach": {
       "aliases": [],
       "automations": [],
-      "code_hash": "4579c74a69ddfaed78870d13504629a8a7f0f723485b9b53d21f6c833a0eb631",
+      "code_hash": "197b274aaccee58f59fbbc9195d473a849f5b2ca3f7afd891ac0bfcfb35858d0",
       "deps": [],
       "doc": "The resource tier lives on the asset; no job indirection.",
       "inputs": {
@@ -307,7 +307,7 @@
       "automations": [
         "manual_upload.every.0"
       ],
-      "code_hash": "4579c74a69ddfaed78870d13504629a8a7f0f723485b9b53d21f6c833a0eb631",
+      "code_hash": "197b274aaccee58f59fbbc9195d473a849f5b2ca3f7afd891ac0bfcfb35858d0",
       "deps": [],
       "doc": "Upload keys are registered externally by the uploads service.",
       "inputs": {},
@@ -369,7 +369,7 @@
       "automations": [
         "psa_mean_data.onchange.0"
       ],
-      "code_hash": "4579c74a69ddfaed78870d13504629a8a7f0f723485b9b53d21f6c833a0eb631",
+      "code_hash": "197b274aaccee58f59fbbc9195d473a849f5b2ca3f7afd891ac0bfcfb35858d0",
       "deps": [],
       "doc": "",
       "inputs": {
@@ -444,7 +444,7 @@
       "automations": [
         "qaqc_samples.onchange.0"
       ],
-      "code_hash": "4579c74a69ddfaed78870d13504629a8a7f0f723485b9b53d21f6c833a0eb631",
+      "code_hash": "197b274aaccee58f59fbbc9195d473a849f5b2ca3f7afd891ac0bfcfb35858d0",
       "deps": [],
       "doc": "qaqc_files arrives filtered to the file_ids whose version changed for this site.",
       "inputs": {
@@ -525,7 +525,7 @@
       "automations": [
         "region_rollup.onchange.0"
       ],
-      "code_hash": "4579c74a69ddfaed78870d13504629a8a7f0f723485b9b53d21f6c833a0eb631",
+      "code_hash": "197b274aaccee58f59fbbc9195d473a849f5b2ca3f7afd891ac0bfcfb35858d0",
       "deps": [],
       "doc": "Static partitions over a site-partitioned input.",
       "inputs": {
@@ -582,7 +582,7 @@
                 "class": "builtins.str"
               },
               {
-                "class": "cursus.sdk.TableRef"
+                "class": "solera.sdk.TableRef"
               }
             ],
             "generic": "dict"
@@ -599,7 +599,7 @@
       "automations": [
         "site_health.onchange.0"
       ],
-      "code_hash": "4579c74a69ddfaed78870d13504629a8a7f0f723485b9b53d21f6c833a0eb631",
+      "code_hash": "197b274aaccee58f59fbbc9195d473a849f5b2ca3f7afd891ac0bfcfb35858d0",
       "deps": [],
       "doc": "In-database: a TableRef in, a statement out; no row enters the harness.\nThe store materializes the SELECT into ops.site_health for this site.",
       "inputs": {
@@ -648,11 +648,11 @@
       "types": {
         "params": {
           "change_events": {
-            "class": "cursus.sdk.TableRef"
+            "class": "solera.sdk.TableRef"
           }
         },
         "return": {
-          "class": "cursus.stores.Sql"
+          "class": "solera.stores.Sql"
         }
       },
       "version": "1"
@@ -663,7 +663,7 @@
         "sites.cron.0",
         "sites.ondeploy.0"
       ],
-      "code_hash": "4579c74a69ddfaed78870d13504629a8a7f0f723485b9b53d21f6c833a0eb631",
+      "code_hash": "197b274aaccee58f59fbbc9195d473a849f5b2ca3f7afd891ac0bfcfb35858d0",
       "deps": [],
       "doc": "Refresh the SharePoint site list daily; new sites surface as missing work.",
       "inputs": {},
@@ -715,7 +715,7 @@
       "automations": [
         "weekly_report.cron.0"
       ],
-      "code_hash": "4579c74a69ddfaed78870d13504629a8a7f0f723485b9b53d21f6c833a0eb631",
+      "code_hash": "197b274aaccee58f59fbbc9195d473a849f5b2ca3f7afd891ac0bfcfb35858d0",
       "deps": [],
       "doc": "A job: inputs, placement and automations like an asset, no outputs.",
       "inputs": {
@@ -743,7 +743,7 @@
       "types": {
         "params": {
           "fleet_dashboard": {
-            "class": "cursus.sdk.TableRef"
+            "class": "solera.sdk.TableRef"
           },
           "mailer": {
             "class": "brimstone.Mailer"
@@ -1327,7 +1327,7 @@
     }
   },
   "retention": null,
-  "revision": "5ec549795f7dd0653407db45fe52b2512034457a845a3a757da1a744af0bd68b",
+  "revision": "252177e2e8372bd9c919ee8136048ed485fa13ca6c9b62ac209af23abcfc78d0",
   "sources": {
     "leach_crosswalk": {
       "handle": {

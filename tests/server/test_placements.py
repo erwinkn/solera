@@ -7,13 +7,13 @@ import types
 import uuid
 
 import pytest
-from cursus.executors import Pool
-from cursus.sdk import Project, asset
-from cursus_server.engine import Engine
-from cursus_server.placements import PlacementContext
-from cursus_server.placements.pool import PoolPlacement
-from cursus_server.state import LostOwnership, State
-from cursus_worker.worker import run_attempt
+from solera.executors import Pool
+from solera.sdk import Project, asset
+from solera_server.engine import Engine
+from solera_server.placements import PlacementContext
+from solera_server.placements.pool import PoolPlacement
+from solera_server.state import LostOwnership, State
+from solera_worker.worker import run_attempt
 
 
 @pytest.fixture
@@ -158,7 +158,7 @@ def stub_boto3(monkeypatch, ecs):
 async def test_awsecs_launch_wait_cancel(state, monkeypatch):
     """§10: AWSECS launch passes attempt+objects as container overrides; wait
     maps STOPPED to an exit; a vanished task is lost."""
-    from cursus_server.placements.remote import AWSECS
+    from solera_server.placements.remote import AWSECS
 
     ecs = FakeEcs()
     stub_boto3(monkeypatch, ecs)
@@ -230,7 +230,7 @@ def stub_kubernetes(monkeypatch, batch):
 async def test_k8sjob_launch_wait_lost(state, monkeypatch):
     """§10: K8sJob creates a job carrying the stage argv; conditions map to
     Exit; a deleted job is lost."""
-    from cursus_server.placements.remote import K8sJob
+    from solera_server.placements.remote import K8sJob
 
     batch = FakeBatchApi()
     stub_kubernetes(monkeypatch, batch)
@@ -254,7 +254,7 @@ async def test_k8sjob_launch_wait_lost(state, monkeypatch):
 async def test_modal_launch_wait_lost(state, monkeypatch):
     """§10: Modal spawns the harness function with the stage; a finished call
     exits 0; a missing call is lost."""
-    from cursus_server.placements.remote import Modal
+    from solera_server.placements.remote import Modal
 
     calls = {}
 
@@ -295,7 +295,7 @@ async def test_modal_launch_wait_lost(state, monkeypatch):
     modal.exception = types.SimpleNamespace(FunctionNotFoundError=FunctionNotFoundError)
     monkeypatch.setitem(sys.modules, "modal", modal)
 
-    placement = Modal({"app": "cursus"}, {"gpu": "A10G"}, None)
+    placement = Modal({"app": "solera"}, {"gpu": "A10G"}, None)
     handle = await placement.launch({"attempt": "a9", "run": "r9", "objects": "s3://o"})
     assert calls[handle["call_id"]][1] == {"attempt": "a9", "run": "r9", "objects": "s3://o"}
 

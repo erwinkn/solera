@@ -9,7 +9,7 @@ import type { ReactNode } from "react";
 
 export type Theme = "light" | "dark";
 
-const KEY = "cursus-theme";
+const KEY = "solera-theme";
 
 // A tiny script string run before hydration in the document head, so the
 // stored (or system) theme is on <html> before first paint — no flash.

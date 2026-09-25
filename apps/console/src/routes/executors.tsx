@@ -122,7 +122,7 @@ function ExecutorsPage() {
           <p className="text-sm text-muted-foreground">
             Registered with{" "}
             <code className="font-mono text-xs">
-              cursus worker pool &lt;name&gt;
+              solera worker pool &lt;name&gt;
             </code>
             .
           </p>
@@ -130,7 +130,7 @@ function ExecutorsPage() {
         {!pool.length ? (
           <Empty title="No pool workers connected">
             Start one with{" "}
-            <code className="font-mono text-xs">cursus worker pool ingest</code>{" "}
+            <code className="font-mono text-xs">solera worker pool ingest</code>{" "}
             to pick up pool-placed tasks.
           </Empty>
         ) : (

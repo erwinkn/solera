@@ -37,7 +37,7 @@ test("a slow asset detail response does not break the sheet", async ({
 
 test("expired token returns to the login screen", async ({ page }) => {
   await login(page);
-  await page.evaluate(() => sessionStorage.setItem("cursus-token", "wrong"));
+  await page.evaluate(() => sessionStorage.setItem("solera-token", "wrong"));
   await page.reload();
   await expect(page.getByLabel("API token", { exact: true })).toBeVisible();
 });

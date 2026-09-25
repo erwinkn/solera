@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 import type { Page } from "@playwright/test";
 
-// §12 console flows against the demo project (`cursus serve`): assets, runs,
+// §12 console flows against the demo project (`solera serve`): assets, runs,
 // automations, sources, executors — desktop and mobile layouts.
 
 async function login(page: Page) {

@@ -13,8 +13,8 @@ independent causes, all still present:
 
 | Cause | Where | Growth |
 |---|---|---|
-| `JsonStore` rewrites the **entire** append history as a new object on every commit | `packages/sdk/src/cursus/stores.py:198-250` | O(N²) bytes — the ~160 GB |
-| The full `key → revision` map is re-staged as a new `keys/{sha}.json` on every commit, for every store | `apps/worker/src/cursus_worker/worker.py:278-285`, `apps/server/src/cursus_server/state.py:784` | O(N²) bytes |
+| `JsonStore` rewrites the **entire** append history as a new object on every commit | `packages/sdk/src/solera/stores.py:198-250` | O(N²) bytes — the ~160 GB |
+| The full `key → revision` map is re-staged as a new `keys/{sha}.json` on every commit, for every store | `apps/worker/src/solera_worker/worker.py:278-285`, `apps/server/src/solera_server/state.py:784` | O(N²) bytes |
 | One `keystate/…` row per consumed key, never deleted, **full prefix scan on every plan**; SlateDB WAL never garbage-collected; per-attempt `specs/results/logs` never reclaimed | `state.py:98-110`, `engine.py:668-687`, `storage.py` | O(N) rows, O(N) work per plan, O(commits) WAL objects |
 
 An append output's key map has one entry per batch forever, so the second
@@ -183,10 +183,10 @@ Implementation notes (accepted deviations):
   diffs against. During a `full` run `prior` is withheld but the baseline is
   still needed to compute the delta; without it a full rewrite could not
   emit a `reset` delta carrying the complete key map.
-- `PostgresStore` keeps a `cursus_keys (output, partition, key, rev)` table:
+- `PostgresStore` keeps a `solera_keys (output, partition, key, rev)` table:
   the logical key map. `RETURNING ... IS DISTINCT FROM` alone cannot express
   deletes or a full-replace reset, so the upsert transaction diffs against
-  `cursus_keys` (one batched `unnest` upsert, never per-key) and sweeps rows
+  `solera_keys` (one batched `unnest` upsert, never per-key) and sweeps rows
   absent from a reset write.
 
 ## 4. Control plane: trimmed state and an in-memory engine
@@ -250,7 +250,7 @@ In `storage.py`:
 - Run the garbage collector: a background task calling
   `Admin.run_gc_once(GarbageCollectorOptions(...))` every 5 minutes with
   `min_age_ms = 300_000` for `wal_options`, `manifest_options`,
-  `compacted_options`, `compactions_options`. Expose `cursus gc` as a CLI
+  `compacted_options`, `compactions_options`. Expose `solera gc` as a CLI
   subcommand for one-shot use. `AdminBuilder(path, object_store)` — same
   `native` store the writer uses.
 
@@ -291,7 +291,7 @@ retention means. Keyed `data/` batches prune below the live fold window
 (the snapshot plus the batches after it); batch-mode `data/` windows are
 the head's content and stay referenced.
 
-`cursus retention sweep` runs one pass locally; on a server the periodic
+`solera retention sweep` runs one pass locally; on a server the periodic
 tick runs it.
 
 ## 6. Non-goals for this pass
@@ -307,7 +307,7 @@ before the next starts. Keep commits per phase.
 
 **Phase A — stop the bleeding (small, independent).**
 `JsonStore` one-object-per-batch (§3); `flush_interval` 1 s and
-`l0_sst_size_bytes` 1 MiB; SlateDB GC background task + `cursus gc`.
+`l0_sst_size_bytes` 1 MiB; SlateDB GC background task + `solera gc`.
 *Gate:* a soak test (`tests/test_soak.py`) runs the demo project in-process
 with a fake clock for ≥ 500 batches per site and asserts `objects/data`
 byte growth is linear in batches (fit slope; reject if the second
@@ -341,7 +341,7 @@ re-queued exactly once and no head or watermark is lost; a test that a
 newest-first.
 
 **Phase D — retention.**
-`Retention` on assets and project; the sweep (§5); `cursus retention
+`Retention` on assets and project; the sweep (§5); `solera retention
 sweep` CLI.
 *Gate:* soak test extended: with `Retention(runs=50)` the number of
 attempt objects per asset is bounded at 50 × outputs after 500 batches

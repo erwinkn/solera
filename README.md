@@ -1,4 +1,4 @@
-# cursus — asset-first data orchestration
+# solera — asset-first data orchestration
 
 A Python data orchestrator: assets declare outputs, partitions, inputs, and
 placement; a durable control plane plans and executes runs; every committed
@@ -11,18 +11,18 @@ shared Postgres tables when `DATABASE_URL` is set.
 
 ## Layout
 
-- `packages/sdk` — `cursus`, the asset SDK project files import
+- `packages/sdk` — `solera`, the asset SDK project files import
   (`@asset`, `Output`, `Patch`, `Sql`, `PartitionSet`, `Incremental`,
-  `AllPartitions`, `TimePartitions`, triggers, placements). `cursus_postgres`
+  `AllPartitions`, `TimePartitions`, triggers, placements). `solera_postgres`
   ships `PostgresStore`.
-- `apps/server` — `cursus_server`: the control plane (state layer, engine,
-  FastAPI, CLI) and the built console under `cursus_server/web`.
-- `apps/worker` — `cursus_worker`: the task harness that executes attempts in
+- `apps/server` — `solera_server`: the control plane (state layer, engine,
+  FastAPI, CLI) and the built console under `solera_server/web`.
+- `apps/worker` — `solera_worker`: the task harness that executes attempts in
   subprocesses and pool workers.
 - `apps/console` — the pnpm/Vite/TanStack console source. The built bundle is
   committed, so running the server needs no Node.
-- `apps/server/src/cursus_server/demo.py` — the self-contained demo project
-  (`uv run cursus serve --insecure` loads it by default).
+- `apps/server/src/solera_server/demo.py` — the self-contained demo project
+  (`uv run solera serve --insecure` loads it by default).
 - `example/brimstone.py` — a second reference project.
 
 ## Quick start
@@ -31,13 +31,13 @@ Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync --locked
-uv run cursus serve --insecure
+uv run solera serve --insecure
 # console + API at http://127.0.0.1:8000
 ```
 
-State lands in `./.cursus` — a `file://` object store using the same client
+State lands in `./.solera` — a `file://` object store using the same client
 interfaces as S3. `--insecure` disables token auth and is restricted to
-loopback; set `CURSUS_API_TOKEN` for anything else.
+loopback; set `SOLERA_API_TOKEN` for anything else.
 
 ## The demo project
 
@@ -46,7 +46,7 @@ The default project is designed to make every architecture feature visible:
 | asset | shows |
 | --- | --- |
 | `sites` | a `PartitionSet` on a `Cron` — the site list grows one site per run (cursor-driven) and caps at four |
-| `uploads` | an external `PartitionSet` source fed by `cursus commit` |
+| `uploads` | an external `PartitionSet` source fed by `solera commit` |
 | `site_feed` | per-site cursor asset on `Every(10)`: `site_events` (unkeyed incremental) + `site_files` (keyed inventory), `Patch` both ways |
 | `file_index` | `Incremental(batch_size=2)` consumer — watch `more` continuation; declared `version="2"` |
 | `site_digest` | `site × day` two-dimensional asset (`TimePartitions`), `deps=` on the `roadmap` source, `BlobStore` output |
@@ -65,17 +65,17 @@ nothing downstream. Run config `feed_tick_seconds` stretches the tick:
 ## Walkthrough
 
 Everything below works against the running server. Set
-`CURSUS_SERVER_URL=http://127.0.0.1:8000` so the CLI talks to it; unset, the
-same commands drive an in-process engine against `CURSUS_STATE_URL`.
+`SOLERA_SERVER_URL=http://127.0.0.1:8000` so the CLI talks to it; unset, the
+same commands drive an in-process engine against `SOLERA_STATE_URL`.
 
 ```bash
-export CURSUS_SERVER_URL=http://127.0.0.1:8000
+export SOLERA_SERVER_URL=http://127.0.0.1:8000
 ```
 
 ### 1. The growing partition set
 
 ```bash
-uv run cursus run sites        # run it a few times — one site appears per run
+uv run solera run sites        # run it a few times — one site appears per run
 ```
 
 Console: **Assets → sites** shows the partition-set head; the keys endpoint
@@ -85,7 +85,7 @@ The `sites.cron.0` automation keeps it fresh on its own once the server is up.
 ### 2. Commit external partition keys
 
 ```bash
-uv run cursus commit uploads --upsert '["u-1", "u-2"]'
+uv run solera commit uploads --upsert '["u-1", "u-2"]'
 ```
 
 **Sources** in the console lists `uploads` with its committed keys. These keys
@@ -96,7 +96,7 @@ committing is enough once a pool worker is running.
 ### 3. The per-site cursor asset
 
 ```bash
-uv run cursus run site_feed --partitions all --upstream
+uv run solera run site_feed --partitions all --upstream
 ```
 
 Each site scope writes a `site_events` incremental batch and a `site_files` keyed
@@ -113,7 +113,7 @@ the "no change wakes nothing" corollary. To see a changed pass, wait one tick
 ### 4. Incremental with `more` continuation
 
 ```bash
-uv run cursus run file_index --partitions all --upstream
+uv run solera run file_index --partitions all --upstream
 ```
 
 `site_files` holds four files per site; `Incremental(batch_size=2)` delivers them in
@@ -121,14 +121,14 @@ two batches — the run detail shows the first attempt completing with
 `more: true` and a follow-up attempt finishing the remaining keys.
 
 `file_index` declares `version="2"`. To demonstrate a version bump, edit it to
-`"3"` in `apps/server/src/cursus_server/demo.py` and re-run — the interpretation
+`"3"` in `apps/server/src/solera_server/demo.py` and re-run — the interpretation
 fingerprint changes and every key reprocesses. To process selected keys only:
-`uv run cursus run file_index --keys 'site_files=alpha-file-0,alpha-file-1'`.
+`uv run solera run file_index --keys 'site_files=alpha-file-0,alpha-file-1'`.
 
 ### 5. Two dimensions: site × day
 
 ```bash
-uv run cursus run site_digest --partitions all --upstream
+uv run solera run site_digest --partitions all --upstream
 ```
 
 `site_digest` is partitioned by `site` and a daily `TimePartitions` dim, so
@@ -140,7 +140,7 @@ plain source in lineage without loading it. The output is bytes in the
 ### 6. AllPartitions fan-in
 
 ```bash
-uv run cursus run fleet_index --upstream
+uv run solera run fleet_index --upstream
 ```
 
 `fleet_index` receives `file_index` as `dict[str, ...]` keyed by site —
@@ -159,9 +159,9 @@ the attempt log.
 ### 8. The job and the standalone automation
 
 ```bash
-uv run cursus automations                        # list all nine
-uv run cursus automations run-now refresh-index  # fires site_feed + file_index
-uv run cursus run weekly_digest                  # sends the fake mail
+uv run solera automations                        # list all nine
+uv run solera automations run-now refresh-index  # fires site_feed + file_index
+uv run solera run weekly_digest                  # sends the fake mail
 ```
 
 **Automations** in the console shows trigger, last fire, and an enable/disable
@@ -173,12 +173,12 @@ toggle per automation; `weekly_digest.cron.0` runs Mondays at 07:00.
 until an external worker claims it. In a second terminal:
 
 ```bash
-export CURSUS_SERVER_URL=http://127.0.0.1:8000
-export CURSUS_PROJECT=cursus_server.demo:project   # the entrypoint the worker executes
-uv run cursus worker pool ingest
+export SOLERA_SERVER_URL=http://127.0.0.1:8000
+export SOLERA_PROJECT=solera_server.demo:project   # the entrypoint the worker executes
+uv run solera worker pool ingest
 ```
 
-Commit a couple of uploads (step 2), then `uv run cursus run manual_ingest
+Commit a couple of uploads (step 2), then `uv run solera run manual_ingest
 --partitions all`. Watch the worker log `[pool] claimed …` / `[pool] completed
 …`, and the **Executors** page shows the registered worker and its claimed
 task. Pool tasks carry `cpu`/`memory`/`gpu` needs and are only offered to
@@ -192,8 +192,8 @@ outputs (`site_events`, `site_files`, `file_index`, `site_status`,
 
 ```bash
 docker compose up postgres
-export DATABASE_URL=postgresql://cursus:cursus@127.0.0.1:5432/cursus
-uv run cursus serve --insecure
+export DATABASE_URL=postgresql://solera:solera@127.0.0.1:5432/solera
+uv run solera serve --insecure
 ```
 
 Partitioned outputs share one physical table per output, sliced by their
@@ -202,15 +202,15 @@ pinned `TableRef` keeps reading the version it was committed at. Writes are
 fenced by a per-partition version marker — a stale attempt's rows can never
 become visible. `Sql` assets materialize straight into `{schema}.{table}`.
 
-The Compose file also has a full `cursus` service:
+The Compose file also has a full `solera` service:
 
 ```bash
-CURSUS_API_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')" \
+SOLERA_API_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')" \
   docker compose up --build
 ```
 
 It wires `DATABASE_URL` to the compose Postgres and keeps object state on a
-named volume — swap `CURSUS_STATE_URL` for `s3://…` in `compose.yml` to run the
+named volume — swap `SOLERA_STATE_URL` for `s3://…` in `compose.yml` to run the
 same stack on S3.
 
 ## Migrations
@@ -221,7 +221,7 @@ payload is a SQL string or a callable taking a cursor. Registration rejects
 migrations on a store without `migrate` (JsonStore has none), duplicate
 names, and payloads that fail `can_store`.
 
-PostgresStore keeps a `cursus_migrations(output, name, at)` ledger and runs
+PostgresStore keeps a `solera_migrations(output, name, at)` ledger and runs
 each pending migration plus its ledger row in one transaction under an
 advisory lock keyed on the output, so concurrent workers apply each exactly
 once. BlobStore records applied names in `_migrations.json` under the
@@ -233,8 +233,8 @@ head carries the last applied name as `schema`.
 Apply pending migrations without running the pipeline:
 
 ```bash
-uv run cursus migrate                 # every output that declares migrations
-uv run cursus migrate site_events     # named outputs only
+uv run solera migrate                 # every output that declares migrations
+uv run solera migrate site_events     # named outputs only
 ```
 
 ## S3 and compatible services
@@ -242,14 +242,14 @@ uv run cursus migrate site_events     # named outputs only
 Point the control plane at a private bucket:
 
 ```bash
-export CURSUS_STATE_URL=s3://your-private-bucket/orchestrator
-export CURSUS_NAMESPACE=development
+export SOLERA_STATE_URL=s3://your-private-bucket/orchestrator
+export SOLERA_NAMESPACE=development
 export AWS_ACCESS_KEY_ID=...
 export AWS_SECRET_ACCESS_KEY=...
 export AWS_REGION=us-east-1
 export AWS_CONDITIONAL_PUT=etag
-export CURSUS_API_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
-uv run cursus serve
+export SOLERA_API_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+uv run solera serve
 ```
 
 For a custom S3 endpoint, `AWS_ENDPOINT` (the Rust object-store client's
@@ -258,7 +258,7 @@ only for a local HTTP emulator. Before trusting a new S3-compatible service,
 run the conformance probe, which writes into a fresh isolated namespace:
 
 ```bash
-uv run cursus selftest --state-url "$CURSUS_STATE_URL"
+uv run solera selftest --state-url "$SOLERA_STATE_URL"
 ```
 
 **One coordinator per namespace.** A second writer on the same namespace
@@ -268,32 +268,32 @@ through the server instead.
 ## CLI
 
 ```text
-cursus serve [--project SPEC] [--insecure]   API + console (default project: the demo)
-cursus manifest --project SPEC               print the project manifest
-cursus run TARGET... [--partitions latest|all|missing] [--partition KEY]
+solera serve [--project SPEC] [--insecure]   API + console (default project: the demo)
+solera manifest --project SPEC               print the project manifest
+solera run TARGET... [--partitions latest|all|missing] [--partition KEY]
            [--upstream] [--full] [--keys EDGE=k1,k2] [--config JSON]
-cursus runs / run-show RUN_ID / logs RUN_ID ATTEMPT_ID [--tail N]
-cursus runs delete RUN_ID                    delete a finished run
-cursus runs prune [--before DATE] [--asset A] [--keep N] [--dry-run]
-cursus automations [enable|disable|run-now NAME]
-cursus migrate [OUTPUT...]                   apply pending output migrations locally
-cursus commit SOURCE [--version V] [--keys JSON] [--upsert JSON] [--remove K]
-cursus worker pool NAME [--server URL]       claim and run pool tasks
-cursus selftest                              storage conformance probe
+solera runs / run-show RUN_ID / logs RUN_ID ATTEMPT_ID [--tail N]
+solera runs delete RUN_ID                    delete a finished run
+solera runs prune [--before DATE] [--asset A] [--keep N] [--dry-run]
+solera automations [enable|disable|run-now NAME]
+solera migrate [OUTPUT...]                   apply pending output migrations locally
+solera commit SOURCE [--version V] [--keys JSON] [--upsert JSON] [--remove K]
+solera worker pool NAME [--server URL]       claim and run pool tasks
+solera selftest                              storage conformance probe
 ```
 
 `--project` accepts `module:attribute`, a `file.py` path, or `file.py:attr`;
-it also reads `CURSUS_PROJECT`. With `CURSUS_SERVER_URL` set every command talks
-to the server (token from `CURSUS_API_TOKEN`); without it they drive a local
-engine against `CURSUS_STATE_URL`/`--state-url` (`--namespace` selects the
-namespace). `cursus worker pool` additionally needs `CURSUS_PROJECT` so claimed
+it also reads `SOLERA_PROJECT`. With `SOLERA_SERVER_URL` set every command talks
+to the server (token from `SOLERA_API_TOKEN`); without it they drive a local
+engine against `SOLERA_STATE_URL`/`--state-url` (`--namespace` selects the
+namespace). `solera worker pool` additionally needs `SOLERA_PROJECT` so claimed
 attempts can load the project.
 
 ## Authoring
 
 ```python
-from cursus.sdk import Output, PartitionSet, Project, TimePartitions, asset
-from cursus.stores import Patch
+from solera.sdk import Output, PartitionSet, Project, TimePartitions, asset
+from solera.stores import Patch
 
 sites = PartitionSet("sites")
 
@@ -314,17 +314,17 @@ def daily_digests(ctx, site_files): ...
 project = Project(assets=[site_files, daily_digests], sources=[sites], name="mine")
 ```
 
-Save as `my_project.py` and `uv run cursus serve --insecure --project
+Save as `my_project.py` and `uv run solera serve --insecure --project
 my_project.py` (the attribute defaults to `project`). Cursors, resources,
 `Incremental`/`AllPartitions` inputs, placements, triggers, and the Postgres stores
 are documented in [docs/architecture.md](docs/architecture.md);
-`apps/server/src/cursus_server/demo.py` exercises all of them.
+`apps/server/src/solera_server/demo.py` exercises all of them.
 
 ## Tests
 
 ```bash
 uv run pytest -q            # includes tests/test_demo_e2e.py (server + pool worker, temp file:// store)
-CURSUS_TEST_DATABASE_URL=postgresql://cursus:cursus@127.0.0.1:5432/cursus uv run pytest -q -m postgres
+SOLERA_TEST_DATABASE_URL=postgresql://solera:solera@127.0.0.1:5432/solera uv run pytest -q -m postgres
 pnpm install --frozen-lockfile && pnpm -C apps/console exec playwright install chromium && pnpm -C apps/console test
 ```
 
@@ -337,7 +337,7 @@ are locked.
 This is a feasibility implementation, not a claim of production readiness.
 Metadata transitions serialize through conditional object-store writes;
 catalog/history scans are unpaginated. Remote placements (AWS ECS, Kubernetes
-jobs, Modal) exist behind `CURSUS_*` configuration but see far less exercise
+jobs, Modal) exist behind `SOLERA_*` configuration but see far less exercise
 than `Local`/`Pool`. There is no artifact garbage collector, retained
 historical code image, or multi-replica writer election. Read
 [docs/architecture.md](docs/architecture.md) before extending the backend.

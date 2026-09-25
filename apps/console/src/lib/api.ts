@@ -10,7 +10,7 @@ export class ApiError extends Error {
 }
 
 export function token() {
-  return sessionStorage.getItem("cursus-token");
+  return sessionStorage.getItem("solera-token");
 }
 
 export async function request<T>(

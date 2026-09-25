@@ -5,8 +5,8 @@ import json
 from pathlib import Path
 
 import pytest
-from cursus.executors import Environment
-from cursus.sdk import (
+from solera.executors import Environment
+from solera.sdk import (
     Automation,
     Cron,
     Every,
@@ -23,7 +23,7 @@ from cursus.sdk import (
     asset,
     job,
 )
-from cursus.stores import BlobStore, JsonStore
+from solera.stores import BlobStore, JsonStore
 
 BRIMSTONE = Path(__file__).parents[2] / "example" / "brimstone.py"
 SNAPSHOT = Path(__file__).parent / "snapshots" / "brimstone.manifest.json"
@@ -228,7 +228,7 @@ def test_keyed_output_requires_row_values():
 
 def test_partitioned_output_on_shared_store_needs_partition_column():
     """§3/§11: a partitioned output on a shared-table store needs partition_column."""
-    from cursus_postgres import PostgresStore
+    from solera_postgres import PostgresStore
 
     partitions = StaticPartitions(["a"])
 
@@ -389,7 +389,7 @@ def test_migrations_require_a_migrating_store():
 
 def test_duplicate_migration_names_rejected():
     """§4/§11: a migration name may not repeat within one output."""
-    from cursus_postgres import PostgresStore
+    from solera_postgres import PostgresStore
 
     @asset(
         outputs=Output(

@@ -4,8 +4,8 @@ import random
 import sys
 import time
 
-import cursus_native
-from cursus.keys import _python
+import solera_native
+from solera.keys import _python
 
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 1_000_000
 
@@ -29,25 +29,30 @@ keys, vers, dele = gen(N)
 n = len(keys)
 raw = sum(len(k) + len(v) for k, v in zip(keys, vers, strict=True))
 print(f"{n:,} entries, {raw / n:.1f} B raw per entry (key {sum(map(len, keys)) / n:.1f} B, version 16 B)")
-for name, impl in (("native", cursus_native), ("python", _python)):
+for name, impl in (("native", solera_native), ("python", _python)):
     if name == "python" and n > 2_000_000:
         continue
     print(name)
     data = timed("encode (blocks + filters)", n, impl.encode_file, keys, vers, dele)
     footer = _python.parse_footer(data[-48:])
-    tail = _python.parse_tail(data[footer["filters_offset"]:], len(data))
+    tail = _python.parse_tail(data[footer["filters_offset"] :], len(data))
     body = footer["filters_offset"]
-    print(f"  file {len(data)/1e6:.1f} MB: blocks {body/n:.1f} B/entry, filters {footer['filters_length']/n:.2f} B/entry, "
-          f"tail {(len(data)-body)/1e6:.2f} MB, {len(tail['blocks'])} blocks")
+    print(
+        f"  file {len(data) / 1e6:.1f} MB: blocks {body / n:.1f} B/entry, filters {footer['filters_length'] / n:.2f} B/entry, "
+        f"tail {(len(data) - body) / 1e6:.2f} MB, {len(tail['blocks'])} blocks"
+    )
 
     def decode_all(impl, data, tail):
         for _, off, size, _, _ in tail["blocks"]:
-            impl.decode_block(data[off:off + size], tail["codec"])
+            impl.decode_block(data[off : off + size], tail["codec"])
+
     timed("decode every block", n, decode_all, impl, data, tail)
     nb, kk, bits = tail["pair_filter"]
     probe = keys[:: max(1, n // 100_000)]
     other = [b"\x00" * 16] * len(probe)
-    timed("pair filter check (changed versions)", len(probe), impl.bloom_check_pairs, bits, nb, kk, probe, other)
+    timed(
+        "pair filter check (changed versions)", len(probe), impl.bloom_check_pairs, bits, nb, kk, probe, other
+    )
     shuffled = keys[:]
     random.Random(1).shuffle(shuffled)
     m = min(n, 1_000_000)

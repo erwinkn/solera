@@ -1,5 +1,5 @@
 .venv/
-.cursus/
+.solera/
 __pycache__/
 *.pyc
 .pytest_cache/

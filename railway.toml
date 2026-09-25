@@ -2,7 +2,7 @@
 builder = "NIXPACKS"
 
 [deploy]
-startCommand = "cursus serve --host 0.0.0.0"
+startCommand = "solera serve --host 0.0.0.0"
 healthcheckPath = "/healthz"
 healthcheckTimeout = 300
 restartPolicyType = "ON_FAILURE"

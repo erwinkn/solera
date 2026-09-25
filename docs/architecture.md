@@ -1,6 +1,6 @@
-# cursus — architecture
+# solera — architecture
 
-cursus is an asset-first orchestrator. An **asset** is a function that produces
+solera is an asset-first orchestrator. An **asset** is a function that produces
 **outputs**. A **store** writes and reads them. A **commit** records which
 outputs changed. Everything else — partitions, incrementality, automations,
 placement — is a small amount of engine state around those three things.
@@ -230,10 +230,10 @@ Batches = (lo: int, hi: int)  # load rows of batches in [lo, hi]
 `Migration(name, payload)` is schema, not data: DDL for a table store, a
 callable over its prefix for a blob store; JsonStore has nothing to
 migrate and rejects the argument. The ledger of applied names lives next
-to the data (`cursus_migrations(output, name, at)` in Postgres), never in
+to the data (`solera_migrations(output, name, at)` in Postgres), never in
 engine state, so the store is the only source of truth about its own
 shape. The harness calls `migrate` before the first `store()` to an output
-in an attempt, so a write can never precede its own migration; `cursus
+in an attempt, so a write can never precede its own migration; `solera
 migrate [OUTPUT…]` applies eagerly through a `Local` harness for deploys
 that should fail fast. A migration that needs data from other outputs is
 an asset with inputs, not a migration.
@@ -331,7 +331,7 @@ revision; `remove` deletes it.
 A keyed source, or a `PartitionSet` listed under `sources=`, is consumable
 via `Incremental` and usable as a partition set (§7) exactly like a keyed
 output, so a system that *pushes* can feed the graph directly. Systems that must be *polled* belong in the graph: a cursor asset
-(§6) is the platform-native sensor and needs no service outside cursus.
+(§6) is the platform-native sensor and needs no service outside solera.
 
 ## 6. Incrementality
 
@@ -467,7 +467,7 @@ they ran has let go of; only runs in progress are protected. Data expires in
 the harness: an attempt of an asset with a finite policy carries the horizon
 in its spec, and before writing an output the harness calls
 `store.expire(head, before)` with the committed head, which stays loadable.
-`cursus runs delete RUN` and `cursus runs prune [--before] [--asset] [--keep]
+`solera runs delete RUN` and `solera runs prune [--before] [--asset] [--keep]
 [--dry-run]` (and `DELETE /runs/{run}`, `POST /runs:prune`) delete runs by hand.
 Postgres has no `expire`: bound an append-only table with a scheduled job
 that deletes old rows (object-store-state.md §11); a keyed table removes
@@ -660,7 +660,7 @@ then commits against its own record of the pins. Inputs that moved since
 they were pinned do not void the commit: the attempt delivered the window
 it was given.
 
-**Harness** (`python -m cursus_worker run --objects URL --attempt ID`; the
+**Harness** (`python -m solera_worker run --objects URL --attempt ID`; the
 project entrypoint comes from the environment): fetch spec → refuse on
 revision mismatch (a failed result, not a crash) → resolve `env:` → load
 inputs per annotation (keyed Incremental edges through the upstream key

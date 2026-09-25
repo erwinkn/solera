@@ -5,11 +5,11 @@ import asyncio
 import json
 
 import pytest
-from cursus.sdk import Automation, Every, Incremental, OnChange, Output, Project, asset
-from cursus_server.engine import Engine
-from cursus_server.model import Model
-from cursus_server.placements.inline import InlinePlacement
-from cursus_server.state import Conflict, LostOwnership, State
+from solera.sdk import Automation, Every, Incremental, OnChange, Output, Project, asset
+from solera_server.engine import Engine
+from solera_server.model import Model
+from solera_server.placements.inline import InlinePlacement
+from solera_server.state import Conflict, LostOwnership, State
 
 
 class Clock:

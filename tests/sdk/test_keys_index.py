@@ -7,9 +7,9 @@ must page back exactly the dict's content."""
 import random
 
 import pytest
-from cursus.keys.index import IndexState, KeyIndex, Options
-from cursus.keys.io import DiskCache, ObjectIO
 from obstore.store import MemoryStore
+from solera.keys.index import IndexState, KeyIndex, Options
+from solera.keys.io import DiskCache, ObjectIO
 
 
 def small_options(**kw):

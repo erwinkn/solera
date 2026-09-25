@@ -11,7 +11,7 @@ import time
 import httpx
 import pytest
 
-PROJECT = "cursus_server.demo:project"
+PROJECT = "solera_server.demo:project"
 OUTPUTS = [
     "sites",
     "site_events",
@@ -29,10 +29,10 @@ def demo(tmp_path, monkeypatch):
     """A real uvicorn server on the demo project + its base URL."""
 
     import uvicorn
-    from cursus_server.api import create_app
+    from solera_server.api import create_app
 
     monkeypatch.delenv("DATABASE_URL", raising=False)
-    monkeypatch.setenv("CURSUS_PROJECT", PROJECT)
+    monkeypatch.setenv("SOLERA_PROJECT", PROJECT)
     app = create_app(
         state_url=(tmp_path / "state").as_uri(),
         namespace="e2e",
@@ -96,13 +96,13 @@ def test_demo_end_to_end(demo):
         client.post(f"{base}/automations/{auto['name']}/disable")
 
     # The external `uploads` partition set is fed from outside (§5) — this
-    # commit is what the README does with `cursus commit uploads`.
+    # commit is what the README does with `solera commit uploads`.
     committed = client.post(f"{base}/sources/uploads/commit", json={"keys": {"u-1": "v1", "u-2": "v1"}})
     assert committed.status_code == 200 and committed.json()["ref"]["version"]
 
     # `manual_ingest` is placed on Pool("ingest"): only an external worker
-    # can complete it — `cursus worker pool ingest` in the README.
-    from cursus_worker.worker import run_pool
+    # can complete it — `solera worker pool ingest` in the README.
+    from solera_worker.worker import run_pool
 
     threading.Thread(target=lambda: asyncio.run(run_pool("ingest", demo)), daemon=True).start()
 
@@ -224,11 +224,11 @@ def test_demo_end_to_end(demo):
 @pytest.mark.postgres
 def test_demo_postgres_migrations_and_ondeploy(tmp_path):
     """§8 gate: with DATABASE_URL the demo's relational outputs land in
-    PostgresStore — each declares one migration, `cursus migrate` applies
-    them into the cursus_migrations ledger, written heads carry the applied
+    PostgresStore — each declares one migration, `solera migrate` applies
+    them into the solera_migrations ledger, written heads carry the applied
     migration as `schema`, and the OnDeploy job fires once on boot.
 
-    The server runs as a real `cursus serve` subprocess so the module-level
+    The server runs as a real `solera serve` subprocess so the module-level
     DATABASE flag in the demo project evaluates against the test DSN.
     """
 
@@ -236,13 +236,13 @@ def test_demo_postgres_migrations_and_ondeploy(tmp_path):
     import shutil
     import subprocess
 
-    dsn = os.environ.get("CURSUS_TEST_DATABASE_URL")
+    dsn = os.environ.get("SOLERA_TEST_DATABASE_URL")
     if not dsn:
-        pytest.skip("CURSUS_TEST_DATABASE_URL is not set")
+        pytest.skip("SOLERA_TEST_DATABASE_URL is not set")
     import psycopg
 
-    cursus = shutil.which("cursus")
-    assert cursus, "the cursus console script is not on PATH"
+    solera = shutil.which("solera")
+    assert solera, "the solera console script is not on PATH"
 
     # Clean slate: drop every table the demo owns plus the store ledgers.
     with psycopg.connect(dsn, autocommit=True) as conn:
@@ -252,8 +252,8 @@ def test_demo_postgres_migrations_and_ondeploy(tmp_path):
             "site_files",
             "file_index",
             "demo_migrations",
-            "cursus_migrations",
-            "cursus_markers",
+            "solera_migrations",
+            "solera_markers",
         ):
             conn.execute(f'DROP TABLE IF EXISTS "{name}"')
 
@@ -261,16 +261,16 @@ def test_demo_postgres_migrations_and_ondeploy(tmp_path):
     env = {
         **os.environ,
         "DATABASE_URL": dsn,
-        "CURSUS_STATE_URL": state_url,
-        "CURSUS_NAMESPACE": "pg-e2e",
-        "CURSUS_PROJECT": PROJECT,
+        "SOLERA_STATE_URL": state_url,
+        "SOLERA_NAMESPACE": "pg-e2e",
+        "SOLERA_PROJECT": PROJECT,
     }
 
-    # `cursus migrate` applies every declared migration before anything runs.
-    migrated = subprocess.run([cursus, "migrate"], env=env, capture_output=True, text=True, timeout=60)
+    # `solera migrate` applies every declared migration before anything runs.
+    migrated = subprocess.run([solera, "migrate"], env=env, capture_output=True, text=True, timeout=60)
     assert migrated.returncode == 0, migrated.stderr
     with psycopg.connect(dsn) as conn:
-        applied = set(conn.execute("SELECT output, name FROM cursus_migrations").fetchall())
+        applied = set(conn.execute("SELECT output, name FROM solera_migrations").fetchall())
     expected = {o for o in ("site_events", "site_files", "file_index", "fleet_status", "site_status")}
     assert {o for o, name in applied if name == "baseline"} == expected
     with psycopg.connect(dsn) as conn:
@@ -283,7 +283,7 @@ def test_demo_postgres_migrations_and_ondeploy(tmp_path):
     port = sock.getsockname()[1]
     sock.close()
     proc = subprocess.Popen(
-        [cursus, "serve", "--insecure", "--port", str(port)],
+        [solera, "serve", "--insecure", "--port", str(port)],
         env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,

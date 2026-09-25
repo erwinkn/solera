@@ -38,16 +38,16 @@ jobs:
           uv run python - <<'PY'
           from glob import glob
           from zipfile import ZipFile
-          with ZipFile(glob('dist/cursus-*.whl')[0]) as z:
+          with ZipFile(glob('dist/solera-*.whl')[0]) as z:
               names = z.namelist()
-              assert 'cursus/__init__.py' in names
-              assert 'cursus_worker/__main__.py' in names
-              assert 'cursus_server/web/index.html' in names
-              assert 'cursus_server/selftest.py' in names
-              assert any(n.startswith('cursus_server/web/assets/') and n.endswith('.js') for n in names), 'no bundled JS in wheel'
-              assert any(n.startswith('cursus_server/web/assets/') and n.endswith('.css') for n in names), 'no bundled CSS in wheel'
+              assert 'solera/__init__.py' in names
+              assert 'solera_worker/__main__.py' in names
+              assert 'solera_server/web/index.html' in names
+              assert 'solera_server/selftest.py' in names
+              assert any(n.startswith('solera_server/web/assets/') and n.endswith('.js') for n in names), 'no bundled JS in wheel'
+              assert any(n.startswith('solera_server/web/assets/') and n.endswith('.css') for n in names), 'no bundled CSS in wheel'
           PY
-          uv run cursus --state-url file:///tmp/ci-native-probe selftest
+          uv run solera --state-url file:///tmp/ci-native-probe selftest
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -69,9 +69,9 @@ jobs:
       - run: uv sync --locked
       - run: cargo fmt --check --manifest-path packages/native/Cargo.toml && cargo test --release --manifest-path packages/native/Cargo.toml
       - run: uv run maturin develop --release -m packages/native/Cargo.toml
-      - run: uv run python -c "import cursus.keys as k; assert k.IMPL == 'native', k.IMPL"
+      - run: uv run python -c "import solera.keys as k; assert k.IMPL == 'native', k.IMPL"
       - run: uv run pytest -q tests/sdk/test_keys_format.py tests/sdk/test_keys_index.py
-      - run: CURSUS_KEYS_IMPL=python uv run pytest -q tests/sdk/test_keys_index.py
+      - run: SOLERA_KEYS_IMPL=python uv run pytest -q tests/sdk/test_keys_index.py
   browser:
     runs-on: ubuntu-latest
     timeout-minutes: 15
