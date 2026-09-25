@@ -86,7 +86,7 @@ export function MaterializeDialog() {
   const [targets, setTargets] = useState<string[]>([]);
   const [partitions, setPartitions] = useState<PartitionMode>("latest");
   const [picked, setPicked] = useState<Set<string>>(new Set());
-  const [mode, setMode] = useState<"incremental" | "recompute">("incremental");
+  const [mode, setMode] = useState<"incremental" | "full">("incremental");
   const [upstream, setUpstream] = useState(false);
   const [config, setConfig] = useState("{}");
   const [keys, setKeys] = useState("");
@@ -112,11 +112,11 @@ export function MaterializeDialog() {
     .map((name) => assets.find((a) => a.name === name))
     .filter((a): a is CatalogAsset => !!a);
 
-  const bykeyEdges = useMemo(() => {
+  const incrementalEdges = useMemo(() => {
     const edges = new Set<string>();
     for (const asset of selectedAssets)
       for (const edge of Object.values(asset.inputs))
-        if (edge.kind === "bykey") edges.add(edge.output);
+        if (edge.kind === "incremental") edges.add(edge.output);
     return [...edges];
   }, [selectedAssets]);
 
@@ -321,7 +321,7 @@ export function MaterializeDialog() {
                 onChange={setMode}
                 options={[
                   { value: "incremental", label: "incremental" },
-                  { value: "recompute", label: "recompute" },
+                  { value: "full", label: "full" },
                 ]}
               />
             </div>
@@ -379,7 +379,7 @@ export function MaterializeDialog() {
           <div
             className={cn(
               "grid gap-3",
-              bykeyEdges.length ? "grid-cols-2" : "grid-cols-1",
+              incrementalEdges.length ? "grid-cols-2" : "grid-cols-1",
             )}
           >
             <div className="flex flex-col gap-1.5">
@@ -392,14 +392,16 @@ export function MaterializeDialog() {
                 onChange={(e) => setConfig(e.target.value)}
               />
             </div>
-            {!!bykeyEdges.length && (
+            {!!incrementalEdges.length && (
               <div className="flex flex-col gap-1.5">
-                <Label htmlFor="md-keys">ByKey override</Label>
+                <Label htmlFor="md-keys">Incremental override</Label>
                 <Textarea
                   id="md-keys"
                   rows={2}
                   className="font-mono text-xs"
-                  placeholder={bykeyEdges.map((e) => `${e}=full`).join("\n")}
+                  placeholder={incrementalEdges
+                    .map((e) => `${e}=full`)
+                    .join("\n")}
                   value={keys}
                   onChange={(e) => setKeys(e.target.value)}
                 />

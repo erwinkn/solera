@@ -68,7 +68,7 @@ const NODE_DOT: Record<string, string> = {
   running: "bg-sky-500",
 };
 
-type EdgeKind = "whole" | "bykey" | "all_partitions" | "dep";
+type EdgeKind = "whole" | "incremental" | "all_partitions" | "dep";
 
 interface GraphNode {
   // IDs are namespaced by kind: a source and an asset may share a name.
@@ -91,7 +91,7 @@ const EDGE_STYLE: Record<
   { stroke: string; dash?: string; width: number; opacity: number }
 > = {
   whole: { stroke: "var(--color-muted-foreground)", width: 1.5, opacity: 0.5 },
-  bykey: {
+  incremental: {
     stroke: "var(--color-primary)",
     dash: "5 4",
     width: 1.6,
@@ -113,7 +113,7 @@ const EDGE_STYLE: Record<
 function EdgeLegend() {
   const items: [EdgeKind, string][] = [
     ["whole", "whole"],
-    ["bykey", "ByKey"],
+    ["incremental", "Incremental"],
     ["all_partitions", "AllPartitions"],
     ["dep", "dep"],
   ];
@@ -192,8 +192,8 @@ function Graph({
         const owner = ownerOf.get(edge.output);
         if (!owner) continue;
         const kind: EdgeKind =
-          edge.kind === "bykey"
-            ? "bykey"
+          edge.kind === "incremental"
+            ? "incremental"
             : edge.kind === "all_partitions"
               ? "all_partitions"
               : "whole";

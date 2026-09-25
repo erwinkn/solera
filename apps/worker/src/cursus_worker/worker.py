@@ -1,15 +1,19 @@
 """User code runs here, never in the API process (§10 worker protocol).
 
-`python -m cursus_worker run --objects URL --attempt ID`:
-fetch spec -> refuse on revision mismatch -> resolve `env:` -> load inputs per
-annotation -> build ctx -> run the producer -> store() each returned output,
-stage key maps -> write the result last, in one PUT.
+`python -m cursus_worker run --objects URL --run RUN --attempt ID`:
+read the spec from the attempt file -> refuse on revision mismatch -> resolve `env:` -> load inputs per
+annotation (Incremental edges through the upstream key index) -> build ctx ->
+run the producer -> for each returned output, work out what changed against
+its key index, expire what retention no longer needs, store() it unless
+nothing did, write the delta file -> rewrite the attempt file with the spec,
+the result and the log index, in one PUT.
 """
 
 from __future__ import annotations
 
 import asyncio
 import dataclasses
+import gzip
 import importlib
 import importlib.util
 import inspect
@@ -21,6 +25,8 @@ import traceback
 import typing
 from pathlib import Path
 
+from cursus.keys.index import DeltaFiles, IndexState, KeyIndex, key_bytes, key_str
+from cursus.keys.io import ObjectIO, key_cache
 from cursus.sdk import (
     UNSET,
     Asset,
@@ -32,7 +38,18 @@ from cursus.sdk import (
     is_ref_type,
     split_partition,
 )
-from cursus.stores import Keys, Scope, StoreError, resolve_env
+from cursus.stores import (
+    Batches,
+    Keys,
+    Patch,
+    Scope,
+    Sql,
+    StoreError,
+    WriteError,
+    _rows,
+    key_map,
+    resolve_env,
+)
 
 
 def _load_module(path: Path):
@@ -133,8 +150,8 @@ class Ctx:
             return next(iter(windows.values()))
         return windows or None
 
-    def log(self, message: str, **fields):
-        entry = {"at": time.time(), "message": str(message), "fields": fields}
+    def log(self, message: str, level: str = "info", **fields):
+        entry = {"at": time.time(), "level": level, "message": str(message), "fields": fields}
         json.dumps(entry, allow_nan=False)
         self._shipper.append(entry)
 
@@ -143,41 +160,96 @@ class Ctx:
         return await store.load(ref, t, None)
 
 
-class LogShipper:
-    """Streams ctx.log lines to logs/{attempt}/{seq}.jsonl chunks."""
+LOG_FLUSH_SECONDS = 2.0
+LOG_FLUSH_BYTES = 256 * 1024
+LOG_CAP = 100 * 2**20  # compressed bytes per attempt
 
-    def __init__(self, objects, attempt: str):
-        self.objects, self.attempt = objects, attempt
-        self.entries: list[dict] = []
-        self.seq = 0
+
+class LogShipper:
+    """`ctx.log` lines as gzip-compressed JSON lines (docs/object-store-state.md §8).
+
+    While the attempt runs, each flush — every 2 s or 256 KB — writes one
+    gzip member as `{attempt}.log.{n}`, so the console can tail it. At the
+    end the members are joined into `{attempt}.log` (concatenated gzip
+    members are one valid gzip file) and the chunks deleted; `index()` lists
+    `[byte offset, lines, first timestamp]` per member for range reads. Past
+    `LOG_CAP` a truncation marker is written and shipping stops."""
+
+    def __init__(self, objects, base: str):
+        self.objects, self.base = objects, base
+        self.pending: list[tuple[float, str]] = []
+        self.pending_bytes = 0
+        self.members: list[bytes] = []
+        self.blocks: list[list] = []
+        self.size = self.lines = 0
+        self.truncated = False
+        self._lock = asyncio.Lock()
 
     def append(self, entry):
-        self.entries.append(entry)
+        if self.truncated:
+            return
+        line = json.dumps(entry, allow_nan=False) + "\n"
+        self.pending.append((entry["at"], line))
+        self.pending_bytes += len(line)
+        if self.pending_bytes >= LOG_FLUSH_BYTES:
+            try:
+                asyncio.get_running_loop().create_task(self.flush())
+            except RuntimeError:
+                pass  # logging from a thread: the next periodic flush ships it
 
     async def flush(self):
-        if not self.entries:
-            return
-        body = "".join(json.dumps(e, allow_nan=False) + "\n" for e in self.entries).encode()
-        await _put(self.objects, f"logs/{self.attempt}/{self.seq:06d}.jsonl", body)
-        self.seq += 1
-        self.entries.clear()
+        async with self._lock:
+            if not self.pending or self.truncated:
+                return
+            lines, self.pending, self.pending_bytes = self.pending, [], 0
+            member = gzip.compress("".join(line for _, line in lines).encode(), compresslevel=6, mtime=0)
+            if self.size + len(member) > LOG_CAP:
+                self.truncated = True
+                marker = {
+                    "at": lines[0][0],
+                    "level": "warning",
+                    "message": f"log truncated: the attempt's log reached {LOG_CAP} bytes",
+                    "fields": {},
+                }
+                lines = [(marker["at"], json.dumps(marker) + "\n")]
+                member = gzip.compress(lines[0][1].encode(), mtime=0)
+            await _put(self.objects, f"{self.base}.log.{len(self.members):06d}", member)
+            self.blocks.append([self.size, len(lines), lines[0][0]])
+            self.members.append(member)
+            self.size += len(member)
+            self.lines += len(lines)
+
+    async def periodically(self):
+        while True:
+            await asyncio.sleep(LOG_FLUSH_SECONDS)
+            await self.flush()
+
+    async def finish(self) -> dict:
+        """Join the chunks into the attempt's log; returns its index."""
+
+        await self.flush()
+        if self.members:
+            import obstore
+
+            await _put(self.objects, f"{self.base}.log", b"".join(self.members))
+            await obstore.delete_async(
+                self.objects, [f"{self.base}.log.{n:06d}" for n in range(len(self.members))]
+            )
+        return {"blocks": self.blocks, "lines": self.lines, "bytes": self.size, "truncated": self.truncated}
 
 
-async def _key_map(objects, ref: Ref) -> dict[str, str] | None:
-    info = (ref.meta or {}).get("keys")
-    if not info:
-        return None
-    data = await _get(objects, info["object"])
-    return json.loads(data) if data else None
+async def _resolve_inputs(spec, project, asset, keys_io):
+    """Load each pin by annotation; build call args + ctx.changes (§5, §10).
 
-
-async def _resolve_inputs(spec, project, asset, objects):
-    """Load each pin by annotation; build call args + ctx.changes (§5, §10)."""
+    An Incremental edge over a keyed upstream reads its page from the pinned
+    key index — the pending deltas in `[from, to]`, or the whole index for a
+    full delivery — and loads just those keys. `delivered` reports where the
+    page ended, for the engine's watermark (§6)."""
 
     manifest_asset = project.manifest["assets"][asset.name]
     edges = manifest_asset["inputs"]
     hints = typing.get_type_hints(asset.fn)
-    args, changes = {}, {}
+    args, changes, delivered = {}, {}, {}
     for name, pin in spec["inputs"].items():
         edge = edges.get(name)
         if edge is None:  # a dep pin: recorded, never bound
@@ -198,20 +270,42 @@ async def _resolve_inputs(spec, project, asset, objects):
             continue
         ref = Ref.from_json(pin["ref"])
         store = project.stores[ref.store]
-        if "changes" in pin:  # ByKey: selection + ctx.changes
-            upserted = pin["changes"].get("upserted") or {}
-            deleted = pin["changes"].get("deleted") or []
-            changes[param] = Changes(upserted=sorted(upserted), deleted=list(deleted))
-            if pin["changes"].get("full"):
-                args[param] = await store.load(ref, t, None)
+        if "changes" in pin:  # Incremental: selection + ctx.changes (§5.1)
+            ch = pin["changes"]
+            full = bool(ch.get("full"))
+            if "batches" in ch:
+                lo, hi = (int(v) for v in ch["batches"])
+                args[param] = await store.load(ref, t, Batches(lo, hi))
+                changes[param] = Changes(rows=args[param], batches=range(lo, hi + 1), full=full)
+                continue
+            if "keys" in ch:  # a run's keys= override: a one-off selection
+                upserted, deleted, after = {str(k): "" for k in ch["keys"]}, (), None
             else:
-                args[param] = await store.load(ref, t, Keys(upserted))
+                index = KeyIndex(keys_io, None, IndexState.from_json(pin["index"]))
+                start = key_bytes(ch["after"]) if ch.get("after") is not None else None
+                if full:
+                    keys, versions, nxt = await index.page(start, int(ch["limit"]))
+                    flags = bytes(len(keys))
+                else:
+                    keys, versions, flags, nxt = await index.pending(
+                        int(ch["from"]), int(ch["to"]), start, int(ch["limit"])
+                    )
+                upserted = {
+                    key_str(k): key_str(v) for k, v, d in zip(keys, versions, flags, strict=True) if not d
+                }
+                deleted = tuple(key_str(k) for k, d in zip(keys, flags, strict=True) if d)
+                after = key_str(nxt) if nxt is not None else None
+            args[param] = await store.load(ref, t, Keys(upserted))
+            changes[param] = Changes(
+                rows=args[param], deleted=deleted, full=full, upserted=tuple(sorted(upserted))
+            )
+            delivered[param] = {"after": after, "upserted": sorted(upserted), "deleted": list(deleted)}
             continue
         if t is not None and is_ref_type(t):
             args[param] = ref
         else:
             args[param] = await store.load(ref, t, None)
-    return args, changes
+    return args, changes, delivered
 
 
 def _dict_inner(t):
@@ -224,13 +318,19 @@ def _dict_inner(t):
     return None
 
 
-async def _store_outputs(spec, project, asset, objects, result_value):
-    """store() each returned output and stage key maps (§4, §6)."""
+async def _store_outputs(spec, project, asset, objects, keys_io, result_value):
+    """Store each returned output (§4, §6, §9).
+
+    A keyed output's write is compared with its key index as pinned in the
+    spec: a write that changes nothing is not stored at all and keeps the
+    head; otherwise the store writes it and the changed entries become the
+    batch's delta file. Returns `{name: entry}` and the cursor."""
 
     manifest_asset = project.manifest["assets"][asset.name]
     declared = {o["name"]: o for o in manifest_asset["outputs"]}
     decls = {o.name or asset.name: o for o in asset.outputs}
     priors = {name: Ref.from_json(r) for name, r in (spec.get("prior") or {}).items()}
+    pinned = spec.get("outputs") or {}
 
     if isinstance(result_value, Result):
         values, cursor = result_value.outputs, result_value.cursor
@@ -243,7 +343,7 @@ async def _store_outputs(spec, project, asset, objects, result_value):
     else:
         raise StoreError(f"{asset.name}: multi-output assets must return Result(outputs={{...}})")
 
-    refs = {}
+    entries = {}
     for name, value in values.items():
         if name not in decls:
             raise StoreError(f"{asset.name}: returned undeclared output {name!r}")
@@ -266,48 +366,115 @@ async def _store_outputs(spec, project, asset, objects, result_value):
             except Exception as error:
                 raise StoreError(f"{output.name}: migration failed: {error}") from error
             schema = applied[-1] if applied else output.migrations[-1].name
+        info = pinned.get(name) or {}
         prior = priors.get(name)
-        prior_keys = await _key_map(objects, prior) if prior is not None else None
-        scope = Scope(output=output, partition=spec["partition"], prior_keys=prior_keys)
-        written = await store.store(value, prior, scope)
+        before = (spec.get("retention") or {}).get("before")
+        committed = Ref.from_json(info["head"]) if info.get("head") else None
+        if before is not None and committed is not None and callable(getattr(store, "expire", None)):
+            # Retention reaches data here (§11): whatever no version written
+            # after `before` needs goes, and the committed head stays loadable.
+            await store.expire(committed, before)
+        scope = Scope(
+            output=output,
+            partition=spec["partition"],
+            batch=info.get("batch"),
+            attempt=spec["attempt"],
+            aliases=tuple(info.get("aliases") or ()),
+        )
+        entry = {}
+        if info.get("index") is not None:
+            index = KeyIndex(keys_io, None, IndexState.from_json(info["index"]))
+            written = None
+            if isinstance(value, Sql):
+                # Rows the harness never sees: the store reports the new key map.
+                written = await store.store(value, prior, scope)
+                if written.keys is None:
+                    raise StoreError(f"{output.name}: store {store_name!r} reported no keys for a Sql write")
+                new, removes, replace = dict(written.keys), [], True
+            else:
+                patch = isinstance(value, Patch)
+                rows = value.rows if patch else value
+                if output.is_partition_set:
+                    rows = list(rows or [])
+                else:
+                    rows = _rows(rows, output.name)
+                new = key_map(output, rows)
+                # With no prior (a first write, or a full run) a Patch is the whole content.
+                replace = not patch or prior is None
+                removes = [] if replace else [str(k) for k in value.remove if str(k) not in new]
+            delta = await index.changes(
+                [key_bytes(k) for k in new],
+                [key_bytes(v) for v in new.values()],
+                [key_bytes(k) for k in removes],
+                replace=replace,
+            )
+            if written is None:
+                if not len(delta) and info.get("exists"):
+                    entries[name] = {"unchanged": True}
+                    continue
+                written = await store.store(value, prior, scope)
+            files = (
+                await index.write(int(info["batch"]), spec["attempt"], delta)
+                if len(delta)
+                else DeltaFiles([], 0, 0, True)
+            )
+            entry["keys"] = files.to_json()
+            if output.is_partition_set:
+                if replace:
+                    elements = set(new)
+                else:
+                    elements = (set(info.get("elements") or ()) - set(removes)) | set(new)
+                entry["elements"] = sorted(elements)
+        else:
+            if isinstance(value, Sql) and output.incremental:
+                raise WriteError(f"{output.name}: Sql writes need a keyed output")
+            written = await store.store(value, prior, scope)
         if written.ref is None:
             continue
         ref = dataclasses.replace(written.ref, store=store_name)
         if schema is not None:
             ref = dataclasses.replace(ref, handle={**(ref.handle or {}), "schema": schema})
-        if written.keys is not None:
-            body = json.dumps(written.keys, sort_keys=True, allow_nan=False).encode()
-            import hashlib
-
-            sha = hashlib.sha256(body).hexdigest()
-            await _put(objects, f"keys/{sha}.json", body)
-            ref = dataclasses.replace(
-                ref, meta={**ref.meta, "keys": {"object": f"keys/{sha}.json", "count": len(written.keys)}}
-            )
-        refs[name] = ref.to_json()
-    return refs, cursor
+        entry["ref"] = ref.to_json()
+        entries[name] = entry
+    return entries, cursor
 
 
-async def run_attempt(objects_url: str, attempt: str, entrypoint: str | Project):
+def _key_io(objects, objects_url: str, project: Project) -> ObjectIO:
+    return ObjectIO(objects, cache=key_cache(project.manifest.get("key_cache"), objects_url))
+
+
+async def run_attempt(objects_url: str, attempt: str, entrypoint: str | Project, *, run: str):
+    """Run one attempt. The engine created `runs/{run}/{attempt}.json` holding
+    the spec; the harness rewrites it once, at the end, with the spec, the
+    result and the log index (docs/object-store-state.md §8)."""
+
     objects = _objects(objects_url)
-    spec_data = await _get(objects, f"specs/{attempt}.json")
-    if spec_data is None:
-        raise StoreError(f"No spec at specs/{attempt}.json")
-    spec = json.loads(spec_data)
-    result_key = f"results/{attempt}.json"
+    base = f"runs/{run}/{attempt}"
+    record = await _get(objects, f"{base}.json")
+    if record is None:
+        raise StoreError(f"No attempt file at {base}.json")
+    spec = json.loads(record)["spec"]
+    shipper = LogShipper(objects, base)
+    flusher = asyncio.create_task(shipper.periodically())
+
+    async def finish(result: dict):
+        flusher.cancel()
+        log = await shipper.finish()
+        body = {"spec": spec, "result": result, "log": log}
+        await _put(objects, f"{base}.json", json.dumps(body, allow_nan=False).encode())
 
     async def fail(error: BaseException, retryable: bool):
-        payload = {
-            "attempt": attempt,
-            "status": "failed",
-            "error": {
-                "type": type(error).__name__,
-                "message": str(error),
-                "traceback": "".join(traceback.format_exception(error))[-32000:],
-                "retryable": retryable,
-            },
-        }
-        await _put(objects, result_key, json.dumps(payload, allow_nan=False).encode())
+        await finish(
+            {
+                "status": "failed",
+                "error": {
+                    "type": type(error).__name__,
+                    "message": str(error),
+                    "traceback": "".join(traceback.format_exception(error))[-32000:],
+                    "retryable": retryable,
+                },
+            }
+        )
 
     try:
         project = entrypoint if isinstance(entrypoint, Project) else load_project(entrypoint)
@@ -326,9 +493,9 @@ async def run_attempt(objects_url: str, attempt: str, entrypoint: str | Project)
     for store in project.stores.values():
         if hasattr(store, "bind_objects"):
             store.bind_objects(objects)
-    shipper = LogShipper(objects, attempt)
     try:
-        args, changes = await _resolve_inputs(spec, project, asset, objects)
+        keys_io = _key_io(objects, objects_url, project)
+        args, changes, delivered = await _resolve_inputs(spec, project, asset, keys_io)
         ctx = Ctx(spec, asset, project, objects, changes, shipper)
         signature = inspect.signature(asset.fn)
         if "ctx" in signature.parameters:
@@ -339,22 +506,18 @@ async def run_attempt(objects_url: str, attempt: str, entrypoint: str | Project)
         value = asset.fn(**args)
         if inspect.isawaitable(value):
             value = await value
-        refs, cursor = await _store_outputs(spec, project, asset, objects, value)
-        await shipper.flush()
-        payload = {"attempt": attempt, "status": "succeeded", "outputs": refs}
+        outputs, cursor = await _store_outputs(spec, project, asset, objects, keys_io, value)
+        result = {"status": "succeeded", "outputs": outputs, "delivered": delivered}
         if cursor is not UNSET:
-            payload["cursor"] = cursor
-        await _put(objects, result_key, json.dumps(payload, allow_nan=False).encode())
+            result["cursor"] = cursor
+        await finish(result)
         return 0
     except StoreError as error:
         await fail(error, getattr(error, "retryable", False))
     except Exception as error:
         await fail(error, True)
     finally:
-        try:
-            await shipper.flush()
-        except Exception:
-            pass
+        flusher.cancel()
     return 1
 
 
@@ -403,7 +566,9 @@ async def run_pool(pool: str, server: str, token: str | None = None):
 
             renewal = asyncio.create_task(renew())
             try:
-                await run_attempt(stage["objects"], stage["attempt"], os.environ["CURSUS_PROJECT"])
+                await run_attempt(
+                    stage["objects"], stage["attempt"], os.environ["CURSUS_PROJECT"], run=stage["run"]
+                )
                 await client.post(f"/api/tasks/{task_id}/complete", json={"worker": worker_id})
                 print(f"[pool] completed {task_id}", flush=True)
             finally:
@@ -422,9 +587,11 @@ async def main():
         Path(out).write_text(json.dumps(project.manifest, allow_nan=False))
         return
     if mode == "run":
-        # cursus_worker run --objects URL --attempt ID (CURSUS_PROJECT env entrypoint)
+        # cursus_worker run --objects URL --attempt ID --run RUN (CURSUS_PROJECT env entrypoint)
         options = dict(zip(rest[::2], rest[1::2], strict=True))
-        code = await run_attempt(options["--objects"], options["--attempt"], os.environ["CURSUS_PROJECT"])
+        code = await run_attempt(
+            options["--objects"], options["--attempt"], os.environ["CURSUS_PROJECT"], run=options["--run"]
+        )
         raise SystemExit(code)
     if mode == "pool":
         options = dict(zip(rest[::2], rest[1::2], strict=True))

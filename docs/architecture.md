@@ -63,7 +63,7 @@ Three processes:
         "qaqc_samples", store="postgres", schema="qaqc", primary_key=["sample_id"], partition_column="site"
     ),
     partitions=sites,  # an asset producing a PartitionSet (§7)
-    inputs={"qaqc_files": ByKey()},  # an incremental edge (§5)
+    inputs={"qaqc_files": Incremental()},  # an incremental edge (§5)
     automations=AutoRefresh(),  # OnChange over inputs + deps (§9)
 )
 async def qaqc_samples(ctx, qaqc_files: pd.DataFrame, sharepoint): ...
@@ -78,13 +78,13 @@ async def qaqc_samples(ctx, qaqc_files: pd.DataFrame, sharepoint): ...
 | `executor` | placement (§10) | `Local()()` |
 | `retries` / `timeout` | `Retry(n, delay, backoff)` / seconds | `Retry(3)` / `3600` |
 | `version` | opaque string; bump to invalidate incremental state (§6) | `"1"` |
-| `on_version_change` | `"fail"` (attempts fail until an operator recomputes) or `"recompute"` (the next attempt of each scope is a recompute) | `"fail"` |
+| `on_version_change` | `"fail"` (attempts fail until an operator runs `full`) or `"full"` (the next attempt of each scope is a full run) | `"fail"` |
 | `automations` | attached automations (§9) | `()` |
 
 Resources (`Project(resources={...})`) bind by parameter name. `ctx` is
 reserved and optional.
 
-**`Output(name=None, store=None, key=None, revision=None, mode=None,
+**`Output(name=None, store=None, key=None, revision=None, incremental=None,
 migrations=(), **config)`** declares a slot: registry key (defaults to the function name
 when the asset has one output), store (default `JsonStore`), and
 store-specific config validated by `can_store` at registration.
@@ -93,7 +93,7 @@ store-specific config validated by `can_store` at registration.
 |---|---|
 | `key` | Column identifying what was materialized. Declared once, here; consumers never name columns. Independent of `primary_key` (storage identity). |
 | `revision` | Column that changes when a key's content changes. Absent: `revision = H(row)`. |
-| `mode="append"` | A keyed output whose keys are engine-numbered **batches**: each `Patch` is one new key, a load is the snapshot of every batch at the pinned version (§3), and a `ByKey` consumer receives only new batches. Cannot declare its own `key`. |
+| `incremental` | The output commits in engine-numbered batches: a keyed output's changes land in its key index (object-store-state.md §6), an unkeyed one's batches in its store; `Incremental()` consumers read what arrived after their watermark. `key=` implies it. Default false — a value output is one object per version. |
 | `migrations` | Ordered `Migration(name, payload)` list owned by this output. The store applies pending ones before its first write to the output in an attempt (§4). Payload type is store-defined (`can_store`). The applied set travels in the handle (§3) and the declared list is in the fingerprint (§6). |
 | `**config` | Store-specific: `schema`, `primary_key`, `columns`, `indexes`, `partition_column`, … |
 
@@ -118,8 +118,8 @@ records lineage and cursor and fires nothing.
 |---|---|
 | `partition` / `partitions` | canonical key string / dict view by dimension (§7) |
 | `partition_window` | `(start, end)` for time dimensions |
-| `cursor` | committed cursor, `None` on first run or recompute |
-| `changes[input]` | `Changes(upserted: list[str], deleted: list[str])` for `ByKey` edges |
+| `cursor` | committed cursor, `None` on first run or `full` |
+| `changes[input]` | `Changes(rows, deleted, batches, full, upserted)` for `Incremental` edges (§6) |
 | `run_id`, `config` | the run and its config |
 | `execution` | resolved placement `{kind, cpu, memory: bytes, gpu}` |
 | `log(message, **fields)` | structured log line |
@@ -167,7 +167,7 @@ by the store before the write:
 | `Patch` | `H(prior.version ‖ H(op))` |
 | no-op (zero rows, zero keys) | `prior` unchanged |
 
-Replay-stable without hashing tables. Accepted imprecision: a recompute or
+Replay-stable without hashing tables. Accepted imprecision: a `full` run or
 converging incremental writes may give different versions for identical
 content (over-eager, never wrong).
 
@@ -178,22 +178,22 @@ with mutable handles must provide it:
 
 **Replace slots** keep a version marker per `(output, partition)`.
 `store()` refuses when the live marker ≠ `prior.version` (first write:
-marker absent; recompute skips the check). `load(ref)` refuses when the live
+marker absent; a `full` run skips the check). `load(ref)` refuses when the live
 marker ≠ `ref.version`: a consumer never reads content that is not its
 pinned version; the attempt fails and retries. Inherent consequence: a
 consumer slower than its producer's interval cannot load a mutable
-replace slot. Use an append output, a content-addressed store, or a coarser
-schedule.
+replace slot. Use an incremental output, a content-addressed store, or a
+coarser schedule.
 
 **Keyed outputs** on a mutable store apply partial writes under the same
-marker check, then delete rows whose key is absent from the resulting map:
-rows left by an attempt that never committed are absent from
-`scope.prior_keys` by construction. An append output is the case where
-every key is a batch number, `prior_keys` gives the next one, and batches
-are never rewritten: the handle carries the newest batch, `load(ref)`
-returns batches `<= ref`'s, a true snapshot at the pinned version, always
+marker check; a write with no prior (a first write or a `full` run) replaces
+the slice. Stores keep no key maps: the engine's key index does (§6). An
+unkeyed incremental output is
+the case where data is a sequence of engine-numbered batches — `scope.batch`
+gives the next one and batches are never rewritten: `load(ref)` returns the
+batches `ref` was committed at, a true snapshot at the pinned version, always
 readable even after later writes. `TableRef.where` carries the same
-filter for raw SQL. Recompute (`prior=None`) truncates the partition. A
+filter for raw SQL. A `full` run (`prior=None`) truncates the partition. A
 sink that cannot delete makes writes idempotent on `(scope, batch)`
 instead.
 
@@ -204,23 +204,25 @@ reader that ignores the filter can see an uncommitted batch.
 
 ```python
 class Store(Protocol):
-    def can_load(self, t: type, selection: type[Keys] | None) -> bool: ...
+    def can_load(self, t: type, selection: type | None) -> bool: ...
     def can_store(self, t: type | None, output: Output) -> bool: ...
     async def store(self, write: Any, prior: Ref | None, scope: Scope) -> Written: ...
-    async def load(self, ref: Ref, t: type, selection: Keys | None) -> Any: ...
+    async def load(self, ref: Ref, t: type, selection: Keys | Batches | None) -> Any: ...
     async def migrate(self, output: Output, migrations: Sequence[Migration]) -> list[str]: ...  # optional
 
-Scope   = (output: Output, partition: str, prior_keys: Mapping[str, str] | None)
-Written = (ref: Ref, keys: Mapping[str, str] | None)
+Scope   = (output: Output, partition: str, batch: int | None, baseline: Ref | None)
+Written = (ref: Ref, delta: Delta | None)
+Delta   = (batch: int, rows: int, upserted: Mapping | None, deleted: tuple, reset: bool)
 Keys    = (revisions: Mapping[str, str])
+Batches = (lo: int, hi: int)  # load rows of batches in [lo, hi]
 ```
 
 | Method | Contract |
 |---|---|
 | `can_load(t, selection)` | Registration. Can you produce `t`, filtered by `Keys` when `selection` is given? `can_load(R, None)` for a `Ref` subclass `R` means "are your refs `R`". |
 | `can_store(t, output)` | Registration. Can you take values of type `t` for this `Output` declaration, and extract its declared key from them? `t` is `None` when the producer is unannotated. |
-| `store(write, prior, scope)` | Apply the write; return the new ref (version per §3) and, when the output declares a key, the scope's **complete** `key → revision` map, merged with `scope.prior_keys` for partial writes. Duplicate keys are a write error. For `partition_column` outputs, stamp the column with `scope.partition` and reject rows that disagree. |
-| `load(ref, t, selection)` | Materialize `t`; under `Keys`, only the selected keys, at their pinned revisions where the data model allows. Refs with `meta.external` were not written by the store and skip the marker check. |
+| `store(write, prior, scope)` | Apply the write; return the new ref (version per §3) and, for an incremental output, the `Delta` this write produced — `scope.batch` is the engine-assigned batch number and `scope.baseline` the committed head to diff against (`prior` is withheld on a `full` run, `baseline` is not). Identical content returns the prior ref with no delta. Duplicate keys are a write error. For `partition_column` outputs, stamp the column with `scope.partition` and reject rows that disagree. |
+| `load(ref, t, selection)` | Materialize `t`; under `Keys`, only the selected keys, at their pinned revisions where the data model allows; under `Batches`, only batches in the range. Refs with `meta.external` were not written by the store and skip the marker check. |
 | `migrate(output, migrations)` | Optional. Apply, in declared order, every migration not yet in the store's own ledger for this output; return the applied names. Must be safe under concurrent attempts of one output (partitions share tables): take a store-level lock and re-read the ledger inside it. Where the backend is transactional, a migration and its ledger row commit together. A store without `migrate` rejects `migrations=` at registration. |
 
 ### Migrations
@@ -241,11 +243,11 @@ an asset with inputs, not a migration.
 A bare value is replace. `Patch` is the SDK's partial write, accepted by
 `JsonStore` and `PostgresStore` (`can_store`) and by any store that opts
 in; it mirrors the commit API's `upsert`/`remove` (§5). The store, not
-the engine, turns it into the scope's complete key map:
+the engine, computes the resulting delta:
 
 | Write | Semantics |
 |---|---|
-| `Patch(rows, remove=())` | after the write, the scope's rows for the keys present in `rows` (read from the declared `key` column) are exactly these; keys in `remove` are gone; every other key is untouched. On a `mode="append"` output the rows are one new batch and `remove` is not allowed. |
+| `Patch(rows, remove=())` | after the write, the scope's rows for the keys present in `rows` (read from the declared `key` column) are exactly these; keys in `remove` are gone; every other key is untouched. On an unkeyed incremental output the rows are one new batch and `remove` is not allowed. |
 | `Sql(stmt)` | PostgresStore only. The output *is* the table `{schema}.{table}` (`table` defaults to the output name, `schema` to `public`): a `SELECT` is materialized into it as a replace; any other statement runs verbatim and must leave that table in place. Returns an ordinary `TableRef`, loadable downstream. Version `H(prior.version ‖ H(stmt))`. |
 
 ### Shipped stores
@@ -269,10 +271,10 @@ earlier versions.
 
 ```python
 inputs = {
-    "qaqc_files": ByKey(batch_size=100),  # incremental edge, same-named output
+    "qaqc_files": Incremental(batch_size=100),  # incremental edge, same-named output
     "site_health": AllPartitions(),  # collapse upstream-only dimensions
     "feed": "station_feed",  # rename, same as In("station_feed")
-    "x": ByKey("some_output"),  # rename + incremental
+    "x": Incremental("some_output"),  # rename + incremental
     "matrix": In(meta={"owner": "lab"}),  # whole value, with edge metadata
 }
 deps = ["usgs_3dep_tiles"]  # pinned, watched, not loaded
@@ -286,18 +288,18 @@ engine knows exactly three edge kinds; user subclasses are rejected.
 | Value | Meaning |
 |---|---|
 | `In(output=None, meta=None)` | whole value (or ref) of the output at its pinned head |
-| `ByKey(output=None, batch_size=100, meta=None)` | receive only keys whose revision changed since this consumer last processed them (§6) |
+| `Incremental(output=None, batch_size=100, meta=None)` | receive only what changed since this consumer's watermark — upserted/deleted keys on a keyed upstream, new batches on an unkeyed one (§6) |
 | `AllPartitions(output=None, meta=None)` | receive every partition of the upstream dimensions this asset lacks (§7) |
 
 **By value or by reference.** The annotation decides. `T` loads through the
 upstream store (`store.load(ref, T, selection)`); a `Ref` subclass hands
 over the pinned ref. Under `AllPartitions`, `dict[str, T]` loads per
-partition and `dict[str, TableRef]` hands over refs. A `ByKey` edge cannot
+partition and `dict[str, TableRef]` hands over refs. An `Incremental` edge cannot
 be ref-annotated.
 
-**The parameter is the selection.** Under `ByKey` the value arrives
-filtered to the upserted keys; `ctx.changes[name].deleted` carries what a
-selection cannot.
+**The parameter is the selection.** Under `Incremental` the value arrives
+filtered to the delivered keys or batches; `ctx.changes[name]` carries the
+rest — `deleted` keys, the `batches` range, `full` on a reset delivery.
 
 **`deps=`** are unbound inputs: planned, pinned into lineage, part of the
 interpretation fingerprint (§6), watched by `AutoRefresh`, bound to no
@@ -321,14 +323,14 @@ client.commit("uploads", upsert=["u-91"], remove=["u-12"])  # PartitionSet: patc
 # POST /api/projects/{p}/sources/{name}/commit
 ```
 
-For a keyed source the server stages the complete map as the key map
-(a patch is merged into the current one) and derives `version` from it, so
-an identical map is not a change. `upsert` inserts a key or replaces its
+For a keyed source the server applies the commit as one delta batch against
+the current key map and derives `version` from the result, so an identical
+map is not a change. `upsert` inserts a key or replaces its
 revision; `remove` deletes it.
 
 A keyed source, or a `PartitionSet` listed under `sources=`, is consumable
-`ByKey` and usable as a partition set (§7) exactly like a keyed output, so a
-system that *pushes* can feed the graph directly. Systems that must be *polled* belong in the graph: a cursor asset
+via `Incremental` and usable as a partition set (§7) exactly like a keyed
+output, so a system that *pushes* can feed the graph directly. Systems that must be *polled* belong in the graph: a cursor asset
 (§6) is the platform-native sensor and needs no service outside cursus.
 
 ## 6. Incrementality
@@ -340,28 +342,36 @@ and receives as `ctx.cursor` next time. Committed atomically with the
 outputs, so a rejected commit re-asks the same question. `graph_delta`
 stores the Graph delta token.
 
-**`ByKey`.** The upstream output declares its key (§2). Its store returns
-the scope's complete `key → revision` map on every write (§4); the harness
-stages it as one object, `keys/{sha256}.json`, and records `{"object",
-"count"}` in `ref.meta["keys"]`. The engine diffs that map against the consumer's
-per-edge key state and hands the harness `Keys(upserted)` plus `deleted`.
-Work is batched by `batch_size`: each batch commits with its key state;
-`more` re-queues the task; `scope_complete := not more` on the head.
+**`Incremental`.** Every commit that changes an incremental output gets
+the next batch number (`head.batch`). A keyed output (or keyed source) has
+a **key index** — an engine-owned log-structured merge tree of `(key,
+version)` files (object-store-state.md §6): the harness compares each write
+with it, skips the store entirely when nothing changed, and otherwise writes
+the changed entries as the batch's delta file. An unkeyed output's batches
+are its store's; `head.base` is the first batch after its last reset. The
+engine keeps a per-edge **watermark** `{batch, until?, after, full,
+fingerprint, output, up}` — the consumer's position. For a keyed upstream
+the spec pins the index and a window — the delta log from `batch` to the
+head, or the whole index for a full delivery — and the harness reads one
+page of it (`batch_size` keys), loads those keys with `Keys(…)`, and reports
+where the page ended (`after`); for an unkeyed one the engine plans a
+`Batches(lo, hi)` range. Each page commits with its watermark update;
+`more` re-queues the task; `complete := not more` on the head.
 
 The **interpretation fingerprint** `H(version, store versions of the
 asset's input and output stores, migration names of the asset's outputs,
-run config, refs of non-ByKey inputs and deps)` is stored per processed
-key. A key is reprocessed when its revision or the fingerprint changes, so
-a `version` bump, a new migration, or a change to any whole input
-reprocesses every key. Code changes alone do not: the code hash
+run config, refs of non-incremental inputs and deps)` is stored on the
+watermark. A fingerprint mismatch — a `version` bump, a new migration, or a
+change to any whole input — forces `full=True` on the edge: the delivery
+resets to the whole head. Code changes alone do not: the code hash
 bumps the project revision, not the fingerprint.
 
-A head written before the key was declared has no key map: "no keys
-known"; the consumer's state starts empty and the next write upserts
+A head written before the output was incremental has no delta log: "no keys
+known"; the consumer's watermark starts empty and the next write upserts
 everything. A `version` mismatch between committed and declared makes an
-incremental attempt fail non-retryably ("recompute required"), or, with
-`on_version_change="recompute"`, turns the next attempt of each scope into
-a recompute.
+incremental attempt fail non-retryably, or, with
+`on_version_change="full"`, turns the next attempt of each scope into
+a full run.
 
 ## 7. Partitions
 
@@ -376,7 +386,7 @@ partitions = {"site": sites, "day": TimePartitions(start="2024-01-01", every="1d
 |---|---|---|
 | `StaticPartitions([...])` | fixed list | none |
 | `TimePartitions(start, every, *, end=None, end_offset=None, timezone="UTC", format=None)` | half-open windows `[start, start+every)` aligned in `timezone`; `every` is a duration (`"15m"`, `"1h"`, `"1d"`, `"1w"`) or a cron expression for calendar slices; the set ends at the newest complete window unless `end`/`end_offset` (a duration) say otherwise; `format` is the key's strftime, defaulted from `every`, required for cron | none |
-| a `PartitionSet`, or any keyed output or source | the current key map of that output | its head |
+| a `PartitionSet`, or any keyed output or source | `meta.partitions` on the head ref (a partition set), else the fold of its delta log | its head |
 
 There is no separate partition-set mechanism. A dynamic set is an asset
 producing a `PartitionSet` (with its own inputs, automations and placement); an
@@ -400,8 +410,8 @@ declaration, or the same key-set output):
   resolved to **keys with committed heads at pin time**, never a barrier on
   missing keys.
 
-`ByKey` requires no upstream-only dimensions (a broadcast `ByKey` diffs the
-whole map per consumer key).
+`Incremental` requires no upstream-only dimensions (a broadcast `Incremental`
+diffs the same delta log per consumer key).
 
 **Fan-out.** A run's `partitions` (§8) selects keys from the current set:
 `"latest"`, `"missing"`, `"all"` or a list. `OnChange` automations default
@@ -417,15 +427,16 @@ A run is `{targets, partitions, mode, upstream, config, keys}`:
 |---|---|
 | `targets` | assets (or outputs) to materialize |
 | `partitions` | `[k…]` · `"all"` (current key set) · `"missing"` (no complete head) · `"latest"` (newest window of each time dimension, every key of the others) · default `"latest"` |
-| `mode` | `incremental` (default) or `recompute` |
+| `mode` | `incremental` (default) or `full` |
 | `upstream` | also plan the upstream closure; default false: **targets only, inputs pinned to current heads**, so a rebuild never re-polls an external system |
 | `config` | JSON passed as `ctx.config` |
-| `keys` | per-edge override `{"qaqc_files": {"keys": [...]} \| "full"}`: explicit keys merge into key state; `full` treats every key as upserted and state-minus-map as deleted |
+| `keys` | per-edge override `{"qaqc_files": {"keys": [...]} \| "full"}`: explicit keys are delivered as that edge's selection; `full` resets the edge — the whole head as a reset delivery |
 
 **Modes.** `incremental`: the store gets `prior` = head, the cursor is
-kept, `ByKey` edges get the diff. `recompute`: no prior, no cursor, key
-state cleared, every key upserted; the store makes the output equal to
-exactly this write. `keys=full` is not recompute: prior is kept.
+kept, `Incremental` edges get the watermark diff. `full`: no prior, no
+cursor, every incremental edge resets to the whole head and its watermark
+lands past the head batch; the store makes the output equal to
+exactly this write. `keys=full` resets one edge only: `prior` is kept.
 
 **Attempts.** A task is claimed under a per-scope lock with a lease and a
 generation. Inputs are resolved to heads when the attempt starts and
@@ -435,16 +446,32 @@ since the claim. A stale generation cannot commit (**fencing**). Outcomes:
 | Outcome | Meaning |
 |---|---|
 | `succeeded` | committed |
-| `skipped` | every `ByKey` edge diff was empty and heads are complete: no harness launched, nothing changes |
-| `failed` | retryable → `retries=` applies with backoff; non-retryable (store conflict, revision mismatch, recompute required) → task fails |
+| `skipped` | every `Incremental` edge was already at its head (empty diff) and heads are complete: no harness launched, nothing changes |
+| `failed` | retryable → `retries=` applies with backoff; non-retryable (store conflict, revision mismatch, version-mismatch without `on_version_change="full"`) → task fails |
 | `canceled` | run canceled or lease lost; a successor may already own the scope |
 
-A commit installs heads, `input_refs`, the cursor, per-edge key state and a
+A commit installs heads, `input_refs`, the cursor, per-edge watermarks and a
 `changed` list, and pends `OnChange` automations in the same transaction.
 Every terminal task outcome also records `{last_outcome, last_attempt, at}`
 on the `(asset, scope)` record, and queued or running tasks are indexed per
 scope. Views such as the partition grid read those two things; nothing
 scans task history.
+
+**Retention.** `@asset(retention=Retention(days=…, runs=…))` bounds an
+asset's history; `Project(retention=…)` sets the default and
+`Retention(forever=True)` opts out of it (object-store-state.md §11). Current
+state — heads, key indexes, cursors, watermarks — never depends on runs and
+never expires. Every `retention_interval` (60 s) the engine deletes finished
+runs (`runs/{run}/`: the run record, attempt files and logs) that every asset
+they ran has let go of; only runs in progress are protected. Data expires in
+the harness: an attempt of an asset with a finite policy carries the horizon
+in its spec, and before writing an output the harness calls
+`store.expire(head, before)` with the committed head, which stays loadable.
+`cursus runs delete RUN` and `cursus runs prune [--before] [--asset] [--keep]
+[--dry-run]` (and `DELETE /runs/{run}`, `POST /runs:prune`) delete runs by hand.
+Postgres has no `expire`: bound an append-only table with a scheduled job
+that deletes old rows (object-store-state.md §11); a keyed table removes
+keys through its own asset, so its key index and consumers see it.
 
 ## 9. Automations
 
@@ -535,18 +562,20 @@ class Placement(Protocol):
 
 | Method | Contract |
 |---|---|
-| `launch` | Start the harness, handing it the two `stage` strings (container override, argv, function argument); the harness reaches `objects` with the environment's own auth. The spec is already at `specs/{attempt}.json`. Raising = attempt failed, retryable. |
+| `launch` | Start the harness, handing it the three `stage` strings — `attempt`, `run`, `objects` — (container override, argv, function argument); the harness reaches `objects` with the environment's own auth. The spec is already in the attempt file. Raising = attempt failed, retryable. |
 | `wait` | Block at most `timeout`; `None` while running, else `Exit`. Idempotent, safe after termination; a vanished run is `Exit(None, "lost")`. |
 | `cancel` | Best-effort, idempotent, never raises for a finished run. |
 
-Object keys are conventional under `objects`: `specs/{attempt}.json`,
-`results/{attempt}.json`, `logs/{attempt}/{seq}.jsonl`.
+Object keys are conventional under `objects`: the attempt file
+`runs/{run}/{attempt}.json` — the spec, then spec + result + log index —
+and its gzip log `runs/{run}/{attempt}.log` (`.log.{n}` chunks while it runs);
+see object-store-state.md §8.
 
 **Engine loop**, per attempt:
 
 ```python
-await objects.put(f"specs/{attempt}.json", spec)
-run = await placement.launch(Stage(attempt, objects_url))
+await objects.create(f"runs/{run_id}/{attempt}.json", {"spec": spec})
+run = await placement.launch(Stage(attempt, run_id, objects_url))
 deadline = now() + timeout
 while (exit := await placement.wait(run, lease_interval)) is None:
     if now() > deadline:
@@ -559,16 +588,15 @@ while (exit := await placement.wait(run, lease_interval)) is None:
         await placement.cancel(run)
         await placement.wait(run, grace)
         return
-result = await objects.get(f"results/{attempt}.json")
+result = (await objects.get(f"runs/{run_id}/{attempt}.json")).get("result")
 if result is None:
     return fail(f"harness exited without a result: {exit}", retryable=True)
 commit_or_fail(result)
 ```
 
-On restart, `active/` attempts with a handle are resumed at `wait`, not
-abandoned. `Local` handles carry `{pid, started_at}` and treat a mismatch
-as lost. The engine counts in-flight attempts per environment against
-`max_concurrent`.
+On restart every lease is expired: in-flight attempts are fenced and their
+tasks requeue and relaunch from scratch — nothing resumes at `wait`. The
+engine counts in-flight attempts per environment against `max_concurrent`.
 
 ### Worker protocol
 
@@ -585,8 +613,12 @@ code.
   "run":       {"id": "r7", "config": {}},
   "cursor":    "token-41",
   "prior":     {"qaqc_samples": Ref},
+  "outputs":   {"qaqc_samples": {"exists": true, "head": Ref, "batch": 7, "index": KeyIndex}},
+  "retention": {"before": 1790000000.0},
   "inputs": {
-    "qaqc_files":      {"ref": Ref, "changes": {"upserted": {"f1": "v3"}, "deleted": ["f0"]}},
+    "qaqc_files":      {"ref": Ref, "index": KeyIndex,
+                        "changes": {"from": 12, "to": 14, "after": null, "full": false, "limit": 100}},
+    "site_events":     {"ref": Ref, "changes": {"batches": [4, 6], "full": false}},
     "site_health":     {"refs": {"Richmond": Ref, "Perth": Ref}},
     "psa_samples":     {"ref": Ref},
     "usgs_3dep_tiles": {"ref": Ref}
@@ -595,32 +627,46 @@ code.
 ```
 
 - `inputs` holds every pin by input name, including `deps`; the manifest
-  says which bind parameters. `upserted` is the `Keys` selection and
-  `ctx.changes[...].upserted` at once.
-- `prior` is the committed head per output; the prior key map is
-  located by `prior.meta["keys"]`. Recompute is expressed by withholding
-  `prior` and `cursor`; there is no `mode` field.
+  says which bind parameters. `changes` is what to deliver — for a keyed
+  upstream a window of its pinned key index (the delta log `from`–`to`, or
+  the whole index when `full`), read `limit` keys at a time from `after`; for
+  an unkeyed one the `[lo, hi]` `Batches` range; a run's `keys=` override
+  names its keys outright. `full` marks a reset delivery.
+- `prior` is the committed head per output; `outputs` pins each output's
+  committed head, its engine-assigned batch number and, when keyed, its key
+  index. A `full` run is expressed by withholding `prior` and `cursor`
+  (`outputs` stays); there is no `mode` field. `retention.before` is the
+  horizon for `store.expire` (§8 Retention).
 - Store names, output config, annotations, placement and time windows are
   derived from the manifest and the key.
 
 ```json
-{"attempt": "t1/3", "status": "succeeded", "outputs": {"qaqc_samples": Ref}, "cursor": "token-42"}
-{"attempt": "t1/3", "status": "failed",
+{"status": "succeeded",
+ "outputs": {"qaqc_samples": {"ref": Ref, "keys": {"files": [FileInfo], "added": 1, "removed": 0, "exact": true}}},
+ "delivered": {"qaqc_files": {"after": null, "upserted": ["f1"], "deleted": ["f0"]}},
+ "cursor": "token-42"}
+{"status": "failed",
  "error": {"type": "ValueError", "message": "…", "traceback": "…", "retryable": true}}
 ```
 
-The result is the attempt's commit request: refs for returned outputs
-(omitted = keep prior), `cursor` if set, or an error. `retryable=false` for
-store conflicts, revision mismatch and recompute-required. No result means
+The result is the attempt's commit request: per returned output its ref
+(or `unchanged`), a keyed output's delta files (`keys`) and a partition
+set's `elements`; per keyed Incremental input the page it `delivered`;
+`cursor` if set; or an error. `retryable=false` for store conflicts,
+revision mismatch and version-mismatch without a full run. No result means
 the harness died. The engine validates the attempt id, that every ref names
-a known output and this scope, and that a keyed output carries its
-key map, then commits against its own record of the pins.
+a known output and this scope, and that a keyed output reports its delta,
+then commits against its own record of the pins. Inputs that moved since
+they were pinned do not void the commit: the attempt delivered the window
+it was given.
 
 **Harness** (`python -m cursus_worker run --objects URL --attempt ID`; the
 project entrypoint comes from the environment): fetch spec → refuse on
 revision mismatch (a failed result, not a crash) → resolve `env:` → load
-inputs per annotation → build `ctx` → run the producer → `store()` each
-returned output, stage key maps → write the result last, in one PUT.
+inputs per annotation (keyed Incremental edges through the upstream key
+index) → build `ctx` → run the producer → for each returned output, compare
+the write with its key index; `store()` it unless nothing changed and write
+the delta file → write the result last, in one PUT.
 Logs stream to chunked objects throughout. `manifest` mode runs through
 `Local` only, at server start.
 
@@ -655,21 +701,20 @@ project = Project(
 ```
 
 The manifest records assets (`outputs` with `{name, store, key, revision,
-mode, migrations, config}`, `inputs`, `deps`, `partitions`, `placement`, `retries`,
+incremental, migrations, config}`, `inputs`, `deps`, `partitions`, `placement`, `retries`,
 `timeout`, `version`, code hash, load types via `typing.get_type_hints`),
 sources, automations, store names with their `Store.version`, executor
 names, and the project revision.
 
 Registration errors:
 
-- an `inputs=` value is not a `str` or one of `In`, `ByKey`, `AllPartitions`,
+- an `inputs=` value is not a `str` or one of `In`, `Incremental`, `AllPartitions`,
   or names an unknown output;
-- a partition edge violates the projection rule (§7); a `ByKey` edge has
+- a partition edge violates the projection rule (§7); an `Incremental` edge has
   upstream-only dimensions or is ref-annotated;
-- a `ByKey` edge's upstream output declares no key, or its store fails
-  `can_load(T, Keys)`;
-- a keyed output is `mode="append"`, or its store fails `can_store(T,
-  output)`;
+- an `Incremental` edge's upstream output is not incremental, or its store fails
+  `can_load(T, selection)`;
+- an output's store fails `can_store(T, output)`;
 - a store-bound input is unannotated, or its store fails `can_load(T,
   selection)`;
 - an output's config or return annotation fails `can_store`;
@@ -687,8 +732,8 @@ A bare `DataFrame` to a `primary_key` output is replace, not a `Patch`.
 ## 12. Later and non-goals
 
 **Later** (specified when a workload demands it): `route=` broadcast
-optimization for `ByKey`; checks and conditions (`when=`); `OnRunStatus`;
-trigger composition; chunked key maps past ~1M keys; console data preview.
+optimization for `Incremental`; checks and conditions (`when=`); `OnRunStatus`;
+trigger composition; delta-log compaction for very long histories; console data preview.
 
 **Non-goals:** cycles (DAG only, including self-triggers; loop inside a
 producer); dynamic topology (the manifest is static per

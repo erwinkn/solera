@@ -234,9 +234,7 @@ function PartitionGrid({
   for (const output of asset.outputs)
     for (const [scope, head] of headEntries(detail, asset, output.name))
       headsByScope.set(scope, head);
-  const keyCountOf = (scope: string) =>
-    (headsByScope.get(scope)?.ref.meta as { keys?: { count?: number } })?.keys
-      ?.count;
+  const keyCountOf = (scope: string) => headsByScope.get(scope)?.count;
 
   if (!dims.length) {
     const scope = "";
@@ -461,7 +459,7 @@ export function AssetSheet() {
                           {output.key ??
                             (output.partition_set ? "<elements>" : "—")}
                           {output.revision ? ` @${output.revision}` : ""}
-                          {output.mode ? ` · ${output.mode}` : ""}
+                          {output.incremental ? " · incremental" : ""}
                         </td>
                         <td className="px-3 py-2">
                           <MigrationCell output={output} heads={heads} />

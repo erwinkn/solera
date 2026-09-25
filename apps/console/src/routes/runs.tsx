@@ -25,6 +25,7 @@ function displayStatus(run: Run) {
 }
 
 function selectionLabel(run: Run) {
+  if (run.source) return `source commit · ${run.by ?? "api"}`;
   return Array.isArray(run.partitions)
     ? `${run.partitions.length} scope${run.partitions.length === 1 ? "" : "s"} · ${run.mode}`
     : `${run.partitions} · ${run.mode}`;

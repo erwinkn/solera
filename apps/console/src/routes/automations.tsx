@@ -102,11 +102,12 @@ function AutomationsPage() {
                     <span className="truncate font-mono text-sm font-medium">
                       {automation.name}
                     </span>
-                    {!!automation.pending.length && (
-                      <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[0.7rem] font-semibold text-primary tabular-nums">
-                        {automation.pending.length} pending
-                      </span>
-                    )}
+                    {automation.trigger.kind === "onchange" &&
+                      !!automation.pending.length && (
+                        <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[0.7rem] font-semibold text-primary tabular-nums">
+                          {automation.pending.length} pending
+                        </span>
+                      )}
                   </div>
                   <div className="text-xs text-muted-foreground">
                     {triggerLabel(automation)}

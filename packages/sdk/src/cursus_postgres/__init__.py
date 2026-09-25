@@ -11,6 +11,7 @@ from typing import Any
 
 from cursus.sdk import Output, Ref, TableRef, digest
 from cursus.stores import (
+    Batches,
     Keys,
     Patch,
     Scope,
@@ -97,13 +98,14 @@ class PostgresStore:
         partition_col = output.config.get("partition_column")
         if partition_col:
             columns.setdefault(partition_col, "text")
-        if output.mode == "append":
+        batch_mode = output.incremental and output.key is None
+        if batch_mode:
             columns.setdefault(BATCH_COLUMN, "integer")
             columns.setdefault(SEQ_COLUMN, "integer")
         pk = list(output.config.get("primary_key") or ([output.key] if output.key else []))
-        if partition_col and partition_col not in pk and (pk or output.mode == "append"):
+        if partition_col and partition_col not in pk and (pk or batch_mode):
             pk = [*pk, partition_col]
-        if output.mode == "append":
+        if batch_mode:
             for c in (BATCH_COLUMN, SEQ_COLUMN):
                 if c not in pk:
                     pk = [*pk, c]
@@ -203,39 +205,47 @@ class PostgresStore:
             (output_name, partition, version, batch),
         )
 
+    def _marker_batch(self, cur, output_name: str, partition: str) -> int | None:
+        row = cur.execute(
+            f"SELECT batch FROM {MARKER_TABLE} WHERE output = %s AND partition = %s",
+            (output_name, partition),
+        ).fetchone()
+        return row["batch"] if row else None
+
     # -- writes ---------------------------------------------------------------
 
     async def store(self, write, prior: Ref | None, scope: Scope) -> Written:
         output = scope.output
         with self._connect() as conn, conn.cursor() as cur:
             self._ensure_markers(cur)
+            self._rename(cur, output, scope)
             table, _, _ = self._table(output)
             partition_col = output.config.get("partition_column")
             slice_where = {partition_col: scope.partition} if partition_col else {}
 
-            if prior is not None:  # recompute (prior=None) skips the marker check
+            if prior is not None:  # a full run (prior=None) skips the marker check
                 live = self._marker(cur, output.name, scope.partition)
                 if live != prior.version:
                     raise StoreConflict(
                         f"{output.name}/{scope.partition}: live marker {live} != pinned {prior.version}"
                     )
 
-            prior_keys = dict(scope.prior_keys or {})
-            batch = None
+            batch = self._assigned_batch(cur, output, scope) if output.incremental else None
+            keys = None
             if isinstance(write, Sql):
-                version, keys, batch = self._apply_sql(cur, output, write, scope, table, slice_where, prior)
+                version, keys = self._apply_sql(cur, output, write, scope, table, slice_where, prior)
             elif isinstance(write, Patch):
-                version, keys, batch = self._apply_patch(
-                    cur, output, write, scope, table, slice_where, prior, prior_keys
-                )
+                version = self._apply_patch(cur, output, write, scope, table, slice_where, prior, batch)
                 if version is None:
-                    return Written(prior, prior_keys)
+                    return Written(prior)
             else:
-                if output.mode == "append":
-                    raise WriteError(f"{output.name}: an append output only accepts Patch writes")
-                version, keys = self._apply_replace(cur, output, write, scope, table, slice_where)
-
+                if output.incremental and output.key is None:
+                    raise WriteError(
+                        f"{output.name}: an unkeyed incremental output only accepts Patch writes"
+                    )
+                version = self._apply_replace(cur, output, write, scope, table, slice_where)
             self._set_marker(cur, output.name, scope.partition, version, batch)
+        batch_mode = output.key is None and output.incremental
         return Written(
             TableRef(
                 output=output.name,
@@ -243,9 +253,9 @@ class PostgresStore:
                 handle={
                     "table": table,
                     "where": slice_where,
-                    "key": BATCH_COLUMN if output.mode == "append" else output.key,
+                    "key": BATCH_COLUMN if batch_mode else output.key,
                     "revision": output.revision,
-                    "batch": batch,
+                    "batch": batch if batch_mode else None,
                 },
                 version=version,
                 partition=scope.partition,
@@ -253,7 +263,29 @@ class PostgresStore:
             keys,
         )
 
-    def _apply_replace(self, cur, output, write, scope, table, slice_where) -> tuple[str, dict | None]:
+    def _rename(self, cur, output, scope):
+        """An output renamed through its asset's aliases (§2) takes its table
+        and markers along, once: the first write under the new name."""
+
+        if not scope.aliases or "table" in output.config:
+            return
+        schema = output.config.get("schema", "public")
+        exists = "SELECT 1 FROM information_schema.tables WHERE table_schema = %s AND table_name = %s"
+        if cur.execute(exists, (schema, output.name)).fetchone():
+            return
+        for alias in scope.aliases:
+            if cur.execute(exists, (schema, alias)).fetchone():
+                cur.execute(f"ALTER TABLE {_qname(schema, alias)} RENAME TO {_ident(output.name)}")
+                cur.execute(f"UPDATE {MARKER_TABLE} SET output = %s WHERE output = %s", (output.name, alias))
+                return
+
+    def _assigned_batch(self, cur, output, scope) -> int:
+        if scope.batch is not None:
+            return scope.batch
+        prior_marker = self._marker_batch(cur, output.name, scope.partition)
+        return int(prior_marker) + 1 if prior_marker is not None else 0
+
+    def _apply_replace(self, cur, output, write, scope, table, slice_where):
         rows = _coerce_rows(write)
         if partition_col := output.config.get("partition_column"):
             for row in rows:
@@ -263,43 +295,39 @@ class PostgresStore:
                         f"with scope {scope.partition!r}"
                     )
                 row[partition_col] = scope.partition
+        if output.key is not None:
+            key_map(output, rows)  # validates the key column and duplicate keys
         self._ensure(cur, output, rows)
         self._delete_slice(cur, table, slice_where)
         self._insert(cur, table, rows)
-        version = digest(rows)
-        keys = key_map(output, rows) if output.key or output.is_partition_set else None
-        return version, keys
+        return digest(rows)
 
-    def _apply_patch(self, cur, output, write: Patch, scope, table, slice_where, prior, prior_keys):
-        if output.key is None and not output.is_partition_set and output.mode != "append":
-            raise WriteError(f"{output.name}: Patch requires a keyed or append output")
+    def _apply_patch(self, cur, output, write: Patch, scope, table, slice_where, prior, batch):
+        if not output.incremental:
+            raise WriteError(f"{output.name}: Patch requires an incremental output")
         remove = {str(k) for k in write.remove}
         rows = _coerce_rows(write.rows)
-        if not rows and not remove:
-            if prior is None:
-                raise WriteError(f"{output.name}: empty Patch with no prior head")
-            return None, None, None
+        if not rows and not remove and prior is not None:
+            return None
         self._ensure(cur, output, rows)
-        batch = None
-        if output.mode == "append":
+        partition_col = output.config.get("partition_column")
+        if output.key is None:
+            # Batch mode: stamp the batch columns, replace this batch's rows.
             if remove:
-                raise WriteError(f"{output.name}: remove is not allowed on an append output")
-            batch = max([int(b) for b in prior_keys], default=-1) + 1
-            partition_col = output.config.get("partition_column")
+                raise WriteError(f"{output.name}: remove is not allowed on an unkeyed incremental output")
             for i, row in enumerate(rows):
                 row[BATCH_COLUMN] = batch
                 row[SEQ_COLUMN] = i
                 if partition_col:
                     row[partition_col] = scope.partition
-            # Idempotent on (scope, batch): replace this batch's rows.
-            where = {**slice_where, BATCH_COLUMN: batch}
-            self._delete_slice(cur, table, where)
+            if prior is None:
+                # A full run replaces the slice: supersede every prior batch.
+                self._delete_slice(cur, table, slice_where)
+            else:
+                self._delete_slice(cur, table, {**slice_where, BATCH_COLUMN: batch})
             self._insert(cur, table, rows)
-            keys = {**prior_keys, str(batch): digest(rows)}
-            version = digest([prior.version if prior else "", digest({"rows": _canon(rows), "remove": []})])
-            return version, keys, batch
+            return digest([prior.version if prior else "", digest({"rows": _canon(rows), "remove": []})])
 
-        partition_col = output.config.get("partition_column")
         for row in rows:
             if partition_col:
                 if partition_col in row and str(row[partition_col]) != scope.partition:
@@ -307,31 +335,25 @@ class PostgresStore:
                         f"{output.name}: row {partition_col}={row[partition_col]!r} disagrees with scope"
                     )
                 row[partition_col] = scope.partition
+        key_map(output, rows)  # validates the key column and duplicate keys
+        if prior is None:
+            # No prior (a first write or a full run): the patch is the whole state.
+            self._delete_slice(cur, table, slice_where)
         self._upsert(cur, table, output, rows)
         if remove:
-            key_col = output.key or "key"
             cur.execute(
-                f"DELETE FROM {table} WHERE {self._where_sql(slice_where)} AND {_ident(key_col)}::text = ANY(%s)",
+                f"DELETE FROM {table} WHERE {self._where_sql(slice_where)} AND {_ident(output.key)}::text = ANY(%s)",
                 ([slice_where[k] for k in sorted(slice_where)] + [sorted(remove)]),
             )
-        patch_map = key_map(output, rows)
-        keys = {k: v for k, v in prior_keys.items() if k not in remove}
-        keys.update(patch_map)
-        # Orphan sweep: rows left by an attempt that never committed are absent
-        # from the resulting map by construction (§3).
-        if keys:
-            cur.execute(
-                f"DELETE FROM {table} WHERE {self._where_sql(slice_where)} AND NOT ({_ident(output.key)}::text = ANY(%s))",
-                ([slice_where[k] for k in sorted(slice_where)] + [sorted(keys)]),
-            )
-        else:
-            self._delete_slice(cur, table, slice_where)
-        version = digest(
+        return digest(
             [prior.version if prior else "", digest({"rows": _canon(rows), "remove": sorted(remove)})]
         )
-        return version, keys, None
 
     def _apply_sql(self, cur, output, write: Sql, scope, table, slice_where, prior):
+        """Materialize a SELECT into the slice, or run a statement verbatim. The
+        harness never sees these rows, so a keyed output reports the slice's
+        complete key map (§6, §9)."""
+
         if _is_select(write.stmt):
             probe = cur.execute(f"SELECT * FROM ({write.stmt}) _probe LIMIT 0")
             columns = [d.name for d in probe.description]
@@ -372,8 +394,7 @@ class PostgresStore:
                 [slice_where[k] for k in sorted(slice_where)],
             ).fetchall()
             keys = key_map(output, rows)
-        version = digest([prior.version if prior else "", digest(write.stmt)])
-        return version, keys, None
+        return digest([prior.version if prior else "", digest(write.stmt)]), keys
 
     # -- migrations (§4) --------------------------------------------------------
 
@@ -420,14 +441,15 @@ class PostgresStore:
 
     # -- reads ----------------------------------------------------------------
 
-    async def load(self, ref: Ref, t, selection: Keys | None) -> Any:
+    async def load(self, ref: Ref, t, selection: Keys | Batches | None) -> Any:
         if isinstance(t, type) and issubclass(t, Ref):
             return ref
         handle = ref.handle or {}
         with self._connect() as conn, conn.cursor() as cur:
             self._ensure_markers(cur)
-            # Append refs are exempt: the `_batch <=` filter is a true snapshot
-            # at the pinned version, always readable after later writes (§3).
+            # Batch-mode refs are exempt: the `_batch <=` filter is a true
+            # snapshot at the pinned version, always readable after later
+            # writes (§3).
             if not ref.meta.get("external") and handle.get("batch") is None:
                 live = self._marker(cur, ref.output, ref.partition)
                 if live != ref.version:
@@ -442,7 +464,10 @@ class PostgresStore:
             if handle.get("batch") is not None:
                 clauses.append(f"{_ident(BATCH_COLUMN)} <= %s")
                 params.append(handle["batch"])
-            if selection is not None:
+            if isinstance(selection, Batches):
+                clauses.append(f"{_ident(BATCH_COLUMN)} BETWEEN %s AND %s")
+                params += [selection.lo, selection.hi]
+            elif selection is not None:
                 key_col = handle.get("key")
                 if not key_col:
                     raise StoreError(f"{ref.output}: no key column for a Keys selection")

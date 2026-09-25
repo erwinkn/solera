@@ -11,6 +11,7 @@ const labels: Record<string, string> = {
   stale: "Stale",
   partial: "Partial",
   queued: "Queued",
+  claimable: "Claimable",
   waiting: "Waiting",
   running: "Running",
   paused: "Paused",
@@ -45,6 +46,7 @@ const tones: Record<string, string> = {
   missing: AMBER,
   paused: AMBER,
   queued: ZINC,
+  claimable: ZINC,
   waiting: ZINC,
   running: SKY,
   skipped: ZINC,
@@ -64,6 +66,7 @@ const dots: Record<string, string> = {
   missing: "bg-amber-500",
   paused: "bg-amber-500",
   queued: "bg-muted-foreground/50",
+  claimable: "bg-muted-foreground/50",
   waiting: "bg-muted-foreground/50",
   running: "bg-sky-500 animate-pulse",
   skipped: "bg-muted-foreground/50",
@@ -148,7 +151,7 @@ export interface SegmentOption<T extends string> {
 }
 
 /** A compact segmented control — the workhorse for latest/missing/all/pick,
-    incremental/recompute, table/graph, and the light/dark theme switch.
+    incremental/full, table/graph, and the light/dark theme switch.
     Radio-group semantics: one tabbable option, arrows/Home/End move and
     select. */
 export function Segmented<T extends string>({

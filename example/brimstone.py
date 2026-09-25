@@ -19,9 +19,9 @@ from cursus.sdk import (
     AllPartitions,
     Automation,
     AutoRefresh,
-    ByKey,
     Cron,
     Every,
+    Incremental,
     Migration,
     OnDeploy,
     Output,
@@ -106,15 +106,19 @@ uploads = PartitionSet("uploads")
 
 # ---------------------------------------------------------------------------
 # Ingress: polling lives in the graph. One cursor asset per site both keeps
-# an append-only event log (a keyed output whose keys are batch numbers) and
-# maintains the keyed file inventory that downstream ByKey edges diff against.
+# an unkeyed incremental event log (one delta batch per commit) and
+# maintains the keyed file inventory that Incremental edges diff against.
 # ---------------------------------------------------------------------------
 
 
 @asset(
     outputs=(
         Output(
-            "change_events", store="postgres", schema="sharepoint", mode="append", partition_column="site"
+            "change_events",
+            store="postgres",
+            schema="sharepoint",
+            incremental=True,
+            partition_column="site",
         ),
         Output("qaqc_files", key="file_id", revision="version"),
     ),
@@ -132,12 +136,12 @@ def graph_delta(ctx, graph: GraphClient):
     kept = {w["file_id"] for w in workbooks}
     return Result(
         outputs={
-            # On an append output a Patch is one new batch key; a retry after
-            # a rejected commit replaces its own orphan.
+            # An unkeyed incremental Patch is one new batch; a retry after a
+            # rejected commit replaces its own orphan batch rows.
             "change_events": Patch(events),
             # Every file_id in `workbooks` is re-owned; touched files that are
             # deleted or not QAQC workbooks leave the inventory. The store
-            # returns the complete key -> version map for this site.
+            # computes the committed delta for this site.
             "qaqc_files": Patch(workbooks, remove=[e["file_id"] for e in events if e["file_id"] not in kept]),
         },
         cursor=token,
@@ -163,7 +167,7 @@ def graph_delta(ctx, graph: GraphClient):
         ],
     ),
     partitions=sites,
-    inputs={"qaqc_files": ByKey()},
+    inputs={"qaqc_files": Incremental()},
     version="2",  # bump to reprocess every key; code changes alone do not
     automations=AutoRefresh(),
 )

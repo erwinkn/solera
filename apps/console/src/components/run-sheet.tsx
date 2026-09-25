@@ -40,7 +40,7 @@ function logTime(at?: number) {
 }
 
 function LogConsole({ path }: { path: string }) {
-  // The endpoint streams newline-delimited JSON log records; poll for a tail.
+  // The endpoint returns the log's last lines as JSON records; poll it for a tail.
   const { data } = useQueryText(path, 1000);
   const lines = (data ?? "")
     .split("\n")
@@ -94,7 +94,7 @@ function AttemptRow({
   attempt: Attempt;
 }) {
   const attemptId = attempt.id ?? `${task.id}/${attempt.generation}`;
-  const encoded = attemptId.split("/").map(encodeURIComponent).join("/");
+  const path = `${base}/runs/${encodeURIComponent(task.run)}/attempts/${encodeURIComponent(attemptId)}`;
   return (
     <details className="rounded-lg border" data-attempt={attemptId}>
       <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2 text-sm">
@@ -120,13 +120,13 @@ function AttemptRow({
             <TabsTrigger value="result">Result</TabsTrigger>
           </TabsList>
           <TabsContent value="logs">
-            <LogConsole path={`${base}/attempts/${encoded}/logs`} />
+            <LogConsole path={`${path}/logs?tail=500`} />
           </TabsContent>
           <TabsContent value="spec">
-            <JsonView path={`${base}/attempts/${encoded}/spec`} />
+            <JsonView path={`${path}/spec`} />
           </TabsContent>
           <TabsContent value="result">
-            <JsonView path={`${base}/attempts/${encoded}/result`} />
+            <JsonView path={`${path}/result`} />
           </TabsContent>
         </Tabs>
       </div>
@@ -166,7 +166,9 @@ export function RunSheet() {
                 run {runId?.slice(0, 12)}
               </SheetTitle>
               <SheetDescription className="text-xs">
-                {run ? (
+                {run?.source ? (
+                  `${run.source} · source commit · ${run.by ?? "api"}`
+                ) : run ? (
                   <>
                     {run.targets.join(", ")} · {run.mode} ·{" "}
                     {Array.isArray(run.partitions)

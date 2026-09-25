@@ -12,7 +12,7 @@ shared Postgres tables when `DATABASE_URL` is set.
 ## Layout
 
 - `packages/sdk` — `cursus`, the asset SDK project files import
-  (`@asset`, `Output`, `Patch`, `Sql`, `PartitionSet`, `ByKey`,
+  (`@asset`, `Output`, `Patch`, `Sql`, `PartitionSet`, `Incremental`,
   `AllPartitions`, `TimePartitions`, triggers, placements). `cursus_postgres`
   ships `PostgresStore`.
 - `apps/server` — `cursus_server`: the control plane (state layer, engine,
@@ -47,8 +47,8 @@ The default project is designed to make every architecture feature visible:
 | --- | --- |
 | `sites` | a `PartitionSet` on a `Cron` — the site list grows one site per run (cursor-driven) and caps at four |
 | `uploads` | an external `PartitionSet` source fed by `cursus commit` |
-| `site_feed` | per-site cursor asset on `Every(10)`: `site_events` (append) + `site_files` (keyed inventory), `Patch` both ways |
-| `file_index` | `ByKey(batch_size=2)` consumer — watch `more` continuation; declared `version="2"` |
+| `site_feed` | per-site cursor asset on `Every(10)`: `site_events` (unkeyed incremental) + `site_files` (keyed inventory), `Patch` both ways |
+| `file_index` | `Incremental(batch_size=2)` consumer — watch `more` continuation; declared `version="2"` |
 | `site_digest` | `site × day` two-dimensional asset (`TimePartitions`), `deps=` on the `roadmap` source, `BlobStore` output |
 | `fleet_index` | `AllPartitions` fan-in: `dict[str, list[dict]]` on JsonStore, `dict[str, TableRef]` on Postgres |
 | `site_status` | `Sql` asset over a `TableRef` (Postgres); on JsonStore it logs that it skipped |
@@ -99,23 +99,24 @@ committing is enough once a pool worker is running.
 uv run cursus run site_feed --partitions all --upstream
 ```
 
-Each site scope writes a `site_events` append batch and a `site_files` keyed
+Each site scope writes a `site_events` incremental batch and a `site_files` keyed
 patch, and stores the feed token as its cursor. **Runs** shows the run; click a
-task to see its attempt spec — `inputs.site_files` carries the pinned ref and
-per-key revisions.
+task to see its attempt spec — `inputs.site_files` carries the pinned ref, the
+pinned key index and the window to read (a delta-log range, or the whole index
+for a first delivery); the attempt's result records the keys it delivered.
 
 Run it again inside the same feed tick: the feed returns identical events,
 the committed versions are unchanged, and `file_index` is not woken — that is
 the "no change wakes nothing" corollary. To see a changed pass, wait one tick
 (or shrink it) and let `site_feed.every.0` fire, or `run-now` it.
 
-### 4. ByKey with `more` continuation
+### 4. Incremental with `more` continuation
 
 ```bash
 uv run cursus run file_index --partitions all --upstream
 ```
 
-`site_files` holds four files per site; `ByKey(batch_size=2)` delivers them in
+`site_files` holds four files per site; `Incremental(batch_size=2)` delivers them in
 two batches — the run detail shows the first attempt completing with
 `more: true` and a follow-up attempt finishing the remaining keys.
 
@@ -196,7 +197,7 @@ uv run cursus serve --insecure
 ```
 
 Partitioned outputs share one physical table per output, sliced by their
-`partition_column`; append outputs get a `_batch`/`_seq` snapshot pair so a
+`partition_column`; unkeyed incremental outputs get a `_batch`/`_seq` snapshot pair so a
 pinned `TableRef` keeps reading the version it was committed at. Writes are
 fenced by a per-partition version marker — a stale attempt's rows can never
 become visible. `Sql` assets materialize straight into `{schema}.{table}`.
@@ -270,8 +271,10 @@ through the server instead.
 cursus serve [--project SPEC] [--insecure]   API + console (default project: the demo)
 cursus manifest --project SPEC               print the project manifest
 cursus run TARGET... [--partitions latest|all|missing] [--partition KEY]
-           [--upstream] [--recompute] [--keys EDGE=k1,k2] [--config JSON]
-cursus runs / run-show RUN_ID / logs ATTEMPT_ID
+           [--upstream] [--full] [--keys EDGE=k1,k2] [--config JSON]
+cursus runs / run-show RUN_ID / logs RUN_ID ATTEMPT_ID [--tail N]
+cursus runs delete RUN_ID                    delete a finished run
+cursus runs prune [--before DATE] [--asset A] [--keep N] [--dry-run]
 cursus automations [enable|disable|run-now NAME]
 cursus migrate [OUTPUT...]                   apply pending output migrations locally
 cursus commit SOURCE [--version V] [--keys JSON] [--upsert JSON] [--remove K]
@@ -313,7 +316,7 @@ project = Project(assets=[site_files, daily_digests], sources=[sites], name="min
 
 Save as `my_project.py` and `uv run cursus serve --insecure --project
 my_project.py` (the attribute defaults to `project`). Cursors, resources,
-`ByKey`/`AllPartitions` inputs, placements, triggers, and the Postgres stores
+`Incremental`/`AllPartitions` inputs, placements, triggers, and the Postgres stores
 are documented in [docs/architecture.md](docs/architecture.md);
 `apps/server/src/cursus_server/demo.py` exercises all of them.
 

@@ -16,9 +16,9 @@ from cursus.sdk import (
     AllPartitions,
     Automation,
     AutoRefresh,
-    ByKey,
     Cron,
     Every,
+    Incremental,
     Migration,
     OnDeploy,
     Output,
@@ -141,8 +141,8 @@ uploads = PartitionSet("uploads")
 
 
 # ---------------------------------------------------------------------------
-# Per-site cursor asset: an append event log and a keyed file inventory,
-# patched both ways; the delta token is the cursor (§2, §5, §6).
+# Per-site cursor asset: an unkeyed incremental event log and a keyed file
+# inventory, patched both ways; the delta token is the cursor (§2, §5, §6).
 # ---------------------------------------------------------------------------
 
 
@@ -151,7 +151,7 @@ uploads = PartitionSet("uploads")
         Output(
             "site_events",
             store=RELATIONAL,
-            mode="append",
+            incremental=True,
             partition_column="site",
             migrations=postgres_migrations("site_events"),
         ),
@@ -187,8 +187,8 @@ def site_feed(ctx, feed: FeedClient):
 
 
 # ---------------------------------------------------------------------------
-# ByKey consumer: only changed file_ids arrive, in batches of two — a busy
-# site shows `more` continuation; bump version="2" to reprocess every key.
+# Incremental consumer: only changed file_ids arrive, in batches of two — a
+# busy site shows `more` continuation; bump version="2" to reprocess every key.
 # ---------------------------------------------------------------------------
 
 
@@ -201,7 +201,7 @@ def site_feed(ctx, feed: FeedClient):
         migrations=postgres_migrations("file_index"),
     ),
     partitions={"site": sites},
-    inputs={"site_files": ByKey(batch_size=2)},
+    inputs={"site_files": Incremental(batch_size=2)},
     version="2",
     automations=AutoRefresh(),
 )

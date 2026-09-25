@@ -13,13 +13,12 @@ from cursus_server.engine import Engine
 from cursus_server.placements import PlacementContext
 from cursus_server.placements.pool import PoolPlacement
 from cursus_server.state import LostOwnership, State
-from cursus_server.storage import SlateState
 from cursus_worker.worker import run_attempt
 
 
 @pytest.fixture
 async def state(tmp_path):
-    opened = State(await SlateState.open(tmp_path.as_uri(), "test"))
+    opened = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     yield opened
     await opened.close()
 
@@ -44,23 +43,24 @@ async def test_pool_task_lifecycle(state):
     await engine.tick()  # dispatch: stage the pool task, wait for a claim
     await asyncio.sleep(0.1)
 
-    attempt = f"{run['id']}/job:/1"
-    record = await state.get_pool_task(attempt)
+    [attempt] = state.model.pool
+    record = state.model.pool[attempt]
     assert record["status"] == "queued" and record["needs"] == {"cpu": 2}
+    assert record["task"] == f"{run['id']}/job:"
 
     # a worker that doesn't fit never sees the task
-    assert await state.claim_pool_task("w-small", ["ingest"], {"cpu": 1}, lease_seconds=30) is None
-    claimed = await state.claim_pool_task("w1", ["ingest"], {"cpu": 4}, lease_seconds=30)
+    assert engine.claim_pool_task("w-small", ["ingest"], {"cpu": 1}, lease_seconds=30) is None
+    claimed = engine.claim_pool_task("w1", ["ingest"], {"cpu": 4}, lease_seconds=30)
     assert claimed["attempt"] == attempt and claimed["status"] == "claimed"
 
     # renew extends the claim; a second worker can't steal it
-    await state.heartbeat_pool_task("w1", attempt, lease_seconds=30)
-    assert await state.claim_pool_task("w2", ["ingest"], {"cpu": 4}, lease_seconds=30) is None
+    engine.heartbeat_pool_task("w1", attempt, lease_seconds=30)
+    assert engine.claim_pool_task("w2", ["ingest"], {"cpu": 4}, lease_seconds=30) is None
 
     # the worker runs the stage and completes; the engine's wait sees the result
-    code = await run_attempt(state.objects_url, attempt, project)
+    code = await run_attempt(state.objects_url, attempt, project, run=record["run"])
     assert code == 0
-    await state.release_pool_task("w1", attempt)
+    engine.release_pool_task("w1", attempt)
     detail = await engine.run_until(run["id"], 10)
     assert detail["request"]["status"] == "succeeded"
     assert detail["tasks"][0]["status"] == "succeeded"
@@ -85,21 +85,21 @@ async def test_pool_expired_claim_requeues_and_late_complete_rejected(state):
         "lease_until": None,
         "created_at": 0,
     }
-    async with state.transaction() as tx:
-        await tx.put_pool_task("t/1", record)
-    claimed = await state.claim_pool_task("w1", ["ingest"], {}, lease_seconds=1)
+    engine = make_engine(state, Project(assets=[]))
+    state.model.pool["t/1"] = record
+    claimed = engine.claim_pool_task("w1", ["ingest"], {}, lease_seconds=1)
     assert claimed["status"] == "claimed"
     await asyncio.sleep(1.05)
-    await state.sweep_pool_leases()
-    reclaimed = await state.claim_pool_task("w2", ["ingest"], {}, lease_seconds=30)
+    engine._sweep_pool()
+    reclaimed = engine.claim_pool_task("w2", ["ingest"], {}, lease_seconds=30)
     assert reclaimed["claimed_by"] == "w2"
     # the stale worker's renew and complete are rejected
     with pytest.raises(LostOwnership):
-        await state.heartbeat_pool_task("w1", "t/1", lease_seconds=30)
-    await state.release_pool_task("w1", "t/1")  # no-op: w1 doesn't own it
-    assert (await state.get_pool_task("t/1"))["claimed_by"] == "w2"
-    await state.release_pool_task("w2", "t/1")
-    assert await state.get_pool_task("t/1") is None
+        engine.heartbeat_pool_task("w1", "t/1", lease_seconds=30)
+    engine.release_pool_task("w1", "t/1")  # no-op: w1 doesn't own it
+    assert state.model.pool["t/1"]["claimed_by"] == "w2"
+    engine.release_pool_task("w2", "t/1")
+    assert "t/1" not in state.model.pool
 
 
 async def test_pool_cancel_stops_renewal(state):
@@ -121,12 +121,12 @@ async def test_pool_cancel_stops_renewal(state):
         "lease_until": state.clock() + 60,
         "created_at": 0,
     }
-    async with state.transaction() as tx:
-        await tx.put_pool_task("t/1", record)
+    engine = make_engine(state, Project(assets=[]))
+    state.model.pool["t/1"] = record
     await placement.cancel({"task": "t/1"})
-    assert await state.get_pool_task("t/1") is None
+    assert "t/1" not in state.model.pool
     with pytest.raises(LostOwnership):
-        await state.heartbeat_pool_task("w1", "t/1", lease_seconds=30)
+        engine.heartbeat_pool_task("w1", "t/1", lease_seconds=30)
 
 
 # -- remote placements against stubbed SDKs ---------------------------------------
@@ -163,7 +163,7 @@ async def test_awsecs_launch_wait_cancel(state, monkeypatch):
     ecs = FakeEcs()
     stub_boto3(monkeypatch, ecs)
     placement = AWSECS({"cluster": "lab", "region": "us-east-1"}, {"cpu": 4, "memory": 30 * 10**9}, None)
-    handle = await placement.launch({"attempt": "a1", "objects": "s3://bkt/ns/objects"})
+    handle = await placement.launch({"attempt": "a1", "run": "r1", "objects": "s3://bkt/ns/objects"})
     task = ecs.tasks[handle["task_arn"]]
     override = task["kw"]["overrides"]["containerOverrides"][0]
     assert override["command"][-3:] == ["--attempt", "a1"] or "a1" in override["command"]
@@ -235,7 +235,7 @@ async def test_k8sjob_launch_wait_lost(state, monkeypatch):
     batch = FakeBatchApi()
     stub_kubernetes(monkeypatch, batch)
     placement = K8sJob({"cluster": "c", "namespace": "ns"}, {"cpu": 2}, None)
-    handle = await placement.launch({"attempt": "a/1", "objects": "s3://x"})
+    handle = await placement.launch({"attempt": "a/1", "run": "r", "objects": "s3://x"})
     job = batch.jobs[handle["job"]]
     args = job.spec.template.spec.containers[0].args
     assert "a/1" in args and "s3://x" in args
@@ -275,9 +275,9 @@ async def test_modal_launch_wait_lost(state, monkeypatch):
     class Function:
         @staticmethod
         def from_name(app, name):
-            def spawn(attempt, objects):
+            def spawn(attempt, run, objects):
                 call = FakeCall(uuid.uuid4().hex)
-                calls[call.object_id] = (call, {"attempt": attempt, "objects": objects})
+                calls[call.object_id] = (call, {"attempt": attempt, "run": run, "objects": objects})
                 return call
 
             return types.SimpleNamespace(spawn=spawn)
@@ -296,8 +296,8 @@ async def test_modal_launch_wait_lost(state, monkeypatch):
     monkeypatch.setitem(sys.modules, "modal", modal)
 
     placement = Modal({"app": "cursus"}, {"gpu": "A10G"}, None)
-    handle = await placement.launch({"attempt": "a9", "objects": "s3://o"})
-    assert calls[handle["call_id"]][1] == {"attempt": "a9", "objects": "s3://o"}
+    handle = await placement.launch({"attempt": "a9", "run": "r9", "objects": "s3://o"})
+    assert calls[handle["call_id"]][1] == {"attempt": "a9", "run": "r9", "objects": "s3://o"}
 
     assert await placement.wait(handle, 0.2) is None  # still running
     calls[handle["call_id"]][0].finished = True

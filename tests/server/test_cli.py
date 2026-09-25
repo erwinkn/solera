@@ -89,7 +89,13 @@ def test_local_run_and_reads(project_file, state_url, capsys, monkeypatch):
 
     task = shown["tasks"][0]
     attempt = shown["attempts"][task["id"]][-1]
-    cli(monkeypatch, capsys, "--state-url", state_url, "logs", attempt["id"])
+    cli(monkeypatch, capsys, "--state-url", state_url, "logs", run_id, attempt["id"], "--tail", "5")
+
+    dry = cli(monkeypatch, capsys, "--state-url", state_url, "runs", "prune", "--asset", "feed", "--dry-run")
+    assert dry == {"deleted": [run_id], "dry_run": True}
+    deleted = cli(monkeypatch, capsys, "--state-url", state_url, "runs", "delete", run_id)
+    assert deleted == {"deleted": [run_id]}
+    assert run_id not in {r["id"] for r in cli(monkeypatch, capsys, "--state-url", state_url, "runs")}
 
     autos = cli(monkeypatch, capsys, "--state-url", state_url, "automations")
     assert isinstance(autos, list)
@@ -107,8 +113,8 @@ def test_local_run_and_reads(project_file, state_url, capsys, monkeypatch):
     assert committed["ref"]["version"]
 
 
-def test_local_recompute_and_partitions(project_file, state_url, capsys, monkeypatch):
-    """--recompute and --partition feed the §8 run vocabulary."""
+def test_local_full_and_partitions(project_file, state_url, capsys, monkeypatch):
+    """--full and --partition feed the §8 run vocabulary."""
 
     monkeypatch.delenv("CURSUS_SERVER_URL", raising=False)
     detail = cli(
@@ -120,10 +126,10 @@ def test_local_recompute_and_partitions(project_file, state_url, capsys, monkeyp
         "--project",
         project_file,
         "feed",
-        "--recompute",
+        "--full",
     )
     assert detail["request"]["status"] == "succeeded"
-    assert detail["request"]["mode"] == "recompute"
+    assert detail["request"]["mode"] == "full"
 
 
 @pytest.fixture
@@ -230,7 +236,7 @@ def test_migrate_command_applies_and_is_idempotent(project_file, state_url, caps
     out = cli(monkeypatch, capsys, "--state-url", state_url, "migrate", "--project", str(path))
     assert "docs: applied seed" in out
 
-    objects = obstore.store.from_url(f"{state_url}/default/objects")
+    objects = obstore.store.from_url(f"{state_url}/default")
     ledger = jsonlib.loads(bytes(obstore.get(objects, "blobs/docs/_migrations.json").bytes()))
     assert [e["name"] for e in ledger["applied"]] == ["seed"]
 

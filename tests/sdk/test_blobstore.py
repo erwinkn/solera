@@ -58,3 +58,18 @@ async def test_migration_payload_must_be_callable(blob_store):
     out.migrations = (Migration("bad", "SELECT 1"),)
     with pytest.raises(StoreError, match="callable"):
         await blob_store.migrate(out, out.migrations)
+
+
+async def test_expire_keeps_the_head(blob_store):
+    """§9: older blob versions go; the head stays."""
+
+    from cursus.ids import ulid
+    from cursus.stores import Scope
+
+    out = Output("t", store="blobs")
+    first = await blob_store.store(b"one", None, Scope(out, "", attempt=ulid(1000)))
+    second = await blob_store.store(b"two", first.ref, Scope(out, "", attempt=ulid(2000)))
+    await blob_store.expire(second.ref, before=1500)
+    assert await blob_store.load(second.ref, bytes, None) == b"two"
+    with pytest.raises(FileNotFoundError):
+        await blob_store.load(first.ref, bytes, None)

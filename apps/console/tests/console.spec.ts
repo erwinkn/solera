@@ -94,7 +94,7 @@ test("lineage graph shows sources and edge kinds", async ({ page }) => {
     graph.getByRole("button", { name: "Inspect site_feed" }),
   ).toBeVisible();
   // The edge-kind legend names every consumption kind.
-  for (const kind of ["whole", "ByKey", "AllPartitions", "dep"])
+  for (const kind of ["whole", "Incremental", "AllPartitions", "dep"])
     await expect(page.getByText(kind, { exact: true })).toBeVisible();
   // Clicking a source node opens its card on the Sources page.
   await graph.getByRole("button", { name: "Inspect uploads" }).click();

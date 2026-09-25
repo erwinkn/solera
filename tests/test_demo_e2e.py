@@ -152,6 +152,12 @@ def test_demo_end_to_end(demo):
     # byte-identical, `changed` comes back empty. (`ref.version` is the
     # committed data version; `version` on the head record is the declared
     # asset version and never changes.)
+    #
+    # The concurrent runs above commit site_files deltas that can land after
+    # a sibling run's last file_index drain — real work the watermark must
+    # not skip. Drain the log first so every watermark sits at head.
+    drain = submit(["file_index"], partitions="all", upstream=False)
+    assert wait(lambda: run_done(drain)) and run_status(drain) == "succeeded"
     site_files = {h["scope"]: h["ref"]["version"] for h in heads("site_files")}
     file_index_heads = {h["scope"]: h["commit"] for h in heads("file_index")}
     poll_run = submit(
@@ -163,8 +169,8 @@ def test_demo_end_to_end(demo):
     assert wait(lambda: run_done(poll_run)) and run_status(poll_run) == "succeeded"
     assert {h["scope"]: h["ref"]["version"] for h in heads("site_files")} == site_files
 
-    # The ByKey consumer over unchanged upstream state skips every scope —
-    # it processed only the (empty) change set.
+    # The Incremental consumer over unchanged upstream state skips every
+    # scope — the delta log holds nothing past its watermark.
     again = submit(["file_index"], partitions=sorted(site_files), upstream=False)
     assert wait(lambda: run_done(again)) and run_status(again) == "succeeded"
     detail = client.get(f"{base}/runs/{again}").json()
@@ -175,7 +181,7 @@ def test_demo_end_to_end(demo):
         h["scope"]: h["commit"] for h in heads("file_index") if h["scope"] in file_index_heads
     } == file_index_heads
 
-    # -- the changed-keys pass (§6, ByKey) ----------------------------------
+    # -- the changed-keys pass (§6, Incremental) -----------------------------
     # Once the tick advances every file's revision bumps; the consumer must
     # process exactly the changed keys (and any deletions), in batches of
     # batch_size=2 — four files per site means `more` continuation.
@@ -195,17 +201,21 @@ def test_demo_end_to_end(demo):
     assert run_status(delta) == "succeeded"
     detail = client.get(f"{base}/runs/{delta}").json()
     current_keys = site_file_keys()
-    spec_changes = {}
+    delivered = {}
     for task in detail["tasks"]:
         if task["asset"] != "file_index":
             continue
         assert task["attempt_count"] >= 2, "batch_size=2 over 4 files must continue with more"
-        attempt_id = detail["attempts"][task["id"]][-1]["id"]
-        spec = client.get(f"{base}/attempts/{attempt_id}/spec").json()
-        spec_changes[task["scope"]] = spec["inputs"]["site_files"]["changes"]
-    assert spec_changes, "file_index should have run on the new tick"
-    for scope, changes in spec_changes.items():
-        upserted, deleted = set(changes["upserted"]), set(changes["deleted"])
+        for attempt in detail["attempts"][task["id"]]:
+            if attempt["status"] != "succeeded":
+                continue
+            result = client.get(f"{base}/runs/{delta}/attempts/{attempt['id']}/result").json()
+            page = result["delivered"]["site_files"]
+            seen = delivered.setdefault(task["scope"], [set(), set()])
+            seen[0] |= set(page["upserted"])
+            seen[1] |= set(page["deleted"])
+    assert delivered, "file_index should have run on the new tick"
+    for scope, (upserted, deleted) in delivered.items():
         assert upserted <= current_keys[scope]
         assert deleted <= prior_keys.get(scope, set()) - current_keys[scope]
         assert upserted or deleted

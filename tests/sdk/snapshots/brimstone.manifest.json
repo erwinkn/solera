@@ -1,10 +1,11 @@
 {
   "assets": {
     "fleet_dashboard": {
+      "aliases": [],
       "automations": [
         "fleet_dashboard.onchange.0"
       ],
-      "code_hash": "bf50eec85eed8e765468d57f02409dd15253fbba6c1ded6ce58107e511737b2d",
+      "code_hash": "4579c74a69ddfaed78870d13504629a8a7f0f723485b9b53d21f6c833a0eb631",
       "deps": [],
       "doc": "Partitioned upstream, unpartitioned consumer: the site dimension is collapsed.",
       "inputs": {
@@ -20,9 +21,9 @@
           "config": {
             "schema": "ops"
           },
+          "incremental": false,
           "key": null,
           "migrations": [],
-          "mode": null,
           "name": "fleet_dashboard",
           "partition_set": false,
           "revision": null,
@@ -35,6 +36,7 @@
         "kind": "Local",
         "placement": {}
       },
+      "retention": null,
       "retries": {
         "backoff": "exponential",
         "delay": 1.0,
@@ -62,10 +64,11 @@
       "version": "1"
     },
     "graph_delta": {
+      "aliases": [],
       "automations": [
         "graph_delta.every.0"
       ],
-      "code_hash": "bf50eec85eed8e765468d57f02409dd15253fbba6c1ded6ce58107e511737b2d",
+      "code_hash": "4579c74a69ddfaed78870d13504629a8a7f0f723485b9b53d21f6c833a0eb631",
       "deps": [],
       "doc": "Poll a site's Graph delta feed; the delta token is the cursor.",
       "inputs": {},
@@ -76,9 +79,9 @@
             "partition_column": "site",
             "schema": "sharepoint"
           },
+          "incremental": true,
           "key": null,
           "migrations": [],
-          "mode": "append",
           "name": "change_events",
           "partition_set": false,
           "revision": null,
@@ -86,9 +89,9 @@
         },
         {
           "config": {},
+          "incremental": true,
           "key": "file_id",
           "migrations": [],
-          "mode": null,
           "name": "qaqc_files",
           "partition_set": false,
           "revision": "version",
@@ -108,6 +111,7 @@
         "kind": "Local",
         "placement": {}
       },
+      "retention": null,
       "retries": {
         "backoff": "exponential",
         "delay": 1.0,
@@ -125,10 +129,11 @@
       "version": "1"
     },
     "hillshade": {
+      "aliases": [],
       "automations": [
         "hillshade.every.0"
       ],
-      "code_hash": "bf50eec85eed8e765468d57f02409dd15253fbba6c1ded6ce58107e511737b2d",
+      "code_hash": "4579c74a69ddfaed78870d13504629a8a7f0f723485b9b53d21f6c833a0eb631",
       "deps": [
         "usgs_3dep_tiles"
       ],
@@ -138,9 +143,9 @@
       "outputs": [
         {
           "config": {},
+          "incremental": false,
           "key": null,
           "migrations": [],
-          "mode": null,
           "name": "hillshade",
           "partition_set": false,
           "revision": null,
@@ -169,6 +174,7 @@
         "kind": "Local",
         "placement": {}
       },
+      "retention": null,
       "retries": {
         "backoff": "exponential",
         "delay": 1.0,
@@ -188,8 +194,9 @@
       "version": "1"
     },
     "leach": {
+      "aliases": [],
       "automations": [],
-      "code_hash": "bf50eec85eed8e765468d57f02409dd15253fbba6c1ded6ce58107e511737b2d",
+      "code_hash": "4579c74a69ddfaed78870d13504629a8a7f0f723485b9b53d21f6c833a0eb631",
       "deps": [],
       "doc": "The resource tier lives on the asset; no job indirection.",
       "inputs": {
@@ -230,9 +237,9 @@
           "config": {
             "schema": "leaching"
           },
+          "incremental": false,
           "key": null,
           "migrations": [],
-          "mode": null,
           "name": "leach_kinetics",
           "partition_set": false,
           "revision": null,
@@ -242,9 +249,9 @@
           "config": {
             "schema": "datasmart"
           },
+          "incremental": false,
           "key": null,
           "migrations": [],
-          "mode": null,
           "name": "leach_invalid_sample_id_log",
           "partition_set": false,
           "revision": null,
@@ -263,6 +270,7 @@
           "memory": 30000000000
         }
       },
+      "retention": null,
       "retries": {
         "backoff": "exponential",
         "delay": 0.2,
@@ -295,10 +303,11 @@
       "version": "1"
     },
     "manual_upload": {
+      "aliases": [],
       "automations": [
         "manual_upload.every.0"
       ],
-      "code_hash": "bf50eec85eed8e765468d57f02409dd15253fbba6c1ded6ce58107e511737b2d",
+      "code_hash": "4579c74a69ddfaed78870d13504629a8a7f0f723485b9b53d21f6c833a0eb631",
       "deps": [],
       "doc": "Upload keys are registered externally by the uploads service.",
       "inputs": {},
@@ -309,9 +318,9 @@
             "partition_column": "upload_id",
             "schema": "uploads"
           },
+          "incremental": false,
           "key": null,
           "migrations": [],
-          "mode": null,
           "name": "manual_upload",
           "partition_set": false,
           "revision": null,
@@ -336,6 +345,7 @@
           "memory": 4000000000
         }
       },
+      "retention": null,
       "retries": {
         "backoff": "exponential",
         "delay": 1.0,
@@ -355,10 +365,11 @@
       "version": "1"
     },
     "psa_mean_data": {
+      "aliases": [],
       "automations": [
         "psa_mean_data.onchange.0"
       ],
-      "code_hash": "bf50eec85eed8e765468d57f02409dd15253fbba6c1ded6ce58107e511737b2d",
+      "code_hash": "4579c74a69ddfaed78870d13504629a8a7f0f723485b9b53d21f6c833a0eb631",
       "deps": [],
       "doc": "",
       "inputs": {
@@ -391,9 +402,9 @@
             ],
             "schema": "analytical"
           },
+          "incremental": false,
           "key": null,
           "migrations": [],
-          "mode": null,
           "name": "psa_mean_data",
           "partition_set": false,
           "revision": null,
@@ -406,6 +417,7 @@
         "kind": "Local",
         "placement": {}
       },
+      "retention": null,
       "retries": {
         "backoff": "exponential",
         "delay": 1.0,
@@ -428,16 +440,17 @@
       "version": "1"
     },
     "qaqc_samples": {
+      "aliases": [],
       "automations": [
         "qaqc_samples.onchange.0"
       ],
-      "code_hash": "bf50eec85eed8e765468d57f02409dd15253fbba6c1ded6ce58107e511737b2d",
+      "code_hash": "4579c74a69ddfaed78870d13504629a8a7f0f723485b9b53d21f6c833a0eb631",
       "deps": [],
       "doc": "qaqc_files arrives filtered to the file_ids whose version changed for this site.",
       "inputs": {
         "qaqc_files": {
           "batch_size": 100,
-          "kind": "bykey",
+          "kind": "incremental",
           "meta": null,
           "output": "qaqc_files"
         }
@@ -457,12 +470,12 @@
             ],
             "schema": "qaqc"
           },
+          "incremental": false,
           "key": null,
           "migrations": [
             "0001_analyst",
             "0002_measured_tz"
           ],
-          "mode": null,
           "name": "qaqc_samples",
           "partition_set": false,
           "revision": null,
@@ -482,6 +495,7 @@
         "kind": "Local",
         "placement": {}
       },
+      "retention": null,
       "retries": {
         "backoff": "exponential",
         "delay": 1.0,
@@ -507,10 +521,11 @@
       "version": "2"
     },
     "region_rollup": {
+      "aliases": [],
       "automations": [
         "region_rollup.onchange.0"
       ],
-      "code_hash": "bf50eec85eed8e765468d57f02409dd15253fbba6c1ded6ce58107e511737b2d",
+      "code_hash": "4579c74a69ddfaed78870d13504629a8a7f0f723485b9b53d21f6c833a0eb631",
       "deps": [],
       "doc": "Static partitions over a site-partitioned input.",
       "inputs": {
@@ -527,9 +542,9 @@
             "partition_column": "region",
             "schema": "ops"
           },
+          "incremental": false,
           "key": null,
           "migrations": [],
-          "mode": null,
           "name": "region_rollup",
           "partition_set": false,
           "revision": null,
@@ -552,6 +567,7 @@
         "kind": "Local",
         "placement": {}
       },
+      "retention": null,
       "retries": {
         "backoff": "exponential",
         "delay": 1.0,
@@ -579,10 +595,11 @@
       "version": "1"
     },
     "site_health": {
+      "aliases": [],
       "automations": [
         "site_health.onchange.0"
       ],
-      "code_hash": "bf50eec85eed8e765468d57f02409dd15253fbba6c1ded6ce58107e511737b2d",
+      "code_hash": "4579c74a69ddfaed78870d13504629a8a7f0f723485b9b53d21f6c833a0eb631",
       "deps": [],
       "doc": "In-database: a TableRef in, a statement out; no row enters the harness.\nThe store materializes the SELECT into ops.site_health for this site.",
       "inputs": {
@@ -599,9 +616,9 @@
             "partition_column": "site",
             "schema": "ops"
           },
+          "incremental": false,
           "key": null,
           "migrations": [],
-          "mode": null,
           "name": "site_health",
           "partition_set": false,
           "revision": null,
@@ -621,6 +638,7 @@
         "kind": "Local",
         "placement": {}
       },
+      "retention": null,
       "retries": {
         "backoff": "exponential",
         "delay": 1.0,
@@ -640,11 +658,12 @@
       "version": "1"
     },
     "sites": {
+      "aliases": [],
       "automations": [
         "sites.cron.0",
         "sites.ondeploy.0"
       ],
-      "code_hash": "bf50eec85eed8e765468d57f02409dd15253fbba6c1ded6ce58107e511737b2d",
+      "code_hash": "4579c74a69ddfaed78870d13504629a8a7f0f723485b9b53d21f6c833a0eb631",
       "deps": [],
       "doc": "Refresh the SharePoint site list daily; new sites surface as missing work.",
       "inputs": {},
@@ -652,9 +671,9 @@
       "outputs": [
         {
           "config": {},
+          "incremental": true,
           "key": "<elements>",
           "migrations": [],
-          "mode": null,
           "name": "sites",
           "partition_set": true,
           "revision": null,
@@ -667,6 +686,7 @@
         "kind": "Local",
         "placement": {}
       },
+      "retention": null,
       "retries": {
         "backoff": "exponential",
         "delay": 1.0,
@@ -691,10 +711,11 @@
       "version": "1"
     },
     "weekly_report": {
+      "aliases": [],
       "automations": [
         "weekly_report.cron.0"
       ],
-      "code_hash": "bf50eec85eed8e765468d57f02409dd15253fbba6c1ded6ce58107e511737b2d",
+      "code_hash": "4579c74a69ddfaed78870d13504629a8a7f0f723485b9b53d21f6c833a0eb631",
       "deps": [],
       "doc": "A job: inputs, placement and automations like an asset, no outputs.",
       "inputs": {
@@ -712,6 +733,7 @@
         "kind": "Local",
         "placement": {}
       },
+      "retention": null,
       "retries": {
         "backoff": "exponential",
         "delay": 1.0,
@@ -959,6 +981,10 @@
     "Local",
     "Pool"
   ],
+  "key_cache": {
+    "max_bytes": 8589934592,
+    "path": null
+  },
   "name": "default",
   "outputs": {
     "change_events": {
@@ -967,9 +993,9 @@
         "partition_column": "site",
         "schema": "sharepoint"
       },
+      "incremental": true,
       "key": null,
       "migrations": [],
-      "mode": "append",
       "name": "change_events",
       "partition_set": false,
       "revision": null,
@@ -981,9 +1007,9 @@
       "config": {
         "schema": "ops"
       },
+      "incremental": false,
       "key": null,
       "migrations": [],
-      "mode": null,
       "name": "fleet_dashboard",
       "partition_set": false,
       "revision": null,
@@ -993,9 +1019,9 @@
     "hillshade": {
       "asset": "hillshade",
       "config": {},
+      "incremental": false,
       "key": null,
       "migrations": [],
-      "mode": null,
       "name": "hillshade",
       "partition_set": false,
       "revision": null,
@@ -1008,9 +1034,9 @@
         "schema": "datasmart"
       },
       "dims": null,
+      "incremental": false,
       "key": null,
       "migrations": [],
-      "mode": null,
       "name": "leach_crosswalk",
       "partition_set": false,
       "revision": null,
@@ -1022,9 +1048,9 @@
       "config": {
         "schema": "datasmart"
       },
+      "incremental": false,
       "key": null,
       "migrations": [],
-      "mode": null,
       "name": "leach_invalid_sample_id_log",
       "partition_set": false,
       "revision": null,
@@ -1036,9 +1062,9 @@
       "config": {
         "schema": "leaching"
       },
+      "incremental": false,
       "key": null,
       "migrations": [],
-      "mode": null,
       "name": "leach_kinetics",
       "partition_set": false,
       "revision": null,
@@ -1051,9 +1077,9 @@
         "partition_column": "upload_id",
         "schema": "uploads"
       },
+      "incremental": false,
       "key": null,
       "migrations": [],
-      "mode": null,
       "name": "manual_upload",
       "partition_set": false,
       "revision": null,
@@ -1066,9 +1092,9 @@
         "schema": "datasmart"
       },
       "dims": null,
+      "incremental": false,
       "key": null,
       "migrations": [],
-      "mode": null,
       "name": "pmpt_project_matrix",
       "partition_set": false,
       "revision": null,
@@ -1081,9 +1107,9 @@
         "schema": "datasmart"
       },
       "dims": null,
+      "incremental": false,
       "key": null,
       "migrations": [],
-      "mode": null,
       "name": "project_team_map",
       "partition_set": false,
       "revision": null,
@@ -1096,9 +1122,9 @@
         "schema": "datasmart"
       },
       "dims": null,
+      "incremental": false,
       "key": null,
       "migrations": [],
-      "mode": null,
       "name": "psa_data",
       "partition_set": false,
       "revision": null,
@@ -1122,9 +1148,9 @@
         ],
         "schema": "analytical"
       },
+      "incremental": false,
       "key": null,
       "migrations": [],
-      "mode": null,
       "name": "psa_mean_data",
       "partition_set": false,
       "revision": null,
@@ -1137,9 +1163,9 @@
         "schema": "datasmart"
       },
       "dims": null,
+      "incremental": false,
       "key": null,
       "migrations": [],
-      "mode": null,
       "name": "psa_samples",
       "partition_set": false,
       "revision": null,
@@ -1149,9 +1175,9 @@
     "qaqc_files": {
       "asset": "graph_delta",
       "config": {},
+      "incremental": true,
       "key": "file_id",
       "migrations": [],
-      "mode": null,
       "name": "qaqc_files",
       "partition_set": false,
       "revision": "version",
@@ -1172,12 +1198,12 @@
         ],
         "schema": "qaqc"
       },
+      "incremental": false,
       "key": null,
       "migrations": [
         "0001_analyst",
         "0002_measured_tz"
       ],
-      "mode": null,
       "name": "qaqc_samples",
       "partition_set": false,
       "revision": null,
@@ -1190,9 +1216,9 @@
         "partition_column": "region",
         "schema": "ops"
       },
+      "incremental": false,
       "key": null,
       "migrations": [],
-      "mode": null,
       "name": "region_rollup",
       "partition_set": false,
       "revision": null,
@@ -1205,9 +1231,9 @@
         "schema": "datasmart"
       },
       "dims": null,
+      "incremental": false,
       "key": null,
       "migrations": [],
-      "mode": null,
       "name": "sample_id_crosswalk",
       "partition_set": false,
       "revision": null,
@@ -1220,9 +1246,9 @@
         "partition_column": "site",
         "schema": "ops"
       },
+      "incremental": false,
       "key": null,
       "migrations": [],
-      "mode": null,
       "name": "site_health",
       "partition_set": false,
       "revision": null,
@@ -1232,9 +1258,9 @@
     "sites": {
       "asset": "sites",
       "config": {},
+      "incremental": true,
       "key": "<elements>",
       "migrations": [],
-      "mode": null,
       "name": "sites",
       "partition_set": true,
       "revision": null,
@@ -1247,9 +1273,9 @@
         "name": "uploads"
       },
       "dims": null,
+      "incremental": true,
       "key": "<elements>",
       "migrations": [],
-      "mode": null,
       "name": "uploads",
       "partition_set": true,
       "revision": null,
@@ -1260,9 +1286,9 @@
       "asset": null,
       "config": {},
       "dims": null,
+      "incremental": false,
       "key": null,
       "migrations": [],
-      "mode": null,
       "name": "usgs_3dep_tiles",
       "partition_set": false,
       "revision": null,
@@ -1275,9 +1301,9 @@
         "schema": "datasmart"
       },
       "dims": null,
+      "incremental": false,
       "key": null,
       "migrations": [],
-      "mode": null,
       "name": "xrd_profex",
       "partition_set": false,
       "revision": null,
@@ -1290,9 +1316,9 @@
         "schema": "datasmart"
       },
       "dims": null,
+      "incremental": false,
       "key": null,
       "migrations": [],
-      "mode": null,
       "name": "xrf",
       "partition_set": false,
       "revision": null,
@@ -1300,7 +1326,8 @@
       "store": "postgres"
     }
   },
-  "revision": "1165b560bafdbdd5f3a3c81403269ac377b5108cb7fba719737c6e4851796658",
+  "retention": null,
+  "revision": "5ec549795f7dd0653407db45fe52b2512034457a845a3a757da1a744af0bd68b",
   "sources": {
     "leach_crosswalk": {
       "handle": {

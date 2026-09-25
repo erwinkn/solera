@@ -76,6 +76,8 @@ class LocalPlacement:
             stage["objects"],
             "--attempt",
             stage["attempt"],
+            "--run",
+            stage["run"],
             env=env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

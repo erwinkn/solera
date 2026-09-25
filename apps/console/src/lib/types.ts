@@ -7,6 +7,7 @@ export type RunStatus =
 export type TaskStatus =
   | "waiting"
   | "queued"
+  | "claimable"
   | "running"
   | "succeeded"
   | "skipped"
@@ -48,6 +49,9 @@ export interface Head {
   complete: boolean;
   asset: string | null;
   version: string | null;
+  batch?: number;
+  count?: number;
+  elements?: string[];
 }
 
 export interface OutputDecl {
@@ -55,7 +59,7 @@ export interface OutputDecl {
   store: string;
   key: string | null;
   revision: string | null;
-  mode: string | null;
+  incremental: boolean;
   /** Ordered migration names declared on the output (§4). */
   migrations?: string[];
   config: Record<string, Json>;
@@ -63,7 +67,7 @@ export interface OutputDecl {
 }
 
 export interface Edge {
-  kind: "in" | "bykey" | "all_partitions" | "dep";
+  kind: "in" | "incremental" | "all_partitions" | "dep";
   output: string;
   param?: string;
   batch_size?: number;
@@ -143,12 +147,7 @@ export interface AutomationRecord extends AutomationDecl {
   last_at: number | null;
   last_run: string | null;
   last_revision: string | null;
-  pending: {
-    commit: string;
-    asset: string | null;
-    scope: string;
-    outputs: string[];
-  }[];
+  pending: [string | null, string][];
 }
 
 export interface Run {
@@ -160,6 +159,8 @@ export interface Run {
   config: Record<string, Json>;
   keys: Record<string, string | string[]> | null;
   automation: string | null;
+  by?: string | null;
+  source?: string;
   status: RunStatus;
   paused: boolean;
   tasks: string[];
@@ -188,7 +189,6 @@ export interface Attempt {
   started_at: number;
   finished_at?: number;
   commit?: string;
-  lease_until?: number;
   error?: {
     type: string;
     message: string;
@@ -221,17 +221,28 @@ export interface OutputHead {
   ref: Ref;
   version: string | null;
   key_count: number | null;
+  batch: number | null;
   complete: boolean;
   cursor: boolean;
   at: number;
   commit: string | null;
 }
 
+export interface Watermark {
+  batch: number;
+  until?: number;
+  after: string | null;
+  full: boolean;
+  fingerprint: string;
+  output: string;
+  up: string;
+}
+
 export interface AssetDetail {
   asset: Omit<CatalogAsset, "name" | "heads">;
   heads: Record<string, [string, Head][]>;
   cursor: Json;
-  key_state: Record<string, Record<string, Json>>;
+  watermarks: Record<string, Watermark | null>;
   current_keys: string[][];
   scopes: Record<string, ScopeOutcome>;
   automations: AutomationRecord[];

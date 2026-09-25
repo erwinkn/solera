@@ -39,27 +39,21 @@ async def _local_engine(args):
     from .engine import Engine
     from .placements.local import load_manifest
     from .state import State
-    from .storage import SlateState
 
-    slate = await SlateState.open(args.state_url, args.namespace)
-    state = State(slate)
+    state = await State.open(args.state_url, args.namespace)
     project = getattr(args, "project", None)
     try:
         if project:
             manifest = await load_manifest(project)
         else:
-            manifest = await state.manifest()
-            async with state.transaction() as tx:
-                project = await tx.get("sys/entrypoint")
-            project = project or manifest["name"]
-    except BaseException:
-        await slate.close()
-        raise
-    runtime = Engine(state, manifest, project=project)
-    try:
+            manifest = state.model.manifest
+            if manifest is None:
+                raise SystemExit("no project registered in this namespace; pass --project")
+            project = state.model.project or manifest["name"]
+        runtime = Engine(state, manifest, project=project)
         await runtime.initialize()
     except BaseException:
-        await slate.close()
+        await state.close()
         raise
     return runtime
 
@@ -95,18 +89,28 @@ def main():
     run.add_argument("targets", nargs="+")
     run.add_argument("--partition", action="append", default=[])
     run.add_argument("--partitions", choices=["latest", "all", "missing"])
-    run.add_argument("--recompute", action="store_true")
+    run.add_argument("--full", action="store_true", help="Full run: reset watermarks, no prior (§8)")
     run.add_argument("--upstream", action="store_true")
     run.add_argument("--config", default="{}", help="Run configuration as a JSON object")
     run.add_argument("--keys", action="append", default=[], help="EDGE=full or EDGE=k1,k2")
 
-    commands.add_parser("runs", help="List runs", parents=[common])
+    runs = commands.add_parser("runs", help="List, delete or prune runs (§11)", parents=[common])
+    runs_sub = runs.add_subparsers(dest="runs_command")
+    runs_delete = runs_sub.add_parser("delete", help="Delete a finished run")
+    runs_delete.add_argument("run_id")
+    runs_prune = runs_sub.add_parser("prune", help="Delete finished runs")
+    runs_prune.add_argument("--before", help="Only runs created before this ISO date or time")
+    runs_prune.add_argument("--asset", help="Only runs of this asset")
+    runs_prune.add_argument("--keep", type=int, help="Keep the N newest matching runs")
+    runs_prune.add_argument("--dry-run", action="store_true")
 
     run_show = commands.add_parser("run-show", help="Show a run's tasks and attempts", parents=[common])
     run_show.add_argument("run_id")
 
     logs = commands.add_parser("logs", help="Print an attempt's log", parents=[common])
+    logs.add_argument("run_id")
     logs.add_argument("attempt_id")
+    logs.add_argument("--tail", type=int, help="Only the last N lines")
 
     automations = commands.add_parser("automations", help="List or control automations", parents=[common])
     automations.add_argument("action", nargs="?", choices=["enable", "disable", "run-now"])
@@ -123,6 +127,7 @@ def main():
     commit.add_argument("--keys", help="Complete key map as JSON, or a JSON list for a partition set")
     commit.add_argument("--upsert", help="Key patch as JSON object (or JSON list for a partition set)")
     commit.add_argument("--remove", action="append", default=[])
+    commit.add_argument("--by", default="cli", help="Who is committing (recorded on the commit's run)")
 
     worker = commands.add_parser("worker", help="Run a pool worker (§10)")
     worker_sub = worker.add_subparsers(dest="worker_command", required=True)
@@ -198,23 +203,18 @@ async def _migrate(args, parser):
     """Apply declared migrations through the local harness path (§4): load the
     project, bind its stores to the namespace's object store, migrate."""
 
-    import obstore
     from cursus_worker.worker import load_project
 
     from .state import State
-    from .storage import SlateState
 
-    slate = await SlateState.open(args.state_url, args.namespace)
+    # Read-only: a running server keeps its place as the namespace's writer.
+    state = await State.open(args.state_url, args.namespace, writer=False)
     try:
-        state = State(slate)
-        entrypoint = args.project
-        if not entrypoint:
-            async with state.transaction() as tx:
-                entrypoint = await tx.get("sys/entrypoint")
+        entrypoint = args.project or state.model.project
         if not entrypoint:
             parser.error("cursus migrate needs --project or a previously registered project")
         project = load_project(entrypoint)
-        objects = obstore.store.from_url(state.objects_url)
+        objects = state.objects
         migrating = {
             output.name: output
             for asset in project.assets.values()
@@ -239,7 +239,7 @@ async def _migrate(args, parser):
             if not applied:
                 print(f"{output.name}: up to date")
     finally:
-        await slate.close()
+        await state.close()
 
 
 def _parse_keys(specs):
@@ -252,10 +252,22 @@ def _parse_keys(specs):
     return out
 
 
+def _prune_payload(args):
+    import datetime as dt
+
+    before = None
+    if args.before:
+        moment = dt.datetime.fromisoformat(args.before)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=dt.UTC)
+        before = moment.timestamp()
+    return {"before": before, "asset": args.asset, "keep": args.keep, "dry_run": args.dry_run}
+
+
 def _commit_payload(args):
     keys = json.loads(args.keys) if args.keys else None
     upsert = json.loads(args.upsert) if args.upsert else None
-    return {"version": args.version, "keys": keys, "upsert": upsert, "remove": args.remove}
+    return {"version": args.version, "keys": keys, "upsert": upsert, "remove": args.remove, "by": args.by}
 
 
 async def _remote(args, parser):
@@ -270,10 +282,11 @@ async def _remote(args, parser):
             body = {
                 "targets": args.targets,
                 "partitions": partitions,
-                "mode": "recompute" if args.recompute else "incremental",
+                "mode": "full" if args.full else "incremental",
                 "upstream": args.upstream,
                 "config": config,
                 "keys": _parse_keys(args.keys),
+                "by": "cli",
             }
             response = await client.post(f"{base}/runs", json=body)
             response.raise_for_status()
@@ -285,6 +298,14 @@ async def _remote(args, parser):
             print(json.dumps(detail, indent=2))
             if detail["request"]["status"] != "succeeded":
                 raise SystemExit(1)
+        elif args.command == "runs" and args.runs_command == "delete":
+            response = await client.delete(f"{base}/runs/{args.run_id}")
+            response.raise_for_status()
+            print(json.dumps(response.json(), indent=2))
+        elif args.command == "runs" and args.runs_command == "prune":
+            response = await client.post(f"{base}/runs:prune", json=_prune_payload(args))
+            response.raise_for_status()
+            print(json.dumps(response.json(), indent=2))
         elif args.command == "runs":
             response = await client.get(f"{base}/runs")
             response.raise_for_status()
@@ -294,7 +315,10 @@ async def _remote(args, parser):
             response.raise_for_status()
             print(json.dumps(response.json(), indent=2))
         elif args.command == "logs":
-            response = await client.get(f"{base}/attempts/{args.attempt_id}/logs")
+            params = {"tail": args.tail} if args.tail else {}
+            response = await client.get(
+                f"{base}/runs/{args.run_id}/attempts/{args.attempt_id}/logs", params=params
+            )
             response.raise_for_status()
             sys.stdout.write(response.text)
         elif args.command == "automations":
@@ -325,10 +349,11 @@ async def _local(args, parser):
             run = await runtime.submit(
                 args.targets,
                 partitions=partitions,
-                mode="recompute" if args.recompute else "incremental",
+                mode="full" if args.full else "incremental",
                 upstream=args.upstream,
                 config=config,
                 keys=_parse_keys(args.keys),
+                by="cli",
             )
             if run is None:
                 print(json.dumps({"status": "skipped-active"}))
@@ -337,18 +362,22 @@ async def _local(args, parser):
             print(json.dumps(detail, indent=2))
             if detail["request"]["status"] != "succeeded":
                 raise SystemExit(1)
+        elif args.command == "runs" and args.runs_command == "delete":
+            await runtime.delete_run(args.run_id)
+            print(json.dumps({"deleted": [args.run_id]}, indent=2))
+        elif args.command == "runs" and args.runs_command == "prune":
+            print(json.dumps(await runtime.prune(**_prune_payload(args)), indent=2))
         elif args.command == "runs":
             print(json.dumps(await runtime.list_runs(), indent=2))
         elif args.command == "run-show":
             print(json.dumps(await runtime.run_detail(args.run_id), indent=2))
         elif args.command == "logs":
-            for key in await runtime.state.list_objects(f"logs/{args.attempt_id}/"):
-                data = await runtime.state.get_object(key)
-                if data:
-                    sys.stdout.write(data.decode())
+            sys.stdout.write(
+                (await runtime.state.attempt_log(args.run_id, args.attempt_id, args.tail)).decode()
+            )
         elif args.command == "automations":
             if not args.action:
-                autos = [a for _, a in await runtime.state.scan("automation/")]
+                autos = list(runtime.m.automations.values())
                 print(json.dumps(autos, indent=2))
             else:
                 if not args.name:

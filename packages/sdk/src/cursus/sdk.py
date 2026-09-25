@@ -176,7 +176,8 @@ class Migration:
 
 
 class Output:
-    """A named slot on a store (§2)."""
+    """A named slot on a store (§2). `incremental=True` emits a per-commit
+    delta; `key=` implies it. Public `mode=` is gone (§2.1)."""
 
     is_partition_set = False
 
@@ -186,16 +187,21 @@ class Output:
         store: str | None = None,
         key: str | None = None,
         revision: str | None = None,
-        mode: str | None = None,
+        incremental: bool | None = None,
         migrations: tuple | list = (),
         **config: Any,
     ):
-        if mode not in (None, "append"):
-            raise RegistrationError(f"Output {name or '?'}: unknown mode {mode!r}")
-        if mode == "append" and key is not None:
-            raise RegistrationError(f"Output {name or '?'}: mode='append' cannot declare its own key (§2)")
+        if "mode" in config:
+            raise RegistrationError(
+                f"Output {name or '?'}: mode= was removed; declare incremental= instead (§2.1)"
+            )
+        if incremental is None:
+            incremental = key is not None
+        elif not incremental and key is not None:
+            raise RegistrationError(f"Output {name or '?'}: key= implies incremental=True (§2.1)")
         self.name, self.store = name, store
-        self.key, self.revision, self.mode, self.config = key, revision, mode, config
+        self.key, self.revision, self.incremental = key, revision, bool(incremental)
+        self.config = config
         self.migrations = tuple(migrations)
 
     def spec(self, default_name: str) -> dict:
@@ -205,7 +211,7 @@ class Output:
             "store": self.store or DEFAULT_STORE,
             "key": self.key,
             "revision": self.revision,
-            "mode": self.mode,
+            "incremental": self.incremental,
             "migrations": [m.name for m in self.migrations],
             "config": self.config,
             "partition_set": self.is_partition_set,
@@ -218,7 +224,7 @@ class PartitionSet(Output):
     is_partition_set = True
 
     def __init__(self, name: str | None = None, store: str | None = None, **config: Any):
-        super().__init__(name, store, key="<elements>", **config)
+        super().__init__(name, store, key="<elements>", incremental=True, **config)
 
 
 class Source:
@@ -282,15 +288,15 @@ class In:
         return {"kind": self.kind, "output": self.output or param, "meta": self.meta}
 
 
-class ByKey(In):
-    """Incremental edge: only keys whose revision changed (§5, §6)."""
+class Incremental(In):
+    """Delta edge: the watermark-planned changes since last delivery (§5, §6)."""
 
-    kind = "bykey"
+    kind = "incremental"
 
     def __init__(self, output: str | None = None, batch_size: int = 100, meta: dict | None = None):
         super().__init__(output, meta=meta)
         if batch_size < 1:
-            raise RegistrationError("ByKey batch_size must be positive")
+            raise RegistrationError("Incremental batch_size must be positive")
         self.batch_size = batch_size
 
     def spec(self, param: str) -> dict:
@@ -305,8 +311,17 @@ class AllPartitions(In):
 
 @dataclass(frozen=True)
 class Changes:
-    upserted: list[str]
-    deleted: list[str]
+    """What an `Incremental` edge delivered to a parameter (§5.1): the delivered
+    `rows` (same object the parameter received), the removed `deleted` keys
+    (keyed upstreams), the delivered `batches` range (batch-mode upstreams),
+    `full` for a reset delivery, and `upserted` — the delivered key list for
+    keyed upstreams."""
+
+    rows: Any = ()
+    deleted: tuple = ()
+    batches: range | None = None
+    full: bool = False
+    upserted: tuple = ()
 
 
 # ---------------------------------------------------------------------------
@@ -525,7 +540,7 @@ class Automation:
             raise RegistrationError("Automation() requires a trigger (§11)")
         if not isinstance(trigger, (Every, Cron, OnChange, OnDeploy)):
             raise RegistrationError(f"Unknown trigger: {trigger!r}")
-        if mode not in ("incremental", "recompute"):
+        if mode not in ("incremental", "full"):
             raise RegistrationError(f"Unknown automation mode: {mode!r}")
         self.name, self.targets, self.trigger = name, targets, trigger
         self.enabled, self.partitions, self.mode = enabled, partitions, mode
@@ -553,6 +568,65 @@ class Retry:
 
     def spec(self) -> dict:
         return {"n": self.n, "delay": self.delay, "backoff": self.backoff}
+
+
+@dataclass(frozen=True)
+class Retention:
+    """How long an asset's history is kept (docs/object-store-state.md §11).
+
+    `days`: runs and data versions older than that go. `runs`: keep the runs
+    of the newest `runs` commits (and the data they wrote). Both: whichever
+    keeps more. `forever=True` keeps everything, overriding a project default.
+    Current state — heads, key indexes, cursors, watermarks — never expires,
+    and neither does a run still in progress."""
+
+    days: float | None = None
+    runs: int | None = None
+    forever: bool = False
+
+    def __post_init__(self):
+        if self.forever:
+            if self.days is not None or self.runs is not None:
+                raise RegistrationError("Retention(forever=True) takes no days or runs")
+            return
+        if self.days is None and self.runs is None:
+            raise RegistrationError("Retention() needs days, runs or forever=True")
+        if self.days is not None and self.days <= 0:
+            raise RegistrationError(f"Invalid retention days: {self.days}")
+        if self.runs is not None and self.runs < 1:
+            raise RegistrationError(f"Invalid retention runs: {self.runs}")
+
+    def spec(self) -> dict:
+        return {"days": self.days, "runs": self.runs, "forever": self.forever}
+
+
+_SIZE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([KMGT]?)B?\s*$", re.IGNORECASE)
+
+
+def _bytes(value: int | str) -> int:
+    if isinstance(value, int):
+        return value
+    match = _SIZE.fullmatch(str(value))
+    if not match:
+        raise RegistrationError(f"Invalid size: {value!r}")
+    return int(float(match[1]) * 1024 ** " KMGT".index((match[2] or " ").upper()))
+
+
+@dataclass(frozen=True)
+class KeyCache:
+    """A local disk cache of key index files (docs/object-store-state.md §6),
+    shared by the engine and attempts on its machine. Index files never
+    change, so a cached copy is never stale. `path=None`: next to `file://`
+    state, else a temporary directory."""
+
+    max_size: int | str = "8GB"
+    path: str | None = None
+
+    def spec(self) -> dict:
+        return {"max_bytes": _bytes(self.max_size), "path": self.path}
+
+
+DEFAULT_KEY_CACHE = KeyCache()
 
 
 # ---------------------------------------------------------------------------
@@ -601,10 +675,13 @@ class Asset:
         timeout: float = 3600,
         version: str = "1",
         on_version_change: str = "fail",
+        retention: Retention | None = None,
         automations: Any = (),
+        aliases: tuple | list = (),
     ):
         self.fn = fn
         self.name = fn.__name__
+        self.aliases = tuple(str(a) for a in aliases)
         if outputs is None:
             outputs = (Output(fn.__name__),)
         elif isinstance(outputs, Output):
@@ -617,9 +694,10 @@ class Asset:
         self.retries = retries or Retry()
         self.timeout = timeout
         self.version = str(version)
-        if on_version_change not in ("fail", "recompute"):
-            raise RegistrationError(f"{self.name}: on_version_change must be 'fail' or 'recompute'")
+        if on_version_change not in ("fail", "full"):
+            raise RegistrationError(f"{self.name}: on_version_change must be 'fail' or 'full'")
         self.on_version_change = on_version_change
+        self.retention = retention
         if isinstance(automations, Automation) or automations.__class__ in (Every, Cron, OnChange, OnDeploy):
             automations = (automations,)
         self.automations = tuple(
@@ -693,11 +771,15 @@ class Project:
         executors: list | None = None,
         resources: dict[str, Any] | None = None,
         automations: list[Automation] | None = None,
+        retention: Retention | None = None,
+        key_cache: KeyCache | None = DEFAULT_KEY_CACHE,
         name: str = "default",
     ):
         from .stores import JsonStore
 
         self.name = name
+        self.retention = retention
+        self.key_cache = key_cache
         self.assets: dict[str, Asset] = {}
         self.stores = {DEFAULT_STORE: JsonStore(), **(stores or {})}
         self.executors = list(executors or [])
@@ -774,7 +856,7 @@ class Project:
                 "store": source.store or DEFAULT_STORE,
                 "key": source.key,
                 "revision": None,
-                "mode": None,
+                "incremental": source.key is not None,
                 "migrations": [],
                 "config": source.handle,
                 "partition_set": source.key == "<elements>",
@@ -799,7 +881,7 @@ class Project:
                     "store": output.store or DEFAULT_STORE,
                     "key": output.key,
                     "revision": output.revision,
-                    "mode": output.mode,
+                    "incremental": output.incremental,
                     "migrations": [m.name for m in output.migrations],
                     "config": output.config,
                     "partition_set": output.is_partition_set,
@@ -810,9 +892,9 @@ class Project:
     def _edge(self, value, param, asset_name) -> In:
         if isinstance(value, str):
             value = In(value)
-        if type(value) not in (In, ByKey, AllPartitions):
+        if type(value) not in (In, Incremental, AllPartitions):
             raise RegistrationError(
-                f"{asset_name}: inputs[{param!r}] must be a str or one of In/ByKey/AllPartitions"
+                f"{asset_name}: inputs[{param!r}] must be a str or one of In/Incremental/AllPartitions"
             )
         return value
 
@@ -821,6 +903,18 @@ class Project:
             if not NAME.fullmatch(store_name):
                 raise RegistrationError(f"Invalid store name: {store_name!r}")
         outputs = self._output_table()
+        claimed = {}
+        for asset in self.assets.values():
+            for alias in asset.aliases:
+                if not NAME.fullmatch(alias) or alias == asset.name:
+                    raise RegistrationError(f"{asset.name}: invalid alias {alias!r}")
+                if alias in self.assets or alias in outputs:
+                    raise RegistrationError(f"{asset.name}: alias {alias!r} names a current asset or output")
+                if alias in claimed:
+                    raise RegistrationError(
+                        f"{asset.name}: alias {alias!r} is also claimed by {claimed[alias]}"
+                    )
+                claimed[alias] = asset.name
 
         # Resolve every asset's inputs/deps/partitions and validate edges.
         assets = {}
@@ -883,22 +977,28 @@ class Project:
                         f"{name}: {output_name} has upstream-only dimensions {sorted(missing)}; "
                         "collapse them with AllPartitions() (§7)"
                     )
-                if isinstance(edge, ByKey):
+                if isinstance(edge, Incremental):
                     if missing:
                         raise RegistrationError(
-                            f"{name}: ByKey edge {param!r} cannot have upstream-only dimensions (§7)"
+                            f"{name}: Incremental edge {param!r} cannot have upstream-only dimensions (§7)"
                         )
-                    if upstream["key"] is None:
+                    if not upstream["incremental"]:
                         raise RegistrationError(
-                            f"{name}: ByKey edge {param!r} upstream {output_name} declares no key (§2)"
+                            f"{name}: Incremental edge {param!r} upstream {output_name} "
+                            "is not incremental (declare incremental=True) (§2.1)"
                         )
                     if is_ref_type(annotation):
-                        raise RegistrationError(f"{name}: ByKey edge {param!r} cannot be ref-annotated (§5)")
+                        raise RegistrationError(
+                            f"{name}: Incremental edge {param!r} cannot be ref-annotated (§5)"
+                        )
                     if annotation is None:
                         raise RegistrationError(f"{name}: store-bound input {param!r} is unannotated (§11)")
-                    if not store.can_load(annotation, _keys_class()):
+                    Keys, Batches = _selection_classes()
+                    selection = Keys if upstream["key"] is not None else Batches
+                    if not store.can_load(annotation, selection):
                         raise RegistrationError(
-                            f"{name}: store {upstream['store']} cannot load {annotation} under Keys"
+                            f"{name}: store {upstream['store']} cannot load {annotation} "
+                            f"under {selection.__name__}"
                         )
                 elif isinstance(edge, AllPartitions):
                     inner = _dict_arg(annotation)
@@ -1073,6 +1173,8 @@ class Project:
                 "timeout": asset.timeout,
                 "version": asset.version,
                 "on_version_change": asset.on_version_change,
+                "retention": asset.retention.spec() if asset.retention else None,
+                "aliases": list(asset.aliases),
                 "code_hash": _code_hash(asset.fn),
                 "doc": inspect.getdoc(asset.fn) or "",
                 "types": {
@@ -1112,6 +1214,8 @@ class Project:
                 | {a["placement"]["kind"] for a in manifest_assets.values()}
             ),
             "automations": automation_records,
+            "retention": self.retention.spec() if self.retention else None,
+            "key_cache": self.key_cache.spec() if self.key_cache else None,
         }
         return {**body, "revision": digest(body)}
 
@@ -1122,10 +1226,10 @@ class Project:
         return assets[owner]["dims"] or {}
 
 
-def _keys_class():
-    from .stores import Keys
+def _selection_classes():
+    from .stores import Batches, Keys
 
-    return Keys
+    return Keys, Batches
 
 
 def _default_placement() -> dict:
