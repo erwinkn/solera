@@ -253,7 +253,6 @@ def test_demo_postgres_migrations_and_ondeploy(tmp_path):
             "file_index",
             "demo_migrations",
             "solera_migrations",
-            "solera_markers",
         ):
             conn.execute(f'DROP TABLE IF EXISTS "{name}"')
 

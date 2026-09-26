@@ -20,6 +20,7 @@ services:
       DATABASE_URL: postgresql://solera:solera@postgres:5432/solera
     volumes:
       - objects:/home/app/state
+      - data:/home/app/data
     healthcheck:
       test: ['CMD', 'python', '-c', "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
       interval: 5s
@@ -27,3 +28,4 @@ services:
       retries: 20
 volumes:
   objects:
+  data:

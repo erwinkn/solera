@@ -1,4 +1,4 @@
-"""§3/§4: PostgresStore — markers, Patch, batch snapshots, partition slices,
+"""§3/§4: PostgresStore — Patch, batch snapshots, partition slices,
 Sql writes. Skips unless SOLERA_TEST_DATABASE_URL points at a scratch database."""
 
 import os
@@ -6,7 +6,7 @@ import uuid
 
 import pytest
 from solera.sdk import Output
-from solera.stores import Keys, Patch, Sql, StaleRead, StoreConflict, StoreError, WriteError
+from solera.stores import Keys, Patch, Sql, StoreError, WriteError
 
 from tests.conftest import scope
 
@@ -64,18 +64,17 @@ async def test_patch_upsert_and_remove(store):
     assert [r["id"] for r in await store.load(reset.ref, list[dict], None)] == ["z"]
 
 
-async def test_marker_fences_store_and_load(store):
-    """§3: store() refuses when the live marker != prior.version; load()
-    refuses when it != ref.version."""
+async def test_a_lost_commit_does_not_stick_the_slice(store):
+    """§8: an attempt whose write landed but whose commit was lost leaves the
+    table ahead of the head. The next write, from the older prior, goes
+    through; reads get what the slice holds now."""
 
     out = output(key="id", revision="v", primary_key=["id"])
     first = await store.store([{"id": "a", "v": "1"}], None, scope(out))
-    moved = await store.store([{"id": "a", "v": "2"}], first.ref, scope(out))
-    with pytest.raises(StoreConflict):
-        await store.store([{"id": "a", "v": "3"}], first.ref, scope(out))
-    with pytest.raises(StaleRead):
-        await store.load(first.ref, list[dict], None)
-    assert (await store.load(moved.ref, list[dict], None))[0]["v"] == "2"
+    await store.store([{"id": "a", "v": "2"}], first.ref, scope(out))  # its commit is lost
+    again = await store.store([{"id": "a", "v": "3"}], first.ref, scope(out))
+    assert (await store.load(first.ref, list[dict], None))[0]["v"] == "3"
+    assert (await store.load(again.ref, list[dict], None))[0]["v"] == "3"
 
 
 async def test_partition_column_stamping(store):

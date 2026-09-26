@@ -86,11 +86,12 @@ reserved and optional.
 
 **`Output(name=None, store=None, key=None, revision=None, incremental=None,
 migrations=(), **config)`** declares a slot: registry key (defaults to the function name
-when the asset has one output), store (default `JsonStore`), and
+when the asset has one output), store (default: the project's `default_store`, a `FileStore`), and
 store-specific config validated by `can_store` at registration.
 
 | Arg | Meaning |
 |---|---|
+| `keyed` | The output is a `dict[str, Any]`: its keys are the keys, its values the content. Excludes `key` and `revision`. |
 | `key` | Column identifying what was materialized. Declared once, here; consumers never name columns. Independent of `primary_key` (storage identity). |
 | `revision` | Column that changes when a key's content changes. Absent: `revision = H(row)`. |
 | `incremental` | The output commits in engine-numbered batches: a keyed output's changes land in its key index (object-store-state.md §6), an unkeyed one's batches in its store; `Incremental()` consumers read what arrived after their watermark. `key=` implies it. Default false — a value output is one object per version. |
@@ -139,7 +140,7 @@ class Ref:
 ```
 
 - **JSON only.** Refs live in state, specs and results. Handles are dicts of
-  primitives. Typed subclasses (`TableRef`, `BlobRef`, `JsonRef`) are
+  primitives. Typed subclasses (`TableRef`, `ObjectRef`) are
   conveniences over the same wire form: `TableRef.table`,
   `TableRef.where`, `TableRef.sql()`.
 - **Self-contained.** A historical ref resolves without current store
@@ -171,34 +172,26 @@ Replay-stable without hashing tables. Accepted imprecision: a `full` run or
 converging incremental writes may give different versions for identical
 content (over-eager, never wrong).
 
-### Mutable-store contract
+### Stores are mutable
 
-Content-addressed stores get pin→load→commit atomicity for free. A store
-with mutable handles must provide it:
+A store holds each output's current content, overwritten in place, and a
+ref names where it lives: **reads are not pinned.** A consumer pinned to
+version 12 that loads after version 13 committed reads version 13's
+content. Nothing needs to expire, and no store keeps version markers.
+What keeps a dead attempt from writing over a live one is the engine's
+write fence (object-store-state.md §8): exactly one of the harness (about
+to write) and the engine (about to cancel, time out or fail the attempt)
+creates `{attempt}.writing`, so an aborted attempt writes nothing and a
+writing one is always committed.
 
-**Replace slots** keep a version marker per `(output, partition)`.
-`store()` refuses when the live marker ≠ `prior.version` (first write:
-marker absent; a `full` run skips the check). `load(ref)` refuses when the live
-marker ≠ `ref.version`: a consumer never reads content that is not its
-pinned version; the attempt fails and retries. Inherent consequence: a
-consumer slower than its producer's interval cannot load a mutable
-replace slot. Use an incremental output, a content-addressed store, or a
-coarser schedule.
-
-**Keyed outputs** on a mutable store apply partial writes under the same
-marker check; a write with no prior (a first write or a `full` run) replaces
-the slice. Stores keep no key maps: the engine's key index does (§6). An
-unkeyed incremental output is
-the case where data is a sequence of engine-numbered batches — `scope.batch`
-gives the next one and batches are never rewritten: `load(ref)` returns the
-batches `ref` was committed at, a true snapshot at the pinned version, always
-readable even after later writes. `TableRef.where` carries the same
-filter for raw SQL. A `full` run (`prior=None`) truncates the partition. A
-sink that cannot delete makes writes idempotent on `(scope, batch)`
-instead.
-
-Residual: between a fenced write and its successor's commit, a raw-SQL
-reader that ignores the filter can see an uncommitted batch.
+**Keyed outputs.** Stores keep no key maps: the engine's key index does
+(§6). The harness tells the store which keys a write changes
+(`Scope.upserts`, `Scope.removes`), so a store may touch only those; with
+no prior (a first write or a `full` run) the write replaces the slice. An
+unkeyed incremental output is a sequence of engine-numbered batches —
+`scope.batch` gives the next one, and a `full` run (`prior=None`) starts
+the partition over. A sink that cannot delete makes writes idempotent on
+`(scope, batch)` instead.
 
 ## 4. Stores
 
@@ -210,9 +203,9 @@ class Store(Protocol):
     async def load(self, ref: Ref, t: type, selection: Keys | Batches | None) -> Any: ...
     async def migrate(self, output: Output, migrations: Sequence[Migration]) -> list[str]: ...  # optional
 
-Scope   = (output: Output, partition: str, batch: int | None, baseline: Ref | None)
-Written = (ref: Ref, delta: Delta | None)
-Delta   = (batch: int, rows: int, upserted: Mapping | None, deleted: tuple, reset: bool)
+Scope   = (output: Output, partition: str, batch: int | None, attempt: str | None, aliases: tuple,
+           upserts: frozenset[str] | None, removes: frozenset[str] | None)
+Written = (ref: Ref, keys: Mapping[str, str] | None)   # keys: only for Sql writes the harness never sees
 Keys    = (revisions: Mapping[str, str])
 Batches = (lo: int, hi: int)  # load rows of batches in [lo, hi]
 ```
@@ -221,15 +214,15 @@ Batches = (lo: int, hi: int)  # load rows of batches in [lo, hi]
 |---|---|
 | `can_load(t, selection)` | Registration. Can you produce `t`, filtered by `Keys` when `selection` is given? `can_load(R, None)` for a `Ref` subclass `R` means "are your refs `R`". |
 | `can_store(t, output)` | Registration. Can you take values of type `t` for this `Output` declaration, and extract its declared key from them? `t` is `None` when the producer is unannotated. |
-| `store(write, prior, scope)` | Apply the write; return the new ref (version per §3) and, for an incremental output, the `Delta` this write produced — `scope.batch` is the engine-assigned batch number and `scope.baseline` the committed head to diff against (`prior` is withheld on a `full` run, `baseline` is not). Identical content returns the prior ref with no delta. Duplicate keys are a write error. For `partition_column` outputs, stamp the column with `scope.partition` and reject rows that disagree. |
-| `load(ref, t, selection)` | Materialize `t`; under `Keys`, only the selected keys, at their pinned revisions where the data model allows; under `Batches`, only batches in the range. Refs with `meta.external` were not written by the store and skip the marker check. |
+| `store(write, prior, scope)` | Apply the write; return the new ref (version per §3). `scope.batch` is the engine-assigned batch number; for a keyed output `scope.upserts` / `scope.removes` are the keys the write changes (`None`: all of them — write everything, delete the rest). `prior` is withheld on a `full` run. Duplicate keys are a write error. For `partition_column` outputs, stamp the column with `scope.partition` and reject rows that disagree. |
+| `load(ref, t, selection)` | Materialize `t` from what the store holds now; under `Keys`, only the selected keys; under `Batches`, only batches in the range. |
 | `migrate(output, migrations)` | Optional. Apply, in declared order, every migration not yet in the store's own ledger for this output; return the applied names. Must be safe under concurrent attempts of one output (partitions share tables): take a store-level lock and re-read the ledger inside it. Where the backend is transactional, a migration and its ledger row commit together. A store without `migrate` rejects `migrations=` at registration. |
 
 ### Migrations
 
 `Migration(name, payload)` is schema, not data: DDL for a table store, a
-callable over its prefix for a blob store; JsonStore has nothing to
-migrate and rejects the argument. The ledger of applied names lives next
+callable over its prefix for an object store. FileStore and S3Store have
+no `migrate` and reject the argument. The ledger of applied names lives next
 to the data (`solera_migrations(output, name, at)` in Postgres), never in
 engine state, so the store is the only source of truth about its own
 shape. The harness calls `migrate` before the first `store()` to an output
@@ -241,7 +234,7 @@ an asset with inputs, not a migration.
 ### Writes
 
 A bare value is replace. `Patch` is the SDK's partial write, accepted by
-`JsonStore` and `PostgresStore` (`can_store`) and by any store that opts
+`FileStore`, `S3Store` and `PostgresStore` (`can_store`) and by any store that opts
 in; it mirrors the commit API's `upsert`/`remove` (§5). The store, not
 the engine, computes the resulting delta:
 
@@ -254,8 +247,8 @@ the engine, computes the resulting delta:
 
 | Store | Accepts | Ref |
 |---|---|---|
-| `JsonStore` (default, built in) | JSON values: scalars, lists, dicts, and `list[dict]` rows for the row ops | `JsonRef` (sha256 object) |
-| `BlobStore` | `bytes`, `Path` | `BlobRef` |
+| `FileStore(path=None)` (default, built in) | anything: JSON when it round-trips, pickle otherwise. One file per value, partition, key or batch under `.solera/data` next to the project file (or `$SOLERA_DATA`) | `ObjectRef` |
+| `S3Store(url, **options)` | the same, in a bucket | `ObjectRef` |
 | `PostgresStore` | `DataFrame`, `GeoDataFrame`, `list[dict]`; `Sql` | `TableRef` |
 
 Secrets travel via `env:` indirection in store and resource config, resolved
@@ -438,17 +431,20 @@ cursor, every incremental edge resets to the whole head and its watermark
 lands past the head batch; the store makes the output equal to
 exactly this write. `keys=full` resets one edge only: `prior` is kept.
 
-**Attempts.** A task is claimed under a per-scope lock with a lease and a
-generation. Inputs are resolved to heads when the attempt starts and
-validated at commit; the commit also checks the output heads are unchanged
-since the claim. A stale generation cannot commit (**fencing**). Outcomes:
+**Attempts.** A task is claimed under a per-scope lock, so one attempt at a
+time writes an (asset, scope). Inputs are resolved to heads when the attempt
+starts. Once launched (`AttemptLaunched`), the claim is durable: a
+restarted engine adopts the attempt rather than launching it again. Before
+its first store write the harness takes the attempt's write fence; the
+engine takes the same fence before it cancels, times out or fails the
+attempt, so exactly one side wins (object-store-state.md §8). Outcomes:
 
 | Outcome | Meaning |
 |---|---|
 | `succeeded` | committed |
 | `skipped` | every `Incremental` edge was already at its head (empty diff) and heads are complete: no harness launched, nothing changes |
-| `failed` | retryable → `retries=` applies with backoff; non-retryable (store conflict, revision mismatch, version-mismatch without `on_version_change="full"`) → task fails |
-| `canceled` | run canceled or lease lost; a successor may already own the scope |
+| `failed` | retryable → `retries=` applies with backoff; non-retryable (revision mismatch, version-mismatch without `on_version_change="full"`) → task fails |
+| `canceled` | run canceled before the attempt began writing; an attempt already writing is committed instead |
 
 A commit installs heads, `input_refs`, the cursor, per-edge watermarks and a
 `changed` list, and pends `OnChange` automations in the same transaction.
@@ -463,13 +459,11 @@ asset's history; `Project(retention=…)` sets the default and
 state — heads, key indexes, cursors, watermarks — never depends on runs and
 never expires. Every `retention_interval` (60 s) the engine deletes finished
 runs (`runs/{run}/`: the run record, attempt files and logs) that every asset
-they ran has let go of; only runs in progress are protected. Data expires in
-the harness: an attempt of an asset with a finite policy carries the horizon
-in its spec, and before writing an output the harness calls
-`store.expire(head, before)` with the committed head, which stays loadable.
+they ran has let go of; only runs in progress are protected. Data never
+expires: stores hold current content only.
 `solera runs delete RUN` and `solera runs prune [--before] [--asset] [--keep]
 [--dry-run]` (and `DELETE /runs/{run}`, `POST /runs:prune`) delete runs by hand.
-Postgres has no `expire`: bound an append-only table with a scheduled job
+Bound an append-only output (FileStore batches, a Postgres event table) with a scheduled job
 that deletes old rows (object-store-state.md §11); a keyed table removes
 keys through its own asset, so its key index and consumers see it.
 
@@ -567,36 +561,36 @@ class Placement(Protocol):
 | `cancel` | Best-effort, idempotent, never raises for a finished run. |
 
 Object keys are conventional under `objects`: the attempt file
-`runs/{run}/{attempt}.json` — the spec, then spec + result + log index —
-and its gzip log `runs/{run}/{attempt}.log` (`.log.{n}` chunks while it runs);
-see object-store-state.md §8.
+`runs/{run}/{attempt}.json` — the spec, then spec + result + log index —,
+its gzip log `runs/{run}/{attempt}.log` (`.log.{n}` chunks while it runs),
+its write fence `.writing` and its heartbeat `.beat`; see
+object-store-state.md §8.
 
 **Engine loop**, per attempt:
 
 ```python
 await objects.create(f"runs/{run_id}/{attempt}.json", {"spec": spec})
+emit(AttemptLaunched(...))                    # from here on, a restart adopts it
 run = await placement.launch(Stage(attempt, run_id, objects_url))
-deadline = now() + timeout
-while (exit := await placement.wait(run, lease_interval)) is None:
-    if now() > deadline:
-        await placement.cancel(run)
-        await placement.wait(run, grace)
-        return fail("timeout", retryable=True)
-    try:
-        await attempts.renew(attempt)  # raises LostOwnership when fenced or canceled
-    except LostOwnership:
-        await placement.cancel(run)
-        await placement.wait(run, grace)
-        return
+while (exit := await placement.wait(run, poll)) is None:   # no handle: follow {attempt}.beat
+    if canceled or now() > deadline:
+        if await take_fence(attempt, "aborted"):          # the harness has not begun writing
+            await placement.cancel(run)
+            return fail("canceled" or "timeout")
+        # else it is writing: wait, and commit what it wrote
 result = (await objects.get(f"runs/{run_id}/{attempt}.json")).get("result")
 if result is None:
     return fail(f"harness exited without a result: {exit}", retryable=True)
 commit_or_fail(result)
 ```
 
-On restart every lease is expired: in-flight attempts are fenced and their
-tasks requeue and relaunch from scratch — nothing resumes at `wait`. The
-engine counts in-flight attempts per environment against `max_concurrent`.
+A launched attempt survives an engine restart: the new engine adopts it,
+following its placement handle if the placement can resume one, else its
+heartbeat (three missed beats: dead). A harness that dies after taking the
+fence leaves its keyed outputs **unsettled**: the next attempt reads the
+keys it meant to change back from the store and folds what landed into its
+own commit. The engine counts in-flight attempts per environment against
+`max_concurrent`.
 
 ### Worker protocol
 
@@ -614,7 +608,6 @@ code.
   "cursor":    "token-41",
   "prior":     {"qaqc_samples": Ref},
   "outputs":   {"qaqc_samples": {"exists": true, "head": Ref, "batch": 7, "index": KeyIndex}},
-  "retention": {"before": 1790000000.0},
   "inputs": {
     "qaqc_files":      {"ref": Ref, "index": KeyIndex,
                         "changes": {"from": 12, "to": 14, "after": null, "full": false, "limit": 100}},
@@ -635,8 +628,8 @@ code.
 - `prior` is the committed head per output; `outputs` pins each output's
   committed head, its engine-assigned batch number and, when keyed, its key
   index. A `full` run is expressed by withholding `prior` and `cursor`
-  (`outputs` stays); there is no `mode` field. `retention.before` is the
-  horizon for `store.expire` (§8 Retention).
+  (`outputs` stays); there is no `mode` field. An output left unsettled
+  by a dead attempt carries its `unsettled` intents in `outputs`.
 - Store names, output config, annotations, placement and time windows are
   derived from the manifest and the key.
 
@@ -652,8 +645,7 @@ code.
 The result is the attempt's commit request: per returned output its ref
 (or `unchanged`), a keyed output's delta files (`keys`) and a partition
 set's `elements`; per keyed Incremental input the page it `delivered`;
-`cursor` if set; or an error. `retryable=false` for store conflicts,
-revision mismatch and version-mismatch without a full run. No result means
+`cursor` if set; or an error. `retryable=false` for revision mismatch and version-mismatch without a full run. No result means
 the harness died. The engine validates the attempt id, that every ref names
 a known output and this scope, and that a keyed output reports its delta,
 then commits against its own record of the pins. Inputs that moved since
@@ -664,9 +656,10 @@ it was given.
 project entrypoint comes from the environment): fetch spec → refuse on
 revision mismatch (a failed result, not a crash) → resolve `env:` → load
 inputs per annotation (keyed Incremental edges through the upstream key
-index) → build `ctx` → run the producer → for each returned output, compare
-the write with its key index; `store()` it unless nothing changed and write
-the delta file → write the result last, in one PUT.
+index) → build `ctx` → run the producer → compare each keyed output with
+its key index and write the delta file (an output where nothing changed is
+not stored) → take the write fence (exit if the engine holds it) →
+`store()` each output → write the result last, in one PUT.
 Logs stream to chunked objects throughout. `manifest` mode runs through
 `Local` only, at server start.
 
@@ -684,7 +677,9 @@ Logs stream to chunked objects throughout. `manifest` mode runs through
 `POST /api/workers/register` `{pool, cpu, memory, gpu}`;
 `POST /api/tasks/claim` returns `{task, stage, lease_seconds}` for a task
 whose placement fits; `POST /api/tasks/{id}/renew`; `POST
-/api/tasks/{id}/complete`. Expired claims are swept in the eval loop.
+/api/tasks/{id}/complete`. Claims are journaled (`AttemptClaimed`), so a
+restarted engine never offers a task twice; a worker whose lease expires is
+lost, and its attempt is failed and retried.
 
 ## 11. Registration
 

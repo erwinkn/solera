@@ -1,4 +1,6 @@
-"""PostgresStore: shared mutable tables behind version markers (§3, §4).
+"""PostgresStore: shared mutable tables (§3, §4). Reads are not pinned: a
+ref names a table slice, and a load reads what it holds now; the engine's
+write fence (§8) keeps a dead attempt from writing over a live one.
 
 `psycopg` is imported lazily so project files can declare the store without a
 driver installed; only `store`/`load` need it (in the harness).
@@ -16,8 +18,6 @@ from solera.stores import (
     Patch,
     Scope,
     Sql,
-    StaleRead,
-    StoreConflict,
     StoreError,
     WriteError,
     Written,
@@ -25,10 +25,16 @@ from solera.stores import (
     resolve_env,
 )
 
-MARKER_TABLE = "public.solera_markers"
 LEDGER_TABLE = "public.solera_migrations"
 BATCH_COLUMN = "_batch"
 SEQ_COLUMN = "_seq"
+
+
+def _assigned_batch(scope: Scope, prior: Ref | None) -> int:
+    if scope.batch is not None:
+        return scope.batch
+    last = (prior.handle or {}).get("batch") if prior is not None else None
+    return int(last) + 1 if last is not None else 0
 
 
 def _ident(name: str) -> str:
@@ -140,7 +146,6 @@ class PostgresStore:
                 cur.execute(f"GRANT SELECT ON {table} TO {_ident(role)}")
             except Exception:
                 pass  # grants are deployment sugar; a missing role is not fatal
-        self._ensure_markers(cur)
         return table
 
     def _check_drift(self, cur, output: Output, table, schema, table_name, declared, pk):
@@ -184,53 +189,17 @@ class PostgresStore:
                 f"({'; '.join(drift)}); reconcile it with a Migration"
             )
 
-    def _ensure_markers(self, cur):
-        cur.execute(
-            f"CREATE TABLE IF NOT EXISTS {MARKER_TABLE} ("
-            "output text NOT NULL, partition text NOT NULL, version text NOT NULL, "
-            "batch integer, PRIMARY KEY (output, partition))"
-        )
-
-    def _marker(self, cur, output_name: str, partition: str) -> str | None:
-        row = cur.execute(
-            f"SELECT version FROM {MARKER_TABLE} WHERE output = %s AND partition = %s",
-            (output_name, partition),
-        ).fetchone()
-        return row["version"] if row else None
-
-    def _set_marker(self, cur, output_name: str, partition: str, version: str, batch: int | None):
-        cur.execute(
-            f"INSERT INTO {MARKER_TABLE} (output, partition, version, batch) VALUES (%s,%s,%s,%s) "
-            "ON CONFLICT (output, partition) DO UPDATE SET version = EXCLUDED.version, batch = EXCLUDED.batch",
-            (output_name, partition, version, batch),
-        )
-
-    def _marker_batch(self, cur, output_name: str, partition: str) -> int | None:
-        row = cur.execute(
-            f"SELECT batch FROM {MARKER_TABLE} WHERE output = %s AND partition = %s",
-            (output_name, partition),
-        ).fetchone()
-        return row["batch"] if row else None
-
     # -- writes ---------------------------------------------------------------
 
     async def store(self, write, prior: Ref | None, scope: Scope) -> Written:
         output = scope.output
         with self._connect() as conn, conn.cursor() as cur:
-            self._ensure_markers(cur)
             self._rename(cur, output, scope)
             table, _, _ = self._table(output)
             partition_col = output.config.get("partition_column")
             slice_where = {partition_col: scope.partition} if partition_col else {}
 
-            if prior is not None:  # a full run (prior=None) skips the marker check
-                live = self._marker(cur, output.name, scope.partition)
-                if live != prior.version:
-                    raise StoreConflict(
-                        f"{output.name}/{scope.partition}: live marker {live} != pinned {prior.version}"
-                    )
-
-            batch = self._assigned_batch(cur, output, scope) if output.incremental else None
+            batch = _assigned_batch(scope, prior) if output.incremental else None
             keys = None
             if isinstance(write, Sql):
                 version, keys = self._apply_sql(cur, output, write, scope, table, slice_where, prior)
@@ -244,7 +213,6 @@ class PostgresStore:
                         f"{output.name}: an unkeyed incremental output only accepts Patch writes"
                     )
                 version = self._apply_replace(cur, output, write, scope, table, slice_where)
-            self._set_marker(cur, output.name, scope.partition, version, batch)
         batch_mode = output.key is None and output.incremental
         return Written(
             TableRef(
@@ -265,7 +233,7 @@ class PostgresStore:
 
     def _rename(self, cur, output, scope):
         """An output renamed through its asset's aliases (§2) takes its table
-        and markers along, once: the first write under the new name."""
+        along, once: the first write under the new name."""
 
         if not scope.aliases or "table" in output.config:
             return
@@ -276,14 +244,7 @@ class PostgresStore:
         for alias in scope.aliases:
             if cur.execute(exists, (schema, alias)).fetchone():
                 cur.execute(f"ALTER TABLE {_qname(schema, alias)} RENAME TO {_ident(output.name)}")
-                cur.execute(f"UPDATE {MARKER_TABLE} SET output = %s WHERE output = %s", (output.name, alias))
                 return
-
-    def _assigned_batch(self, cur, output, scope) -> int:
-        if scope.batch is not None:
-            return scope.batch
-        prior_marker = self._marker_batch(cur, output.name, scope.partition)
-        return int(prior_marker) + 1 if prior_marker is not None else 0
 
     def _apply_replace(self, cur, output, write, scope, table, slice_where):
         rows = _coerce_rows(write)
@@ -446,16 +407,6 @@ class PostgresStore:
             return ref
         handle = ref.handle or {}
         with self._connect() as conn, conn.cursor() as cur:
-            self._ensure_markers(cur)
-            # Batch-mode refs are exempt: the `_batch <=` filter is a true
-            # snapshot at the pinned version, always readable after later
-            # writes (§3).
-            if not ref.meta.get("external") and handle.get("batch") is None:
-                live = self._marker(cur, ref.output, ref.partition)
-                if live != ref.version:
-                    raise StaleRead(
-                        f"{ref.output}/{ref.partition}: live marker {live} != pinned {ref.version}"
-                    )
             table = handle.get("table") or _qname(handle.get("schema", "public"), handle["name"])
             where = dict(handle.get("where") or {})
             sql, params = f"SELECT * FROM {table}", []

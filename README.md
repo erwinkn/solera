@@ -36,7 +36,8 @@ uv run solera serve --insecure
 ```
 
 State lands in `./.solera` — a `file://` object store using the same client
-interfaces as S3. `--insecure` disables token auth and is restricted to
+interfaces as S3. Asset data lands in `.solera/data` next to the project
+file (`$SOLERA_DATA` overrides it). `--insecure` disables token auth and is restricted to
 loopback; set `SOLERA_API_TOKEN` for anything else.
 
 ## The demo project
@@ -49,9 +50,9 @@ The default project is designed to make every architecture feature visible:
 | `uploads` | an external `PartitionSet` source fed by `solera commit` |
 | `site_feed` | per-site cursor asset on `Every(10)`: `site_events` (unkeyed incremental) + `site_files` (keyed inventory), `Patch` both ways |
 | `file_index` | `Incremental(batch_size=2)` consumer — watch `more` continuation; declared `version="2"` |
-| `site_digest` | `site × day` two-dimensional asset (`TimePartitions`), `deps=` on the `roadmap` source, `BlobStore` output |
-| `fleet_index` | `AllPartitions` fan-in: `dict[str, list[dict]]` on JsonStore, `dict[str, TableRef]` on Postgres |
-| `site_status` | `Sql` asset over a `TableRef` (Postgres); on JsonStore it logs that it skipped |
+| `site_digest` | `site × day` two-dimensional asset (`TimePartitions`), `deps=` on the `roadmap` source, a `bytes` output (pickled by FileStore) |
+| `fleet_index` | `AllPartitions` fan-in: `dict[str, list[dict]]` on FileStore, `dict[str, TableRef]` on Postgres |
+| `site_status` | `Sql` asset over a `TableRef` (Postgres); on FileStore it logs that it skipped |
 | `fleet_status` | Postgres-only `AllPartitions` consumer over `TableRef`s — the SELECT runs in-database |
 | `manual_ingest` | the one non-`Local` asset: `Pool("ingest")`, on an `Every(30)` schedule with `partitions="missing"` |
 | `weekly_digest` | a `@job` on a weekly `Cron` — inputs and placement, no outputs |
@@ -134,8 +135,8 @@ uv run solera run site_digest --partitions all --upstream
 `site_digest` is partitioned by `site` and a daily `TimePartitions` dim, so
 its scopes look like `day=2026-09-01,site=alpha` (explicit multi-dim keys use
 that canonical comma form with `--partition`). Its `deps=["roadmap"]` pins the
-plain source in lineage without loading it. The output is bytes in the
-`BlobStore` — check the head's ref on the asset page.
+plain source in lineage without loading it. The output is bytes, which
+FileStore pickles — check the head's ref on the asset page.
 
 ### 6. AllPartitions fan-in
 
@@ -144,7 +145,7 @@ uv run solera run fleet_index --upstream
 ```
 
 `fleet_index` receives `file_index` as `dict[str, ...]` keyed by site —
-committed heads at pin time, never a barrier on missing keys. With JsonStore
+committed heads at pin time, never a barrier on missing keys. With FileStore
 the values are `list[dict]`; with Postgres they are `TableRef`s.
 
 ### 7. SQL inside Postgres
@@ -186,7 +187,8 @@ workers whose capacity fits.
 
 ## Postgres
 
-The demo runs entirely on JsonStore by default. To move the relational
+The demo runs entirely on FileStore by default: files under `.solera/data`,
+or in a bucket when `SOLERA_DATA_URL` names one (`S3Store`). To move the relational
 outputs (`site_events`, `site_files`, `file_index`, `site_status`,
 `fleet_status`) into shared Postgres tables:
 
@@ -198,9 +200,9 @@ uv run solera serve --insecure
 
 Partitioned outputs share one physical table per output, sliced by their
 `partition_column`; unkeyed incremental outputs get a `_batch`/`_seq` snapshot pair so a
-pinned `TableRef` keeps reading the version it was committed at. Writes are
-fenced by a per-partition version marker — a stale attempt's rows can never
-become visible. `Sql` assets materialize straight into `{schema}.{table}`.
+pinned `TableRef` keeps reading the version it was committed at. The
+engine's write fence keeps a dead attempt from writing over a live one:
+an attempt the engine has aborted never writes. `Sql` assets materialize straight into `{schema}.{table}`.
 
 The Compose file also has a full `solera` service:
 
@@ -209,8 +211,8 @@ SOLERA_API_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))'
   docker compose up --build
 ```
 
-It wires `DATABASE_URL` to the compose Postgres and keeps object state on a
-named volume — swap `SOLERA_STATE_URL` for `s3://…` in `compose.yml` to run the
+It wires `DATABASE_URL` to the compose Postgres and keeps object state and
+asset data on named volumes — swap `SOLERA_STATE_URL` for `s3://…` in `compose.yml` to run the
 same stack on S3.
 
 ## Migrations
@@ -218,14 +220,13 @@ same stack on S3.
 Schema changes are declared on the output, not implied by the store. An
 `Output` carries `migrations=(Migration(name, payload), …)` in order; the
 payload is a SQL string or a callable taking a cursor. Registration rejects
-migrations on a store without `migrate` (JsonStore has none), duplicate
+migrations on a store without `migrate` (FileStore has none), duplicate
 names, and payloads that fail `can_store`.
 
 PostgresStore keeps a `solera_migrations(output, name, at)` ledger and runs
 each pending migration plus its ledger row in one transaction under an
 advisory lock keyed on the output, so concurrent workers apply each exactly
-once. BlobStore records applied names in `_migrations.json` under the
-output's prefix. A table that already exists must match the declaration —
+once. A table that already exists must match the declaration —
 drift fails non-retryably instead of triggering a silent `ALTER`. The
 harness migrates before the first write in an attempt, and the output's
 head carries the last applied name as `schema`.

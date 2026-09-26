@@ -1,6 +1,6 @@
 # Object-store state: data model
 
-Status: **implemented** (K0, J1–J4), except where a section says otherwise. Replaces the SlateDB persistence and the
+Status: **implemented** (K0, J1–J5), except where a section says otherwise. Replaces the SlateDB persistence and the
 retention design in `storage-redesign.md` §4–§5. Keeps `Incremental`
 edges, per-batch deltas and watermarks from PR #7, and the in-memory
 engine model from PR #8.
@@ -36,15 +36,17 @@ Everything lives under `{root}/{namespace}/`.
 | Key index file | `keys/{output}/{scope}/{name}.kx` | harness (delta files), compaction | create-only | no longer in the index and no consumer needs it (§6) |
 | Run record | `runs/{run}/run.json` | engine | written once, when the run ends | retention (§11) |
 | Attempt file | `runs/{run}/{attempt}.json` | engine creates it with the spec; the harness overwrites it with spec + result + log index | two writes, one writer each | with its run |
+| Write fence | `runs/{run}/{attempt}.writing` | the harness before it writes, or the engine before it ends the attempt — whichever is first | create-only | with its run |
+| Heartbeat | `runs/{run}/{attempt}.beat` | harness, every 30 s | overwritten | with its run |
 | Attempt log | `runs/{run}/{attempt}.log` (chunks `{attempt}.log.{n:06d}` while running) | harness | chunks write-once; joined at the end | with its run |
-| Output data | store-defined (JsonStore: `data/{output}/{scope}/…`, named after the writing attempt) | the store, inside the harness | store-defined | `store.expire` (§9) |
+| Output data | store-defined (FileStore: `{output}/{partition}/{key}.json` under `.solera/data`, §9) | the store, inside the harness | overwritten in place | when the output no longer holds it (§9); never expired |
 
 **Growth.** `control/` is bounded: at most two checkpoints plus the
 journal since the older one, and a checkpoint is written whenever that
 journal reaches the size of the last checkpoint (§10) — so `control/`
 stays under about three times the engine's state size. `keys/` is bounded
 by live keys plus unconsumed deltas. What grows over time is `runs/`,
-bounded by retention, and user data.
+bounded by retention, and user data, which holds only current content.
 
 ```
 {root}/{namespace}/
@@ -62,8 +64,12 @@ bounded by retention, and user data.
     01J8ZB3K…/run.json
     01J8ZB3K…/01J8ZB3M….json                 ← attempt: spec, then spec + result
     01J8ZB3K…/01J8ZB3M….log                  ← gzip blocks
-  data/…                                     ← JsonStore / BlobStore
+    01J8ZB3K…/01J8ZB3M….writing              ← write fence
+    01J8ZB3K…/01J8ZB3M….beat                 ← heartbeat
 ```
+
+Output data lives wherever its store puts it: FileStore under
+`.solera/data` next to the project file, S3Store in its own bucket.
 
 ## 2. Identifiers
 
@@ -71,7 +77,7 @@ bounded by retention, and user data.
 |---|---|---|
 | run | `{ulid}` | sorts by time and embeds its creation time; carries no names, so renames never orphan history |
 | task | `{asset}:{scope}` | unique within its run |
-| attempt | `{ulid}` | globally unique; names delta files and data objects, so a zombie attempt can never overwrite a committed one |
+| attempt | `{ulid}` | globally unique; names delta files and attempt files |
 | commit | `(run, attempt)` | no separate commit id or record |
 | batch | integer per (output, scope) | engine-assigned, starts at 0 |
 | seq | integer per namespace | journal position |
@@ -123,7 +129,9 @@ status are derived inside `apply`; they are not events.
 | `ProjectRegistered` | `revision`, `manifest` | replaces the manifest; applies aliases; reconciles automation state |
 | `RunSubmitted` | `run` (id, request, tasks) | adds an active run |
 | `RunControlled` | `run`, `action` (`cancel` \| `pause` \| `resume`) | |
-| `AttemptFinished` | `run`, `task`, `attempt`, `outcome` (`succeeded` \| `failed` \| `skipped` \| `expired`), `started_at`, `finished_at`, `error?`, `retryable?`, `commit?` | records the attempt; on commit, installs heads, cursor, watermarks, and each keyed output's new delta file |
+| `AttemptLaunched` | `run`, `task`, `attempt`, `started_at`, `at`, `execution`, `prepared`, `pool?` | the attempt file exists and a placement is about to start it: its claim and scope lock become durable (§8) |
+| `AttemptClaimed` | `attempt`, `worker`, `at` | a pool worker took a launched attempt; no other worker is offered it |
+| `AttemptFinished` | `run`, `task`, `attempt`, `outcome` (`succeeded` \| `failed` \| `skipped` \| `canceled`), `started_at`, `finished_at`, `error?`, `retryable?`, `commit?`, `unsettled?` | records the attempt; on commit, installs heads, cursor, watermarks, and each keyed output's new delta file; `unsettled` keeps the intents of a writer that died (§8) |
 | `SourceCommitted` | `source`, `head`, `keys?`, `at` | installs a source head and its delta file |
 | `IndexCompacted` | `output`, `scope`, `added` [file], `removed` [name], `recount?`, `at` | swaps compacted files into a key index; a recount replaces its count |
 | `IndexTruncated` | `output`, `scope`, `below`, `at` | drops delta log entries below `below` |
@@ -132,9 +140,11 @@ status are derived inside `apply`; they are not events.
 | `AutomationFired` | `name`, `at`, `run` | clears its pending set |
 | `RunArchived` | `run` | drops a finished run from memory once `run.json` is written |
 
-A claim is **not** an event: attempt ids are unique, so after a restart a
-harness that was running reports into an attempt the engine no longer
-knows, and its result is rejected. The task is simply re-queued.
+An attempt that has not launched yet — it is still pinning inputs and
+writing its spec — is **not** in the journal: after a restart its task is
+simply dispatched again. Once `AttemptLaunched` is written, the attempt
+outlives the engine: the next engine adopts it, waits for it and commits
+its result (§8).
 
 ## 5. State (in memory) — also the checkpoint's content
 
@@ -152,6 +162,7 @@ State
   automations  {name: AutomationState}
   retention    {asset: [run, …]}                   # finite policies only, oldest first (§11)
   runs         {run: Run}                          # active, or finished and not yet archived
+  unsettled    {output: {scope: [Intent, …]}}      # keyed outputs a dead writer may have half-written (§8)
   garbage      [[path, at], …]                     # index files no index references any more
 ```
 
@@ -163,13 +174,18 @@ State
 | `Outcome` | `outcome`, `run`, `attempt`, `at` | assets × partitions |
 | `AutomationState` | `enabled`, `last_fired`, `last_run`, `last_revision`, `pending` (set of `[asset, scope]` for OnChange) | automations × partitions |
 | `Run` | `id`, `request` {targets, partitions, mode, config, keys, automation}, `status`, `paused`, `created_at`, `tasks` {task: `Task`} | in-flight work |
-| `Task` | `status`, `deps`, `ready_at`, `max_attempts`, `attempts` [`Attempt`] | |
+| `Task` | `status`, `deps`, `ready_at`, `max_attempts`, `attempts` [`Attempt`], `launched?` {`attempt`, `started_at`, `at`, `execution`, `prepared`, `pool?`, `worker?`, `claimed_at?`} | |
+| `Intent` | `added`, `removed`, `exact`, `files` (the dead attempt's delta files), `run`, `attempt` | writers that died mid-write, until the next commit of that output |
 | `Attempt` | `id`, `outcome`, `started_at`, `finished_at`, `error?`, `outputs?` {output: ref} | |
 
-**Memory only, rebuilt at start:** leases and scope locks (every lock is
-treated as expired on restart), the ready queue, the dependents index,
-registered workers (they re-register on their next heartbeat), a cache of
-key index blocks, and the recent-runs list for the console.
+**Derived, rebuilt at start:** the claims and scope locks of launched
+attempts (from `Task.launched`), the pool queue, the ready queue and the
+dependents index.
+
+**Memory only:** the claim of an attempt still preparing (a restart
+dispatches its task again), pool leases, registered workers (they
+re-register on their next heartbeat), a cache of key index blocks, and the
+recent-runs list for the console.
 
 Example (abridged):
 
@@ -177,8 +193,8 @@ Example (abridged):
 {
   "seq": 1040, "writer": 1001, "revision": "c0ffee…", "manifest": {"…": "…"},
   "heads": {"site_files": {"alpha": {
-    "ref": {"output": "site_files", "store": "json", "partition": "alpha", "version": "8f35…",
-            "handle": {"mode": "keyed", "prefix": "data/site_files/alpha/", "batches": [0, 57]}},
+    "ref": {"output": "site_files", "store": "default", "partition": "alpha", "version": "8f35…",
+            "handle": {"mode": "keyed", "path": "site_files/alpha", "key": "path"}},
     "run": "01J8ZC7Q…", "attempt": "01J8ZC7R…",
     "batch": 57, "count": 4, "complete": true, "version": "1", "at": 1790074866.0}}},
   "indexes": {"site_files": {"alpha": {
@@ -257,12 +273,12 @@ Levels small enough (≤ 32 MB) are always read whole.
 | Operation | Who | How |
 |---|---|---|
 | Compute a delta | harness, at write time | Extract `(key, version)` from the written rows (declared `revision` column, else row digest). Check them against the index **as pinned in the spec**, with the filters and the read strategy above. Keep entries whose version changed, plus `deleted` entries for removed keys that may exist. A full replacement also compares against every existing key, which is inherent. Write the result as the batch's delta file. |
-| Commit | engine | Add the delta file to level 0 and to `log`; `count += added − removed`. The existing commit check — head unchanged since the attempt was claimed — guarantees the index didn't change underneath. |
+| Commit | engine | Add the delta file to level 0 and to `log`; `count += added − removed`. The scope lock — one attempt per (asset, scope) from launch to settlement — guarantees the index didn't change underneath. |
 | Deliver pending deltas | harness, for an `Incremental` edge | Read the `log` files from the watermark to the head; chunk by `batch_size` in key order; ask the upstream store for those rows with `Keys(…)`. |
 | Full delivery | harness | Page through the merged view of all levels from `after`, `batch_size` keys at a time, and ask the store for them with `Keys(…)`. Per level, only the files covering the page are opened, and only their index parts are read. |
 | Compaction | the engine's machine by default (§6, *Engine work*) | When level 0 exceeds ~8 files, merge it with the overlapping level-1 files into new level-1 files, cascading down; commit with `IndexCompacted`. |
 | Truncate the log | engine | Drop `log` entries below the lowest consumer watermark and below every window an in-flight attempt was given (`IndexTruncated`); an output with no `Incremental` consumers keeps none. A consumer whose window the log no longer holds gets a full delivery. |
-| Delete files | engine | A file in neither `files` nor `log` joins `garbage`, and is deleted once every attempt that could have pinned it has finished (`GarbageDeleted`). A delta file of an attempt that never committed is deleted when the attempt ends. |
+| Delete files | engine | A file in neither `files` nor `log` joins `garbage`, and is deleted once every attempt that could have pinned it has finished (`GarbageDeleted`). A delta file of an attempt that never committed is deleted when the attempt ends, unless it is an unsettled intent (§8). |
 
 Writes that never pass through the harness as rows — `Sql` materialized
 inside Postgres — are the one case where the store must report the written
@@ -318,7 +334,7 @@ still in the checkpoint and gets archived again (the write is idempotent).
   "tasks": {
     "file_index:alpha": {"status": "succeeded", "attempts": [
       {"id": "01J8ZB3M…", "outcome": "succeeded", "started_at": 1790074791.0, "finished_at": 1790074800.0,
-       "outputs": {"file_index": {"output": "file_index", "store": "json", "version": "…", "handle": {"…": "…"}}}}]},
+       "outputs": {"file_index": {"output": "file_index", "store": "default", "version": "…", "handle": {"…": "…"}}}}]},
     "file_index:bravo": {"status": "skipped", "attempts": [{"id": "01J8ZB3N…", "outcome": "skipped"}]}
   }
 }
@@ -378,6 +394,47 @@ of the outputs it writes and the incremental inputs it reads).
 }
 ```
 
+**Launch and adoption.** The engine writes the attempt file, then
+`AttemptLaunched`, then starts the placement. From that event on, the
+attempt's claim and its scope lock are durable: an engine that restarts
+does not launch the task again, it adopts the attempt — waits for it and
+settles it (commits its result, or fails it) as the first engine would
+have.
+
+**Heartbeat.** The engine follows an attempt through its placement handle
+(a process, an ECS task). After a restart it may have none, so the harness
+also rewrites `{attempt}.beat` every `heartbeat_seconds` (30 s), from a
+thread so a producer that blocks its event loop still beats, and marks it
+done when its result is written. Three missed beats and the worker is dead:
+the engine fails the attempt, and the task is retried.
+
+**Write fence — `{attempt}.writing`.** Stores overwrite in place (§9), so
+a dead attempt must never write over a live one. One create-only object
+decides it:
+
+- The harness creates it — `{"state": "writing", "intents": {…}}`, listing
+  the delta files of the keys it is about to change — before its first
+  store write. If it already exists, the engine got there first: the
+  harness writes nothing and exits.
+- The engine creates it — `{"state": "aborted"}` — before it cancels, times
+  out or fails a launched attempt. If it already exists, the harness is
+  writing: the engine waits for it and commits its result, even on a
+  canceled run, since its data has landed.
+
+For example, a run is canceled while `file_index:alpha` computes. The
+engine takes the fence first; the harness, done computing, finds it taken
+and exits without touching the store. Had the harness taken it first, the
+engine would have waited, and the commit would stand.
+
+**Unsettled outputs.** A harness that dies after taking the fence may have
+written part of its keyed outputs. The engine fails the attempt with the
+fence's intents (`AttemptFinished.unsettled`) and keeps their delta files.
+The next attempt on that scope reads the intended keys back from the store
+and folds what landed into its own delta — keys it writes itself end as it
+says either way — and its commit settles the output, releasing the intent
+files. Unkeyed outputs need no repair: the next attempt writes the same
+value or batch again. The console shows unsettled outputs.
+
 **The attempt log** is gzip-compressed JSON lines, one line per
 `ctx.log(message, level="info", **fields)` call: `{"at", "level", "message", "fields"}`.
 
@@ -398,28 +455,50 @@ of the outputs it writes and the incremental inputs it reads).
 
 ```python
 class Store(Protocol):
+    def can_store(self, t, output) -> bool                  # checked at registration
+    def can_load(self, t, selection) -> bool
     async def store(self, write, prior, scope) -> Written   # Written(ref, keys?)
-    async def load(self, ref, t, selection) -> Any           # selection: None | Keys | Batches
-    async def expire(self, head, before) -> None             # delete what no version written after `before` needs
+    async def load(self, ref, t, selection) -> Any          # selection: None | Keys | Batches
 ```
 
 - `Scope` carries the engine-assigned `batch`, the `attempt` id and the
-  output's `aliases`. Stores put the attempt id in object names, so no
-  attempt overwrites another's objects. JsonStore writes
-  `data/{output}/{scope}/{batch // 1000}/b{batch}-{attempt}.json` (and
-  `s…` snapshots, `v{attempt}.json` for values); when attempts wrote the
-  same batch, the newest attempt's object is the committed one — a later
-  attempt only gets that batch number while it is still uncommitted.
+  output's `aliases`. For a keyed output it also says which keys the write
+  changes against the key index: `upserts` to write, `removes` to delete.
+  Both are `None` when there is no prior (a first write or a `full` run):
+  the store then writes everything and deletes whatever else it holds.
+  A patch that changes 3 keys of 100,000 reaches the store as 3 upserts.
 - `Written.keys` is only for writes the harness never sees as rows
   (§6); for everything else the harness computes keys itself.
-- `expire` is optional; it is how data retention reaches the store (§11).
-  The harness calls it with the committed head before writing that output.
-  JsonStore dates each object by the attempt id in its name (a ULID) and
-  deletes what no version written after `before` needs: older values, keyed
-  batches below the snapshot the oldest retained version folds from, event
-  log batches written before `before` (an event log's content is the batches
-  it retains), and objects of attempts that never committed. Postgres keeps
-  no old versions and has no `expire`. The head always stays loadable.
+- **Reads are not pinned.** A ref names where content lives, and a load
+  reads what is there now. A consumer pinned to version 12 that loads after
+  version 13 committed gets version 13's content. Keeping one copy is what
+  lets data need no expiry; the write fence (§8) is what keeps a dead
+  attempt from writing over a live one.
+- **Nothing expires.** A store holds the current content of each output,
+  nothing older; the engine never deletes data.
+
+**FileStore**, the default, writes what an asset returns as files under
+`.solera/data` next to the project file (or `FileStore(path)`, or
+`$SOLERA_DATA`) — one object per value, partition, key or batch:
+
+```
+rollup.json                       a value
+site_status/alpha.json            a value, partition alpha
+uploads/u-7.json                  a keyed output: one object per key
+site_files/alpha/f-1.json         keyed and partitioned
+site_events/alpha/000000000042.json
+                                  an unkeyed incremental output: one object per batch
+```
+
+Content is JSON when it round-trips exactly, pickle (`.pkl`) otherwise.
+Keyed outputs are declared `Output(keyed=True)` and return
+`dict[str, Any]`, or rows with `key="id"`. A removed key's object is
+deleted. Batches of an unkeyed incremental output accumulate until a
+`full` run starts the output over. **S3Store(url)** is the same layout in a
+bucket; `Project(default_store=S3Store("s3://…"))` makes it the default.
+
+**PostgresStore** keeps one table per output, shared by its partitions,
+and rewrites the rows a write covers.
 
 ## 10. Lifecycles
 
@@ -427,7 +506,8 @@ class Store(Protocol):
 `LIST control/journal/` after its `seq` → `GET` and apply each segment →
 create `journal/{seq+1}` with `[WriterStarted]`. If that create fails,
 another writer appended: `GET` it, apply it, retry at the next `seq`.
-Then re-queue every task that was running.
+Then adopt every launched attempt (§8); tasks that were preparing are
+dispatched again.
 
 **Fencing.** Every segment write is create-only at `seq+1`. A writer
 whose create collides reads the colliding segment: if it has another
@@ -449,6 +529,12 @@ unreadable can be recovered from.
 **Run lifecycle.** submit → `RunSubmitted` · attempts → `AttemptFinished`
 · terminal → write `run.json` → `RunArchived`.
 
+**Attempt lifecycle.** claim (memory) → pin and write the spec →
+`AttemptLaunched` → [pool: `AttemptClaimed`] → the harness takes the
+fence, writes, and writes its result → the engine commits it
+(`AttemptFinished`). A cancel or timeout takes the fence first and ends the
+attempt with `AttemptFinished` (`canceled`, or `failed` and retryable).
+
 ## 11. Retention
 
 Policies are set per asset, with a project default:
@@ -464,6 +550,8 @@ Retention(forever=True)
 key indexes stand on their own; a head keeps its `run` and `attempt`
 references even after that run is deleted ("produced 45 days ago, run
 expired"). The only runs that cannot be deleted are active ones.
+Retention applies to runs only: output data holds no history (§9), so
+there is nothing else to expire.
 
 **Run records.** For each asset with a `runs` policy, the engine keeps the
 ids of the newest `runs` runs in which it succeeded (`State.retention`).
@@ -474,15 +562,10 @@ each finished run older than the horizon of every asset it ran. A run of
 an asset that keeps everything is kept. The engine lists `runs/` once when
 it starts and keeps that list in memory.
 
-**Data versions.** An attempt of an asset with a finite policy carries
-its horizon in its spec (`retention.before`); before writing an output, the
-harness calls `store.expire(head, before)` with the committed head. Every
-version written after the horizon still loads; the head always does,
-whatever becomes of the attempt's own commit.
-
-**Table stores don't version.** Retention reaches data through
-`store.expire`, and a store without one (Postgres) keeps its tables as they
-are. To bound an append-only table, schedule a job:
+**Bounding data.** Stores keep only current content, so a keyed output is
+bounded by its live keys, and a value by its size. What grows is an
+append-only output — FileStore batches, a Postgres event table. Bound it
+with a scheduled job, or a periodic `full` run:
 
 ```python
 @job(deps=["site_events"], automations=Automation(trigger=Every(3600)))
@@ -514,8 +597,8 @@ POST   /api/projects/{p}/runs:prune   {"before", "asset", "keep", "dry_run"}
 | `Page` in the store contract | full delivery pages through the key index and loads with `Keys` |
 | separate commit ids and records | commit = `(run, attempt)`; lineage inputs are in the attempt's `spec` |
 | separate `spec.json`, `result.json`, per-flush log files | one attempt file; one gzip log per attempt, chunked only while running |
-| persisted locks, leases, queue, workers | memory only; rebuilt or re-registered |
-| claim events | unique attempt ids make unknown attempts harmless |
+| persisted locks, queue, workers | locks and queue derived from runs and launches; workers re-register |
+| claim events for attempts still preparing | a restart dispatches them again; launches are journaled (`AttemptLaunched`) |
 | `ref.meta.delta` / `.keys` / `.partitions` | engine fields on `Head`: `batch`, `base`, `count`, `elements` |
 | watermark `offset` and `after_key` | one `after` field, plus `full` and `until` |
 | refusing a commit whose inputs moved after pinning | the commit stands: it delivered what it pinned |
@@ -523,6 +606,10 @@ POST   /api/projects/{p}/runs:prune   {"before", "asset", "keep", "dry_run"}
 | per-automation retention, automation names in run ids | per-asset retention; run id = ULID |
 | pinned runs | nothing but active runs is protected; current state is independent of runs |
 | HTTP-only attempt I/O for pool workers | one uniform attempt-file channel |
+| JsonStore, BlobStore, per-attempt data objects | FileStore / S3Store: one object per value, partition, key or batch, overwritten in place |
+| `store.expire`, data retention | stores hold current content only; retention covers runs |
+| per-partition version markers in stores, `StoreConflict`, `StaleRead` | the write fence (§8); reads are not pinned (§9) |
+| attempt leases and their sweeps; a restart re-queues running tasks | durable launches: the next engine adopts them (§8) |
 
 ## 13. Open questions
 
@@ -545,4 +632,5 @@ Built on PR #8's branch.
 | J1 journal | `solera_server/journal.py`: flush, fencing, checkpoint, replay, cleanup | crash between `PUT` and ack; replaced-writer test; replaying the full journal equals checkpoint + tail; passes on `file://` and S3 |
 | J2 model | events + `apply`; engine and API on `State`; SlateDB removed | full suite; restart tests; a counting object store asserts 0 GETs on plan and API paths |
 | J3 key index | `solera.keys` in the harness, delta files, local compaction + `engine_executor`, `key_cache`, full delivery through the index, sources on the index, aliases | 10k-batch soak: object operations per commit stay flat; `Keys`-only store contract |
-| J4 runs and retention | `runs/` layout, archive, per-asset retention, `store.expire`, CLI and API | soak with `Retention(days=1)` on a 10-second poller stays bounded; a consumer added after expiry receives the full head |
+| J4 runs and retention | `runs/` layout, archive, per-asset retention, CLI and API | soak with `Retention(days=1)` on a 10-second poller keeps `runs/` bounded |
+| J5 fence and stores | durable launches, adoption, heartbeats, write fence, unsettled outputs; FileStore / S3Store; no expiry | a worker killed mid-write is repaired by the next attempt; a restarted engine adopts a running attempt |

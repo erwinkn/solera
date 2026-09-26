@@ -21,16 +21,6 @@ class StoreError(Exception):
     retryable = False
 
 
-class StoreConflict(StoreError):
-    """A fenced write refused: the live marker differs from `prior` (§3)."""
-
-
-class StaleRead(StoreError):
-    """A pinned read refused: live marker != ref.version (§3). Retryable."""
-
-    retryable = True
-
-
 class WriteError(StoreError):
     """Malformed write: duplicate keys, wrong shape, disallowed op."""
 
