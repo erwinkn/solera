@@ -23,7 +23,7 @@ from solera.sdk import (
     asset,
     job,
 )
-from solera.stores import BlobStore, JsonStore
+from solera.stores import FileStore
 
 BRIMSTONE = Path(__file__).parents[2] / "example" / "brimstone.py"
 SNAPSHOT = Path(__file__).parent / "snapshots" / "brimstone.manifest.json"
@@ -149,7 +149,7 @@ def test_incremental_requires_incremental_upstream():
 def test_incremental_requires_selection_capable_store():
     """§11: the upstream store must serve the edge's selection type."""
 
-    class NoSelection(JsonStore):
+    class NoSelection(FileStore):
         def can_load(self, t, selection):
             return selection is None and super().can_load(t, None)
 
@@ -177,12 +177,12 @@ def test_output_mode_is_removed():
 def test_store_must_accept_output_type():
     """§11: an output's return annotation must pass can_store."""
 
-    @asset(outputs=Output("x", store="blobby", key="id"))
+    @asset(outputs=Output("x", keyed=True))
     def bad() -> str:
         return "nope"
 
     with pytest.raises(RegistrationError, match="cannot store"):
-        Project(assets=[bad], stores={"blobby": BlobStore()})
+        Project(assets=[bad])
 
 
 def test_unannotated_store_bound_input():
@@ -203,16 +203,20 @@ def test_unannotated_store_bound_input():
 def test_store_must_load_input_type():
     """§11: an input's store must pass can_load for the annotation."""
 
-    @asset
+    class NoBytes(FileStore):
+        def can_load(self, t, selection):
+            return t is not bytes
+
+    @asset(outputs=Output("up", store="nobytes"))
     def up():
         return []
 
     @asset(inputs={"up": In()})
-    def down(up: bytes):  # JsonStore cannot produce bytes
+    def down(up: bytes):
         return up
 
     with pytest.raises(RegistrationError, match="cannot load"):
-        Project(assets=[up, down])
+        Project(assets=[up, down], stores={"nobytes": NoBytes()})
 
 
 def test_keyed_output_requires_row_values():
@@ -348,7 +352,7 @@ def test_deps_pin_but_never_bind():
 def test_source_synthesized_head():
     """§5: a source gets a synthesized external head at registration."""
 
-    project = Project(sources=[Source("ext", store="json", key="id", region="us")])
+    project = Project(sources=[Source("ext", key="id", region="us")])
     head = project.manifest["sources"]["ext"]["head"]
     assert head["meta"]["external"] is True
     assert head["handle"]["region"] == "us"
@@ -371,7 +375,7 @@ def test_migrations_in_manifest():
     def producer() -> bytes:
         return b""
 
-    project = Project(assets=[producer], stores={"blobs": BlobStore()})
+    project = Project(assets=[producer], stores={"blobs": Migrating()})
     out = project.manifest["outputs"]["docs"]
     assert out["migrations"] == ["a_seed", "b_fix"]
 
@@ -413,4 +417,14 @@ def test_migration_payload_must_pass_can_store():
         return b""
 
     with pytest.raises(RegistrationError, match="can_store"):
-        Project(assets=[bad], stores={"blobs": BlobStore()})
+        Project(assets=[bad], stores={"blobs": Migrating()})
+
+
+class Migrating(FileStore):
+    """A store that runs callable migrations only."""
+
+    def can_store(self, t, output):
+        return t is not str and super().can_store(t, output)
+
+    async def migrate(self, output, migrations):
+        return [m.name for m in migrations]

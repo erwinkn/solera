@@ -48,7 +48,6 @@ from solera.stores import (
     Sql,
     StoreError,
     WriteError,
-    _rows,
     key_map,
     resolve_env,
 )
@@ -424,8 +423,6 @@ async def _store_outputs(spec, project, asset, objects, keys_io, result_value, f
             raise StoreError(f"{asset.name}: returned undeclared output {name!r}")
         output = decls[name]
         store = project.stores[declared[name]["store"]]
-        if hasattr(store, "bind_objects"):
-            store.bind_objects(objects)
         info = pinned.get(name) or {}
         prior = priors.get(name)
         plan = plans[name] = {"output": output, "store": store, "info": info, "prior": prior}
@@ -440,15 +437,15 @@ async def _store_outputs(spec, project, asset, objects, keys_io, result_value, f
             intents[name] = DeltaFiles([], 0, 0, True).to_json()
             continue
         patch = isinstance(value, Patch)
-        rows = value.rows if patch else value
-        rows = list(rows or []) if output.is_partition_set else _rows(rows, output.name)
-        new = key_map(output, rows)
+        new = key_map(output, value.rows if patch else value)
         # With no prior (a first write, or a full run) a Patch is the whole content.
         replace = not patch or prior is None
         removes = [] if replace else [str(k) for k in value.remove if str(k) not in new]
+        own = set(new), set(removes)
         unsettled = info.get("unsettled") or []
+        intended = set(await _intended(info, keys_io, unsettled)) if unsettled else set()
         if unsettled and not replace:
-            new, removes = await _repair(output, store, prior, info, keys_io, unsettled, new, removes)
+            new, removes = await _repair(output, store, prior, intended - own[0] - own[1], new, removes)
         delta = await index.changes(
             [key_bytes(k) for k in new],
             [key_bytes(v) for v in new.values()],
@@ -465,6 +462,14 @@ async def _store_outputs(spec, project, asset, objects, keys_io, result_value, f
             else DeltaFiles([], 0, 0, True)
         )
         plan["keys"] = intents[name] = files.to_json()
+        if prior is not None:
+            # The store writes only what changes: the delta, and whatever a
+            # dead attempt may have left half-done among this write's keys.
+            changed = {key_str(k) for k, d in zip(delta.keys, delta.deleted, strict=True) if not d}
+            deleted = {key_str(k) for k, d in zip(delta.keys, delta.deleted, strict=True) if d}
+            plan["upserts"] = frozenset((changed & own[0]) | (own[0] & intended))
+            stale = (intended - own[0]) if replace else (own[1] & intended)
+            plan["removes"] = frozenset(deleted | stale)
         if output.is_partition_set:
             if replace:
                 elements = set(new)
@@ -507,18 +512,14 @@ async def _store_outputs(spec, project, asset, objects, keys_io, result_value, f
             except Exception as error:
                 raise StoreError(f"{output.name}: migration failed: {error}") from error
             schema = applied[-1] if applied else output.migrations[-1].name
-        before = (spec.get("retention") or {}).get("before")
-        committed = Ref.from_json(info["head"]) if info.get("head") else None
-        if before is not None and committed is not None and callable(getattr(store, "expire", None)):
-            # Retention reaches data here (§11): whatever no version written
-            # after `before` needs goes, and the committed head stays loadable.
-            await store.expire(committed, before)
         scope = Scope(
             output=output,
             partition=spec["partition"],
             batch=info.get("batch"),
             attempt=spec["attempt"],
             aliases=tuple(info.get("aliases") or ()),
+            upserts=plan.get("upserts"),
+            removes=plan.get("removes"),
         )
         written = await store.store(value, prior, scope)
         entry = {}
@@ -554,16 +555,11 @@ async def _store_outputs(spec, project, asset, objects, keys_io, result_value, f
 REPAIR_PAGE = 100_000
 
 
-async def _repair(output, store, prior, info, keys_io, unsettled, new, removes):
-    """Take in what dead attempts left in the store (§8).
+async def _intended(info, keys_io, unsettled) -> list[str]:
+    """The keys dead attempts meant to change (§8): each unsettled intent
+    lists the delta files of an attempt that died while writing, and any of
+    those writes may have landed."""
 
-    Each unsettled intent lists the keys an attempt that died while writing
-    meant to change; any of those writes may have landed. Keys this patch
-    writes or removes end as it says either way. For the others, the store
-    is read back: the index learns what landed, as part of this commit's
-    delta. Returns the key map and removes to check against the index."""
-
-    touched = set(new) | set(removes)
     state = IndexState(
         prefix=info["index"]["prefix"],
         log=tuple(
@@ -571,18 +567,24 @@ async def _repair(output, store, prior, info, keys_io, unsettled, new, removes):
         ),
     )
     index = KeyIndex(keys_io, None, state)
-    left, after = [], None
+    found, after = [], None
     while True:
         keys, _, _, after = await index.pending(0, len(unsettled) - 1, after, REPAIR_PAGE)
-        left.extend(k for k in map(key_str, keys) if k not in touched)
+        found.extend(map(key_str, keys))
         if after is None:
-            break
-    new, removes = dict(new), list(removes)
+            return found
+
+
+async def _repair(output, store, prior, left, new, removes):
+    """Take in what dead attempts left in the store (§8). Keys this patch
+    writes or removes end as it says either way; the others (`left`) are
+    read back, and the index learns what landed as part of this commit's
+    delta. Returns the key map and removes to check against the index."""
+
+    new, removes, left = dict(new), list(removes), sorted(left)
     for i in range(0, len(left), REPAIR_PAGE):
         page = left[i : i + REPAIR_PAGE]
-        rows = await store.load(prior, None, Keys({k: "" for k in page}))
-        rows = list(rows or []) if output.is_partition_set else _rows(rows, output.name)
-        found = key_map(output, rows)
+        found = key_map(output, await store.load(prior, None, Keys({k: "" for k in page})))
         new.update(found)
         removes.extend(k for k in page if k not in found)
     return new, removes
@@ -667,9 +669,6 @@ async def _attempt(objects, objects_url: str, base: str, spec: dict, entrypoint)
         )
         return 1
     asset = project.assets[spec["asset"]]
-    for store in project.stores.values():
-        if hasattr(store, "bind_objects"):
-            store.bind_objects(objects)
     try:
         keys_io = _key_io(objects, objects_url, project)
         args, changes, delivered = await _resolve_inputs(spec, project, asset, keys_io)

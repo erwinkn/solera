@@ -154,7 +154,7 @@ project = Project(assets=[slow])
     assert "without a result" in (attempts[0].get("error") or "")
 
 
-async def test_env_indirection_resolves_in_harness(state, tmp_path, monkeypatch):
+async def test_env_indirection_resolves_in_harness(state, tmp_path, monkeypatch, data):
     """§5: `env:` strings in resource config resolve in the worker process."""
     monkeypatch.setenv("TEST_SECRET", "s3cr3t")
     entrypoint = write_project(
@@ -174,7 +174,7 @@ project = Project(assets=[whoami], resources={"vault": {"token": "env:TEST_SECRE
     detail = await engine.run_until((await engine.submit(["whoami"]))["id"], 60)
     assert detail["request"]["status"] == "succeeded"
     head = state.model.heads[("whoami", "")]
-    body = await state.get_object(head["ref"]["handle"]["object"])
+    body = (data / f"{head['ref']['handle']['path']}.json").read_text()
     assert json.loads(body) == [{"secret": "s3cr3t"}]
 
 
@@ -182,9 +182,9 @@ MIGRATING_PROJECT = """
 import os
 from collections.abc import Callable
 from solera.sdk import Migration, Output, Project, asset
-from solera.stores import JsonStore
+from solera.stores import FileStore
 
-class MigStore(JsonStore):
+class MigStore(FileStore):
     def can_store(self, t, output):
         return t is Callable or super().can_store(t, output)
 

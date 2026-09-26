@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from solera.sdk import Output, Ref, TableRef, digest
+from solera.sdk import KEYS, Output, Ref, TableRef, digest
 from solera.stores import (
     Batches,
     Keys,
@@ -73,8 +73,8 @@ class PostgresStore:
         return False
 
     def can_store(self, t, output) -> bool:
-        if output.is_partition_set:
-            return False  # partition sets live on the default store
+        if output.is_partition_set or output.key == KEYS:
+            return False  # partition sets and dict outputs live on the default store
         return True  # DataFrame / list[dict] / Patch / Sql / unannotated
 
     # -- plumbing -----------------------------------------------------------

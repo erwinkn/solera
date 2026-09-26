@@ -214,7 +214,6 @@ async def _migrate(args, parser):
         if not entrypoint:
             parser.error("solera migrate needs --project or a previously registered project")
         project = load_project(entrypoint)
-        objects = state.objects
         migrating = {
             output.name: output
             for asset in project.assets.values()
@@ -231,8 +230,6 @@ async def _migrate(args, parser):
         for output in selected:
             record = project.manifest["outputs"][output.name]
             store = project.stores[record["store"]]
-            if hasattr(store, "bind_objects"):
-                store.bind_objects(objects)
             applied = await store.migrate(output, output.migrations)
             for name in applied:
                 print(f"{output.name}: applied {name}")

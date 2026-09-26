@@ -79,7 +79,7 @@ export const CELL_TONE: Record<string, string> = {
 };
 
 const STORE_ICON: Record<string, typeof Database> = {
-  json: Braces,
+  default: Braces,
   postgres: TableIcon,
   blob: Package,
 };

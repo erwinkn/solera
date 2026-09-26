@@ -6,7 +6,7 @@ import json
 
 from solera.executors import Environment
 from solera.sdk import Output, Project, Ref, Retry, asset
-from solera.stores import JsonStore, Keys, Patch, Written
+from solera.stores import FileStore, Keys, Patch, Written
 from solera_server.engine import Engine
 from solera_server.placements.inline import InlinePlacement
 from solera_server.state import State
@@ -63,8 +63,8 @@ async def finish_as_worker(state, run_id, attempt, output):
     await state.create_object(f"{base}.writing", json.dumps({"state": "writing", "intents": {}}).encode())
     ref = {
         "output": output,
-        "store": "json",
-        "handle": {"object": "x.json"},
+        "store": "default",
+        "handle": {"path": "x"},
         "version": "v1",
         "partition": "",
     }
@@ -185,7 +185,7 @@ async def test_a_cancel_aborts_a_worker_that_is_not_writing(tmp_path):
     await state.close()
 
 
-class LiveStore(JsonStore):
+class LiveStore(FileStore):
     """A row store read in place, like a database table: what a dead attempt
     wrote is visible. `die` makes the next write land its first n rows, then
     kills the worker."""
@@ -293,5 +293,43 @@ async def test_an_aborted_worker_writes_nothing(tmp_path):
     assert len(calls) == 2
     prefix = state.model.index("slow", "").prefix
     assert await state.list_objects(prefix) == []  # its delta file was deleted
+    await engine.stop()
+    await state.close()
+
+
+async def test_a_retry_puts_back_what_a_dead_keyed_write_half_did(tmp_path, data, monkeypatch):
+    """The dead attempt meant to change `a`, add `c` and drop `b`, and died
+    after its first object landed. The retry's content matches the index, so
+    its delta is empty — yet it rewrites the keys the dead one touched and
+    deletes the one it may have added."""
+
+    values = [{"a": 1, "b": 1}, {"a": 2, "c": 1}, {"a": 1, "b": 1}]
+
+    @asset(outputs=Output("scores", keyed=True), retries=Retry(1, delay=0))
+    def scores():
+        return values.pop(0)
+
+    project = Project(assets=[scores])
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = engine_for(state, project, placement="inline")
+    await engine.initialize()
+    assert (await engine.run_until((await engine.submit(["scores"]))["id"], 10))["request"][
+        "status"
+    ] == "succeeded"
+    put, puts = FileStore._put, []
+
+    async def dying(self, base, value):
+        puts.append(base)
+        first = len(puts) == 1
+        await put(self, base, value)
+        if first:
+            raise asyncio.CancelledError  # the worker dies once one object landed
+
+    monkeypatch.setattr(FileStore, "_put", dying)
+    detail = await engine.run_until((await engine.submit(["scores"]))["id"], 20)
+    assert detail["request"]["status"] == "succeeded", detail
+    assert len(detail["attempts"][detail["tasks"][0]["id"]]) == 2  # it died, and the retry committed
+    assert state.model.unsettled == {}
+    assert {p.name: p.read_text() for p in (data / "scores").iterdir()} == {"a.json": "1", "b.json": "1"}
     await engine.stop()
     await state.close()

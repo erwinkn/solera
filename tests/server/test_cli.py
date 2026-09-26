@@ -202,45 +202,57 @@ def test_serve_insecure_guard(capsys, monkeypatch):
 
 
 MIGRATE_PROJECT = """
+import json
+import os
+
 from solera.sdk import Migration, Output, Project, asset
-from solera.stores import BlobStore
+from solera.stores import FileStore
 
 
-def seed(objects, prefix):
-    import obstore
+class Ledgered(FileStore):
+    \"\"\"Runs callable migrations once each, noting them in a ledger file.\"\"\"
 
-    obstore.put(objects, prefix + "seeded.txt", b"1")
+    async def migrate(self, output, migrations):
+        path = os.path.join(os.environ["SOLERA_DATA"], "ledger.json")
+        applied = json.load(open(path)) if os.path.exists(path) else []
+        for m in migrations:
+            if m.name not in applied:
+                m.payload()
+                applied.append(m.name)
+        json.dump(applied, open(path, "w"))
+        return applied
 
 
-@asset(outputs=Output("docs", store="blobs", migrations=[Migration("seed", seed)]))
+def seed():
+    pass
+
+
+@asset(outputs=Output("docs", store="ledgered", migrations=[Migration("seed", seed)]))
 def docs():
     return b"x"
 
 
-project = Project(assets=[docs], stores={"blobs": BlobStore()}, name="migdemo")
+project = Project(assets=[docs], stores={"ledgered": Ledgered()}, name="migdemo")
 """
 
 
-def test_migrate_command_applies_and_is_idempotent(project_file, state_url, capsys, monkeypatch, tmp_path):
+def test_migrate_command_applies_and_is_idempotent(
+    project_file, state_url, capsys, monkeypatch, tmp_path, data
+):
     """§4: `solera migrate` applies pending migrations for all migrating
     outputs through the local path, prints the applied names, and a second
     run applies nothing."""
     import json as jsonlib
 
-    import obstore
-
     path = tmp_path / "migdemo.py"
     path.write_text(MIGRATE_PROJECT)
     monkeypatch.delenv("SOLERA_SERVER_URL", raising=False)
+    data.mkdir()
 
     out = cli(monkeypatch, capsys, "--state-url", state_url, "migrate", "--project", str(path))
     assert "docs: applied seed" in out
-
-    objects = obstore.store.from_url(f"{state_url}/default")
-    ledger = jsonlib.loads(bytes(obstore.get(objects, "blobs/docs/_migrations.json").bytes()))
-    assert [e["name"] for e in ledger["applied"]] == ["seed"]
+    assert jsonlib.loads((data / "ledger.json").read_text()) == ["seed"]
 
     out = cli(monkeypatch, capsys, "--state-url", state_url, "migrate", "--project", str(path))
     assert "docs: applied seed" in out  # ledger names; nothing re-applied
-    ledger = jsonlib.loads(bytes(obstore.get(objects, "blobs/docs/_migrations.json").bytes()))
-    assert len(ledger["applied"]) == 1
+    assert jsonlib.loads((data / "ledger.json").read_text()) == ["seed"]

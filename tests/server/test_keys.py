@@ -10,7 +10,7 @@ import random
 import pytest
 from solera.keys.index import Options
 from solera.sdk import Incremental, Output, PartitionSet, Project, Ref, Source, asset
-from solera.stores import JsonStore, Patch
+from solera.stores import FileStore, Patch
 from solera_server.engine import Engine
 from solera_server.placements.inline import InlinePlacement
 from solera_server.state import State
@@ -59,7 +59,7 @@ def on_disk(state, index) -> set[str]:
     return {str(p.relative_to(root)) for p in (Path(root) / index.prefix).glob("*.kx")}
 
 
-class CountingStore(JsonStore):
+class CountingStore(FileStore):
     def __init__(self):
         super().__init__()
         self.writes = 0
@@ -95,6 +95,29 @@ async def test_unchanged_writes_skip_the_store(state):
     await run(engine, ["items"])
     head = state.model.heads[("items", "")]
     assert store.writes == 2 and head["batch"] == 1 and head["count"] == 1
+
+
+async def test_a_keyed_write_reaches_the_store_as_its_delta(state, data):
+    """§6: the store is told which keys changed, and writes only those: a
+    dict output whose `b` changed and `a` went touches two objects."""
+
+    values = {"v": {"a": 1, "b": 1, "c": 1}}
+
+    @asset(outputs=Output("scores", keyed=True))
+    def scores():
+        return values["v"]
+
+    project = Project(assets=[scores])
+    engine = engine_for(state, project)
+    await engine.initialize()
+    await run(engine, ["scores"])
+    before = {p.name: p.stat().st_mtime_ns for p in (data / "scores").iterdir()}
+    values["v"] = {"b": 2, "c": 1}
+    await run(engine, ["scores"])
+    after = {p.name: p.stat().st_mtime_ns for p in (data / "scores").iterdir()}
+    assert sorted(after) == ["b.json", "c.json"]
+    assert after["c.json"] == before["c.json"]  # unchanged: not rewritten
+    assert (data / "scores" / "b.json").read_text() == "2"
 
 
 async def test_compaction_truncation_and_garbage(state):
@@ -212,7 +235,7 @@ async def test_keyed_source_commits_go_through_the_index(state):
         got.append((sorted(ctx.changes["uploads"].upserted), sorted(ctx.changes["uploads"].deleted)))
         return []
 
-    class External(JsonStore):
+    class External(FileStore):
         """The source's data lives elsewhere; loads answer from the selection."""
 
         async def load(self, ref, t, selection):
@@ -308,5 +331,5 @@ async def test_renamed_asset_keeps_its_state(state):
     assert m.heads[("source_feed", "")]["batch"] == 1
     assert delivered == [(True, ["a", "b"]), (False, ["b"])]  # only the change, not everything
     ref = Ref.from_json(m.heads[("source_feed", "")]["ref"])
-    loaded = await project.stores["json"].load(ref, None, None)
+    loaded = await project.stores["default"].load(ref, None, None)
     assert {r["id"]: r["v"] for r in loaded} == {"a": 1, "b": 2}

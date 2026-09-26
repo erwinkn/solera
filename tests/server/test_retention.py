@@ -1,6 +1,6 @@
 """Retention (docs/object-store-state.md §11): finished runs go once every
-asset they ran lets go of them; data versions expire in the harness; current
-state never does. Runs in which every task was skipped are never written."""
+asset they ran lets go of them; current state and the data in stores never
+do. Runs in which every task was skipped are never written."""
 
 import pytest
 from solera.sdk import Incremental, Output, Project, Retention, asset
@@ -95,34 +95,6 @@ async def test_quiet_runs_are_not_written(state, clock):
     assert quiet not in await state.archived_ids()
     assert (await engine.run_detail(quiet))["tasks"][0]["status"] == "skipped"
     assert quiet in {r["id"] for r in await engine.list_runs()}
-
-
-async def test_data_expires_with_its_asset(state, clock):
-    """An asset's data versions older than its horizon expire at its next
-    write; its head keeps loading."""
-
-    rows = {"v": 0}
-
-    @asset(outputs=Output("log", incremental=True), retention=Retention(days=1))
-    def log():
-        from solera.stores import Patch
-
-        rows["v"] += 1
-        return Patch([{"e": rows["v"]}])
-
-    project = Project(assets=[log])
-    engine = engine_for(state, project, clock)
-    await engine.initialize()
-    for _ in range(5):
-        clock.now += 43200  # half a day
-        await run(engine, ["log"])
-    from solera.sdk import Ref
-
-    ref = Ref.from_json(state.model.heads[("log", "")]["ref"])
-    loaded = await project.stores["json"].load(ref, list[dict], None)
-    # Written at +0.5, +1, +1.5, +2, +2.5 days; the last write expired what
-    # was older than a day before it.
-    assert [r["e"] for r in loaded] == [3, 4, 5]
 
 
 async def test_source_commits_are_recorded_as_runs(state, clock):

@@ -2,7 +2,9 @@
 
 `uv run solera serve --insecure` and nothing else: all resources are in-process
 fakes. With `DATABASE_URL` set (docker compose up postgres) the relational
-outputs go to PostgresStore and the Sql asset materializes in-database.
+outputs go to PostgresStore and the Sql asset materializes in-database. The
+rest lives in `.solera/data` next to this file, or in `SOLERA_DATA_URL`
+(`s3://bucket/prefix`) where the disk doesn't outlive the process.
 """
 
 from __future__ import annotations
@@ -31,11 +33,12 @@ from solera.sdk import (
     asset,
     job,
 )
-from solera.stores import BlobStore, Patch, Sql
+from solera.stores import Patch, S3Store, Sql
 from solera_postgres import PostgresStore
 
 DATABASE = bool(os.getenv("DATABASE_URL"))
-RELATIONAL = "postgres" if DATABASE else None  # None → default JsonStore
+RELATIONAL = "postgres" if DATABASE else None  # None → the default store
+DATA_URL = os.getenv("SOLERA_DATA_URL")
 
 
 def migration_log(output_name: str):
@@ -50,7 +53,7 @@ def migration_log(output_name: str):
 
 
 def postgres_migrations(output_name: str, payload=None):
-    """Every Postgres output carries one migration; the JsonStore path declares
+    """Every Postgres output carries one migration; the default store declares
     none — a store without `migrate` would reject them at registration."""
     if not DATABASE:
         return ()
@@ -217,12 +220,12 @@ def file_index(ctx, site_files: list[dict]):
 
 # ---------------------------------------------------------------------------
 # site × day: two dimensions; deps= on a plain Source gives the digest job
-# lineage and change-watching without loading it. The output is a Blob.
+# lineage and change-watching without loading it. The output is a text.
 # ---------------------------------------------------------------------------
 
 
 @asset(
-    outputs=Output("site_digest", store="blob"),
+    outputs=Output("site_digest"),
     partitions={"site": sites, "day": TimePartitions(start="2026-09-01", every="1d")},
     deps=["roadmap"],
     automations=Automation(trigger=Every(120)),
@@ -285,7 +288,7 @@ if DATABASE:
 
 
 # ---------------------------------------------------------------------------
-# In-database SQL over a TableRef — Postgres only; with JsonStore the asset
+# In-database SQL over a TableRef — Postgres only; without it the asset
 # still runs and logs that it skipped (§4).
 # ---------------------------------------------------------------------------
 
@@ -376,8 +379,8 @@ project = Project(
     ],
     stores={
         "postgres": PostgresStore(dsn="env:DATABASE_URL"),
-        "blob": BlobStore(url=os.getenv("ARTIFACT_STORE")),
     },
+    default_store=S3Store(DATA_URL) if DATA_URL else None,
     resources={
         "registry": SiteRegistry(),
         "feed": FeedClient(),

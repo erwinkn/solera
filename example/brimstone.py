@@ -36,7 +36,7 @@ from solera.sdk import (
     asset,
     job,
 )
-from solera.stores import BlobStore, Patch, Sql
+from solera.stores import Patch, S3Store, Sql
 from solera_postgres import PostgresStore
 
 # ---------------------------------------------------------------------------
@@ -360,7 +360,7 @@ project = Project(
     ],
     stores={
         "postgres": PostgresStore(dsn="env:DATABASE_URL", grants=["qgis", "felt"]),
-        "blob": BlobStore(url="env:ARTIFACT_STORE"),
+        "blob": S3Store("env:ARTIFACT_STORE"),
     },
     resources={
         "graph": GraphClient(),

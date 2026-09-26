@@ -5,7 +5,7 @@
       "automations": [
         "fleet_dashboard.onchange.0"
       ],
-      "code_hash": "197b274aaccee58f59fbbc9195d473a849f5b2ca3f7afd891ac0bfcfb35858d0",
+      "code_hash": "998d379e5ac8dc6879539f47cb06c3bc141464fa9e4b4504eb3bc2536a49b96b",
       "deps": [],
       "doc": "Partitioned upstream, unpartitioned consumer: the site dimension is collapsed.",
       "inputs": {
@@ -68,7 +68,7 @@
       "automations": [
         "graph_delta.every.0"
       ],
-      "code_hash": "197b274aaccee58f59fbbc9195d473a849f5b2ca3f7afd891ac0bfcfb35858d0",
+      "code_hash": "998d379e5ac8dc6879539f47cb06c3bc141464fa9e4b4504eb3bc2536a49b96b",
       "deps": [],
       "doc": "Poll a site's Graph delta feed; the delta token is the cursor.",
       "inputs": {},
@@ -95,7 +95,7 @@
           "name": "qaqc_files",
           "partition_set": false,
           "revision": "version",
-          "store": "json"
+          "store": "default"
         }
       ],
       "partitions": {
@@ -133,7 +133,7 @@
       "automations": [
         "hillshade.every.0"
       ],
-      "code_hash": "197b274aaccee58f59fbbc9195d473a849f5b2ca3f7afd891ac0bfcfb35858d0",
+      "code_hash": "998d379e5ac8dc6879539f47cb06c3bc141464fa9e4b4504eb3bc2536a49b96b",
       "deps": [
         "usgs_3dep_tiles"
       ],
@@ -196,7 +196,7 @@
     "leach": {
       "aliases": [],
       "automations": [],
-      "code_hash": "197b274aaccee58f59fbbc9195d473a849f5b2ca3f7afd891ac0bfcfb35858d0",
+      "code_hash": "998d379e5ac8dc6879539f47cb06c3bc141464fa9e4b4504eb3bc2536a49b96b",
       "deps": [],
       "doc": "The resource tier lives on the asset; no job indirection.",
       "inputs": {
@@ -307,7 +307,7 @@
       "automations": [
         "manual_upload.every.0"
       ],
-      "code_hash": "197b274aaccee58f59fbbc9195d473a849f5b2ca3f7afd891ac0bfcfb35858d0",
+      "code_hash": "998d379e5ac8dc6879539f47cb06c3bc141464fa9e4b4504eb3bc2536a49b96b",
       "deps": [],
       "doc": "Upload keys are registered externally by the uploads service.",
       "inputs": {},
@@ -369,7 +369,7 @@
       "automations": [
         "psa_mean_data.onchange.0"
       ],
-      "code_hash": "197b274aaccee58f59fbbc9195d473a849f5b2ca3f7afd891ac0bfcfb35858d0",
+      "code_hash": "998d379e5ac8dc6879539f47cb06c3bc141464fa9e4b4504eb3bc2536a49b96b",
       "deps": [],
       "doc": "",
       "inputs": {
@@ -444,7 +444,7 @@
       "automations": [
         "qaqc_samples.onchange.0"
       ],
-      "code_hash": "197b274aaccee58f59fbbc9195d473a849f5b2ca3f7afd891ac0bfcfb35858d0",
+      "code_hash": "998d379e5ac8dc6879539f47cb06c3bc141464fa9e4b4504eb3bc2536a49b96b",
       "deps": [],
       "doc": "qaqc_files arrives filtered to the file_ids whose version changed for this site.",
       "inputs": {
@@ -525,7 +525,7 @@
       "automations": [
         "region_rollup.onchange.0"
       ],
-      "code_hash": "197b274aaccee58f59fbbc9195d473a849f5b2ca3f7afd891ac0bfcfb35858d0",
+      "code_hash": "998d379e5ac8dc6879539f47cb06c3bc141464fa9e4b4504eb3bc2536a49b96b",
       "deps": [],
       "doc": "Static partitions over a site-partitioned input.",
       "inputs": {
@@ -599,7 +599,7 @@
       "automations": [
         "site_health.onchange.0"
       ],
-      "code_hash": "197b274aaccee58f59fbbc9195d473a849f5b2ca3f7afd891ac0bfcfb35858d0",
+      "code_hash": "998d379e5ac8dc6879539f47cb06c3bc141464fa9e4b4504eb3bc2536a49b96b",
       "deps": [],
       "doc": "In-database: a TableRef in, a statement out; no row enters the harness.\nThe store materializes the SELECT into ops.site_health for this site.",
       "inputs": {
@@ -663,7 +663,7 @@
         "sites.cron.0",
         "sites.ondeploy.0"
       ],
-      "code_hash": "197b274aaccee58f59fbbc9195d473a849f5b2ca3f7afd891ac0bfcfb35858d0",
+      "code_hash": "998d379e5ac8dc6879539f47cb06c3bc141464fa9e4b4504eb3bc2536a49b96b",
       "deps": [],
       "doc": "Refresh the SharePoint site list daily; new sites surface as missing work.",
       "inputs": {},
@@ -677,7 +677,7 @@
           "name": "sites",
           "partition_set": true,
           "revision": null,
-          "store": "json"
+          "store": "default"
         }
       ],
       "partitions": null,
@@ -715,7 +715,7 @@
       "automations": [
         "weekly_report.cron.0"
       ],
-      "code_hash": "197b274aaccee58f59fbbc9195d473a849f5b2ca3f7afd891ac0bfcfb35858d0",
+      "code_hash": "998d379e5ac8dc6879539f47cb06c3bc141464fa9e4b4504eb3bc2536a49b96b",
       "deps": [],
       "doc": "A job: inputs, placement and automations like an asset, no outputs.",
       "inputs": {
@@ -1182,7 +1182,7 @@
       "partition_set": false,
       "revision": "version",
       "source": false,
-      "store": "json"
+      "store": "default"
     },
     "qaqc_samples": {
       "asset": "qaqc_samples",
@@ -1265,7 +1265,7 @@
       "partition_set": true,
       "revision": null,
       "source": false,
-      "store": "json"
+      "store": "default"
     },
     "uploads": {
       "asset": null,
@@ -1280,7 +1280,7 @@
       "partition_set": true,
       "revision": null,
       "source": true,
-      "store": "json"
+      "store": "default"
     },
     "usgs_3dep_tiles": {
       "asset": null,
@@ -1293,7 +1293,7 @@
       "partition_set": false,
       "revision": null,
       "source": true,
-      "store": "json"
+      "store": "default"
     },
     "xrd_profex": {
       "asset": null,
@@ -1327,7 +1327,7 @@
     }
   },
   "retention": null,
-  "revision": "252177e2e8372bd9c919ee8136048ed485fa13ca6c9b62ac209af23abcfc78d0",
+  "revision": "7221b00849b543393f38f6a47d8f3ebda1311c6b7d9238e6ab66c684b6bfa0e0",
   "sources": {
     "leach_crosswalk": {
       "handle": {
@@ -1468,12 +1468,12 @@
         },
         "output": "uploads",
         "partition": "",
-        "store": "json",
+        "store": "default",
         "version": "2b4f69fbd4e1417a60a9620682862564271d76afde65cd42ea69a5313ead1fcb"
       },
       "key": "<elements>",
       "name": "uploads",
-      "store": "json"
+      "store": "default"
     },
     "usgs_3dep_tiles": {
       "handle": {},
@@ -1486,12 +1486,12 @@
         },
         "output": "usgs_3dep_tiles",
         "partition": "",
-        "store": "json",
+        "store": "default",
         "version": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
       },
       "key": null,
       "name": "usgs_3dep_tiles",
-      "store": "json"
+      "store": "default"
     },
     "xrd_profex": {
       "handle": {
@@ -1538,11 +1538,11 @@
   },
   "stores": {
     "blob": {
-      "ref": "blob",
+      "ref": "object",
       "version": "1"
     },
-    "json": {
-      "ref": "json",
+    "default": {
+      "ref": "object",
       "version": "1"
     },
     "postgres": {

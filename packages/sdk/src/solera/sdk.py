@@ -6,7 +6,9 @@ import datetime as dt
 import hashlib
 import inspect
 import json
+import os
 import re
+import sys
 import typing
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -18,7 +20,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from croniter import croniter
 
 NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,127}$")
-DEFAULT_STORE = "json"
+DEFAULT_STORE = "default"
+KEYS = "<keys>"  # the key of a keyed output: its value is a dict[str, Any]
 MAX_PARTITION_KEYS = 5000
 
 
@@ -96,21 +99,14 @@ class Ref:
 
 
 @dataclass(frozen=True)
-class JsonRef(Ref):
-    kind: ClassVar[str | None] = "json"
+class ObjectRef(Ref):
+    """A FileStore or S3Store ref: where the scope's objects live."""
+
+    kind: ClassVar[str | None] = "object"
 
     @property
-    def object(self) -> str:
-        return self.handle["object"]
-
-
-@dataclass(frozen=True)
-class BlobRef(Ref):
-    kind: ClassVar[str | None] = "blob"
-
-    @property
-    def object(self) -> str:
-        return self.handle["object"]
+    def path(self) -> str:
+        return self.handle["path"]
 
 
 @dataclass(frozen=True)
@@ -177,7 +173,10 @@ class Migration:
 
 class Output:
     """A named slot on a store (§2). `incremental=True` emits a per-commit
-    delta; `key=` implies it. Public `mode=` is gone (§2.1)."""
+    delta; `key=` implies it. Public `mode=` is gone (§2.1).
+
+    `keyed=True` makes the value a `dict[str, Any]`, one entry per key;
+    `key="id"` makes it rows, keyed by their `id` column."""
 
     is_partition_set = False
 
@@ -189,12 +188,19 @@ class Output:
         revision: str | None = None,
         incremental: bool | None = None,
         migrations: tuple | list = (),
+        keyed: bool = False,
         **config: Any,
     ):
         if "mode" in config:
             raise RegistrationError(
                 f"Output {name or '?'}: mode= was removed; declare incremental= instead (§2.1)"
             )
+        if keyed:
+            if key is not None or revision is not None:
+                raise RegistrationError(
+                    f"Output {name or '?'}: keyed=True takes a dict[str, Any]; key= and revision= are for rows"
+                )
+            key = KEYS
         if incremental is None:
             incremental = key is not None
         elif not incremental and key is not None:
@@ -574,11 +580,10 @@ class Retry:
 class Retention:
     """How long an asset's history is kept (docs/object-store-state.md §11).
 
-    `days`: runs and data versions older than that go. `runs`: keep the runs
-    of the newest `runs` commits (and the data they wrote). Both: whichever
-    keeps more. `forever=True` keeps everything, overriding a project default.
-    Current state — heads, key indexes, cursors, watermarks — never expires,
-    and neither does a run still in progress."""
+    `days`: runs older than that go. `runs`: keep the runs of the newest
+    `runs` commits. Both: whichever keeps more. `forever=True` keeps everything, overriding a project default.
+    Current state — heads, key indexes, cursors, watermarks, and the data
+    in stores — never expires, and neither does a run still in progress."""
 
     days: float | None = None
     runs: int | None = None
@@ -761,6 +766,16 @@ def _dict_arg(t: Any) -> Any | None:
 # ---------------------------------------------------------------------------
 
 
+def _caller_dir() -> str | None:
+    """The directory of the file that called into this module."""
+
+    frame = sys._getframe(1)
+    while frame is not None and frame.f_code.co_filename == __file__:
+        frame = frame.f_back
+    path = frame.f_globals.get("__file__") if frame is not None else None
+    return os.path.dirname(os.path.abspath(path)) if path else None
+
+
 class Project:
     def __init__(
         self,
@@ -768,6 +783,7 @@ class Project:
         sources: list[Source | PartitionSet] | None = None,
         *,
         stores: dict[str, Any] | None = None,
+        default_store: Any = None,
         executors: list | None = None,
         resources: dict[str, Any] | None = None,
         automations: list[Automation] | None = None,
@@ -775,13 +791,22 @@ class Project:
         key_cache: KeyCache | None = DEFAULT_KEY_CACHE,
         name: str = "default",
     ):
-        from .stores import JsonStore
+        """`default_store` holds every output that names no store: unless
+        given, a FileStore. A FileStore without a path keeps its data in
+        `.solera/data` next to the file that builds the project, or in
+        `$SOLERA_DATA`."""
+
+        from .stores import FileStore
 
         self.name = name
         self.retention = retention
         self.key_cache = key_cache
         self.assets: dict[str, Asset] = {}
-        self.stores = {DEFAULT_STORE: JsonStore(), **(stores or {})}
+        self.stores = {DEFAULT_STORE: default_store or FileStore(), **(stores or {})}
+        home = _caller_dir()
+        for store in self.stores.values():
+            if isinstance(store, FileStore) and store.home is None:
+                store.home = home
         self.executors = list(executors or [])
         self.resources = dict(resources or {})
         self.sources: dict[str, Source] = {}

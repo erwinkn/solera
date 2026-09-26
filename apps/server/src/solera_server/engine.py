@@ -989,9 +989,6 @@ class Engine:
         }
         if prepared["cursor"] is not None:
             spec["cursor"] = prepared["cursor"]
-        before = self._horizon(task["asset"])
-        if before is not None and math.isfinite(before):
-            spec["retention"] = {"before": before}
         # The attempt file (§8): created here with the spec; the harness
         # rewrites it once, with the spec, its result and its log index.
         path = f"{self.state.attempt_path(task['run'], attempt)}.json"
@@ -1742,8 +1739,8 @@ class Engine:
     # -- retention (§11) ---------------------------------------------------------------
 
     def _horizon(self, asset: str | None) -> float | None:
-        """Runs and data versions of `asset` older than this may go; `None`
-        keeps everything. With both `days` and `runs`, whichever keeps more."""
+        """Runs of `asset` older than this may go; `None` keeps everything.
+        With both `days` and `runs`, whichever keeps more."""
 
         policy = self.m.policy(asset)
         if policy is None:

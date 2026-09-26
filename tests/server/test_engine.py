@@ -13,7 +13,7 @@ from solera.sdk import (
     Every,
     In,
     Incremental,
-    JsonRef,
+    ObjectRef,
     OnChange,
     OnDeploy,
     Output,
@@ -26,7 +26,7 @@ from solera.sdk import (
     asset,
     job,
 )
-from solera.stores import JsonStore
+from solera.stores import FileStore
 from solera_server.engine import Engine
 from solera_server.placements.inline import InlinePlacement
 from solera_server.state import State
@@ -427,7 +427,7 @@ async def test_ref_annotated_input_receives_ref(state):
         return [1, 2, 3]
 
     @asset(inputs={"upstream": "upstream"})
-    def by_ref(upstream: JsonRef):
+    def by_ref(upstream: ObjectRef):
         seen["ref"] = upstream
         return [{"v": upstream.version[:8]}]
 
@@ -439,7 +439,7 @@ async def test_ref_annotated_input_receives_ref(state):
     assert isinstance(seen["ref"], Ref) and seen["ref"].output == "upstream"
 
 
-async def test_all_partitions_values(state):
+async def test_all_partitions_values(state, data):
     """§7: AllPartitions yields dict[key, value] over upstream-only dimensions,
     resolved to keys with complete heads at pin time."""
 
@@ -462,8 +462,7 @@ async def test_all_partitions_values(state):
     await drive(engine, await engine.submit(["sites"]))
     detail = await drive(engine, await engine.submit(["rollup"], upstream=True))
     assert status_of(detail) == "succeeded"
-    result = await state.get_object(head(state, "rollup")["ref"]["handle"]["object"])
-    rows = json.loads(result)
+    rows = json.loads((data / f"{head(state, 'rollup')['ref']['handle']['path']}.json").read_text())
     assert rows == [{"n": 2, "sites": ["east", "west"]}]
 
 
@@ -953,9 +952,9 @@ async def test_job_commits_lineage_only(state):
     assert spec["inputs"]["feed"]["ref"]["output"] == "feed"  # lineage is the spec
 
 
-class MigratingJsonStore(JsonStore):
-    """A JsonStore with a migration ledger: lets keyed outputs declare
-    migrations on the file:// test store (§4)."""
+class MigratingStore(FileStore):
+    """A FileStore with a migration ledger: lets outputs declare
+    migrations on the default test store (§4)."""
 
     def __init__(self):
         super().__init__()
@@ -978,7 +977,7 @@ async def test_migration_changes_fingerprint_and_marks_handle(state):
     from solera.sdk import Migration
 
     seen = []
-    store = MigratingJsonStore()
+    store = MigratingStore()
 
     @asset(outputs=Output("files", key="id"))
     def files():

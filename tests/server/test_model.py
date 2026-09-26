@@ -135,7 +135,7 @@ async def test_failed_precondition_changes_nothing(state, clock):
     _, task_id, attempt = await held(engine, ["files"])
     before = durable(state.model)
     prepared = {"inputs": {}, "baseline": {"files": None}, "scope_complete": True}  # a stale baseline
-    ref = {"output": "files", "store": "json", "handle": {}, "version": "v2", "partition": "", "meta": {}}
+    ref = {"output": "files", "store": "default", "handle": {}, "version": "v2", "partition": "", "meta": {}}
     with pytest.raises(Conflict):
         await engine.commit_attempt(attempt, prepared, {"outputs": {"files": ref}})
     assert durable(state.model) == before

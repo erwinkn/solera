@@ -12,6 +12,7 @@ Set these environment variables with Railway's reference picker (verify the actu
 |---|---|
 | `SOLERA_STATE_URL` | `s3://<bucket BUCKET reference>/orchestrator` |
 | `SOLERA_NAMESPACE` | `demo` |
+| `SOLERA_DATA_URL` | `s3://<bucket BUCKET reference>/data`: the demo's outputs; without it they sit on the container's disk and a redeploy loses them |
 | `AWS_ACCESS_KEY_ID` | Bucket `ACCESS_KEY_ID` reference |
 | `AWS_SECRET_ACCESS_KEY` | Bucket `SECRET_ACCESS_KEY` reference |
 | `AWS_REGION` | Bucket `REGION` reference |

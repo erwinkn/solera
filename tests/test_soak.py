@@ -1,8 +1,8 @@
 """Soak: the demo project runs in-process on `file://` state with a fake clock
 for >= 500 batches per site, and nothing may grow faster than the work does.
 
-- `data/` grows linearly in committed batches (one object per batch, no
-  rewrites of history);
+- the demo's data (FileStore, under `$SOLERA_DATA`) grows linearly in
+  committed batches: one object per event batch, and per changed key;
 - `control/` — the journal and checkpoints — stays bounded however many runs
   happen: at most two checkpoints, and the journal since the older one;
 - finished runs leave memory and land under `runs/`;
@@ -11,7 +11,7 @@ for >= 500 batches per site, and nothing may grow faster than the work does.
   truncated behind the consumer's watermark, and unreferenced files are
   deleted.
 
-The real engine, JsonStore and LocalStore all run in-process; `time.time` is
+The real engine, FileStore and LocalStore all run in-process; `time.time` is
 patched to the fake clock (advanced 6 s per run) so the demo's five-second
 feed tick produces a new batch every iteration without wall-clock sleeps.
 """
@@ -120,7 +120,13 @@ async def test_soak(tmp_path, monkeypatch):
         runs_in_memory_peak = max(runs_in_memory_peak, len(state.model.runs))
         if (i + 1) % SAMPLE_EVERY == 0 or i == BATCHES - 1:
             samples.append(
-                (i + 1, _bytes(root, "data"), _bytes(root, "control"), _bytes(root, "keys"), calls.total())
+                (
+                    i + 1,
+                    _bytes(tmp_path, "data"),
+                    _bytes(root, "control"),
+                    _bytes(root, "keys"),
+                    calls.total(),
+                )
             )
 
     runs, sizes = [s[0] for s in samples], [s[1] for s in samples]
@@ -185,14 +191,9 @@ async def test_soak(tmp_path, monkeypatch):
     # Every head loads through its store, including after a restart.
     await state.close()
     state = await State.open((tmp_path / "state").as_uri(), "soak", clock=lambda: clock[0])
-    for store in project.stores.values():
-        bind = getattr(store, "bind_objects", None)
-        if bind is not None:
-            bind(state.objects)
     for head in state.model.heads.values():
         ref = Ref.from_json(head["ref"])
-        handle = ref.handle or {}
-        if "object" not in handle and "batches" not in handle:
+        if "path" not in (ref.handle or {}):
             continue  # lineage-only source heads carry no object payload
         await project.stores[ref.store].load(ref, None, None)
     await state.close()
@@ -202,9 +203,9 @@ async def test_soak_with_retention(tmp_path, monkeypatch):
     """J4 gate (docs/object-store-state.md §11): the demo under
     `Retention(days=1)`, its 10-second poller driven by a fake clock that
     steps ten minutes a run, so a day passes every 144 runs. Once the first
-    day has gone by, `data/` and `runs/` stop growing: every run past the
-    horizon is deleted, and every data version before it expires — while
-    each head still loads, and a consumer added afterwards gets everything."""
+    day has gone by, `runs/` stops growing: every run past the
+    horizon is deleted — while each head still loads, and a consumer added
+    afterwards gets everything. Data in stores never expires."""
 
     monkeypatch.delenv("DATABASE_URL", raising=False)
     clock = [1_700_000_000.0]
@@ -238,12 +239,11 @@ async def test_soak_with_retention(tmp_path, monkeypatch):
     await engine.initialize()
     for name in list(state.model.automations):
         await engine.set_automation(name, False)
-    root = tmp_path / "state" / "retained"
     for _ in range(4):
         await engine.run_until((await engine.submit(["sites"]))["id"], timeout=1e9)
 
     runs_total = max(300, BATCHES // 2)
-    samples = []  # (run, data bytes, data objects, run directories)
+    samples = []  # (run, run directories)
     for i in range(runs_total):
         clock[0] += 600
         detail = await engine.run_until(
@@ -256,14 +256,13 @@ async def test_soak_with_retention(tmp_path, monkeypatch):
         await engine.tick()
         if (i + 1) % 25 == 0:
             run_dirs = len(await state.archived_ids())
-            samples.append((i + 1, _bytes(root, "data"), _count(root, "data"), run_dirs))
+            samples.append((i + 1, run_dirs))
 
-    print(f"\nretention soak: {runs_total} runs, samples (run, data B, data objects, run dirs): {samples}")
+    print(f"\nretention soak: {runs_total} runs, samples (run, run dirs): {samples}")
     steady = [s for s in samples if s[0] >= 200]  # well past the first day (144 runs)
     assert steady, "the soak must run past the retention horizon"
-    for column in (1, 2, 3):
-        first, peak = steady[0][column], max(s[column] for s in steady)
-        assert peak <= 1.2 * first + 50, (column, [s[column] for s in steady])
+    first, peak = steady[0][1], max(s[1] for s in steady)
+    assert peak <= 1.2 * first + 50, [s[1] for s in steady]
     # Runs older than a day are gone; the newest day's are all there.
     oldest = min(ulid_time(r) for r in await state.archived_ids())
     assert oldest >= clock[0] - 86400 - 1200
@@ -271,10 +270,10 @@ async def test_soak_with_retention(tmp_path, monkeypatch):
     # Every head still loads.
     for head in state.model.heads.values():
         ref = Ref.from_json(head["ref"])
-        if "object" in (ref.handle or {}) or "batches" in (ref.handle or {}):
+        if "path" in (ref.handle or {}):
             await project.stores[ref.store].load(ref, None, None)
 
-    # A consumer added after a day of expiry receives the full head.
+    # A consumer added after a day of run expiry receives the full head.
     seen = {}
 
     @asset(partitions={"site": demo.sites}, inputs={"site_files": Incremental(batch_size=100)})
