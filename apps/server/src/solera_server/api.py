@@ -429,7 +429,7 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
         worker = runtime.m.workers.get(body["worker"])
         if worker is None:
             raise KeyError(body["worker"])
-        task = runtime.claim_pool_task(
+        task = await runtime.claim_pool_task(
             body["worker"],
             worker["pools"],
             body.get("capacity") or {},

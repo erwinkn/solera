@@ -99,6 +99,24 @@ function headEntries(
 
 // Migrations are declared on the output; the last applied name travels in the
 // head's handle as `schema`. Applied count = its position in the declared list.
+/** A worker died while writing: the store may hold changes its key index
+ * doesn't know about yet. The next successful write reads them back. */
+function UnsettledNote({ scopes }: { scopes?: string[] }) {
+  if (!scopes?.length) return null;
+  const where =
+    scopes.length === 1 && scopes[0] === ""
+      ? ""
+      : ` in ${scopes.length} partition${scopes.length === 1 ? "" : "s"}`;
+  return (
+    <span
+      className="mt-0.5 block text-[0.7rem] text-amber-700 dark:text-amber-300"
+      title="An attempt died while writing this output. The store may hold changes that no commit recorded yet; the next successful write takes them in."
+    >
+      unsettled{where}
+    </span>
+  );
+}
+
 function appliedCount(output: OutputDecl, heads: [string, Head][]): number {
   const declared = output.migrations ?? [];
   if (!declared.length) return 0;
@@ -448,7 +466,12 @@ export function AssetSheet() {
                     const heads = headEntries(detail.data, asset, output.name);
                     return (
                       <tr key={output.name} className="border-b last:border-0">
-                        <td className="px-3 py-2 font-mono">{output.name}</td>
+                        <td className="px-3 py-2">
+                          <span className="font-mono">{output.name}</span>
+                          <UnsettledNote
+                            scopes={detail.data?.unsettled?.[output.name]}
+                          />
+                        </td>
                         <td className="px-3 py-2">
                           <span className="flex items-center gap-1.5">
                             <StoreIcon className="size-3.5 text-muted-foreground" />

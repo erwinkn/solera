@@ -1,5 +1,5 @@
 """The event-sourced model (docs/object-store-state.md §4, §5) and the engine's
-use of it: commits, fencing, leases, pool claims, restarts, and replay."""
+use of it: commits, fencing, durable launches, restarts, and replay."""
 
 import asyncio
 import json
@@ -141,19 +141,18 @@ async def test_failed_precondition_changes_nothing(state, clock):
     assert durable(state.model) == before
 
 
-async def test_an_expired_lease_requeues_and_fences_the_old_attempt(state, clock):
-    engine = engine_on(state, clock, placement="hold", lease_seconds=10)
+async def test_an_aborted_attempt_can_no_longer_commit(state, clock):
+    engine = engine_on(state, clock, placement="hold")
     await quiet(engine)
-    _, task_id, attempt = await held(engine, ["polled"])
-    clock.now += 11
-    await engine._sweep_leases()
-    task = state.model.task(task_id)
-    assert task["status"] == "queued" and task["attempts"][-1]["outcome"] == "expired"
-    assert state.model.claimed(attempt) is None
+    run, task_id, attempt = await held(engine, ["polled"])
+    await engine.cancel(run["id"])
+    for _ in range(20):
+        await asyncio.sleep(0.02)
+        if state.model.claimed(attempt) is None:
+            break
+    assert state.model.task(task_id)["attempts"][-1]["outcome"] == "canceled"
     with pytest.raises(LostOwnership):
         await engine.commit_attempt(attempt, {"inputs": {}, "baseline": {}}, {"outputs": {}})
-    await engine.tick()  # redispatched under a new attempt
-    assert state.model.claims[task_id]["attempt"] != attempt
 
 
 async def test_a_moved_input_still_commits(state, clock):
@@ -195,51 +194,21 @@ async def test_a_moved_input_still_commits(state, clock):
     assert delivered == [["a", "b"], ["c"]]
 
 
-async def test_restart_forgets_claims_and_pool_claims(tmp_path, clock):
+async def test_restart_keeps_launched_claims(tmp_path, clock):
+    """A launched attempt is durable (§8): after a restart its task still
+    holds its claim and scope lock, and is not queued again."""
+
     state = await State.open(tmp_path.as_uri(), "test", clock=clock, flush_interval=0.001)
     engine = engine_on(state, clock, placement="hold")
     await quiet(engine)
     _, task_id, attempt = await held(engine, ["polled"])
-    engine.m.pool[attempt] = {
-        "attempt": attempt,
-        "task": task_id,
-        "status": "claimed",
-        "claimed_by": "w",
-        "lease_until": clock.now + 30,
-        "pool": "p",
-        "created_at": clock.now,
-    }
-    for _, job in engine.inflight.values():
-        job.cancel()
+    await engine.stop()
     await state.close()
     again = await State.open(tmp_path.as_uri(), "test", clock=clock, flush_interval=0.001)
-    assert again.model.claims == {} and again.model.pool == {} and again.model.locks == {}
-    assert again.model.task(task_id)["status"] == "queued" and task_id in again.model.queue
+    task = again.model.task(task_id)
+    assert again.model.claimed(attempt)["launched"] and again.model.locks == {("polled", ""): attempt}
+    assert task["status"] == "running" and task_id not in again.model.queue
     await again.close()
-
-
-async def test_pool_claims_lease_and_expire(state, clock):
-    engine = engine_on(state, clock)
-    engine.m.pool["a1"] = {
-        "attempt": "a1",
-        "task": "t",
-        "status": "queued",
-        "claimed_by": None,
-        "lease_until": None,
-        "pool": "p",
-        "needs": {"cpu": 2},
-        "created_at": 1,
-    }
-    assert engine.claim_pool_task("w", ["p"], {"cpu": 1}, 30) is None  # too small
-    record = engine.claim_pool_task("w", ["p"], {"cpu": 4}, 30)
-    assert record["claimed_by"] == "w"
-    assert engine.heartbeat_pool_task("w", "a1", 30) == clock.now + 30
-    with pytest.raises(LostOwnership):
-        engine.heartbeat_pool_task("other", "a1", 30)
-    clock.now += 31
-    engine._sweep_pool()
-    assert engine.m.pool["a1"]["status"] == "queued"
-    assert engine.claim_pool_task("w2", ["p"], {"cpu": 4}, 30)["claimed_by"] == "w2"
 
 
 def test_finishing_a_task_touches_only_its_dependents():

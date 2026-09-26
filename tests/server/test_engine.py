@@ -836,7 +836,7 @@ async def test_timeout_fails_retryably(state):
         return []
 
     project = Project(assets=[never], executors=[Fake()])
-    engine = make_engine(state, project, placements=fake(project), lease_seconds=1)
+    engine = make_engine(state, project, placements=fake(project), heartbeat_seconds=1)
     FakePlacement.script.clear()
     await engine.initialize()
     run = await engine.submit(["never"])
@@ -865,89 +865,13 @@ async def test_harness_exit_without_result_fails_retryably(state):
         return []
 
     project = Project(assets=[ghost], executors=[Fake()])
-    engine = make_engine(state, project, placements={"Fake": lambda e, o, c: NoResult(c)}, lease_seconds=1)
+    engine = make_engine(
+        state, project, placements={"Fake": lambda e, o, c: NoResult(c)}, heartbeat_seconds=1
+    )
     await engine.initialize()
     detail = await engine.run_until((await engine.submit(["ghost"]))["id"], 15)
     assert status_of(detail) == "failed"
     assert "without a result" in detail["tasks"][0]["error"]
-
-
-async def test_restart_requeues_and_relaunches_inflight(tmp_path):
-    """§4.3/§10: claims are never journaled, so after a restart an in-flight
-    attempt is simply gone: its task is queued exactly once, and dispatch
-    relaunches it under a fresh attempt id."""
-    launches = []
-    release = {"go": False}
-
-    class Slow(FakePlacement):
-        async def launch(self, stage):
-            launches.append(stage["attempt"])
-            return {"id": stage["attempt"], "run": stage["run"]}
-
-        async def wait(self, run, timeout):
-            if not release["go"]:
-                return None
-            # the harness finishes by rewriting its attempt file with the result
-            await self.ctx.state.put_object(
-                f"runs/{run['run']}/{run['id']}.json",
-                json.dumps(
-                    {
-                        "spec": {},
-                        "result": {
-                            "status": "succeeded",
-                            "outputs": {
-                                "resumable": {
-                                    "ref": {
-                                        "output": "resumable",
-                                        "store": "json",
-                                        "handle": {"object": "x.json"},
-                                        "version": "v1",
-                                        "partition": "",
-                                        "meta": {},
-                                    }
-                                }
-                            },
-                        },
-                    }
-                ).encode(),
-            )
-            return {"code": 0, "reason": None, "meta": {}}
-
-    @asset(executor=Fake()())
-    def resumable():
-        return [{"ok": True}]
-
-    project = Project(assets=[resumable], executors=[Fake()])
-    url = tmp_path.as_uri()
-    state = await State.open(url, "test", flush_interval=0.001)
-    engine = make_engine(state, project, placements={"Fake": lambda e, o, c: Slow(c)}, lease_seconds=30)
-    await engine.initialize()
-    run = await engine.submit(["resumable"])
-    await engine.tick()
-    await asyncio.sleep(0.3)
-    assert launches  # attempt is mid-flight
-    task_id = state.model.attempts[launches[0]]
-    # Crash the engine: cancel in-flight asyncio tasks and reopen the state,
-    # like a process restart would.
-    for _, t in engine.inflight.values():
-        t.cancel()
-    await asyncio.gather(*(t for _, t in engine.inflight.values()), return_exceptions=True)
-    engine.inflight.clear()
-    await state.close()
-
-    state2 = await State.open(url, "test", flush_interval=0.001)
-    task = state2.model.task(task_id)
-    assert task["status"] == "queued" and task["attempts"] == []  # the lost attempt left no trace
-    assert task_id in state2.model.queue and not state2.model.claims
-    engine2 = make_engine(state2, project, placements={"Fake": lambda e, o, c: Slow(c)}, lease_seconds=30)
-    await engine2.initialize()
-    await engine2.start()
-    release["go"] = True
-    detail = await engine2.run_until(run["id"], 10)
-    await engine2.stop()
-    await state2.close()
-    assert status_of(detail) == "succeeded"
-    assert len(launches) == 2 and launches[1] != launches[0]  # relaunched under a fresh attempt id
 
 
 async def test_max_concurrent(state):

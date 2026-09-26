@@ -5,14 +5,16 @@ The model is plain data changed only by `apply(event)`, so replaying the
 journal reproduces it exactly. It has three layers:
 
 - **Durable**: the project, heads, key indexes, cursors, watermarks,
-  per-scope outcomes, automation state, active runs (tasks nested inside),
-  idempotency receipts, and index files awaiting deletion. `snapshot()`
-  serializes exactly this, and `restore()` loads it.
-- **Derived**: the ready queue, pending-per-scope, dependency counters and
-  run roll-ups. Rebuilt by `restore()`, maintained by `apply()`.
-- **Memory only**: claims, locks and leases, pool claims, workers. Never
-  journaled, and never read by `apply` for anything durable — a claimed task
-  is still "queued" on disk, and a restart simply dispatches it again.
+  per-scope outcomes, automation state, active runs (tasks nested inside,
+  each launched attempt on its task), unsettled outputs, idempotency
+  receipts, and index files awaiting deletion. `snapshot()` serializes
+  exactly this, and `restore()` loads it.
+- **Derived**: the ready queue, pending-per-scope, dependency counters, run
+  roll-ups, and the claims, scope locks and pool work of launched attempts.
+  Rebuilt by `restore()`, maintained by `apply()`.
+- **Memory only**: the claim an attempt holds while it prepares, before it
+  is launched (a restart simply dispatches its task again), pool leases, and
+  workers.
 
 Events carry every timestamp they need; `apply` never reads a clock.
 """
@@ -75,6 +77,7 @@ class Model:
                 "cursors": _nest(self.cursors, 2),
                 "watermarks": _nest(self.watermarks, 3),
                 "outcomes": _nest(self.outcomes, 2),
+                "unsettled": _nest(self.unsettled, 2),
                 "automations": self.automations,
                 "retention": self.retention,
                 "runs": self.runs,
@@ -97,16 +100,19 @@ class Model:
         self.cursors: dict[tuple, object] = _flatten(snap.get("cursors"), 2)
         self.watermarks: dict[tuple, dict] = _flatten(snap.get("watermarks"), 3)
         self.outcomes: dict[tuple, dict] = _flatten(snap.get("outcomes"), 2)
+        # (output, scope) -> intents of attempts that died while writing it (§8)
+        self.unsettled: dict[tuple, list] = _flatten(snap.get("unsettled"), 2)
         self.automations: dict[str, dict] = snap.get("automations") or {}
         # asset -> the newest `runs` run ids that committed to it, oldest first (§11)
         self.retention: dict[str, list[str]] = snap.get("retention") or {}
         self.runs: dict[str, dict] = snap.get("runs") or {}
         self.receipts: dict[str, str] = dict(snap.get("receipts") or [])
-        # memory only
-        self.claims: dict[str, dict] = {}  # task id -> {attempt, started_at, lease_until, status}
+        # derived from launched attempts, plus memory-only claims of attempts preparing
+        self.claims: dict[str, dict] = {}  # task id -> {attempt, started_at, status, launched?}
         self.attempts: dict[str, str] = {}  # attempt id -> task id, while claimed
         self.locks: dict[tuple, str] = {}  # (asset, scope) -> attempt id
-        self.pool: dict[str, dict] = {}  # attempt id -> claimable pool work
+        self.pool: dict[str, dict] = {}  # attempt id -> pool work
+        # memory only
         self.workers: dict[str, dict] = {}
         self._reindex()
 
@@ -131,6 +137,8 @@ class Model:
         for tid, task in tasks.items():
             self.task_run[tid] = run_id
             status = task["status"]
+            if task.get("launched"):
+                self._hold(task)
             if status in TERMINAL_TASK:
                 bad += status in BAD_OUTCOME
                 continue
@@ -215,19 +223,57 @@ class Model:
 
         return [tid for tid, at in sorted(self.queue.items(), key=lambda kv: (kv[1], kv[0])) if at <= now]
 
-    # -- memory-only claims (never journaled) ---------------------------------------------------
+    # -- claims ------------------------------------------------------------------------
 
-    def claim(self, task_id: str, attempt: str, now: float, lease: float) -> None:
+    def claim(self, task_id: str, attempt: str, now: float) -> None:
+        """Claim a task for an attempt that is preparing: memory only, until
+        `AttemptLaunched` makes it durable."""
+
         task = self.task(task_id)
-        self.claims[task_id] = {
-            "attempt": attempt,
-            "started_at": now,
-            "lease_until": now + lease,
-            "status": "running",
-        }
+        self.claims[task_id] = {"attempt": attempt, "started_at": now, "status": "running"}
         self.attempts[attempt] = task_id
         self.locks[(task["asset"], task["scope"])] = attempt
         self.queue.pop(task_id, None)
+
+    def release(self, task_id: str, attempt: str) -> None:
+        """Drop the memory-only claim of an attempt that was never launched."""
+
+        claim = self.claims.get(task_id)
+        if claim is not None and claim["attempt"] == attempt and not claim.get("launched"):
+            self._release_claim(task_id, attempt)
+
+    def _hold(self, task: dict) -> None:
+        """The claim, scope lock and pool work of a task's launched attempt."""
+
+        launched = task["launched"]
+        attempt = launched["attempt"]
+        pool = launched.get("pool")
+        status = "running" if pool is None or launched.get("worker") else "claimable"
+        self.claims[task["id"]] = {
+            "attempt": attempt,
+            "started_at": launched["started_at"],
+            "status": status,
+            "launched": True,
+        }
+        self.attempts[attempt] = task["id"]
+        self.locks[(task["asset"], task["scope"])] = attempt
+        self.queue.pop(task["id"], None)
+        if pool is not None:
+            record = self.pool.get(attempt) or {"lease_until": None}
+            self.pool[attempt] = {
+                **record,
+                "attempt": attempt,
+                "task": task["id"],
+                "run": self.task_run[task["id"]],
+                "asset": task["asset"],
+                "scope": task["scope"],
+                "pool": pool["name"],
+                "needs": pool.get("needs") or {},
+                "status": "claimed" if launched.get("worker") else "queued",
+                "claimed_by": launched.get("worker"),
+                "claimed_at": launched.get("claimed_at"),
+                "created_at": launched["at"],
+            }
 
     def claimed(self, attempt: str) -> dict | None:
         """The live claim behind an attempt, if it still holds its scope."""
@@ -373,7 +419,6 @@ class Model:
                 if task["status"] in TERMINAL_TASK:
                     continue
                 attempt = (self.claims.get(tid) or {}).get("attempt")
-                self._release_claim(tid)
                 task["status"] = "canceled"
                 self.outcomes[(task["asset"], task["scope"])] = {
                     "outcome": "canceled",
@@ -381,6 +426,9 @@ class Model:
                     "attempt": attempt,
                     "at": at,
                 }
+            # Claims go with their tasks, except those of launched attempts:
+            # each is aborted, or — if it is already writing — waited for and
+            # committed (§8).
             self._unindex_run(run["id"])
             self._index_run(run["id"], run)
         elif action == "retry":
@@ -408,12 +456,42 @@ class Model:
                     self._requeue(task, at)
             self._roll_up(run["id"], at)
 
+    def _on_AttemptLaunched(self, e):
+        run = self.runs.get(e["run"])
+        task = run["tasks"].get(e["task"]) if run else None
+        if task is None or task["status"] in TERMINAL_TASK:
+            return
+        launched = {k: e[k] for k in ("attempt", "started_at", "at", "execution", "prepared")}
+        if e.get("pool"):
+            launched["pool"] = e["pool"]
+        task["launched"] = launched
+        if task["status"] == "queued":
+            task["status"] = "running"
+        self._hold(task)
+
+    def _on_AttemptClaimed(self, e):
+        """A pool worker took a launched attempt (§10)."""
+
+        task = self.task(self.attempts.get(e["attempt"], ""))
+        launched = (task or {}).get("launched")
+        if launched is None or launched["attempt"] != e["attempt"]:
+            return
+        launched["worker"], launched["claimed_at"] = e["worker"], e["at"]
+        self._hold(task)
+
     def _on_AttemptFinished(self, e):
         run = self.runs.get(e["run"])
         task = run["tasks"].get(e["task"]) if run else None
         if task is None:
             return
         self._release_claim(task["id"], e["attempt"])
+        if (task.get("launched") or {}).get("attempt") == e["attempt"]:
+            del task["launched"]
+            if task["status"] == "running":
+                task["status"] = "queued"  # until the outcome below says otherwise
+        for output, intent in (e.get("unsettled") or {}).items():
+            intents = self.unsettled.setdefault((output, task["scope"]), [])
+            intents.append({**intent, "run": e["run"], "attempt": e["attempt"]})
         outcome, at = e["outcome"], e["finished_at"]
         summary = {
             "id": e["attempt"],
@@ -428,7 +506,11 @@ class Model:
             summary["outputs"] = {name: h["ref"] for name, h in commit.get("heads", {}).items()}
         task["attempts"].append(summary)
         if task["status"] in TERMINAL_TASK:
-            return  # e.g. its run was canceled while it ran: history only
+            # Its run was canceled while it ran. An attempt that was already
+            # writing still commits: its data landed (§8).
+            if outcome == "succeeded" and commit:
+                self._install(task, commit, e)
+            return
         if outcome == "succeeded":
             self._install(task, commit or {}, e)
             if e.get("more"):
@@ -462,6 +544,12 @@ class Model:
                 changed.append(name)
             self.heads[(name, scope)] = {**head, "run": e["run"], "attempt": e["attempt"], "at": at}
             self._commit_keys(name, scope, (commit.get("keys") or {}).get(name))
+            if name in commit.get("settled", ()):
+                # The commit's delta took in what the dead attempts left (§8):
+                # their intent files are no longer needed.
+                index = self.index(name, scope)
+                for intent in self.unsettled.pop((name, scope), ()):
+                    self.garbage.extend([index.path(f["name"]), at] for f in intent["files"])
         if "cursor" in commit:
             if commit["cursor"] is None:
                 self.cursors.pop((asset, scope), None)

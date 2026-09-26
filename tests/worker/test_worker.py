@@ -51,7 +51,7 @@ def consumer(ctx, feed: list):
 project = Project(assets=[feed, consumer])
 """,
     )
-    engine = make_engine(state, entrypoint, lease_seconds=30)
+    engine = make_engine(state, entrypoint, heartbeat_seconds=30)
     await engine.initialize()
     detail = await engine.run_until((await engine.submit(["consumer"], upstream=True))["id"], 60)
     assert detail["request"]["status"] == "succeeded"
@@ -94,7 +94,7 @@ def job():
 project = Project(assets=[job])
 """,
     )
-    engine = make_engine(state, entrypoint, lease_seconds=30)
+    engine = make_engine(state, entrypoint, heartbeat_seconds=30)
     await engine.initialize()
     # Rewrite the project so the subprocess computes a different revision.
     (tmp_path / "proj.py").write_text(
@@ -130,33 +130,23 @@ from solera.sdk import Project, asset
 def slow():
     flag = pathlib.Path(os.environ["KILL_FLAG"])
     if not flag.exists():
-        flag.write_text("x")
+        flag.write_text(str(os.getpid()))
         time.sleep(30)          # first attempt is killed here
     return [{"ok": True}]
 
 project = Project(assets=[slow])
 """,
     )
-    engine = make_engine(state, entrypoint, lease_seconds=30)
+    engine = make_engine(state, entrypoint, heartbeat_seconds=30)
     await engine.initialize()
     run = await engine.submit(["slow"])
     await engine.tick()  # dispatch: launch the subprocess
     # Wait for the subprocess to be mid-flight, then SIGKILL it — a real crash.
-    pid = None
     for _ in range(100):
-        if engine.handles:
-            pid = next(iter(engine.handles.values()))["pid"]
+        if flag.exists() and flag.read_text():
             break
         await asyncio.sleep(0.05)
-    assert pid
-    flag_ready = False
-    for _ in range(100):
-        if flag.exists():
-            flag_ready = True
-            break
-        await asyncio.sleep(0.05)
-    assert flag_ready
-    os.kill(pid, signal.SIGKILL)
+    os.kill(int(flag.read_text()), signal.SIGKILL)
     detail = await engine.run_until(run["id"], 60)
     assert detail["request"]["status"] == "succeeded"
     attempts = detail["attempts"][detail["tasks"][0]["id"]]
@@ -179,7 +169,7 @@ def whoami(vault):
 project = Project(assets=[whoami], resources={"vault": {"token": "env:TEST_SECRET"}})
 """,
     )
-    engine = make_engine(state, entrypoint, lease_seconds=30)
+    engine = make_engine(state, entrypoint, heartbeat_seconds=30)
     await engine.initialize()
     detail = await engine.run_until((await engine.submit(["whoami"]))["id"], 60)
     assert detail["request"]["status"] == "succeeded"
@@ -225,7 +215,7 @@ async def test_migrate_runs_before_first_write(state, tmp_path, monkeypatch):
     log = tmp_path / "calls.log"
     monkeypatch.setenv("MIGRATE_LOG", str(log))
     entrypoint = write_project(tmp_path, MIGRATING_PROJECT)
-    engine = make_engine(state, entrypoint, lease_seconds=30)
+    engine = make_engine(state, entrypoint, heartbeat_seconds=30)
     await engine.initialize()
     detail = await engine.run_until((await engine.submit(["producer"]))["id"], 60)
     assert detail["request"]["status"] == "succeeded"
@@ -240,7 +230,7 @@ async def test_failed_migration_is_not_retryable(state, tmp_path, monkeypatch):
         tmp_path,
         MIGRATING_PROJECT.replace("lambda objects, prefix: None", "lambda objects, prefix: 1 / 0"),
     )
-    engine = make_engine(state, entrypoint, lease_seconds=30)
+    engine = make_engine(state, entrypoint, heartbeat_seconds=30)
     await engine.initialize()
     detail = await engine.run_until((await engine.submit(["producer"]))["id"], 60)
     assert detail["request"]["status"] == "failed"

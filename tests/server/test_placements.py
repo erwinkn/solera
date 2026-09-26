@@ -1,14 +1,15 @@
-"""§10 placements: the pool pull path (claim fit, renew, complete, expiry,
-cancel) and the remote kinds against stubbed SDK clients."""
+"""§10 placements: the pool pull path (claim fit, renew, complete, a lost
+worker, cancel) and the remote kinds against stubbed SDK clients."""
 
 import asyncio
+import json
 import sys
 import types
 import uuid
 
 import pytest
 from solera.executors import Pool
-from solera.sdk import Project, asset
+from solera.sdk import Project, Retry, asset
 from solera_server.engine import Engine
 from solera_server.placements import PlacementContext
 from solera_server.placements.pool import PoolPlacement
@@ -37,7 +38,7 @@ async def test_pool_task_lifecycle(state):
         return [{"ok": True}]
 
     project = Project(assets=[job])
-    engine = make_engine(state, project, lease_seconds=30)
+    engine = make_engine(state, project, heartbeat_seconds=30)
     await engine.initialize()
     run = await engine.submit(["job"])
     await engine.tick()  # dispatch: stage the pool task, wait for a claim
@@ -49,13 +50,15 @@ async def test_pool_task_lifecycle(state):
     assert record["task"] == f"{run['id']}/job:"
 
     # a worker that doesn't fit never sees the task
-    assert engine.claim_pool_task("w-small", ["ingest"], {"cpu": 1}, lease_seconds=30) is None
-    claimed = engine.claim_pool_task("w1", ["ingest"], {"cpu": 4}, lease_seconds=30)
+    assert await engine.claim_pool_task("w-small", ["ingest"], {"cpu": 1}, lease_seconds=30) is None
+    claimed = await engine.claim_pool_task("w1", ["ingest"], {"cpu": 4}, lease_seconds=30)
     assert claimed["attempt"] == attempt and claimed["status"] == "claimed"
+    # the claim is durable: a restarted engine never offers the task again
+    assert state.model.task(record["task"])["launched"]["worker"] == "w1"
 
     # renew extends the claim; a second worker can't steal it
     engine.heartbeat_pool_task("w1", attempt, lease_seconds=30)
-    assert engine.claim_pool_task("w2", ["ingest"], {"cpu": 4}, lease_seconds=30) is None
+    assert await engine.claim_pool_task("w2", ["ingest"], {"cpu": 4}, lease_seconds=30) is None
 
     # the worker runs the stage and completes; the engine's wait sees the result
     code = await run_attempt(state.objects_url, attempt, project, run=record["run"])
@@ -66,40 +69,40 @@ async def test_pool_task_lifecycle(state):
     assert detail["tasks"][0]["status"] == "succeeded"
 
 
-async def test_pool_expired_claim_requeues_and_late_complete_rejected(state):
-    """§10: an expired claim is swept back to queued; a late complete is
-    rejected because the claim moved on."""
+async def test_a_lost_pool_worker_fails_its_attempt_and_the_retry_goes_to_another(state):
+    """§10: a worker whose lease expires is lost. Its attempt is aborted and
+    fails retryably; the retry is a new attempt, which another worker claims,
+    and the lost worker's renew and complete are rejected."""
 
-    record = {
-        "attempt": "t/1",
-        "task": "t",
-        "run": "r",
-        "asset": "a",
-        "scope": "",
-        "pool": "ingest",
-        "needs": {},
-        "spec": {},
-        "prepared": {},
-        "status": "queued",
-        "claimed_by": None,
-        "lease_until": None,
-        "created_at": 0,
-    }
-    engine = make_engine(state, Project(assets=[]))
-    state.model.pool["t/1"] = record
-    claimed = engine.claim_pool_task("w1", ["ingest"], {}, lease_seconds=1)
-    assert claimed["status"] == "claimed"
-    await asyncio.sleep(1.05)
-    engine._sweep_pool()
-    reclaimed = engine.claim_pool_task("w2", ["ingest"], {}, lease_seconds=30)
-    assert reclaimed["claimed_by"] == "w2"
-    # the stale worker's renew and complete are rejected
+    @asset(executor=Pool("ingest")(), retries=Retry(1, delay=0))
+    def job():
+        return [{"ok": True}]
+
+    project = Project(assets=[job])
+    engine = make_engine(state, project, heartbeat_seconds=30)
+    await engine.initialize()
+    run = await engine.submit(["job"])
+    await engine.tick()
+    await asyncio.sleep(0.1)
+    [first] = state.model.pool
+    assert (await engine.claim_pool_task("w1", ["ingest"], {}, lease_seconds=0.2))["claimed_by"] == "w1"
+    for _ in range(40):
+        await engine.tick()
+        await asyncio.sleep(0.05)
+        if state.model.pool and first not in state.model.pool:
+            break
+    [second] = state.model.pool
+    task = state.model.task(state.model.pool[second]["task"])
+    assert task["attempts"][0]["id"] == first and task["attempts"][0]["outcome"] == "failed"
+    assert (
+        json.loads(await state.get_object(f"{state.attempt_path(run['id'], first)}.writing"))["state"]
+        == "aborted"
+    )
+    assert (await engine.claim_pool_task("w2", ["ingest"], {}, lease_seconds=30))["attempt"] == second
     with pytest.raises(LostOwnership):
-        engine.heartbeat_pool_task("w1", "t/1", lease_seconds=30)
-    engine.release_pool_task("w1", "t/1")  # no-op: w1 doesn't own it
-    assert state.model.pool["t/1"]["claimed_by"] == "w2"
-    engine.release_pool_task("w2", "t/1")
-    assert "t/1" not in state.model.pool
+        engine.heartbeat_pool_task("w1", first, lease_seconds=30)
+    engine.release_pool_task("w1", second)  # no-op: w1 doesn't own it
+    assert state.model.pool[second]["claimed_by"] == "w2"
 
 
 async def test_pool_cancel_stops_renewal(state):

@@ -4,14 +4,15 @@
 read the spec from the attempt file -> refuse on revision mismatch -> resolve `env:` -> load inputs per
 annotation (Incremental edges through the upstream key index) -> build ctx ->
 run the producer -> for each returned output, work out what changed against
-its key index, expire what retention no longer needs, store() it unless
-nothing did, write the delta file -> rewrite the attempt file with the spec,
-the result and the log index, in one PUT.
+its key index and write the delta file -> take the write fence -> store()
+each output unless nothing changed -> rewrite the attempt file with the spec,
+the result and the log index, in one PUT. All along, a thread beats.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import gzip
 import importlib
@@ -20,12 +21,13 @@ import inspect
 import json
 import os
 import sys
+import threading
 import time
 import traceback
 import typing
 from pathlib import Path
 
-from solera.keys.index import DeltaFiles, IndexState, KeyIndex, key_bytes, key_str
+from solera.keys.index import DeltaFiles, FileInfo, IndexState, KeyIndex, key_bytes, key_str
 from solera.keys.io import ObjectIO, key_cache
 from solera.sdk import (
     UNSET,
@@ -101,6 +103,19 @@ async def _put(objects, key: str, value: bytes):
     await obstore.put_async(objects, key, value, mode="overwrite", use_multipart=False)
 
 
+async def _create(objects, key: str, value: bytes) -> bool:
+    """Create-only PUT: False if the object already exists."""
+
+    import obstore
+    from obstore.exceptions import AlreadyExistsError
+
+    try:
+        await obstore.put_async(objects, key, value, mode="create", use_multipart=False)
+    except AlreadyExistsError:
+        return False
+    return True
+
+
 async def _get(objects, key: str) -> bytes | None:
     import obstore
     from obstore.exceptions import NotFoundError
@@ -110,6 +125,61 @@ async def _get(objects, key: str) -> bytes | None:
     except NotFoundError:
         return None
     return bytes(await result.bytes_async())
+
+
+class Aborted(Exception):
+    """The engine took the attempt's write fence first: it may write nothing."""
+
+
+ABORTED = 3  # the exit code of an aborted attempt
+
+
+class Heartbeat:
+    """Proof of life for an engine with no handle on this worker (§8).
+
+    A thread rewrites `{attempt}.beat` every `interval` seconds — from a
+    thread, so a producer that blocks the event loop still beats — and reads
+    the write fence each time: once the engine has aborted the attempt,
+    `on_abort` runs. A worker that stops marks the beat done, so the engine
+    settles it without waiting for three missed beats."""
+
+    def __init__(self, objects, base: str, interval: float, on_abort):
+        self.objects, self.base, self.interval, self.on_abort = objects, base, interval, on_abort
+        self.aborted = False
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name=f"beat {base}", daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def _run(self):
+        import obstore
+        from obstore.exceptions import NotFoundError
+
+        n = 0
+        while True:
+            try:
+                beat = json.dumps({"at": time.time(), "n": n}).encode()
+                obstore.put(self.objects, f"{self.base}.beat", beat, use_multipart=False)
+                try:
+                    fence = json.loads(bytes(obstore.get(self.objects, f"{self.base}.writing").bytes()))
+                except NotFoundError:
+                    fence = None
+                if fence is not None and fence["state"] == "aborted":
+                    self.aborted = True
+                    self.on_abort()
+                    return
+            except Exception:
+                pass  # a missed beat: only three in a row make the worker dead
+            n += 1
+            if self._stop.wait(self.interval):
+                return
+
+    async def stop(self):
+        self._stop.set()
+        await asyncio.to_thread(self._thread.join)
+        with contextlib.suppress(Exception):
+            await _put(self.objects, f"{self.base}.beat", json.dumps({"done": True}).encode())
 
 
 class Ctx:
@@ -318,13 +388,17 @@ def _dict_inner(t):
     return None
 
 
-async def _store_outputs(spec, project, asset, objects, keys_io, result_value):
-    """Store each returned output (§4, §6, §9).
+async def _store_outputs(spec, project, asset, objects, keys_io, result_value, fence):
+    """Store each returned output (§4, §6, §8, §9), in two phases.
 
-    A keyed output's write is compared with its key index as pinned in the
-    spec: a write that changes nothing is not stored at all and keeps the
-    head; otherwise the store writes it and the changed entries become the
-    batch's delta file. Returns `{name: entry}` and the cursor."""
+    Planning compares each keyed output's write with its key index as pinned
+    in the spec, and writes the changes as the batch's delta file: a write
+    that changes nothing is not stored at all and keeps the head. Then
+    `fence(intents)` takes the attempt's write fence, listing those delta
+    files — the keys this attempt is about to change — and only then do the
+    stores write. An engine that finds the fence taken by a worker that then
+    died keeps the outputs unsettled, and their intents, for the next attempt
+    to repair (`_repair`). Returns `{name: entry}` and the cursor."""
 
     manifest_asset = project.manifest["assets"][asset.name]
     declared = {o["name"]: o for o in manifest_asset["outputs"]}
@@ -343,15 +417,82 @@ async def _store_outputs(spec, project, asset, objects, keys_io, result_value):
     else:
         raise StoreError(f"{asset.name}: multi-output assets must return Result(outputs={{...}})")
 
-    entries = {}
+    # Plan: what each keyed write changes, as delta files.
+    plans, intents, entries = {}, {}, {}
     for name, value in values.items():
         if name not in decls:
             raise StoreError(f"{asset.name}: returned undeclared output {name!r}")
         output = decls[name]
-        store_name = declared[name]["store"]
-        store = project.stores[store_name]
+        store = project.stores[declared[name]["store"]]
         if hasattr(store, "bind_objects"):
             store.bind_objects(objects)
+        info = pinned.get(name) or {}
+        prior = priors.get(name)
+        plan = plans[name] = {"output": output, "store": store, "info": info, "prior": prior}
+        if info.get("index") is None:
+            if isinstance(value, Sql) and output.incremental:
+                raise WriteError(f"{output.name}: Sql writes need a keyed output")
+            continue
+        index = plan["index"] = KeyIndex(keys_io, None, IndexState.from_json(info["index"]))
+        if isinstance(value, Sql):
+            # Rows the harness never sees: the store reports the whole new key
+            # map once it wrote, so its delta comes after — and needs no repair.
+            intents[name] = DeltaFiles([], 0, 0, True).to_json()
+            continue
+        patch = isinstance(value, Patch)
+        rows = value.rows if patch else value
+        rows = list(rows or []) if output.is_partition_set else _rows(rows, output.name)
+        new = key_map(output, rows)
+        # With no prior (a first write, or a full run) a Patch is the whole content.
+        replace = not patch or prior is None
+        removes = [] if replace else [str(k) for k in value.remove if str(k) not in new]
+        unsettled = info.get("unsettled") or []
+        if unsettled and not replace:
+            new, removes = await _repair(output, store, prior, info, keys_io, unsettled, new, removes)
+        delta = await index.changes(
+            [key_bytes(k) for k in new],
+            [key_bytes(v) for v in new.values()],
+            [key_bytes(k) for k in removes],
+            replace=replace,
+        )
+        if not len(delta) and info.get("exists") and not unsettled:
+            entries[name] = {"unchanged": True}
+            del plans[name]
+            continue
+        files = (
+            await index.write(int(info["batch"]), spec["attempt"], delta)
+            if len(delta)
+            else DeltaFiles([], 0, 0, True)
+        )
+        plan["keys"] = intents[name] = files.to_json()
+        if output.is_partition_set:
+            if replace:
+                elements = set(new)
+            else:
+                elements = (set(info.get("elements") or ()) - set(removes)) | set(new)
+            plan["elements"] = sorted(elements)
+
+    try:
+        await fence(intents)
+    except Aborted:
+        # The engine has discarded this attempt's delta files; these came after.
+        import obstore
+
+        paths = [plans[n]["index"].path(f["name"]) for n, files in intents.items() for f in files["files"]]
+        with contextlib.suppress(Exception):
+            await obstore.delete_async(objects, paths)
+        raise
+
+    # Write: nothing reaches a store before the fence is ours.
+    for name, plan in plans.items():
+        value, output, store, info, prior = (
+            values[name],
+            plan["output"],
+            plan["store"],
+            plan["info"],
+            plan["prior"],
+        )
+        store_name = declared[name]["store"]
         schema = None
         if output.migrations:
             migrate = getattr(store, "migrate", None)
@@ -366,8 +507,6 @@ async def _store_outputs(spec, project, asset, objects, keys_io, result_value):
             except Exception as error:
                 raise StoreError(f"{output.name}: migration failed: {error}") from error
             schema = applied[-1] if applied else output.migrations[-1].name
-        info = pinned.get(name) or {}
-        prior = priors.get(name)
         before = (spec.get("retention") or {}).get("before")
         committed = Ref.from_json(info["head"]) if info.get("head") else None
         if before is not None and committed is not None and callable(getattr(store, "expire", None)):
@@ -381,54 +520,27 @@ async def _store_outputs(spec, project, asset, objects, keys_io, result_value):
             attempt=spec["attempt"],
             aliases=tuple(info.get("aliases") or ()),
         )
+        written = await store.store(value, prior, scope)
         entry = {}
-        if info.get("index") is not None:
-            index = KeyIndex(keys_io, None, IndexState.from_json(info["index"]))
-            written = None
-            if isinstance(value, Sql):
-                # Rows the harness never sees: the store reports the new key map.
-                written = await store.store(value, prior, scope)
-                if written.keys is None:
-                    raise StoreError(f"{output.name}: store {store_name!r} reported no keys for a Sql write")
-                new, removes, replace = dict(written.keys), [], True
-            else:
-                patch = isinstance(value, Patch)
-                rows = value.rows if patch else value
-                if output.is_partition_set:
-                    rows = list(rows or [])
-                else:
-                    rows = _rows(rows, output.name)
-                new = key_map(output, rows)
-                # With no prior (a first write, or a full run) a Patch is the whole content.
-                replace = not patch or prior is None
-                removes = [] if replace else [str(k) for k in value.remove if str(k) not in new]
-            delta = await index.changes(
-                [key_bytes(k) for k in new],
-                [key_bytes(v) for v in new.values()],
-                [key_bytes(k) for k in removes],
-                replace=replace,
+        if "index" in plan and isinstance(value, Sql):
+            if written.keys is None:
+                raise StoreError(f"{output.name}: store {store_name!r} reported no keys for a Sql write")
+            new = dict(written.keys)
+            delta = await plan["index"].changes(
+                [key_bytes(k) for k in new], [key_bytes(v) for v in new.values()], [], replace=True
             )
-            if written is None:
-                if not len(delta) and info.get("exists"):
-                    entries[name] = {"unchanged": True}
-                    continue
-                written = await store.store(value, prior, scope)
             files = (
-                await index.write(int(info["batch"]), spec["attempt"], delta)
+                await plan["index"].write(int(info["batch"]), spec["attempt"], delta)
                 if len(delta)
                 else DeltaFiles([], 0, 0, True)
             )
             entry["keys"] = files.to_json()
             if output.is_partition_set:
-                if replace:
-                    elements = set(new)
-                else:
-                    elements = (set(info.get("elements") or ()) - set(removes)) | set(new)
-                entry["elements"] = sorted(elements)
-        else:
-            if isinstance(value, Sql) and output.incremental:
-                raise WriteError(f"{output.name}: Sql writes need a keyed output")
-            written = await store.store(value, prior, scope)
+                entry["elements"] = sorted(new)
+        elif "index" in plan:
+            entry["keys"] = plan["keys"]
+            if "elements" in plan:
+                entry["elements"] = plan["elements"]
         if written.ref is None:
             continue
         ref = dataclasses.replace(written.ref, store=store_name)
@@ -439,14 +551,55 @@ async def _store_outputs(spec, project, asset, objects, keys_io, result_value):
     return entries, cursor
 
 
+REPAIR_PAGE = 100_000
+
+
+async def _repair(output, store, prior, info, keys_io, unsettled, new, removes):
+    """Take in what dead attempts left in the store (§8).
+
+    Each unsettled intent lists the keys an attempt that died while writing
+    meant to change; any of those writes may have landed. Keys this patch
+    writes or removes end as it says either way. For the others, the store
+    is read back: the index learns what landed, as part of this commit's
+    delta. Returns the key map and removes to check against the index."""
+
+    touched = set(new) | set(removes)
+    state = IndexState(
+        prefix=info["index"]["prefix"],
+        log=tuple(
+            (n, tuple(FileInfo.from_json(f) for f in intent["files"])) for n, intent in enumerate(unsettled)
+        ),
+    )
+    index = KeyIndex(keys_io, None, state)
+    left, after = [], None
+    while True:
+        keys, _, _, after = await index.pending(0, len(unsettled) - 1, after, REPAIR_PAGE)
+        left.extend(k for k in map(key_str, keys) if k not in touched)
+        if after is None:
+            break
+    new, removes = dict(new), list(removes)
+    for i in range(0, len(left), REPAIR_PAGE):
+        page = left[i : i + REPAIR_PAGE]
+        rows = await store.load(prior, None, Keys({k: "" for k in page}))
+        rows = list(rows or []) if output.is_partition_set else _rows(rows, output.name)
+        found = key_map(output, rows)
+        new.update(found)
+        removes.extend(k for k in page if k not in found)
+    return new, removes
+
+
 def _key_io(objects, objects_url: str, project: Project) -> ObjectIO:
     return ObjectIO(objects, cache=key_cache(project.manifest.get("key_cache"), objects_url))
 
 
-async def run_attempt(objects_url: str, attempt: str, entrypoint: str | Project, *, run: str):
+async def run_attempt(objects_url: str, attempt: str, entrypoint: str | Project, *, run: str, on_abort=None):
     """Run one attempt. The engine created `runs/{run}/{attempt}.json` holding
     the spec; the harness rewrites it once, at the end, with the spec, the
-    result and the log index (docs/object-store-state.md §8)."""
+    result and the log index (docs/object-store-state.md §8).
+
+    Returns 0 on success, 1 on failure, and 3 if the engine aborted the
+    attempt: then nothing was written. Once aborted, `on_abort` runs — from
+    the heartbeat thread; by default the attempt's work is canceled."""
 
     objects = _objects(objects_url)
     base = f"runs/{run}/{attempt}"
@@ -454,6 +607,23 @@ async def run_attempt(objects_url: str, attempt: str, entrypoint: str | Project,
     if record is None:
         raise StoreError(f"No attempt file at {base}.json")
     spec = json.loads(record)["spec"]
+    loop = asyncio.get_running_loop()
+    work = asyncio.create_task(_attempt(objects, objects_url, base, spec, entrypoint))
+    beat = Heartbeat(
+        objects, base, spec.get("heartbeat", 30), on_abort or (lambda: loop.call_soon_threadsafe(work.cancel))
+    )
+    beat.start()
+    try:
+        return await work
+    except asyncio.CancelledError:
+        if not beat.aborted:
+            raise
+        return ABORTED
+    finally:
+        await beat.stop()
+
+
+async def _attempt(objects, objects_url: str, base: str, spec: dict, entrypoint) -> int:
     shipper = LogShipper(objects, base)
     flusher = asyncio.create_task(shipper.periodically())
 
@@ -475,6 +645,13 @@ async def run_attempt(objects_url: str, attempt: str, entrypoint: str | Project,
                 },
             }
         )
+
+    async def fence(intents: dict):
+        """Take the write fence (§8), or learn that the engine aborted us."""
+
+        body = json.dumps({"state": "writing", "intents": intents}).encode()
+        if not await _create(objects, f"{base}.writing", body):
+            raise Aborted(spec["attempt"])
 
     try:
         project = entrypoint if isinstance(entrypoint, Project) else load_project(entrypoint)
@@ -506,12 +683,14 @@ async def run_attempt(objects_url: str, attempt: str, entrypoint: str | Project,
         value = asset.fn(**args)
         if inspect.isawaitable(value):
             value = await value
-        outputs, cursor = await _store_outputs(spec, project, asset, objects, keys_io, value)
+        outputs, cursor = await _store_outputs(spec, project, asset, objects, keys_io, value, fence)
         result = {"status": "succeeded", "outputs": outputs, "delivered": delivered}
         if cursor is not UNSET:
             result["cursor"] = cursor
         await finish(result)
         return 0
+    except Aborted:
+        return ABORTED  # the engine has finished this attempt: write nothing, not even a result
     except StoreError as error:
         await fail(error, getattr(error, "retryable", False))
     except Exception as error:
@@ -590,7 +769,11 @@ async def main():
         # solera_worker run --objects URL --attempt ID --run RUN (SOLERA_PROJECT env entrypoint)
         options = dict(zip(rest[::2], rest[1::2], strict=True))
         code = await run_attempt(
-            options["--objects"], options["--attempt"], os.environ["SOLERA_PROJECT"], run=options["--run"]
+            options["--objects"],
+            options["--attempt"],
+            os.environ["SOLERA_PROJECT"],
+            run=options["--run"],
+            on_abort=lambda: os._exit(ABORTED),  # an aborted process stops at once
         )
         raise SystemExit(code)
     if mode == "pool":

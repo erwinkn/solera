@@ -244,6 +244,8 @@ export interface AssetDetail {
   cursor: Json;
   watermarks: Record<string, Watermark | null>;
   current_keys: string[][];
+  // Output -> partitions a dead attempt may have partly written (the next commit repairs them).
+  unsettled: Record<string, string[]>;
   scopes: Record<string, ScopeOutcome>;
   automations: AutomationRecord[];
 }

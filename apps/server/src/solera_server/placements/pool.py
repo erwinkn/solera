@@ -1,10 +1,14 @@
-"""Pool placement (§10): the pull path. `launch` is a no-op — the engine stages
-the claimable task in memory when it dispatches; `wait` reports when the
-result object appears, the task is completed, or the claim lease expired."""
+"""Pool placement (§10): the pull path. `launch` is a no-op — the engine's
+`AttemptLaunched` event makes the task claimable; `wait` reports when the
+result object appears, the task is completed, or the worker's claim lease
+expired. A lost worker is not replaced: the engine aborts or settles its
+attempt, and retries the task under a new one (§8)."""
 
 from __future__ import annotations
 
 import asyncio
+
+GRACE_SECONDS = 30.0
 
 
 class PoolPlacement:
@@ -15,6 +19,8 @@ class PoolPlacement:
 
     async def launch(self, stage: dict) -> dict:
         return {"task": stage["attempt"], "run": stage["run"], "pool": self.name}
+
+    resume = launch  # an adopted attempt waits on the same durable pool record
 
     async def wait(self, run: dict, timeout: float) -> dict | None:
         state = self.ctx.state
@@ -29,15 +35,18 @@ class PoolPlacement:
                 if await state.attempt_finished(run["run"], attempt):
                     return {"code": 0, "reason": None, "meta": {}}
                 return {"code": None, "reason": "lost", "meta": {}}
-            if record["status"] == "claimed" and record["lease_until"] <= self.ctx.clock():
-                # The worker's claim expired: offer the task to another worker.
-                record.update(status="queued", claimed_by=None, lease_until=None)
+            if record["status"] == "claimed":
+                if record["lease_until"] is None:
+                    # Restored after a restart: give the worker time to renew.
+                    record["lease_until"] = self.ctx.clock() + GRACE_SECONDS
+                elif record["lease_until"] <= self.ctx.clock():
+                    return {"code": None, "reason": "lost", "meta": {}}
             remaining = deadline - self.ctx.clock()
             if remaining <= 0:
                 return None
             await asyncio.sleep(min(0.2, remaining))
 
     async def cancel(self, run: dict) -> None:
-        # Best-effort: an unclaimed task is withdrawn; a claimed one is fenced by
-        # its lost scope claim — the worker's result can no longer commit.
+        # An unclaimed task is withdrawn; a claimed one was aborted by the
+        # engine's write fence — the worker can no longer write (§8).
         self.ctx.state.model.pool.pop(run["task"], None)
