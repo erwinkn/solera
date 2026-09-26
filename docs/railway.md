@@ -37,6 +37,6 @@ Real-provider results must be reported separately from the local filesystem and 
 
 The dedicated `data-orchestrator-s3-test` Railway project was created and the application built, but bucket provisioning did not complete: the environment returned no buckets and bucket references resolved without a bucket name. The application correctly failed before S3 tests. **No real Railway S3 validation or public demo is claimed.** Local filesystem and HTTP S3-emulator results are separate.
 
-Cleanup of the failed `orchestrator-s3-test` service is staged but requires two-factor approval in the Railway dashboard. The API cannot complete it. Project: `87381f11-c1f0-4cac-a0d5-e872be0b8ada`; environment: `production`. The user must approve that staged removal; the service is not reported as deleted. No bucket was provisioned.
+The failed `orchestrator-s3-test` service was deleted on September 26, 2026; no bucket was ever provisioned. Its removal had sat staged since this attempt: Railway requires two-factor verification to commit staged destructive changes, which API tokens cannot provide. Delete services directly through the API instead of staging their removal.
 
 For a future new Railway bucket, inspect its actual addressing mode: new buckets may use virtual-hosted style, requiring `AWS_VIRTUAL_HOSTED_STYLE_REQUEST=true`. Do not assume path-style compatibility or substitute a filesystem deployment for a provider test.
