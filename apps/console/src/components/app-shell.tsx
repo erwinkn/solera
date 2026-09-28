@@ -149,21 +149,12 @@ function ConnectionDot({ offline }: { offline: boolean }) {
 }
 
 export function AppShell({ children }: { children: ReactNode }) {
-  const {
-    diagnostics,
-    assets,
-    runs,
-    error,
-    refresh,
-    checked,
-    openMaterialize,
-  } = useWorkspace();
+  const { diagnostics, assets, error, refresh, checked, openMaterialize } =
+    useWorkspace();
   const unauthorized = error instanceof ApiError && error.status === 401;
   if (unauthorized || (!diagnostics && !sessionStorage.getItem("solera-token")))
     return <Login />;
-  const activeRuns = runs.filter((run) =>
-    ["running", "queued"].includes(run.status),
-  ).length;
+  const activeRuns = diagnostics?.active_runs ?? 0;
   return (
     <div className="flex h-dvh flex-col md:flex-row">
       <aside className="flex shrink-0 flex-col gap-4 border-b bg-sidebar px-4 py-3 text-sidebar-foreground md:w-60 md:border-r md:border-b-0 md:py-5">

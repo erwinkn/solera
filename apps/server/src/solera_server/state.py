@@ -1,13 +1,14 @@
 """The engine's state on an object store (docs/object-store-state.md): the
 in-memory model (model.py), made durable by the journal (journal.py), next to
-the objects attempts, runs and data live in.
+the objects attempts, run history and data live in.
 
 Everything lives under `{root}/{namespace}/`:
 
     control/      the journal and checkpoints (journal.py)
     keys/         key index files (solera.keys, §6)
-    runs/{run}/   run.json once finished; per attempt `{attempt}.json` (spec,
-                  then spec + result + log index) and `{attempt}.log`
+    history/      the run history: `{table}/{id}.parquet` (history.py, §7)
+    runs/{run}/   per attempt `{attempt}.json` (spec, then spec + result +
+                  log index) and `{attempt}.log`
     data/ blobs/  store data
 
 `emit()` applies events to the model at once — so the engine checks a
@@ -20,7 +21,6 @@ from __future__ import annotations
 import json
 import re
 import time
-from collections import OrderedDict
 from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
 
@@ -30,8 +30,6 @@ from obstore.store import LocalStore, MemoryStore
 
 from .journal import Fenced, Journal
 from .model import Model
-
-RECENT_RUNS = 500  # finished runs that wrote nothing, kept in memory for the console
 
 
 class Unavailable(RuntimeError):
@@ -96,7 +94,6 @@ class State:
         self.objects = store
         self.url, self.namespace, self.objects_url = url, namespace, objects_url
         self.journal, self.model, self.clock = journal, model, clock
-        self.recent: OrderedDict[str, dict] = OrderedDict()
 
     @classmethod
     async def open(
@@ -149,52 +146,16 @@ class State:
     async def close(self) -> None:
         await self.journal.close()
 
-    # -- runs and attempts (§7, §8) -------------------------------------------------
-
-    def _run_path(self, run_id: str) -> str:
-        return f"runs/{esc(run_id)}/run.json"
+    # -- attempts (§8) -----------------------------------------------------------------
 
     def attempt_path(self, run_id: str, attempt: str) -> str:
         return f"runs/{esc(run_id)}/{esc(attempt)}"
 
-    async def archive(self, run_id: str, *, committed=(), write: bool = True) -> None:
-        """Write a finished run to `runs/{run}/run.json`, then drop it from
-        memory. A run that wrote nothing (every task skipped) is not written:
-        it stays in the recent list only."""
-
-        run = self.model.runs.get(run_id)
-        if run is None:
-            return
-        if write:
-            data = json.dumps(run, sort_keys=True, allow_nan=False).encode()
-            await obstore.put_async(self.objects, self._run_path(run_id), data, mode="overwrite")
-        else:
-            self.recent[run_id] = run
-            while len(self.recent) > RECENT_RUNS:
-                self.recent.popitem(last=False)
-        await self.emit({"type": "RunArchived", "run": run_id, "committed": sorted(committed)})
-
-    async def archived(self, run_id: str) -> dict | None:
-        if run_id in self.recent:
-            return self.recent[run_id]
-        data = await self.get_object(self._run_path(run_id))
-        return json.loads(data) if data is not None else None
-
-    async def archived_ids(self) -> list[str]:
-        """Every run with a directory under `runs/` (ULIDs sort by creation time)."""
-
-        out = []
-        result = await obstore.list_with_delimiter_async(self.objects, "runs/")
-        for prefix in result["common_prefixes"]:
-            out.append(unesc(prefix.rstrip("/").rsplit("/", 1)[-1]))
-        return sorted(out)
-
     async def delete_run(self, run_id: str) -> None:
-        """Delete a run's record, attempt files and logs."""
+        """Delete a run's attempt files and logs."""
 
         from solera.stores import remove_empty_dirs
 
-        self.recent.pop(run_id, None)
         await self.delete_objects(await self.list_objects(f"runs/{esc(run_id)}/"))
         remove_empty_dirs(self.objects, [f"runs/{esc(run_id)}"])
 

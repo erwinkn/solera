@@ -76,6 +76,28 @@ const dots: Record<string, string> = {
   canceled: "bg-muted-foreground/50",
 };
 
+/** Solid fills for charts, in the badges' colour language. */
+export const statusFill: Record<string, string> = {
+  succeeded: "bg-emerald-500",
+  failed: "bg-red-500",
+  canceled: "bg-zinc-400 dark:bg-zinc-500",
+  running: "bg-sky-500",
+  queued: "bg-zinc-300 dark:bg-zinc-600",
+  paused: "bg-amber-500",
+  skipped: "bg-zinc-200 dark:bg-zinc-700",
+};
+
+/** The order statuses stack in, bottom first. */
+export const statusOrder = [
+  "succeeded",
+  "failed",
+  "canceled",
+  "running",
+  "queued",
+  "paused",
+  "skipped",
+];
+
 export function StatusBadge({
   status,
   className,

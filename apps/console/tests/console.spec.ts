@@ -153,6 +153,48 @@ test("partition grid, attempt logs, upstream run", async ({ page }) => {
   });
 });
 
+test("run history: facets, asset versions, lineage, workload", async ({
+  page,
+}) => {
+  await login(page);
+  // Earlier tests ran `sites` and `site_feed` by hand, so the history has
+  // manual runs; filtering on them lands in the URL and shows a chip.
+  await page
+    .getByRole("navigation", { name: "Main navigation" })
+    .getByRole("link", { name: "Runs" })
+    .click();
+  await expect(page.getByRole("img", { name: "Runs over time" })).toBeVisible();
+  await page
+    .locator('[data-facet="trigger"]')
+    .getByRole("button", { name: /manual/ })
+    .click();
+  await expect(page).toHaveURL(/trigger=/);
+  await expect(
+    page.getByRole("button", { name: "Remove trigger: manual" }),
+  ).toBeVisible();
+  await expect(page.getByRole("button", { name: "Clear all" })).toBeVisible();
+
+  // Every materialization of `sites` is a version; lineage shows what read it.
+  await page
+    .getByRole("navigation", { name: "Main navigation" })
+    .getByRole("link", { name: "Assets" })
+    .click();
+  await page.getByRole("button", { name: "sites", exact: true }).click();
+  const asset = page.getByRole("dialog", { name: "sites" });
+  const version = asset.locator("[data-version]").first();
+  await expect(version).toBeVisible({ timeout: 30000 });
+  await version.getByRole("button", { name: /Lineage of/ }).click();
+  const lineage = page.getByRole("dialog", { name: "Lineage" });
+  await expect(lineage.getByText("This version")).toBeVisible();
+  await expect(lineage.locator('[data-lineage="sites"]')).toBeVisible();
+  await page.keyboard.press("Escape");
+
+  await page.goto("/executors");
+  await expect(
+    page.getByRole("table", { name: "Workload per executor" }),
+  ).toContainText("Local");
+});
+
 test("automation toggle and run-now", async ({ page }) => {
   await login(page);
   await page

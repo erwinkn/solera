@@ -29,6 +29,8 @@ export interface Diagnostics {
   project: string;
   revision: string;
   inflight: number;
+  /** Runs submitted and not yet finished. */
+  active_runs: number;
   postgres: boolean;
   last_error: string | null;
 }
@@ -161,6 +163,7 @@ export interface Run {
   automation: string | null;
   by?: string | null;
   source?: string;
+  tags?: Record<string, string>;
   status: RunStatus;
   paused: boolean;
   tasks: string[];
@@ -264,4 +267,114 @@ export interface PoolWorker {
   meta: { cpu?: number; memory?: number | null; gpu?: number | null };
   seen_at: number;
   task: string | null;
+}
+
+/** A run as the history lists it (object-store-state.md §7). */
+export interface RunRow {
+  id: string;
+  created_at: number;
+  finished_at: number | null;
+  status: RunStatus | "skipped";
+  trigger: "manual" | "automation" | "commit";
+  automation: string | null;
+  by: string | null;
+  source: string | null;
+  targets: string[];
+  assets: string[];
+  committed: string[];
+  mode: string | null;
+  partitions: string | string[] | null;
+  upstream: boolean;
+  tags: Record<string, string>;
+  task_count: number;
+  failed_count: number;
+  error: string | null;
+}
+
+export interface RunPage {
+  runs: RunRow[];
+  /** The `before` cursor of the next page, or null on the last one. */
+  next: string | null;
+}
+
+export interface FacetValue {
+  value: string;
+  count: number;
+}
+
+export type Facets = Record<
+  "status" | "asset" | "tag" | "trigger" | "automation" | "by" | "source",
+  FacetValue[]
+>;
+
+export interface Histogram {
+  bucket: number;
+  since: number | null;
+  until: number;
+  bars: { t: number; counts: Record<string, number> }[];
+}
+
+export interface Materialization {
+  output: string;
+  asset: string | null;
+  scope: string;
+  version: string | null;
+  store: string | null;
+  run: string | null;
+  attempt: string | null;
+  at: number;
+  batch: number | null;
+  added: number | null;
+  removed: number | null;
+  rows: number | null;
+  complete: boolean;
+  metadata: Record<string, Json> | null;
+}
+
+export interface AssetHistory {
+  asset: string;
+  materializations: Materialization[];
+  next: string | null;
+}
+
+export interface VersionRef {
+  output: string;
+  scope: string;
+  version: string | null;
+}
+
+export interface LineageNode extends VersionRef {
+  asset?: string | null;
+  run?: string | null;
+  attempt?: string | null;
+  at?: number;
+  rows?: number | null;
+  /** Still the output's head for that scope. */
+  current: boolean;
+}
+
+export interface Lineage {
+  root: VersionRef;
+  direction: "upstream" | "downstream";
+  nodes: LineageNode[];
+  edges: { from: VersionRef; to: VersionRef; param: string; run: string }[];
+}
+
+export interface StatsRow {
+  tasks: number;
+  skipped: number;
+  failed: number;
+  p50: number | null;
+  p95: number | null;
+  wait_p50: number | null;
+  wait_p95: number | null;
+  hours: number | null;
+  cpu_hours: number | null;
+  gb_hours: number | null;
+  gpu_hours: number | null;
+}
+
+export interface Stats {
+  assets: (StatsRow & { asset: string })[];
+  executors: (StatsRow & { executor: string })[];
 }

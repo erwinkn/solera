@@ -195,6 +195,15 @@ export function RunSheet() {
               <span className="text-xs text-muted-foreground tabular-nums">
                 {tasks.length} task{tasks.length === 1 ? "" : "s"}
               </span>
+              {Object.entries(run.tags ?? {}).map(([k, v]) => (
+                <span
+                  key={k}
+                  className="rounded border px-1.5 font-mono text-[0.7rem] text-muted-foreground"
+                  data-tag={k}
+                >
+                  {k}={v}
+                </span>
+              ))}
               <span className="ml-auto flex gap-1.5">
                 {live && (
                   <>

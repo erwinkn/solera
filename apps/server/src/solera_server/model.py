@@ -7,8 +7,9 @@ journal reproduces it exactly. It has three layers:
 - **Durable**: the project, heads, key indexes, cursors, watermarks,
   per-scope outcomes, automation state, active runs (tasks nested inside,
   each launched attempt on its task), unsettled outputs, idempotency
-  receipts, and index files awaiting deletion. `snapshot()` serializes
-  exactly this, and `restore()` loads it.
+  receipts, files awaiting deletion, and the run history's files and the
+  rows not yet flushed to them (§7). `snapshot()` serializes exactly this,
+  and `restore()` loads it.
 - **Derived**: the ready queue, pending-per-scope, dependency counters, run
   roll-ups, and the claims, scope locks and pool work of launched attempts.
   Rebuilt by `restore()`, maintained by `apply()`.
@@ -24,6 +25,8 @@ from __future__ import annotations
 import copy
 
 from solera.keys.index import DeltaFiles, FileInfo, IndexState, index_prefix
+
+from . import history
 
 TERMINAL_TASK = frozenset({"succeeded", "skipped", "failed", "blocked", "canceled"})
 TERMINAL_RUN = frozenset({"succeeded", "failed", "canceled"})
@@ -79,9 +82,14 @@ class Model:
                 "outcomes": _nest(self.outcomes, 2),
                 "unsettled": _nest(self.unsettled, 2),
                 "automations": self.automations,
-                "retention": self.retention,
                 "runs": self.runs,
                 "receipts": list(self.receipts.items()),
+                "history": {
+                    "files": self.history_files,
+                    "rows": self.history_rows,
+                    "seq": self.history_seq,
+                    "imported": self.history_imported,
+                },
             }
         )
 
@@ -103,10 +111,14 @@ class Model:
         # (output, scope) -> intents of attempts that died while writing it (§8)
         self.unsettled: dict[tuple, list] = _flatten(snap.get("unsettled"), 2)
         self.automations: dict[str, dict] = snap.get("automations") or {}
-        # asset -> the newest `runs` run ids that committed to it, oldest first (§11)
-        self.retention: dict[str, list[str]] = snap.get("retention") or {}
         self.runs: dict[str, dict] = snap.get("runs") or {}
         self.receipts: dict[str, str] = dict(snap.get("receipts") or [])
+        # the run history (§7): per table, its files and the rows awaiting a flush
+        hist = snap.get("history") or {}
+        self.history_files: dict[str, list[dict]] = hist.get("files") or {}
+        self.history_rows: dict[str, list[list]] = hist.get("rows") or {}  # [seq, row]
+        self.history_seq: int = hist.get("seq") or 0
+        self.history_imported: bool = bool(hist.get("imported"))
         # derived from launched attempts, plus memory-only claims of attempts preparing
         self.claims: dict[str, dict] = {}  # task id -> {attempt, started_at, status, launched?}
         self.attempts: dict[str, str] = {}  # attempt id -> task id, while claimed
@@ -380,9 +392,6 @@ class Model:
                 wm["output"] = output_map[wm["output"]]
         for auto in self.automations.values():
             auto["pending"] = [[asset_map.get(a, a), s] for a, s in auto.get("pending") or []]
-        for old, new in asset_map.items():
-            if old in self.retention and new not in self.retention:
-                self.retention[new] = self.retention.pop(old)
         return renamed
 
     def _on_RunSubmitted(self, e):
@@ -397,6 +406,8 @@ class Model:
 
     def _on_RunReopened(self, e):
         run = e["run"]
+        # Its history rows describe how it ended, and it is running again.
+        self._forget({run["id"]}, history.RUN_TABLES, e["at"])
         if run["id"] in self.runs:
             self._unindex_run(run["id"])
         self.runs[run["id"]] = run
@@ -485,7 +496,9 @@ class Model:
         if task is None:
             return
         self._release_claim(task["id"], e["attempt"])
+        reads = []
         if (task.get("launched") or {}).get("attempt") == e["attempt"]:
+            reads = task["launched"]["prepared"].get("lineage") or []
             del task["launched"]
             if task["status"] == "running":
                 task["status"] = "queued"  # until the outcome below says otherwise
@@ -509,17 +522,17 @@ class Model:
             # Its run was canceled while it ran. An attempt that was already
             # writing still commits: its data landed (§8).
             if outcome == "succeeded" and commit:
-                self._install(task, commit, e)
+                self._install(task, commit, e, reads)
             return
         if outcome == "succeeded":
-            self._install(task, commit or {}, e)
+            self._install(task, commit or {}, e, reads)
             if e.get("more"):
                 self._requeue(task, at)
             else:
                 task["status"] = "succeeded"
                 self._finished(run, task, "succeeded", e["attempt"], at)
         elif outcome == "skipped":
-            self._install(task, commit or {}, e)
+            self._install(task, commit or {}, e, reads)
             task["status"] = "skipped"
             self._finished(run, task, "skipped", e["attempt"], at)
         elif outcome == "failed":
@@ -535,7 +548,11 @@ class Model:
         else:
             raise ValueError(f"unknown attempt outcome {outcome!r}")
 
-    def _install(self, task: dict, commit: dict, e: dict) -> None:
+    def _install(self, task: dict, commit: dict, e: dict, reads=()) -> None:
+        """Install a commit: heads, key indexes, cursor, watermarks. Each
+        output version it makes enters the history, with what it was built
+        from (`reads`: `[output, scope, version, param]`)."""
+
         asset, scope, at = task["asset"], task["scope"], e["finished_at"]
         changed = []
         for name, head in commit.get("heads", {}).items():
@@ -557,6 +574,22 @@ class Model:
                 self.cursors[(asset, scope)] = commit["cursor"]
         for edge, wm in commit.get("watermarks", {}).items():
             self.watermarks[(asset, edge, scope)] = wm
+        for name in changed:
+            head = self.heads[(name, scope)]
+            self._record(
+                "materializations",
+                history.materialization(
+                    name,
+                    asset,
+                    scope,
+                    head,
+                    keys=(commit.get("keys") or {}).get(name),
+                    rows=(commit.get("rows") or {}).get(name),
+                    metadata=(commit.get("metadata") or {}).get(name),
+                ),
+            )
+            for row in history.lineage(name, scope, head, reads):
+                self._record("lineage", row)
         self._pend_onchange(asset, scope, changed)
 
     def _pend_onchange(self, asset: str | None, scope: str, changed: list[str]) -> None:
@@ -678,6 +711,14 @@ class Model:
         head = e["head"]
         self.heads[(e["source"], "")] = {**head, "at": e["at"]}
         self._commit_keys(e["source"], "", e.get("keys"))
+        run = e.get("run")
+        if run is not None:
+            self._record("runs", history.commit_row(run, e["at"]))
+            installed = {**self.heads[(e["source"], "")], "run": run["id"], "attempt": None}
+            self._record(
+                "materializations",
+                history.materialization(e["source"], None, "", installed, keys=e.get("keys")),
+            )
         if before is None or before["ref"].get("version") != head["ref"].get("version"):
             self._pend_onchange(None, "", [e["source"]])
 
@@ -710,11 +751,58 @@ class Model:
         return policy
 
     def _on_RunArchived(self, e):
-        if e["run"] in self.runs:
-            self._unindex_run(e["run"])
-            del self.runs[e["run"]]
-        for asset in e.get("committed") or ():
-            keep = (self.policy(asset) or {}).get("runs")
-            if keep:
-                runs = sorted({*self.retention.get(asset, ()), e["run"]})
-                self.retention[asset] = runs[-int(keep) :]
+        run = self.runs.get(e["run"])
+        if run is None:
+            return
+        self._unindex_run(e["run"])
+        del self.runs[e["run"]]
+        for table, rows in history.run_rows(run, self.manifest).items():
+            for row in rows:
+                self._record(table, row)
+
+    # -- history (§7) ------------------------------------------------------------------
+
+    def _record(self, table: str, row: dict) -> None:
+        self.history_seq += 1
+        self.history_rows.setdefault(table, []).append([self.history_seq, row])
+
+    def _forget(self, runs: set[str], tables, at: float) -> None:
+        """Drop the rows of `runs`: those pending now, those in files once the
+        files are rewritten — until then, the files hide them."""
+
+        for table in tables:
+            column = history.TABLES[table].run
+            rows = self.history_rows.get(table)
+            if rows:
+                self.history_rows[table] = [r for r in rows if r[1].get(column) not in runs]
+            for f in self.history_files.get(table, ()):
+                lo, hi = f["runs"]
+                hit = sorted(r for r in runs if lo is not None and lo <= r <= hi)
+                if hit:
+                    f["deleted"] = sorted({*(f.get("deleted") or ()), *hit})
+                    f.setdefault("deleted_at", at)
+
+    def _on_HistoryFlushed(self, e):
+        for table, f in e["files"].items():
+            self.history_files.setdefault(table, []).append(f)
+            upto = e["upto"][table]
+            self.history_rows[table] = [r for r in self.history_rows.get(table, ()) if r[0] > upto]
+
+    def _on_HistoryCompacted(self, e):
+        for change in e["changes"]:
+            files = self.history_files.get(change["table"], [])
+            removed = set(change["removed"])
+            at = next((i for i, f in enumerate(files) if f["path"] in removed), len(files))
+            kept = [f for f in files if f["path"] not in removed]
+            if change.get("added"):
+                kept.insert(at, change["added"])
+            self.history_files[change["table"]] = kept
+            self.garbage.extend([path, e["at"]] for path in sorted(removed))
+
+    def _on_HistoryImported(self, e):
+        for table, files in e["files"].items():
+            self.history_files[table] = [*files, *self.history_files.get(table, ())]
+        self.history_imported = True
+
+    def _on_RunsDeleted(self, e):
+        self._forget(set(e["runs"]), history.TABLES, e["at"])

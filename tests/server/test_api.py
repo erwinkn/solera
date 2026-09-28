@@ -339,11 +339,11 @@ async def test_partitions_read_scope_records_not_task_history(client, base, engi
     in memory, never reading a run's tasks or an archived run."""
 
     reads = []
-    original_archived = engine.state.archived
+    original = engine.history.query
 
-    async def spy(run_id):
-        reads.append(run_id)
-        return await original_archived(run_id)
+    async def spy(*args, **kwargs):
+        reads.append(args)
+        return await original(*args, **kwargs)
 
     # complete (a succeeded scope) and missing (a key never run)
     await engine.run_until((await engine.submit(["daily"], partitions=["2026-09-18"]))["id"])
@@ -361,7 +361,7 @@ async def test_partitions_read_scope_records_not_task_history(client, base, engi
     await engine.submit(["daily"], partitions=["2026-09-19"], mode="full")
     await engine.submit(["by_site"], partitions=["b"])
 
-    monkeypatch.setattr(engine.state, "archived", spy)
+    monkeypatch.setattr(engine.history, "query", spy)
     daily = (await client.get(f"{base}/partitions/daily")).json()["partitions"]
     flaky = (await client.get(f"{base}/partitions/flaky")).json()["partitions"]
     by_site = (await client.get(f"{base}/partitions/by_site")).json()["partitions"]

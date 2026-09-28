@@ -272,8 +272,9 @@ through the server instead.
 solera serve [--project SPEC] [--insecure]   API + console (default project: the demo)
 solera manifest --project SPEC               print the project manifest
 solera run TARGET... [--partitions latest|all|missing] [--partition KEY]
-           [--upstream] [--full] [--keys EDGE=k1,k2] [--config JSON]
-solera runs / run-show RUN_ID / logs RUN_ID ATTEMPT_ID [--tail N]
+           [--upstream] [--full] [--keys EDGE=k1,k2] [--config JSON] [--tag NAME=VALUE]
+solera runs [--status S] [--asset A] [--tag NAME=VALUE] [-q TEXT] [--before RUN_ID] [--limit N]
+solera run-show RUN_ID / logs RUN_ID ATTEMPT_ID [--tail N]
 solera runs delete RUN_ID                    delete a finished run
 solera runs prune [--before DATE] [--asset A] [--keep N] [--dry-run]
 solera automations [enable|disable|run-now NAME]
@@ -336,12 +337,14 @@ are locked.
 ## Boundaries
 
 This is a feasibility implementation, not a claim of production readiness.
-Metadata transitions serialize through conditional object-store writes;
-catalog/history scans are unpaginated. Remote placements (AWS ECS, Kubernetes
-jobs, Modal) exist behind `SOLERA_*` configuration but see far less exercise
-than `Local`/`Pool`. There is no artifact garbage collector, retained
-historical code image, or multi-replica writer election. Read
-[docs/architecture.md](docs/architecture.md) before extending the backend.
+One engine writes each namespace, through an append-only journal on the
+object store; a second one fences the first rather than sharing the work.
+Remote placements (AWS ECS, Kubernetes jobs, Modal) exist behind `SOLERA_*`
+configuration but see far less exercise than `Local`/`Pool`. There is no
+retained historical code image. Read
+[docs/object-store-state.md](docs/object-store-state.md) for the storage
+design and [docs/architecture.md](docs/architecture.md) before extending the
+backend.
 
 ## License
 

@@ -14,6 +14,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from .engine import Conflict, Engine
+from .history import TERMINAL_RUN, RunFilter
 from .placements.local import load_manifest
 from .state import LostOwnership, State, Unavailable
 
@@ -26,6 +27,7 @@ class RunInput(BaseModel):
     config: dict = Field(default_factory=dict)
     keys: dict | None = None
     by: str | None = Field(default=None, max_length=200)
+    tags: dict[str, str] = Field(default_factory=dict)
 
 
 class PruneInput(BaseModel):
@@ -152,6 +154,7 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
             "project": runtime.manifest["name"],
             "revision": runtime.manifest["revision"],
             "inflight": len(runtime.inflight),
+            "active_runs": sum(1 for r in runtime.m.runs.values() if r["status"] not in TERMINAL_RUN),
             "postgres": bool(os.environ.get("DATABASE_URL")),
             "last_error": runtime.last_error,
         }
@@ -276,10 +279,117 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
         run = await runtime.submit(**fields, command_id=idempotency_key)
         return run or {"status": "skipped-active"}
 
+    def run_filter(request: Request) -> RunFilter:
+        """A run filter from the query string: `?status=failed&status=canceled
+        &asset=feed&tag=team=growth&q=timeout&since=…`. Repeat a field to
+        match any of its values."""
+
+        query = request.query_params
+        f = RunFilter(q=query.get("q") or None)
+        for name in ("status", "asset", "asset_tag", "trigger", "automation", "by", "source", "tag"):
+            setattr(f, name, [v for v in query.getlist(name) if v])
+        for name in ("since", "until"):
+            if query.get(name):
+                setattr(f, name, float(query[name]))
+        return f
+
     @app.get("/api/projects/{p}/runs")
-    async def runs(p: str, request: Request, limit: int = Query(default=50, ge=1, le=500)):
+    async def runs(
+        p: str,
+        request: Request,
+        before: str | None = Query(default=None),
+        limit: int = Query(default=50, ge=1, le=500),
+    ):
         runtime = await project_engine(request, p)
-        return {"runs": await runtime.list_runs(limit)}
+        return await runtime.list_runs(run_filter(request), before=before, limit=limit)
+
+    @app.get("/api/projects/{p}/runs:facets")
+    async def run_facets(p: str, request: Request):
+        runtime = await project_engine(request, p)
+        return await runtime.history.facets(run_filter(request))
+
+    @app.get("/api/projects/{p}/runs:histogram")
+    async def run_histogram(p: str, request: Request, bars: int = Query(default=60, ge=1, le=500)):
+        runtime = await project_engine(request, p)
+        return await runtime.history.histogram(run_filter(request), bars=bars)
+
+    @app.get("/api/projects/{p}/tasks")
+    async def tasks(
+        p: str,
+        request: Request,
+        asset: str | None = None,
+        scope: str | None = None,
+        run: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        before: str | None = None,
+        limit: int = Query(default=100, ge=1, le=1000),
+    ):
+        runtime = await project_engine(request, p)
+        status = [v for v in request.query_params.getlist("status") if v]
+        return await runtime.history.tasks(
+            asset=asset,
+            scope=scope,
+            status=status,
+            run=run,
+            since=since,
+            until=until,
+            before=before,
+            limit=limit,
+        )
+
+    @app.get("/api/projects/{p}/stats")
+    async def stats(
+        p: str,
+        request: Request,
+        since: float | None = None,
+        until: float | None = None,
+        asset: str | None = None,
+    ):
+        runtime = await project_engine(request, p)
+        return await runtime.history.stats(since=since, until=until, asset=asset)
+
+    @app.get("/api/projects/{p}/assets/{name}/history")
+    async def asset_history(
+        p: str,
+        name: str,
+        request: Request,
+        output: str | None = None,
+        scope: str | None = None,
+        before: str | None = None,
+        limit: int = Query(default=200, ge=1, le=5000),
+    ):
+        runtime = await project_engine(request, p)
+        info = runtime.manifest["assets"].get(name)
+        if info is None:
+            raise KeyError(name)
+        names = [o["name"] for o in info["outputs"]]
+        if output is not None:
+            if output not in names:
+                raise KeyError(output)
+            names = [output]
+        page = await runtime.history.materializations(outputs=names, scope=scope, before=before, limit=limit)
+        return {"asset": name, **page}
+
+    @app.get("/api/projects/{p}/outputs/{name}/lineage")
+    async def output_lineage(
+        p: str,
+        name: str,
+        request: Request,
+        scope: str = "",
+        version: str | None = None,
+        direction: str = Query(default="upstream", pattern="^(upstream|downstream)$"),
+        depth: int = Query(default=5, ge=1, le=50),
+    ):
+        runtime = await project_engine(request, p)
+        if version is None:
+            head = runtime.m.heads.get((name, scope))
+            if head is None:
+                raise KeyError(name)
+            version = head["ref"].get("version")
+        return await runtime.history.lineage(
+            name, scope, version, downstream=direction == "downstream", depth=depth
+        )
 
     @app.get("/api/projects/{p}/runs/{run_id}")
     async def run_detail(p: str, run_id: str, request: Request):

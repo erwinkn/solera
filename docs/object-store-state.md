@@ -1,6 +1,6 @@
 # Object-store state: data model
 
-Status: **implemented** (K0, J1–J5), except where a section says otherwise. Replaces the SlateDB persistence and the
+Status: **implemented** (K0, J1–J5, H1), except where a section says otherwise. Replaces the SlateDB persistence and the
 retention design in `storage-redesign.md` §4–§5. Keeps `Incremental`
 edges, per-batch deltas and watermarks from PR #7, and the in-memory
 engine model from PR #8.
@@ -34,7 +34,7 @@ Everything lives under `{root}/{namespace}/`.
 | Journal segment | `control/journal/{seq:020d}.json` | engine | create-only | the checkpoint before the newest covers it |
 | Checkpoint | `control/checkpoints/{seq:020d}.json` | engine | create-only | two newer checkpoints exist |
 | Key index file | `keys/{output}/{scope}/{name}.kx` | harness (delta files), compaction | create-only | no longer in the index and no consumer needs it (§6) |
-| Run record | `runs/{run}/run.json` | engine | written once, when the run ends | retention (§11) |
+| History file | `history/{table}/{ulid}.parquet` | engine | create-only | merged into a bigger file, or rewritten without deleted runs (§7) |
 | Attempt file | `runs/{run}/{attempt}.json` | engine creates it with the spec; the harness overwrites it with spec + result + log index | two writes, one writer each | with its run |
 | Write fence | `runs/{run}/{attempt}.writing` | the harness before it writes, or the engine before it ends the attempt — whichever is first | create-only | with its run |
 | Heartbeat | `runs/{run}/{attempt}.beat` | harness, every 30 s | overwritten | with its run |
@@ -45,8 +45,9 @@ Everything lives under `{root}/{namespace}/`.
 journal since the older one, and a checkpoint is written whenever that
 journal reaches the size of the last checkpoint (§10) — so `control/`
 stays under about three times the engine's state size. `keys/` is bounded
-by live keys plus unconsumed deltas. What grows over time is `runs/`,
-bounded by retention, and user data, which holds only current content.
+by live keys plus unconsumed deltas. What grows over time is `runs/` and
+`history/`, both bounded by retention, and user data, which holds only
+current content.
 
 ```
 {root}/{namespace}/
@@ -60,8 +61,11 @@ bounded by retention, and user data, which holds only current content.
     site_files/alpha/000000000057.kx         ← delta file of batch 57
     site_files/alpha/c01J8ZE2….kx            ← compacted file
     uploads/_/000000000003.kx                ← external source
+  history/
+    runs/01J9A2….parquet                     ← merged: 4,000 runs
+    runs/01J9C7….parquet                     ← one flush
+    tasks/…  attempts/…  materializations/…  lineage/…
   runs/
-    01J8ZB3K…/run.json
     01J8ZB3K…/01J8ZB3M….json                 ← attempt: spec, then spec + result
     01J8ZB3K…/01J8ZB3M….log                  ← gzip blocks
     01J8ZB3K…/01J8ZB3M….writing              ← write fence
@@ -132,13 +136,18 @@ status are derived inside `apply`; they are not events.
 | `AttemptLaunched` | `run`, `task`, `attempt`, `started_at`, `at`, `execution`, `prepared`, `pool?` | the attempt file exists and a placement is about to start it: its claim and scope lock become durable (§8) |
 | `AttemptClaimed` | `attempt`, `worker`, `at` | a pool worker took a launched attempt; no other worker is offered it |
 | `AttemptFinished` | `run`, `task`, `attempt`, `outcome` (`succeeded` \| `failed` \| `skipped` \| `canceled`), `started_at`, `finished_at`, `error?`, `retryable?`, `commit?`, `unsettled?` | records the attempt; on commit, installs heads, cursor, watermarks, and each keyed output's new delta file; `unsettled` keeps the intents of a writer that died (§8) |
-| `SourceCommitted` | `source`, `head`, `keys?`, `at` | installs a source head and its delta file |
+| `SourceCommitted` | `source`, `head`, `keys?`, `at`, `run?` | installs a source head and its delta file; a commit that changed something records `run` in the history (§7) |
 | `IndexCompacted` | `output`, `scope`, `added` [file], `removed` [name], `recount?`, `at` | swaps compacted files into a key index; a recount replaces its count |
 | `IndexTruncated` | `output`, `scope`, `below`, `at` | drops delta log entries below `below` |
 | `GarbageDeleted` | `paths` | forgets index files that were deleted |
 | `AutomationChanged` | `name`, `enabled` | |
 | `AutomationFired` | `name`, `at`, `run` | clears its pending set |
-| `RunArchived` | `run` | drops a finished run from memory once `run.json` is written |
+| `RunArchived` | `run`, `at` | drops a finished run from memory; its rows join the pending history (§7) |
+| `RunReopened` | `run`, `at` | a retry brings a finished run back; its history rows are dropped until it ends again |
+| `HistoryFlushed` | `files` {table: file}, `upto` {table: row seq} | installs one Parquet file per table and drops the rows it holds |
+| `HistoryCompacted` | `changes` [{`table`, `removed` [path], `added?` file}], `at` | swaps merged or purged files in; the removed ones become garbage |
+| `HistoryImported` | `files` | installs the files of the one-time `run.json` import |
+| `RunsDeleted` | `runs`, `at` | drops their pending rows and hides them in files that may hold them |
 
 An attempt that has not launched yet — it is still pinning inputs and
 writing its spec — is **not** in the journal: after a restart its task is
@@ -160,10 +169,10 @@ State
   watermarks   {asset: {edge: {scope: Watermark}}}
   outcomes     {asset: {scope: Outcome}}           # last terminal result per scope
   automations  {name: AutomationState}
-  retention    {asset: [run, …]}                   # finite policies only, oldest first (§11)
   runs         {run: Run}                          # active, or finished and not yet archived
+  history      {files: {table: [File]}, rows: {table: [[seq, row], …]}, seq, imported}   # §7
   unsettled    {output: {scope: [Intent, …]}}      # keyed outputs a dead writer may have half-written (§8)
-  garbage      [[path, at], …]                     # index files no index references any more
+  garbage      [[path, at], …]                     # index and history files nothing references any more
 ```
 
 | Type | Fields | Bounded by |
@@ -173,8 +182,9 @@ State
 | `Watermark` | `batch` (first batch not fully delivered; during a full drain, the head's batch + 1 when the drain began, so changes made while draining arrive afterwards as deltas), `until` (the last batch of a delta window being delivered in pages), `after` (last key delivered inside the window or the full drain), `full` (a full drain is in progress), `fingerprint`, `output` and `up` (the upstream index it reads) | edges × partitions |
 | `Outcome` | `outcome`, `run`, `attempt`, `at` | assets × partitions |
 | `AutomationState` | `enabled`, `last_fired`, `last_run`, `last_revision`, `pending` (set of `[asset, scope]` for OnChange) | automations × partitions |
-| `Run` | `id`, `request` {targets, partitions, mode, config, keys, automation}, `status`, `paused`, `created_at`, `tasks` {task: `Task`} | in-flight work |
+| `Run` | `id`, `request` {targets, partitions, mode, config, keys, automation, tags}, `status`, `paused`, `created_at`, `tasks` {task: `Task`} | in-flight work |
 | `Task` | `status`, `deps`, `ready_at`, `max_attempts`, `attempts` [`Attempt`], `launched?` {`attempt`, `started_at`, `at`, `execution`, `prepared`, `pool?`, `worker?`, `claimed_at?`} | |
+| `File` | `path`, `rows`, `bytes`, `at` [lo, hi] (time column), `runs` [first, last], `deleted?` [run] (hidden until rewritten), `deleted_at?` | files per table: ~log(rows) after merging |
 | `Intent` | `added`, `removed`, `exact`, `files` (the dead attempt's delta files), `run`, `attempt` | writers that died mid-write, until the next commit of that output |
 | `Attempt` | `id`, `outcome`, `started_at`, `finished_at`, `error?`, `outputs?` {output: ref} | |
 
@@ -184,8 +194,8 @@ dependents index.
 
 **Memory only:** the claim of an attempt still preparing (a restart
 dispatches its task again), pool leases, registered workers (they
-re-register on their next heartbeat), a cache of key index blocks, and the
-recent-runs list for the console.
+re-register on their next heartbeat), a cache of key index blocks, and a
+local copy of the history files (§7).
 
 Example (abridged):
 
@@ -208,7 +218,8 @@ Example (abridged):
   "outcomes": {"file_index": {"alpha": {"outcome": "succeeded", "run": "01J8ZB3K…", "attempt": "01J8ZB3M…", "at": 1790074800.0}}},
   "automations": {"site_feed.every.0": {"enabled": true, "last_fired": 1790074866.1,
                   "last_run": "01J8ZC7S…", "last_revision": "c0ffee…", "pending": []}},
-  "retention": {"site_feed": ["01J8Y…", "01J8Z…"]},
+  "history": {"files": {"runs": [{"path": "history/runs/01J9A2….parquet", "rows": 4000, "…": "…"}]},
+              "rows": {"runs": [[311, {"id": "01J9C8…", "status": "succeeded", "…": "…"}]]}, "seq": 311},
   "runs": {"01J8ZC7S…": {"…": "Run"}}
 }
 ```
@@ -319,44 +330,127 @@ merging, lookups over fetched bytes), with I/O through obstore, and a
 pure-Python implementation of the same format as the reference and
 fallback.
 
-## 7. Run record — `runs/{run}/run.json`
+## 7. Run history — `history/{table}/*.parquet`
 
-The finished `Run` from §5, written once when the run reaches a terminal
-status, before `RunArchived`. If the engine crashes in between, the run is
-still in the checkpoint and gets archived again (the write is idempotent).
+What ran and what it made, kept as Parquet files on the object store and
+queried with DuckDB, embedded in the engine. It answers questions like
+"failed runs of `site_feed` tagged `env=prod` last week", "how long does
+`file_index` take at p95, and how long does it wait for a slot", or "which
+input versions built this version of `revenue`".
 
-```json
-{
-  "id": "01J8ZB3K…",
-  "request": {"targets": ["file_index"], "partitions": "all", "mode": "incremental",
-              "config": {}, "keys": null, "automation": null},
-  "status": "succeeded", "created_at": 1790074790.0, "finished_at": 1790074800.0,
-  "tasks": {
-    "file_index:alpha": {"status": "succeeded", "attempts": [
-      {"id": "01J8ZB3M…", "outcome": "succeeded", "started_at": 1790074791.0, "finished_at": 1790074800.0,
-       "outputs": {"file_index": {"output": "file_index", "store": "default", "version": "…", "handle": {"…": "…"}}}}]},
-    "file_index:bravo": {"status": "skipped", "attempts": [{"id": "01J8ZB3N…", "outcome": "skipped"}]}
-  }
-}
+**Tables.** One row per thing that finished:
+
+| Table | One row per | Notable columns |
+|---|---|---|
+| `runs` | finished run or source commit | `status` (`succeeded`, `failed`, `canceled`, `skipped`), `trigger` (`manual`, `automation`, `commit`), `automation`, `by`, `source`, `targets`, `assets`, `committed`, `tags` (map), `task_count`, `failed_count`, `error`, `record` (the full run as JSON) |
+| `tasks` | task of a finished run | `asset`, `scope`, `status`, `ready_at` (its dependencies were done), `started_at`, `finished_at`, `attempts`, `duration`, `executor`, `cpu`, `memory`, `gpu` |
+| `attempts` | attempt | `task`, `n`, `outcome`, `started_at`, `finished_at`, `duration`, `error`, `executor` |
+| `materializations` | output version a commit installed | `output`, `scope`, `version`, `run`, `attempt`, `at`, `batch`, `added`, `removed`, `rows`, `metadata` (JSON) |
+| `lineage` | input version an output version was read from | `output`, `scope`, `version`, `input`, `input_scope`, `input_version`, `param` |
+
+A run where every task was skipped — it launched nothing and wrote
+nothing — is recorded with status `skipped`. Listings hide skipped runs
+unless the filter asks for that status, so a 10-second poller that
+usually finds nothing new does not bury the runs that did something.
+
+A source commit that changed something is a `runs` row with trigger
+`commit`, and a record holding only what nothing else says —
+`{"id", "source", "by", "batch", "upserted", "deleted"}`, the keys listed
+up to 1,000 and counted past that, or `version` for an unkeyed source.
+The source's head points at it (`head.run`).
+
+**Where rows come from.** Rows are born inside `apply`, from the events
+that finish things: `RunArchived` yields a run's `runs`, `tasks` and
+`attempts` rows; `AttemptFinished` with a commit yields a
+`materializations` row per changed output, plus `lineage` rows from the
+input versions pinned in the attempt's spec; `SourceCommitted` yields a
+`runs` row and a `materializations` row. They wait in `State.history.rows`,
+durable in the checkpoint, until a **flush** writes each table's rows as
+one Parquet file (zstd, sorted by the table's time column) and
+`HistoryFlushed` installs them. A flush happens once 10,000 rows are
+pending or the oldest has waited 15 minutes, so a namespace with a run a
+minute writes about 5 small files per quarter hour.
+
+**Merging.** The model keeps each file's row count, time range and run
+range. Files are grouped in size tiers — up to 1,000 rows, then ×4 per
+tier — and four neighbours of one tier are merged into one, up to 1M rows
+per file, on a worker thread (`HistoryCompacted`). The file count stays
+logarithmic in the history's size: a year of a run per minute (~0.5M runs)
+is a few dozen `runs` files.
+
+**Deleting runs.** `RunsDeleted` drops the runs' pending rows at once and
+adds the runs to the `deleted` list of every file whose run range covers
+them; queries filter them out (`WHERE run NOT IN (…)`). A file is
+rewritten without them after an hour, or as soon as it hides 1,000 runs,
+and the old file becomes garbage. A flush or merge that raced a deletion
+is discarded rather than installed, so a deleted run never comes back.
+
+**Queries.** Each query opens a fresh in-memory DuckDB connection on a
+worker thread, with one view per table over three parts:
+
+- the Parquet files, skipped when their time or run range cannot match
+  (a query for last week's runs never opens last year's files);
+- the pending rows, from memory;
+- for `runs`, `tasks` and `attempts`, the runs still in progress, so a run
+  appears in listings the moment it is submitted.
+
+History files never change once written. With `file://` state, DuckDB
+reads them in place. With other stores, they are copied once to a local
+cache, then read from there.
+
+**Tags and metadata.** Runs carry string tags, from any of three places:
+
+```python
+solera run revenue --tag env=prod --tag ticket=OPS-42     # CLI
+POST /api/projects/{p}/runs  {"targets": ["revenue"], "tags": {"env": "prod"}}
+Automation(trigger=Every(3600), tags={"team": "growth"})   # its runs carry them
 ```
 
-A source commit that changes something is recorded as a run with no
-tasks. Its `run.json` holds only what nothing else says:
+Assets declare tags too (`@asset(tags={"team": "growth"})`), and a run
+filter can keep runs that ran any asset with a given tag. An attempt
+records facts about the versions it writes, to chart across versions:
 
-```json
-{"id": "01J9QX…", "source": "uploads", "by": "sharepoint-webhook", "batch": 12,
- "upserted": ["u-7"], "deleted": []}
+```python
+@asset
+def orders(ctx):
+    rows = fetch()
+    ctx.metadata(rows=len(rows), source="shop")           # its only output
+    return rows
+
+@asset(outputs=[Output("model"), Output("report")])
+def train(ctx):
+    return Result(..., metadata={"model": {"auc": 0.91}})  # per output
 ```
 
-The time is the id's (a ULID). `by` is whatever the caller passed, else
-the channel (`api`, `cli`). `upserted` and `deleted` list the changed keys,
-or count them past 1,000. An unkeyed source records `version` instead. The
-source's head points at the run (`head.run`). Runs submitted by hand carry
-the same `by` in their request; automation runs name their `automation`.
+Metadata is a JSON object per output version, at most 64 KB (larger is
+dropped, with a warning). `rows` is filled in without asking: the live key
+count of a keyed output, else the length of a returned list.
 
-A run where every task was skipped launched nothing and wrote nothing, so
-it is **not archived**; it only appears in the console's in-memory recent
-list.
+**Reading it.**
+
+| Question | API | CLI |
+|---|---|---|
+| runs, filtered, newest first | `GET /runs?status=failed&asset=site_feed&tag=env=prod&q=timeout&since=…&limit=50` → `{runs, next}` | `solera runs --status failed --asset site_feed --tag env=prod -q timeout` |
+| the next page | `GET /runs?…&before={next}` | `solera runs … --before {next}` |
+| value counts per filter field | `GET /runs:facets?…` → `{status: [{value, count}], asset, tag, trigger, automation, by, source}` | |
+| runs over time, per status | `GET /runs:histogram?…&bars=60` → `{bucket, since, until, bars: [{t, counts}]}` | |
+| finished tasks | `GET /tasks?asset=&status=&run=&since=&before=` | |
+| p50/p95 duration and wait, failure counts, compute hours, per asset and per executor | `GET /stats?since=&asset=` | |
+| an asset's versions and their metadata | `GET /assets/{name}/history?output=&scope=&before=` | |
+| what a version was built from, or what was built from it | `GET /outputs/{name}/lineage?scope=&version=&direction=upstream\|downstream&depth=5` | |
+
+Filter fields combine with AND; repeating one field (`status=failed&status=canceled`)
+matches any of its values. A facet counts its values with every *other*
+field applied, so the console can show "12 failed, 340 succeeded" while
+failed is selected. Histogram buckets are the smallest of 1 min, 5 min,
+15 min, 1 h, 3 h, 6 h, 12 h, 1 d, 7 d, 30 d that fit the span in the
+requested number of bars. `next` is a cursor: the last run id of the page.
+
+**Import.** Namespaces written before the history existed have a
+`runs/{run}/run.json` per finished run. The first engine that starts
+imports them into the history (`HistoryImported`), once, then deletes
+them. Their attempts' outputs become `materializations` rows; lineage was
+not recorded then.
 
 ## 8. Attempt files — `runs/{run}/{attempt}.json` and `.log`
 
@@ -527,7 +621,9 @@ journal after it are kept so a newest checkpoint that turns out
 unreadable can be recovered from.
 
 **Run lifecycle.** submit → `RunSubmitted` · attempts → `AttemptFinished`
-· terminal → write `run.json` → `RunArchived`.
+· terminal → `RunArchived` (its rows join the pending history) · flush →
+`HistoryFlushed` · merge → `HistoryCompacted` · retention →
+`DELETE runs/{run}/` and `RunsDeleted`.
 
 **Attempt lifecycle.** claim (memory) → pin and write the spec →
 `AttemptLaunched` → [pool: `AttemptClaimed`] → the harness takes the
@@ -553,14 +649,20 @@ expired"). The only runs that cannot be deleted are active ones.
 Retention applies to runs only: output data holds no history (§9), so
 there is nothing else to expire.
 
-**Run records.** For each asset with a `runs` policy, the engine keeps the
-ids of the newest `runs` runs in which it succeeded (`State.retention`).
-An asset's **horizon** is `now − days`, or the time of the `runs`-th newest
-of those runs; with both, the earlier (whichever keeps more). Every
-`retention_interval` (60 s) the engine deletes — `DELETE runs/{run}/` —
-each finished run older than the horizon of every asset it ran. A run of
-an asset that keeps everything is kept. The engine lists `runs/` once when
-it starts and keeps that list in memory.
+**Runs.** An asset's **horizon** is `now − days`, or the creation time of
+the `runs`-th newest run that committed to it; with both, the earlier
+(whichever keeps more). Every `retention_interval` (60 s) the engine asks
+the history (§7) for those times and for the finished runs older than the
+latest horizon, and deletes each run older than the horizon of every asset
+it ran: its directory — `DELETE runs/{run}/` — and its history rows
+(`RunsDeleted`). A run of an asset that keeps everything is kept; a source
+commit or a run with no tasks follows the project default. Nothing about
+retention is held in memory.
+
+For example, with `site_feed` at `Retention(days=1)` and `file_index` at
+`Retention(runs=90)`: a two-day-old run of only `site_feed` goes; a
+two-day-old run of both stays while it is among the 90 newest that
+committed to `file_index`.
 
 **Bounding data.** Stores keep only current content, so a keyed output is
 bounded by its live keys, and a value by its size. What grows is an
@@ -604,6 +706,8 @@ POST   /api/projects/{p}/runs:prune   {"before", "asset", "keep", "dry_run"}
 | refusing a commit whose inputs moved after pinning | the commit stands: it delivered what it pinned |
 | automation commit watermark | a pending set of `(asset, scope)` |
 | per-automation retention, automation names in run ids | per-asset retention; run id = ULID |
+| `runs/{run}/run.json`, the in-memory recent-runs list and run-id listing, `State.retention` | the run history: Parquet tables queried with DuckDB (§7) |
+| skipped runs kept only in memory | recorded with status `skipped`, hidden by default |
 | pinned runs | nothing but active runs is protected; current state is independent of runs |
 | HTTP-only attempt I/O for pool workers | one uniform attempt-file channel |
 | JsonStore, BlobStore, per-attempt data objects | FileStore / S3Store: one object per value, partition, key or batch, overwritten in place |
@@ -633,4 +737,22 @@ Built on PR #8's branch.
 | J2 model | events + `apply`; engine and API on `State`; SlateDB removed | full suite; restart tests; a counting object store asserts 0 GETs on plan and API paths |
 | J3 key index | `solera.keys` in the harness, delta files, local compaction + `engine_executor`, `key_cache`, full delivery through the index, sources on the index, aliases | 10k-batch soak: object operations per commit stay flat; `Keys`-only store contract |
 | J4 runs and retention | `runs/` layout, archive, per-asset retention, CLI and API | soak with `Retention(days=1)` on a 10-second poller keeps `runs/` bounded |
+| H1 run history | Parquet history tables, flush, merge, deletion, `run.json` import; filters, facets, histogram, stats, asset history, lineage; tags and metadata; console runs explorer, asset history and lineage | soak: request count per run stays flat, retention keeps the history bounded |
 | J5 fence and stores | durable launches, adoption, heartbeats, write fence, unsettled outputs; FileStore / S3Store; no expiry | a worker killed mid-write is repaired by the next attempt; a restarted engine adopts a running attempt |
+
+## 15. Future ideas
+
+Not built; recorded because DuckDB in the engine makes them cheap.
+
+- **Data preview.** DuckDB reads Parquet, CSV and JSON from S3 or local
+  files directly, so the console could show the first rows of an output
+  version, its column types, and summary statistics (`SUMMARIZE`) without
+  a store-specific reader.
+- **A read-only SQL page, and `solera sql`.** Arbitrary queries over the
+  history tables, for questions the built-in views do not answer. It must
+  be sandboxed: a connection holding only the history views, with
+  `enable_external_access=false` so a query cannot read other files or
+  URLs, plus memory and time limits.
+- **A DuckDB store.** A `Store` that keeps outputs as DuckDB or Parquet
+  tables, for assets that are naturally tabular and want SQL between
+  steps.

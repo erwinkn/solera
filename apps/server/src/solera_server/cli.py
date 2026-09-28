@@ -93,8 +93,17 @@ def main():
     run.add_argument("--upstream", action="store_true")
     run.add_argument("--config", default="{}", help="Run configuration as a JSON object")
     run.add_argument("--keys", action="append", default=[], help="EDGE=full or EDGE=k1,k2")
+    run.add_argument("--tag", action="append", default=[], help="Label the run: NAME=VALUE (repeatable)")
 
-    runs = commands.add_parser("runs", help="List, delete or prune runs (§11)", parents=[common])
+    runs = commands.add_parser("runs", help="List, delete or prune runs (§7, §11)", parents=[common])
+    runs.add_argument("--status", action="append", default=[], help="Only runs with this status (repeatable)")
+    runs.add_argument("--asset", action="append", default=[], help="Only runs of this asset (repeatable)")
+    runs.add_argument("--tag", action="append", default=[], help="Only runs tagged NAME=VALUE, or NAME")
+    runs.add_argument("-q", dest="q", help="Only runs whose error contains this, or whose id starts with it")
+    runs.add_argument(
+        "--before", dest="cursor", help="Only runs older than this run id (the previous page's `next`)"
+    )
+    runs.add_argument("--limit", type=int, default=50)
     runs_sub = runs.add_subparsers(dest="runs_command")
     runs_delete = runs_sub.add_parser("delete", help="Delete a finished run")
     runs_delete.add_argument("run_id")
@@ -249,6 +258,25 @@ def _parse_keys(specs):
     return out
 
 
+def _parse_tags(specs) -> dict[str, str]:
+    tags = {}
+    for spec in specs:
+        name, eq, value = spec.partition("=")
+        if not eq:
+            raise SystemExit(f"--tag {spec!r}: expected NAME=VALUE")
+        tags[name] = value
+    return tags
+
+
+def _runs_query(args) -> dict:
+    query = {"status": args.status, "asset": args.asset, "tag": args.tag, "limit": args.limit}
+    if args.q:
+        query["q"] = args.q
+    if args.cursor:
+        query["before"] = args.cursor
+    return query
+
+
 def _prune_payload(args):
     import datetime as dt
 
@@ -284,6 +312,7 @@ async def _remote(args, parser):
                 "config": config,
                 "keys": _parse_keys(args.keys),
                 "by": "cli",
+                "tags": _parse_tags(args.tag),
             }
             response = await client.post(f"{base}/runs", json=body)
             response.raise_for_status()
@@ -304,9 +333,9 @@ async def _remote(args, parser):
             response.raise_for_status()
             print(json.dumps(response.json(), indent=2))
         elif args.command == "runs":
-            response = await client.get(f"{base}/runs")
+            response = await client.get(f"{base}/runs", params=_runs_query(args))
             response.raise_for_status()
-            print(json.dumps(response.json()["runs"], indent=2))
+            print(json.dumps(response.json(), indent=2))
         elif args.command == "run-show":
             response = await client.get(f"{base}/runs/{args.run_id}")
             response.raise_for_status()
@@ -351,6 +380,7 @@ async def _local(args, parser):
                 config=config,
                 keys=_parse_keys(args.keys),
                 by="cli",
+                tags=_parse_tags(args.tag),
             )
             if run is None:
                 print(json.dumps({"status": "skipped-active"}))
@@ -365,7 +395,12 @@ async def _local(args, parser):
         elif args.command == "runs" and args.runs_command == "prune":
             print(json.dumps(await runtime.prune(**_prune_payload(args)), indent=2))
         elif args.command == "runs":
-            print(json.dumps(await runtime.list_runs(), indent=2))
+            from .history import RunFilter
+
+            query = _runs_query(args)
+            f = RunFilter(status=query["status"], asset=query["asset"], tag=query["tag"], q=query.get("q"))
+            page = await runtime.list_runs(f, before=query.get("before"), limit=query["limit"])
+            print(json.dumps(page, indent=2))
         elif args.command == "run-show":
             print(json.dumps(await runtime.run_detail(args.run_id), indent=2))
         elif args.command == "logs":

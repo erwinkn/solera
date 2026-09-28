@@ -1,11 +1,12 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { Bot, Cpu, Layers, MonitorSmartphone } from "lucide-react";
-import { Empty, Eyebrow, PageHeader } from "@/components/common";
+import { useState } from "react";
+import { Empty, Eyebrow, PageHeader, Segmented } from "@/components/common";
 import { useQuery } from "@/lib/api";
-import { time } from "@/lib/format";
+import { count, failures, seconds, time } from "@/lib/format";
 import { useWorkspace } from "@/lib/workspace";
 import { cn } from "cn";
-import type { EnvironmentInfo, PoolWorker } from "@/lib/types";
+import type { EnvironmentInfo, PoolWorker, Stats, StatsRow } from "@/lib/types";
 
 export const Route = createFileRoute("/executors")({
   component: ExecutorsPage,
@@ -116,6 +117,8 @@ function ExecutorsPage() {
         })}
       </div>
 
+      <ExecutorStats />
+
       <div className="flex flex-col gap-3">
         <div className="flex flex-col gap-0.5">
           <Eyebrow>Pool workers</Eyebrow>
@@ -183,5 +186,112 @@ function ExecutorsPage() {
         )}
       </div>
     </section>
+  );
+}
+
+const RANGES = { "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400 } as const;
+type Range = keyof typeof RANGES;
+
+function hours(value: number | null) {
+  if (value == null) return "—";
+  return value >= 10
+    ? count(Math.round(value))
+    : value.toFixed(value >= 1 ? 1 : 2);
+}
+
+/** Finished tasks from the run history, per executor: volume, failures,
+    how long tasks took and waited for a slot, and the compute they used. */
+function ExecutorStats() {
+  const { base } = useWorkspace();
+  const [range, setRange] = useState<Range>("7d");
+  // Rounded to the minute so the polled path stays stable.
+  const minute = Math.floor(Date.now() / 60000) * 60;
+  const stats = useQuery<Stats>(
+    base ? `${base}/stats?since=${minute - RANGES[range]}` : null,
+    15000,
+  );
+  const rows = stats.data?.executors ?? [];
+  const columns: [string, (r: StatsRow) => string, string?][] = [
+    ["tasks", (r) => count(r.tasks)],
+    ["failed", (r) => failures(r.failed, r.tasks)],
+    ["p50", (r) => seconds(r.p50), "Median duration of succeeded tasks"],
+    ["p95", (r) => seconds(r.p95)],
+    ["wait p50", (r) => seconds(r.wait_p50), "From ready to started"],
+    ["wait p95", (r) => seconds(r.wait_p95)],
+    ["hours", (r) => hours(r.hours), "Wall-clock task hours"],
+    ["cpu·h", (r) => hours(r.cpu_hours), "Requested cpus × hours"],
+    ["GB·h", (r) => hours(r.gb_hours), "Requested memory × hours"],
+    ["gpu·h", (r) => hours(r.gpu_hours)],
+  ];
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex items-end justify-between gap-3">
+        <div className="flex flex-col gap-0.5">
+          <Eyebrow>Workload</Eyebrow>
+          <p className="text-sm text-muted-foreground">
+            Finished tasks per executor, from the run history.
+          </p>
+        </div>
+        <Segmented
+          ariaLabel="Workload range"
+          value={range}
+          onChange={setRange}
+          options={(Object.keys(RANGES) as Range[]).map((r) => ({
+            value: r,
+            label: r,
+          }))}
+        />
+      </div>
+      {stats.data && !rows.length ? (
+        <Empty title="No finished tasks">
+          Nothing finished in the last {range}.
+        </Empty>
+      ) : (
+        <div className="overflow-x-auto rounded-xl border bg-card">
+          <table className="w-full text-xs" aria-label="Workload per executor">
+            <thead>
+              <tr className="border-b text-muted-foreground">
+                <th className="px-3 py-2 text-left font-medium">executor</th>
+                {columns.map(([label, , title]) => (
+                  <th
+                    key={label}
+                    title={title}
+                    className="px-3 py-2 text-right font-medium whitespace-nowrap"
+                  >
+                    {label}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => (
+                <tr
+                  key={row.executor}
+                  data-executor={row.executor}
+                  className="border-b last:border-0"
+                >
+                  <td className="px-3 py-2 font-mono whitespace-nowrap">
+                    {row.executor}
+                  </td>
+                  {columns.map(([label, cell]) => (
+                    <td
+                      key={label}
+                      className={cn(
+                        "px-3 py-2 text-right font-mono whitespace-nowrap tabular-nums",
+                        label === "failed" &&
+                          row.failed > 0 &&
+                          "text-red-600 dark:text-red-400",
+                      )}
+                    >
+                      {cell(row)}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
   );
 }

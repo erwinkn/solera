@@ -19,6 +19,7 @@ import {
   SheetTitle,
 } from "@/components/ui/sheet";
 import { Switch } from "@/components/ui/switch";
+import { AssetHistory } from "@/components/asset-history";
 import { Eyebrow, ErrorNotice } from "@/components/common";
 import { request, useAction, useQuery } from "@/lib/api";
 import { time } from "@/lib/format";
@@ -570,6 +571,8 @@ export function AssetSheet() {
               opens its last attempt.
             </p>
           </section>
+
+          <AssetHistory key={asset.name} asset={asset} scopes={scopes} />
 
           <section className="flex flex-col gap-2">
             <SectionLabel>Automations</SectionLabel>

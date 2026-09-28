@@ -7,7 +7,7 @@ import {
 } from "react";
 import type { ReactNode } from "react";
 import { useQuery } from "./api";
-import type { CatalogAsset, Diagnostics, Run } from "./types";
+import type { CatalogAsset, Diagnostics } from "./types";
 
 export type Selection =
   { kind: "asset"; name: string } | { kind: "run"; id: string } | null;
@@ -17,7 +17,6 @@ interface Workspace {
   /** `/projects/{name}` — the API prefix for every project-scoped call. */
   base: string | null;
   assets: CatalogAsset[];
-  runs: Run[];
   error: Error | null;
   refresh: () => void;
   selection: Selection;
@@ -33,7 +32,7 @@ interface Workspace {
 const WorkspaceContext = createContext<Workspace | null>(null);
 
 export function WorkspaceProvider({ children }: { children: ReactNode }) {
-  const diagnostics = useQuery<Diagnostics>("/diagnostics", 10000);
+  const diagnostics = useQuery<Diagnostics>("/diagnostics", 3000);
   const base = diagnostics.data
     ? `/projects/${diagnostics.data.project}`
     : null;
@@ -41,7 +40,6 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     base ? `${base}/assets` : null,
     2000,
   );
-  const runs = useQuery<{ runs: Run[] }>(base ? `${base}/runs` : null, 1500);
   const [selection, setSelection] = useState<Selection>(null);
   const [checked, setChecked] = useState<string[]>([]);
   const [materializeTargets, setMaterializeTargets] = useState<string[] | null>(
@@ -61,15 +59,13 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   const refresh = useCallback(() => {
     diagnostics.refresh();
     catalog.refresh();
-    runs.refresh();
-  }, [diagnostics.refresh, catalog.refresh, runs.refresh]);
+  }, [diagnostics.refresh, catalog.refresh]);
   const value = useMemo<Workspace>(
     () => ({
       diagnostics: diagnostics.data ?? null,
       base,
       assets: catalog.data?.assets ?? [],
-      runs: runs.data?.runs ?? [],
-      error: diagnostics.error ?? catalog.error ?? runs.error,
+      error: diagnostics.error ?? catalog.error,
       refresh,
       selection,
       select,
@@ -86,8 +82,6 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       base,
       catalog.data,
       catalog.error,
-      runs.data,
-      runs.error,
       refresh,
       selection,
       select,

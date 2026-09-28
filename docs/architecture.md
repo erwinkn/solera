@@ -453,13 +453,24 @@ on the `(asset, scope)` record, and queued or running tasks are indexed per
 scope. Views such as the partition grid read those two things; nothing
 scans task history.
 
+**History.** Everything that finishes — runs, tasks, attempts, output
+versions with their metadata, and the input versions each was built from —
+lands in the run history: Parquet tables under `history/`, queried with an
+embedded DuckDB (object-store-state.md §7). It serves run listings with
+filters, facets and a time histogram, operations stats (p50/p95 duration
+and queue wait, failure rates, compute hours per executor), an asset's
+version timeline, and lineage in both directions. Runs carry tags
+(`solera run --tag env=prod`, `"tags"` in the API, `Automation(tags=…)`);
+assets carry tags too (`@asset(tags=…)`); an attempt records per-version
+metadata with `ctx.metadata(rows=…, auc=…)` or `Result(metadata=…)`.
+
 **Retention.** `@asset(retention=Retention(days=…, runs=…))` bounds an
 asset's history; `Project(retention=…)` sets the default and
 `Retention(forever=True)` opts out of it (object-store-state.md §11). Current
 state — heads, key indexes, cursors, watermarks — never depends on runs and
 never expires. Every `retention_interval` (60 s) the engine deletes finished
-runs (`runs/{run}/`: the run record, attempt files and logs) that every asset
-they ran has let go of; only runs in progress are protected. Data never
+runs — their attempt files and logs under `runs/{run}/`, and their history
+rows — that every asset they ran has let go of; only runs in progress are protected. Data never
 expires: stores hold current content only.
 `solera runs delete RUN` and `solera runs prune [--before] [--asset] [--keep]
 [--dry-run]` (and `DELETE /runs/{run}`, `POST /runs:prune`) delete runs by hand.
@@ -728,7 +739,8 @@ A bare `DataFrame` to a `primary_key` output is replace, not a `Patch`.
 
 **Later** (specified when a workload demands it): `route=` broadcast
 optimization for `Incremental`; checks and conditions (`when=`); `OnRunStatus`;
-trigger composition; delta-log compaction for very long histories; console data preview.
+trigger composition; delta-log compaction for very long histories; data preview, a read-only SQL
+page and a DuckDB store (object-store-state.md §15).
 
 **Non-goals:** cycles (DAG only, including self-triggers; loop inside a
 producer); dynamic topology (the manifest is static per

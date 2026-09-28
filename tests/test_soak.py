@@ -154,7 +154,7 @@ async def test_soak(tmp_path, monkeypatch):
     # Finished runs leave memory for runs/.
     assert runs_in_memory_peak <= 2
     await engine.tick()
-    assert len(await state.archived_ids()) == submitted
+    assert len(await history_ids(engine)) == submitted
 
     # keys/ is bounded by live keys and the log the consumer still needs.
     assert max(keys[len(keys) // 2 :]) <= 2 * max(keys[: len(keys) // 2]) + 64 * 1024, keys
@@ -199,11 +199,20 @@ async def test_soak(tmp_path, monkeypatch):
     await state.close()
 
 
+async def history_ids(engine) -> list[str]:
+    """Every finished run the history holds."""
+
+    def work(con):
+        return [r[0] for r in con.execute("SELECT id FROM runs").fetchall()]
+
+    return await engine.history.query(work, ("runs",), live=False)
+
+
 async def test_soak_with_retention(tmp_path, monkeypatch):
     """J4 gate (docs/object-store-state.md §11): the demo under
     `Retention(days=1)`, its 10-second poller driven by a fake clock that
     steps ten minutes a run, so a day passes every 144 runs. Once the first
-    day has gone by, `runs/` stops growing: every run past the
+    day has gone by, the history stops growing: every run past the
     horizon is deleted — while each head still loads, and a consumer added
     afterwards gets everything. Data in stores never expires."""
 
@@ -243,7 +252,7 @@ async def test_soak_with_retention(tmp_path, monkeypatch):
         await engine.run_until((await engine.submit(["sites"]))["id"], timeout=1e9)
 
     runs_total = max(300, BATCHES // 2)
-    samples = []  # (run, run directories)
+    samples = []  # (run, runs in the history)
     for i in range(runs_total):
         clock[0] += 600
         detail = await engine.run_until(
@@ -255,16 +264,15 @@ async def test_soak_with_retention(tmp_path, monkeypatch):
             assert (await engine.run_until(run["id"], timeout=1e9))["request"]["status"] == "succeeded"
         await engine.tick()
         if (i + 1) % 25 == 0:
-            run_dirs = len(await state.archived_ids())
-            samples.append((i + 1, run_dirs))
+            samples.append((i + 1, len(await history_ids(engine))))
 
-    print(f"\nretention soak: {runs_total} runs, samples (run, run dirs): {samples}")
+    print(f"\nretention soak: {runs_total} runs, samples (run, runs kept): {samples}")
     steady = [s for s in samples if s[0] >= 200]  # well past the first day (144 runs)
     assert steady, "the soak must run past the retention horizon"
     first, peak = steady[0][1], max(s[1] for s in steady)
     assert peak <= 1.2 * first + 50, [s[1] for s in steady]
     # Runs older than a day are gone; the newest day's are all there.
-    oldest = min(ulid_time(r) for r in await state.archived_ids())
+    oldest = min(ulid_time(r) for r in await history_ids(engine))
     assert oldest >= clock[0] - 86400 - 1200
 
     # Every head still loads.

@@ -47,6 +47,18 @@ def _jsonable(value: Any, where: str) -> Any:
     return value
 
 
+def _tags(tags: dict | None, where: str) -> dict[str, str]:
+    """Labels to find things by (§7): short names without `=`, string values."""
+
+    tags = dict(tags or {})
+    for key, value in tags.items():
+        if not isinstance(key, str) or not key or "=" in key or len(key) > 64:
+            raise RegistrationError(f"{where}: tag names are 1–64 characters without '='")
+        if not isinstance(value, str) or len(value) > 256:
+            raise RegistrationError(f"{where}: tag {key!r} needs a string value of at most 256 characters")
+    return dict(sorted(tags.items()))
+
+
 # ---------------------------------------------------------------------------
 # Refs (§3)
 # ---------------------------------------------------------------------------
@@ -271,10 +283,12 @@ UNSET = _Unset()
 
 @dataclass(frozen=True)
 class Result:
-    """Multi-output return: `outputs` plus an optional `cursor` (§2)."""
+    """Multi-output return: `outputs` plus an optional `cursor` (§2), and
+    `metadata` per output to record with the versions written (§7)."""
 
     outputs: dict[str, Any]
     cursor: Any = UNSET
+    metadata: dict[str, dict] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -541,6 +555,7 @@ class Automation:
         upstream: bool = False,
         config: dict | None = None,
         keys: dict | None = None,
+        tags: dict[str, str] | None = None,
     ):
         if trigger is None:
             raise RegistrationError("Automation() requires a trigger (§11)")
@@ -551,6 +566,7 @@ class Automation:
         self.name, self.targets, self.trigger = name, targets, trigger
         self.enabled, self.partitions, self.mode = enabled, partitions, mode
         self.upstream, self.config, self.keys = upstream, config, keys
+        self.tags = _tags(tags, f"Automation {name or ''}".strip())
 
 
 def AutoRefresh(**kwargs) -> Automation:
@@ -683,10 +699,12 @@ class Asset:
         retention: Retention | None = None,
         automations: Any = (),
         aliases: tuple | list = (),
+        tags: dict[str, str] | None = None,
     ):
         self.fn = fn
         self.name = fn.__name__
         self.aliases = tuple(str(a) for a in aliases)
+        self.tags = _tags(tags, self.name)
         if outputs is None:
             outputs = (Output(fn.__name__),)
         elif isinstance(outputs, Output):
@@ -1164,6 +1182,7 @@ class Project:
                 "upstream": bool(auto.upstream),
                 "config": auto.config,
                 "keys": auto.keys,
+                "tags": auto.tags,
                 "watched": watched,
             }
 
@@ -1200,6 +1219,7 @@ class Project:
                 "on_version_change": asset.on_version_change,
                 "retention": asset.retention.spec() if asset.retention else None,
                 "aliases": list(asset.aliases),
+                "tags": asset.tags,
                 "code_hash": _code_hash(asset.fn),
                 "doc": inspect.getdoc(asset.fn) or "",
                 "types": {

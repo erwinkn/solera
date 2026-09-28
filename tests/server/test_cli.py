@@ -82,7 +82,7 @@ def test_local_run_and_reads(project_file, state_url, capsys, monkeypatch):
     run_id = detail["request"]["id"]
 
     runs = cli(monkeypatch, capsys, "--state-url", state_url, "runs")
-    assert run_id in {r["id"] for r in runs}
+    assert run_id in {r["id"] for r in runs["runs"]}
 
     shown = cli(monkeypatch, capsys, "--state-url", state_url, "run-show", run_id)
     assert shown["request"]["id"] == run_id and shown["tasks"]
@@ -95,7 +95,7 @@ def test_local_run_and_reads(project_file, state_url, capsys, monkeypatch):
     assert dry == {"deleted": [run_id], "dry_run": True}
     deleted = cli(monkeypatch, capsys, "--state-url", state_url, "runs", "delete", run_id)
     assert deleted == {"deleted": [run_id]}
-    assert run_id not in {r["id"] for r in cli(monkeypatch, capsys, "--state-url", state_url, "runs")}
+    assert run_id not in {r["id"] for r in cli(monkeypatch, capsys, "--state-url", state_url, "runs")["runs"]}
 
     autos = cli(monkeypatch, capsys, "--state-url", state_url, "automations")
     assert isinstance(autos, list)
@@ -179,7 +179,7 @@ def test_remote_run_and_reads(server, project_file, capsys, monkeypatch):
     run_id = detail["request"]["id"]
 
     runs = cli(monkeypatch, capsys, "runs")
-    assert run_id in {r["id"] for r in runs}
+    assert run_id in {r["id"] for r in runs["runs"]}
 
     shown = cli(monkeypatch, capsys, "run-show", run_id)
     assert shown["request"]["id"] == run_id

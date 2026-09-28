@@ -31,6 +31,7 @@ from solera.keys.index import IndexState, KeyIndex, Options, key_bytes, key_str
 from solera.keys.io import ObjectIO, key_cache
 from solera.sdk import TimePartitions, canonical_partition, digest, split_partition
 
+from .history import MAX_METADATA, History, RunFilter
 from .model import TERMINAL_RUN
 from .placements import PlacementContext, Registry
 from .state import Conflict, LostOwnership, State
@@ -52,6 +53,20 @@ class NonRetryable(RuntimeError):
     """A dispatch-time failure no retry will fix (§8: full run required, …)."""
 
 
+def check_tags(tags) -> dict[str, str]:
+    """Run tags: up to 32 short string pairs."""
+
+    tags = tags or {}
+    if not isinstance(tags, dict) or len(tags) > 32:
+        raise ValueError("tags must be an object of at most 32 entries")
+    for key, value in tags.items():
+        if not isinstance(key, str) or not isinstance(value, str) or not key or "=" in key:
+            raise ValueError("tags map non-empty names without '=' to strings")
+        if len(key) > 64 or len(value) > 256:
+            raise ValueError("A tag name is at most 64 characters, its value at most 256")
+    return dict(sorted(tags.items()))
+
+
 class Engine:
     def __init__(
         self,
@@ -69,6 +84,7 @@ class Engine:
         recount_interval: float = 3600.0,
         maintenance_concurrency: int = 2,
         retention_interval: float = 60.0,
+        history: History | None = None,
     ):
         import time
 
@@ -102,13 +118,9 @@ class Engine:
         self._recounted: dict[tuple, float] = {}
         self._checked: dict[tuple, IndexState] = {}
         self._io: ObjectIO | None = None
-        # Retention (§11), memory only: archived run ids oldest first (listed
-        # once, then kept up to date) and the assets each one ran.
+        self.history = history or History(state, clock=self.clock)
         self.retention_interval = retention_interval
         self._swept = -math.inf
-        self._run_index: list[str] | None = None
-        self._run_assets_indexed: set[str] = set()
-        self._run_assets: dict[str, list[str]] = {}
         self._set_dims = {
             dim["output"]
             for a in manifest["assets"].values()
@@ -141,6 +153,7 @@ class Engine:
                     "at": self.clock(),
                 }
             )
+        await self.history.backfill()
 
     async def start(self):
         """Start the eval loop. Its first tick adopts the attempts launched
@@ -169,6 +182,7 @@ class Engine:
         for job in list(self.maintaining.values()):
             job.cancel()
         await asyncio.gather(*self.maintaining.values(), return_exceptions=True)
+        await self.history.stop()
 
     async def _loop(self):
         while not self._stopping:
@@ -181,7 +195,8 @@ class Engine:
             await asyncio.sleep(self.eval_interval)
 
     async def tick(self):
-        """One evaluation pass: adoption, dispatch, automations, archiving."""
+        """One evaluation pass: adoption, dispatch, automations, archiving,
+        and upkeep of key indexes and the history."""
 
         self._adopt()
         await self._dispatch_due()
@@ -189,6 +204,7 @@ class Engine:
         await self._archive_due()
         await self._maintain_indexes()
         await self._retention_sweep()
+        await self.history.tick()
 
     async def run_until(self, run_id: str, timeout: float = 120.0):
         """Tick until the run reaches a terminal status (CLI and tests)."""
@@ -196,7 +212,7 @@ class Engine:
         deadline = self.clock() + timeout
         while self.clock() < deadline:
             await self.tick()
-            run = self.m.runs.get(run_id) or await self.state.archived(run_id)
+            run = self.m.runs.get(run_id) or await self.history.run(run_id)
             if run and run["status"] in TERMINAL:
                 # Wait only on this run's attempts — unrelated pool-placed runs
                 # may hold inflight waiters until a worker claims them.
@@ -222,10 +238,11 @@ class Engine:
         command_id=None,
         skip_active=False,
         by=None,
+        tags=None,
     ):
         """A run request becomes one task per (asset, scope) (§8). `by` says
         who asked (the API or CLI, or what the caller names); automation runs
-        carry `automation` instead."""
+        carry `automation` instead. `tags` label the run for finding it later."""
 
         if isinstance(targets, str):
             targets = [targets]
@@ -236,6 +253,7 @@ class Engine:
         config = config or {}
         if not isinstance(config, dict):
             raise ValueError("config must be a JSON object")
+        tags = check_tags(tags)
         m = self.m
         if command_id and command_id in m.receipts:
             return await self._run_view_of(m.receipts[command_id])
@@ -303,6 +321,7 @@ class Engine:
             "keys": keys,
             "automation": automation,
             "by": by,
+            "tags": tags,
             "status": "running",
             "paused": False,
             "created_at": now,
@@ -793,8 +812,16 @@ class Engine:
                 if output.get("partition_set") or name in self._set_dims:
                     info["elements"] = list((head or {}).get("elements") or ())
             outputs[name] = info
+        # The input versions its outputs will be built from, for the history (§7).
+        lineage = []
+        for param, edge in edges:
+            pin = inputs.get(param) or {}
+            refs = [pin["ref"]] if pin.get("ref") else list((pin.get("refs") or {}).values())
+            for ref in refs:
+                lineage.append([edge["output"], ref.get("partition") or "", ref.get("version"), param])
         return {
             "inputs": inputs,
+            "lineage": lineage,
             "baseline": baseline,
             "plans": plans,
             "more": more,
@@ -825,7 +852,7 @@ class Engine:
             if index is not None:
                 info["prefix"] = index["prefix"]
             outputs[name] = info
-        kept = {k: prepared[k] for k in ("baseline", "plans", "more", "full", "prior")}
+        kept = {k: prepared[k] for k in ("baseline", "plans", "more", "full", "prior", "lineage")}
         return {**kept, "outputs": outputs}
 
     def _pin(self, output: str, up_dims: dict, asset: dict, scope: str):
@@ -1247,6 +1274,21 @@ class Engine:
         commit = {"heads": heads, "watermarks": watermarks}
         if keys:
             commit["keys"] = keys
+        # What the attempt said of each output version, for the history (§7).
+        metadata, rows = {}, {}
+        for name, entry in outputs.items():
+            found = entry.get("metadata")
+            if isinstance(found, dict) and found:
+                if len(json.dumps(found, default=str)) <= MAX_METADATA:
+                    metadata[name] = found
+                else:
+                    log.warning("%s: metadata of %s over %d bytes dropped", attempt, name, MAX_METADATA)
+            if isinstance(entry.get("rows"), int):
+                rows[name] = entry["rows"]
+        if metadata:
+            commit["metadata"] = metadata
+        if rows:
+            commit["rows"] = rows
         settled = sorted(
             name
             for name, entry in outputs.items()
@@ -1388,14 +1430,8 @@ class Engine:
                 await self.state.delete_objects([index.path(f["name"]) for f in event["keys"]["files"]])
             raise Conflict(f"source {name!r} moved while committing; retry")
         event["at"] = self.clock()
+        event["run"] = run
         await self.state.emit(event)
-        await self.state.put_object(
-            f"runs/{run_id}/run.json", json.dumps(run, sort_keys=True, allow_nan=False).encode()
-        )
-        self._run_assets[run_id] = []
-        if self._run_index is not None:
-            self._run_index.append(run_id)
-            self._run_assets_indexed.add(run_id)
         return {"changed": True, "ref": ref, "run": run_id}
 
     # -- key index upkeep (§6) --------------------------------------------------------
@@ -1586,6 +1622,7 @@ class Engine:
             keys=auto.get("keys"),
             automation=auto["name"],
             skip_active=True,
+            tags=auto.get("tags"),
         )
 
     async def _fire(self, auto, partitions):
@@ -1680,7 +1717,7 @@ class Engine:
     async def cancel(self, run_id: str):
         run = self.m.runs.get(run_id)
         if run is None:
-            archived = await self.state.archived(run_id)
+            archived = await self.history.run(run_id)
             if archived is None:
                 raise KeyError(run_id)
             return self._run_view(archived)
@@ -1693,7 +1730,7 @@ class Engine:
     async def pause(self, run_id: str, paused=True):
         run = self.m.runs.get(run_id)
         if run is None:
-            if await self.state.archived(run_id) is None:
+            if await self.history.run(run_id) is None:
                 raise KeyError(run_id)
             raise Conflict(f"run {run_id} is finished")
         await self._control(run_id, "pause" if paused else "resume")
@@ -1702,19 +1739,19 @@ class Engine:
     async def retry(self, run_id: str):
         run = self.m.runs.get(run_id)
         if run is None:
-            archived = await self.state.archived(run_id)
-            if archived is None:
+            archived = await self.history.run(run_id)
+            if archived is None or "source" in archived:
                 raise KeyError(run_id)
-            await self.state.emit({"type": "RunReopened", "run": archived, "at": self.clock()})
+            if run_id not in self.m.runs:  # reopened while we read it
+                await self.state.emit({"type": "RunReopened", "run": archived, "at": self.clock()})
         await self._control(run_id, "retry")
         return self._run_view(self.m.runs[run_id])
 
     # -- finished runs -------------------------------------------------------------------
 
     async def _archive_due(self):
-        """Write finished runs to `runs/{run}/run.json` and drop them from memory,
-        once none of their attempts is still in flight here. A run in which
-        every task was skipped launched and wrote nothing: it is not written."""
+        """Move finished runs from memory into the history, once none of
+        their attempts is still in flight here (§7)."""
 
         busy = {run_id for run_id, _ in self.inflight.values()}
         for run_id in sorted(self.m.archivable):
@@ -1723,43 +1760,23 @@ class Engine:
             run = self.m.runs.get(run_id)
             if run is None or any(tid in self.m.claims for tid in run["tasks"]):
                 continue
-            tasks = run["tasks"].values()
-            committed = {t["asset"] for t in tasks if t["status"] == "succeeded"}
-            quiet = all(
-                t["status"] == "skipped" and all(a["outcome"] == "skipped" for a in t["attempts"])
-                for t in tasks
-            )
-            await self.state.archive(run_id, committed=committed, write=not quiet)
-            if not quiet:
-                self._run_assets[run_id] = sorted({t["asset"] for t in tasks})
-                if self._run_index is not None and run_id not in self._run_assets_indexed:
-                    self._run_index.append(run_id)
-                    self._run_assets_indexed.add(run_id)
+            await self.state.emit({"type": "RunArchived", "run": run_id, "at": self.clock()})
 
     # -- retention (§11) ---------------------------------------------------------------
 
-    def _horizon(self, asset: str | None) -> float | None:
-        """Runs of `asset` older than this may go; `None` keeps everything.
-        With both `days` and `runs`, whichever keeps more."""
+    def _horizon(self, policy: dict | None, nth: float | None) -> float | None:
+        """Runs older than this may go; `None` keeps everything. `nth` is
+        when the policy's `runs`-th newest committing run was created. With
+        both `days` and `runs`, whichever keeps more."""
 
-        policy = self.m.policy(asset)
         if policy is None:
             return None
         bounds = []
         if policy.get("days"):
             bounds.append(self.clock() - float(policy["days"]) * 86400)
         if policy.get("runs"):
-            newest = self.m.retention.get(asset) or []
-            bounds.append(ulid_time(newest[0]) if len(newest) >= int(policy["runs"]) else -math.inf)
+            bounds.append(nth if nth is not None else -math.inf)
         return min(bounds)
-
-    async def _assets_of(self, run_id: str) -> list[str] | None:
-        if run_id not in self._run_assets:
-            run = await self.state.archived(run_id)
-            if run is None:
-                return None
-            self._run_assets[run_id] = sorted({t["asset"] for t in (run.get("tasks") or {}).values()})
-        return self._run_assets[run_id]
 
     async def _retention_sweep(self):
         """Delete finished runs every asset they ran has let go of (§11): a
@@ -1769,58 +1786,47 @@ class Engine:
         if now - self._swept < self.retention_interval:
             return
         self._swept = now
-        horizons = {name: self._horizon(name) for name in self.manifest["assets"]}
+        policies = {name: self.m.policy(name) for name in self.manifest["assets"]}
+        keeps = {name: int(p["runs"]) for name, p in policies.items() if p and p.get("runs")}
+        nth = await self.history.nth_newest(keeps)
+        horizons = {name: self._horizon(p, nth.get(name)) for name, p in policies.items()}
         finite = [h for h in horizons.values() if h is not None]
-        default = self._horizon(None)
+        default = self._horizon(self.m.policy(None), None)
         if not finite and default is None:
             return
         latest = max(finite + ([default] if default is not None else []))
-        if self._run_index is None:
-            self._run_index = [r for r in await self.state.archived_ids() if r not in self.m.runs]
-            self._run_assets_indexed = set(self._run_index)
         doomed = []
-        for run_id in self._run_index:
-            if ulid_time(run_id) >= latest:
-                break  # sorted: nothing newer can be past any horizon
-            if run_id in self.m.runs:
-                continue
-            assets = await self._assets_of(run_id)
+        for run_id, created, assets, status in await self.history.older_than(latest):
             bounds = [horizons.get(a) for a in assets] if assets else [default]
-            if all(h is not None and ulid_time(run_id) < h for h in bounds):
-                doomed.append(run_id)
-        for run_id in doomed:
-            await self.delete_run(run_id)
+            if all(h is not None and created < h for h in bounds):
+                doomed.append((run_id, status))
+        await self._delete_runs(doomed)
+
+    async def _delete_runs(self, runs: list[tuple[str, str | None]]) -> None:
+        """Delete finished runs, `(id, status)`: their attempt files and logs,
+        then their history."""
+
+        for run_id, status in runs:
+            if status != "skipped":  # a skipped run launched nothing
+                await self.state.delete_run(run_id)
+        await self.history.delete([run_id for run_id, _ in runs])
 
     async def delete_run(self, run_id: str) -> None:
-        """Delete a finished run: its record, attempt files and logs. Current
+        """Delete a finished run: its history, attempt files and logs. Current
         state never depends on runs, so only a run in progress is refused."""
 
         if run_id in self.m.runs:
             raise Conflict(f"run {run_id} is still active", retryable=False)
-        await self.state.delete_run(run_id)
-        self._run_assets.pop(run_id, None)
-        if run_id in self._run_assets_indexed:
-            self._run_index.remove(run_id)
-            self._run_assets_indexed.discard(run_id)
+        await self._delete_runs([(run_id, None)])
 
     async def prune(self, *, before=None, asset=None, keep=None, dry_run=False) -> dict:
         """Delete finished runs created before `before` (epoch seconds), of
         `asset` if given, except the `keep` newest of them."""
 
-        matching = []
-        for run_id in await self.state.archived_ids():
-            if run_id in self.m.runs:
-                continue
-            if asset is not None and asset not in (await self._assets_of(run_id) or ()):
-                continue
-            matching.append(run_id)
-        if keep:
-            matching = matching[: -int(keep)]
-        doomed = [r for r in matching if before is None or ulid_time(r) < float(before)]
+        doomed = await self.history.prunable(before=before, asset=asset, keep=keep)
         if not dry_run:
-            for run_id in doomed:
-                await self.delete_run(run_id)
-        return {"deleted": doomed, "dry_run": bool(dry_run)}
+            await self._delete_runs(doomed)
+        return {"deleted": [run_id for run_id, _ in doomed], "dry_run": bool(dry_run)}
 
     # -- read models -------------------------------------------------------------------
 
@@ -1835,7 +1841,7 @@ class Engine:
         return view
 
     async def _run_view_of(self, run_id: str) -> dict:
-        run = self.m.runs.get(run_id) or await self.state.archived(run_id)
+        run = self.m.runs.get(run_id) or await self.history.run(run_id)
         if run is None:
             raise KeyError(run_id)
         return self._run_view(run)
@@ -1882,26 +1888,16 @@ class Engine:
             )
         return out
 
-    async def list_runs(self, limit=50):
-        runs = list(self.m.runs.values()) + list(self.state.recent.values())
-        needed = limit - len(runs)
-        if needed > 0:
-            active = set(self.m.runs) | set(self.state.recent)
-            archived = [r for r in await self.state.archived_ids() if r not in active]
-            for run_id in reversed(archived[-needed:]):
-                run = await self.state.archived(run_id)
-                if run is not None:
-                    runs.append(run)
-        views = sorted(
-            (self._run_view(r) for r in runs), key=lambda r: (r["created_at"], r["id"]), reverse=True
-        )
-        return views[:limit]
+    async def list_runs(self, filter: RunFilter | None = None, *, before: str | None = None, limit=50):
+        """Runs, newest first — in progress and finished alike (§7)."""
+
+        return await self.history.runs(filter or RunFilter(), before=before, limit=limit)
 
     async def run_detail(self, run_id: str):
         run = self.m.runs.get(run_id)
         live = run is not None
         if run is None:
-            run = await self.state.archived(run_id)
+            run = await self.history.run(run_id)
             if run is None:
                 raise KeyError(run_id)
         tasks = [run["tasks"][tid] for tid in sorted(run.get("tasks") or {})]

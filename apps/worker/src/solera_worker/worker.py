@@ -198,6 +198,8 @@ class Ctx:
         self.config = spec["run"].get("config") or {}
         self.execution = spec.get("execution") or {"kind": "Local", "environment": {}, "placement": {}}
         self._stores = project.stores
+        self._outputs = [o.name or asset.name for o in asset.outputs]
+        self._metadata: dict[str, dict] = {}
 
     def _window(self, project, asset):
         declared = project.manifest["assets"][asset.name]["partitions"]
@@ -227,6 +229,31 @@ class Ctx:
     async def load(self, ref: Ref, t):
         store = self._stores[ref.store]
         return await store.load(ref, t, None)
+
+    def metadata(self, output: str | None = None, /, **values):
+        """Record facts about the version this attempt writes — row counts,
+        a checksum, a model's score — in the run history (§7), to chart
+        across versions. `output` defaults to the asset's only output."""
+
+        if output is None:
+            if len(self._outputs) != 1:
+                raise ValueError("ctx.metadata: name the output (this asset has several, or none)")
+            output = self._outputs[0]
+        if output not in self._outputs:
+            raise ValueError(f"ctx.metadata: {output!r} is not an output of this asset")
+        json.dumps(values, allow_nan=False)
+        self._metadata.setdefault(output, {}).update(values)
+
+    def _recorded(self, result) -> dict[str, dict]:
+        """What `metadata` recorded, and what the result's `metadata` adds."""
+
+        out = {name: dict(values) for name, values in self._metadata.items()}
+        for name, values in ((result.metadata or {}) if isinstance(result, Result) else {}).items():
+            if name not in self._outputs:
+                raise StoreError(f"Result.metadata names {name!r}, which is not an output of this asset")
+            json.dumps(values, allow_nan=False)
+            out.setdefault(name, {}).update(values)
+        return out
 
 
 LOG_FLUSH_SECONDS = 2.0
@@ -548,6 +575,8 @@ async def _store_outputs(spec, project, asset, objects, keys_io, result_value, f
         if schema is not None:
             ref = dataclasses.replace(ref, handle={**(ref.handle or {}), "schema": schema})
         entry["ref"] = ref.to_json()
+        if isinstance(value, (list, tuple)):
+            entry["rows"] = len(value)
         entries[name] = entry
     return entries, cursor
 
@@ -682,7 +711,11 @@ async def _attempt(objects, objects_url: str, base: str, spec: dict, entrypoint)
         value = asset.fn(**args)
         if inspect.isawaitable(value):
             value = await value
+        metadata = ctx._recorded(value)
         outputs, cursor = await _store_outputs(spec, project, asset, objects, keys_io, value, fence)
+        for name, values in metadata.items():
+            if values and "ref" in outputs.get(name, {}):
+                outputs[name]["metadata"] = values
         result = {"status": "succeeded", "outputs": outputs, "delivered": delivered}
         if cursor is not UNSET:
             result["cursor"] = cursor

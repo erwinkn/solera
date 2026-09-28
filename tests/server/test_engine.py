@@ -771,7 +771,7 @@ async def test_every_skips_active_scope(state):
     await asyncio.sleep(0.1)
     state.model.automations["polled.every.0"]["last_at"] = 0  # make the interval due on the next tick
     await engine.tick()  # would fire again but the scope is active
-    runs = await engine.list_runs(10)
+    runs = (await engine.list_runs(limit=10))["runs"]
     assert len([r for r in runs if r.get("automation") == "polled.every.0"]) == 1
 
 
