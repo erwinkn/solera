@@ -3,30 +3,17 @@ import { Bot, Cpu, Layers, MonitorSmartphone } from "lucide-react";
 import { useState } from "react";
 import { Empty, Eyebrow, PageHeader, Segmented } from "@/components/common";
 import { useQuery } from "@/lib/api";
-import { count, failures, seconds, time } from "@/lib/format";
+import { count, failures, resources, seconds, time } from "@/lib/format";
 import { useWorkspace } from "@/lib/workspace";
 import { cn } from "cn";
-import type { EnvironmentInfo, PoolWorker, Stats, StatsRow } from "@/lib/types";
+import type { ExecutorInfo, PoolWorker, Stats, StatsRow } from "@/lib/types";
 
 export const Route = createFileRoute("/executors")({
   component: ExecutorsPage,
 });
 
-function bytes(value: number | null | undefined) {
-  if (value == null) return null;
-  const gb = value / 1024 ** 3;
-  return gb >= 1
-    ? `${gb.toFixed(gb < 10 ? 1 : 0)} GB`
-    : `${Math.round(value / 1024 ** 2)} MB`;
-}
-
 function capacityLabel(meta: PoolWorker["meta"]) {
-  const parts = [
-    meta.cpu != null ? `${meta.cpu} cpu` : null,
-    bytes(meta.memory),
-    meta.gpu != null ? `${meta.gpu} gpu` : null,
-  ].filter(Boolean);
-  return parts.length ? parts.join(" · ") : "unbounded";
+  return resources(meta) || "unbounded";
 }
 
 function envIcon(kind: string) {
@@ -35,20 +22,17 @@ function envIcon(kind: string) {
   return Cpu;
 }
 
-// The API keys environments by a serialized spec; show the human form instead.
-function envLabel(env: EnvironmentInfo) {
-  const environment = env.environment as Record<string, unknown>;
-  const detail =
-    (environment?.name as string) ??
-    (environment?.cluster as string) ??
-    (environment?.app as string);
-  return detail ? `${env.kind}(${detail})` : env.kind;
+// "AWSECS · lab · us-east-1": the kind, then its settings.
+function settings(executor: ExecutorInfo) {
+  return [executor.kind, ...Object.values(executor.environment ?? {})]
+    .map(String)
+    .join(" · ");
 }
 
 function ExecutorsPage() {
   const { diagnostics, base, select } = useWorkspace();
-  const environments = useQuery<{ environments: EnvironmentInfo[] }>(
-    base ? `${base}/environments` : null,
+  const executors = useQuery<{ executors: ExecutorInfo[] }>(
+    base ? `${base}/executors` : null,
     3000,
   );
   const workers = useQuery<{ workers: PoolWorker[] }>(
@@ -56,14 +40,14 @@ function ExecutorsPage() {
     3000,
   );
   if (!diagnostics) return null;
-  const envs = environments.data?.environments ?? [];
+  const envs = executors.data?.executors ?? [];
   const pool = workers.data?.workers ?? [];
   return (
     <section className="flex flex-col gap-5">
       <PageHeader
         eyebrow="Execution"
         title="Executors"
-        description="Environments declare where tasks run and how many run concurrently."
+        description="Named environments where tasks run, and how many run at once."
       />
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
         {envs.map((env) => {
@@ -72,14 +56,19 @@ function ExecutorsPage() {
             env.max_concurrent != null && env.in_flight >= env.max_concurrent;
           return (
             <div
-              key={env.key}
-              data-environment={env.key}
+              key={env.name}
+              data-executor={env.name}
               className="flex flex-col gap-3 rounded-xl border bg-card p-4"
             >
-              <div className="flex items-center gap-2">
-                <Icon className="size-4 text-muted-foreground" />
-                <span className="font-mono text-sm font-semibold">
-                  {envLabel(env)}
+              <div className="flex min-w-0 flex-col gap-0.5">
+                <div className="flex items-center gap-2">
+                  <Icon className="size-4 text-muted-foreground" />
+                  <span className="font-mono text-sm font-semibold">
+                    {env.name}
+                  </span>
+                </div>
+                <span className="truncate text-xs text-muted-foreground">
+                  {settings(env)}
                 </span>
               </div>
               <div className="flex items-end justify-between">

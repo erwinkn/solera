@@ -77,9 +77,9 @@ def site_region(site: str) -> str: ...
 def is_qaqc_workbook(event: dict) -> bool: ...
 
 
-# Environments are project-level; a placement is built per asset by calling
-# one with typed, kind-specific options.
-ecs = AWSECS(cluster="lab", region="us-east-1")
+# Executors are named, project-level environments; a placement is built per
+# asset by calling one with typed, kind-specific options.
+ecs = AWSECS("lab", cluster="lab", region="us-east-1")
 ingest = Pool("ingest")
 
 

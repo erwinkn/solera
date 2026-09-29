@@ -81,3 +81,27 @@ export function failures(failed: number, total: number) {
   const pct = (failed / total) * 100;
   return `${count(failed)} · ${pct < 1 ? "<1" : Math.round(pct)}%`;
 }
+
+// Bytes in decimal units, as the SDK reads "30GB".
+export function bytes(value: number | null | undefined) {
+  if (value == null) return null;
+  const gb = value / 1e9;
+  return gb >= 1
+    ? `${gb.toFixed(gb < 10 ? 1 : 0)} GB`
+    : `${Math.round(value / 1e6)} MB`;
+}
+
+// "4 cpu · 30 GB · 1 gpu", or "" when nothing was asked for.
+export function resources(r: {
+  cpu?: number | null;
+  memory?: number | null;
+  gpu?: number | null;
+}) {
+  return [
+    r.cpu != null ? `${r.cpu} cpu` : null,
+    bytes(r.memory),
+    r.gpu != null ? `${r.gpu} gpu` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}

@@ -5,7 +5,7 @@
       "automations": [
         "fleet_dashboard.onchange.0"
       ],
-      "code_hash": "998d379e5ac8dc6879539f47cb06c3bc141464fa9e4b4504eb3bc2536a49b96b",
+      "code_hash": "79f94232eea8519c39b52c7d74f683eb1e58eda481ff48b5515ec867c4e81042",
       "deps": [],
       "doc": "Partitioned upstream, unpartitioned consumer: the site dimension is collapsed.",
       "inputs": {
@@ -33,6 +33,7 @@
       "partitions": null,
       "placement": {
         "environment": {},
+        "executor": "local",
         "kind": "Local",
         "placement": {}
       },
@@ -69,7 +70,7 @@
       "automations": [
         "graph_delta.every.0"
       ],
-      "code_hash": "998d379e5ac8dc6879539f47cb06c3bc141464fa9e4b4504eb3bc2536a49b96b",
+      "code_hash": "79f94232eea8519c39b52c7d74f683eb1e58eda481ff48b5515ec867c4e81042",
       "deps": [],
       "doc": "Poll a site's Graph delta feed; the delta token is the cursor.",
       "inputs": {},
@@ -109,6 +110,7 @@
       },
       "placement": {
         "environment": {},
+        "executor": "local",
         "kind": "Local",
         "placement": {}
       },
@@ -135,7 +137,7 @@
       "automations": [
         "hillshade.every.0"
       ],
-      "code_hash": "998d379e5ac8dc6879539f47cb06c3bc141464fa9e4b4504eb3bc2536a49b96b",
+      "code_hash": "79f94232eea8519c39b52c7d74f683eb1e58eda481ff48b5515ec867c4e81042",
       "deps": [
         "usgs_3dep_tiles"
       ],
@@ -173,6 +175,7 @@
       },
       "placement": {
         "environment": {},
+        "executor": "local",
         "kind": "Local",
         "placement": {}
       },
@@ -199,7 +202,7 @@
     "leach": {
       "aliases": [],
       "automations": [],
-      "code_hash": "998d379e5ac8dc6879539f47cb06c3bc141464fa9e4b4504eb3bc2536a49b96b",
+      "code_hash": "79f94232eea8519c39b52c7d74f683eb1e58eda481ff48b5515ec867c4e81042",
       "deps": [],
       "doc": "The resource tier lives on the asset; no job indirection.",
       "inputs": {
@@ -267,6 +270,7 @@
           "cluster": "lab",
           "region": "us-east-1"
         },
+        "executor": "lab",
         "kind": "AWSECS",
         "placement": {
           "cpu": 4,
@@ -311,7 +315,7 @@
       "automations": [
         "manual_upload.every.0"
       ],
-      "code_hash": "998d379e5ac8dc6879539f47cb06c3bc141464fa9e4b4504eb3bc2536a49b96b",
+      "code_hash": "79f94232eea8519c39b52c7d74f683eb1e58eda481ff48b5515ec867c4e81042",
       "deps": [],
       "doc": "Upload keys are registered externally by the uploads service.",
       "inputs": {},
@@ -340,9 +344,8 @@
         }
       },
       "placement": {
-        "environment": {
-          "name": "ingest"
-        },
+        "environment": {},
+        "executor": "ingest",
         "kind": "Pool",
         "placement": {
           "cpu": 1,
@@ -374,7 +377,7 @@
       "automations": [
         "psa_mean_data.onchange.0"
       ],
-      "code_hash": "998d379e5ac8dc6879539f47cb06c3bc141464fa9e4b4504eb3bc2536a49b96b",
+      "code_hash": "79f94232eea8519c39b52c7d74f683eb1e58eda481ff48b5515ec867c4e81042",
       "deps": [],
       "doc": "",
       "inputs": {
@@ -419,6 +422,7 @@
       "partitions": null,
       "placement": {
         "environment": {},
+        "executor": "local",
         "kind": "Local",
         "placement": {}
       },
@@ -450,7 +454,7 @@
       "automations": [
         "qaqc_samples.onchange.0"
       ],
-      "code_hash": "998d379e5ac8dc6879539f47cb06c3bc141464fa9e4b4504eb3bc2536a49b96b",
+      "code_hash": "79f94232eea8519c39b52c7d74f683eb1e58eda481ff48b5515ec867c4e81042",
       "deps": [],
       "doc": "qaqc_files arrives filtered to the file_ids whose version changed for this site.",
       "inputs": {
@@ -498,6 +502,7 @@
       },
       "placement": {
         "environment": {},
+        "executor": "local",
         "kind": "Local",
         "placement": {}
       },
@@ -532,7 +537,7 @@
       "automations": [
         "region_rollup.onchange.0"
       ],
-      "code_hash": "998d379e5ac8dc6879539f47cb06c3bc141464fa9e4b4504eb3bc2536a49b96b",
+      "code_hash": "79f94232eea8519c39b52c7d74f683eb1e58eda481ff48b5515ec867c4e81042",
       "deps": [],
       "doc": "Static partitions over a site-partitioned input.",
       "inputs": {
@@ -571,6 +576,7 @@
       },
       "placement": {
         "environment": {},
+        "executor": "local",
         "kind": "Local",
         "placement": {}
       },
@@ -607,7 +613,7 @@
       "automations": [
         "site_health.onchange.0"
       ],
-      "code_hash": "998d379e5ac8dc6879539f47cb06c3bc141464fa9e4b4504eb3bc2536a49b96b",
+      "code_hash": "79f94232eea8519c39b52c7d74f683eb1e58eda481ff48b5515ec867c4e81042",
       "deps": [],
       "doc": "In-database: a TableRef in, a statement out; no row enters the harness.\nThe store materializes the SELECT into ops.site_health for this site.",
       "inputs": {
@@ -643,6 +649,7 @@
       },
       "placement": {
         "environment": {},
+        "executor": "local",
         "kind": "Local",
         "placement": {}
       },
@@ -672,7 +679,7 @@
         "sites.cron.0",
         "sites.ondeploy.0"
       ],
-      "code_hash": "998d379e5ac8dc6879539f47cb06c3bc141464fa9e4b4504eb3bc2536a49b96b",
+      "code_hash": "79f94232eea8519c39b52c7d74f683eb1e58eda481ff48b5515ec867c4e81042",
       "deps": [],
       "doc": "Refresh the SharePoint site list daily; new sites surface as missing work.",
       "inputs": {},
@@ -692,6 +699,7 @@
       "partitions": null,
       "placement": {
         "environment": {},
+        "executor": "local",
         "kind": "Local",
         "placement": {}
       },
@@ -725,7 +733,7 @@
       "automations": [
         "weekly_report.cron.0"
       ],
-      "code_hash": "998d379e5ac8dc6879539f47cb06c3bc141464fa9e4b4504eb3bc2536a49b96b",
+      "code_hash": "79f94232eea8519c39b52c7d74f683eb1e58eda481ff48b5515ec867c4e81042",
       "deps": [],
       "doc": "A job: inputs, placement and automations like an asset, no outputs.",
       "inputs": {
@@ -740,6 +748,7 @@
       "partitions": null,
       "placement": {
         "environment": {},
+        "executor": "local",
         "kind": "Local",
         "placement": {}
       },
@@ -999,11 +1008,23 @@
       "watched": []
     }
   },
-  "executors": [
-    "AWSECS",
-    "Local",
-    "Pool"
-  ],
+  "executors": {
+    "ingest": {
+      "environment": {},
+      "kind": "Pool"
+    },
+    "lab": {
+      "environment": {
+        "cluster": "lab",
+        "region": "us-east-1"
+      },
+      "kind": "AWSECS"
+    },
+    "local": {
+      "environment": {},
+      "kind": "Local"
+    }
+  },
   "key_cache": {
     "max_bytes": 8589934592,
     "path": null
@@ -1350,7 +1371,7 @@
     }
   },
   "retention": null,
-  "revision": "7c7e1f48f15e4bd3596fcbea3eeac02df051c56665a8082b4abe81a6f4c4c27c",
+  "revision": "d449251e977f668a9941483e999a402b9fcee605eb6adec4e08ae42eb6fabfe3",
   "sources": {
     "leach_crosswalk": {
       "handle": {

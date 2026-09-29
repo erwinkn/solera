@@ -45,7 +45,7 @@ yields an identical version, no changed ref, and wakes nothing.
 | **attempt** | One execution of a task. |
 | **cursor** | Per-scope JSON state the producer sets and receives back (§6). |
 | **key map** | The complete `key → revision` map of `(output, scope)` at a commit: one object, staged by the harness, read by the engine (§6). |
-| **placement** | Where an attempt runs: a typed request built from a project-level environment (§10). |
+| **placement** | Where an attempt runs: a typed request built from a named, project-level executor (§10). |
 
 Three processes:
 
@@ -529,20 +529,27 @@ name; renaming an asset rekeys its attached automations.
 ### Placement
 
 ```python
-ecs = AWSECS(cluster="lab", region="us-east-1")      # environment, project level
-pool = Pool("ingest")
+etl = AWSECS("etl", cluster="lab", region="us-east-1")   # executor, project level
+ingest = Pool("ingest")
 
-@asset(executor=ecs(cpu=4, memory="30GB"))           # placement, per asset
+@asset(executor=etl(cpu=4, memory="30GB"))                # placement, per asset
 ```
 
-An **environment** is a project-level object describing where attempts can
-run and how to reach it; calling it returns a **placement**, the typed
-per-asset request. Each kind defines its own placement signature (`AWSECS`:
-`cpu`, `memory`, `gpu`, `image`; `Modal`: `gpu`; `Local`: none), so a bad
-option fails at construction. The manifest records `{kind, environment,
-placement}`; the server rebuilds the placement from a registry of kinds
-(built-ins, plus classes declared with `Project(executors=[MyKind])`, which
-the server must be able to import since `launch` runs in the engine).
+An **executor** is a named, project-level environment: where attempts can
+run and how to reach it. The name is what the engine, the console and the
+history call it — `etl`, not `AWSECS(lab/us-east-1)` — and one name means
+one kind and environment: declaring `etl` twice, differently, fails
+registration. `Local()` is always `local`; a `Pool`'s name is its pool's.
+Calling an executor returns a **placement**, the typed per-asset request.
+Each kind defines its own placement signature (`AWSECS`: `cpu`, `memory`,
+`gpu`, `image`; `Modal`: `gpu`; `Local`: none), so a bad option fails at
+construction. The manifest records each placement as `{executor, kind,
+environment, placement}` and the executors as `{name: {kind,
+environment}}`; the server rebuilds placements from a registry of kinds
+(built-ins, plus custom kinds whose executors are declared with
+`Project(executors=[MyKind("name", ...)])`, which the server must be able
+to import since `launch` runs in the engine). Each launched attempt records
+where it ran and what it asked for (object-store-state.md §7).
 Placements are not part of the interpretation fingerprint. `retries=` and
 `timeout=` are engine policy. `ctx.execution` is the placement's serialized
 form.
@@ -562,7 +569,7 @@ class Placement(Protocol):
     async def launch(self, stage: Stage) -> RunHandle: ...
     async def wait(self, run: RunHandle, timeout: float) -> Exit | None: ...
     async def cancel(self, run: RunHandle) -> None: ...
-    max_concurrent: int | None                 # per environment
+    max_concurrent: int | None                 # per executor
 ```
 
 | Method | Contract |
@@ -600,7 +607,7 @@ following its placement handle if the placement can resume one, else its
 heartbeat (three missed beats: dead). A harness that dies after taking the
 fence leaves its keyed outputs **unsettled**: the next attempt reads the
 keys it meant to change back from the store and folds what landed into its
-own commit. The engine counts in-flight attempts per environment against
+own commit. The engine counts in-flight attempts per executor against
 `max_concurrent`.
 
 ### Worker protocol
@@ -679,9 +686,9 @@ Logs stream to chunked objects throughout. `manifest` mode runs through
 | Kind | `launch` | handle | `wait` | `cancel` |
 |---|---|---|---|---|
 | `Local()()` | subprocess with an explicit env allow-list | `{pid, started_at}` | polls the process | `SIGTERM`, then `SIGKILL` |
-| `AWSECS(cluster, region)(cpu, memory, gpu, image)` | `run_task` with container overrides carrying the stage | `{task_arn}` | describes until `STOPPED`; `Exit.meta.log_url` | `stop_task` |
-| `Modal(app)(gpu)` | spawns the harness function | `{call_id}` | polls the call | cancels it |
-| `K8sJob(cluster, namespace)(cpu, memory, image)` | creates a job | `{job}` | watches conditions | deletes the job |
+| `AWSECS(name, cluster, region)(cpu, memory, gpu, image)` | `run_task` with container overrides carrying the stage | `{task_arn}` | describes until `STOPPED`; `Exit.meta.log_url` | `stop_task` |
+| `Modal(name, app)(gpu)` | spawns the harness function | `{call_id}` | polls the call | cancels it |
+| `K8sJob(name, cluster, namespace)(cpu, memory, image)` | creates a job | `{job}` | watches conditions | deletes the job |
 | `Pool(name)(cpu, memory, gpu)` | publishes the stage as a claimable task | `{task}` | result appeared, `complete` called, or claim lease expired | marks the task canceled |
 
 `Pool` is the pull path. Workers are external processes:
@@ -709,8 +716,8 @@ project = Project(
 The manifest records assets (`outputs` with `{name, store, key, revision,
 incremental, migrations, config}`, `inputs`, `deps`, `partitions`, `placement`, `retries`,
 `timeout`, `version`, code hash, load types via `typing.get_type_hints`),
-sources, automations, store names with their `Store.version`, executor
-names, and the project revision.
+sources, automations, store names with their `Store.version`, executors
+by name, and the project revision.
 
 Registration errors:
 

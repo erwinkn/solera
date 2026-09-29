@@ -71,7 +71,7 @@ async def engine(tmp_path):
     runtime = Engine(
         state,
         project.manifest,
-        placements={"Local": lambda e, o, c: InlinePlacement(c, project)},
+        placements={"Local": lambda s, c: InlinePlacement(c, project)},
         clock=state.clock,
         eval_interval=0.05,
     )
@@ -279,10 +279,9 @@ async def test_source_commit_endpoints(client, base, engine):
     assert missing.status_code == 404
 
 
-async def test_environments_and_workers(client, base):
-    envs = (await client.get(f"{base}/environments")).json()["environments"]
-    kinds = {e["kind"] for e in envs}
-    assert "Local" in kinds and "Pool" in kinds
+async def test_executors_and_workers(client, base):
+    executors = (await client.get(f"{base}/executors")).json()["executors"]
+    assert {e["name"]: e["kind"] for e in executors} == {"gpu": "Pool", "local": "Local"}
     assert (await client.get(f"{base}/workers")).json() == {"workers": []}
 
 

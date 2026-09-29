@@ -67,11 +67,11 @@ class FakePlacement:
 
 
 def inline(project, **env_kw):
-    return {"Local": lambda e, o, c: InlinePlacement(c, project)}
+    return {"Local": lambda s, c: InlinePlacement(c, project)}
 
 
 def fake(project, **env_kw):
-    return {"Fake": lambda e, o, c: FakePlacement(c)}
+    return {"Fake": lambda s, c: FakePlacement(c)}
 
 
 @pytest.fixture
@@ -627,7 +627,7 @@ async def test_fencing_concurrent_claim(state):
         return [1]
 
     project = Project(assets=[slow])
-    engine = make_engine(state, project, placements={"Local": lambda e, o, c: Hold(c, project)})
+    engine = make_engine(state, project, placements={"Local": lambda s, c: Hold(c, project)})
     await engine.initialize()
     run1 = await engine.submit(["slow"])
     run2 = await engine.submit(["slow"])
@@ -830,11 +830,11 @@ async def test_timeout_fails_retryably(state):
     """§10: a wait past the attempt timeout cancels the run and fails the
     attempt retryably."""
 
-    @asset(executor=Fake()(), timeout=1, retries=Retry(0))
+    @asset(executor=Fake("fake")(), timeout=1, retries=Retry(0))
     def never():
         return []
 
-    project = Project(assets=[never], executors=[Fake()])
+    project = Project(assets=[never], executors=[Fake("fake")])
     engine = make_engine(state, project, placements=fake(project), heartbeat_seconds=1)
     FakePlacement.script.clear()
     await engine.initialize()
@@ -859,14 +859,12 @@ async def test_harness_exit_without_result_fails_retryably(state):
         async def wait(self, run, timeout):
             return {"code": 0, "reason": None, "meta": {}}
 
-    @asset(executor=Fake()(), retries=Retry(0))
+    @asset(executor=Fake("fake")(), retries=Retry(0))
     def ghost():
         return []
 
-    project = Project(assets=[ghost], executors=[Fake()])
-    engine = make_engine(
-        state, project, placements={"Fake": lambda e, o, c: NoResult(c)}, heartbeat_seconds=1
-    )
+    project = Project(assets=[ghost], executors=[Fake("fake")])
+    engine = make_engine(state, project, placements={"Fake": lambda s, c: NoResult(c)}, heartbeat_seconds=1)
     await engine.initialize()
     detail = await engine.run_until((await engine.submit(["ghost"]))["id"], 15)
     assert status_of(detail) == "failed"
@@ -890,12 +888,12 @@ async def test_max_concurrent(state):
             in_flight["now"] -= 1
             return {"code": None, "reason": "lost", "meta": {}}
 
-    @asset(executor=Fake()(), partitions=StaticPartitions(["a", "b", "c"]))
+    @asset(executor=Fake("fake")(), partitions=StaticPartitions(["a", "b", "c"]))
     def work(ctx):
         return [{"p": ctx.partition}]
 
-    project = Project(assets=[work], executors=[Fake()])
-    engine = make_engine(state, project, placements={"Fake": lambda e, o, c: Tracked(c)}, concurrency=10)
+    project = Project(assets=[work], executors=[Fake("fake")])
+    engine = make_engine(state, project, placements={"Fake": lambda s, c: Tracked(c)}, concurrency=10)
     await engine.initialize()
     await engine.run_until((await engine.submit(["work"], partitions="all"))["id"], 15)
     assert in_flight["peak"] == 1

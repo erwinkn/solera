@@ -1196,17 +1196,23 @@ class Project:
             add_automation(auto, targets=targets, attached=None)
 
         manifest_assets = {}
-        known_kinds = {"Local", "AWSECS", "K8sJob", "Modal", "Pool"} | {
-            getattr(e, "kind", type(e).__name__) for e in self.executors
-        }
+        executors = self._executors()
         for name, asset in self.assets.items():
             info = assets[name]
             placement = asset.executor.serialized() if asset.executor else _default_placement()
-            if placement["kind"] not in known_kinds:
+            declared = executors.get(placement["executor"])
+            if declared is None and placement["kind"] not in _builtin_kinds():
                 raise RegistrationError(
-                    f"{name}: placement kind {placement['kind']!r} is not registered; "
-                    "declare it with Project(executors=[...])"
+                    f"{name}: executor {placement['executor']!r} of kind {placement['kind']!r} "
+                    "is not registered; declare it with Project(executors=[...])"
                 )
+            executor = {"kind": placement["kind"], "environment": placement["environment"]}
+            if declared not in (None, executor):
+                raise RegistrationError(
+                    f"{name}: executor {placement['executor']!r} is declared as {declared}, "
+                    f"but the asset places it as {executor}"
+                )
+            executors[placement["executor"]] = executor
             manifest_assets[name] = {
                 "outputs": [o.spec(asset.name) for o in asset.outputs],
                 "inputs": {p: e.spec(p) for p, e in info["edges"].items()},
@@ -1254,15 +1260,22 @@ class Project:
             },
             "sources": source_records,
             "stores": store_records,
-            "executors": sorted(
-                {getattr(e, "kind", type(e).__name__) for e in self.executors}
-                | {a["placement"]["kind"] for a in manifest_assets.values()}
-            ),
+            "executors": dict(sorted(executors.items())),
             "automations": automation_records,
             "retention": self.retention.spec() if self.retention else None,
             "key_cache": self.key_cache.spec() if self.key_cache else None,
         }
         return {**body, "revision": digest(body)}
+
+    def _executors(self) -> dict[str, dict]:
+        """`Project(executors=)`, by name: one kind and environment per name."""
+
+        executors: dict[str, dict] = {}
+        for e in self.executors:
+            record = {"kind": e.kind, "environment": dict(e.config)}
+            if executors.setdefault(e.name, record) != record:
+                raise RegistrationError(f"Executor {e.name!r} is declared twice, differently")
+        return executors
 
     def _output_dims(self, output_name, outputs, assets):
         owner = outputs[output_name]["asset"]
@@ -1275,6 +1288,12 @@ def _selection_classes():
     from .stores import Batches, Keys
 
     return Keys, Batches
+
+
+def _builtin_kinds() -> dict:
+    from .executors import BUILTIN_KINDS
+
+    return BUILTIN_KINDS
 
 
 def _default_placement() -> dict:

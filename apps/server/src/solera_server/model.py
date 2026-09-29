@@ -488,9 +488,10 @@ class Model:
         if task is None:
             return
         self._release_claim(task["id"], e["attempt"])
-        reads = []
+        reads, execution = [], {}
         if (task.get("launched") or {}).get("attempt") == e["attempt"]:
             reads = task["launched"]["prepared"].get("lineage") or []
+            execution = history.execution(task["launched"]["execution"])
             del task["launched"]
             if task["status"] == "running":
                 task["status"] = "queued"  # until the outcome below says otherwise
@@ -503,6 +504,7 @@ class Model:
             "outcome": outcome,
             "started_at": e.get("started_at"),
             "finished_at": at,
+            **execution,
         }
         if e.get("error"):
             summary["error"] = e["error"]
@@ -750,7 +752,7 @@ class Model:
             return
         self._unindex_run(e["run"])
         del self.runs[e["run"]]
-        for table, rows in history.run_rows(run, self.manifest).items():
+        for table, rows in history.run_rows(run).items():
             for row in rows:
                 self._record(table, row)
 

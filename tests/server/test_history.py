@@ -4,7 +4,7 @@ flushed to Parquet, merged, hidden when deleted, and queried with DuckDB."""
 import pytest
 from solera.sdk import In, Output, Project, Result, Retry, Source, asset
 from solera_server.engine import Engine
-from solera_server.history import History, RunFilter, bucket_for
+from solera_server.history import History, RunFilter, bucket_for, execution
 from solera_server.placements.inline import InlinePlacement
 from solera_server.state import State
 
@@ -55,7 +55,7 @@ def engine_for(state, clock, **history):
     return Engine(
         state,
         PROJECT.manifest,
-        placements={"Local": lambda e, o, c: InlinePlacement(c, PROJECT)},
+        placements={"Local": lambda s, c: InlinePlacement(c, PROJECT)},
         clock=clock,
         eval_interval=0.01,
         history=History(state, clock=clock, **history) if history else None,
@@ -176,6 +176,7 @@ async def test_a_run_reads_the_same_once_archived(state, clock):
     state.emit = emit
     before = details[failed["id"]]
     assert [t["retried"] for t in before["tasks"] if t["asset"] == "revenue"] == [1]
+    assert {a.get("executor") for t in before["attempts"].values() for a in t} == {"local"}
     assert await engine.run_detail(failed["id"]) == before
     record = await engine.history.run(commit["run"])
     assert record == {
@@ -241,6 +242,21 @@ async def test_stale_flush_is_discarded(state, clock):
     assert await engine.history.run(doomed) is None
 
 
+def test_an_attempt_records_where_it_ran():
+    """The executor and what was asked of it: numbers as columns, the rest
+    verbatim; a named GPU type counts one."""
+
+    spec = {"executor": "gpu", "kind": "Modal", "environment": {"app": "a"}, "placement": {"gpu": "A10G"}}
+    assert execution(spec) == {"executor": "gpu", "gpu": 1, "options": {"gpu": "A10G"}}
+    spec = {"executor": "etl", "placement": {"cpu": 4, "memory": 30 * 10**9, "image": "etl:3"}}
+    assert execution(spec) == {
+        "executor": "etl",
+        "cpu": 4,
+        "memory": 30 * 10**9,
+        "options": {"image": "etl:3"},
+    }
+
+
 async def test_stats(state, clock):
     engine = engine_for(state, clock)
     await engine.initialize()
@@ -252,7 +268,7 @@ async def test_stats(state, clock):
     assert by["orders"]["tasks"] == 3 and by["orders"]["failed"] == 0
     assert by["revenue"]["failed"] == 1
     assert by["orders"]["p50"] is not None and by["orders"]["hours"] >= 0
-    assert [row["executor"] for row in stats["executors"]] == ["Local"]
+    assert [row["executor"] for row in stats["executors"]] == ["local"]
     # Unpartitioned tasks have the empty scope; a partition narrows to its own.
     assert (await engine.history.stats(asset="orders", scope=""))["assets"] == [by["orders"]]
     assert (await engine.history.stats(asset="orders", scope="2026-01-01"))["assets"] == []

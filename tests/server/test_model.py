@@ -71,9 +71,9 @@ async def state(tmp_path, clock):
 
 def engine_on(state, clock, placement="inline", **kw):
     if placement == "inline":
-        placements = {"Local": lambda e, o, c: InlinePlacement(c, PROJECT)}
+        placements = {"Local": lambda s, c: InlinePlacement(c, PROJECT)}
     else:
-        placements = {"Local": lambda e, o, c: Hold(c)}
+        placements = {"Local": lambda s, c: Hold(c)}
     return Engine(state, PROJECT.manifest, placements=placements, clock=clock, eval_interval=0.01, **kw)
 
 
@@ -182,7 +182,7 @@ async def test_a_moved_input_still_commits(state, clock):
     engine2 = Engine(
         state,
         project.manifest,
-        placements={"Local": lambda e, o, c: InlinePlacement(c, project)},
+        placements={"Local": lambda s, c: InlinePlacement(c, project)},
         clock=clock,
         eval_interval=0.01,
     )

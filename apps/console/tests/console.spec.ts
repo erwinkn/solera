@@ -202,9 +202,10 @@ test("run history: facets, asset versions, lineage, workload", async ({
   await page.keyboard.press("Escape");
 
   await page.goto("/executors");
+  await expect(page.locator('[data-executor="ingest"]')).toContainText("Pool");
   await expect(
     page.getByRole("table", { name: "Workload per executor" }),
-  ).toContainText("Local");
+  ).toContainText("local");
 });
 
 test("automation toggle and run-now", async ({ page }) => {

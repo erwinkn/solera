@@ -305,7 +305,7 @@ with its own event loop, at most `maintenance_concurrency` at a time. A
 project-level setting to offload it to an executor is planned, not built:
 
 ```python
-Project(..., engine_executor=ecs(cpu=2, memory="8GB"))   # not built yet; local today
+Project(..., engine_executor=etl(cpu=2, memory="8GB"))   # not built yet; local today
 ```
 
 **Local disk cache.** Index files never change once written, so a cached
@@ -343,8 +343,8 @@ input versions built this version of `revenue`".
 | Table | One row per | Notable columns |
 |---|---|---|
 | `runs` | finished run or source commit | `status` (`succeeded`, `failed`, `canceled`, `skipped`), `trigger` (`manual`, `automation`, `commit`), `automation`, `by`, `source`, `targets`, `assets`, `committed`, `tags` (map), `task_count`, `failed_count`, `error`, `config` and `keys` (JSON, as submitted) |
-| `tasks` | task of a finished run | `asset`, `scope`, `status`, `ready_at` (its dependencies were done), `started_at`, `finished_at`, `attempts`, `duration`, `deps`, `max_attempts`, `retry_delay`, `retry_backoff`, `retried`, `executor`, `cpu`, `memory`, `gpu` |
-| `attempts` | attempt | `task`, `n`, `outcome`, `started_at`, `finished_at`, `duration`, `error`, `executor`, `outputs` (map: output → version committed) |
+| `tasks` | task of a finished run | `asset`, `scope`, `status`, `ready_at` (its dependencies were done), `started_at`, `finished_at`, `attempts`, `duration`, `deps`, `max_attempts`, `retry_delay`, `retry_backoff`, `retried`, `executor` (of its last attempt) |
+| `attempts` | attempt | `task`, `n`, `outcome`, `started_at`, `finished_at`, `duration`, `error`, `executor`, `cpu`, `memory`, `gpu` (requested; all null if it never launched), `options` (map: its other placement options, e.g. `image`), `outputs` (map: output → version committed) |
 | `materializations` | output version a commit installed | `output`, `scope`, `version`, `run`, `attempt`, `at`, `batch`, `added`, `removed`, `added_keys`, `removed_keys` (a source commit's keys, up to 1,000), `rows`, `metadata` (JSON) |
 | `lineage` | input version an output version was read from | `output`, `scope`, `version`, `input`, `input_scope`, `input_version`, `param` |
 

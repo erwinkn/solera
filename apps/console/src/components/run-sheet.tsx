@@ -11,7 +11,7 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Empty, ErrorNotice, StatusBadge } from "@/components/common";
 import { request, useAction, useQuery, useQueryText } from "@/lib/api";
-import { duration, time } from "@/lib/format";
+import { duration, resources, time } from "@/lib/format";
 import { useWorkspace } from "@/lib/workspace";
 import type { Attempt, RunDetail, Task } from "@/lib/types";
 
@@ -108,6 +108,23 @@ function AttemptRow({
         </span>
       </summary>
       <div className="flex flex-col gap-3 border-t p-3">
+        {attempt.executor && (
+          <div className="text-xs text-muted-foreground" data-execution>
+            on{" "}
+            <span className="font-mono text-foreground">
+              {attempt.executor}
+            </span>
+            {[
+              resources(attempt),
+              ...Object.entries(attempt.options ?? {}).map(
+                ([k, v]) => `${k} ${v}`,
+              ),
+            ]
+              .filter(Boolean)
+              .map((part) => ` · ${part}`)
+              .join("")}
+          </div>
+        )}
         {attempt.error && (
           <ErrorNotice
             message={`${attempt.error.type}: ${attempt.error.message}`}

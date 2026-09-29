@@ -191,6 +191,12 @@ export interface Attempt {
   status: string;
   started_at: number;
   finished_at?: number;
+  // Where it ran and what it requested; absent if it never launched.
+  executor?: string;
+  cpu?: number;
+  memory?: number;
+  gpu?: number;
+  options?: Record<string, string>;
   commit?: string;
   error?: {
     type: string;
@@ -253,8 +259,8 @@ export interface AssetDetail {
   automations: AutomationRecord[];
 }
 
-export interface EnvironmentInfo {
-  key: string;
+export interface ExecutorInfo {
+  name: string;
   kind: string;
   environment: Record<string, Json>;
   max_concurrent: number | null;

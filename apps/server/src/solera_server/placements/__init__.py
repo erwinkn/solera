@@ -26,7 +26,7 @@ class PlacementContext:
 
 
 class ServerPlacement(Protocol):
-    """launch/wait/cancel; `max_concurrent` caps in-flight attempts per env (§10)."""
+    """launch/wait/cancel; `max_concurrent` caps in-flight attempts per executor (§10)."""
 
     max_concurrent: int | None = None
 
@@ -56,12 +56,12 @@ class UnavailablePlacement(ServerPlacement):
 def _remote(kind: str):
     """AWSECS / K8sJob / Modal: lazily resolved, unavailable without the SDK."""
 
-    def build(environment, options, ctx):
+    def build(spec, ctx):
         from . import remote
 
         try:
             env_cls = getattr(remote, kind)
-            return env_cls(environment, options, ctx)
+            return env_cls(spec["environment"], spec["placement"], ctx)
         except Exception as error:
             return UnavailablePlacement(kind, error)
 
@@ -69,7 +69,9 @@ def _remote(kind: str):
 
 
 class Registry:
-    """Rebuilds executable placements from manifest `{kind, environment, placement}`.
+    """Rebuilds executable placements from a manifest placement
+    `{executor, kind, environment, placement}`: a builder per kind, called
+    with that spec and the context.
 
     Built-ins plus any kinds registered for this engine (tests, or executor
     classes declared with `Project(executors=)` that the server can import).
@@ -78,8 +80,8 @@ class Registry:
     def __init__(self, ctx: PlacementContext, extra: dict | None = None):
         self.ctx = ctx
         self.builders = {
-            "Local": lambda env, opt, c: LocalPlacement(c),
-            "Pool": lambda env, opt, c: PoolPlacement(c, env["name"]),
+            "Local": lambda spec, c: LocalPlacement(c),
+            "Pool": lambda spec, c: PoolPlacement(c, spec["executor"]),
             "AWSECS": _remote("AWSECS"),
             "K8sJob": _remote("K8sJob"),
             "Modal": _remote("Modal"),
@@ -93,17 +95,7 @@ class Registry:
         kind = spec["kind"]
         if kind not in self.builders:
             raise ValueError(f"Unregistered placement kind: {kind!r}")
-        return self.builders[kind](spec.get("environment") or {}, spec.get("placement") or {}, self.ctx)
-
-    def env_key(self, spec: dict) -> str:
-        """In-flight attempts are counted per environment against max_concurrent."""
-
-        import json
-
-        return json.dumps(
-            {"kind": spec["kind"], "environment": spec.get("environment") or {}},
-            sort_keys=True,
-        )
+        return self.builders[kind](spec, self.ctx)
 
 
 __all__ = [

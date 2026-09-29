@@ -31,6 +31,7 @@ from solera.keys.index import IndexState, KeyIndex, Options, key_bytes, key_str
 from solera.keys.io import ObjectIO, key_cache
 from solera.sdk import TimePartitions, canonical_partition, digest, split_partition
 
+from . import history
 from .history import MAX_METADATA, History, RunFilter
 from .model import TERMINAL_RUN
 from .placements import PlacementContext, Registry
@@ -102,7 +103,7 @@ class Engine:
         # Attempts consuming a local execution slot. Pool attempts only poll
         # state — they run no local work and must not starve dispatch (§10).
         self.engine_inflight: set[str] = set()
-        self.env_inflight: dict[str, int] = {}
+        self.executor_inflight: dict[str, int] = {}
         self.runner: asyncio.Task | None = None
         self.last_error = None
         self._stopping = False
@@ -558,7 +559,7 @@ class Engine:
     async def _dispatch_due(self):
         now = self.clock()
         engine_used = len(self.engine_inflight)
-        env_used = dict(self.env_inflight)
+        executor_used = dict(self.executor_inflight)
         for task_id in self.m.due(now):
             task = self.m.task(task_id)
             if task is None or task["status"] != "queued" or task_id in self.m.claims:
@@ -568,27 +569,27 @@ class Engine:
                 continue
             spec = self.manifest["assets"][task["asset"]]["placement"]
             placement = self.registry.build(spec)
-            env_key = self.registry.env_key(spec)
+            executor = spec["executor"]
             limit = getattr(placement, "max_concurrent", None)
             is_pool = spec["kind"] == "Pool"
             if not is_pool and engine_used >= self.concurrency:
                 continue
-            if limit is not None and env_used.get(env_key, 0) >= limit:
+            if limit is not None and executor_used.get(executor, 0) >= limit:
                 continue
             if self._scope_active_claim(task["asset"], task["scope"]):
                 continue
             attempt = ulid(now)
             self.m.claim(task_id, attempt, now)
-            env_used[env_key] = env_used.get(env_key, 0) + 1
+            executor_used[executor] = executor_used.get(executor, 0) + 1
             engine_used += not is_pool
-            self._spawn(task["run"], attempt, is_pool, env_key, self._attempt(task_id, attempt, placement))
+            self._spawn(task["run"], attempt, is_pool, executor, self._attempt(task_id, attempt, placement))
 
-    def _spawn(self, run_id: str, attempt: str, is_pool: bool, env_key: str, work):
+    def _spawn(self, run_id: str, attempt: str, is_pool: bool, executor: str, work):
         """Drive one attempt in the background, holding its execution slots."""
 
         if not is_pool:
             self.engine_inflight.add(attempt)
-        self.env_inflight[env_key] = self.env_inflight.get(env_key, 0) + 1
+        self.executor_inflight[executor] = self.executor_inflight.get(executor, 0) + 1
         job = asyncio.create_task(work)
         self.inflight[attempt] = (run_id, job)
 
@@ -596,7 +597,7 @@ class Engine:
             self.inflight.pop(attempt, None)
             self.reading.pop(attempt, None)
             self.engine_inflight.discard(attempt)
-            self.env_inflight[env_key] = max(0, self.env_inflight.get(env_key, 1) - 1)
+            self.executor_inflight[executor] = max(0, self.executor_inflight.get(executor, 1) - 1)
 
         job.add_done_callback(done)
 
@@ -618,9 +619,7 @@ class Engine:
                 placement = None
             self.reading[attempt] = self._reads(launched["prepared"])
             work = self._resume(task_id, attempt, placement)
-            self._spawn(
-                task["run"], attempt, execution["kind"] == "Pool", self.registry.env_key(execution), work
-            )
+            self._spawn(task["run"], attempt, execution["kind"] == "Pool", execution["executor"], work)
 
     def _scope_active_claim(self, asset: str, scope: str) -> bool:
         attempt = self.m.locks.get((asset, scope))
@@ -1037,7 +1036,7 @@ class Engine:
             needs = {
                 k: v for k in ("cpu", "memory", "gpu") if (v := execution["placement"].get(k)) is not None
             }
-            event["pool"] = {"name": execution["environment"]["name"], "needs": needs}
+            event["pool"] = {"name": execution["executor"], "needs": needs}
         await self.state.emit(event)
         return {"attempt": attempt, "run": task["run"], "objects": self.state.objects_url}
 
@@ -1867,6 +1866,7 @@ class Engine:
                 "status": a["outcome"],
                 "started_at": a.get("started_at"),
                 "finished_at": a.get("finished_at"),
+                **{k: a[k] for k in history.EXECUTION if k in a},
             }
             if a.get("error"):
                 view["error"] = a["error"]
@@ -1883,6 +1883,7 @@ class Engine:
                     "generation": len(out) + 1,
                     "status": claim["status"],
                     "started_at": claim["started_at"],
+                    **(history.execution(task["launched"]["execution"]) if claim.get("launched") else {}),
                 }
             )
         return out

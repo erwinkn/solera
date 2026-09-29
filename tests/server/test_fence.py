@@ -41,9 +41,9 @@ class Remote:
 
 def engine_for(state, project, placement="remote", **kw):
     if placement == "remote":
-        placements = {"Fake": lambda e, o, c: Remote(c)}
+        placements = {"Fake": lambda s, c: Remote(c)}
     else:
-        placements = {"Local": lambda e, o, c: InlinePlacement(c, project)}
+        placements = {"Local": lambda s, c: InlinePlacement(c, project)}
     kw.setdefault("heartbeat_seconds", 0.3)
     return Engine(state, project.manifest, placements=placements, clock=state.clock, eval_interval=0.02, **kw)
 
@@ -94,12 +94,12 @@ async def restart(state, engine, url, project, **kw):
     return again, engine_for(again, project, **kw)
 
 
-@asset(executor=Fake()())
+@asset(executor=Fake("fake")())
 def remote():
     return [{"ok": True}]
 
 
-REMOTE = Project(assets=[remote], executors=[Fake()])
+REMOTE = Project(assets=[remote], executors=[Fake("fake")])
 
 
 async def test_a_restarted_engine_adopts_and_commits_a_launched_attempt(tmp_path):
@@ -269,13 +269,13 @@ async def test_an_aborted_worker_writes_nothing(tmp_path):
 
     calls = []
 
-    @asset(executor=Fake()(), outputs=Output("slow", key="id"))
+    @asset(executor=Fake("fake")(), outputs=Output("slow", key="id"))
     async def slow():
         calls.append(1)
         await asyncio.sleep(0 if len(calls) > 1 else 10)
         return [{"id": "a"}]
 
-    project = Project(assets=[slow], executors=[Fake()])
+    project = Project(assets=[slow], executors=[Fake("fake")])
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = engine_for(state, project)
     await engine.initialize()

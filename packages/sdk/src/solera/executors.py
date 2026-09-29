@@ -1,4 +1,6 @@
-"""Environments and placements (§10). Calling an environment returns a placement."""
+"""Executors and placements (§10). An executor is a named environment —
+`AWSECS("etl", cluster="prod", region="us-east-1")` — and calling it returns
+a placement: that executor, with per-asset options (`etl(cpu=4)`)."""
 
 from __future__ import annotations
 
@@ -32,22 +34,30 @@ def parse_bytes(value: str | int | None) -> int | None:
 
 @dataclass(frozen=True)
 class Placement:
-    """A typed per-asset request built from an environment (§10)."""
+    """A typed per-asset request built from an executor (§10)."""
 
+    executor: str
     kind: str
     environment: dict
     options: dict
 
     def serialized(self) -> dict:
-        return {"kind": self.kind, "environment": self.environment, "placement": self.options}
+        return {
+            "executor": self.executor,
+            "kind": self.kind,
+            "environment": self.environment,
+            "placement": self.options,
+        }
 
 
 class Environment:
     kind = "?"
     allowed: frozenset[str] = frozenset()
 
-    def __init__(self, **config: Any):
-        self.config = config
+    def __init__(self, name: str, **config: Any):
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
+            raise RegistrationError(f"{self.kind}: invalid executor name {name!r}")
+        self.name, self.config = name, config
 
     def _options(self, **options: Any) -> dict:
         return {k: v for k, v in options.items() if v is not None}
@@ -62,76 +72,74 @@ class Environment:
             options["memory"] = parse_bytes(options["memory"])
         return {k: v for k, v in options.items() if v is not None}
 
+    def _placement(self, options: dict) -> Placement:
+        return Placement(self.name, self.kind, dict(self.config), options)
+
     def __call__(self, **options) -> Placement:
-        return Placement(self.kind, dict(self.config), self._check(options, set(self.allowed)))
+        return self._placement(self._check(options, set(self.allowed)))
 
 
 class Local(Environment):
-    """In-process/subprocess on the engine host. No options."""
+    """In-process/subprocess on the engine host, always named `local`. No options."""
 
     kind = "Local"
 
     def __init__(self):
-        super().__init__()
+        super().__init__("local")
 
     def __call__(self, **options) -> Placement:
-        return Placement(self.kind, dict(self.config), self._check(options, set()))
+        return self._placement(self._check(options, set()))
 
 
 class AWSECS(Environment):
     kind = "AWSECS"
 
-    def __init__(self, *, cluster: str, region: str):
-        super().__init__(cluster=cluster, region=region)
+    def __init__(self, name: str, *, cluster: str, region: str):
+        super().__init__(name, cluster=cluster, region=region)
 
     def __call__(self, *, cpu: int | None = None, memory=None, gpu=None, image=None) -> Placement:
-        return Placement(
-            self.kind,
-            dict(self.config),
+        return self._placement(
             self._check(
                 {"cpu": cpu, "memory": memory, "gpu": gpu, "image": image},
                 {"cpu", "memory", "gpu", "image"},
-            ),
+            )
         )
 
 
 class K8sJob(Environment):
     kind = "K8sJob"
 
-    def __init__(self, *, cluster: str, namespace: str = "default"):
-        super().__init__(cluster=cluster, namespace=namespace)
+    def __init__(self, name: str, *, cluster: str, namespace: str = "default"):
+        super().__init__(name, cluster=cluster, namespace=namespace)
 
     def __call__(self, *, cpu: int | None = None, memory=None, image=None) -> Placement:
-        return Placement(
-            self.kind,
-            dict(self.config),
-            self._check({"cpu": cpu, "memory": memory, "image": image}, {"cpu", "memory", "image"}),
+        return self._placement(
+            self._check({"cpu": cpu, "memory": memory, "image": image}, {"cpu", "memory", "image"})
         )
 
 
 class Modal(Environment):
     kind = "Modal"
 
-    def __init__(self, *, app: str):
-        super().__init__(app=app)
+    def __init__(self, name: str, *, app: str):
+        super().__init__(name, app=app)
 
     def __call__(self, *, gpu=None) -> Placement:
-        return Placement(self.kind, dict(self.config), self._check({"gpu": gpu}, {"gpu"}))
+        return self._placement(self._check({"gpu": gpu}, {"gpu"}))
 
 
 class Pool(Environment):
-    """Pull path: external workers claim stages through the API (§10)."""
+    """Pull path: external workers claim stages through the API (§10). The
+    executor's name is the pool's."""
 
     kind = "Pool"
 
     def __init__(self, name: str):
-        super().__init__(name=name)
+        super().__init__(name)
 
     def __call__(self, *, cpu: int | None = None, memory=None, gpu=None) -> Placement:
-        return Placement(
-            self.kind,
-            dict(self.config),
-            self._check({"cpu": cpu, "memory": memory, "gpu": gpu}, {"cpu", "memory", "gpu"}),
+        return self._placement(
+            self._check({"cpu": cpu, "memory": memory, "gpu": gpu}, {"cpu", "memory", "gpu"})
         )
 
 

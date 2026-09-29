@@ -499,24 +499,27 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
             by=body.by or "api",
         )
 
-    # -- environments + workers -----------------------------------------------------
+    # -- executors + workers --------------------------------------------------------
 
-    @app.get("/api/projects/{p}/environments")
-    async def environments(p: str, request: Request):
+    @app.get("/api/projects/{p}/executors")
+    async def executors(p: str, request: Request):
         runtime = await project_engine(request, p)
-        seen = {}
-        for info in runtime.manifest["assets"].values():
-            spec = info["placement"]
-            key = runtime.registry.env_key(spec)
-            placement = runtime.registry.build(spec)
-            seen[key] = {
-                "key": key,
-                "kind": spec["kind"],
-                "environment": spec["environment"],
-                "max_concurrent": getattr(placement, "max_concurrent", None),
-                "in_flight": runtime.env_inflight.get(key, 0),
-            }
-        return {"environments": list(seen.values())}
+
+        def limit(name, executor):
+            placement = runtime.registry.build({"executor": name, **executor, "placement": {}})
+            return getattr(placement, "max_concurrent", None)
+
+        return {
+            "executors": [
+                {
+                    "name": name,
+                    **executor,
+                    "max_concurrent": limit(name, executor),
+                    "in_flight": runtime.executor_inflight.get(name, 0),
+                }
+                for name, executor in runtime.manifest["executors"].items()
+            ]
+        }
 
     @app.get("/api/projects/{p}/workers")
     async def workers(p: str, request: Request):

@@ -196,7 +196,12 @@ class Ctx:
         self.changes = changes
         self.run_id = spec["run"]["id"]
         self.config = spec["run"].get("config") or {}
-        self.execution = spec.get("execution") or {"kind": "Local", "environment": {}, "placement": {}}
+        self.execution = spec.get("execution") or {
+            "executor": "local",
+            "kind": "Local",
+            "environment": {},
+            "placement": {},
+        }
         self._stores = project.stores
         self._outputs = [o.name or asset.name for o in asset.outputs]
         self._metadata: dict[str, dict] = {}

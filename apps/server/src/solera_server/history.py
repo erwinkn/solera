@@ -79,10 +79,7 @@ TABLES = {
             "retry_delay": "DOUBLE",  # seconds; no retry policy if null
             "retry_backoff": "VARCHAR",
             "retried": "INTEGER",  # times the run was retried with it failed
-            "executor": "VARCHAR",
-            "cpu": "DOUBLE",
-            "memory": "DOUBLE",
-            "gpu": "DOUBLE",
+            "executor": "VARCHAR",  # where its last attempt ran
         },
     ),
     "attempts": Table(
@@ -100,7 +97,11 @@ TABLES = {
             "finished_at": "DOUBLE",
             "duration": "DOUBLE",
             "error": "VARCHAR",
-            "executor": "VARCHAR",
+            "executor": "VARCHAR",  # null if never launched: skipped, or failed preparing
+            "cpu": "INTEGER",  # requested
+            "memory": "BIGINT",  # bytes, requested
+            "gpu": "INTEGER",  # requested; a named GPU type counts one
+            "options": "MAP(VARCHAR, VARCHAR)",  # its other placement options: image, GPU type
             "outputs": "MAP(VARCHAR, VARCHAR)",  # output -> the version it committed
         },
     ),
@@ -150,19 +151,26 @@ MAX_METADATA = 64 << 10  # bytes of JSON per output version
 # -- rows -----------------------------------------------------------------------------
 
 
-def _executor(placement: dict | None) -> dict:
-    placement = placement or {}
-    kind = placement.get("kind") or "Local"
-    env = placement.get("environment") or {}
-    options = placement.get("placement") or {}
-    label = kind if not env else f"{kind}({'/'.join(str(v) for _, v in sorted(env.items()))})"
-    gpu = options.get("gpu")
-    return {
-        "executor": label,
-        "cpu": options.get("cpu"),
-        "memory": options.get("memory"),
-        "gpu": float(gpu) if isinstance(gpu, (int, float)) else 1.0 if gpu else None,
+EXECUTION = ("executor", "cpu", "memory", "gpu", "options")
+
+
+def execution(spec: dict) -> dict:
+    """Where a launched attempt ran, as its row holds it: the executor, the
+    resources it requested, and its other options verbatim. Unset fields
+    are left out: `Local()()` is just `{"executor": "local"}`."""
+
+    options = dict(spec.get("placement") or {})
+    cpu, memory, gpu = options.pop("cpu", None), options.pop("memory", None), options.get("gpu")
+    if not isinstance(gpu, str):
+        options.pop("gpu", None)
+    record = {
+        "executor": spec["executor"],
+        "cpu": cpu,
+        "memory": memory,
+        "gpu": 1 if isinstance(gpu, str) else gpu,
+        "options": {k: str(v) for k, v in options.items()},
     }
+    return {k: v for k, v in record.items() if v not in (None, {})}
 
 
 def _span(attempt: dict) -> float:
@@ -174,18 +182,18 @@ def _json(value) -> str | None:
     return None if value is None else json.dumps(value, sort_keys=True)
 
 
-def run_rows(run: dict, manifest: dict | None, *, live: bool = False) -> dict[str, list[dict]]:
+def run_rows(run: dict, *, live: bool = False) -> dict[str, list[dict]]:
     """A run's rows in `runs`, `tasks` and `attempts`. `live` describes a run
     still in progress: no finish time."""
 
-    assets = (manifest or {}).get("assets") or {}
     tasks = run["tasks"]
     ends = {tid: t["attempts"][-1].get("finished_at") for tid, t in tasks.items() if t["attempts"]}
     task_rows, attempt_rows = [], []
     for tid in sorted(tasks):
         task = tasks[tid]
         attempts = task["attempts"]
-        executor = _executor((assets.get(task["asset"]) or {}).get("placement"))
+        launched = (task.get("launched") or {}).get("execution")
+        ran = [launched["executor"]] if launched else [a["executor"] for a in attempts if "executor" in a]
         done = [ends[d] for d in task["deps"] if ends.get(d) is not None]
         retry = task.get("retry") or {}
         task_rows.append(
@@ -207,7 +215,7 @@ def run_rows(run: dict, manifest: dict | None, *, live: bool = False) -> dict[st
                 "retry_delay": retry.get("delay"),
                 "retry_backoff": retry.get("backoff"),
                 "retried": task.get("retried", 0),
-                **executor,
+                "executor": ran[-1] if ran else None,
             }
         )
         for n, a in enumerate(attempts, 1):
@@ -224,7 +232,8 @@ def run_rows(run: dict, manifest: dict | None, *, live: bool = False) -> dict[st
                     "finished_at": a.get("finished_at"),
                     "duration": _span(a),
                     "error": a.get("error"),
-                    "executor": executor["executor"],
+                    **{k: a.get(k) for k in EXECUTION},
+                    "options": a.get("options") or {},
                     "outputs": a.get("outputs") or {},
                 }
             )
@@ -284,6 +293,7 @@ def run_record(rows: dict[str, list[dict]]) -> dict:
     attempts: dict[str, list[dict]] = {}
     for a in rows["attempts"]:
         attempt = {k: a[k] for k in ("id", "outcome", "started_at", "finished_at")}
+        attempt |= {k: a[k] for k in EXECUTION if a[k]}
         if a["error"]:
             attempt["error"] = a["error"]
         if a["outputs"]:
@@ -561,7 +571,7 @@ class History:
         if live:
             m = self.m
             for run_id in list(m.runs):
-                for table, rows in run_rows(m.runs[run_id], m.manifest, live=True).items():
+                for table, rows in run_rows(m.runs[run_id], live=True).items():
                     extra.setdefault(table, []).extend(rows)
         return await self.lake.query(work, tables, since=since, until=until, key=run, extra=extra)
 
@@ -742,8 +752,9 @@ class History:
     ) -> dict:
         """Operations at a glance, from finished tasks: per asset and per
         executor, how many ran and failed, how long they took and waited
-        (p50, p95), and the compute they used. `scope` narrows to one
-        partition of `asset`."""
+        (p50, p95), and the compute their attempts requested. A task counts
+        under the executor of its last attempt; compute, under each
+        attempt's. `scope` narrows to one partition of `asset`."""
 
         clauses, params = ["status NOT IN ('waiting', 'queued', 'running')"], []
         if since is not None:
@@ -767,26 +778,35 @@ class History:
             quantile_cont(duration, 0.95) FILTER (WHERE status = 'succeeded') AS p95,
             quantile_cont(greatest(started_at - ready_at, 0), 0.5) FILTER (WHERE started_at IS NOT NULL) AS wait_p50,
             quantile_cont(greatest(started_at - ready_at, 0), 0.95) FILTER (WHERE started_at IS NOT NULL) AS wait_p95,
-            sum(duration) / 3600 AS hours,
-            sum(duration * cpu) / 3600 AS cpu_hours,
-            sum(duration * memory) / 3600 / 1e9 AS gb_hours,
-            sum(duration * gpu) / 3600 AS gpu_hours
+            sum(duration) / 3600 AS hours
+        """
+        compute = """
+            sum(a.duration * a.cpu) / 3600 AS cpu_hours,
+            sum(a.duration * a.memory) / 3600 / 1e9 AS gb_hours,
+            sum(a.duration * a.gpu) / 3600 AS gpu_hours
         """
 
         def work(con):
-            by_asset = _dicts(
-                con.execute(
-                    f"SELECT asset, {measures} FROM tasks WHERE {where} GROUP BY 1 ORDER BY 1", params
+            con.execute(f"CREATE TEMP TABLE picked AS SELECT * FROM tasks WHERE {where}", params)
+            result = {}
+            for group, name in (("asset", "assets"), ("executor", "executors")):
+                result[name] = _dicts(
+                    con.execute(f"""
+                        WITH t AS (
+                            SELECT {group}, {measures} FROM picked
+                            WHERE {group} IS NOT NULL GROUP BY 1
+                        ), c AS (
+                            SELECT a.{group}, {compute}
+                            FROM attempts a JOIN picked p ON a.run = p.run AND a.task = p.id
+                            GROUP BY 1
+                        )
+                        SELECT * FROM t LEFT JOIN c USING ({group}) ORDER BY 1
+                    """)
                 )
-            )
-            by_executor = _dicts(
-                con.execute(
-                    f"SELECT executor, {measures} FROM tasks WHERE {where} GROUP BY 1 ORDER BY 1", params
-                )
-            )
-            return {"assets": by_asset, "executors": by_executor}
+            return result
 
-        return await self.query(work, ("tasks",), since=since, until=until, live=False)
+        # Not pruned by `until`: an attempt may start after it, its task before.
+        return await self.query(work, ("tasks", "attempts"), since=since, live=False)
 
     async def materializations(
         self,

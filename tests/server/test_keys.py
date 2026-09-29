@@ -27,7 +27,7 @@ def engine_for(state, project, **kw):
     return Engine(
         state,
         project.manifest,
-        placements={"Local": lambda e, o, c: InlinePlacement(c, project)},
+        placements={"Local": lambda s, c: InlinePlacement(c, project)},
         clock=state.clock,
         eval_interval=0.01,
         **kw,

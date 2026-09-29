@@ -317,20 +317,25 @@ def test_onchange_cannot_watch_own_outputs():
 
 
 def test_unregistered_placement_kind():
-    """§10/§11: a placement's kind must be registered."""
+    """§10/§11: a custom kind's executor must be registered, and a name
+    means one executor."""
 
     class Custom(Environment):
         kind = "Custom"
         allowed = frozenset({"cpu"})
 
-    @asset(executor=Custom()(cpu=1))
+    custom = Custom("custom", zone="a")
+
+    @asset(executor=custom(cpu=1))
     def a():
         return []
 
     with pytest.raises(RegistrationError, match="kind"):
         Project(assets=[a])
-    project = Project(assets=[a], executors=[Custom])
-    assert "Custom" in project.manifest["executors"]
+    project = Project(assets=[a], executors=[custom])
+    assert project.manifest["executors"] == {"custom": {"kind": "Custom", "environment": {"zone": "a"}}}
+    with pytest.raises(RegistrationError, match="custom"):
+        Project(assets=[a], executors=[Custom("custom", zone="b")])
 
 
 def test_deps_pin_but_never_bind():

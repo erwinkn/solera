@@ -82,7 +82,7 @@ async def test_soak(tmp_path, monkeypatch):
     engine = Engine(
         state,
         project.manifest,
-        placements={"Local": lambda env, opt, ctx: InlinePlacement(ctx, project)},
+        placements={"Local": lambda spec, ctx: InlinePlacement(ctx, project)},
         clock=lambda: clock[0],
     )
     await engine.initialize()
@@ -241,7 +241,7 @@ async def test_soak_with_retention(tmp_path, monkeypatch):
     engine = Engine(
         state,
         project.manifest,
-        placements={"Local": lambda env, opt, ctx: InlinePlacement(ctx, project)},
+        placements={"Local": lambda spec, ctx: InlinePlacement(ctx, project)},
         clock=lambda: clock[0],
         retention_interval=0,
     )
@@ -301,7 +301,7 @@ async def test_soak_with_retention(tmp_path, monkeypatch):
     engine = Engine(
         state,
         later.manifest,
-        placements={"Local": lambda env, opt, ctx: InlinePlacement(ctx, later)},
+        placements={"Local": lambda spec, ctx: InlinePlacement(ctx, later)},
         clock=lambda: clock[0],
     )
     await engine.initialize()
