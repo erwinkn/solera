@@ -164,26 +164,27 @@ async def test_flush_merge_delete_and_purge(state, clock):
     await engine.initialize()
     runs = [(await run(engine, clock, ["orders"], config={"n": i}))["id"] for i in range(4)]
     await engine.tick()
-    files = state.model.history_files
-    assert not any(state.model.history_rows.values())
+    files = state.model.history.files
+    assert not any(state.model.history.rows.values())
     # Each run's rows went out in its own flush; pairs of them were merged.
     assert sum(f["rows"] for f in files["runs"]) == 4
-    await engine.history.stop()
-    while engine.history.plan():
-        engine.history.maintain()
-        await engine.history.job
+    lake = engine.history.lake
+    await lake.stop()
+    while lake.plan():
+        lake.maintain()
+        await lake.job
     assert len(files["runs"]) == 1
     assert [r["id"] for r in (await engine.list_runs())["runs"]] == runs[::-1]
 
     await engine.delete_run(runs[1])
     hidden = files["runs"][0]
-    assert hidden["deleted"] == [runs[1]]
+    assert hidden["hidden"] == [runs[1]]
     assert runs[1] not in [r["id"] for r in (await engine.list_runs())["runs"]]
     assert await engine.history.run(runs[1]) is None
     clock.now += 101  # the file is rewritten without the run
-    engine.history.maintain()
-    await engine.history.job
-    assert "deleted" not in files["runs"][0] and files["runs"][0]["rows"] == 3
+    lake.maintain()
+    await lake.job
+    assert "hidden" not in files["runs"][0] and files["runs"][0]["rows"] == 3
     assert hidden["path"] in {path for path, _ in state.model.garbage}
     made = (await engine.history.materializations(outputs=["orders"]))["materializations"]
     assert runs[1] not in {m["run"] for m in made}
@@ -193,8 +194,8 @@ async def test_stale_flush_is_discarded(state, clock):
     engine = engine_for(state, clock)
     await engine.initialize()
     doomed = (await run(engine, clock, ["orders"]))["id"]
-    history = engine.history
-    write = history._write
+    history, lake = engine.history, engine.history.lake
+    write = lake._write
 
     async def racing(table, rows):
         written = await write(table, rows)
@@ -202,12 +203,12 @@ async def test_stale_flush_is_discarded(state, clock):
             await history.delete([doomed])  # deleted while the flush was writing
         return written
 
-    history._write = racing
-    await history.flush(force=True)
-    history._write = write
-    assert not state.model.history_files  # the stale files were not installed
+    lake._write = racing
+    await lake.flush(force=True)
+    lake._write = write
+    assert not state.model.history.files  # the stale files were not installed
     assert await state.list_objects("history/") == []
-    await history.flush(force=True)
+    await lake.flush(force=True)
     assert await engine.history.run(doomed) is None
 
 
@@ -268,7 +269,7 @@ async def test_backfill_imports_run_json(tmp_path, clock):
     await state.put_object(f"runs/{legacy['id']}/at-1.json", b"{}")
     engine = engine_for(state, clock)
     await engine.initialize()
-    assert state.model.history_imported
+    assert state.model.history.imported
     assert await state.list_objects("runs/") == [f"runs/{legacy['id']}/at-1.json"]
     assert await engine.history.run(legacy["id"]) == legacy
     listed = (await engine.list_runs())["runs"]

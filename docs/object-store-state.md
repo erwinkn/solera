@@ -218,8 +218,10 @@ Example (abridged):
   "outcomes": {"file_index": {"alpha": {"outcome": "succeeded", "run": "01J8ZB3K…", "attempt": "01J8ZB3M…", "at": 1790074800.0}}},
   "automations": {"site_feed.every.0": {"enabled": true, "last_fired": 1790074866.1,
                   "last_run": "01J8ZC7S…", "last_revision": "c0ffee…", "pending": []}},
-  "history": {"files": {"runs": [{"path": "history/runs/01J9A2….parquet", "rows": 4000, "…": "…"}]},
-              "rows": {"runs": [[311, {"id": "01J9C8…", "status": "succeeded", "…": "…"}]]}, "seq": 311},
+  "history": {"files": {"runs": [{"path": "history/runs/01J9A2….parquet", "rows": 4000, "at": [1790…, 1790…],
+                                  "keys": ["01J9A2…", "01J9B7…"], "bytes": 81233}]},
+              "rows": {"runs": {"columns": ["id", "created_at", "…"], "rows": [[311, ["01J9C8…", 1790074866.1, "…"]]]}},
+              "seq": 311, "imported": true},
   "runs": {"01J8ZC7S…": {"…": "Run"}}
 }
 ```
@@ -364,33 +366,48 @@ that finish things: `RunArchived` yields a run's `runs`, `tasks` and
 `attempts` rows; `AttemptFinished` with a commit yields a
 `materializations` row per changed output, plus `lineage` rows from the
 input versions pinned in the attempt's spec; `SourceCommitted` yields a
-`runs` row and a `materializations` row. They wait in `State.history.rows`,
-durable in the checkpoint, until a **flush** writes each table's rows as
-one Parquet file (zstd, sorted by the table's time column) and
-`HistoryFlushed` installs them. A flush happens once 10,000 rows are
-pending or the oldest has waited 15 minutes, so a namespace with a run a
-minute writes about 5 small files per quarter hour.
+`runs` row and a `materializations` row. From there, they are the **lake's**
+business.
 
-**Merging.** The model keeps each file's row count, time range and run
+**The lake** (`lake.py`) is the storage layer under the history: a set of
+append-only tables, each a list of Parquet files plus a buffer of rows not
+yet written. Nothing above it knows how rows are buffered, flushed, merged
+or rewritten; the history only declares its tables (columns, the time
+column files are sorted by, the key rows are deleted by), appends rows, and
+asks questions in SQL. Its durable part, `State.history`, holds the files
+and the buffered rows — as value lists in column order, so the checkpoint
+names each column once per table rather than once per row.
+
+**Flushing.** A flush writes each table's buffered rows as one Parquet
+file (zstd, sorted by the table's time column), and `HistoryFlushed`
+installs them. It happens once 2,000 rows are buffered or the oldest has
+waited a minute, so the checkpoint never carries more than a minute or so
+of history.
+
+**Merging.** The lake keeps each file's row count, time range and key
 range. Files are grouped in size tiers — up to 1,000 rows, then ×4 per
 tier — and four neighbours of one tier are merged into one, up to 1M rows
 per file, on a worker thread (`HistoryCompacted`). The file count stays
 logarithmic in the history's size: a year of a run per minute (~0.5M runs)
 is a few dozen `runs` files.
 
-**Deleting runs.** `RunsDeleted` drops the runs' pending rows at once and
-adds the runs to the `deleted` list of every file whose run range covers
+**Deleting runs.** `RunsDeleted` drops the runs' buffered rows at once and
+adds the runs to the `hidden` list of every file whose key range covers
 them; queries filter them out (`WHERE run NOT IN (…)`). A file is
 rewritten without them after an hour, or as soon as it hides 1,000 runs,
 and the old file becomes garbage. A flush or merge that raced a deletion
 is discarded rather than installed, so a deleted run never comes back.
 
-**Queries.** Each query opens a fresh in-memory DuckDB connection on a
-worker thread, with one view per table over three parts:
+**Queries.** A query runs on a worker thread, with one view per table
+over three parts:
 
-- the Parquet files, skipped when their time or run range cannot match
+- the Parquet files, skipped when their time or key range cannot match
   (a query for last week's runs never opens last year's files);
-- the pending rows, from memory;
+- the buffered rows, mirrored in an in-memory DuckDB table that each query
+  brings up to date — dropping what was flushed, adding what was appended —
+  so a query copies only the rows that arrived since the last one. The
+  query reads the mirror in a transaction of its own: rows that change
+  while it runs are not seen, as in any database snapshot;
 - for `runs`, `tasks` and `attempts`, the runs still in progress, so a run
   appears in listings the moment it is submitted.
 

@@ -10,46 +10,26 @@ Five tables, each row about one:
     lineage           input version an output version was built from
 
 Rows are born in the model: `apply` derives them from the events that finish
-things — a run archived, a commit installed, a source committed — and holds
-them, durable in the checkpoint, until a flush writes each table's rows as
-one Parquet file under `history/{table}/` (`HistoryFlushed`). Small files are
-merged on a worker thread (`HistoryCompacted`). Deleting a run drops its
-pending rows at once and hides it in the files that may hold it, until they
-are rewritten.
+things — a run archived, a commit installed, a source committed — and appends
+them to the history's `LakeState`. How they reach Parquet files, and how the
+files are merged and rewritten, is the lake's business (`lake.py`): this
+module knows the tables, their rows and the questions asked of them.
 
-A query reads the files — cached on local disk, since they never change —
-plus the pending rows and the runs still in progress, so a run shows up the
-moment it is submitted.
+Queries also see the runs still in progress, so a run shows up the moment it
+is submitted.
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
-import logging
 import math
-import os
-import tempfile
-import time
 from dataclasses import dataclass, field
-from hashlib import sha256
-from pathlib import Path
-from urllib.parse import unquote, urlsplit
 
-from solera.ids import ulid
-
-log = logging.getLogger(__name__)
+from .lake import Lake, Table
 
 TERMINAL_RUN = frozenset({"succeeded", "failed", "canceled"})
 BAD_TASK = frozenset({"failed", "blocked", "canceled"})
-
-
-@dataclass(frozen=True)
-class Table:
-    run: str  # the column naming the run a row belongs to
-    time: str  # the column files are pruned and sorted by
-    columns: dict[str, str]
 
 
 TABLES = {
@@ -488,10 +468,6 @@ def bucket_for(span: float, target: int = 60) -> int:
     return next((b for b in BUCKETS if span / b <= target), BUCKETS[-1])
 
 
-def _sql_str(value: str) -> str:
-    return "'" + str(value).replace("'", "''") + "'"
-
-
 def _dicts(cursor) -> list[dict]:
     names = [d[0] for d in cursor.description]
     return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
@@ -501,226 +477,23 @@ def _dicts(cursor) -> list[dict]:
 
 
 class History:
-    """The run history of one namespace: its write path (flush, merge,
-    delete, import) and its queries. Memory only; the model holds the rest."""
+    """The run history of one namespace: its lake, and the questions asked
+    of it. Memory only; the model holds the rest."""
 
-    def __init__(
-        self,
-        state,
-        *,
-        clock=None,
-        cache: str | None = None,
-        flush_rows: int = 10_000,
-        flush_seconds: float = 900.0,
-        purge_seconds: float = 3600.0,
-        merge_width: int = 4,
-        base_rows: int = 1_000,
-        final_rows: int = 1_000_000,
-    ):
+    def __init__(self, state, *, clock=None, **lake):
         self.state = state
-        self.clock = clock or time.time
-        self.flush_rows, self.flush_seconds = flush_rows, flush_seconds
-        self.purge_seconds = purge_seconds
-        self.merge_width, self.base_rows, self.final_rows = merge_width, base_rows, final_rows
-        u = urlsplit(state.objects_url)
-        # `file://` state is read in place; anything else is copied to local disk.
-        self.root = Path(unquote(u.path)) if u.scheme == "file" else None
-        if cache is None and self.root is None:
-            if u.scheme == "memory":
-                cache = tempfile.mkdtemp(prefix="solera-history-")
-            else:
-                digest = sha256(state.objects_url.encode()).hexdigest()[:16]
-                cache = os.path.join(tempfile.gettempdir(), "solera-history", digest)
-        self.cache = Path(cache) if cache else None
-        self.job: asyncio.Task | None = None
-        self.last_error: str | None = None
+        self.lake = Lake(state, TABLES, lambda: state.model.history, name="History", clock=clock, **lake)
+        self.clock = self.lake.clock
 
     @property
     def m(self):
         return self.state.model
 
-    # -- write path ----------------------------------------------------------------------
-
     async def tick(self) -> None:
-        await self.flush()
-        self.maintain()
+        await self.lake.tick()
 
     async def stop(self) -> None:
-        if self.job is not None:
-            self.job.cancel()
-            await asyncio.gather(self.job, return_exceptions=True)
-
-    async def flush(self, force: bool = False) -> None:
-        """Write the pending rows out, one file per table, once there are
-        `flush_rows` of them or the oldest has waited `flush_seconds`."""
-
-        pending = {t: rows for t, rows in self.m.history_rows.items() if rows}
-        count = sum(len(rows) for rows in pending.values())
-        if not count:
-            return
-        now = self.clock()
-        oldest = min((rows[0][1].get(TABLES[t].time) or now) for t, rows in pending.items())
-        if not force and count < self.flush_rows and now - oldest < self.flush_seconds:
-            return
-        upto = {t: rows[-1][0] for t, rows in pending.items()}
-        batches = {t: [row for _, row in rows] for t, rows in pending.items()}
-        files = {}
-        try:
-            for table, rows in batches.items():
-                files[table] = await self._write(table, rows)
-        except BaseException:
-            await self._discard([f["path"] for f in files.values()])
-            raise
-        # A run deleted meanwhile must not come back with this file.
-        for table, rows in batches.items():
-            left = sum(1 for seq, _ in self.m.history_rows.get(table, ()) if seq <= upto[table])
-            if left != len(rows):
-                await self._discard([f["path"] for f in files.values()])
-                return
-        await self.state.emit({"type": "HistoryFlushed", "files": files, "upto": upto})
-
-    async def _write(self, table: str, rows: list[dict]) -> dict:
-        path = f"history/{table}/{ulid(self.clock())}.parquet"
-        data, stats = await asyncio.to_thread(self._encode, table, rows)
-        await self.state.create_object(path, data)
-        self._keep(path, data)
-        return {"path": path, **stats, "bytes": len(data)}
-
-    def _encode(self, table: str, rows: list[dict]) -> tuple[bytes, dict]:
-        """Rows as a Parquet file, sorted by the table's time column."""
-
-        import duckdb
-
-        with tempfile.TemporaryDirectory() as tmp:
-            source = os.path.join(tmp, "rows.json")
-            with open(source, "w") as out:
-                for row in rows:
-                    out.write(json.dumps(row, allow_nan=False, default=str))
-                    out.write("\n")
-            con = duckdb.connect()
-            try:
-                return self._copy(con, table, self._json_sql(table, [source]), tmp)
-            finally:
-                con.close()
-
-    def _copy(self, con, table: str, sql: str, tmp: str) -> tuple[bytes, dict]:
-        spec = TABLES[table]
-        target = os.path.join(tmp, "out.parquet")
-        con.execute(
-            f'COPY (SELECT * FROM ({sql}) ORDER BY "{spec.time}") TO {_sql_str(target)} '
-            "(FORMAT parquet, COMPRESSION zstd)"
-        )
-        rows, lo, hi, first, last = con.execute(
-            f'SELECT count(*), min("{spec.time}"), max("{spec.time}"), min("{spec.run}"), max("{spec.run}") '
-            f"FROM read_parquet({_sql_str(target)})"
-        ).fetchone()
-        stats = {"rows": rows, "at": [lo, hi], "runs": [first, last]}
-        return Path(target).read_bytes(), stats
-
-    async def _discard(self, paths: list[str]) -> None:
-        with contextlib.suppress(Exception):
-            await self.state.delete_objects(paths)
-        for path in paths:
-            self._evict(path)
-
-    def maintain(self) -> None:
-        """Start merging small files, and rewriting those hiding deleted runs,
-        unless that is already under way."""
-
-        if self.job is not None:
-            return
-        plan = self.plan()
-        if not plan:
-            return
-        self.job = asyncio.create_task(self._compact(plan))
-
-        def done(_job):
-            self.job = None
-
-        self.job.add_done_callback(done)
-
-    def plan(self) -> list[tuple[str, list[dict]]]:
-        """Groups of files to rewrite as one: `merge_width` neighbours of one
-        size tier (rows grow by `merge_width` per tier, up to `final_rows`),
-        and any file that has hidden deleted runs for `purge_seconds` or
-        hides more than a thousand."""
-
-        now = self.clock()
-        out = []
-        for table, files in self.m.history_files.items():
-            grouped = set()
-            run, tier = [], None
-            for f in files:
-                t = self._tier(f["rows"])
-                if t is None or t != tier:
-                    run, tier = [], t
-                if t is None:
-                    continue
-                run.append(f)
-                if len(run) == self.merge_width:
-                    out.append((table, [dict(x) for x in run]))
-                    grouped.update(x["path"] for x in run)
-                    run, tier = [], None
-            for f in files:
-                hidden = f.get("deleted")
-                if not hidden or f["path"] in grouped:
-                    continue
-                if len(hidden) >= 1000 or now - f.get("deleted_at", now) >= self.purge_seconds:
-                    out.append((table, [dict(f)]))
-        return out
-
-    def _tier(self, rows: int) -> int | None:
-        if rows >= self.final_rows:
-            return None
-        return int(math.log(max(rows, 1) / self.base_rows, self.merge_width)) if rows > self.base_rows else 0
-
-    async def _compact(self, plan) -> None:
-        try:
-            for _, group in plan:
-                await self._fetch([f["path"] for f in group])
-            results = await asyncio.to_thread(self._merge, plan)
-            changes, created = [], []
-            for (table, group), (data, stats) in zip(plan, results, strict=True):
-                added = None
-                if stats["rows"]:
-                    path = f"history/{table}/{ulid(self.clock())}.parquet"
-                    await self.state.create_object(path, data)
-                    self._keep(path, data)
-                    created.append(path)
-                    added = {"path": path, **stats, "bytes": len(data)}
-                changes.append({"table": table, "removed": [f["path"] for f in group], "added": added})
-            # Unless every file it replaces is unchanged — no run hidden in
-            # it since — the rewrite is stale.
-            current = {f["path"]: f for files in self.m.history_files.values() for f in files}
-            for _, group in plan:
-                for f in group:
-                    now = current.get(f["path"])
-                    if now is None or len(now.get("deleted") or ()) != len(f.get("deleted") or ()):
-                        await self._discard(created)
-                        return
-            await self.state.emit({"type": "HistoryCompacted", "changes": changes, "at": self.clock()})
-            for change in changes:
-                for path in change["removed"]:
-                    self._evict(path)
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            self.last_error = f"history: {type(error).__name__}: {error}"
-            log.exception("history compaction failed")
-
-    def _merge(self, plan) -> list[tuple[bytes, dict]]:
-        import duckdb
-
-        out = []
-        for table, group in plan:
-            with tempfile.TemporaryDirectory() as tmp:
-                con = duckdb.connect()
-                try:
-                    files = [(self._local(f["path"]), f.get("deleted") or []) for f in group]
-                    out.append(self._copy(con, table, self._files_sql(table, files), tmp))
-                finally:
-                    con.close()
-        return out
+        await self.lake.stop()
 
     async def delete(self, runs: list[str]) -> None:
         """Forget finished runs: their rows go now, or from the files that
@@ -734,10 +507,10 @@ class History:
         existed, once, then delete them."""
 
         m = self.m
-        if m.history_imported:
+        if m.history.imported:
             return
         paths = [p for p in await self.state.list_objects("runs/") if p.endswith("/run.json")]
-        known = set(m.runs) | {row["id"] for _, row in m.history_rows.get("runs", ())}
+        known = set(m.runs) | {row["id"] for row in m.history.buffered("runs")}
         rows: dict[str, list[dict]] = {}
         for i in range(0, len(paths), 64):
             chunk = paths[i : i + 64]
@@ -749,84 +522,10 @@ class History:
                     continue
                 for table, found in legacy_rows(run, m.manifest).items():
                     rows.setdefault(table, []).extend(found)
-        files: dict[str, list[dict]] = {}
-        for table, found in rows.items():
-            for i in range(0, len(found), 100_000):
-                files.setdefault(table, []).append(await self._write(table, found[i : i + 100_000]))
-        await self.state.emit({"type": "HistoryImported", "files": files})
+        files = {table: await self.lake.write(table, found) for table, found in rows.items()}
+        await self.lake.imported(files)
         if paths:
             await self.state.delete_objects(paths)
-
-    # -- local files -------------------------------------------------------------------------
-
-    def _local(self, path: str) -> str:
-        return str((self.root if self.root is not None else self.cache) / path)
-
-    def _keep(self, path: str, data: bytes) -> None:
-        """Cache a file this process just wrote."""
-
-        if self.root is not None:
-            return
-        target = Path(self._local(path))
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_suffix(f".{os.getpid()}.tmp")
-        tmp.write_bytes(data)
-        tmp.replace(target)
-
-    def _evict(self, path: str) -> None:
-        if self.root is None:
-            with contextlib.suppress(OSError):
-                os.unlink(self._local(path))
-
-    async def _fetch(self, paths: list[str]) -> None:
-        if self.root is not None:
-            return
-        missing = [p for p in paths if not os.path.exists(self._local(p))]
-        for i in range(0, len(missing), 16):
-            chunk = missing[i : i + 16]
-            for path, data in zip(
-                chunk, await asyncio.gather(*(self.state.get_object(p) for p in chunk)), strict=True
-            ):
-                if data is not None:
-                    self._keep(path, data)
-
-    # -- queries -------------------------------------------------------------------------------
-
-    def _json_sql(self, table: str, paths: list[str]) -> str:
-        columns = ", ".join(f"{_sql_str(c)}: {_sql_str(t)}" for c, t in TABLES[table].columns.items())
-        listed = ", ".join(_sql_str(p) for p in paths)
-        return f"SELECT * FROM read_json([{listed}], format='newline_delimited', columns={{{columns}}})"
-
-    def _files_sql(self, table: str, files: list[tuple[str, list[str]]], rows: list[str] = ()) -> str:
-        """One table over Parquet `files` — `(path, hidden runs)` — and
-        newline-delimited JSON `rows`, with every column, typed."""
-
-        spec = TABLES[table]
-        parts = [
-            "SELECT " + ", ".join(f'NULL::{t} AS "{c}"' for c, t in spec.columns.items()) + " WHERE false"
-        ]
-        clean = [p for p, hidden in files if not hidden]
-        if clean:
-            listed = ", ".join(_sql_str(p) for p in clean)
-            parts.append(f"SELECT * FROM read_parquet([{listed}], union_by_name=true)")
-        for path, hidden in files:
-            if hidden:
-                runs = ", ".join(_sql_str(r) for r in hidden)
-                parts.append(
-                    f'SELECT * FROM read_parquet({_sql_str(path)}) WHERE "{spec.run}" NOT IN ({runs})'
-                )
-        if rows:
-            parts.append(self._json_sql(table, list(rows)))
-        union = " UNION ALL BY NAME ".join(f"({p})" for p in parts)
-        return f"SELECT {', '.join(f'"{c}"' for c in spec.columns)} FROM ({union})"
-
-    def _live(self, table: str) -> list[dict]:
-        """Rows of the runs still in progress."""
-
-        if table not in RUN_TABLES:
-            return []
-        m = self.m
-        return [row for run in m.runs.values() for row in run_rows(run, m.manifest, live=True)[table]]
 
     async def query(
         self,
@@ -838,59 +537,22 @@ class History:
         run: str | None = None,
         live: bool = True,
     ):
-        """Run `work(con)` on a worker thread against a DuckDB connection with
-        a view per table: its files, its pending rows, and — if `live` — the
+        """Run `work(con)` against a view per table — with, if `live`, the
         runs in progress. Files outside `since`/`until`, or unable to hold
         `run`, are left out."""
 
-        import duckdb
-
-        m = self.m
-        files, rows = {}, {}
-        for table in tables:
-            chosen = []
-            for f in m.history_files.get(table, ()):
-                lo, hi = f["at"]
-                if since is not None and hi is not None and hi < since:
-                    continue
-                if until is not None and lo is not None and lo >= until:
-                    continue
-                if run is not None and not (f["runs"][0] <= run <= f["runs"][1]):
-                    continue
-                chosen.append(f)
-            await self._fetch([f["path"] for f in chosen])
-            files[table] = [(self._local(f["path"]), list(f.get("deleted") or ())) for f in chosen]
-            pending = [row for _, row in m.history_rows.get(table, ())]
-            if table == "runs":
-                pending = [{**row, "record": None} for row in pending]  # read from memory instead
-            rows[table] = pending + (self._live(table) if live else [])
-
-        def go():
-            with tempfile.TemporaryDirectory() as tmp:
-                con = duckdb.connect()
-                try:
-                    for table in tables:
-                        paths = []
-                        if rows[table]:
-                            path = os.path.join(tmp, f"{table}.json")
-                            with open(path, "w") as out:
-                                for row in rows[table]:
-                                    out.write(json.dumps(row, allow_nan=False, default=str))
-                                    out.write("\n")
-                            paths.append(path)
-                        con.execute(
-                            f"CREATE TEMP VIEW {table} AS {self._files_sql(table, files[table], paths)}"
-                        )
-                    return work(con)
-                finally:
-                    con.close()
-
-        return await asyncio.to_thread(go)
+        extra = {}
+        if live:
+            m = self.m
+            for run_id in list(m.runs):
+                for table, rows in run_rows(m.runs[run_id], m.manifest, live=True).items():
+                    extra.setdefault(table, []).extend(rows)
+        return await self.lake.query(work, tables, since=since, until=until, key=run, extra=extra)
 
     async def run(self, run_id: str) -> dict | None:
         """A finished run's record: what `run.json` used to hold."""
 
-        for _, row in reversed(self.m.history_rows.get("runs", ())):
+        for row in reversed(self.m.history.buffered("runs")):
             if row["id"] == run_id:
                 return row["record"]
 

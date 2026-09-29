@@ -27,6 +27,7 @@ import copy
 from solera.keys.index import DeltaFiles, FileInfo, IndexState, index_prefix
 
 from . import history
+from .lake import LakeState
 
 TERMINAL_TASK = frozenset({"succeeded", "skipped", "failed", "blocked", "canceled"})
 TERMINAL_RUN = frozenset({"succeeded", "failed", "canceled"})
@@ -84,12 +85,7 @@ class Model:
                 "automations": self.automations,
                 "runs": self.runs,
                 "receipts": list(self.receipts.items()),
-                "history": {
-                    "files": self.history_files,
-                    "rows": self.history_rows,
-                    "seq": self.history_seq,
-                    "imported": self.history_imported,
-                },
+                "history": self.history.to_json(),
             }
         )
 
@@ -114,11 +110,7 @@ class Model:
         self.runs: dict[str, dict] = snap.get("runs") or {}
         self.receipts: dict[str, str] = dict(snap.get("receipts") or [])
         # the run history (§7): per table, its files and the rows awaiting a flush
-        hist = snap.get("history") or {}
-        self.history_files: dict[str, list[dict]] = hist.get("files") or {}
-        self.history_rows: dict[str, list[list]] = hist.get("rows") or {}  # [seq, row]
-        self.history_seq: int = hist.get("seq") or 0
-        self.history_imported: bool = bool(hist.get("imported"))
+        self.history = LakeState(history.TABLES, snap.get("history"))
         # derived from launched attempts, plus memory-only claims of attempts preparing
         self.claims: dict[str, dict] = {}  # task id -> {attempt, started_at, status, launched?}
         self.attempts: dict[str, str] = {}  # attempt id -> task id, while claimed
@@ -407,7 +399,7 @@ class Model:
     def _on_RunReopened(self, e):
         run = e["run"]
         # Its history rows describe how it ended, and it is running again.
-        self._forget({run["id"]}, history.RUN_TABLES, e["at"])
+        self.history.forget({run["id"]}, e["at"], history.RUN_TABLES)
         if run["id"] in self.runs:
             self._unindex_run(run["id"])
         self.runs[run["id"]] = run
@@ -763,46 +755,16 @@ class Model:
     # -- history (§7) ------------------------------------------------------------------
 
     def _record(self, table: str, row: dict) -> None:
-        self.history_seq += 1
-        self.history_rows.setdefault(table, []).append([self.history_seq, row])
-
-    def _forget(self, runs: set[str], tables, at: float) -> None:
-        """Drop the rows of `runs`: those pending now, those in files once the
-        files are rewritten — until then, the files hide them."""
-
-        for table in tables:
-            column = history.TABLES[table].run
-            rows = self.history_rows.get(table)
-            if rows:
-                self.history_rows[table] = [r for r in rows if r[1].get(column) not in runs]
-            for f in self.history_files.get(table, ()):
-                lo, hi = f["runs"]
-                hit = sorted(r for r in runs if lo is not None and lo <= r <= hi)
-                if hit:
-                    f["deleted"] = sorted({*(f.get("deleted") or ()), *hit})
-                    f.setdefault("deleted_at", at)
+        self.history.append(table, row)
 
     def _on_HistoryFlushed(self, e):
-        for table, f in e["files"].items():
-            self.history_files.setdefault(table, []).append(f)
-            upto = e["upto"][table]
-            self.history_rows[table] = [r for r in self.history_rows.get(table, ()) if r[0] > upto]
+        self.history.flushed(e["files"], e["upto"])
 
     def _on_HistoryCompacted(self, e):
-        for change in e["changes"]:
-            files = self.history_files.get(change["table"], [])
-            removed = set(change["removed"])
-            at = next((i for i, f in enumerate(files) if f["path"] in removed), len(files))
-            kept = [f for f in files if f["path"] not in removed]
-            if change.get("added"):
-                kept.insert(at, change["added"])
-            self.history_files[change["table"]] = kept
-            self.garbage.extend([path, e["at"]] for path in sorted(removed))
+        self.garbage.extend([path, e["at"]] for path in self.history.compacted(e["changes"]))
 
     def _on_HistoryImported(self, e):
-        for table, files in e["files"].items():
-            self.history_files[table] = [*files, *self.history_files.get(table, ())]
-        self.history_imported = True
+        self.history.imported_files(e["files"])
 
     def _on_RunsDeleted(self, e):
-        self._forget(set(e["runs"]), history.TABLES, e["at"])
+        self.history.forget(set(e["runs"]), e["at"])

@@ -317,8 +317,8 @@ async def test_replay_reproduces_the_live_model(tmp_path, clock):
     await state.close()
     again = await State.open(tmp_path.as_uri(), "test", clock=clock, writer=False)
     history = again.model
-    finished = len(history.history_rows.get("runs", ())) + sum(
-        f["rows"] for f in history.history_files.get("runs", ())
+    finished = len(history.history.rows.get("runs", ())) + sum(
+        f["rows"] for f in history.history.files.get("runs", ())
     )
     assert finished >= 6
     replayed = durable(again.model)
