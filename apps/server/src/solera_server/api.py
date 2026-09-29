@@ -298,10 +298,14 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
         p: str,
         request: Request,
         before: str | None = Query(default=None),
+        anchor: str | None = Query(default=None),
+        offset: int = Query(default=0, ge=0),
         limit: int = Query(default=50, ge=1, le=500),
     ):
         runtime = await project_engine(request, p)
-        return await runtime.list_runs(run_filter(request), before=before, limit=limit)
+        return await runtime.list_runs(
+            run_filter(request), before=before, anchor=anchor, offset=offset, limit=limit
+        )
 
     @app.get("/api/projects/{p}/runs:facets")
     async def run_facets(p: str, request: Request):
@@ -345,9 +349,10 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
         since: float | None = None,
         until: float | None = None,
         asset: str | None = None,
+        scope: str | None = None,
     ):
         runtime = await project_engine(request, p)
-        return await runtime.history.stats(since=since, until=until, asset=asset)
+        return await runtime.history.stats(since=since, until=until, asset=asset, scope=scope)
 
     @app.get("/api/projects/{p}/assets/{name}/history")
     async def asset_history(

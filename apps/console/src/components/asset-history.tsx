@@ -70,8 +70,13 @@ export function AssetHistory({
     5000,
   );
   const minute = Math.floor(Date.now() / 60000) * 60;
+  const statsParams = new URLSearchParams({
+    asset: asset.name,
+    since: String(minute - WEEK),
+  });
+  if (partitioned && scope !== ALL) statsParams.set("scope", scope);
   const stats = useQuery<Stats>(
-    base ? `${base}/stats?asset=${asset.name}&since=${minute - WEEK}` : null,
+    base ? `${base}/stats?${statsParams}` : null,
     15000,
   );
   const made = history.data?.materializations ?? [];

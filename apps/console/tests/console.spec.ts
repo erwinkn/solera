@@ -173,6 +173,18 @@ test("run history: facets, asset versions, lineage, workload", async ({
     page.getByRole("button", { name: "Remove trigger: manual" }),
   ).toBeVisible();
   await expect(page.getByRole("button", { name: "Clear all" })).toBeVisible();
+  await expect(page.getByRole("navigation", { name: "Pages" })).toContainText(
+    /1–\d+ of \d+/,
+  );
+
+  // Zooming into a bar selects its window in the time range control; a
+  // preset zooms back out.
+  await page.locator("[data-bar]:has(span)").last().click();
+  await expect(page).toHaveURL(/window=/);
+  const range = page.getByRole("radiogroup", { name: "Time range" });
+  await expect(range.getByRole("radio", { checked: true })).toContainText("–");
+  await range.getByRole("radio", { name: "7d" }).click();
+  await expect(page).not.toHaveURL(/window=/);
 
   // Every materialization of `sites` is a version; lineage shows what read it.
   await page

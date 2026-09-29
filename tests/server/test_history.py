@@ -129,6 +129,7 @@ async def test_runs_filter_facets_and_pages(state, clock):
     assert [r["id"] for r in page["runs"]] == [third["id"], bad["id"]] and page["next"] == bad["id"]
     rest = await engine.list_runs(before=page["next"], limit=2)
     assert [r["id"] for r in rest["runs"]] == [ok["id"]] and rest["next"] is None
+    assert page["total"] == 3 and rest["total"] == 1
     row = page["runs"][1]
     assert row["error"] and "upstream timeout" in row["error"] and row["failed_count"] == 1
 
@@ -141,6 +142,12 @@ async def test_runs_filter_facets_and_pages(state, clock):
     histogram = await engine.history.histogram(RunFilter(since=ok["created_at"] - 1))
     assert sum(sum(b["counts"].values()) for b in histogram["bars"]) == 3
     assert bucket_for(3600) == 60 and bucket_for(30 * 86400) == 43200
+
+    # Numbered pages pin the newest run of the first page: a run arriving
+    # meanwhile doesn't shift the second page.
+    await run(engine, clock, ["orders"])
+    second = await engine.list_runs(anchor=third["id"], offset=2, limit=2)
+    assert [r["id"] for r in second["runs"]] == [ok["id"]] and second["total"] == 3
 
 
 async def test_live_runs_are_listed(state, clock):
@@ -216,6 +223,9 @@ async def test_stats(state, clock):
     assert by["revenue"]["failed"] == 1
     assert by["orders"]["p50"] is not None and by["orders"]["hours"] >= 0
     assert [row["executor"] for row in stats["executors"]] == ["Local"]
+    # Unpartitioned tasks have the empty scope; a partition narrows to its own.
+    assert (await engine.history.stats(asset="orders", scope=""))["assets"] == [by["orders"]]
+    assert (await engine.history.stats(asset="orders", scope="2026-01-01"))["assets"] == []
 
 
 async def test_backfill_imports_run_json(tmp_path, clock):

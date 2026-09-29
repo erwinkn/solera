@@ -1,8 +1,25 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link, createFileRoute, useNavigate } from "@tanstack/react-router";
-import { ArrowRight, RefreshCw, Search, X, ZoomOut } from "lucide-react";
+import {
+  ArrowRight,
+  ChevronLeft,
+  ChevronRight,
+  ChevronsLeft,
+  ChevronsRight,
+  RefreshCw,
+  Search,
+  X,
+  ZoomIn,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import {
   Table,
   TableBody,
@@ -22,7 +39,7 @@ import {
   statusOrder,
 } from "@/components/common";
 import { useQuery } from "@/lib/api";
-import { bucketLabel, count, seconds, time } from "@/lib/format";
+import { bucketLabel, count, seconds, time, windowLabel } from "@/lib/format";
 import { useWorkspace } from "@/lib/workspace";
 import { cn } from "cn";
 import type { Facets, Histogram, RunPage, RunRow } from "@/lib/types";
@@ -47,16 +64,22 @@ const RANGES = {
   all: null,
 } as const;
 type Range = keyof typeof RANGES;
+/** The time range control's value: a preset, or the histogram window. */
+type RangeChoice = Range | "window";
+
+const SIZES = [25, 50, 100, 200] as const;
 
 type RunSearch = Partial<Record<Field, string[]>> & {
   q?: string;
   range?: Range;
   /** A window picked on the histogram; overrides `range`. */
   window?: [number, number];
+  /** 1-based; past the first page, `anchor` pins the newest run so arriving
+      runs don't shift the pages. */
+  page?: number;
+  anchor?: string;
+  size?: number;
 };
-
-const PAGE = 50;
-const MAX = 500;
 
 export const Route = createFileRoute("/runs")({
   component: RunsPage,
@@ -78,6 +101,11 @@ export const Route = createFileRoute("/runs")({
       raw.window.every((n) => typeof n === "number")
     )
       out.window = raw.window as [number, number];
+    const page = Number(raw.page);
+    if (Number.isInteger(page) && page > 1) out.page = page;
+    if (typeof raw.anchor === "string" && raw.anchor) out.anchor = raw.anchor;
+    const size = Number(raw.size);
+    if ((SIZES as readonly number[]).includes(size)) out.size = size;
     return out;
   },
 });
@@ -111,13 +139,16 @@ function RunsPage() {
   const { base, diagnostics, select, refresh } = useWorkspace();
   const search = Route.useSearch();
   const navigate = useNavigate({ from: Route.fullPath });
-  const [limit, setLimit] = useState(PAGE);
   const params = filterQuery(search);
-  const key = params.toString();
-  useEffect(() => setLimit(PAGE), [key]);
+  const size = search.size ?? 50;
+  const pageNo = search.page ?? 1;
 
   const listParams = new URLSearchParams(params);
-  listParams.set("limit", String(limit));
+  listParams.set("limit", String(size));
+  if (pageNo > 1) {
+    listParams.set("offset", String((pageNo - 1) * size));
+    if (search.anchor) listParams.set("anchor", search.anchor);
+  }
   const page = useQuery<RunPage>(
     base ? withParams(`${base}/runs`, listParams) : null,
     3000,
@@ -131,10 +162,16 @@ function RunsPage() {
     5000,
   );
 
+  /** Changes the search; any change but paging goes back to the first page. */
   function update(next: Partial<RunSearch>) {
     void navigate({
       search: (current: RunSearch) => {
-        const merged: RunSearch = { ...current, ...next };
+        const merged: RunSearch = {
+          ...current,
+          page: undefined,
+          anchor: undefined,
+          ...next,
+        };
         for (const [k, v] of Object.entries(merged))
           if (v === undefined || (Array.isArray(v) && !v.length))
             delete merged[k as keyof RunSearch];
@@ -195,29 +232,35 @@ function RunsPage() {
 
       <div className="flex flex-wrap items-center gap-3">
         <SearchBox value={search.q ?? ""} onChange={(q) => update({ q })} />
-        <Segmented<Range>
+        <Segmented<RangeChoice>
           ariaLabel="Time range"
-          value={search.window ? ("" as Range) : (search.range ?? "7d")}
-          onChange={(range) => update({ range, window: undefined })}
-          options={(Object.keys(RANGES) as Range[]).map((r) => ({
-            value: r,
-            label: r === "all" ? "All" : r,
-          }))}
+          value={search.window ? "window" : (search.range ?? "7d")}
+          onChange={(range) => {
+            if (range !== "window") update({ range, window: undefined });
+          }}
+          options={[
+            ...(Object.keys(RANGES) as Range[]).map((r) => ({
+              value: r,
+              label: r === "all" ? "All" : r,
+            })),
+            ...(search.window
+              ? [
+                  {
+                    value: "window" as const,
+                    label: windowLabel(...search.window),
+                    icon: <ZoomIn className="size-3.5" />,
+                  },
+                ]
+              : []),
+          ]}
         />
       </div>
 
-      {(chips.length > 0 || search.window) && (
+      {chips.length > 0 && (
         <div
           className="flex flex-wrap items-center gap-1.5"
           aria-label="Filters"
         >
-          {search.window && (
-            <Chip
-              label={`${time(search.window[0])} – ${time(search.window[1])}`}
-              icon={<ZoomOut className="size-3" />}
-              onRemove={() => update({ window: undefined })}
-            />
-          )}
           {chips.map(({ field, value }) => (
             <Chip
               key={`${field}:${value}`}
@@ -274,25 +317,113 @@ function RunsPage() {
               tagged={search.tag ?? []}
             />
           )}
-          {page.data?.next &&
-            (limit < MAX ? (
-              <Button
-                variant="outline"
-                size="sm"
-                className="self-center"
-                onClick={() => setLimit((n) => Math.min(MAX, n + PAGE))}
-              >
-                Show more
-              </Button>
-            ) : (
-              <p className="text-center text-xs text-muted-foreground">
-                Showing the newest {MAX}. Narrow the time range to see older
-                runs.
-              </p>
-            ))}
+          {page.data && page.data.total > 0 && (
+            <Pager
+              page={pageNo}
+              size={size}
+              total={page.data.total}
+              onPage={(n) =>
+                update({
+                  page: n > 1 ? n : undefined,
+                  anchor:
+                    n > 1
+                      ? (search.anchor ??
+                        (pageNo === 1 ? runs[0]?.id : undefined))
+                      : undefined,
+                })
+              }
+              onSize={(n) => update({ size: n === 50 ? undefined : n })}
+            />
+          )}
         </div>
       </div>
     </section>
+  );
+}
+
+/** "51–100 of 1,234", the page size, and first / previous / next / last. */
+function Pager({
+  page,
+  size,
+  total,
+  onPage,
+  onSize,
+}: {
+  page: number;
+  size: number;
+  total: number;
+  onPage: (page: number) => void;
+  onSize: (size: number) => void;
+}) {
+  const last = Math.max(1, Math.ceil(total / size));
+  const first = (page - 1) * size + 1;
+  const steps = [
+    { label: "First page", icon: <ChevronsLeft />, to: 1, off: page <= 1 },
+    {
+      label: "Previous page",
+      icon: <ChevronLeft />,
+      to: page - 1,
+      off: page <= 1,
+    },
+    {
+      label: "Next page",
+      icon: <ChevronRight />,
+      to: page + 1,
+      off: page >= last,
+    },
+    {
+      label: "Last page",
+      icon: <ChevronsRight />,
+      to: last,
+      off: page >= last,
+    },
+  ];
+  return (
+    <nav
+      className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground"
+      aria-label="Pages"
+    >
+      <span className="tabular-nums">
+        {first > total
+          ? `Past the last of ${count(total)}`
+          : `${count(first)}–${count(Math.min(total, page * size))} of ${count(total)}`}
+      </span>
+      <div className="flex items-center gap-2">
+        <Select
+          value={String(size)}
+          onValueChange={(value) => onSize(Number(value))}
+          items={SIZES.map((n) => ({ value: String(n), label: `${n} / page` }))}
+        >
+          <SelectTrigger size="sm" aria-label="Runs per page">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {SIZES.map((n) => (
+              <SelectItem key={n} value={String(n)}>
+                {n} / page
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <span className="tabular-nums">
+          Page {count(page)} of {count(last)}
+        </span>
+        <div className="flex items-center">
+          {steps.map((step) => (
+            <Button
+              key={step.label}
+              variant="ghost"
+              size="icon-sm"
+              aria-label={step.label}
+              disabled={step.off}
+              onClick={() => onPage(Math.min(last, Math.max(1, step.to)))}
+            >
+              {step.icon}
+            </Button>
+          ))}
+        </div>
+      </div>
+    </nav>
   );
 }
 
@@ -325,18 +456,9 @@ function SearchBox({
   );
 }
 
-function Chip({
-  label,
-  icon,
-  onRemove,
-}: {
-  label: string;
-  icon?: ReactNode;
-  onRemove: () => void;
-}) {
+function Chip({ label, onRemove }: { label: string; onRemove: () => void }) {
   return (
     <span className="flex items-center gap-1 rounded-full border bg-muted/40 py-0.5 pr-1 pl-2 text-xs">
-      {icon}
       <span className="font-mono">{label}</span>
       <button
         aria-label={`Remove ${label}`}

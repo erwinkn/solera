@@ -430,12 +430,13 @@ count of a keyed output, else the length of a returned list.
 
 | Question | API | CLI |
 |---|---|---|
-| runs, filtered, newest first | `GET /runs?status=failed&asset=site_feed&tag=env=prod&q=timeout&since=…&limit=50` → `{runs, next}` | `solera runs --status failed --asset site_feed --tag env=prod -q timeout` |
+| runs, filtered, newest first | `GET /runs?status=failed&asset=site_feed&tag=env=prod&q=timeout&since=…&limit=50` → `{runs, next, total}` | `solera runs --status failed --asset site_feed --tag env=prod -q timeout` |
 | the next page | `GET /runs?…&before={next}` | `solera runs … --before {next}` |
+| page 3 of 50, not shifted by newer runs | `GET /runs?…&anchor={newest id of page 1}&offset=100&limit=50` | |
 | value counts per filter field | `GET /runs:facets?…` → `{status: [{value, count}], asset, tag, trigger, automation, by, source}` | |
 | runs over time, per status | `GET /runs:histogram?…&bars=60` → `{bucket, since, until, bars: [{t, counts}]}` | |
 | finished tasks | `GET /tasks?asset=&status=&run=&since=&before=` | |
-| p50/p95 duration and wait, failure counts, compute hours, per asset and per executor | `GET /stats?since=&asset=` | |
+| p50/p95 duration and wait, failure counts, compute hours, per asset and per executor | `GET /stats?since=&asset=&scope=` | |
 | an asset's versions and their metadata | `GET /assets/{name}/history?output=&scope=&before=` | |
 | what a version was built from, or what was built from it | `GET /outputs/{name}/lineage?scope=&version=&direction=upstream\|downstream&depth=5` | |
 

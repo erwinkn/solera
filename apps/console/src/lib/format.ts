@@ -60,6 +60,21 @@ export function bucketLabel(t: number, bucket: number) {
   ).format(new Date(t * 1000));
 }
 
+/** A time window, sharing what its ends share: `Sep 29, 3:00 – 6:00 PM`, or
+    by day `Sep 22 – 28` (the last day included, not the midnight after it). */
+export function windowLabel(since: number, until: number) {
+  const days = until - since >= 86400;
+  return new Intl.DateTimeFormat(
+    undefined,
+    days
+      ? { month: "short", day: "numeric" }
+      : { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" },
+  ).formatRange(
+    new Date(since * 1000),
+    new Date((until - (days ? 1 : 0)) * 1000),
+  );
+}
+
 /** Failures out of a total: `0`, or `3 · 12%` — never a misleading `0%`. */
 export function failures(failed: number, total: number) {
   if (!failed) return "0";

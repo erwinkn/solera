@@ -295,6 +295,8 @@ export interface RunPage {
   runs: RunRow[];
   /** The `before` cursor of the next page, or null on the last one. */
   next: string | null;
+  /** How many runs match, across every page. */
+  total: number;
 }
 
 export interface FacetValue {

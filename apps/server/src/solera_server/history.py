@@ -901,31 +901,48 @@ class History:
         record = await self.query(work, ("runs",), run=run_id, live=False)
         return json.loads(record) if record else None
 
-    async def runs(self, f: RunFilter, *, before: str | None = None, limit: int = 50) -> dict:
-        """Runs matching `f`, newest first, `limit` at a time: `next` is the
-        `before` cursor of the following page."""
+    async def runs(
+        self,
+        f: RunFilter,
+        *,
+        before: str | None = None,
+        anchor: str | None = None,
+        offset: int = 0,
+        limit: int = 50,
+    ) -> dict:
+        """Runs matching `f`, newest first, `limit` at a time. Two ways to
+        page: follow `next` (the `before` cursor of the following page), or
+        jump by `offset`, pinning `anchor` (the newest run id of the first
+        page) so new runs don't shift later pages. `total` counts every
+        match."""
 
         where, params = run_where(f, self.m.manifest or {})
         if before:
             where += " AND id < ?"
             params.append(before)
+        if anchor:
+            where += " AND id <= ?"
+            params.append(anchor)
         columns = ", ".join(f'"{c}"' for c in TABLES["runs"].columns if c != "record")
 
         def work(con):
-            return _dicts(
+            found = _dicts(
                 con.execute(
-                    f"SELECT {columns} FROM runs WHERE {where} ORDER BY id DESC LIMIT ?", [*params, limit + 1]
+                    f"SELECT {columns} FROM runs WHERE {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+                    [*params, limit + 1, offset],
                 )
             )
+            total = con.execute(f"SELECT count(*) FROM runs WHERE {where}", params).fetchone()[0]
+            return found, total
 
-        found = await self.query(work, ("runs",), since=f.since, until=f.until)
+        found, total = await self.query(work, ("runs",), since=f.since, until=f.until)
         more = len(found) > limit
         found = found[:limit]
         for row in found:
             text = row["partitions"]
             if text and text.startswith("["):
                 row["partitions"] = json.loads(text)
-        return {"runs": found, "next": found[-1]["id"] if more and found else None}
+        return {"runs": found, "next": found[-1]["id"] if more and found else None, "total": total}
 
     async def facets(self, f: RunFilter, *, top: int = 50) -> dict:
         """For each facet, how many runs each value has — counted with every
@@ -1029,11 +1046,17 @@ class History:
         return {"tasks": found, "next": found[-1]["id"] if more and found else None}
 
     async def stats(
-        self, *, since: float | None = None, until: float | None = None, asset: str | None = None
+        self,
+        *,
+        since: float | None = None,
+        until: float | None = None,
+        asset: str | None = None,
+        scope: str | None = None,
     ) -> dict:
         """Operations at a glance, from finished tasks: per asset and per
         executor, how many ran and failed, how long they took and waited
-        (p50, p95), and the compute they used."""
+        (p50, p95), and the compute they used. `scope` narrows to one
+        partition of `asset`."""
 
         clauses, params = ["status NOT IN ('waiting', 'queued', 'running')"], []
         if since is not None:
@@ -1045,6 +1068,9 @@ class History:
         if asset is not None:
             clauses.append("asset = ?")
             params.append(asset)
+        if scope is not None:
+            clauses.append("scope = ?")
+            params.append(scope)
         where = " AND ".join(clauses)
         measures = """
             count(*) FILTER (WHERE status <> 'skipped') AS tasks,

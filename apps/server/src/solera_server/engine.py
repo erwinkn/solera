@@ -1888,10 +1888,20 @@ class Engine:
             )
         return out
 
-    async def list_runs(self, filter: RunFilter | None = None, *, before: str | None = None, limit=50):
+    async def list_runs(
+        self,
+        filter: RunFilter | None = None,
+        *,
+        before: str | None = None,
+        anchor: str | None = None,
+        offset: int = 0,
+        limit=50,
+    ):
         """Runs, newest first — in progress and finished alike (§7)."""
 
-        return await self.history.runs(filter or RunFilter(), before=before, limit=limit)
+        return await self.history.runs(
+            filter or RunFilter(), before=before, anchor=anchor, offset=offset, limit=limit
+        )
 
     async def run_detail(self, run_id: str):
         run = self.m.runs.get(run_id)
