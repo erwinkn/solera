@@ -508,7 +508,9 @@ class Model:
             summary["error"] = e["error"]
         commit = e.get("commit")
         if commit:
-            summary["outputs"] = {name: h["ref"] for name, h in commit.get("heads", {}).items()}
+            summary["outputs"] = {
+                name: h["ref"].get("version") for name, h in commit.get("heads", {}).items()
+            }
         task["attempts"].append(summary)
         if task["status"] in TERMINAL_TASK:
             # Its run was canceled while it ran. An attempt that was already
@@ -709,7 +711,7 @@ class Model:
             installed = {**self.heads[(e["source"], "")], "run": run["id"], "attempt": None}
             self._record(
                 "materializations",
-                history.materialization(e["source"], None, "", installed, keys=e.get("keys")),
+                history.materialization(e["source"], None, "", installed, keys=e.get("keys"), listed=run),
             )
         if before is None or before["ref"].get("version") != head["ref"].get("version"):
             self._pend_onchange(None, "", [e["source"]])
@@ -762,9 +764,6 @@ class Model:
 
     def _on_HistoryCompacted(self, e):
         self.garbage.extend([path, e["at"]] for path in self.history.compacted(e["changes"]))
-
-    def _on_HistoryImported(self, e):
-        self.history.imported_files(e["files"])
 
     def _on_RunsDeleted(self, e):
         self.history.forget(set(e["runs"]), e["at"])

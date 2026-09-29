@@ -947,7 +947,7 @@ async def test_job_commits_lineage_only(state):
     assert status_of(detail) == "succeeded"
     task = next(t for t in detail["tasks"] if t["asset"] == "vacuum")
     [attempt] = detail["attempts"][task["id"]]
-    assert attempt["status"] == "succeeded" and not attempt.get("result")  # no outputs, no heads
+    assert attempt["status"] == "succeeded" and not attempt.get("outputs")  # no outputs, no heads
     spec = (await state.attempt_record(detail["request"]["id"], attempt["id"]))["spec"]
     assert spec["inputs"]["feed"]["ref"]["output"] == "feed"  # lineage is the spec
 

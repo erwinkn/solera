@@ -1,10 +1,8 @@
 """The run history (docs/object-store-state.md §7): rows born in the model,
 flushed to Parquet, merged, hidden when deleted, and queried with DuckDB."""
 
-import json
-
 import pytest
-from solera.sdk import In, Output, Project, Result, Retry, asset
+from solera.sdk import In, Output, Project, Result, Retry, Source, asset
 from solera_server.engine import Engine
 from solera_server.history import History, RunFilter, bucket_for
 from solera_server.placements.inline import InlinePlacement
@@ -50,7 +48,7 @@ def ranked():
     return [{"id": "a"}, {"id": "b"}]
 
 
-PROJECT = Project(assets=[orders, revenue, ranked])
+PROJECT = Project(assets=[orders, revenue, ranked], sources=[Source("uploads", key="id")])
 
 
 def engine_for(state, clock, **history):
@@ -159,6 +157,37 @@ async def test_live_runs_are_listed(state, clock):
     assert [(r["id"], r["status"]) for r in listed] == [(submitted["id"], "paused")]
 
 
+async def test_a_run_reads_the_same_once_archived(state, clock):
+    engine = engine_for(state, clock)
+    await engine.initialize()
+    details = {}
+    emit = state.emit
+
+    async def spy(e):  # the run's detail just before it moves into the history
+        if e["type"] == "RunArchived":
+            details[e["run"]] = await engine.run_detail(e["run"])
+        await emit(e)
+
+    state.emit = spy
+    failed = await run(engine, clock, ["revenue"], upstream=True, config={"fail": True}, tags={"env": "prod"})
+    await engine.retry(failed["id"])
+    await engine.run_until(failed["id"], 60)
+    commit = await engine.commit_source("uploads", upsert=["a", "b"], by="api")
+    state.emit = emit
+    before = details[failed["id"]]
+    assert [t["retried"] for t in before["tasks"] if t["asset"] == "revenue"] == [1]
+    assert await engine.run_detail(failed["id"]) == before
+    record = await engine.history.run(commit["run"])
+    assert record == {
+        "id": commit["run"],
+        "source": "uploads",
+        "by": "api",
+        "batch": 0,
+        "upserted": ["a", "b"],
+        "deleted": [],
+    }
+
+
 async def test_flush_merge_delete_and_purge(state, clock):
     engine = engine_for(state, clock, flush_rows=1, merge_width=2, purge_seconds=100)
     await engine.initialize()
@@ -227,54 +256,3 @@ async def test_stats(state, clock):
     # Unpartitioned tasks have the empty scope; a partition narrows to its own.
     assert (await engine.history.stats(asset="orders", scope=""))["assets"] == [by["orders"]]
     assert (await engine.history.stats(asset="orders", scope="2026-01-01"))["assets"] == []
-
-
-async def test_backfill_imports_run_json(tmp_path, clock):
-    state = await State.open(tmp_path.as_uri(), "test", clock=clock, flush_interval=0.001)
-    legacy = {
-        "id": "01K0000000000000000000000A",
-        "targets": ["orders"],
-        "partitions": "latest",
-        "mode": "incremental",
-        "upstream": False,
-        "config": {},
-        "automation": None,
-        "by": "cli",
-        "status": "succeeded",
-        "paused": False,
-        "created_at": 1_700_000_000.0,
-        "updated_at": 1_700_000_005.0,
-        "tasks": {
-            "01K0000000000000000000000A/orders:": {
-                "id": "01K0000000000000000000000A/orders:",
-                "asset": "orders",
-                "scope": "",
-                "status": "succeeded",
-                "deps": [],
-                "attempts": [
-                    {
-                        "id": "at-1",
-                        "outcome": "succeeded",
-                        "started_at": 1_700_000_001.0,
-                        "finished_at": 1_700_000_004.0,
-                        "outputs": {"orders": {"store": "default", "version": "v1", "partition": ""}},
-                    }
-                ],
-            }
-        },
-    }
-    commit = {"id": "01K0000000000000000000000B", "source": "uploads", "by": "api", "version": "7"}
-    for record in (legacy, commit):
-        await state.put_object(f"runs/{record['id']}/run.json", json.dumps(record).encode())
-    await state.put_object(f"runs/{legacy['id']}/at-1.json", b"{}")
-    engine = engine_for(state, clock)
-    await engine.initialize()
-    assert state.model.history.imported
-    assert await state.list_objects("runs/") == [f"runs/{legacy['id']}/at-1.json"]
-    assert await engine.history.run(legacy["id"]) == legacy
-    listed = (await engine.list_runs())["runs"]
-    assert [(r["id"], r["trigger"]) for r in listed] == [(commit["id"], "commit"), (legacy["id"], "manual")]
-    made = (await engine.history.materializations(outputs=["orders"]))["materializations"]
-    assert [(m["version"], m["run"]) for m in made] == [("v1", legacy["id"])]
-    await engine.initialize()  # once only
-    await state.close()

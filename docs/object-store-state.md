@@ -146,7 +146,6 @@ status are derived inside `apply`; they are not events.
 | `RunReopened` | `run`, `at` | a retry brings a finished run back; its history rows are dropped until it ends again |
 | `HistoryFlushed` | `files` {table: file}, `upto` {table: row seq} | installs one Parquet file per table and drops the rows it holds |
 | `HistoryCompacted` | `changes` [{`table`, `removed` [path], `added?` file}], `at` | swaps merged or purged files in; the removed ones become garbage |
-| `HistoryImported` | `files` | installs the files of the one-time `run.json` import |
 | `RunsDeleted` | `runs`, `at` | drops their pending rows and hides them in files that may hold them |
 
 An attempt that has not launched yet — it is still pinning inputs and
@@ -220,8 +219,7 @@ Example (abridged):
                   "last_run": "01J8ZC7S…", "last_revision": "c0ffee…", "pending": []}},
   "history": {"files": {"runs": [{"path": "history/runs/01J9A2….parquet", "rows": 4000, "at": [1790…, 1790…],
                                   "keys": ["01J9A2…", "01J9B7…"], "bytes": 81233}]},
-              "rows": {"runs": {"columns": ["id", "created_at", "…"], "rows": [[311, ["01J9C8…", 1790074866.1, "…"]]]}},
-              "seq": 311, "imported": true},
+              "rows": {"runs": [[311, ["01J9C8…", 1790074866.1, "…"]]]}, "seq": 311},
   "runs": {"01J8ZC7S…": {"…": "Run"}}
 }
 ```
@@ -344,10 +342,10 @@ input versions built this version of `revenue`".
 
 | Table | One row per | Notable columns |
 |---|---|---|
-| `runs` | finished run or source commit | `status` (`succeeded`, `failed`, `canceled`, `skipped`), `trigger` (`manual`, `automation`, `commit`), `automation`, `by`, `source`, `targets`, `assets`, `committed`, `tags` (map), `task_count`, `failed_count`, `error`, `record` (the full run as JSON) |
-| `tasks` | task of a finished run | `asset`, `scope`, `status`, `ready_at` (its dependencies were done), `started_at`, `finished_at`, `attempts`, `duration`, `executor`, `cpu`, `memory`, `gpu` |
-| `attempts` | attempt | `task`, `n`, `outcome`, `started_at`, `finished_at`, `duration`, `error`, `executor` |
-| `materializations` | output version a commit installed | `output`, `scope`, `version`, `run`, `attempt`, `at`, `batch`, `added`, `removed`, `rows`, `metadata` (JSON) |
+| `runs` | finished run or source commit | `status` (`succeeded`, `failed`, `canceled`, `skipped`), `trigger` (`manual`, `automation`, `commit`), `automation`, `by`, `source`, `targets`, `assets`, `committed`, `tags` (map), `task_count`, `failed_count`, `error`, `config` and `keys` (JSON, as submitted) |
+| `tasks` | task of a finished run | `asset`, `scope`, `status`, `ready_at` (its dependencies were done), `started_at`, `finished_at`, `attempts`, `duration`, `deps`, `max_attempts`, `retry_delay`, `retry_backoff`, `retried`, `executor`, `cpu`, `memory`, `gpu` |
+| `attempts` | attempt | `task`, `n`, `outcome`, `started_at`, `finished_at`, `duration`, `error`, `executor`, `outputs` (map: output → version committed) |
+| `materializations` | output version a commit installed | `output`, `scope`, `version`, `run`, `attempt`, `at`, `batch`, `added`, `removed`, `added_keys`, `removed_keys` (a source commit's keys, up to 1,000), `rows`, `metadata` (JSON) |
 | `lineage` | input version an output version was read from | `output`, `scope`, `version`, `input`, `input_scope`, `input_version`, `param` |
 
 A run where every task was skipped — it launched nothing and wrote
@@ -356,10 +354,16 @@ unless the filter asks for that status, so a 10-second poller that
 usually finds nothing new does not bury the runs that did something.
 
 A source commit that changed something is a `runs` row with trigger
-`commit`, and a record holding only what nothing else says —
-`{"id", "source", "by", "batch", "upserted", "deleted"}`, the keys listed
-up to 1,000 and counted past that, or `version` for an unkeyed source.
-The source's head points at it (`head.run`).
+`commit`, plus the `materializations` row of the version it made, which
+lists the keys it changed (up to 1,000; past that, only counted). The
+source's head points at it (`head.run`).
+
+**No run documents.** The tables are the record: a finished run's detail
+— and the run a retry reopens — is rebuilt from its `runs`, `tasks` and
+`attempts` rows (a source commit's from its `runs` and `materializations`
+rows), and reads the same as it did while the run was live. Only what has
+no shape of its own stays JSON: a run's `config` and `keys`, and output
+metadata.
 
 **Where rows come from.** Rows are born inside `apply`, from the events
 that finish things: `RunArchived` yields a run's `runs`, `tasks` and
@@ -375,8 +379,8 @@ yet written. Nothing above it knows how rows are buffered, flushed, merged
 or rewritten; the history only declares its tables (columns, the time
 column files are sorted by, the key rows are deleted by), appends rows, and
 asks questions in SQL. Its durable part, `State.history`, holds the files
-and the buffered rows — as value lists in column order, so the checkpoint
-names each column once per table rather than once per row.
+and the buffered rows, each `[seq, values]` with values in the table's
+column order, so the checkpoint doesn't repeat column names on every row.
 
 **Flushing.** A flush writes each table's buffered rows as one Parquet
 file (zstd, sorted by the table's time column), and `HistoryFlushed`
@@ -463,12 +467,6 @@ field applied, so the console can show "12 failed, 340 succeeded" while
 failed is selected. Histogram buckets are the smallest of 1 min, 5 min,
 15 min, 1 h, 3 h, 6 h, 12 h, 1 d, 7 d, 30 d that fit the span in the
 requested number of bars. `next` is a cursor: the last run id of the page.
-
-**Import.** Namespaces written before the history existed have a
-`runs/{run}/run.json` per finished run. The first engine that starts
-imports them into the history (`HistoryImported`), once, then deletes
-them. Their attempts' outputs become `materializations` rows; lineage was
-not recorded then.
 
 ## 8. Attempt files — `runs/{run}/{attempt}.json` and `.log`
 

@@ -55,40 +55,18 @@ class LakeState:
     def __init__(self, schema: dict[str, Table], snap: dict | None = None):
         snap = snap or {}
         self.schema = schema
-        self.files: dict[str, list[dict]] = {
-            table: [_file(f) for f in files] for table, files in (snap.get("files") or {}).items()
-        }
+        self.files: dict[str, list[dict]] = snap.get("files") or {}
         self.seq: int = snap.get("seq") or 0
-        self.imported: bool = bool(snap.get("imported"))
-        self.rows: dict[str, list[list]] = {}
-        for table, held in (snap.get("rows") or {}).items():
-            if table not in schema:
-                continue
-            if isinstance(held, dict):  # {columns, rows}: realign to today's columns
-                names = held["columns"]
-                self.rows[table] = [
-                    [seq, self._values(table, dict(zip(names, values, strict=True)))]
-                    for seq, values in held["rows"]
-                ]
-            else:  # [[seq, row]], rows as objects
-                self.rows[table] = [[seq, self._values(table, row)] for seq, row in held]
+        self.rows: dict[str, list[list]] = snap.get("rows") or {}
         # memory only: bumped when rows leave a buffer other than by a flush
         self.generation: dict[str, int] = {}
 
     def to_json(self) -> dict:
         return {
             "files": self.files,
-            "rows": {
-                table: {"columns": list(self.schema[table].columns), "rows": rows}
-                for table, rows in self.rows.items()
-                if rows
-            },
+            "rows": {table: rows for table, rows in self.rows.items() if rows},
             "seq": self.seq,
-            "imported": self.imported,
         }
-
-    def _values(self, table: str, row: dict) -> list:
-        return [row.get(c) for c in self.schema[table].columns]
 
     def buffered(self, table: str) -> list[dict]:
         names = list(self.schema[table].columns)
@@ -96,7 +74,7 @@ class LakeState:
 
     def append(self, table: str, row: dict) -> None:
         self.seq += 1
-        self.rows.setdefault(table, []).append([self.seq, self._values(table, row)])
+        self.rows.setdefault(table, []).append([self.seq, [row.get(c) for c in self.schema[table].columns]])
 
     def forget(self, keys: set[str], at: float, tables=None) -> None:
         """Drop the rows keyed by `keys`: buffered ones now, those in files
@@ -120,7 +98,7 @@ class LakeState:
 
     def flushed(self, files: dict[str, dict], upto: dict[str, int]) -> None:
         for table, f in files.items():
-            self.files.setdefault(table, []).append(_file(f))
+            self.files.setdefault(table, []).append(f)
             self.rows[table] = [r for r in self.rows.get(table, ()) if r[0] > upto[table]]
 
     def compacted(self, changes: list[dict]) -> list[str]:
@@ -134,33 +112,16 @@ class LakeState:
             at = next((i for i, f in enumerate(files) if f["path"] in removed), len(files))
             kept = [f for f in files if f["path"] not in removed]
             if change.get("added"):
-                kept.insert(at, _file(change["added"]))
+                kept.insert(at, change["added"])
             self.files[change["table"]] = kept
             gone.extend(sorted(removed))
         return gone
-
-    def imported_files(self, files: dict[str, list[dict]]) -> None:
-        """Files written by an import, older than every file flushed."""
-
-        for table, found in files.items():
-            self.files[table] = [*map(_file, found), *self.files.get(table, ())]
-        self.imported = True
-
-
-def _file(f: dict) -> dict:
-    """A file's entry, renaming the fields of the run history's first files."""
-
-    if "runs" in f:
-        f = {("keys" if k == "runs" else k): v for k, v in f.items()}
-        if "deleted" in f:
-            f["hidden"], f["hidden_at"] = f.pop("deleted"), f.pop("deleted_at", None)
-    return f
 
 
 class Lake:
     """A lake's write path and queries. Memory only: `held()` returns the
     `LakeState`, and every change to it goes through an event the model
-    applies: `{name}Flushed`, `{name}Compacted`, `{name}Imported`."""
+    applies: `{name}Flushed` and `{name}Compacted`."""
 
     def __init__(
         self,
@@ -240,18 +201,6 @@ class Lake:
                 await self._discard([f["path"] for f in files.values()])
                 return
         await self.state.emit({"type": f"{self.name}Flushed", "files": files, "upto": upto})
-
-    async def write(self, table: str, rows: list[dict]) -> list[dict]:
-        """Files of `rows` (as objects), for an import: at most 100k rows each."""
-
-        out = []
-        for i in range(0, len(rows), 100_000):
-            chunk = [[row.get(c) for c in self.schema[table].columns] for row in rows[i : i + 100_000]]
-            out.append(await self._write(table, chunk))
-        return out
-
-    async def imported(self, files: dict[str, list[dict]]) -> None:
-        await self.state.emit({"type": f"{self.name}Imported", "files": files})
 
     def _time(self, table: str, values: list):
         spec = self.schema[table]

@@ -153,7 +153,6 @@ class Engine:
                     "at": self.clock(),
                 }
             )
-        await self.history.backfill()
 
     async def start(self):
         """Start the eval loop. Its first tick adopts the attempts launched
@@ -1855,7 +1854,7 @@ class Engine:
         latest = attempts[-1] if attempts else None
         if latest:
             view.setdefault("error", latest.get("error"))
-            view.setdefault("result", latest.get("outputs"))
+            view.setdefault("outputs", latest.get("outputs"))
         return view
 
     def _attempt_views(self, task: dict, live: bool) -> list[dict]:
@@ -1872,7 +1871,7 @@ class Engine:
             if a.get("error"):
                 view["error"] = a["error"]
             if a.get("outputs"):
-                view["result"] = a["outputs"]
+                view["outputs"] = a["outputs"]
                 view["commit"] = f"{task['run']}/{a['id']}"
             out.append(view)
         claim = self.m.claims.get(task["id"]) if live else None

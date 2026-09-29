@@ -3,9 +3,9 @@ Parquet files on the object store, queried with DuckDB.
 
 Five tables, each row about one:
 
-    runs              finished run or source commit, with its full record
-    tasks             task of a finished run: timings, attempts, executor
-    attempts          attempt of a finished run
+    runs              finished run or source commit: how it was asked for, how it ended
+    tasks             task of a finished run: timings, retries, executor
+    attempts          attempt of a finished run, and the versions it committed
     materializations  output version a commit installed, with its metadata
     lineage           input version an output version was built from
 
@@ -21,7 +21,6 @@ is submitted.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import math
 from dataclasses import dataclass, field
@@ -55,7 +54,8 @@ TABLES = {
             "task_count": "INTEGER",
             "failed_count": "INTEGER",
             "error": "VARCHAR",
-            "record": "VARCHAR",  # the run as JSON: tasks, attempts, everything
+            "config": "VARCHAR",  # JSON object
+            "keys": "VARCHAR",  # JSON object: the keys asked for, per incremental edge
         },
     ),
     "tasks": Table(
@@ -74,6 +74,11 @@ TABLES = {
             "attempts": "INTEGER",
             "duration": "DOUBLE",  # seconds, summed over its attempts
             "error": "VARCHAR",
+            "deps": "VARCHAR[]",  # the tasks it waited on
+            "max_attempts": "INTEGER",
+            "retry_delay": "DOUBLE",  # seconds; no retry policy if null
+            "retry_backoff": "VARCHAR",
+            "retried": "INTEGER",  # times the run was retried with it failed
             "executor": "VARCHAR",
             "cpu": "DOUBLE",
             "memory": "DOUBLE",
@@ -96,6 +101,7 @@ TABLES = {
             "duration": "DOUBLE",
             "error": "VARCHAR",
             "executor": "VARCHAR",
+            "outputs": "MAP(VARCHAR, VARCHAR)",  # output -> the version it committed
         },
     ),
     "materializations": Table(
@@ -113,6 +119,8 @@ TABLES = {
             "batch": "BIGINT",
             "added": "BIGINT",
             "removed": "BIGINT",
+            "added_keys": "VARCHAR[]",  # a source commit's keys, listed up to 1,000
+            "removed_keys": "VARCHAR[]",
             "rows": "BIGINT",
             "complete": "BOOLEAN",
             "metadata": "VARCHAR",  # JSON object
@@ -162,9 +170,13 @@ def _span(attempt: dict) -> float:
     return max(0.0, end - start) if start is not None and end is not None else 0.0
 
 
+def _json(value) -> str | None:
+    return None if value is None else json.dumps(value, sort_keys=True)
+
+
 def run_rows(run: dict, manifest: dict | None, *, live: bool = False) -> dict[str, list[dict]]:
     """A run's rows in `runs`, `tasks` and `attempts`. `live` describes a run
-    still in progress: no record, and no finish time."""
+    still in progress: no finish time."""
 
     assets = (manifest or {}).get("assets") or {}
     tasks = run["tasks"]
@@ -175,6 +187,7 @@ def run_rows(run: dict, manifest: dict | None, *, live: bool = False) -> dict[st
         attempts = task["attempts"]
         executor = _executor((assets.get(task["asset"]) or {}).get("placement"))
         done = [ends[d] for d in task["deps"] if ends.get(d) is not None]
+        retry = task.get("retry") or {}
         task_rows.append(
             {
                 "id": tid,
@@ -189,6 +202,11 @@ def run_rows(run: dict, manifest: dict | None, *, live: bool = False) -> dict[st
                 "attempts": len(attempts),
                 "duration": sum(_span(a) for a in attempts),
                 "error": next((a["error"] for a in reversed(attempts) if a.get("error")), None),
+                "deps": task["deps"],
+                "max_attempts": task["max_attempts"],
+                "retry_delay": retry.get("delay"),
+                "retry_backoff": retry.get("backoff"),
+                "retried": task.get("retried", 0),
                 **executor,
             }
         )
@@ -207,6 +225,7 @@ def run_rows(run: dict, manifest: dict | None, *, live: bool = False) -> dict[st
                     "duration": _span(a),
                     "error": a.get("error"),
                     "executor": executor["executor"],
+                    "outputs": a.get("outputs") or {},
                 }
             )
     status = run["status"]
@@ -241,9 +260,71 @@ def run_rows(run: dict, manifest: dict | None, *, live: bool = False) -> dict[st
         "task_count": len(tasks),
         "failed_count": len(failed),
         "error": next((r["error"] for r in failed if r["error"]), None),
-        "record": None if live else run,
+        "config": _json(run.get("config")),
+        "keys": _json(run.get("keys")),
     }
     return {"runs": [row], "tasks": task_rows, "attempts": attempt_rows}
+
+
+def run_record(rows: dict[str, list[dict]]) -> dict:
+    """A finished run as the model held it, from its rows — `run_rows` (or
+    `commit_row`) backwards."""
+
+    [row] = rows["runs"]
+    if row["trigger"] == "commit":
+        record = {"id": row["id"], "source": row["source"], "by": row["by"]}
+        for m in rows.get("materializations") or ():
+            if m["batch"] is None:
+                record["version"] = m["version"]
+            else:
+                record["batch"] = m["batch"]
+                record["upserted"] = m["added_keys"] if m["added_keys"] is not None else m["added"]
+                record["deleted"] = m["removed_keys"] if m["removed_keys"] is not None else m["removed"]
+        return record
+    attempts: dict[str, list[dict]] = {}
+    for a in rows["attempts"]:
+        attempt = {k: a[k] for k in ("id", "outcome", "started_at", "finished_at")}
+        if a["error"]:
+            attempt["error"] = a["error"]
+        if a["outputs"]:
+            attempt["outputs"] = dict(a["outputs"])
+        attempts.setdefault(a["task"], []).append(attempt)
+    tasks = {}
+    for t in rows["tasks"]:
+        tasks[t["id"]] = task = {
+            "id": t["id"],
+            "run": row["id"],
+            "asset": t["asset"],
+            "scope": t["scope"],
+            "status": t["status"],
+            "deps": list(t["deps"] or ()),
+            "max_attempts": t["max_attempts"],
+            "retry": None
+            if t["retry_delay"] is None
+            else {"n": t["max_attempts"] - 1, "delay": t["retry_delay"], "backoff": t["retry_backoff"]},
+            "ready_at": t["ready_at"],
+            "attempts": attempts.get(t["id"], []),
+        }
+        if t["retried"]:
+            task["retried"] = t["retried"]
+    partitions = row["partitions"]
+    return {
+        "id": row["id"],
+        "targets": list(row["targets"] or ()),
+        "partitions": json.loads(partitions) if partitions and partitions.startswith("[") else partitions,
+        "mode": row["mode"],
+        "upstream": row["upstream"],
+        "config": None if row["config"] is None else json.loads(row["config"]),
+        "keys": None if row["keys"] is None else json.loads(row["keys"]),
+        "automation": row["automation"],
+        "by": row["by"],
+        "tags": dict(row["tags"] or {}),
+        "status": "succeeded" if row["status"] == "skipped" else row["status"],
+        "paused": False,
+        "created_at": row["created_at"],
+        "updated_at": row["finished_at"],
+        "tasks": tasks,
+    }
 
 
 def commit_row(run: dict, at: float) -> dict:
@@ -268,13 +349,17 @@ def commit_row(run: dict, at: float) -> dict:
         "task_count": 0,
         "failed_count": 0,
         "error": None,
-        "record": run,
+        "config": None,
+        "keys": None,
     }
 
 
-def materialization(output, asset, scope, head, *, keys=None, rows=None, metadata=None) -> dict:
+def materialization(output, asset, scope, head, *, keys=None, rows=None, metadata=None, listed=None) -> dict:
     """The row of an output version a commit installed: `head` is the head
-    as installed, `keys` the commit's key delta for the output."""
+    as installed, `keys` the commit's key delta for the output, `listed` a
+    source commit's record, which lists the keys it changed."""
+
+    listed = listed or {}
 
     count = head.get("count")
     return {
@@ -289,6 +374,9 @@ def materialization(output, asset, scope, head, *, keys=None, rows=None, metadat
         "batch": head.get("batch"),
         "added": (keys or {}).get("added"),
         "removed": (keys or {}).get("removed"),
+        # listed up to 1,000, counted past that
+        "added_keys": listed.get("upserted") if isinstance(listed.get("upserted"), list) else None,
+        "removed_keys": listed.get("deleted") if isinstance(listed.get("deleted"), list) else None,
         "rows": count if count is not None else rows,
         "complete": bool(head.get("complete", True)),
         "metadata": metadata or None,
@@ -310,53 +398,6 @@ def lineage(output, scope, head, reads) -> list[dict]:
     return [
         {**base, "input": i, "input_scope": s, "input_version": v, "param": p} for i, s, v, p in reads or ()
     ]
-
-
-def legacy_rows(run: dict, manifest: dict | None) -> dict[str, list[dict]]:
-    """Rows for a `run.json` written before the history existed: its run,
-    tasks and attempts, and one materialization per new output version its
-    attempts committed. Lineage was not recorded then."""
-
-    from solera.ids import ulid_time
-
-    if "source" in run:
-        at = ulid_time(run["id"])
-        rows = {"runs": [commit_row(run, at)]}
-        if run.get("version") is not None or run.get("batch") is not None:
-            added, removed = run.get("upserted"), run.get("deleted")
-            rows["materializations"] = [
-                {
-                    "output": run["source"],
-                    "asset": None,
-                    "scope": "",
-                    "version": run.get("version"),
-                    "store": None,
-                    "run": run["id"],
-                    "attempt": None,
-                    "at": at,
-                    "batch": run.get("batch"),
-                    "added": len(added) if isinstance(added, list) else added,
-                    "removed": len(removed) if isinstance(removed, list) else removed,
-                    "rows": None,
-                    "complete": True,
-                    "metadata": None,
-                }
-            ]
-        return rows
-    rows = run_rows(run, manifest)
-    seen, made = set(), []
-    for tid in sorted(run["tasks"]):
-        task = run["tasks"][tid]
-        for a in task["attempts"]:
-            for output, ref in (a.get("outputs") or {}).items():
-                key = (output, task["scope"], ref.get("version"))
-                if key in seen:
-                    continue
-                seen.add(key)
-                head = {"ref": ref, "run": run["id"], "attempt": a["id"], "at": a.get("finished_at")}
-                made.append(materialization(output, task["asset"], task["scope"], head))
-    rows["materializations"] = made
-    return rows
 
 
 # -- filters ------------------------------------------------------------------------------
@@ -502,31 +543,6 @@ class History:
         if runs:
             await self.state.emit({"type": "RunsDeleted", "runs": sorted(runs), "at": self.clock()})
 
-    async def backfill(self) -> None:
-        """Import the `runs/{run}/run.json` records written before the history
-        existed, once, then delete them."""
-
-        m = self.m
-        if m.history.imported:
-            return
-        paths = [p for p in await self.state.list_objects("runs/") if p.endswith("/run.json")]
-        known = set(m.runs) | {row["id"] for row in m.history.buffered("runs")}
-        rows: dict[str, list[dict]] = {}
-        for i in range(0, len(paths), 64):
-            chunk = paths[i : i + 64]
-            for data in await asyncio.gather(*(self.state.get_object(p) for p in chunk)):
-                if data is None:
-                    continue
-                run = json.loads(data)
-                if run["id"] in known:
-                    continue
-                for table, found in legacy_rows(run, m.manifest).items():
-                    rows.setdefault(table, []).extend(found)
-        files = {table: await self.lake.write(table, found) for table, found in rows.items()}
-        await self.lake.imported(files)
-        if paths:
-            await self.state.delete_objects(paths)
-
     async def query(
         self,
         work,
@@ -550,18 +566,27 @@ class History:
         return await self.lake.query(work, tables, since=since, until=until, key=run, extra=extra)
 
     async def run(self, run_id: str) -> dict | None:
-        """A finished run's record: what `run.json` used to hold."""
-
-        for row in reversed(self.m.history.buffered("runs")):
-            if row["id"] == run_id:
-                return row["record"]
+        """A finished run as the model held it, rebuilt from its rows."""
 
         def work(con):
-            found = con.execute("SELECT record FROM runs WHERE id = ?", [run_id]).fetchall()
-            return found[-1][0] if found else None
+            found = {}
+            for table, order in (
+                ("runs", "id"),
+                ("tasks", "id"),
+                ("attempts", "task, n"),
+                ("materializations", "output"),
+            ):
+                found[table] = _dicts(
+                    con.execute(
+                        f'SELECT * FROM {table} WHERE "{TABLES[table].key}" = ? ORDER BY {order}', [run_id]
+                    )
+                )
+            return found
 
-        record = await self.query(work, ("runs",), run=run_id, live=False)
-        return json.loads(record) if record else None
+        found = await self.query(
+            work, ("runs", "tasks", "attempts", "materializations"), run=run_id, live=False
+        )
+        return run_record(found) if found["runs"] else None
 
     async def runs(
         self,
@@ -585,7 +610,7 @@ class History:
         if anchor:
             where += " AND id <= ?"
             params.append(anchor)
-        columns = ", ".join(f'"{c}"' for c in TABLES["runs"].columns if c != "record")
+        columns = ", ".join(f'"{c}"' for c in TABLES["runs"].columns if c not in ("config", "keys"))
 
         def work(con):
             found = _dicts(
