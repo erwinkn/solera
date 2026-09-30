@@ -237,3 +237,207 @@ replacement of 100M keys takes ~60 s (at 10M: `replace_diff` 3.3 s, sort
 0.8 s, Python 0.8 s, reads ~1 s), and an initial load ~225 s (at 10M: the
 Python loops in `KeyIndex._replace` and `_split` 14 s, encoding 4.5 s,
 sorting and diffing 1.5 s).
+
+## Fixes to the follow-up's findings (2026-09-30, later)
+
+The follow-up above found five things to fix in the index itself; they are
+fixed, and this section measures before and after on the same machine and
+setup (8 cores, local MinIO, 30 ms per request, 80 MB/s per connection, 64
+in parallel, native). "Before" at 1M and 10M is a rerun of the previous
+commit today, within 10% of the follow-up's figures; at 100M it is the
+follow-up's own run.
+
+    uv run python bench/keys/bench.py --s3 http://solera:solera-bench-secret@127.0.0.1:9100/solera-test --sizes 1e6,1e7
+    uv run python bench/keys/bench.py --s3 http://solera:solera-bench-secret@127.0.0.1:9100/solera-test --sizes 1e8
+    uv run python bench/keys/amplification.py --sizes 1e6,1e7,1e8 --commits 100000
+    uv run python bench/keys/params.py
+
+What changed:
+
+1. **The read planner decides after reading the tails.** Levels over 32 MB
+   start with their files' tails; the filters say which keys need an exact
+   read, and only then does the planner pick, per level, between their
+   blocks and the rest of each file whole — fewest requests within the 2 s
+   budget, else fastest. Its estimate gained CPU (decoding at 4.5M
+   entries/s native, 1M/s Python; filter checks at 0.4M/0.12M keys/s,
+   measured through `KeyIndex._filter`) and an 80 MB/s per-request cap.
+   Exact reads go only to files whose key filter matched.
+2. **Level 0 merges in itself until it is a tenth of level 1**, then into
+   level 1.
+3. **A recount applies to the state it pinned**, commits since adding their
+   `added − removed` (`IndexRecounted`; `count_exact` became `inexact`, a
+   count of filter-based commits since the last recount).
+4. **No sequential awaits**: level-0 files and small levels are fetched at
+   once, lookups in every filtered level run at once, a scan fetches all its
+   files' blocks at once, keeps each file's last page of blocks for the
+   next, and reads files under ~2.4 MB (one request's latency worth of
+   transfer) whole, once.
+5. **Row digests are 16 raw bytes** (BLAKE2b of the row's encoding) from
+   `key_map` to the index and back; a declared revision is its text.
+
+### Before and after
+
+Steady state (the `steady` suite) differs in one way: level 0 now holds,
+besides six deltas, a merged file of on average half the size at which it
+joins level 1 (1.7 / 3.6 / 3.9 MB), where before it held seven deltas.
+
+| Operation | 1M before → after | 10M before → after | 100M before → after |
+|---|---|---|---|
+| steady: 1K random keys changed | 792 ms · 9 GET → **544 ms · 9 GET** | 1.2 s · 17 GET → **500 ms · 13 GET** | 1.5 s · 65 GET → **765 ms · 48 GET** |
+| steady: 1K random keys, half unchanged | 771 ms · 9 GET → **565 ms · 9 GET** | 1.7 s · 364 GET → **1.0 s · 32 GET** | 2.3 s · 857 GET → **1.1 s · 291 GET** |
+| steady: commit, 1K random changes + delta write | 811 ms · 9 GET → **571 ms · 9 GET** | 1.3 s · 15 GET → **543 ms · 12 GET** | 1.5 s · 58 GET → **817 ms · 50 GET** |
+| steady: full-delivery page of 10K keys | 331 ms · 16 GET → **108 ms · 9 GET** | 392 ms · 18 GET → **105 ms · 12 GET** | 421 ms · 20 GET → **102 ms · 14 GET** |
+| steady: full scan (recount), 100K-key pages | 4.4 s · 96 GET → **1.7 s · 19 GET** | 53.2 s · 929 GET → **21.6 s · 219 GET** | 615.5 s · 10,518 GET → **241.7 s · 3,029 GET** |
+| steady: level 0 compacted | 1.4 s, ↑29.0 MB for 0.23 MB of deltas | 2.8 s, ↑65.1 MB | 2.8 s, ↑67.3 MB |
+| → now, 8 files merged in level 0 | **176 ms, ↑1.7 MB** | **307 ms, ↑3.5 MB** | **272 ms, ↑3.7 MB** |
+| → now, level 0 at a tenth of level 1, into level 1 | **1.4 s, ↑29.0 MB** | **2.9 s, ↑68.5 MB** | **3.1 s, ↑71.8 MB** |
+| 1K random keys, half unchanged (fresh index) | 490 ms · 2 GET → 477 ms · 2 GET | 773 ms · 453 GET → **950 ms · 20 GET** | 938 ms · 542 GET → 1.0 s · 542 GET |
+| 100K random keys changed (fresh index) | 851 ms · 2 GET → 883 ms · 2 GET | 2.6 s · 17 GET → **1.4 s · 20 GET** | 1.3 s · 376 GET → 1.3 s · 376 GET |
+| entry size, random ids, row digest (`params.py`) | 68.5 B → **29.0 B** | | |
+
+Rows not listed make the same requests as before and moved within
+run-to-run noise (the largest, the 100M base commit at 560 → 720 ms, ran
+at 733 ms in K0 on the same code).
+
+- **Planner.** Half-unchanged writes at 10M read the level whole after its
+  tails: 20 GETs instead of 453, 180 ms slower, still within the budget —
+  fewer requests is what the policy asks for. At 100M the rest of the level
+  is 2.7 GB, over the budget, so the blocks stay (542 GETs). In the steady
+  state the filters' per-file matches cut the exact reads: 857 → 291 GETs.
+  One case got slower: a million keys written into 10M (crossover table)
+  now pays the tails and a million filter checks before reading the level
+  whole, 8.4 s against 7.0 s reading it whole straight away; the planner
+  cannot know that without the filters.
+- **Sequential awaits.** Seven level-0 reads are now one round trip; a
+  steady page costs 100 ms instead of 330–420; a steady full scan reads 3–5×
+  fewer times.
+- **Recount reads.** A full scan of a freshly compacted 100M index is 1,077
+  GETs (1,000 pages plus 29 index parts plus a few), not the ~150 §6 said;
+  with the upper levels full, 3,029.
+
+### Compaction write amplification (`amplification.py`)
+
+The real planner replayed over 100,000 commits of 1K random keys, on file
+metadata only (a merge keeps each key's newest entry; files split as
+`merge_files` splits them); measured over the second half, once the levels
+filled. "ratio R" merges level 0 into level 1 at 1/R of its size instead of
+1/10.
+
+| Keys | Policy | Written per byte committed | Level-0 files read per commit | Level-0 MB read per commit | Compaction GETs / PUTs per commit |
+|---|---|---|---|---|---|
+| 1,000,000 | before | 125.0 | 3.5 | 0.10 | 1.25 / 0.125 |
+| 1,000,000 | **now** | **16.3** | 4.0 | 1.48 | 1.15 / 0.141 |
+| 1,000,000 | ratio 3 | 27.5 | 4.0 | 5.18 | 1.14 / 0.142 |
+| 1,000,000 | ratio 30 | 29.8 | 3.9 | 0.50 | 1.17 / 0.139 |
+| 10,000,000 | before | 155.2 | 3.5 | 0.10 | 1.33 / 0.126 |
+| 10,000,000 | **now** | **22.3** | 3.9 | 1.80 | 1.16 / 0.142 |
+| 10,000,000 | ratio 3 | 36.8 | 4.0 | 6.14 | 1.16 / 0.143 |
+| 10,000,000 | ratio 30 | 33.3 | 3.9 | 0.63 | 1.18 / 0.139 |
+| 100,000,000 | before | 159.2 | 3.5 | 0.10 | 1.34 / 0.129 |
+| 100,000,000 | **now** | **31.0** | 3.9 | 1.81 | 1.18 / 0.144 |
+| 100,000,000 | ratio 3 | 42.0 | 4.0 | 5.37 | 1.17 / 0.146 |
+| 100,000,000 | ratio 30 | 42.5 | 3.8 | 0.59 | 1.19 / 0.142 |
+
+Why a tenth: level 0 rewrites itself every seven commits, costing about
+x / (2 · 7d) per byte for a merged file of up to x and deltas of d; the
+merge into level 1 costs L1 / x. The sum is smallest at x = √(14 · d ·
+L1), ≈ L1 / 12 for 1K-key deltas (d = 29 KB) and L1 = 64 MB. Both
+neighbours measure worse. The price is level 0 read whole on every commit:
+1.8 MB instead of 0.1 MB, about 20 ms at 80 MB/s. Before, the ~280× the
+follow-up saw was the step at a full level 1; averaged over level 1
+filling up it is 125–159×.
+
+### Scenario E, steady state
+
+1K random changes every 10 s into 100M keys, cold, 259,200 commits a month.
+Per commit: the steady commit's requests plus compaction's (from the
+simulation), plus the attempt and journal overhead ($6.69 a month) and
+storage ($0.06):
+
+| | Commit | Compaction per commit | Key index / month | **Total / month** | Time per commit |
+|---|---|---|---|---|---|
+| before | 58 GET, 1 PUT | 1.34 GET, 0.129 PUT | $7.62 | **$14.37** | 1.5 s |
+| now | 50 GET, 1 PUT | 1.18 GET, 0.144 PUT | $6.79 | **$13.54** | 817 ms |
+
+(The follow-up estimated ~$14.60 for "before", amortizing compaction from
+its one measured compaction of each kind rather than a long run.)
+
+### Format (`params.py`, 1M entries, row digests now 16 bytes)
+
+| Keys | Versions | Blocks (zlib) | Filters | **Total per entry** | Entries per block |
+|---|---|---|---|---|---|
+| random ids `cust-%013d` (bench) | row digest | 25.5 B | 3.50 B | **29.0 B** (68.5 B with SHA-256 hex) | 2,439 |
+| UUIDs | row digest | 47.8 B | 3.50 B | **51.3 B** (91.4 B) | 1,267 |
+| sequential ids `order-%012d` | row digest | 20.2 B | 3.50 B | **23.7 B** (63.1 B) | 3,096 |
+| sequential ids `order-%012d` | short revision `%d` | 7.2 B | 3.50 B | **10.7 B** | 5,952 |
+| paths `site-…/file-i` (cpu.py) | row digest | 31.8 B | 3.50 B | **35.3 B** (75.5 B) | 1,698 |
+
+Filters are unchanged: 3.5 B per entry, 0.35% false positives per check.
+
+### Full results after the fixes
+#### Key index benchmark (native, 30 ms per request, 80 MB/s per connection, 64 in parallel)
+
+| Keys | Build | Build rate | Index size | Per entry (incl. filters) | Filters per entry | Files | Levels | Peak RSS |
+|---|---|---|---|---|---|---|---|---|
+| 1,000,000 | 1.3 s | 0.75 M keys/s, 22 MB/s | 29.0 MB | 29.0 B | 3.51 B | 1 | 1 | 0.9 GB |
+| 10,000,000 | 13.3 s | 0.75 M keys/s, 21 MB/s | 281.4 MB | 28.1 B | 3.51 B | 3 | 2 | 5.0 GB |
+| 100,000,000 | 118.0 s | 0.85 M keys/s, 23 MB/s | 2,719.6 MB | 27.2 B | 3.51 B | 29 | 3 | 5.9 GB |
+
+| Operation | 1,000,000 keys | 10,000,000 keys | 100,000,000 keys |
+|---|---|---|---|
+| 100 random keys changed | 361 ms · 2 GET 0 PUT · 29.0 MB | 251 ms · 3 GET 0 PUT · 35.1 MB | 434 ms · 28 GET 0 PUT · 338.5 MB |
+| 1K random keys changed | 507 ms · 2 GET 0 PUT · 29.0 MB | 298 ms · 5 GET 0 PUT · 35.2 MB | 509 ms · 34 GET 0 PUT · 351.2 MB |
+| 1K random keys, half unchanged | 477 ms · 2 GET 0 PUT · 29.0 MB | 950 ms · 20 GET 0 PUT · 281.4 MB | 1.0 s · 542 GET 0 PUT · 383.3 MB |
+| 1K clustered keys changed | 304 ms · 2 GET 0 PUT · 29.0 MB | 261 ms · 2 GET 0 PUT · 12.5 MB | 229 ms · 1 GET 0 PUT · 12.4 MB |
+| 1K new keys inserted | 474 ms · 2 GET 0 PUT · 29.0 MB | 250 ms · 3 GET 0 PUT · 35.1 MB | 458 ms · 29 GET 0 PUT · 350.9 MB |
+| 100K random keys changed | 883 ms · 2 GET 0 PUT · 29.0 MB | 1.4 s · 20 GET 0 PUT · 281.4 MB | 1.3 s · 376 GET 0 PUT · 372.7 MB |
+| 1K random keys changed, disk cache warm | 164 ms · 0 GET 0 PUT · 0.0 MB | 28 ms · 0 GET 0 PUT · 0.0 MB | 311 ms · 0 GET 0 PUT · 0.0 MB |
+| full-delivery page of 10K keys | 84 ms · 2 GET 0 PUT · 0.3 MB | 82 ms · 2 GET 0 PUT · 0.3 MB | 97 ms · 2 GET 0 PUT · 0.3 MB |
+| commit: 1K random changes + delta write | 512 ms · 2 GET 1 PUT · 29.0 MB | 332 ms · 6 GET 1 PUT · 35.3 MB | 720 ms · 36 GET 1 PUT · 351.3 MB |
+| compaction: 8 delta files | 91 ms · 8 GET 1 PUT · 0.3 MB ↑0.2 MB | 97 ms · 8 GET 1 PUT · 0.3 MB ↑0.2 MB | 87 ms · 8 GET 1 PUT · 0.3 MB ↑0.2 MB |
+| full replacement, 1% changed | 762 ms · 2 GET 0 PUT · 29.0 MB | 6.1 s · 17 GET 0 PUT · 281.4 MB | — |
+| initial load: every key, unsorted, changes + write | 1.9 s · 0 GET 1 PUT · 0.0 MB ↑28.9 MB | 23.9 s · 0 GET 3 PUT · 0.0 MB ↑279.9 MB | — |
+| full scan (recount), 100K-key pages | 1.5 s · 12 GET 0 PUT · 25.5 MB | 14.7 s · 105 GET 0 PUT · 246.4 MB | 122.0 s · 1077 GET 0 PUT · 2369.6 MB |
+| full scan (recount), disk cache warm | 698 ms · 0 GET 0 PUT · 0.0 MB | 7.2 s · 0 GET 0 PUT · 0.0 MB | 42.6 s · 0 GET 0 PUT · 0.0 MB |
+| steady: 1K random keys changed | 544 ms · 9 GET 0 PUT · 30.7 MB | 500 ms · 13 GET 0 PUT · 46.8 MB | 765 ms · 48 GET 0 PUT · 445.4 MB |
+| steady: 1K random keys, half unchanged | 565 ms · 9 GET 0 PUT · 30.7 MB | 1.0 s · 32 GET 0 PUT · 349.9 MB | 1.1 s · 291 GET 0 PUT · 519.3 MB |
+| steady: full-delivery page of 10K keys | 108 ms · 9 GET 0 PUT · 2.0 MB | 105 ms · 12 GET 0 PUT · 1.1 MB | 102 ms · 14 GET 0 PUT · 1.4 MB |
+| steady: full scan (recount), 100K-key pages | 1.7 s · 19 GET 0 PUT · 27.2 MB | 21.6 s · 219 GET 0 PUT · 306.6 MB | 241.7 s · 3029 GET 0 PUT · 2999.4 MB |
+| steady: commit: 1K random changes + delta write | 571 ms · 9 GET 1 PUT · 30.7 MB | 543 ms · 12 GET 1 PUT · 46.7 MB | 817 ms · 50 GET 1 PUT · 445.6 MB |
+| steady: compaction: level 0, 8 files | 176 ms · 8 GET 1 PUT · 1.7 MB ↑1.7 MB | 307 ms · 8 GET 1 PUT · 3.7 MB ↑3.5 MB | 272 ms · 8 GET 1 PUT · 3.9 MB ↑3.7 MB |
+| steady: compaction: level 0, a tenth of level 1, into level 1 | 1.4 s · 4 GET 1 PUT · 32.2 MB ↑29.0 MB | 2.9 s · 6 GET 1 PUT · 71.9 MB ↑68.5 MB | 3.1 s · 6 GET 1 PUT · 74.5 MB ↑71.8 MB |
+| steady: compaction: a level-1 file into level 2 | — | 12.4 s · 22 GET 3 PUT · 349.9 MB ↑281.4 MB | 27.8 s · 45 GET 8 PUT · 721.3 MB ↑702.1 MB |
+| steady: compaction: a level-2 file into level 3 | — | — | 5.7 s · 10 GET 2 PUT · 143.8 MB ↑126.0 MB |
+
+Steady-state shape (level: files, MB), before and after the compactions:
+
+| Keys | Before | After |
+|---|---|---|
+| 1,000,000 | L0: 7, 1.7 MB · L1: 1, 29.0 MB | L1: 1, 29.0 MB |
+| 10,000,000 | L0: 7, 3.6 MB · L1: 1, 64.9 MB · L2: 3, 281.4 MB | L2: 3, 281.4 MB |
+| 100,000,000 | L0: 7, 3.9 MB · L1: 1, 67.0 MB · L2: 7, 649.6 MB · L3: 29, 2,719.6 MB | L2: 7, 684.3 MB · L3: 29, 2,719.6 MB |
+
+Read strategy, forced each way (cold; wall · GETs · MB read):
+
+| Keys | Written keys | Unchanged | Whole levels | Tails, then blocks | Tails, then rest | Planner picks | Planner's estimate, blocks / rest |
+|---|---|---|---|---|---|---|---|
+| 1,000,000 | 1,000 | 0% | 437 ms · 2 GET 0 PUT · 29.0 MB | 128 ms · 5 GET 0 PUT · 3.8 MB | 376 ms · 3 GET 0 PUT · 29.0 MB | whole: 457 ms · 2 GET 0 PUT · 29.0 MB | — |
+| 1,000,000 | 10,000 | 0% | 589 ms · 2 GET 0 PUT · 29.0 MB | 241 ms · 33 GET 0 PUT · 5.6 MB | 439 ms · 3 GET 0 PUT · 29.0 MB | whole: 513 ms · 2 GET 0 PUT · 29.0 MB | — |
+| 1,000,000 | 100,000 | 0% | 792 ms · 2 GET 0 PUT · 29.0 MB | 678 ms · 110 GET 0 PUT · 17.9 MB | 812 ms · 3 GET 0 PUT · 29.0 MB | whole: 747 ms · 2 GET 0 PUT · 29.0 MB | — |
+| 1,000,000 | 1,000 | 50% | 451 ms · 2 GET 0 PUT · 29.0 MB | 330 ms · 79 GET 0 PUT · 22.3 MB | 509 ms · 3 GET 0 PUT · 29.0 MB | whole: 455 ms · 2 GET 0 PUT · 29.0 MB | — |
+| 1,000,000 | 10,000 | 50% | 493 ms · 2 GET 0 PUT · 29.0 MB | 576 ms · 3 GET 0 PUT · 29.0 MB | 612 ms · 3 GET 0 PUT · 29.0 MB | whole: 481 ms · 2 GET 0 PUT · 29.0 MB | — |
+| 1,000,000 | 100,000 | 50% | 749 ms · 2 GET 0 PUT · 29.0 MB | 1.0 s · 3 GET 0 PUT · 29.0 MB | 1.0 s · 3 GET 0 PUT · 29.0 MB | whole: 741 ms · 2 GET 0 PUT · 29.0 MB | — |
+| 10,000,000 | 1,000 | 0% | 812 ms · 17 GET 0 PUT · 281.4 MB | 277 ms · 8 GET 0 PUT · 35.4 MB | 640 ms · 20 GET 0 PUT · 281.4 MB | tails, then blocks: 283 ms · 8 GET 0 PUT · 35.4 MB | 221 ms / 713 ms |
+| 10,000,000 | 10,000 | 0% | 2.0 s · 17 GET 0 PUT · 281.4 MB | 328 ms · 31 GET 0 PUT · 36.8 MB | 661 ms · 20 GET 0 PUT · 281.4 MB | tails, then rest: 683 ms · 20 GET 0 PUT · 281.4 MB | 259 ms / 748 ms |
+| 10,000,000 | 100,000 | 0% | 2.4 s · 17 GET 0 PUT · 281.4 MB | 960 ms · 311 GET 0 PUT · 57.0 MB | 1.2 s · 20 GET 0 PUT · 281.4 MB | tails, then rest: 1.1 s · 20 GET 0 PUT · 281.4 MB | 827 ms / 1.2 s |
+| 10,000,000 | 1,000,000 | 0% | 7.0 s · 17 GET 0 PUT · 281.4 MB | 8.4 s · 975 GET 0 PUT · 178.5 MB | 9.0 s · 20 GET 0 PUT · 281.4 MB | tails, then rest: 8.4 s · 20 GET 0 PUT · 281.4 MB | 4.7 s / 4.5 s |
+| 10,000,000 | 1,000 | 50% | 815 ms · 17 GET 0 PUT · 281.4 MB | 682 ms · 411 GET 0 PUT · 63.6 MB | 852 ms · 20 GET 0 PUT · 281.4 MB | tails, then rest: 844 ms · 20 GET 0 PUT · 281.4 MB | 712 ms / 968 ms |
+| 10,000,000 | 10,000 | 50% | 2.0 s · 17 GET 0 PUT · 281.4 MB | 2.0 s · 789 GET 0 PUT · 212.0 MB | 2.0 s · 20 GET 0 PUT · 281.4 MB | tails, then rest: 1.9 s · 20 GET 0 PUT · 281.4 MB | 2.6 s / 2.3 s |
+| 10,000,000 | 100,000 | 50% | 2.5 s · 17 GET 0 PUT · 281.4 MB | 2.7 s · 20 GET 0 PUT · 281.4 MB | 2.8 s · 20 GET 0 PUT · 281.4 MB | tails, then blocks: 2.8 s · 20 GET 0 PUT · 281.4 MB | 3.2 s / 3.2 s |
+| 100,000,000 | 1,000 | 0% | 2.8 s · 170 GET 0 PUT · 2719.6 MB | 567 ms · 30 GET 0 PUT · 350.9 MB | 823 ms · 34 GET 0 PUT · 434.5 MB | tails, then blocks: 527 ms · 30 GET 0 PUT · 350.9 MB | 766 ms / 975 ms |
+| 100,000,000 | 10,000 | 0% | 6.3 s · 170 GET 0 PUT · 2719.6 MB | 580 ms · 63 GET 0 PUT · 353.0 MB | 1.5 s · 121 GET 0 PUT · 1883.0 MB | tails, then blocks: 525 ms · 63 GET 0 PUT · 353.0 MB | 811 ms / 3.9 s |
+| 100,000,000 | 100,000 | 0% | 17.7 s · 170 GET 0 PUT · 2719.6 MB | 1.2 s · 372 GET 0 PUT · 372.5 MB | 2.5 s · 171 GET 0 PUT · 2719.6 MB | tails, then blocks: 1.1 s · 372 GET 0 PUT · 372.5 MB | 1.4 s / 6.0 s |
+| 100,000,000 | 1,000,000 | 0% | 22.2 s · 170 GET 0 PUT · 2719.6 MB | 8.9 s · 3080 GET 0 PUT · 558.2 MB | 8.6 s · 171 GET 0 PUT · 2719.6 MB | tails, then blocks: 9.3 s · 3080 GET 0 PUT · 558.2 MB | 7.0 s / 10.0 s |
+| 100,000,000 | 1,000 | 50% | 2.5 s · 170 GET 0 PUT · 2719.6 MB | 901 ms · 515 GET 0 PUT · 381.6 MB | 2.3 s · 171 GET 0 PUT · 2719.6 MB | tails, then blocks: 929 ms · 515 GET 0 PUT · 381.6 MB | 1.3 s / 5.9 s |
+| 100,000,000 | 10,000 | 50% | 5.9 s · 170 GET 0 PUT · 2719.6 MB | 7.3 s · 4167 GET 0 PUT · 645.6 MB | 5.3 s · 171 GET 0 PUT · 2719.6 MB | tails, then blocks: 5.1 s · 4167 GET 0 PUT · 645.6 MB | 6.1 s / 8.3 s |
+| 100,000,000 | 100,000 | 50% | 17.5 s · 170 GET 0 PUT · 2719.6 MB | 17.4 s · 7395 GET 0 PUT · 2105.9 MB | 14.5 s · 171 GET 0 PUT · 2719.6 MB | tails, then rest: 16.0 s · 171 GET 0 PUT · 2719.6 MB | 24.4 s / 22.3 s |

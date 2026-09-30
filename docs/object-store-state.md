@@ -160,7 +160,8 @@ status are derived inside `apply`; they are not events.
 | `AttemptClaimed` | `attempt`, `worker`, `at` | a pool worker took a launched attempt; no other worker is offered it |
 | `AttemptFinished` | `run`, `task`, `attempt`, `outcome` (`succeeded` \| `failed` \| `skipped` \| `canceled`), `started_at`, `finished_at`, `error?`, `retryable?`, `commit?`, `unsettled?` | records the attempt; on commit, installs heads, cursor, watermarks, and each keyed output's new delta file; `unsettled` keeps the intents of a writer that died (§8) |
 | `SourceCommitted` | `source`, `head`, `keys?`, `at`, `run?` | installs a source head and its delta file; a commit that changed something records `run` in the history (§7) |
-| `IndexCompacted` | `output`, `scope`, `added` [file], `removed` [name], `recount?`, `at` | swaps compacted files into a key index; a recount replaces its count |
+| `IndexCompacted` | `output`, `scope`, `added` [file], `removed` [name], `at` | swaps compacted files into a key index |
+| `IndexRecounted` | `output`, `scope`, `live`, `pinned_count`, `pinned_inexact` | a recount found `live` keys where the state it scanned said `pinned_count`: the count becomes `live` plus what commits since added, and `inexact` drops by `pinned_inexact` (§6) |
 | `IndexTruncated` | `output`, `scope`, `below`, `at` | drops delta log entries below `below` |
 | `GarbageDeleted` | `paths` | forgets index files that were deleted |
 | `AutomationChanged` | `name`, `enabled` | |
@@ -200,7 +201,7 @@ State
 | Type | Fields | Bounded by |
 |---|---|---|
 | `Head` | `ref` (from the store), `run`, `attempt` (may point at a deleted run), `batch` (incremental outputs: the last batch that changed it, −1 before any), `base` (unkeyed incremental outputs: the first batch after the last reset), `count` (keyed: live keys), `elements?` (partition sets and set dimensions), `complete`, `version` (declared asset version), `asset`, `at` | outputs × partitions |
-| `KeyIndex` | `prefix` (where its files live — kept across renames), `count`, `count_exact`, `files` [{`name`, `level`, `min`, `max`, `entries`, `size`, `tail`, `index`}], `log` [[`batch`, [file]], …] — see §6 | a few dozen files per index |
+| `KeyIndex` | `prefix` (where its files live — kept across renames), `count`, `inexact` (commits since the last recount whose count came from filters; the count is exact at 0), `files` [{`name`, `level`, `min`, `max`, `entries`, `size`, `tail`, `index`}], `log` [[`batch`, [file]], …] — see §6 | a few dozen files per index |
 | `Watermark` | `batch` (first batch not fully delivered; during a full drain, the head's batch + 1 when the drain began, so changes made while draining arrive afterwards as deltas), `until` (the last batch of a delta window being delivered in pages), `after` (last key delivered inside the window or the full drain), `full` (a full drain is in progress), `fingerprint`, `output` and `up` (the upstream index it reads) | edges × partitions |
 | `Outcome` | `outcome`, `run`, `attempt`, `at` | assets × partitions |
 | `AutomationState` | `enabled`, `last_fired`, `last_run`, `last_revision`, `pending` (set of `[asset, scope]` for OnChange) | automations × partitions |
@@ -230,7 +231,7 @@ Example (abridged):
     "run": "01J8ZC7Q…", "attempt": "01J8ZC7R…",
     "batch": 57, "count": 4, "complete": true, "version": "1", "at": 1790074866.0}}},
   "indexes": {"site_files": {"alpha": {
-    "prefix": "keys/site_files/alpha/", "count": 4, "count_exact": true,
+    "prefix": "keys/site_files/alpha/", "count": 4, "inexact": 0,
     "files": [{"name": "c01J8ZE2…-0000", "level": 1, "min": "alpha-file-0", "max": "alpha-file-3", "entries": 4, "size": 212, "…": "…"},
               {"name": "000000000057-01J8ZC7R…", "level": 0, "min": "alpha-file-1", "max": "alpha-file-3", "entries": 2, "size": 140, "…": "…"}],
     "log": [[56, [{"name": "000000000056-01J8ZB…", "…": "…"}]], [57, [{"name": "000000000057-01J8ZC7R…", "…": "…"}]]]}}},
@@ -257,8 +258,9 @@ holds each index's `KeyIndex` record.
 **Structure: a log-structured merge tree of sorted files.** Every file
 holds `(key, version, deleted)` entries sorted by key.
 
-- **Level 0** holds delta files, one per commit, named by batch. Their key
-  ranges overlap.
+- **Level 0** holds delta files, one per commit, named by batch, and files
+  merged from them. Their key ranges overlap; a file is as recent as the
+  newest batch it holds, which leads its name.
 - **Levels 1+** hold compacted files with non-overlapping key ranges, each
   up to ~64 MB, each level ~10× the previous.
 - **Newest wins:** a key's current version is its entry in the newest file
@@ -277,8 +279,9 @@ the tail when it checks filters, the index part when it scans, the whole
 file when it is small — then range-reads only the blocks it needs.
 
 **Filters.** Each file carries three blocked Bloom filters (14 bits per
-item, ~0.1% false positives): its keys, its live `(key, version)` pairs,
-and its deleted keys. A written `(key, version)` that no pair filter and
+item, 3.5 B per entry, 0.35% false positives measured — keeping an
+item's bits in one 512-bit block costs ~1.8× over independent bits): its
+keys, its live `(key, version)` pairs, and its deleted keys. A written `(key, version)` that no pair filter and
 no tombstone filter matches, across every file whose key range could hold
 the key, is a real change of a live key and needs no block read: the
 key's current `(key, version)` is always present in some file. A key no
@@ -289,28 +292,38 @@ that may be deleted, false positives — gets an exact lookup.
 exact, which is always the case for indexes small enough to read whole.
 When a commit relies on the filters, a new key that some key filter
 falsely matches is counted as an update, so the count drifts low by about
-the filters' false-positive rate on inserted keys, and `count_exact`
-turns false. Compaction then schedules a **recount** — a full scan of the
-index's block indexes and blocks, about 150 reads at 100M keys — at most
-once per `recount_interval` (default 1 hour), which makes it exact again.
+the filters' false-positive rate on inserted keys; `inexact` counts such
+commits. While it is non-zero, the engine schedules a **recount** — a
+full scan of the index's block indexes and blocks, about 1,100 reads at
+100M keys (3,000 with the upper levels full) — at most once per
+`recount_interval` (default 1 hour). The recount is exact
+for the state it pinned, and commits landing while it runs keep their
+`added − removed` on top of it (`IndexRecounted`), so a busy index gets
+its exact count back unless one of those commits was itself inexact.
 Deltas themselves are always exact; only the count is approximate.
 
-**Read strategy.** Per level, the reader chooses between streaming the
-whole level, reading the touched blocks, and reading the file tails and
-then only the blocks the filters could not clear. Consecutive blocks are
-one range read; files are selected by key range. The cheapest option in
-requests that fits a latency budget (default 2 s) wins, else the fastest.
-Levels small enough (≤ 32 MB) are always read whole.
+**Read strategy.** Newest first, levels up to 32 MB — two range reads, no
+more than a tail and a block — are read whole, all at once. From the
+first larger level on, the reader fetches the tails of the files that
+could hold the written keys and runs the filters; only then, knowing
+which keys need an exact read, does it choose per level between reading
+their blocks (consecutive blocks are one range read) and reading the rest
+of those files whole. It estimates each combination from request rounds,
+transfer (500 MB/s in all, 80 MB/s per request) and CPU (decoding and
+filter checks at the measured native or pure-Python rates); the one with
+the fewest requests that fits a latency budget (default 2 s) wins, else
+the fastest. An exact read only goes to files whose key filter matched,
+all levels at once, and each key takes its newest entry.
 
 **Operations.**
 
 | Operation | Who | How |
 |---|---|---|
-| Compute a delta | harness, at write time | Extract `(key, version)` from the written rows (declared `revision` column, else row digest). Check them against the index **as pinned in the spec**, with the filters and the read strategy above. Keep entries whose version changed, plus `deleted` entries for removed keys that may exist. A full replacement also compares against every existing key, which is inherent. Write the result as the batch's delta file. |
-| Commit | engine | Add the delta file to level 0 and to `log`; `count += added − removed`. The scope lock — one attempt per (asset, scope) from launch to settlement — guarantees the index didn't change underneath. |
+| Compute a delta | harness, at write time | Extract `(key, version)` from the written rows (the declared `revision` column's text, else a 16-byte digest of the row). Check them against the index **as pinned in the spec**, with the filters and the read strategy above. Keep entries whose version changed, plus `deleted` entries for removed keys that may exist. A full replacement also compares against every existing key, which is inherent. Write the result as the batch's delta file. |
+| Commit | engine | Add the delta file to level 0 and to `log`; `count += added − removed`, and `inexact += 1` if the count change came from filters. The scope lock — one attempt per (asset, scope) from launch to settlement — guarantees the index didn't change underneath. |
 | Deliver pending deltas | harness, for an `Incremental` edge | Read the `log` files from the watermark to the head; chunk by `batch_size` in key order; ask the upstream store for those rows with `Keys(…)`. |
-| Full delivery | harness | Page through the merged view of all levels from `after`, `batch_size` keys at a time, and ask the store for them with `Keys(…)`. Per level, only the files covering the page are opened, and only their index parts are read. |
-| Compaction | the engine's machine by default (§6, *Engine work*) | When level 0 exceeds ~8 files, merge it with the overlapping level-1 files into new level-1 files, cascading down; commit with `IndexCompacted`. |
+| Full delivery | harness | Page through the merged view of all levels from `after`, `batch_size` keys at a time, and ask the store for them with `Keys(…)`. Per level, only the files covering the page are opened, and only their index parts are read — or the whole file, once, when it is small (below one request's latency worth of transfer, ~2.4 MB). A multi-page scan keeps each file's last fetched blocks for the next page, so it reads every block once. |
+| Compaction | the engine's machine by default (§6, *Engine work*) | Once level 0 holds ~8 files, merge them into one level-0 file — or, once level 0 holds a tenth of level 1's bytes, into level 1 with the level-1 files it overlaps (all of them, for random keys). A level over its target pushes one file down, merging it with the files it overlaps there. Commit with `IndexCompacted`. Each merge into a level rewrites about ten times the bytes it brings: ~20–30× over an entry's life with random keys (`bench/keys/amplification.py`). |
 | Truncate the log | engine | Drop `log` entries below the lowest consumer watermark and below every window an in-flight attempt was given (`IndexTruncated`); an output with no `Incremental` consumers keeps none. A consumer whose window the log no longer holds gets a full delivery. |
 | Delete files | engine | A file in neither `files` nor `log` joins `garbage`, and is deleted once every attempt that could have pinned it has finished (`GarbageDeleted`). A delta file of an attempt that never committed is deleted when the attempt ends, unless it is an unsettled intent (§8). |
 
@@ -822,14 +835,14 @@ POST   /api/projects/{p}/runs:prune   {"before", "asset", "keep", "dry_run"}
 
 ## 13. Open questions
 
-1. **Key index parameters**, measured by the prototype against the
-   assumptions in `key-index-costs.md`: entry size and compression ratio,
-   filter size and false-positive rate, block size, level fanout, the
-   read-strategy crossovers, and native vs pure-Python throughput. Targets
-   at 1M, 10M and 100M keys: write throughput, a 1K random-key delta
-   (requests, bytes, wall time with S3-like latency), a bulk merge, one
-   compaction, and a full scan. Run against a local S3-compatible server
-   with injected latency; validate once on real S3.
+1. **The key index on real S3.** Its parameters and costs are measured at
+   1M, 10M and 100M keys against MinIO with 30 ms injected per request and
+   80 MB/s per connection (`bench/keys/results.md`, compared with the model
+   in `key-index-costs.md` → Measured). Request counts and bytes carry over
+   to S3 exactly; wall times rest on the injected latency and bandwidth,
+   which nobody has checked against S3. One run of
+   `bench/keys/bench.py --s3 s3://bucket/prefix --latency 0 --bandwidth 0`
+   from a worker in the bucket's region settles it.
 
 ## 14. Implementation plan
 

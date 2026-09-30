@@ -3,10 +3,11 @@
 Companion to `object-store-state.md` §6. What the engine-owned key index
 costs on S3, per operation and per month, from 1K to 100M keys per index.
 
-Every number comes from `bench/cost_model/` (`model.py` holds the
-assumptions and formulas; `tables.py` and `scenarios.py` print the tables
-below). They are **estimates**: the K0 prototype measures the assumptions
-marked below and the model is re-run with the measured values.
+The per-operation and per-month tables come from `bench/cost_model/`
+(`model.py` holds the assumptions and formulas; `tables.py` and
+`scenarios.py` print them). They are **estimates**, left at the model's
+assumptions; the measured values are in the assumptions table's last
+column and under **Measured**, which compares the two.
 
 ## Summary
 
@@ -19,27 +20,28 @@ marked below and the model is re-run with the measured values.
   log and journal writes.
 - **Scattered writes into a very large index are the one pattern that
   costs noticeably more.** Per-file Bloom filters keep them in check: 100M
-  keys with 1,000 random changes every 10 s costs ~$14 a month on a cold
-  worker (~$116 without filters), ~$8 with index files cached on local
-  disk, and ~$1 if the same changes are committed every 10 minutes.
+  keys with 1,000 random changes every 10 s costs ~$13.50 a month measured
+  on a cold worker in steady state (~$116 modelled without filters), ~$8
+  with index files cached on local disk, and ~$1 if the same changes are
+  committed every 10 minutes.
 - **CPU, not requests, is what needs native code:** at 10M–100M keys,
   sorting and comparing take seconds natively and minutes in pure Python.
 
 ## Assumptions
 
-| Parameter | Value | Measured in K0 |
+| Parameter | Value (model) | Measured (`bench/keys/results.md`) |
 |---|---|---|
-| Entry size | ~40 B raw (24 B key, 16 B version), ~20 B compressed | yes |
-| Filters | per file, a Bloom filter of keys and one of `(key, version)` pairs, 14 bits per item each (~3.5 B per entry); 0.2% false positives per check | yes |
-| Block | 64 KB raw, ~1,640 entries, ~32 KB compressed | |
-| Compacted file cap | 64 MB | |
-| Level structure | level 0: up to 8 delta files; deeper levels 10× apart (about 4 levels at 100M keys); upper levels ≈ 11% of the bottom level | |
-| Read strategy | per level, one of: stream the whole level in 16 MB range reads; read each file's tail (footer, block index, filters) and then the touched blocks; or the same with filters, reading blocks only for keys the filters can't clear. Consecutive blocks are one range read; files are selected by key range. The **cheapest option that fits a 2 s latency budget** wins, else the fastest. | yes (crossover) |
+| Entry size | ~40 B raw (24 B key, 16 B version), ~20 B compressed | 29 B with filters on random ids with 16-byte row digests; 51 B on UUIDs; 24 B on sequential ids, 11 B with short revisions |
+| Filters | per file, a Bloom filter of keys and one of `(key, version)` pairs, 14 bits per item each (~3.5 B per entry); 0.2% false positives per check | 3.5 B per entry; 0.35% false positives per check |
+| Block | 64 KB raw, ~1,640 entries, ~32 KB compressed | ~2,400 entries, ~60 KB compressed on random ids |
+| Compacted file cap | 64 MB | files split at ~95 MB compressed |
+| Level structure | level 0: up to 8 delta files; deeper levels 10× apart (about 4 levels at 100M keys); upper levels ≈ 11% of the bottom level | 3 levels at 100M; level 0 merges in itself until it holds a tenth of level 1 |
+| Read strategy | per level, one of: stream the whole level in 16 MB range reads; read each file's tail (footer, block index, filters) and then the touched blocks; or the same with filters, reading blocks only for keys the filters can't clear. Consecutive blocks are one range read; files are selected by key range. The **cheapest option that fits a 2 s latency budget** wins, else the fastest. | levels over 32 MB always start with their tails; once the filters say which keys need a block, the planner picks per level between those blocks and the rest of each file (crossover tables) |
 | Requests in parallel | 64 | |
-| Request latency | 30 ms | yes, on real S3 |
-| Throughput to S3 | 500 MB/s aggregate | yes, on real S3 |
-| CPU (merge, compare, scan) | native 30M entries/s; pure Python 1.5M entries/s | yes |
-| Compaction write amplification | ~5× per level (each entry rewritten ~5–20× over its life) | yes |
+| Request latency | 30 ms | not yet on real S3 |
+| Throughput to S3 | 500 MB/s aggregate | not yet on real S3 |
+| CPU (merge, compare, scan) | native 30M entries/s; pure Python 1.5M entries/s | native: decode 4.6M, encode 1.3M, merge 1.5M entries/s; filters ~0.4M keys/s including Python. Pure Python 4–10× slower |
+| Compaction write amplification | ~5× per level (each entry rewritten ~5–20× over its life) | 16× / 22× / 31× over an entry's life at 1M / 10M / 100M keys |
 | Attempt overhead | 4 PUT + 2 GET: spec, result, log chunk, joined log; plus 1 journal PUT per commit (upper bound — flushes are shared when several commits land within a second) | |
 | Prices | S3 Standard list prices: PUT $5 per million, GET $0.40 per million, storage $0.023/GB-month; DELETE and same-region transfer free. Cloudflare R2 is ~10% cheaper per request and $0.015/GB, with free egress. | check before relying |
 
@@ -63,46 +65,65 @@ present" or "maybe present".
 - The key filter tells new keys from existing ones for the key count, and
   lets exact lookups skip files that don't hold the key.
 
-The **key count** becomes "exact after each compaction, and within the
-filters' false-positive rate between compactions": a new key that a key
-filter wrongly reports as present is counted as an update until the next
-compaction recounts.
+The **key count** becomes "exact after each recount, and within the
+filters' false-positive rate in between": a new key that a key filter
+wrongly reports as present is counted as an update until the next recount.
 
-## Measured (K0)
+## Measured
 
-The K0 prototype ran every operation below against an S3-compatible
-server (MinIO) with 30 ms injected per request, 80 MB/s per connection and
-64 requests in parallel; full numbers in `bench/keys/results.md`. The
-request counts are exact — they are what S3 would bill; wall times are
-only as good as the latency model.
+The K0 prototype and its follow-ups ran every operation below against an
+S3-compatible server (MinIO) with 30 ms injected per request, 80 MB/s per
+connection and 64 requests in parallel; full numbers in
+`bench/keys/results.md`. The request counts are exact — they are what S3
+would bill; wall times are only as good as the latency model. "Fresh" is
+an index built straight into its bottom level; "steady" has its upper
+levels filled the way steady-state random writes leave them.
 
-| At 100M keys | Model | Measured |
-|---|---|---|
-| Index size, incl. filters | 2.5 GB (23.5 B/entry) | 2.7 GB (27.2 B/entry; filters 3.5 B) |
-| 1K random keys changed, cold | 56 GETs, 0.8 s | **34 GETs, 0.5 s**, 351 MB read |
-| 1K written, half unchanged | 552 GETs | 542 GETs, 0.8 s |
-| 1K clustered keys changed | 12 GETs | 1 GET, 0.2 s |
-| 1K new keys inserted | — | 29 GETs, 0.5 s |
-| 100K random keys changed | 845 GETs, 1.6 s | 376 GETs, 1.3 s |
-| 1K random, disk cache warm | 10 GETs | 0 GETs, 0.2 s (CPU) |
-| Full-delivery page of 10K keys | 12 GETs | 2 GETs, 0.3 MB, 0.1 s |
+| At 100M keys | Model | Measured, fresh | Measured, steady |
+|---|---|---|---|
+| Index size, incl. filters | 2.5 GB (23.5 B/entry) | 2.7 GB (27.2 B/entry; filters 3.5 B) | 3.4 GB |
+| 1K random keys changed, cold | 56 GETs, 0.8 s | **34 GETs, 0.5 s**, 351 MB read | **48 GETs, 0.8 s**, 445 MB read |
+| 1K written, half unchanged | 552 GETs | 542 GETs, 1.0 s | 291 GETs, 1.1 s |
+| 1K clustered keys changed | 12 GETs | 1 GET, 0.2 s | |
+| 1K new keys inserted | — | 29 GETs, 0.5 s | |
+| 100K random keys changed | 845 GETs, 1.6 s | 376 GETs, 1.3 s | |
+| 1K random, disk cache warm | 10 GETs | 0 GETs, 0.3 s (CPU) | |
+| Full-delivery page of 10K keys | 12 GETs | 2 GETs, 0.3 MB, 0.1 s | 14 GETs, 1.4 MB, 0.1 s |
+| Full scan (recount), 100K-key pages | ~150 GETs (§6) | 1,077 GETs, 122 s | 3,029 GETs, 242 s |
 
-Scenario E (1K random changes every 10 s into 100M keys, cold) is
-therefore about **$11.50 a month** measured, against $13.67 modelled.
+Scenario E (1K random changes every 10 s into 100M keys, cold) is about
+**$11.50 a month** on a fresh index and **$13.54 in steady state** — 50
+GETs and a PUT per commit, plus compaction's 1.2 GETs and 0.14 PUTs per
+commit (`bench/keys/amplification.py`) — against $13.67 modelled. Before
+level 0 merged in itself and the planner read the filters first, the
+steady state cost ~$14.40–14.60 at 1.5 s per commit; it now takes 0.8 s.
 
 Where the model was wrong:
 
 - **Entries are bigger than assumed**: 27–29 B with filters on random
-  12-digit ids, 39 B on UUIDs, but 3.5 B on sequential ids (prefix
-  compression). Sizes and transfer scale accordingly; request counts barely
-  move.
-- **CPU is much slower than assumed.** Native encoding runs at about 1.6M
-  entries/s (zlib level 1 is most of it), decoding at about 4.7M/s, merging
-  at about 1.4M/s; the model assumed 30M/s. Request costs are unaffected —
+  12-digit ids, 51 B on UUIDs, 24 B on sequential ids (prefix compression),
+  and 11 B on sequential ids with short declared revisions. A row digest is
+  16 bytes; until 2026-09-30 it was a 64-character SHA-256 hex digest, which
+  made those 68.5 B, 91 B and 63 B. Sizes and transfer scale accordingly;
+  request counts barely move.
+- **Filters false-positive 0.35% of the time**, not 0.2%: keeping an
+  item's 10 bits inside one 512-bit block costs ~1.8× over independent bits.
+- **Compaction rewrote far more than assumed** while every level-0 merge
+  went into level 1: with random keys every level-1 file overlaps every
+  delta, so 0.23 MB of deltas rewrote up to 67 MB, 125–159× over an
+  entry's life. Level 0 now merges in itself until it holds a tenth of
+  level 1: 16×, 22× and 31× at 1M, 10M and 100M keys, near the model's
+  ~5–20×.
+- **A recount is ~1,100 reads at 100M keys**, not ~150: one or two per
+  100K-key page, each page a request round trip; ~3,000 with the upper
+  levels full.
+- **CPU is much slower than assumed.** Native encoding runs at about 1.3M
+  entries/s (zlib level 1 is most of it), decoding at about 4.6M/s, merging
+  at about 1.5M/s; the model assumed 30M/s. Request costs are unaffected —
   the work runs on the worker — but a full replacement of 10M keys takes
-  about 6 s (mostly sorting the written keys), and of 100M about a minute.
-  Parallel block compression is the obvious next optimization if that
-  matters.
+  about 6 s (mostly sorting the written keys), and of 100M about a minute
+  (and ~45 GB of memory today). Parallel block compression is the obvious
+  next optimization if that matters.
 - **Pure Python** encodes at about 0.1M entries/s: fine for indexes up to
   about 1M keys, and the reason the native extension exists.
 
@@ -291,13 +312,9 @@ Without filters that is ~1,000 small reads per commit, 270M a month.
    instead of chunk + join when the log fits in one chunk. That takes a
    typical attempt from 4 PUT to 2–3.
 
-## What K0 must confirm
+## What remains to measure
 
-- Entry size and compression ratio on realistic keys (the 20 B/entry
-  assumption scales every size and read above).
-- Filter size and false-positive rate as built.
-- Native and pure-Python throughput for sort, merge, compare and scan.
-- The read-strategy crossovers, and how many range reads in parallel a
-  worker actually sustains.
-- Request latency and throughput on real S3 — the one thing a local
-  S3-compatible server cannot tell us.
+Everything above ran against MinIO with injected latency and bandwidth.
+Request counts and bytes carry over to S3 exactly; wall times need one run
+on real S3 from a worker in the bucket's region (`object-store-state.md`
+§13).
