@@ -334,8 +334,9 @@ def push_plan(state: IndexState, lv: int):
 
 async def steady(n, prefix, state, sample, opts, cold) -> tuple[list[dict], dict]:
     """The index as steady-state writes leave it — upper levels filled, level 0 one delta
-    short of a compaction — then operations on it and one compaction of each kind. Checks
-    afterwards that every key kept its newest version."""
+    short of a compaction, holding on average half the merged level-0 file it pushes into
+    level 1 — then operations on it and one compaction of each kind. Checks afterwards that
+    every key kept its newest version."""
 
     setup = ObjectIO(store())
     current = dict(sample)
@@ -344,10 +345,23 @@ async def steady(n, prefix, state, sample, opts, cold) -> tuple[list[dict], dict
     upper = await fill_upper(setup, prefix, n, opts, state.depth, per_entry, current)
     st = replace(state, files=state.files + tuple(upper))
     rng = random.Random(21)
-    batch = 0
+    batch = 1
 
     def pick(k):
         return sorted(rng.sample(list(current.items()), k))
+
+    async def fill_l0(name):
+        """A level-0 file of newer versions of sampled keys: half the size at which
+        level 0 merges into level 1."""
+
+        nonlocal st
+        l1 = sum(f.size for f in st.level(1))
+        items = pick(min(len(current), round(l1 / opts.fanout / 2 / per_entry)))
+        vers = [rng.randbytes(16) for _ in items]
+        data = K.encode_file([key_of(i) for i, _ in items], vers, bytes(len(items)), level=opts.level)
+        await setup.write(f"{prefix}{name}.kx", data)
+        st = replace(st, files=st.files + (FileInfo.describe(name, 0, data),))
+        current.update((i, v) for (i, _), v in zip(items, vers, strict=True))
 
     async def commit(io):
         nonlocal st, batch
@@ -359,7 +373,8 @@ async def steady(n, prefix, state, sample, opts, cold) -> tuple[list[dict], dict
         current.update((i, v) for (i, _), v in zip(items, vers, strict=True))
         batch += 1
 
-    for _ in range(opts.l0_max_files - 1):  # level 0 one delta short of a compaction
+    await fill_l0(f"{0:012d}-fill")
+    for _ in range(opts.l0_max_files - 2):  # level 0 one delta short of a compaction
         await commit(setup)
     shape = {"before": levels(st), "fill_s": time.perf_counter() - t}
 
@@ -403,9 +418,17 @@ async def steady(n, prefix, state, sample, opts, cold) -> tuple[list[dict], dict
         await measure("steady: commit: 1K random changes + delta write", io, lambda io=io: commit(io))
     )
     io = cold()
+    rows.append(await measure("steady: compaction: level 0, 8 files", io, lambda io=io: compact(io)))
+    await fill_l0(f"{batch:012d}-fill")
+    io = cold()
+    l0 = st.level(0)
+    lo, hi = min(f.min for f in l0), max(f.max for f in l0)
+    plan = (l0 + [f for f in st.level(1) if f.max >= lo and f.min <= hi], 1)
     rows.append(
         await measure(
-            "steady: compaction: 8 delta files + level 1 into level 1", io, lambda io=io: compact(io)
+            "steady: compaction: level 0, a tenth of level 1, into level 1",
+            io,
+            lambda io=io, plan=plan: compact(io, plan),
         )
     )
     for lv in range(1, state.depth):
@@ -579,7 +602,7 @@ async def _run_size(n: int, prefix: str, args) -> dict:
             s2 = s2.compacted(*out)
             return out
 
-        rows.append(await measure("compaction: 8 delta files into level 1", io, compact))
+        rows.append(await measure("compaction: 8 delta files", io, compact))
 
     if n <= args.max_replace and ("base" in args.suites or "load" in args.suites):
         ks_all, vs_all = all_entries(n)

@@ -862,18 +862,25 @@ class KeyIndex:
     def plan_compaction(self) -> tuple[list[FileInfo], int] | None:
         """The next compaction: input files (newest first) and the output level.
 
-        Level 0 is merged into level 1 once it holds `l0_max_files` files or
-        `l0_max_bytes`. A level over its target (`level_base · fanout^(n-1)`)
-        pushes one file — the one overlapping the next level least — down,
-        merging it with the files it overlaps; the deepest level moves down
-        whole, which rewrites nothing."""
+        Level 0 acts once it holds `l0_max_files` files or `l0_max_bytes`. It
+        merges into level 1 — with every level-1 file it overlaps, which for
+        random keys is all of them — only once it holds a `fanout`-th of level
+        1's bytes, so each merge rewrites level 1 for at least that many new
+        bytes; until then its files merge among themselves, into one level-0
+        file. A level over its target (`level_base · fanout^(n-1)`) pushes one
+        file — the one overlapping the next level least — down, merging it with
+        the files it overlaps; the deepest level moves down whole, which
+        rewrites nothing."""
 
         s, o = self.state, self.o
         l0 = s.level(0)
-        if l0 and (len(l0) >= o.l0_max_files or sum(f.size for f in l0) >= o.l0_max_bytes):
+        size = sum(f.size for f in l0)
+        if l0 and (len(l0) >= o.l0_max_files or size >= o.l0_max_bytes):
+            l1 = s.level(1)
+            if len(l0) > 1 and size * o.fanout < sum(f.size for f in l1):
+                return l0, 0
             lo, hi = min(f.min for f in l0), max(f.max for f in l0)
-            below = [f for f in s.level(1) if f.max >= lo and f.min <= hi]
-            return l0 + below, 1
+            return l0 + [f for f in l1 if f.max >= lo and f.min <= hi], 1
         for n in range(1, s.depth + 1):
             files = s.level(n)
             if not files or sum(f.size for f in files) <= o.level_base * o.fanout ** (n - 1):
@@ -909,10 +916,12 @@ class KeyIndex:
             k=self.o.k,
             max_file_bytes=self.o.max_file_bytes,
         )
-        stamp = ulid()
+        # A level-0 file is as recent as its newest input: level 0 orders by name, and delta
+        # names start with their batch.
+        stamp = ulid() if out_level else f"{inputs[0].name.split('-', 1)[0]}-c{ulid()}"
         added = []
         for n, data in enumerate(merged):
-            name = f"c{stamp}-{n:04d}"
+            name = f"c{stamp}-{n:04d}" if out_level else f"{stamp}.{n:04d}"
             await self.io.write(self.path(name), data)
             added.append(FileInfo.describe(name, out_level, data))
         return added, [f.name for f in inputs]

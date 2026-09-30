@@ -310,3 +310,39 @@ async def test_a_full_scan_reads_each_block_once():
             break
     assert pages >= 50
     assert h.io.metrics.bytes_in <= sum(f.size for f in h.state.files)
+
+
+async def test_level_0_merges_in_itself_until_it_is_a_tenth_of_level_1():
+    h = Harness(small_options(l0_max_files=3, level_base=1 << 30, fanout=10))
+    rng = random.Random(9)
+    await h.commit([key(i) for i in range(3000)], [b"v1"] * 3000)
+    l1 = sum(f.size for f in h.state.level(1))
+    pushed = False
+    for step in range(200):
+        some = sorted({key(rng.randrange(3000)) for _ in range(10)})
+        await h.commit(some, [ver(rng) for _ in some])
+        plan = h.index().plan_compaction()
+        if plan is None:
+            continue
+        inputs, level = plan
+        l0 = sum(f.size for f in h.state.level(0))
+        if level == 0:
+            assert 10 * l0 < l1 and inputs == h.state.level(0)
+        else:
+            assert level == 1 and 10 * l0 >= l1
+            pushed = True
+        await h.compact_all()
+        assert len(h.state.level(0)) <= (0 if level else 1)
+        if step % 10 == 0:
+            await h.check()
+        if pushed:
+            break
+    assert pushed
+    # A merged level-0 file stays older than the deltas after it.
+    await h.commit([key(1)], [b"old"])
+    await h.commit([key(2)], [b"x"])
+    await h.commit([key(3)], [b"x"])
+    assert h.index().plan_compaction()[1] == 0
+    await h.compact_all()
+    await h.commit([key(1)], [b"new"])
+    await h.check()
