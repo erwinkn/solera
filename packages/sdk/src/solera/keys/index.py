@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import bisect
+import itertools
 import math
 from dataclasses import dataclass, field, replace
 from urllib.parse import quote
@@ -23,6 +24,7 @@ from urllib.parse import quote
 from ..ids import ulid
 from . import (
     FOOTER_SIZE,
+    IMPL,
     bloom_check_keys,
     bloom_check_pairs,
     bloom_check_tombstones,
@@ -267,11 +269,15 @@ class Options:
     bits_per_item: int = 14
     k: int = 10
     max_file_bytes: int = 64 * 2**20
-    whole_threshold: int = 32 * 2**20  # levels up to this size are always read whole
+    whole_threshold: int = 2 * RANGE  # levels this small are read whole: no more requests than tail + block
     latency_budget: float = 2.0  # seconds; the read strategy's tie-breaker
     concurrency: int = 64
-    request_latency: float = 0.03  # planning estimates for a remote store
-    bandwidth: float = 500e6
+    # Planning estimates: a remote store, and this implementation's CPU (bench/keys/results.md).
+    request_latency: float = 0.03
+    bandwidth: float = 500e6  # all requests together
+    connection_bandwidth: float = 80e6  # one request
+    decode_rate: float = 4.5e6 if IMPL == "native" else 1e6  # entries per second
+    check_rate: float = 0.4e6 if IMPL == "native" else 0.12e6  # keys through a file's filters per second
     l0_max_files: int = 8
     l0_max_bytes: int = 64 * 2**20
     level_base: int = 64 * 2**20
@@ -285,9 +291,13 @@ class Options:
 class _Parsed:
     info: FileInfo
     tail: dict  # parsed index, plus the filters when `filters`
-    firsts: list[bytes] = field(default_factory=list)
-    whole: bytes | None = None
     filters: bool = True
+    data: bytes | None = None  # the file from its start through at least its last block
+    window: dict[int, bytes] = field(default_factory=dict)  # the blocks a scan's last page fetched
+    firsts: list[bytes] = field(init=False)
+
+    def __post_init__(self):
+        self.firsts = [b[0] for b in self.tail["blocks"]]
 
     def block_of(self, key: bytes) -> int:
         """Index of the only block that could hold `key`, or -1."""
@@ -295,6 +305,41 @@ class _Parsed:
         if not self.tail["blocks"] or key < self.info.min or key > self.info.max:
             return -1
         return bisect.bisect_right(self.firsts, key) - 1
+
+    def runs(self, wanted) -> list[list[int]]:
+        """Sorted block indexes grouped into range reads: consecutive blocks, up to `RANGE` each."""
+
+        blocks = self.tail["blocks"]
+        out: list[list[int]] = []
+        for i in sorted(wanted):
+            if out and out[-1][-1] == i - 1 and blocks[i][1] + blocks[i][2] - blocks[out[-1][0]][1] <= RANGE:
+                out[-1].append(i)
+            else:
+                out.append([i])
+        return out
+
+    def span(self, run: list[int]) -> tuple[int, int]:
+        blocks = self.tail["blocks"]
+        return blocks[run[0]][1], blocks[run[-1]][1] + blocks[run[-1]][2]
+
+
+@dataclass(frozen=True)
+class Cost:
+    """What a set of reads costs: requests, bytes, the largest request, and
+    entries to decode."""
+
+    requests: int = 0
+    nbytes: int = 0
+    largest: int = 0
+    entries: int = 0
+
+    def __add__(self, other: Cost) -> Cost:
+        return Cost(
+            self.requests + other.requests,
+            self.nbytes + other.nbytes,
+            max(self.largest, other.largest),
+            self.entries + other.entries,
+        )
 
 
 class KeyIndex:
@@ -312,71 +357,71 @@ class KeyIndex:
 
     # -- file access ---------------------------------------------------------------------
 
-    async def _open(self, f: FileInfo, *, whole: bool = False, filters: bool = True) -> _Parsed:
+    def _small(self, f: FileInfo) -> bool:
+        """Read whole at once rather than tail, then blocks: mostly tail anyway, or
+        cheaper to transfer than a second round trip."""
+
+        return f.size <= 2 * f.tail or f.size <= self.o.request_latency * self.o.connection_bandwidth
+
+    async def _open(self, f: FileInfo, *, data: bool = False, filters: bool = True) -> _Parsed:
         """A parsed file: its block index, plus its filters when `filters`, plus
-        all its bytes when `whole`. Reads only what was not read before."""
+        its data blocks when `data`. Reads only what was not read before."""
 
         p = self._parsed.get(f.name)
-        if p is not None and (p.whole is not None or (not whole and (p.filters or not filters))):
-            return p
-        if whole or f.size <= 2 * f.tail:
-            # Small files, and files that are mostly tail anyway: one read of everything.
-            data = await self.io.read_whole(self.path(f.name), f.size)
-            tail = parse_tail(data[f.size - f.tail :], f.size)
-            p = _Parsed(f, tail, [b[0] for b in tail["blocks"]], data)
-        elif filters:
-            raw = await self.io.read(self.path(f.name), f.size - f.tail, f.size, f.size)
-            tail = parse_tail(raw, f.size)
-            p = _Parsed(f, tail, [b[0] for b in tail["blocks"]])
-        else:
-            raw = await self.io.read(self.path(f.name), f.size - f.index, f.size, f.size)
-            tail = parse_index(raw, f.size)
-            p = _Parsed(f, tail, [b[0] for b in tail["blocks"]], filters=False)
-        self._parsed[f.name] = p
+        if p is None or (filters and not p.filters):
+            if data or self._small(f):
+                raw = await self.io.read_whole(self.path(f.name), f.size)
+                p = _Parsed(f, parse_tail(raw[f.size - f.tail :], f.size), data=raw)
+            elif filters:
+                raw = await self.io.read(self.path(f.name), f.size - f.tail, f.size, f.size)
+                p = _Parsed(f, parse_tail(raw, f.size))
+            else:
+                raw = await self.io.read(self.path(f.name), f.size - f.index, f.size, f.size)
+                p = _Parsed(f, parse_index(raw, f.size), filters=False)
+            self._parsed[f.name] = p
+        if data and p.data is None:
+            p.data = await self.io.read(self.path(f.name), 0, f.size - f.tail, f.size)
         return p
 
-    async def _blocks(self, p: _Parsed, wanted: list[int]) -> dict[int, bytes]:
+    async def _blocks(self, p: _Parsed, wanted) -> dict[int, bytes]:
         """Fetch blocks by index, consecutive ones as a single range read."""
 
         blocks = p.tail["blocks"]
         out: dict[int, bytes] = {}
-        wanted = sorted(set(wanted))
-        if p.whole is not None:
+        wanted = set(wanted)
+        for i in wanted & p.window.keys():
+            out[i] = p.window[i]
+        wanted -= out.keys()
+        if p.data is not None:
             for i in wanted:
                 _, off, size, _, crc = blocks[i]
-                out[i] = p.whole[off : off + size]
+                out[i] = p.data[off : off + size]
                 check_block(out[i], crc)
             return out
-        runs: list[list[int]] = []
-        for i in wanted:
-            if (
-                runs
-                and runs[-1][-1] == i - 1
-                and blocks[i][1] + blocks[i][2] - blocks[runs[-1][0]][1] <= RANGE
-            ):
-                runs[-1].append(i)
-            else:
-                runs.append([i])
 
         async def fetch(run: list[int]):
-            start = blocks[run[0]][1]
-            end = blocks[run[-1]][1] + blocks[run[-1]][2]
+            start, end = p.span(run)
             data = await self.io.read(self.path(p.info.name), start, end, p.info.size)
             for i in run:
                 _, off, size, _, crc = blocks[i]
                 out[i] = data[off - start : off - start + size]
                 check_block(out[i], crc)
 
-        await asyncio.gather(*(fetch(r) for r in runs))
+        await asyncio.gather(*(fetch(r) for r in p.runs(wanted)))
         return out
 
     async def _all_blocks(self, f: FileInfo) -> tuple[int, list[bytes]]:
-        p = await self._open(f, whole=True)
-        fetched = await self._blocks(p, list(range(len(p.tail["blocks"]))))
+        p = await self._open(f, data=True)
+        fetched = await self._blocks(p, range(len(p.tail["blocks"])))
         return p.tail["codec"], [fetched[i] for i in range(len(fetched))]
 
-    def _estimate(self, requests: float, nbytes: float) -> float:
-        return math.ceil(requests / self.o.concurrency) * self.o.request_latency + nbytes / self.o.bandwidth
+    def _estimate(self, cost: Cost, checks: int = 0) -> float:
+        """Seconds for `cost`, plus `checks` filter checks: request rounds, transfer, and CPU."""
+
+        o = self.o
+        transfer = max(cost.nbytes / o.bandwidth, cost.largest / o.connection_bandwidth)
+        rounds = math.ceil(cost.requests / o.concurrency) * o.request_latency
+        return rounds + transfer + cost.entries / o.decode_rate + checks / o.check_rate
 
     # -- a commit's delta ----------------------------------------------------------------
 
@@ -438,27 +483,33 @@ class KeyIndex:
         known: dict[bytes, tuple[bool, bytes]] = {}  # key -> (live, version), read exactly
         absent: set[bytes] = set()  # keys no file holds
         exact = True
-        filtered: list[list[FileInfo]] = []
+        levels = self.state.newest_first()
+        # Newest first, levels are read whole — exact answers, no filters — up to the first
+        # one too big to; from there every level goes through its filters, since "definitely
+        # changed" must hold across every level that could hold the key.
+        n = next((i for i, level in enumerate(levels) if not self._read_whole(level)), len(levels))
+        whole, filtered = levels[:n], levels[n:]
 
-        # 1. Newest to oldest, levels cheap enough are read whole: exact answers.
-        for level in self.state.newest_first():
+        # 1. The whole levels, fetched at once and then consulted newest first.
+        candidates = [self._candidates(level, unresolved) for level in whole]
+        await asyncio.gather(
+            *(
+                self._open(f, data=True)
+                for level, c in zip(whole, candidates, strict=True)
+                for f in level
+                if f.name in c
+            )
+        )
+        for level in whole:
             if not unresolved:
                 break
-            candidates = self._candidates(level, unresolved)
-            if not candidates:
-                continue
-            if filtered or not self._read_whole(level, sum(len(v) for v in candidates.values())):
-                # From the first level read through its filters, every older level is too:
-                # "definitely changed" must hold across every level that could hold the key.
-                filtered.append(level)
-                continue
-            found = await self._exact(level, candidates, whole=True)
+            found = await self._exact(level, self._candidates(level, unresolved))
             known.update(found)
             unresolved = [k for k in unresolved if k not in found]
 
         # 2. The rest through their filters; only "maybe" keys get block reads.
         if unresolved and filtered:
-            verdicts = await self._filter(filtered, unresolved, want)
+            verdicts, holders, spent = await self._filter(filtered, unresolved, want)
             maybe = []
             for key in unresolved:
                 verdict = verdicts[key]
@@ -471,13 +522,10 @@ class KeyIndex:
                     known[key] = (True, None)
                 else:
                     maybe.append(key)
-            for level in filtered:
-                if not maybe:
-                    break
-                found = await self._exact(level, self._candidates(level, maybe), whole=False)
+            if maybe:
+                found = await self._resolve(filtered, holders, maybe, spent)
                 known.update(found)
-                maybe = [k for k in maybe if k not in found]
-            absent.update(maybe)
+                absent.update(k for k in maybe if k not in found)
         else:
             absent.update(unresolved)
 
@@ -519,71 +567,74 @@ class KeyIndex:
                 out.setdefault(level[i].name, []).append(key)
         return out
 
-    def _read_whole(self, level: list[FileInfo], nkeys: int) -> bool:
-        """Read this level whole (exact, no filters), or through its filters?
+    def _read_whole(self, level: list[FileInfo]) -> bool:
+        """Whether a level is small enough to read whole without looking at its filters."""
 
-        The cheapest option in requests that fits the latency budget wins,
-        else the fastest; small levels and level-0 files are always read whole."""
+        return sum(f.size for f in level) <= self.o.whole_threshold
 
-        size = sum(f.size for f in level)
-        if level[0].level == 0 or size <= self.o.whole_threshold:
-            return True
-        whole = (math.ceil(size / RANGE), size)
-        # Through the filters: every candidate tail, then blocks for the few keys
-        # the filters can't clear — assume about 1%, at least one.
-        filtered = (len(level) + max(1, nkeys // 100), sum(f.tail for f in level))
-        options = [("whole", *whole), ("filtered", *filtered)]
-        fits = [o for o in options if self._estimate(o[1], o[2]) <= self.o.latency_budget]
-        best = (
-            min(fits, key=lambda o: o[1]) if fits else min(options, key=lambda o: self._estimate(o[1], o[2]))
-        )
-        return best[0] == "whole"
-
-    async def _exact(self, level, candidates, *, whole: bool) -> dict[bytes, tuple[bool, bytes]]:
+    async def _exact(self, level, candidates) -> dict[bytes, tuple[bool, bytes]]:
         by_name = {f.name: f for f in level}
-        found: dict[bytes, tuple[bool, bytes]] = {}
 
         async def one(name: str, keys: list[bytes]):
-            p = await self._open(by_name[name], whole=whole)
-            blocks_for: dict[int, list[bytes]] = {}
-            for key in keys:
-                b = p.block_of(key)
-                if b >= 0:
-                    blocks_for.setdefault(b, []).append(key)
-            if not blocks_for:
-                return
-            fetched = await self._blocks(p, list(blocks_for))
-            for b, bkeys in blocks_for.items():
-                hit, vers, dels = lookup([fetched[b]], p.tail["codec"], bkeys)
-                for key, h, v, d in zip(bkeys, hit, vers, dels, strict=True):
-                    if h:
-                        found[key] = (not d, v)
+            return await self._lookup(await self._open(by_name[name], data=True), keys)
 
-        await asyncio.gather(*(one(name, keys) for name, keys in candidates.items()))
+        found: dict[bytes, tuple[bool, bytes]] = {}
+        for part in await asyncio.gather(*(one(name, keys) for name, keys in candidates.items())):
+            found.update(part)
         return found
 
-    async def _filter(self, levels, keys, want) -> dict[bytes, str]:
+    async def _lookup(self, p: _Parsed, keys: list[bytes]) -> dict[bytes, tuple[bool, bytes]]:
+        """`(live, version)` of each of the sorted `keys` the file holds."""
+
+        blocks_for: dict[int, list[bytes]] = {}
+        for key in keys:
+            b = p.block_of(key)
+            if b >= 0:
+                blocks_for.setdefault(b, []).append(key)
+        if not blocks_for:
+            return {}
+        fetched = await self._blocks(p, blocks_for)
+        found = {}
+        for b, bkeys in blocks_for.items():
+            hit, vers, dels = lookup([fetched[b]], p.tail["codec"], bkeys)
+            for key, h, v, d in zip(bkeys, hit, vers, dels, strict=True):
+                if h:
+                    found[key] = (not d, v)
+        return found
+
+    async def _filter(self, levels, keys, want):
         """Classify keys with the filters of every file that could hold them:
         "absent" (no key filter matches), "changed" (a written key that no pair
         filter and no tombstone filter matches: live, at another version), or
-        "maybe" (needs an exact read)."""
+        "maybe" (needs an exact read). Also returns, per file, the keys its key
+        filter matched — the only files an exact read of them needs — and the
+        estimated seconds this took."""
 
         key_hit = dict.fromkeys(keys, False)
         pair_hit = dict.fromkeys(keys, False)
         tomb_hit = dict.fromkeys(keys, False)
+        holders: dict[str, list[bytes]] = {}
         per_file = []
         for level in levels:
             by_name = {f.name: f for f in level}
             per_file += [(by_name[n], ks) for n, ks in self._candidates(level, keys).items()]
         parsed = await asyncio.gather(*(self._open(f) for f, _ in per_file))
+        tails = [f.tail for f, _ in per_file]
+        spent = self._estimate(
+            Cost(len(tails), sum(tails), max(tails, default=0)), sum(len(ks) for _, ks in per_file)
+        )
         for p, (_, ks) in zip(parsed, per_file, strict=True):
             nb, kk, bits = p.tail["key_filter"]
-            for k, h in zip(ks, bloom_check_keys(bits, nb, kk, ks), strict=True):
-                key_hit[k] = key_hit[k] or bool(h)
+            held = [k for k, h in zip(ks, bloom_check_keys(bits, nb, kk, ks), strict=True) if h]
+            if not held:
+                continue
+            holders[p.info.name] = held
+            for k in held:
+                key_hit[k] = True
             nb, kk, bits = p.tail["tomb_filter"]
-            for k, h in zip(ks, bloom_check_tombstones(bits, nb, kk, ks), strict=True):
+            for k, h in zip(held, bloom_check_tombstones(bits, nb, kk, held), strict=True):
                 tomb_hit[k] = tomb_hit[k] or bool(h)
-            pks = [k for k in ks if k in want]
+            pks = [k for k in held if k in want]
             if pks:
                 nb, kk, bits = p.tail["pair_filter"]
                 for k, h in zip(
@@ -598,7 +649,81 @@ class KeyIndex:
                 out[k] = "changed"
             else:
                 out[k] = "maybe"
-        return out
+        return out, holders, spent
+
+    async def _resolve(self, levels, holders, maybe, spent: float) -> dict[bytes, tuple[bool, bytes]]:
+        """Exact lookups of `maybe` keys in every file whose key filter matched
+        them, all levels at once; each key's newest entry wins. Per level, the
+        planner reads just the blocks, or the rest of its files whole."""
+
+        wanted = set(maybe)
+        needs = []  # per level, newest first: (parsed file, keys to look up)
+        for level in levels:
+            row = []
+            for f in level:
+                ks = [k for k in holders.get(f.name, ()) if k in wanted]
+                if ks:
+                    row.append((self._parsed[f.name], ks))
+            needs.append(row)
+        rest = self._plan_reads(needs, spent)
+
+        async def one(p, ks, whole):
+            if whole:
+                await self._open(p.info, data=True)
+            return await self._lookup(p, ks)
+
+        found: dict[bytes, tuple[bool, bytes]] = {}
+        parts = await asyncio.gather(
+            *(one(p, ks, whole) for row, whole in zip(needs, rest, strict=True) for p, ks in row)
+        )
+        for part in parts:  # newest first
+            for key, entry in part.items():
+                found.setdefault(key, entry)
+        return found
+
+    def _plan_reads(self, needs, spent: float) -> list[bool]:
+        """Per level: read the rest of its files whole (True), or only the blocks
+        the lookups need (False)? Both decode the same blocks; they differ in
+        requests and bytes. The combination with the fewest requests that fits
+        the latency budget wins, else the fastest. The `spent` seconds — tails
+        and filter checks — count toward the budget."""
+
+        best = None
+        for combo, cost in self._read_options(needs):
+            total = spent + self._estimate(cost)
+            rank = (0, cost.requests, total) if total <= self.o.latency_budget else (1, total, cost.requests)
+            if best is None or rank < best[0]:
+                best = (rank, combo)
+        return list(best[1])
+
+    def _read_options(self, needs):
+        """Every way to read `needs` (per level: files and their keys), level by
+        level blocks or rest, with its cost."""
+
+        per_level = []
+        for row in needs:
+            blocks = rest = Cost()
+            for p, ks in row:
+                wanted = {p.block_of(k) for k in ks} - {-1}
+                entries = sum(p.tail["blocks"][i][3] for i in wanted)
+                if p.data is not None:  # read whole already
+                    blocks, rest = blocks + Cost(entries=entries), rest + Cost(entries=entries)
+                    continue
+                spans = [p.span(r) for r in p.runs(wanted)]
+                blocks += Cost(
+                    len(spans),
+                    sum(e - s for s, e in spans),
+                    max((e - s for s, e in spans), default=0),
+                    entries,
+                )
+                size = p.info.size - p.info.tail
+                rest += Cost(math.ceil(size / RANGE), size, min(size, RANGE), entries)
+            per_level.append((blocks, rest))
+        for combo in itertools.product((False, True), repeat=len(needs)):
+            cost = Cost()
+            for whole, options in zip(combo, per_level, strict=True):
+                cost += options[whole]
+            yield combo, cost
 
     # -- writing ------------------------------------------------------------------------
 
@@ -663,26 +788,29 @@ class KeyIndex:
                 chosen.append(f)
                 got += f.entries
         parsed = await asyncio.gather(*(self._open(f, filters=False) for f in chosen))
-        runs = []
-        codec = 1
+        spans = []
         for p in parsed:
-            codec = p.tail["codec"]
             blocks = p.tail["blocks"]
-            if not blocks:
-                runs.append([])
-                continue
-            start = max(0, bisect.bisect_right(p.firsts, after) - 1) if after is not None else 0
+            start = max(0, bisect.bisect_right(p.firsts, after) - 1) if after is not None and blocks else 0
             end, got = start, 0
             # Enough blocks for `limit` entries, and at least one block past the
             # one holding `after`, so every call makes progress.
             while end < len(blocks) and (got < limit + 1 or end - start < 2):
                 got += blocks[end][3]
                 end += 1
-            fetched = await self._blocks(p, list(range(start, end)))
-            runs.append([fetched[i] for i in range(start, end)])
+            spans.append(range(start, end))
             if end < len(blocks):
                 nxt = blocks[end][0]  # everything below the next unfetched block is complete
                 bound = nxt if bound is None else min(bound, nxt)
+        fetched = await asyncio.gather(
+            *(self._blocks(p, span) for p, span in zip(parsed, spans, strict=True))
+        )
+        runs = []
+        for p, span, got in zip(parsed, spans, fetched, strict=True):
+            runs.append([got[i] for i in span])
+            if p.data is None:
+                p.window = got  # the next page starts in it: a file never pays for the same block twice
+        codec = parsed[0].tail["codec"] if parsed else 1
         keys, versions, deleted = merge_range(runs, codec, after, None, False)
         out_k, out_v, out_d = [], [], bytearray()
         cursor = after

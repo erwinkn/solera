@@ -12,7 +12,8 @@ Suites (`--suites`, all by default):
 - base: the operations recorded in results.md, in the same order and with the same keys.
 - scan: a full scan of the index (the recount), in 100K-key pages.
 - load: an initial load of every key, unsorted, through `KeyIndex.changes` and `write`.
-- crossover: the read strategy forced each way (whole levels, filters) against the planner's pick.
+- crossover: the read strategy forced each way (whole levels; tails, then blocks; tails, then the
+  rest of each file) against the planner's pick.
 - steady: the upper levels filled as steady-state writes leave them, then commits and one
   compaction of each kind.
 
@@ -28,7 +29,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import math
 import os
 import random
 import resource
@@ -43,7 +43,7 @@ import boto3
 from obstore.store import S3Store
 from solera import keys as K
 from solera.keys.index import FileInfo, IndexState, KeyIndex, Options
-from solera.keys.io import RANGE, DiskCache, ObjectIO
+from solera.keys.io import DiskCache, ObjectIO
 
 S3 = {
     "endpoint": "http://127.0.0.1:9100",
@@ -211,38 +211,41 @@ def levels(state: IndexState) -> dict[int, tuple[int, float, int]]:
 
 
 class Strategy(KeyIndex):
-    """A KeyIndex that reads every level whole or through its filters (`force`), or as
-    the planner decides (`force=None`), and records each decision."""
+    """A KeyIndex that reads every level whole (`force="whole"`), or reads the tails and
+    then only the blocks (`"blocks"`) or the rest of each file (`"rest"`), or does as the
+    planner decides (`force=None`); records the route taken and the planner's estimates."""
 
     def __init__(self, *args, force: str | None = None, **kw):
         super().__init__(*args, **kw)
         self.force = force
-        self.decisions: list[tuple[int, int, str]] = []
+        self.route = "whole"
+        self.estimates: dict[str, float] = {}
 
-    def _read_whole(self, level, nkeys):
-        if level[0].level == 0:
-            return True
-        whole = super()._read_whole(level, nkeys) if self.force is None else self.force == "whole"
-        self.decisions.append((level[0].level, nkeys, "whole" if whole else "filtered"))
-        return whole
+    def _read_whole(self, level):
+        return self.force == "whole" or (self.force is None and super()._read_whole(level))
 
-    def estimates(self, level, nkeys) -> dict[str, float]:
-        """The planner's own time estimates for one level (as in `KeyIndex._read_whole`)."""
+    async def _filter(self, levels, keys, want):
+        self.route = "tails only"
+        return await super()._filter(levels, keys, want)
 
-        size = sum(f.size for f in level)
-        return {
-            "whole": self._estimate(math.ceil(size / RANGE), size),
-            "filtered": self._estimate(len(level) + max(1, nkeys // 100), sum(f.tail for f in level)),
-        }
+    def _plan_reads(self, needs, spent):
+        options = dict(self._read_options(needs))
+        n = len(needs)
+        self.estimates = {w: spent + self._estimate(options[(w == "rest",) * n]) for w in ("blocks", "rest")}
+        if self.force in ("blocks", "rest"):
+            rest = [self.force == "rest"] * n
+        else:
+            rest = super()._plan_reads(needs, spent)
+        self.route = "tails, then " + ("rest" if all(rest) else "blocks" if not any(rest) else "mixed")
+        return rest
 
 
 async def crossover(prefix, state, big, opts, cold) -> list[dict]:
     """Every written key changed, then half of them rewritten unchanged — the case the
-    filters can't clear, and the planner's 1% guess doesn't foresee."""
+    filters can't clear."""
 
     rng = random.Random(30)
     rows = []
-    bottom = state.level(state.depth)
     for k, same_share in (
         (1_000, 0.0),
         (10_000, 0.0),
@@ -258,7 +261,7 @@ async def crossover(prefix, state, big, opts, cold) -> list[dict]:
         keys = [key_of(i) for i, _ in items]
         vers = [v if rng.random() < same_share else rng.randbytes(16) for _, v in items]
         row = {"k": k, "unchanged": same_share}
-        for force in (None, "whole", "filtered"):
+        for force in (None, "whole", "blocks", "rest"):
             io = cold()
             idx = Strategy(io, prefix, state, opts, force=force)
             r = await measure(
@@ -267,8 +270,7 @@ async def crossover(prefix, state, big, opts, cold) -> list[dict]:
             r.pop("out")
             row[force or "planner"] = r
             if force is None:
-                row["picked"] = idx.decisions
-                row["estimates"] = idx.estimates(bottom, k)
+                row["picked"], row["estimates"] = idx.route, idx.estimates
         rows.append(row)
     return rows
 
@@ -710,18 +712,18 @@ def report(results, args):
     if crossed:
         print("\nRead strategy, forced each way (cold; wall · GETs · MB read):\n")
         print(
-            "| Keys | Written keys | Unchanged | Whole levels | Filters | Planner picks | "
-            "Planner's estimate, whole / filters |"
+            "| Keys | Written keys | Unchanged | Whole levels | Tails, then blocks | Tails, then rest | "
+            "Planner picks | Planner's estimate, blocks / rest |"
         )
-        print("|---|---|---|---|---|---|---|")
+        print("|---|---|---|---|---|---|---|---|")
         for res in crossed:
             for row in res["crossover"]:
-                picked = ", ".join(sorted({d[2] for d in row["picked"]})) or "—"
                 est = row["estimates"]
+                estimate = f"{fmt_s(est['blocks'])} / {fmt_s(est['rest'])}" if est else "—"
                 print(
                     f"| {res['info']['n']:,} | {row['k']:,} | {row.get('unchanged', 0):.0%} | {cell(row['whole'])} | "
-                    f"{cell(row['filtered'])} | {picked}: {fmt_s(row['planner']['wall'])} | "
-                    f"{fmt_s(est['whole'])} / {fmt_s(est['filtered'])} |"
+                    f"{cell(row['blocks'])} | {cell(row['rest'])} | {row['picked']}: "
+                    f"{cell(row['planner'])} | {estimate} |"
                 )
 
 

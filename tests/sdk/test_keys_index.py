@@ -223,3 +223,90 @@ async def test_pages_read_only_the_block_indexes_they_need():
     assert keys == ks[10001:10051] and nxt == ks[10050]
     assert h.io.metrics.gets <= 4
     assert h.io.metrics.bytes_in < tails / 5
+
+
+class Tracking(ObjectIO):
+    """Counts the most requests ever in flight at once."""
+
+    def __init__(self, *args, **kw):
+        super().__init__(*args, latency=0.002, **kw)
+        self.inflight = self.peak = 0
+
+    async def _get(self, path, start, end):
+        self.inflight += 1
+        self.peak = max(self.peak, self.inflight)
+        try:
+            return await super()._get(path, start, end)
+        finally:
+            self.inflight -= 1
+
+
+async def test_level_0_files_are_read_at_once():
+    h = Harness(small_options(l0_max_files=100))
+    h.io = Tracking(h.io.store)
+    rng = random.Random(3)
+    await h.commit([key(i) for i in range(2000)], [b"v1"] * 2000)
+    for _ in range(6):
+        ks = sorted({key(rng.randrange(2000)) for _ in range(20)})
+        await h.commit(ks, [b"v2"] * len(ks))
+    assert len(h.state.level(0)) == 6
+    h.io.peak = 0
+    await h.index().changes([key(i) for i in range(0, 2000, 50)], [b"v3"] * 40)
+    assert h.io.peak >= 7  # six deltas and level 1, not one after another
+
+
+async def test_the_planner_reads_blocks_or_the_rest_once_it_knows_how_many():
+    """The tails first; then, knowing which keys the filters could not clear,
+    the fewest requests: their blocks when there are few, else the rest of
+    each file in one read."""
+
+    # Everything goes through the filters, and every plan fits the latency budget.
+    h = Harness(small_options(whole_threshold=0, request_latency=0.0, l0_max_files=100))
+    rng = random.Random(4)
+    ks = [key(i) for i in range(4000)]
+    vs = [rng.randbytes(16) for _ in ks]  # incompressible: data outweighs filters
+    await h.commit(ks, vs)
+    files = h.state.level(1)
+    assert len(files) >= 3 and all(f.size > 2 * f.tail for f in files)
+    probe, same = ks[::60], vs[::60]  # every few blocks: no two consecutive
+
+    # All changed: the filters clear nearly every key, so only tails and a false positive's block.
+    h.io.metrics.reset()
+    delta = await h.index().changes(probe, [b"v2"] * len(probe))
+    assert len(delta) == len(probe)
+    assert h.io.metrics.gets <= len(files) + 2
+
+    # All rewritten unchanged: every key needs its block, scattered over each file.
+    idx = h.index()
+    h.io.metrics.reset()
+    delta = await idx.changes(probe, same)
+    assert len(delta) == 0
+    parsed = [idx._parsed[f.name] for f in files]
+    runs = sum(len(p.runs({p.block_of(k) for k in probe} - {-1})) for p in parsed)
+    assert runs > len(files) and h.io.metrics.gets == 2 * len(files)  # tails, then the rest
+
+
+async def test_a_full_scan_reads_each_block_once():
+    """Pages overlap in the files they read — a small file spans every page —
+    but a scan never fetches the same block twice."""
+
+    h = Harness(small_options(request_latency=0.0, l0_max_files=100))
+    rng = random.Random(5)
+    ks = [key(i) for i in range(3000)]
+    await h.commit(ks, [rng.randbytes(16) for _ in ks])
+    for _ in range(3):
+        some = sorted({key(rng.randrange(3000)) for _ in range(300)})
+        await h.commit(some, [rng.randbytes(16) for _ in some])
+    assert len(h.state.level(0)) == 3 and all(f.size > 2 * f.tail for f in h.state.files)
+    h.io.metrics.reset()
+    assert await h.index().recount() == 3000
+    h.io.metrics.reset()
+    idx = h.index()
+    after, pages = None, 0
+    while True:
+        _, _, after = await idx.page(after, 50)
+        pages += 1
+        if after is None:
+            break
+    assert pages >= 50
+    assert h.io.metrics.bytes_in <= sum(f.size for f in h.state.files)
