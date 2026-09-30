@@ -541,7 +541,9 @@ class OnDeploy:
 
 
 class Automation:
-    """When `trigger` fires, submit this run in §8 vocabulary."""
+    """When `trigger` fires, submit this run in §8 vocabulary.
+    `skip_missing_inputs`: skip a scope whose inputs have never been written
+    (and that the run doesn't build), rather than run it to fail."""
 
     def __init__(
         self,
@@ -556,6 +558,7 @@ class Automation:
         config: dict | None = None,
         keys: dict | None = None,
         tags: dict[str, str] | None = None,
+        skip_missing_inputs: bool = False,
     ):
         if trigger is None:
             raise RegistrationError("Automation() requires a trigger (§11)")
@@ -567,6 +570,7 @@ class Automation:
         self.enabled, self.partitions, self.mode = enabled, partitions, mode
         self.upstream, self.config, self.keys = upstream, config, keys
         self.tags = _tags(tags, f"Automation {name or ''}".strip())
+        self.skip_missing_inputs = bool(skip_missing_inputs)
 
 
 def AutoRefresh(**kwargs) -> Automation:
@@ -1183,6 +1187,7 @@ class Project:
                 "config": auto.config,
                 "keys": auto.keys,
                 "tags": auto.tags,
+                "skip_missing_inputs": auto.skip_missing_inputs,
                 "watched": watched,
             }
 

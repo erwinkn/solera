@@ -345,7 +345,7 @@ def manual_ingest(ctx, uploads_reader: UploadReader):
 
 @job(
     inputs={"fleet_index": "fleet_index"},
-    automations=Automation(trigger=Cron("0 7 * * 1")),
+    automations=Automation(trigger=Cron("0 7 * * 1"), skip_missing_inputs=True),
 )
 def weekly_digest(ctx, fleet_index: list, mailer: Mailer):
     """Jobs take inputs, placement and automations; they return no outputs."""

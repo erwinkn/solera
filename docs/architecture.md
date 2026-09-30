@@ -496,6 +496,8 @@ Automation(
     upstream=False,
     config=None,
     keys=None,
+    tags=None,
+    skip_missing_inputs=False,
 )
 AutoRefresh()  # Automation(trigger=OnChange()) over inputs + deps
 ```
@@ -526,7 +528,11 @@ asset whose outputs declare migrations applies them as part of the deploy;
 on a job it is a post-deploy hook.
 
 Automation runs plan targets only, pinned to current heads; every pinned
-input must have a head (sources synthesize theirs). Toggles are keyed by
+input must have a head (sources synthesize theirs). With
+`skip_missing_inputs=True`, a scope reading an input that was never written
+(and that the run doesn't build, with `upstream=True`) is left out rather
+than run to fail, and a tick left with nothing is skipped: a weekly digest
+over an index nobody has built yet waits for it. Toggles are keyed by
 name; renaming an asset rekeys its attached automations.
 
 ## 10. Execution
@@ -597,6 +603,7 @@ record(AttemptLaunched(...))                  # from here on, a restart adopts i
 await durable()                               # never launch what a restart wouldn't adopt
 run = await placement.launch(Stage(attempt, run_id, objects_url))
 while (exit := await placement.wait(run, poll)) is None:   # no handle: follow {attempt}.beat
+    # a cancel wakes this wait at once; a timeout ends it on time
     if canceled or now() > deadline:
         if await take_fence(attempt, "aborted"):          # the harness has not begun writing
             await placement.cancel(run)

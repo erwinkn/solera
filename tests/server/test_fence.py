@@ -2,6 +2,7 @@
 write fence, adoption after a restart, heartbeats, and unsettled outputs."""
 
 import asyncio
+import contextlib
 import json
 
 from solera.executors import Environment
@@ -39,9 +40,9 @@ class Remote:
         return None
 
 
-def engine_for(state, project, placement="remote", **kw):
+def engine_for(state, project, placement="remote", worker=None, **kw):
     if placement == "remote":
-        placements = {"Fake": lambda s, c: Remote(c)}
+        placements = {"Fake": lambda s, c: (worker or Remote)(c)}
     else:
         placements = {"Local": lambda s, c: InlinePlacement(c, project)}
     kw.setdefault("heartbeat_seconds", 0.3)
@@ -181,6 +182,39 @@ async def test_a_cancel_aborts_a_worker_that_is_not_writing(tmp_path):
     await until(engine, lambda: state.model.claimed(attempt) is None)
     assert (await fence(state, run["id"], attempt)) == {"state": "aborted"}
     assert ("remote", "") not in state.model.heads
+    await engine.stop()
+    await state.close()
+
+
+class Quiet(Remote):
+    """A worker that says nothing until it exits, like a real process."""
+
+    def __init__(self, ctx):
+        super().__init__(ctx)
+        self.stopped = asyncio.Event()
+
+    async def wait(self, run, timeout):
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self.stopped.wait(), timeout)
+            return {"code": -15, "reason": "stopped", "meta": {}}
+        return None
+
+    async def cancel(self, run):
+        self.stopped.set()
+
+
+async def test_a_cancel_lands_at_once_however_long_the_wait(tmp_path):
+    """The watcher is woken by the cancel, not by its next look at the worker."""
+
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = engine_for(state, REMOTE, worker=Quiet, heartbeat_seconds=30)  # looks every 10 s
+    await engine.initialize()
+    run, attempt = await launched(engine, ["remote"])
+    started = asyncio.get_running_loop().time()
+    await engine.cancel(run["id"])
+    await until(engine, lambda: state.model.claimed(attempt) is None)
+    assert asyncio.get_running_loop().time() - started < 1.0
+    assert (await fence(state, run["id"], attempt)) == {"state": "aborted"}
     await engine.stop()
     await state.close()
 

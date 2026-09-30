@@ -754,6 +754,30 @@ async def test_automation_toggle_and_run_now(state):
     assert calls["n"] == 1
 
 
+async def test_an_automation_can_skip_until_its_inputs_are_written(state):
+    """§9: with skip_missing_inputs, a tick over an input never written is
+    skipped rather than run to fail; one that builds the input is not."""
+
+    @asset
+    def index():
+        return [1]
+
+    @asset(inputs={"index": "index"}, automations=Automation(trigger=Every(1), skip_missing_inputs=True))
+    def digest(index: list):
+        return index
+
+    project = Project(assets=[index, digest])
+    engine = make_engine(state, project)
+    await engine.initialize()
+    await engine.tick()
+    auto = state.model.automations["digest.every.0"]
+    assert auto["last_at"] is not None and auto["last_run"] is None and not state.model.runs
+    run = await engine.submit(["digest"], upstream=True, skip_missing_inputs=True)
+    assert run is not None and sorted(run["targets"]) == ["digest", "index"]
+    await engine.run_until(run["id"], 10)
+    assert await engine.submit(["digest"], skip_missing_inputs=True) is not None
+
+
 async def test_every_skips_active_scope(state):
     """§9: a tick is skipped for any scope still running."""
     calls = {"n": 0}

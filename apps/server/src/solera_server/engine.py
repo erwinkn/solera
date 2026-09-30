@@ -57,6 +57,20 @@ class NonRetryable(RuntimeError):
     """A dispatch-time failure no retry will fix (§8: full run required, …)."""
 
 
+async def _unless(stirred: asyncio.Event, work):
+    """Await `work`, but give up on it, returning `None`, once `stirred` is set."""
+
+    job, woken = asyncio.ensure_future(work), asyncio.ensure_future(stirred.wait())
+    try:
+        await asyncio.wait((job, woken), return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for pending in (job, woken):
+            pending.cancel()
+        await asyncio.gather(job, woken, return_exceptions=True)
+        stirred.clear()
+    return job.result() if not job.cancelled() else None
+
+
 def check_tags(tags) -> dict[str, str]:
     """Run tags: up to 32 short string pairs."""
 
@@ -103,6 +117,8 @@ class Engine:
         self.registry = registry or Registry(ctx, extra=placements)
         # attempt id -> (run id, asyncio task): attempts this process is driving.
         self.inflight: dict[str, tuple[str, asyncio.Task]] = {}
+        # attempt id -> set when its run is controlled, so its watcher looks at once.
+        self._stirred: dict[str, asyncio.Event] = {}
         # Attempts consuming a local execution slot. Pool attempts only poll
         # state — they run no local work and must not starve dispatch (§10).
         self.engine_inflight: set[str] = set()
@@ -255,12 +271,15 @@ class Engine:
         automation=None,
         command_id=None,
         skip_active=False,
+        skip_missing_inputs=False,
         by=None,
         tags=None,
     ):
         """A run request becomes one task per (asset, scope) (§8). `by` says
         who asked (the API or CLI, or what the caller names); automation runs
-        carry `automation` instead. `tags` label the run for finding it later."""
+        carry `automation` instead. `tags` label the run for finding it later.
+        `skip_active` and `skip_missing_inputs` leave out the scopes already
+        in flight, or with an input never written; `None` if none is left."""
 
         if isinstance(targets, str):
             targets = [targets]
@@ -305,6 +324,14 @@ class Engine:
                 assets[name] = [s for s in assets[name] if not self._scope_active(name, s)]
             if not any(assets.values()):
                 return None  # §9: the tick is skipped — every scope is in flight
+        if skip_missing_inputs:
+            while dropped := [
+                (n, s) for n, scopes in assets.items() for s in scopes if await self._missing(n, s, assets)
+            ]:
+                for name, scope in dropped:
+                    assets[name].remove(scope)
+            if not any(assets.values()):
+                return None  # nothing can run until its inputs are written
         now = self.clock()
         run_id = ulid(now)
         tasks = {}
@@ -368,22 +395,42 @@ class Engine:
         """(owner_asset, upstream_scope) for every edge, dep, and partition-set
         dimension of (asset, scope) — a bound key set is a pinned dep (§7)."""
 
+        return [(owner, up_scope) for _, _, owner, up_scope in await self._reads(asset, scope)]
+
+    async def _reads(self, asset: str, scope: str):
+        """(edge kind, output, owner asset, upstream scope) for every edge,
+        dep, and partition-set dimension of (asset, scope)."""
+
         info = self.manifest["assets"][asset]
         edges = list(info["inputs"].values()) + [{"kind": "dep", "output": d} for d in info["deps"]]
         out = []
         for edge in edges:
-            owner = self.manifest["outputs"][edge["output"]].get("asset")
+            output = edge["output"]
+            owner = self.manifest["outputs"][output].get("asset")
             up_dims = self._dims(owner) if owner else {}
             if edge["kind"] in {"all_partitions", "dep"} and owner is not None:
-                out.extend((owner, s) for s in await self._spread(info, scope, up_dims))
+                out.extend((edge["kind"], output, owner, s) for s in await self._spread(info, scope, up_dims))
                 continue
-            out.append((owner, self._project(info, scope, up_dims)))
+            out.append((edge["kind"], output, owner, self._project(info, scope, up_dims)))
         for dim in self._dims(asset).values():
             if dim["kind"] == "set":
                 owner = self.manifest["outputs"][dim["output"]].get("asset")
                 if owner is not None:
-                    out.append((owner, ""))
+                    out.append(("dep", dim["output"], owner, ""))
         return out
+
+    async def _missing(self, asset: str, scope: str, planned: dict) -> bool:
+        """Whether (asset, scope) reads an input never written that the run
+        doesn't build — preparing it would fail. AllPartitions reads what
+        there is."""
+
+        for kind, output, owner, up_scope in await self._reads(asset, scope):
+            if kind == "all_partitions" or up_scope in planned.get(owner, ()):
+                continue
+            source = owner is None and output in self.manifest["sources"] and up_scope == ""
+            if not source and (output, up_scope) not in self.m.heads:
+                return True
+        return False
 
     async def _spread(self, consumer: dict, consumer_scope: str, upstream_dims: dict):
         """Every upstream scope visible at (consumer, consumer_scope): shared
@@ -643,6 +690,7 @@ class Engine:
                 await work
             finally:  # before anyone awaiting the attempt resumes
                 self.inflight.pop(attempt, None)
+                self._stirred.pop(attempt, None)
                 self.engine_inflight.discard(attempt)
                 self.executor_inflight[executor] = max(0, self.executor_inflight.get(executor, 1) - 1)
 
@@ -1090,7 +1138,7 @@ class Engine:
         a restart — the worker's heartbeat does: it rewrites `{attempt}.beat`
         every `heartbeat_seconds`, marks it done once its result is written,
         and is dead after three missed beats. A cancel or a timeout aborts the
-        attempt; one that is already writing is waited for instead."""
+        attempt as it happens; one already writing is waited for instead."""
 
         task = self.m.task(task_id)
         run_id, launched = task["run"], self._launched(task, attempt)
@@ -1100,17 +1148,18 @@ class Engine:
         poll = self.heartbeat_seconds / 3
         beat, beat_at = None, self.clock()
         writing = False  # an abort found the worker writing: wait for it
+        stirred = self._stirred.setdefault(attempt, asyncio.Event())
         while True:
             polled = self.clock()
+            timeout = poll if writing else max(0.0, min(poll, deadline - polled))
             exit_ = None
-            if handle is not None:
-                try:
-                    exit_ = await placement.wait(handle, poll)
-                except Exception as error:
-                    log.warning("attempt %s: placement wait failed, following heartbeats: %s", attempt, error)
-                    handle = None
-            else:
-                await asyncio.sleep(poll)
+            try:
+                exit_ = await _unless(
+                    stirred, placement.wait(handle, timeout) if handle is not None else asyncio.sleep(timeout)
+                )
+            except Exception as error:
+                log.warning("attempt %s: placement wait failed, following heartbeats: %s", attempt, error)
+                handle = None
             if exit_ is not None:
                 break
             # A placement that returns before its timeout must not spin the loop.
@@ -1594,6 +1643,7 @@ class Engine:
             keys=auto.get("keys"),
             automation=auto["name"],
             skip_active=True,
+            skip_missing_inputs=auto.get("skip_missing_inputs") or False,
             tags=auto.get("tags"),
         )
 
@@ -1686,6 +1736,9 @@ class Engine:
     def _control(self, run_id: str, action: str, by: str | None):
         event = {"type": "RunControlled", "run": run_id, "action": action, "at": self.clock()}
         self.state.record({**event, "by": by} if by else event)
+        for attempt, (run, _job) in self.inflight.items():
+            if run == run_id:
+                self._stirred.setdefault(attempt, asyncio.Event()).set()
 
     async def cancel(self, run_id: str, by: str | None = None):
         run = self.m.runs.get(run_id)

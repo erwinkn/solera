@@ -35,6 +35,7 @@ from hashlib import sha256
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+import duckdb
 from solera.ids import ulid
 
 log = logging.getLogger(__name__)
@@ -234,8 +235,6 @@ class Lake:
     def _encode(self, table: str, rows: list[list]) -> tuple[bytes, dict]:
         """Rows as a Parquet file, sorted by the table's time column."""
 
-        import duckdb
-
         with tempfile.TemporaryDirectory() as tmp:
             source = os.path.join(tmp, "rows.json")
             self._ndjson(source, table, rows)
@@ -361,8 +360,6 @@ class Lake:
             log.exception("%s compaction failed", self.prefix)
 
     def _merge(self, plan) -> list[tuple[bytes, dict]]:
-        import duckdb
-
         out = []
         for table, group in plan:
             with tempfile.TemporaryDirectory() as tmp:
@@ -443,8 +440,6 @@ class Lake:
 
     def _database(self):
         if self._db is None:
-            import duckdb
-
             self._db = duckdb.connect()
         return self._db
 
