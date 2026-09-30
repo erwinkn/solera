@@ -32,7 +32,7 @@ class Store:
         for path in paths:
             (self.root / path).unlink(missing_ok=True)
 
-    async def emit(self, e):
+    def record(self, e):
         if e["type"] == "LogFlushed":
             self.lake.flushed(e["files"], e["upto"])
         elif e["type"] == "LogCompacted":

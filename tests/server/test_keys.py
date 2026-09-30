@@ -43,13 +43,14 @@ async def run(engine, targets, **kw):
 async def settle(engine):
     """Let background compactions finish, then tick so their results land."""
 
+    upkeep = engine.upkeep
     for _ in range(20):
-        await engine.tick()
-        if not engine.maintaining:
-            await engine.tick()
-            if not engine.maintaining:
+        await upkeep.tick()
+        if not upkeep.jobs:
+            await upkeep.tick()
+            if not upkeep.jobs:
                 return
-        await asyncio.gather(*engine.maintaining.values(), return_exceptions=True)
+        await asyncio.gather(*upkeep.jobs.values(), return_exceptions=True)
 
 
 def on_disk(state, index) -> set[str]:
@@ -218,6 +219,7 @@ async def test_a_consumer_without_a_log_starts_over(state):
     engine = engine_for(state, project)
     await engine.initialize()
     await run(engine, ["mirror"], upstream=True)
+    engine.upkeep.truncate()
     wm = state.model.watermarks[("mirror", "items", "")]
     state.model.watermarks[("mirror", "items", "")] = {**wm, "batch": 0}  # behind the (empty) log
     await run(engine, ["mirror"])

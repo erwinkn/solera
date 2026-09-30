@@ -156,21 +156,39 @@ class Lake:
                 digest = sha256(state.objects_url.encode()).hexdigest()[:16]
                 cache = os.path.join(tempfile.gettempdir(), f"solera-{self.prefix}", digest)
         self.cache = Path(cache) if cache else None
-        self.job: asyncio.Task | None = None
+        self.check_seconds = min(flush_seconds, 1.0)
+        self._task: asyncio.Task | None = None  # the background loop, once started
+        self.job: asyncio.Task | None = None  # the merge under way
         self.last_error: str | None = None
         self._db = None  # in-memory DuckDB mirroring the buffers
         self._mirrored: dict[str, tuple] = {}  # table -> (state, generation, first seq, last seq)
 
     # -- write path ----------------------------------------------------------------------
 
+    def start(self) -> None:
+        """Flush and merge in the background from here on."""
+
+        self._task = asyncio.create_task(self._run())
+
+    async def _run(self) -> None:
+        while True:
+            await asyncio.sleep(self.check_seconds)
+            try:
+                await self.tick()
+            except Exception as error:
+                self.last_error = f"{self.prefix}: {type(error).__name__}: {error}"
+                log.exception("%s flush failed", self.prefix)
+
     async def tick(self) -> None:
         await self.flush()
         self.maintain()
 
     async def stop(self) -> None:
-        if self.job is not None:
-            self.job.cancel()
-            await asyncio.gather(self.job, return_exceptions=True)
+        jobs = [j for j in (self._task, self.job) if j is not None]
+        for job in jobs:
+            job.cancel()
+        await asyncio.gather(*jobs, return_exceptions=True)
+        self._task = None
 
     async def flush(self, force: bool = False) -> None:
         """Write the buffered rows out, one file per table, once there are
@@ -200,7 +218,7 @@ class Lake:
             if left != len(rows):
                 await self._discard([f["path"] for f in files.values()])
                 return
-        await self.state.emit({"type": f"{self.name}Flushed", "files": files, "upto": upto})
+        self.state.record({"type": f"{self.name}Flushed", "files": files, "upto": upto})
 
     def _time(self, table: str, values: list):
         spec = self.schema[table]
@@ -332,7 +350,7 @@ class Lake:
                     if now is None or len(now.get("hidden") or ()) != len(f.get("hidden") or ()):
                         await self._discard(created)
                         return
-            await self.state.emit({"type": f"{self.name}Compacted", "changes": changes, "at": self.clock()})
+            self.state.record({"type": f"{self.name}Compacted", "changes": changes, "at": self.clock()})
             for change in changes:
                 for path in change["removed"]:
                     self._evict(path)

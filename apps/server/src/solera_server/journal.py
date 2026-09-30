@@ -17,10 +17,12 @@ A replaced writer's next create collides with a segment it did not write
 and the journal becomes `fenced`: every later append fails.
 
 **Durability.** `append` applies nothing; the caller applies an event to
-memory and appends it, and anything the outside world must be able to rely
-on (a commit, a run submission) awaits `durable()` — the flush containing
-it. Flushes happen when events are pending and either `flush_interval` has
-passed or `max_buffer` bytes are buffered.
+memory and appends it, and a background flusher writes what is buffered
+once `flush_interval` has passed or `max_buffer` bytes are buffered. Only
+what acts on the outside world on the strength of an event — launching an
+attempt, deleting what the event made garbage, answering an API call —
+awaits `durable()`, which flushes at once. A failed write is retried with
+the very same segment.
 
 **Checkpoints.** After a flush, once the journal written since the last
 checkpoint reaches that checkpoint's size (and at least `min_checkpoint`
@@ -35,6 +37,7 @@ unreadable can be recovered from.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -90,7 +93,10 @@ class Journal:
         self._buffer: list[dict] = []
         self._buffer_bytes = 0
         self._first_buffered: float | None = None
-        self._waiters: list[asyncio.Future] = []
+        self.appended = self.written = 0  # events this writer appended, and wrote
+        self._waiters: list[tuple[int, asyncio.Future]] = []  # (events appended, waiter)
+        self._urgent = False  # someone waits on `durable()`
+        self._sealed: tuple | None = None  # (seq, data, events, checkpoint): written next, as is
         self._flushing: asyncio.Lock = asyncio.Lock()
         self._wake = asyncio.Event()
         self._task: asyncio.Task | None = None
@@ -133,7 +139,6 @@ class Journal:
         apply: Callable[[dict], None],
         snapshot: Callable[[], dict],
         *,
-        start: bool = True,
         writer: bool = True,
     ) -> OpenResult:
         """Load the newest readable checkpoint, replay the segments after it,
@@ -162,8 +167,7 @@ class Journal:
             self.fenced = True  # read-only: every append fails
             return OpenResult(seq=None, replayed=replayed, checkpoint=loaded)
         await self._fence(apply)
-        if start:
-            self._task = asyncio.create_task(self._run())
+        self._task = asyncio.create_task(self._run())
         return OpenResult(seq=self.writer, replayed=replayed, checkpoint=loaded)
 
     async def _replay(self, apply) -> int:
@@ -200,75 +204,90 @@ class Journal:
 
     # -- appending ----------------------------------------------------------------------
 
-    def append(self, *events: dict) -> asyncio.Future:
-        """Queue events for the next flush; the future resolves once they are durable."""
+    def append(self, *events: dict) -> None:
+        """Queue events for the next flush."""
 
         if self.fenced:
             raise Fenced("this writer was replaced")
-        loop = asyncio.get_running_loop()
-        fut = loop.create_future()
         for event in events:
             self._buffer.append(event)
             self._buffer_bytes += len(_dumps(event))
-        first = self._first_buffered is None
-        if first:
+        self.appended += len(events)
+        if self._first_buffered is None:
             # Flush timing is monotonic loop time; `clock` only stamps records.
-            self._first_buffered = loop.time()
-        self._waiters.append(fut)
-        if self._task is None:
-            # No background flusher (tests, tools): flush on the next loop turn.
-            if first:
-                loop.call_soon(lambda: asyncio.ensure_future(self.flush()))
-        elif first or self._buffer_bytes >= self.max_buffer:
-            # Wake the flusher: it starts the flush-interval clock, or flushes now when full.
+            self._first_buffered = asyncio.get_running_loop().time()
+            self._wake.set()  # the flusher starts the flush-interval clock
+        elif self._buffer_bytes >= self.max_buffer:
             self._wake.set()
-        return fut
 
-    async def durable(self, *events: dict) -> None:
-        """Append and wait until durable."""
+    async def durable(self) -> None:
+        """Return once every event appended so far is in the object store.
+        What is buffered is flushed now, not after `flush_interval`: waiting
+        costs one write."""
 
-        await self.append(*events)
+        target = self.appended
+        if self.written >= target:
+            return
+        if self.fenced:
+            raise Fenced("this writer was replaced")
+        if self._task is None:  # closed: nothing flushes in the background
+            await self.flush()
+            return
+        waiter = asyncio.get_running_loop().create_future()
+        self._waiters.append((target, waiter))
+        self._urgent = True
+        self._wake.set()
+        await waiter
 
     async def flush(self) -> None:
-        """Write everything buffered as one segment (and checkpoint if due)."""
+        """Write everything buffered, as one segment (and a checkpoint if one
+        is due). A segment is sealed before it is written: if the write fails
+        or is interrupted, the next flush writes it again, byte for byte."""
 
         async with self._flushing:
-            if not self._buffer:
-                return
-            if self.fenced:
-                self._fail(Fenced("this writer was replaced"))
-                return
-            events, waiters = self._buffer, self._waiters
-            self._buffer, self._waiters, self._buffer_bytes, self._first_buffered = [], [], 0, None
-            seq = self.seq + 1
-            body = {"seq": seq, "writer": self.writer, "at": self.clock(), "events": events}
-            data = _dumps(body)
-            # Sealed: memory now reflects exactly segments 1..seq, so a snapshot
-            # taken here matches `seq` — before any later event is applied.
-            due = self._snapshot is not None and self._since_checkpoint + len(data) >= max(
-                self.min_checkpoint, self._last_checkpoint_size
-            )
-            snap = (
-                _dumps({"seq": seq, "writer": self.writer, "at": self.clock(), "state": self._snapshot()})
-                if due
-                else None
-            )
-            try:
-                await self._put_segment(seq, data)
-            except BaseException as error:
-                for w in waiters:
-                    if not w.done():
-                        w.set_exception(error if isinstance(error, Exception) else RuntimeError(str(error)))
-                if isinstance(error, Fenced):
+            while self._sealed is not None or self._buffer:
+                if self.fenced:
+                    self._fail(Fenced("this writer was replaced"))
+                    return
+                if self._sealed is None:
+                    self._seal()
+                seq, data, count, snap = self._sealed
+                try:
+                    await self._put_segment(seq, data)
+                except Fenced as error:
+                    self._sealed = None
                     self._fail(error)
-                raise
-            self.seq = seq
-            self._since_checkpoint += len(data)
-            for w in waiters:
-                if not w.done():
-                    w.set_result(seq)
-            if snap is not None:
-                await self._write_checkpoint(seq, snap)
+                    raise
+                self._sealed = None
+                self.seq = seq
+                self.written += count
+                self._since_checkpoint += len(data)
+                waiting = []
+                for target, waiter in self._waiters:
+                    if target > self.written:
+                        waiting.append((target, waiter))
+                    elif not waiter.done():
+                        waiter.set_result(None)
+                self._waiters = waiting
+                if snap is not None:
+                    await self._write_checkpoint(seq, snap)
+
+    def _seal(self) -> None:
+        events = self._buffer
+        self._buffer, self._buffer_bytes, self._first_buffered, self._urgent = [], 0, None, False
+        seq = self.seq + 1
+        data = _dumps({"seq": seq, "writer": self.writer, "at": self.clock(), "events": events})
+        # Sealed: memory now reflects exactly segments 1..seq, so a snapshot
+        # taken here matches `seq` — before any later event is applied.
+        due = self._snapshot is not None and self._since_checkpoint + len(data) >= max(
+            self.min_checkpoint, self._last_checkpoint_size
+        )
+        snap = (
+            _dumps({"seq": seq, "writer": self.writer, "at": self.clock(), "state": self._snapshot()})
+            if due
+            else None
+        )
+        self._sealed = (seq, data, len(events), snap)
 
     async def _put_segment(self, seq: int, data: bytes) -> None:
         for attempt in range(5):
@@ -314,34 +333,38 @@ class Journal:
 
     def _fail(self, error: BaseException) -> None:
         self.fenced = True
-        for w in self._waiters:
-            if not w.done():
-                w.set_exception(error)
+        for _, waiter in self._waiters:
+            if not waiter.done():
+                waiter.set_exception(error)
         self._waiters, self._buffer, self._buffer_bytes = [], [], 0
 
     # -- the flusher ----------------------------------------------------------------------
 
     async def _run(self) -> None:
+        """Flush once the oldest buffered event has waited `flush_interval`,
+        `max_buffer` bytes are buffered, or someone waits on `durable()`. A
+        failed write is retried after `flush_interval`."""
+
+        loop = asyncio.get_running_loop()
         while True:
-            if self._first_buffered is None:
-                self._wake.clear()
-                await self._wake.wait()
-                continue
-            wait = self._first_buffered + self.flush_interval - asyncio.get_running_loop().time()
-            if wait > 0 and self._buffer_bytes < self.max_buffer:
-                self._wake.clear()
-                try:
-                    await asyncio.wait_for(self._wake.wait(), timeout=wait)
-                except TimeoutError:
-                    pass
-                continue
+            self._wake.clear()
+            if self._sealed is None:
+                if self._first_buffered is None:
+                    await self._wake.wait()
+                    continue
+                wait = self._first_buffered + self.flush_interval - loop.time()
+                if wait > 0 and not self._urgent and self._buffer_bytes < self.max_buffer:
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(self._wake.wait(), timeout=wait)
+                    continue
             try:
                 await self.flush()
             except Fenced:
                 log.error("journal fenced: another writer took over; stopping")
                 return
-            except Exception as error:  # a failed flush already failed its waiters
-                log.error("journal flush failed: %s", error)
+            except Exception as error:
+                log.error("journal flush failed, retrying: %s", error)
+                await asyncio.sleep(self.flush_interval)
 
     async def close(self, *, checkpoint: bool = True) -> None:
         """Flush what is buffered, write a final checkpoint, stop the flusher."""

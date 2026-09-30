@@ -97,10 +97,32 @@ physical name from the output (a Postgres table) can rename it.
 
 ## 3. Journal segment
 
-One object per flush. The engine flushes when events are pending and
-either 1 s has passed or 1 MB is buffered. Anything that must be
-acknowledged as durable (a commit, a run submission, a source commit)
-waits for the flush that contains it.
+One object per flush. There is one way to change state:
+`State.record(*events)` applies the events to the model and buffers them,
+synchronously — the engine never waits on storage. A background flusher
+writes what is buffered as one segment once the oldest event has waited
+1 s or 1 MB is buffered.
+
+Only what acts on the outside world on the strength of an event waits for
+it to be written, with `await state.durable()`, which flushes at once
+rather than after the interval:
+
+- an attempt is started only once its `AttemptLaunched` is durable, so a
+  crash never leaves a running attempt no restart would adopt (§8);
+- files are deleted only once the events that let go of them are durable,
+  so a replay never references them again;
+- an API call that recorded anything (a run submission, a source commit,
+  a cancel, a claim) is answered only once that is durable — a `503` if
+  this writer was replaced meanwhile.
+
+A segment is sealed before it is written: a failed or interrupted write is
+retried with the very same bytes, so a retry that finds its segment
+already there recognizes it as its own rather than another writer's.
+
+Everything else the storage does runs on its own loop, off the engine's:
+the history lake flushes and merges (§7), and `Upkeep` truncates delta
+logs, compacts and recounts key indexes (§6), deletes garbage and applies
+retention (§11).
 
 ```json
 {

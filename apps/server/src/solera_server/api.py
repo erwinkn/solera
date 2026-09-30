@@ -92,7 +92,15 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
             authorization = request.headers.get("Authorization", "")
             if not hmac.compare_digest(authorization.encode(), f"Bearer {token}".encode()):
                 return JSONResponse({"detail": "Authentication required"}, status_code=401)
+        state = request.app.state.engine.state
+        recorded = state.recorded
         response = await call_next(request)
+        if request.url.path.startswith("/api/") and state.recorded != recorded:
+            # A request that changed state is answered once the change is durable.
+            try:
+                await state.durable()
+            except Unavailable as error:
+                response = JSONResponse({"detail": str(error)}, status_code=503)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
         # The prerendered console shell relies on framework-injected inline
@@ -137,7 +145,7 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
     @app.get("/healthz")
     async def health(request: Request):
         runtime = engine_of(request)
-        healthy = not runtime.state.poisoned and not runtime.last_error
+        healthy = not runtime.state.poisoned and not runtime.failing
         return JSONResponse(
             {"status": "ok" if healthy else "unavailable", "backend": "object-store"},
             status_code=200 if healthy else 503,
@@ -156,7 +164,7 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
             "inflight": len(runtime.inflight),
             "active_runs": sum(1 for r in runtime.m.runs.values() if r["status"] not in TERMINAL_RUN),
             "postgres": bool(os.environ.get("DATABASE_URL")),
-            "last_error": runtime.last_error,
+            "last_error": runtime.failing,
         }
 
     # -- project reads ---------------------------------------------------------
@@ -552,7 +560,7 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
         worker = runtime.m.workers.get(body["worker"])
         if worker is None:
             raise KeyError(body["worker"])
-        task = await runtime.claim_pool_task(
+        task = runtime.claim_pool_task(
             body["worker"],
             worker["pools"],
             body.get("capacity") or {},

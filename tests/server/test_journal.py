@@ -73,7 +73,8 @@ async def open_journal(store, state=None, **kw):
 async def add(j, state, key, n=1):
     event = {"type": "Add", "key": key, "n": n}
     state.apply(event)
-    await j.durable(event)
+    j.append(event)
+    await j.durable()
 
 
 def names(store, kind):
@@ -99,7 +100,8 @@ async def test_events_group_into_segments(store):
     events = [{"type": "Add", "key": "a", "n": 1} for _ in range(50)]
     for e in events:
         state.apply(e)
-    await asyncio.gather(*(j.append(e) for e in events))
+    j.append(*events)
+    await asyncio.sleep(0.3)  # the flush interval passes
     await j.close(checkpoint=False)
     # The fence, then one segment holding all 50 events.
     assert len(names(store, "journal")) == 2

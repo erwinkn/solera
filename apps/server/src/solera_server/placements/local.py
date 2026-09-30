@@ -107,21 +107,25 @@ class LocalPlacement:
         }
 
     async def wait(self, run: dict, timeout: float) -> dict | None:
-        deadline = self.ctx.clock() + timeout
         pid = run["pid"]
-        while True:
-            process = _running.get(pid)
-            if process is not None:
-                if process.returncode is not None:
-                    log = _process_log(pid)
-                    del _running[pid]
-                    return {"code": process.returncode, "reason": None, "meta": {"log": log}}
-            elif not await _alive(pid, run.get("ticks")):
-                return {"code": None, "reason": "lost", "meta": {"log": _process_log(pid)}}
+        process = _running.get(pid)
+        if process is not None:
+            # Our own child: its exit wakes us.
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(process.wait(), timeout)
+            if process.returncode is None:
+                return None
+            log = _process_log(pid)
+            del _running[pid]
+            return {"code": process.returncode, "reason": None, "meta": {"log": log}}
+        # Adopted after a restart, so not our child: watch whether it lives.
+        deadline = self.ctx.clock() + timeout
+        while await _alive(pid, run.get("ticks")):
             remaining = deadline - self.ctx.clock()
             if remaining <= 0:
                 return None
             await asyncio.sleep(min(0.2, remaining))
+        return {"code": None, "reason": "lost", "meta": {"log": _process_log(pid)}}
 
     async def cancel(self, run: dict) -> None:
         pid = run["pid"]

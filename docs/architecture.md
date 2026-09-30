@@ -593,7 +593,8 @@ object-store-state.md §8.
 
 ```python
 await objects.create(f"runs/{run_id}/{attempt}.json", {"spec": spec})
-emit(AttemptLaunched(...))                    # from here on, a restart adopts it
+record(AttemptLaunched(...))                  # from here on, a restart adopts it
+await durable()                               # never launch what a restart wouldn't adopt
 run = await placement.launch(Stage(attempt, run_id, objects_url))
 while (exit := await placement.wait(run, poll)) is None:   # no handle: follow {attempt}.beat
     if canceled or now() > deadline:

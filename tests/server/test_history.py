@@ -162,19 +162,19 @@ async def test_a_run_reads_the_same_once_archived(state, clock):
     engine = engine_for(state, clock)
     await engine.initialize()
     details = {}
-    emit = state.emit
+    record = state.record
 
-    async def spy(e):  # the run's detail just before it moves into the history
+    def spy(e):  # the run's detail just before it moves into the history
         if e["type"] == "RunArchived":
-            details[e["run"]] = await engine.run_detail(e["run"])
-        await emit(e)
+            details[e["run"]] = engine._detail(state.model.runs[e["run"]], live=True)
+        record(e)
 
-    state.emit = spy
+    state.record = spy
     failed = await run(engine, clock, ["revenue"], upstream=True, config={"fail": True}, tags={"env": "prod"})
     await engine.retry(failed["id"])
     await engine.run_until(failed["id"], 60)
     commit = await engine.commit_source("uploads", upsert=["a", "b"], by="api")
-    state.emit = emit
+    state.record = record
     before = details[failed["id"]]
     assert [t["retried"] for t in before["tasks"] if t["asset"] == "revenue"] == [1]
     # Reopened, the run went on counting its events.
@@ -198,7 +198,7 @@ async def test_flush_merge_delete_and_purge(state, clock):
     engine = engine_for(state, clock, flush_rows=1, merge_width=2, purge_seconds=100)
     await engine.initialize()
     runs = [(await run(engine, clock, ["orders"], config={"n": i}))["id"] for i in range(4)]
-    await engine.tick()
+    await engine.history.lake.tick()
     files = state.model.history.files
     assert not any(state.model.history.rows.values())
     # Each run's rows went out in its own flush; pairs of them were merged.
@@ -235,7 +235,7 @@ async def test_stale_flush_is_discarded(state, clock):
     async def racing(table, rows):
         written = await write(table, rows)
         if table == "runs":
-            await history.delete([doomed])  # deleted while the flush was writing
+            history.delete([doomed])  # deleted while the flush was writing
         return written
 
     lake._write = racing

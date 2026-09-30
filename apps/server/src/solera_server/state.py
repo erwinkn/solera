@@ -11,13 +11,16 @@ Everything lives under `{root}/{namespace}/`:
                   log index) and `{attempt}.log`
     data/ blobs/  store data
 
-`emit()` applies events to the model at once — so the engine checks a
+`record()` applies events to the model at once — so the engine checks a
 precondition and changes state in one synchronous step, with nothing
-interleaved — and returns once they are durable.
+interleaved — and the journal makes them durable in the background.
+`durable()` waits for that, for the few things that act on the outside
+world on the strength of an event.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -94,6 +97,7 @@ class State:
         self.objects = store
         self.url, self.namespace, self.objects_url = url, namespace, objects_url
         self.journal, self.model, self.clock = journal, model, clock
+        self.changed = asyncio.Event()  # set by every record, for whoever waits on changes
 
     @classmethod
     async def open(
@@ -108,7 +112,7 @@ class State:
     ) -> State:
         """Load the newest checkpoint, replay the journal, and fence out any
         earlier writer: from here on this process is the namespace's writer.
-        `writer=False` only reads: nothing is fenced and `emit` fails."""
+        `writer=False` only reads: nothing is fenced and `record` fails."""
 
         clock = clock or time.time
         store, objects_url = open_store(url, namespace)
@@ -131,28 +135,29 @@ class State:
     def poisoned(self) -> bool:
         return self.journal.fenced
 
-    async def emit(self, *events: dict) -> None:
-        """Apply events to the model now; return once they are durable."""
+    def record(self, *events: dict) -> None:
+        """Apply events to the model now, and make them durable in the
+        background: the one way state changes."""
 
         if self.journal.fenced:
             raise Unavailable("This writer was replaced; restart required")
         for event in events:
             self.model.apply(event)
+        self.journal.append(*events)
+        self.changed.set()
+
+    @property
+    def recorded(self) -> int:
+        return self.journal.appended
+
+    async def durable(self) -> None:
+        """Return once everything recorded so far is durable — for what acts
+        on the outside world on the strength of it (docs/object-store-state.md §3)."""
+
         try:
-            await self.journal.durable(*events)
+            await self.journal.durable()
         except Fenced as error:
             raise Unavailable("This writer was replaced; restart required") from error
-
-    def record(self, *events: dict) -> None:
-        """Apply events now; they become durable with the next flush. For
-        what nothing outside this process waits on — lost in a crash, it is
-        simply recorded again."""
-
-        if self.journal.fenced:
-            raise Unavailable("This writer was replaced; restart required")
-        for event in events:
-            self.model.apply(event)
-        self.journal.append(*events).add_done_callback(lambda done: done.cancelled() or done.exception())
 
     async def close(self) -> None:
         await self.journal.close()

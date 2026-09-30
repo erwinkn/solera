@@ -1,14 +1,25 @@
 """Pool placement (§10): the pull path. `launch` is a no-op — the engine's
-`AttemptLaunched` event makes the task claimable; `wait` reports when the
-result object appears, the task is completed, or the worker's claim lease
-expired. A lost worker is not replaced: the engine aborts or settles its
+`AttemptLaunched` event makes the task claimable; `wait` wakes when the
+worker completes the task or its claim lease expires, and reports whether
+the result object is there. A lost worker is not replaced: the engine aborts or settles its
 attempt, and retries the task under a new one (§8)."""
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
 GRACE_SECONDS = 30.0
+
+_woken: dict[str, asyncio.Event] = {}  # attempt -> set when a worker claims or completes it
+
+
+def wake(attempt: str) -> None:
+    """A worker claimed or completed `attempt`: wake whoever waits on it."""
+
+    woken = _woken.get(attempt)
+    if woken is not None:
+        woken.set()
 
 
 class PoolPlacement:
@@ -23,28 +34,31 @@ class PoolPlacement:
     resume = launch  # an adopted attempt waits on the same durable pool record
 
     async def wait(self, run: dict, timeout: float) -> dict | None:
-        state = self.ctx.state
-        deadline = self.ctx.clock() + timeout
+        state, clock = self.ctx.state, self.ctx.clock
         attempt = run["task"]
+        deadline = clock() + timeout
+        woken = _woken.setdefault(attempt, asyncio.Event())
         while True:
-            if await state.attempt_finished(run["run"], attempt):
-                return {"code": 0, "reason": None, "meta": {}}
             record = state.model.pool.get(attempt)
-            if record is None:
-                # complete() removed the claim without a result we can see.
+            over = record is None  # completed, or withdrawn
+            if record is not None and record["status"] == "claimed":
+                if record["lease_until"] is None:
+                    # Restored after a restart: give the worker time to renew.
+                    record["lease_until"] = clock() + GRACE_SECONDS
+                over = record["lease_until"] <= clock()
+            if over:
+                _woken.pop(attempt, None)
                 if await state.attempt_finished(run["run"], attempt):
                     return {"code": 0, "reason": None, "meta": {}}
                 return {"code": None, "reason": "lost", "meta": {}}
-            if record["status"] == "claimed":
-                if record["lease_until"] is None:
-                    # Restored after a restart: give the worker time to renew.
-                    record["lease_until"] = self.ctx.clock() + GRACE_SECONDS
-                elif record["lease_until"] <= self.ctx.clock():
-                    return {"code": None, "reason": "lost", "meta": {}}
-            remaining = deadline - self.ctx.clock()
+            remaining = deadline - clock()
             if remaining <= 0:
                 return None
-            await asyncio.sleep(min(0.2, remaining))
+            if record["lease_until"] is not None:
+                remaining = min(remaining, record["lease_until"] - clock())
+            woken.clear()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(woken.wait(), remaining)
 
     async def cancel(self, run: dict) -> None:
         # An unclaimed task is withdrawn; a claimed one was aborted by the

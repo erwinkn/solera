@@ -35,6 +35,13 @@ BAD_OUTCOME = frozenset({"failed", "blocked", "canceled"})
 MAX_RECEIPTS = 10_000  # idempotency receipts kept for replayed submissions
 
 
+def delta_reads(plans: dict) -> list[tuple]:
+    """The delta logs an attempt's Incremental plans read: `(output, scope,
+    first batch)` — kept until its claim goes (§6)."""
+
+    return [(p["output"], p["up"], p["from"]) for p in plans.values() if p and "from" in p]
+
+
 def _nest(flat: dict, depth: int) -> dict:
     """{(a, b): v} -> {a: {b: v}} (depth 2), {(a, b, c): v} -> {a: {b: {c: v}}} (depth 3)."""
 
@@ -112,7 +119,7 @@ class Model:
         # the run history (§7): per table, its files and the rows awaiting a flush
         self.history = LakeState(history.TABLES, snap.get("history"))
         # derived from launched attempts, plus memory-only claims of attempts preparing
-        self.claims: dict[str, dict] = {}  # task id -> {attempt, started_at, status, launched?}
+        self.claims: dict[str, dict] = {}  # task id -> {attempt, started_at, status, launched?, reads?}
         self.attempts: dict[str, str] = {}  # attempt id -> task id, while claimed
         self.locks: dict[tuple, str] = {}  # (asset, scope) -> attempt id
         self.pool: dict[str, dict] = {}  # attempt id -> pool work
@@ -258,6 +265,7 @@ class Model:
             "started_at": launched["started_at"],
             "status": status,
             "launched": True,
+            "reads": delta_reads(launched["prepared"].get("plans") or {}),
         }
         self.attempts[attempt] = task["id"]
         self.locks[(task["asset"], task["scope"])] = attempt

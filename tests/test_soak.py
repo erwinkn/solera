@@ -16,6 +16,7 @@ patched to the fake clock (advanced 6 s per run) so the demo's five-second
 feed tick produces a new batch every iteration without wall-clock sleeps.
 """
 
+import asyncio
 import importlib
 import os
 import time
@@ -113,6 +114,8 @@ async def test_soak(tmp_path, monkeypatch):
             detail = await engine.run_until(run["id"], timeout=1e9)
             submitted += 1
             assert detail["request"]["status"] == "succeeded", detail["request"]["id"]
+        await engine.upkeep.tick()  # what their own loops do every second
+        await engine.history.lake.tick()
         # A flush acknowledges its events before it writes a due checkpoint and
         # cleans up; wait for that, so the sample sees the steady state.
         await state.journal.flush()
@@ -158,7 +161,8 @@ async def test_soak(tmp_path, monkeypatch):
 
     # keys/ is bounded by live keys and the log the consumer still needs.
     assert max(keys[len(keys) // 2 :]) <= 2 * max(keys[: len(keys) // 2]) + 64 * 1024, keys
-    await engine.tick()  # the last garbage goes
+    await asyncio.gather(*engine.upkeep.jobs.values())
+    await engine.upkeep.tick()  # the last garbage goes
     for (output, scope), index in state.model.indexes.items():
         assert len(index.files) <= 2 * engine.key_options.l0_max_files, (output, scope, len(index.files))
         referenced = {index.path(n) for n in index.referenced()}
@@ -262,7 +266,8 @@ async def test_soak_with_retention(tmp_path, monkeypatch):
         if i % 20 == 10:
             run = await engine.submit(["file_index"], partitions="all")
             assert (await engine.run_until(run["id"], timeout=1e9))["request"]["status"] == "succeeded"
-        await engine.tick()
+        await engine.upkeep.tick()
+        await engine.history.lake.tick()
         if (i + 1) % 25 == 0:
             samples.append((i + 1, len(await history_ids(engine))))
 

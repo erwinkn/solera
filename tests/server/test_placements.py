@@ -50,15 +50,15 @@ async def test_pool_task_lifecycle(state):
     assert record["task"] == f"{run['id']}/job:"
 
     # a worker that doesn't fit never sees the task
-    assert await engine.claim_pool_task("w-small", ["ingest"], {"cpu": 1}, lease_seconds=30) is None
-    claimed = await engine.claim_pool_task("w1", ["ingest"], {"cpu": 4}, lease_seconds=30)
+    assert engine.claim_pool_task("w-small", ["ingest"], {"cpu": 1}, lease_seconds=30) is None
+    claimed = engine.claim_pool_task("w1", ["ingest"], {"cpu": 4}, lease_seconds=30)
     assert claimed["attempt"] == attempt and claimed["status"] == "claimed"
     # the claim is durable: a restarted engine never offers the task again
     assert state.model.task(record["task"])["launched"]["worker"] == "w1"
 
     # renew extends the claim; a second worker can't steal it
     engine.heartbeat_pool_task("w1", attempt, lease_seconds=30)
-    assert await engine.claim_pool_task("w2", ["ingest"], {"cpu": 4}, lease_seconds=30) is None
+    assert engine.claim_pool_task("w2", ["ingest"], {"cpu": 4}, lease_seconds=30) is None
 
     # the worker runs the stage and completes; the engine's wait sees the result
     code = await run_attempt(state.objects_url, attempt, project, run=record["run"])
@@ -85,7 +85,7 @@ async def test_a_lost_pool_worker_fails_its_attempt_and_the_retry_goes_to_anothe
     await engine.tick()
     await asyncio.sleep(0.1)
     [first] = state.model.pool
-    assert (await engine.claim_pool_task("w1", ["ingest"], {}, lease_seconds=0.2))["claimed_by"] == "w1"
+    assert (engine.claim_pool_task("w1", ["ingest"], {}, lease_seconds=0.2))["claimed_by"] == "w1"
     for _ in range(40):
         await engine.tick()
         await asyncio.sleep(0.05)
@@ -98,7 +98,7 @@ async def test_a_lost_pool_worker_fails_its_attempt_and_the_retry_goes_to_anothe
         json.loads(await state.get_object(f"{state.attempt_path(run['id'], first)}.writing"))["state"]
         == "aborted"
     )
-    assert (await engine.claim_pool_task("w2", ["ingest"], {}, lease_seconds=30))["attempt"] == second
+    assert (engine.claim_pool_task("w2", ["ingest"], {}, lease_seconds=30))["attempt"] == second
     with pytest.raises(LostOwnership):
         engine.heartbeat_pool_task("w1", first, lease_seconds=30)
     engine.release_pool_task("w1", second)  # no-op: w1 doesn't own it

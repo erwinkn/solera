@@ -239,7 +239,6 @@ export interface RunDetail {
   request: Run;
   tasks: Task[];
   attempts: Record<string, Attempt[]>;
-  events: RunEvent[];
 }
 
 export interface ScopeOutcome {

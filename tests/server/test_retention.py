@@ -85,7 +85,7 @@ async def test_keep_the_newest_runs(state, clock):
     clock.now += 60
     kept_forever = await run(engine, ["forever"], mode="full")
     clock.now += 2 * 86400  # past the project default too
-    await engine.tick()
+    await engine.upkeep.tick()
     assert await history_ids(engine) == [*ids[-2:], kept_forever]
     assert await run_dirs(state) == {*ids[-2:], kept_forever}
     # The head of a run long gone still loads, and still names that run.
@@ -147,5 +147,5 @@ async def test_source_commits_are_recorded_as_runs(state, clock):
     listed = [r["id"] for r in (await engine.list_runs())["runs"]]
     assert listed[:2] == [second["run"], first["run"]]
     clock.now += 2 * 86400
-    await engine.tick()
+    await engine.upkeep.tick()
     assert await history_ids(engine) == []  # expired under the project default

@@ -594,18 +594,18 @@ class History:
     def m(self):
         return self.state.model
 
-    async def tick(self) -> None:
-        await self.lake.tick()
+    def start(self) -> None:
+        self.lake.start()
 
     async def stop(self) -> None:
         await self.lake.stop()
 
-    async def delete(self, runs: list[str]) -> None:
+    def delete(self, runs: list[str]) -> None:
         """Forget finished runs: their rows go now, or from the files that
         hold them when those are next rewritten."""
 
         if runs:
-            await self.state.emit({"type": "RunsDeleted", "runs": sorted(runs), "at": self.clock()})
+            self.state.record({"type": "RunsDeleted", "runs": sorted(runs), "at": self.clock()})
 
     async def query(
         self,
