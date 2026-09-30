@@ -205,7 +205,11 @@ function ExecutorStats() {
     ["failed", (r) => failures(r.failed, r.tasks)],
     ["p50", (r) => seconds(r.p50), "Median duration of succeeded tasks"],
     ["p95", (r) => seconds(r.p95)],
-    ["wait p50", (r) => seconds(r.wait_p50), "From ready to started"],
+    [
+      "wait p50",
+      (r) => seconds(r.wait_p50),
+      "Ready to start, not counting pauses or engine outages",
+    ],
     ["wait p95", (r) => seconds(r.wait_p95)],
     ["hours", (r) => hours(r.hours), "Wall-clock task hours"],
     ["cpu·h", (r) => hours(r.cpu_hours), "Requested cpus × hours"],

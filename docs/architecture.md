@@ -462,7 +462,12 @@ and queue wait, failure rates, compute hours per executor), an asset's
 version timeline, and lineage in both directions. Runs carry tags
 (`solera run --tag env=prod`, `"tags"` in the API, `Automation(tags=…)`);
 assets carry tags too (`@asset(tags=…)`); an attempt records per-version
-metadata with `ctx.metadata(rows=…, auc=…)` or `Result(metadata=…)`.
+metadata with `ctx.metadata(rows=…, auc=…)` or `Result(metadata=…)`. Each
+run also keeps a timeline — `run_events`: submitted, held and why, claimed,
+launched, booted, loaded, computing, `ctx.mark("joined")`, stored,
+committed… — from which each attempt's phases (provisioning, loading,
+computing, writing, …) and each task's wait are computed; pauses and
+engine outages don't count as wait.
 
 **Retention.** `@asset(retention=Retention(days=…, runs=…))` bounds an
 asset's history; `Project(retention=…)` sets the default and

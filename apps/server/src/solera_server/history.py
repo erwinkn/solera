@@ -1,17 +1,20 @@
 """Run history (docs/object-store-state.md §7): what ran and what it made, as
 Parquet files on the object store, queried with DuckDB.
 
-Five tables, each row about one:
+Six tables, each row about one:
 
+    run_events        thing that happened to a run, one of its tasks or attempts
     runs              finished run or source commit: how it was asked for, how it ended
     tasks             task of a finished run: timings, retries, executor
-    attempts          attempt of a finished run, and the versions it committed
+    attempts          attempt of a finished run: its phases, and the versions it committed
     materializations  output version a commit installed, with its metadata
     lineage           input version an output version was built from
 
-Rows are born in the model: `apply` derives them from the events that finish
-things — a run archived, a commit installed, a source committed — and appends
-them to the history's `LakeState`. How they reach Parquet files, and how the
+`run_events` is the timeline: the engine's events and the worker's, appended
+as they are applied. The timings in `runs`, `tasks` and `attempts` summarize
+it. Rows are born in the model: `apply` derives them from the events that
+finish things — a run archived, a commit installed, a source committed — and
+appends them to the history's `LakeState`. How they reach Parquet files, and how the
 files are merged and rewritten, is the lake's business (`lake.py`): this
 module knows the tables, their rows and the questions asked of them.
 
@@ -32,6 +35,23 @@ BAD_TASK = frozenset({"failed", "blocked", "canceled"})
 
 
 TABLES = {
+    "run_events": Table(
+        "run",
+        "at",
+        {
+            "run": "VARCHAR",
+            "n": "INTEGER",  # its order within the run: events at the same moment keep theirs
+            "at": "DOUBLE",
+            "type": "VARCHAR",
+            "task": "VARCHAR",  # null for the run's own events
+            "attempt": "VARCHAR",  # null for a run's or task's own events
+            "by": "VARCHAR",  # engine | worker | who asked
+            "name": "VARCHAR",  # what it is about: an input, output, executor, host, mark...
+            "reason": "VARCHAR",
+            "until": "DOUBLE",  # the end of what it announces: a retry's due time, an outage
+            "rows": "BIGINT",
+        },
+    ),
     "runs": Table(
         "id",
         "created_at",
@@ -68,10 +88,10 @@ TABLES = {
             "scope": "VARCHAR",
             "status": "VARCHAR",
             "created_at": "DOUBLE",
-            "ready_at": "DOUBLE",  # when its dependencies were done
             "started_at": "DOUBLE",
             "finished_at": "DOUBLE",
             "attempts": "INTEGER",
+            "wait": "DOUBLE",  # seconds ready to run, and not: paused, or the engine down
             "duration": "DOUBLE",  # seconds, summed over its attempts
             "error": "VARCHAR",
             "deps": "VARCHAR[]",  # the tasks it waited on
@@ -96,6 +116,16 @@ TABLES = {
             "started_at": "DOUBLE",
             "finished_at": "DOUBLE",
             "duration": "DOUBLE",
+            # seconds in each phase: from its first event to the next phase's
+            "preparing": "DOUBLE",  # claimed: inputs pinned, the spec written
+            "provisioning": "DOUBLE",  # launched: a machine found, the harness started
+            "importing": "DOUBLE",  # booted: the project imported
+            "loading": "DOUBLE",  # imported: the inputs loaded
+            "computing": "DOUBLE",  # computing: the asset's function ran
+            "writing": "DOUBLE",  # computed: the outputs stored
+            "settling": "DOUBLE",  # finished: the result committed
+            "peak_memory": "BIGINT",  # bytes; measured in a process of its own only
+            "cpu_seconds": "DOUBLE",
             "error": "VARCHAR",
             "executor": "VARCHAR",  # null if never launched: skipped, or failed preparing
             "cpu": "INTEGER",  # requested
@@ -144,7 +174,7 @@ TABLES = {
         },
     ),
 }
-RUN_TABLES = ("runs", "tasks", "attempts")  # replaced when a run is reopened
+RUN_TABLES = ("runs", "tasks", "attempts")  # replaced when a run is reopened; its events stay
 MAX_METADATA = 64 << 10  # bytes of JSON per output version
 
 
@@ -173,6 +203,29 @@ def execution(spec: dict) -> dict:
     return {k: v for k, v in record.items() if v not in (None, {})}
 
 
+# An attempt's phases, and the events that start them: each lasts until the
+# next of these the attempt reached, or until it ended.
+PHASES = {
+    "preparing": "claimed",
+    "provisioning": "launched",
+    "importing": "booted",
+    "loading": "imported",
+    "computing": "computing",
+    "writing": "computed",
+    "settling": "finished",
+}
+USAGE = ("peak_memory", "cpu_seconds")
+
+
+def phases(times: dict[str, float], end: float) -> dict[str, float]:
+    """Seconds in each phase an attempt reached, from `times` — when each
+    event that starts one happened — and when it ended."""
+
+    reached = [(phase, times[event]) for phase, event in PHASES.items() if event in times]
+    ends = [at for _, at in reached[1:]] + [end]
+    return {phase: max(0.0, stop - start) for (phase, start), stop in zip(reached, ends, strict=True)}
+
+
 def _span(attempt: dict) -> float:
     start, end = attempt.get("started_at"), attempt.get("finished_at")
     return max(0.0, end - start) if start is not None and end is not None else 0.0
@@ -187,14 +240,12 @@ def run_rows(run: dict, *, live: bool = False) -> dict[str, list[dict]]:
     still in progress: no finish time."""
 
     tasks = run["tasks"]
-    ends = {tid: t["attempts"][-1].get("finished_at") for tid, t in tasks.items() if t["attempts"]}
     task_rows, attempt_rows = [], []
     for tid in sorted(tasks):
         task = tasks[tid]
         attempts = task["attempts"]
         launched = (task.get("launched") or {}).get("execution")
         ran = [launched["executor"]] if launched else [a["executor"] for a in attempts if "executor" in a]
-        done = [ends[d] for d in task["deps"] if ends.get(d) is not None]
         retry = task.get("retry") or {}
         task_rows.append(
             {
@@ -204,10 +255,10 @@ def run_rows(run: dict, *, live: bool = False) -> dict[str, list[dict]]:
                 "scope": task["scope"],
                 "status": task["status"],
                 "created_at": run["created_at"],
-                "ready_at": max([run["created_at"], *done]),
                 "started_at": attempts[0].get("started_at") if attempts else None,
                 "finished_at": attempts[-1].get("finished_at") if attempts else None,
                 "attempts": len(attempts),
+                "wait": task["wait"],
                 "duration": sum(_span(a) for a in attempts),
                 "error": next((a["error"] for a in reversed(attempts) if a.get("error")), None),
                 "deps": task["deps"],
@@ -231,6 +282,7 @@ def run_rows(run: dict, *, live: bool = False) -> dict[str, list[dict]]:
                     "started_at": a.get("started_at"),
                     "finished_at": a.get("finished_at"),
                     "duration": _span(a),
+                    **{k: a.get(k) for k in (*PHASES, *USAGE)},
                     "error": a.get("error"),
                     **{k: a.get(k) for k in EXECUTION},
                     "options": a.get("options") or {},
@@ -275,9 +327,9 @@ def run_rows(run: dict, *, live: bool = False) -> dict[str, list[dict]]:
     return {"runs": [row], "tasks": task_rows, "attempts": attempt_rows}
 
 
-def run_record(rows: dict[str, list[dict]]) -> dict:
+def run_record(rows: dict[str, list[dict]], events: int = 0) -> dict:
     """A finished run as the model held it, from its rows — `run_rows` (or
-    `commit_row`) backwards."""
+    `commit_row`) backwards — and how many events it has had."""
 
     [row] = rows["runs"]
     if row["trigger"] == "commit":
@@ -293,6 +345,7 @@ def run_record(rows: dict[str, list[dict]]) -> dict:
     attempts: dict[str, list[dict]] = {}
     for a in rows["attempts"]:
         attempt = {k: a[k] for k in ("id", "outcome", "started_at", "finished_at")}
+        attempt |= {k: a[k] for k in (*PHASES, *USAGE) if a[k] is not None}
         attempt |= {k: a[k] for k in EXECUTION if a[k]}
         if a["error"]:
             attempt["error"] = a["error"]
@@ -312,7 +365,7 @@ def run_record(rows: dict[str, list[dict]]) -> dict:
             "retry": None
             if t["retry_delay"] is None
             else {"n": t["max_attempts"] - 1, "delay": t["retry_delay"], "backoff": t["retry_backoff"]},
-            "ready_at": t["ready_at"],
+            "wait": t["wait"],
             "attempts": attempts.get(t["id"], []),
         }
         if t["retried"]:
@@ -333,6 +386,7 @@ def run_record(rows: dict[str, list[dict]]) -> dict:
         "paused": False,
         "created_at": row["created_at"],
         "updated_at": row["finished_at"],
+        "events": events,
         "tasks": tasks,
     }
 
@@ -591,12 +645,23 @@ class History:
                         f'SELECT * FROM {table} WHERE "{TABLES[table].key}" = ? ORDER BY {order}', [run_id]
                     )
                 )
+            [(found["events"],)] = con.execute(
+                "SELECT max(n) FROM run_events WHERE run = ?", [run_id]
+            ).fetchall()
             return found
 
         found = await self.query(
-            work, ("runs", "tasks", "attempts", "materializations"), run=run_id, live=False
+            work, ("runs", "tasks", "attempts", "materializations", "run_events"), run=run_id, live=False
         )
-        return run_record(found) if found["runs"] else None
+        return run_record(found, found.pop("events") or 0) if found["runs"] else None
+
+    async def events(self, run_id: str) -> list[dict]:
+        """A run's timeline: its events in the order they happened."""
+
+        def work(con):
+            return _dicts(con.execute('SELECT * FROM run_events WHERE run = ? ORDER BY "at", n', [run_id]))
+
+        return await self.query(work, ("run_events",), run=run_id, live=False)
 
     async def runs(
         self,
@@ -776,8 +841,8 @@ class History:
             count(*) FILTER (WHERE status = 'failed') AS failed,
             quantile_cont(duration, 0.5) FILTER (WHERE status = 'succeeded') AS p50,
             quantile_cont(duration, 0.95) FILTER (WHERE status = 'succeeded') AS p95,
-            quantile_cont(greatest(started_at - ready_at, 0), 0.5) FILTER (WHERE started_at IS NOT NULL) AS wait_p50,
-            quantile_cont(greatest(started_at - ready_at, 0), 0.95) FILTER (WHERE started_at IS NOT NULL) AS wait_p95,
+            quantile_cont(wait, 0.5) FILTER (WHERE started_at IS NOT NULL) AS wait_p50,
+            quantile_cont(wait, 0.95) FILTER (WHERE started_at IS NOT NULL) AS wait_p95,
             sum(duration) / 3600 AS hours
         """
         compute = """

@@ -239,6 +239,8 @@ def test_finishing_a_task_touches_only_its_dependents():
             "max_attempts": 1,
             "retry": None,
             "ready_at": 0,
+            "queued_at": 0,
+            "wait": 0.0,
             "attempts": [],
         }
     tasks["r/b:"] = {
@@ -251,6 +253,8 @@ def test_finishing_a_task_touches_only_its_dependents():
         "max_attempts": 1,
         "retry": None,
         "ready_at": 0,
+        "queued_at": None,
+        "wait": 0.0,
         "attempts": [],
     }
     m.apply(
@@ -262,6 +266,7 @@ def test_finishing_a_task_touches_only_its_dependents():
                 "created_at": 0,
                 "updated_at": 0,
                 "paused": False,
+                "events": 0,
                 "tasks": tasks,
             },
         }

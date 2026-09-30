@@ -180,7 +180,9 @@ export interface Task {
   deps: string[];
   generation: number;
   attempt_count: number;
-  ready_at: number;
+  // Seconds it could have run but didn't: not while its run was paused or
+  // the engine down. Counted up to its latest claim.
+  wait: number;
   error?: string | null;
 }
 
@@ -197,6 +199,17 @@ export interface Attempt {
   memory?: number;
   gpu?: number;
   options?: Record<string, string>;
+  // Seconds in each phase, from one milestone to the next one reached.
+  preparing?: number;
+  provisioning?: number;
+  importing?: number;
+  loading?: number;
+  computing?: number;
+  writing?: number;
+  settling?: number;
+  // What it used; peak memory only in a process of its own.
+  peak_memory?: number;
+  cpu_seconds?: number;
   commit?: string;
   error?: {
     type: string;
@@ -206,10 +219,27 @@ export interface Attempt {
   };
 }
 
+/** One moment of a run: of the run itself (no task), a task (no attempt),
+    or an attempt. `n` orders events recorded at the same time. */
+export interface RunEvent {
+  run: string;
+  n: number;
+  at: number;
+  type: string;
+  task: string | null;
+  attempt: string | null;
+  by: string;
+  name: string | null;
+  reason: string | null;
+  until: number | null;
+  rows: number | null;
+}
+
 export interface RunDetail {
   request: Run;
   tasks: Task[];
   attempts: Record<string, Attempt[]>;
+  events: RunEvent[];
 }
 
 export interface ScopeOutcome {

@@ -158,6 +158,8 @@ async def test_run_submit_list_detail_cancel(client, base, engine):
     assert run["id"] in {r["id"] for r in runs}
     shown = (await client.get(f"{base}/runs/{run['id']}")).json()
     assert {t["status"] for t in shown["tasks"]} == {"succeeded"}
+    timeline = (await client.get(f"{base}/runs/{run['id']}/events")).json()
+    assert (timeline[0]["type"], timeline[-1]["type"]) == ("submitted", "succeeded")
 
     again = await client.post(f"{base}/runs/{run['id']}/cancel")
     assert again.status_code == 200
@@ -227,6 +229,7 @@ async def test_delete_and_prune_runs(client, base, engine):
     gone = await client.delete(f"{base}/runs/{finished[0]}")
     assert gone.status_code == 200
     assert (await client.get(f"{base}/runs/{finished[0]}")).status_code == 404
+    assert (await client.get(f"{base}/runs/{finished[0]}/events")).json() == []
     dry = (await client.post(f"{base}/runs:prune", json={"asset": "feed", "keep": 1, "dry_run": True})).json()
     assert dry == {"deleted": [finished[1]], "dry_run": True}
     assert (await client.get(f"{base}/runs/{finished[1]}")).status_code == 200

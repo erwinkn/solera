@@ -6,7 +6,8 @@ annotation (Incremental edges through the upstream key index) -> build ctx ->
 run the producer -> for each returned output, work out what changed against
 its key index and write the delta file -> take the write fence -> store()
 each output unless nothing changed -> rewrite the attempt file with the spec,
-the result and the log index, in one PUT. All along, a thread beats.
+the result and the log index, in one PUT. All along, a thread beats, and
+the timeline records each step for the run's history.
 """
 
 from __future__ import annotations
@@ -20,6 +21,8 @@ import importlib.util
 import inspect
 import json
 import os
+import resource
+import socket
 import sys
 import threading
 import time
@@ -133,17 +136,69 @@ class Aborted(Exception):
 ABORTED = 3  # the exit code of an aborted attempt
 
 
+MAX_EVENTS = 1_000  # per attempt: past this, marks and lazy loads are not recorded
+
+
+def _rows(value) -> int | None:
+    """How many rows a value holds, if it has a length: a list, a DataFrame."""
+
+    if isinstance(value, (str, bytes, dict)):
+        return None
+    try:
+        return len(value)
+    except Exception:
+        return None
+
+
+def _cpu_seconds() -> float:
+    own, children = resource.getrusage(resource.RUSAGE_SELF), resource.getrusage(resource.RUSAGE_CHILDREN)
+    return own.ru_utime + own.ru_stime + children.ru_utime + children.ru_stime
+
+
+class Timeline:
+    """What the attempt did, when, by this worker's clock (§7): `booted`,
+    `imported`, `loaded` (each input), `computing`, `mark` (each `ctx.mark`),
+    `computed`, `writing` (the fence is ours), `stored` (each output),
+    `finished`. Every heartbeat carries it, and so does the result, with
+    what the attempt used: CPU seconds, and — in a process of its own —
+    peak memory."""
+
+    def __init__(self, own_process: bool):
+        self.events: list[dict] = []
+        self.own_process = own_process
+        self._cpu = _cpu_seconds()
+
+    def add(self, type_: str, name=None, rows=None, *, optional=False):
+        if optional and len(self.events) >= MAX_EVENTS:
+            return
+        event = {"type": type_, "at": time.time()}
+        if name is not None:
+            event["name"] = str(name)[:200]
+        if rows is not None:
+            event["rows"] = rows
+        self.events.append(event)
+
+    def report(self) -> dict:
+        usage = {"cpu_seconds": round(_cpu_seconds() - self._cpu, 3)}
+        if self.own_process:
+            peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            usage["peak_memory"] = peak if sys.platform == "darwin" else peak * 1024
+        return {"events": list(self.events), "usage": usage}
+
+
 class Heartbeat:
     """Proof of life for an engine with no handle on this worker (§8).
 
     A thread rewrites `{attempt}.beat` every `interval` seconds — from a
-    thread, so a producer that blocks the event loop still beats — and reads
-    the write fence each time: once the engine has aborted the attempt,
-    `on_abort` runs. A worker that stops marks the beat done, so the engine
-    settles it without waiting for three missed beats."""
+    thread, so a producer that blocks the event loop still beats — with the
+    timeline so far, and reads the write fence each time: once the engine
+    has aborted the attempt, `on_abort` runs. A worker that stops marks the
+    beat done, so the engine settles it without waiting for three missed
+    beats."""
 
-    def __init__(self, objects, base: str, interval: float, on_abort):
+    def __init__(self, objects, base: str, interval: float, on_abort, timeline: Timeline):
         self.objects, self.base, self.interval, self.on_abort = objects, base, interval, on_abort
+        self.timeline = timeline
         self.aborted = False
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name=f"beat {base}", daemon=True)
@@ -158,7 +213,7 @@ class Heartbeat:
         n = 0
         while True:
             try:
-                beat = json.dumps({"at": time.time(), "n": n}).encode()
+                beat = json.dumps({"at": time.time(), "n": n, **self.timeline.report()}).encode()
                 obstore.put(self.objects, f"{self.base}.beat", beat, use_multipart=False)
                 try:
                     fence = json.loads(bytes(obstore.get(self.objects, f"{self.base}.writing").bytes()))
@@ -178,14 +233,15 @@ class Heartbeat:
         self._stop.set()
         await asyncio.to_thread(self._thread.join)
         with contextlib.suppress(Exception):
-            await _put(self.objects, f"{self.base}.beat", json.dumps({"done": True}).encode())
+            beat = {"done": True, **self.timeline.report()}
+            await _put(self.objects, f"{self.base}.beat", json.dumps(beat).encode())
 
 
 class Ctx:
     """The `ctx` argument handed to producers (§2)."""
 
-    def __init__(self, spec, asset: Asset, project: Project, objects, changes, shipper):
-        self._spec, self._objects, self._shipper = spec, objects, shipper
+    def __init__(self, spec, asset: Asset, project: Project, objects, changes, shipper, timeline):
+        self._spec, self._objects, self._shipper, self._timeline = spec, objects, shipper, timeline
         self.partition: str = spec["partition"]
         declared = project.manifest["assets"][asset.name]["partitions"]
         self.partitions: dict[str, str] = (
@@ -233,7 +289,15 @@ class Ctx:
 
     async def load(self, ref: Ref, t):
         store = self._stores[ref.store]
-        return await store.load(ref, t, None)
+        value = await store.load(ref, t, None)
+        self._timeline.add("loaded", ref.output, _rows(value), optional=True)
+        return value
+
+    def mark(self, name: str):
+        """Mark a moment in the run's timeline — `ctx.mark("trained")` —
+        to see where the time went between the attempt's own steps."""
+
+        self._timeline.add("mark", name, optional=True)
 
     def metadata(self, output: str | None = None, /, **values):
         """Record facts about the version this attempt writes — row counts,
@@ -339,13 +403,14 @@ class LogShipper:
         return {"blocks": self.blocks, "lines": self.lines, "bytes": self.size, "truncated": self.truncated}
 
 
-async def _resolve_inputs(spec, project, asset, keys_io):
+async def _resolve_inputs(spec, project, asset, keys_io, timeline):
     """Load each pin by annotation; build call args + ctx.changes (§5, §10).
 
     An Incremental edge over a keyed upstream reads its page from the pinned
     key index — the pending deltas in `[from, to]`, or the whole index for a
     full delivery — and loads just those keys. `delivered` reports where the
-    page ended, for the engine's watermark (§6)."""
+    page ended, for the engine's watermark (§6). Each input loaded is a
+    `loaded` event."""
 
     manifest_asset = project.manifest["assets"][asset.name]
     edges = manifest_asset["inputs"]
@@ -368,6 +433,7 @@ async def _resolve_inputs(spec, project, asset, keys_io):
                     else await project.stores[ref.store].load(ref, inner, None)
                 )
             args[param] = out
+            timeline.add("loaded", param)
             continue
         ref = Ref.from_json(pin["ref"])
         store = project.stores[ref.store]
@@ -378,6 +444,7 @@ async def _resolve_inputs(spec, project, asset, keys_io):
                 lo, hi = (int(v) for v in ch["batches"])
                 args[param] = await store.load(ref, t, Batches(lo, hi))
                 changes[param] = Changes(rows=args[param], batches=range(lo, hi + 1), full=full)
+                timeline.add("loaded", param, _rows(args[param]))
                 continue
             if "keys" in ch:  # a run's keys= override: a one-off selection
                 upserted, deleted, after = {str(k): "" for k in ch["keys"]}, (), None
@@ -401,11 +468,13 @@ async def _resolve_inputs(spec, project, asset, keys_io):
                 rows=args[param], deleted=deleted, full=full, upserted=tuple(sorted(upserted))
             )
             delivered[param] = {"after": after, "upserted": sorted(upserted), "deleted": list(deleted)}
+            timeline.add("loaded", param, _rows(args[param]))
             continue
         if t is not None and is_ref_type(t):
             args[param] = ref
         else:
             args[param] = await store.load(ref, t, None)
+            timeline.add("loaded", param, _rows(args[param]))
     return args, changes, delivered
 
 
@@ -419,7 +488,7 @@ def _dict_inner(t):
     return None
 
 
-async def _store_outputs(spec, project, asset, objects, keys_io, result_value, fence):
+async def _store_outputs(spec, project, asset, objects, keys_io, result_value, fence, timeline):
     """Store each returned output (§4, §6, §8, §9), in two phases.
 
     Planning compares each keyed output's write with its key index as pinned
@@ -580,9 +649,11 @@ async def _store_outputs(spec, project, asset, objects, keys_io, result_value, f
         if schema is not None:
             ref = dataclasses.replace(ref, handle={**(ref.handle or {}), "schema": schema})
         entry["ref"] = ref.to_json()
-        if isinstance(value, (list, tuple)):
-            entry["rows"] = len(value)
+        rows = _rows(value)
+        if rows is not None:
+            entry["rows"] = rows
         entries[name] = entry
+        timeline.add("stored", name, rows)
     return entries, cursor
 
 
@@ -628,15 +699,27 @@ def _key_io(objects, objects_url: str, project: Project) -> ObjectIO:
     return ObjectIO(objects, cache=key_cache(project.manifest.get("key_cache"), objects_url))
 
 
-async def run_attempt(objects_url: str, attempt: str, entrypoint: str | Project, *, run: str, on_abort=None):
+async def run_attempt(
+    objects_url: str,
+    attempt: str,
+    entrypoint: str | Project,
+    *,
+    run: str,
+    on_abort=None,
+    own_process=False,
+):
     """Run one attempt. The engine created `runs/{run}/{attempt}.json` holding
     the spec; the harness rewrites it once, at the end, with the spec, the
     result and the log index (docs/object-store-state.md §8).
 
     Returns 0 on success, 1 on failure, and 3 if the engine aborted the
     attempt: then nothing was written. Once aborted, `on_abort` runs — from
-    the heartbeat thread; by default the attempt's work is canceled."""
+    the heartbeat thread; by default the attempt's work is canceled.
+    `own_process` says the process runs this attempt alone: its peak memory
+    is the attempt's."""
 
+    timeline = Timeline(own_process)
+    timeline.add("booted", socket.gethostname())
     objects = _objects(objects_url)
     base = f"runs/{run}/{attempt}"
     record = await _get(objects, f"{base}.json")
@@ -644,9 +727,13 @@ async def run_attempt(objects_url: str, attempt: str, entrypoint: str | Project,
         raise StoreError(f"No attempt file at {base}.json")
     spec = json.loads(record)["spec"]
     loop = asyncio.get_running_loop()
-    work = asyncio.create_task(_attempt(objects, objects_url, base, spec, entrypoint))
+    work = asyncio.create_task(_attempt(objects, objects_url, base, spec, entrypoint, timeline))
     beat = Heartbeat(
-        objects, base, spec.get("heartbeat", 30), on_abort or (lambda: loop.call_soon_threadsafe(work.cancel))
+        objects,
+        base,
+        spec.get("heartbeat", 30),
+        on_abort or (lambda: loop.call_soon_threadsafe(work.cancel)),
+        timeline,
     )
     beat.start()
     try:
@@ -659,14 +746,15 @@ async def run_attempt(objects_url: str, attempt: str, entrypoint: str | Project,
         await beat.stop()
 
 
-async def _attempt(objects, objects_url: str, base: str, spec: dict, entrypoint) -> int:
+async def _attempt(objects, objects_url: str, base: str, spec: dict, entrypoint, timeline: Timeline) -> int:
     shipper = LogShipper(objects, base)
     flusher = asyncio.create_task(shipper.periodically())
 
     async def finish(result: dict):
         flusher.cancel()
         log = await shipper.finish()
-        body = {"spec": spec, "result": result, "log": log}
+        timeline.add("finished")
+        body = {"spec": spec, "result": {**result, **timeline.report()}, "log": log}
         await _put(objects, f"{base}.json", json.dumps(body, allow_nan=False).encode())
 
     async def fail(error: BaseException, retryable: bool):
@@ -688,12 +776,14 @@ async def _attempt(objects, objects_url: str, base: str, spec: dict, entrypoint)
         body = json.dumps({"state": "writing", "intents": intents}).encode()
         if not await _create(objects, f"{base}.writing", body):
             raise Aborted(spec["attempt"])
+        timeline.add("writing")
 
     try:
         project = entrypoint if isinstance(entrypoint, Project) else load_project(entrypoint)
     except Exception as error:
         await fail(error, False)
         return 1
+    timeline.add("imported")
     if project.manifest["revision"] != spec["revision"]:
         await fail(
             StoreError(
@@ -705,19 +795,21 @@ async def _attempt(objects, objects_url: str, base: str, spec: dict, entrypoint)
     asset = project.assets[spec["asset"]]
     try:
         keys_io = _key_io(objects, objects_url, project)
-        args, changes, delivered = await _resolve_inputs(spec, project, asset, keys_io)
-        ctx = Ctx(spec, asset, project, objects, changes, shipper)
+        args, changes, delivered = await _resolve_inputs(spec, project, asset, keys_io, timeline)
+        ctx = Ctx(spec, asset, project, objects, changes, shipper, timeline)
         signature = inspect.signature(asset.fn)
         if "ctx" in signature.parameters:
             args["ctx"] = ctx
         for name, resource in project.resources.items():
             if name in signature.parameters:
                 args[name] = resolve_env(resource)  # env: secrets resolve in the harness (§5)
+        timeline.add("computing")
         value = asset.fn(**args)
         if inspect.isawaitable(value):
             value = await value
+        timeline.add("computed")
         metadata = ctx._recorded(value)
-        outputs, cursor = await _store_outputs(spec, project, asset, objects, keys_io, value, fence)
+        outputs, cursor = await _store_outputs(spec, project, asset, objects, keys_io, value, fence, timeline)
         for name, values in metadata.items():
             if values and "ref" in outputs.get(name, {}):
                 outputs[name]["metadata"] = values
@@ -811,6 +903,7 @@ async def main():
             os.environ["SOLERA_PROJECT"],
             run=options["--run"],
             on_abort=lambda: os._exit(ABORTED),  # an aborted process stops at once
+            own_process=True,
         )
         raise SystemExit(code)
     if mode == "pool":

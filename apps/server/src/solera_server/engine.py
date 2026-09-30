@@ -44,6 +44,8 @@ TERMINAL = SUCCESS | {"failed", "blocked", "canceled"}
 HEARTBEAT_SECONDS = 30.0  # a worker beats this often; three missed beats and it is dead
 SOURCE_KEYS_RECORDED = 1000  # a source commit's run lists changed keys up to this many, else counts
 GRACE_SECONDS = 5.0
+ALIVE = "engine/alive.json"  # when the engine last said it was up, while runs were in progress
+ALIVE_SECONDS = 30.0
 
 
 class Retryable(RuntimeError):
@@ -122,6 +124,7 @@ class Engine:
         self.history = history or History(state, clock=self.clock)
         self.retention_interval = retention_interval
         self._swept = -math.inf
+        self._alive = -math.inf
         self._set_dims = {
             dim["output"]
             for a in manifest["assets"].values()
@@ -137,9 +140,15 @@ class Engine:
 
     async def initialize(self):
         """Register the served project (§11): a new manifest reconciles
-        automation state and seeds source heads."""
+        automation state and seeds source heads. Runs in progress record
+        that the engine was down, since it last said it was alive."""
 
         m = self.m
+        alive = await self.state.get_object(ALIVE)
+        if alive is not None and any(run["status"] not in TERMINAL_RUN for run in m.runs.values()):
+            now = self.clock()
+            down = min(json.loads(alive)["at"], now)
+            await self.state.emit({"type": "EngineRestarted", "down": down, "at": now})
         if (
             m.revision != self.manifest["revision"]
             or m.manifest != self.manifest
@@ -183,6 +192,8 @@ class Engine:
             job.cancel()
         await asyncio.gather(*self.maintaining.values(), return_exceptions=True)
         await self.history.stop()
+        with contextlib.suppress(Exception):
+            await self._say_alive(force=True)
 
     async def _loop(self):
         while not self._stopping:
@@ -198,6 +209,7 @@ class Engine:
         """One evaluation pass: adoption, dispatch, automations, archiving,
         and upkeep of key indexes and the history."""
 
+        await self._say_alive()
         self._adopt()
         await self._dispatch_due()
         await self._automation_tick()
@@ -205,6 +217,15 @@ class Engine:
         await self._maintain_indexes()
         await self._retention_sweep()
         await self.history.tick()
+
+    async def _say_alive(self, force=False):
+        """While runs are in progress, note every `ALIVE_SECONDS` that the
+        engine is up: after a crash, the next one knows when it went down."""
+
+        now = self.clock()
+        if self.m.runs and (force or now - self._alive >= ALIVE_SECONDS):
+            self._alive = now
+            await self.state.put_object(ALIVE, json.dumps({"at": now}).encode())
 
     async def run_until(self, run_id: str, timeout: float = 120.0):
         """Tick until the run reaches a terminal status (CLI and tests)."""
@@ -303,6 +324,8 @@ class Engine:
                     "max_attempts": 1 + self.manifest["assets"][name].get("retries", {}).get("n", 0),
                     "retry": self.manifest["assets"][name].get("retries"),
                     "ready_at": now,
+                    "queued_at": now,
+                    "wait": 0.0,
                     "attempts": [],
                 }
         for task_id, task in tasks.items():
@@ -310,7 +333,7 @@ class Engine:
                 dep_id = f"{run_id}/{owner}:{up_scope}"
                 if dep_id in tasks and dep_id != task_id:
                     task["deps"].append(dep_id)
-                    task["status"] = "waiting"
+                    task["status"], task["queued_at"] = "waiting", None
         run = {
             "id": run_id,
             "targets": sorted(assets),
@@ -326,6 +349,7 @@ class Engine:
             "paused": False,
             "created_at": now,
             "updated_at": now,
+            "events": 0,
             "tasks": tasks,
         }
         if command_id and command_id in m.receipts:  # submitted while we planned
@@ -531,7 +555,15 @@ class Engine:
         commit=None,
         more=False,
         unsettled=None,
+        worker=None,
+        end=None,
+        reason=None,
     ):
+        """End an attempt. `worker` is what its worker reported — its result,
+        or its last heartbeat: the events it recorded and what it used. `end`
+        names how it ended if its outcome does not say (`aborted`, `lost`),
+        and `reason` why."""
+
         event = {
             "type": "AttemptFinished",
             "run": task["run"],
@@ -552,14 +584,25 @@ class Engine:
             event["more"] = True
         if unsettled:
             event["unsettled"] = unsettled
+        if worker:
+            event["worker"] = {k: worker[k] for k in ("events", "usage") if worker.get(k)}
+        if end is not None:
+            event["end"] = end
+        if reason is not None:
+            event["reason"] = str(reason)[:200]
         await self.state.emit(event)
 
     # -- dispatch ---------------------------------------------------------------
 
     async def _dispatch_due(self):
+        """Claim the tasks that are due, as far as the engine, their
+        executors and their scopes allow. Those held back are recorded, with
+        why, when that changes."""
+
         now = self.clock()
         engine_used = len(self.engine_inflight)
         executor_used = dict(self.executor_inflight)
+        held = {}
         for task_id in self.m.due(now):
             task = self.m.task(task_id)
             if task is None or task["status"] != "queued" or task_id in self.m.claims:
@@ -572,17 +615,24 @@ class Engine:
             executor = spec["executor"]
             limit = getattr(placement, "max_concurrent", None)
             is_pool = spec["kind"] == "Pool"
-            if not is_pool and engine_used >= self.concurrency:
-                continue
-            if limit is not None and executor_used.get(executor, 0) >= limit:
-                continue
-            if self._scope_active_claim(task["asset"], task["scope"]):
+            holder = self.m.locks.get((task["asset"], task["scope"]))
+            if holder is not None and self.m.claimed(holder) is not None:
+                held[task_id] = ["lock", holder]
+            elif not is_pool and engine_used >= self.concurrency:
+                held[task_id] = ["engine", None]
+            elif limit is not None and executor_used.get(executor, 0) >= limit:
+                held[task_id] = ["executor", executor]
+            if task_id in held:
+                if task.get("held") == held[task_id]:
+                    del held[task_id]
                 continue
             attempt = ulid(now)
             self.m.claim(task_id, attempt, now)
             executor_used[executor] = executor_used.get(executor, 0) + 1
             engine_used += not is_pool
             self._spawn(task["run"], attempt, is_pool, executor, self._attempt(task_id, attempt, placement))
+        if held:
+            self.state.record({"type": "TasksHeld", "held": held, "at": now})
 
     def _spawn(self, run_id: str, attempt: str, is_pool: bool, executor: str, work):
         """Drive one attempt in the background, holding its execution slots."""
@@ -662,7 +712,7 @@ class Engine:
             try:
                 handle = await placement.launch(stage)
             except Exception as error:
-                await self._fail(task_id, attempt, f"launch: {error}", retryable=True)
+                await self._fail(task_id, attempt, f"launch: {error}", retryable=True, reason="launch")
                 return
             await self._watch(task_id, attempt, placement, handle)
         except LostOwnership:
@@ -698,9 +748,11 @@ class Engine:
             return
         with contextlib.suppress(Exception):
             if claim.get("launched"):
-                await self._fail(task_id, attempt, f"engine: {error}", retryable=True)
+                await self._fail(task_id, attempt, f"engine: {error}", retryable=True, reason="engine")
             else:
-                await self._finish(task, claim, "failed", error=f"engine: {error}", retryable=True)
+                await self._finish(
+                    task, claim, "failed", error=f"engine: {error}", retryable=True, reason="engine"
+                )
 
     # -- input resolution + Incremental plans (§5, §6, §8) --------------------------
 
@@ -1093,9 +1145,11 @@ class Engine:
             if handle is not None:
                 await self._cancel(placement, handle)
             if canceled:
-                await self._fail(task_id, attempt, "canceled", outcome="canceled")
+                await self._fail(
+                    task_id, attempt, "canceled", outcome="canceled", end="aborted", reason="canceled"
+                )
             else:
-                await self._fail(task_id, attempt, "timeout", retryable=True)
+                await self._fail(task_id, attempt, "timeout", retryable=True, end="aborted", reason="timeout")
             return
         await self._settle(task_id, attempt, exit_)
 
@@ -1107,7 +1161,14 @@ class Engine:
         record = await self.state.attempt_record(task["run"], attempt)
         result = (record or {}).get("result")
         if result is None:
-            await self._fail(task_id, attempt, f"harness exited without a result: {exit_}", retryable=True)
+            await self._fail(
+                task_id,
+                attempt,
+                f"harness exited without a result: {exit_}",
+                retryable=True,
+                end="lost",
+                reason=exit_["reason"] or f"exit code {exit_['code']}",
+            )
             return
         if result.get("status") == "failed":
             error = result.get("error") or {}
@@ -1117,6 +1178,7 @@ class Engine:
                 f"{error.get('type', 'Error')}: {error.get('message', '')}",
                 retryable=bool(error.get("retryable")),
                 delay=self._retry_delay(task),
+                worker=result,
             )
             return
         try:
@@ -1124,7 +1186,14 @@ class Engine:
         except LostOwnership:
             return
         except Conflict as error:
-            await self._fail(task_id, attempt, str(error), retryable=getattr(error, "retryable", True))
+            await self._fail(
+                task_id,
+                attempt,
+                str(error),
+                retryable=getattr(error, "retryable", True),
+                worker=result,
+                reason="conflict",
+            )
 
     @staticmethod
     def _launched(task: dict | None, attempt: str) -> dict:
@@ -1147,24 +1216,53 @@ class Engine:
             return None if fence["state"] == "aborted" else fence
 
     async def _fail(
-        self, task_id: str, attempt: str, error: str, *, retryable=False, delay=0.0, outcome="failed"
+        self,
+        task_id: str,
+        attempt: str,
+        error: str,
+        *,
+        retryable=False,
+        delay=0.0,
+        outcome="failed",
+        worker=None,
+        end=None,
+        reason=None,
     ):
         """End a launched attempt without a commit (§8). It is aborted first,
         so it can never write after this. If it had begun writing, the keyed
         outputs it meant to change stay unsettled until a later commit takes
-        in what landed; their intent files are kept for that."""
+        in what landed; their intent files are kept for that. Without a
+        result (`worker`), what the worker last reported is in its heartbeat."""
 
         task = self.m.task(task_id)
         prepared = self._launched(task, attempt)["prepared"]
         fence = await self._abort(task["run"], attempt)
         unsettled = (fence or {}).get("intents") or {}
+        if worker is None:
+            worker = await self._last_beat(task["run"], attempt)
         claim = self.m.claimed(attempt)
         if claim is None:
             return
         await self._finish(
-            task, claim, outcome, error=error, retryable=retryable, delay=delay, unsettled=unsettled
+            task,
+            claim,
+            outcome,
+            error=error,
+            retryable=retryable,
+            delay=delay,
+            unsettled=unsettled,
+            worker=worker,
+            end=end,
+            reason=reason,
         )
         await self._discard(attempt, prepared, keep=set(unsettled))
+
+    async def _last_beat(self, run_id: str, attempt: str) -> dict:
+        try:
+            beat = await self.state.get_object(f"{self.state.attempt_path(run_id, attempt)}.beat")
+            return json.loads(beat) if beat else {}
+        except Exception:
+            return {}
 
     async def _discard(self, attempt: str, prepared: dict, keep=()):
         """Delete the delta files an attempt wrote but never committed, except
@@ -1299,7 +1397,7 @@ class Engine:
             commit["cursor"] = result["cursor"]
         elif prepared.get("full"):
             commit["cursor"] = None  # a full run clears the committed cursor (§8)
-        await self._finish(task, claim, "succeeded", commit=commit, more=more)
+        await self._finish(task, claim, "succeeded", commit=commit, more=more, worker=result)
         return {"run": task["run"], "attempt": attempt, "outputs": outputs}
 
     # -- pool work (§10) ---------------------------------------------------------------
@@ -1709,10 +1807,11 @@ class Engine:
 
     # -- run control ------------------------------------------------------------------
 
-    async def _control(self, run_id: str, action: str):
-        await self.state.emit({"type": "RunControlled", "run": run_id, "action": action, "at": self.clock()})
+    async def _control(self, run_id: str, action: str, by: str | None):
+        event = {"type": "RunControlled", "run": run_id, "action": action, "at": self.clock()}
+        await self.state.emit({**event, "by": by} if by else event)
 
-    async def cancel(self, run_id: str):
+    async def cancel(self, run_id: str, by: str | None = None):
         run = self.m.runs.get(run_id)
         if run is None:
             archived = await self.history.run(run_id)
@@ -1722,19 +1821,19 @@ class Engine:
         if run["status"] not in TERMINAL_RUN:
             # Unlaunched claims go with the tasks. Each launched attempt is
             # aborted by its wait loop — or, if already writing, committed (§8).
-            await self._control(run_id, "cancel")
+            await self._control(run_id, "cancel", by)
         return self._run_view(self.m.runs.get(run_id) or run)
 
-    async def pause(self, run_id: str, paused=True):
+    async def pause(self, run_id: str, paused=True, by: str | None = None):
         run = self.m.runs.get(run_id)
         if run is None:
             if await self.history.run(run_id) is None:
                 raise KeyError(run_id)
             raise Conflict(f"run {run_id} is finished")
-        await self._control(run_id, "pause" if paused else "resume")
+        await self._control(run_id, "pause" if paused else "resume", by)
         return self._run_view(self.m.runs[run_id])
 
-    async def retry(self, run_id: str):
+    async def retry(self, run_id: str, by: str | None = None):
         run = self.m.runs.get(run_id)
         if run is None:
             archived = await self.history.run(run_id)
@@ -1742,7 +1841,7 @@ class Engine:
                 raise KeyError(run_id)
             if run_id not in self.m.runs:  # reopened while we read it
                 await self.state.emit({"type": "RunReopened", "run": archived, "at": self.clock()})
-        await self._control(run_id, "retry")
+        await self._control(run_id, "retry", by)
         return self._run_view(self.m.runs[run_id])
 
     # -- finished runs -------------------------------------------------------------------
@@ -1845,7 +1944,7 @@ class Engine:
         return self._run_view(run)
 
     def _task_view(self, task: dict, live: bool) -> dict:
-        view = {k: v for k, v in task.items() if k not in ("attempts", "launched")}
+        view = {k: v for k, v in task.items() if k not in ("attempts", "launched", "ready_at", "queued_at")}
         claim = self.m.claims.get(task["id"]) if live else None
         attempts = task["attempts"]
         view["status"] = claim["status"] if claim else task["status"]
@@ -1866,7 +1965,7 @@ class Engine:
                 "status": a["outcome"],
                 "started_at": a.get("started_at"),
                 "finished_at": a.get("finished_at"),
-                **{k: a[k] for k in history.EXECUTION if k in a},
+                **{k: a[k] for k in (*history.PHASES, *history.USAGE, *history.EXECUTION) if k in a},
             }
             if a.get("error"):
                 view["error"] = a["error"]

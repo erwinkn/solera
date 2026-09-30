@@ -38,6 +38,7 @@ Everything lives under `{root}/{namespace}/`.
 | Attempt file | `runs/{run}/{attempt}.json` | engine creates it with the spec; the harness overwrites it with spec + result + log index | two writes, one writer each | with its run |
 | Write fence | `runs/{run}/{attempt}.writing` | the harness before it writes, or the engine before it ends the attempt — whichever is first | create-only | with its run |
 | Heartbeat | `runs/{run}/{attempt}.beat` | harness, every 30 s | overwritten | with its run |
+| Engine heartbeat | `engine/alive.json` | engine, every 30 s while runs are live | overwritten | never (one object) |
 | Attempt log | `runs/{run}/{attempt}.log` (chunks `{attempt}.log.{n:06d}` while running) | harness | chunks write-once; joined at the end | with its run |
 | Output data | store-defined (FileStore: `{output}/{partition}/{key}.json` under `.solera/data`, §9) | the store, inside the harness | overwritten in place | when the output no longer holds it (§9); never expired |
 
@@ -181,11 +182,11 @@ State
 | `Watermark` | `batch` (first batch not fully delivered; during a full drain, the head's batch + 1 when the drain began, so changes made while draining arrive afterwards as deltas), `until` (the last batch of a delta window being delivered in pages), `after` (last key delivered inside the window or the full drain), `full` (a full drain is in progress), `fingerprint`, `output` and `up` (the upstream index it reads) | edges × partitions |
 | `Outcome` | `outcome`, `run`, `attempt`, `at` | assets × partitions |
 | `AutomationState` | `enabled`, `last_fired`, `last_run`, `last_revision`, `pending` (set of `[asset, scope]` for OnChange) | automations × partitions |
-| `Run` | `id`, `request` {targets, partitions, mode, config, keys, automation, tags}, `status`, `paused`, `created_at`, `tasks` {task: `Task`} | in-flight work |
-| `Task` | `status`, `deps`, `ready_at`, `max_attempts`, `attempts` [`Attempt`], `launched?` {`attempt`, `started_at`, `at`, `execution`, `prepared`, `pool?`, `worker?`, `claimed_at?`} | |
+| `Run` | `id`, `request` {targets, partitions, mode, config, keys, automation, tags}, `status`, `paused`, `created_at`, `events` (how many it has recorded), `tasks` {task: `Task`} | in-flight work |
+| `Task` | `status`, `deps`, `ready_at` (now, or a retry's due time), `wait` (seconds counted so far), `queued_at` (when the wait clock last started; null while stopped), `held?` [reason, name] (why the dispatcher last passed it over), `max_attempts`, `attempts` [`Attempt`], `launched?` {`attempt`, `started_at`, `at`, `execution`, `prepared`, `pool?`, `worker?`, `claimed_at?`} | |
 | `File` | `path`, `rows`, `bytes`, `at` [lo, hi] (time column), `runs` [first, last], `deleted?` [run] (hidden until rewritten), `deleted_at?` | files per table: ~log(rows) after merging |
 | `Intent` | `added`, `removed`, `exact`, `files` (the dead attempt's delta files), `run`, `attempt` | writers that died mid-write, until the next commit of that output |
-| `Attempt` | `id`, `outcome`, `started_at`, `finished_at`, `error?`, `outputs?` {output: ref} | |
+| `Attempt` | `id`, `outcome`, `started_at`, `finished_at`, the seconds of each phase it reached, `cpu_seconds?`, `peak_memory?`, `error?`, `outputs?` {output: ref} | |
 
 **Derived, rebuilt at start:** the claims and scope locks of launched
 attempts (from `Task.launched`), the pool queue, the ready queue and the
@@ -338,13 +339,14 @@ queried with DuckDB, embedded in the engine. It answers questions like
 `file_index` take at p95, and how long does it wait for a slot", or "which
 input versions built this version of `revenue`".
 
-**Tables.** One row per thing that finished:
+**Tables.** One row per thing that finished, and one per moment of a run:
 
 | Table | One row per | Notable columns |
 |---|---|---|
 | `runs` | finished run or source commit | `status` (`succeeded`, `failed`, `canceled`, `skipped`), `trigger` (`manual`, `automation`, `commit`), `automation`, `by`, `source`, `targets`, `assets`, `committed`, `tags` (map), `task_count`, `failed_count`, `error`, `config` and `keys` (JSON, as submitted) |
-| `tasks` | task of a finished run | `asset`, `scope`, `status`, `ready_at` (its dependencies were done), `started_at`, `finished_at`, `attempts`, `duration`, `deps`, `max_attempts`, `retry_delay`, `retry_backoff`, `retried`, `executor` (of its last attempt) |
-| `attempts` | attempt | `task`, `n`, `outcome`, `started_at`, `finished_at`, `duration`, `error`, `executor`, `cpu`, `memory`, `gpu` (requested; all null if it never launched), `options` (map: its other placement options, e.g. `image`), `outputs` (map: output → version committed) |
+| `tasks` | task of a finished run | `asset`, `scope`, `status`, `started_at`, `finished_at`, `attempts`, `duration`, `wait` (seconds it could have run but didn't), `deps`, `max_attempts`, `retry_delay`, `retry_backoff`, `retried`, `executor` (of its last attempt) |
+| `attempts` | attempt | `task`, `n`, `outcome`, `started_at`, `finished_at`, `duration`, `preparing`, `provisioning`, `importing`, `loading`, `computing`, `writing`, `settling` (seconds per phase, below), `peak_memory` (bytes; only in a process of its own), `cpu_seconds`, `error`, `executor`, `cpu`, `memory`, `gpu` (requested; all null if it never launched), `options` (map: its other placement options, e.g. `image`), `outputs` (map: output → version committed) |
+| `run_events` | moment of a run | `n` (its order in the run), `at`, `type`, `task` and `attempt` (null for the run's own events), `by`, `name`, `reason`, `until`, `rows` — the timeline, below |
 | `materializations` | output version a commit installed | `output`, `scope`, `version`, `run`, `attempt`, `at`, `batch`, `added`, `removed`, `added_keys`, `removed_keys` (a source commit's keys, up to 1,000), `rows`, `metadata` (JSON) |
 | `lineage` | input version an output version was read from | `output`, `scope`, `version`, `input`, `input_scope`, `input_version`, `param` |
 
@@ -364,6 +366,70 @@ source's head points at it (`head.run`).
 rows), and reads the same as it did while the run was live. Only what has
 no shape of its own stays JSON: a run's `config` and `keys`, and output
 metadata.
+
+**The timeline — `run_events`.** Everything that happened to a run, in
+order: the engine's decisions and what the worker reports. The summary
+columns of the other tables are computed from it. For example, one
+attempt of `revenue`:
+
+```
++0.00  run          submitted        by erwin
++0.00  revenue      ready
++0.02  revenue      held             engine · the engine is at its concurrency
++4.10  revenue #1   claimed
++4.35  revenue #1   launched         etl
++38.9  revenue #1   booted           ip-10-0-3-17          ← by the worker
++40.2  revenue #1   imported
++41.0  revenue #1   loaded           orders · 1,204 rows
++41.1  revenue #1   computing
++47.5  revenue #1   mark             joined                ← ctx.mark("joined")
++52.3  revenue #1   computed
++52.3  revenue #1   writing
++53.9  revenue #1   stored           revenue · 88 rows
++54.0  revenue #1   finished
++54.1  revenue #1   committed
++54.1  revenue      succeeded
++54.1  run          succeeded
+```
+
+- **Run events:** `submitted` (`by` the user, or `engine` with `name` the
+  automation), `paused`, `resumed`, `canceled`, `retried` (`by`),
+  `outage` (the engine was down from `at` to `until`), the run's outcome,
+  and a source commit's `committed` (`name` the source).
+- **Task events:** `ready`, `retry_scheduled` (`until` its due time),
+  `held` (`reason` `lock`, `engine` or `executor`, `name` the attempt
+  holding the lock or the full executor — recorded when the reason
+  changes, not every tick), `canceled`, and its outcome.
+- **Attempt events:** from the engine, `claimed`, `launched` (`name` the
+  executor), `taken` (by a pool worker, `name`); from the worker (`by`
+  `worker`), `booted` (`name` the host), `imported`, `loaded` and `stored`
+  (per input and output, with `rows` when the value has a length),
+  `computing`, `mark` (each `ctx.mark(name)`), `computed`, `writing`,
+  `finished`; and how it ended, from the engine: `committed`, `skipped`,
+  `failed` (`reason` `launch`, `engine`, `conflict`, or none when the
+  asset raised), `aborted` (`canceled` or `timeout`), or `lost` (the
+  worker exited without a result: `reason` the exit, e.g. `exit code 137`).
+
+The worker keeps its events and sends them with every heartbeat and in
+its result, so even a lost attempt keeps what it did up to its last beat.
+Its clock is not the engine's: its times are kept within the attempt —
+not before its launch, not after its end — and in order.
+
+**Phases** are read off the timeline: from one milestone to the next one
+reached — `preparing` (claimed → launched), `provisioning` (launched →
+booted), `importing` (booted → imported), `loading` (imported →
+computing), `computing` (→ computed), `writing` (computed → finished),
+`settling` (finished → the engine's end). A missing milestone folds its
+phase into the one before: an attempt lost while computing has
+`computing` up to its end, and no `writing`. **Wait** is the time a task
+was ready but not running: from `ready` to `claimed`, minus pauses of its
+run and engine outages. An engine writes `engine/alive.json` every 30 s
+while it has live runs; the next engine to start reads it, and records an
+`outage` for each live run from then to now.
+
+Run events are appended as they happen, not when the run finishes: a live
+run's timeline is queryable, and a reopened run keeps its events and
+numbers the new ones after them.
 
 **Where rows come from.** Rows are born inside `apply`, from the events
 that finish things: `RunArchived` yields a run's `runs`, `tasks` and
@@ -515,7 +581,8 @@ have.
 (a process, an ECS task). After a restart it may have none, so the harness
 also rewrites `{attempt}.beat` every `heartbeat_seconds` (30 s), from a
 thread so a producer that blocks its event loop still beats, and marks it
-done when its result is written. Three missed beats and the worker is dead:
+done when its result is written. Each beat carries the attempt's timeline
+so far (§7). Three missed beats and the worker is dead:
 the engine fails the attempt, and the task is retried.
 
 **Write fence — `{attempt}.writing`.** Stores overwrite in place (§9), so

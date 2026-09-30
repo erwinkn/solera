@@ -32,6 +32,7 @@ async def state(tmp_path, clock):
 @asset(tags={"team": "growth"})
 def orders(ctx):
     n = ctx.config.get("n", 3)
+    ctx.mark("counted")
     ctx.metadata(rows=n, source="shop")
     return [{"id": i} for i in range(n)]
 
@@ -176,6 +177,10 @@ async def test_a_run_reads_the_same_once_archived(state, clock):
     state.emit = emit
     before = details[failed["id"]]
     assert [t["retried"] for t in before["tasks"] if t["asset"] == "revenue"] == [1]
+    # Reopened, the run went on counting its events.
+    events = await engine.history.events(failed["id"])
+    assert [e["n"] for e in events] == list(range(1, len(events) + 1))
+    assert [e["type"] for e in events if e["task"] is None] == ["submitted", "failed", "retried", "failed"]
     assert {a.get("executor") for t in before["attempts"].values() for a in t} == {"local"}
     assert await engine.run_detail(failed["id"]) == before
     record = await engine.history.run(commit["run"])
@@ -240,6 +245,116 @@ async def test_stale_flush_is_discarded(state, clock):
     assert await state.list_objects("history/") == []
     await lake.flush(force=True)
     assert await engine.history.run(doomed) is None
+
+
+def line(e):
+    """An event as `who type [name]`: `run`, a task's asset, or `asset#` for its attempt."""
+
+    who = "run" if e["task"] is None else e["task"].split("/")[1].split(":")[0] + "#" * bool(e["attempt"])
+    named = e["type"] in ("launched", "loaded", "mark", "stored")
+    return " ".join(
+        [who, e["type"], *([e["name"]] if named else []), *([str(e["rows"])] if e["rows"] else [])]
+    )
+
+
+async def test_a_run_has_one_timeline(state, clock):
+    """The engine's events and the worker's, in the order they happened.
+    The worker's clock is not the engine's: its events are kept within the
+    attempt's launch and end — here, one engine moment."""
+
+    engine = engine_for(state, clock)
+    await engine.initialize()
+    done = await run(engine, clock, ["revenue"], upstream=True)
+    events = await engine.history.events(done["id"])
+    assert [line(e) for e in events] == [
+        "run submitted",
+        "orders ready",
+        "orders# claimed",
+        "orders# launched local",
+        "orders# booted",
+        "orders# imported",
+        "orders# computing",
+        "orders# mark counted",
+        "orders# computed",
+        "orders# writing",
+        "orders# stored orders 3",
+        "orders# finished",
+        "orders# committed",
+        "orders succeeded",
+        "revenue ready",
+        "revenue# claimed",
+        "revenue# launched local",
+        "revenue# booted",
+        "revenue# imported",
+        "revenue# loaded orders 3",
+        "revenue# computing",
+        "revenue# computed",
+        "revenue# writing",
+        "revenue# stored revenue",
+        "revenue# finished",
+        "revenue# committed",
+        "revenue succeeded",
+        "run succeeded",
+    ]
+    assert {e["at"] for e in events} == {clock.now}
+    assert {e["by"] for e in events if e["type"] in ("booted", "mark")} == {"worker"}
+
+    await engine.tick()  # archived
+    rows = await engine.history.query(
+        lambda con: con.execute(
+            "SELECT preparing, provisioning, importing, loading, computing, writing, settling, "
+            "peak_memory, cpu_seconds FROM attempts WHERE run = ?",
+            [done["id"]],
+        ).fetchall(),
+        ("attempts",),
+    )
+    for *phases, peak, cpu in rows:
+        assert phases == [0.0] * 7  # every phase reached, at one engine moment
+        assert peak is None and cpu >= 0  # an attempt in the engine's process has no peak of its own
+
+
+async def test_a_task_waits_only_while_it_could_run(state, clock):
+    """A task's wait leaves out its run being paused, and the engine being down."""
+
+    engine = engine_for(state, clock)
+    await engine.initialize()
+    start = clock.now
+    submitted = await engine.submit(["orders"])
+    clock.now += 10
+    await engine.pause(submitted["id"])
+    clock.now += 20
+    await engine.pause(submitted["id"], False)
+    clock.now += 10
+    await engine.stop()  # down since `start + 40`
+    clock.now += 60
+    engine = engine_for(state, clock)
+    await engine.initialize()
+    clock.now += 10
+    await engine.run_until(submitted["id"], 60)
+    events = await engine.history.events(submitted["id"])
+    outage = next(e for e in events if e["type"] == "outage")
+    assert (outage["at"], outage["until"]) == (start + 40, start + 100)
+    assert [e["type"] for e in events][:6] == ["submitted", "ready", "paused", "resumed", "outage", "claimed"]
+    await engine.tick()
+    [(wait,)] = await engine.history.query(
+        lambda con: con.execute("SELECT wait FROM tasks WHERE run = ?", [submitted["id"]]).fetchall(),
+        ("tasks",),
+    )
+    assert wait == 10 + 10 + 10
+
+
+async def test_a_task_held_back_says_why(state, clock):
+    engine = Engine(
+        state,
+        PROJECT.manifest,
+        placements={"Local": lambda s, c: InlinePlacement(c, PROJECT)},
+        clock=clock,
+        concurrency=1,
+    )
+    await engine.initialize()
+    done = await run(engine, clock, ["orders", "ranked"])
+    held = [e for e in await engine.history.events(done["id"]) if e["type"] == "held"]
+    assert [(line(e), e["reason"]) for e in held] == [("ranked held", "engine")]  # once, not every tick
 
 
 def test_an_attempt_records_where_it_ran():

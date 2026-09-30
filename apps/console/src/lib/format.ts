@@ -34,6 +34,7 @@ export function describeInterval(seconds: number) {
 /** A length of time in seconds, at the precision that matters for it. */
 export function seconds(value: number | null | undefined) {
   if (value == null) return "—";
+  if (value > 0 && value < 0.0005) return "<1 ms";
   if (value < 1) return `${Math.round(value * 1000)} ms`;
   if (value < 60) return `${value.toFixed(value < 10 ? 1 : 0)} s`;
   if (value < 3600)

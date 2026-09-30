@@ -281,15 +281,16 @@ async def test_an_aborted_worker_writes_nothing(tmp_path):
     await engine.initialize()
     run, attempt = await launched(engine, ["slow"])
     await engine._abort(run["id"], attempt)
-    for on_abort in (None, lambda: None):  # the heartbeat stops it; the fence does
+    # the heartbeat stops it while it computes; the fence, once it has computed
+    for on_abort, reached in ((None, "computing"), (lambda: None, "computed")):
         code = await asyncio.wait_for(
             run_attempt(state.objects_url, attempt, project, run=run["id"], on_abort=on_abort), 5
         )
         assert code == ABORTED
         assert "result" not in await state.attempt_record(run["id"], attempt)
-        assert json.loads(await state.get_object(f"{state.attempt_path(run['id'], attempt)}.beat")) == {
-            "done": True
-        }
+        beat = json.loads(await state.get_object(f"{state.attempt_path(run['id'], attempt)}.beat"))
+        assert beat["done"] is True
+        assert [e["type"] for e in beat["events"]][-1] == reached  # never "writing"
     assert len(calls) == 2
     prefix = state.model.index("slow", "").prefix
     assert await state.list_objects(prefix) == []  # its delta file was deleted

@@ -849,6 +849,8 @@ async def test_timeout_fails_retryably(state):
     detail = await engine.run_detail(run["id"])
     assert status_of(detail) == "failed"
     assert "timeout" in detail["tasks"][0]["error"]
+    closed = [e for e in await engine.history.events(run["id"]) if e["type"] == "aborted"]
+    assert [e["reason"] for e in closed] == ["timeout"]
 
 
 async def test_harness_exit_without_result_fails_retryably(state):
@@ -856,6 +858,17 @@ async def test_harness_exit_without_result_fails_retryably(state):
     failure."""
 
     class NoResult(FakePlacement):
+        async def launch(self, stage):
+            # What the worker said before it went silent, by a clock far off.
+            beat = {
+                "at": 0,
+                "n": 1,
+                "events": [{"type": "booted", "at": 0}, {"type": "computing", "at": 1e12}],
+            }
+            path = f"{self.ctx.state.attempt_path(stage['run'], stage['attempt'])}.beat"
+            await self.ctx.state.put_object(path, json.dumps(beat).encode())
+            return await super().launch(stage)
+
         async def wait(self, run, timeout):
             return {"code": 0, "reason": None, "meta": {}}
 
@@ -866,9 +879,20 @@ async def test_harness_exit_without_result_fails_retryably(state):
     project = Project(assets=[ghost], executors=[Fake("fake")])
     engine = make_engine(state, project, placements={"Fake": lambda s, c: NoResult(c)}, heartbeat_seconds=1)
     await engine.initialize()
-    detail = await engine.run_until((await engine.submit(["ghost"]))["id"], 15)
+    run = await engine.submit(["ghost"])
+    detail = await engine.run_until(run["id"], 15)
     assert status_of(detail) == "failed"
     assert "without a result" in detail["tasks"][0]["error"]
+    events = [e for e in await engine.history.events(run["id"]) if e["attempt"]]
+    assert [(e["type"], e["reason"]) for e in events] == [
+        ("claimed", None),
+        ("launched", None),
+        ("booted", None),
+        ("computing", None),
+        ("lost", "exit code 0"),
+    ]
+    launched, booted, computing, lost = events[1:]
+    assert booted["at"] >= launched["at"] and computing["at"] == lost["at"]  # within the attempt
 
 
 async def test_max_concurrent(state):
@@ -895,8 +919,11 @@ async def test_max_concurrent(state):
     project = Project(assets=[work], executors=[Fake("fake")])
     engine = make_engine(state, project, placements={"Fake": lambda s, c: Tracked(c)}, concurrency=10)
     await engine.initialize()
-    await engine.run_until((await engine.submit(["work"], partitions="all"))["id"], 15)
+    run = await engine.submit(["work"], partitions="all")
+    await engine.run_until(run["id"], 15)
     assert in_flight["peak"] == 1
+    held = [e for e in await engine.history.events(run["id"]) if e["type"] == "held"]
+    assert held and {(e["reason"], e["name"]) for e in held} == {("executor", "fake")}
 
 
 async def test_identical_poll_wakes_nothing(state):

@@ -143,6 +143,17 @@ class State:
         except Fenced as error:
             raise Unavailable("This writer was replaced; restart required") from error
 
+    def record(self, *events: dict) -> None:
+        """Apply events now; they become durable with the next flush. For
+        what nothing outside this process waits on — lost in a crash, it is
+        simply recorded again."""
+
+        if self.journal.fenced:
+            raise Unavailable("This writer was replaced; restart required")
+        for event in events:
+            self.model.apply(event)
+        self.journal.append(*events).add_done_callback(lambda done: done.cancelled() or done.exception())
+
     async def close(self) -> None:
         await self.journal.close()
 

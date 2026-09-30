@@ -401,6 +401,11 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
         runtime = await project_engine(request, p)
         return await runtime.run_detail(run_id)
 
+    @app.get("/api/projects/{p}/runs/{run_id}/events")
+    async def run_events(p: str, run_id: str, request: Request):
+        runtime = await project_engine(request, p)
+        return await runtime.history.events(run_id)
+
     @app.post("/api/projects/{p}/runs/{run_id}/cancel")
     async def cancel_run(p: str, run_id: str, request: Request):
         runtime = await project_engine(request, p)

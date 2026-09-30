@@ -144,6 +144,18 @@ test("partition grid, attempt logs, upstream run", async ({ page }) => {
     "polled",
     { timeout: 15000 },
   );
+  // Where its time went, and the run's timeline, from submitted to succeeded.
+  await expect(feedTask.locator("[data-phases]").first()).toContainText(
+    "computing",
+  );
+  await sheet.getByRole("tab", { name: "Timeline" }).click();
+  const timeline = sheet.getByLabel("Run timeline");
+  await expect(timeline.locator('[data-event="submitted"]')).toBeVisible();
+  await expect(timeline.locator('[data-event="booted"]').first()).toBeVisible();
+  await expect(timeline.locator("li").last()).toHaveAttribute(
+    "data-event",
+    "succeeded",
+  );
   await sheet.getByRole("button", { name: "Close", exact: true }).click();
   // The partition grid colors committed scopes complete.
   await page.getByRole("button", { name: "site_feed", exact: true }).click();

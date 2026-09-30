@@ -388,17 +388,24 @@ class Model:
 
     def _on_RunSubmitted(self, e):
         run = e["run"]
+        at = run["created_at"]
         self.runs[run["id"]] = run
         if e.get("command"):
             self.receipts[e["command"]] = run["id"]
             while len(self.receipts) > MAX_RECEIPTS:
                 del self.receipts[next(iter(self.receipts))]
         self._index_run(run["id"], run)
-        self._roll_up(run["id"], e["run"]["created_at"])
+        by = run.get("by") or "engine"
+        self._event(run, "submitted", at, by=by, name=run.get("automation"))
+        for task in run["tasks"].values():
+            if task["status"] == "queued":
+                self._event(run, "ready", at, task["id"])
+        self._roll_up(run["id"], at)
 
     def _on_RunReopened(self, e):
         run = e["run"]
         # Its history rows describe how it ended, and it is running again.
+        # Its events stay: the timeline goes on.
         self.history.forget({run["id"]}, e["at"], history.RUN_TABLES)
         if run["id"] in self.runs:
             self._unindex_run(run["id"])
@@ -410,19 +417,31 @@ class Model:
         run = self.runs.get(e["run"])
         if run is None:
             return
-        at, action = e["at"], e["action"]
+        at, action, by = e["at"], e["action"], e.get("by") or "user"
         if action in ("pause", "resume"):
             run["paused"] = action == "pause"
+            self._event(run, "paused" if run["paused"] else "resumed", at, by=by)
+            for task in run["tasks"].values():
+                if task["status"] != "queued":
+                    continue
+                if run["paused"]:
+                    self._stop_clock(task, at)
+                else:
+                    task["queued_at"] = max(at, task["ready_at"])
         elif action == "cancel":
             # Every unfinished task is canceled together: no dependent is
             # blocked on the way, and nothing is left to roll up.
             run["status"] = "canceled"
             run["updated_at"] = at
+            self._event(run, "canceled", at, by=by)
             for tid, task in run["tasks"].items():
                 if task["status"] in TERMINAL_TASK:
                     continue
                 attempt = (self.claims.get(tid) or {}).get("attempt")
                 task["status"] = "canceled"
+                task.pop("held", None)
+                self._stop_clock(task, at)
+                self._event(run, "canceled", at, tid)
                 self.outcomes[(task["asset"], task["scope"])] = {
                     "outcome": "canceled",
                     "run": run["id"],
@@ -436,11 +455,11 @@ class Model:
             self._index_run(run["id"], run)
         elif action == "retry":
             # Failed tasks run again; blocked ones wait on their dependencies again.
+            self._event(run, "retried", at, by=by)
             for task in run["tasks"].values():
                 if task["status"] == "failed":
-                    task["status"] = "queued"
-                    task["ready_at"] = at
                     task["retried"] = task.get("retried", 0) + 1
+                    self._ready(run, task, at)
                 elif task["status"] == "blocked":
                     task["status"] = "waiting"
             run["status"] = "running"
@@ -456,8 +475,41 @@ class Model:
                     task["status"] = "blocked"
                     self._finished(run, task, "blocked", None, at)
                 else:
-                    self._requeue(task, at)
+                    self._ready(run, task, at)
             self._roll_up(run["id"], at)
+
+    def _on_TasksHeld(self, e):
+        """Why tasks ready to run are not claimed (`[reason, name]`): the
+        engine is full, their executor is, or another attempt holds their
+        scope. Only a change of reason is an event."""
+
+        for tid, held in sorted(e["held"].items()):
+            task = self.task(tid)
+            if task is None or task["status"] != "queued" or task.get("held") == held:
+                continue
+            task["held"] = held
+            self._event(self.runs[task["run"]], "held", e["at"], tid, reason=held[0], name=held[1])
+
+    def _on_EngineRestarted(self, e):
+        """The engine was down from `down` (the last time it said it was
+        alive) to `at`: every run in progress records the outage, and its
+        tasks' wait leaves it out."""
+
+        for run in self.runs.values():
+            if run["status"] in TERMINAL_RUN:
+                continue
+            self._event(run, "outage", max(e["down"], run["created_at"]), until=e["at"])
+            for task in run["tasks"].values():
+                if task.get("queued_at") is not None:
+                    task["wait"] += max(0.0, e["down"] - task["queued_at"])
+                    task["queued_at"] = max(task["queued_at"], e["at"])
+
+    def _claimed(self, run: dict, task: dict, attempt: str, at: float) -> None:
+        """A task's attempt claimed it at `at`: its wait ends."""
+
+        self._stop_clock(task, at)
+        task.pop("held", None)
+        self._event(run, "claimed", at, task["id"], attempt)
 
     def _on_AttemptLaunched(self, e):
         run = self.runs.get(e["run"])
@@ -471,6 +523,8 @@ class Model:
         if task["status"] == "queued":
             task["status"] = "running"
         self._hold(task)
+        self._claimed(run, task, e["attempt"], e["started_at"])
+        self._event(run, "launched", e["at"], task["id"], e["attempt"], name=e["execution"]["executor"])
 
     def _on_AttemptClaimed(self, e):
         """A pool worker took a launched attempt (§10)."""
@@ -481,6 +535,7 @@ class Model:
             return
         launched["worker"], launched["claimed_at"] = e["worker"], e["at"]
         self._hold(task)
+        self._event(self.runs[task["run"]], "taken", e["at"], task["id"], e["attempt"], name=e["worker"])
 
     def _on_AttemptFinished(self, e):
         run = self.runs.get(e["run"])
@@ -488,22 +543,30 @@ class Model:
         if task is None:
             return
         self._release_claim(task["id"], e["attempt"])
+        outcome, at = e["outcome"], e["finished_at"]
         reads, execution = [], {}
-        if (task.get("launched") or {}).get("attempt") == e["attempt"]:
-            reads = task["launched"]["prepared"].get("lineage") or []
-            execution = history.execution(task["launched"]["execution"])
+        launched = task.get("launched")
+        if (launched or {}).get("attempt") == e["attempt"]:
             del task["launched"]
+            reads = launched["prepared"].get("lineage") or []
+            execution = history.execution(launched["execution"])
             if task["status"] == "running":
                 task["status"] = "queued"  # until the outcome below says otherwise
+        else:
+            launched = None
+            self._claimed(run, task, e["attempt"], e["started_at"])
+        times = self._attempt_events(run, task, e, launched)
         for output, intent in (e.get("unsettled") or {}).items():
             intents = self.unsettled.setdefault((output, task["scope"]), [])
             intents.append({**intent, "run": e["run"], "attempt": e["attempt"]})
-        outcome, at = e["outcome"], e["finished_at"]
+        usage = (e.get("worker") or {}).get("usage") or {}
         summary = {
             "id": e["attempt"],
             "outcome": outcome,
-            "started_at": e.get("started_at"),
+            "started_at": e["started_at"],
             "finished_at": at,
+            **history.phases(times, at),
+            **{k: usage[k] for k in history.USAGE if usage.get(k) is not None},
             **execution,
         }
         if e.get("error"):
@@ -523,7 +586,7 @@ class Model:
         if outcome == "succeeded":
             self._install(task, commit or {}, e, reads)
             if e.get("more"):
-                self._requeue(task, at)
+                self._ready(run, task, at)
             else:
                 task["status"] = "succeeded"
                 self._finished(run, task, "succeeded", e["attempt"], at)
@@ -535,14 +598,42 @@ class Model:
             failures = sum(1 for a in task["attempts"] if a["outcome"] == "failed")
             allowed = task["max_attempts"] * (1 + task.get("retried", 0))
             if e.get("retryable") and failures < allowed:
-                self._requeue(task, at + float(e.get("delay") or 0))
+                self._ready(run, task, at, float(e.get("delay") or 0))
             else:
                 task["status"] = "failed"
                 self._finished(run, task, "failed", e["attempt"], at)
-        elif outcome in ("expired", "canceled"):
-            self._requeue(task, at)
+        elif outcome == "canceled":
+            self._ready(run, task, at)
         else:
             raise ValueError(f"unknown attempt outcome {outcome!r}")
+
+    def _attempt_events(self, run: dict, task: dict, e: dict, launched: dict | None) -> dict[str, float]:
+        """Record what the worker says of an ended attempt, then how it
+        ended. The worker's clock is not the engine's: its times are kept
+        between the moment it could have started and the attempt's end, in
+        order. Returns when each event first happened."""
+
+        tid, attempt, end = task["id"], e["attempt"], e["finished_at"]
+        times = {"claimed": e["started_at"]}
+        if launched is not None:
+            times["launched"] = launched["at"]
+            at = launched.get("claimed_at") or launched["at"]
+            for event in (e.get("worker") or {}).get("events") or ():
+                at = min(max(at, float(event["at"])), end)
+                times.setdefault(event["type"], at)
+                self._event(
+                    run,
+                    event["type"],
+                    at,
+                    tid,
+                    attempt,
+                    by="worker",
+                    name=event.get("name"),
+                    rows=event.get("rows"),
+                )
+        closing = e.get("end") or {"succeeded": "committed"}.get(e["outcome"], e["outcome"])
+        self._event(run, closing, end, tid, attempt, reason=e.get("reason"))
+        return times
 
     def _install(self, task: dict, commit: dict, e: dict, reads=()) -> None:
         """Install a commit: heads, key indexes, cursor, watermarks. Each
@@ -601,10 +692,34 @@ class Model:
                 if entry not in auto["pending"]:
                     auto["pending"].append(entry)
 
-    def _requeue(self, task: dict, ready_at: float) -> None:
+    def _ready(self, run: dict, task: dict, at: float, delay: float = 0.0) -> None:
+        """Queue a task to run from `at + delay`: its wait starts then,
+        unless its run is paused."""
+
+        due = at + delay
         task["status"] = "queued"
-        task["ready_at"] = ready_at
-        self.queue[task["id"]] = ready_at
+        task["ready_at"] = due
+        task["queued_at"] = None if run.get("paused") else due
+        self.queue[task["id"]] = due
+        if delay:
+            self._event(run, "retry_scheduled", at, task["id"], until=due)
+        else:
+            self._event(run, "ready", at, task["id"])
+
+    @staticmethod
+    def _stop_clock(task: dict, at: float) -> None:
+        """A task stops waiting to run: claimed, paused or canceled."""
+
+        if task.get("queued_at") is not None:
+            task["wait"] += max(0.0, at - task["queued_at"])
+            task["queued_at"] = None
+
+    def _event(self, run: dict, type_: str, at: float, task=None, attempt=None, *, by="engine", **fields):
+        """Append to the run's timeline (§7): `run_events` rows, in order."""
+
+        run["events"] += 1
+        row = {"run": run["id"], "n": run["events"], "at": at, "type": type_, "task": task}
+        self._record("run_events", {**row, "attempt": attempt, "by": by, **fields})
 
     def _finished(self, run: dict, task: dict, outcome: str, attempt, at, *, roll_up: bool = True) -> None:
         """A terminal transition: outcome, pending index, dependents, run roll-up."""
@@ -622,6 +737,7 @@ class Model:
             "attempt": attempt,
             "at": at,
         }
+        self._event(run, outcome, at, tid)
         stats = self.run_left.setdefault(run["id"], [0, 0])
         if roll_up:
             stats[0] -= 1
@@ -642,7 +758,7 @@ class Model:
                 dep["status"] = "blocked"
                 self._finished(run, dep, "blocked", None, at, roll_up=roll_up)
             else:
-                self._requeue(dep, at)
+                self._ready(run, dep, at)
         if roll_up:
             self._roll_up(run["id"], at)
 
@@ -655,6 +771,7 @@ class Model:
         if left <= 0:
             run["status"] = "failed" if bad else "succeeded"
             self.archivable.add(run_id)
+            self._event(run, run["status"], at)
         else:
             run["status"] = "running"
 
@@ -710,6 +827,17 @@ class Model:
         run = e.get("run")
         if run is not None:
             self._record("runs", history.commit_row(run, e["at"]))
+            self._record(
+                "run_events",
+                {
+                    "run": run["id"],
+                    "n": 1,
+                    "at": e["at"],
+                    "type": "committed",
+                    "by": run.get("by"),
+                    "name": e["source"],
+                },
+            )
             installed = {**self.heads[(e["source"], "")], "run": run["id"], "attempt": None}
             self._record(
                 "materializations",
