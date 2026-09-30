@@ -28,6 +28,7 @@ from solera.stores import (
 LEDGER_TABLE = "public.solera_migrations"
 BATCH_COLUMN = "_batch"
 SEQ_COLUMN = "_seq"
+KEY_CHUNK = 100_000  # (key, version) pairs per chunk a keyed Sql write reports
 
 
 def _assigned_batch(scope: Scope, prior: Ref | None) -> int:
@@ -313,7 +314,7 @@ class PostgresStore:
     def _apply_sql(self, cur, output, write: Sql, scope, table, slice_where, prior):
         """Materialize a SELECT into the slice, or run a statement verbatim. The
         harness never sees these rows, so a keyed output reports the slice's
-        complete key map (§6, §9)."""
+        complete content, sorted, as the harness reads it (§6, §9)."""
 
         if _is_select(write.stmt):
             probe = cur.execute(f"SELECT * FROM ({write.stmt}) _probe LIMIT 0")
@@ -348,14 +349,26 @@ class PostgresStore:
             ).fetchone()
             if not exists:
                 raise WriteError(f"{output.name}: Sql statement must leave {table} in place")
-        keys = None
-        if output.key:
-            rows = cur.execute(
-                f"SELECT * FROM {table} WHERE {self._where_sql(slice_where)}",
-                [slice_where[k] for k in sorted(slice_where)],
-            ).fetchall()
-            keys = key_map(output, rows)
+        keys = self._sorted_keys(table, output, slice_where) if output.key else None
         return digest([prior.version if prior else "", digest(write.stmt)]), keys
+
+    def _sorted_keys(self, table, output: Output, where: dict):
+        """The slice's `(key, version)` pairs sorted by the key's bytes, a chunk
+        at a time from a server-side cursor once the write has committed: the
+        declared revision's text, else an MD5 digest of the row's text."""
+
+        import psycopg
+
+        key = f"convert_to({_ident(output.key)}::text, 'UTF8')"
+        if output.revision:
+            version = f"convert_to({_ident(output.revision)}::text, 'UTF8')"
+        else:
+            version = "decode(md5(_row::text), 'hex')"
+        sql = f"SELECT {key}, {version} FROM {table} _row WHERE {self._where_sql(where)} ORDER BY 1"
+        with psycopg.connect(resolve_env(self.dsn)) as conn, conn.cursor(name="solera_keys") as cur:
+            cur.execute(sql, [where[k] for k in sorted(where)])
+            while chunk := cur.fetchmany(KEY_CHUNK):
+                yield chunk
 
     # -- migrations (§4) --------------------------------------------------------
 

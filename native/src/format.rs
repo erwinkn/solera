@@ -23,11 +23,13 @@ pub enum Error {
     Format(String),
     /// Caller error: unsorted or duplicate keys, mismatched lengths.
     Value(String),
+    /// Raised by a caller's callback (a version function), passed through.
+    Callback(Box<dyn std::error::Error + Send + Sync>),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-fn fmt_err<T>(msg: impl Into<String>) -> Result<T> {
+pub(crate) fn fmt_err<T>(msg: impl Into<String>) -> Result<T> {
     Err(Error::Format(msg.into()))
 }
 
@@ -60,12 +62,12 @@ pub fn get_varint(buf: &[u8], pos: &mut usize) -> Result<u64> {
     }
 }
 
-fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+pub(crate) fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
     put_varint(out, b.len() as u64);
     out.extend_from_slice(b);
 }
 
-fn get_bytes<'a>(buf: &'a [u8], pos: &mut usize) -> Result<&'a [u8]> {
+pub(crate) fn get_bytes<'a>(buf: &'a [u8], pos: &mut usize) -> Result<&'a [u8]> {
     let n = get_varint(buf, pos)? as usize;
     let end = pos.checked_add(n).filter(|&e| e <= buf.len());
     let Some(end) = end else {
@@ -78,7 +80,7 @@ fn get_bytes<'a>(buf: &'a [u8], pos: &mut usize) -> Result<&'a [u8]> {
 
 // -- compression --------------------------------------------------------------------
 
-fn compress(data: &[u8], codec: u8, level: u32) -> Vec<u8> {
+pub(crate) fn compress(data: &[u8], codec: u8, level: u32) -> Vec<u8> {
     if codec == CODEC_ZLIB {
         let mut enc = ZlibEncoder::new(
             Vec::with_capacity(data.len() / 2 + 64),
@@ -91,7 +93,7 @@ fn compress(data: &[u8], codec: u8, level: u32) -> Vec<u8> {
     }
 }
 
-fn decompress(data: &[u8], codec: u8) -> Result<Vec<u8>> {
+pub(crate) fn decompress(data: &[u8], codec: u8) -> Result<Vec<u8>> {
     match codec {
         CODEC_ZLIB => {
             let mut out = Vec::with_capacity(data.len() * 3);
@@ -115,26 +117,31 @@ pub fn filter_nbits(items: u64, bits_per_item: u64) -> u64 {
 /// Blocked Bloom filter: all k bits of an item fall in one 64-byte block.
 #[inline]
 fn bit_positions(item: &[u8], nbits: u64, k: u8) -> impl Iterator<Item = u64> {
-    let h = xxhash_rust::xxh3::xxh3_128(item);
+    hash_positions(xxhash_rust::xxh3::xxh3_128(item), nbits, k)
+}
+
+/// Bit positions of an item from its hash, `XXH3-128(item)`.
+#[inline]
+pub(crate) fn hash_positions(h: u128, nbits: u64, k: u8) -> impl Iterator<Item = u64> {
     let (h1, h2) = (h as u64, (h >> 64) as u64);
     let base = ((((h1 as u128) * ((nbits >> 9) as u128)) >> 64) as u64) << 9;
     let (a, b) = (h2 & 0xFFFF_FFFF, (h2 >> 32) | 1);
     (0..k as u64).map(move |i| base + (a.wrapping_add(i.wrapping_mul(b)) & 511))
 }
 
-fn key_item(buf: &mut Vec<u8>, key: &[u8]) {
+pub(crate) fn key_item(buf: &mut Vec<u8>, key: &[u8]) {
     buf.clear();
     buf.push(b'k');
     buf.extend_from_slice(key);
 }
 
-fn tomb_item(buf: &mut Vec<u8>, key: &[u8]) {
+pub(crate) fn tomb_item(buf: &mut Vec<u8>, key: &[u8]) {
     buf.clear();
     buf.push(b't');
     buf.extend_from_slice(key);
 }
 
-fn pair_item(buf: &mut Vec<u8>, key: &[u8], version: &[u8]) {
+pub(crate) fn pair_item(buf: &mut Vec<u8>, key: &[u8], version: &[u8]) {
     buf.clear();
     buf.push(b'p');
     put_varint(buf, key.len() as u64);
@@ -241,7 +248,7 @@ fn close_block<'a>(
     out.extend_from_slice(&data);
 }
 
-fn shared_prefix(a: &[u8], b: &[u8]) -> usize {
+pub(crate) fn shared_prefix(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
@@ -465,165 +472,102 @@ pub struct BlockMeta {
     pub crc: u32,
 }
 
-/// The blocks of a whole file, after checking the footer and tail checksum.
-pub fn file_blocks(data: &[u8]) -> Result<(u8, Vec<BlockMeta>)> {
-    if data.len() < FOOTER_SIZE {
-        return fmt_err("file too short");
+pub struct Index {
+    pub footer: Footer,
+    pub min_key: Vec<u8>,
+    pub max_key: Vec<u8>,
+    /// Per block: first key, offset, compressed size, entries, CRC.
+    pub blocks: Vec<(Vec<u8>, u64, u64, u64, u32)>,
+}
+
+/// A file's block index from its last bytes (`part` ends at `file_size`).
+pub fn parse_index(part: &[u8], file_size: u64) -> Result<Index> {
+    if part.len() < FOOTER_SIZE {
+        return fmt_err("index part too short");
     }
-    let f = parse_footer(&data[data.len() - FOOTER_SIZE..])?;
-    let tail_end = data.len() - FOOTER_SIZE;
-    let io = f.index_offset as usize;
-    let il = f.index_length as usize;
-    if io + il > tail_end {
+    let footer = parse_footer(&part[part.len() - FOOTER_SIZE..])?;
+    let start = file_size - part.len() as u64;
+    if footer.index_offset < start {
+        return fmt_err("index part too short");
+    }
+    let rel = (footer.index_offset - start) as usize;
+    let Some(raw) = part.get(rel..rel + footer.index_length as usize) else {
         return fmt_err("index out of bounds");
-    }
-    if crc32fast::hash(&data[io..io + il]) != f.index_crc {
+    };
+    if crc32fast::hash(raw) != footer.index_crc {
         return fmt_err("index checksum mismatch");
     }
-    let idx = decompress(&data[io..io + il], f.codec)?;
+    let idx = decompress(raw, footer.codec)?;
     let mut pos = 0;
-    get_bytes(&idx, &mut pos)?; // min key
-    get_bytes(&idx, &mut pos)?; // max key
+    let min_key = get_bytes(&idx, &mut pos)?.to_vec();
+    let max_key = get_bytes(&idx, &mut pos)?.to_vec();
     let nblocks = get_varint(&idx, &mut pos)?;
-    let mut blocks = Vec::with_capacity(nblocks as usize);
+    let mut blocks = Vec::with_capacity(nblocks.min(1 << 20) as usize);
     for _ in 0..nblocks {
-        get_bytes(&idx, &mut pos)?; // first key
+        let first = get_bytes(&idx, &mut pos)?.to_vec();
         let offset = get_varint(&idx, &mut pos)?;
         let size = get_varint(&idx, &mut pos)?;
-        get_varint(&idx, &mut pos)?; // entries
+        let entries = get_varint(&idx, &mut pos)?;
         if pos + 4 > idx.len() {
             return fmt_err("truncated index");
         }
         let crc = u32_at(&idx, pos);
         pos += 4;
-        blocks.push(BlockMeta { offset, size, crc });
+        blocks.push((first, offset, size, entries, crc));
     }
-    let _ = f.entries;
-    let _ = f.filters_length;
-    Ok((f.codec, blocks))
+    Ok(Index {
+        footer,
+        min_key,
+        max_key,
+        blocks,
+    })
 }
 
-// -- merging ------------------------------------------------------------------------
-
-/// Iterates a whole file's entries in key order, decoding one block at a time.
-struct FileIter<'a> {
-    data: &'a [u8],
-    codec: u8,
-    blocks: Vec<BlockMeta>,
-    next_block: usize,
-    cur: Decoded,
-    pos: usize,
-}
-
-impl<'a> FileIter<'a> {
-    fn new(data: &'a [u8]) -> Result<Self> {
-        let (codec, blocks) = file_blocks(data)?;
-        Ok(FileIter {
-            data,
-            codec,
-            blocks,
-            next_block: 0,
-            cur: (vec![], vec![], vec![]),
-            pos: 0,
-        })
+/// A file's three filters, `(nbits, k, bits)`, from its tail (`tail` ends at `file_size`).
+pub fn parse_filters(tail: &[u8], file_size: u64) -> Result<[(u64, u8, &[u8]); 3]> {
+    if tail.len() < FOOTER_SIZE {
+        return fmt_err("tail too short");
     }
-
-    fn next_entry(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>, u8)>> {
-        while self.pos >= self.cur.0.len() {
-            if self.next_block >= self.blocks.len() {
-                return Ok(None);
-            }
-            let b = &self.blocks[self.next_block];
-            self.next_block += 1;
-            let end = (b.offset + b.size) as usize;
-            if end > self.data.len() {
-                return fmt_err("block out of bounds");
-            }
-            let raw = &self.data[b.offset as usize..end];
-            if crc32fast::hash(raw) != b.crc {
-                return fmt_err("block checksum mismatch");
-            }
-            self.cur = decode_block(raw, self.codec)?;
-            self.pos = 0;
-        }
-        let i = self.pos;
-        self.pos += 1;
-        Ok(Some((
-            std::mem::take(&mut self.cur.0[i]),
-            std::mem::take(&mut self.cur.1[i]),
-            self.cur.2[i],
-        )))
+    let footer = parse_footer(&tail[tail.len() - FOOTER_SIZE..])?;
+    let start = file_size - tail.len() as u64;
+    if footer.filters_offset < start {
+        return fmt_err("tail too short");
     }
-}
-
-/// Merge whole files, newest first; for each key the newest entry wins.
-pub fn merge_files(
-    files: &[&[u8]],
-    drop_deleted: bool,
-    o: Options,
-    max_file_bytes: usize,
-) -> Result<Vec<Vec<u8>>> {
-    let mut iters: Vec<FileIter> = files
-        .iter()
-        .map(|f| FileIter::new(f))
-        .collect::<Result<_>>()?;
-    // Heap of (key, rank): for equal keys the smallest rank — the newest file — pops first.
-    let mut heap: BinaryHeap<Reverse<(Vec<u8>, usize)>> = BinaryHeap::new();
-    let mut heads: Vec<Option<(Vec<u8>, u8)>> = vec![None; iters.len()];
-    for (rank, it) in iters.iter_mut().enumerate() {
-        if let Some((k, v, f)) = it.next_entry()? {
-            heads[rank] = Some((v, f));
-            heap.push(Reverse((k, rank)));
-        }
-    }
-    let raw_budget = 2 * max_file_bytes;
-    let mut out = Vec::new();
-    let mut keys: Vec<Vec<u8>> = Vec::new();
-    let mut versions: Vec<Vec<u8>> = Vec::new();
-    let mut flags: Vec<u8> = Vec::new();
-    let mut approx = 0usize;
-    let mut last: Option<Vec<u8>> = None;
-
-    let flush = |keys: &mut Vec<Vec<u8>>,
-                 versions: &mut Vec<Vec<u8>>,
-                 flags: &mut Vec<u8>,
-                 out: &mut Vec<Vec<u8>>|
-     -> Result<()> {
-        if !keys.is_empty() {
-            let ks: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
-            let vs: Vec<&[u8]> = versions.iter().map(|v| v.as_slice()).collect();
-            out.push(encode_file(&ks, &vs, flags, o)?);
-        }
-        keys.clear();
-        versions.clear();
-        flags.clear();
-        Ok(())
+    let rel = (footer.filters_offset - start) as usize;
+    let Some(filters) = tail.get(rel..rel + footer.filters_length as usize) else {
+        return fmt_err("filters out of bounds");
     };
-
-    while let Some(Reverse((key, rank))) = heap.pop() {
-        let (ver, flag) = heads[rank].take().expect("a heap entry always has a head");
-        if let Some((k, v, f)) = iters[rank].next_entry()? {
-            heads[rank] = Some((v, f));
-            heap.push(Reverse((k, rank)));
-        }
-        if last.as_deref() == Some(key.as_slice()) {
-            continue; // an older entry for a key already taken from a newer file
-        }
-        last = Some(key.clone());
-        if flag != 0 && drop_deleted {
-            continue;
-        }
-        approx += key.len() + ver.len() + 4;
-        keys.push(key);
-        versions.push(ver);
-        flags.push(flag);
-        if approx >= raw_budget {
-            flush(&mut keys, &mut versions, &mut flags, &mut out)?;
-            approx = 0;
-        }
+    if filters.len() < 4
+        || crc32fast::hash(&filters[..filters.len() - 4]) != u32_at(filters, filters.len() - 4)
+    {
+        return fmt_err("filters checksum mismatch");
     }
-    flush(&mut keys, &mut versions, &mut flags, &mut out)?;
-    Ok(out)
+    let mut pos = 0;
+    let mut one = || -> Result<(u64, u8, &[u8])> {
+        let nbits = get_varint(filters, &mut pos)?;
+        let Some(&k) = filters.get(pos) else {
+            return fmt_err("truncated filters");
+        };
+        pos += 1;
+        let n = (nbits / 8) as usize;
+        let Some(bits) = filters.get(pos..pos + n) else {
+            return fmt_err("truncated filters");
+        };
+        pos += n;
+        Ok((nbits, k, bits))
+    };
+    Ok([one()?, one()?, one()?])
+}
+
+/// The blocks of a whole file, after checking the footer and index checksum.
+pub fn file_blocks(data: &[u8]) -> Result<(u8, Vec<BlockMeta>)> {
+    let idx = parse_index(data, data.len() as u64)?;
+    let blocks = idx
+        .blocks
+        .iter()
+        .map(|&(_, offset, size, _, crc)| BlockMeta { offset, size, crc })
+        .collect();
+    Ok((idx.footer.codec, blocks))
 }
 
 // -- read kernels -------------------------------------------------------------------
@@ -764,38 +708,6 @@ pub fn merge_range(
     Ok((keys, versions, flags))
 }
 
-pub type ReplaceDiff = (Vec<u8>, Vec<u8>, Vec<Vec<u8>>, u64);
-
-/// Compare a full replacement (sorted keys, versions) with the merged existing index.
-pub fn replace_diff(
-    runs: &[Vec<&[u8]>],
-    codec: u8,
-    keys: &[&[u8]],
-    versions: &[&[u8]],
-) -> Result<ReplaceDiff> {
-    let (ek, ev, _) = merge_range(runs, codec, None, None, true)?;
-    let mut changed = Vec::with_capacity(keys.len());
-    let mut existed = Vec::with_capacity(keys.len());
-    let mut removed = Vec::new();
-    let (mut i, mut j) = (0usize, 0usize);
-    while i < keys.len() || j < ek.len() {
-        if j >= ek.len() || (i < keys.len() && keys[i] < ek[j].as_slice()) {
-            changed.push(1);
-            existed.push(0);
-            i += 1;
-        } else if i >= keys.len() || ek[j].as_slice() < keys[i] {
-            removed.push(ek[j].clone());
-            j += 1;
-        } else {
-            changed.push((versions[i] != ev[j].as_slice()) as u8);
-            existed.push(1);
-            i += 1;
-            j += 1;
-        }
-    }
-    Ok((changed, existed, removed, ek.len() as u64))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -809,23 +721,23 @@ mod tests {
     };
 
     #[test]
-    fn roundtrip_and_merge() {
+    fn roundtrip() {
         let keys: Vec<Vec<u8>> = (0..500)
             .map(|i| format!("key-{i:05}").into_bytes())
             .collect();
         let vers: Vec<Vec<u8>> = (0..500).map(|i| format!("v{i}").into_bytes()).collect();
         let ks: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
         let vs: Vec<&[u8]> = vers.iter().map(|v| v.as_slice()).collect();
-        let del = vec![0u8; 500];
-        let f = encode_file(&ks, &vs, &del, O).unwrap();
-        let merged = merge_files(&[&f], false, O, 1 << 20).unwrap();
-        assert_eq!(merged.len(), 1);
-        let mut it = FileIter::new(&merged[0]).unwrap();
+        let f = encode_file(&ks, &vs, &[0u8; 500], O).unwrap();
+        let (codec, blocks) = file_blocks(&f).unwrap();
         let mut n = 0;
-        while let Some((k, v, _)) = it.next_entry().unwrap() {
-            assert_eq!(k, keys[n]);
-            assert_eq!(v, vers[n]);
-            n += 1;
+        for b in blocks {
+            let (k, v, _) =
+                decode_block(&f[b.offset as usize..(b.offset + b.size) as usize], codec).unwrap();
+            for (k, v) in k.iter().zip(&v) {
+                assert_eq!((k, v), (&keys[n], &vers[n]));
+                n += 1;
+            }
         }
         assert_eq!(n, 500);
     }

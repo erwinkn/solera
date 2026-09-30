@@ -111,7 +111,10 @@ async def test_keyed_sql_reports_its_keys(store):
     written = await store.store([{"id": "a", "v": "1"}, {"id": "b", "v": "2"}], None, scope(source))
     derived = output(key="id", revision="v")
     sql = await store.store(Sql(f"SELECT id, v FROM {written.ref.table}"), None, scope(derived))
-    assert sql.keys == {"a": b"1", "b": b"2"}
+    assert [pair for chunk in sql.keys for pair in chunk] == [(b"a", b"1"), (b"b", b"2")]
+    digested = await store.store(Sql(f"SELECT id, v FROM {written.ref.table}"), None, scope(output(key="id")))
+    pairs = [pair for chunk in digested.keys for pair in chunk]
+    assert [k for k, _ in pairs] == [b"a", b"b"] and all(len(v) == 16 for _, v in pairs)
 
 
 async def test_aliases_rename_the_table(store):

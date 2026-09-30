@@ -52,6 +52,7 @@ from solera.stores import (
     StoreError,
     WriteError,
     key_map,
+    key_rows,
     resolve_env,
 )
 
@@ -531,44 +532,55 @@ async def _store_outputs(spec, project, asset, objects, keys_io, result_value, f
             continue
         index = plan["index"] = KeyIndex(keys_io, None, IndexState.from_json(info["index"]))
         if isinstance(value, Sql):
+            if output.is_partition_set:
+                raise WriteError(f"{output.name}: Sql writes need a table output")
             # Rows the harness never sees: the store reports the whole new key
             # map once it wrote, so its delta comes after — and needs no repair.
             intents[name] = DeltaFiles([], 0, 0, True).to_json()
             continue
         patch = isinstance(value, Patch)
-        new = key_map(output, value.rows if patch else value)
         # With no prior (a first write, or a full run) a Patch is the whole content.
         replace = not patch or prior is None
-        removes = [] if replace else [str(k) for k in value.remove if str(k) not in new]
-        own = set(new), set(removes)
+        content = value.rows if patch else value
         unsettled = info.get("unsettled") or []
-        intended = set(await _intended(info, keys_io, unsettled)) if unsettled else set()
-        if unsettled and not replace:
-            new, removes = await _repair(output, store, prior, intended - own[0] - own[1], new, removes)
-        delta = await index.changes(
-            [key_bytes(k) for k in new], list(new.values()), [key_bytes(k) for k in removes], replace=replace
-        )
-        if not len(delta) and info.get("exists") and not unsettled:
+        batch, attempt = int(info["batch"]), spec["attempt"]
+        if replace:
+            # Every written key against every live one, streamed: the delta goes out as it fills.
+            rows = await asyncio.to_thread(key_rows, output, content)
+            files, changed = await index.replace(rows, batch, attempt, collect=LISTED)
+        else:
+            new = key_map(output, content)
+            removes = [str(k) for k in value.remove if str(k) not in new]
+            own = set(new), set(removes)
+            intended = set(await _intended(info, keys_io, unsettled)) if unsettled else set()
+            if unsettled:
+                new, removes = await _repair(output, store, prior, intended - own[0] - own[1], new, removes)
+            delta = await index.changes(
+                [key_bytes(k) for k in new], list(new.values()), [key_bytes(k) for k in removes]
+            )
+            files = await index.write(batch, attempt, delta)
+            changed = (
+                [k for k, d in zip(delta.keys, delta.deleted, strict=True) if not d],
+                [k for k, d in zip(delta.keys, delta.deleted, strict=True) if d],
+            )
+        if not files.files and info.get("exists") and not unsettled:
             entries[name] = {"unchanged": True}
             del plans[name]
             continue
-        files = (
-            await index.write(int(info["batch"]), spec["attempt"], delta)
-            if len(delta)
-            else DeltaFiles([], 0, 0, True)
-        )
         plan["keys"] = intents[name] = files.to_json()
-        if prior is not None:
-            # The store writes only what changes: the delta, and whatever a
-            # dead attempt may have left half-done among this write's keys.
-            changed = {key_str(k) for k, d in zip(delta.keys, delta.deleted, strict=True) if not d}
-            deleted = {key_str(k) for k, d in zip(delta.keys, delta.deleted, strict=True) if d}
-            plan["upserts"] = frozenset((changed & own[0]) | (own[0] & intended))
-            stale = (intended - own[0]) if replace else (own[1] & intended)
-            plan["removes"] = frozenset(deleted | stale)
+        if prior is not None and not (replace and (changed is None or unsettled)):
+            # The store writes only what changes: the delta, and for a patch whatever a
+            # dead attempt may have left half-done among its keys. A replacement with
+            # more changes than it lists, or with dead attempts', rewrites the scope.
+            upserted, deleted = ({key_str(k) for k in keys} for keys in changed)
+            if replace:
+                plan["upserts"], plan["removes"] = frozenset(upserted), frozenset(deleted)
+            else:
+                plan["upserts"] = frozenset((upserted & own[0]) | (own[0] & intended))
+                plan["removes"] = frozenset(deleted | (own[1] & intended))
         if output.is_partition_set:
             if replace:
-                elements = set(new)
+                elements = {str(e) for e in content or ()}
             else:
                 elements = (set(info.get("elements") or ()) - set(removes)) | set(new)
             plan["elements"] = sorted(elements)
@@ -622,18 +634,8 @@ async def _store_outputs(spec, project, asset, objects, keys_io, result_value, f
         if "index" in plan and isinstance(value, Sql):
             if written.keys is None:
                 raise StoreError(f"{output.name}: store {store_name!r} reported no keys for a Sql write")
-            new = dict(written.keys)
-            delta = await plan["index"].changes(
-                [key_bytes(k) for k in new], list(new.values()), [], replace=True
-            )
-            files = (
-                await plan["index"].write(int(info["batch"]), spec["attempt"], delta)
-                if len(delta)
-                else DeltaFiles([], 0, 0, True)
-            )
+            files, _ = await plan["index"].replace(written.keys, int(info["batch"]), spec["attempt"])
             entry["keys"] = files.to_json()
-            if output.is_partition_set:
-                entry["elements"] = sorted(new)
         elif "index" in plan:
             entry["keys"] = plan["keys"]
             if "elements" in plan:
@@ -653,6 +655,7 @@ async def _store_outputs(spec, project, asset, objects, keys_io, result_value, f
 
 
 REPAIR_PAGE = 100_000
+LISTED = 1_000_000  # changed keys a replacement lists for its store; past it, the store rewrites the scope
 
 
 async def _intended(info, keys_io, unsettled) -> list[str]:

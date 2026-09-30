@@ -29,6 +29,7 @@ from zoneinfo import ZoneInfo
 from croniter import croniter
 from obstore.exceptions import AlreadyExistsError
 from solera.ids import ulid, ulid_time
+from solera.keys import Rows
 from solera.keys.index import KeyIndex, Options, key_bytes, key_str
 from solera.keys.io import ObjectIO, key_cache
 from solera.sdk import TimePartitions, canonical_partition, digest, split_partition
@@ -1540,16 +1541,24 @@ class Engine:
                 new = {str(k): str(v) for k, v in items}
                 removes, replace = [str(k) for k in remove or [] if str(k) not in new], False
             index = KeyIndex(self._key_io(), None, self.m.index(name, "").pinned(), self.key_options)
-            delta = await index.changes(
-                [key_bytes(k) for k in new],
-                [key_bytes(v) for v in new.values()],
-                [key_bytes(k) for k in removes],
-                replace=replace,
-            )
-            if not len(delta):
-                return {"changed": False, "ref": ref}
             batch = int((head or {}).get("batch", -1)) + 1
-            files = await index.write(batch, ulid(self.clock()), delta)
+            attempt = ulid(self.clock())
+            if replace:
+                rows = Rows.objects(list(new.items()), 0, lambda kv: key_bytes(kv[1]))
+                files, changed = await index.replace(rows, batch, attempt, collect=2 * SOURCE_KEYS_RECORDED)
+            else:
+                delta = await index.changes(
+                    [key_bytes(k) for k in new],
+                    [key_bytes(v) for v in new.values()],
+                    [key_bytes(k) for k in removes],
+                )
+                files = await index.write(batch, attempt, delta)
+                changed = (
+                    [k for k, d in zip(delta.keys, delta.deleted, strict=True) if not d],
+                    [k for k, d in zip(delta.keys, delta.deleted, strict=True) if d],
+                )
+            if not files.files:
+                return {"changed": False, "ref": ref}
             ref["version"] = digest([ref["version"], batch, [f.name for f in files.files]])
             record["batch"] = batch
             if source.get("key") == "<elements>" or name in self._set_dims:
@@ -1557,9 +1566,12 @@ class Engine:
                 record["elements"] = sorted(set(new) if replace else (before - set(removes)) | set(new))
             event["keys"] = {**files.to_json(), "batch": batch}
             run["batch"] = batch
-            for field, flag in (("upserted", 0), ("deleted", 1)):
-                changed = [key_str(k) for k, d in zip(delta.keys, delta.deleted, strict=True) if d == flag]
-                run[field] = changed if len(changed) <= SOURCE_KEYS_RECORDED else len(changed)
+            counts = (sum(f.entries for f in files.files) - files.removed, files.removed)
+            for field, keys, count in zip(
+                ("upserted", "deleted"), changed or (None, None), counts, strict=True
+            ):
+                listed = keys is not None and len(keys) <= SOURCE_KEYS_RECORDED
+                run[field] = [key_str(k) for k in keys] if listed else count
         meta = dict(ref.get("meta") or {})
         meta["external"] = True
         ref["meta"] = meta

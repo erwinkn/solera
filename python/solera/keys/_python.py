@@ -1,7 +1,8 @@
 """Pure-Python implementation of the `.kx` key index format (docs/key-index-format.md).
 
-The reference for `solera_native`: the native extension exposes the same
-functions with the same signatures and must decode to identical content.
+The reference for `solera._native`: its kernels have the same signatures,
+its jobs must produce the same content (`merge_files` is a compaction), and
+each must decode the other's files to identical content. Tests only.
 """
 
 from __future__ import annotations
@@ -503,30 +504,3 @@ def merge_range(runs: list, codec: int, after, upto, drop_deleted: bool):
         versions.append(v)
         flags.append(f)
     return keys, versions, bytes(flags)
-
-
-def replace_diff(runs: list, codec: int, keys: list[bytes], versions: list[bytes]):
-    """Compare a full replacement (sorted `keys`, `versions`) with the merged
-    existing index in `runs` (newest first, whole files' blocks).
-
-    Returns: changed (per written entry, 1 if new or at a different version),
-    existed (per written entry, 1 if the key was live before), the live keys
-    the replacement drops, and the number of live keys before."""
-
-    ek, ev, _ = merge_range(runs, codec, None, None, drop_deleted=True)
-    changed, existed, removed = bytearray(), bytearray(), []
-    i = j = 0
-    while i < len(keys) or j < len(ek):
-        if j >= len(ek) or (i < len(keys) and keys[i] < ek[j]):
-            changed.append(1)
-            existed.append(0)
-            i += 1
-        elif i >= len(keys) or ek[j] < keys[i]:
-            removed.append(ek[j])
-            j += 1
-        else:
-            changed.append(0 if versions[i] == ev[j] else 1)
-            existed.append(1)
-            i += 1
-            j += 1
-    return bytes(changed), bytes(existed), removed, len(ek)

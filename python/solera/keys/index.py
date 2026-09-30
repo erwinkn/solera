@@ -4,7 +4,9 @@ An index is one log-structured merge tree of `.kx` files per keyed output
 and partition. `IndexState` is the engine-held record of which files exist;
 it is plain data, changed only through its pure transition methods, so the
 engine can journal it. `KeyIndex` does the I/O: computing a commit's delta,
-writing delta files, paging, reading pending deltas, and compaction.
+writing delta files, paging, reading pending deltas, and compaction. A full
+replacement, a compaction and a recount stream over the whole index
+(`jobs`): memory is a few segments per level and one output file.
 
 Levels: level 0 holds delta files, one per commit, with overlapping key
 ranges, newest first. Levels 1+ hold compacted files with non-overlapping
@@ -18,26 +20,27 @@ import asyncio
 import bisect
 import itertools
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from urllib.parse import quote
 
 from ..ids import ulid
 from . import (
     FOOTER_SIZE,
-    IMPL,
+    Job,
+    Rows,
     bloom_check_keys,
     bloom_check_pairs,
     bloom_check_tombstones,
     check_block,
-    encode_file,
+    jobs,
     lookup,
-    merge_files,
     merge_range,
     parse_footer,
     parse_index,
     parse_tail,
-    replace_diff,
     sort_entries,
+    write_files,
 )
 from .io import RANGE, ObjectIO
 
@@ -279,8 +282,8 @@ class Options:
     request_latency: float = 0.03
     bandwidth: float = 500e6  # all requests together
     connection_bandwidth: float = 80e6  # one request
-    decode_rate: float = 4.5e6 if IMPL == "native" else 1e6  # entries per second
-    check_rate: float = 0.4e6 if IMPL == "native" else 0.12e6  # keys through a file's filters per second
+    decode_rate: float = 4.5e6  # entries per second
+    check_rate: float = 0.4e6  # keys through a file's filters per second
     l0_max_files: int = 8
     l0_max_bytes: int = 64 * 2**20
     level_base: int = 64 * 2**20
@@ -413,11 +416,6 @@ class KeyIndex:
         await asyncio.gather(*(fetch(r) for r in p.runs(wanted)))
         return out
 
-    async def _all_blocks(self, f: FileInfo) -> tuple[int, list[bytes]]:
-        p = await self._open(f, data=True)
-        fetched = await self._blocks(p, range(len(p.tail["blocks"])))
-        return p.tail["codec"], [fetched[i] for i in range(len(fetched))]
-
     def _estimate(self, cost: Cost, checks: int = 0) -> float:
         """Seconds for `cost`, plus `checks` filter checks: request rounds, transfer, and CPU."""
 
@@ -428,57 +426,55 @@ class KeyIndex:
 
     # -- a commit's delta ----------------------------------------------------------------
 
-    async def changes(
-        self,
-        keys: list[bytes],
-        versions: list[bytes],
-        removes: list[bytes] = (),
-        *,
-        replace: bool = False,
-    ) -> Delta:
-        """Which written entries change the index.
-
-        `replace=False`: upsert `keys` at `versions`, delete `removes`.
-        `replace=True`: the written entries are the whole new content; every
-        live key not written is deleted."""
+    async def changes(self, keys: list[bytes], versions: list[bytes], removes: list[bytes] = ()) -> Delta:
+        """Which entries of a patch change the index: upsert `keys` at
+        `versions`, delete `removes`. A full replacement is `replace`."""
 
         keys, versions, _ = sort_entries(list(keys), list(versions), bytes(len(keys)))
         keys, versions = list(keys), list(versions)
-        if replace:
-            if removes:
-                raise ValueError("a replacement has no separate removes")
-            return await self._replace(keys, versions)
         removes = sorted(set(removes))
         if removes and set(removes) & set(keys):
             raise ValueError("a key cannot be both written and removed")
         return await self._patch(keys, versions, removes)
 
-    async def _replace(self, keys: list[bytes], versions: list[bytes]) -> Delta:
-        runs, codec = [], 1
-        for level in self.state.newest_first():
-            run = []
-            for file_codec, blocks in await asyncio.gather(*(self._all_blocks(f) for f in level)):
-                codec = file_codec
-                run += blocks
-            runs.append(run)
-        changed, existed, removed, _live = replace_diff(runs, codec, keys, versions)
-        idx = [n for n in range(len(keys)) if changed[n]]
-        out_k, out_v, out_d = [], [], bytearray()
-        added = i = j = 0
-        while i < len(idx) or j < len(removed):
-            if j >= len(removed) or (i < len(idx) and keys[idx[i]] < removed[j]):
-                n = idx[i]
-                out_k.append(keys[n])
-                out_v.append(versions[n])
-                out_d.append(0)
-                added += 0 if existed[n] else 1
-                i += 1
-            else:
-                out_k.append(removed[j])
-                out_v.append(b"")
-                out_d.append(1)
-                j += 1
-        return Delta(out_k, out_v, bytes(out_d), added, len(removed), True)
+    async def replace(
+        self, rows: Rows | Iterable, batch: int, attempt: str, *, collect: int = 0
+    ) -> tuple[DeltaFiles, tuple[list[bytes], list[bytes]] | None]:
+        """A full replacement: `rows` is the whole new content — a `Rows`, or
+        `(key, version)` chunks sorted by key, pulled as needed. Every live
+        key is compared as the join reaches it; new keys and changed versions
+        are written, live keys not in `rows` deleted. The delta goes out as
+        the batch's files as they fill. Returns them and, up to `collect`
+        keys, the written and the deleted keys (None past it)."""
+
+        runs = self.state.newest_first()
+        job = Job.replace(
+            rows if isinstance(rows, Rows) else None, len(runs), **self._writer(), collect=collect
+        )
+        files = await self._run(job, runs, lambda n: f"{batch:012d}-{attempt}.{n:04d}", 0, rows)
+        return DeltaFiles(files, job.added, job.removed, True), job.collected()
+
+    def _writer(self) -> dict:
+        o = self.o
+        return {
+            "block_size": o.block_size,
+            "level": o.level,
+            "bits_per_item": o.bits_per_item,
+            "k": o.k,
+            "max_file_bytes": o.max_file_bytes,
+        }
+
+    async def _run(self, job: Job, runs, name=None, level: int = 0, rows=None) -> list[FileInfo]:
+        """Drive a streaming job over `runs`; its files are written as `name(n)`, at `level`."""
+
+        files: dict[int, FileInfo] = {}
+
+        async def put(n: int, data: bytes):
+            await self.io.write(self.path(name(n)), data)
+            files[n] = FileInfo.describe(name(n), level, data)
+
+        await jobs.run(job, self.io, self.path, runs, put, None if isinstance(rows, Rows) else rows)
+        return [files[n] for n in sorted(files)]
 
     async def _patch(self, keys: list[bytes], versions: list[bytes], removes: list[bytes]) -> Delta:
         want = dict(zip(keys, versions, strict=True))
@@ -731,41 +727,15 @@ class KeyIndex:
     # -- writing ------------------------------------------------------------------------
 
     async def write(self, batch: int, attempt: str, delta: Delta) -> DeltaFiles:
-        """Write a delta as the batch's files, `{batch}-{attempt}[.{n}]`: the
-        attempt id keeps a retried batch from colliding with its own upload."""
+        """Write a patch's delta as the batch's files, `{batch}-{attempt}.{n}`:
+        the attempt id keeps a retried batch from colliding with its own upload."""
 
-        chunks = self._split(delta.keys, delta.versions, delta.deleted)
-        files = []
-        for n, (ks, vs, ds) in enumerate(chunks):
-            data = encode_file(
-                ks,
-                vs,
-                ds,
-                block_size=self.o.block_size,
-                level=self.o.level,
-                bits_per_item=self.o.bits_per_item,
-                k=self.o.k,
-            )
-            name = f"{batch:012d}-{attempt}" + (f".{n:04d}" if len(chunks) > 1 else "")
-            await self.io.write(self.path(name), data)
-            files.append(FileInfo.describe(name, 0, data))
+        datas = write_files(delta.keys, delta.versions, delta.deleted, **self._writer()) if delta.keys else []
+        files = [FileInfo.describe(f"{batch:012d}-{attempt}.{n:04d}", 0, d) for n, d in enumerate(datas)]
+        await asyncio.gather(
+            *(self.io.write(self.path(f.name), d) for f, d in zip(files, datas, strict=True))
+        )
         return DeltaFiles(files, delta.added, delta.removed, delta.exact)
-
-    def _split(self, keys, versions, deleted):
-        """Consecutive chunks of about `max_file_bytes` once compressed (~2x)."""
-
-        if not keys:
-            return []
-        out, start, size = [], 0, 0
-        budget = 2 * self.o.max_file_bytes
-        for i in range(len(keys)):
-            size += len(keys[i]) + len(versions[i]) + 4
-            if size >= budget:
-                out.append((keys[start : i + 1], versions[start : i + 1], deleted[start : i + 1]))
-                start, size = i + 1, 0
-        if start < len(keys):
-            out.append((keys[start:], versions[start:], deleted[start:]))
-        return out
 
     # -- scans: full delivery and pending deltas ----------------------------------------------
 
@@ -850,15 +820,12 @@ class KeyIndex:
         levels = [list(logged[b]) for b in range(last_batch, first_batch - 1, -1)]
         return await self._scan(levels, after, limit, drop_deleted=False)
 
-    async def recount(self, page: int = 100_000) -> int:
-        """Count live keys exactly by scanning the whole index."""
+    async def recount(self) -> int:
+        """Count live keys exactly: one streaming pass over the whole index."""
 
-        n, after = 0, None
-        while True:
-            keys, _, after = await self.page(after, page)
-            n += len(keys)
-            if after is None:
-                return n
+        job = Job.count(len(runs := self.state.newest_first()))
+        await self._run(job, runs)
+        return job.live
 
     # -- compaction ------------------------------------------------------------------------
 
@@ -909,22 +876,16 @@ class KeyIndex:
             # The deepest level moves down whole: nothing below it to merge with.
             return [replace(f, level=out_level) for f in inputs], [f.name for f in inputs]
         drop = out_level >= self.state.depth  # nothing older below: tombstones can go
-        datas = await asyncio.gather(*(self.io.read_whole(self.path(f.name), f.size) for f in inputs))
-        merged = merge_files(
-            list(datas),
-            drop_deleted=drop,
-            block_size=self.o.block_size,
-            level=self.o.level,
-            bits_per_item=self.o.bits_per_item,
-            k=self.o.k,
-            max_file_bytes=self.o.max_file_bytes,
-        )
+        # Runs, newest first: each level-0 file alone, a deeper level's files together.
+        runs = []
+        for lv, group in itertools.groupby(inputs, lambda f: f.level):
+            group = list(group)
+            runs += [[f] for f in group] if lv == 0 else [group]
+        job = Job.compact(len(runs), drop_deleted=drop, **self._writer())
         # A level-0 file is as recent as its newest input: level 0 orders by name, and delta
         # names start with their batch.
         stamp = ulid() if out_level else f"{inputs[0].name.split('-', 1)[0]}-c{ulid()}"
-        added = []
-        for n, data in enumerate(merged):
-            name = f"c{stamp}-{n:04d}" if out_level else f"{stamp}.{n:04d}"
-            await self.io.write(self.path(name), data)
-            added.append(FileInfo.describe(name, out_level, data))
+        added = await self._run(
+            job, runs, lambda n: f"c{stamp}-{n:04d}" if out_level else f"{stamp}.{n:04d}", out_level
+        )
         return added, [f.name for f in inputs]

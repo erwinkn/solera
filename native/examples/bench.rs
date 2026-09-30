@@ -1,6 +1,9 @@
 //! Encode and merge throughput without Python: `cargo run --release --example bench`.
 
 use solera_native::format::{self, Options, CODEC_NONE, CODEC_ZLIB};
+use solera_native::jobs::{Compact, Step};
+use solera_native::stream::{Bytes, Segment, Writer};
+use std::sync::Arc;
 use std::time::Instant;
 
 fn main() {
@@ -66,20 +69,50 @@ fn main() {
             f.len() as f64 / 1e6
         );
     }
-    let f = format::encode_file(&ks, &vs, &del, o).unwrap();
     let t = Instant::now();
-    let out = format::merge_files(&[&f], true, o, 64 << 20).unwrap();
+    let mut w = Writer::new(o, 64 << 20);
+    for i in 0..ks.len() {
+        w.push(ks[i], vs[i], false).unwrap();
+    }
+    w.finish(false).unwrap();
     println!(
         "{:32} {:6.3} s  {} files",
-        "merge (decode + re-encode)",
+        "streaming writer (every core)",
         t.elapsed().as_secs_f64(),
-        out.len()
+        w.files.len()
     );
+    let f = format::encode_file(&ks, &vs, &del, o).unwrap();
+    let (codec, blocks) = format::file_blocks(&f).unwrap();
+    let data: Bytes = Arc::new(f);
     let t = Instant::now();
-    let _ = format::merge_range(&[vec![&f[..f.len()]]], CODEC_ZLIB, None, None, true);
+    let mut job = Compact::new(1, true, o, 64 << 20);
+    let mut fed = false;
+    let mut files = 0;
+    loop {
+        match job.step().unwrap() {
+            Step::Run(r) if !fed => {
+                job.merge.runs[r].feed(Segment {
+                    data: data.clone(),
+                    blocks: blocks
+                        .iter()
+                        .map(|b| (b.offset as usize, b.size as usize, b.crc))
+                        .collect(),
+                    codec,
+                });
+                fed = true;
+            }
+            Step::Run(r) => job.merge.runs[r].end(),
+            Step::File => {
+                job.writer.files.pop_front();
+                files += 1;
+            }
+            Step::Rows => unreachable!(),
+            Step::Done => break,
+        }
+    }
     println!(
-        "{:32} {:6.3} s",
-        "(bogus single-run merge_range)",
-        t.elapsed().as_secs_f64()
+        "{:32} {:6.3} s  {files} files",
+        "compact (decode + re-encode)",
+        t.elapsed().as_secs_f64(),
     );
 }

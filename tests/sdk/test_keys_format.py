@@ -7,6 +7,8 @@ import pytest
 from solera import _native
 from solera.keys import _python
 
+from .keys_driver import drive
+
 _MODULES = {"python": _python, "native": _native}
 IMPLS = [pytest.param(m, id=name) for name, m in _MODULES.items()]
 CROSS = [
@@ -126,22 +128,33 @@ def test_rejects_unsorted_or_duplicate_keys(impl):
         impl.encode_file([b"a", b"a"], [b"", b""], b"\x00\x00")
 
 
+@pytest.mark.parametrize("writer,reader", CROSS)
+def test_tails_parse_alike(writer, reader):
+    keys, versions, deleted = entries(3000, deleted_every=9)
+    data = writer.encode_file(keys, versions, deleted, block_size=2048)
+    footer = reader.parse_footer(data[-48:])
+    assert reader.parse_tail(data[footer["filters_offset"] :], len(data)) == _python.parse_tail(
+        data[footer["filters_offset"] :], len(data)
+    )
+    assert reader.parse_index(data[footer["index_offset"] :], len(data)) == _python.parse_index(
+        data[footer["index_offset"] :], len(data)
+    )
+
+
 @pytest.mark.parametrize("impl", IMPLS)
 def test_detects_corruption(impl):
     keys, versions, deleted = entries(500)
     data = bytearray(impl.encode_file(keys, versions, deleted, block_size=1024))
-    tail = _python.parse_tail(
-        bytes(data[_python.parse_footer(bytes(data[-48:]))["filters_offset"] :]), len(data)
-    )
+    tail = impl.parse_tail(bytes(data[impl.parse_footer(bytes(data[-48:]))["filters_offset"] :]), len(data))
     _, off, size, _, crc = tail["blocks"][3]
     data[off + size // 2] ^= 0xFF
-    with pytest.raises(_python.FormatError):
-        _python.check_block(bytes(data[off : off + size]), crc)
+    with pytest.raises(impl.FormatError):
+        impl.check_block(bytes(data[off : off + size]), crc)
     data[-60] ^= 0xFF  # inside the index
-    with pytest.raises(_python.FormatError):
-        _python.parse_tail(bytes(data[tail["filters_offset"] :]), len(data))
-    with pytest.raises(_python.FormatError):
-        _python.parse_footer(b"XXXX" + bytes(data[-44:]))
+    with pytest.raises(impl.FormatError):
+        impl.parse_tail(bytes(data[tail["filters_offset"] :]), len(data))
+    with pytest.raises(impl.FormatError):
+        impl.parse_footer(b"XXXX" + bytes(data[-44:]))
 
 
 @pytest.mark.parametrize("impl", IMPLS)
@@ -157,11 +170,20 @@ def test_sort_entries(impl):
         impl.sort_entries([b"x", b"x"], [b"", b""], b"\x00\x00")
 
 
+def merge(impl, files, **kw):
+    """Merge whole files, newest first: the reference's `merge_files`, or a native compaction."""
+
+    if impl is _python:
+        return _python.merge_files(files, **kw)
+    job = _native.Job.compact(len(files), **kw)
+    return drive(job, [[f] for f in files])
+
+
 @pytest.mark.parametrize("writer,reader", CROSS)
 def test_merge_newest_wins(writer, reader):
     old = writer.encode_file([b"a", b"b", b"c", b"d"], [b"1", b"1", b"1", b"1"], b"\x00\x00\x00\x00")
     new = writer.encode_file([b"b", b"c", b"e"], [b"2", b"2", b"2"], b"\x00\x01\x00")  # c deleted
-    [merged] = reader.merge_files([new, old], drop_deleted=False)
+    [merged] = merge(reader, [new, old], drop_deleted=False)
     _, k, v, f = decode_all(reader, merged)
     assert list(zip(k, v, f, strict=True)) == [
         (b"a", b"1", 0),
@@ -170,7 +192,7 @@ def test_merge_newest_wins(writer, reader):
         (b"d", b"1", 0),
         (b"e", b"2", 0),
     ]
-    [bottom] = reader.merge_files([new, old], drop_deleted=True)
+    [bottom] = merge(reader, [new, old], drop_deleted=True)
     _, k, _, _ = decode_all(reader, bottom)
     assert k == [b"a", b"b", b"d", b"e"]
 
@@ -180,7 +202,7 @@ def test_merge_splits_large_output(impl):
     keys, versions, deleted = entries(20000)
     a = impl.encode_file(keys[::2], versions[::2], deleted[::2])
     b = impl.encode_file(keys[1::2], versions[1::2], deleted[1::2])
-    out = impl.merge_files([a, b], drop_deleted=True, max_file_bytes=100_000)
+    out = merge(impl, [a, b], drop_deleted=True, max_file_bytes=100_000)
     assert len(out) > 2
     seen = []
     for f in out:
@@ -226,19 +248,6 @@ def test_merge_range(writer, reader):
     assert k == [b"d", b"e"]
 
 
-@pytest.mark.parametrize("writer,reader", CROSS)
-def test_replace_diff(writer, reader):
-    old = writer.encode_file([b"a", b"b", b"c", b"d"], [b"1", b"1", b"1", b"1"], b"\x00\x00\x00\x00")
-    new = writer.encode_file([b"d"], [b"2"], b"\x01")  # d was deleted since
-    runs = [blocks_of(new)[1], blocks_of(old)[1]]
-    written = [b"a", b"c", b"d", b"e"]
-    changed, existed, removed, live = reader.replace_diff(runs, 1, written, [b"1", b"9", b"1", b"1"])
-    assert changed == b"\x00\x01\x01\x01"  # a same; c new version; d re-added; e new
-    assert existed == b"\x01\x01\x00\x00"
-    assert removed == [b"b"]
-    assert live == 3
-
-
 @pytest.mark.parametrize("impl", IMPLS)
 def test_detects_filter_corruption_and_reads_the_index_alone(impl):
     keys, versions, deleted = entries(800)
@@ -248,5 +257,5 @@ def test_detects_filter_corruption_and_reads_the_index_alone(impl):
     idx = _python.parse_index(bytes(data[footer["index_offset"] :]), len(data))
     assert idx["min_key"] == keys[0] and "key_filter" not in idx
     data[footer["filters_offset"] + 10] ^= 0xFF
-    with pytest.raises(_python.FormatError):
-        _python.parse_tail(bytes(data[footer["filters_offset"] :]), len(data))
+    with pytest.raises(impl.FormatError):
+        impl.parse_tail(bytes(data[footer["filters_offset"] :]), len(data))

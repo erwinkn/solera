@@ -8,7 +8,8 @@ import random
 
 import pytest
 from obstore.store import MemoryStore
-from solera.keys.index import IndexState, KeyIndex, Options
+from solera.keys import Rows, _python
+from solera.keys.index import Delta, IndexState, KeyIndex, Options
 from solera.keys.io import DiskCache, ObjectIO
 
 
@@ -46,7 +47,29 @@ class Harness:
     async def commit(self, keys, versions, removes=(), replace=False):
         before = dict(self.model)
         idx = self.index()
-        delta = await idx.changes(keys, versions, removes, replace=replace)
+        if replace:
+            # Streamed out as files: read them back.
+            items = list(zip(keys, versions, strict=True))
+            random.Random(len(items)).shuffle(items)
+            rows = Rows.objects(items, 0, lambda kv: kv[1])
+            files, changed = await idx.replace(rows, self.batch, f"a{self.batch}", collect=10**6)
+            written = [
+                e
+                for f in files.files
+                for e in _python.iter_file(await self.io.read_whole(idx.path(f.name), f.size))
+            ]
+            delta = Delta(
+                [k for k, _, _ in written],
+                [v for _, v, _ in written],
+                bytes(d for _, _, d in written),
+                files.added,
+                files.removed,
+                files.exact,
+            )
+            assert changed == ([k for k, _, d in written if not d], [k for k, _, d in written if d])
+        else:
+            delta = await idx.changes(keys, versions, removes)
+            files = await idx.write(self.batch, f"a{self.batch}", delta)
         # What the dict says changed.
         if replace:
             after = dict(zip(keys, versions, strict=True))
@@ -64,7 +87,6 @@ class Harness:
         assert delta.keys == sorted(delta.keys)
         if delta.exact:
             assert delta.added - delta.removed == len(after) - len(before)
-        files = await idx.write(self.batch, f"a{self.batch}", delta)
         self.state = self.state.committed(self.batch, files, keep_log=True)
         self.batch += 1
         self.model = after
@@ -215,7 +237,8 @@ async def test_pages_read_only_the_block_indexes_they_need():
 
     h = Harness(small_options())
     ks = [key(i) for i in range(20000)]
-    await h.commit(ks, [b"v"] * len(ks))
+    rng = random.Random(0)
+    await h.commit(ks, [rng.randbytes(16) for _ in ks])  # row digests: blocks outweigh filters
     assert len(h.state.files) >= 6
     tails = sum(f.tail for f in h.state.files)
     h.io.metrics.reset()

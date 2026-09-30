@@ -9,7 +9,7 @@ import json
 import os
 import pickle
 import typing
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 from urllib.parse import quote, unquote
@@ -81,11 +81,13 @@ class Scope:
 class Written:
     """What a store wrote. `keys` is only for writes the harness never sees as
     rows (`Sql` materialized inside Postgres): the scope's complete new
-    `key -> version` map. For every other write the harness derives keys from
-    the rows itself (§6, §9)."""
+    content as `(key, version)` pairs sorted by key's UTF-8 bytes, in chunks —
+    lists of pairs, or Arrow data with key and version columns — which the
+    harness pulls one at a time, after `store` returned. For every other write
+    the harness derives keys from the rows itself (§6, §9)."""
 
     ref: Ref
-    keys: Mapping[str, bytes] | None = None
+    keys: Iterable | None = None
 
 
 @runtime_checkable
@@ -206,6 +208,52 @@ def key_map(output: Output, value: Any) -> dict[str, bytes]:
             raise WriteError(f"{output.name}: {key!r} lacks the declared revision field {output.revision!r}")
         result[key] = str(row[output.revision]).encode()
     return result
+
+
+def key_rows(output: Output, value: Any):
+    """A keyed replacement's content for the key index (`solera.keys.Rows`):
+    the keys and versions `key_map` defines, packed or read in place, with
+    versions computed as the index reaches each row. Arrow data (anything
+    with `__arrow_c_stream__`) is read in place; a DataFrame becomes Arrow
+    through DuckDB. Its row digests are over the Arrow values (see
+    `native/src/arrow.rs`), so they differ from a `list[dict]`'s."""
+
+    from .keys import Rows
+
+    name = output.name
+    try:
+        if output.is_partition_set:
+            return Rows.objects([str(e) for e in value or ()], None, b"1")
+        if output.key == KEYS:
+            if value is None:
+                value = {}
+            if not isinstance(value, Mapping) or not all(isinstance(k, str) for k in value):
+                raise WriteError(f"{name}: a keyed output takes dict[str, Any], got {type(value).__name__}")
+            return Rows.objects(list(value.items()), 0, lambda kv: revision(kv[1]))
+        if _is_dataframe(value):
+            import duckdb
+
+            value = duckdb.connect().from_df(value)
+        if hasattr(value, "__arrow_c_stream__"):
+            return Rows.arrow(value, output.key, output.revision)
+        if value is None:
+            value = []
+        if not isinstance(value, list) or not all(isinstance(r, Mapping) for r in value):
+            raise WriteError(f"{name}: expected rows (list[dict] or DataFrame), got {type(value).__name__}")
+        if output.revision:
+            rev = output.revision
+
+            def version(row):
+                if rev not in row:
+                    raise WriteError(f"{name}: {row[output.key]!r} lacks the declared revision field {rev!r}")
+                return str(row[rev]).encode()
+
+            return Rows.objects(value, output.key, version)
+        return Rows.objects(value, output.key, revision)
+    except KeyError as e:
+        raise WriteError(f"{name}: row lacks the declared key column {output.key!r}") from e
+    except ValueError as e:  # a duplicate key, or Arrow data without the columns
+        raise WriteError(f"{name}: {e} in write") from e
 
 
 def remove_empty_dirs(objects, prefixes) -> None:

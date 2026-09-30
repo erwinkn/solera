@@ -39,15 +39,14 @@ async def create_only_probe(objects):
 async def key_index_probe(objects):
     """Index files are written create-only and read back by range (§6)."""
 
+    from solera.keys import Rows
     from solera.keys.index import IndexState, KeyIndex
     from solera.keys.io import ObjectIO
 
     io = ObjectIO(objects)
     state = IndexState(prefix="conformance/keys/")
     index = KeyIndex(io, None, state)
-    files = await index.write(
-        0, uuid.uuid4().hex, await index.changes([b"a", b"b"], [b"1", b"1"], replace=True)
-    )
+    files, _ = await index.replace(Rows.objects([b"b", b"a"], None, b"1"), 0, uuid.uuid4().hex)
     state = state.committed(0, files, keep_log=True)
     try:
         index = KeyIndex(io, None, state)
