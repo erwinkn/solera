@@ -93,7 +93,7 @@ store-specific config validated by `can_store` at registration.
 |---|---|
 | `keyed` | The output is a `dict[str, Any]`: its keys are the keys, its values the content. Excludes `key` and `revision`. |
 | `key` | Column identifying what was materialized. Declared once, here; consumers never name columns. Independent of `primary_key` (storage identity). |
-| `revision` | Column that changes when a key's content changes. Absent: `revision = H(row)`. |
+| `revision` | Column that changes when a key's content changes. Absent: a 16-byte digest of the row. |
 | `incremental` | The output commits in engine-numbered batches: a keyed output's changes land in its key index (object-store-state.md §6), an unkeyed one's batches in its store; `Incremental()` consumers read what arrived after their watermark. `key=` implies it. Default false — a value output is one object per version. |
 | `migrations` | Ordered `Migration(name, payload)` list owned by this output. The store applies pending ones before its first write to the output in an attempt (§4). Payload type is store-defined (`can_store`). The applied set travels in the handle (§3) and the declared list is in the fingerprint (§6). |
 | `**config` | Store-specific: `schema`, `primary_key`, `columns`, `indexes`, `partition_column`, … |
@@ -205,8 +205,8 @@ class Store(Protocol):
 
 Scope   = (output: Output, partition: str, batch: int | None, attempt: str | None, aliases: tuple,
            upserts: frozenset[str] | None, removes: frozenset[str] | None)
-Written = (ref: Ref, keys: Mapping[str, str] | None)   # keys: only for Sql writes the harness never sees
-Keys    = (revisions: Mapping[str, str])
+Written = (ref: Ref, keys: Mapping[str, bytes] | None)   # keys: only for Sql writes the harness never sees
+Keys    = (revisions: Mapping[str, bytes])  # revisions as the key index holds them
 Batches = (lo: int, hi: int)  # load rows of batches in [lo, hi]
 ```
 

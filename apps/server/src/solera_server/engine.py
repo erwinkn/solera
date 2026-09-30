@@ -1591,10 +1591,14 @@ class Engine:
         index = KeyIndex(self._key_io(), None, state.pinned(), self.key_options)
         start = key_bytes(after) if after is not None else None
         keys, versions, nxt = await index.page(start, offset + limit)
+        # Versions are a declared revision's text, a source's version, or else a row digest.
+        record = self.manifest["outputs"].get(output) or {}
+        digests = not (record.get("source") or record.get("partition_set") or record.get("revision"))
+        show = bytes.hex if digests else key_str
         return {
             "total": state.count,
             "exact": state.count_exact,
-            "keys": {key_str(k): key_str(v) for k, v in list(zip(keys, versions, strict=True))[offset:]},
+            "keys": {key_str(k): show(v) for k, v in list(zip(keys, versions, strict=True))[offset:]},
             "next": key_str(nxt) if nxt is not None else None,
         }
 

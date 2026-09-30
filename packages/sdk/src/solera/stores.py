@@ -42,9 +42,10 @@ class Sql:
 
 @dataclass(frozen=True)
 class Keys:
-    """A `key -> revision` selection passed to `store.load` (§4)."""
+    """A `key -> revision` selection passed to `store.load` (§4), revisions as
+    the key index holds them (see `key_map`)."""
 
-    revisions: Mapping[str, str]
+    revisions: Mapping[str, bytes]
 
 
 @dataclass(frozen=True)
@@ -84,7 +85,7 @@ class Written:
     the rows itself (§6, §9)."""
 
     ref: Ref
-    keys: Mapping[str, str] | None = None
+    keys: Mapping[str, bytes] | None = None
 
 
 @runtime_checkable
@@ -159,11 +160,10 @@ def encode(value: Any) -> tuple[bytes, str]:
     return pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL), "pkl"
 
 
-def revision(value: Any) -> str:
-    """A content revision: the hash of the value's encoding. For JSON it is
-    `digest(value)`."""
+def revision(value: Any) -> bytes:
+    """A content revision: a 16-byte digest of the value's encoding."""
 
-    return hashlib.sha256(encode(value)[0]).hexdigest()
+    return hashlib.blake2b(encode(value)[0], digest_size=16).digest()
 
 
 def entries(output: Output, value: Any) -> dict[str, Any]:
@@ -191,19 +191,20 @@ def entries(output: Output, value: Any) -> dict[str, Any]:
     return result
 
 
-def key_map(output: Output, value: Any) -> dict[str, str]:
-    """The scope's complete `key -> revision` map for a keyed write (§4)."""
+def key_map(output: Output, value: Any) -> dict[str, bytes]:
+    """The scope's complete `key -> revision` map for a keyed write (§4): the
+    declared revision field's text, else a row digest (`revision`)."""
 
     content = entries(output, value)
     if output.is_partition_set:
-        return dict.fromkeys(content, "1")
+        return dict.fromkeys(content, b"1")
     if not output.revision:
         return {key: revision(entry) for key, entry in content.items()}
     result = {}
     for key, row in content.items():
         if not isinstance(row, Mapping) or output.revision not in row:
             raise WriteError(f"{output.name}: {key!r} lacks the declared revision field {output.revision!r}")
-        result[key] = str(row[output.revision])
+        result[key] = str(row[output.revision]).encode()
     return result
 
 

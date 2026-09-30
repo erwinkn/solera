@@ -175,11 +175,12 @@ async def test_refs_round_trip_and_gone_values_fail(store):
         await store.load(back, None, None)
 
 
-def test_revision_of_json_is_its_digest():
-    from solera.sdk import digest
+def test_revision_is_a_16_byte_digest_of_the_encoding():
+    import hashlib
 
     row = {"id": "a", "n": [1, 2]}
-    assert revision(row) == digest(row)
+    assert revision(row) == hashlib.blake2b(b'{"id":"a","n":[1,2]}', digest_size=16).digest()
+    assert revision(row) != revision({**row, "n": [2, 1]})
 
 
 def test_the_default_path(tmp_path, monkeypatch):

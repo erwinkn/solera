@@ -10,8 +10,9 @@ import threading
 
 import pytest
 from solera.keys.index import DeltaFiles, IndexState, KeyIndex, Options
+from solera.keys.io import ObjectIO
 from solera.sdk import Incremental, Output, PartitionSet, Project, Ref, Source, asset
-from solera.stores import FileStore, Patch
+from solera.stores import FileStore, Patch, revision
 from solera_server.engine import Engine
 from solera_server.placements.inline import InlinePlacement
 from solera_server.state import State
@@ -120,6 +121,27 @@ async def test_a_keyed_write_reaches_the_store_as_its_delta(state, data):
     assert sorted(after) == ["b.json", "c.json"]
     assert after["c.json"] == before["c.json"]  # unchanged: not rewritten
     assert (data / "scores" / "b.json").read_text() == "2"
+
+
+async def test_row_digests_are_16_bytes_end_to_end(state):
+    """§6: without a declared revision, a row's version is a 16-byte digest of
+    its content: what the index stores, and what key listings show in hex."""
+
+    rows = [{"id": "a", "n": 1}, {"id": "b", "n": 2}]
+
+    @asset(outputs=Output("items", key="id"))
+    def items():
+        return rows
+
+    engine = engine_for(state, Project(assets=[items]))
+    await engine.initialize()
+    await run(engine, ["items"])
+    index = KeyIndex(ObjectIO(state.objects), None, state.model.indexes[("items", "")])
+    keys, versions, _ = await index.page(None, 10)
+    assert keys == [b"a", b"b"] and versions == [revision(r) for r in rows]
+    assert all(len(v) == 16 for v in versions)
+    listed = await engine.list_keys("items")
+    assert listed["keys"] == {"a": revision(rows[0]).hex(), "b": revision(rows[1]).hex()}
 
 
 async def test_compaction_truncation_and_garbage(state):

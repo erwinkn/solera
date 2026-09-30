@@ -11,7 +11,6 @@ it is installed. Results print as Markdown.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import math
 import random
 import time
@@ -19,6 +18,7 @@ import uuid
 
 from solera import keys as K
 from solera.keys import CODEC_NONE, parse_footer, parse_tail
+from solera.stores import revision
 
 
 def random_ids(n: int, rng: random.Random) -> list[bytes]:
@@ -42,9 +42,8 @@ KEYS = {
     ),
 }
 VERSIONS = {
-    "16 random bytes (bench, model)": lambda n, rng: [rng.randbytes(16) for _ in range(n)],
-    "SHA-256 hex (row digest, the default)": lambda n, rng: [
-        hashlib.sha256(rng.randbytes(8)).hexdigest().encode() for _ in range(n)
+    "row digest (the default; bench, model)": lambda n, rng: [
+        revision({"id": i, "value": rng.random()}) for i in range(n)
     ],
     "short revision `%d`": lambda n, rng: [b"%d" % rng.randrange(10**6) for _ in range(n)],
 }
@@ -129,7 +128,7 @@ def false_positives(n: int, probes: int):
 
 
 def block_sizes(n: int):
-    print(f"\n### Block size ({n:,} entries: random ids; 16-byte and SHA-256 hex versions)\n")
+    print(f"\n### Block size ({n:,} entries: random ids, row digests)\n")
     print(
         "| Versions | Block (raw) | Total per entry | Blocks per entry | Index part | Entries per block | "
         "Block, compressed | Encode | Decode one block |"
@@ -137,7 +136,7 @@ def block_sizes(n: int):
     print("|---|---|---|---|---|---|---|---|---|")
     rng = random.Random(4)
     keys = random_ids(n, rng)
-    for vname, vgen in list(VERSIONS.items())[:2]:
+    for vname, vgen in list(VERSIONS.items())[:1]:
         vers = vgen(n, random.Random(5))
         for bs in (4, 16, 32, 64, 128, 256):
             t = time.perf_counter()
