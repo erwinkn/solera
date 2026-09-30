@@ -2,8 +2,8 @@
 
 `docs/architecture.md` is normative. `example/brimstone.py` is the reference
 project and must register without error at every gate from Phase 1 on.
-This plan turns the current experimental code (`apps/server/src/solera_server`,
-`apps/worker/src/solera_worker`, `packages/sdk/src/solera`,
+This plan turns the current experimental code (`python/solera_server`,
+`python/solera_worker`, `python/solera`,
 `apps/console`) into a working implementation of that document. Where
 existing code disagrees with the document, the document wins and the code
 is replaced, including its tests. Do not keep old concepts (`Inventory`,
@@ -45,7 +45,7 @@ to the new ones.
 
 ## Phase 1 — SDK: declarations, manifest, stores
 
-Package `packages/sdk/src/solera`. Everything a project file
+Package `python/solera`. Everything a project file
 imports. No engine code.
 
 Deliverables:
@@ -110,7 +110,7 @@ prints the manifest.
 
 ## Phase 2 — Server state
 
-Package `apps/server/src/solera_server/state.py` (replaces `storage.py`'s domain
+Package `python/solera_server/state.py` (replaces `storage.py`'s domain
 layer; keep the SlateDB/obstore plumbing).
 
 Deliverables, all keyed under the namespace and written through SlateDB
@@ -143,7 +143,7 @@ Gate 2: standard gate.
 
 ## Phase 3 — Engine
 
-`apps/server/src/solera_server/engine.py` rewritten around §6–§9.
+`python/solera_server/engine.py` rewritten around §6–§9.
 
 Deliverables:
 
@@ -215,7 +215,7 @@ Gate 3: standard gate. Engine tests run under two seconds each.
 
 ## Phase 4 — Harness and placements
 
-`apps/worker/src/solera_worker` and `apps/server/src/solera_server/placements/`.
+`python/solera_worker` and `python/solera_server/placements/`.
 
 Deliverables:
 
@@ -256,7 +256,7 @@ subprocess.
 
 ## Phase 5 — API and CLI
 
-`apps/server/src/solera_server/api.py`, `cli.py`.
+`python/solera_server/api.py`, `cli.py`.
 
 Deliverables (all under `/api/projects/{p}` unless noted, token auth as
 today):
@@ -325,11 +325,11 @@ of an attempt; cancel a run. Desktop and mobile projects as configured.
 
 Gate 6: standard gate plus `pnpm -C apps/console typecheck`, `pnpm -C
 apps/console format:check`, `pnpm -C apps/console test`. Rebuild the
-bundle (`pnpm -C apps/console build`) and commit `apps/server/src/solera_server/web`.
+bundle (`pnpm -C apps/console build`) and commit `python/solera_server/web`.
 
 ## Phase 7 — Runnable demo
 
-`apps/server/src/solera_server/demo.py` rewritten as a self-contained project that
+`python/solera_server/demo.py` rewritten as a self-contained project that
 exercises everything in the doc with in-process fakes, so it runs with
 `uv run solera serve --insecure` and nothing else, and uses Postgres when
 `DATABASE_URL` is set (compose service).

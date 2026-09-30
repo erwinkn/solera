@@ -360,11 +360,12 @@ state, or a temporary directory for `s3://` state. It is what keeps
 frequent scattered writes into very large indexes cheap; see
 `key-index-costs.md`. Remote placements start cold unless given a volume.
 
-**Implementation.** The file format is ours (no Parquet): a small Rust
-extension (PyO3, abi3 wheels, computation only — encoding, decoding,
-merging, lookups over fetched bytes), with I/O through obstore, and a
-pure-Python implementation of the same format as the reference and
-fallback.
+**Implementation.** The file format is ours (no Parquet). The per-key
+work — encoding, decoding, sorting, merging, lookups over fetched bytes —
+is Rust, in the `solera._native` extension (PyO3, abi3) that the `solera`
+distribution builds and both the engine and the worker require; I/O goes
+through obstore. A pure-Python implementation of the format is kept as the
+tests' reference.
 
 ## 7. Run history — `history/{table}/*.parquet`
 

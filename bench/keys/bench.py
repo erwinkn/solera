@@ -782,7 +782,7 @@ async def main():
         t = time.perf_counter()
         results.append(await run_size(n, args))
         print(f"[{n:,} keys done in {time.perf_counter() - t:.0f} s]", flush=True)
-    meta = {"impl": K.IMPL, "latency": args.latency, "bandwidth": args.bandwidth}
+    meta = {"impl": "native", "latency": args.latency, "bandwidth": args.bandwidth}
     if args.json:
         with open(args.json, "w") as f:
             json.dump({"args": meta, "results": jsonable(results)}, f, indent=1, default=str)

@@ -62,7 +62,7 @@ def layout(data: bytes) -> dict:
 
 
 def entry_sizes(n: int):
-    print(f"\n### Entry size by key and version shape ({n:,} entries, {K.IMPL})\n")
+    print(f"\n### Entry size by key and version shape ({n:,} entries)\n")
     print(
         "| Keys | Versions | Raw | Prefix-encoded | Blocks (zlib) | Compression | Filters | Index | "
         "**Total per entry** | Entries per block | Block, compressed |"

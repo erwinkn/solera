@@ -1,13 +1,20 @@
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS build
+
+# The Rust toolchain builds the `solera._native` extension; the image only keeps the venv.
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates gcc libc6-dev \
+    && curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+ENV PATH="/root/.cargo/bin:$PATH"
+
+WORKDIR /home/app
+COPY pyproject.toml uv.lock README.md ./
+COPY native native
+COPY python python
+RUN uv sync --locked --no-dev --no-editable --extra postgres
+
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 
 WORKDIR /home/app
-
-COPY pyproject.toml uv.lock README.md ./
-COPY packages packages
-COPY apps/server apps/server
-COPY apps/worker apps/worker
-
-RUN uv sync --locked --no-dev --no-editable --extra postgres
+COPY --from=build /home/app/.venv .venv
 
 ENV PATH="/home/app/.venv/bin:$PATH" \
     SOLERA_STATE_URL=file:///home/app/state \

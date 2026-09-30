@@ -1,6 +1,6 @@
 [build-system]
-requires = ["hatchling>=1.27,<2"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
 
 [project]
 name = "solera"
@@ -33,29 +33,28 @@ Repository = "https://github.com/erwinkn/solera"
 
 [tool.uv]
 package = true
-
-# One distribution ("solera") bundles the three source trees: the asset SDK
-# (`solera`), the worker (`solera_worker`), and the control plane with its
-# committed console bundle (`solera_server`).
-[tool.hatch.build.targets.wheel]
-packages = [
-    "packages/sdk/src/solera",
-    "packages/sdk/src/solera_postgres",
-    "apps/server/src/solera_server",
-    "apps/worker/src/solera_worker",
+# Editable installs rebuild the extension when its sources change.
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "native/Cargo.toml" },
+    { file = "native/Cargo.lock" },
+    { file = "native/src/**/*.rs" },
 ]
 
-[tool.hatch.build.targets.sdist]
-include = [
-    "packages/sdk/src/solera",
-    "packages/sdk/src/solera_postgres",
-    "apps/server/src/solera_server",
-    "apps/worker/src/solera_worker",
-    "README.md",
-]
+# One distribution ("solera") holds four Python packages under `python/` —
+# the asset SDK (`solera`), `solera_postgres`, the worker (`solera_worker`),
+# and the control plane with its committed console bundle (`solera_server`) —
+# and the Rust extension in `native/`, built as `solera._native`.
+[tool.maturin]
+python-source = "python"
+python-packages = ["solera_postgres", "solera_server", "solera_worker"]
+module-name = "solera._native"
+manifest-path = "native/Cargo.toml"
+features = ["pyo3/extension-module"]
+profile = "release"
 
 [dependency-groups]
-dev = ["maturin>=1.7,<2", "pytest>=8,<10", "pytest-asyncio>=1,<2", "httpx>=0.28,<1", "ruff>=0.12,<1", "moto[server,s3]>=5,<6", "boto3>=1.36,<2", "pandas>=2.2,<3", "psycopg[binary]>=3.2,<4"]
+dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "httpx>=0.28,<1", "ruff>=0.12,<1", "moto[server,s3]>=5,<6", "boto3>=1.36,<2", "pandas>=2.2,<3", "psycopg[binary]>=3.2,<4"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -68,7 +67,11 @@ markers = [
 
 [tool.ruff]
 line-length = 110
+extend-exclude = ["*.md"]  # the docs' code blocks are sketches
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"bench/cost_model/*" = ["F403", "F405", "B023"]  # table scripts: star imports, lambdas over loop rows

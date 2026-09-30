@@ -1,10 +1,10 @@
 # Key index file format (`.kx`, version 1)
 
-Byte-level format of a key index file (`object-store-state.md` §6). Two
-implementations read and write it — `solera.keys` in pure Python and the
-`solera_native` Rust extension — and each must read the other's files.
-Compressed bytes may differ between them (different deflate
-implementations); decoded content may not.
+Byte-level format of a key index file (`object-store-state.md` §6). The
+`solera._native` Rust extension reads and writes it; `solera/keys/_python.py`
+is an executable reference the tests hold the extension to, and each must
+read the other's files. Compressed bytes may differ between them (different
+deflate implementations); decoded content may not.
 
 All integers are little-endian. `varint` is unsigned LEB128.
 

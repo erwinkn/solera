@@ -1,4 +1,4 @@
-//! `solera_native`: native implementation of the `.kx` key index format.
+//! `solera._native`: the `.kx` key index format.
 //!
 //! Exposes the same functions, with the same signatures, as
 //! `solera/keys/_python.py`. Keys, versions and file contents cross the
@@ -242,6 +242,7 @@ fn replace_diff<'py>(
 }
 
 #[pymodule]
+#[pyo3(name = "_native")]
 fn solera_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encode_file, m)?)?;
     m.add_function(wrap_pyfunction!(decode_block, m)?)?;

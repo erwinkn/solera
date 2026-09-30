@@ -4,7 +4,7 @@ import random
 import sys
 import time
 
-import solera_native
+from solera import _native
 from solera.keys import _python
 
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 1_000_000
@@ -29,7 +29,7 @@ keys, vers, dele = gen(N)
 n = len(keys)
 raw = sum(len(k) + len(v) for k, v in zip(keys, vers, strict=True))
 print(f"{n:,} entries, {raw / n:.1f} B raw per entry (key {sum(map(len, keys)) / n:.1f} B, version 16 B)")
-for name, impl in (("native", solera_native), ("python", _python)):
+for name, impl in (("native", _native), ("python", _python)):
     if name == "python" and n > 2_000_000:
         continue
     print(name)

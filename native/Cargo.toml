@@ -3,7 +3,7 @@ name = "solera-native"
 version = "0.0.1"
 edition = "2021"
 license = "Apache-2.0"
-description = "Native acceleration for solera: the .kx key index format"
+description = "solera._native: the .kx key index format"
 publish = false
 
 [lib]
@@ -15,9 +15,6 @@ pyo3 = { version = "0.29", features = ["abi3-py312"] }
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 crc32fast = "1"
-
-[features]
-extension-module = ["pyo3/extension-module"]
 
 [profile.release]
 lto = "thin"

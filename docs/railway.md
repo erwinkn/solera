@@ -4,7 +4,7 @@ Use a dedicated project and a **private Storage Bucket**, not a Railway disk vol
 
 ## Configuration
 
-Deploy `erwinkn/solera` from `main`. `railway.toml` selects the Nixpacks builder: it detects `uv.lock`, runs `uv sync --no-dev --frozen`, and starts `solera serve --host 0.0.0.0` (the CLI reads `$PORT`). The console bundle is committed under `apps/server/src/solera_server/web`, so no Node runtime, Dockerfile, database service, or persistent application volume is needed for S3 mode.
+Deploy `erwinkn/solera` from `main`. `railway.toml` selects the `Dockerfile` builder: its first stage installs a Rust toolchain and runs `uv sync --locked --no-dev --no-editable`, which builds the `solera._native` extension; the image keeps only the resulting environment and starts `solera serve --host 0.0.0.0` (the CLI reads `$PORT`). The console bundle is committed under `python/solera_server/web`, so no Node runtime, database service, or persistent application volume is needed for S3 mode.
 
 Set these environment variables with Railway's reference picker (verify the actual bucket reference names; do not invent them):
 

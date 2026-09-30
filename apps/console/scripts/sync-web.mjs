@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 
 const ui = join(dirname(fileURLToPath(import.meta.url)), "..");
 const source = join(ui, "dist", "client");
-const target = join(ui, "..", "server", "src", "solera_server", "web");
+const target = join(ui, "..", "..", "python", "solera_server", "web");
 
 if (!existsSync(join(source, "index.html"))) {
   console.error("SPA build output missing index.html at", source);

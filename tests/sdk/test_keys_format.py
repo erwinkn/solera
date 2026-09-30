@@ -1,19 +1,13 @@
-"""The `.kx` key index format (docs/key-index-format.md): both implementations,
-and each reading the other's files."""
+"""The `.kx` key index format (docs/key-index-format.md): the native
+extension against the pure-Python reference, each reading the other's files."""
 
 import random
 
 import pytest
+from solera import _native
 from solera.keys import _python
 
-try:
-    import solera_native
-except ImportError:  # the extension is optional; the reference always runs
-    solera_native = None
-
-_MODULES = {"python": _python}
-if solera_native is not None:
-    _MODULES["native"] = solera_native
+_MODULES = {"python": _python, "native": _native}
 IMPLS = [pytest.param(m, id=name) for name, m in _MODULES.items()]
 CROSS = [
     pytest.param(w, r, id=f"{wn}-writes-{rn}-reads")

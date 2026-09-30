@@ -11,23 +11,30 @@ shared Postgres tables when `DATABASE_URL` is set.
 
 ## Layout
 
-- `packages/sdk` — `solera`, the asset SDK project files import
+One distribution, `solera`, built with maturin: four Python packages under
+`python/` and a Rust extension.
+
+- `python/solera` — the asset SDK project files import
   (`@asset`, `Output`, `Patch`, `Sql`, `PartitionSet`, `Incremental`,
-  `AllPartitions`, `TimePartitions`, triggers, placements). `solera_postgres`
-  ships `PostgresStore`.
-- `apps/server` — `solera_server`: the control plane (state layer, engine,
+  `AllPartitions`, `TimePartitions`, triggers, placements), and the key
+  index (`solera.keys`). `solera_postgres` ships `PostgresStore`.
+- `python/solera_server` — the control plane (state layer, engine,
   FastAPI, CLI) and the built console under `solera_server/web`.
-- `apps/worker` — `solera_worker`: the task harness that executes attempts in
+- `python/solera_worker` — the task harness that executes attempts in
   subprocesses and pool workers.
+- `native` — the Rust crate built into `solera._native`: the key index's
+  per-key work (encoding, decoding, sorting, merging).
 - `apps/console` — the pnpm/Vite/TanStack console source. The built bundle is
   committed, so running the server needs no Node.
-- `apps/server/src/solera_server/demo.py` — the self-contained demo project
+- `python/solera_server/demo.py` — the self-contained demo project
   (`uv run solera serve --insecure` loads it by default).
 - `example/brimstone.py` — a second reference project.
 
 ## Quick start
 
-Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
+Requires Python 3.12+, [uv](https://docs.astral.sh/uv/) and a Rust toolchain
+([rustup](https://rustup.rs)): `uv sync` builds the extension, and rebuilds it
+whenever a file under `native/` changes.
 
 ```bash
 uv sync --locked
@@ -122,7 +129,7 @@ two batches — the run detail shows the first attempt completing with
 `more: true` and a follow-up attempt finishing the remaining keys.
 
 `file_index` declares `version="2"`. To demonstrate a version bump, edit it to
-`"3"` in `apps/server/src/solera_server/demo.py` and re-run — the interpretation
+`"3"` in `python/solera_server/demo.py` and re-run — the interpretation
 fingerprint changes and every key reprocesses. To process selected keys only:
 `uv run solera run file_index --keys 'site_files=alpha-file-0,alpha-file-1'`.
 
@@ -320,7 +327,7 @@ Save as `my_project.py` and `uv run solera serve --insecure --project
 my_project.py` (the attribute defaults to `project`). Cursors, resources,
 `Incremental`/`AllPartitions` inputs, placements, triggers, and the Postgres stores
 are documented in [docs/architecture.md](docs/architecture.md);
-`apps/server/src/solera_server/demo.py` exercises all of them.
+`python/solera_server/demo.py` exercises all of them.
 
 ## Tests
 

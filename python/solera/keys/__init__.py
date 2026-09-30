@@ -1,18 +1,15 @@
 """The engine-owned key index (docs/object-store-state.md §6).
 
-`.kx` files are encoded and decoded by the `solera_native` extension when it
-is installed, else by the pure-Python reference in `_python`; both follow
-docs/key-index-format.md. Set `SOLERA_KEYS_IMPL=python` to force the
-reference. Tails are always parsed in Python (they are small); the
-per-entry work — encoding, decoding, filter checks, sorting, merging — is
-what the native extension accelerates.
+`.kx` files are encoded and decoded by the `solera._native` extension,
+following docs/key-index-format.md. Tails are parsed in Python (they are
+small); the per-entry work — encoding, decoding, filter checks, sorting,
+merging — is native. `_python` is the format's executable reference, which
+the tests hold the extension to.
 """
 
 from __future__ import annotations
 
-import os
-
-from . import _python
+from .. import _native as _impl
 from ._python import (
     CODEC_NONE,
     CODEC_ZLIB,
@@ -24,21 +21,6 @@ from ._python import (
     parse_index,
     parse_tail,
 )
-
-
-def _load_native():
-    if os.environ.get("SOLERA_KEYS_IMPL", "").lower() == "python":
-        return None
-    try:
-        import solera_native
-    except ImportError:
-        return None
-    return solera_native
-
-
-_native = _load_native()
-IMPL = "native" if _native is not None else "python"
-_impl = _native or _python
 
 encode_file = _impl.encode_file
 decode_block = _impl.decode_block
@@ -55,7 +37,6 @@ __all__ = [
     "CODEC_NONE",
     "CODEC_ZLIB",
     "FOOTER_SIZE",
-    "IMPL",
     "FormatError",
     "bloom_check_keys",
     "bloom_check_pairs",

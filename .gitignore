@@ -8,4 +8,5 @@ dist/
 .env
 node_modules/
 apps/console/test-results/
-packages/native/target/
+native/target/
+python/solera/_native*.so
