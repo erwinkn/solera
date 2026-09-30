@@ -173,17 +173,17 @@ class Upkeep:
         output, scope = key
         current = self.m.indexes.get(key)
         if recount:
+            # Exact for the state it pinned; commits since add their `added - removed`.
             self._recounted[key] = self.clock()
-            if current is index:  # no commit landed meanwhile, so the count is still current
+            if current is not None and current.prefix == index.prefix:  # still the same index
                 self.state.record(
                     {
-                        "type": "IndexCompacted",
+                        "type": "IndexRecounted",
                         "output": output,
                         "scope": scope,
-                        "added": [],
-                        "removed": [],
-                        "recount": result,
-                        "at": self.clock(),
+                        "live": result,
+                        "pinned_count": index.count,
+                        "pinned_inexact": index.inexact,
                     }
                 )
             return

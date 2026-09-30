@@ -109,14 +109,14 @@ class FileInfo:
 
 @dataclass(frozen=True)
 class IndexState:
-    """What the engine holds per index: `count` live keys (exact unless
-    `count_exact` is false, see §6), the files by level, and the delta log
-    consumers read — `(batch, files)`, oldest first. A delta file stays in
-    the log after compaction merges it out of the levels, until no consumer
-    needs it."""
+    """What the engine holds per index: `count` live keys, the files by level,
+    and the delta log consumers read — `(batch, files)`, oldest first. A delta
+    file stays in the log after compaction merges it out of the levels, until
+    no consumer needs it. `inexact` counts the commits since the last recount
+    whose count change came from filters (§6): the count is exact when it is 0."""
 
     count: int = 0
-    count_exact: bool = True
+    inexact: int = 0
     files: tuple[FileInfo, ...] = ()
     log: tuple[tuple[int, tuple[FileInfo, ...]], ...] = ()
     prefix: str = ""  # where the files live (`index_prefix` when the index was created)
@@ -125,7 +125,7 @@ class IndexState:
         return {
             "prefix": self.prefix,
             "count": self.count,
-            "count_exact": self.count_exact,
+            "inexact": self.inexact,
             "files": [f.to_json() for f in self.files],
             "log": [[b, [f.to_json() for f in fs]] for b, fs in self.log],
         }
@@ -136,11 +136,15 @@ class IndexState:
             return cls()
         return cls(
             d["count"],
-            d.get("count_exact", True),
+            d["inexact"],
             tuple(FileInfo.from_json(f) for f in d["files"]),
             tuple((b, tuple(FileInfo.from_json(f) for f in fs)) for b, fs in d["log"]),
-            d.get("prefix", ""),
+            d["prefix"],
         )
+
+    @property
+    def count_exact(self) -> bool:
+        return self.inexact == 0
 
     def path(self, name: str) -> str:
         return f"{self.prefix}{name}.kx"
@@ -197,25 +201,24 @@ class IndexState:
         log = self.log + ((batch, placed),) if keep_log and placed else self.log
         return IndexState(
             count=self.count + delta.added - delta.removed,
-            count_exact=self.count_exact and delta.exact,
+            inexact=self.inexact + int(not delta.exact),
             files=self.files + placed,
             log=log,
             prefix=self.prefix,
         )
 
-    def compacted(
-        self, added: list[FileInfo], removed: list[str], *, recount: int | None = None
-    ) -> IndexState:
+    def compacted(self, added: list[FileInfo], removed: list[str]) -> IndexState:
         """Swap compaction inputs for outputs (a moved file is both, under one name)."""
 
         gone = set(removed)
-        return IndexState(
-            count=recount if recount is not None else self.count,
-            count_exact=True if recount is not None else self.count_exact,
-            files=tuple(f for f in self.files if f.name not in gone) + tuple(added),
-            log=self.log,
-            prefix=self.prefix,
-        )
+        return replace(self, files=tuple(f for f in self.files if f.name not in gone) + tuple(added))
+
+    def recounted(self, live: int, pinned_count: int, pinned_inexact: int) -> IndexState:
+        """Apply a recount of an earlier state of this index (`live` keys where
+        that state said `pinned_count`): the commits since keep their
+        `added - removed`, and the count stays inexact only if one of them was."""
+
+        return replace(self, count=live + self.count - pinned_count, inexact=self.inexact - pinned_inexact)
 
     def truncated(self, lowest_needed_batch: int | None) -> IndexState:
         """Drop log entries no consumer still needs (`None`: no consumers at all)."""

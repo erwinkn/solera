@@ -811,12 +811,17 @@ class Model:
         key = (e["output"], e["scope"])
         if key not in self.indexes:
             return
-        index = self.indexes[key].compacted(
-            [FileInfo.from_json(f) for f in e["added"]], e["removed"], recount=e.get("recount")
-        )
+        index = self.indexes[key].compacted([FileInfo.from_json(f) for f in e["added"]], e["removed"])
         self._replace_index(key, index, e["at"])
-        if key in self.heads:
-            self.heads[key]["count"] = index.count
+
+    def _on_IndexRecounted(self, e):
+        key = (e["output"], e["scope"])
+        if key in self.indexes:
+            index = self.indexes[key] = self.indexes[key].recounted(
+                e["live"], e["pinned_count"], e["pinned_inexact"]
+            )
+            if key in self.heads:
+                self.heads[key]["count"] = index.count
 
     def _on_IndexTruncated(self, e):
         key = (e["output"], e["scope"])
