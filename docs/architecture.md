@@ -704,7 +704,7 @@ Logs stream to chunked objects throughout. `manifest` mode runs through
 
 | Kind | `launch` | handle | `wait` | `cancel` |
 |---|---|---|---|---|
-| `Local()()` | subprocess with an explicit env allow-list | `{pid, started_at, ticks, host}` | polls the process; another host's: can't tell | `SIGTERM`, then `SIGKILL` |
+| `Local()()` | subprocess with an explicit env allow-list | `{launch, pid, started_at, ticks, host}` | polls its own child; an adopted pid only if host and /proc start time match, else can't tell | `SIGTERM`, then `SIGKILL`, only to that same process |
 | `AWSECS(name, cluster, region)(cpu, memory, gpu, image)` | `run_task` with container overrides carrying the stage, `clientToken` = attempt | `{task_arn}` | describes until `STOPPED`; `Exit.meta.log_url`; a task not shown: can't tell | `stop_task` |
 | `Modal(name, app)(gpu)` | spawns the harness function | `{call_id}` | polls the call | cancels it |
 | `K8sJob(name, cluster, namespace)(cpu, memory, image)` | creates the job `solera-{attempt}` (lowercased); an existing one is its own | `{job}` | watches conditions; deleted: lost | deletes the job |

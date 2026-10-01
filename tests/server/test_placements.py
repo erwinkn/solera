@@ -336,17 +336,55 @@ async def test_modal_launch_wait_lost(state, monkeypatch):
     assert (await placement.wait(handle, 1))["reason"] == "lost"
 
 
-async def test_a_local_process_on_another_host_is_out_of_sight(state):
-    """A Local handle recorded on another host names a pid that means
-    nothing here: wait cannot tell, and cancel signals nothing — not even
-    the process that happens to hold that pid here."""
+async def test_a_local_handle_is_only_ever_its_own_process(state, monkeypatch):
+    """A handle names one launch. A handle adopted from another host, or
+    naming a pid since reused here, never reaches the process now holding
+    that pid — not even this engine's own child: wait cannot tell, cancel
+    signals nothing. A handle that provably names a live process here is
+    followed and canceled."""
 
+    import asyncio
     import os
+    import socket
 
-    from solera_server.placements.local import LocalPlacement
+    from solera_server.placements import local
+    from solera_server.placements.local import LocalPlacement, _start_ticks
 
+    spawn = asyncio.create_subprocess_exec
+
+    async def sleeper(*args, **kw):
+        return await spawn("sleep", "30", **kw)
+
+    monkeypatch.setattr(local.asyncio, "create_subprocess_exec", sleeper)
     placement = LocalPlacement(PlacementContext(state, state.objects_url, "", state.clock))
-    elsewhere = {"pid": os.getpid(), "started_at": 0, "ticks": None, "host": "another-host"}
+    ours = await placement.launch({"attempt": "a", "run": "r", "objects": "file:///x"})
+    pid = ours["pid"]
+
+    def alive(pid):
+        try:
+            os.kill(pid, 0)
+            return open(f"/proc/{pid}/stat").read().split(") ")[1][0] != "Z"
+        except OSError:
+            return False
+
+    elsewhere = {**ours, "launch": "from-host-a", "host": "host-a"}
+    reused = {**ours, "launch": "an-old-launch", "ticks": "1"}
     with pytest.raises(LookupError):
         await placement.wait(elsewhere, 0.1)
-    await placement.cancel(elsewhere)  # this test process survives it
+    assert (await placement.wait(reused, 0.1))["reason"] == "lost"
+    await placement.cancel(elsewhere)
+    await placement.cancel(reused)
+    assert alive(pid)  # our own child, untouched
+
+    adopted = await spawn("sleep", "30", start_new_session=True)
+    handle = {
+        "launch": "before-the-restart",
+        "pid": adopted.pid,
+        "ticks": await _start_ticks(adopted.pid),
+        "host": socket.gethostname(),
+    }
+    assert await placement.wait(handle, 0.1) is None
+    await placement.cancel(handle)
+    assert await asyncio.wait_for(adopted.wait(), 5) == -15
+    await placement.cancel(ours)
+    assert not alive(pid)

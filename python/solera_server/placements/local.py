@@ -1,10 +1,12 @@
 """Local placement (§10): the harness runs as a subprocess on the engine host.
 
-Handles carry `{pid, started_at, ticks, host}` and treat a mismatch as lost.
-`wait` polls the process; after an engine restart the pid is re-checked via
-/proc so an orphaned or replaced pid is not mistaken for the same run. An
-engine on another host cannot see the process at all: its `wait` raises, and
-the engine follows the worker's own reports.
+Handles carry `{launch, pid, started_at, ticks, host}`. `launch` names this
+launch: only a handle this engine process launched finds its child in the
+registry, so an adopted handle never matches another child that happens to
+hold the same pid. An adopted handle is followed only when it is provably
+the same process — same host, and the same /proc start time — and is
+signaled only then. Anything else cannot be told: `wait` raises, `cancel`
+does nothing, and the engine follows the worker's own reports.
 """
 
 from __future__ import annotations
@@ -17,11 +19,13 @@ import signal
 import socket
 import sys
 import tempfile
+import time
+import uuid
 from pathlib import Path
 
 ENV_BLOCKLIST_PREFIXES = ("AWS_", "SOLERA_API_TOKEN", "GITHUB_", "GH_TOKEN", "RAILWAY_TOKEN")
-_running: dict[int, asyncio.subprocess.Process] = {}
-_tails: dict[int, list[bytearray]] = {}
+_running: dict[str, asyncio.subprocess.Process] = {}  # launch id -> this process's child
+_tails: dict[str, list[bytearray]] = {}
 
 
 def _env() -> dict:
@@ -39,21 +43,18 @@ async def _start_ticks(pid: int) -> str | None:
         return None
 
 
-async def _alive(pid: int, started_ticks: str | None) -> bool:
-    if pid in _running:
-        return _running[pid].returncode is None
-    ticks = await _start_ticks(pid)
-    if ticks is None:
-        try:
-            os.kill(pid, 0)
-        except OSError:
-            return False
-        return started_ticks is None
-    return ticks == started_ticks
+async def _same(run: dict) -> bool | None:
+    """Whether an adopted handle's process still runs: `None` if that cannot
+    be told — another host, or no /proc start time to tell it from a later
+    process given the same pid."""
+
+    if run.get("host") != socket.gethostname() or run.get("ticks") is None:
+        return None
+    return await _start_ticks(run["pid"]) == run["ticks"]
 
 
-def _process_log(pid: int) -> str:
-    tails = _tails.pop(pid, None)
+def _process_log(launch: str | None) -> str:
+    tails = _tails.pop(launch, None)
     if not tails:
         return ""
     return (bytes(tails[0]) + bytes(tails[1])).decode(errors="replace")[-65536:]
@@ -101,9 +102,11 @@ class LocalPlacement:
 
         for stream, tail in zip((process.stdout, process.stderr), tails, strict=True):
             asyncio.create_task(drain(stream, tail))
-        _running[process.pid] = process
-        _tails[process.pid] = tails
+        launch = uuid.uuid4().hex
+        _running[launch] = process
+        _tails[launch] = tails
         return {
+            "launch": launch,
             "pid": process.pid,
             "started_at": self.ctx.clock(),
             "ticks": await _start_ticks(process.pid),
@@ -111,49 +114,53 @@ class LocalPlacement:
         }
 
     async def wait(self, run: dict, timeout: float) -> dict | None:
-        pid = run["pid"]
-        process = _running.get(pid)
+        launch = run.get("launch")
+        process = _running.get(launch)
         if process is not None:
             # Our own child: its exit wakes us.
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(process.wait(), timeout)
             if process.returncode is None:
                 return None
-            log = _process_log(pid)
-            del _running[pid]
-            return {"code": process.returncode, "reason": None, "meta": {"log": log}}
+            del _running[launch]
+            return {"code": process.returncode, "reason": None, "meta": {"log": _process_log(launch)}}
         # Adopted after a restart, so not our child: watch whether it lives.
-        if run.get("host") != socket.gethostname():
-            raise LookupError(f"process {pid} runs on {run.get('host')}, not here")
-        deadline = self.ctx.clock() + timeout
-        while await _alive(pid, run.get("ticks")):
-            remaining = deadline - self.ctx.clock()
+        deadline = time.monotonic() + timeout
+        while True:
+            alive = await _same(run)
+            if alive is None:
+                raise LookupError(f"process {run['pid']} on {run.get('host')} cannot be told from here")
+            if not alive:
+                return {"code": None, "reason": "lost", "meta": {}}
+            remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return None
             await asyncio.sleep(min(0.2, remaining))
-        return {"code": None, "reason": "lost", "meta": {"log": _process_log(pid)}}
 
     async def cancel(self, run: dict) -> None:
-        pid = run["pid"]
-        process = _running.get(pid)
-        if process is None and run.get("host") != socket.gethostname():
-            return  # another host's process: its pid means nothing here
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            if process is not None:
+        launch = run.get("launch")
+        process = _running.get(launch)
+        if process is not None:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(process.pid, signal.SIGTERM)
-            else:
-                os.kill(pid, signal.SIGTERM)
-        for _ in range(50):
-            if not await _alive(pid, run.get("ticks")):
-                break
-            await asyncio.sleep(0.1)
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            if process is not None:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(process.wait(), 5)
+            with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(process.pid, signal.SIGKILL)
-            else:
-                os.kill(pid, signal.SIGKILL)
-        _running.pop(pid, None)
-        _process_log(pid)
+            _running.pop(launch, None)
+            _process_log(launch)
+            return
+        # Adopted: signal only the very process the handle names, checked each time.
+        if not await _same(run):
+            return
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(run["pid"], signal.SIGTERM)
+        for _ in range(50):
+            await asyncio.sleep(0.1)
+            if not await _same(run):
+                return
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(run["pid"], signal.SIGKILL)
 
 
 async def load_manifest(project: str, *, timeout: float = 60, log_limit: int = 8 * 1024 * 1024):
