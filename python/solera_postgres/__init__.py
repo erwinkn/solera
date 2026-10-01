@@ -121,7 +121,16 @@ class PostgresStore:
     def _ensure(self, cur, output: Output, rows: list[dict] | None = None):
         table, schema, table_name = self._table(output)
         indexes = self._indexes(output)
+        names = [table_name + "_" + "_".join(index) for index in indexes]
         exists = "SELECT 1 FROM information_schema.tables WHERE table_schema = %s AND table_name = %s"
+        indexed = cur.execute(
+            "SELECT count(*) AS n FROM pg_indexes WHERE schemaname = %s AND tablename = %s AND indexname = ANY(%s)",
+            (schema, table_name, names),
+        ).fetchone()["n"]
+        if indexed < len(names) or not cur.execute(exists, (schema, table_name)).fetchone():
+            # Partitions write one table at once, and `IF NOT EXISTS` DDL collides until the
+            # first creator commits: take turns, until the end of the transaction.
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (table,))
         cur.execute(f"CREATE SCHEMA IF NOT EXISTS {_ident(schema)}")
         declared, pk = self._declared_shape(output)
         columns = dict(declared)
