@@ -52,10 +52,9 @@ Solera exception the user's error subclasses — `Rejected`, `Failed`,
 `Transient`, `Abort` — and a key that did not succeed lands in the edge's
 **failure index**, a key index of its own, so it is visible, retried on a
 bounded schedule, and never blocks the keys behind it. `include` and
-`exclude` patterns on an edge select keys by name; the engine evaluates
-them from its cache to skip work, the worker evaluates them for
-correctness. A `Source` subclass with `observe()` is polled by an
-automation and committed like the commit API. Throughout, the engine sees
+`exclude` patterns on an edge select keys by name; the worker evaluates
+them on every page it reads. A `Source` subclass with `observe()` is
+polled by a sensor and committed like the commit API. Throughout, the engine sees
 keys and revisions only.
 
 ## 3. What the engine sees
@@ -735,8 +734,11 @@ word rules to segment-anchored patterns (`**/old/**`, `**/old *`,
 ## 12. Observable sources
 
 A `Source` today is an output with no producer, advanced from outside
-through the commit API. An observable source adds `observe()`, which an
-automation calls; its result is committed exactly as a commit-API call:
+through the commit API. An **observable source** adds `observe()`, which
+Solera calls on a schedule and commits like a commit-API call. It is sugar
+for a **sensor** (`lifecycle.md` §11): `Source(name, observe=Every(300))`
+declares a sensor `{name}.observe` whose body calls `observe()` and returns
+a `Commit` to its own source.
 
 ```python
 class DatasmartTable(Source):
@@ -759,75 +761,66 @@ class Feed(Source):
         return Observed(upsert=page.upserts, remove=page.removes, cursor=page.token)
 ```
 
-| `observe()` returns | Committed as |
+| `observe()` returns | The sensor's `Tick` |
 |---|---|
-| `str` | `commit(name, version=…)` |
-| `dict[str, str]`, or Arrow data with key and revision columns (read through `Rows.arrow`) | `commit(name, keys=…)`: the full map |
-| `Observed(upsert, remove, cursor)` | `commit(name, upsert=…, remove=…)`, with the cursor in the same commit |
+| `str` | `Commit(name, version=…)` |
+| `dict[str, str]`, or Arrow data with key and revision columns | `Commit(name, keys=…)`: the full map |
+| `Observed(upsert, remove, cursor)` | `Commit(name, upsert=…, remove=…)` and `cursor=` |
+| `None` | nothing |
 
-An identical result is not a change and wakes nothing.
+Subclasses share one `observe` across a family of sources; a `@source`
+decorator is sugar for one-offs. A sensor that does more than advance its
+own source — commits to several sources, requests runs — is written with
+`@sensor` directly; `observe()` covers the common case.
 
-**"Unchanged" means nothing durable changed**: no new version, no key
-change, **and no new cursor**. A cursored feed often returns an empty page
-with a newer token; if that took the unchanged path, the cursor would
-never be saved and the feed would return the same empty page forever.
-So there are three outcomes:
+**Where it runs.** In a **sensor host**: a long-lived process with the
+project loaded, so a tick costs a function call, not a process start and
+an import. By default the engine keeps one host subprocess beside it;
+`observe=Every(300), executor=Pool("sensors")` runs the tick on a remote
+host instead, for sources the engine's machine cannot reach. The engine
+holds the clock and no user code: a host long-polls for due ticks, runs
+the body, and posts the outcome. A tick is not an attempt — no `.spec`,
+`.worker`, `.result`, fence or run of its own.
 
-| Observation | Commits | Wakes consumers |
+**How a tick lands.** The engine dispatches each tick with the head of
+the source as `base`, and applies the posted outcome in one step, through
+the commit API's own checks:
+
+- **Head-checked.** If the source's head moved since dispatch — an API
+  client, another sensor — the tick is refused and the next one observes
+  again. A stale full map must never undo a newer commit.
+- **"Unchanged" means nothing durable changed**: no new version, no key
+  change, **and no new cursor**. A cursored feed often returns an empty
+  page with a newer token; saving that token is what moves the feed on.
+
+| Tick | Records | Wakes consumers |
 |---|---|---|
-| changed (version or keys) | a source commit: delta (keyed) and cursor | yes |
-| cursor only | the cursor alone, to the journal: no delta, no new version | no |
+| changed (version or keys) | the source commit, and the cursor if it moved, in one journal record | yes |
+| cursor only | `SensorAdvanced {sensor, cursor}`: no delta, no new version | no |
 | unchanged | nothing | no |
+| raised | nothing; the cursor stays; a `failed` tick row | no |
 
-The commit-API path cannot be reused as is for the second row: a keyed
-source commit with no delta files returns early today, so it must still
-record the cursor. Subclasses share
-one `observe` across a family of sources; a `@source` decorator is sugar
-for one-offs. Use a cursor once the full map is large: comparing a 10M-key
-map every 5 minutes is a full replacement every 5 minutes.
+**Key maps.** A full map up to `sensor_map_max` (1M keys) is posted as a
+sorted run and resolved by the engine in-process against the source's
+index, as API commits are. A bigger one is resolved **on the host** — the
+streaming merge-join against the tick's `base` — which uploads the delta
+file and posts a reference; the engine installs it only if `base` is
+still the head, else refuses it and deletes the file. Past a few million
+keys, use a cursor and `Observed(upsert, remove)`: comparing a 10M-key map
+every five minutes is a full replacement every five minutes.
 
-**Where it runs.** The trigger is the engine's — the `Every(300)` clock
-holds no user code, and the server runs none (architecture §1). The
-`observe()` body is user code with secrets, so it runs on a placement
-like any task: `Local` by default (a subprocess on the engine's machine,
-a second or two of imports per tick), or a `Pool` for tight intervals,
-whose long-lived workers keep the project imported — the shape of
-Dagster's code server.
+**What it costs.** An unchanged tick is a long-poll answer, a function
+call on a warm host, an HTTP post, and a row in the `ticks` history table
+(buffered, written with the next history flush, kept a day). No object
+writes, no journal entry, no run. A tick that committed is recorded as a
+source commit — a run with no tasks, as API commits are — and its tick row
+is kept as long as that run. After an engine restart no tick is in
+flight; each sensor is due again at its next interval, from its durable
+cursor.
 
-> **Held.** Erwin chose the lightweight path, generalized as a sensor
-> primitive: ticks run in a warm sensor host and land through the
-> existing source-commit and run-submission APIs, not as attempts.
-> `lifecycle.md` §11 is being rewritten to define it; the launch path
-> below predates that and will be aligned to it. The semantics above —
-> what `observe()` returns, what "unchanged" means, cursor-only commits —
-> stand.
-
-**An unchanged observation is cheap.** Under the HTTP lifecycle, an
-observation needs none of an attempt's durable objects until it changes
-something. How observations are launched and claimed is `lifecycle.md`'s;
-what this proposal needs from it is the left column:
-
-| | Unchanged | Changed |
-|---|---|---|
-| `.spec` | none: it rides the launch or the claim over HTTP | same |
-| `.worker` | none on `Local`; a Pool claim creates it — at most one small PUT, unless `lifecycle.md` lets observation claims stay in memory | same |
-| `.result` | none: an HTTP report; for a keyed map, the HTTP resolver answers "no delta" from the engine cache | the delta file (keyed), uploaded by the worker as for any commit |
-| `.writing` fence | none: an observation writes no store data | none |
-| Journal | nothing | the source commit, with its cursor |
-| Logs | live only | the final log |
-| History | its `runs` and `attempts` rows, outcome `skipped`, kind `observe` | as any run |
-| Restart | an observation in flight may vanish; the next tick reruns it | the commit is durable once journaled |
-
-So a skipped observation costs one launch or claim, one HTTP report and a
-few history rows riding the shared history flush — no object writes of its
-own. Skipped observation runs are hidden from the runs list by default and
-kept a day (`Retention` for kind `observe`, outcome `skipped`); an
-observation that changed its source is a normal run with lineage and
-normal retention. That is the pattern elsewhere: Dagster keeps sensor
-ticks out of runs and purges skipped ones, Airflow's triggerer runs cheap
-checks in one long-lived process, Temporal polls inside long activities.
-Solera keeps observations as runs for uniformity — logs, placement,
-cancel, history — and makes the empty ones nearly free instead.
+This is the pattern elsewhere: Dagster evaluates sensors in a code server
+and keeps ticks out of runs, Airflow's triggerer runs cheap checks in one
+long-lived process, Temporal polls inside long activities.
 
 ## 13. Project revision from a build identity
 
@@ -884,9 +877,11 @@ is below the current one.
   admitted to its cache (exact counts, no index reads on the worker), and
   the cold path otherwise. Failure deltas are always resolved by the
   worker itself (§9). The worker uploads both.
-- Inlined retries, "is this observation a change" and, later, pattern hints
-  are all answered from the one warm engine cache, which `resolved-commits`
-  builds anyway; this proposal adds readers, not a cache.
+- Inlined retries and, later, pattern hints are answered from the one
+  warm engine cache, which `resolved-commits` builds anyway; this proposal
+  adds readers, not a cache.
+- Observable sources are sugar for sensors (`lifecycle.md` §11): no
+  launch path, result route or retention class of their own.
 - The failure index is an ordinary key index: format, compaction, cache,
   delta naming, garbage collection — none new.
 - Indexes count keys, not rows: a file of 40 samples is one entry.
@@ -900,10 +895,8 @@ is below the current one.
 - `Rows` must group natively, and patches must move onto `Rows` (§7).
 - The watermark gains two positions: the rescope drain (§11) and the retry
   pass (§9).
-- Observations want a launch path with no `.spec` or `.result` (§12),
-  which only the HTTP lifecycle makes possible.
-- Cancel commits a partial page (§5): the worker, not the engine, takes
-  the fence on cancel while it answers.
+- Cancel commits a partial page (§5): it needs the lifecycle's two-phase
+  cancel, with a drain before any forced abort.
 
 **Obsolete**, from the earlier draft of this proposal.
 
@@ -919,6 +912,8 @@ is below the current one.
 - A `rows` count per key in `key_outcomes`: dropped.
 - Filters in the poller (`example/brimstone.py`'s `is_qaqc_workbook`):
   replaced by patterns on the consumer's edge.
+- Observations as attempts or runs, `skipped` observation runs and their
+  retention class: replaced by sensor ticks (§12).
 - `grouped=True` and the duplicate-key error: every key is a group (§6).
 
 ## 16. Interactions with work in flight
@@ -927,14 +922,14 @@ is below the current one.
 |---|---|
 | Key index (`object-store-state.md` §6) | No format change. A new kind of index (`keys/@{asset}/{scope}/`, the failure index) compacted like the others; `Rows` groups every key (§6), with `Store.key_rows` and the digest grammar — the native thread's current work; patches build `Rows`. |
 | Engine cache (`resolved-commits.md`, being rewritten) | New readers: inlined retry keys in v1; pattern counts at commit and failure-summary recomputation later. No new cached content beyond failure indexes. |
-| HTTP resolver (`resolved-commits.md`) | Each pages' output deltas are small resolves when the index is admitted; failure deltas are resolved locally, not by the resolver (its §8 readers should follow §9 here: one eligibility predicate, incremental minima with identities, no rescan per commit); the worker uploads both. Inlined windows are filtered before the `inline_max` check; observations resolve to learn "unchanged". The grammar gains the group production. |
-| Attempt lifecycle (`lifecycle.md`, being written) | Observation launches without `.spec` or `.result`, and ideally without `.worker`; live per-key events and key-tagged logs; per-key outcomes in `.result`; cancel delivered to the worker, which commits finished keys before the engine would take the fence (§5). |
+| HTTP resolver (`resolved-commits.md`) | Each pages' output deltas are small resolves when the index is admitted; failure deltas are resolved locally, not by the resolver (its §8 readers should follow §9 here: one eligibility predicate, incremental minima with identities, no rescan per commit); the worker uploads both. Inlined windows are filtered before the `inline_max` check. A sensor's full key map is resolved in-process (small) or on the host (big), not through an attempt's resolve. The grammar gains the group production. |
+| Attempt lifecycle (`lifecycle.md`) | The two-phase cancel of §7, which §5 follows; live per-key events and key-tagged logs; per-key outcomes in `.result`. Sensors (§11) carry observable sources: `Source.observe` declares one. |
 
 ## 17. What changes in the code
 
 - `python/solera/sdk.py`: `Each`; `include`/`exclude` on `Incremental`;
   `Output(meta=…)`; `Rejected`, `Failed`, `Transient(retry_after,
-  retry_for)`, `Abort`, `Project(errors=…)`; `Source.observe`, `Observed`;
+  retry_for)`, `Abort`, `Project(errors=…)`; `Source.observe` as a sensor, `Observed`;
   `ctx.key`, `ctx.revision`, `ctx.keys(output, prefix=)`; the revision from
   a build identity; `code_hash` removed.
 - `python/solera/stores.py`: `Patch({key: value})`; the `key_rows` hook;
@@ -943,11 +938,10 @@ is below the current one.
   keyed loads as `dict[str, T]`.
 - `python/solera_worker/worker.py`: the per-key loop, classification,
   outcomes, the failure delta, retry and rescope pages, partial commits on
-  cancel, observations.
+  cancel.
 - `python/solera_server/engine.py`: the `Failures` record, the due clock,
   epochs, rescope and retry positions on the
-  watermark, alternation of retry and change pages, cancel sent to the
-  worker, observation runs.
+  watermark, alternation of retry and change pages, the cancel drain.
 - `python/solera_server/history.py`: `key_outcomes`; per-key counts on
   `attempts`.
 - `native/`: the group digest and grouping in `Rows` (in progress), the
@@ -955,7 +949,7 @@ is below the current one.
 - `example/brimstone.py`: the §4 shape; `qaqc_samples` becomes an
   `Each`.
 - Docs: architecture §2 (outputs), §4 (writes, store hook), §5 (edges,
-  sources), §6 (incrementality), §8 (runs and errors), §9 (observations),
+  sources), §6 (incrementality), §8 (runs and errors), §9 (observable sources as sensors),
   §11 (revision); `object-store-state.md` §5–7.
 
 ## 18. Tests
@@ -994,9 +988,11 @@ is below the current one.
   first.
 - Build identity: an uncommitted edit, deployed twice with different
   content, gives two revisions.
-- Observations: unchanged ticks write nothing durable; a cursor-only tick
-  commits its cursor without a new version or a wake-up; a changed tick
-  commits once; a restart mid-observation drops it harmlessly.
+- Observable sources: each `observe()` return shape becomes the right
+  `Tick`; unchanged ticks write nothing durable; a cursor-only tick
+  records `SensorAdvanced` without a new version or a wake-up; a tick whose
+  `base` is no longer the head is refused, whether resolved by the engine
+  or on the host; a restart mid-tick drops it harmlessly.
 
 ## 19. Open questions
 
