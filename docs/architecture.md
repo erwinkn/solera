@@ -690,7 +690,8 @@ inputs per annotation (keyed Incremental edges through the upstream key
 index) → build `ctx` → run the producer → compare each keyed output with
 its key index and write the delta file (an output where nothing changed is
 not stored) → take the write fence (exit if the engine holds it) →
-`store()` each output → write the result last, in one PUT.
+`store()` each output → seal the result's bytes and write them last, in one
+PUT, retried as they are: a failed upload never changes the outcome.
 Logs stream to chunked objects throughout. `manifest` mode runs through
 `Local` only, at server start.
 

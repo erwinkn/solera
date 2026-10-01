@@ -379,14 +379,20 @@ class LogShipper:
             await asyncio.sleep(LOG_FLUSH_SECONDS)
             await self.flush()
 
-    async def finish(self) -> dict:
-        """Join the chunks into the attempt's log; returns its index."""
+    async def finish(self) -> dict | None:
+        """Join the chunks into the attempt's log; returns its index — or
+        `None` if the log could not be joined: then its chunks stay, and are
+        what the console reads. The log never changes an attempt's outcome."""
 
-        await self.flush()
-        if self.members:
-            import obstore
+        import obstore
 
-            await _put(self.objects, f"{self.base}.log", b"".join(self.members))
+        try:
+            await self.flush()
+            if self.members:
+                await _put(self.objects, f"{self.base}.log", b"".join(self.members))
+        except Exception:
+            return None
+        with contextlib.suppress(Exception):
             await obstore.delete_async(
                 self.objects, [f"{self.base}.log.{n:06d}" for n in range(len(self.members))]
             )
@@ -703,7 +709,8 @@ async def run_attempt(
     result and the log index (docs/object-store-state.md §8).
 
     Returns 0 on success, 1 on failure, and 3 if the engine aborted the
-    attempt: then nothing was written. Once aborted, `on_abort` runs — from
+    attempt: then nothing was written. Raises if the result could not be
+    published. Once aborted, `on_abort` runs — from
     the heartbeat thread; by default the attempt's work is canceled.
     `own_process` says the process runs this attempt alone: its peak memory
     is the attempt's."""
@@ -736,29 +743,61 @@ async def run_attempt(
         await beat.stop()
 
 
+def _failed(error: BaseException, retryable: bool) -> dict:
+    return {
+        "status": "failed",
+        "error": {
+            "type": type(error).__name__,
+            "message": str(error),
+            "traceback": "".join(traceback.format_exception(error))[-32000:],
+            "retryable": retryable,
+        },
+    }
+
+
+PUBLISH_TRIES = 6
+
+
 async def _attempt(objects, objects_url: str, base: str, spec: dict, entrypoint, timeline: Timeline) -> int:
+    """Execute, then publish. The outcome is settled before anything is
+    published, and sealed into bytes once: publishing retries exactly those
+    bytes, and a failure to publish never changes what is published. A
+    worker that cannot publish exits without a result, which the engine
+    treats as a worker that died."""
+
     shipper = LogShipper(objects, base)
     flusher = asyncio.create_task(shipper.periodically())
-
-    async def finish(result: dict):
+    try:
+        result = await _execute(objects, objects_url, base, spec, entrypoint, timeline, shipper)
+    finally:
         flusher.cancel()
-        log = await shipper.finish()
-        timeline.add("finished")
-        body = {"spec": spec, "result": {**result, **timeline.report()}, "log": log}
-        await _put(objects, f"{base}.json", json.dumps(body, allow_nan=False).encode())
+    if result is None:
+        return ABORTED  # the engine has finished this attempt: write nothing, not even a result
+    log = await shipper.finish()
+    timeline.add("finished")
 
-    async def fail(error: BaseException, retryable: bool):
-        await finish(
-            {
-                "status": "failed",
-                "error": {
-                    "type": type(error).__name__,
-                    "message": str(error),
-                    "traceback": "".join(traceback.format_exception(error))[-32000:],
-                    "retryable": retryable,
-                },
-            }
-        )
+    def seal(result: dict) -> bytes:
+        body = {"spec": spec, "result": {**result, **timeline.report()}, "log": log}
+        return json.dumps(body, allow_nan=False).encode()
+
+    try:
+        data = seal(result)
+    except (TypeError, ValueError) as error:  # the result cannot be told as it is
+        result = _failed(error, True)
+        data = seal(result)
+    for attempt in range(PUBLISH_TRIES):
+        try:
+            await _put(objects, f"{base}.json", data)
+            break
+        except Exception:
+            if attempt == PUBLISH_TRIES - 1:
+                raise
+            await asyncio.sleep(0.2 * 2**attempt)
+    return 0 if result["status"] == "succeeded" else 1
+
+
+async def _execute(objects, objects_url, base, spec, entrypoint, timeline, shipper) -> dict | None:
+    """Run the attempt: its result, or `None` once the engine aborted it."""
 
     async def fence(intents: dict):
         """Take the write fence (§8), or learn that the engine aborted us. A
@@ -774,17 +813,13 @@ async def _attempt(objects, objects_url: str, base: str, spec: dict, entrypoint,
     try:
         project = entrypoint if isinstance(entrypoint, Project) else load_project(entrypoint)
     except Exception as error:
-        await fail(error, False)
-        return 1
+        return _failed(error, False)
     timeline.add("imported")
     if project.manifest["revision"] != spec["revision"]:
-        await fail(
-            StoreError(
-                f"revision mismatch: spec {spec['revision'][:12]} != project {project.manifest['revision'][:12]}"
-            ),
-            False,
+        mismatch = (
+            f"revision mismatch: spec {spec['revision'][:12]} != project {project.manifest['revision'][:12]}"
         )
-        return 1
+        return _failed(StoreError(mismatch), False)
     asset = project.assets[spec["asset"]]
     try:
         keys_io = _key_io(objects, objects_url, project)
@@ -809,17 +844,13 @@ async def _attempt(objects, objects_url: str, base: str, spec: dict, entrypoint,
         result = {"status": "succeeded", "outputs": outputs, "delivered": delivered}
         if cursor is not UNSET:
             result["cursor"] = cursor
-        await finish(result)
-        return 0
+        return result
     except Aborted:
-        return ABORTED  # the engine has finished this attempt: write nothing, not even a result
+        return None
     except StoreError as error:
-        await fail(error, getattr(error, "retryable", False))
+        return _failed(error, getattr(error, "retryable", False))
     except Exception as error:
-        await fail(error, True)
-    finally:
-        flusher.cancel()
-    return 1
+        return _failed(error, True)
 
 
 async def run_pool(pool: str, server: str, token: str | None = None):
@@ -867,9 +898,12 @@ async def run_pool(pool: str, server: str, token: str | None = None):
 
             renewal = asyncio.create_task(renew())
             try:
-                await run_attempt(
-                    stage["objects"], stage["attempt"], os.environ["SOLERA_PROJECT"], run=stage["run"]
-                )
+                try:
+                    await run_attempt(
+                        stage["objects"], stage["attempt"], os.environ["SOLERA_PROJECT"], run=stage["run"]
+                    )
+                except Exception:  # it could not publish: the engine treats it as dead
+                    traceback.print_exc()
                 await client.post(f"/api/tasks/{task_id}/complete", json={"worker": worker_id})
                 print(f"[pool] completed {task_id}", flush=True)
             finally:

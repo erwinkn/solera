@@ -409,3 +409,55 @@ async def test_a_create_whose_response_was_lost_is_its_own(tmp_path, monkeypatch
         await create(state.objects, f"{state.attempt_path(detail['request']['id'], 'x')}.writing", b"b")
     await engine.stop()
     await state.close()
+
+
+async def test_a_result_that_fails_to_publish_stays_what_it_was(tmp_path, monkeypatch):
+    """Publishing is not executing. The joined log fails to upload, and the
+    result's PUT lands but loses its response: the retry puts the very same
+    bytes, so the success stays a success, its log read from its chunks.
+    A worker that cannot publish at all leaves no result — never a failure
+    it did not have — and the engine retries it as dead."""
+
+    from solera_worker import worker
+
+    put, puts, broken = worker._put, [], {"on": False}
+
+    async def flaky(objects, key, value):
+        if key.endswith(".log"):
+            raise OSError("log upload failed")
+        if key.endswith(".json"):
+            puts.append(value)
+            if broken["on"]:
+                raise OSError("store unreachable")
+            if len(puts) == 1:
+                await put(objects, key, value)
+                raise OSError("the response was lost")
+        await put(objects, key, value)
+
+    monkeypatch.setattr(worker, "_put", flaky)
+    monkeypatch.setattr(worker, "PUBLISH_TRIES", 2)
+    calls = []
+
+    @asset(outputs=Output("scores", keyed=True), retries=Retry(1, delay=0))
+    def scores(ctx):
+        calls.append(1)
+        broken["on"] = len(calls) == 2  # the next run's first attempt cannot publish
+        ctx.log("scoring")
+        return {"a": len(calls)}
+
+    project = Project(assets=[scores])
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = engine_for(state, project, placement="inline")
+    await engine.initialize()
+    detail = await engine.run_until((await engine.submit(["scores"]))["id"], 10)
+    [attempt] = detail["attempts"][detail["tasks"][0]["id"]]
+    assert attempt["status"] == "succeeded" and len(puts) == 2 and puts[0] == puts[1]
+    record = await state.attempt_record(detail["request"]["id"], attempt["id"])
+    assert record["result"]["status"] == "succeeded" and record["log"] is None
+    assert b"scoring" in await state.attempt_log(detail["request"]["id"], attempt["id"])
+
+    detail = await engine.run_until((await engine.submit(["scores"]))["id"], 20)
+    first, second = detail["attempts"][detail["tasks"][0]["id"]]
+    assert "without a result" in first["error"] and second["status"] == "succeeded"
+    await engine.stop()
+    await state.close()

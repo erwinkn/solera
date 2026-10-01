@@ -620,6 +620,12 @@ ids are unique, so no two harnesses ever write the same file. The engine
 reads it after the harness exits; a file without `result` means the
 harness died.
 
+The harness settles its outcome before it publishes anything, and seals
+the file's bytes once: a failed or unconfirmed PUT is retried with those
+very bytes, so publishing can fail but never turns a success into a
+failure. A harness that cannot publish at all exits without a result, as
+if it had died.
+
 `spec` is everything the harness needs and the lineage record of what the
 attempt read, including the key indexes as pinned (the `KeyIndex` records
 of the outputs it writes and the incremental inputs it reads).
@@ -698,7 +704,9 @@ value or batch again. The console shows unsettled outputs.
   console tails a running attempt by reading new chunks.
 - When the attempt ends, the harness joins the chunks into
   `{attempt}.log` and deletes them. Concatenated gzip blocks are a valid
-  gzip file, so nothing is recompressed and standard tools read it.
+  gzip file, so nothing is recompressed and standard tools read it. If
+  the join fails, the result carries no `log` and the chunks stay: the
+  console reads them instead.
 - `log.blocks` lists `[byte offset, lines, first timestamp]` per block, so
   the console fetches "the last 200 lines" or a given page with a range
   read of just those blocks.
