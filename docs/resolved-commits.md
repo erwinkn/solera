@@ -12,9 +12,12 @@ It depends on two other designs, and says where:
 - `lifecycle.md` — the worker → engine HTTPS channel (§5), the `.worker`
   claim that admits one invocation (§4), and the store kinds `immutable`,
   `fenced` and `overwrite` (§9.6), which decide the repair rules of §3.
-- `per-key-processing.md` — the failure index and pattern edges, whose
-  readers live in this cache (§8). Its own semantics (rescoping,
-  cancellation, retry pacing, observations) belong to that doc.
+- `per-key-processing.md` — the failure index, whose one v1 reader here
+  (inlined retry pages) follows that doc's eligibility predicate and
+  transition table (§8). Its own semantics (rescoping, cancellation, retry
+  pacing, sensors) belong to that doc.
+- `key-index-format.md` — entries with a locator, and deltas with
+  predecessors (the `.kx` bump of the row-digest work).
 
 ## 1. Why
 
@@ -83,9 +86,12 @@ the first:
    kind (`lifecycle.md` §9.6).
 
 **`immutable` stores** (FileStore, S3Store) write each key at its version
-under a new name and never overwrite. A dead attempt leaves only
+under a name carrying the writer's generation, `{key}/{version}.{generation}`
+(`lifecycle.md` §9.8), and never overwrite. A dead attempt leaves only
 unreferenced objects, so there are no unsettled intents and no repair: the
-store writes the delta's upserts, and the commit records the delta.
+store writes the delta's upserts, and the commit records the delta. The
+generation is the delta entry's **locator**; superseded objects are
+collected through their predecessors' locators (§6).
 
 **`fenced` and `overwrite` stores** keep intents and repair, in this
 order — the order matters for `fenced` stores, and is today's for
@@ -94,8 +100,9 @@ order — the order matters for `fenced` stores, and is today's for
 ```
 1. acquire       fenced: the store's generation for (output, scope), before reading anything
                  (an older writer's open transaction finishes first; its later ones are refused)
-2. repair read   keys dead attempts meant to change and this patch does not mention:
-                 read back from the store, folded into the run
+2. repair read   named intents: keys dead attempts meant to change and this patch does
+                 not mention, read back from the store and folded into the run;
+                 an unknown-writes intent: the store's whole key map, reconciled (below)
 3. resolve       the repaired run — by the engine or locally
 4. upload        the delta file, create-only
 5. gate          the attempt's `.writing` gate with its intents (both kinds keep it, lifecycle §9.6)
@@ -113,10 +120,32 @@ What those stores write:
 | Write | Unsettled intents | Store writes |
 |---|---|---|
 | Patch | none | the delta's upserts and removes |
-| Patch | some | the delta, plus the patch's own keys an intent touched (`own ∩ intended`), even when unchanged in the index; step 2 already folded in the intents' other keys |
+| Patch | named | the delta, plus the patch's own keys an intent touched (`own ∩ intended`), even when unchanged in the index; step 2 already folded in the intents' other keys |
+| Patch | unknown writes | step 2 reads the store's whole key map and reconciles it (below); then as for named intents, with every key of the scope as `intended` |
 | Replacement | none | the delta's upserts and removes; the whole scope if the delta's key list was not collected |
-| Replacement | some | the whole scope. Step 2 does not run: it would keep stray rows the replacement means to remove |
-| `Sql` | — | the statement; the store reports its key map afterwards, resolved as a replacement |
+| Replacement | named or unknown | the whole scope, overwritten. Step 2 does not run: it would keep stray rows the replacement means to remove |
+| `Sql` | — | the statement; the store reports its rows afterwards, resolved as a replacement |
+
+**Unknown writes.** A `Sql` write's intent names no keys: the statement
+can change any of them, and its key map is known only once it reports. If
+its worker dies after the gate and before reporting, the next attempt
+cannot read back "the intended keys":
+
+```
+committed           a=1, b absent
+Sql attempt         deletes a, inserts b=1, commits its transaction, dies before reporting
+next attempt        a patch of c
+```
+
+So after acquisition (step 1), a **patch** against an unknown-writes
+intent reads the store's full key map for the scope — the same extraction
+a `Sql` write reports with — and reconciles it with the pinned index:
+every key whose store version differs from the index's, that the store
+holds and the index does not, or that the index holds live and the store
+does not (here `a` deleted and `b` inserted), joins the run as a repair
+entry before resolution. Only then can the commit clear the intent. A
+**replacement** needs no read: it overwrites the whole scope, as with any
+unsettled intent.
 
 An output is **unchanged** — no store write, no new batch, head kept —
 only when the delta is empty, the output exists, and no intent is
@@ -149,15 +178,17 @@ resolves locally.
 
 ```json
 {"invocation": "k3f…", "outputs": [
-  {"name": "orders", "scope": "", "kind": "patch", "batch": 12,
+  {"name": "orders", "scope": "", "kind": "patch", "batch": 12, "generation": 184467,
    "base": {"prefix": "keys/orders/_/", "head_batch": 11},
    "keys": 1000, "offset": 0, "size": 41250, "digest": "9e07…"}
 ]}
 ```
 
 - The payload is the sorted run as a `.kx` file (`key-index-format.md`):
-  `(key, version, deleted)`, `deleted` for removes. One format, one
-  parser, the CRCs included.
+  `(key, version, locator, deleted)`, `deleted` for removes. Every written
+  entry's locator is `generation`, the attempt's (`lifecycle.md` §9.7), so
+  an immutable store's name for it is known. One format, one parser, the
+  CRCs included.
 - `kind` is `patch` or `replace`: the same run means different deltas
   (`{a: 1}` against `{a: 1, b: 1}` is empty as a patch and deletes `b` as
   a replacement).
@@ -174,8 +205,9 @@ live attempt (and rebuilds from `.spec` on adoption):
   `start`ed one, or after a restart the one in `.worker`); any other gets
   `409` and resolves nothing — it should not be running;
 - the attempt is live and holds the scope lock for `(name, scope)`;
-- `name`, `scope`, `batch` and `base.prefix` are the ones prepared for that
-  output, and `base.head_batch` is the head's batch now;
+- `name`, `scope`, `batch`, `generation` and `base.prefix` are the ones
+  prepared for that output, the run's locators are that generation, and
+  `base.head_batch` is the head's batch now;
 - `kind` is allowed for the output (a `replace` of an output whose write
   can only be a patch is refused).
 
@@ -186,7 +218,7 @@ a guess.
 when their whole semantic input matches:
 
 ```
-(attempt, invocation, name, scope, kind, batch, base.prefix, base.head_batch, digest)
+(attempt, invocation, name, scope, kind, batch, generation, base.prefix, base.head_batch, digest)
 ```
 
 The answer is a pure function of that tuple and the snapshot content,
@@ -206,7 +238,11 @@ freeze, no response to recover and no engine-written file to clean up.
 ```
 
 - `delta`: the payload is the delta as a complete `.kx` file, ready to
-  upload under the worker's own name `{batch:012d}-{attempt}`. The worker
+  upload under the worker's own name `{batch:012d}-{attempt}`. Its entries
+  are `(key, version, locator, deleted)`, and every changed or deleted key
+  that had a live entry carries that entry's **predecessor** `(version,
+  locator)` — always, since the engine reads full entries; for an
+  immutable output, the names to collect once the delta commits (§6). The worker
   validates it — footer, index and block CRCs, filter CRC, its digest —
   and decodes it once for its store selection (§3); it uploads the bytes
   unchanged and builds `DeltaFiles` with the header's `added` and
@@ -274,8 +310,8 @@ the engine checks again.
   sensor host, which commits a reference to its delta file. Neither uses
   this route or an attempt's validation.
 - **Failure indexes** are not resolve targets: failure deltas are resolved
-  by the worker (§8). The engine can answer a `lookup` of prior failure
-  records from a warm failure index, with the same framing.
+  by the worker, with exact lookups of prior records
+  (`per-key-processing.md` §9).
 
 **Failure cases.**
 
@@ -313,7 +349,8 @@ header     magic "KXL1" · format version · source path · source size · sourc
 directory  per block: first key, last key, local offset, length, entries, restart count,
            CRC32C of the block's entries and restart table
            CRC32C of header and directory together
-blocks     per block: decompressed entries, then its restart table (offsets of full keys, every 16 entries)
+blocks     per block: decompressed entries (key, version, locator, deleted, predecessor if any),
+           then its restart table (offsets of full keys, every 16 entries)
 ```
 
 A lookup binary-searches the directory (held in RAM), then the block's
@@ -347,7 +384,7 @@ read fails with `corrupt`.
   (estimated from the steady-state level sizes).
 - `cache_ram` (default 512 MB): directories of every local file (~0.01 B
   per entry: ~1.3 MB at 100M), an LRU of hot decompressed blocks, and the
-  summaries of §7 and §8. Filters are not cached: a warm reader never
+  summaries of §7 and the retry pages of §8. Filters are not cached: a warm reader never
   needs them.
 
 **Pins.** A reader pins the file set it reads; eviction skips pinned
@@ -454,6 +491,41 @@ reads per changed key instead of ~0.01: ~1,250 more GETs for 1K keys at
 100M, ~$0.0005 per commit. Indexes over the cache budget take this path on
 every commit, so the design keeps filters and recounts (§13).
 
+**Predecessors of immutable outputs.** An immutable store collects a
+superseded object by name, `{key}/{version}.{locator}`, so someone must
+learn each changed or deleted key's previous `(version, locator)`. The
+filter shortcut cannot: for `k → v2` it knows that `k` holds some other
+version, not whether that was `k/v1.17` or `k/v1.93`. The design uses two
+triggers, each with one rule:
+
+- **At resolution, whenever the old entry was read.** The delta names
+  the predecessor of every changed or deleted key whose resolution read
+  its old entry: always on the engine, always in the streaming merge-join,
+  and for the sparse reader's maybe keys. The commit's data-garbage entry
+  collects those names once no reader pins them (`lifecycle.md` §9.8).
+- **At compaction, for the rest.** A key the pair filter cleared has no
+  named predecessor, but its old entry is still in the index, shadowed.
+  Every merge that drops a shadowed entry — or the entry under a
+  tombstone at the bottom level — emits that entry's `(key, version,
+  locator)` as data garbage at the compaction's event position, under the
+  same reader-pin rule. Compaction emits every entry it drops, named
+  before or not: names are never reused, so discarding a name twice is a
+  no-op (`discard` ignores missing names), and no "already collected" bit
+  has to survive compaction.
+
+The alternatives, priced at 100M keys, 1K random changes per commit:
+
+| Choice | Cold sparse path | Collection |
+|---|---|---|
+| exact predecessors only, at resolution | the pair filter no longer decides: ~1.25 block reads per changed key, ~1,300 GETs instead of ~50, ~$0.0005 per commit | prompt |
+| deferred only, at compaction | ~50 GETs | every superseded object waits until its new entry merges over the old one — for random keys mostly at the bottom level, so ~20% of keys (the upper levels' share in steady state) keep a second object, hours to days |
+| **both (chosen)** | ~50 GETs | prompt wherever the old entry was read (warm and streaming: every key); deferred only for keys the cold path's filters cleared |
+
+An index over the cache budget takes the cold path on every commit, so
+the first row would cost scenario E ~$130 a month; the second gives up
+prompt collection that the warm path gets for free. Outputs on `fenced`
+and `overwrite` stores carry locators too but collect nothing by them.
+
 **Streaming merge-join**, for replacements and dense patches: the native
 job that full replacement, compaction and recount already use, extended to
 patches — it streams every level in 8 MB segments, merges them with the
@@ -498,9 +570,14 @@ instead of making the worker read deltas:
 
 ```json
 "changes": {"from": 56, "to": 57, "after": null, "limit": 10000, "full": false,
-            "inline": {"upserted": {"alpha-file-2": "3f9c…"}, "deleted": ["alpha-file-7"],
+            "inline": {"upserted": {"alpha-file-2": ["3f9c…", 184467]}, "deleted": ["alpha-file-7"],
                        "next": null}}
 ```
+
+An upserted key carries its `(version, locator)`, as a paged window's
+does: the worker hands them to the load as `Keys({key: (revision,
+locator)})` (`lifecycle.md` §9.8), and an immutable store computes every
+name without a LIST.
 
 - **The pinned window, nothing newer.** The page merges exactly the delta
   files of batches `from…to` in the spec's pinned log, newest batch
@@ -528,84 +605,39 @@ instead of making the worker read deltas:
 
 ## 8. Readers for per-key processing
 
-`per-key-processing.md` adds three readers of this cache. Its semantics
-(what is eligible, when retry passes start, cancellation, rescoping) are
-that doc's; this section is how the cache computes them without ever
-suppressing required work.
+`per-key-processing.md` is authoritative for everything about failures:
+the entry format, the **transition table** (an explicitly canceled key
+becomes `canceled` and stays dormant until a request or an upstream change
+brings it back; a timed-out key counts a try and backs off), the **one
+eligibility predicate** `eligible(entry, now, epoch, forced)`, the
+outcome counts moved by transitions, the conservative minima maintained
+from each commit and made exact by completed retry passes, and retry-pass
+identity. This doc implements none of that differently; it calls the same
+SDK predicate.
 
-**Every summary carries its input identity, checked on publish and on
-use.** A summary is computed on a maintenance thread from a stated input,
-and the engine loop accepts it only if that input is still current:
+In v1 the cache has **one** per-key reader: the **inlined retry page**.
+When a scope has retries and its failure index is warm, a maintenance
+thread selects the next page of entries after the pass position that
+satisfy `eligible`, at most `inline_max`, with their prior records, and
+holds it for prepare, under §7's caps:
 
-| Summary | Input identity |
-|---|---|
-| pattern match count | (upstream index prefix, batch, edge, pattern fingerprint) |
-| failure bounds `due`, `epoch_min` | (failure index prefix, its head batch, project epoch, retry pass id) |
-| due-retry page | the same, plus the pass position `retry.after` |
+- it carries its **input identity** — (failure index prefix, its head
+  batch, the pass identity of the per-key doc, the pass position
+  `retry.after`) — and is discarded rather than published if any of them
+  moved while it was computed, and ignored by prepare unless they all
+  match the scope's current ones;
+- prepare never waits for it: without a matching page, `.spec` pins the
+  failure index and the worker pages it with the same predicate.
 
-A summary computed against failure head 10 that finishes after head 11
-was committed is discarded, not published; a pattern count computed under
-the old patterns is never used once the manifest changes them.
+Failure deltas are not resolved here: the worker resolves them locally,
+with exact lookups of prior records (per-key doc §9), and an inlined page
+already carries the prior records of its keys.
 
-**Commits keep conservative bounds synchronously.** The engine loop does
-not wait for a maintenance thread to learn what a commit changed:
-
-- A failure delta's commit carries, in the worker's result, the minimum
-  eligibility time of the entries it writes (a retry's `next_at`, now for
-  an interrupted key) and the outcome-count transitions (below). The
-  engine applies `due = min(due, that)` and the counts in the same commit,
-  so a newly due key is never stranded behind a slow summary.
-- A committed upstream batch without a published match count for an edge
-  is **unknown**: its window is launched, and the worker filters it.
-  Skipping a batch requires a published zero for the current pattern
-  fingerprint.
-- A worker that finishes a retry pass reports its bounds with the identity
-  it ran against; the engine applies them only for that identity, and
-  folds in commits since — as recounts do with `IndexRecounted`.
-
-**Incremental minima, not rescans.** A failure index under a systemic
-failure has 1M entries and is worked through in 10,000 pages; rescanning
-it after every page would visit ~5 billion entries. So `due` and
-`epoch_min` move by the entries each commit writes. A commit that removes
-or reschedules the entry holding the minimum marks the summary **dirty**:
-the bound stays where it was — conservative, so at worst a scope wakes
-early, finds its due page empty, and launches nothing — and one coalesced
-recomputation runs at most every `summary_interval` (60 s), or at the end
-of a retry pass, whichever is first.
-
-**One eligibility predicate.** Whether an entry is due — retrying or
-interrupted with `next_at ≤ now`, failed under an older epoch, or covered
-by a forced retry — is one native function, used by the engine's
-summaries and due pages and by the worker's paging. A new pass identity
-(a new epoch, a new forced request) restarts the pass from the beginning
-of the index, so keys before the old `retry.after` are covered.
-
-**Failure deltas are resolved by the worker.** The failure index is not a
-resolve target: an entry's next state depends on its previous one (tries,
-first failure, retry deadline), and a small page can target a cold
-million-entry index the engine has not admitted. For the page's keys, the
-worker:
-
-1. looks up their prior failure records **exactly** — values, not
-   verdicts: through the engine's `lookup` when the failure index is warm,
-   else locally (read whole up to 32 MB, else the sparse reader's block
-   reads with no pair-filter shortcut);
-2. computes each key's new record and its **outcome transition** (e.g.
-   `failed → retrying`, `retrying → ok` as a tombstone), which a key-index
-   delta cannot express: changing a record from `failed` to `retrying`
-   adds and removes nothing;
-3. uploads the failure delta and reports the transitions as count changes
-   (`{"failed": -1, "retrying": +1}`) in its result.
-
-Outcome counts in state change only by those transitions, never by
-`added`/`removed`. The per-key doc's entry format should use a varint for
-`tries` (a `u8` saturates for a record kept indefinitely).
-
-| Reader | Computes | If the input is not cached |
-|---|---|---|
-| Pattern match counts | per committed delta and consuming edge: matching keys, and the keys themselves when ≤ `inline_max` (they become the edge's inline summary, §7) | unknown: launch, the worker filters |
-| Failure bounds | `due`, `epoch_min`, incrementally (above) | the commit-time bounds stand; exact values at pass end |
-| Due-retry page | the next page of eligible entries after `retry.after`, held for prepare to inline under §7's caps | the spec pins the failure index and the worker pages it |
+Not in v1, and not to be built from this doc: engine-side pattern skip
+hints (pattern match counts per committed delta), and coalesced
+recomputation of failure minima from the cache. The per-key doc records
+both as later optimizations; if they come, they follow the same identity
+rule.
 
 ## 9. Costs
 
@@ -634,7 +666,15 @@ to re-estimate, not this one's.
   size; the measured streaming read is the fresh index's 371 GETs and
   2.4 GB).
 - **The cold path when declined.** Today's figures: ~50 GETs per 1K-key
-  commit at 100M; a streaming patch reads the snapshot.
+  commit at 100M, immutable outputs included, since predecessors the
+  filters skip are collected at compaction (§6); a streaming patch reads
+  the snapshot.
+- **Locators and predecessors.** A varint generation per entry, and a
+  predecessor `(version, locator)` per changed key in deltas until
+  compaction drops it; the bytes per entry are the format work's to
+  measure (`lifecycle.md` §15). Discards are DELETEs, free on S3, batched
+  by 1,000; keys collected at commit are discarded a second time, as a
+  no-op, when compaction drops their old entry.
 - **Network.** Requests and responses are ~40 KB and ~27 KB per 1K-key
   commit. Within one availability zone that is free; across zones EC2
   charges per GB in each direction (about $0.01/GB each way at today's
@@ -683,10 +723,19 @@ reports both.
   fills are deduplicated; failed and canceled fills release their
   reservations; a compaction that cannot reserve demotes its index;
   pinned files survive eviction and garbage collection.
-- **Summaries.** A summary computed against an older head is discarded; a
-  commit's bounds make a new due key schedulable before any summary runs;
-  a pattern change invalidates zero counts; a dirty minimum stays
-  conservative; outcome counts follow transitions, not `added`/`removed`.
+- **Locators.** Resolver deltas, cold deltas, inlined pages and `Keys`
+  carry `(version, locator)`; every superseded object of an immutable
+  output is discarded — by its commit when the old entry was read, by the
+  compaction that drops it otherwise, including keys the pair filter
+  cleared and keys deleted at the bottom level — and none while a reader
+  pins it; a second discard is a no-op.
+- **Unknown writes.** A dead `Sql` writer that deleted `a` and inserted
+  `b`: the next patch acquires, reads the store's key map, reconciles both
+  keys and only then clears the intent; a replacement overwrites instead.
+- **Retry pages.** An inlined retry page computed against an older failure
+  head or pass position is discarded; prepare without a matching page
+  pins the failure index instead of waiting; canceled keys are never
+  selected by themselves (the per-key predicate).
 - **Inlining.** Inlined pages equal `pending` pages for the same pinned
   window, including a later batch that must not leak in, tombstones, the
   byte cap, an oversized first entry (no inline), the summary and merge
@@ -700,16 +749,20 @@ reports both.
 
 - `solera/keys`: delete `_plan_reads`, `_read_options`, `Cost`,
   `_estimate` and the rate options; add the patch variant of the streaming
-  job and the two switch rules; `FileInfo.digest`; keep filters and
+  job and the two switch rules; `FileInfo.digest`; locators and
+  predecessors in deltas (on the `.kx` bump of `key-index-format.md`);
+  compaction emitting dropped entries as data garbage; keep filters and
   `inexact` for the sparse reader.
 - `native/`: the local form (build, verify, lookup), a resolve job over
-  it, the in-RAM window merge, the shared eligibility predicate.
-- `solera_worker`: the phases of §3 (`acquire` before repair reads);
-  build the run; ask, wait, fall back; validate and upload the returned
-  delta; failure deltas with exact prior lookups and outcome transitions.
+  it, the in-RAM window merge.
+- `solera_worker`: the phases of §3 (`acquire` before repair reads, the
+  unknown-writes reconciliation); build the run; ask, wait, fall back;
+  validate and upload the returned delta.
 - `solera_server`: the resolve route and its validation; the cache, its
-  threads, reservations, admission and demotion; candidates; summaries
-  with input identities; commit-time bounds; `inline` in prepare.
+  threads, reservations, admission and demotion; candidates; the inlined
+  retry page with its identity; `inline` in prepare.
+- Not here: failure deltas, transitions, the eligibility predicate and
+  minima are the per-key implementation's.
 - Docs: §6 "Compute a delta" and "Deliver pending deltas" in
   `object-store-state.md`; `key-index-costs.md`; the route's row in
   `lifecycle.md` §5.1.
@@ -726,8 +779,10 @@ reports both.
   Arrow and SQL.
 - **An object-store channel** for resolves. Workers can always reach the
   engine over HTTPS; a worker that cannot simply resolves locally.
-- **Observation publication, rescoping, cancellation and retry pacing** —
+- **Sensor publication, rescoping, cancellation and retry pacing** —
   `per-key-processing.md` and `lifecycle.md`.
+- **Later, not v1:** pattern skip hints and coalesced recomputation of
+  failure minima (§8).
 
 ## 13. Where this departs from the reviews
 
@@ -750,7 +805,7 @@ The follow-up review agrees with all three.
    `resolve_max_entries` and `resolve_timeout` from the grid of §6; the
    absolute caps stay regardless.
 2. **Engine capacity.** No rate threshold is credible before the local
-   form is measured. Resolves, summaries and compaction have separate
+   form is measured. Resolves, retry pages and compaction have separate
    threads; if offloading becomes necessary, the cache and all its readers
    move together into `engine_executor` (`object-store-state.md` §6),
    rather than a second cache-owning service.
@@ -758,4 +813,5 @@ The follow-up review agrees with all three.
    RAM (a bigger `cache_ram`) to beat a warm worker, or SSD reads suffice.
 4. **With `lifecycle.md`:** settled there — the route (§5.1),
    `Store.acquire` (§9.7), and failure deltas staying out of the gate's
-   intents (§9.6); sensors (§11 there) need no attempt validation.
+   intents (§9.6); sensors (§11 there) need no attempt validation. Its
+   §9.8 collection gains the compaction trigger of §6 here.
