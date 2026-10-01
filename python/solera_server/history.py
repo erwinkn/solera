@@ -600,12 +600,14 @@ class History:
     async def stop(self) -> None:
         await self.lake.stop()
 
-    def delete(self, runs: list[str]) -> None:
+    def delete(self, runs: list[str], files: list[str] = ()) -> None:
         """Forget finished runs: their rows go now, or from the files that
-        hold them when those are next rewritten."""
+        hold them when those are next rewritten. Of `files`, the run
+        directories are deleted next (§11)."""
 
         if runs:
-            self.state.record({"type": "RunsDeleted", "runs": sorted(runs), "at": self.clock()})
+            event = {"type": "RunsDeleted", "runs": sorted(runs), "at": self.clock()}
+            self.state.record({**event, "files": sorted(files)} if files else event)
 
     async def query(
         self,

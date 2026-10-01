@@ -8,7 +8,7 @@ from solera.sdk import Incremental, Output, Project, Retention, asset
 from solera_server.engine import Engine
 from solera_server.history import RunFilter
 from solera_server.placements.inline import InlinePlacement
-from solera_server.state import State
+from solera_server.state import State, Unavailable
 
 
 class Clock:
@@ -149,3 +149,88 @@ async def test_source_commits_are_recorded_as_runs(state, clock):
     clock.now += 2 * 86400
     await engine.upkeep.tick()
     assert await history_ids(engine) == []  # expired under the project default
+
+
+@asset
+def plain():
+    return {"n": 1}
+
+
+PLAIN = Project(assets=[plain])
+
+
+async def test_a_run_retires_for_good_before_its_files_go(tmp_path, state, clock):
+    """Deletion is retirement first: `RunsDeleted` is durable before any file
+    goes. A replaced engine cannot make it durable, so it deletes nothing;
+    and a deletion cut short resumes after a restart."""
+
+    engine = engine_for(state, PLAIN, clock)
+    await engine.initialize()
+    gone, kept = await run(engine, ["plain"]), await run(engine, ["plain"])
+    await engine.history.lake.flush(force=True)
+
+    successor = await State.open(tmp_path.as_uri(), "test", clock=clock, flush_interval=0.001)
+    with pytest.raises(Unavailable):
+        await engine.delete_run(gone)  # replaced: retirement never becomes durable
+    assert await run_dirs(state) == {gone, kept}
+    await engine.stop()
+
+    later = engine_for(successor, PLAIN, clock)
+    await later.initialize()
+    delete = successor.delete_run
+
+    async def crash(run_id):
+        raise OSError("the engine went down")
+
+    successor.delete_run = crash
+    with pytest.raises(OSError):
+        await later.delete_run(gone)
+    assert successor.model.retired == [gone] and await later.history.run(gone) is None
+    await later.stop()
+    await successor.close()
+
+    again = await State.open(tmp_path.as_uri(), "test", clock=clock, flush_interval=0.001)
+    assert again.model.retired == [gone]
+    restarted = engine_for(again, PLAIN, clock)
+    await restarted.upkeep.tick()
+    assert again.model.retired == [] and await run_dirs(again) == {kept}
+    with pytest.raises(KeyError):
+        await restarted.retry(gone)  # a retired run never comes back
+    successor.delete_run = delete
+    await again.close()
+
+
+async def test_a_run_reopened_while_chosen_for_deletion_is_kept(state, clock):
+    """Retention picks a run, and a retry reopens it before its deletion
+    begins: it is kept. A retry that is reading the run when its deletion
+    begins finishes reopening it first."""
+
+    import asyncio
+
+    engine = engine_for(state, PLAIN, clock)
+    await engine.initialize()
+    first, second = await run(engine, ["plain"]), await run(engine, ["plain"])
+    await engine.history.lake.flush(force=True)
+
+    await engine.retry(first)
+    await engine.upkeep.delete_runs([(first, "succeeded")])
+    assert first in state.model.runs and first in await run_dirs(state)
+
+    read, reading, release = engine.history.run, asyncio.Event(), asyncio.Event()
+
+    async def slow(run_id):
+        found = await read(run_id)
+        reading.set()
+        await release.wait()
+        return found
+
+    engine.history.run = slow
+    retry = asyncio.create_task(engine.retry(second))
+    await reading.wait()
+    deletion = asyncio.create_task(engine.upkeep.delete_runs([(second, "succeeded")]))
+    await asyncio.sleep(0.05)
+    release.set()
+    await asyncio.gather(retry, deletion)
+    assert second in state.model.runs and second in await run_dirs(state)
+    assert state.model.retired == []
+    await engine.stop()

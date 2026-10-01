@@ -85,6 +85,7 @@ class Model:
                 "heads": _nest(self.heads, 2),
                 "indexes": _nest({k: v.to_json() for k, v in self.indexes.items()}, 2),
                 "garbage": self.garbage,
+                "retired": self.retired,
                 "cursors": _nest(self.cursors, 2),
                 "watermarks": _nest(self.watermarks, 3),
                 "outcomes": _nest(self.outcomes, 2),
@@ -108,6 +109,8 @@ class Model:
             k: IndexState.from_json(v) for k, v in _flatten(snap.get("indexes"), 2).items()
         }
         self.garbage: list[list] = snap.get("garbage") or []  # [path, at]: unreferenced index files
+        # deleted runs whose directories are still to be deleted (§11)
+        self.retired: list[str] = snap.get("retired") or []
         self.cursors: dict[tuple, object] = _flatten(snap.get("cursors"), 2)
         self.watermarks: dict[tuple, dict] = _flatten(snap.get("watermarks"), 3)
         self.outcomes: dict[tuple, dict] = _flatten(snap.get("outcomes"), 2)
@@ -909,4 +912,12 @@ class Model:
         self.garbage.extend([path, e["at"]] for path in self.history.compacted(e["changes"]))
 
     def _on_RunsDeleted(self, e):
+        """Runs retire for good: their history goes, and their directories
+        are deleted only from here on — `RunsPurged` once they are."""
+
         self.history.forget(set(e["runs"]), e["at"])
+        self.retired.extend(r for r in e.get("files") or () if r not in self.retired)
+
+    def _on_RunsPurged(self, e):
+        gone = set(e["runs"])
+        self.retired = [r for r in self.retired if r not in gone]

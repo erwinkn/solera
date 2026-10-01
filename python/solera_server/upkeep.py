@@ -54,6 +54,10 @@ class Upkeep:
         self._swept = -math.inf
         self._alive = -math.inf
         self._task: asyncio.Task | None = None
+        # Held while runs are retired, and by a retry while it reopens one:
+        # a run is never reopened between being chosen and being retired.
+        self.retiring = asyncio.Lock()
+        self._purging = asyncio.Lock()
 
     @property
     def m(self):
@@ -86,6 +90,7 @@ class Upkeep:
         self.truncate()
         self.maintain()
         await self.collect()
+        await self.purge()
         await self.sweep()
 
     async def say_alive(self, force=False) -> None:
@@ -273,10 +278,24 @@ class Upkeep:
         await self.delete_runs(doomed)
 
     async def delete_runs(self, runs: list[tuple[str, str | None]]) -> None:
-        """Delete finished runs, `(id, status)`: their attempt files and logs,
-        then their history."""
+        """Delete finished runs, `(id, status)`. Retirement comes first and
+        is for good: `RunsDeleted` drops their history and is made durable
+        before any of their files go, so a replaced engine deletes nothing.
+        A run reopened since it was chosen is kept."""
 
-        for run_id, status in runs:
-            if status != "skipped":  # a skipped run launched nothing
+        async with self.retiring:
+            runs = [(r, s) for r, s in runs if r not in self.m.runs and r not in self.m.retired]
+            files = [r for r, status in runs if status != "skipped"]  # a skipped run launched nothing
+            self.history.delete([r for r, _ in runs], files)
+        await self.purge()
+
+    async def purge(self) -> None:
+        """Delete the directories of retired runs: their attempt files and logs."""
+
+        async with self._purging:
+            if not self.m.retired:
+                return
+            await self.state.durable()
+            for run_id in list(self.m.retired):
                 await self.state.delete_run(run_id)
-        self.history.delete([run_id for run_id, _ in runs])
+                self.state.record({"type": "RunsPurged", "runs": [run_id]})

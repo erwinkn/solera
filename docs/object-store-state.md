@@ -177,7 +177,8 @@ status are derived inside `apply`; they are not events.
 | `RunReopened` | `run`, `at` | a retry brings a finished run back; its history rows are dropped until it ends again |
 | `HistoryFlushed` | `files` {table: file}, `upto` {table: row seq} | installs one Parquet file per table and drops the rows it holds |
 | `HistoryCompacted` | `changes` [{`table`, `removed` [path], `added?` file}], `at` | swaps merged or purged files in; the removed ones become garbage |
-| `RunsDeleted` | `runs`, `at` | drops their pending rows and hides them in files that may hold them |
+| `RunsDeleted` | `runs`, `files`, `at` | retires runs for good: drops their pending rows, hides them in files that may hold them, and queues the directories of `files` (runs that launched anything) for deletion (§11) |
+| `RunsPurged` | `runs` | their directories are deleted |
 
 An attempt that has not launched yet — it is still pinning inputs and
 writing its spec — is **not** in the journal: after a restart its task is
@@ -203,6 +204,7 @@ State
   history      {files: {table: [File]}, rows: {table: [[seq, row], …]}, seq, imported}   # §7
   unsettled    {output: {scope: [Intent, …]}}      # keyed outputs a dead writer may have half-written (§8)
   garbage      [[path, at], …]                     # index and history files nothing references any more
+  retired      [run, …]                            # deleted runs whose directories are still to delete (§11)
 ```
 
 | Type | Fields | Bounded by |
@@ -799,7 +801,7 @@ unreadable can be recovered from.
 **Run lifecycle.** submit → `RunSubmitted` · attempts → `AttemptFinished`
 · terminal → `RunArchived` (its rows join the pending history) · flush →
 `HistoryFlushed` · merge → `HistoryCompacted` · retention →
-`DELETE runs/{run}/` and `RunsDeleted`.
+`RunsDeleted`, durable → `DELETE runs/{run}/` → `RunsPurged`.
 
 **Attempt lifecycle.** claim (memory) → pin and write the spec →
 `AttemptLaunched` → [pool: `AttemptClaimed`] → the harness takes the
@@ -830,10 +832,20 @@ the `runs`-th newest run that committed to it; with both, the earlier
 (whichever keeps more). Every `retention_interval` (60 s) the engine asks
 the history (§7) for those times and for the finished runs older than the
 latest horizon, and deletes each run older than the horizon of every asset
-it ran: its directory — `DELETE runs/{run}/` — and its history rows
-(`RunsDeleted`). A run of an asset that keeps everything is kept; a source
-commit or a run with no tasks follows the project default. Nothing about
-retention is held in memory.
+it ran: its history rows and its directory. A run of an asset that keeps
+everything is kept; a source commit or a run with no tasks follows the
+project default. Nothing about retention is held in memory.
+
+**Retire, then delete.** Deleting a run is irreversible, so it is recorded
+first: `RunsDeleted` hides the run from the history for good and lists it
+in `retired`; once that is durable, `DELETE runs/{run}/`, then
+`RunsPurged`. An engine replaced meanwhile cannot make `RunsDeleted`
+durable, so it deletes nothing; an engine that stops between the two picks
+the deletion up again from `retired`. A retry reopens a run only while
+holding the same lock retirement takes, and retirement skips runs that are
+active: so a run is never reopened after it was chosen for deletion and
+before it is retired, and a retired run — gone from the history — is never
+reopened, nor its directory reused.
 
 For example, with `site_feed` at `Retention(days=1)` and `file_index` at
 `Retention(runs=90)`: a two-day-old run of only `site_feed` goes; a

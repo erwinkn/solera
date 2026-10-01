@@ -1779,13 +1779,13 @@ class Engine:
         return self._run_view(self.m.runs[run_id])
 
     async def retry(self, run_id: str, by: str | None = None):
-        run = self.m.runs.get(run_id)
-        if run is None:
-            archived = await self.history.run(run_id)
-            if archived is None or "source" in archived:
-                raise KeyError(run_id)
-            if run_id not in self.m.runs:  # reopened while we read it
-                self.state.record({"type": "RunReopened", "run": archived, "at": self.clock()})
+        if run_id not in self.m.runs:
+            async with self.upkeep.retiring:  # nothing retires it between reading and reopening it
+                archived = None if run_id in self.m.retired else await self.history.run(run_id)
+                if archived is None or "source" in archived:
+                    raise KeyError(run_id)
+                if run_id not in self.m.runs:  # reopened while we read it
+                    self.state.record({"type": "RunReopened", "run": archived, "at": self.clock()})
         self._control(run_id, "retry", by)
         return self._run_view(self.m.runs[run_id])
 
