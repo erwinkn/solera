@@ -235,7 +235,9 @@ class IndexState:
 class Delta:
     """A commit's delta: entries sorted by key (`deleted` 1 for removals), and
     how the live key count changes. `exact` is false when a count change was
-    inferred from a filter rather than read."""
+    inferred from a filter rather than read. Each entry's locator is the
+    writer's generation; its predecessor is the key's `(version, locator)`
+    before, where it was read (None for a new key, or one a filter cleared)."""
 
     keys: list[bytes]
     versions: list[bytes]
@@ -243,6 +245,8 @@ class Delta:
     added: int
     removed: int
     exact: bool
+    locators: list[int] = field(default_factory=list)
+    predecessors: list = field(default_factory=list)
 
     def __len__(self) -> int:
         return len(self.keys)
@@ -426,16 +430,19 @@ class KeyIndex:
 
     # -- a commit's delta ----------------------------------------------------------------
 
-    async def changes(self, keys: list[bytes], versions: list[bytes], removes: list[bytes] = ()) -> Delta:
+    async def changes(
+        self, keys: list[bytes], versions: list[bytes], removes: list[bytes] = (), *, generation: int = 0
+    ) -> Delta:
         """Which entries of a patch change the index: upsert `keys` at
-        `versions`, delete `removes`. A full replacement is `replace`."""
+        `versions`, delete `removes`, written by `generation`. A full
+        replacement is `replace`."""
 
         keys, versions, _ = sort_entries(list(keys), list(versions), bytes(len(keys)))
         keys, versions = list(keys), list(versions)
         removes = sorted(set(removes))
         if removes and set(removes) & set(keys):
             raise ValueError("a key cannot be both written and removed")
-        return await self._patch(keys, versions, removes)
+        return await self._patch(keys, versions, removes, generation)
 
     async def replace(
         self,
@@ -446,14 +453,16 @@ class KeyIndex:
         collect: int = 0,
         key: str | None = None,
         revision: str | None = None,
+        generation: int = 0,
     ) -> tuple[DeltaFiles, tuple[list[bytes], list[bytes]] | None]:
         """A full replacement: `rows` is the whole new content — a `Rows`, or
         chunks sorted by key, pulled as needed: `(key, version)` pairs, or
         with `key` rows keyed by that column, whose versions are computed
         natively (docs/row-digest.md). Every live key is compared as the
         join reaches it; new keys and changed versions are written, live keys
-        not in `rows` deleted. The delta goes out as the batch's files as
-        they fill. Returns them and, up to `collect` keys, the written and
+        not in `rows` deleted, each entry located at `generation` and
+        carrying the key's predecessor `(version, locator)`. The delta goes out
+        as the batch's files as they fill. Returns them and, up to `collect` keys, the written and
         the deleted keys (None past it)."""
 
         runs = self.state.newest_first()
@@ -464,6 +473,7 @@ class KeyIndex:
             collect=collect,
             key=key,
             revision=revision,
+            generation=generation,
         )
         files = await self._run(job, runs, lambda n: f"{batch:012d}-{attempt}.{n:04d}", 0, rows)
         return DeltaFiles(files, job.added, job.removed, True), job.collected()
@@ -490,10 +500,12 @@ class KeyIndex:
         await jobs.run(job, self.io, self.path, runs, put, None if isinstance(rows, Rows) else rows)
         return [files[n] for n in sorted(files)]
 
-    async def _patch(self, keys: list[bytes], versions: list[bytes], removes: list[bytes]) -> Delta:
+    async def _patch(
+        self, keys: list[bytes], versions: list[bytes], removes: list[bytes], generation: int
+    ) -> Delta:
         want = dict(zip(keys, versions, strict=True))
         unresolved = sorted(set(keys) | set(removes))
-        known: dict[bytes, tuple[bool, bytes]] = {}  # key -> (live, version), read exactly
+        known: dict[bytes, tuple] = {}  # key -> (live, version, locator), read exactly
         absent: set[bytes] = set()  # keys no file holds
         exact = True
         levels = self.state.newest_first()
@@ -532,7 +544,7 @@ class KeyIndex:
                     # Live at another version — or, behind a false-positive key
                     # filter, not there at all: counted as an existing key.
                     exact = False
-                    known[key] = (True, None)
+                    known[key] = (True, None, None)
                 else:
                     maybe.append(key)
             if maybe:
@@ -542,16 +554,20 @@ class KeyIndex:
         else:
             absent.update(unresolved)
 
-        out_k, out_v, out_d = [], [], bytearray()
+        out_k, out_v, out_d, out_p = [], [], bytearray(), []
         added = removed = 0
         rm = set(removes)
         for key in sorted(set(keys) | rm):
-            live, version = (False, None) if key in absent else known.get(key, (False, None))
+            live, version, locator = (
+                (False, None, None) if key in absent else known.get(key, (False, None, None))
+            )
+            before = (version, locator) if live and version is not None else None
             if key in rm:
                 if live:
                     out_k.append(key)
                     out_v.append(b"")
                     out_d.append(1)
+                    out_p.append(before)
                     removed += 1
                 continue
             v = want[key]
@@ -560,8 +576,9 @@ class KeyIndex:
             out_k.append(key)
             out_v.append(v)
             out_d.append(0)
+            out_p.append(before)
             added += 0 if live else 1
-        return Delta(out_k, out_v, bytes(out_d), added, removed, exact)
+        return Delta(out_k, out_v, bytes(out_d), added, removed, exact, [generation] * len(out_k), out_p)
 
     def _candidates(self, level: list[FileInfo], keys: list[bytes]) -> dict[str, list[bytes]]:
         """Per file of a level, the sorted keys inside its key range."""
@@ -596,8 +613,8 @@ class KeyIndex:
             found.update(part)
         return found
 
-    async def _lookup(self, p: _Parsed, keys: list[bytes]) -> dict[bytes, tuple[bool, bytes]]:
-        """`(live, version)` of each of the sorted `keys` the file holds."""
+    async def _lookup(self, p: _Parsed, keys: list[bytes]) -> dict[bytes, tuple[bool, bytes, int]]:
+        """`(live, version, locator)` of each of the sorted `keys` the file holds."""
 
         blocks_for: dict[int, list[bytes]] = {}
         for key in keys:
@@ -609,10 +626,10 @@ class KeyIndex:
         fetched = await self._blocks(p, blocks_for)
         found = {}
         for b, bkeys in blocks_for.items():
-            hit, vers, dels = lookup([fetched[b]], p.tail["codec"], bkeys)
-            for key, h, v, d in zip(bkeys, hit, vers, dels, strict=True):
+            hit, vers, dels, locs = lookup([fetched[b]], p.tail["codec"], bkeys)
+            for key, h, v, d, loc in zip(bkeys, hit, vers, dels, locs, strict=True):
                 if h:
-                    found[key] = (not d, v)
+                    found[key] = (not d, v, loc)
         return found
 
     async def _filter(self, levels, keys, want):
@@ -744,7 +761,18 @@ class KeyIndex:
         """Write a patch's delta as the batch's files, `{batch}-{attempt}.{n}`:
         the attempt id keeps a retried batch from colliding with its own upload."""
 
-        datas = write_files(delta.keys, delta.versions, delta.deleted, **self._writer()) if delta.keys else []
+        datas = (
+            write_files(
+                delta.keys,
+                delta.versions,
+                delta.deleted,
+                locators=delta.locators or None,
+                predecessors=delta.predecessors or None,
+                **self._writer(),
+            )
+            if delta.keys
+            else []
+        )
         files = [FileInfo.describe(f"{batch:012d}-{attempt}.{n:04d}", 0, d) for n, d in enumerate(datas)]
         await asyncio.gather(
             *(self.io.write(self.path(f.name), d) for f, d in zip(files, datas, strict=True))
@@ -773,7 +801,8 @@ class KeyIndex:
                     bound = f.min if bound is None else min(bound, f.min)
                     break
                 chosen.append(f)
-                got += f.entries
+                # A file the cursor falls inside may have nothing left past it: count only whole files.
+                got += f.entries if after is None or f.min > after else 0
         parsed = await asyncio.gather(*(self._open(f, filters=False) for f in chosen))
         spans = []
         for p in parsed:
@@ -798,33 +827,36 @@ class KeyIndex:
             if p.data is None:
                 p.window = got  # the next page starts in it: a file never pays for the same block twice
         codec = parsed[0].tail["codec"] if parsed else 1
-        keys, versions, deleted = merge_range(runs, codec, after, None, False)
-        out_k, out_v, out_d = [], [], bytearray()
+        keys, versions, deleted, locators = merge_range(runs, codec, after, None, False)
+        out_k, out_v, out_d, out_l = [], [], bytearray(), []
         cursor = after
         for i, key in enumerate(keys):
             if bound is not None and key >= bound:
-                return out_k, out_v, bytes(out_d), cursor
+                return out_k, out_v, bytes(out_d), out_l, cursor
             cursor = key
             if drop_deleted and deleted[i]:
                 continue
             out_k.append(key)
             out_v.append(versions[i])
             out_d.append(deleted[i])
+            out_l.append(locators[i])
             if len(out_k) == limit:
                 more = i + 1 < len(keys) or bound is not None
-                return out_k, out_v, bytes(out_d), cursor if more else None
-        return out_k, out_v, bytes(out_d), cursor if bound is not None else None
+                return out_k, out_v, bytes(out_d), out_l, cursor if more else None
+        return out_k, out_v, bytes(out_d), out_l, cursor if bound is not None else None
 
     async def page(self, after: bytes | None, limit: int):
-        """One page of the full delivery: live keys > `after`, their versions, and
-        the next cursor (`None` when done)."""
+        """One page of the full delivery: live keys > `after`, their versions and
+        locators, and the next cursor (`None` when done)."""
 
-        keys, versions, _, nxt = await self._scan(self.state.newest_first(), after, limit, drop_deleted=True)
-        return keys, versions, nxt
+        keys, versions, _, locators, nxt = await self._scan(
+            self.state.newest_first(), after, limit, drop_deleted=True
+        )
+        return keys, versions, locators, nxt
 
     async def pending(self, first_batch: int, last_batch: int, after: bytes | None, limit: int):
         """Changes in batches `[first_batch, last_batch]`, newest winning, keys > `after`:
-        keys, versions, deleted flags, and the next cursor (`None` when done)."""
+        keys, versions, deleted flags, locators, and the next cursor (`None` when done)."""
 
         logged = dict(self.state.log)
         missing = [b for b in range(first_batch, last_batch + 1) if b not in logged]

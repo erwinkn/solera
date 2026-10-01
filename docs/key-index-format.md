@@ -1,4 +1,4 @@
-# Key index file format (`.kx`, version 1)
+# Key index file format (`.kx`, version 2)
 
 Byte-level format of a key index file (`object-store-state.md` §6). The
 `solera._native` Rust extension reads and writes it; `solera/keys/_python.py`
@@ -15,9 +15,15 @@ file   := block* filters index footer
 tail   := filters index footer          ← everything after the last block
 ```
 
-A file holds **entries** `(key, version, deleted)`: `key` and `version`
-are byte strings, `deleted` a flag. Entries are strictly increasing by
-`key` (byte-wise comparison); a file never holds the same key twice.
+A file holds **entries** `(key, version, deleted, locator)`: `key` and
+`version` are byte strings, `deleted` a flag, and `locator` the generation
+of the attempt that wrote the key at that version — what a store names the
+key's object by (`lifecycle.md` §9.8). An entry of a delta file may also
+hold its key's **predecessor** `(version, locator)`: what the commit
+superseded, for the store to discard. Compaction drops predecessors;
+comparing versions ("is this a change?") ignores locators. Entries are
+strictly increasing by `key` (byte-wise comparison); a file never holds the
+same key twice.
 
 ## Blocks
 
@@ -29,11 +35,17 @@ last entry.
 Encoded entry:
 
 ```
-shared   varint     bytes shared with the previous key in this block (0 for the first)
-suffix   varint len + bytes
-version  varint len + bytes
-flags    u8         bit 0: deleted; other bits 0
+shared    varint     bytes shared with the previous key in this block (0 for the first)
+suffix    varint len + bytes
+version   varint len + bytes
+flags     u8         bit 0: deleted; bit 1: predecessor follows; other bits 0
+locator   varint
+predecessor varint len + bytes, then varint    only with flag bit 1: the key's version and locator before
 ```
+
+Readers reject an entry with other flag bits set. Neighbouring entries
+usually share a locator (one attempt wrote them), which the block's
+compression absorbs.
 
 The block's bytes are the concatenated encoded entries, compressed with
 the file's codec (footer).
@@ -87,7 +99,7 @@ Fixed 48 bytes at the very end of the file:
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 4 | magic `CKX1` |
-| 4 | 2 | format version, `1` |
+| 4 | 2 | format version, `2` |
 | 6 | 1 | codec: `0` none, `1` zlib |
 | 7 | 1 | reserved, `0` |
 | 8 | 8 | entries |
@@ -101,7 +113,8 @@ Fixed 48 bytes at the very end of the file:
 `tail length = file size − filters offset`; `index part = file size −
 index offset`. A reader that needs only the block index (a scan) fetches
 the index part alone; one that needs the filters fetches the whole tail.
-Readers verify both magics, the version, the index CRC, the filters CRC
+Readers verify both magics, the version (2: version 1 had no locators
+and is not read), the index CRC, the filters CRC
 when they read the filters, and each block's CRC before decoding it.
 
 ## Empty files

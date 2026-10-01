@@ -33,7 +33,7 @@ def decode_all(impl, data):
     for _, off, size, count, crc in tail["blocks"]:
         blk = data[off : off + size]
         _python.check_block(blk, crc)
-        k, v, f = impl.decode_block(blk, tail["codec"])
+        k, v, f, _, _ = impl.decode_block(blk, tail["codec"])
         assert len(k) == count
         keys += k
         versions += v
@@ -67,7 +67,7 @@ def test_tail_alone_is_enough(writer, reader):
     firsts = [b[0] for b in tail["blocks"]]
     i = max(j for j, fk in enumerate(firsts) if fk <= target)
     _, off, size, _, _ = tail["blocks"][i]
-    k, v, _ = reader.decode_block(data[off : off + size], tail["codec"])
+    k, v, _, _, _ = reader.decode_block(data[off : off + size], tail["codec"])
     assert v[k.index(target)] == versions[1234]
 
 
@@ -221,13 +221,13 @@ def test_lookup(writer, reader):
     keys, versions, deleted = entries(3000, deleted_every=11)
     tail, blocks = blocks_of(writer.encode_file(keys, versions, deleted, block_size=1024))
     probe = sorted([keys[5], keys[1500], keys[2999], b"zzz-absent", keys[11], b"aaa-absent"])
-    found, vers, dels = reader.lookup(blocks, tail["codec"], probe)
-    for key, f, v, d in zip(probe, found, vers, dels, strict=True):
+    found, vers, dels, locs = reader.lookup(blocks, tail["codec"], probe)
+    for key, f, v, d, loc in zip(probe, found, vers, dels, locs, strict=True):
         if key.endswith(b"-absent"):
-            assert (f, v, d) == (0, b"", 0)
+            assert (f, v, d, loc) == (0, b"", 0, 0)
         else:
             i = keys.index(key)
-            assert (f, v, d) == (1, versions[i], deleted[i])
+            assert (f, v, d, loc) == (1, versions[i], deleted[i], 0)
 
 
 @pytest.mark.parametrize("writer,reader", CROSS)
@@ -235,7 +235,7 @@ def test_merge_range(writer, reader):
     old = writer.encode_file([b"a", b"b", b"c", b"d", b"f"], [b"1"] * 5, b"\x00" * 5, block_size=8)
     new = writer.encode_file([b"b", b"c", b"e"], [b"2"] * 3, b"\x00\x01\x00", block_size=8)
     runs = [blocks_of(new)[1], blocks_of(old)[1]]
-    k, v, f = reader.merge_range(runs, 1, None, None, False)
+    k, v, f, _ = reader.merge_range(runs, 1, None, None, False)
     assert list(zip(k, v, f, strict=True)) == [
         (b"a", b"1", 0),
         (b"b", b"2", 0),
@@ -244,7 +244,7 @@ def test_merge_range(writer, reader):
         (b"e", b"2", 0),
         (b"f", b"1", 0),
     ]
-    k, _, _ = reader.merge_range(runs, 1, b"b", b"e", True)  # (after, upto], tombstones dropped
+    k, _, _, _ = reader.merge_range(runs, 1, b"b", b"e", True)  # (after, upto], tombstones dropped
     assert k == [b"d", b"e"]
 
 
@@ -259,3 +259,38 @@ def test_detects_filter_corruption_and_reads_the_index_alone(impl):
     data[footer["filters_offset"] + 10] ^= 0xFF
     with pytest.raises(impl.FormatError):
         impl.parse_tail(bytes(data[footer["filters_offset"] :]), len(data))
+
+
+@pytest.mark.parametrize("writer,reader", CROSS)
+def test_locators_and_predecessors(writer, reader):
+    """Every entry has a locator (the generation that wrote it); a delta
+    entry may also have its key's predecessor `(version, locator)`, which a
+    compaction drops."""
+
+    keys, versions, deleted = entries(3000, deleted_every=7)
+    locators = [i * 997 for i in range(len(keys))]
+    predecessors = [(b"old-%d" % i, i) if i % 3 else None for i in range(len(keys))]
+    data = writer.encode_file(
+        keys, versions, deleted, locators=locators, predecessors=predecessors, block_size=1024
+    )
+    footer = reader.parse_footer(data[-48:])
+    tail = reader.parse_tail(data[footer["filters_offset"] :], len(data))
+    got_l, got_p = [], []
+    for _, off, size, _, _ in tail["blocks"]:
+        _, _, _, ls, ps = reader.decode_block(data[off : off + size], tail["codec"])
+        got_l += ls
+        got_p += ps
+    assert got_l == locators and got_p == predecessors
+    blocks = [data[off : off + size] for _, off, size, _, _ in tail["blocks"]]
+    assert reader.lookup(blocks, tail["codec"], [keys[5]])[3] == [locators[5]]
+    assert reader.merge_range([blocks], tail["codec"], None, None, False)[3] == locators
+    [merged] = merge(reader, [data], drop_deleted=False)
+    assert [e[3:] for e in _python.iter_file(merged)] == [(loc, None) for loc in locators]
+
+
+@pytest.mark.parametrize("impl", IMPLS)
+def test_rejects_the_previous_format_version(impl):
+    data = bytearray(impl.encode_file([b"a"], [b"1"], b"\x00"))
+    data[-44:-42] = (1).to_bytes(2, "little")
+    with pytest.raises(impl.FormatError, match="version"):
+        impl.parse_footer(bytes(data[-48:]))

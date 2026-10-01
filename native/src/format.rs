@@ -3,16 +3,17 @@
 //! Mirrors `solera/keys/_python.py` function for function; the two must decode
 //! each other's files to identical content.
 
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::io::{Read, Write};
+use std::sync::Arc;
 
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 
+use crate::stream::{Block, Bytes, Merge, Next, Segment, Writer};
+
 pub const MAGIC: &[u8; 4] = b"CKX1";
-pub const FORMAT_VERSION: u16 = 1;
+pub const FORMAT_VERSION: u16 = 2;
 pub const CODEC_NONE: u8 = 0;
 pub const CODEC_ZLIB: u8 = 1;
 pub const FOOTER_SIZE: usize = 48;
@@ -149,12 +150,6 @@ pub(crate) fn pair_item(buf: &mut Vec<u8>, key: &[u8], version: &[u8]) {
     buf.extend_from_slice(version);
 }
 
-fn set_bits(bits: &mut [u8], item: &[u8], nbits: u64, k: u8) {
-    for b in bit_positions(item, nbits, k) {
-        bits[(b >> 3) as usize] |= 1 << (b & 7);
-    }
-}
-
 fn test_bits(bits: &[u8], item: &[u8], nbits: u64, k: u8) -> bool {
     bit_positions(item, nbits, k).all(|b| {
         bits.get((b >> 3) as usize)
@@ -227,201 +222,65 @@ pub struct Options {
     pub codec: u8,
 }
 
-type IndexEntry<'a> = (&'a [u8], u64, u64, u64, u32);
-
-fn close_block<'a>(
-    block: &[u8],
-    first: &'a [u8],
-    count: u64,
-    o: &Options,
-    out: &mut Vec<u8>,
-    index: &mut Vec<IndexEntry<'a>>,
-) {
-    let data = compress(block, o.codec, o.level);
-    index.push((
-        first,
-        out.len() as u64,
-        data.len() as u64,
-        count,
-        crc32fast::hash(&data),
-    ));
-    out.extend_from_slice(&data);
-}
-
 pub(crate) fn shared_prefix(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
+
+/// A key's version and locator before a delta entry changed it.
+pub type Predecessor<'a> = Option<(&'a [u8], u64)>;
 
 /// Encode entries (strictly increasing by key) into one `.kx` file.
 pub fn encode_file(
     keys: &[&[u8]],
     versions: &[&[u8]],
     deleted: &[u8],
+    locators: &[u64],
+    predecessors: &[Predecessor],
     o: Options,
 ) -> Result<Vec<u8>> {
     let n = keys.len();
-    if versions.len() != n || deleted.len() != n {
+    if versions.len() != n || deleted.len() != n || locators.len() != n || predecessors.len() != n {
         return Err(Error::Value(
-            "keys, versions and deleted must have the same length".into(),
+            "keys, versions, deleted, locators and predecessors must have the same length".into(),
         ));
     }
-    let mut out: Vec<u8> = Vec::new();
-    let mut index: Vec<IndexEntry> = Vec::new();
-    let mut block: Vec<u8> = Vec::with_capacity(o.block_size + 256);
-    let mut block_first: Option<&[u8]> = None;
-    let mut block_prev: Option<&[u8]> = None;
-    let mut prev: Option<&[u8]> = None;
-    let mut count: u64 = 0;
-    let mut live: u64 = 0;
-
+    let mut w = Writer::new(o, usize::MAX);
     for i in 0..n {
-        let key = keys[i];
-        if let Some(p) = prev {
-            if key <= p {
-                return Err(Error::Value(format!(
-                    "keys must be strictly increasing: {:?} then {:?}",
-                    String::from_utf8_lossy(p),
-                    String::from_utf8_lossy(key)
-                )));
-            }
-        }
-        let shared = match block_prev {
-            None => {
-                block_first = Some(key);
-                0
-            }
-            Some(bp) => shared_prefix(bp, key),
-        };
-        put_varint(&mut block, shared as u64);
-        put_bytes(&mut block, &key[shared..]);
-        put_bytes(&mut block, versions[i]);
-        let flag = (deleted[i] != 0) as u8;
-        block.push(flag);
-        live += 1 - flag as u64;
-        count += 1;
-        prev = Some(key);
-        block_prev = Some(key);
-        if block.len() >= o.block_size {
-            close_block(
-                &block,
-                block_first.unwrap(),
-                count,
-                &o,
-                &mut out,
-                &mut index,
-            );
-            block.clear();
-            block_first = None;
-            block_prev = None;
-            count = 0;
-        }
+        w.push(
+            keys[i],
+            versions[i],
+            deleted[i] != 0,
+            locators[i],
+            predecessors[i],
+        )?;
     }
-    if count > 0 {
-        close_block(
-            &block,
-            block_first.unwrap(),
-            count,
-            &o,
-            &mut out,
-            &mut index,
-        );
-    }
-
-    // Filters: every key, every live (key, version) pair, and every deleted key.
-    let key_nbits = filter_nbits(n as u64, o.bits_per_item);
-    let pair_nbits = filter_nbits(live, o.bits_per_item);
-    let tomb_nbits = filter_nbits(n as u64 - live, o.bits_per_item);
-    let mut key_bits = vec![0u8; (key_nbits / 8) as usize];
-    let mut pair_bits = vec![0u8; (pair_nbits / 8) as usize];
-    let mut tomb_bits = vec![0u8; (tomb_nbits / 8) as usize];
-    let mut buf = Vec::new();
-    for i in 0..n {
-        key_item(&mut buf, keys[i]);
-        set_bits(&mut key_bits, &buf, key_nbits, o.k);
-        if deleted[i] != 0 {
-            tomb_item(&mut buf, keys[i]);
-            set_bits(&mut tomb_bits, &buf, tomb_nbits, o.k);
-        } else {
-            pair_item(&mut buf, keys[i], versions[i]);
-            set_bits(&mut pair_bits, &buf, pair_nbits, o.k);
-        }
-    }
-    let mut filters = Vec::with_capacity(key_bits.len() + pair_bits.len() + tomb_bits.len() + 48);
-    for (nbits, bits) in [
-        (key_nbits, &key_bits),
-        (pair_nbits, &pair_bits),
-        (tomb_nbits, &tomb_bits),
-    ] {
-        put_varint(&mut filters, nbits);
-        filters.push(o.k);
-        filters.extend_from_slice(bits);
-    }
-    let filters_crc = crc32fast::hash(&filters);
-    filters.extend_from_slice(&filters_crc.to_le_bytes());
-
-    let mut idx = Vec::new();
-    put_bytes(&mut idx, if n > 0 { keys[0] } else { b"" });
-    put_bytes(&mut idx, if n > 0 { keys[n - 1] } else { b"" });
-    put_varint(&mut idx, index.len() as u64);
-    for (fk, off, size, cnt, crc) in &index {
-        put_bytes(&mut idx, fk);
-        put_varint(&mut idx, *off);
-        put_varint(&mut idx, *size);
-        put_varint(&mut idx, *cnt);
-        idx.extend_from_slice(&crc.to_le_bytes());
-    }
-    let idx_data = compress(&idx, o.codec, o.level);
-
-    let filters_offset = out.len() as u64;
-    out.extend_from_slice(&filters);
-    let index_offset = out.len() as u64;
-    out.extend_from_slice(&idx_data);
-    let index_crc = crc32fast::hash(&idx_data);
-    out.extend_from_slice(MAGIC);
-    out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-    out.push(o.codec);
-    out.push(0);
-    out.extend_from_slice(&(n as u64).to_le_bytes());
-    out.extend_from_slice(&filters_offset.to_le_bytes());
-    out.extend_from_slice(&(filters.len() as u32).to_le_bytes());
-    out.extend_from_slice(&index_offset.to_le_bytes());
-    out.extend_from_slice(&(idx_data.len() as u32).to_le_bytes());
-    out.extend_from_slice(&index_crc.to_le_bytes());
-    out.extend_from_slice(MAGIC);
-    Ok(out)
+    w.finish(true)?;
+    Ok(w.files.pop_front().expect("finish(true) writes a file"))
 }
 
 // -- decoding -----------------------------------------------------------------------
 
-pub type Decoded = (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<u8>);
+/// A block's entries: keys, versions, deleted flags, locators, predecessors `(version, locator)`.
+pub type Decoded = (
+    Vec<Vec<u8>>,
+    Vec<Vec<u8>>,
+    Vec<u8>,
+    Vec<u64>,
+    Vec<Option<(Vec<u8>, u64)>>,
+);
 
 pub fn decode_block(data: &[u8], codec: u8) -> Result<Decoded> {
-    let raw = decompress(data, codec)?;
-    let mut keys: Vec<Vec<u8>> = Vec::new();
-    let mut versions = Vec::new();
-    let mut flags = Vec::new();
-    let mut pos = 0usize;
-    let mut prev: Vec<u8> = Vec::new();
-    while pos < raw.len() {
-        let shared = get_varint(&raw, &mut pos)? as usize;
-        let suffix = get_bytes(&raw, &mut pos)?;
-        let version = get_bytes(&raw, &mut pos)?;
-        let Some(&flag) = raw.get(pos) else {
-            return fmt_err("truncated entry");
-        };
-        pos += 1;
-        if shared > prev.len() {
-            return fmt_err("bad shared prefix length");
-        }
-        let mut key = Vec::with_capacity(shared + suffix.len());
-        key.extend_from_slice(&prev[..shared]);
-        key.extend_from_slice(suffix);
-        prev.clone_from(&key);
-        keys.push(key);
-        versions.push(version.to_vec());
-        flags.push(flag & 1);
-    }
-    Ok((keys, versions, flags))
+    let b = Block::decode(data, codec)?;
+    let n = b.len();
+    Ok((
+        (0..n).map(|i| b.key(i).to_vec()).collect(),
+        (0..n).map(|i| b.version(i).to_vec()).collect(),
+        (0..n).map(|i| b.deleted(i) as u8).collect(),
+        (0..n).map(|i| b.locator(i)).collect(),
+        (0..n)
+            .map(|i| b.predecessor(i).map(|(v, l)| (v.to_vec(), l)))
+            .collect(),
+    ))
 }
 
 pub struct Footer {
@@ -572,140 +431,99 @@ pub fn file_blocks(data: &[u8]) -> Result<(u8, Vec<BlockMeta>)> {
 
 // -- read kernels -------------------------------------------------------------------
 
-/// Find sorted `keys` in one file's consecutive `blocks`: per key, found, version, deleted.
-pub fn lookup(
-    blocks: &[&[u8]],
-    codec: u8,
-    keys: &[&[u8]],
-) -> Result<(Vec<u8>, Vec<Vec<u8>>, Vec<u8>)> {
-    let mut ek: Vec<Vec<u8>> = Vec::new();
-    let mut ev: Vec<Vec<u8>> = Vec::new();
-    let mut ef: Vec<u8> = Vec::new();
-    for blk in blocks {
-        let (k, v, f) = decode_block(blk, codec)?;
-        ek.extend(k);
-        ev.extend(v);
-        ef.extend(f);
-    }
-    let mut found = Vec::with_capacity(keys.len());
-    let mut versions = Vec::with_capacity(keys.len());
-    let mut deleted = Vec::with_capacity(keys.len());
+/// Per key: found, version, deleted, locator.
+pub type Found = (Vec<u8>, Vec<Vec<u8>>, Vec<u8>, Vec<u64>);
+
+/// Find sorted `keys` in one file's consecutive `blocks`.
+pub fn lookup(blocks: &[&[u8]], codec: u8, keys: &[&[u8]]) -> Result<Found> {
+    let blocks: Vec<Block> = blocks
+        .iter()
+        .map(|b| Block::decode(b, codec))
+        .collect::<Result<_>>()?;
+    let mut out: Found = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for key in keys {
-        match ek.binary_search_by(|probe| probe.as_slice().cmp(key)) {
-            Ok(i) => {
-                found.push(1);
-                versions.push(ev[i].clone());
-                deleted.push(ef[i]);
+        // The last block whose first key is <= key, then the key within it.
+        let b = blocks.partition_point(|b| !b.is_empty() && b.key(0) <= *key);
+        let hit = b.checked_sub(1).and_then(|b| {
+            let blk = &blocks[b];
+            let (mut lo, mut hi) = (0, blk.len());
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                match blk.key(mid).cmp(key) {
+                    std::cmp::Ordering::Less => lo = mid + 1,
+                    std::cmp::Ordering::Equal => return Some((blk, mid)),
+                    std::cmp::Ordering::Greater => hi = mid,
+                }
             }
-            Err(_) => {
-                found.push(0);
-                versions.push(Vec::new());
-                deleted.push(0);
+            None
+        });
+        match hit {
+            Some((blk, j)) => {
+                out.0.push(1);
+                out.1.push(blk.version(j).to_vec());
+                out.2.push(blk.deleted(j) as u8);
+                out.3.push(blk.locator(j));
+            }
+            None => {
+                out.0.push(0);
+                out.1.push(Vec::new());
+                out.2.push(0);
+                out.3.push(0);
             }
         }
     }
-    Ok((found, versions, deleted))
+    Ok(out)
 }
 
-/// Iterates one run — a file's consecutive blocks — decoding a block at a time.
-struct RunIter<'a> {
-    blocks: &'a [&'a [u8]],
-    codec: u8,
-    next_block: usize,
-    cur: Decoded,
-    pos: usize,
-}
+/// Keys, versions, deleted flags and locators of a merged view.
+pub type Merged = (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<u8>, Vec<u64>);
 
-impl<'a> RunIter<'a> {
-    fn new(blocks: &'a [&'a [u8]], codec: u8) -> Self {
-        RunIter {
-            blocks,
-            codec,
-            next_block: 0,
-            cur: (vec![], vec![], vec![]),
-            pos: 0,
-        }
-    }
-
-    fn next_entry(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>, u8)>> {
-        while self.pos >= self.cur.0.len() {
-            if self.next_block >= self.blocks.len() {
-                return Ok(None);
-            }
-            self.cur = decode_block(self.blocks[self.next_block], self.codec)?;
-            self.next_block += 1;
-            self.pos = 0;
-        }
-        let i = self.pos;
-        self.pos += 1;
-        Ok(Some((
-            std::mem::take(&mut self.cur.0[i]),
-            std::mem::take(&mut self.cur.1[i]),
-            self.cur.2[i],
-        )))
-    }
-
-    /// The next entry with a key inside `(after, upto]`, or None past `upto`.
-    fn next_in(
-        &mut self,
-        after: Option<&[u8]>,
-        upto: Option<&[u8]>,
-    ) -> Result<Option<(Vec<u8>, Vec<u8>, u8)>> {
-        loop {
-            let Some(e) = self.next_entry()? else {
-                return Ok(None);
-            };
-            if after.is_some_and(|a| e.0.as_slice() <= a) {
-                continue;
-            }
-            if upto.is_some_and(|u| e.0.as_slice() > u) {
-                return Ok(None);
-            }
-            return Ok(Some(e));
-        }
-    }
-}
-
-/// The newest-wins merged view of `runs` (newest first) over keys in `(after, upto]`.
+/// The newest-wins merged view of `runs` (newest first, each a file's
+/// consecutive blocks) over keys in `(after, upto]`.
 pub fn merge_range(
     runs: &[Vec<&[u8]>],
     codec: u8,
     after: Option<&[u8]>,
     upto: Option<&[u8]>,
     drop_deleted: bool,
-) -> Result<Decoded> {
-    let mut iters: Vec<RunIter> = runs
-        .iter()
-        .map(|r| RunIter::new(r.as_slice(), codec))
-        .collect();
-    let mut heap: BinaryHeap<Reverse<(Vec<u8>, usize)>> = BinaryHeap::new();
-    let mut heads: Vec<Option<(Vec<u8>, u8)>> = vec![None; iters.len()];
-    for (rank, it) in iters.iter_mut().enumerate() {
-        if let Some((k, v, f)) = it.next_in(after, upto)? {
-            heads[rank] = Some((v, f));
-            heap.push(Reverse((k, rank)));
+) -> Result<Merged> {
+    let mut m = Merge::new(runs.len());
+    for (r, blocks) in runs.iter().enumerate() {
+        let mut data = Vec::new();
+        let mut metas = Vec::new();
+        for b in blocks {
+            metas.push((data.len(), b.len(), crc32fast::hash(b)));
+            data.extend_from_slice(b);
+        }
+        let data: Bytes = Arc::new(data);
+        m.runs[r].feed(Segment {
+            data,
+            blocks: metas,
+            codec,
+        });
+        m.runs[r].end();
+    }
+    let mut out: Merged = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    loop {
+        match m.next_key()? {
+            Next::Entry => {
+                let key = m.key();
+                if after.is_some_and(|a| key <= a) || (drop_deleted && m.deleted()) {
+                    continue;
+                }
+                if upto.is_some_and(|u| key > u) {
+                    break;
+                }
+                out.0.push(key.to_vec());
+                out.1.push(m.version().to_vec());
+                out.2.push(m.deleted() as u8);
+                out.3.push(m.locator());
+            }
+            Next::Need(_) => unreachable!("every run is fed whole"),
+            Next::End => break,
         }
     }
-    let (mut keys, mut versions, mut flags) = (Vec::new(), Vec::new(), Vec::new());
-    let mut last: Option<Vec<u8>> = None;
-    while let Some(Reverse((key, rank))) = heap.pop() {
-        let (ver, flag) = heads[rank].take().expect("a heap entry always has a head");
-        if let Some((k, v, f)) = iters[rank].next_in(after, upto)? {
-            heads[rank] = Some((v, f));
-            heap.push(Reverse((k, rank)));
-        }
-        if last.as_deref() == Some(key.as_slice()) {
-            continue;
-        }
-        last = Some(key.clone());
-        if flag != 0 && drop_deleted {
-            continue;
-        }
-        keys.push(key);
-        versions.push(ver);
-        flags.push(flag);
-    }
-    Ok((keys, versions, flags))
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -728,14 +546,19 @@ mod tests {
         let vers: Vec<Vec<u8>> = (0..500).map(|i| format!("v{i}").into_bytes()).collect();
         let ks: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
         let vs: Vec<&[u8]> = vers.iter().map(|v| v.as_slice()).collect();
-        let f = encode_file(&ks, &vs, &[0u8; 500], O).unwrap();
+        let locs: Vec<u64> = (0..500).map(|i| i * 1000).collect();
+        let prev: Vec<Predecessor> = (0..500u64)
+            .map(|i| (i % 3 == 0).then_some((b"old".as_slice(), i)))
+            .collect();
+        let f = encode_file(&ks, &vs, &[0u8; 500], &locs, &prev, O).unwrap();
         let (codec, blocks) = file_blocks(&f).unwrap();
         let mut n = 0;
         for b in blocks {
-            let (k, v, _) =
+            let (k, v, _, l, p) =
                 decode_block(&f[b.offset as usize..(b.offset + b.size) as usize], codec).unwrap();
-            for (k, v) in k.iter().zip(&v) {
-                assert_eq!((k, v), (&keys[n], &vers[n]));
+            for i in 0..k.len() {
+                assert_eq!((&k[i], &v[i], l[i]), (&keys[n], &vers[n], locs[n]));
+                assert_eq!(p[i], prev[n].map(|(v, l)| (v.to_vec(), l)));
                 n += 1;
             }
         }

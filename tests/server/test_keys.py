@@ -139,7 +139,7 @@ async def test_row_digests_are_16_bytes_end_to_end(state):
     await engine.initialize()
     await run(engine, ["items"])
     index = KeyIndex(ObjectIO(state.objects), None, state.model.indexes[("items", "")])
-    keys, versions, _ = await index.page(None, 10)
+    keys, versions, _, _ = await index.page(None, 10)
     digests = [group_digest([r], "id") for r in rows]
     assert keys == [b"a", b"b"] and versions == digests
     assert all(len(v) == 16 for v in versions)

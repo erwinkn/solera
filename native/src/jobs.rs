@@ -53,7 +53,9 @@ impl Collected {
 
 /// A full replacement: every written key against the live keys of the index.
 /// New keys and changed versions are written, unchanged ones dropped, and
-/// live keys not written become deletions.
+/// live keys not written become deletions. Written entries carry the
+/// writer's `generation` as their locator, and a changed or deleted key its
+/// predecessor, its version and locator.
 pub struct Replace {
     pub src: Source,
     pub merge: Merge,
@@ -62,6 +64,7 @@ pub struct Replace {
     pub removed: u64,
     pub changed: u64,
     pub collected: Collected,
+    generation: u64,
     old: Option<bool>, // Some(true): the merge holds a live entry; Some(false): exhausted
     done: bool,
 }
@@ -73,6 +76,7 @@ impl Replace {
         o: Options,
         max_file_bytes: usize,
         collect: usize,
+        generation: u64,
     ) -> Replace {
         Replace {
             src,
@@ -82,6 +86,7 @@ impl Replace {
             removed: 0,
             changed: 0,
             collected: Collected::new(collect),
+            generation,
             old: None,
             done: false,
         }
@@ -122,14 +127,18 @@ impl Replace {
             match ord {
                 std::cmp::Ordering::Less => {
                     let (k, v) = self.src.entry();
-                    self.writer.push(k, v, false)?;
+                    self.writer.push(k, v, false, self.generation, None)?;
                     self.collected.add(k, false);
                     self.added += 1;
                     self.src.advance();
                 }
                 std::cmp::Ordering::Greater => {
-                    let k = self.merge.key();
-                    self.writer.push(k, b"", true)?;
+                    let (k, predecessor) = (
+                        self.merge.key(),
+                        (self.merge.version(), self.merge.locator()),
+                    );
+                    self.writer
+                        .push(k, b"", true, self.generation, Some(predecessor))?;
                     self.collected.add(k, true);
                     self.removed += 1;
                     self.old = None;
@@ -137,7 +146,9 @@ impl Replace {
                 std::cmp::Ordering::Equal => {
                     let (k, v) = self.src.entry();
                     if v != self.merge.version() {
-                        self.writer.push(k, v, false)?;
+                        let predecessor = (self.merge.version(), self.merge.locator());
+                        self.writer
+                            .push(k, v, false, self.generation, Some(predecessor))?;
                         self.collected.add(k, false);
                         self.changed += 1;
                     }
@@ -180,8 +191,10 @@ impl Compact {
                 Next::Entry => {
                     let deleted = self.merge.deleted();
                     if !(deleted && self.drop_deleted) {
+                        // A merge keeps locators; predecessors belong to delta files only.
                         let (k, v) = (self.merge.key(), self.merge.version());
-                        self.writer.push(k, v, deleted)?;
+                        self.writer
+                            .push(k, v, deleted, self.merge.locator(), None)?;
                     }
                 }
                 Next::Need(r) => return Ok(Step::Run(r)),

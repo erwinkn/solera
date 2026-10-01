@@ -50,7 +50,7 @@ async def key_index_probe(objects):
     state = state.committed(0, files, keep_log=True)
     try:
         index = KeyIndex(io, None, state)
-        keys, versions, _ = await index.page(None, 10)
+        keys, versions, _, _ = await index.page(None, 10)
         check(keys == [b"a", b"b"] and versions == [b"1", b"1"], "Key index page read back wrong")
         check(len(await index.changes([b"b"], [b"2"])) == 1, "Key index delta read back wrong")
         changes = await index.pending(0, 0, None, 10)

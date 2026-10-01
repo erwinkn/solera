@@ -42,10 +42,12 @@ class Sql:
 
 @dataclass(frozen=True)
 class Keys:
-    """A `key -> revision` selection passed to `store.load` (§4), revisions as
-    the key index holds them (docs/row-digest.md)."""
+    """A selection passed to `store.load` (§4): `key -> (revision, locator)`,
+    as the key index holds them — the version (docs/row-digest.md), and the
+    generation that wrote it, from which a store names the key's object
+    without listing (lifecycle.md §9.8)."""
 
-    revisions: Mapping[str, bytes]
+    revisions: Mapping[str, tuple[bytes, int]]
 
 
 @dataclass(frozen=True)

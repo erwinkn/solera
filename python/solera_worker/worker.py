@@ -442,18 +442,22 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline):
                 timeline.add("loaded", param, _rows(args[param]))
                 continue
             if "keys" in ch:  # a run's keys= override: a one-off selection
-                upserted, deleted, after = {str(k): b"" for k in ch["keys"]}, (), None
+                upserted, deleted, after = {str(k): (b"", 0) for k in ch["keys"]}, (), None
             else:
                 index = KeyIndex(keys_io, None, IndexState.from_json(pin["index"]))
                 start = key_bytes(ch["after"]) if ch.get("after") is not None else None
                 if full:
-                    keys, versions, nxt = await index.page(start, int(ch["limit"]))
+                    keys, versions, locators, nxt = await index.page(start, int(ch["limit"]))
                     flags = bytes(len(keys))
                 else:
-                    keys, versions, flags, nxt = await index.pending(
+                    keys, versions, flags, locators, nxt = await index.pending(
                         int(ch["from"]), int(ch["to"]), start, int(ch["limit"])
                     )
-                upserted = {key_str(k): v for k, v, d in zip(keys, versions, flags, strict=True) if not d}
+                upserted = {
+                    key_str(k): (v, loc)
+                    for k, v, d, loc in zip(keys, versions, flags, locators, strict=True)
+                    if not d
+                }
                 deleted = tuple(key_str(k) for k, d in zip(keys, flags, strict=True) if d)
                 after = key_str(nxt) if nxt is not None else None
             args[param] = await store.load(ref, t, Keys(upserted))
@@ -538,11 +542,14 @@ async def _store_outputs(spec, project, asset, objects, keys_io, result_value, f
         content = value.rows if patch else value
         unsettled = info.get("unsettled") or []
         batch, attempt = int(info["batch"]), spec["attempt"]
+        generation = int(spec.get("generation") or 0)  # each entry's locator (lifecycle.md §9.8)
         rows = await asyncio.to_thread(store_key_rows, store, content, output)
         if replace:
             # Every written key against every live one, streamed: the delta goes out as it fills.
             try:
-                files, changed = await index.replace(rows, batch, attempt, collect=LISTED)
+                files, changed = await index.replace(
+                    rows, batch, attempt, collect=LISTED, generation=generation
+                )
             except ValueError as e:  # a value with no digest, found as the join reaches it
                 raise WriteError(f"{output.name}: {e}") from e
         else:
@@ -553,7 +560,10 @@ async def _store_outputs(spec, project, asset, objects, keys_io, result_value, f
             if unsettled:
                 new, removes = await _repair(output, store, prior, intended - own[0] - own[1], new, removes)
             delta = await index.changes(
-                [key_bytes(k) for k in new], list(new.values()), [key_bytes(k) for k in removes]
+                [key_bytes(k) for k in new],
+                list(new.values()),
+                [key_bytes(k) for k in removes],
+                generation=generation,
             )
             files = await index.write(batch, attempt, delta)
             changed = (
@@ -632,7 +642,12 @@ async def _store_outputs(spec, project, asset, objects, keys_io, result_value, f
             if written.keys is None:
                 raise StoreError(f"{output.name}: store {store_name!r} reported no keys for a Sql write")
             files, _ = await plan["index"].replace(
-                written.keys, int(info["batch"]), spec["attempt"], key=output.key, revision=output.revision
+                written.keys,
+                int(info["batch"]),
+                spec["attempt"],
+                key=output.key,
+                revision=output.revision,
+                generation=int(spec.get("generation") or 0),
             )
             entry["keys"] = files.to_json()
         elif "index" in plan:
@@ -671,7 +686,7 @@ async def _intended(info, keys_io, unsettled) -> list[str]:
     index = KeyIndex(keys_io, None, state)
     found, after = [], None
     while True:
-        keys, _, _, after = await index.pending(0, len(unsettled) - 1, after, REPAIR_PAGE)
+        keys, _, _, _, after = await index.pending(0, len(unsettled) - 1, after, REPAIR_PAGE)
         found.extend(map(key_str, keys))
         if after is None:
             return found
@@ -686,7 +701,7 @@ async def _repair(output, store, prior, left, new, removes):
     new, removes, left = dict(new), list(removes), sorted(left)
     for i in range(0, len(left), REPAIR_PAGE):
         page = left[i : i + REPAIR_PAGE]
-        loaded = await store.load(prior, None, Keys(dict.fromkeys(page, b"")))
+        loaded = await store.load(prior, None, Keys(dict.fromkeys(page, (b"", 0))))
         found = await _versions(output, await asyncio.to_thread(store_key_rows, store, loaded, output))
         new.update(found)
         removes.extend(k for k in page if k not in found)

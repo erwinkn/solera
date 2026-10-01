@@ -15,7 +15,8 @@ import zlib
 import xxhash
 
 MAGIC = b"CKX1"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
+DELETED, PREDECESSOR = 1, 2  # entry flags
 CODEC_NONE, CODEC_ZLIB = 0, 1
 FOOTER = struct.Struct("<4sHBBQQIQII4s")
 FOOTER_SIZE = FOOTER.size  # 48
@@ -164,17 +165,23 @@ def encode_file(
     versions: list[bytes],
     deleted: bytes,
     *,
+    locators: list[int] | None = None,
+    predecessors: list | None = None,
     block_size: int = 64 * 1024,
     level: int = 1,
     bits_per_item: int = 14,
     k: int = 10,
     codec: int = CODEC_ZLIB,
 ) -> bytes:
-    """Encode entries (strictly increasing by key) into one `.kx` file."""
+    """Encode entries (strictly increasing by key) into one `.kx` file. Each
+    has a locator (0 by default), and a delta entry may have its key's
+    predecessor `(version, locator)`."""
 
     n = len(keys)
     if len(versions) != n or len(deleted) != n:
         raise ValueError("keys, versions and deleted must have the same length")
+    locators = locators if locators is not None else [0] * n
+    predecessors = predecessors if predecessors is not None else [None] * n
     out = bytearray()
     index = []  # (first_key, offset, size, entries, crc)
     block = bytearray()
@@ -199,7 +206,11 @@ def encode_file(
         _put_bytes(block, key[shared:])
         _put_bytes(block, versions[i])
         flag = 1 if deleted[i] else 0
-        block.append(flag)
+        block.append(flag | (PREDECESSOR if predecessors[i] is not None else 0))
+        put_varint(block, locators[i])
+        if predecessors[i] is not None:
+            _put_bytes(block, predecessors[i][0])
+            put_varint(block, predecessors[i][1])
         live += 1 - flag
         count += 1
         prev = block_prev = key
@@ -267,9 +278,12 @@ def encode_file(
 # -- decoding ------------------------------------------------------------------------
 
 
-def decode_block(data, codec: int) -> tuple[list[bytes], list[bytes], bytes]:
+def decode_block(data, codec: int):
+    """A block's keys, versions, deleted flags, locators, and each entry's
+    predecessor `(version, locator)` or None."""
+
     raw = _decompress(data, codec)
-    keys, versions, flags = [], [], bytearray()
+    keys, versions, flags, locators, predecessors = [], [], bytearray(), [], []
     pos, prev, n = 0, b"", len(raw)
     while pos < n:
         shared, pos = get_varint(raw, pos)
@@ -277,12 +291,22 @@ def decode_block(data, codec: int) -> tuple[list[bytes], list[bytes], bytes]:
         version, pos = _get_bytes(raw, pos)
         flag = raw[pos]
         pos += 1
+        if flag & ~(DELETED | PREDECESSOR):
+            raise FormatError("unknown entry flags")
+        locator, pos = get_varint(raw, pos)
+        before = None
+        if flag & PREDECESSOR:
+            pv, pos = _get_bytes(raw, pos)
+            pl, pos = get_varint(raw, pos)
+            before = (pv, pl)
         key = prev[:shared] + suffix
         keys.append(key)
         versions.append(version)
-        flags.append(flag & 1)
+        flags.append(flag & DELETED)
+        locators.append(locator)
+        predecessors.append(before)
         prev = key
-    return keys, versions, bytes(flags)
+    return keys, versions, bytes(flags), locators, predecessors
 
 
 def parse_footer(footer) -> dict:
@@ -367,7 +391,7 @@ def check_block(data, crc: int) -> None:
 
 
 def iter_file(data) -> iter:
-    """Every entry of a whole file, in key order: (key, version, deleted)."""
+    """Every entry of a whole file, in key order: (key, version, deleted, locator, predecessor)."""
 
     data = memoryview(data)
     footer = parse_footer(data[-FOOTER_SIZE:])
@@ -375,8 +399,7 @@ def iter_file(data) -> iter:
     for _, off, size, _, crc in tail["blocks"]:
         blk = data[off : off + size]
         check_block(blk, crc)
-        keys, versions, flags = decode_block(blk, tail["codec"])
-        yield from zip(keys, versions, flags, strict=True)
+        yield from zip(*decode_block(blk, tail["codec"]), strict=True)
 
 
 def merge_files(
@@ -389,7 +412,8 @@ def merge_files(
     k: int = 10,
     max_file_bytes: int = 64 * 2**20,
 ) -> list[bytes]:
-    """Merge whole files, newest first: for each key the newest entry wins.
+    """Merge whole files, newest first: for each key the newest entry wins,
+    with its locator; predecessors are dropped.
 
     `drop_deleted` removes deleted entries from the output (merging into the
     bottom level). Output is split into files of about `max_file_bytes`."""
@@ -397,37 +421,38 @@ def merge_files(
     heap = []
     iters = [iter_file(f) for f in files]
     for rank, it in enumerate(iters):
-        for key, ver, flag in it:
-            heap.append((key, rank, ver, flag, it))
+        for key, ver, flag, loc, _ in it:
+            heap.append((key, rank, ver, flag, loc, it))
             break
     heapq.heapify(heap)
     out: list[bytes] = []
-    keys, versions, flags = [], [], bytearray()
+    keys, versions, flags, locators = [], [], bytearray(), []
     approx = 0
     raw_budget = 2 * max_file_bytes  # blocks compress about 2x
 
     def flush():
-        nonlocal keys, versions, flags, approx
+        nonlocal keys, versions, flags, locators, approx
         if keys:
             out.append(
                 encode_file(
                     keys,
                     versions,
                     bytes(flags),
+                    locators=locators,
                     block_size=block_size,
                     level=level,
                     bits_per_item=bits_per_item,
                     k=k,
                 )
             )
-        keys, versions, flags, approx = [], [], bytearray(), 0
+        keys, versions, flags, locators, approx = [], [], bytearray(), [], 0
 
     last = None
     while heap:
-        key, rank, ver, flag, it = heapq.heappop(heap)
+        key, rank, ver, flag, loc, it = heapq.heappop(heap)
         nxt = next(it, None)
         if nxt is not None:
-            heapq.heappush(heap, (nxt[0], rank, nxt[1], nxt[2], it))
+            heapq.heappush(heap, (nxt[0], rank, nxt[1], nxt[2], nxt[3], it))
         if key == last:
             continue  # an older entry for a key already taken from a newer file
         last = key
@@ -436,6 +461,7 @@ def merge_files(
         keys.append(key)
         versions.append(ver)
         flags.append(flag)
+        locators.append(loc)
         approx += len(key) + len(ver) + 4
         if approx >= raw_budget:
             flush()
@@ -448,53 +474,56 @@ def merge_files(
 # entries only cross into Python when they are part of the answer.
 
 
-def lookup(blocks: list, codec: int, keys: list[bytes]) -> tuple[bytes, list[bytes], bytes]:
+def lookup(blocks: list, codec: int, keys: list[bytes]):
     """Find sorted `keys` in one file's `blocks` (consecutive blocks, in key order).
 
-    Returns, per key: found (0/1), version (b"" when not found), deleted (0/1)."""
+    Returns, per key: found (0/1), version (b"" when not found), deleted
+    (0/1), locator (0 when not found)."""
 
     table = {}
     for blk in blocks:
-        ks, vs, fs = decode_block(blk, codec)
-        table.update(zip(ks, zip(vs, fs, strict=True), strict=True))
-    found, versions, deleted = bytearray(), [], bytearray()
+        ks, vs, fs, ls, _ = decode_block(blk, codec)
+        table.update(zip(ks, zip(vs, fs, ls, strict=True), strict=True))
+    found, versions, deleted, locators = bytearray(), [], bytearray(), []
     for key in keys:
         hit = table.get(key)
         found.append(1 if hit else 0)
         versions.append(hit[0] if hit else b"")
         deleted.append(hit[1] if hit else 0)
-    return bytes(found), versions, bytes(deleted)
+        locators.append(hit[2] if hit else 0)
+    return bytes(found), versions, bytes(deleted), locators
 
 
 def _run_entries(run: list, codec: int, after, upto):
     for blk in run:
-        ks, vs, fs = decode_block(blk, codec)
-        for k, v, f in zip(ks, vs, fs, strict=True):
+        ks, vs, fs, ls, _ = decode_block(blk, codec)
+        for k, v, f, loc in zip(ks, vs, fs, ls, strict=True):
             if after is not None and k <= after:
                 continue
             if upto is not None and k > upto:
                 return
-            yield k, v, f
+            yield k, v, f, loc
 
 
 def merge_range(runs: list, codec: int, after, upto, drop_deleted: bool):
     """The newest-wins merged view of `runs` (newest first; each a list of one
-    file's consecutive blocks) over keys in `(after, upto]`; `None` bounds are open."""
+    file's consecutive blocks) over keys in `(after, upto]`; `None` bounds are
+    open. Returns keys, versions, deleted flags and locators."""
 
     heap = []
     iters = [_run_entries(run, codec, after, upto) for run in runs]
     for rank, it in enumerate(iters):
-        for k, v, f in it:
-            heap.append((k, rank, v, f, it))
+        for k, v, f, loc in it:
+            heap.append((k, rank, v, f, loc, it))
             break
     heapq.heapify(heap)
-    keys, versions, flags = [], [], bytearray()
+    keys, versions, flags, locators = [], [], bytearray(), []
     last = None
     while heap:
-        k, rank, v, f, it = heapq.heappop(heap)
+        k, rank, v, f, loc, it = heapq.heappop(heap)
         nxt = next(it, None)
         if nxt is not None:
-            heapq.heappush(heap, (nxt[0], rank, nxt[1], nxt[2], it))
+            heapq.heappush(heap, (nxt[0], rank, nxt[1], nxt[2], nxt[3], it))
         if k == last:
             continue
         last = k
@@ -503,4 +532,5 @@ def merge_range(runs: list, codec: int, after, upto, drop_deleted: bool):
         keys.append(k)
         versions.append(v)
         flags.append(f)
-    return keys, versions, bytes(flags)
+        locators.append(loc)
+    return keys, versions, bytes(flags), locators

@@ -179,7 +179,7 @@ async def test_keys_selection(store):
 
     out = output(key="id", revision="v", primary_key=["id"])
     written = await store.store([{"id": "a", "v": "1"}, {"id": "b", "v": "2"}], None, scope(out))
-    rows = await store.load(written.ref, list[dict], Keys({"b": "2"}))
+    rows = await store.load(written.ref, list[dict], Keys({"b": (b"2", 0)}))
     assert [r["id"] for r in rows] == ["b"]
 
 

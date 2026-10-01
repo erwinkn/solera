@@ -54,7 +54,7 @@ class Harness:
             rows = Rows.pairs(items)
             files, changed = await idx.replace(rows, self.batch, f"a{self.batch}", collect=10**6)
             written = [
-                e
+                e[:3]
                 for f in files.files
                 for e in _python.iter_file(await self.io.read_whole(idx.path(f.name), f.size))
             ]
@@ -104,7 +104,7 @@ class Harness:
         idx = self.index()
         seen, after = {}, None
         while True:
-            keys, versions, after = await idx.page(after, 97)
+            keys, versions, _, after = await idx.page(after, 97)
             for k, v in zip(keys, versions, strict=True):
                 assert k not in seen
                 seen[k] = v
@@ -189,7 +189,7 @@ async def test_pending_deltas_newest_wins_and_survive_compaction():
     await h.commit([key(4)], [b"c"])  # batch 2
     await h.compact_all()
     idx = h.index()
-    keys, versions, deleted, nxt = await idx.pending(1, 2, None, 10)
+    keys, versions, deleted, _, nxt = await idx.pending(1, 2, None, 10)
     assert list(zip(keys, versions, deleted, strict=True)) == [
         (key(2), b"b", 0),
         (key(3), b"", 1),
@@ -199,7 +199,7 @@ async def test_pending_deltas_newest_wins_and_survive_compaction():
     # Paged, two at a time.
     got, after = [], None
     while True:
-        k, _, _, after = await idx.pending(0, 2, after, 2)
+        k, _, _, _, after = await idx.pending(0, 2, after, 2)
         got += k
         if after is None:
             break
@@ -240,12 +240,12 @@ async def test_pages_read_only_the_block_indexes_they_need():
     rng = random.Random(0)
     await h.commit(ks, [rng.randbytes(16) for _ in ks])  # row digests: blocks outweigh filters
     assert len(h.state.files) >= 6
-    tails = sum(f.tail for f in h.state.files)
+    size = sum(f.size for f in h.state.files)
     h.io.metrics.reset()
-    keys, _, nxt = await h.index().page(key(10000), 50)
-    assert keys == ks[10001:10051] and nxt == ks[10050]
+    keys, _, _, nxt = await h.index().page(key(10000), 50)
+    assert keys == ks[10001:10051] and nxt == ks[10050]  # a full page, across a file boundary
     assert h.io.metrics.gets <= 4
-    assert h.io.metrics.bytes_in < tails / 5
+    assert h.io.metrics.bytes_in < size / 5  # the two files it spans, of dozens
 
 
 class Tracking(ObjectIO):
@@ -327,7 +327,7 @@ async def test_a_full_scan_reads_each_block_once():
     idx = h.index()
     after, pages = None, 0
     while True:
-        _, _, after = await idx.page(after, 50)
+        _, _, _, after = await idx.page(after, 50)
         pages += 1
         if after is None:
             break
@@ -369,3 +369,41 @@ async def test_level_0_merges_in_itself_until_it_is_a_tenth_of_level_1():
     await h.compact_all()
     await h.commit([key(1)], [b"new"])
     await h.check()
+
+
+async def test_locators_and_predecessors():
+    """Entries carry the generation that wrote them; delta entries carry the
+    key's predecessor `(version, locator)`, for the store to discard the object
+    they superseded (lifecycle.md §9.8). Compaction keeps locators only."""
+
+    io = ObjectIO(MemoryStore())
+    state = IndexState(prefix="keys/out/")
+
+    async def entries(files):
+        return [e for f in files for e in _python.iter_file(await io.read_whole(state.path(f.name), f.size))]
+
+    first, _ = await KeyIndex(io, None, state).replace(
+        Rows.pairs([(b"a", b"1"), (b"b", b"1"), (b"c", b"1")]), 0, "w1", generation=10
+    )
+    assert await entries(first.files) == [(k, b"1", 0, 10, None) for k in (b"a", b"b", b"c")]
+    state = state.committed(0, first, keep_log=True)
+    second, _ = await KeyIndex(io, None, state).replace(
+        Rows.pairs([(b"a", b"1"), (b"b", b"2"), (b"d", b"1")]), 1, "w2", generation=20
+    )
+    assert await entries(second.files) == [
+        (b"b", b"2", 0, 20, (b"1", 10)),  # changed: the object of generation 10 is superseded
+        (b"c", b"", 1, 20, (b"1", 10)),  # deleted
+        (b"d", b"1", 0, 20, None),  # new: nothing superseded
+    ]
+    state = state.committed(1, second, keep_log=True)
+    idx = KeyIndex(io, None, state)
+    delta = await idx.changes([b"a", b"d"], [b"2", b"1"], [b"b"], generation=30)
+    assert list(zip(delta.keys, delta.locators, delta.predecessors, strict=True)) == [
+        (b"a", 30, (b"1", 10)),
+        (b"b", 30, (b"2", 20)),
+    ]
+    state = state.committed(2, await idx.write(2, "w3", delta), keep_log=True)
+    keys, versions, locators, _ = await KeyIndex(io, None, state).page(None, 10)
+    assert list(zip(keys, versions, locators, strict=True)) == [(b"a", b"2", 30), (b"d", b"1", 20)]
+    added, removed = await KeyIndex(io, None, state).compact((state.level(0) + state.level(1), 1))
+    assert [e[3:] for e in await entries(added)] == [(30, None), (20, None)]

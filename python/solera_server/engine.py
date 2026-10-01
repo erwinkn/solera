@@ -1665,7 +1665,7 @@ class Engine:
             return {"total": 0, "exact": True, "keys": {}, "next": None}
         index = KeyIndex(self._key_io(), None, state.pinned(), self.key_options)
         start = key_bytes(after) if after is not None else None
-        keys, versions, nxt = await index.page(start, offset + limit)
+        keys, versions, _, nxt = await index.page(start, offset + limit)
         # Versions are a declared revision's text, a source's version, or else a row digest.
         record = self.manifest["outputs"].get(output) or {}
         digests = not (record.get("source") or record.get("partition_set") or record.get("revision"))

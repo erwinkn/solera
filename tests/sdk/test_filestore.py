@@ -85,7 +85,7 @@ async def test_a_keyed_output_is_one_object_per_key(store):
     assert await paths(store) == ["uploads/u-1.json", "uploads/u-2.json"]
     patched = await store.store(Patch({"u-3": {"bytes": 8}}, remove=["u-1"]), first.ref, scope(out))
     assert await store.load(patched.ref, None, None) == {"u-2": {"bytes": 5}, "u-3": {"bytes": 8}}
-    assert await store.load(patched.ref, None, Keys({"u-3": ""})) == {"u-3": {"bytes": 8}}
+    assert await store.load(patched.ref, None, Keys({"u-3": (b"", 0)})) == {"u-3": {"bytes": 8}}
     # A replacement with no word from the harness writes it all and drops the rest.
     replaced = await store.store({"u-9": 1}, patched.ref, scope(out))
     assert await paths(store) == ["uploads/u-9.json"]
@@ -126,14 +126,14 @@ async def test_rows_by_key_column(store):
     assert await paths(store) == ["files/1.json", "files/2.json"]
     patched = await store.store(Patch([{"id": 3, "v": "1"}], remove=[1]), first.ref, scope(out))
     assert await store.load(patched.ref, list[dict], None) == [{"id": 2, "v": "1"}, {"id": 3, "v": "1"}]
-    frame = await store.load(patched.ref, pd.DataFrame, Keys({"3": "1"}))
+    frame = await store.load(patched.ref, pd.DataFrame, Keys({"3": (b"1", 0)}))
     assert list(frame["id"]) == [3]
     # Every key holds all its rows: a second row for a key joins its group, and a
     # patch of the key replaces the whole group.
     grouped = await store.store(
         Patch([{"id": 3, "v": "2"}, {"id": 3, "v": "2", "n": 1}]), patched.ref, scope(out)
     )
-    assert await store.load(grouped.ref, list[dict], Keys({"3": "2"})) == [
+    assert await store.load(grouped.ref, list[dict], Keys({"3": (b"2", 0)})) == [
         {"id": 3, "v": "2"},
         {"id": 3, "v": "2", "n": 1},
     ]
@@ -161,7 +161,7 @@ async def test_a_partition_set_is_its_element_list(store):
     out = PartitionSet("sites")
     written = await store.store(["Richmond", "Perth"], None, scope(out))
     assert await store.load(written.ref, list, None) == ["Richmond", "Perth"]
-    assert await store.load(written.ref, list, Keys({"Perth": "1"})) == ["Perth"]
+    assert await store.load(written.ref, list, Keys({"Perth": (b"1", 0)})) == ["Perth"]
     patched = await store.store(Patch(["Hobart"], remove=["Perth"]), written.ref, scope(out))
     assert await store.load(patched.ref, list, None) == ["Richmond", "Hobart"]
 

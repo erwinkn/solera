@@ -34,6 +34,8 @@ fn main() {
     let ks: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
     let vs: Vec<&[u8]> = vers.iter().map(|v| v.as_slice()).collect();
     let del = vec![0u8; ks.len()];
+    let locs = vec![1u64; ks.len()];
+    let prev = vec![None; ks.len()];
     let o = Options {
         block_size: 65536,
         level: 1,
@@ -62,7 +64,7 @@ fn main() {
         ("zlib-rs level 6, filters", Options { level: 6, ..o }),
     ] {
         let t = Instant::now();
-        let f = format::encode_file(&ks, &vs, &del, o).unwrap();
+        let f = format::encode_file(&ks, &vs, &del, &locs, &prev, o).unwrap();
         println!(
             "{label:32} {:6.3} s  {:.1} MB",
             t.elapsed().as_secs_f64(),
@@ -72,7 +74,7 @@ fn main() {
     let t = Instant::now();
     let mut w = Writer::new(o, 64 << 20);
     for i in 0..ks.len() {
-        w.push(ks[i], vs[i], false).unwrap();
+        w.push(ks[i], vs[i], false, 1, None).unwrap();
     }
     w.finish(false).unwrap();
     println!(
@@ -81,7 +83,7 @@ fn main() {
         t.elapsed().as_secs_f64(),
         w.files.len()
     );
-    let f = format::encode_file(&ks, &vs, &del, o).unwrap();
+    let f = format::encode_file(&ks, &vs, &del, &locs, &prev, o).unwrap();
     let (codec, blocks) = format::file_blocks(&f).unwrap();
     let data: Bytes = Arc::new(f);
     let t = Instant::now();

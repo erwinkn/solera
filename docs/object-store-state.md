@@ -267,7 +267,10 @@ by compaction, and by the server for key listings. The engine itself only
 holds each index's `KeyIndex` record.
 
 **Structure: a log-structured merge tree of sorted files.** Every file
-holds `(key, version, deleted)` entries sorted by key.
+holds `(key, version, deleted, locator)` entries sorted by key — the
+locator is the generation that wrote the key's object (`lifecycle.md`
+§9.8) — and a delta's entries also the predecessor `(version, locator)`
+of the key they change or delete, which compaction drops.
 
 - **Level 0** holds delta files, one per commit, named by batch, and files
   merged from them. Their key ranges overlap; a file is as recent as the

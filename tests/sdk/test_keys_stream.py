@@ -18,7 +18,7 @@ OPTS = {"block_size": 512}
 def content(files):
     """Every entry of consecutive files: [(key, version, deleted)]."""
 
-    return [e for f in files for e in _python.iter_file(f)]
+    return [e[:3] for f in files for e in _python.iter_file(f)]
 
 
 def index(entries, max_file_bytes=4096):

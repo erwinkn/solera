@@ -25,6 +25,24 @@ def timed(label, n, fn, *args, **kw):
     return out
 
 
+def compact(files, drop_deleted):
+    """The native merge: a compaction job fed each whole file as one segment."""
+
+    job = _native.Job.compact(len(files), drop_deleted=drop_deleted)
+    fed, out = set(), []
+    while (step := job.step()) is not None:
+        kind, x = step
+        if kind == "file":
+            out.append(x)
+        elif x in fed:
+            job.end(x)
+        else:
+            fed.add(x)
+            idx = _native.parse_index(files[x], len(files[x]))
+            job.feed(x, files[x], [(off, size, crc) for _, off, size, _, crc in idx["blocks"]], idx["codec"])
+    return out
+
+
 keys, vers, dele = gen(N)
 n = len(keys)
 raw = sum(len(k) + len(v) for k, v in zip(keys, vers, strict=True))
@@ -59,4 +77,5 @@ for name, impl in (("native", _native), ("python", _python)):
     timed("sort", m, impl.sort_entries, shuffled[:m], vers[:m], dele[:m])
     half_a = impl.encode_file(keys[::2], vers[::2], dele[::2])
     half_b = impl.encode_file(keys[1::2], vers[1::2], dele[1::2])
-    timed("merge two files into one", n, impl.merge_files, [half_a, half_b], drop_deleted=True)
+    merge = _python.merge_files if impl is _python else compact
+    timed("merge two files into one", n, merge, [half_a, half_b], drop_deleted=True)

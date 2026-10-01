@@ -10,9 +10,8 @@ use rayon::prelude::*;
 use xxhash_rust::xxh3::xxh3_128;
 
 use crate::format::{
-    compress, decompress, filter_nbits, fmt_err, get_bytes, get_varint, hash_positions, key_item,
-    pair_item, put_bytes, put_varint, shared_prefix, tomb_item, Error, Options, Result,
-    FORMAT_VERSION, MAGIC,
+    compress, decompress, filter_nbits, fmt_err, get_varint, hash_positions, key_item, pair_item,
+    put_bytes, put_varint, shared_prefix, tomb_item, Error, Options, Result, FORMAT_VERSION, MAGIC,
 };
 
 /// Bytes owned elsewhere — a Python `bytes`, or a `Vec` in tests.
@@ -20,13 +19,93 @@ pub type Bytes = Arc<dyn AsRef<[u8]> + Send + Sync>;
 
 // -- blocks -----------------------------------------------------------------------
 
+/// Entry flags (docs/key-index-format.md § Blocks).
+const DELETED: u8 = 1;
+const PREDECESSOR: u8 = 2;
+
+/// One encoded entry, its byte strings as ranges of the block.
+struct Fields {
+    shared: usize,
+    suffix: (usize, usize),
+    version: (usize, usize),
+    flags: u8,
+    locator: u64,
+    predecessor: Option<((usize, usize), u64)>,
+}
+
+fn range(buf: &[u8], pos: &mut usize) -> Result<(usize, usize)> {
+    let n = get_varint(buf, pos)? as usize;
+    let start = *pos;
+    if start + n > buf.len() {
+        return fmt_err("truncated entry");
+    }
+    *pos += n;
+    Ok((start, start + n))
+}
+
+fn read_entry(raw: &[u8], pos: &mut usize) -> Result<Fields> {
+    let shared = get_varint(raw, pos)? as usize;
+    let suffix = range(raw, pos)?;
+    let version = range(raw, pos)?;
+    let Some(&flags) = raw.get(*pos) else {
+        return fmt_err("truncated entry");
+    };
+    *pos += 1;
+    if flags & !(DELETED | PREDECESSOR) != 0 {
+        return fmt_err("unknown entry flags");
+    }
+    let locator = get_varint(raw, pos)?;
+    let predecessor = if flags & PREDECESSOR != 0 {
+        Some((range(raw, pos)?, get_varint(raw, pos)?))
+    } else {
+        None
+    };
+    Ok(Fields {
+        shared,
+        suffix,
+        version,
+        flags,
+        locator,
+        predecessor,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_entry(
+    out: &mut Vec<u8>,
+    shared: usize,
+    suffix: &[u8],
+    version: &[u8],
+    deleted: bool,
+    locator: u64,
+    predecessor: Option<(&[u8], u64)>,
+) {
+    put_varint(out, shared as u64);
+    put_bytes(out, suffix);
+    put_bytes(out, version);
+    out.push(
+        if deleted { DELETED } else { 0 }
+            | if predecessor.is_some() {
+                PREDECESSOR
+            } else {
+                0
+            },
+    );
+    put_varint(out, locator);
+    if let Some((v, l)) = predecessor {
+        put_bytes(out, v);
+        put_varint(out, l);
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Ent {
     key: u32,
     key_len: u32,
-    ver: u32,
-    ver_len: u32,
+    ver: (u32, u32),
     deleted: bool,
+    locator: u64,
+    predecessor: Option<((u32, u32), u64)>,
 }
 
 /// A decoded block: whole keys in one arena, versions in place in the raw bytes.
@@ -42,31 +121,24 @@ impl Block {
         let mut keys: Vec<u8> = Vec::with_capacity(raw.len());
         let mut ents = Vec::new();
         let (mut pos, mut prev, mut prev_len) = (0usize, 0usize, 0usize);
+        let r = |(a, b): (usize, usize)| (a as u32, b as u32);
         while pos < raw.len() {
-            let shared = get_varint(&raw, &mut pos)? as usize;
-            let suffix = get_bytes(&raw, &mut pos)?;
-            let key = keys.len();
-            if shared > prev_len {
+            let f = read_entry(&raw, &mut pos)?;
+            if f.shared > prev_len {
                 return fmt_err("bad shared prefix length");
             }
-            keys.extend_from_within(prev..prev + shared);
-            keys.extend_from_slice(suffix);
-            let ver_len = get_varint(&raw, &mut pos)? as usize;
-            let ver = pos;
-            if ver + ver_len >= raw.len() {
-                return fmt_err("truncated entry");
-            }
-            pos += ver_len;
-            let deleted = raw[pos] & 1 != 0;
-            pos += 1;
+            let key = keys.len();
+            keys.extend_from_within(prev..prev + f.shared);
+            keys.extend_from_slice(&raw[f.suffix.0..f.suffix.1]);
             prev = key;
             prev_len = keys.len() - key;
             ents.push(Ent {
                 key: key as u32,
                 key_len: prev_len as u32,
-                ver: ver as u32,
-                ver_len: ver_len as u32,
-                deleted,
+                ver: r(f.version),
+                deleted: f.flags & DELETED != 0,
+                locator: f.locator,
+                predecessor: f.predecessor.map(|(v, l)| (r(v), l)),
             });
         }
         Ok(Block { raw, keys, ents })
@@ -88,13 +160,25 @@ impl Block {
 
     #[inline]
     pub fn version(&self, i: usize) -> &[u8] {
-        let e = &self.ents[i];
-        &self.raw[e.ver as usize..(e.ver + e.ver_len) as usize]
+        let (a, b) = self.ents[i].ver;
+        &self.raw[a as usize..b as usize]
     }
 
     #[inline]
     pub fn deleted(&self, i: usize) -> bool {
         self.ents[i].deleted
+    }
+
+    #[inline]
+    pub fn locator(&self, i: usize) -> u64 {
+        self.ents[i].locator
+    }
+
+    /// The version and locator the key had before this entry (delta files only).
+    pub fn predecessor(&self, i: usize) -> Option<(&[u8], u64)> {
+        self.ents[i]
+            .predecessor
+            .map(|((a, b), l)| (&self.raw[a as usize..b as usize], l))
     }
 }
 
@@ -311,6 +395,11 @@ impl Merge {
     pub fn deleted(&self) -> bool {
         self.runs[self.cur.0].block().deleted(self.cur.1)
     }
+
+    #[inline]
+    pub fn locator(&self) -> u64 {
+        self.runs[self.cur.0].block().locator(self.cur.1)
+    }
 }
 
 // -- writing ------------------------------------------------------------------------
@@ -343,13 +432,11 @@ fn pack(b: RawBlock, o: &Options) -> Result<Packed> {
     let mut key: Vec<u8> = Vec::new();
     let mut item = Vec::new();
     while pos < raw.len() {
-        let shared = get_varint(raw, &mut pos)? as usize;
-        let suffix = get_bytes(raw, &mut pos)?;
-        key.truncate(shared);
-        key.extend_from_slice(suffix);
-        let version = get_bytes(raw, &mut pos)?;
-        let deleted = raw[pos] & 1 != 0;
-        pos += 1;
+        let f = read_entry(raw, &mut pos)?;
+        key.truncate(f.shared);
+        key.extend_from_slice(&raw[f.suffix.0..f.suffix.1]);
+        let version = &raw[f.version.0..f.version.1];
+        let deleted = f.flags & DELETED != 0;
         key_item(&mut item, &key);
         keys.push(xxh3_128(&item));
         if deleted {
@@ -502,7 +589,14 @@ impl Writer {
         }
     }
 
-    pub fn push(&mut self, key: &[u8], version: &[u8], deleted: bool) -> Result<()> {
+    pub fn push(
+        &mut self,
+        key: &[u8],
+        version: &[u8],
+        deleted: bool,
+        locator: u64,
+        predecessor: Option<(&[u8], u64)>,
+    ) -> Result<()> {
         if self.started && key <= self.prev.as_slice() {
             return Err(Error::Value(format!(
                 "keys must be strictly increasing: {:?} then {:?}",
@@ -517,10 +611,15 @@ impl Writer {
         } else {
             shared_prefix(&self.prev, key)
         };
-        put_varint(&mut self.block, shared as u64);
-        put_bytes(&mut self.block, &key[shared..]);
-        put_bytes(&mut self.block, version);
-        self.block.push(deleted as u8);
+        write_entry(
+            &mut self.block,
+            shared,
+            &key[shared..],
+            version,
+            deleted,
+            locator,
+            predecessor,
+        );
         self.prev.clear();
         self.prev.extend_from_slice(key);
         self.started = true;
@@ -626,7 +725,7 @@ mod tests {
     fn write(es: &[(Vec<u8>, Vec<u8>, bool)], max: usize) -> Vec<Vec<u8>> {
         let mut w = Writer::new(O, max);
         for (k, v, d) in es {
-            w.push(k, v, *d).unwrap();
+            w.push(k, v, *d, 7, None).unwrap();
         }
         w.finish(true).unwrap();
         w.files.into_iter().collect()
@@ -640,10 +739,12 @@ mod tests {
         let ks: Vec<&[u8]> = es.iter().map(|e| e.0.as_slice()).collect();
         let vs: Vec<&[u8]> = es.iter().map(|e| e.1.as_slice()).collect();
         let ds: Vec<u8> = es.iter().map(|e| e.2 as u8).collect();
-        assert_eq!(files[0], encode_file(&ks, &vs, &ds, O).unwrap());
+        let ls = vec![7u64; ks.len()];
+        let ps = vec![None; ks.len()];
+        assert_eq!(files[0], encode_file(&ks, &vs, &ds, &ls, &ps, O).unwrap());
         assert_eq!(
             write(&[], usize::MAX),
-            vec![encode_file(&[], &[], &[], O).unwrap()]
+            vec![encode_file(&[], &[], &[], &[], &[], O).unwrap()]
         );
     }
 
@@ -681,7 +782,7 @@ mod tests {
         let (codec, blocks) = file_blocks(&old_files[0]).unwrap();
         let b = &blocks[0];
         let raw = &old_files[0][b.offset as usize..(b.offset + b.size) as usize];
-        let (ks, vs, fs) = decode_block(raw, codec).unwrap();
+        let (ks, vs, fs, _, _) = decode_block(raw, codec).unwrap();
         let blk = Block::decode(raw, codec).unwrap();
         for i in 0..ks.len() {
             assert_eq!(

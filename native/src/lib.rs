@@ -74,14 +74,39 @@ fn options(block_size: usize, level: u32, bits_per_item: u64, k: u8, codec: u8) 
 
 // -- kernels ----------------------------------------------------------------------------
 
+/// Optional per-entry columns: locators (0 when absent), and the predecessor
+/// `(version, locator)` of a delta entry's key, or None.
+type Extra = (Vec<u64>, Vec<Option<(PyBackedBytes, u64)>>);
+
+fn extra(
+    n: usize,
+    locators: Option<Vec<u64>>,
+    predecessors: Option<Vec<Option<(PyBackedBytes, u64)>>>,
+) -> PyResult<Extra> {
+    let locators = locators.unwrap_or_else(|| vec![0; n]);
+    let predecessors = predecessors.unwrap_or_else(|| (0..n).map(|_| None).collect());
+    if locators.len() != n || predecessors.len() != n {
+        return Err(PyValueError::new_err(
+            "locators and predecessors must have one item per key",
+        ));
+    }
+    Ok((locators, predecessors))
+}
+
+fn prev(p: &Option<(PyBackedBytes, u64)>) -> format::Predecessor<'_> {
+    p.as_ref().map(|(v, l)| (v.as_ref(), *l))
+}
+
 #[pyfunction]
-#[pyo3(signature = (keys, versions, deleted, *, block_size=65536, level=1, bits_per_item=14, k=10, codec=1))]
+#[pyo3(signature = (keys, versions, deleted, *, locators=None, predecessors=None, block_size=65536, level=1, bits_per_item=14, k=10, codec=1))]
 #[allow(clippy::too_many_arguments)]
 fn encode_file<'py>(
     py: Python<'py>,
     keys: Vec<PyBackedBytes>,
     versions: Vec<PyBackedBytes>,
     deleted: PyBackedBytes,
+    locators: Option<Vec<u64>>,
+    predecessors: Option<Vec<Option<(PyBackedBytes, u64)>>>,
     block_size: usize,
     level: u32,
     bits_per_item: u64,
@@ -89,20 +114,31 @@ fn encode_file<'py>(
     codec: u8,
 ) -> PyResult<Bound<'py, PyBytes>> {
     let o = options(block_size, level, bits_per_item, k, codec);
-    let out =
-        format::encode_file(&slices(&keys), &slices(&versions), &deleted, o).map_err(to_py)?;
+    let (locators, predecessors) = extra(keys.len(), locators, predecessors)?;
+    let predecessors: Vec<format::Predecessor> = predecessors.iter().map(prev).collect();
+    let out = format::encode_file(
+        &slices(&keys),
+        &slices(&versions),
+        &deleted,
+        &locators,
+        &predecessors,
+        o,
+    )
+    .map_err(to_py)?;
     Ok(PyBytes::new(py, &out))
 }
 
 /// Entries (sorted, unique keys) as files of about `max_file_bytes` each.
 #[pyfunction]
-#[pyo3(signature = (keys, versions, deleted, *, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864))]
+#[pyo3(signature = (keys, versions, deleted, *, locators=None, predecessors=None, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864))]
 #[allow(clippy::too_many_arguments)]
 fn write_files<'py>(
     py: Python<'py>,
     keys: Vec<PyBackedBytes>,
     versions: Vec<PyBackedBytes>,
     deleted: PyBackedBytes,
+    locators: Option<Vec<u64>>,
+    predecessors: Option<Vec<Option<(PyBackedBytes, u64)>>>,
     block_size: usize,
     level: u32,
     bits_per_item: u64,
@@ -115,12 +151,19 @@ fn write_files<'py>(
             "keys, versions and deleted must have the same length",
         ));
     }
+    let (locators, predecessors) = extra(keys.len(), locators, predecessors)?;
     let o = options(block_size, level, bits_per_item, k, codec);
     let files = py
         .detach(|| {
             let mut w = stream::Writer::new(o, max_file_bytes);
             for i in 0..keys.len() {
-                w.push(&keys[i], &versions[i], deleted[i] != 0)?;
+                w.push(
+                    &keys[i],
+                    &versions[i],
+                    deleted[i] != 0,
+                    locators[i],
+                    prev(&predecessors[i]),
+                )?;
             }
             w.finish(false)?;
             Ok(w.files.into_iter().collect::<Vec<_>>())
@@ -129,17 +172,32 @@ fn write_files<'py>(
     list_of_bytes(py, &files)
 }
 
+type Block5<'py> = (
+    Bound<'py, PyList>,
+    Bound<'py, PyList>,
+    Bound<'py, PyBytes>,
+    Vec<u64>,
+    Bound<'py, PyList>,
+);
+
+/// A block's keys, versions, deleted flags, locators, and each entry's predecessor `(version, locator)` or None.
 #[pyfunction]
-fn decode_block<'py>(
-    py: Python<'py>,
-    data: PyBackedBytes,
-    codec: u8,
-) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyList>, Bound<'py, PyBytes>)> {
-    let (keys, versions, flags) = format::decode_block(&data, codec).map_err(to_py)?;
+fn decode_block<'py>(py: Python<'py>, data: PyBackedBytes, codec: u8) -> PyResult<Block5<'py>> {
+    let (keys, versions, flags, locators, prev) =
+        format::decode_block(&data, codec).map_err(to_py)?;
+    let predecessors = PyList::empty(py);
+    for p in prev {
+        match p {
+            Some((v, l)) => predecessors.append((PyBytes::new(py, &v), l))?,
+            None => predecessors.append(py.None())?,
+        }
+    }
     Ok((
         list_of_bytes(py, &keys)?,
         list_of_bytes(py, &versions)?,
         PyBytes::new(py, &flags),
+        locators,
+        predecessors,
     ))
 }
 
@@ -213,24 +271,39 @@ fn sort_entries<'py>(
     Ok((sk, sv, PyBytes::new(py, &sd)))
 }
 
-type Triple<'py> = (Bound<'py, PyBytes>, Bound<'py, PyList>, Bound<'py, PyBytes>);
+type Found<'py> = (
+    Bound<'py, PyBytes>,
+    Bound<'py, PyList>,
+    Bound<'py, PyBytes>,
+    Vec<u64>,
+);
 
+/// Per sorted key: found, version, deleted, locator.
 #[pyfunction]
 fn lookup<'py>(
     py: Python<'py>,
     blocks: Vec<PyBackedBytes>,
     codec: u8,
     keys: Vec<PyBackedBytes>,
-) -> PyResult<Triple<'py>> {
-    let (found, versions, deleted) =
+) -> PyResult<Found<'py>> {
+    let (found, versions, deleted, locators) =
         format::lookup(&slices(&blocks), codec, &slices(&keys)).map_err(to_py)?;
     Ok((
         PyBytes::new(py, &found),
         list_of_bytes(py, &versions)?,
         PyBytes::new(py, &deleted),
+        locators,
     ))
 }
 
+type Merged<'py> = (
+    Bound<'py, PyList>,
+    Bound<'py, PyList>,
+    Bound<'py, PyBytes>,
+    Vec<u64>,
+);
+
+/// The merged view's keys, versions, deleted flags and locators.
 #[pyfunction]
 fn merge_range<'py>(
     py: Python<'py>,
@@ -239,9 +312,9 @@ fn merge_range<'py>(
     after: Option<PyBackedBytes>,
     upto: Option<PyBackedBytes>,
     drop_deleted: bool,
-) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyList>, Bound<'py, PyBytes>)> {
+) -> PyResult<Merged<'py>> {
     let runs: Vec<Vec<&[u8]>> = runs.iter().map(|r| slices(r)).collect();
-    let (k, v, f) = format::merge_range(
+    let (k, v, f, l) = format::merge_range(
         &runs,
         codec,
         after.as_ref().map(|a| a.as_ref()),
@@ -253,6 +326,7 @@ fn merge_range<'py>(
         list_of_bytes(py, &k)?,
         list_of_bytes(py, &v)?,
         PyBytes::new(py, &f),
+        l,
     ))
 }
 
@@ -754,9 +828,10 @@ impl Job {
     /// first. A streamed chunk holds `(key, version)` pairs, or with `key`
     /// rows keyed by that column: their versions are their digests, folded
     /// into each key's group, or the `revision` a key's rows share. At most
-    /// `collect` changed keys are kept for `collected`.
+    /// `collect` changed keys are kept for `collected`. Written entries carry
+    /// `generation` as their locator.
     #[staticmethod]
-    #[pyo3(signature = (rows, runs, *, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864, collect=0, key=None, revision=None))]
+    #[pyo3(signature = (rows, runs, *, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864, collect=0, key=None, revision=None, generation=0))]
     #[allow(clippy::too_many_arguments)]
     fn replace(
         rows: Option<PyRefMut<'_, Rows>>,
@@ -770,6 +845,7 @@ impl Job {
         collect: usize,
         key: Option<String>,
         revision: Option<String>,
+        generation: u64,
     ) -> PyResult<Job> {
         let src = match rows {
             Some(mut r) => Source::Table(
@@ -787,6 +863,7 @@ impl Job {
                 o,
                 max_file_bytes,
                 collect,
+                generation,
             ))),
             records: key.map(|k| (k, revision)),
         })
