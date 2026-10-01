@@ -129,16 +129,29 @@ async def test_a_restarted_engine_adopts_and_commits_a_launched_attempt(tmp_path
     await state.close()
 
 
-async def test_an_adopted_attempt_without_heartbeats_is_dead(tmp_path):
-    """After a restart the engine has no placement handle: three missed beats
-    and the attempt is aborted and fails retryably."""
+class Blind(Remote):
+    """A placement whose provider cannot be reached: it cannot tell."""
+
+    async def wait(self, run, timeout):
+        raise ConnectionError("the provider's API is down")
+
+
+async def test_an_attempt_its_placement_cannot_see_is_followed_by_its_heartbeat(tmp_path):
+    """After a restart the provider's API is down: the engine keeps the
+    handle and follows the worker's beats. Its worker beat once, then went
+    quiet: three missed beats and it is dead, aborted and failed retryably."""
 
     url = tmp_path.as_uri()
     state = await State.open(url, "test", flush_interval=0.001)
     engine = engine_for(state, REMOTE)
     await engine.initialize()
     run, attempt = await launched(engine, ["remote"])
-    state, engine = await restart(state, engine, url, REMOTE, heartbeat_seconds=0.1)
+    await state.put_object(f"{state.attempt_path(run['id'], attempt)}.beat", json.dumps({"n": 0}).encode())
+    state, engine = await restart(state, engine, url, REMOTE, worker=Blind, heartbeat_seconds=0.1)
+    assert state.model.task(state.model.attempts[attempt])["launched"]["handle"] == {
+        "id": attempt,
+        "run": run["id"],
+    }
     await engine.initialize()
     await until(engine, lambda: state.model.claimed(attempt) is None)
     task = state.model.task(next(iter(state.model.runs[run["id"]]["tasks"])))
@@ -147,6 +160,120 @@ async def test_an_adopted_attempt_without_heartbeats_is_dead(tmp_path):
     assert "no heartbeat" in first["error"]
     assert (await fence(state, run["id"], attempt)) == {"state": "aborted"}
     await engine.stop()
+    await state.close()
+
+
+class Flaky(Remote):
+    """A provider whose API fails now and then; the run is there throughout."""
+
+    errors = 0
+    seen: list = []
+
+    async def wait(self, run, timeout):
+        self.seen.append(run)
+        if Flaky.errors:
+            Flaky.errors -= 1
+            raise TimeoutError("DescribeTasks timed out")
+        return await super().wait(run, timeout)
+
+
+async def test_a_placement_that_cannot_tell_keeps_its_handle(tmp_path):
+    """Errors from the provider are not news of the worker: the engine keeps
+    asking through the same handle, and settles once it says the run exited."""
+
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = engine_for(state, REMOTE, worker=Flaky)
+    await engine.initialize()
+    Flaky.errors, Flaky.seen = 5, []
+    run, attempt = await launched(engine, ["remote"])
+    await until(engine, lambda: Flaky.errors == 0)
+    await finish_as_worker(state, run["id"], attempt, "remote")
+    detail = await engine.run_until(run["id"], 10)
+    assert detail["request"]["status"] == "succeeded"
+    assert all(h == {"id": attempt, "run": run["id"]} for h in Flaky.seen)
+    await engine.stop()
+    await state.close()
+
+
+class Named(Remote):
+    """A provider that names each run after its attempt: launching one twice
+    starts it once. Its first launch hangs, as if the engine died in it."""
+
+    started: set = set()
+    hang = True
+
+    async def launch(self, stage):
+        if Named.hang:
+            Named.hang = False
+            await asyncio.Event().wait()
+        Named.started.add(stage["attempt"])
+        return await super().launch(stage)
+
+    resume = launch
+
+
+async def test_an_attempt_whose_launch_was_cut_short_is_resumed(tmp_path):
+    """The engine stops after the launch is durable but before the placement
+    answers: no handle was recorded. The next engine resumes it through the
+    placement's own name for it, records the handle, and commits it — the
+    attempt is not failed, and no retry is spent."""
+
+    url = tmp_path.as_uri()
+    state = await State.open(url, "test", flush_interval=0.001)
+    engine = engine_for(state, REMOTE, worker=Named)
+    await engine.initialize()
+    Named.hang, Named.started = True, set()
+    run = await engine.submit(["remote"])
+    await until(engine, lambda: any(c.get("launched") for c in state.model.claims.values()))
+    [attempt] = [c["attempt"] for c in state.model.claims.values()]
+    state, engine = await restart(state, engine, url, REMOTE, worker=Named)
+    assert "handle" not in state.model.task(state.model.attempts[attempt])["launched"]
+    await engine.initialize()
+    await until(engine, lambda: Named.started)
+    assert state.model.task(state.model.attempts[attempt])["launched"]["handle"]["id"] == attempt
+    await finish_as_worker(state, run["id"], attempt, "remote")
+    detail = await engine.run_until(run["id"], 10)
+    assert detail["request"]["status"] == "succeeded"
+    assert [a["status"] for a in detail["attempts"][detail["tasks"][0]["id"]]] == ["succeeded"]
+    await engine.stop()
+    await state.close()
+
+
+async def test_a_worker_that_never_reports_is_given_up_on(tmp_path):
+    """Provisioning has a deadline of its own: a worker that has not said a
+    word by then never started. It is aborted, its run canceled at the
+    provider, and the attempt fails retryably."""
+
+    class Stuck(Quiet):
+        canceled = []
+
+        async def cancel(self, run):
+            Stuck.canceled.append(run["id"])
+            await super().cancel(run)
+
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = engine_for(state, REMOTE, worker=Stuck, provision_seconds=0.3)
+    await engine.initialize()
+    run, attempt = await launched(engine, ["remote"])
+    await until(engine, lambda: state.model.claimed(attempt) is None)
+    task = state.model.task(next(iter(state.model.runs[run["id"]]["tasks"])))
+    assert "did not report" in task["attempts"][0]["error"] and Stuck.canceled == [attempt]
+    assert (await fence(state, run["id"], attempt)) == {"state": "aborted"}
+    await engine.stop()
+    await state.close()
+
+
+async def test_an_adopted_deadline_trusts_the_launching_clock_within_bounds(tmp_path):
+    """An adopted attempt keeps what the launching engine's clock says is
+    left of its budget, but never less than three heartbeats — that clock
+    may have run fast — nor more than the whole budget."""
+
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = engine_for(state, REMOTE, heartbeat_seconds=30)
+    now = state.clock()
+    assert abs(engine._left({"at": now - 600}, 3600) - 3000) < 5
+    assert engine._left({"at": now - 86400}, 3600) == 90  # three heartbeats
+    assert engine._left({"at": now + 86400}, 3600) == 3600
     await state.close()
 
 

@@ -1,9 +1,16 @@
 """Server-side placements (§10): a placement is lifecycle only — start the
 harness somewhere, report when it stopped. It never reads a spec or a result.
 
-    Stage    = {"attempt": str, "objects": str}
-    RunHandle = JSON dict, durable across engine restarts
+    Stage    = {"attempt": str, "run": str, "objects": str}
+    RunHandle = JSON dict, recorded (`AttemptPlaced`) for whichever engine follows the attempt
     Exit     = {"code": int | None, "reason": str | None, "meta": dict}
+
+`wait` returns an `Exit` only when the provider says the run ended, and
+raises when it cannot tell: the engine keeps the handle and asks again.
+`resume`, where a placement has it, finds or starts an attempt adopted
+without a handle — `launch` again, for a provider that names runs after
+their attempt. `provision_seconds` overrides the engine's deadline for a
+worker's first report; `None` waits as long as it takes.
 """
 
 from __future__ import annotations
@@ -29,6 +36,7 @@ class ServerPlacement(Protocol):
     """launch/wait/cancel; `max_concurrent` caps in-flight attempts per executor (§10)."""
 
     max_concurrent: int | None = None
+    provision_seconds: float | None
 
     async def launch(self, stage: dict) -> dict: ...
 
@@ -111,4 +119,5 @@ __all__ = [
 @dataclass(frozen=True)
 class Stage:
     attempt: str
+    run: str
     objects: str

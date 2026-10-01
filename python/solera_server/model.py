@@ -563,6 +563,14 @@ class Model:
         self._hold(task)
         self._event(self.runs[task["run"]], "taken", e["at"], task["id"], e["attempt"], name=e["worker"])
 
+    def _on_AttemptPlaced(self, e):
+        """Where a launched attempt runs: its placement handle (§10)."""
+
+        task = self.task(self.attempts.get(e["attempt"], ""))
+        launched = (task or {}).get("launched")
+        if launched is not None and launched["attempt"] == e["attempt"]:
+            launched["handle"] = e["handle"]
+
     def _on_AttemptFinished(self, e):
         run = self.runs.get(e["run"])
         task = run["tasks"].get(e["task"]) if run else None

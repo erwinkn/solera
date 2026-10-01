@@ -2,8 +2,16 @@
 
 Each lazily imports its SDK so the server runs without the optional extras
 installed; a missing SDK raises at `launch`, which the engine records as a
-retryable attempt failure. `launch` hands the harness the two stage strings —
-`attempt` and `objects` — via container override, argv, or function argument.
+retryable attempt failure. `launch` hands the harness the stage strings —
+`attempt`, `run` and `objects` — via container override, argv, or function
+argument.
+
+The provider names each attempt's run after the attempt (an ECS client
+token, a Kubernetes job name), so launching an attempt twice starts it once:
+`resume`, after a restart that lost the handle, is `launch` again. `wait`
+reports an exit only when the provider says so; when it cannot tell — an API
+error, a run it does not show (yet) — it raises, and the engine keeps the
+handle and follows the worker's own reports meanwhile.
 """
 
 from __future__ import annotations
@@ -56,11 +64,14 @@ class AWSECS:
             taskDefinition=self.options.get("image") or "solera-worker",
             overrides=self._overrides(stage),
             launchType="FARGATE",
+            clientToken=stage["attempt"],  # a second launch of the attempt returns the first's task
         )
         failures = response.get("failures") or []
         if failures:
             raise RuntimeError(f"run_task failed: {failures[0].get('reason')}")
         return {"task_arn": response["tasks"][0]["taskArn"]}
+
+    resume = launch
 
     async def wait(self, run: dict, timeout: float) -> dict | None:
         client = self._client()
@@ -73,7 +84,9 @@ class AWSECS:
             )
             tasks = response.get("tasks") or []
             if not tasks:
-                return {"code": None, "reason": "lost", "meta": {}}
+                # Not shown yet (ECS is eventually consistent after a launch),
+                # or stopped long ago: either way, ECS cannot tell.
+                raise LookupError(f"ECS shows no task {run['task_arn']}")
             task = tasks[0]
             if task.get("lastStatus") == "STOPPED":
                 containers = task.get("containers") or [{}]
@@ -132,17 +145,27 @@ class K8sJob:
                 spec=kclient.V1PodSpec(restart_policy="Never", containers=[container])
             ),
         )
-        return kclient.V1Job(
-            metadata=kclient.V1ObjectMeta(name=f"solera-{stage['attempt'][-12:]}".replace("/", "-")),
-            spec=spec,
-        )
+        return kclient.V1Job(metadata=kclient.V1ObjectMeta(name=self._name(stage)), spec=spec)
+
+    @staticmethod
+    def _name(stage: dict) -> str:
+        """The attempt's job: a DNS label, so lowercase."""
+
+        return f"solera-{stage['attempt'].lower()}"
 
     async def launch(self, stage: dict) -> dict:
         _, api = self._clients()
-        job = await asyncio.to_thread(
-            api.create_namespaced_job, self.environment["namespace"], self._job(stage)
-        )
-        return {"job": job.metadata.name}
+        try:
+            await asyncio.to_thread(
+                api.create_namespaced_job, self.environment["namespace"], self._job(stage)
+            )
+        except Exception as error:
+            if getattr(error, "status", None) != 409:
+                raise
+            # Already there: this attempt's job, from a launch whose answer was lost.
+        return {"job": self._name(stage)}
+
+    resume = launch
 
     async def wait(self, run: dict, timeout: float) -> dict | None:
         _, api = self._clients()
@@ -152,8 +175,10 @@ class K8sJob:
                 job = await asyncio.to_thread(
                     api.read_namespaced_job, run["job"], self.environment["namespace"]
                 )
-            except Exception:
-                return {"code": None, "reason": "lost", "meta": {}}
+            except Exception as error:
+                if getattr(error, "status", None) == 404:
+                    return {"code": None, "reason": "lost", "meta": {}}
+                raise
             for condition in job.status.conditions or []:
                 if condition.type == "Complete" and condition.status == "True":
                     return {"code": 0, "reason": None, "meta": {}}
@@ -209,7 +234,9 @@ class Modal:
                 if time.monotonic() >= deadline:
                     return None
                 await asyncio.sleep(min(2.0, deadline - time.monotonic()))
-            except Exception as error:
+            except OSError:
+                raise  # Modal is out of reach: no word on the call
+            except Exception as error:  # the call itself failed
                 return {"code": 1, "reason": f"{type(error).__name__}: {error}", "meta": {}}
 
     async def cancel(self, run: dict) -> None:

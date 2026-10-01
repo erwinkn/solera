@@ -580,13 +580,16 @@ class Placement(Protocol):
     async def launch(self, stage: Stage) -> RunHandle: ...
     async def wait(self, run: RunHandle, timeout: float) -> Exit | None: ...
     async def cancel(self, run: RunHandle) -> None: ...
+    resume: Callable[[Stage], Awaitable[RunHandle]]   # optional: `launch`, where it is idempotent
     max_concurrent: int | None                 # per executor
+    provision_seconds: float | None            # optional: the engine's default, None for no deadline
 ```
 
 | Method | Contract |
 |---|---|
-| `launch` | Start the harness, handing it the three `stage` strings — `attempt`, `run`, `objects` — (container override, argv, function argument); the harness reaches `objects` with the environment's own auth. The spec is already in the attempt file. Raising = attempt failed, retryable. |
-| `wait` | Block at most `timeout`; `None` while running, else `Exit`. Idempotent, safe after termination; a vanished run is `Exit(None, "lost")`. |
+| `launch` | Start the harness, handing it the three `stage` strings — `attempt`, `run`, `objects` — (container override, argv, function argument); the harness reaches `objects` with the environment's own auth. The spec is already in the attempt file. Where the provider allows it, the run is named after the attempt, so launching twice starts it once. Raising = attempt failed, retryable. The handle is recorded (`AttemptPlaced`). |
+| `resume` | Optional, for an attempt adopted without a handle: find its run, or start it if the launch never happened — `launch` itself, when that is idempotent. |
+| `wait` | Block at most `timeout`; `None` while running, else `Exit`. Idempotent, safe after termination; a run the provider says is gone is `Exit(None, "lost")`. Raises when it cannot tell — an API error, a run not shown yet: the engine keeps the handle and asks again. |
 | `cancel` | Best-effort, idempotent, never raises for a finished run. |
 
 Object keys are conventional under `objects`: the attempt file
@@ -602,9 +605,11 @@ await objects.create(f"runs/{run_id}/{attempt}.json", {"spec": spec})
 record(AttemptLaunched(...))                  # from here on, a restart adopts it
 await durable()                               # never launch what a restart wouldn't adopt
 run = await placement.launch(Stage(attempt, run_id, objects_url))
-while (exit := await placement.wait(run, poll)) is None:   # no handle: follow {attempt}.beat
-    # a cancel wakes this wait at once; a timeout ends it on time
-    if canceled or now() > deadline:
+record(AttemptPlaced(attempt, run))           # a restart follows it through this handle
+while (exit := await placement.wait(run, poll)) is None:   # can't tell: follow {attempt}.beat
+    # a cancel wakes this wait at once; a timeout ends it on time; so does
+    # provisioning that never ends in a first report
+    if canceled or now() > deadline or not reported and now() > provisioned_by:
         if await take_fence(attempt, "aborted"):          # the harness has not begun writing
             await placement.cancel(run)
             return fail("canceled" or "timeout")
@@ -616,8 +621,8 @@ commit_or_fail(result)
 ```
 
 A launched attempt survives an engine restart: the new engine adopts it,
-following its placement handle if the placement can resume one, else its
-heartbeat (three missed beats: dead). A harness that dies after taking the
+following its recorded placement handle, else the one `resume` finds,
+else its heartbeat (three missed beats: dead) — object-store-state.md §8. A harness that dies after taking the
 fence leaves its keyed outputs **unsettled**: the next attempt reads the
 keys it meant to change back from the store and folds what landed into its
 own commit. The engine counts in-flight attempts per executor against
@@ -699,10 +704,10 @@ Logs stream to chunked objects throughout. `manifest` mode runs through
 
 | Kind | `launch` | handle | `wait` | `cancel` |
 |---|---|---|---|---|
-| `Local()()` | subprocess with an explicit env allow-list | `{pid, started_at}` | polls the process | `SIGTERM`, then `SIGKILL` |
-| `AWSECS(name, cluster, region)(cpu, memory, gpu, image)` | `run_task` with container overrides carrying the stage | `{task_arn}` | describes until `STOPPED`; `Exit.meta.log_url` | `stop_task` |
+| `Local()()` | subprocess with an explicit env allow-list | `{pid, started_at, ticks, host}` | polls the process; another host's: can't tell | `SIGTERM`, then `SIGKILL` |
+| `AWSECS(name, cluster, region)(cpu, memory, gpu, image)` | `run_task` with container overrides carrying the stage, `clientToken` = attempt | `{task_arn}` | describes until `STOPPED`; `Exit.meta.log_url`; a task not shown: can't tell | `stop_task` |
 | `Modal(name, app)(gpu)` | spawns the harness function | `{call_id}` | polls the call | cancels it |
-| `K8sJob(name, cluster, namespace)(cpu, memory, image)` | creates a job | `{job}` | watches conditions | deletes the job |
+| `K8sJob(name, cluster, namespace)(cpu, memory, image)` | creates the job `solera-{attempt}` (lowercased); an existing one is its own | `{job}` | watches conditions; deleted: lost | deletes the job |
 | `Pool(name)(cpu, memory, gpu)` | publishes the stage as a claimable task | `{task}` | result appeared, `complete` called, or claim lease expired | marks the task canceled |
 
 `Pool` is the pull path. Workers are external processes:

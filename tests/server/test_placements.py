@@ -3,6 +3,7 @@ worker, cancel) and the remote kinds against stubbed SDK clients."""
 
 import asyncio
 import json
+import re
 import sys
 import types
 import uuid
@@ -159,8 +160,10 @@ def stub_boto3(monkeypatch, ecs):
 
 
 async def test_awsecs_launch_wait_cancel(state, monkeypatch):
-    """§10: AWSECS launch passes attempt+objects as container overrides; wait
-    maps STOPPED to an exit; a vanished task is lost."""
+    """§10: AWSECS launch passes attempt+objects as container overrides, and
+    the attempt as the client token, so a second launch starts nothing new;
+    wait maps STOPPED to an exit; a task ECS does not show is unknown, not
+    lost — it may not show yet."""
     from solera_server.placements.remote import AWSECS
 
     ecs = FakeEcs()
@@ -172,6 +175,7 @@ async def test_awsecs_launch_wait_cancel(state, monkeypatch):
     assert override["command"][-3:] == ["--attempt", "a1"] or "a1" in override["command"]
     assert "s3://bkt/ns/objects" in override["command"]
     assert override["cpu"] == "4096" and override["memory"] == "30000"
+    assert task["kw"]["clientToken"] == "a1"
 
     ecs.tasks[handle["task_arn"]]["lastStatus"] = "STOPPED"
     ecs.tasks[handle["task_arn"]]["containers"] = [{"exitCode": 0}]
@@ -179,27 +183,38 @@ async def test_awsecs_launch_wait_cancel(state, monkeypatch):
     assert exit_["code"] == 0
 
     del ecs.tasks[handle["task_arn"]]
-    exit_ = await placement.wait(handle, 1)
-    assert exit_ == {"code": None, "reason": "lost", "meta": {}}
+    with pytest.raises(LookupError):
+        await placement.wait(handle, 1)
 
     await placement.cancel({"task_arn": "arn:ecs:task/dead"})
     assert ecs.stopped == ["arn:ecs:task/dead"]
 
 
+class ApiError(Exception):
+    def __init__(self, status):
+        super().__init__(status)
+        self.status = status
+
+
 class FakeBatchApi:
     def __init__(self):
         self.jobs = {}
+        self.down = False
 
     def create_namespaced_job(self, namespace, body):
         name = body.metadata.name
+        if name in self.jobs:
+            raise ApiError(409)
         self.jobs[name] = types.SimpleNamespace(
             metadata=body.metadata, spec=body.spec, status=types.SimpleNamespace(conditions=[])
         )
         return self.jobs[name]
 
     def read_namespaced_job(self, name, namespace):
+        if self.down:
+            raise ApiError(503)
         if name not in self.jobs:
-            raise KeyError(name)
+            raise ApiError(404)
         return self.jobs[name]
 
     def delete_namespaced_job(self, name, namespace, propagation_policy=None):
@@ -231,17 +246,28 @@ def stub_kubernetes(monkeypatch, batch):
 
 
 async def test_k8sjob_launch_wait_lost(state, monkeypatch):
-    """§10: K8sJob creates a job carrying the stage argv; conditions map to
-    Exit; a deleted job is lost."""
+    """§10: K8sJob creates a job named after the attempt — a valid,
+    lowercase DNS label — carrying the stage argv; launching it again finds
+    that job. Conditions map to Exit; an API error is unknown; a deleted job
+    is lost."""
     from solera_server.placements.remote import K8sJob
 
     batch = FakeBatchApi()
     stub_kubernetes(monkeypatch, batch)
     placement = K8sJob({"cluster": "c", "namespace": "ns"}, {"cpu": 2}, None)
-    handle = await placement.launch({"attempt": "a/1", "run": "r", "objects": "s3://x"})
+    stage = {"attempt": "01J8ZB3MXQ5R2K7T9V4W6Y8Z0A", "run": "r", "objects": "s3://x"}
+    handle = await placement.launch(stage)
+    assert handle == {"job": "solera-01j8zb3mxq5r2k7t9v4w6y8z0a"}
+    assert re.fullmatch(r"[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?", handle["job"])
     job = batch.jobs[handle["job"]]
     args = job.spec.template.spec.containers[0].args
-    assert "a/1" in args and "s3://x" in args
+    assert stage["attempt"] in args and "s3://x" in args
+    assert await placement.resume(stage) == handle and batch.jobs[handle["job"]] is job
+
+    batch.down = True
+    with pytest.raises(ApiError):
+        await placement.wait(handle, 1)
+    batch.down = False
 
     job.status.conditions = [
         types.SimpleNamespace(type="Failed", status="True", reason="BackoffLimitExceeded")
@@ -308,3 +334,19 @@ async def test_modal_launch_wait_lost(state, monkeypatch):
 
     del calls[handle["call_id"]]
     assert (await placement.wait(handle, 1))["reason"] == "lost"
+
+
+async def test_a_local_process_on_another_host_is_out_of_sight(state):
+    """A Local handle recorded on another host names a pid that means
+    nothing here: wait cannot tell, and cancel signals nothing — not even
+    the process that happens to hold that pid here."""
+
+    import os
+
+    from solera_server.placements.local import LocalPlacement
+
+    placement = LocalPlacement(PlacementContext(state, state.objects_url, "", state.clock))
+    elsewhere = {"pid": os.getpid(), "started_at": 0, "ticks": None, "host": "another-host"}
+    with pytest.raises(LookupError):
+        await placement.wait(elsewhere, 0.1)
+    await placement.cancel(elsewhere)  # this test process survives it

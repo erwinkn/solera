@@ -24,6 +24,7 @@ def wake(attempt: str) -> None:
 
 class PoolPlacement:
     max_concurrent = None
+    provision_seconds = None  # an attempt waits for a worker as long as it takes
 
     def __init__(self, ctx, name: str):
         self.ctx, self.name = ctx, name

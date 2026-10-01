@@ -1,8 +1,10 @@
 """Local placement (§10): the harness runs as a subprocess on the engine host.
 
-Handles carry `{pid, started_at}` and treat a mismatch as lost. `wait` polls the
-process; after an engine restart the pid is re-checked via /proc so an orphaned
-or replaced pid is not mistaken for the same run.
+Handles carry `{pid, started_at, ticks, host}` and treat a mismatch as lost.
+`wait` polls the process; after an engine restart the pid is re-checked via
+/proc so an orphaned or replaced pid is not mistaken for the same run. An
+engine on another host cannot see the process at all: its `wait` raises, and
+the engine follows the worker's own reports.
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ import contextlib
 import json
 import os
 import signal
+import socket
 import sys
 import tempfile
 from pathlib import Path
@@ -104,6 +107,7 @@ class LocalPlacement:
             "pid": process.pid,
             "started_at": self.ctx.clock(),
             "ticks": await _start_ticks(process.pid),
+            "host": socket.gethostname(),
         }
 
     async def wait(self, run: dict, timeout: float) -> dict | None:
@@ -119,6 +123,8 @@ class LocalPlacement:
             del _running[pid]
             return {"code": process.returncode, "reason": None, "meta": {"log": log}}
         # Adopted after a restart, so not our child: watch whether it lives.
+        if run.get("host") != socket.gethostname():
+            raise LookupError(f"process {pid} runs on {run.get('host')}, not here")
         deadline = self.ctx.clock() + timeout
         while await _alive(pid, run.get("ticks")):
             remaining = deadline - self.ctx.clock()
@@ -130,6 +136,8 @@ class LocalPlacement:
     async def cancel(self, run: dict) -> None:
         pid = run["pid"]
         process = _running.get(pid)
+        if process is None and run.get("host") != socket.gethostname():
+            return  # another host's process: its pid means nothing here
         with contextlib.suppress(ProcessLookupError, PermissionError):
             if process is not None:
                 os.killpg(process.pid, signal.SIGTERM)

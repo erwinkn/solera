@@ -163,7 +163,8 @@ status are derived inside `apply`; they are not events.
 | `ProjectRegistered` | `revision`, `manifest` | replaces the manifest; applies aliases; reconciles automation state |
 | `RunSubmitted` | `run` (id, request, tasks) | adds an active run |
 | `RunControlled` | `run`, `action` (`cancel` \| `pause` \| `resume`) | |
-| `AttemptLaunched` | `run`, `task`, `attempt`, `started_at`, `at`, `execution`, `prepared`, `pool?` | the attempt file exists and a placement is about to start it: its claim and scope lock become durable (§8) |
+| `AttemptLaunched` | `run`, `task`, `attempt`, `started_at`, `pin`, `at`, `execution`, `prepared`, `pool?` | the attempt file exists and a placement is about to start it: its claim and scope lock become durable (§8) |
+| `AttemptPlaced` | `attempt`, `handle` | the placement started it: where it runs, for whichever engine follows it (§8) |
 | `AttemptClaimed` | `attempt`, `worker`, `at` | a pool worker took a launched attempt; no other worker is offered it |
 | `AttemptFinished` | `run`, `task`, `attempt`, `outcome` (`succeeded` \| `failed` \| `skipped` \| `canceled`), `started_at`, `finished_at`, `error?`, `retryable?`, `commit?`, `unsettled?` | records the attempt; on commit, installs heads, cursor, watermarks, and each keyed output's new delta file; `unsettled` keeps the intents of a writer that died (§8) |
 | `SourceCommitted` | `source`, `head`, `keys?`, `at`, `run?` | installs a source head and its delta file; a commit that changed something records `run` in the history (§7) |
@@ -215,7 +216,7 @@ State
 | `Outcome` | `outcome`, `run`, `attempt`, `at` | assets × partitions |
 | `AutomationState` | `enabled`, `last_fired`, `last_run`, `last_revision`, `pending` (set of `[asset, scope]` for OnChange) | automations × partitions |
 | `Run` | `id`, `request` {targets, partitions, mode, config, keys, automation, tags}, `status`, `paused`, `created_at`, `events` (how many it has recorded), `tasks` {task: `Task`} | in-flight work |
-| `Task` | `status`, `deps`, `ready_at` (now, or a retry's due time), `wait` (seconds counted so far), `queued_at` (when the wait clock last started; null while stopped), `held?` [reason, name] (why the dispatcher last passed it over), `max_attempts`, `attempts` [`Attempt`], `launched?` {`attempt`, `started_at`, `pin` (`applied` when it was claimed), `at`, `execution`, `prepared`, `pool?`, `worker?`, `claimed_at?`} | |
+| `Task` | `status`, `deps`, `ready_at` (now, or a retry's due time), `wait` (seconds counted so far), `queued_at` (when the wait clock last started; null while stopped), `held?` [reason, name] (why the dispatcher last passed it over), `max_attempts`, `attempts` [`Attempt`], `launched?` {`attempt`, `started_at`, `pin` (`applied` when it was claimed), `at`, `execution`, `prepared`, `handle?`, `pool?`, `worker?`, `claimed_at?`} | |
 | `File` | `path`, `rows`, `bytes`, `at` [lo, hi] (time column), `runs` [first, last], `deleted?` [run] (hidden until rewritten), `deleted_at?` | files per table: ~log(rows) after merging |
 | `Intent` | `added`, `removed`, `exact`, `files` (the dead attempt's delta files), `run`, `attempt` | writers that died mid-write, until the next commit of that output |
 | `Attempt` | `id`, `outcome`, `started_at`, `finished_at`, the seconds of each phase it reached, `cpu_seconds?`, `peak_memory?`, `error?`, `outputs?` {output: ref} | |
@@ -662,13 +663,38 @@ does not launch the task again, it adopts the attempt — waits for it and
 settles it (commits its result, or fails it) as the first engine would
 have.
 
-**Heartbeat.** The engine follows an attempt through its placement handle
-(a process, an ECS task). After a restart it may have none, so the harness
-also rewrites `{attempt}.beat` every `heartbeat_seconds` (30 s), from a
-thread so a producer that blocks its event loop still beats, and marks it
-done when its result is written. Each beat carries the attempt's timeline
-so far (§7). Three missed beats and the worker is dead:
-the engine fails the attempt, and the task is retried.
+**Placement handles.** The engine follows an attempt through its
+placement handle (a process, an ECS task, a Kubernetes job), recorded as
+`AttemptPlaced` once the placement answers, so a restarted engine follows
+it the same way. A handle is never given up: a provider that errs, or does
+not show the run (ECS right after a launch), cannot tell for now — it is
+asked again at the next look, and the worker's own reports stand in
+meanwhile. Only the provider saying the run ended is an exit.
+
+A restart can come between `AttemptLaunched` and `AttemptPlaced` — even
+before the placement was called. Placements that name runs after their
+attempt (ECS `clientToken`, the Kubernetes job `solera-{attempt}`) start an
+attempt once however often it is launched, so the next engine simply
+launches it again (`resume`) and records the handle it gets. Others
+(Local, Modal) are followed through the worker's reports.
+
+**Heartbeat.** The harness rewrites `{attempt}.beat` every
+`heartbeat_seconds` (30 s), from a thread so a producer that blocks its
+event loop still beats, and marks it done when its result is written. Each
+beat carries the attempt's timeline so far (§7). Where the engine has no
+handle, or the placement cannot tell, three missed beats and the worker is
+dead: the engine fails the attempt, and the task is retried.
+
+**Provisioning.** Until its first beat a worker is provisioning — an image
+pulling, a task waiting for capacity — and missed beats mean nothing yet.
+Provisioning has its own deadline (`provision_seconds`, 10 min; none for a
+pool, whose attempts wait for a worker as long as it takes): a worker that
+has not reported by then never started, and is aborted like a timeout.
+
+**Deadlines.** The engine times attempts on its own monotonic clock. An
+adopted attempt was launched by another engine, whose clock may disagree:
+it keeps what that clock says is left of its timeout (or provisioning
+deadline), but never less than three heartbeats, nor more than all of it.
 
 **Write fence — `{attempt}.writing`.** Stores overwrite in place (§9), so
 a dead attempt must never write over a live one. One create-only object
@@ -804,7 +830,7 @@ unreadable can be recovered from.
 `RunsDeleted`, durable → `DELETE runs/{run}/` → `RunsPurged`.
 
 **Attempt lifecycle.** claim (memory) → pin and write the spec →
-`AttemptLaunched` → [pool: `AttemptClaimed`] → the harness takes the
+`AttemptLaunched` → launch → `AttemptPlaced` → [pool: `AttemptClaimed`] → the harness takes the
 fence, writes, and writes its result → the engine commits it
 (`AttemptFinished`). A cancel or timeout takes the fence first and ends the
 attempt with `AttemptFinished` (`canceled`, or `failed` and retryable).
