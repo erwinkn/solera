@@ -22,7 +22,7 @@ failure indexes, sensors' sources).
 **This doc is the authority for four records the others use:** the cancel
 record (§2.2), write-completion evidence (§2.3), the sensor snapshot
 (§11.3) and accepted tick outcomes (§11.4). The key index entry's
-`(version, locator)` and the delta's `prev` are named here (§9.8) and laid
+`(version, locator)` and the delta's predecessor are named here (§9.8) and laid
 out in bytes in `key-index-format.md`.
 
 ## 1. The shape in one paragraph
@@ -683,9 +683,9 @@ they can go at once. It costs the same one integer per index entry.
   before compression; neighbouring entries share generations and compress
   well). Deciding whether a write is a change still compares versions
   only.
-- **Delta entry:** the same, plus an optional `prev: (version, locator)`
-  — the entry it replaces or deletes — when the writer knows it. Compaction
-  drops `prev`.
+- **Delta entry:** the same, plus an optional **predecessor**
+  `(version, locator)` — the entry it replaces or deletes — when the
+  writer read it. Compaction drops predecessors.
 - **Everywhere an entry travels, the locator travels with it:** resolver
   responses (the delta file), inline pages and summaries
   (`resolved-commits.md` §7–8: `{key: [version, locator]}`), and the
@@ -702,38 +702,51 @@ generation: the attempts that used batch `n` all ran between the commits
 of `n − 1` and `n`, one at a time, and the one that committed `n` was the
 last of them.
 
-**Predecessors.** Collecting a superseded object needs its exact name, so
-its `prev`. The writer records `prev` when it read the old entry anyway —
-the warm resolver always does, and so do the cold path's exact lookups —
-and leaves it out where a filter alone decided the key changed (the sparse
-reader's shortcut, `resolved-commits.md` §6), keeping that path's cost.
-Collection fills the gaps: for keys of a delta without `prev`, it looks
-the old entry up in the commit's **pre-commit snapshot**, which its
-pending garbage entry pins (below). So resolution stays as cheap as it is,
-and collection pays one exact lookup per key it could not name, in the
-engine, usually warm.
+**Predecessors.** Collecting a superseded object needs its exact name,
+so its predecessor's `(version, locator)`. `resolved-commits.md` §6
+chooses two triggers, and this section's collection follows them:
+
+- **At resolution, whenever the old entry was read** — always on the
+  engine and in the streaming merge-join, and for the sparse reader's
+  maybe keys — the delta names the predecessor.
+- **At compaction, for the rest.** A key the pair filter cleared has no
+  named predecessor, but its old entry is still in the index, shadowed.
+  Every merge that drops an entry (shadowed, or under a bottom-level
+  tombstone) emits it as data garbage, named before or not: names are
+  never reused, so discarding one twice is a no-op.
+
+So the cold path keeps its cost, and collection is prompt wherever the old
+entry was read, deferred to compaction elsewhere.
 
 **Reader pins.** An object or index file may go only when no reader can
 still need it. The pins, all by event position (`object-store-state.md`
 §6):
 
 - every live claim (as today);
-- every pending data-garbage entry, at its commit's position: it will read
-  the pre-commit snapshot;
-- **durable multi-attempt reads**: a rescope drain or a retry pass that
-  reads one pinned snapshot across many attempts (`per-key-processing.md`)
-  records its pin in its watermark state, so the pin holds in the gaps
-  between its attempts and across engine restarts, until the drain ends.
+- **durable multi-attempt reads**, recorded with their pin in the
+  watermark state, so the pin holds in the gaps between attempts and
+  across engine restarts, until the read ends:
+  - a **paged delta window**: an `Incremental` edge delivering one pinned
+    window `from…to` over several attempts (`after` set). A later commit
+    may supersede a key inside the window, and an attempt launched after
+    that commit would not otherwise cover the version the window still
+    delivers;
+  - a **rescope drain** and a **retry pass** (`per-key-processing.md`),
+    each reading one pinned snapshot across many attempts.
 
 **Collection.** Only from durable decisions; never from what a listing
 shows.
 
-- **Superseded versions.** A commit records one data-garbage entry for its
-  delta file at its event position. Once no pin predates it, the engine
-  resolves any missing `prev` (above) and calls `store.discard(output,
-  scope, names)` with the previous names, in batches of 1,000; then the
-  entry and the delta file go. A superseded value is one name from the
-  previous head's ref.
+- **Superseded versions, named at resolution.** A commit records one
+  data-garbage entry for its delta file at its event position. Once no
+  pin predates it, the engine calls `store.discard(output, scope, names)`
+  with the delta's predecessors, in batches of 1,000; then the entry goes.
+  A superseded value is one name from the previous head's ref.
+- **Entries dropped by compaction.** An `IndexCompacted` records, at its
+  event position, one data-garbage entry naming the dropped entries (in a
+  sidecar file the compaction writes, not in the event); they are
+  discarded under the same pin rule. A name already discarded through a
+  predecessor is discarded again, harmlessly.
 - **Attempts that ended without committing.** Their names carry their own
   generation, which no other attempt uses, and their `AttemptFinished`
   without a commit is durable: the engine discards the names in their
