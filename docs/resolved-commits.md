@@ -320,7 +320,7 @@ the engine checks again.
 | Engine unreachable, restarting, or slow | Local resolve after the timeout; same delta, possibly an inexact count (§6) |
 | Worker dies after the response, before the gate | Nothing to clean on the engine; the uploaded delta is the worker's and is discarded at attempt end as today |
 | Worker dies after the gate | Unsettled intents and repair (overwrite, fenced); nothing for immutable stores |
-| Attempt canceled while a resolve runs | The resolve checks liveness when it starts and between chunks, and stops; its pins are released |
+| Attempt canceled while a resolve runs | By the cancel record (`lifecycle.md` §2.2): a draining attempt still resolves; once the record is `forced`, or the attempt ended, a resolve checks that when it starts and between chunks, and stops, releasing its pins |
 | Compaction commits during a resolve | The resolve keeps the file set it pinned; garbage collection waits for the pin |
 | A second invocation of the attempt | `409`: the engine admits one invocation (lifecycle §4) |
 | Local copy corrupt | Dropped, refetched from S3 and rebuilt; the request is declined `cold` meanwhile |
@@ -606,9 +606,8 @@ name without a LIST.
 ## 8. Readers for per-key processing
 
 `per-key-processing.md` is authoritative for everything about failures:
-the entry format, the **transition table** (an explicitly canceled key
-becomes `canceled` and stays dormant until a request or an upstream change
-brings it back; a timed-out key counts a try and backs off), the **one
+the entry format, the **transition table** (interrupted keys follow the
+cancel record's `reason`, `lifecycle.md` §2.2), the **one
 eligibility predicate** `eligible(entry, now, epoch, forced)`, the
 outcome counts moved by transitions, the conservative minima maintained
 from each commit and made exact by completed retry passes, and retry-pass
