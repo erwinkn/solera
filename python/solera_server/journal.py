@@ -12,7 +12,10 @@ Only create-only puts and LIST are needed — no compare-and-swap, which
 obstore's local filesystem backend does not implement.
 
 **Fencing.** A writer's first segment is its fence (`WriterStarted`); the
-segment's seq is the writer id. Every later segment is created at `seq+1`.
+segment's seq is the writer id. The fence carries a random nonce: a create
+that finds its segment's exact bytes takes them for its own earlier try,
+and without the nonce two writers fencing at one seq could seal the same
+bytes. Every later segment is created at `seq+1`.
 A replaced writer's next create collides with a segment it did not write
 and the journal becomes `fenced`: every later append fails. That segment is
 its successor's fence, so fence segments are never deleted: were cleanup to
@@ -44,6 +47,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import secrets
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -94,6 +98,9 @@ class Journal:
 
         self.seq = 0  # last segment written (by anyone) and applied
         self.writer: int | None = None
+        # This writer's own: two writers fencing at one seq in the same instant
+        # would otherwise seal the same bytes, each taking the other's for its own.
+        self.nonce = secrets.token_hex(8)
         self.fenced = False
         self._buffer: list[dict] = []
         self._buffer_bytes = 0
@@ -191,7 +198,7 @@ class Journal:
     async def _fence(self, apply) -> None:
         while True:
             seq = self.seq + 1
-            fence = {"type": "WriterStarted", "writer": seq}
+            fence = {"type": "WriterStarted", "writer": seq, "nonce": self.nonce}
             body = {"seq": seq, "writer": seq, "at": self.clock(), "events": [fence]}
             try:
                 await create(self.store, self._segment(seq), _dumps(body))

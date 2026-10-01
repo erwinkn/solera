@@ -15,7 +15,8 @@ infrastructure.
   compare-and-swap: obstore's `file://` backend does not implement it
   (verified on 0.11.1), so nothing may depend on it.
 - **A create can land unheard.** The object is written, the response is
-  lost, and the retry finds it there. So every create-only write that
+  lost, and the retry finds it there. (So two writers must never seal the
+  same bytes for one name: a writer's fence carries a random nonce.) So every create-only write that
   decides something — a journal segment, a spec, a delta file, a write
   fence — reads back an object in its way: holding exactly the bytes being
   written, it is the writer's own earlier try, and the write succeeded
@@ -159,7 +160,7 @@ status are derived inside `apply`; they are not events.
 
 | Event | Fields | Effect |
 |---|---|---|
-| `WriterStarted` | — | first event of every writer; its segment's `seq` becomes the writer id |
+| `WriterStarted` | `writer`, `nonce` | first event of every writer; its segment's `seq` becomes the writer id; `nonce` is random, so no two writers' fences have the same bytes |
 | `ProjectRegistered` | `revision`, `manifest` | replaces the manifest; applies aliases; reconciles automation state |
 | `RunSubmitted` | `run` (id, request, tasks) | adds an active run |
 | `RunControlled` | `run`, `action` (`cancel` \| `pause` \| `resume`) | |

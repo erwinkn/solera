@@ -232,3 +232,29 @@ async def test_a_replaced_writer_stays_fenced_after_cleanup(store):
     await b.close()
     _, again, _ = await open_journal(store)
     assert again.counts == sb.counts and "x" in again.counts and again.counts["x"] == 1
+
+
+async def test_two_writers_never_take_the_same_fence(store):
+    """Two writers starting at the same seq at the same instant would seal
+    identical fence segments, and each would take the other's for its own
+    unconfirmed write. Each writer's fence carries a nonce of its own, so
+    the second collides, and the first is fenced at its next write."""
+
+    a, sa, first = await open_journal(store, clock=lambda: 1790000000.0)
+    b = Journal(store, "control", flush_interval=0.01, clock=lambda: 1790000000.0)
+    real = b._list
+
+    async def raced(kind, after=None):  # b listed before a's fence landed
+        return [] if kind == "journal" else await real(kind, after)
+
+    b._list = raced
+    sb = Counter()
+    second = await b.open(sb.restore, sb.apply, sb.snapshot)
+    b._list = real
+    assert (first.seq, second.seq) == (1, 2)
+    with pytest.raises(Fenced):
+        await add(a, sa, "x", 1)
+    await add(b, sb, "y", 1)
+    await b.close()
+    _, again, _ = await open_journal(store)
+    assert again.counts == {"y": 1}
