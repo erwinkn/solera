@@ -268,10 +268,11 @@ the engine checks again.
 - **Source commits** (`commit_source`) run in the engine: they call the
   same warm resolver in-process, with the same local fallback, and keep
   today's optimistic head check before recording.
-- **Observations** (`lifecycle.md` §11) resolve against their source's
-  scope; validation uses the observation's memory-only claim instead of
-  `.worker`, and `base` is the source head's batch. Publication of their
-  deltas is the lifecycle's and per-key docs' subject.
+- **Sensor ticks** (`lifecycle.md` §11) post a small key map in this
+  framing to their tick route, and the engine resolves it in-process as it
+  does for source commits; a map over `sensor_map_max` is resolved on the
+  sensor host, which commits a reference to its delta file. Neither uses
+  this route or an attempt's validation.
 - **Failure indexes** are not resolve targets: failure deltas are resolved
   by the worker (§8). The engine can answer a `lookup` of prior failure
   records from a warm failure index, with the same framing.
@@ -757,5 +758,4 @@ The follow-up review agrees with all three.
    RAM (a bigger `cache_ram`) to beat a warm worker, or SSD reads suffice.
 4. **With `lifecycle.md`:** settled there — the route (§5.1),
    `Store.acquire` (§9.7), and failure deltas staying out of the gate's
-   intents (§9.6). The observation claim used for validation waits on the
-   held observation path (§11 there).
+   intents (§9.6); sensors (§11 there) need no attempt validation.

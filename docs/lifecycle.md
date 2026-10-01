@@ -5,10 +5,8 @@ It replaces the attempt files, heartbeat, pool protocol and write-safety
 rules of `object-store-state.md` §8 and `architecture.md` §10. It settles
 D2–D4, and D1 as Erwin decided it after the review: heartbeats are evidence
 only, built-in stores are exact, user overwrite stores choose between a
-bounded wait and holding the scope.
-
-Two sections are **held** for Erwin's decisions and marked so: the
-observation launch path (§11) and FileStore naming and collection (§9.8).
+bounded wait and holding the scope. Observations are sensors (§11), which
+are not attempts at all.
 
 It assumes what is built: fence segments kept for good and carrying a
 writer nonce, create-only writes that recognize their own bytes
@@ -66,7 +64,7 @@ token.
 | `{attempt}.spec` | engine, before `AttemptLaunched` | create-only, immutable | what to run: today's `spec`, plus `engine` (HTTPS URL), `token` (§5.2), `generation` (§9.7) |
 | `{attempt}.worker` | the invocation that claims it | created once; then overwritten only by its owner, only while HTTP fails (§6) | the claim `{"invocation", "host", "pid", "at"}`; later also `{"seq", "timeline", "usage"}` |
 | `{attempt}.writing` | worker before its first store write, or engine to abort | create-only | the gate, as today, now carrying `invocation`; only for outputs on `fenced` and `overwrite` stores (§9.6) |
-| `{attempt}.log.{n:06d}` | worker | create-only, immutable | a gzip member of the log, flushed every 30 s or 1 MB |
+| `{attempt}.log.{n:06d}` | worker | create-only, immutable | a gzip member of the log, flushed every 30 s or 1 MB; a short log has none (§13) |
 | `{attempt}.result` | worker | create-only, immutable, sealed bytes | the outcome; its existence means the worker is done |
 
 Gone: the two-write `{attempt}.json`, `.beat` and its done marker, the
@@ -85,7 +83,7 @@ usage, the log index, and what is known of the attempt's writes:
   "cursor": "token-42",
   "timeline": [{"type": "booted", "at": 1790074791.2}, {"type": "computing", "at": 1790074793.0}],
   "usage": {"cpu_seconds": 4.1, "peak_memory": 512000000},
-  "log": {"chunks": [[0, 412, 1790074791.2], [1, 388, 1790074821.2]], "lines": 800, "truncated": false}
+  "log": {"chunks": [[0, 412, 1790074791.2], [1, 388, 1790074821.2]], "tail": "H4sIAAAA…", "lines": 812, "truncated": false}
 }
 ```
 
@@ -93,9 +91,10 @@ usage, the log index, and what is known of the attempt's writes:
 - `writes` is `none` (it made no store call), `complete` (every store call
   it made returned), or `uncertain` (a store call raised or was abandoned).
   §9.5 says why that matters.
-- `log.chunks` lists `[n, lines, first timestamp]` per chunk. Chunks are
-  never joined: the console reads "the last 200 lines" as the last few
-  chunks.
+- `log.chunks` lists `[n, lines, first timestamp]` per chunk; `log.tail`
+  holds the lines written after the last chunk, gzipped, when they are
+  under 64 KB (§13). Chunks are never joined: the console reads "the last
+  200 lines" from the tail and the last few chunks.
 
 ## 3. One attempt, step by step
 
@@ -185,6 +184,8 @@ All under `/api/projects/{p}/`, over HTTPS.
 | `POST attempts/{a}/resolve` | binary, versioned: `resolved-commits.md` §4 | worker, small keyed writes |
 | `POST attempts/{a}/finished` | `{invocation}` → `204` | worker, after `.result` |
 | `GET pools/{pool}/work?wait=30` | capacity → `[stage]` | pool workers (§10) |
+| `GET sensors/next?wait=30` | revision → `[{tick, sensor, cursor, base}]` | sensor hosts (§11) |
+| `POST sensors/{s}/ticks/{t}` | the tick's outcome (§11.3); key maps in the resolver's framing → `{runs}` · `409` | sensor hosts |
 
 `cancel` is `null`, `"requested"` or `"forced"` (§7). `events` are timeline
 events (`loaded`, `mark`, per-key outcomes); `progress` is free-form for
@@ -199,8 +200,10 @@ Gone: `POST /api/workers/register`, `/api/tasks/claim`,
 - **Bootstrap.** A placement hands the worker the stage — `attempt`, `run`,
   `objects` — as today. The worker reads the spec with the environment's
   own object-store credentials; the spec gives it the engine's URL and its
-  token. Pool workers get the stage from discovery (§10). Observations:
-  held with §11.
+  token. Pool workers get the stage from discovery (§10). Sensor hosts
+  need no spec: a remote host is configured with its pool token, and the
+  local host gets a token for the engine's own pool in its environment
+  when the engine starts it (§11).
 - **Attempt token.** `HMAC(engine_secret, attempt)`, in the spec. Every
   `attempts/{a}/…` call carries it; the engine verifies it statelessly and
   only for that attempt's routes. Whoever can read the spec can already
@@ -542,24 +545,84 @@ Internal to the store; the engine supplies one number.
 - **Cost**: one indexed upsert per acquisition and one row lock per write
   transaction; a takeover waits for at most one older transaction.
 
-### 9.8 FileStore and S3Store: naming and collection — HELD
+### 9.8 FileStore and S3Store: unique names, collected without a lock
 
-> **Held for Erwin's decision.** The two candidates, both `immutable`:
->
-> - **`{key}/{version}`**, collected per scope under that scope's lock
->   (preferred by Erwin). Safe on the assumption that the engine's own
->   DELETEs do not land after it stopped waiting for them.
-> - **`{key}/{version}.{batch}`**, unique physical names with the batch
->   recorded per key in the index. Provably safe with no lock and no
->   timing assumption; costs a key-index format change.
->
-> Either way: reused versions (`v1 → v2 → v1`) must never be deleted while
-> current or about to be (review finding 5); reads become pinned; values
-> get unique names from the head's ref (`alpha@{attempt}.json`) with no
-> index change; logical batch numbers of append outputs stay dense, their
-> physical files uniquely named and listed by the commit. This section
-> will specify the layout, `discard()`, collection and its costs once
-> decided.
+**Decided** (Erwin): every object the store writes has a name no other
+attempt will ever write, so deleting one can never hit something current.
+
+**Names.** The physical name carries the logical version and the
+attempt's **generation** (§9.7: the claim's event position, in the spec):
+
+```
+site_files/alpha/f-1/9c41e0d2….184467.json       a key, at its version, by generation 184467
+site_status/alpha@184467.json                    a value
+site_events/alpha/000000000042.184467.json       batch 42 of an append output, by generation 184467
+```
+
+Writes are create-only. Two writers of one name are the same attempt (a
+delayed duplicate of itself), so they write the same bytes. A declared
+`revision` longer than 64 bytes is named by its XXH3-128 instead.
+
+**Why the generation, not the batch.** A retry reuses its predecessor's
+batch number: W1 (batch 57) dies having written `f-1/v.57`, and its retry
+W2, also batch 57, may write that very name and commit it. W1's leftovers
+could then be judged only once batch 57 is committed, and only by diffing
+them against the committing delta. A generation is never reused, so an
+attempt that ends without committing leaves objects nobody else names:
+they can go at once. It costs the same one integer per index entry.
+
+**What the key index needs.** Each entry gains a **locator**: the
+generation that wrote that key at that version (a varint, ~4–5 bytes
+before compression; neighbouring entries share generations and compress
+well). It rides the `.kx` format bump of the row-digest work: entries
+gain `locator`, and delta entries may carry the **previous** version and
+locator of the key they change or delete (a flag bit; compaction drops
+them). Version comparison — "is this a change?" — still compares versions
+only.
+
+**How loads receive it.** `Keys` carries `{key: (revision, locator)}`, so
+a keyed load computes every name and needs no LIST. A full load of a keyed
+input becomes a `Keys` selection the harness pages from the pinned index
+(the spec pins the index of every keyed input, as it does for incremental
+ones); stores never read an index. A value's name is in its head's ref. An
+append output's range load lists the batches' prefix and keeps, per batch,
+the file with the highest generation: the attempts that used batch `n` all
+ran between the commits of `n − 1` and `n`, one at a time, and the one
+that committed `n` was the last of them.
+
+**Collection.** Two sources of garbage, neither needing a lock or a
+timing assumption:
+
+- **Superseded versions.** A commit's delta lists each changed or deleted
+  key's previous `(version, locator)`. The commit records one data-garbage
+  entry for that delta file at its event position; once no claim predates
+  it (the reader pins of `object-store-state.md` §6), the engine calls
+  `store.discard(output, scope, names)` with the previous names, in batches
+  of 1,000. A superseded value is one name from the previous head's ref.
+  The delta file stays until its entry is processed.
+- **Attempts that never committed.** Their names carry their own
+  generation, so the engine discards them when the attempt ends: the
+  names in its uploaded delta file, its value, its batch file. A worker
+  still running after its attempt ended (given up on, or a duplicate) can
+  only add more names of that generation: orphans, found by an occasional
+  sweep (list a scope, drop names whose generation is not current for
+  their key), never wrong data.
+
+Reusing a version (`v1 → v2 → v1`) writes a new name (`f-1/v1.{g3}`):
+deleting the old `f-1/v1.{g1}` cannot touch it. That is what removes the
+GC lock, the dequeue-on-reuse rule and the DELETE timing assumption of the
+alternative.
+
+**Costs.** Per changed key: one PUT, as today, and one DELETE (free on
+S3) when superseded, batched. Per commit: the delta's previous-version
+columns (a few bytes per changed key). Per full load of a keyed input: a
+read of its pinned index. In return: no gate, intents or repair for these
+stores (§9.6); readers see the version they pinned; a stale write is an
+orphan.
+
+**Readable listings.** A key's directory holds its current object, plus
+superseded ones until collection catches up (minutes, behind the oldest
+reader pin). `solera data get OUTPUT KEY` resolves the current one.
 
 ### 9.9 User `overwrite` stores
 
@@ -625,27 +688,139 @@ memory and rebuilds them after a restart from the journal and `.worker`:
 - The handle is `{attempt, pool}`. A cancel before the claim withdraws the
   attempt from discovery and ends it; after it, cancel is §7.
 
-## 11. Observations — HELD
+## 11. Sensors
 
-> **Held for Erwin's decision:** observations as ordinary attempts in v1
-> (one review's advice: no new protocol), or the spec-less fast path
-> (`per-key-processing.md` §12): launched without `.spec`, `.worker` or
-> `.result`, with an in-memory invocation claim at `start`, the spec in the
-> `start` answer, a bootstrap credential delivered with the launch, and
-> history rows for skipped observations that a crash may lose. This
-> section will specify the chosen path, its claim (which
-> `resolved-commits.md` §4 validates resolves against) and its bootstrap.
+**Decided** (Erwin): frequent checks that may or may not lead to a change
+are **sensors**, Dagster's concept, not a variant of attempts. A tick is
+not an attempt: no `.spec`, `.worker`, `.result`, gate, journal event or
+run of its own. Observable sources (`per-key-processing.md` §12) become
+sugar for a sensor.
 
-These hold either way:
+### 11.1 The API
 
-- **"Unchanged" means no durable change**: no new version, no key change,
-  and no new cursor. A cursor-only observation commits the cursor to the
-  journal (no delta file, no new version, no consumer woken); a truly
-  unchanged one commits nothing (review finding 9).
-- An observation writes no store data, so it needs no gate and no repair;
-  its source commit is the engine's.
-- An observation in flight at an engine restart may be rerun by the next
-  tick; its source's cursor did not move, so nothing is lost.
+```python
+@sensor(every=60, executor=Pool("sensors"))                 # default: the engine's local sensor host
+def new_uploads(ctx, s3: S3Client) -> Tick:
+    page = s3.list_since(ctx.cursor)
+    return Tick(
+        cursor=page.token,                                   # optional
+        commits=[Commit("uploads", upsert={o.key: o.etag for o in page.objects})],
+        runs=[RunRequest(["ingest"], partitions=[o.prefix for o in page.objects])],
+    )
+```
+
+A body returns `None` (nothing happened) or a `Tick` of up to three
+things, all optional:
+
+| Outcome | Lands as |
+|---|---|
+| `cursor` | the sensor's cursor, durable |
+| `commits`: `Commit(source, version=…)`, `Commit(source, keys={…})`, `Commit(source, upsert=…, remove=…)` | a source commit, exactly the commit API's (`architecture.md` §5) |
+| `runs`: `RunRequest(targets, partitions=, config=, keys=, tags=)` | a run submission, exactly the API's |
+
+`Source.observe()` is sugar: `Source("datasmart", observe=Every(300))`
+declares a sensor `datasmart.observe` whose body calls `observe()` and
+returns a `Commit` to its own source (a `str` as `version`, a map as
+`keys`, `Observed` as `upsert`/`remove` plus `cursor`).
+
+### 11.2 Where ticks run
+
+In a **sensor host**: a long-lived process with the project loaded, like
+Dagster's code server, so a tick costs a function call, not a process
+start and an import.
+
+- **Local (default).** When the project declares sensors, the engine
+  keeps one sensor host subprocess alive beside it, restarted with backoff
+  if it exits and replaced when a new revision is served.
+- **Pool.** `solera_worker sensors --pool NAME` on any machine: the same
+  host, remote, for sensors that need a network the engine cannot reach or
+  that should not run beside it. `executor=` on the sensor picks.
+
+A host long-polls `GET sensors/next?wait=30` with its pool token and its
+project revision; the engine answers with due ticks for sensors on that
+executor and revision: `{tick, sensor, cursor, base}`, where `base` is,
+per source the sensor commits to, the head batch it should resolve
+against. The host runs the body (up to `concurrency` ticks at once, each
+within the sensor's `timeout`, 60 s by default) and posts the outcome to
+`POST sensors/{sensor}/ticks/{tick}`.
+
+### 11.3 How the engine applies a tick
+
+The engine keeps, per sensor, one **tick claim** in memory: the tick it
+dispatched, from which cursor, to which host. A posted outcome is applied
+in one synchronous step:
+
+1. The tick must be the sensor's current claim; otherwise `409` (a late
+   tick, or one from before a restart) and nothing happens.
+2. Each commit goes through the commit API's own checks, against the
+   `base` the tick was dispatched with: if the source's head moved since
+   (another sensor, an API client), the tick is refused (`409`, nothing
+   applied) and the next one observes again — a stale full map must not
+   undo a newer commit. An identical version or map is no change.
+3. Run requests are submitted with `command = {tick}/{n}`, so a retried
+   post of the same tick submits nothing twice (the run receipts that
+   exist today).
+4. All of it is recorded together: the source commits, the run
+   submissions, and `SensorAdvanced {sensor, cursor}` if the cursor moved,
+   in one `record()`, so one journal segment holds all or none of it.
+   A tick whose outcome is nothing records nothing.
+
+"Unchanged" therefore means what review finding 9 asks: no version, no key
+change and no new cursor. A cursor-only tick records only
+`SensorAdvanced`: no delta, no new version, no consumer woken.
+
+**Key maps.** A small map (up to `sensor_map_max`, 1M keys) is posted as a
+sorted run in the resolver's framing (`resolved-commits.md` §4), and the
+engine resolves it in-process against the source's index, as it does for
+API commits. A bigger one is resolved by the host — the streaming
+merge-join, against the `base` the tick carries — which uploads the delta
+file and posts a **delta reference** `{files, batch, base}`; the engine
+installs it if `base` is still the head, else refuses it and deletes the
+file. Large sources should use a cursor anyway: comparing a 10M-key map
+every five minutes is a full replacement every five minutes.
+
+### 11.4 Restarts, failures, history
+
+- **Claims are memory only.** After a restart no tick is in flight; each
+  sensor is due again at its next interval, from its durable cursor. A
+  host still running a tick from before posts it and gets `409`.
+- **A tick that raises** is recorded as `failed` with its error; the
+  cursor does not move. A tick over its `timeout` is dropped by the engine
+  (its late post gets `409`); a host whose ticks keep overrunning is
+  restarted.
+- **History is the `ticks` table**: sensor, tick, started and ended, host,
+  outcome (`skipped`, `committed`, `requested`, `failed`), error, the runs
+  it requested. Its rows are buffered in memory and written with the next
+  history flush (a `HistoryFlushed` installs the file, as for other
+  tables), never journaled: a crash loses the last minute of ticks, which
+  is acceptable for a log of checks. Kept a day; ticks that did something
+  are kept as long as the runs they caused.
+- **What a tick caused is a run like any other**: a source commit is a
+  run with no tasks (as API commits are today), a requested run is a run,
+  tagged with the sensor and tick.
+
+### 11.5 What this removes
+
+Compared with the spec-less observation attempt of the previous draft:
+
+- no launch path without a spec, and no attempt that is not journaled;
+- no per-launch bootstrap credential, no in-memory invocation claim per
+  observation, no observation result route;
+- no process start per check: a 300-second sensor on `Local` cost a
+  subprocess and an import every tick;
+- no `skipped` runs, attempts and `kind: observe` retention class: checks
+  that found nothing are tick rows, not runs;
+- no resolve route validated against an observation claim: small maps
+  resolve in the engine, big ones on the host.
+
+What it adds: the sensor host (one long-lived process kind, which Pool
+workers resemble), two routes, a cursor per sensor in the engine's state,
+and the `ticks` table.
+
+**Risks.** User code in a long-lived process can leak memory or state
+between ticks, and a body that hangs holds a host thread: hosts are
+restarted when ticks overrun or after `host_max_ticks` (10,000). A host
+on an old revision gets no ticks.
 
 ## 12. Engine restart, attempt by attempt
 
@@ -658,7 +833,7 @@ These hold either way:
 | canceling | the cancel is durable for a canceled run (`RunControlled`); a timeout is re-derived from the restarted clocks. Either way it starts at phase 1 again, which a draining worker answers with its result |
 | done, result written | reads `.result` and settles it |
 | aborted by the old engine (gate `aborted`) | ends it as the old engine would have, under §9.6 |
-| an observation | §11 |
+| a sensor tick | forgotten: due again at its next interval, from its durable cursor (§11.4) |
 
 ## 13. What an attempt costs
 
@@ -668,37 +843,47 @@ counting what the attempt itself costs, apart from its key-index reads and
 delta file (`resolved-commits.md` §9). A short attempt here logs a few
 lines and sends no periodic heartbeat to the object store.
 
+Two choices of this design keep a short attempt cheap:
+
+- **`AttemptPlaced` rides the next segment.** It is recorded **lazily**:
+  buffered without starting the flush timer, so it is written with
+  whatever comes next — for a short attempt, its `AttemptFinished`. A crash
+  before then loses only the handle, which `resume` or the worker's reports
+  recover (§12). Lazy recording is a small journal feature (`record(…,
+  lazy=True)`), useful for any event nothing waits on.
+- **A short log travels inside the result.** Chunks are flushed every
+  30 s or 1 MB; at the end, the lines not yet in a chunk go into
+  `.result` (`log.tail`) if they are under 64 KB, else into one last
+  chunk. An attempt shorter than 30 s that logs a little writes no log
+  object at all; its lines were live over HTTP meanwhile.
+
 | Per attempt | Today (counted from the code) | Target, `immutable` store | Target, `fenced`/`overwrite` |
 |---|---|---|---|
-| Engine PUTs | spec · journal: launch, placed, finished = 4 | same = 4 | same = 4 |
-| Engine GETs | beats while provisioning ~1, result 1 = 2 | result 1 | result 1 |
-| Worker PUTs | beat, gate, log chunk, joined log, result, done beat = 6 (more chunks while it logs: one per 2 s) | claim, log chunk, result = 3 | + gate = 4 |
-| Worker GETs | spec, fence read by the beat = 2 | spec 1 | spec 1 |
+| Engine PUTs | spec · journal: launch, placed, finished = 4 | spec · journal: launch, finished = 3 | 3 |
+| Engine GETs | beats while provisioning ~1, result 1 = 2 | result 1 | 1 |
+| Worker PUTs | beat, gate, log chunk, joined log, result, done beat = 6 (more chunks while it logs: one per 2 s) | claim, result = 2 | + gate = 3 |
+| Worker GETs | spec, fence read by the beat = 2 | spec 1 | 1 |
 | Worker DELETEs | chunks 1 (free) | — | — |
-| **Requests** | **10 PUT + 4 GET** | **7 PUT + 2 GET** | **8 PUT + 2 GET** |
-| **Per month** | **$13.38** | **$9.28** | **$10.58** |
+| **Requests** | **10 PUT + 4 GET** | **5 PUT + 2 GET** | **6 PUT + 2 GET** |
+| **Per month** | **$13.38** | **$6.69** | **$7.98** |
 
 Shared by all attempts, not per attempt: history flushes (one Parquet
 file per table per minute, ~6 PUTs a minute: ~$1.30 a month, merges
 extra), `engine/alive.json` every 30 s while runs are live (~$0.43), and
 checkpoints (negligible here). The older model's $6.69 (4 PUT + 2 GET +
 one journal PUT) left out the beats, the gate, `AttemptPlaced` and the
-done beat; the measured today is about twice it.
+done beat: today really costs about twice it, and the target lands on it
+as a count rather than an underestimate. A longer attempt adds one chunk
+per 30 s of logging; one that loses HTTP adds three `.worker` PUTs a
+minute.
 
-Where the rest could go, in order of value:
+Not worth a second path: putting the spec in the `start` answer would save
+the worker's GET ($0.10 a month).
 
-- **`AttemptPlaced` without a flush of its own** (−1 PUT, −$1.30): record
-  it lazily, to ride the next segment (`AttemptFinished`'s, for a short
-  attempt). A crash before then loses only the handle, which `resume` or
-  the worker's reports recover (§12).
-- **No chunk when the result can carry the log** (−1 PUT): a short log
-  (under 64 KB) travels inside `.result`.
-- **The spec in the `start` answer** saves the worker's GET (−$0.10); not
-  worth a second path.
-
-With both of the first two, a short attempt on an immutable store costs
-5 PUT + 2 GET: **$6.69 a month**, today's model figure, now as a measured
-count rather than an underestimate.
+**Sensors** cost none of this: a tick that finds nothing is a long-poll
+answer and a post, with no object request and no journal write; one that
+commits pays the source commit (a journal PUT, and a delta file for keyed
+sources).
 
 ## 14. What changes from today
 
@@ -714,7 +899,8 @@ count rather than an underestimate.
 | a failed result releases the scope | a failure after the gate is uncertain completion |
 | repair before the store is fenced | `Store.acquire` before repair, for fenced stores |
 | resolve through `.ask` objects (proposal) | binary `resolve` route, nothing persisted |
-| observations as full attempts | held (§11) |
+| observable sources as proposed attempts without a spec | sensors: ticks in a warm host, applied through the commit and run APIs, `SensorAdvanced` for the cursor, a lossy `ticks` table |
+| `{key}.json` overwritten in place (FileStore, S3Store) | `{key}/{version}.{generation}.json`, create-only; superseded and abandoned names collected without a lock |
 | one API token | admin token; per-attempt HMAC token from a stable secret; per-pool token |
 
 ## 15. Open questions
@@ -727,6 +913,9 @@ count rather than an underestimate.
 3. **Strict stores during an engine outage.** A worker on a strict store
    keeps writing on its launch authorization; nothing changes for it. An
    attempt ended uncertain stays blocked across the restart, as recorded.
-4. **Lazy events in the journal** (§13): a buffered event that does not
-   start the flush timer is a small journal feature, useful beyond
-   `AttemptPlaced`.
+4. **`sensor_map_max`.** Where a key map stops being posted to the engine
+   and is resolved on the host instead; from the resolver's grid
+   (`resolved-commits.md` §6), like its other thresholds.
+5. **Locator size.** The `.kx` bump adds a generation per entry; the
+   index benchmarks should report bytes per entry with it, at 1M–100M
+   keys, before the format is frozen.
