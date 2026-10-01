@@ -134,10 +134,9 @@ Content-Type: application/vnd.solera.resolve; version=1
 Authorization: Bearer {attempt token}
 ```
 
-The token, invocation rule and retries are `lifecycle.md`'s (§4, §5.2);
-the framing, limits and validation below are this doc's. `lifecycle.md`
-§5.1 lists the route with a JSON body; the body is binary, and its row
-there should point here. One request per attempt that has something to
+The token, invocation rule and retries are `lifecycle.md`'s (§4, §5.2,
+§5.3); the framing, limits and validation below are this doc's, and
+`lifecycle.md` §5.1 points here. One request per attempt that has something to
 resolve, covering every output the worker wants resolved; outputs it
 resolves itself (big writes, `Sql`, unkeyed, failure deltas, §8) are
 absent.
@@ -756,8 +755,7 @@ The follow-up review agrees with all three.
    rather than a second cache-owning service.
 3. **Page cache vs SSD.** Whether a 100M-key index needs its hot blocks in
    RAM (a bigger `cache_ram`) to beat a warm worker, or SSD reads suffice.
-4. **With `lifecycle.md`:** the route's row in §5.1 (binary, versioned,
-   per this doc); the observation claim used for validation (§11 there);
-   `Store.acquire` as the fenced stores' acquisition phase; and whether
-   failure deltas join the gate's intents (they are engine metadata, not
-   store data).
+4. **With `lifecycle.md`:** settled there — the route (§5.1),
+   `Store.acquire` (§9.7), and failure deltas staying out of the gate's
+   intents (§9.6). The observation claim used for validation waits on the
+   held observation path (§11 there).
