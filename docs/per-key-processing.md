@@ -338,18 +338,16 @@ class Store(Protocol):
 | `Sql` writes | after writing, the store reports the content sorted by key, by one of two paths (below) |
 
 **`Sql` writes have two paths**, because the rows never pass through the
-worker and today's per-row versions — `md5` of PostgreSQL's row text,
-key included (`PostgresStore._sorted_keys`) — are not canonical digests
-and cannot be folded into a group:
+worker (built; the `md5` per-row versions are gone):
 
 | Output declares | The store reports | Versions |
 |---|---|---|
-| `revision="col"` | `SELECT key, col … ORDER BY key` through a server-side cursor | native code checks that every row of a key carries the same value, else a write error; the version is that value, verbatim — the same rule as rows from Python or Arrow |
-| no `revision` | the written rows themselves, typed, as Arrow batches in key order (`SELECT * … ORDER BY key` through a cursor) | `Rows.arrow`: the same canonical row digests and group production as any other write |
+| `revision="col"` | `SELECT key, col … ORDER BY key` through a server-side cursor | native code checks that every row of a key carries the same value, else a write error; the version is that value's text (`row-digest.md` § Revisions) — the same rule as rows from Python or Arrow |
+| no `revision` | the written rows themselves, typed, in key order (`SELECT * … ORDER BY key` through a cursor; PostgresStore hands over chunks of row mappings, since pyarrow is not a runtime dependency — Arrow chunks are accepted too) | the same canonical row digests and group production as any other write, computed natively |
 
 The first path is the cheap one: one short value per row. The second
 reads back every written row, which a large `Sql` replacement pays in
-transfer; declaring a revision column avoids it. The `md5` path goes away.
+transfer; declaring a revision column avoids it.
 
 - `Rows` is the only currency: an opaque native handle of keys and
   versions, sorted and grouped natively. Neither the worker nor the

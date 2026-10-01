@@ -81,10 +81,11 @@ class Scope:
 class Written:
     """What a store wrote. `keys` is only for writes the harness never sees as
     rows (`Sql` materialized inside Postgres): the scope's complete new
-    content as `(key, version)` pairs sorted by key's UTF-8 bytes, in chunks —
-    lists of pairs, or Arrow data with key and version columns — which the
-    harness pulls one at a time, after `store` returned. For every other write
-    the harness derives keys from the rows itself (§6, §9)."""
+    content, sorted by the key's UTF-8 bytes, in chunks the harness pulls one
+    at a time after `store` returned — rows (a list of mappings, or Arrow
+    data) with the key column and the declared revision, or every column, so
+    their versions are those of any other write (docs/row-digest.md). For
+    every other write the harness derives keys from the rows itself (§6, §9)."""
 
     ref: Ref
     keys: Iterable | None = None

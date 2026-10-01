@@ -34,9 +34,9 @@ def index(entries, max_file_bytes=4096):
     )
 
 
-def replace(rows, runs, max_file_bytes=4096, collect=10**6, stream=(), fold=False):
+def replace(rows, runs, max_file_bytes=4096, collect=10**6, stream=(), key=None, revision=None):
     job = _native.Job.replace(
-        rows, len(runs), max_file_bytes=max_file_bytes, collect=collect, fold=fold, **OPTS
+        rows, len(runs), max_file_bytes=max_file_bytes, collect=collect, key=key, revision=revision, **OPTS
     )
     files = drive(job, runs, stream)
     return job, files
@@ -205,15 +205,26 @@ def test_replace_sorted_stream():
 
 
 def test_streamed_rows_fold_into_groups():
-    # A store reporting one version per row: a key's rows may span chunks.
-    rows = [(b"a", b"1" * 16), (b"b", b"2" * 16), (b"b", b"3" * 16), (b"b", b"4" * 16), (b"c", b"5" * 16)]
-    _, files = replace(None, [], stream=[rows[:2], rows[2:3], rows[3:]], fold=True)
+    # A store reporting the rows it wrote (a `Sql` write): a key's rows may span chunks.
+    rows = [
+        {"k": "a", "n": 1},
+        {"k": "b", "n": 2},
+        {"k": "b", "n": 3},
+        {"k": "b", "n": 4},
+        {"k": "c", "n": 5},
+    ]
+    _, files = replace(None, [], stream=[rows[:2], rows[2:3], rows[3:]], key="k")
+    want = _native.Rows.records(rows[::-1], "k").entries()
+    assert [(k, v) for k, v, _ in content(files)] == list(zip(*want, strict=True))
     reordered = [rows[0], rows[3], rows[1], rows[2], rows[4]]  # b's rows in another order and chunking
-    _, again = replace(None, [], stream=[reordered[:3], reordered[3:]], fold=True)
-    assert [k for k, _, _ in content(files)] == [b"a", b"b", b"c"]
+    _, again = replace(None, [], stream=[reordered[:3], reordered[3:]], key="k")
     assert content(files) == content(again)
-    _, fewer = replace(None, [], stream=[rows[:3] + rows[4:]], fold=True)
-    assert content(fewer)[1] != content(files)[1]  # a group counts its rows
+    table = pa.Table.from_pylist(rows)
+    _, arrow = replace(None, [], stream=[table.slice(0, 3), table.slice(3)], key="k")
+    assert content(arrow) == content(files)
+    revised = [{"k": "a", "v": True}, {"k": "a", "v": True}]
+    _, files = replace(None, [], stream=[revised], key="k", revision="v")
+    assert content(files) == [(b"a", b"true", 0)]
     # Without folding, a repeated key must repeat its version.
     _, files = replace(None, [], stream=[[(b"a", b"x"), (b"a", b"x")]])
     assert content(files) == [(b"a", b"x", 0)]

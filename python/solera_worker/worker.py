@@ -632,7 +632,7 @@ async def _store_outputs(spec, project, asset, objects, keys_io, result_value, f
             if written.keys is None:
                 raise StoreError(f"{output.name}: store {store_name!r} reported no keys for a Sql write")
             files, _ = await plan["index"].replace(
-                written.keys, int(info["batch"]), spec["attempt"], fold=not output.revision
+                written.keys, int(info["batch"]), spec["attempt"], key=output.key, revision=output.revision
             )
             entry["keys"] = files.to_json()
         elif "index" in plan:

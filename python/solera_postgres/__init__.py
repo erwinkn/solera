@@ -27,7 +27,7 @@ from solera.stores import (
 LEDGER_TABLE = "public.solera_migrations"
 BATCH_COLUMN = "_batch"
 SEQ_COLUMN = "_seq"
-KEY_CHUNK = 100_000  # (key, version) pairs per chunk a keyed Sql write reports
+KEY_CHUNK = 100_000  # rows per chunk a keyed Sql write reports
 
 
 def _assigned_batch(scope: Scope, prior: Ref | None) -> int:
@@ -344,7 +344,7 @@ class PostgresStore:
     def _apply_sql(self, cur, output, write: Sql, scope, table, slice_where, prior):
         """Materialize a SELECT into the slice, or run a statement verbatim. The
         harness never sees these rows, so a keyed output reports the slice's
-        complete content, sorted, as the harness reads it (§6, §9)."""
+        rows, sorted, for the harness to version (§6, §9)."""
 
         if _is_select(write.stmt):
             probe = cur.execute(f"SELECT * FROM ({write.stmt}) _probe LIMIT 0")
@@ -379,28 +379,35 @@ class PostgresStore:
             ).fetchone()
             if not exists:
                 raise WriteError(f"{output.name}: Sql statement must leave {table} in place")
-        keys = self._sorted_keys(table, output, slice_where) if output.key else None
+        keys = self._sorted_rows(table, output, slice_where) if output.key else None
         return digest([prior.version if prior else "", digest(write.stmt)]), keys
 
-    def _sorted_keys(self, table, output: Output, where: dict):
-        """The slice's rows as `(key, version)` pairs sorted by the key's bytes,
-        a chunk at a time from a server-side cursor once the write has
-        committed: the declared revision's text, else an MD5 digest of the
-        row's JSON without its key column. A key repeats once per row; the
-        harness folds each key's rows into one version."""
+    def _sorted_rows(self, table, output: Output, where: dict):
+        """The slice's rows sorted by the key's bytes, a chunk at a time from a
+        server-side cursor once the write has committed, for the harness to
+        version as it versions any rows: the key (as text) and the declared
+        revision, or every column but the partition column, typed."""
 
         import psycopg
+        from psycopg.rows import dict_row
 
-        key = f"convert_to({_ident(output.key)}::text, 'UTF8')"
-        if output.revision:
-            version = f"convert_to({_ident(output.revision)}::text, 'UTF8')"
-        else:
-            version = f"decode(md5((to_jsonb(_row) - {_literal(output.key)})::text), 'hex')"
-        sql = f"SELECT {key}, {version} FROM {table} _row WHERE {self._where_sql(where)} ORDER BY 1"
-        with psycopg.connect(resolve_env(self.dsn)) as conn, conn.cursor(name="solera_keys") as cur:
-            cur.execute(sql, [where[k] for k in sorted(where)])
-            while chunk := cur.fetchmany(KEY_CHUNK):
-                yield chunk
+        key = _ident(output.key)
+        params = [where[k] for k in sorted(where)]
+        with psycopg.connect(resolve_env(self.dsn), row_factory=dict_row) as conn:
+            if output.revision:
+                columns = [output.revision]
+            else:
+                probe = conn.execute(f"SELECT * FROM {table} LIMIT 0")
+                columns = [d.name for d in probe.description if d.name != output.key and d.name not in where]
+            select = ", ".join([f"{key}::text AS {key}", *(_ident(c) for c in columns)])
+            with conn.cursor(name="solera_keys") as cur:
+                cur.execute(
+                    f"SELECT {select} FROM {table} WHERE {self._where_sql(where)} "
+                    f"ORDER BY convert_to({key}::text, 'UTF8')",
+                    params,
+                )
+                while chunk := cur.fetchmany(KEY_CHUNK):
+                    yield chunk
 
     # -- migrations (§4) --------------------------------------------------------
 
@@ -507,10 +514,6 @@ def _keys(output: Output, rows: list[dict]) -> list[str]:
         return [str(row[output.key]) for row in rows]
     except KeyError:
         raise WriteError(f"{output.name}: row lacks the declared key column {output.key!r}") from None
-
-
-def _literal(text: str) -> str:
-    return "'" + text.replace("'", "''") + "'"
 
 
 def _coerce_rows(write: Any) -> list[dict]:

@@ -119,12 +119,12 @@ Keys are sorted natively, each run of equal keys is folded into one
 version, and no per-key Python object is made. A patch reads the same
 `Rows` (`Rows.entries()`).
 
-A `Sql` write's rows never reach the harness: its store reports one
-`(key, version)` per row, sorted by key, and the harness folds them the
-same way — the group of the per-row digests, or the revision they share.
-Those per-row digests are the store's own (PostgresStore: MD5 of the row's
-JSON without the key column), so a `Sql` write and a row write of the same
-content differ.
+A `Sql` write's rows never pass through the worker: after writing, its
+store reads them back sorted by key — the key and the revision column, or
+every column without one (the partition column aside) — a chunk at a time,
+and the harness versions them as any rows, natively. PostgresStore's
+values arrive as psycopg's Python types, so a row written by `Sql` and the
+same row returned from Python digest alike.
 
 ## Golden vectors
 

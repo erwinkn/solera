@@ -350,10 +350,10 @@ two in flight: at 100M keys, 0.8 GB on top of the data for shuffled Arrow
 rows (0.4 GB sorted; 28 s), 3.4 GB for Python rows, whose keys are packed
 (`bench/keys/results.md`).
 
-A `Sql` write's store reports its content already sorted, as chunks of
-`(key, version)` it computes itself — PostgresStore reads
-`ORDER BY key` with the revision column's text or an MD5 of the row
-through a server-side cursor — so nothing is sorted or held.
+A `Sql` write's store reports its rows already sorted by key, a chunk at
+a time through a server-side cursor — PostgresStore reads the key and the
+revision column, or every column without one — and the harness versions
+them as it versions any rows, so nothing is sorted or held.
 
 **Operations.**
 

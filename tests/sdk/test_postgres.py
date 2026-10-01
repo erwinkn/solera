@@ -5,6 +5,7 @@ import os
 import uuid
 
 import pytest
+from solera.keys import Rows
 from solera.sdk import Output
 from solera.stores import Keys, Patch, Sql, StoreError, WriteError
 
@@ -132,10 +133,14 @@ async def test_keyed_sql_reports_its_keys(store):
     written = await store.store([{"id": "a", "v": "1"}, {"id": "b", "v": "2"}], None, scope(source))
     derived = output(key="id", revision="v")
     sql = await store.store(Sql(f"SELECT id, v FROM {written.ref.table}"), None, scope(derived))
-    assert [pair for chunk in sql.keys for pair in chunk] == [(b"a", b"1"), (b"b", b"2")]
+    assert [row for chunk in sql.keys for row in chunk] == [{"id": "a", "v": "1"}, {"id": "b", "v": "2"}]
+    # Without a revision, every column: versioned as the same rows from Python would be.
     digested = await store.store(Sql(f"SELECT id, v FROM {written.ref.table}"), None, scope(output(key="id")))
-    pairs = [pair for chunk in digested.keys for pair in chunk]
-    assert [k for k, _ in pairs] == [b"a", b"b"] and all(len(v) == 16 for _, v in pairs)
+    rows = [row for chunk in digested.keys for row in chunk]
+    assert (
+        Rows.records(rows, "id").entries()
+        == Rows.records([{"id": "b", "v": "2"}, {"id": "a", "v": "1"}], "id").entries()
+    )
 
 
 async def test_aliases_rename_the_table(store):

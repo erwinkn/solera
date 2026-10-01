@@ -639,9 +639,15 @@ fn revision_text<'py>(py: Python<'py>, value: Bound<'py, PyAny>) -> PyResult<Bou
     Ok(PyBytes::new(py, &out))
 }
 
-/// A chunk of a sorted stream: an Arrow stream of (key, version) columns, or
-/// a list of `(key, version)` pairs.
-fn chunk(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<(Arena, Arena)> {
+/// A chunk of a sorted stream: `(key, version)` pairs — a list, or Arrow
+/// data whose first two columns they are — or with `records`, rows (a list
+/// of mappings, or Arrow data) whose versions are computed here: each row's
+/// digest without its key column, or the text of its revision column.
+fn chunk(
+    py: Python<'_>,
+    obj: &Bound<'_, PyAny>,
+    records: Option<&(String, Option<String>)>,
+) -> PyResult<(Arena, Arena)> {
     let (mut keys, mut versions) = (Arena::default(), Arena::default());
     if obj.hasattr("__arrow_c_stream__")? {
         let batches = arrow_batches(py, obj)?;
@@ -649,17 +655,26 @@ fn chunk(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<(Arena, Arena)> {
             return Ok((keys, versions));
         };
         let schema = first.schema();
-        if schema.fields().len() < 2 {
-            return Err(PyValueError::new_err(
-                "a sorted chunk has key and version columns",
-            ));
-        }
-        let (kn, vn) = (
-            schema.field(0).name().clone(),
-            schema.field(1).name().clone(),
-        );
+        let (kn, mut v): (String, Box<dyn Versions>) = match records {
+            Some((key, None)) => (
+                key.clone(),
+                Box::new(arrow::RowDigest::new(batches.clone(), key).map_err(to_py)?),
+            ),
+            Some((key, Some(rev))) => (
+                key.clone(),
+                Box::new(arrow::Revision::new(&batches, rev).map_err(to_py)?),
+            ),
+            None if schema.fields().len() >= 2 => (
+                schema.field(0).name().clone(),
+                Box::new(arrow::Revision::new(&batches, schema.field(1).name()).map_err(to_py)?),
+            ),
+            None => {
+                return Err(PyValueError::new_err(
+                    "a sorted chunk has key and version columns",
+                ))
+            }
+        };
         let k = arrow::keys(&batches, &kn).map_err(to_py)?;
-        let mut v = arrow::Revision::new(&batches, &vn).map_err(to_py)?;
         for i in 0..k.len() {
             keys.push(k.key(i));
         }
@@ -667,11 +682,31 @@ fn chunk(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<(Arena, Arena)> {
         v.fill(&rows, &mut versions).map_err(to_py)?;
         return Ok((keys, versions));
     }
+    let mut w = pyvalue::Walker::new(py)?;
     for item in obj.try_iter()? {
         let item = item?;
-        key_of(&item.get_item(0)?, &mut keys.data)?;
+        match records {
+            None => {
+                key_of(&item.get_item(0)?, &mut keys.data)?;
+                key_of(&item.get_item(1)?, &mut versions.data)?;
+            }
+            Some((key, revision)) => {
+                let k = field(&item, key)?.ok_or_else(|| PyKeyError::new_err(key.clone()))?;
+                key_of(&k, &mut keys.data)?;
+                match revision {
+                    None => versions.data.extend_from_slice(&w.row(&item, Some(key))?),
+                    Some(rev) => {
+                        let v = field(&item, rev)?.ok_or_else(|| {
+                            PyValueError::new_err(format!(
+                                "a row lacks the declared revision field {rev:?}"
+                            ))
+                        })?;
+                        w.render(&v, &mut versions.data)?;
+                    }
+                }
+            }
+        }
         keys.ends.push(keys.data.len());
-        key_of(&item.get_item(1)?, &mut versions.data)?;
         versions.ends.push(versions.data.len());
     }
     Ok((keys, versions))
@@ -692,6 +727,7 @@ enum Kind {
 #[pyclass(module = "solera._native")]
 struct Job {
     kind: Kind,
+    records: Option<(String, Option<String>)>,
 }
 
 impl Job {
@@ -714,11 +750,13 @@ impl Job {
 #[pymethods]
 impl Job {
     /// The merge-join of the written content (`rows`, or with None a stream
-    /// fed sorted chunks — a key may repeat, its versions row digests to
-    /// `fold`, else shared) against `runs` existing runs, newest first. At
-    /// most `collect` changed keys are kept for `collected`.
+    /// fed sorted chunks, `feed_rows`) against `runs` existing runs, newest
+    /// first. A streamed chunk holds `(key, version)` pairs, or with `key`
+    /// rows keyed by that column: their versions are their digests, folded
+    /// into each key's group, or the `revision` a key's rows share. At most
+    /// `collect` changed keys are kept for `collected`.
     #[staticmethod]
-    #[pyo3(signature = (rows, runs, *, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864, collect=0, fold=false))]
+    #[pyo3(signature = (rows, runs, *, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864, collect=0, key=None, revision=None))]
     #[allow(clippy::too_many_arguments)]
     fn replace(
         rows: Option<PyRefMut<'_, Rows>>,
@@ -730,7 +768,8 @@ impl Job {
         codec: u8,
         max_file_bytes: usize,
         collect: usize,
-        fold: bool,
+        key: Option<String>,
+        revision: Option<String>,
     ) -> PyResult<Job> {
         let src = match rows {
             Some(mut r) => Source::Table(
@@ -738,7 +777,7 @@ impl Job {
                     .take()
                     .ok_or_else(|| PyValueError::new_err("rows already used"))?,
             ),
-            None => Source::Stream(Stream::new(fold)),
+            None => Source::Stream(Stream::new(key.is_some() && revision.is_none())),
         };
         let o = options(block_size, level, bits_per_item, k, codec);
         Ok(Job {
@@ -749,6 +788,7 @@ impl Job {
                 max_file_bytes,
                 collect,
             ))),
+            records: key.map(|k| (k, revision)),
         })
     }
 
@@ -769,6 +809,7 @@ impl Job {
     ) -> Job {
         let o = options(block_size, level, bits_per_item, k, codec);
         Job {
+            records: None,
             kind: Kind::Compact(Box::new(Compact::new(
                 runs,
                 drop_deleted,
@@ -782,6 +823,7 @@ impl Job {
     #[staticmethod]
     fn count(runs: usize) -> Job {
         Job {
+            records: None,
             kind: Kind::Count(Count::new(runs)),
         }
     }
@@ -801,7 +843,7 @@ impl Job {
     }
 
     fn feed_rows(&mut self, py: Python<'_>, rows: Bound<'_, PyAny>) -> PyResult<()> {
-        let (k, v) = chunk(py, &rows)?;
+        let (k, v) = chunk(py, &rows, self.records.as_ref())?;
         match &mut self.replacement()?.src {
             Source::Stream(s) => s.feed(k, v).map_err(to_py),
             Source::Table(_) => Err(PyTypeError::new_err("not a streamed replacement")),

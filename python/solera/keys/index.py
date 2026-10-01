@@ -438,12 +438,19 @@ class KeyIndex:
         return await self._patch(keys, versions, removes)
 
     async def replace(
-        self, rows: Rows | Iterable, batch: int, attempt: str, *, collect: int = 0, fold: bool = False
+        self,
+        rows: Rows | Iterable,
+        batch: int,
+        attempt: str,
+        *,
+        collect: int = 0,
+        key: str | None = None,
+        revision: str | None = None,
     ) -> tuple[DeltaFiles, tuple[list[bytes], list[bytes]] | None]:
         """A full replacement: `rows` is the whole new content — a `Rows`, or
-        `(key, version)` chunks sorted by key, pulled as needed, in which a
-        key may repeat: its versions are row digests to `fold` into the
-        key's group, else they must agree. Every live key is compared as the
+        chunks sorted by key, pulled as needed: `(key, version)` pairs, or
+        with `key` rows keyed by that column, whose versions are computed
+        natively (docs/row-digest.md). Every live key is compared as the
         join reaches it; new keys and changed versions are written, live keys
         not in `rows` deleted. The delta goes out as the batch's files as
         they fill. Returns them and, up to `collect` keys, the written and
@@ -451,7 +458,12 @@ class KeyIndex:
 
         runs = self.state.newest_first()
         job = Job.replace(
-            rows if isinstance(rows, Rows) else None, len(runs), **self._writer(), collect=collect, fold=fold
+            rows if isinstance(rows, Rows) else None,
+            len(runs),
+            **self._writer(),
+            collect=collect,
+            key=key,
+            revision=revision,
         )
         files = await self._run(job, runs, lambda n: f"{batch:012d}-{attempt}.{n:04d}", 0, rows)
         return DeltaFiles(files, job.added, job.removed, True), job.collected()
