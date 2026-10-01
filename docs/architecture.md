@@ -706,7 +706,7 @@ Logs stream to chunked objects throughout. `manifest` mode runs through
 |---|---|---|---|---|
 | `Local()()` | subprocess with an explicit env allow-list | `{launch, pid, started_at, ticks, host}` | polls its own child; an adopted pid only if host and /proc start time match, else can't tell | `SIGTERM`, then `SIGKILL`, only to that same process |
 | `AWSECS(name, cluster, region)(cpu, memory, gpu, image)` | `run_task` with container overrides carrying the stage, `clientToken` = attempt | `{task_arn}` | describes until `STOPPED`; `Exit.meta.log_url`; a task not shown: can't tell | `stop_task` |
-| `Modal(name, app)(gpu)` | spawns the harness function | `{call_id}` | polls the call | cancels it |
+| `Modal(name, app)(gpu)` | spawns the harness function | `{call_id}` | polls the call: its return, raise or timeout is an exit; Modal's client and service errors: can't tell | cancels it |
 | `K8sJob(name, cluster, namespace)(cpu, memory, image)` | creates the job `solera-{attempt}` (lowercased); an existing one is its own | `{job}` | watches conditions; deleted: lost | deletes the job |
 | `Pool(name)(cpu, memory, gpu)` | publishes the stage as a claimable task | `{task}` | result appeared, `complete` called, or claim lease expired | marks the task canceled |
 

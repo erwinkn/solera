@@ -280,26 +280,50 @@ async def test_k8sjob_launch_wait_lost(state, monkeypatch):
     assert exit_["reason"] == "lost"
 
 
-async def test_modal_launch_wait_lost(state, monkeypatch):
-    """§10: Modal spawns the harness function with the stage; a finished call
-    exits 0; a missing call is lost."""
+def modal_exceptions():
+    """Modal 1.6's exception hierarchy, as far as `wait` tells its members apart."""
+
+    class Error(Exception): ...
+
+    class ModalTimeout(Error): ...  # modal.exception.TimeoutError: not the builtin
+
+    names = {"Error": Error, "TimeoutError": ModalTimeout}
+    for name, base in [
+        ("FunctionTimeoutError", ModalTimeout),
+        ("OutputExpiredError", ModalTimeout),
+        ("ConnectionError", Error),
+        ("ServiceError", Error),
+        ("AuthError", Error),
+        ("NotFoundError", Error),
+        ("InternalFailure", Error),
+        ("RemoteError", Error),
+        ("ExecutionError", Error),
+    ]:
+        names[name] = type(name, (base,), {})
+    return types.SimpleNamespace(**names)
+
+
+async def test_modal_reports_only_what_modal_says_of_the_call(state, monkeypatch):
+    """§10: Modal spawns the harness function with the stage. A call that
+    returned exits with its code; one that raised or timed out fails; one
+    Modal does not know is lost. Modal's own client and service errors say
+    nothing of the call: wait raises, so the engine keeps the handle."""
     from solera_server.placements.remote import Modal
 
-    calls = {}
+    errors, calls = modal_exceptions(), {}
 
     class FakeCall:
         def __init__(self, object_id):
             self.object_id = object_id
-            self.finished = False
-            self.canceled = False
+            self.outcome = TimeoutError()  # builtin: not done yet
 
         def get(self, timeout=0):
-            if not self.finished:
-                raise TimeoutError
-            return 0
+            if isinstance(self.outcome, BaseException):
+                raise self.outcome
+            return self.outcome
 
         def cancel(self):
-            self.canceled = True
+            pass
 
     class Function:
         @staticmethod
@@ -311,27 +335,34 @@ async def test_modal_launch_wait_lost(state, monkeypatch):
 
             return types.SimpleNamespace(spawn=spawn)
 
-    FunctionNotFoundError = type("FunctionNotFoundError", (Exception,), {})
+    class Unknown:
+        def get(self, timeout=0):
+            raise errors.NotFoundError("no such call")
 
     def from_id(cid):
-        if cid not in calls:
-            raise FunctionNotFoundError(cid)
-        return calls[cid][0]
+        return calls[cid][0] if cid in calls else Unknown()
 
     modal = types.ModuleType("modal")
     modal.Function = Function
     modal.functions = types.SimpleNamespace(FunctionCall=types.SimpleNamespace(from_id=from_id))
-    modal.exception = types.SimpleNamespace(FunctionNotFoundError=FunctionNotFoundError)
+    modal.exception = errors
     monkeypatch.setitem(sys.modules, "modal", modal)
 
     placement = Modal({"app": "solera"}, {"gpu": "A10G"}, None)
     handle = await placement.launch({"attempt": "a9", "run": "r9", "objects": "s3://o"})
-    assert calls[handle["call_id"]][1] == {"attempt": "a9", "run": "r9", "objects": "s3://o"}
-
+    call, stage = calls[handle["call_id"]]
+    assert stage == {"attempt": "a9", "run": "r9", "objects": "s3://o"}
     assert await placement.wait(handle, 0.2) is None  # still running
-    calls[handle["call_id"]][0].finished = True
-    assert (await placement.wait(handle, 1))["code"] == 0
 
+    for transport in (errors.ConnectionError("down"), errors.ServiceError("UNAVAILABLE"), OSError("reset")):
+        call.outcome = transport
+        with pytest.raises(type(transport)):
+            await placement.wait(handle, 1)
+    for ended, code in ((3, 3), (errors.FunctionTimeoutError("2h"), 1), (ValueError("bad row"), 1)):
+        call.outcome = ended
+        assert (await placement.wait(handle, 1))["code"] == code
+    call.outcome = errors.OutputExpiredError()
+    assert (await placement.wait(handle, 1))["reason"] == "lost"
     del calls[handle["call_id"]]
     assert (await placement.wait(handle, 1))["reason"] == "lost"
 

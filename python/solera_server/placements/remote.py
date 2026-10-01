@@ -220,23 +220,39 @@ class Modal:
         return {"call_id": call.object_id}
 
     async def wait(self, run: dict, timeout: float) -> dict | None:
+        """An exit only for what Modal says of the call itself: it returned
+        (its code), raised, timed out, or failed inside Modal. Modal's own
+        client, service and auth errors say nothing of the call: they raise,
+        as does a network error. (Polling with `timeout=0` signals "not done
+        yet" with the builtin `TimeoutError`; Modal's own `TimeoutError`
+        family is something else.)"""
+
         import modal
 
+        errors = modal.exception
+        ended = (
+            errors.FunctionTimeoutError,
+            errors.InternalFailure,
+            errors.RemoteError,
+            errors.ExecutionError,
+        )
         deadline = time.monotonic() + timeout
         while True:
             try:
                 call = modal.functions.FunctionCall.from_id(run["call_id"])
-                await asyncio.to_thread(call.get, timeout=0)
-                return {"code": 0, "reason": None, "meta": {}}
-            except modal.exception.FunctionNotFoundError:
-                return {"code": None, "reason": "lost", "meta": {}}
+                code = await asyncio.to_thread(call.get, timeout=0)
+                return {"code": code if isinstance(code, int) else 0, "reason": None, "meta": {}}
             except TimeoutError:
                 if time.monotonic() >= deadline:
                     return None
                 await asyncio.sleep(min(2.0, deadline - time.monotonic()))
-            except OSError:
-                raise  # Modal is out of reach: no word on the call
-            except Exception as error:  # the call itself failed
+            except (errors.NotFoundError, errors.OutputExpiredError):
+                return {"code": None, "reason": "lost", "meta": {}}  # no call, or its outcome is gone
+            except ended as error:
+                return {"code": 1, "reason": f"{type(error).__name__}: {error}", "meta": {}}
+            except (OSError, errors.Error):
+                raise  # no word on the call
+            except Exception as error:  # the function itself raised
                 return {"code": 1, "reason": f"{type(error).__name__}: {error}", "meta": {}}
 
     async def cancel(self, run: dict) -> None:
