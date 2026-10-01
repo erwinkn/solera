@@ -222,6 +222,7 @@ fn text(a: &ArrayRef, i: usize, out: &mut Vec<u8>) -> Result<bool> {
 /// A declared revision column: each row's version is its value's text.
 pub struct Revision {
     chunks: Vec<ArrayRef>,
+    bytes: Vec<Option<Bytes>>, // the chunks holding strings or binaries, typed once
     at: Chunks,
 }
 
@@ -238,18 +239,32 @@ impl Revision {
             }
         }
         let at = Chunks::new(chunks.iter().map(|a| a.len()));
-        Ok(Revision { chunks, at })
+        let bytes = chunks.iter().map(Bytes::of).collect();
+        Ok(Revision { chunks, bytes, at })
     }
 }
 
 impl Versions for Revision {
     fn fill(&mut self, rows: &[u32], out: &mut Arena) -> Result<()> {
-        let mut buf = Vec::new();
-        for &r in rows {
-            let (c, j) = self.at.locate(r as usize);
-            buf.clear();
-            text(&self.chunks[c], j, &mut buf)?;
-            out.push(&buf);
+        let parts: Vec<Arena> = rows
+            .par_chunks(1024)
+            .map(|c| {
+                let (mut a, mut buf) = (Arena::default(), Vec::new());
+                for &r in c {
+                    let (c, j) = self.at.locate(r as usize);
+                    if let Some(b) = &self.bytes[c] {
+                        a.push(b.value(j));
+                        continue;
+                    }
+                    buf.clear();
+                    text(&self.chunks[c], j, &mut buf)?;
+                    a.push(&buf);
+                }
+                Ok(a)
+            })
+            .collect::<Result<_>>()?;
+        for p in parts {
+            out.append(p);
         }
         Ok(())
     }

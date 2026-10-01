@@ -104,7 +104,7 @@ impl Replace {
                 }
                 continue;
             }
-            let new = match self.src.state() {
+            let new = match self.src.state()? {
                 State::Starved => return Ok(Step::Rows),
                 s => s == State::Ready,
             };
@@ -121,7 +121,7 @@ impl Replace {
             };
             match ord {
                 std::cmp::Ordering::Less => {
-                    let (k, v) = self.src.entry()?;
+                    let (k, v) = self.src.entry();
                     self.writer.push(k, v, false)?;
                     self.collected.add(k, false);
                     self.added += 1;
@@ -135,7 +135,7 @@ impl Replace {
                     self.old = None;
                 }
                 std::cmp::Ordering::Equal => {
-                    let (k, v) = self.src.entry()?;
+                    let (k, v) = self.src.entry();
                     if v != self.merge.version() {
                         self.writer.push(k, v, false)?;
                         self.collected.add(k, false);

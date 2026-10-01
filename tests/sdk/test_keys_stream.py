@@ -111,7 +111,9 @@ def test_objects_keys_and_errors():
     job, files = replace(_native.Rows.objects(rows, "id", lambda r: r["v"].encode()), [])
     assert content(files) == [(b"3", b"a", 0), (b"x\xff", b"b", 0)]  # str(), surrogateescape
     with pytest.raises(ValueError, match="duplicate key"):
-        _native.Rows.objects([{"id": 1}, {"id": "1"}], "id", b"")
+        _native.Rows.objects([{"id": 1}, {"id": "1"}], "id", b"")  # sorted
+    with pytest.raises(ValueError, match="duplicate key"):
+        replace(_native.Rows.objects([{"id": 2}, {"id": 1}, {"id": "2"}], "id", b""), [])
     with pytest.raises(KeyError):
         _native.Rows.objects([{"id": 1}, {}], "id", b"")
 
@@ -227,7 +229,9 @@ def test_key_rows_shapes():
     _, files = replace(key_rows(Output("k", key=KEYS), {"x": [1]}), [])
     assert content(files) == [(b"x", revision([1]), 0)]
     with pytest.raises(WriteError, match='duplicate key "1"'):
-        key_rows(declared, rows + rows)
+        key_rows(declared, sorted(rows + rows, key=lambda r: r["id"]))  # sorted: found at once
+    with pytest.raises(ValueError, match='duplicate key "1"'):
+        replace(key_rows(declared, rows + rows), [])  # else as the join reaches it
     with pytest.raises(WriteError, match="key column"):
         key_rows(declared, [{"x": 1}])
     with pytest.raises(WriteError, match="revision field"):

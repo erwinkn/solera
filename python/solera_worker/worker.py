@@ -547,7 +547,10 @@ async def _store_outputs(spec, project, asset, objects, keys_io, result_value, f
         if replace:
             # Every written key against every live one, streamed: the delta goes out as it fills.
             rows = await asyncio.to_thread(key_rows, output, content)
-            files, changed = await index.replace(rows, batch, attempt, collect=LISTED)
+            try:
+                files, changed = await index.replace(rows, batch, attempt, collect=LISTED)
+            except ValueError as e:  # a duplicate key, found as the join reaches it
+                raise WriteError(f"{output.name}: {e} in write") from e
         else:
             new = key_map(output, content)
             removes = [str(k) for k in value.remove if str(k) not in new]

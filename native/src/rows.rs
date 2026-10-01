@@ -7,6 +7,8 @@
 
 use std::collections::VecDeque;
 
+use rayon::prelude::*;
+
 use crate::format::{Error, Result};
 use crate::sort::{self, Keys};
 use crate::stream::State;
@@ -22,6 +24,12 @@ impl Arena {
     pub fn push(&mut self, b: &[u8]) {
         self.data.extend_from_slice(b);
         self.ends.push(self.data.len());
+    }
+
+    pub fn append(&mut self, other: Arena) {
+        let base = self.data.len();
+        self.data.extend_from_slice(&other.data);
+        self.ends.extend(other.ends.iter().map(|e| e + base));
     }
 
     pub fn clear(&mut self) {
@@ -81,30 +89,29 @@ pub struct Table {
     keys: Box<dyn Keys + Send>,
     order: Option<Vec<u32>>,
     versions: Box<dyn Versions>,
-    window: Arena,
+    // The next rows in key order, keys and versions side by side: rows sit in
+    // any order in memory, so they are gathered a window at a time, on every core.
+    wkeys: Arena,
+    wvers: Arena,
     start: usize,
     pos: usize,
 }
 
 impl Table {
-    /// Sorts the keys unless they arrive sorted; a duplicate key is an error.
+    /// Sorts the keys unless they arrive sorted. A duplicate key is an error
+    /// here when they arrive sorted, else when the replacement reaches it.
     pub fn new(keys: Box<dyn Keys + Send>, versions: Box<dyn Versions>) -> Result<Table> {
         let order = match sort::is_sorted(&*keys) {
             Ok(true) => None,
             Err(i) => return Err(duplicate(keys.key(i))),
-            Ok(false) => {
-                let order = sort::order(&*keys);
-                if let Some(i) = sort::duplicate(&*keys, &order) {
-                    return Err(duplicate(keys.key(i as usize)));
-                }
-                Some(order)
-            }
+            Ok(false) => Some(sort::order(&*keys)),
         };
         Ok(Table {
             keys,
             order,
             versions,
-            window: Arena::default(),
+            wkeys: Arena::default(),
+            wvers: Arena::default(),
             start: 0,
             pos: 0,
         })
@@ -123,28 +130,46 @@ impl Table {
         self.order.is_none()
     }
 
-    #[inline]
-    fn row(&self, i: usize) -> usize {
-        self.order.as_ref().map_or(i, |o| o[i] as usize)
-    }
-
-    #[inline]
-    fn key(&self) -> &[u8] {
-        self.keys.key(self.row(self.pos))
-    }
-
-    fn version(&mut self) -> Result<&[u8]> {
-        if self.pos >= self.start + self.window.len() {
-            self.window.clear();
-            self.start = self.pos;
-            let end = (self.pos + WINDOW).min(self.len());
-            let rows: Vec<u32> = match &self.order {
-                Some(o) => o[self.pos..end].to_vec(),
-                None => (self.pos as u32..end as u32).collect(),
-            };
-            self.versions.fill(&rows, &mut self.window)?;
+    /// Makes the window hold row `pos`.
+    fn fill(&mut self) -> Result<()> {
+        if self.pos < self.start + self.wkeys.len() {
+            return Ok(());
         }
-        Ok(self.window.get(self.pos - self.start))
+        let end = (self.pos + WINDOW).min(self.len());
+        let rows: Vec<u32> = match &self.order {
+            Some(o) => o[self.pos..end].to_vec(),
+            None => (self.pos as u32..end as u32).collect(),
+        };
+        let last = (!self.wkeys.is_empty()).then(|| self.wkeys.get(self.wkeys.len() - 1).to_vec());
+        self.wkeys.clear();
+        gather(&*self.keys, &rows, &mut self.wkeys);
+        let first = (last.as_deref() == Some(self.wkeys.get(0))).then_some(0);
+        if let Some(i) = first
+            .or_else(|| (1..self.wkeys.len()).find(|&i| self.wkeys.get(i - 1) == self.wkeys.get(i)))
+        {
+            return Err(duplicate(self.wkeys.get(i)));
+        }
+        self.wvers.clear();
+        self.versions.fill(&rows, &mut self.wvers)?;
+        self.start = self.pos;
+        Ok(())
+    }
+}
+
+/// Appends the keys of `rows` to `out`, on every core.
+fn gather<K: Keys + ?Sized>(keys: &K, rows: &[u32], out: &mut Arena) {
+    let parts: Vec<Arena> = rows
+        .par_chunks(1024)
+        .map(|c| {
+            let mut a = Arena::default();
+            for &r in c {
+                a.push(keys.key(r as usize));
+            }
+            a
+        })
+        .collect();
+    for p in parts {
+        out.append(p);
     }
 }
 
@@ -198,24 +223,24 @@ pub enum Source {
 }
 
 impl Source {
-    pub fn state(&mut self) -> State {
+    pub fn state(&mut self) -> Result<State> {
         match self {
             Source::Table(t) => {
-                if t.pos < t.len() {
-                    State::Ready
-                } else {
-                    State::Done
+                if t.pos >= t.len() {
+                    return Ok(State::Done);
                 }
+                t.fill()?;
+                Ok(State::Ready)
             }
             Source::Stream(s) => loop {
                 match s.chunks.front() {
-                    Some((k, _)) if s.pos < k.len() => return State::Ready,
+                    Some((k, _)) if s.pos < k.len() => return Ok(State::Ready),
                     Some(_) => {
                         s.chunks.pop_front();
                         s.pos = 0;
                     }
-                    None if s.ended => return State::Done,
-                    None => return State::Starved,
+                    None if s.ended => return Ok(State::Done),
+                    None => return Ok(State::Starved),
                 }
             },
         }
@@ -225,22 +250,18 @@ impl Source {
     #[inline]
     pub fn key(&self) -> &[u8] {
         match self {
-            Source::Table(t) => t.key(),
+            Source::Table(t) => t.wkeys.get(t.pos - t.start),
             Source::Stream(s) => s.chunks[0].0.get(s.pos),
         }
     }
 
-    /// The current key and its version.
-    pub fn entry(&mut self) -> Result<(&[u8], &[u8])> {
+    /// The current key and its version; only when `state` is `Ready`.
+    pub fn entry(&self) -> (&[u8], &[u8]) {
         match self {
-            Source::Table(t) => {
-                t.version()?;
-                let v = t.window.get(t.pos - t.start);
-                Ok((t.keys.key(t.row(t.pos)), v))
-            }
+            Source::Table(t) => (t.wkeys.get(t.pos - t.start), t.wvers.get(t.pos - t.start)),
             Source::Stream(s) => {
                 let (k, v) = &s.chunks[0];
-                Ok((k.get(s.pos), v.get(s.pos)))
+                (k.get(s.pos), v.get(s.pos))
             }
         }
     }
