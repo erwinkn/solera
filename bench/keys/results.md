@@ -441,3 +441,131 @@ Read strategy, forced each way (cold; wall · GETs · MB read):
 | 100,000,000 | 1,000 | 50% | 2.5 s · 170 GET 0 PUT · 2719.6 MB | 901 ms · 515 GET 0 PUT · 381.6 MB | 2.3 s · 171 GET 0 PUT · 2719.6 MB | tails, then blocks: 929 ms · 515 GET 0 PUT · 381.6 MB | 1.3 s / 5.9 s |
 | 100,000,000 | 10,000 | 50% | 5.9 s · 170 GET 0 PUT · 2719.6 MB | 7.3 s · 4167 GET 0 PUT · 645.6 MB | 5.3 s · 171 GET 0 PUT · 2719.6 MB | tails, then blocks: 5.1 s · 4167 GET 0 PUT · 645.6 MB | 6.1 s / 8.3 s |
 | 100,000,000 | 100,000 | 50% | 17.5 s · 170 GET 0 PUT · 2719.6 MB | 17.4 s · 7395 GET 0 PUT · 2105.9 MB | 14.5 s · 171 GET 0 PUT · 2719.6 MB | tails, then rest: 16.0 s · 171 GET 0 PUT · 2719.6 MB | 24.4 s / 22.3 s |
+
+## Streaming bulk operations (2026-10-01)
+
+Finding 6 of the follow-up above: a 100M-key full replacement needed ~45 GB,
+because every key crossed into the index as Python objects, and every block
+of every level was loaded at once. Full replacement is now a streaming
+merge-join in Rust, and compaction and recount stream too
+(`object-store-state.md` §6). Same machine (8 cores, 31 GB), local MinIO
+with 30 ms per request and 80 MB/s per connection, 64 requests in
+parallel. Nothing here ran on real S3.
+
+    cargo run --release --example sort -- 1e8 ids        # in native/; also uuids, paths
+    uv run python bench/keys/bulk.py --s3 http://solera:solera-bench-secret@127.0.0.1:9100/solera-test --sizes 1e6,1e7,1e8
+
+### Sorting the written keys (`native/examples/sort.rs`)
+
+Keys in one packed buffer with `u32` offsets, as in an Arrow string column,
+in random order. Time, and the heap each strategy adds at its peak per key
+(a counting allocator), on top of the keys. Every strategy returns the same
+`u32` permutation; the pair strategies compact their pairs into it in place.
+Pairs hold the 8 bytes after the prefix every key shares (5 bytes for the
+ids and paths) and break ties through the keys.
+
+random ids `cust-%013d`:
+
+| Strategy | 1M | 10M | 100M |
+|---|---|---|---|
+| bare `u32` permutation | 240 ms · 4.0 B | 5.5 s · 4.0 B | 96.2 s · 4.0 B |
+| bare permutation, every core | 80 ms · 4.1 B | 1.1 s · 4.0 B | 17.7 s · 4.0 B |
+| (8-byte prefix, `u32`) pairs | 70 ms · 12.1 B | 790 ms · 12.0 B | 45.0 s · 12.0 B |
+| pairs, every core | 30 ms · 12.1 B | 210 ms · 12.0 B | 6.2 s · 12.0 B |
+| pairs, LSD radix + tie fix-up | 40 ms · 24.1 B | 470 ms · 24.0 B | 41.9 s · 24.0 B |
+| pairs, one in-place MSD pass, buckets on every core | 80 ms · 12.1 B | 430 ms · 12.0 B | 44.2 s · 12.0 B |
+| **buckets of a permutation, each as pairs, every core (chosen)** | 90 ms · 8.8 B | 210 ms · 5.7 B | 4.9 s · 4.6 B |
+
+UUIDs:
+
+| Strategy | 1M | 10M | 100M |
+|---|---|---|---|
+| bare `u32` permutation | 270 ms · 4.0 B | 6.4 s · 4.0 B | 95.5 s · 4.0 B |
+| bare permutation, every core | 110 ms · 4.1 B | 1.2 s · 4.0 B | 18.1 s · 4.0 B |
+| (8-byte prefix, `u32`) pairs | 70 ms · 12.1 B | 640 ms · 12.0 B | 7.5 s · 12.0 B |
+| pairs, every core | 70 ms · 12.1 B | 170 ms · 12.0 B | 1.5 s · 12.0 B |
+| pairs, LSD radix + tie fix-up | 60 ms · 24.1 B | 350 ms · 24.0 B | 3.8 s · 24.0 B |
+| pairs, one in-place MSD pass, buckets on every core | 40 ms · 12.1 B | 260 ms · 12.0 B | 2.5 s · 12.0 B |
+| **buckets of a permutation, each as pairs, every core (chosen)** | 30 ms · 8.8 B | 190 ms · 5.7 B | 1.5 s · 4.4 B |
+
+paths `site-%05d/file-%09d`:
+
+| Strategy | 1M | 10M | 100M |
+|---|---|---|---|
+| bare `u32` permutation | 270 ms · 4.0 B | 6.0 s · 4.0 B | 92.2 s · 4.0 B |
+| bare permutation, every core | 90 ms · 4.1 B | 1.2 s · 4.0 B | 19.4 s · 4.0 B |
+| (8-byte prefix, `u32`) pairs | 220 ms · 12.1 B | 3.9 s · 12.0 B | 60.3 s · 12.0 B |
+| pairs, every core | 60 ms · 12.1 B | 590 ms · 12.0 B | 9.1 s · 12.0 B |
+| pairs, LSD radix + tie fix-up | 140 ms · 24.1 B | 2.6 s · 24.0 B | 37.1 s · 24.0 B |
+| pairs, one in-place MSD pass, buckets on every core | 260 ms · 12.1 B | 3.9 s · 12.0 B | 59.6 s · 12.0 B |
+| **buckets of a permutation, each as pairs, every core (chosen)** | 40 ms · 9.4 B | 930 ms · 5.7 B | 6.1 s · 4.4 B |
+
+A bare permutation is the least memory but compares through the offsets,
+missing cache on every comparison: 18–19 s at 100M on every core. Prefix
+pairs settle most comparisons on their own, but cost 12 B per key, and
+collapse when keys share more than their common prefix — ids whose next 8
+bytes are mostly the same digits, paths with `/file-` in the middle. The
+chosen strategy scatters a permutation into 65,536 buckets by the two bytes
+after the common prefix, sorts each bucket as pairs on every core, then
+re-buckets ties by the next 8 bytes (`sort_deep`); a bucket over 1/64 of
+the rows splits again by its next two bytes instead of becoming pairs. It
+is fastest or close at every size and shape, and peaks at the permutation
+plus the pairs of the buckets in flight: 4.4–4.6 B per key at 100M (the
+fixed 65,536-bucket histograms show at 1M).
+
+An earlier round of this benchmark freed one small allocation per key just
+before timing; glibc's cleanup of them on the next large allocation was
+billed to whichever strategy ran first, inflating it up to 3×. Keys are now
+generated in two large buffers.
+
+### Bulk operations (`bulk.py`)
+
+Each operation ran in a process of its own after its input existed, and
+reports the peak resident memory it added on top of that input (the
+kernel's peak counter reset first) — what a worker needs beyond the data it
+already holds. The index: every key in level 1, plus a delta in level 0
+changing 1% of versions; the replacement writes every key back at its first
+version, so the 1% change again. Keys `cust-%013d` with random gaps,
+versions the MD5 of the key. `list` input is Python `bytes` keys with a
+version function in Python (MD5: about a row digest's cost); `arrow` is a
+pyarrow Table read in place. Rows arrive shuffled unless sorted.
+
+Before: the code as of the follow-up above (`KeyIndex.changes(..., replace=True)`
+and `write`; compaction through whole files), same script. It cannot run at
+100M on this machine.
+
+| Operation | 1M keys, before | 1M keys, after | 10M keys, before | 10M keys, after | 100M keys, after |
+|---|---|---|---|---|---|
+| initial load, `list` | 3.5 s · **0.18 GB** | 1.7 s · **0.11 GB** | 40.8 s · **1.13 GB** | 11.4 s · **0.57 GB** | 136.5 s · **3.35 GB** |
+| initial load, `arrow` | — | 874 ms · **0.09 GB** | — | 4.2 s · **0.36 GB** | 37.6 s · **0.81 GB** |
+| initial load, `arrow`, sorted | — | 835 ms · **0.08 GB** | — | 3.6 s · **0.32 GB** | 30.1 s · **0.37 GB** |
+| full replacement, 1% changed, `list` | 1.8 s · **0.32 GB** | 1.1 s · **0.11 GB** | 20.1 s · **2.86 GB** | 10.2 s · **0.44 GB** | 139.3 s · **3.35 GB** |
+| full replacement, 1% changed, `arrow` | — | 562 ms · **0.05 GB** | — | 2.8 s · **0.18 GB** | 27.6 s · **0.83 GB** |
+| compaction: delta + all of level 1 into level 1 | 1.5 s · **0.23 GB** | 1.1 s · **0.12 GB** | 12.9 s · **1.13 GB** | 3.8 s · **0.45 GB** | 27.1 s · **0.54 GB** |
+| recount | 1.4 s · **0.06 GB** | 315 ms · **0.05 GB** | 13.8 s · **0.09 GB** | 1.7 s · **0.14 GB** | 14.1 s · **0.20 GB** |
+
+Requests (after): a replacement, compaction or recount reads the index in
+8 MB segments — 6, 40 and 371 GETs (26 MB, 251 MB, 2.4 GB) at 1M, 10M and
+100M; the recount was 1,077 GETs and 118.8 s at 100M in the follow-up. The
+delta of a 1% replacement is one PUT at every size (27 MB at 100M); a load
+or a compaction writes a file per ~66 MB (41 at 100M).
+
+Where the memory goes at 100M:
+
+- **Sorting**: the permutation, 0.4 GB, plus a few buckets' pairs while it
+  sorts — the difference between shuffled and sorted Arrow input (0.81 and
+  0.37 GB).
+- **Python keys**: packed once into one buffer, 26 B per key here (18 B of
+  key, an 8-byte offset): 2.6 GB of the `list` cases' 3.35 GB. Arrow keys
+  stay in place.
+- **Buffers**, whatever the size: the file being written (up to 64 MB of
+  blocks plus 32 B of filter hashes per entry, ~75 MB), two files
+  uploading, and per level three segments read ahead plus 32 decoded blocks
+  — ~0.35 GB, the whole of a sorted load and most of a compaction or recount.
+
+The `list` cases' time is the version function: 100M calls of Python MD5 run
+one window of rows at a time under the GIL, about 1 µs each. Arrow versions
+— a revision column or a row digest — are read or computed on every core.
+The old figure of ~45 GB for a 100M-key replacement also counted the worker
+building `key_map` (a dict of every key and its digest) and the lists it
+passed in; the worker now hands its rows to `key_rows` directly.

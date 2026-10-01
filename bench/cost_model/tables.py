@@ -57,7 +57,6 @@ row("requests", lambda n: f"{initial_load(n)['puts']} PUT")
 row("cost", lambda n: usd(initial_load(n)["usd"]))
 row("upload time", lambda n: sec(initial_load(n)["io_s"]))
 row("sort, native", lambda n: sec(initial_load(n)["sort_native_s"]))
-row("sort, pure Python", lambda n: sec(initial_load(n)["sort_python_s"]))
 
 for k, cl, un, label in [
     (100, False, 0.0, "100 random keys changed"),
@@ -87,7 +86,6 @@ row("GETs", lambda n: num(full_replace(n, n // 100)["gets"]))
 row("cost", lambda n: usd(full_replace(n, n // 100)["usd"]))
 row("read time", lambda n: sec(full_replace(n, n // 100)["io_s"]))
 row("compare, native", lambda n: sec(full_replace(n, n // 100)["cpu_native_s"]))
-row("compare, pure Python", lambda n: sec(full_replace(n, n // 100)["cpu_python_s"]))
 
 for pg in (10_000, 100_000):
     print(f"\n### Full delivery to a consumer (pages of {pg // 1000}K keys, one attempt per page)\n")

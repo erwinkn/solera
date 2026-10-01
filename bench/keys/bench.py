@@ -11,7 +11,8 @@ top of a local server. Results print as Markdown.
 Suites (`--suites`, all by default):
 - base: the operations recorded in results.md, in the same order and with the same keys.
 - scan: a full scan of the index (the recount), in 100K-key pages.
-- load: an initial load of every key, unsorted, through `KeyIndex.changes` and `write`.
+- load: an initial load of every key, unsorted, through `KeyIndex.replace` (`bulk.py` measures
+  the bulk operations' memory, each in a process of its own).
 - crossover: the read strategy forced each way (whole levels; tails, then blocks; tails, then the
   rest of each file) against the planner's pick.
 - steady: the upper levels filled as steady-state writes leave them, then commits and one
@@ -37,11 +38,13 @@ import tempfile
 import time
 import uuid
 from dataclasses import replace
+from operator import itemgetter
 from urllib.parse import unquote, urlsplit
 
 import boto3
 from obstore.store import S3Store
 from solera import keys as K
+from solera.keys import Rows
 from solera.keys.index import FileInfo, IndexState, KeyIndex, Options
 from solera.keys.io import DiskCache, ObjectIO
 
@@ -614,7 +617,9 @@ async def _run_size(n: int, prefix: str, args) -> dict:
                 await measure(
                     "full replacement, 1% changed",
                     io,
-                    lambda io=io: KeyIndex(io, prefix, state, opts).changes(ks_all, vs_all, replace=True),
+                    lambda io=io: KeyIndex(io, prefix, state, opts).replace(
+                        Rows.objects(list(zip(ks_all, vs_all, strict=True)), 0, itemgetter(1)), 1, "replace"
+                    ),
                 )
             )
         if "load" in args.suites:
@@ -627,9 +632,11 @@ async def _run_size(n: int, prefix: str, args) -> dict:
 
             async def load(io=io):
                 idx = KeyIndex(io, f"{prefix}load/", IndexState(), opts)
-                return await idx.write(0, "load", await idx.changes(ks, vs, replace=True))
+                return await idx.replace(
+                    Rows.objects(list(zip(ks, vs, strict=True)), 0, itemgetter(1)), 0, "load"
+                )
 
-            rows.append(await measure("initial load: every key, unsorted, changes + write", io, load))
+            rows.append(await measure("initial load: every key, unsorted", io, load))
             del ks, vs
         else:
             del ks_all, vs_all

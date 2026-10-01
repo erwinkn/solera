@@ -24,8 +24,10 @@ column and under **Measured**, which compares the two.
   on a cold worker in steady state (~$116 modelled without filters), ~$8
   with index files cached on local disk, and ~$1 if the same changes are
   committed every 10 minutes.
-- **CPU, not requests, is what needs native code:** at 10M–100M keys,
-  sorting and comparing take seconds natively and minutes in pure Python.
+- **Bulk operations are bounded in memory, not in keys:** a full
+  replacement of 100M keys takes ~28 s and 0.8 GB beyond the data the
+  worker holds (Arrow rows); a compaction rewriting a 100M-key level 27 s
+  and 0.5 GB. All per-key work is native.
 
 ## Assumptions
 
@@ -40,7 +42,7 @@ column and under **Measured**, which compares the two.
 | Requests in parallel | 64 | |
 | Request latency | 30 ms | not yet on real S3 |
 | Throughput to S3 | 500 MB/s aggregate | not yet on real S3 |
-| CPU (merge, compare, scan) | native 30M entries/s; pure Python 1.5M entries/s | native: decode 4.6M, encode 1.3M, merge 1.5M entries/s; filters ~0.4M keys/s including Python. Pure Python 4–10× slower |
+| CPU (merge, compare, scan) | native 30M entries/s; pure Python 1.5M entries/s | native, one core: decode 4.6M, encode 1.3M entries/s; streaming on 8 cores: write 6M, replace ~4M, compact ~4M entries/s; filters ~0.4M keys/s including Python |
 | Compaction write amplification | ~5× per level (each entry rewritten ~5–20× over its life) | 16× / 22× / 31× over an entry's life at 1M / 10M / 100M keys |
 | Attempt overhead | 4 PUT + 2 GET: spec, result, log chunk, joined log; plus 1 journal PUT per commit (upper bound — flushes are shared when several commits land within a second) | |
 | Prices | S3 Standard list prices: PUT $5 per million, GET $0.40 per million, storage $0.023/GB-month; DELETE and same-region transfer free. Cloudflare R2 is ~10% cheaper per request and $0.015/GB, with free egress. | check before relying |
@@ -114,18 +116,16 @@ Where the model was wrong:
   entry's life. Level 0 now merges in itself until it holds a tenth of
   level 1: 16×, 22× and 31× at 1M, 10M and 100M keys, near the model's
   ~5–20×.
-- **A recount is ~1,100 reads at 100M keys**, not ~150: one or two per
-  100K-key page, each page a request round trip; ~3,000 with the upper
-  levels full.
-- **CPU is much slower than assumed.** Native encoding runs at about 1.3M
-  entries/s (zlib level 1 is most of it), decoding at about 4.6M/s, merging
-  at about 1.5M/s; the model assumed 30M/s. Request costs are unaffected —
-  the work runs on the worker — but a full replacement of 10M keys takes
-  about 6 s (mostly sorting the written keys), and of 100M about a minute
-  (and ~45 GB of memory today). Parallel block compression is the obvious
-  next optimization if that matters.
-- **Pure Python** encodes at about 0.1M entries/s: fine for indexes up to
-  about 1M keys, and the reason the native extension exists.
+- **A recount is ~370 reads at 100M keys**, not ~150: it streams every
+  level in 8 MB segments (2.4 GB, 14 s); paging it 100K keys at a time
+  took ~1,100.
+- **CPU is slower than assumed.** On one core, native encoding runs at
+  about 1.3M entries/s (zlib level 1 is most of it) and decoding at about
+  4.6M/s; the model assumed 30M/s. Blocks now decode and compress on every
+  core, so the streaming operations run at ~4M entries/s on 8 cores: a
+  full replacement of 100M keys takes ~28 s (sorting them ~5 s of it) and
+  0.8 GB beyond the written rows, against ~45 GB before it streamed.
+  Request costs are unaffected — the work runs on the worker.
 
 ## Per operation
 
@@ -149,7 +149,6 @@ level, so there is no compaction.
 | cost | $0.0000308 | $0.0000308 | $0.0000308 | $0.0000358 | $0.0000858 | $0.00063 |
 | upload time | 0 ms | 0 ms | 4 ms | 40 ms | 400 ms | 4.0 s |
 | sort, native | 0 ms | 1 ms | 14 ms | 166 ms | 1.9 s | 22.1 s |
-| sort, pure Python | 2 ms | 22 ms | 277 ms | 3.3 s | 38.8 s | 7 min |
 
 ### Incremental commit: 100 random keys changed
 
@@ -228,7 +227,6 @@ index; that is inherent, and cheap in requests.
 | cost | $0.0000316 | $0.0000316 | $0.0000316 | $0.0000320 | $0.0000368 | $0.0000958 |
 | read time | 30 ms | 30 ms | 34 ms | 70 ms | 430 ms | 4.1 s |
 | compare, native | 0 ms | 0 ms | 3 ms | 33 ms | 333 ms | 3.3 s |
-| compare, pure Python | 1 ms | 7 ms | 67 ms | 667 ms | 6.7 s | 66.7 s |
 
 ### Full delivery to a consumer
 
@@ -303,10 +301,10 @@ Without filters that is ~1,000 small reads per commit, 270M a month.
    read strategy.
 3. **`Project(key_cache=…)`**, on by default for the `Local` placement
    when the engine's machine has a writable directory, with a size cap.
-4. **Native code is needed for large indexes**, for CPU rather than
-   request cost: 100M-key sorts and full comparisons take seconds natively
-   and minutes in pure Python. Pure Python remains fine up to ~1M keys per
-   operation.
+4. **Native code, streaming, for large indexes**, for CPU and memory
+   rather than request cost: 100M-key sorts and full comparisons take
+   seconds, and hold a permutation of the written rows and a few buffers,
+   never the index.
 5. **Attempt overhead is worth trimming** since it dominates at high
    frequency: no log object when nothing was logged, and a single write
    instead of chunk + join when the log fits in one chunk. That takes a

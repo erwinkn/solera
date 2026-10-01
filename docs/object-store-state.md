@@ -293,9 +293,9 @@ exact, which is always the case for indexes small enough to read whole.
 When a commit relies on the filters, a new key that some key filter
 falsely matches is counted as an update, so the count drifts low by about
 the filters' false-positive rate on inserted keys; `inexact` counts such
-commits. While it is non-zero, the engine schedules a **recount** — a
-full scan of the index's block indexes and blocks, about 1,100 reads at
-100M keys (3,000 with the upper levels full) — at most once per
+commits. While it is non-zero, the engine schedules a **recount** — one
+streaming pass over every level, 8 MB of blocks per read: ~370 reads and
+14 s at 100M keys, a few more with the upper levels full — at most once per
 `recount_interval` (default 1 hour). The recount is exact
 for the state it pinned, and commits landing while it runs keep their
 `added − removed` on top of it (`IndexRecounted`), so a busy index gets
@@ -310,26 +310,56 @@ which keys need an exact read, does it choose per level between reading
 their blocks (consecutive blocks are one range read) and reading the rest
 of those files whole. It estimates each combination from request rounds,
 transfer (500 MB/s in all, 80 MB/s per request) and CPU (decoding and
-filter checks at the measured native or pure-Python rates); the one with
+filter checks at the measured rates); the one with
 the fewest requests that fits a latency budget (default 2 s) wins, else
 the fastest. An exact read only goes to files whose key filter matched,
 all levels at once, and each key takes its newest entry.
+
+**Full replacement.** A bare return of every row must compare every live
+key, so it reads the whole index — as a stream, never whole. The written
+content stays where the worker holds it: an Arrow key column is read in
+place (anything with `__arrow_c_stream__`; a pandas DataFrame goes through
+DuckDB to get there), Python keys are packed once into one buffer (~28 B
+per key). One O(n) pass finds whether they arrive sorted; if not, a
+permutation sorts them — bucketed by the two key bytes after the prefix
+they all share, each bucket sorted as 12-byte (prefix, row) pairs on every
+core, ~4.5 B per key at the peak (`native/examples/sort.rs`). A merge-join
+then walks the sorted keys and the index's newest-wins view together, each
+level fed a segment of 8 MB of consecutive blocks at a time, a few ahead.
+A row's version is computed when the join reaches it and compared once —
+the declared revision column's value, else a digest of the row: Python
+rows' `revision`, a window of rows at a time, or for Arrow data XXH3-128
+over its columns in name order, each value in a canonical encoding that
+ignores its physical type (`native/src/arrow.rs`; switching an output
+between Python rows and Arrow data changes every digest once). New keys
+and changed versions go straight into the current delta file, live keys
+not written into `deleted` entries, and each file goes to the store as it
+fills. Memory is the permutation, a few segments per level and a file or
+two in flight: at 100M keys, 0.8 GB on top of the data for shuffled Arrow
+rows (0.4 GB sorted; 28 s), 3.4 GB for Python rows, whose keys are packed
+(`bench/keys/results.md`).
+
+A `Sql` write's store reports its content already sorted, as chunks of
+`(key, version)` it computes itself — PostgresStore reads
+`ORDER BY key` with the revision column's text or an MD5 of the row
+through a server-side cursor — so nothing is sorted or held.
 
 **Operations.**
 
 | Operation | Who | How |
 |---|---|---|
-| Compute a delta | harness, at write time | Extract `(key, version)` from the written rows (the declared `revision` column's text, else a 16-byte digest of the row). Check them against the index **as pinned in the spec**, with the filters and the read strategy above. Keep entries whose version changed, plus `deleted` entries for removed keys that may exist. A full replacement also compares against every existing key, which is inherent. Write the result as the batch's delta file. |
+| Compute a delta | harness, at write time | Extract `(key, version)` from the written rows (the declared `revision` column's text, else a 16-byte digest of the row), against the index **as pinned in the spec**. A patch is checked with the filters and the read strategy above: keep entries whose version changed, plus `deleted` entries for removed keys that may exist. A full replacement is the streaming merge-join above. Either way the result is the batch's delta files, split at ~64 MB. |
 | Commit | engine | Add the delta file to level 0 and to `log`; `count += added − removed`, and `inexact += 1` if the count change came from filters. The scope lock — one attempt per (asset, scope) from launch to settlement — guarantees the index didn't change underneath. |
 | Deliver pending deltas | harness, for an `Incremental` edge | Read the `log` files from the watermark to the head; chunk by `batch_size` in key order; ask the upstream store for those rows with `Keys(…)`. |
 | Full delivery | harness | Page through the merged view of all levels from `after`, `batch_size` keys at a time, and ask the store for them with `Keys(…)`. Per level, only the files covering the page are opened, and only their index parts are read — or the whole file, once, when it is small (below one request's latency worth of transfer, ~2.4 MB). A multi-page scan keeps each file's last fetched blocks for the next page, so it reads every block once. |
-| Compaction | the engine's machine by default (§6, *Engine work*) | Once level 0 holds ~8 files, merge them into one level-0 file — or, once level 0 holds a tenth of level 1's bytes, into level 1 with the level-1 files it overlaps (all of them, for random keys). A level over its target pushes one file down, merging it with the files it overlaps there. Commit with `IndexCompacted`. Each merge into a level rewrites about ten times the bytes it brings: ~20–30× over an entry's life with random keys (`bench/keys/amplification.py`). |
+| Compaction | the engine's machine by default (§6, *Engine work*) | Once level 0 holds ~8 files, merge them into one level-0 file — or, once level 0 holds a tenth of level 1's bytes, into level 1 with the level-1 files it overlaps (all of them, for random keys). A level over its target pushes one file down, merging it with the files it overlaps there. A merge streams, a few segments per input and one output file at a time. Commit with `IndexCompacted`. Each merge into a level rewrites about ten times the bytes it brings: ~20–30× over an entry's life with random keys (`bench/keys/amplification.py`). |
 | Truncate the log | engine | Drop `log` entries below the lowest consumer watermark and below every window an in-flight attempt was given (`IndexTruncated`); an output with no `Incremental` consumers keeps none. A consumer whose window the log no longer holds gets a full delivery. |
 | Delete files | engine | A file in neither `files` nor `log` joins `garbage`, and is deleted once every attempt that could have pinned it has finished (`GarbageDeleted`). A delta file of an attempt that never committed is deleted when the attempt ends, unless it is an unsettled intent (§8). |
 
 Writes that never pass through the harness as rows — `Sql` materialized
 inside Postgres — are the one case where the store must report the written
-`(key, version)` pairs; only stores supporting such writes need to.
+`(key, version)` pairs, sorted (above); only stores supporting such writes
+need to.
 
 External sources use the same index. An API commit becomes a delta file;
 for very large commits the client builds the file itself and commits a
@@ -364,7 +394,11 @@ frequent scattered writes into very large indexes cheap; see
 work — encoding, decoding, sorting, merging, lookups over fetched bytes —
 is Rust, in the `solera._native` extension (PyO3, abi3) that the `solera`
 distribution builds and both the engine and the worker require; I/O goes
-through obstore. A pure-Python implementation of the format is kept as the
+through obstore. A full replacement, a compaction and a recount run as
+streaming jobs (`native/src/jobs.rs`) that ask for the file segments they
+need and hand back the files they write; Python only chooses files, fetches
+bytes and parses tails (`solera/keys/jobs.py`). Blocks decode and compress
+on every core. A pure-Python implementation of the format is kept as the
 tests' reference.
 
 ## 7. Run history — `history/{table}/*.parquet`
