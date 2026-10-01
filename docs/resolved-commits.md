@@ -1,60 +1,68 @@
 # Engine-resolved commits — design
 
-Status: **target design**, not built (decision D4). It replaces the
-object-store `.ask` protocol of the earlier proposal, which two reviews
-rejected; it keeps that proposal's idea, a warm engine cache. It changes
-how a keyed write learns what it changed (`object-store-state.md` §6,
-"Compute a delta"), how a downstream attempt receives small pending
-windows, and what the worker does when no warm reader is available. It
-goes to one review with `lifecycle.md` (the worker → engine HTTP channel)
-and `per-key-processing.md` (new readers of the cache, §8).
+Status: **target design**, not built (decision D4), revised after the
+follow-up review. It replaces the object-store `.ask` protocol of the
+earlier proposal; it keeps that proposal's idea, a warm engine cache. It
+changes how a keyed write learns what it changed (`object-store-state.md`
+§6, "Compute a delta"), how a downstream attempt receives small pending
+windows, and what the worker does when no warm reader is available.
+
+It depends on two other designs, and says where:
+
+- `lifecycle.md` — the worker → engine HTTPS channel (§5), the `.worker`
+  claim that admits one invocation (§4), and the store kinds `immutable`,
+  `fenced` and `overwrite` (§9.6), which decide the repair rules of §3.
+- `per-key-processing.md` — the failure index and pattern edges, whose
+  readers live in this cache (§8). Its own semantics (rescoping,
+  cancellation, retry pacing, observations) belong to that doc.
 
 ## 1. Why
 
 A keyed write must know, for each key it writes, whether the key is new,
 changed or unchanged: the index records only real changes, the store writes
 only what must be written, and downstream consumers see only real changes.
-Today the worker answers that against the index on S3, and a worker is a
-cold reader.
+Today the worker answers that against the index on S3, and a worker is
+usually a cold reader.
 
 Measured at 100M keys in steady state (`bench/keys/results.md`, MinIO with
-30 ms injected per request and 80 MB/s per connection):
+30 ms injected per request and 80 MB/s per connection — not real S3):
 
-| 1K random keys, cold worker | GETs | Bytes read | Wall |
+| 1K random keys | GETs | Bytes read | Wall |
 |---|---|---|---|
-| lookup | 48 | 445 MB | 765 ms |
-| lookup + delta PUT | 50 + 1 PUT | 446 MB | 817 ms |
-| lookup, worker disk cache warm | 0 | 0 | 311 ms (decoding blocks) |
+| cold worker: lookup | 48 | 445 MB | 765 ms |
+| cold worker: lookup + delta PUT | 50 + 1 PUT | 446 MB | 817 ms |
+| warm worker (its disk cache holds every file): lookup | 0 | 0 | 311 ms, decoding compressed blocks |
 
 Most of the 445 MB is the tail of every file — its filters — fetched again
-on every commit to answer a question about 1,000 keys. The engine, by
-contrast, sees every index file come into existence: it writes compaction
-outputs and commits every delta. Index files are immutable, so a copy it
-keeps is never stale. A warm engine can answer the same question with no
-GETs.
+on every commit to answer a question about 1,000 keys. A warm worker
+removes the requests but still decodes a 64 KB block per lookup, and only
+`Local` placements and workers with a volume can be warm. The engine sees
+every index file come into existence: it writes compaction outputs and
+commits every delta. Index files are immutable, so a copy it keeps is
+never stale. The question this design must answer by measurement is how
+much a warm engine beats both rows above, not only the first.
 
 ## 2. The design in one paragraph
 
 The worker sorts what it intends to write and sends it to the engine with
-`POST /resolve`. The engine answers from its warm cache with the exact
+`POST …/resolve`. The engine answers from its warm cache with the exact
 delta and counts, computed purely from the snapshot the attempt pinned; it
 persists nothing and writes no object. The worker uploads the delta as its
-own delta file, takes the fence and applies today's repair rules, exactly
-as if it had computed the delta itself. If the engine cannot be reached,
-declines or is too slow, the worker resolves locally: a sparse exact
+own delta file and follows its store's write rules — repair, gate, fencing
+— exactly as if it had computed the delta itself. If the engine cannot be
+reached, declines or is too slow, the worker resolves locally: a sparse
 reader for small patches, a streaming merge-join for replacements and
 dense patches. The read planner is deleted. The same cache inlines small
 pending windows into downstream specs and serves the per-key readers.
 
 Correctness never depends on the resolver: its answer is a pure function
-of the pinned snapshot and the request, the worker could compute the same
-delta, and every durable decision — delta file, fence, result, journal —
-is made exactly where it is made today.
+of the pinned snapshot and the request, the worker can compute the same
+delta, and every durable decision — delta file, gate, result, journal — is
+made exactly where it is made without it.
 
 ## 3. Two questions per keyed output
 
-The earlier proposal let "the delta is empty" mean "write nothing". That
-is wrong after a dead attempt (review finding 1):
+A delta that is empty does not mean the store has nothing to write:
 
 ```
 committed           a=1
@@ -69,17 +77,45 @@ the first:
 
 1. **What changes in the index?** The delta: entries whose version differs
    from the pinned snapshot, deletions of live keys the write removes, and
-   exact `added` / `removed`. This is what the resolver computes, and what
+   `added` / `removed`. This is what the resolver computes, and what
    becomes the batch's delta file.
-2. **What must the store write?** The delta, plus repair. Today's rules,
-   unchanged and owned by the worker:
+2. **What must the store write?** Decided by the worker, by the store's
+   kind (`lifecycle.md` §9.6).
+
+**`immutable` stores** (FileStore, S3Store) write each key at its version
+under a new name and never overwrite. A dead attempt leaves only
+unreferenced objects, so there are no unsettled intents and no repair: the
+store writes the delta's upserts, and the commit records the delta.
+
+**`fenced` and `overwrite` stores** keep intents and repair, in this
+order — the order matters for `fenced` stores, and is today's for
+`overwrite`:
+
+```
+1. acquire       fenced: the store's generation for (output, scope), before reading anything
+                 (an older writer's open transaction finishes first; its later ones are refused)
+2. repair read   keys dead attempts meant to change and this patch does not mention:
+                 read back from the store, folded into the run
+3. resolve       the repaired run — by the engine or locally
+4. upload        the delta file, create-only
+5. gate          the attempt's `.writing` gate with its intents (both kinds keep it, lifecycle §9.6)
+6. write         under the store's checks: fenced, every transaction checks the generation
+```
+
+Repair reads before acquisition — what `_store_outputs` does today — would
+read `k=1` while an older transaction is about to commit `k=2`, and the new
+commit would then clear the intents with the index still saying `k=1`.
+Acquisition is a new store phase (`Store.acquire(scope)`, a no-op for
+other kinds); the `generation` is the lifecycle's.
+
+What those stores write:
 
 | Write | Unsettled intents | Store writes |
 |---|---|---|
 | Patch | none | the delta's upserts and removes |
-| Patch | some | first `_repair`: keys dead attempts meant to change and this patch does not mention are read back from the store and folded into the run *before* it is resolved. Then the delta, plus the patch's own keys that an intent touched (`own ∩ intended`), even when unchanged in the index |
+| Patch | some | the delta, plus the patch's own keys an intent touched (`own ∩ intended`), even when unchanged in the index; step 2 already folded in the intents' other keys |
 | Replacement | none | the delta's upserts and removes; the whole scope if the delta's key list was not collected |
-| Replacement | some | the whole scope. `_repair` does not run: it would keep stray rows the replacement means to remove |
+| Replacement | some | the whole scope. Step 2 does not run: it would keep stray rows the replacement means to remove |
 | `Sql` | — | the statement; the store reports its key map afterwards, resolved as a replacement |
 
 An output is **unchanged** — no store write, no new batch, head kept —
@@ -90,38 +126,81 @@ intents.
 
 ## 4. The resolver protocol
 
-`POST /api/attempts/{attempt}/resolve` on the worker → engine HTTPS channel
-of `lifecycle.md`, authenticated as that channel authenticates the attempt
-(its token is bound to the attempt and invocation). One request per
-attempt that has something to resolve, covering every output the worker
-wants resolved; outputs it resolves itself (big writes, `Sql`, unkeyed)
-are simply absent.
+**Route.** One project-scoped binary route on the lifecycle channel:
 
-**Request.** A binary body: a `u32` header length, a JSON header, then one
-payload per output.
+```
+POST /api/projects/{p}/attempts/{a}/resolve
+Content-Type: application/vnd.solera.resolve; version=1
+Authorization: Bearer {attempt token}
+```
+
+The token, invocation rule and retries are `lifecycle.md`'s (§4, §5.2);
+the framing, limits and validation below are this doc's. `lifecycle.md`
+§5.1 lists the route with a JSON body; the body is binary, and its row
+there should point here. One request per attempt that has something to
+resolve, covering every output the worker wants resolved; outputs it
+resolves itself (big writes, `Sql`, unkeyed, failure deltas, §8) are
+absent.
+
+**Framing.** `u8` protocol version · `u32` header length · JSON header ·
+payloads. A version the engine does not speak gets `415`, and the worker
+resolves locally.
+
+**Request.**
 
 ```json
-{"attempt": "01J9…", "invocation": "k3f…", "outputs": [
-  {"name": "orders", "scope": "", "batch": 12,
+{"invocation": "k3f…", "outputs": [
+  {"name": "orders", "scope": "", "kind": "patch", "batch": 12,
    "base": {"prefix": "keys/orders/_/", "head_batch": 11},
-   "kind": "patch", "keys": 1000, "offset": 0, "size": 41250, "digest": "9e07…"}
+   "keys": 1000, "offset": 0, "size": 41250, "digest": "9e07…"}
 ]}
 ```
 
 - The payload is the sorted run as a `.kx` file (`key-index-format.md`):
-  `(key, version, deleted)` with `deleted` for removes. One format, one
+  `(key, version, deleted)`, `deleted` for removes. One format, one
   parser, the CRCs included.
-- `base` binds the request to the pinned snapshot: the index (its prefix,
-  which survives renames) and the head's batch as pinned in the spec.
-  `batch` is the batch the delta will carry.
-- `digest` is the payload's XXH3-128, for deduplication.
+- `kind` is `patch` or `replace`: the same run means different deltas
+  (`{a: 1}` against `{a: 1, b: 1}` is empty as a patch and deletes `b` as
+  a replacement).
+- `base` names the snapshot the worker resolved against: the index (its
+  prefix, which survives renames) and the head's batch, as pinned in its
+  spec. `batch` is the batch the delta will carry.
+- `digest` is the payload's XXH3-128.
+
+**Validation.** The engine trusts nothing in the header it can check
+against the attempt's preparation, which it holds in memory for every
+live attempt (and rebuilds from `.spec` on adoption):
+
+- the invocation is the one the engine admitted (`lifecycle.md` §4: the
+  `start`ed one, or after a restart the one in `.worker`); any other gets
+  `409` and resolves nothing — it should not be running;
+- the attempt is live and holds the scope lock for `(name, scope)`;
+- `name`, `scope`, `batch` and `base.prefix` are the ones prepared for that
+  output, and `base.head_batch` is the head's batch now;
+- `kind` is allowed for the output (a `replace` of an output whose write
+  can only be a patch is refused).
+
+A mismatch is a per-output decline (`stale`, `not_live`, `invalid`), never
+a guess.
+
+**Deduplication.** Concurrent and repeated requests share one computation
+when their whole semantic input matches:
+
+```
+(attempt, invocation, name, scope, kind, batch, base.prefix, base.head_batch, digest)
+```
+
+The answer is a pure function of that tuple and the snapshot content,
+and the engine writes nothing, so a retry after a dropped connection or an
+engine restart gets the same answer or a decline. There is no request to
+freeze, no response to recover and no engine-written file to clean up.
 
 **Response.** Same framing: a header, then each resolved output's delta.
 
 ```json
 {"outputs": [
   {"name": "orders", "result": "delta", "added": 212, "removed": 3, "entries": 640,
-   "offset": 0, "size": 26810},
+   "file": {"size": 26810, "digest": "51aa…"}, "offset": 0},
   {"name": "events", "result": "empty"},
   {"name": "sessions", "result": "declined", "reason": "cold"}
 ]}
@@ -129,151 +208,196 @@ payload per output.
 
 - `delta`: the payload is the delta as a complete `.kx` file, ready to
   upload under the worker's own name `{batch:012d}-{attempt}`. The worker
-  checks its CRCs and footer, uploads the bytes, and builds `DeltaFiles`
-  from them with the header's `added` and `removed`, `exact: true`. A
-  response is capped at `resolve_max_bytes` (16 MB), so it is one file —
-  below the 64 MB split.
-- `empty`: the write changes nothing in the index. No file; `DeltaFiles([],
-  0, 0, exact=True)`. §3 decides whether that means "unchanged".
+  validates it — footer, index and block CRCs, filter CRC, its digest —
+  and decodes it once for its store selection (§3); it uploads the bytes
+  unchanged and builds `DeltaFiles` with the header's `added` and
+  `removed`, `exact: true`, and the file's `digest` (§5, candidates). A
+  response is capped at `resolve_max_bytes` (16 MB), so it is one file,
+  below the 64 MB split. The `.kx` format version travels in the file's
+  footer as today; the worker refuses a version it cannot read and
+  resolves locally.
+- `empty`: the write changes nothing in the index. No file;
+  `DeltaFiles([], 0, 0, exact=True)`. §3 decides whether that means
+  "unchanged".
 - `declined`: the worker resolves this output locally (§6), at once.
-  Reasons: `cold` (the snapshot is not fully in the cache), `busy` (queue
-  full), `too_big` (over the key, byte or replacement limits), `stale`
-  (`base` does not match the index the engine holds for that scope),
-  `not_live` (the attempt is not running, or does not hold that scope),
-  `corrupt` (a local copy and its S3 object both failed validation).
+  Reasons: `cold` (the snapshot is not warm), `busy` (queue full),
+  `too_big` (over the key, byte or replacement limits), `stale` (the head
+  moved), `not_live`, `invalid` (see validation), `corrupt` (a local copy
+  and its S3 object both failed validation).
 - Overload of the whole engine is `503` with no body; transport errors and
   timeouts count as declines.
 
 **Exact counts.** The engine resolves against full entries, never through
-filters, so `added` and `removed` are exact, and an engine-resolved commit
+filters, so `added` and `removed` are exact and an engine-resolved commit
 never increments `inexact`.
 
 **Which snapshot.** While an attempt is live it holds its scope lock: no
 other commit can change that index, and compaction and recounts change its
 files and count fields but not its content. The engine therefore resolves
-against the file set it currently holds for that scope, after checking
-that the attempt still holds the lock and that `base.head_batch` is the
-head's batch; the content is the pinned snapshot's even if compaction
-swapped files since prepare. It pins that file set for the duration of
-the resolve (§5).
+against the file set it currently holds for that scope, once validation
+passed, and pins that file set before any asynchronous work (§5); the
+content is the pinned snapshot's even if compaction swapped files since
+prepare.
 
-**Idempotent by construction.** The answer is a pure function of the
-snapshot content and the payload, and the engine writes nothing, so a
-retried or duplicated request — after a dropped connection, an engine
-restart, a second invocation of the same attempt — gets the same answer or
-a decline. Concurrent requests with the same `(attempt, output, digest)`
-share one computation. Requests that differ (two invocations writing
-different rows) are both answered; the fence decides which invocation
-writes, as today. There is no request to freeze, no response to recover
-after a restart, and no engine-written file to clean up — review findings
-2, 3 and 4 have nothing left to apply to.
-
-**Mixed attempts.** Each output is independent: one may be resolved by the
-engine, one declined and resolved by a streaming merge-join, one written
-by `Sql`, and the attempt commits them together. The worker uses exactly
-one answer per output, chosen before it uploads that output's delta.
+**Mixed attempts.** Each output is independent: one may be resolved by
+the engine, one declined and resolved by a streaming merge-join, one
+written by `Sql`, and the attempt commits them together. The worker uses
+exactly one answer per output, chosen before it uploads that output's
+delta.
 
 **Waiting.** The worker waits at most `min(resolve_timeout, remaining
-deadline)` — `resolve_timeout` is 5 s, a few times the slowest warm resolve
-we expect — and then resolves locally. A late response is dropped
-unread. Nothing the engine did needs undoing: it wrote nothing.
+deadline)` — `resolve_timeout` is 5 s — and then resolves locally. A late
+response is dropped unread; the engine wrote nothing.
 
-**Limits** (all to be set from the benchmark of §10, starting values):
+**Limits.** Absolute caps, with starting values; the measured thresholds
+are §6's:
 
 | Limit | Start | Applies to |
 |---|---|---|
 | `resolve_max_keys` | 100K run entries | patches |
-| `resolve_max_bytes` | 16 MB | request and response |
+| `resolve_max_bytes` | 16 MB | request and response bodies |
 | `resolve_max_entries` | 2M physical entries in the snapshot | replacements: the engine merges the run with every entry |
-| `resolve_queue_bytes` | 64 MB of queued payloads | admission; beyond it, `busy` |
-| `resolve_concurrency` | 2 | resolves in flight, on their own threads |
+| `resolve_queue_bytes` | 64 MB of queued payloads | admission; beyond it, `busy` at once |
+| `resolve_concurrency` | 2 | resolves in flight, on their own threads, apart from compaction's |
 
-The worker sends a patch only when it is under `resolve_max_keys` and a
-replacement only when the pinned count plus its run is under
-`resolve_max_entries`; the engine checks again.
+The worker sends a patch only under `resolve_max_keys` and a replacement
+only when the pinned count plus its run is under `resolve_max_entries`;
+the engine checks again.
+
+**Other resolver targets.**
+
+- **Source commits** (`commit_source`) run in the engine: they call the
+  same warm resolver in-process, with the same local fallback, and keep
+  today's optimistic head check before recording.
+- **Observations** (`lifecycle.md` §11) resolve against their source's
+  scope; validation uses the observation's memory-only claim instead of
+  `.worker`, and `base` is the source head's batch. Publication of their
+  deltas is the lifecycle's and per-key docs' subject.
+- **Failure indexes** are not resolve targets: failure deltas are resolved
+  by the worker (§8). The engine can answer a `lookup` of prior failure
+  records from a warm failure index, with the same framing.
 
 **Failure cases.**
 
 | Case | Outcome |
 |---|---|
 | Engine unreachable, restarting, or slow | Local resolve after the timeout; same delta, possibly an inexact count (§6) |
-| Worker dies after the response, before the fence | Nothing to clean: the engine wrote nothing; an uploaded delta is the worker's own and is discarded at attempt end as today |
-| Worker dies after the fence | Unsettled intents and repair, unchanged |
+| Worker dies after the response, before the gate | Nothing to clean on the engine; the uploaded delta is the worker's and is discarded at attempt end as today |
+| Worker dies after the gate | Unsettled intents and repair (overwrite, fenced); nothing for immutable stores |
 | Attempt canceled while a resolve runs | The resolve checks liveness when it starts and between chunks, and stops; its pins are released |
-| Compaction commits during a resolve | The resolve keeps the file set it pinned; GC waits for the pin |
-| Two invocations of one attempt | Both may be answered; one takes the fence |
+| Compaction commits during a resolve | The resolve keeps the file set it pinned; garbage collection waits for the pin |
+| A second invocation of the attempt | `409`: the engine admits one invocation (lifecycle §4) |
 | Local copy corrupt | Dropped, refetched from S3 and rebuilt; the request is declined `cold` meanwhile |
 
 ## 5. The engine cache
 
 One cache serves every reader on the engine: resolves, inlined windows,
 compaction (which reads what it just wrote), recounts, and the per-key
-readers (§8). It runs on the maintenance threads, never on the engine's
-event loop.
+readers (§8). It runs on maintenance threads, never on the engine's event
+loop.
 
 **Unit: an immutable file.** Entries are keyed by object path; a path is
-never reused, so an entry is never stale and never invalidated, only
-evicted. An index is "warm" when every file of the snapshot is present.
+never reused, so an entry is never stale, only evicted. An index is
+**warm** when every file of its snapshot is present.
 
-**Local form.** On disk, each file becomes `{name}.kxl`: its blocks
-decompressed, with a restart point every 16 entries (offset of a full,
-unshared key), and a header:
+**Identity of a file.** `FileInfo` gains `digest`: the XXH3-128 of the
+file's bytes, computed by whoever writes it (the worker for deltas, the
+engine for compaction outputs) and recorded with the file in the commit.
+The cache checks a fill against it, and candidates (below) are matched by
+it.
+
+**Local form.** On disk, each file becomes `{name}.kxl`:
 
 ```
-magic "KXL1" · source size · source footer CRC · blocks · per block: local offset, length, entries, CRC32C
+header     magic "KXL1" · format version · source path · source size · source digest
+directory  per block: first key, last key, local offset, length, entries, restart count,
+           CRC32C of the block's entries and restart table
+           CRC32C of header and directory together
+blocks     per block: decompressed entries, then its restart table (offsets of full keys, every 16 entries)
 ```
 
-A lookup binary-searches the block index (in RAM), then the block's restart
-points, then scans at most 16 entries: microseconds, where decoding a
-compressed 64 KB block costs ~0.45 ms. The S3 format does not change.
+A lookup binary-searches the directory (held in RAM), then the block's
+restart points, then scans at most 16 entries — where a cold or warm
+worker decodes a compressed 64 KB block (~0.45 ms). The S3 format does not
+change.
 
-**Integrity** (review finding 6). The source block's CRC covers compressed
-bytes and says nothing about the decompressed form, so the local form
-carries its own: CRC32C over each block's entries *and* its restart table.
-A block is verified each time it is read from disk (~10 µs for 128 KB);
-local files are written to a temporary name and renamed into place, so a
-crash leaves no half-written file under a real name. A mismatch drops the
-local file, refetches the source, validates it against its own CRCs and
-rebuilds; if the source fails too, the read fails with `corrupt`.
+**Integrity.** No byte of the local form is used unverified:
+
+- **The directory** — boundaries, offsets, lengths, counts and the source
+  identity — is covered by its own CRC32C, checked whenever the file is
+  opened: at fill, and on every reopen after an engine restart. A
+  corrupted first key would otherwise steer a lookup to a valid block of
+  the wrong range, and a live key would read as absent.
+- **A block** — its entries and restart table — is checked each time it
+  is read from disk (~10 µs for 128 KB). A lookup also checks the key
+  against the block's first and last key from the directory.
+- **Atomic publication**: a local file is written under a temporary name
+  and renamed, so a crash leaves no half-written file under a real name;
+  temporary files are deleted when the cache opens.
+
+A failure drops the local file, refetches the source, validates it against
+its own CRCs and its `digest`, and rebuilds; if the source fails too, the
+read fails with `corrupt`.
 
 **Budgets, separate:**
 
-- `cache_disk` (default 16 GB): local files. A 100M-key index in steady
-  state holds ~125M physical entries across its levels — not 100M — at
-  ~40 B decompressed: ~5 GB.
-- `cache_ram` (default 512 MB): block indexes of every local file (~0.01 B
-  per entry: ~1.3 MB at 100M), plus an LRU of hot decompressed blocks, plus
-  the inline summaries of §7 and §8. Filters are not cached: a warm reader
-  never needs them.
+- `cache_disk` (default 16 GB): local files, candidates, temporary files
+  and reservations. A 100M-key index in steady state holds ~125M physical
+  entries across its levels — not 100M — at ~40 B decompressed: ~5 GB
+  (estimated from the steady-state level sizes).
+- `cache_ram` (default 512 MB): directories of every local file (~0.01 B
+  per entry: ~1.3 MB at 100M), an LRU of hot decompressed blocks, and the
+  summaries of §7 and §8. Filters are not cached: a warm reader never
+  needs them.
 
 **Pins.** A reader pins the file set it reads; eviction skips pinned
 files. A reader that fetches from S3 is also a reader pin in the garbage
 order of `object-store-state.md` (pins and deletions by event position),
 so compaction cannot delete a file under a fill.
 
+**Reservations.** Every operation that adds bytes reserves them first,
+against `cache_disk`:
+
+| Operation | Reserves | Released |
+|---|---|---|
+| fill of a file | its decompressed size, estimated from entries × the index's mean raw entry size, plus 10% | when installed, or when the fill fails or is canceled (its temporary file deleted) |
+| compaction | its outputs' estimated size, while its inputs stay pinned by readers | when the outputs are installed and the inputs unpinned and evicted |
+| candidate | its delta's decompressed size (below) | when installed, dropped or evicted |
+
+A reservation that cannot be met evicts first (below). If eviction cannot
+make room, the operation runs without the cache: a fill is not started; a
+compaction installs nothing, and its index is **demoted** — marked cold,
+its files evictable like an inactive index's — so its writers decline
+`cold` until it is admitted again.
+
 **Fills, deduplicated.** One fill per path at a time; a second reader
 awaits the first. A fill streams the file in 8 MB segments, as the
 streaming merge-join does, and builds the local form as it goes. A resolve
 never waits on a fill: if its snapshot is not warm, it declines `cold` and
-queues fills for the missing files (if admission allows, below). The
-worker's local resolve and the engine's fill then run side by side once,
-and the next commit is warm.
+queues fills for the missing files, if the index is admitted. The worker's
+local resolve and the engine's fill then run side by side once, and the
+next commit is warm.
 
-**Write-through.** The engine never reads what it produced or saw:
+**Write-through.** The engine does not read back what it produced or saw:
 
 - compaction outputs are installed from the bytes the engine has in hand;
-- a resolve keeps the delta bytes it returned as a **candidate**, keyed by
-  `(attempt, output, size, CRC)`: present in the byte cache, invisible as
-  index state. When the attempt commits, the committed delta's size and CRC
-  match the candidate (the worker uploaded those exact bytes), and the
+- a resolve keeps the delta it returned as a **candidate**, keyed by
+  `(path the worker will use, size, digest)`: present on disk, invisible as
+  index state. The worker uploads exactly those bytes and its result's
+  `DeltaFiles` carries the same `digest`, so when the attempt commits the
   candidate becomes that file's local form without a GET. Candidates of
   attempts that end without committing are dropped;
-- deltas the engine did not produce (a local resolve, a source commit
-  resolved elsewhere) are fetched once at commit, on the maintenance
-  thread — they are small.
+- deltas the engine did not produce (a local resolve, a delta built
+  elsewhere) are fetched once at commit, on a maintenance thread — they
+  are small.
 
-**Admission and eviction** (review finding 10). An LRU over files thrashes
-on the simplest bad case:
+Candidates have their own sub-budget (`cache_candidates`, 1 GB of
+`cache_disk`): many attempts can finish resolving and then spend minutes
+writing their stores. Over budget, the oldest candidate is evicted; an
+evicted candidate costs one GET at commit, nothing else.
+
+**Admission and eviction.** An LRU over files thrashes on the simplest bad
+case:
 
 ```
 budget 6 GB; index A 5 GB, index B 5 GB; commits alternate A, B, A, B…
@@ -282,28 +406,34 @@ LRU: every commit evicts the other index and refills its own — 5 GB of GETs pe
 
 So the cache admits by index and evicts by file, with hysteresis:
 
-- An index is **admitted** when its snapshot fits beside the indexes
-  **active** within `cache_window` (default 15 minutes) — those that served
-  a reader in that window. Otherwise it stays cold: its writers resolve
-  locally, with no thrash.
-- Eviction takes files of inactive indexes first (least recently used),
-  then superseded files (inputs of a compaction, still pinned by no one),
-  and never files of an active index.
-- In the example, A is admitted and B declined; B's workers pay the cold
+- An index is **admitted** when its snapshot, plus a reservation for one
+  compaction's overlap (its largest level's size), fits beside the indexes
+  **active** within `cache_window` (15 minutes) — those that served a
+  reader in that window. Otherwise it stays cold: its writers resolve
+  locally, without thrash.
+- Eviction order: candidates past their budget, then files of inactive or
+  demoted indexes (least recently used), then superseded files (inputs of
+  a finished compaction, unpinned). Never pinned files, never files of an
+  active index.
+- An admitted index whose new snapshot no longer fits after a compaction
+  or growth is demoted, as above, and re-admitted under the same rule.
+- In the example, A is admitted and B declined; B's writers pay the cold
   path until A has been idle for the window. Two indexes that both fit are
   both warm.
 
 Block-granular eviction — keeping only the touched part of a big index —
-helps only clustered workloads and is deferred until a benchmark shows one.
+helps only clustered workloads and is deferred until a benchmark shows
+one; so are priorities between indexes.
 
 ## 6. The cold path, without the planner
 
 When the engine cannot answer, the worker resolves alone. Two readers,
 chosen by one rule each; `_plan_reads`, `_read_options`, `Cost`, the
-estimate and the CPU-rate options are deleted.
+estimate and the CPU-rate options are deleted, and no other cost model
+replaces them.
 
-**Sparse exact reader**, for small patches. Today's filtered path minus
-the planner:
+**Sparse reader**, for small patches — today's filtered path minus the
+planner:
 
 1. read every level small enough (≤ 32 MB) and every level-0 file whole,
    all at once, and resolve newest first;
@@ -315,31 +445,36 @@ the planner:
 4. read the blocks of the maybe keys, only in files whose key filter
    matched, all levels at once; each key takes its newest entry.
 
-The delta is exact. The count is exact unless a pair filter cleared a key
-behind a key-filter false positive (0.35% per check), which increments
-`inexact` as today. Dropping the pair-filter shortcut would make the count
-exact on this path too, at ~1.25 block reads per changed key instead of
-~0.01: ~1,250 more GETs for 1K keys at 100M, ~$0.0005 per commit. That is
-the price of removing recounts altogether; this design keeps them (§11).
+**Its contract:** the delta is exact; the count is exact unless a pair
+filter cleared a key behind a key-filter false positive (0.35% per check),
+which increments `inexact` as today. Nothing that decides correctness —
+scheduling, skipping, "unchanged" — reads the count. Dropping the
+pair-filter shortcut would make the count exact here too, at ~1.25 block
+reads per changed key instead of ~0.01: ~1,250 more GETs for 1K keys at
+100M, ~$0.0005 per commit. Indexes over the cache budget take this path on
+every commit, so the design keeps filters and recounts (§13).
 
 **Streaming merge-join**, for replacements and dense patches: the native
 job that full replacement, compaction and recount already use, extended to
 patches — it streams every level in 8 MB segments, merges them with the
-sorted run, and emits the delta as it goes. At 100M keys it reads 2.4 GB in
-371 GETs; memory is the buffers, whatever the size.
+sorted run, and emits the delta as it goes. Measured for a recount of a
+fresh 100M index (one level): 2.4 GB in 371 GETs, 14.1 s. A steady-state
+snapshot (~3.4 GB over three levels) and a patch merge are not measured
+yet; the patch merge adds a lookup per run key to the recount's work.
 
-**The crossover, measured.** A patch goes to the sparse reader, then
-switches at most once:
+**The crossover.** A patch goes to the sparse reader, and switches at
+most once, by two thresholds expressed in the quantities that decide it —
+physical snapshot size and distinct block reads:
 
-- **Before reading:** a patch denser than `stream_density` — run entries
-  per physical entry in the snapshot — streams directly. Every block will
-  be decoded anyway, and the tails and filter checks are wasted work.
-- **After the filters:** if the maybe keys' block reads exceed
-  `stream_reads` × the streaming read count (the snapshot's bytes / 8 MB),
-  stream instead of reading blocks. The tails already read are not
-  repeated: streaming reads index parts and data segments.
+- **Before reading:** a patch whose run is more than `stream_density` of
+  the snapshot's physical entries streams directly: nearly every block
+  will be decoded anyway, so the tails and filter checks are wasted.
+- **After the filters:** if the maybe keys need more distinct block reads
+  than `stream_reads` × the streaming read count (snapshot bytes / 8 MB),
+  stream instead. The tails already read are not repeated: streaming reads
+  index parts and data segments.
 
-Both constants come from one grid, run cold and warm:
+Both constants come from one grid, run cold, warm-worker and warm-engine:
 
 | Variable | Values |
 |---|---|
@@ -347,13 +482,13 @@ Both constants come from one grid, run cold and warm:
 | patch size | 1K, 10K, 100K, 1M keys |
 | share rewritten unchanged | 0%, 50%, 100% |
 | path | sparse, streaming, forced each way |
-| report | GETs, bytes, wall, CPU seconds, peak memory |
+| report | GETs, bytes, wall time, CPU seconds, peak memory |
 
-What we already have suggests where they land, but does not set them:
-1M keys into 10M (10% density) took 7.0 s reading the level whole and
-8.4 s through the filters; 100K keys at 100M with half unchanged took
-17.4 s and 7,395 GETs through the filters, against 371 GETs and ~14 s
-streaming.
+What we have suggests where they land, from other measurements: 1M keys
+into 10M (10% density) took 7.0 s reading the level whole and 8.4 s
+through the filters; 100K keys at 100M with half unchanged took 17.4 s
+and 7,395 GETs through the filters, where a streaming read of that index
+is 371 GETs.
 
 ## 7. Inlined downstream changes
 
@@ -367,8 +502,6 @@ instead of making the worker read deltas:
                        "next": null}}
 ```
 
-The rules (review recommendation 7):
-
 - **The pinned window, nothing newer.** The page merges exactly the delta
   files of batches `from…to` in the spec's pinned log, newest batch
   winning per key. A batch 58 committed after prepare is not in it, even
@@ -379,164 +512,252 @@ The rules (review recommendation 7):
   for a paged window, and the next attempt continues from `next` — inlined
   or not.
 - **A byte cap.** At most `inline_max_bytes` (1 MB) of serialized page; a
-  page that reaches it ends early with `next` set.
-- **Never waiting in prepare, on S3 or on disk.** Prepare reads only RAM:
-  at commit, on the maintenance thread, the engine keeps for each committed
-  delta that is small (≤ `inline_max` entries, 10K) its sorted entries in
-  RAM, within the `cache_ram` budget, until the consumers' watermarks pass
-  the batch. A window whose batches all have their summaries is merged in
-  RAM at prepare (a k-way merge of a few small sorted lists); a window
-  missing any summary — after a restart, or with a big batch — goes out as
-  today, and the worker pages it from the index.
+  page that reaches it ends early with `next` set. If the first entry
+  alone exceeds the cap, the window is not inlined at all — an empty page
+  with a cursor would not advance.
+- **Bounded work in prepare.** Prepare reads only RAM. At commit, on a
+  maintenance thread, the engine keeps for each committed delta of at most
+  `inline_max` entries (10K) its sorted entries as a **summary**, within
+  `cache_ram`, preferably until the consumers' watermarks pass the batch;
+  the budget evicts the oldest first. A window is inlined only when every
+  batch in it has a summary, it spans at most `inline_max_batches` (64)
+  summaries, and their entries total at most `inline_max_merge` (100K):
+  then prepare merges them (a k-way merge of small sorted lists). Anything
+  else — after a restart, a big batch, a lagging consumer with thousands
+  of batches — goes out as today, and the worker pages the window.
 
 ## 8. Readers for per-key processing
 
-`per-key-processing.md` adds three readers. Each is a maintenance-thread
-computation from the cache, published to the engine loop as a small
-record; none runs on the scheduling path, and none adds cached content
-beyond failure indexes (themselves ordinary indexes).
+`per-key-processing.md` adds three readers of this cache. Its semantics
+(what is eligible, when retry passes start, cancellation, rescoping) are
+that doc's; this section is how the cache computes them without ever
+suppressing required work.
 
-| Reader | When | Computes | If the input is not cached |
-|---|---|---|---|
-| Pattern match counts | per committed delta, per consuming edge with `include`/`exclude` | matching keys per (edge, batch), and the keys themselves when ≤ `inline_max` (they become that edge's inline summary, §7) | unknown: the window is launched, and the worker filters |
-| Failure index summary | after each commit of a failure delta | `due` (earliest `next_at`) and `epoch_min`, exact, by streaming the failure index's local form; failure indexes are small unless something fails systemically | lower bounds, as the per-key doc says; the worker that finishes a retry pass reports the exact values |
-| Due-retry page | when `due` passes, and after each failure commit | the next page of due entries (`next_at ≤ now`, `> retry.after`), held in RAM for prepare to inline | the spec pins the failure index and the worker pages through it |
+**Every summary carries its input identity, checked on publish and on
+use.** A summary is computed on a maintenance thread from a stated input,
+and the engine loop accepts it only if that input is still current:
 
-The same "never wait in prepare" rule applies: prepare uses these records
-if they are there.
+| Summary | Input identity |
+|---|---|
+| pattern match count | (upstream index prefix, batch, edge, pattern fingerprint) |
+| failure bounds `due`, `epoch_min` | (failure index prefix, its head batch, project epoch, retry pass id) |
+| due-retry page | the same, plus the pass position `retry.after` |
+
+A summary computed against failure head 10 that finishes after head 11
+was committed is discarded, not published; a pattern count computed under
+the old patterns is never used once the manifest changes them.
+
+**Commits keep conservative bounds synchronously.** The engine loop does
+not wait for a maintenance thread to learn what a commit changed:
+
+- A failure delta's commit carries, in the worker's result, the minimum
+  eligibility time of the entries it writes (a retry's `next_at`, now for
+  an interrupted key) and the outcome-count transitions (below). The
+  engine applies `due = min(due, that)` and the counts in the same commit,
+  so a newly due key is never stranded behind a slow summary.
+- A committed upstream batch without a published match count for an edge
+  is **unknown**: its window is launched, and the worker filters it.
+  Skipping a batch requires a published zero for the current pattern
+  fingerprint.
+- A worker that finishes a retry pass reports its bounds with the identity
+  it ran against; the engine applies them only for that identity, and
+  folds in commits since — as recounts do with `IndexRecounted`.
+
+**Incremental minima, not rescans.** A failure index under a systemic
+failure has 1M entries and is worked through in 10,000 pages; rescanning
+it after every page would visit ~5 billion entries. So `due` and
+`epoch_min` move by the entries each commit writes. A commit that removes
+or reschedules the entry holding the minimum marks the summary **dirty**:
+the bound stays where it was — conservative, so at worst a scope wakes
+early, finds its due page empty, and launches nothing — and one coalesced
+recomputation runs at most every `summary_interval` (60 s), or at the end
+of a retry pass, whichever is first.
+
+**One eligibility predicate.** Whether an entry is due — retrying or
+interrupted with `next_at ≤ now`, failed under an older epoch, or covered
+by a forced retry — is one native function, used by the engine's
+summaries and due pages and by the worker's paging. A new pass identity
+(a new epoch, a new forced request) restarts the pass from the beginning
+of the index, so keys before the old `retry.after` are covered.
+
+**Failure deltas are resolved by the worker.** The failure index is not a
+resolve target: an entry's next state depends on its previous one (tries,
+first failure, retry deadline), and a small page can target a cold
+million-entry index the engine has not admitted. For the page's keys, the
+worker:
+
+1. looks up their prior failure records **exactly** — values, not
+   verdicts: through the engine's `lookup` when the failure index is warm,
+   else locally (read whole up to 32 MB, else the sparse reader's block
+   reads with no pair-filter shortcut);
+2. computes each key's new record and its **outcome transition** (e.g.
+   `failed → retrying`, `retrying → ok` as a tombstone), which a key-index
+   delta cannot express: changing a record from `failed` to `retrying`
+   adds and removes nothing;
+3. uploads the failure delta and reports the transitions as count changes
+   (`{"failed": -1, "retrying": +1}`) in its result.
+
+Outcome counts in state change only by those transitions, never by
+`added`/`removed`. The per-key doc's entry format should use a varint for
+`tries` (a `u8` saturates for a record kept indefinitely).
+
+| Reader | Computes | If the input is not cached |
+|---|---|---|
+| Pattern match counts | per committed delta and consuming edge: matching keys, and the keys themselves when ≤ `inline_max` (they become the edge's inline summary, §7) | unknown: launch, the worker filters |
+| Failure bounds | `due`, `epoch_min`, incrementally (above) | the commit-time bounds stand; exact values at pass end |
+| Due-retry page | the next page of eligible entries after `retry.after`, held for prepare to inline under §7's caps | the spec pins the failure index and the worker pages it |
 
 ## 9. Costs
 
-Prices: GET $0.40 and PUT $5.00 per million, so **a PUT is 12.5 GETs**;
-storage $0.023/GB-month. Scenario E: 1K random changes every 10 s into
-100M keys, 259,200 commits a month, steady state, per commit:
+**Requests.** GET $0.40 and PUT $5.00 per million, so a PUT is 12.5 GETs.
+Scenario E: 1K random changes every 10 s into 100M keys, 259,200 commits a
+month, steady state, per commit:
 
 | | Today (measured) | Resolver, warm (projected) |
 |---|---|---|
 | Worker index GETs | 50 | 0 |
 | Worker index PUTs | 1 (delta) | 1 (delta) |
-| Engine index GETs | 0 | 0 (write-through) |
+| Engine index GETs | 0 | 0 (write-through; an evicted candidate costs 1) |
 | Compaction (simulated, `amplification.py`) | 1.18 GET + 0.144 PUT | same |
-| GET-equivalents | 50 + 12.5 + 1.18 + 1.8 = **65.5** | 12.5 + 1.18 + 1.8 = **15.5** |
-| Key index / month | $6.79 | **$1.60** |
-| Attempt + journal overhead / month | $6.69 | $6.69 (the lifecycle doc's subject) |
-| Total / month, with storage | $13.54 | **$8.35** |
+| GET-equivalents | **65.5** | **15.5** |
+| Key index requests / month | $6.79 | **$1.60** |
 
-The resolver adds no object requests; HTTP traffic within the region is
-free. Two costs it adds elsewhere:
+That is $5.18 a month saved on scenario E's requests, before the engine's
+added disk, CPU and network. Earlier drafts added today's $6.69 of attempt
+and journal overhead to both columns; that figure is the lifecycle doc's
+to re-estimate, not this one's.
 
-- **Cold fills.** One streaming read of a snapshot when an index is
-  admitted: ~430 GETs and ~3.4 GB at 100M in steady state — what seven of
-  today's commits cost in requests — once per admission, not per commit.
-- **The cold path when declined.** Unchanged from today's figures: ~50
-  GETs per 1K-key commit at 100M, ~371 GETs for a streaming patch.
+**Elsewhere:**
 
-**Latency and CPU, kept apart.** For a warm 1K-key resolve at 100M:
+- **Cold fills.** One streaming read of a snapshot per admission: ~430
+  GETs and ~3.4 GB at 100M in steady state (projected from the snapshot
+  size; the measured streaming read is the fresh index's 371 GETs and
+  2.4 GB).
+- **The cold path when declined.** Today's figures: ~50 GETs per 1K-key
+  commit at 100M; a streaming patch reads the snapshot.
+- **Network.** Requests and responses are ~40 KB and ~27 KB per 1K-key
+  commit. Within one availability zone that is free; across zones EC2
+  charges per GB in each direction (about $0.01/GB each way at today's
+  prices): ~17 GB a month for scenario E, ~$0.35. Placing workers in the
+  engine's zone avoids it.
 
-| | Today (measured) | Resolver (estimate, to measure) |
-|---|---|---|
-| Network | ~2 rounds of 30 ms, ~445 MB at 80 MB/s per request | 1 HTTPS round trip in region (~1–5 ms) with a ~40 KB request |
-| CPU | filter checks and block decoding inside the 765 ms | ~2.8 lookups per key × a few µs ≈ 10–20 ms on the engine |
-| Delta upload | 1 PUT, ~30 ms | same |
-| Time to delta | 765 ms | ~20–30 ms, then the PUT |
+**Latency and CPU, kept apart.** For a 1K-key lookup at 100M — every
+figure in the last column is a projection to measure:
 
-The CPU figure is an estimate from the local form's design, not a
-measurement; the benchmark below measures time to delta, engine CPU per
-resolve and engine RSS, separately.
+| | Cold worker (measured) | Warm worker (measured) | Resolver (projected) |
+|---|---|---|---|
+| Network | 2 rounds of 30 ms, ~445 MB at 80 MB/s per request | none | 1 HTTPS round trip in region (~1–5 ms), ~67 KB |
+| CPU | filter checks and block decoding, inside 765 ms | decoding a compressed block per lookup, inside 311 ms | ~2.8 lookups per key × a few µs ≈ 10–20 ms, if the touched blocks are in the page cache |
+| Time to delta | 765 ms | 311 ms | ~20–30 ms + the round trip |
+| then | 1 PUT, ~30 ms | same | same |
+
+"Warm" has two levels on the engine, measured separately: blocks in the OS
+page cache (the projection above), and blocks only on local SSD, where
+~2,800 random reads of ~128 KB each cost what the device's random-read
+rate allows — likely tens of milliseconds on NVMe, more on network disks.
+A 512 MB RAM budget does not make a 5 GB index resident; the benchmark
+reports both.
 
 ## 10. Tests and benchmarks
 
-- Engine-resolved and locally resolved deltas are byte-identical, with
-  equal counts, over random patches, removes, replacements, repairs and
-  compactions between prepare and resolve (property test against
-  `_python.py`).
-- Repair: the `a=1 → a=2 → a=1` sequence of §3 rewrites the store with an
+- **Equivalence.** Engine-resolved and locally resolved deltas decode to
+  the same entries (compressed bytes may differ); engine counts equal an
+  oracle's exact counts; the cold path's counts satisfy its contract
+  (`inexact` set exactly when a pair filter decided, and `added − removed`
+  off by at most the keys it decided). Over random patches, removes,
+  replacements, repairs and compactions between prepare and resolve.
+- **Repair.** The `a=1 → a=2 → a=1` sequence rewrites the store with an
   empty delta; a replacement with unsettled intents rewrites the scope;
-  "unchanged" only without intents.
-- Protocol: duplicate and concurrent requests share one computation; a
-  decline of each reason falls back locally; a timeout falls back and the
-  late response is dropped; `stale` after a head move; `not_live` after
-  cancel; mixed attempts (engine, local, `Sql`) commit together.
-- Cache: the alternating-indexes case stays warm for one and cold for the
-  other without refills; a corrupted local block is refetched; a
-  corrupted source fails `corrupt`; a candidate delta is installed without
-  a GET at commit; fills are deduplicated; pinned files survive eviction
-  and GC.
-- Inlining: inlined pages equal `pending` pages for the same pinned window,
-  including a later batch that must not leak in, tombstones, the byte cap
-  and the continuation cursor.
-- Benchmarks: the crossover grid of §6; warm resolves at 1K/10K/100K keys
-  into 1M/10M/100M — time to delta, engine CPU, RSS, cache disk; Scenario
-  E end to end, counting every request.
+  "unchanged" only without intents; for a fenced store, an older writer's
+  pending `k=2` lands before the repair read; immutable stores skip repair.
+- **Protocol.** Requests differing only in `kind` are not deduplicated;
+  identical ones are; a header naming another scope, batch or prefix is
+  declined; a second invocation gets `409`; each decline reason falls back
+  locally; a timeout falls back and the late response is dropped; an
+  unknown protocol version gets `415`; mixed attempts commit together.
+- **Cache.** The alternating-indexes case stays warm for one and cold for
+  the other without refills; a corrupted block and a corrupted directory
+  (a shifted first key) are both detected and refetched, including on
+  reopen after a restart; a corrupted source fails `corrupt`; a candidate
+  is installed without a GET at commit, and an evicted one costs one GET;
+  fills are deduplicated; failed and canceled fills release their
+  reservations; a compaction that cannot reserve demotes its index;
+  pinned files survive eviction and garbage collection.
+- **Summaries.** A summary computed against an older head is discarded; a
+  commit's bounds make a new due key schedulable before any summary runs;
+  a pattern change invalidates zero counts; a dirty minimum stays
+  conservative; outcome counts follow transitions, not `added`/`removed`.
+- **Inlining.** Inlined pages equal `pending` pages for the same pinned
+  window, including a later batch that must not leak in, tombstones, the
+  byte cap, an oversized first entry (no inline), the summary and merge
+  caps, and the continuation cursor.
+- **Benchmarks.** The crossover grid of §6; warm resolves at 1K/10K/100K
+  keys into 1M/10M/100M against the cold-worker and warm-worker baselines
+  — time to delta end to end, engine CPU, RSS, cache disk, with the page
+  cache dropped and not; scenario E end to end, counting every request.
 
 ## 11. What changes in the code
 
 - `solera/keys`: delete `_plan_reads`, `_read_options`, `Cost`,
   `_estimate` and the rate options; add the patch variant of the streaming
-  job and the two switch rules; keep filters and `inexact` for the sparse
-  reader.
-- `native/`: the local form (build, verify, lookup) and a resolve job over
-  it; the in-RAM window merge.
-- `solera_worker`: build the run after `_repair`; ask, wait, fall back;
-  upload the returned delta; the store-write selection of §3 unchanged.
-- `solera_server`: the `/resolve` route on the lifecycle channel; the
-  cache, its threads, admission and fills; candidates; inline summaries
-  and the per-key readers; `inline` in prepare.
+  job and the two switch rules; `FileInfo.digest`; keep filters and
+  `inexact` for the sparse reader.
+- `native/`: the local form (build, verify, lookup), a resolve job over
+  it, the in-RAM window merge, the shared eligibility predicate.
+- `solera_worker`: the phases of §3 (`acquire` before repair reads);
+  build the run; ask, wait, fall back; validate and upload the returned
+  delta; failure deltas with exact prior lookups and outcome transitions.
+- `solera_server`: the resolve route and its validation; the cache, its
+  threads, reservations, admission and demotion; candidates; summaries
+  with input identities; commit-time bounds; `inline` in prepare.
 - Docs: §6 "Compute a delta" and "Deliver pending deltas" in
-  `object-store-state.md`; `key-index-costs.md`.
+  `object-store-state.md`; `key-index-costs.md`; the route's row in
+  `lifecycle.md` §5.1.
 
 ## 12. Not in this design
 
-- **The canonical row digest** of the earlier proposal (one encoding for
-  Python and Arrow rows) is independent of resolution. It is being built
-  with `Rows` grouping by the native work in flight, and belongs in its own
-  spec next to that code (`row-digest.md`), together with the group
-  production `per-key-processing.md` §6 defines; that doc's references to
-  the grammar should move there. The review's requirements stand for it: a versioned byte grammar
-  with framing for rows and structs (the Arrow struct framing is fixed
-  already), nanosecond timestamps, dates distinct from timestamps, decimal
-  normalization, missing versus null fields, no automatic pickle fallback,
-  and golden vectors across Python and Arrow. `per-key-processing.md`
-  should point there for its group production.
+- **The canonical row digest** of the earlier proposal is independent of
+  resolution and belongs in its own spec next to its code
+  (`row-digest.md`), with the group production `per-key-processing.md`
+  defines. The first review's requirements stand for it: a versioned byte
+  grammar with framing for rows and structs, nanosecond timestamps, dates
+  distinct from timestamps, decimal normalization, missing versus null
+  fields, no automatic pickle fallback, and golden vectors across Python,
+  Arrow and SQL.
 - **An object-store channel** for resolves. Workers can always reach the
   engine over HTTPS; a worker that cannot simply resolves locally.
+- **Observation publication, rescoping, cancellation and retry pacing** —
+  `per-key-processing.md` and `lifecycle.md`.
 
 ## 13. Where this departs from the reviews
 
-- **No frozen request per attempt** (finding 4 asked for one, with
-  conflicting retries rejected). The resolver persists nothing and decides
-  nothing, so two different requests for one attempt are harmless: each
-  gets a correct answer for its own rows, and the fence picks the writer.
-- **Resolve against the current file set, not the pinned manifest**
-  (finding 6 asked for the manifest). Under the scope lock they have the
-  same content, and the current files are the warm ones; `base` and the
-  lock check make a moved head a `stale` decline rather than a wrong
-  answer.
-- **Filters and recounts stay** (recommendation 9 removes them if every
-  path is exact). The sparse reader's pair-filter shortcut is what keeps
-  a declined or over-budget index at ~50 GETs per small commit instead of
-  ~1,300, and indexes over the cache budget take that path on every
-  commit.
+The follow-up review agrees with all three.
+
+- **No frozen request per attempt.** The resolver persists nothing and
+  decides nothing, so a retried request needs no stored answer: it is
+  recomputed, or deduplicated while in flight.
+- **Resolve against the current file set, not the pinned manifest.**
+  Under the scope lock they have the same content, and the current files
+  are the warm ones; validation and pinning before any asynchronous work
+  make a moved head a `stale` decline rather than a wrong answer.
+- **Filters and recounts stay.** The sparse reader's pair-filter shortcut
+  keeps a declined or over-budget index at ~50 GETs per small commit
+  instead of ~1,300, and approximate counts never decide correctness.
 
 ## 14. Open questions
 
-1. **Limits and constants**: `resolve_max_keys`, `resolve_max_entries`,
-   `stream_density`, `stream_reads`, `resolve_timeout` — set from the
-   benchmark, or derived from the snapshot (e.g. relative to its block
-   count)?
-2. **Admission policy**: is "fits beside the indexes active in the last
-   15 minutes" enough, or do we need priorities (an index whose writers
-   commit every 10 s over one written hourly)?
-3. **Engine capacity**: at what commit rate does the single engine's
-   resolve CPU or disk become the bottleneck, and is the planned
-   `engine_executor` (`object-store-state.md` §6) the place to offload
-   resolves as well as compaction — with the cache moving along?
-4. **Source commits** resolve in the engine process already; should they
-   use the warm cache directly (exact counts) and decline to today's
-   in-process cold path like a worker would?
-5. **`.kx` as the response format** spares the worker an encode, but ties
-   the uploaded bytes to the engine's encoder. Should the worker re-encode
-   instead, so its delta files never depend on the engine's build?
-6. **Coordination with `lifecycle.md`**: route, authentication, and the
-   invocation token are that doc's; this one assumes a request/response
-   route on the attempt's channel with a body up to 16 MB.
+1. **Thresholds.** `stream_density`, `stream_reads`, `resolve_max_keys`,
+   `resolve_max_entries` and `resolve_timeout` from the grid of §6; the
+   absolute caps stay regardless.
+2. **Engine capacity.** No rate threshold is credible before the local
+   form is measured. Resolves, summaries and compaction have separate
+   threads; if offloading becomes necessary, the cache and all its readers
+   move together into `engine_executor` (`object-store-state.md` §6),
+   rather than a second cache-owning service.
+3. **Page cache vs SSD.** Whether a 100M-key index needs its hot blocks in
+   RAM (a bigger `cache_ram`) to beat a warm worker, or SSD reads suffice.
+4. **With `lifecycle.md`:** the route's row in §5.1 (binary, versioned,
+   per this doc); the observation claim used for validation (§11 there);
+   `Store.acquire` as the fenced stores' acquisition phase; and whether
+   failure deltas join the gate's intents (they are engine metadata, not
+   store data).
