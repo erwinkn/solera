@@ -17,6 +17,8 @@ from urllib.parse import quote
 
 import obstore
 
+from ..objects import create
+
 RANGE = 16 * 2**20  # large reads are split into ranges of this size, fetched in parallel
 
 
@@ -184,7 +186,7 @@ class ObjectIO:
 
     async def write(self, path: str, data: bytes) -> None:
         async with self._sem:
-            await obstore.put_async(self.store, path, data, mode="create", use_multipart=False)
+            await create(self.store, path, data)
             self.metrics.puts += 1
             self.metrics.bytes_out += len(data)
             await self._delay(len(data))

@@ -30,6 +30,7 @@ from urllib.parse import quote, unquote, urlsplit
 import obstore
 from obstore.exceptions import NotFoundError
 from obstore.store import LocalStore, MemoryStore
+from solera.objects import create
 
 from .journal import Fenced, Journal
 from .model import Model
@@ -225,7 +226,9 @@ class State:
         await obstore.put_async(self.objects, key, value, mode="overwrite", use_multipart=False)
 
     async def create_object(self, key: str, value: bytes):
-        await obstore.put_async(self.objects, key, value, mode="create", use_multipart=False)
+        """Raises `AlreadyExistsError` if another writer's object is at `key`."""
+
+        await create(self.objects, key, value)
 
     async def get_object(self, key: str) -> bytes | None:
         try:

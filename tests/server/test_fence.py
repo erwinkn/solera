@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import json
 
+import pytest
 from solera.executors import Environment
 from solera.sdk import Output, Project, Ref, Retry, asset
 from solera.stores import FileStore, Keys, Patch, Written
@@ -366,5 +367,45 @@ async def test_a_retry_puts_back_what_a_dead_keyed_write_half_did(tmp_path, data
     assert len(detail["attempts"][detail["tasks"][0]["id"]]) == 2  # it died, and the retry committed
     assert state.model.unsettled == {}
     assert {p.name: p.read_text() for p in (data / "scores").iterdir()} == {"a.json": "1", "b.json": "1"}
+    await engine.stop()
+    await state.close()
+
+
+async def test_a_create_whose_response_was_lost_is_its_own(tmp_path, monkeypatch):
+    """Every create-only write lands but loses its response, so its retry
+    finds the object there — the spec, the delta file, the write fence,
+    the journal. Each holds the writer's own bytes, so each is a success:
+    the worker writes and commits rather than taking itself for aborted."""
+
+    import obstore
+    from obstore.exceptions import AlreadyExistsError
+    from solera.objects import create
+
+    put = obstore.put_async
+    retried = []
+
+    async def unheard(store, path, data, **kw):
+        await put(store, path, data, **kw)
+        if kw.get("mode") == "create":
+            retried.append(path.rsplit(".", 1)[-1])
+            await put(store, path, data, **kw)  # the retry: AlreadyExists
+
+    monkeypatch.setattr(obstore, "put_async", unheard)
+
+    @asset(outputs=Output("scores", keyed=True))
+    def scores():
+        return {"a": 1, "b": 2}
+
+    project = Project(assets=[scores])
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = engine_for(state, project, placement="inline")
+    await engine.initialize()
+    detail = await engine.run_until((await engine.submit(["scores"]))["id"], 10)
+    assert detail["request"]["status"] == "succeeded", detail
+    assert {"json", "kx", "writing"} <= set(retried)
+    assert state.model.heads[("scores", "")]["count"] == 2 and state.model.unsettled == {}
+    with pytest.raises(AlreadyExistsError):  # another writer's object is still a collision
+        await create(state.objects, f"{state.attempt_path(detail['request']['id'], 'x')}.writing", b"a")
+        await create(state.objects, f"{state.attempt_path(detail['request']['id'], 'x')}.writing", b"b")
     await engine.stop()
     await state.close()

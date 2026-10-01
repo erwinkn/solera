@@ -50,6 +50,7 @@ from dataclasses import dataclass
 
 import obstore
 from obstore.exceptions import AlreadyExistsError, NotFoundError
+from solera.objects import create
 
 log = logging.getLogger(__name__)
 
@@ -193,7 +194,7 @@ class Journal:
             fence = {"type": "WriterStarted", "writer": seq}
             body = {"seq": seq, "writer": seq, "at": self.clock(), "events": [fence]}
             try:
-                await obstore.put_async(self.store, self._segment(seq), _dumps(body), mode="create")
+                await create(self.store, self._segment(seq), _dumps(body))
             except AlreadyExistsError:
                 # Another writer appended since we listed: apply it and try the next seq.
                 self._apply_segment(seq, await self._get_json(self._segment(seq)), apply)
@@ -301,14 +302,9 @@ class Journal:
     async def _put_segment(self, seq: int, data: bytes) -> None:
         for attempt in range(5):
             try:
-                await obstore.put_async(self.store, self._segment(seq), data, mode="create")
+                await create(self.store, self._segment(seq), data)  # or finds our own earlier try
                 return
             except AlreadyExistsError:
-                # Either our own earlier try succeeded without us hearing back, or
-                # another writer took this seq: only the first is ours.
-                existing = await obstore.get_async(self.store, self._segment(seq))
-                if bytes(await existing.bytes_async()) == data:
-                    return
                 self.fenced = True
                 raise Fenced(f"segment {seq} was written by another writer") from None
             except (OSError, TimeoutError, ConnectionError) as error:
@@ -319,7 +315,7 @@ class Journal:
 
     async def _write_checkpoint(self, seq: int, data: bytes) -> None:
         try:
-            await obstore.put_async(self.store, self._checkpoint(seq), data, mode="create")
+            await create(self.store, self._checkpoint(seq), data)
         except AlreadyExistsError:
             return
         self._checkpoints.append(seq)

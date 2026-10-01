@@ -30,8 +30,10 @@ import traceback
 import typing
 from pathlib import Path
 
+from obstore.exceptions import AlreadyExistsError
 from solera.keys.index import DeltaFiles, FileInfo, IndexState, KeyIndex, key_bytes, key_str
 from solera.keys.io import ObjectIO, key_cache
+from solera.objects import create
 from solera.sdk import (
     UNSET,
     Asset,
@@ -104,19 +106,6 @@ async def _put(objects, key: str, value: bytes):
     import obstore
 
     await obstore.put_async(objects, key, value, mode="overwrite", use_multipart=False)
-
-
-async def _create(objects, key: str, value: bytes) -> bool:
-    """Create-only PUT: False if the object already exists."""
-
-    import obstore
-    from obstore.exceptions import AlreadyExistsError
-
-    try:
-        await obstore.put_async(objects, key, value, mode="create", use_multipart=False)
-    except AlreadyExistsError:
-        return False
-    return True
 
 
 async def _get(objects, key: str) -> bytes | None:
@@ -772,11 +761,14 @@ async def _attempt(objects, objects_url: str, base: str, spec: dict, entrypoint,
         )
 
     async def fence(intents: dict):
-        """Take the write fence (§8), or learn that the engine aborted us."""
+        """Take the write fence (§8), or learn that the engine aborted us. A
+        fence holding our own bytes is ours: a try that landed unheard."""
 
         body = json.dumps({"state": "writing", "intents": intents}).encode()
-        if not await _create(objects, f"{base}.writing", body):
-            raise Aborted(spec["attempt"])
+        try:
+            await create(objects, f"{base}.writing", body)
+        except AlreadyExistsError:
+            raise Aborted(spec["attempt"]) from None
         timeline.add("writing")
 
     try:

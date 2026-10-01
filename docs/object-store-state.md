@@ -14,6 +14,12 @@ infrastructure.
   `LIST` (lexicographic, with or without a delimiter), `DELETE`. No
   compare-and-swap: obstore's `file://` backend does not implement it
   (verified on 0.11.1), so nothing may depend on it.
+- **A create can land unheard.** The object is written, the response is
+  lost, and the retry finds it there. So every create-only write that
+  decides something — a journal segment, a spec, a delta file, a write
+  fence — reads back an object in its way: holding exactly the bytes being
+  written, it is the writer's own earlier try, and the write succeeded
+  (`solera.objects.create`). Only different bytes are another writer's.
 - **One writer per namespace.** The engine's in-memory state is the source
   of truth; storage is written to, and read only when a writer starts.
 - **The engine owns keys; stores own rows.** Every key → version index,
@@ -662,8 +668,9 @@ decides it:
 
 - The harness creates it — `{"state": "writing", "intents": {…}}`, listing
   the delta files of the keys it is about to change — before its first
-  store write. If it already exists, the engine got there first: the
-  harness writes nothing and exits.
+  store write. If it already exists with other contents, the engine got
+  there first: the harness writes nothing and exits. Its own contents mean
+  its own earlier try landed: the fence is its.
 - The engine creates it — `{"state": "aborted"}` — before it cancels, times
   out or fails a launched attempt. If it already exists, the harness is
   writing: the engine waits for it and commits its result, even on a
