@@ -198,43 +198,49 @@ store.store(Patch({a: …, b: …}, remove=[e]))      one write per output
 commit: delta files · watermark → batch 42 · failure index: +c, +d
 ```
 
-> **Held.** This cancel protocol contradicts `lifecycle.md` §7, where a
-> cancel takes the abort gate at once and an aborted attempt writes no
-> result. It waits on the lifecycle's two-phase cancel (a bounded
-> "cancel requested" drain, then a forced abort) and on Erwin's scope
-> decision; the reviews also ask that an explicit cancel not resume itself
-> through immediately due `interrupted` keys, and that timeouts be bounded.
-> The text below is the intent, not the protocol.
+**Cancel and timeout keep finished keys.** They follow the attempt's
+two-phase cancel (`lifecycle.md` §7); for a per-key page the phases are:
 
-**Cancel and timeout keep finished keys.** The engine sends the cancel to
-the worker over the HTTP channel; the worker:
-
-1. stops starting keys, and cancels the calls in flight (an `async` call
-   is cancelled; a thread is abandoned and its result ignored);
-2. writes the keys that finished — one store write per output, one commit,
-   as for a whole page;
-3. records every key it did not finish in the failure index as
-   **interrupted**, due immediately, its `tries` unchanged.
+1. **Cancel requested.** The engine latches the cancel and answers
+   `cancel: "requested"` to the worker's next beat. The worker stops
+   starting keys and cancels the calls in flight (an `async` call is
+   cancelled; a thread is abandoned and its result ignored). Then, within
+   `cancel_grace` (60 s by default, per asset), it **drains**: it writes
+   the keys that finished — one store write per output, as for a whole
+   page — records the keys it did not finish as **interrupted** in the
+   failure delta, and publishes all of it as one `.result` with
+   `status: canceled`. The engine commits outputs, failure delta and
+   watermark as one journal decision.
+2. **Forced abort,** after `cancel_grace` without a result. The engine
+   cancels at the provider and ends the attempt, taking `.writing` as
+   `aborted` first for a gated store; a late drain result is refused.
+   Nothing of the page commits and it is delivered again — unless the
+   worker already held the gate, in which case the attempt ends with
+   `writes: uncertain` and repair applies (`lifecycle.md` §9.5). Only a
+   worker that cannot drain in time loses finished work.
 
 Finished keys need not be a key-order prefix of the page — with
 `concurrency=16`, `a c d` may finish while `b` is still reading. So the
 watermark does not stop at the first unfinished key: it moves past the
 whole page, exactly as on success, and the holes are carried by the
-failure index instead. The next run takes the interrupted keys as a retry
-page (§9) at their current upstream revision.
+failure index instead.
 
 ```
-page: a b c d e(deleted)   cancel while b, d are in flight
+page: a b c d e(deleted)   cancel requested while b, d are in flight
 store.store(Patch({a: …, c: …}, remove=[e]))
-commit: watermark → past e · failure index: +b interrupted (due now), +d interrupted (due now)
+.result status: canceled → one commit: watermark past e · failure index +b, +d interrupted
 ```
 
-If the worker had already taken the fence when the cancel arrived,
-today's rule stands: the write completes and commits. If the worker does
-not answer within the grace, the engine takes the fence itself as today:
-nothing commits and the page is delivered again — only a dead or
-unreachable worker loses finished work. The attempt ends `canceled` (or
-`timed out`) with the outputs it committed.
+What happens to the holes depends on why the page stopped:
+
+| Interrupted by | Recorded as | Runs again |
+|---|---|---|
+| an explicit cancel | `canceled`, not due | only when a later run is requested for it: `solera retry` (or a forced retry), or a new change of the key upstream. A run the user stopped does not resume itself. |
+| a timeout | `timed out`, `tries + 1`, due after the retry backoff (§8) | by the retry clock (§9); once `tries` passes the asset's `retries=`, the key becomes `failed`, so a key that always outlives the timeout stops cycling |
+
+The attempt ends `canceled` or `timed out`, with the outputs it
+committed; an attempt timeout stays retryable within `retries=`, as
+today.
 
 ## 6. Every key is a group
 
@@ -446,12 +452,12 @@ outcome u8 · tries varint · epoch varint · since varint · last varint · nex
 
 | Field | |
 |---|---|
-| `outcome` | rejected, failed, retrying, interrupted (§5, held) |
+| `outcome` | rejected, failed, retrying, canceled, timed out (the last two are interrupted keys, §5) |
 | `tries` | calls at this `revision`; a varint, since a record can outlive any fixed width |
 | `epoch` | the project revision number (§13) of the last try |
 | `since` | first failure at this `revision` |
 | `last` | time of the last try |
-| `next_at` | when a retrying or interrupted key is due |
+| `next_at` | when a retrying or timed-out key is due |
 | `until` | when a retrying key turns failed: `since + retry_for` |
 | `revision` | the upstream version that failed |
 | `message` | class and message of the last error |
@@ -479,6 +485,8 @@ intents, and an attempt that never commits leaves it as garbage.
 | none, or a record at another `revision` → not ok | a fresh record: `tries = 1`, `since = last = now` |
 | retrying → `Transient` again | `tries + 1`, `since` and `until` kept, `next_at` by backoff or `retry_after`; failed once `now ≥ until` |
 | failed or rejected → the same class again | `tries + 1`, `epoch` and `last` updated |
+| any → interrupted by a cancel | `canceled`, `tries` unchanged, no `next_at` |
+| any → interrupted by a timeout | `timed out`, `tries + 1`, `next_at` by backoff; `failed` once `tries` passes `retries=` |
 | any → another class | the new class, `tries + 1`, `since` kept; `until` set when it becomes retrying |
 
 **Counts move by explicit transitions.** Changing an entry from failed to
@@ -495,8 +503,8 @@ failure count:
 
 ```
 Failures  index: KeyIndex
-          counts: {rejected, failed, retrying, interrupted}       exact (transitions)
-          due_min                                                 ≤ every retrying or interrupted next_at
+          counts: {rejected, failed, retrying, canceled, timed_out}   exact (transitions)
+          due_min                                                 ≤ every retrying or timed-out next_at
           epoch_min                                               ≤ every failed entry's epoch
           forced: {id, classes, at}?                              an operator's `solera retry`
 ```
@@ -507,32 +515,33 @@ that a scope has retries and by the worker to select them:
 ```python
 def eligible(entry, now, epoch, forced) -> bool:
     return (
-        (entry.outcome in (RETRYING, INTERRUPTED) and entry.next_at <= now)
+        (entry.outcome in (RETRYING, TIMED_OUT) and entry.next_at <= now)
         or (entry.outcome == FAILED and entry.epoch < epoch)                  # one try per deploy
         or (forced is not None and entry.outcome in forced.classes and entry.last < forced.at)
     )
 ```
 
 Each clause retires itself: a retried key's `next_at` moves on, its
-`epoch` becomes current, its `last` passes `forced.at`. None loops.
+`epoch` becomes current, its `last` passes `forced.at`. None loops. A
+`canceled` key matches no clause but the forced one: only a request
+brings it back.
 
 **Minima are conservative and maintained incrementally.** `due_min` and
 `epoch_min` are lower bounds. Each commit lowers them from the entries it
 wrote (`min(due_min, next_at)` for each), which is O(page). Removing the
 entry that held a minimum leaves the bound too low — a scope may then
 start a retry pass that finds nothing, which is safe — and marks the
-summary dirty. Exact values come from two places, never from a rescan per
-commit:
+summary dirty. Exact values come only from **a completed retry pass**
+(below), which reports the minima over what it read — never from a rescan
+per commit. The report carries its **identity** — the failure index head
+it read — and is applied as the minimum of its value and every commit's
+bound since that head, the rule recounts already follow, so it can never
+erase a key that a newer commit made due.
 
-- **a completed retry pass** (below) reports the minima over what it read;
-- **a coalesced recomputation** from the engine cache, on the maintenance
-  thread, at most once per `failure_summary_interval` (1 min) while dirty.
-
-Either is published with its **identity** — the failure index head it
-read — and applied as the minimum of its value and every commit's bound
-since that head, the rule recounts already follow. An older summary
-finishing last can therefore never erase a key that a newer commit made
-due.
+*Later:* a coalesced recomputation from the engine cache, on the
+maintenance thread, at most once a minute while dirty, under the same
+identity rule. v1 does without it: a too-low bound costs at most one
+retry pass that finds nothing.
 
 **When retries come due.** An `Each` asset normally runs when its upstream
 changes. A retrying key needs its own clock, or a quiet afternoon would
@@ -542,7 +551,7 @@ never retry it:
 10:00  c raises Throttled(retry_after=60)       → c retrying, next_at 10:01; due_min = 10:01
 10:01  no new events; icp(site=oakland) has due_min ≤ now
        → the engine starts a run of that asset and scope with a retry page [c]
-       → c ok → tombstone; due_min stays 10:01 (dirty) until recomputed
+       → c ok → tombstone; due_min stays 10:01 (dirty) until the pass completes
 ```
 
 A scope has retries when `due_min ≤ now`, `epoch_min < epoch`, or a
@@ -642,9 +651,15 @@ patterns (named, so `explain` can say which rule) or a list. They apply to
 `Each` and `Incremental` alike, and compile to one native matcher shared
 by engine and worker.
 
-**The worker is authoritative.** It filters every page it reads, so
-correctness never depends on what the engine knew. **The engine evaluates
-patterns only to skip work**, and only from what it already holds:
+**The worker filters.** It filters every page it reads, so correctness
+never depends on what the engine knew. In v1 the engine does not evaluate
+patterns: a window with changes launches an attempt, and a page whose
+keys all fall outside the patterns ends `skipped` after advancing the
+watermark.
+
+*Later: engine-side skip hints.* An optimization once wasted launches are
+measured; the engine would evaluate patterns only to skip work, and only
+from what it already holds:
 
 1. **Pruning.** Each include pattern has a literal prefix
    (`ICP/Results/`). A delta file whose `[min, max]` key range misses every
@@ -665,9 +680,9 @@ patterns only to skip work**, and only from what it already holds:
    unknown — after a restart, or a delta never cached — is launched, and
    the worker filters it.
 
-The engine never waits on S3 to decide, and never scans an index. A
-consumer that cares about one site matches nothing in the others: those
-scopes are skipped at commit time.
+With the hints, the engine never waits on S3 to decide and never scans an
+index, and a consumer that cares about one site would skip the others at
+commit time instead of launching for them.
 
 **A pattern change is a key-set diff, not a reset** — taken in three
 steps around a **cutover batch**, so that no pending change is judged by
@@ -778,12 +793,13 @@ a second or two of imports per tick), or a `Pool` for tight intervals,
 whose long-lived workers keep the project imported — the shape of
 Dagster's code server.
 
-> **Held.** The launch path below — observations without `.spec` or
-> `.result` — waits on Erwin's scope decision: one review would ship
-> observations as ordinary attempts first, which removes most of the
-> extra protocol (ownership without `.worker`, invocation-specific upload
-> names, first-report settlement, orphan collection). The cost targets
-> stand either way.
+> **Held.** Erwin chose the lightweight path, generalized as a sensor
+> primitive: ticks run in a warm sensor host and land through the
+> existing source-commit and run-submission APIs, not as attempts.
+> `lifecycle.md` §11 is being rewritten to define it; the launch path
+> below predates that and will be aligned to it. The semantics above —
+> what `observe()` returns, what "unchanged" means, cursor-only commits —
+> stand.
 
 **An unchanged observation is cheap.** Under the HTTP lifecycle, an
 observation needs none of an attempt's durable objects until it changes
@@ -867,7 +883,7 @@ is below the current one.
   admitted to its cache (exact counts, no index reads on the worker), and
   the cold path otherwise. Failure deltas are always resolved by the
   worker itself (§9). The worker uploads both.
-- Pattern evaluation, inlined retries and "is this observation a change"
+- Inlined retries, "is this observation a change" and, later, pattern hints
   are all answered from the one warm engine cache, which `resolved-commits`
   builds anyway; this proposal adds readers, not a cache.
 - The failure index is an ordinary key index: format, compaction, cache,
@@ -909,7 +925,7 @@ is below the current one.
 | Work | What this proposal needs from it |
 |---|---|
 | Key index (`object-store-state.md` §6) | No format change. A new kind of index (`keys/@{asset}/{scope}/`, the failure index) compacted like the others; `Rows` groups every key (§6), with `Store.key_rows` and the digest grammar — the native thread's current work; patches build `Rows`. |
-| Engine cache (`resolved-commits.md`, being rewritten) | New readers on the maintenance thread: pattern counts at commit, failure-index `due`, inlined retry keys. No new cached content beyond failure indexes. |
+| Engine cache (`resolved-commits.md`, being rewritten) | New readers: inlined retry keys in v1; pattern counts at commit and failure-summary recomputation later. No new cached content beyond failure indexes. |
 | HTTP resolver (`resolved-commits.md`) | Each pages' output deltas are small resolves when the index is admitted; failure deltas are resolved locally, not by the resolver (its §8 readers should follow §9 here: one eligibility predicate, incremental minima with identities, no rescan per commit); the worker uploads both. Inlined windows are filtered before the `inline_max` check; observations resolve to learn "unchanged". The grammar gains the group production. |
 | Attempt lifecycle (`lifecycle.md`, being written) | Observation launches without `.spec` or `.result`, and ideally without `.worker`; live per-key events and key-tagged logs; per-key outcomes in `.result`; cancel delivered to the worker, which commits finished keys before the engine would take the fence (§5). |
 
@@ -928,7 +944,7 @@ is below the current one.
   outcomes, the failure delta, retry and rescope pages, partial commits on
   cancel, observations.
 - `python/solera_server/engine.py`: the `Failures` record, the due clock,
-  epochs, pattern counts at commit, rescope and retry positions on the
+  epochs, rescope and retry positions on the
   watermark, alternation of retry and change pages, cancel sent to the
   worker, observation runs.
 - `python/solera_server/history.py`: `key_outcomes`; per-key counts on
@@ -955,10 +971,12 @@ is below the current one.
 - Each error class in and out of the per-key call; `errors=` mapping;
   `Transient` turning failed after its `retry_for`; failed keys retried
   once per epoch and never more.
-- Cancel: finished keys commit whatever their order; unfinished keys are
-  interrupted and retried by the next run; a fence already taken
-  completes; an unresponsive worker loses the page to the engine's
-  fence.
+- Cancel: a drain within `cancel_grace` commits finished keys whatever
+  their order, the interrupted holes and the watermark as one decision;
+  canceled keys never come due by themselves; timed-out keys count a try
+  and end `failed` past `retries=`; a forced abort commits nothing, or
+  ends `writes: uncertain` if the gate was held; a late drain result is
+  refused.
 - Failure index: a 1M-key systemic failure leaves state constant and no
   commit rescans the index; every row of the transition table, with exact
   outcome counts; the engine's and worker's eligibility agree; a deploy or
@@ -967,9 +985,8 @@ is below the current one.
   passes inline when small and page when big; retry and change pages
   alternate when both are pending; a due key changed upstream is
   processed once.
-- Patterns: the worker's and engine's matchers agree; pruning never drops a
-  match; a cold engine launches and the worker filters; a count taken
-  under old patterns never skips a batch under new ones; a rescope with
+- Patterns: a page with no matching key ends `skipped` with its
+  watermark advanced; a rescope with
   pending deletions of newly excluded keys removes their rows; the drain
   delivers exactly the symmetric difference at the cutover snapshot,
   whatever is committed meanwhile; a second pattern change waits for the
