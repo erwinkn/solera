@@ -200,15 +200,20 @@ commit: delta files · watermark → batch 42 · failure index: +c, +d
 **Cancel and timeout keep finished keys.** They follow the attempt's
 two-phase cancel (`lifecycle.md` §7); for a per-key page the phases are:
 
-1. **Cancel requested.** The engine latches the cancel and answers
-   `cancel: "requested"` to the worker's next beat. The worker stops
+1. **Cancel requested.** The engine latches the cancel and answers the
+   worker's next beat with the latched cancellation object
+   `{phase: "requested", reason}` (`lifecycle.md` §7 defines it, the
+   reasons, and which one wins when a timeout and an explicit cancel
+   race). The worker stops
    starting keys and cancels the calls in flight (an `async` call is
    cancelled; a thread is abandoned and its result ignored). Then, within
    `cancel_grace` (60 s by default, per asset), it **drains**: it writes
    the keys that finished — one store write per output, as for a whole
    page — records the keys it did not finish as **interrupted** in the
-   failure delta, and publishes all of it as one `.result` with
-   `status: canceled`. The engine commits outputs, failure delta and
+   failure delta, according to the `reason` it received, and publishes
+   all of it as one `.result` with `status: canceled` and that `reason`.
+   The worker never infers the reason from its own clock; the engine
+   rejects a result whose reason is not the one it latched. The engine commits outputs, failure delta and
    watermark as one journal decision.
 2. **Forced abort,** after `cancel_grace` without a result. The engine
    cancels at the provider and ends the attempt, taking `.writing` as
@@ -230,7 +235,7 @@ store.store(Patch({a: …, c: …}, remove=[e]))
 .result status: canceled → one commit: watermark past e · failure index +b, +d interrupted
 ```
 
-What happens to the holes depends on why the page stopped:
+What happens to the holes depends on the latched `reason`:
 
 | Interrupted by | Recorded as | Runs again |
 |---|---|---|
@@ -443,21 +448,28 @@ So the failing set is not a map in state: it is a **key index** per
 `Each` asset and scope, in the format and machinery of every other index
 (`object-store-state.md` §6), under `keys/@{asset}/{scope}/`.
 
+**This section is authoritative** for the failure record, the transition
+table, the eligibility predicate, the retry-pass state and forced-request
+identity. `resolved-commits.md` and `lifecycle.md` refer here, and the
+SDK holds one implementation that the engine, the worker and the engine
+cache's inline reader all call.
+
 **An entry** is `key → version`, the version packing what a retry needs:
 
 ```
-outcome u8 · tries varint · epoch varint · since varint · last varint · next_at varint · until varint
-       · revision (len, bytes) · message (len, ≤ 200 bytes)
+outcome u8 · tries varint · epoch varint · forced varint · since varint · last varint · next_at varint
+       · until varint · revision (len, bytes) · message (len, ≤ 200 bytes)
 ```
 
 | Field | |
 |---|---|
 | `outcome` | rejected, failed, retrying, canceled, timed out (the last two are interrupted keys, §5) |
 | `tries` | calls at this `revision`; a varint, since a record can outlive any fixed width |
-| `epoch` | the project revision number (§13) of the last try |
+| `epoch` | the project revision number (§13) the last try ran under, copied from the spec |
+| `forced` | the position of the latest forced request the last try ran under (below), copied from the spec; 0 if none |
 | `since` | first failure at this `revision` |
-| `last` | time of the last try |
-| `next_at` | when a retrying or timed-out key is due |
+| `last` | time of the last try: display only |
+| `next_at` | when a retrying or timed-out key is due: scheduling only |
 | `until` | when a retrying key turns failed: `since + retry_for` |
 | `revision` | the upstream version that failed |
 | `message` | class and message of the last error |
@@ -484,10 +496,16 @@ intents, and an attempt that never commits leaves it as garbage.
 | any → ok, removed, or unmatched | tombstone |
 | none, or a record at another `revision` → not ok | a fresh record: `tries = 1`, `since = last = now` |
 | retrying → `Transient` again | `tries + 1`, `since` and `until` kept, `next_at` by backoff or `retry_after`; failed once `now ≥ until` |
-| failed or rejected → the same class again | `tries + 1`, `epoch` and `last` updated |
+| failed or rejected → the same class again | `tries + 1`, `last` updated |
 | any → interrupted by a cancel | `canceled`, `tries` unchanged, no `next_at` |
 | any → interrupted by a timeout | `timed out`, `tries + 1`, `next_at` by backoff; `failed` once `tries` passes `retries=` |
 | any → another class | the new class, `tries + 1`, `since` kept; `until` set when it becomes retrying |
+
+Every record a try writes takes `epoch` and `forced` from the page's
+spec — engine-assigned positions, never the worker's clock — so whether a
+key has had its deploy retry or its forced retry is decided causally.
+`last`, `next_at` and `until` are worker times; a skewed clock shifts when
+a key is retried, never whether it is.
 
 **Counts move by explicit transitions.** Changing an entry from failed to
 retrying adds and removes no key, so the index's own key count says
@@ -506,7 +524,7 @@ Failures  index: KeyIndex
           counts: {rejected, failed, retrying, canceled, timed_out}   exact (transitions)
           due_min                                                 ≤ every retrying or timed-out next_at
           epoch_min                                               ≤ every failed entry's epoch
-          forced: {id, classes, at}?                              an operator's `solera retry`
+          forced: {class: position}                               latest forced request per class
 ```
 
 **One eligibility predicate**, in the SDK, used by the engine to decide
@@ -517,31 +535,35 @@ def eligible(entry, now, epoch, forced) -> bool:
     return (
         (entry.outcome in (RETRYING, TIMED_OUT) and entry.next_at <= now)
         or (entry.outcome == FAILED and entry.epoch < epoch)                  # one try per deploy
-        or (forced is not None and entry.outcome in forced.classes and entry.last < forced.at)
+        or entry.forced < forced.get(entry.outcome, 0)                        # an operator's retry
     )
 ```
 
+**Forced requests are positions, not times.** `solera retry icp --failed`
+(or `--rejected`, `--canceled`, `--all`) is journaled as an event; its
+journal position is the request's identity, and `forced[class]` keeps the
+latest position per class — constant size, and a request for one class
+never cancels a pending one for another. A pass runs under the forced
+positions as they were when it started (`forced_pos`, their maximum), and
+every record it writes carries `forced = forced_pos`. A key has satisfied
+a request exactly when its record's `forced` is at least that request's
+position.
+
 Each clause retires itself: a retried key's `next_at` moves on, its
-`epoch` becomes current, its `last` passes `forced.at`. None loops. A
-`canceled` key matches no clause but the forced one: only a request
-brings it back.
+`epoch` becomes the pass's, its `forced` the pass's position. None loops.
+A `canceled` key matches no clause but the forced one: only a request, or
+a new change of the key, brings it back.
 
-**Minima are conservative and maintained incrementally.** `due_min` and
-`epoch_min` are lower bounds. Each commit lowers them from the entries it
-wrote (`min(due_min, next_at)` for each), which is O(page). Removing the
-entry that held a minimum leaves the bound too low — a scope may then
-start a retry pass that finds nothing, which is safe — and marks the
-summary dirty. Exact values come only from **a completed retry pass**
-(below), which reports the minima over what it read — never from a rescan
-per commit. The report carries its **identity** — the failure index head
-it read — and is applied as the minimum of its value and every commit's
-bound since that head, the rule recounts already follow, so it can never
-erase a key that a newer commit made due.
-
-*Later:* a coalesced recomputation from the engine cache, on the
-maintenance thread, at most once a minute while dirty, under the same
-identity rule. v1 does without it: a too-low bound costs at most one
-retry pass that finds nothing.
+**Minima are conservative, and exact at pass completion.** `due_min` and
+`epoch_min` are lower bounds. Every commit — change page or retry page —
+lowers them from the records it wrote (`min(due_min, next_at)` over
+retrying and timed-out records, `min(epoch_min, epoch)` over failed ones),
+which is O(page). Removing the record that held a minimum leaves the bound
+too low: a scope may start a retry pass that finds nothing, which is safe.
+Nothing rescans the index per commit. Exact values come from the retry
+pass, which accumulates them as it walks (below), and replace the bounds
+when it completes. A coalesced recomputation from the engine cache is a
+later optimization, not v1.
 
 **When retries come due.** An `Each` asset normally runs when its upstream
 changes. A retrying key needs its own clock, or a quiet afternoon would
@@ -551,11 +573,11 @@ never retry it:
 10:00  c raises Throttled(retry_after=60)       → c retrying, next_at 10:01; due_min = 10:01
 10:01  no new events; icp(site=oakland) has due_min ≤ now
        → the engine starts a run of that asset and scope with a retry page [c]
-       → c ok → tombstone; due_min stays 10:01 (dirty) until the pass completes
+       → c ok → tombstone; the pass completes, due_min = its due_acc (none)
 ```
 
 A scope has retries when `due_min ≤ now`, `epoch_min < epoch`, or a
-`forced` request is newer than the last pass completed. Only automated
+forced request is newer than the `forced_pos` of the last completed pass. Only automated
 assets are started by the clock; an asset run by hand picks up due keys
 on its next run.
 
@@ -565,16 +587,35 @@ a walk over the failure index in key order, with its position in the
 watermark:
 
 ```
-retry: {pass: 7, epoch: 12, forced: "r-3", after: "ICP/Results/run-17.csv"}
+retry: {pass: 7, epoch: 12, forced_pos: 4031, after: "ICP/Results/run-17.csv",
+        due_acc: 10:42, epoch_acc: 11}
 ```
 
-- A pass has an identity — its number and the predicate inputs it runs
-  under (`epoch`, `forced` id). If either input changes mid-pass — a
-  deploy, a new `solera retry` — the pass restarts from the first key
-  under a new number, so keys before `after` are not skipped.
-- A pass is complete when a page reaches the end of the index; it reports
-  the minima it saw. If anything became eligible behind it meanwhile,
-  the scope still has retries and the next pass starts.
+| Field | |
+|---|---|
+| `pass`, `epoch`, `forced_pos` | the pass's identity: its number and the predicate inputs it runs under |
+| `after` | the last key the pass has walked |
+| `due_acc`, `epoch_acc` | minima over the **resulting records** of every key at or before `after`: `next_at` over retrying and timed-out records, `epoch` over failed ones |
+
+- **Each retry page** walks the index from `after` until it has
+  `batch_size` eligible keys or reaches the end. Its commit — atomic with
+  the outputs, failure delta and watermark — advances `after` and folds
+  into the accumulators every record in the walked range *as it is after
+  the page's transitions*, eligible or not. The worker computes that from
+  what it read; an inlined page carries the same range minima, computed
+  by the same function.
+- **Each change page** commits records too; the engine folds the ones at
+  or before `after` into the accumulators (records past `after` will be
+  walked). A change can only lower an accumulator or leave a stale
+  lower value behind — conservative either way.
+- **A restart** — `epoch` or `forced_pos` changes mid-pass, from a deploy
+  or a new `solera retry` — starts a new pass from the first key, with
+  empty accumulators, so no key before `after` is skipped. The global
+  bounds stay as they were until a pass completes.
+- **Completion** is the page that reaches the end of the index: `due_min`
+  and `epoch_min` become `due_acc` and `epoch_acc`, folded with that
+  page's own records, in the same commit. If anything is still eligible —
+  it became due behind the walk — the next pass starts.
 - If the engine holds the index in its cache and the next eligible keys
   number at most `inline_max`, it **inlines** them, with their prior
   records, into `.spec`; otherwise `.spec` pins the failure index and the
@@ -782,13 +823,19 @@ holds the clock and no user code: a host long-polls for due ticks, runs
 the body, and posts the outcome. A tick is not an attempt — no `.spec`,
 `.worker`, `.result`, fence or run of its own.
 
-**How a tick lands.** The engine dispatches each tick with the head of
-the source as `base`, and applies the posted outcome in one step, through
-the commit API's own checks:
+**How a tick lands.** Observable sources follow the lifecycle's
+source-head identity and snapshot contract for sensors (`lifecycle.md`
+§11): the engine dispatches each tick with an opaque, monotonic identity
+of the source's head — for unkeyed sources as for keyed ones, so a string
+version committed by an API client in between is caught too — plus, when
+the host may resolve a big map, the pinned index manifest, whose reader
+pin lasts until the tick ends. `observe()` declares its one commit target,
+its own source, so the dispatcher knows which head to send. The posted
+outcome is applied in one step, through the commit API's own checks:
 
-- **Head-checked.** If the source's head moved since dispatch — an API
-  client, another sensor — the tick is refused and the next one observes
-  again. A stale full map must never undo a newer commit.
+- **Head-checked.** If the source's head identity moved since dispatch —
+  an API client, another sensor — the tick is refused and the next one
+  observes again. A stale full map must never undo a newer commit.
 - **"Unchanged" means nothing durable changed**: no new version, no key
   change, **and no new cursor**. A cursored feed often returns an empty
   page with a newer token; saving that token is what moves the feed on.
@@ -803,9 +850,10 @@ the commit API's own checks:
 **Key maps.** A full map up to `sensor_map_max` (1M keys) is posted as a
 sorted run and resolved by the engine in-process against the source's
 index, as API commits are. A bigger one is resolved **on the host** — the
-streaming merge-join against the tick's `base` — which uploads the delta
-file and posts a reference; the engine installs it only if `base` is
-still the head, else refuses it and deletes the file. Past a few million
+streaming merge-join against the pinned manifest the tick carries — which
+uploads the delta file and posts a reference; the engine installs it only
+if the head identity is unchanged. A refused or repeated post and its file
+follow the lifecycle's retry-safe sensor rules. Past a few million
 keys, use a cursor and `Observed(upsert, remove)`: comparing a 10M-key map
 every five minutes is a full replacement every five minutes.
 
@@ -922,7 +970,7 @@ is below the current one.
 |---|---|
 | Key index (`object-store-state.md` §6) | No format change. A new kind of index (`keys/@{asset}/{scope}/`, the failure index) compacted like the others; `Rows` groups every key (§6), with `Store.key_rows` and the digest grammar — the native thread's current work; patches build `Rows`. |
 | Engine cache (`resolved-commits.md`, being rewritten) | New readers: inlined retry keys in v1; pattern counts at commit and failure-summary recomputation later. No new cached content beyond failure indexes. |
-| HTTP resolver (`resolved-commits.md`) | Each pages' output deltas are small resolves when the index is admitted; failure deltas are resolved locally, not by the resolver (its §8 readers should follow §9 here: one eligibility predicate, incremental minima with identities, no rescan per commit); the worker uploads both. Inlined windows are filtered before the `inline_max` check. A sensor's full key map is resolved in-process (small) or on the host (big), not through an attempt's resolve. The grammar gains the group production. |
+| HTTP resolver (`resolved-commits.md`) | Each pages' output deltas are small resolves when the index is admitted; failure deltas are resolved locally, not by the resolver (§9 here is authoritative for the record, transitions, eligibility, pass state and forced-request identity; the resolver's inline reader calls the same SDK functions, and its v1 has no pattern hints or summary recomputation); the worker uploads both. Inlined windows are filtered before the `inline_max` check. A sensor's full key map is resolved in-process (small) or on the host (big), not through an attempt's resolve. The grammar gains the group production. |
 | Attempt lifecycle (`lifecycle.md`) | The two-phase cancel of §7, which §5 follows; live per-key events and key-tagged logs; per-key outcomes in `.result`. Sensors (§11) carry observable sources: `Source.observe` declares one. |
 
 ## 17. What changes in the code
@@ -966,7 +1014,8 @@ is below the current one.
 - Each error class in and out of the per-key call; `errors=` mapping;
   `Transient` turning failed after its `retry_for`; failed keys retried
   once per epoch and never more.
-- Cancel: a drain within `cancel_grace` commits finished keys whatever
+- Cancel: the failure delta follows the latched `reason`, and a result
+  with another reason is refused; a drain within `cancel_grace` commits finished keys whatever
   their order, the interrupted holes and the watermark as one decision;
   canceled keys never come due by themselves; timed-out keys count a try
   and end `failed` past `retries=`; a forced abort commits nothing, or
@@ -975,8 +1024,11 @@ is below the current one.
 - Failure index: a 1M-key systemic failure leaves state constant and no
   commit rescans the index; every row of the transition table, with exact
   outcome counts; the engine's and worker's eligibility agree; a deploy or
-  a forced retry mid-pass restarts the pass and misses no key; a stale
-  summary published after a newer commit never hides a due key; retry
+  a forced retry mid-pass restarts the pass and misses no key; a worker
+  clock minutes off neither skips nor repeats a forced retry; a retry
+  request for one class leaves a pending one for another intact; pass
+  accumulators over several pages give the exact minima at completion,
+  with change pages committed in between; retry
   passes inline when small and page when big; retry and change pages
   alternate when both are pending; a due key changed upstream is
   processed once.
@@ -991,8 +1043,9 @@ is below the current one.
 - Observable sources: each `observe()` return shape becomes the right
   `Tick`; unchanged ticks write nothing durable; a cursor-only tick
   records `SensorAdvanced` without a new version or a wake-up; a tick whose
-  `base` is no longer the head is refused, whether resolved by the engine
-  or on the host; a restart mid-tick drops it harmlessly.
+  head identity is no longer current is refused — including an unkeyed
+  source whose version an API client changed — whether resolved by the
+  engine or on the host; a restart mid-tick drops it harmlessly.
 
 ## 19. Open questions
 
