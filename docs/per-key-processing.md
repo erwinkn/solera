@@ -200,27 +200,21 @@ commit: delta files · watermark → batch 42 · failure index: +c, +d
 **Cancel and timeout keep finished keys.** They follow the attempt's
 two-phase cancel (`lifecycle.md` §7); for a per-key page the phases are:
 
-1. **Cancel requested.** The engine latches the cancel and answers the
-   worker's next beat with the latched cancellation object
-   `{phase: "requested", reason}` (`lifecycle.md` §7 defines it, the
-   reasons, and which one wins when a timeout and an explicit cancel
-   race). The worker stops
-   starting keys and cancels the calls in flight (an `async` call is
+1. **Cancel requested** — the cancel record (`lifecycle.md` §2.2) reaches
+   the worker with phase `requested`. The worker stops starting keys and cancels the calls in flight (an `async` call is
    cancelled; a thread is abandoned and its result ignored). Then, within
    `cancel_grace` (60 s by default, per asset), it **drains**: it writes
    the keys that finished — one store write per output, as for a whole
    page — records the keys it did not finish as **interrupted** in the
-   failure delta, according to the `reason` it received, and publishes
-   all of it as one `.result` with `status: canceled` and that `reason`.
-   The worker never infers the reason from its own clock; the engine
-   rejects a result whose reason is not the one it latched. The engine commits outputs, failure delta and
-   watermark as one journal decision.
-2. **Forced abort,** after `cancel_grace` without a result. The engine
-   cancels at the provider and ends the attempt, taking `.writing` as
-   `aborted` first for a gated store; a late drain result is refused.
-   Nothing of the page commits and it is delivered again — unless the
-   worker already held the gate, in which case the attempt ends with
-   `writes: uncertain` and repair applies (`lifecycle.md` §9.5). Only a
+   failure delta by the record's `reason` (table below), and publishes
+   all of it as one `.result` with `status: canceled`, carrying the record
+   as §2.2 says. The engine commits outputs, failure delta and watermark
+   as one journal decision.
+2. **Forced abort,** after `cancel_grace` without a result: the record's
+   phase becomes `forced` and the attempt ends as `lifecycle.md` §7
+   describes. Nothing of the page commits and it is delivered again;
+   whether its writes may still land is the attempt's write-completion
+   evidence (`lifecycle.md` §2.3), and repair follows from it. Only a
    worker that cannot drain in time loses finished work.
 
 Finished keys need not be a key-order prefix of the page — with
@@ -235,12 +229,12 @@ store.store(Patch({a: …, c: …}, remove=[e]))
 .result status: canceled → one commit: watermark past e · failure index +b, +d interrupted
 ```
 
-What happens to the holes depends on the latched `reason`:
+What happens to the holes depends on the record's `reason`:
 
-| Interrupted by | Recorded as | Runs again |
+| `reason` | Recorded as | Runs again |
 |---|---|---|
-| an explicit cancel | `canceled`, not due | only when a later run is requested for it: `solera retry` (or a forced retry), or a new change of the key upstream. A run the user stopped does not resume itself. |
-| a timeout | `timed out`, `tries + 1`, due after the retry backoff (§8) | by the retry clock (§9); once `tries` passes the asset's `retries=`, the key becomes `failed`, so a key that always outlives the timeout stops cycling |
+| `user` | `canceled`, not due | only when a later run is requested for it: `solera retry` (or a forced retry), or a new change of the key upstream. A run the user stopped does not resume itself. |
+| `timeout` | `timed out`, `tries + 1`, due after the retry backoff (§8) | by the retry clock (§9); once `tries` passes the asset's `retries=`, the key becomes `failed`, so a key that always outlives the timeout stops cycling |
 
 The attempt ends `canceled` or `timed out`, with the outputs it
 committed; an attempt timeout stays retryable within `retries=`, as
@@ -971,7 +965,7 @@ is below the current one.
 | Key index (`object-store-state.md` §6) | No format change. A new kind of index (`keys/@{asset}/{scope}/`, the failure index) compacted like the others; `Rows` groups every key (§6), with `Store.key_rows` and the digest grammar — the native thread's current work; patches build `Rows`. |
 | Engine cache (`resolved-commits.md`, being rewritten) | New readers: inlined retry keys in v1; pattern counts at commit and failure-summary recomputation later. No new cached content beyond failure indexes. |
 | HTTP resolver (`resolved-commits.md`) | Each pages' output deltas are small resolves when the index is admitted; failure deltas are resolved locally, not by the resolver (§9 here is authoritative for the record, transitions, eligibility, pass state and forced-request identity; the resolver's inline reader calls the same SDK functions, and its v1 has no pattern hints or summary recomputation); the worker uploads both. Inlined windows are filtered before the `inline_max` check. A sensor's full key map is resolved in-process (small) or on the host (big), not through an attempt's resolve. The grammar gains the group production. |
-| Attempt lifecycle (`lifecycle.md`) | The two-phase cancel of §7, which §5 follows; live per-key events and key-tagged logs; per-key outcomes in `.result`. Sensors (§11) carry observable sources: `Source.observe` declares one. |
+| Attempt lifecycle (`lifecycle.md`) | The cancel record (§2.2) and write-completion evidence (§2.3), authoritative there; the two-phase cancel of §7, which §5 follows; live per-key events and key-tagged logs; per-key outcomes in `.result`. Sensors (§11) carry observable sources: `Source.observe` declares one. |
 
 ## 17. What changes in the code
 
@@ -1014,12 +1008,12 @@ is below the current one.
 - Each error class in and out of the per-key call; `errors=` mapping;
   `Transient` turning failed after its `retry_for`; failed keys retried
   once per epoch and never more.
-- Cancel: the failure delta follows the latched `reason`, and a result
-  with another reason is refused; a drain within `cancel_grace` commits finished keys whatever
+- Cancel: the failure delta follows the `reason` of the record the worker
+  sealed with; a drain within `cancel_grace` commits finished keys whatever
   their order, the interrupted holes and the watermark as one decision;
   canceled keys never come due by themselves; timed-out keys count a try
   and end `failed` past `retries=`; a forced abort commits nothing, or
-  ends `writes: uncertain` if the gate was held; a late drain result is
+  ends with the evidence `lifecycle.md` §2.3 assigns; a late drain result is
   refused.
 - Failure index: a 1M-key systemic failure leaves state constant and no
   commit rescans the index; every row of the transition table, with exact
