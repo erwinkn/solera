@@ -569,3 +569,33 @@ one window of rows at a time under the GIL, about 1 µs each. Arrow versions
 The old figure of ~45 GB for a 100M-key replacement also counted the worker
 building `key_map` (a dict of every key and its digest) and the lists it
 passed in; the worker now hands its rows to `key_rows` directly.
+
+## One row digest for Python and Arrow (2026-10-01)
+
+Versions are now the canonical digest of `docs/row-digest.md`: one grammar,
+in Rust, fed from Python values and from Arrow arrays, every key the group
+of rows that carry it. Before, a Python row was BLAKE2b-128 of its JSON — or
+of its pickle, for anything JSON cannot hold, a `datetime` included —
+computed by a Python function the native join called a row at a time;
+an Arrow row was XXH3-128 of a different encoding.
+
+    uv run python bench/keys/digest.py --sizes 1e6,1e7
+
+Each case in a process of its own: its rows built first, then — measured —
+`key_rows` and an initial load into an empty index on local disk, so every
+version is computed once. Peak memory is above the rows. Rows: a key, an
+integer, a float, a string, a list of two strings and a timestamp; `flat`
+leaves the timestamp out (JSON values only, the old digest's fast path).
+Same machine, before and after back to back.
+
+| Rows | 1M, before | 1M, after | 10M, before | 10M, after |
+|---|---|---|---|---|
+| `list[dict]` | 7.3 s · 0.10 GB | **3.7 s** · 0.10 GB | 71.3 s · 0.51 GB | **35.8 s** · 0.51 GB |
+| `list[dict]`, flat | 6.9 s · 0.10 GB | **2.1 s** · 0.10 GB | 67.8 s · 0.51 GB | **24.0 s** · 0.51 GB |
+| Arrow table | 0.6 s · 0.11 GB | 0.7 s · 0.10 GB | 4.8 s · 0.32 GB | 5.5 s · 0.32 GB |
+
+Python rows digest 2–3× faster: the walk is native (still under the GIL,
+one window of rows at a time), with no JSON round trip and no pickle. A
+flat row costs ~0.9 µs and a `datetime` field ~1 µs more (its attributes
+are read through Python). Arrow rows cost 14% more than before: records
+are framed and their fields sorted per row. Memory is the same.
