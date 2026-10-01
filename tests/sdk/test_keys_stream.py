@@ -173,6 +173,14 @@ def test_row_digests():
         _native.Rows.arrow(pa.table({"id": ["a"], "u": pa.array([[1]], pa.list_view(pa.int64()))}), "id")
 
 
+def test_struct_digests_are_framed():
+    # Moving `c` into `a` changes the row; without a field count the bytes would not.
+    flat = pa.table({"id": ["x"], "a": [{"b": 1}], "c": [2]})
+    nested = pa.table({"id": ["x"], "a": [{"b": 1, "c": 2}]})
+    (_, v1, _), (_, v2, _) = (content(replace(_native.Rows.arrow(t, "id"), [])[1])[0] for t in (flat, nested))
+    assert v1 != v2
+
+
 def test_duckdb_relation_is_arrow():
     rel = duckdb.sql("select 'k' || lpad(range::varchar, 6, '0') as k, range as n from range(5000)")
     rows = _native.Rows.arrow(rel, "k")

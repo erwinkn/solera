@@ -521,6 +521,7 @@ fn value(a: &dyn Array, i: usize, out: &mut Vec<u8>) {
         DataType::FixedSizeList(_, _) => list(out, a.as_fixed_size_list().value(i).as_ref()),
         DataType::Struct(fields) => {
             out.push(14);
+            put_varint(out, fields.len() as u64); // framed: a struct's fields never run into the row's
             let s = a.as_struct();
             let mut order: Vec<usize> = (0..fields.len()).collect();
             order.sort_by(|&x, &y| fields[x].name().cmp(fields[y].name()));
