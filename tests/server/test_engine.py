@@ -851,15 +851,21 @@ async def test_missing_on_schedule_picks_up_new_keys(state):
 
 
 async def test_timeout_fails_retryably(state):
-    """§10: a wait past the attempt timeout cancels the run and fails the
-    attempt retryably."""
+    """§10: a worker running past the attempt timeout is canceled, and the
+    attempt fails retryably."""
+
+    class Running(FakePlacement):
+        async def launch(self, stage):  # the worker starts, and reports once
+            path = f"{self.ctx.state.attempt_path(stage['run'], stage['attempt'])}.beat"
+            await self.ctx.state.put_object(path, json.dumps({"n": 0}).encode())
+            return await super().launch(stage)
 
     @asset(executor=Fake("fake")(), timeout=1, retries=Retry(0))
     def never():
         return []
 
     project = Project(assets=[never], executors=[Fake("fake")])
-    engine = make_engine(state, project, placements=fake(project), heartbeat_seconds=1)
+    engine = make_engine(state, project, placements={"Fake": lambda s, c: Running(c)}, heartbeat_seconds=1)
     FakePlacement.script.clear()
     await engine.initialize()
     run = await engine.submit(["never"])

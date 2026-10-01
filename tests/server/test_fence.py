@@ -617,3 +617,43 @@ async def test_garbage_waits_for_attempts_claimed_before_it_whatever_the_clocks(
     assert await state.get_object(path) is None and state.model.garbage == []
     await engine.stop()
     await state.close()
+
+
+async def test_the_timeout_runs_from_the_first_report(tmp_path):
+    """Provisioning is not running: an asset's timeout starts when its
+    worker first reports, however long it took to get there. After a
+    restart, a running attempt gets its whole timeout again, from when the
+    new engine first hears from it — never what an old clock says is left."""
+
+    @asset(executor=Fake("fake")(), timeout=0.5, retries=Retry(0))
+    def brief():
+        return [{"ok": True}]
+
+    project = Project(assets=[brief], executors=[Fake("fake")])
+    url = tmp_path.as_uri()
+    state = await State.open(url, "test", flush_interval=0.001)
+    engine = engine_for(state, project, worker=Quiet, heartbeat_seconds=0.3)
+    await engine.initialize()
+    run, attempt = await launched(engine, ["brief"])
+    beat = f"{state.attempt_path(run['id'], attempt)}.beat"
+    for _ in range(50):  # a second of provisioning, twice the timeout
+        await engine.tick()
+        await asyncio.sleep(0.02)
+    assert state.model.claimed(attempt) is not None
+    await state.put_object(beat, json.dumps({"n": 0}).encode())
+    reported = asyncio.get_running_loop().time()
+    await until(engine, lambda: state.model.claimed(attempt) is None)
+    assert asyncio.get_running_loop().time() - reported >= 0.5
+    task = state.model.task(next(iter(state.model.runs[run["id"]]["tasks"])))
+    assert task["attempts"][0]["error"] == "timeout"
+
+    run, attempt = await launched(engine, ["brief"])
+    await state.put_object(f"{state.attempt_path(run['id'], attempt)}.beat", json.dumps({"n": 0}).encode())
+    state, engine = await restart(state, engine, url, project, worker=Quiet, heartbeat_seconds=0.1)
+    await asyncio.sleep(0.6)  # no engine for longer than its timeout
+    await engine.initialize()
+    adopted = asyncio.get_running_loop().time()
+    await until(engine, lambda: state.model.claimed(attempt) is None)
+    assert asyncio.get_running_loop().time() - adopted >= 0.5
+    await engine.stop()
+    await state.close()

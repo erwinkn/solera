@@ -1152,10 +1152,10 @@ class Engine:
             self.state.record({"type": "AttemptPlaced", "attempt": attempt, "handle": handle})
 
     def _left(self, launched: dict, seconds: float) -> float:
-        """What an adopted attempt has left of `seconds` from its launch. The
-        launch time is the launching engine's clock, which may disagree with
-        this one: it is trusted, but it never leaves less than three
-        heartbeats, nor more than all of `seconds`."""
+        """What an adopted attempt has left of its provisioning allowance,
+        `seconds` from its launch. The launch time is the launching engine's
+        clock, which may disagree with this one: it is trusted, but it never
+        leaves less than three heartbeats, nor more than all of `seconds`."""
 
         return min(seconds, max(seconds - (self.clock() - launched["at"]), 3 * self.heartbeat_seconds))
 
@@ -1166,13 +1166,17 @@ class Engine:
         or the placement cannot tell for now, the worker's own reports do: it
         rewrites `{attempt}.beat` every `heartbeat_seconds`, marks it done
         once its result is written, and is dead after three missed beats.
-        Until its first report it is provisioning, which has a deadline of
-        its own (`provision_seconds`). A cancel, a timeout or a provisioning
-        deadline aborts the attempt as it happens; one already writing is
-        waited for instead.
+        Until its first report it is provisioning, under a deadline of its
+        own (`provision_seconds`); its `timeout` runs from then on. A cancel,
+        a timeout or a provisioning deadline aborts the attempt as it
+        happens; one already writing is waited for instead.
 
         Deadlines run on this process's monotonic clock. An adopted attempt
-        keeps what the launching engine's clock says is left (`_left`)."""
+        still provisioning keeps what the launching engine's clock says is
+        left of its allowance (`_left`). When it started running was never
+        recorded, so an adopted attempt that is running gets its whole
+        `timeout` again, from when this engine first hears from it: a
+        restart can stretch an attempt by one timeout, never cut it short."""
 
         task = self.m.task(task_id)
         run_id, launched = task["run"], self._launched(task, attempt)
@@ -1181,7 +1185,7 @@ class Engine:
         limit = (self.manifest["assets"].get(task["asset"]) or {}).get("timeout") or 3600
         provision = getattr(placement, "provision_seconds", self.provision_seconds)
         started = loop.time()
-        deadline = started + (self._left(launched, limit) if adopted else limit)
+        deadline = math.inf  # set once it runs
         provisioned_by = math.inf
         if provision is not None:
             provisioned_by = started + (self._left(launched, provision) if adopted else provision)
@@ -1199,7 +1203,8 @@ class Engine:
 
         while True:
             polled = loop.time()
-            timeout = poll if writing else max(0.0, min(poll, deadline - polled))
+            wake = deadline if reported else provisioned_by
+            timeout = poll if writing else max(0.0, min(poll, wake - polled))
             observed = handle is not None
             try:
                 exit_ = await _unless(stirred, look(timeout))
@@ -1221,7 +1226,8 @@ class Engine:
                     if json.loads(current).get("done"):
                         exit_ = {"code": None, "reason": "done", "meta": {}}
                         break
-                    reported = True
+                    if not reported:
+                        reported, deadline = True, now + limit  # it runs: its timeout starts
                 if current != beat:
                     beat, beat_at = current, now
                 elif reported and now - beat_at > 3 * self.heartbeat_seconds:

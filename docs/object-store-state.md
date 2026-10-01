@@ -691,11 +691,16 @@ pulling, a task waiting for capacity — and missed beats mean nothing yet.
 Provisioning has its own deadline (`provision_seconds`, 10 min; none for a
 pool, whose attempts wait for a worker as long as it takes): a worker that
 has not reported by then never started, and is aborted like a timeout.
+The asset's `timeout` counts from the first report, not from the launch: a
+20-minute image pull does not eat a 30-second timeout.
 
 **Deadlines.** The engine times attempts on its own monotonic clock. An
-adopted attempt was launched by another engine, whose clock may disagree:
-it keeps what that clock says is left of its timeout (or provisioning
-deadline), but never less than three heartbeats, nor more than all of it.
+adopted attempt was launched by another engine, whose clock may disagree.
+Still provisioning, it keeps what that clock says is left of its
+allowance, but never less than three heartbeats, nor more than all of it.
+Already running, it gets its whole timeout again from when the new engine
+first hears from it, since when it started running was never recorded: a
+restart can stretch an attempt by one timeout, never cut it short.
 
 **Write fence — `{attempt}.writing`.** Stores overwrite in place (§9), so
 a dead attempt must never write over a live one. One create-only object
