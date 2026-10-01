@@ -18,6 +18,10 @@ journal reproduces it exactly. It has three layers:
   workers.
 
 Events carry every timestamp they need; `apply` never reads a clock.
+`applied` counts the events applied: the model's own clock, the same in
+every engine that replays the journal. What must not be compared across
+hosts' wall clocks is ordered by it: an attempt pins the files it may read
+at its claim's position, and a file let go of at a later one waits for it.
 """
 
 from __future__ import annotations
@@ -78,6 +82,7 @@ class Model:
     def snapshot(self) -> dict:
         return copy.deepcopy(
             {
+                "applied": self.applied,
                 "writer": self.writer,
                 "revision": self.revision,
                 "manifest": self.manifest,
@@ -100,6 +105,7 @@ class Model:
     def restore(self, snap: dict | None) -> None:
         snap = copy.deepcopy(snap) if snap else {}
         # durable
+        self.applied: int = snap.get("applied") or 0
         self.writer = snap.get("writer")
         self.revision = snap.get("revision")
         self.manifest = snap.get("manifest")
@@ -108,7 +114,8 @@ class Model:
         self.indexes: dict[tuple, IndexState] = {
             k: IndexState.from_json(v) for k, v in _flatten(snap.get("indexes"), 2).items()
         }
-        self.garbage: list[list] = snap.get("garbage") or []  # [path, at]: unreferenced index files
+        # [path, n]: files nothing references since the n-th event applied
+        self.garbage: list[list] = snap.get("garbage") or []
         # deleted runs whose directories are still to be deleted (§11)
         self.retired: list[str] = snap.get("retired") or []
         self.cursors: dict[tuple, object] = _flatten(snap.get("cursors"), 2)
@@ -122,7 +129,8 @@ class Model:
         # the run history (§7): per table, its files and the rows awaiting a flush
         self.history = LakeState(history.TABLES, snap.get("history"))
         # derived from launched attempts, plus memory-only claims of attempts preparing
-        self.claims: dict[str, dict] = {}  # task id -> {attempt, started_at, status, launched?, reads?}
+        # task id -> {attempt, started_at, pin, status, launched?, reads?}; `pin`: `applied` at the claim
+        self.claims: dict[str, dict] = {}
         self.attempts: dict[str, str] = {}  # attempt id -> task id, while claimed
         self.locks: dict[tuple, str] = {}  # (asset, scope) -> attempt id
         self.pool: dict[str, dict] = {}  # attempt id -> pool work
@@ -244,7 +252,12 @@ class Model:
         `AttemptLaunched` makes it durable."""
 
         task = self.task(task_id)
-        self.claims[task_id] = {"attempt": attempt, "started_at": now, "status": "running"}
+        self.claims[task_id] = {
+            "attempt": attempt,
+            "started_at": now,
+            "pin": self.applied,
+            "status": "running",
+        }
         self.attempts[attempt] = task_id
         self.locks[(task["asset"], task["scope"])] = attempt
         self.queue.pop(task_id, None)
@@ -266,6 +279,7 @@ class Model:
         self.claims[task["id"]] = {
             "attempt": attempt,
             "started_at": launched["started_at"],
+            "pin": launched["pin"],
             "status": status,
             "launched": True,
             "reads": delta_reads(launched["prepared"].get("plans") or {}),
@@ -316,6 +330,7 @@ class Model:
     # -- apply -------------------------------------------------------------------------
 
     def apply(self, event: dict) -> None:
+        self.applied += 1
         getattr(self, f"_on_{event['type']}")(event)
 
     def _on_WriterStarted(self, e):
@@ -527,7 +542,7 @@ class Model:
         task = run["tasks"].get(e["task"]) if run else None
         if task is None or task["status"] in TERMINAL_TASK:
             return
-        launched = {k: e[k] for k in ("attempt", "started_at", "at", "execution", "prepared")}
+        launched = {k: e[k] for k in ("attempt", "started_at", "pin", "at", "execution", "prepared")}
         if e.get("pool"):
             launched["pool"] = e["pool"]
         task["launched"] = launched
@@ -664,7 +679,7 @@ class Model:
                 # their intent files are no longer needed.
                 index = self.index(name, scope)
                 for intent in self.unsettled.pop((name, scope), ()):
-                    self.garbage.extend([index.path(f["name"]), at] for f in intent["files"])
+                    self.garbage.extend([index.path(f["name"]), self.applied] for f in intent["files"])
         if "cursor" in commit:
             if commit["cursor"] is None:
                 self.cursors.pop((asset, scope), None)
@@ -802,20 +817,20 @@ class Model:
         if index is not None:
             self.heads[(output, scope)]["count"] = index.count
 
-    def _replace_index(self, key: tuple, index: IndexState, at: float) -> None:
+    def _replace_index(self, key: tuple, index: IndexState) -> None:
         """Swap in a new index state; files it no longer references await deletion."""
 
         before = self.indexes[key]
         self.indexes[key] = index
         for name in sorted(before.referenced() - index.referenced()):
-            self.garbage.append([before.path(name), at])
+            self.garbage.append([before.path(name), self.applied])
 
     def _on_IndexCompacted(self, e):
         key = (e["output"], e["scope"])
         if key not in self.indexes:
             return
         index = self.indexes[key].compacted([FileInfo.from_json(f) for f in e["added"]], e["removed"])
-        self._replace_index(key, index, e["at"])
+        self._replace_index(key, index)
 
     def _on_IndexRecounted(self, e):
         key = (e["output"], e["scope"])
@@ -829,7 +844,7 @@ class Model:
     def _on_IndexTruncated(self, e):
         key = (e["output"], e["scope"])
         if key in self.indexes:
-            self._replace_index(key, self.indexes[key].truncated(e["below"]), e["at"])
+            self._replace_index(key, self.indexes[key].truncated(e["below"]))
 
     def _on_GarbageDeleted(self, e):
         gone = set(e["paths"])
@@ -909,7 +924,7 @@ class Model:
         self.history.flushed(e["files"], e["upto"])
 
     def _on_HistoryCompacted(self, e):
-        self.garbage.extend([path, e["at"]] for path in self.history.compacted(e["changes"]))
+        self.garbage.extend([path, self.applied] for path in self.history.compacted(e["changes"]))
 
     def _on_RunsDeleted(self, e):
         """Runs retire for good: their history goes, and their directories

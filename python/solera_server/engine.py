@@ -1118,6 +1118,7 @@ class Engine:
             "task": task["id"],
             "attempt": attempt,
             "started_at": claim["started_at"],
+            "pin": claim["pin"],
             "at": self.clock(),
             "execution": execution,
             "prepared": self._durable(prepared),

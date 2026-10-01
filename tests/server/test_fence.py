@@ -461,3 +461,32 @@ async def test_a_result_that_fails_to_publish_stays_what_it_was(tmp_path, monkey
     assert "without a result" in first["error"] and second["status"] == "succeeded"
     await engine.stop()
     await state.close()
+
+
+async def test_garbage_waits_for_attempts_claimed_before_it_whatever_the_clocks(tmp_path):
+    """The engine that launched this attempt ran an hour fast; the one that
+    adopted it is right. A file let go of after the claim is kept until the
+    attempt ends: both are placed by their position in the journal, which
+    every engine replays alike, not by either engine's clock."""
+
+    import time
+
+    url = tmp_path.as_uri()
+    state = await State.open(url, "test", clock=lambda: time.time() + 3600, flush_interval=0.001)
+    engine = engine_for(state, REMOTE)
+    await engine.initialize()
+    run, attempt = await launched(engine, ["remote"])
+    state, engine = await restart(state, engine, url, REMOTE)
+    await engine.initialize()
+    path = "history/runs/merged-away.parquet"
+    await state.put_object(path, b"rows")
+    removed = {"table": "runs", "removed": [path], "added": None}
+    state.record({"type": "HistoryCompacted", "changes": [removed], "at": time.time()})
+    await engine.upkeep.collect()
+    assert await state.get_object(path) is not None  # the attempt may still read it
+    await finish_as_worker(state, run["id"], attempt, "remote")
+    await engine.run_until(run["id"], 10)
+    await engine.upkeep.collect()
+    assert await state.get_object(path) is None and state.model.garbage == []
+    await engine.stop()
+    await state.close()

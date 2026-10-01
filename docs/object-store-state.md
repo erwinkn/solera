@@ -193,7 +193,7 @@ than joined string keys, because partition keys may contain `/`.
 
 ```
 State
-  seq, writer, revision, manifest
+  seq, writer, applied, revision, manifest         # applied: events applied so far, the model's clock
   heads        {output: {scope: Head}}             # assets and external sources
   indexes      {output: {scope: KeyIndex}}         # keyed outputs and keyed sources (§6)
   cursors      {asset: {scope: json}}
@@ -203,7 +203,7 @@ State
   runs         {run: Run}                          # active, or finished and not yet archived
   history      {files: {table: [File]}, rows: {table: [[seq, row], …]}, seq, imported}   # §7
   unsettled    {output: {scope: [Intent, …]}}      # keyed outputs a dead writer may have half-written (§8)
-  garbage      [[path, at], …]                     # index and history files nothing references any more
+  garbage      [[path, n], …]                      # index and history files nothing references since event n
   retired      [run, …]                            # deleted runs whose directories are still to delete (§11)
 ```
 
@@ -215,7 +215,7 @@ State
 | `Outcome` | `outcome`, `run`, `attempt`, `at` | assets × partitions |
 | `AutomationState` | `enabled`, `last_fired`, `last_run`, `last_revision`, `pending` (set of `[asset, scope]` for OnChange) | automations × partitions |
 | `Run` | `id`, `request` {targets, partitions, mode, config, keys, automation, tags}, `status`, `paused`, `created_at`, `events` (how many it has recorded), `tasks` {task: `Task`} | in-flight work |
-| `Task` | `status`, `deps`, `ready_at` (now, or a retry's due time), `wait` (seconds counted so far), `queued_at` (when the wait clock last started; null while stopped), `held?` [reason, name] (why the dispatcher last passed it over), `max_attempts`, `attempts` [`Attempt`], `launched?` {`attempt`, `started_at`, `at`, `execution`, `prepared`, `pool?`, `worker?`, `claimed_at?`} | |
+| `Task` | `status`, `deps`, `ready_at` (now, or a retry's due time), `wait` (seconds counted so far), `queued_at` (when the wait clock last started; null while stopped), `held?` [reason, name] (why the dispatcher last passed it over), `max_attempts`, `attempts` [`Attempt`], `launched?` {`attempt`, `started_at`, `pin` (`applied` when it was claimed), `at`, `execution`, `prepared`, `pool?`, `worker?`, `claimed_at?`} | |
 | `File` | `path`, `rows`, `bytes`, `at` [lo, hi] (time column), `runs` [first, last], `deleted?` [run] (hidden until rewritten), `deleted_at?` | files per table: ~log(rows) after merging |
 | `Intent` | `added`, `removed`, `exact`, `files` (the dead attempt's delta files), `run`, `attempt` | writers that died mid-write, until the next commit of that output |
 | `Attempt` | `id`, `outcome`, `started_at`, `finished_at`, the seconds of each phase it reached, `cpu_seconds?`, `peak_memory?`, `error?`, `outputs?` {output: ref} | |
@@ -363,7 +363,7 @@ through a server-side cursor — so nothing is sorted or held.
 | Full delivery | harness | Page through the merged view of all levels from `after`, `batch_size` keys at a time, and ask the store for them with `Keys(…)`. Per level, only the files covering the page are opened, and only their index parts are read — or the whole file, once, when it is small (below one request's latency worth of transfer, ~2.4 MB). A multi-page scan keeps each file's last fetched blocks for the next page, so it reads every block once. |
 | Compaction | the engine's machine by default (§6, *Engine work*) | Once level 0 holds ~8 files, merge them into one level-0 file — or, once level 0 holds a tenth of level 1's bytes, into level 1 with the level-1 files it overlaps (all of them, for random keys). A level over its target pushes one file down, merging it with the files it overlaps there. A merge streams, a few segments per input and one output file at a time. Commit with `IndexCompacted`. Each merge into a level rewrites about ten times the bytes it brings: ~20–30× over an entry's life with random keys (`bench/keys/amplification.py`). |
 | Truncate the log | engine | Drop `log` entries below the lowest consumer watermark and below every window an in-flight attempt was given (`IndexTruncated`); an output with no `Incremental` consumers keeps none. A consumer whose window the log no longer holds gets a full delivery. |
-| Delete files | engine | A file in neither `files` nor `log` joins `garbage`, and is deleted once every attempt that could have pinned it has finished (`GarbageDeleted`). A delta file of an attempt that never committed is deleted when the attempt ends, unless it is an unsettled intent (§8). |
+| Delete files | engine | A file in neither `files` nor `log` joins `garbage`, and is deleted once every attempt that could have pinned it has finished (`GarbageDeleted`): every attempt claimed before the event that let go of it. Both are positions in event order (`applied`), the same in every engine that replays the journal — never wall clocks, which two engines may disagree on. A delta file of an attempt that never committed is deleted when the attempt ends, unless it is an unsettled intent (§8). |
 
 Writes that never pass through the harness as rows — `Sql` materialized
 inside Postgres — are the one case where the store must report the written

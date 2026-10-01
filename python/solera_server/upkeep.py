@@ -213,13 +213,15 @@ class Upkeep:
     # -- garbage ---------------------------------------------------------------------
 
     async def collect(self) -> None:
-        """Delete the files nothing references, once no attempt that started
-        before they were let go of is still running."""
+        """Delete the files nothing references, once no attempt claimed
+        before they were let go of is still running. Both are positions in
+        the model's event order, never wall clocks: two engines' clocks may
+        disagree, the order they replay may not."""
 
         if not self.m.garbage:
             return
-        oldest = min((c["started_at"] for c in self.m.claims.values()), default=math.inf)
-        due = [path for path, at in self.m.garbage if at < oldest]
+        oldest = min((c["pin"] for c in self.m.claims.values()), default=math.inf)
+        due = [path for path, n in self.m.garbage if n <= oldest]
         if not due:
             return
         await self.state.durable()  # a replay must never reference them again
