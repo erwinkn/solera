@@ -31,7 +31,7 @@ Everything lives under `{root}/{namespace}/`.
 
 | Kind | Path | Written by | Mutability | Deleted when |
 |---|---|---|---|---|
-| Journal segment | `control/journal/{seq:020d}.json` | engine | create-only | the checkpoint before the newest covers it |
+| Journal segment | `control/journal/{seq:020d}.json` | engine | create-only | the checkpoint before the newest covers it; a writer's fence segment never |
 | Checkpoint | `control/checkpoints/{seq:020d}.json` | engine | create-only | two newer checkpoints exist |
 | Key index file | `keys/{output}/{scope}/{name}.kx` | harness (delta files), compaction | create-only | no longer in the index and no consumer needs it (§6) |
 | History file | `history/{table}/{ulid}.parquet` | engine | create-only | merged into a bigger file, or rewritten without deleted runs (§7) |
@@ -43,7 +43,8 @@ Everything lives under `{root}/{namespace}/`.
 | Output data | store-defined (FileStore: `{output}/{partition}/{key}.json` under `.solera/data`, §9) | the store, inside the harness | overwritten in place | when the output no longer holds it (§9); never expired |
 
 **Growth.** `control/` is bounded: at most two checkpoints plus the
-journal since the older one, and a checkpoint is written whenever that
+journal since the older one — and one fence segment per writer that ever
+started —, and a checkpoint is written whenever that
 journal reaches the size of the last checkpoint (§10) — so `control/`
 stays under about three times the engine's state size. `keys/` is bounded
 by live keys plus unconsumed deltas. What grows over time is `runs/` and
@@ -762,6 +763,13 @@ writer id, it has been replaced and shuts down. Segments a replaced
 writer managed to write before the new fence were acknowledged and are
 replayed by the new writer, so no acknowledged work is lost.
 
+The slot a replaced writer collides in is always its successor's fence,
+so fence segments are kept for good. Were cleanup to delete one, say
+writer 1001 fenced by 1042 that has since checkpointed past 1042, then
+1001's next create at 1042 would succeed: its events acknowledged,
+replayed by no one. Each checkpoint lists the fences (`fences`), and
+cleanup skips them.
+
 **Checkpoint.** Written when the journal bytes since the last checkpoint
 exceed `max(256 KB, size of the last checkpoint)`, and on clean shutdown.
 Write cost stays proportional to the journal volume; restart replays at
@@ -769,7 +777,7 @@ most about one checkpoint's worth of journal.
 
 **Journal cleanup.** Immediately after writing a checkpoint, delete every
 checkpoint older than the previous one, and every journal segment at or
-below the previous checkpoint's `seq`. The previous checkpoint and the
+below the previous checkpoint's `seq` except fence segments. The previous checkpoint and the
 journal after it are kept so a newest checkpoint that turns out
 unreadable can be recovered from.
 

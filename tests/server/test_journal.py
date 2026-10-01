@@ -118,7 +118,8 @@ async def test_checkpoints_match_full_replay_and_cleanup_keeps_two(store):
     checkpoints = names(store, "checkpoints")
     assert len(checkpoints) == 2  # the newest and the previous
     oldest_kept = int(checkpoints[0][:-5])
-    assert all(int(s[:-5]) > oldest_kept for s in names(store, "journal"))
+    kept = [int(s[:-5]) for s in names(store, "journal")]
+    assert [s for s in kept if s <= oldest_kept] == [1]  # but the writer's fence
     _, again, result = await open_journal(store)
     assert result.checkpoint == int(checkpoints[-1][:-5])
     assert again.counts == state.counts
@@ -212,3 +213,22 @@ async def test_close_writes_a_final_checkpoint(store):
     assert body["state"]["counts"] == {"x": 3}
     _, again, result = await open_journal(store)
     assert result.replayed == 0 and again.counts == {"x": 3}
+
+
+async def test_a_replaced_writer_stays_fenced_after_cleanup(store):
+    """The new writer's fence outlives cleanup: however far it has moved on,
+    the old writer's next segment collides with that fence and nothing it
+    appends is acknowledged."""
+
+    a, sa, _ = await open_journal(store)
+    await add(a, sa, "x", 1)
+    b, sb, result = await open_journal(store, min_checkpoint=50)
+    for i in range(40):  # checkpoints come and go, and so does the journal under them
+        await add(b, sb, "y", i)
+    assert len(names(store, "checkpoints")) == 2
+    assert f"{result.seq:020d}.json" in names(store, "journal")  # b's fence is kept
+    with pytest.raises(Fenced):
+        await add(a, sa, "x", 100)
+    await b.close()
+    _, again, _ = await open_journal(store)
+    assert again.counts == sb.counts and "x" in again.counts and again.counts["x"] == 1

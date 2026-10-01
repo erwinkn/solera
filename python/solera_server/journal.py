@@ -6,7 +6,7 @@ whole state as a checkpoint. A writer starting up loads the newest
 checkpoint and replays the segments after it.
 
     {prefix}/journal/{seq:020d}.json      {"seq", "writer", "at", "events": [...]}
-    {prefix}/checkpoints/{seq:020d}.json  {"seq", "writer", "at", "state": {...}}
+    {prefix}/checkpoints/{seq:020d}.json  {"seq", "writer", "at", "fences", "state": {...}}
 
 Only create-only puts and LIST are needed — no compare-and-swap, which
 obstore's local filesystem backend does not implement.
@@ -14,7 +14,11 @@ obstore's local filesystem backend does not implement.
 **Fencing.** A writer's first segment is its fence (`WriterStarted`); the
 segment's seq is the writer id. Every later segment is created at `seq+1`.
 A replaced writer's next create collides with a segment it did not write
-and the journal becomes `fenced`: every later append fails.
+and the journal becomes `fenced`: every later append fails. That segment is
+its successor's fence, so fence segments are never deleted: were cleanup to
+remove one, the replaced writer's next create would succeed in its slot, and
+what it appended would be acknowledged yet never replayed. Each checkpoint
+lists them (`fences`) so cleanup can skip them: one small object per writer.
 
 **Durability.** `append` applies nothing; the caller applies an event to
 memory and appends it, and a background flusher writes what is buffered
@@ -29,7 +33,7 @@ checkpoint reaches that checkpoint's size (and at least `min_checkpoint`
 bytes), the state is snapshotted — at the moment the flushed batch was
 sealed, so it matches the segment's seq exactly — and written. Then
 checkpoints older than the previous one are deleted, and so are segments
-at or below the previous checkpoint's seq: the previous checkpoint and the
+at or below the previous checkpoint's seq but fences: the previous checkpoint and the
 journal after it are kept, so a newest checkpoint that turns out
 unreadable can be recovered from.
 """
@@ -104,6 +108,7 @@ class Journal:
         self._since_checkpoint = 0
         self._last_checkpoint_size = 0
         self._checkpoints: list[int] = []
+        self.fences: list[int] = []  # every writer's fence segment: never deleted
 
     # -- paths ----------------------------------------------------------------------
 
@@ -154,6 +159,7 @@ class Journal:
             try:
                 body = await self._get_json(self._checkpoint(seq))
                 restore(body["state"])
+                self.fences = list(body["fences"])
                 loaded = seq
                 self._last_checkpoint_size = len(_dumps(body))
                 break
@@ -176,9 +182,7 @@ class Journal:
             if seq != self.seq + 1:
                 raise JournalCorrupt(f"journal gap: expected segment {self.seq + 1}, found {seq}")
             body = await self._get_json(self._segment(seq))
-            for event in body["events"]:
-                apply(event)
-            self.seq = seq
+            self._apply_segment(seq, body, apply)
             self._since_checkpoint += len(_dumps(body))
             count += 1
         return count
@@ -192,15 +196,20 @@ class Journal:
                 await obstore.put_async(self.store, self._segment(seq), _dumps(body), mode="create")
             except AlreadyExistsError:
                 # Another writer appended since we listed: apply it and try the next seq.
-                other = await self._get_json(self._segment(seq))
-                for event in other["events"]:
-                    apply(event)
-                self.seq = seq
+                self._apply_segment(seq, await self._get_json(self._segment(seq)), apply)
                 continue
             apply(fence)
             self.seq = seq
             self.writer = seq
+            self.fences.append(seq)
             return
+
+    def _apply_segment(self, seq: int, body: dict, apply) -> None:
+        for event in body["events"]:
+            apply(event)
+            if event["type"] == "WriterStarted":
+                self.fences.append(seq)
+        self.seq = seq
 
     # -- appending ----------------------------------------------------------------------
 
@@ -282,12 +291,12 @@ class Journal:
         due = self._snapshot is not None and self._since_checkpoint + len(data) >= max(
             self.min_checkpoint, self._last_checkpoint_size
         )
-        snap = (
-            _dumps({"seq": seq, "writer": self.writer, "at": self.clock(), "state": self._snapshot()})
-            if due
-            else None
-        )
+        snap = _dumps(self._checkpoint_body(seq)) if due else None
         self._sealed = (seq, data, len(events), snap)
+
+    def _checkpoint_body(self, seq: int) -> dict:
+        at, fences = self.clock(), list(self.fences)
+        return {"seq": seq, "writer": self.writer, "at": at, "fences": fences, "state": self._snapshot()}
 
     async def _put_segment(self, seq: int, data: bytes) -> None:
         for attempt in range(5):
@@ -319,13 +328,15 @@ class Journal:
         await self._collect()
 
     async def _collect(self) -> None:
-        """Keep the newest checkpoint, the one before it, and the journal after that."""
+        """Keep the newest checkpoint, the one before it, the journal after
+        that, and every fence."""
 
         if len(self._checkpoints) < 2:
             return
         previous = self._checkpoints[-2]
         old = [c for c in self._checkpoints if c < previous]
-        segments = [s for s in await self._list("journal") if s <= previous]
+        fences = set(self.fences)
+        segments = [s for s in await self._list("journal") if s <= previous and s not in fences]
         paths = [self._checkpoint(c) for c in old] + [self._segment(s) for s in segments]
         for i in range(0, len(paths), 1000):
             await obstore.delete_async(self.store, paths[i : i + 1000])
@@ -380,7 +391,4 @@ class Journal:
             return
         await self.flush()
         if checkpoint and self._snapshot is not None and self._since_checkpoint:
-            snap = _dumps(
-                {"seq": self.seq, "writer": self.writer, "at": self.clock(), "state": self._snapshot()}
-            )
-            await self._write_checkpoint(self.seq, snap)
+            await self._write_checkpoint(self.seq, _dumps(self._checkpoint_body(self.seq)))
