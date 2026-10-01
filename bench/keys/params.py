@@ -17,8 +17,8 @@ import time
 import uuid
 
 from solera import keys as K
+from solera._native import value_digest
 from solera.keys import CODEC_NONE, parse_footer, parse_tail
-from solera.stores import revision
 
 
 def random_ids(n: int, rng: random.Random) -> list[bytes]:
@@ -43,7 +43,7 @@ KEYS = {
 }
 VERSIONS = {
     "row digest (the default; bench, model)": lambda n, rng: [
-        revision({"id": i, "value": rng.random()}) for i in range(n)
+        value_digest({"id": i, "value": rng.random()}) for i in range(n)
     ],
     "short revision `%d`": lambda n, rng: [b"%d" % rng.randrange(10**6) for _ in range(n)],
 }

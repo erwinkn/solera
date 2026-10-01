@@ -64,6 +64,27 @@ async def test_patch_upsert_and_remove(store):
     assert [r["id"] for r in await store.load(reset.ref, list[dict], None)] == ["z"]
 
 
+async def test_patch_replaces_each_keys_rows(store):
+    """§6: every key is the group of rows that carry it. A patch replaces all
+    of a key's rows; keys it does not name keep theirs."""
+
+    out = output(key="path", revision="v")
+    first = await store.store(
+        Patch(
+            [
+                {"path": "a.csv", "v": "1", "n": 1},
+                {"path": "a.csv", "v": "1", "n": 2},
+                {"path": "b.csv", "v": "1", "n": 1},
+            ]
+        ),
+        None,
+        scope(out),
+    )
+    second = await store.store(Patch([{"path": "a.csv", "v": "2", "n": 3}]), first.ref, scope(out))
+    rows = await store.load(second.ref, list[dict], None)
+    assert sorted((r["path"], r["n"]) for r in rows) == [("a.csv", 3), ("b.csv", 1)]
+
+
 async def test_a_lost_commit_does_not_stick_the_slice(store):
     """§8: an attempt whose write landed but whose commit was lost leaves the
     table ahead of the head. The next write, from the older prior, goes

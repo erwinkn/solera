@@ -53,9 +53,8 @@ from solera.stores import (
     Sql,
     StoreError,
     WriteError,
-    key_map,
-    key_rows,
     resolve_env,
+    store_key_rows,
 )
 
 
@@ -539,15 +538,15 @@ async def _store_outputs(spec, project, asset, objects, keys_io, result_value, f
         content = value.rows if patch else value
         unsettled = info.get("unsettled") or []
         batch, attempt = int(info["batch"]), spec["attempt"]
+        rows = await asyncio.to_thread(store_key_rows, store, content, output)
         if replace:
             # Every written key against every live one, streamed: the delta goes out as it fills.
-            rows = await asyncio.to_thread(key_rows, output, content)
             try:
                 files, changed = await index.replace(rows, batch, attempt, collect=LISTED)
-            except ValueError as e:  # a duplicate key, found as the join reaches it
-                raise WriteError(f"{output.name}: {e} in write") from e
+            except ValueError as e:  # a value with no digest, found as the join reaches it
+                raise WriteError(f"{output.name}: {e}") from e
         else:
-            new = key_map(output, content)
+            new = await _versions(output, rows)
             removes = [str(k) for k in value.remove if str(k) not in new]
             own = set(new), set(removes)
             intended = set(await _intended(info, keys_io, unsettled)) if unsettled else set()
@@ -632,7 +631,9 @@ async def _store_outputs(spec, project, asset, objects, keys_io, result_value, f
         if "index" in plan and isinstance(value, Sql):
             if written.keys is None:
                 raise StoreError(f"{output.name}: store {store_name!r} reported no keys for a Sql write")
-            files, _ = await plan["index"].replace(written.keys, int(info["batch"]), spec["attempt"])
+            files, _ = await plan["index"].replace(
+                written.keys, int(info["batch"]), spec["attempt"], fold=not output.revision
+            )
             entry["keys"] = files.to_json()
         elif "index" in plan:
             entry["keys"] = plan["keys"]
@@ -685,10 +686,21 @@ async def _repair(output, store, prior, left, new, removes):
     new, removes, left = dict(new), list(removes), sorted(left)
     for i in range(0, len(left), REPAIR_PAGE):
         page = left[i : i + REPAIR_PAGE]
-        found = key_map(output, await store.load(prior, None, Keys(dict.fromkeys(page, b""))))
+        loaded = await store.load(prior, None, Keys(dict.fromkeys(page, b"")))
+        found = await _versions(output, await asyncio.to_thread(store_key_rows, store, loaded, output))
         new.update(found)
         removes.extend(k for k in page if k not in found)
     return new, removes
+
+
+async def _versions(output, rows) -> dict[str, bytes]:
+    """A patch's keys and versions — few enough to check one by one."""
+
+    try:
+        keys, versions = await asyncio.to_thread(rows.entries)
+    except ValueError as e:  # a value with no digest
+        raise WriteError(f"{output.name}: {e}") from e
+    return dict(zip(map(key_str, keys), versions, strict=True))
 
 
 def _key_io(objects, objects_url: str, project: Project) -> ObjectIO:

@@ -9,9 +9,9 @@ a delta changing 1% of versions; the replacement writes them back. Each runs in 
 reports the peak resident memory it added on top of that input — the data a
 worker would already hold (the kernel's peak counter is reset first).
 
-Input shapes: `list` is Python `bytes` keys with a version function (MD5 of
-the key: a row digest's cost, in Python); `arrow` is a pyarrow Table of
-`k` and `v` columns, read in place. Rows arrive shuffled unless `sorted`.
+Input shapes: `list` is Python `(key, version)` pairs (`Rows.pairs`;
+versions the MD5 of the key); `arrow` is a pyarrow Table of `k` and `v`
+columns, read in place. `digest.py` measures digesting rows. Rows arrive shuffled unless `sorted`.
 Keys are `cust-%013d` with random gaps, as in bench.py. The same script
 runs against the pre-streaming code (`KeyIndex.changes(..., replace=True)`)
 for the before figures; `--cases` picks what applies.
@@ -122,6 +122,9 @@ async def one(case: str, n: int, prefix: str, state_file: str | None, args) -> d
         ks = key_list(n, shuffled=True)
         if Rows is None:
             vs = [version(k) for k in ks]
+        else:
+            pairs = [(k, version(k)) for k in ks]
+            del ks
     elif "-arrow" in case:
         table = arrow_table(n, shuffled=not case.endswith("sorted"), changed=False)
 
@@ -130,7 +133,7 @@ async def one(case: str, n: int, prefix: str, state_file: str | None, args) -> d
             delta = await idx.changes(ks, vs, replace=True)
             return await idx.write(2, case, delta)
         if case.endswith("-list"):
-            rows = Rows.objects(ks, None, version)
+            rows = Rows.pairs(pairs)
         elif "-arrow" in case:
             rows = Rows.arrow(table, "k", "v")
         if load or changed:

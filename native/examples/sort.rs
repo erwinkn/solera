@@ -119,7 +119,7 @@ fn main() {
         let t = Instant::now();
         let order = match name {
             "sorted_check" => {
-                assert_eq!(sort::is_sorted(&packed), Ok(false));
+                assert!(!sort::is_sorted(&packed));
                 Vec::new()
             }
             "perm" => sort::perm(&packed),

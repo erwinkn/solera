@@ -9,6 +9,7 @@ use std::collections::VecDeque;
 
 use rayon::prelude::*;
 
+use crate::digest::{self, Digest};
 use crate::format::{Error, Result};
 use crate::sort::{self, Keys};
 use crate::stream::State;
@@ -62,8 +63,14 @@ impl Keys for Arena {
 }
 
 /// Where versions come from: `fill` appends the versions of `rows` to `out`.
+/// Either they are row digests (`rows`), folded into each key's `group`, or
+/// they are final, and every row of a key must have the same one.
 pub trait Versions: Send + Sync {
     fn fill(&mut self, rows: &[u32], out: &mut Arena) -> Result<()>;
+
+    fn rows(&self) -> bool {
+        false
+    }
 }
 
 /// Every row has the same version (a partition set's elements).
@@ -78,13 +85,58 @@ impl Versions for Constant {
     }
 }
 
+/// The rows of one key, read one at a time: their version is the group of
+/// their row digests (`fold`), else the version they all share.
+#[derive(Default)]
+pub struct Group {
+    pub key: Vec<u8>,
+    pub version: Vec<u8>,
+    digests: Vec<Digest>,
+    fold: bool,
+    rows: usize,
+}
+
+impl Group {
+    fn start(&mut self, key: &[u8], fold: bool) {
+        self.key.clear();
+        self.key.extend_from_slice(key);
+        self.version.clear();
+        self.digests.clear();
+        self.fold = fold;
+        self.rows = 0;
+    }
+
+    fn add(&mut self, version: &[u8]) -> Result<()> {
+        if self.fold {
+            let d = version
+                .try_into()
+                .map_err(|_| Error::Value("a row digest is 16 bytes".into()))?;
+            self.digests.push(d);
+        } else if self.rows == 0 {
+            self.version.extend_from_slice(version);
+        } else if version != self.version.as_slice() {
+            return Err(Error::Value(format!(
+                "the rows of key {:?} have different revisions",
+                String::from_utf8_lossy(&self.key)
+            )));
+        }
+        self.rows += 1;
+        Ok(())
+    }
+
+    fn finish(&mut self) {
+        if self.fold {
+            self.version.clear();
+            self.version
+                .extend_from_slice(&digest::group(&mut self.digests));
+        }
+    }
+}
+
 /// Versions computed a window of rows at a time, in key order.
 const WINDOW: usize = 1 << 14;
 
-fn duplicate(key: &[u8]) -> Error {
-    Error::Value(format!("duplicate key {:?}", String::from_utf8_lossy(key)))
-}
-
+/// Written rows, read a key — a group of rows — at a time, in key order.
 pub struct Table {
     keys: Box<dyn Keys + Send>,
     order: Option<Vec<u32>>,
@@ -95,17 +147,14 @@ pub struct Table {
     wvers: Arena,
     start: usize,
     pos: usize,
+    group: Group,
+    ready: bool,
 }
 
 impl Table {
-    /// Sorts the keys unless they arrive sorted. A duplicate key is an error
-    /// here when they arrive sorted, else when the replacement reaches it.
+    /// Sorts the keys unless they arrive sorted.
     pub fn new(keys: Box<dyn Keys + Send>, versions: Box<dyn Versions>) -> Result<Table> {
-        let order = match sort::is_sorted(&*keys) {
-            Ok(true) => None,
-            Err(i) => return Err(duplicate(keys.key(i))),
-            Ok(false) => Some(sort::order(&*keys)),
-        };
+        let order = (!sort::is_sorted(&*keys)).then(|| sort::order(&*keys));
         Ok(Table {
             keys,
             order,
@@ -114,9 +163,12 @@ impl Table {
             wvers: Arena::default(),
             start: 0,
             pos: 0,
+            group: Group::default(),
+            ready: false,
         })
     }
 
+    /// Rows, not keys.
     pub fn len(&self) -> usize {
         self.keys.len()
     }
@@ -140,19 +192,36 @@ impl Table {
             Some(o) => o[self.pos..end].to_vec(),
             None => (self.pos as u32..end as u32).collect(),
         };
-        let last = (!self.wkeys.is_empty()).then(|| self.wkeys.get(self.wkeys.len() - 1).to_vec());
         self.wkeys.clear();
         gather(&*self.keys, &rows, &mut self.wkeys);
-        let first = (last.as_deref() == Some(self.wkeys.get(0))).then_some(0);
-        if let Some(i) = first
-            .or_else(|| (1..self.wkeys.len()).find(|&i| self.wkeys.get(i - 1) == self.wkeys.get(i)))
-        {
-            return Err(duplicate(self.wkeys.get(i)));
-        }
         self.wvers.clear();
         self.versions.fill(&rows, &mut self.wvers)?;
         self.start = self.pos;
         Ok(())
+    }
+
+    /// Reads the next key's rows into `group`; false past the last.
+    fn group(&mut self) -> Result<bool> {
+        if self.pos >= self.len() {
+            return Ok(false);
+        }
+        self.fill()?;
+        let fold = self.versions.rows();
+        self.group
+            .start(self.wkeys.get(self.pos - self.start), fold);
+        loop {
+            self.group.add(self.wvers.get(self.pos - self.start))?;
+            self.pos += 1;
+            if self.pos >= self.len() {
+                break;
+            }
+            self.fill()?;
+            if self.wkeys.get(self.pos - self.start) != self.group.key.as_slice() {
+                break;
+            }
+        }
+        self.group.finish();
+        Ok(true)
     }
 }
 
@@ -173,16 +242,28 @@ fn gather<K: Keys + ?Sized>(keys: &K, rows: &[u32], out: &mut Arena) {
     }
 }
 
-/// Sorted chunks of `(key, version)`, fed as they are read.
+/// Sorted chunks of `(key, version)`, fed as they are read. A key may
+/// repeat: its versions are row digests to `fold`, or must agree.
 #[derive(Default)]
 pub struct Stream {
     chunks: VecDeque<(Arena, Arena)>,
     pos: usize,
     last: Option<Vec<u8>>,
     ended: bool,
+    fold: bool,
+    group: Group,
+    open: bool,
+    ready: bool,
 }
 
 impl Stream {
+    pub fn new(fold: bool) -> Stream {
+        Stream {
+            fold,
+            ..Stream::default()
+        }
+    }
+
     pub fn feed(&mut self, keys: Arena, versions: Arena) -> Result<()> {
         for i in 0..keys.len() {
             let k = keys.get(i);
@@ -191,17 +272,12 @@ impl Stream {
             } else {
                 self.last.as_deref()
             };
-            if let Some(p) = prev {
-                if k == p {
-                    return Err(duplicate(k));
-                }
-                if k < p {
-                    return Err(Error::Value(format!(
-                        "keys must arrive sorted: {:?} then {:?}",
-                        String::from_utf8_lossy(p),
-                        String::from_utf8_lossy(k)
-                    )));
-                }
+            if let Some(p) = prev.filter(|&p| k < p) {
+                return Err(Error::Value(format!(
+                    "keys must arrive sorted: {:?} then {:?}",
+                    String::from_utf8_lossy(p),
+                    String::from_utf8_lossy(k)
+                )));
             }
         }
         if !keys.is_empty() {
@@ -213,6 +289,43 @@ impl Stream {
 
     pub fn end(&mut self) {
         self.ended = true;
+    }
+
+    /// Reads the next key's rows into `group`, across chunks.
+    fn state(&mut self) -> Result<State> {
+        if self.ready {
+            return Ok(State::Ready);
+        }
+        loop {
+            let Some((k, v)) = self.chunks.front() else {
+                if !self.ended {
+                    return Ok(State::Starved); // the group may go on in the next chunk
+                }
+                if self.open {
+                    self.group.finish();
+                    (self.open, self.ready) = (false, true);
+                    return Ok(State::Ready);
+                }
+                return Ok(State::Done);
+            };
+            if self.pos >= k.len() {
+                self.chunks.pop_front();
+                self.pos = 0;
+                continue;
+            }
+            let key = k.get(self.pos);
+            if self.open && key != self.group.key.as_slice() {
+                self.group.finish();
+                (self.open, self.ready) = (false, true);
+                return Ok(State::Ready);
+            }
+            if !self.open {
+                self.group.start(key, self.fold);
+                self.open = true;
+            }
+            self.group.add(v.get(self.pos))?;
+            self.pos += 1;
+        }
     }
 }
 
@@ -226,23 +339,15 @@ impl Source {
     pub fn state(&mut self) -> Result<State> {
         match self {
             Source::Table(t) => {
-                if t.pos >= t.len() {
-                    return Ok(State::Done);
+                if !t.ready {
+                    if !t.group()? {
+                        return Ok(State::Done);
+                    }
+                    t.ready = true;
                 }
-                t.fill()?;
                 Ok(State::Ready)
             }
-            Source::Stream(s) => loop {
-                match s.chunks.front() {
-                    Some((k, _)) if s.pos < k.len() => return Ok(State::Ready),
-                    Some(_) => {
-                        s.chunks.pop_front();
-                        s.pos = 0;
-                    }
-                    None if s.ended => return Ok(State::Done),
-                    None => return Ok(State::Starved),
-                }
-            },
+            Source::Stream(s) => s.state(),
         }
     }
 
@@ -250,26 +355,23 @@ impl Source {
     #[inline]
     pub fn key(&self) -> &[u8] {
         match self {
-            Source::Table(t) => t.wkeys.get(t.pos - t.start),
-            Source::Stream(s) => s.chunks[0].0.get(s.pos),
+            Source::Table(t) => &t.group.key,
+            Source::Stream(s) => &s.group.key,
         }
     }
 
     /// The current key and its version; only when `state` is `Ready`.
     pub fn entry(&self) -> (&[u8], &[u8]) {
         match self {
-            Source::Table(t) => (t.wkeys.get(t.pos - t.start), t.wvers.get(t.pos - t.start)),
-            Source::Stream(s) => {
-                let (k, v) = &s.chunks[0];
-                (k.get(s.pos), v.get(s.pos))
-            }
+            Source::Table(t) => (&t.group.key, &t.group.version),
+            Source::Stream(s) => (&s.group.key, &s.group.version),
         }
     }
 
     pub fn advance(&mut self) {
         match self {
-            Source::Table(t) => t.pos += 1,
-            Source::Stream(s) => s.pos += 1,
+            Source::Table(t) => t.ready = false,
+            Source::Stream(s) => s.ready = false,
         }
     }
 }

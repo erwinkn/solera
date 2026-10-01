@@ -92,8 +92,8 @@ store-specific config validated by `can_store` at registration.
 | Arg | Meaning |
 |---|---|
 | `keyed` | The output is a `dict[str, Any]`: its keys are the keys, its values the content. Excludes `key` and `revision`. |
-| `key` | Column identifying what was materialized. Declared once, here; consumers never name columns. Independent of `primary_key` (storage identity). |
-| `revision` | Column that changes when a key's content changes. Absent: a 16-byte digest of the row. |
+| `key` | Column identifying what was materialized. Declared once, here; consumers never name columns. A key holds every row that carries it — one, or the many rows parsed from one file. Independent of `primary_key` (storage identity). |
+| `revision` | Column that changes when a key's content changes; a key's rows must share it. Absent: a 16-byte digest of the key's rows (`row-digest.md`). |
 | `incremental` | The output commits in engine-numbered batches: a keyed output's changes land in its key index (object-store-state.md §6), an unkeyed one's batches in its store; `Incremental()` consumers read what arrived after their watermark. `key=` implies it. Default false — a value output is one object per version. |
 | `migrations` | Ordered `Migration(name, payload)` list owned by this output. The store applies pending ones before its first write to the output in an attempt (§4). Payload type is store-defined (`can_store`). The applied set travels in the handle (§3) and the declared list is in the fingerprint (§6). |
 | `**config` | Store-specific: `schema`, `primary_key`, `columns`, `indexes`, `partition_column`, … |

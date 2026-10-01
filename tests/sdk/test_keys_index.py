@@ -51,7 +51,7 @@ class Harness:
             # Streamed out as files: read them back.
             items = list(zip(keys, versions, strict=True))
             random.Random(len(items)).shuffle(items)
-            rows = Rows.objects(items, 0, lambda kv: kv[1])
+            rows = Rows.pairs(items)
             files, changed = await idx.replace(rows, self.batch, f"a{self.batch}", collect=10**6)
             written = [
                 e

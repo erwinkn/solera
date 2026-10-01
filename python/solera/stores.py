@@ -43,7 +43,7 @@ class Sql:
 @dataclass(frozen=True)
 class Keys:
     """A `key -> revision` selection passed to `store.load` (§4), revisions as
-    the key index holds them (see `key_map`)."""
+    the key index holds them (docs/row-digest.md)."""
 
     revisions: Mapping[str, bytes]
 
@@ -92,6 +92,12 @@ class Written:
 
 @runtime_checkable
 class Store(Protocol):
+    """A store may also define `key_rows(write, output) -> solera.keys.Rows`:
+    a keyed write's content — the whole write, or a `Patch`'s rows — for the
+    key index, read from the store's own types (§6, docs/row-digest.md).
+    Without it, `key_rows` below reads lists of dicts, dicts, DataFrames and
+    Arrow data."""
+
     version: str = "1"
     ref_type: type[Ref] = Ref
 
@@ -162,15 +168,10 @@ def encode(value: Any) -> tuple[bytes, str]:
     return pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL), "pkl"
 
 
-def revision(value: Any) -> bytes:
-    """A content revision: a 16-byte digest of the value's encoding."""
-
-    return hashlib.blake2b(encode(value)[0], digest_size=16).digest()
-
-
 def entries(output: Output, value: Any) -> dict[str, Any]:
     """A keyed write's content as `key -> entry` (§4): a `keyed=True`
-    output's dict, a partition set's elements, or rows by their key column."""
+    output's dict, a partition set's elements, or rows grouped by their key
+    column — every key holds the list of rows that carry it."""
 
     if output.is_partition_set:
         return {str(e): str(e) for e in value or ()}
@@ -182,78 +183,55 @@ def entries(output: Output, value: Any) -> dict[str, Any]:
                 f"{output.name}: a keyed output takes dict[str, Any], got {type(value).__name__}"
             )
         return dict(value)
-    result = {}
+    result: dict[str, list] = {}
     for row in _rows(value, output.name):
         if output.key not in row:
             raise WriteError(f"{output.name}: row lacks the declared key column {output.key!r}")
-        key = str(row[output.key])
-        if key in result:
-            raise WriteError(f"{output.name}: duplicate key {key!r} in write")
-        result[key] = row
+        result.setdefault(str(row[output.key]), []).append(row)
     return result
 
 
-def key_map(output: Output, value: Any) -> dict[str, bytes]:
-    """The scope's complete `key -> revision` map for a keyed write (§4): the
-    declared revision field's text, else a row digest (`revision`)."""
-
-    content = entries(output, value)
-    if output.is_partition_set:
-        return dict.fromkeys(content, b"1")
-    if not output.revision:
-        return {key: revision(entry) for key, entry in content.items()}
-    result = {}
-    for key, row in content.items():
-        if not isinstance(row, Mapping) or output.revision not in row:
-            raise WriteError(f"{output.name}: {key!r} lacks the declared revision field {output.revision!r}")
-        result[key] = str(row[output.revision]).encode()
-    return result
-
-
-def key_rows(output: Output, value: Any):
-    """A keyed replacement's content for the key index (`solera.keys.Rows`):
-    the keys and versions `key_map` defines, packed or read in place, with
-    versions computed as the index reaches each row. Arrow data (anything
+def key_rows(write: Any, output: Output):
+    """A keyed write's content for the key index (`solera.keys.Rows`), every
+    key the group of rows that carry it, with versions computed natively as
+    the index reaches each key (docs/row-digest.md). Arrow data (anything
     with `__arrow_c_stream__`) is read in place; a DataFrame becomes Arrow
-    through DuckDB. Its row digests are over the Arrow values (see
-    `native/src/arrow.rs`), so they differ from a `list[dict]`'s."""
+    through DuckDB."""
 
     from .keys import Rows
 
     name = output.name
     try:
         if output.is_partition_set:
-            return Rows.objects([str(e) for e in value or ()], None, b"1")
+            return Rows.keys([str(e) for e in write or ()], b"1")
         if output.key == KEYS:
-            if value is None:
-                value = {}
-            if not isinstance(value, Mapping) or not all(isinstance(k, str) for k in value):
-                raise WriteError(f"{name}: a keyed output takes dict[str, Any], got {type(value).__name__}")
-            return Rows.objects(list(value.items()), 0, lambda kv: revision(kv[1]))
-        if _is_dataframe(value):
+            if write is None:
+                write = {}
+            if not isinstance(write, Mapping) or not all(isinstance(k, str) for k in write):
+                raise WriteError(f"{name}: a keyed output takes dict[str, Any], got {type(write).__name__}")
+            return Rows.values(list(write.items()))
+        if _is_dataframe(write):
             import duckdb
 
-            value = duckdb.connect().from_df(value)
-        if hasattr(value, "__arrow_c_stream__"):
-            return Rows.arrow(value, output.key, output.revision)
-        if value is None:
-            value = []
-        if not isinstance(value, list) or not all(isinstance(r, Mapping) for r in value):
-            raise WriteError(f"{name}: expected rows (list[dict] or DataFrame), got {type(value).__name__}")
-        if output.revision:
-            rev = output.revision
-
-            def version(row):
-                if rev not in row:
-                    raise WriteError(f"{name}: {row[output.key]!r} lacks the declared revision field {rev!r}")
-                return str(row[rev]).encode()
-
-            return Rows.objects(value, output.key, version)
-        return Rows.objects(value, output.key, revision)
+            write = duckdb.connect().from_df(write)
+        if hasattr(write, "__arrow_c_stream__"):
+            return Rows.arrow(write, output.key, output.revision)
+        if write is None:
+            write = []
+        if not isinstance(write, list) or not all(isinstance(r, Mapping) for r in write):
+            raise WriteError(f"{name}: expected rows (list[dict] or DataFrame), got {type(write).__name__}")
+        return Rows.records(write, output.key, output.revision)
     except KeyError as e:
         raise WriteError(f"{name}: row lacks the declared key column {output.key!r}") from e
-    except ValueError as e:  # a duplicate key, or Arrow data without the columns
-        raise WriteError(f"{name}: {e} in write") from e
+    except ValueError as e:  # Arrow data without the columns, a value with no digest
+        raise WriteError(f"{name}: {e}") from e
+
+
+def store_key_rows(store: Store, write: Any, output: Output):
+    """`store.key_rows`, or the default `key_rows`."""
+
+    own = getattr(store, "key_rows", None)
+    return own(write, output) if own is not None else key_rows(write, output)
 
 
 def remove_empty_dirs(objects, prefixes) -> None:
@@ -291,7 +269,7 @@ class FileStore:
         {root}/rollup.json                      a value
         {root}/site_status/alpha.json           a value, partition alpha
         {root}/uploads/u-7.pkl                  a keyed output: one object per key
-        {root}/site_files/alpha/f-1.json        keyed and partitioned
+        {root}/site_files/alpha/f-1.json        keyed and partitioned: the key's rows
         {root}/site_events/alpha/000000000042.json
                                                 an unkeyed incremental output: one per batch
 
@@ -457,7 +435,7 @@ class FileStore:
             content = {k: v for k, v in zip(keys, found, strict=True) if v is not MISSING}
             if handle.get("key") == KEYS:
                 return content
-            return _materialize(list(content.values()), t)
+            return _materialize([row for rows in content.values() for row in rows], t)
         value = await self._get(base)
         if value is MISSING:
             raise StoreError(f"{ref.output}: {base} is gone")

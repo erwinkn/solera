@@ -34,8 +34,10 @@ def index(entries, max_file_bytes=4096):
     )
 
 
-def replace(rows, runs, max_file_bytes=4096, collect=10**6, stream=()):
-    job = _native.Job.replace(rows, len(runs), max_file_bytes=max_file_bytes, collect=collect, **OPTS)
+def replace(rows, runs, max_file_bytes=4096, collect=10**6, stream=(), fold=False):
+    job = _native.Job.replace(
+        rows, len(runs), max_file_bytes=max_file_bytes, collect=collect, fold=fold, **OPTS
+    )
     files = drive(job, runs, stream)
     return job, files
 
@@ -78,7 +80,7 @@ def test_replace_objects(presorted):
     items = sorted(written.items())
     if not presorted:
         random.Random(1).shuffle(items)
-    rows = _native.Rows.objects(items, 0, lambda kv: kv[1])
+    rows = _native.Rows.pairs(items)
     assert rows.presorted == presorted and len(rows) == len(written)
     job, files = replace(rows, runs)
     want = expected(live, written)
@@ -93,35 +95,38 @@ def test_replace_objects(presorted):
 
 def test_replace_initial_load_and_nothing_changed():
     written = {b"%05d" % i: b"v" for i in range(2000)}
-    rows = _native.Rows.objects(list(written), None, b"v")
+    rows = _native.Rows.keys(list(written), b"v")
     _, files = replace(rows, [])
     assert content(files) == [(k, b"v", 0) for k in sorted(written)]
-    job, files = replace(_native.Rows.objects(list(written), None, b"v"), [files])
+    job, files = replace(_native.Rows.keys(list(written), b"v"), [files])
     assert files == [] and (job.added, job.removed, job.changed) == (0, 0, 0)
 
 
 def test_collected_stops_at_its_limit():
     live, written, runs = scenario()
-    job, _ = replace(_native.Rows.objects(list(written.items()), 0, lambda kv: kv[1]), runs, collect=10)
+    job, _ = replace(_native.Rows.pairs(list(written.items())), runs, collect=10)
     assert job.collected() is None
 
 
-def test_objects_keys_and_errors():
+def test_records_keys_groups_and_errors():
     rows = [{"id": 3, "v": "a"}, {"id": "x\udcff", "v": "b"}]
-    job, files = replace(_native.Rows.objects(rows, "id", lambda r: r["v"].encode()), [])
+    job, files = replace(_native.Rows.records(rows, "id", "v"), [])
     assert content(files) == [(b"3", b"a", 0), (b"x\xff", b"b", 0)]  # str(), surrogateescape
-    with pytest.raises(ValueError, match="duplicate key"):
-        _native.Rows.objects([{"id": 1}, {"id": "1"}], "id", b"")  # sorted
-    with pytest.raises(ValueError, match="duplicate key"):
-        replace(_native.Rows.objects([{"id": 2}, {"id": 1}, {"id": "2"}], "id", b""), [])
+    # A key repeats: its rows are one group, whatever their order.
+    grouped = [{"id": 2, "n": 1}, {"id": 1, "n": 0}, {"id": "2", "n": 2}]
+    _, files = replace(_native.Rows.records(grouped, "id"), [])
+    assert content(files) == [
+        (b"1", _native.group_digest([grouped[1]], "id"), 0),
+        (b"2", _native.group_digest([grouped[2], grouped[0]], "id"), 0),
+    ]
+    with pytest.raises(ValueError, match="different revisions"):
+        replace(_native.Rows.records([{"id": 1, "v": "a"}, {"id": 1, "v": "b"}], "id", "v"), [])
     with pytest.raises(KeyError):
-        _native.Rows.objects([{"id": 1}, {}], "id", b"")
-
-    def boom(row):
-        raise LookupError("no revision")
-
-    with pytest.raises(LookupError, match="no revision"):
-        replace(_native.Rows.objects([1, 2], None, boom), [])
+        _native.Rows.records([{"id": 1}, {}], "id")
+    with pytest.raises(ValueError, match="revision field"):
+        replace(_native.Rows.records([{"id": 1}], "id", "v"), [])
+    with pytest.raises(ValueError, match="cannot digest a value of type set"):
+        replace(_native.Rows.records([{"id": 1, "s": {1}}], "id"), [])
 
 
 def test_replace_arrow_in_place():
@@ -169,8 +174,9 @@ def test_row_digests():
     assert digests(same) == base
     changed = digests(t.set_column(1, "n", pa.array([1, 3, None], pa.int64())))
     assert changed[b"a"] == base[b"a"] and changed[b"b"] != base[b"b"]
+    ree = pa.RunEndEncodedArray.from_arrays(pa.array([1], pa.int32()), pa.array(["x"]))
     with pytest.raises(ValueError, match="cannot digest"):
-        _native.Rows.arrow(pa.table({"id": ["a"], "u": pa.array([[1]], pa.list_view(pa.int64()))}), "id")
+        replace(_native.Rows.arrow(pa.table({"id": ["a"], "u": ree}), "id"), [])
 
 
 def test_struct_digests_are_framed():
@@ -198,6 +204,23 @@ def test_replace_sorted_stream():
         replace(None, runs, stream=[items[5:10], items[:5]])
 
 
+def test_streamed_rows_fold_into_groups():
+    # A store reporting one version per row: a key's rows may span chunks.
+    rows = [(b"a", b"1" * 16), (b"b", b"2" * 16), (b"b", b"3" * 16), (b"b", b"4" * 16), (b"c", b"5" * 16)]
+    _, files = replace(None, [], stream=[rows[:2], rows[2:3], rows[3:]], fold=True)
+    reordered = [rows[0], rows[3], rows[1], rows[2], rows[4]]  # b's rows in another order and chunking
+    _, again = replace(None, [], stream=[reordered[:3], reordered[3:]], fold=True)
+    assert [k for k, _, _ in content(files)] == [b"a", b"b", b"c"]
+    assert content(files) == content(again)
+    _, fewer = replace(None, [], stream=[rows[:3] + rows[4:]], fold=True)
+    assert content(fewer)[1] != content(files)[1]  # a group counts its rows
+    # Without folding, a repeated key must repeat its version.
+    _, files = replace(None, [], stream=[[(b"a", b"x"), (b"a", b"x")]])
+    assert content(files) == [(b"a", b"x", 0)]
+    with pytest.raises(ValueError, match="different revisions"):
+        replace(None, [], stream=[[(b"a", b"x")], [(b"a", b"y")]])
+
+
 def test_compact_many_files():
     rng = random.Random(3)
     levels = []
@@ -221,26 +244,27 @@ def test_compact_many_files():
 
 
 def test_key_rows_shapes():
-    """A keyed write's content, whatever its shape, as `key_map` defines it."""
+    """A keyed write's content, whatever its shape, with one version for the same rows."""
 
     import pandas as pd
     from solera.sdk import KEYS, Output
-    from solera.stores import WriteError, key_rows, revision
+    from solera.stores import WriteError, key_rows
 
     rows = [{"id": 2, "v": "b"}, {"id": 1, "v": "a"}]
     declared = Output("t", key="id", revision="v")
     for value in (rows, pd.DataFrame(rows), pa.Table.from_pylist(rows)):
-        _, files = replace(key_rows(declared, value), [])
+        _, files = replace(key_rows(value, declared), [])
         assert content(files) == [(b"1", b"a", 0), (b"2", b"b", 0)]
-    _, files = replace(key_rows(Output("d", key="id"), rows), [])
-    assert content(files) == [(b"1", revision(rows[1]), 0), (b"2", revision(rows[0]), 0)]
-    _, files = replace(key_rows(Output("k", key=KEYS), {"x": [1]}), [])
-    assert content(files) == [(b"x", revision([1]), 0)]
-    with pytest.raises(WriteError, match='duplicate key "1"'):
-        key_rows(declared, sorted(rows + rows, key=lambda r: r["id"]))  # sorted: found at once
-    with pytest.raises(ValueError, match='duplicate key "1"'):
-        replace(key_rows(declared, rows + rows), [])  # else as the join reaches it
+    digested = Output("d", key="id")
+    want = [
+        (b"1", _native.group_digest([rows[1]], "id"), 0),
+        (b"2", _native.group_digest([rows[0]], "id"), 0),
+    ]
+    for value in (rows, pd.DataFrame(rows), pa.Table.from_pylist(rows)):
+        assert content(replace(key_rows(value, digested), [])[1]) == want
+    _, files = replace(key_rows({"x": [1]}, Output("k", key=KEYS)), [])
+    assert content(files) == [(b"x", _native.value_digest([1]), 0)]
+    _, files = replace(key_rows(rows + rows, declared), [])  # a key's rows agree on their revision
+    assert content(files) == [(b"1", b"a", 0), (b"2", b"b", 0)]
     with pytest.raises(WriteError, match="key column"):
-        key_rows(declared, [{"x": 1}])
-    with pytest.raises(WriteError, match="revision field"):
-        replace(key_rows(declared, [{"id": 1}]), [])
+        key_rows([{"x": 1}], declared)

@@ -46,7 +46,7 @@ async def key_index_probe(objects):
     io = ObjectIO(objects)
     state = IndexState(prefix="conformance/keys/")
     index = KeyIndex(io, None, state)
-    files, _ = await index.replace(Rows.objects([b"b", b"a"], None, b"1"), 0, uuid.uuid4().hex)
+    files, _ = await index.replace(Rows.keys([b"b", b"a"], b"1"), 0, uuid.uuid4().hex)
     state = state.committed(0, files, keep_log=True)
     try:
         index = KeyIndex(io, None, state)

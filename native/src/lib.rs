@@ -9,8 +9,10 @@
 //! as `bytes`; flags as a `bytes` with one byte per entry.
 
 pub mod arrow;
+pub mod digest;
 pub mod format;
 pub mod jobs;
+mod pyvalue;
 pub mod rows;
 pub mod sort;
 pub mod stream;
@@ -361,29 +363,105 @@ fn key_of(obj: &Bound<'_, PyAny>, out: &mut Vec<u8>) -> PyResult<()> {
     Ok(())
 }
 
-/// A version function over Python rows, called a window of rows at a time.
-struct PyVersions {
-    rows: Py<PyList>,
-    f: Py<PyAny>,
+/// Python rows' versions, a window of rows at a time under the GIL.
+enum PyVersions {
+    /// Mappings: the row digest without the key column, or the revision column's text.
+    Records(Py<PyList>, String, Option<String>),
+    /// `(key, value)` pairs: `value(v)`.
+    Values(Py<PyList>),
+    /// `(key, version)` pairs: the version as given.
+    Pairs(Py<PyList>),
+}
+
+impl PyVersions {
+    fn fill_py(&self, py: Python<'_>, rows: &[u32], out: &mut Arena) -> PyResult<()> {
+        let mut w = pyvalue::Walker::new(py)?;
+        let mut buf = Vec::new();
+        match self {
+            PyVersions::Records(list, key, revision) => {
+                let list = list.bind(py);
+                for &r in rows {
+                    let row = list.get_item(r as usize)?;
+                    match revision {
+                        None => out.push(&w.row(&row, Some(key))?),
+                        Some(rev) => {
+                            let v = field(&row, rev)?.ok_or_else(|| {
+                                PyValueError::new_err(format!(
+                                    "a row lacks the declared revision field {rev:?}"
+                                ))
+                            })?;
+                            buf.clear();
+                            w.render(&v, &mut buf)?;
+                            out.push(&buf);
+                        }
+                    }
+                }
+            }
+            PyVersions::Values(list) => {
+                let list = list.bind(py);
+                for &r in rows {
+                    buf.clear();
+                    w.value(&list.get_item(r as usize)?.get_item(1)?, &mut buf, 0)?;
+                    out.push(&digest::value(&buf));
+                }
+            }
+            PyVersions::Pairs(list) => {
+                let list = list.bind(py);
+                for &r in rows {
+                    buf.clear();
+                    key_of(&list.get_item(r as usize)?.get_item(1)?, &mut buf)?;
+                    out.push(&buf);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Versions for PyVersions {
     fn fill(&mut self, rows: &[u32], out: &mut Arena) -> format::Result<()> {
-        Python::attach(|py| -> PyResult<()> {
-            let list = self.rows.bind(py);
-            let f = self.f.bind(py);
-            for &r in rows {
-                let v = f.call1((list.get_item(r as usize)?,))?;
-                out.push(v.cast::<PyBytes>()?.as_bytes());
-            }
-            Ok(())
-        })
-        .map_err(|e| Error::Callback(Box::new(e)))
+        Python::attach(|py| self.fill_py(py, rows, out)).map_err(|e| Error::Callback(Box::new(e)))
+    }
+
+    fn rows(&self) -> bool {
+        matches!(self, PyVersions::Records(_, _, None))
     }
 }
 
-/// The written content of a full replacement, sorted (unless it arrived
-/// sorted) and checked for duplicate keys.
+/// `row[name]` of a mapping row, None when it has no such field.
+fn field<'py>(row: &Bound<'py, PyAny>, name: &str) -> PyResult<Option<Bound<'py, PyAny>>> {
+    match row.cast::<PyDict>() {
+        Ok(d) => d.get_item(name),
+        Err(_) => match row.get_item(name) {
+            Ok(v) => Ok(Some(v)),
+            Err(e) if e.is_instance_of::<PyKeyError>(row.py()) => Ok(None),
+            Err(e) => Err(e),
+        },
+    }
+}
+
+/// Packs each item's key once: `key(item)` as its `str`, UTF-8 encoded.
+fn pack<'py>(
+    py: Python<'py>,
+    items: &Bound<'py, PyList>,
+    key: impl Fn(&Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>>,
+) -> PyResult<Arena> {
+    let mut keys = Arena::default();
+    keys.ends.reserve(items.len());
+    for (i, item) in items.iter().enumerate() {
+        key_of(&key(&item)?, &mut keys.data)?;
+        keys.ends.push(keys.data.len());
+        if i % 65536 == 65535 {
+            py.detach(|| ()); // let other threads run: this loop holds the GIL
+        }
+    }
+    keys.data.shrink_to_fit();
+    Ok(keys)
+}
+
+/// A keyed write's content, sorted by key (unless it arrived sorted) and
+/// read a key at a time: every key is the group of rows that carry it, and
+/// its version is computed as the reader reaches it (docs/row-digest.md).
 #[pyclass(module = "solera._native")]
 struct Rows {
     table: Option<Table>,
@@ -408,50 +486,56 @@ impl Rows {
 
 #[pymethods]
 impl Rows {
-    /// Python rows: each row's key is `row[key]` (the row itself when `key` is
-    /// None) as its `str`, UTF-8 encoded; its version is `version(row)`, or
-    /// `version` itself when it is `bytes`. Keys are packed once; versions are
-    /// computed as the replacement reaches each row.
+    /// Rows as mappings: the key is `row[key]` as its `str`; the version is
+    /// the group of the key's row digests, the key column left out, or with
+    /// `revision` that column's text, which the key's rows must share.
     #[staticmethod]
-    #[pyo3(signature = (rows, key, version))]
-    fn objects(
+    #[pyo3(signature = (rows, key, revision=None))]
+    fn records(
         py: Python<'_>,
         rows: Bound<'_, PyList>,
-        key: Option<Bound<'_, PyAny>>,
-        version: Bound<'_, PyAny>,
+        key: &str,
+        revision: Option<&str>,
     ) -> PyResult<Rows> {
-        let mut keys = Arena::default();
-        keys.ends.reserve(rows.len());
-        for (i, row) in rows.iter().enumerate() {
-            match &key {
-                None => key_of(&row, &mut keys.data)?,
-                Some(k) => match row.cast::<PyDict>() {
-                    Ok(d) => match d.get_item(k)? {
-                        Some(v) => key_of(&v, &mut keys.data)?,
-                        None => return Err(PyKeyError::new_err(k.clone().unbind())),
-                    },
-                    Err(_) => key_of(&row.get_item(k)?, &mut keys.data)?,
-                },
-            }
-            keys.ends.push(keys.data.len());
-            if i % 65536 == 65535 {
-                py.detach(|| ()); // let other threads run: this loop holds the GIL
-            }
-        }
-        keys.data.shrink_to_fit();
-        let versions: Box<dyn Versions> = match version.cast::<PyBytes>() {
-            Ok(b) => Box::new(Constant(b.as_bytes().to_vec())),
-            Err(_) => Box::new(PyVersions {
-                rows: rows.unbind(),
-                f: version.unbind(),
-            }),
-        };
-        Rows::new(py, Box::new(keys), versions)
+        let keys = pack(py, &rows, |row| {
+            field(row, key)?.ok_or_else(|| PyKeyError::new_err(key.to_string()))
+        })?;
+        let versions = PyVersions::Records(rows.unbind(), key.into(), revision.map(Into::into));
+        Rows::new(py, Box::new(keys), Box::new(versions))
+    }
+
+    /// `(key, value)` pairs (a `keyed=True` output): the version is `value(v)`.
+    #[staticmethod]
+    fn values(py: Python<'_>, items: Bound<'_, PyList>) -> PyResult<Rows> {
+        let keys = pack(py, &items, |item| item.get_item(0))?;
+        Rows::new(
+            py,
+            Box::new(keys),
+            Box::new(PyVersions::Values(items.unbind())),
+        )
+    }
+
+    /// `(key, version)` pairs, versions as given (`str` or `bytes`).
+    #[staticmethod]
+    fn pairs(py: Python<'_>, items: Bound<'_, PyList>) -> PyResult<Rows> {
+        let keys = pack(py, &items, |item| item.get_item(0))?;
+        Rows::new(
+            py,
+            Box::new(keys),
+            Box::new(PyVersions::Pairs(items.unbind())),
+        )
+    }
+
+    /// Keys, every one at `version` (a partition set's elements).
+    #[staticmethod]
+    fn keys(py: Python<'_>, keys: Bound<'_, PyList>, version: &[u8]) -> PyResult<Rows> {
+        let packed = pack(py, &keys, |k| Ok(k.clone()))?;
+        Rows::new(py, Box::new(packed), Box::new(Constant(version.to_vec())))
     }
 
     /// Arrow data (any object with `__arrow_c_stream__`), read in place: keys
     /// from the `key` column, versions from the `revision` column's text, or
-    /// else a digest of each row (`arrow.rs`).
+    /// else each key's group of row digests (`arrow.rs`).
     #[staticmethod]
     #[pyo3(signature = (data, key, revision=None))]
     fn arrow(
@@ -464,11 +548,12 @@ impl Rows {
         let keys = arrow::keys(&batches, key).map_err(to_py)?;
         let versions: Box<dyn Versions> = match revision {
             Some(r) => Box::new(arrow::Revision::new(&batches, r).map_err(to_py)?),
-            None => Box::new(arrow::RowDigest::new(batches).map_err(to_py)?),
+            None => Box::new(arrow::RowDigest::new(batches, key).map_err(to_py)?),
         };
         Rows::new(py, keys, versions)
     }
 
+    /// Rows, not keys.
     fn __len__(&self) -> usize {
         self.len
     }
@@ -478,6 +563,80 @@ impl Rows {
     fn presorted(&self) -> bool {
         self.presorted
     }
+
+    /// Every key and its version, in key order — for a patch, which checks
+    /// its keys one by one. Uses the rows up.
+    fn entries<'py>(
+        &mut self,
+        py: Python<'py>,
+    ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyList>)> {
+        let table = self
+            .table
+            .take()
+            .ok_or_else(|| PyValueError::new_err("rows already used"))?;
+        let mut src = Source::Table(table);
+        let (keys, versions) = (PyList::empty(py), PyList::empty(py));
+        while src.state().map_err(to_py)? == stream::State::Ready {
+            let (k, v) = src.entry();
+            keys.append(PyBytes::new(py, k))?;
+            versions.append(PyBytes::new(py, v))?;
+            src.advance();
+        }
+        Ok((keys, versions))
+    }
+}
+
+// -- digests ------------------------------------------------------------------------------
+
+/// `enc(v)` of a Python value: the canonical bytes (docs/row-digest.md).
+#[pyfunction]
+fn encode<'py>(py: Python<'py>, value: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyBytes>> {
+    let mut out = Vec::new();
+    pyvalue::Walker::new(py)?.value(&value, &mut out, 0)?;
+    Ok(PyBytes::new(py, &out))
+}
+
+/// `row(r)` of a row, without its `key` column.
+#[pyfunction]
+#[pyo3(signature = (row, key=None))]
+fn row_digest<'py>(
+    py: Python<'py>,
+    row: Bound<'py, PyAny>,
+    key: Option<&str>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    Ok(PyBytes::new(py, &pyvalue::Walker::new(py)?.row(&row, key)?))
+}
+
+/// `group(rows)`: the version of a key whose rows these are.
+#[pyfunction]
+#[pyo3(signature = (rows, key=None))]
+fn group_digest<'py>(
+    py: Python<'py>,
+    rows: Bound<'py, PyAny>,
+    key: Option<&str>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let mut w = pyvalue::Walker::new(py)?;
+    let mut digests: Vec<digest::Digest> = rows
+        .try_iter()?
+        .map(|r| w.row(&r?, key))
+        .collect::<PyResult<_>>()?;
+    Ok(PyBytes::new(py, &digest::group(&mut digests)))
+}
+
+/// `value(v)`: a `keyed=True` output's version.
+#[pyfunction]
+fn value_digest<'py>(py: Python<'py>, value: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyBytes>> {
+    let mut out = Vec::new();
+    pyvalue::Walker::new(py)?.value(&value, &mut out, 0)?;
+    Ok(PyBytes::new(py, &digest::value(&out)))
+}
+
+/// A declared revision's text.
+#[pyfunction]
+fn revision_text<'py>(py: Python<'py>, value: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyBytes>> {
+    let mut out = Vec::new();
+    pyvalue::Walker::new(py)?.render(&value, &mut out)?;
+    Ok(PyBytes::new(py, &out))
 }
 
 /// A chunk of a sorted stream: an Arrow stream of (key, version) columns, or
@@ -555,10 +714,11 @@ impl Job {
 #[pymethods]
 impl Job {
     /// The merge-join of the written content (`rows`, or with None a stream
-    /// fed sorted chunks) against `runs` existing runs, newest first. At most
-    /// `collect` changed keys are kept for `collected`.
+    /// fed sorted chunks — a key may repeat, its versions row digests to
+    /// `fold`, else shared) against `runs` existing runs, newest first. At
+    /// most `collect` changed keys are kept for `collected`.
     #[staticmethod]
-    #[pyo3(signature = (rows, runs, *, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864, collect=0))]
+    #[pyo3(signature = (rows, runs, *, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864, collect=0, fold=false))]
     #[allow(clippy::too_many_arguments)]
     fn replace(
         rows: Option<PyRefMut<'_, Rows>>,
@@ -570,6 +730,7 @@ impl Job {
         codec: u8,
         max_file_bytes: usize,
         collect: usize,
+        fold: bool,
     ) -> PyResult<Job> {
         let src = match rows {
             Some(mut r) => Source::Table(
@@ -577,7 +738,7 @@ impl Job {
                     .take()
                     .ok_or_else(|| PyValueError::new_err("rows already used"))?,
             ),
-            None => Source::Stream(Stream::default()),
+            None => Source::Stream(Stream::new(fold)),
         };
         let o = options(block_size, level, bits_per_item, k, codec);
         Ok(Job {
@@ -740,6 +901,12 @@ fn solera_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_index, m)?)?;
     m.add_function(wrap_pyfunction!(parse_tail, m)?)?;
     m.add_function(wrap_pyfunction!(check_block, m)?)?;
+    m.add_function(wrap_pyfunction!(encode, m)?)?;
+    m.add_function(wrap_pyfunction!(row_digest, m)?)?;
+    m.add_function(wrap_pyfunction!(group_digest, m)?)?;
+    m.add_function(wrap_pyfunction!(value_digest, m)?)?;
+    m.add_function(wrap_pyfunction!(revision_text, m)?)?;
+    m.add("DIGEST_VERSION", digest::VERSION)?;
     m.add_class::<Rows>()?;
     m.add_class::<Job>()?;
     Ok(())

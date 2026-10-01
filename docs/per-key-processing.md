@@ -4,8 +4,8 @@ Status: **proposed**, not built. It adds an `Each` edge (an asset written
 for one key, run over every changed key), keys that hold many rows,
 per-key outcomes with user-classified errors, key patterns on edges, and
 observable sources. It builds on the engine cache, the HTTP resolver,
-inlined changes and the canonical row digest of `resolved-commits.md`
-(being rewritten), and on the worker → engine HTTP channel and attempt
+inlined changes of `resolved-commits.md`, the canonical row digest of
+`row-digest.md`, and on the worker → engine HTTP channel and attempt
 objects of `lifecycle.md` (being written): `{attempt}.spec`, the
 `{attempt}.worker` invocation claim, `{attempt}.result`, and the
 `{attempt}.writing` fence.
@@ -281,7 +281,7 @@ as written. An index has one entry per key: 3,000 files of 200,000 rows
 are 3,000 entries.
 
 **The version of a key** is one rule, the group production of the
-canonical digest grammar (`resolved-commits.md`), so Python and Arrow
+canonical digest grammar (`row-digest.md`), so Python and Arrow
 input agree and the definition is versioned with the grammar:
 
 ```
@@ -334,7 +334,7 @@ class Store(Protocol):
 |---|---|
 | default (absent) | `solera.stores.key_rows`: `list[dict]`, `dict`, DataFrame (through DuckDB), anything with `__arrow_c_stream__` |
 | PostgresStore | the default for flat rows; for `Patch({key: frames})`, the concatenated Arrow table it is about to insert, through `Rows.arrow(table, key, revision)` |
-| a custom store for a custom type | builds `Rows.arrow(…)` from its own columnar form, or `Rows.objects(…)` |
+| a custom store for a custom type | builds `Rows.arrow(…)` from its own columnar form, or `Rows.records(…)` |
 | `Sql` writes | after writing, the store reports the content sorted by key, by one of two paths (below) |
 
 **`Sql` writes have two paths**, because the rows never pass through the
@@ -357,7 +357,10 @@ transfer; declaring a revision column avoids it. The `md5` path goes away.
 - **Grouping is native**: `Rows` sorts by key with the existing
   permutation, digests rows in parallel, and folds each run of equal keys
   into `group(…)`; for the by-key form, keys with no rows come as a
-  separate packed list. The native work lands with the digest grammar.
+  separate packed list. Built: `Rows.records`, `Rows.arrow`, `Rows.values`
+  (`keyed=True`), `Rows.pairs` and `Rows.keys`, grouping natively, and
+  `Store.key_rows`; not yet the by-key `Patch({key: frames})` form or its
+  empty groups.
 - **Patches move off `key_map`** onto the same `Rows` (removes as a packed
   key list). That is also what the HTTP resolver needs — the worker's
   sorted run of `(key, version, deleted)` — so one path serves
@@ -895,7 +898,7 @@ is below the current one.
 **Harder.**
 
 - The canonical digest grammar must define the group production, which
-  is now every key's version, and be versioned (§6).
+  is now every key's version, and be versioned (§6) — done, `row-digest.md`.
 - `Rows` must group natively, and patches must move onto `Rows` (§7).
 - The watermark gains two positions: the rescope drain (§11) and the retry
   pass (§9).

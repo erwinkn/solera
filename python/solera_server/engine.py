@@ -1607,7 +1607,7 @@ class Engine:
             batch = int((head or {}).get("batch", -1)) + 1
             attempt = ulid(self.clock())
             if replace:
-                rows = Rows.objects(list(new.items()), 0, lambda kv: key_bytes(kv[1]))
+                rows = Rows.pairs(list(new.items()))
                 files, changed = await index.replace(rows, batch, attempt, collect=2 * SOURCE_KEYS_RECORDED)
             else:
                 delta = await index.changes(

@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 import pandas as pd
 import pytest
 from solera.sdk import KEYS, Output, PartitionSet, Ref, RegistrationError
-from solera.stores import Batches, FileStore, Keys, Patch, S3Store, StoreError, WriteError, revision
+from solera.stores import Batches, FileStore, Keys, Patch, S3Store, StoreError, WriteError
 
 from tests.conftest import scope
 
@@ -128,8 +128,17 @@ async def test_rows_by_key_column(store):
     assert await store.load(patched.ref, list[dict], None) == [{"id": 2, "v": "1"}, {"id": 3, "v": "1"}]
     frame = await store.load(patched.ref, pd.DataFrame, Keys({"3": "1"}))
     assert list(frame["id"]) == [3]
-    with pytest.raises(WriteError, match="duplicate"):
-        await store.store([{"id": 1}, {"id": 1}], None, scope(out))
+    # Every key holds all its rows: a second row for a key joins its group, and a
+    # patch of the key replaces the whole group.
+    grouped = await store.store(
+        Patch([{"id": 3, "v": "2"}, {"id": 3, "v": "2", "n": 1}]), patched.ref, scope(out)
+    )
+    assert await store.load(grouped.ref, list[dict], Keys({"3": "2"})) == [
+        {"id": 3, "v": "2"},
+        {"id": 3, "v": "2", "n": 1},
+    ]
+    with pytest.raises(WriteError, match="key column"):
+        await store.store([{"v": 1}], None, scope(out))
 
 
 async def test_unkeyed_incremental_is_one_object_per_batch(store):
@@ -173,14 +182,6 @@ async def test_refs_round_trip_and_gone_values_fail(store):
     await obstore.delete_async(store._objects(), "v.json")
     with pytest.raises(StoreError, match="gone"):
         await store.load(back, None, None)
-
-
-def test_revision_is_a_16_byte_digest_of_the_encoding():
-    import hashlib
-
-    row = {"id": "a", "n": [1, 2]}
-    assert revision(row) == hashlib.blake2b(b'{"id":"a","n":[1,2]}', digest_size=16).digest()
-    assert revision(row) != revision({**row, "n": [2, 1]})
 
 
 def test_the_default_path(tmp_path, monkeypatch):

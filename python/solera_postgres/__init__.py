@@ -21,7 +21,6 @@ from solera.stores import (
     StoreError,
     WriteError,
     Written,
-    key_map,
     resolve_env,
 )
 
@@ -109,7 +108,8 @@ class PostgresStore:
         if batch_mode:
             columns.setdefault(BATCH_COLUMN, "integer")
             columns.setdefault(SEQ_COLUMN, "integer")
-        pk = list(output.config.get("primary_key") or ([output.key] if output.key else []))
+        # A key names a group of rows, not one: it is never a primary key by itself.
+        pk = list(output.config.get("primary_key") or [])
         if partition_col and partition_col not in pk and (pk or batch_mode):
             pk = [*pk, partition_col]
         if batch_mode:
@@ -120,6 +120,8 @@ class PostgresStore:
 
     def _ensure(self, cur, output: Output, rows: list[dict] | None = None):
         table, schema, table_name = self._table(output)
+        indexes = self._indexes(output)
+        exists = "SELECT 1 FROM information_schema.tables WHERE table_schema = %s AND table_name = %s"
         cur.execute(f"CREATE SCHEMA IF NOT EXISTS {_ident(schema)}")
         declared, pk = self._declared_shape(output)
         columns = dict(declared)
@@ -127,17 +129,14 @@ class PostgresStore:
             for row in rows:
                 for column, value in row.items():
                     columns.setdefault(column, _column_type(value))
-        existed = cur.execute(
-            "SELECT 1 FROM information_schema.tables WHERE table_schema = %s AND table_name = %s",
-            (schema, table_name),
-        ).fetchone()
+        existed = cur.execute(exists, (schema, table_name)).fetchone()
         defs = [f"{_ident(c)} {_sql_type(t)}" for c, t in (columns or {"value": "jsonb"}).items()]
         if pk:
             defs.append(f"PRIMARY KEY ({', '.join(_ident(c) for c in pk)})")
         cur.execute(f"CREATE TABLE IF NOT EXISTS {table} ({', '.join(defs)})")
         if existed:
             self._check_drift(cur, output, table, schema, table_name, columns, pk)
-        for index in output.config.get("indexes") or []:
+        for index in indexes:
             cols = ", ".join(_ident(c) for c in index)
             cur.execute(
                 f"CREATE INDEX IF NOT EXISTS {_ident(table_name + '_' + '_'.join(index))} ON {table} ({cols})"
@@ -148,6 +147,13 @@ class PostgresStore:
             except Exception:
                 pass  # grants are deployment sugar; a missing role is not fatal
         return table
+
+    def _indexes(self, output: Output) -> list[list[str]]:
+        """The table's indexes: the declared ones, and one on the key column."""
+
+        _, pk = self._declared_shape(output)
+        keyed = [[output.key]] if output.key and output.key not in pk[:1] else []
+        return keyed + [list(i) for i in output.config.get("indexes") or []]
 
     def _check_drift(self, cur, output: Output, table, schema, table_name, declared, pk):
         """A pre-existing table must already match the declaration; evolving
@@ -193,6 +199,14 @@ class PostgresStore:
     # -- writes ---------------------------------------------------------------
 
     async def store(self, write, prior: Ref | None, scope: Scope) -> Written:
+        import psycopg
+
+        try:
+            return self._store(write, prior, scope)
+        except psycopg.IntegrityError as e:  # the data breaks the table's constraints (`primary_key`)
+            raise WriteError(f"{scope.output.name}: {e}") from e
+
+    def _store(self, write, prior: Ref | None, scope: Scope) -> Written:
         output = scope.output
         with self._connect() as conn, conn.cursor() as cur:
             self._rename(cur, output, scope)
@@ -258,7 +272,7 @@ class PostgresStore:
                     )
                 row[partition_col] = scope.partition
         if output.key is not None:
-            key_map(output, rows)  # validates the key column and duplicate keys
+            _keys(output, rows)
         self._ensure(cur, output, rows)
         self._delete_slice(cur, table, slice_where)
         self._insert(cur, table, rows)
@@ -297,16 +311,23 @@ class PostgresStore:
                         f"{output.name}: row {partition_col}={row[partition_col]!r} disagrees with scope"
                     )
                 row[partition_col] = scope.partition
-        key_map(output, rows)  # validates the key column and duplicate keys
+        # Every key is the group of rows that carry it: a patch replaces the
+        # rows of the keys it writes, all of them, and drops the keys it removes.
+        written = _keys(output, rows)
+        inserted = rows
         if prior is None:
             # No prior (a first write or a full run): the patch is the whole state.
             self._delete_slice(cur, table, slice_where)
-        self._upsert(cur, table, output, rows)
-        if remove:
-            cur.execute(
-                f"DELETE FROM {table} WHERE {self._where_sql(slice_where)} AND {_ident(output.key)}::text = ANY(%s)",
-                ([slice_where[k] for k in sorted(slice_where)] + [sorted(remove)]),
-            )
+        else:
+            keys = scope.upserts if scope.upserts is not None else written
+            inserted = [r for r, k in zip(rows, written, strict=True) if k in keys]
+            gone = set(keys) | (scope.removes if scope.removes is not None else remove)
+            if gone:
+                cur.execute(
+                    f"DELETE FROM {table} WHERE {self._where_sql(slice_where)} AND {_ident(output.key)}::text = ANY(%s)",
+                    ([slice_where[k] for k in sorted(slice_where)] + [sorted(gone)]),
+                )
+        self._insert(cur, table, inserted)
         return digest(
             [prior.version if prior else "", digest({"rows": _canon(rows), "remove": sorted(remove)})]
         )
@@ -353,9 +374,11 @@ class PostgresStore:
         return digest([prior.version if prior else "", digest(write.stmt)]), keys
 
     def _sorted_keys(self, table, output: Output, where: dict):
-        """The slice's `(key, version)` pairs sorted by the key's bytes, a chunk
-        at a time from a server-side cursor once the write has committed: the
-        declared revision's text, else an MD5 digest of the row's text."""
+        """The slice's rows as `(key, version)` pairs sorted by the key's bytes,
+        a chunk at a time from a server-side cursor once the write has
+        committed: the declared revision's text, else an MD5 digest of the
+        row's JSON without its key column. A key repeats once per row; the
+        harness folds each key's rows into one version."""
 
         import psycopg
 
@@ -363,7 +386,7 @@ class PostgresStore:
         if output.revision:
             version = f"convert_to({_ident(output.revision)}::text, 'UTF8')"
         else:
-            version = "decode(md5(_row::text), 'hex')"
+            version = f"decode(md5((to_jsonb(_row) - {_literal(output.key)})::text), 'hex')"
         sql = f"SELECT {key}, {version} FROM {table} _row WHERE {self._where_sql(where)} ORDER BY 1"
         with psycopg.connect(resolve_env(self.dsn)) as conn, conn.cursor(name="solera_keys") as cur:
             cur.execute(sql, [where[k] for k in sorted(where)])
@@ -467,27 +490,18 @@ class PostgresStore:
                 [row.get(c) for c in columns],
             )
 
-    def _upsert(self, cur, table, output, rows: list[dict]):
-        if not rows:
-            return
-        pk = list(output.config.get("primary_key") or [output.key])
-        partition_col = output.config.get("partition_column")
-        if partition_col and partition_col not in pk:
-            pk = [*pk, partition_col]
-        columns = sorted({c for r in rows for c in r})
-        update = [c for c in columns if c not in pk]
-        conflict = (
-            f"ON CONFLICT ({', '.join(_ident(c) for c in pk)}) DO UPDATE SET "
-            + ", ".join(f"{_ident(c)} = EXCLUDED.{_ident(c)}" for c in update)
-            if update
-            else "ON CONFLICT DO NOTHING"
-        )
-        for row in rows:
-            cur.execute(
-                f"INSERT INTO {table} ({', '.join(_ident(c) for c in columns)}) "
-                f"VALUES ({', '.join('%s' for _ in columns)}) {conflict}",
-                [row.get(c) for c in columns],
-            )
+
+def _keys(output: Output, rows: list[dict]) -> list[str]:
+    """Each row's key; a row without the key column is a write error."""
+
+    try:
+        return [str(row[output.key]) for row in rows]
+    except KeyError:
+        raise WriteError(f"{output.name}: row lacks the declared key column {output.key!r}") from None
+
+
+def _literal(text: str) -> str:
+    return "'" + text.replace("'", "''") + "'"
 
 
 def _coerce_rows(write: Any) -> list[dict]:

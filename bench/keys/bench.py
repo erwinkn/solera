@@ -38,7 +38,6 @@ import tempfile
 import time
 import uuid
 from dataclasses import replace
-from operator import itemgetter
 from urllib.parse import unquote, urlsplit
 
 import boto3
@@ -618,7 +617,7 @@ async def _run_size(n: int, prefix: str, args) -> dict:
                     "full replacement, 1% changed",
                     io,
                     lambda io=io: KeyIndex(io, prefix, state, opts).replace(
-                        Rows.objects(list(zip(ks_all, vs_all, strict=True)), 0, itemgetter(1)), 1, "replace"
+                        Rows.pairs(list(zip(ks_all, vs_all, strict=True))), 1, "replace"
                     ),
                 )
             )
@@ -632,9 +631,7 @@ async def _run_size(n: int, prefix: str, args) -> dict:
 
             async def load(io=io):
                 idx = KeyIndex(io, f"{prefix}load/", IndexState(), opts)
-                return await idx.replace(
-                    Rows.objects(list(zip(ks, vs, strict=True)), 0, itemgetter(1)), 0, "load"
-                )
+                return await idx.replace(Rows.pairs(list(zip(ks, vs, strict=True))), 0, "load")
 
             rows.append(await measure("initial load: every key, unsorted", io, load))
             del ks, vs

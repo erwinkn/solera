@@ -337,12 +337,12 @@ they all share, each bucket sorted as 12-byte (prefix, row) pairs on every
 core, ~4.5 B per key at the peak (`native/examples/sort.rs`). A merge-join
 then walks the sorted keys and the index's newest-wins view together, each
 level fed a segment of 8 MB of consecutive blocks at a time, a few ahead.
-A row's version is computed when the join reaches it and compared once —
-the declared revision column's value, else a digest of the row: Python
-rows' `revision`, a window of rows at a time, or for Arrow data XXH3-128
-over its columns in name order, each value in a canonical encoding that
-ignores its physical type (`native/src/arrow.rs`; switching an output
-between Python rows and Arrow data changes every digest once). New keys
+A key's version — every key is the group of rows that carry it — is
+computed when the join reaches it and compared once: the text of the
+declared revision column, which the key's rows share, else the digest of
+its rows in the canonical grammar of `row-digest.md`, the same whether
+they arrive as Python values or Arrow data (Python rows a window at a time
+under the GIL, Arrow rows on every core). New keys
 and changed versions go straight into the current delta file, live keys
 not written into `deleted` entries, and each file goes to the store as it
 fills. Memory is the permutation, a few segments per level and a file or
@@ -359,7 +359,7 @@ through a server-side cursor — so nothing is sorted or held.
 
 | Operation | Who | How |
 |---|---|---|
-| Compute a delta | harness, at write time | Extract `(key, version)` from the written rows (the declared `revision` column's text, else a 16-byte digest of the row), against the index **as pinned in the spec**. A patch is checked with the filters and the read strategy above: keep entries whose version changed, plus `deleted` entries for removed keys that may exist. A full replacement is the streaming merge-join above. Either way the result is the batch's delta files, split at ~64 MB. |
+| Compute a delta | harness, at write time | Extract `(key, version)` from the written rows with the store's `key_rows` (the declared `revision` column's text, else the 16-byte digest of the key's rows, `row-digest.md`), against the index **as pinned in the spec**. A patch is checked with the filters and the read strategy above: keep entries whose version changed, plus `deleted` entries for removed keys that may exist. A full replacement is the streaming merge-join above. Either way the result is the batch's delta files, split at ~64 MB. |
 | Commit | engine | Add the delta file to level 0 and to `log`; `count += added − removed`, and `inexact += 1` if the count change came from filters. The scope lock — one attempt per (asset, scope) from launch to settlement — guarantees the index didn't change underneath. |
 | Deliver pending deltas | harness, for an `Incremental` edge | Read the `log` files from the watermark to the head; chunk by `batch_size` in key order; ask the upstream store for those rows with `Keys(…)`. |
 | Full delivery | harness | Page through the merged view of all levels from `after`, `batch_size` keys at a time, and ask the store for them with `Keys(…)`. Per level, only the files covering the page are opened, and only their index parts are read — or the whole file, once, when it is small (below one request's latency worth of transfer, ~2.4 MB). A multi-page scan keeps each file's last fetched blocks for the next page, so it reads every block once. |

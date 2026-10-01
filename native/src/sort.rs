@@ -16,25 +16,9 @@ pub trait Keys: Sync {
     }
 }
 
-/// Whether the keys are strictly increasing already; `Err(i)` when key `i`
-/// equals key `i + 1` (a duplicate), found before any decrease.
-pub fn is_sorted<K: Keys + ?Sized>(keys: &K) -> std::result::Result<bool, usize> {
-    for i in 1..keys.len() {
-        match keys.key(i - 1).cmp(keys.key(i)) {
-            Ordering::Less => {}
-            Ordering::Equal => return Err(i - 1),
-            Ordering::Greater => return Ok(false),
-        }
-    }
-    Ok(true)
-}
-
-/// The first adjacent duplicate in sorted order, if any.
-pub fn duplicate<K: Keys + ?Sized>(keys: &K, order: &[u32]) -> Option<u32> {
-    order
-        .windows(2)
-        .find(|w| keys.key(w[0] as usize) == keys.key(w[1] as usize))
-        .map(|w| w[0])
+/// Whether the keys are in order already (equal keys may repeat).
+pub fn is_sorted<K: Keys + ?Sized>(keys: &K) -> bool {
+    (1..keys.len()).all(|i| keys.key(i - 1) <= keys.key(i))
 }
 
 /// The permutation that sorts `keys`, by the strategy the benchmarks picked:
@@ -482,7 +466,7 @@ mod tests {
             r = r.wrapping_mul(6364136223846793005).wrapping_add(1);
             keys.0.swap(i, (r >> 33) as usize % (i + 1));
         }
-        assert_eq!(is_sorted(&keys), Ok(false));
+        assert!(!is_sorted(&keys));
         for f in [
             perm,
             perm_par,
@@ -495,12 +479,9 @@ mod tests {
             let o = f(&keys);
             let got: Vec<Vec<u8>> = o.iter().map(|&i| keys.0[i as usize].clone()).collect();
             assert_eq!(got, sorted);
-            assert_eq!(duplicate(&keys, &o), None);
         }
-        assert_eq!(is_sorted(&V(sorted.clone())), Ok(true));
-        let mut dup = sorted.clone();
-        dup.insert(5, dup[5].clone());
-        assert_eq!(is_sorted(&V(dup)), Err(5));
+        assert!(is_sorted(&V(sorted.clone())));
+        // Repeated keys sort next to each other.
         let dup = V(vec![
             b"2".to_vec(),
             b"1".to_vec(),
@@ -508,7 +489,9 @@ mod tests {
             b"1".to_vec(),
         ]);
         for f in [buckets_par, pairs_par, perm] {
-            assert!(duplicate(&dup, &f(&dup)).is_some());
+            let o = f(&dup);
+            let got: Vec<&[u8]> = o.iter().map(|&i| dup.key(i as usize)).collect();
+            assert_eq!(got, [b"1", b"1", b"2", b"2"]);
         }
     }
 }
