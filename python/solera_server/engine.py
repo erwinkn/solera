@@ -50,7 +50,7 @@ from . import history, planning
 from .attempts import POOL_OFFERED_GRACE, Attempts, Live
 from .history import MAX_METADATA, History, RunFilter
 from .keyservice import KeyService, cache_root
-from .model import TERMINAL_RUN, delta_reads
+from .model import TERMINAL_RUN, commit_of, delta_reads
 from .placements import PlacementContext, Registry
 from .sensors import Sensors
 from .state import Conflict, LostOwnership, State
@@ -1380,7 +1380,7 @@ class Engine(Attempts, Sensors, Views):
         # a shared-table store has already made.
         # Output heads must be unchanged since the claim.
         for output, baseline in prepared["baseline"].items():
-            if self.m.heads.get((output, task["scope"])) != baseline:
+            if commit_of(self.m.heads.get((output, task["scope"]))) != commit_of(baseline):
                 raise Conflict(f"output {output} head changed since this attempt was claimed")
         outputs = result.get("outputs") or {}
         # Settled under the contract it was launched with, not today's manifest.
@@ -1524,7 +1524,7 @@ class Engine(Attempts, Sensors, Views):
         event, ref = await self._prepare_commit(name, version, keys, upsert, remove, by)
         if event is None:
             return {"changed": False, "ref": ref}
-        if self.m.heads.get((name, "")) != head:
+        if commit_of(self.m.heads.get((name, ""))) != commit_of(head):
             await self._drop_prepared([event])
             raise Conflict(f"source {name!r} moved while committing; retry")
         event["at"] = self.clock()

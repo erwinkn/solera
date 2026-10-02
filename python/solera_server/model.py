@@ -85,6 +85,22 @@ def _renumbered(entries: list[dict]) -> list[dict]:
     return out
 
 
+def commit_of(head: dict | None) -> tuple | None:
+    """What identifies the commit that installed a head — not the figures
+    upkeep corrects on it (a recount's `count`): whether a writer came in
+    between is a question of this alone."""
+
+    if head is None:
+        return None
+    return (
+        head.get("run"),
+        head.get("attempt"),
+        head["ref"].get("version"),
+        head.get("batch"),
+        head.get("n"),
+    )
+
+
 class Model:
     def __init__(self):
         self.restore(None)

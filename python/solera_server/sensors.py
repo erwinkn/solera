@@ -19,6 +19,7 @@ from solera import lifecycle
 from solera.build import method_note
 from solera.ids import ulid
 
+from .model import commit_of
 from .placements.local import _env
 
 log = logging.getLogger(__name__)
@@ -245,7 +246,9 @@ class Sensors:
                     tags={**(request.get("tags") or {}), **tags},
                 )
                 planned.append((f"{claim['tick']}/{n}", run))
-            if any(self.m.heads.get((source, "")) != head for source, head in heads.items()):
+            if any(
+                commit_of(self.m.heads.get((source, ""))) != commit_of(head) for source, head in heads.items()
+            ):
                 raise self.Conflict("a source moved while the tick was applied")
         except BaseException:
             await self._drop_prepared(prepared)
