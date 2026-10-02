@@ -369,7 +369,7 @@ impl Revision {
 }
 
 impl Versions for Revision {
-    fn fill(&mut self, rows: &[u32], out: &mut Arena) -> Result<()> {
+    fn fill(&self, rows: &[u32], out: &mut Arena) -> Result<()> {
         let parts: Vec<Arena> = rows
             .par_chunks(1024)
             .map(|c| {
@@ -456,7 +456,7 @@ impl RowDigest {
 type Values = (Vec<u8>, Vec<(usize, usize, usize)>);
 
 impl Versions for RowDigest {
-    fn fill(&mut self, rows: &[u32], out: &mut Arena) -> Result<()> {
+    fn fill(&self, rows: &[u32], out: &mut Arena) -> Result<()> {
         let parts: Vec<Vec<Digest>> = rows
             .par_chunks(1024)
             .map(|c| {

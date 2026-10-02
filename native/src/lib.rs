@@ -34,7 +34,8 @@ use pyo3::types::{PyBool, PyBytes, PyCapsule, PyDict, PyInt, PyList, PyString};
 use format::{Error, Options};
 use jobs::{Compact, Count, Patch, Replace, Step};
 use pyo3::types::PyTuple;
-use rows::{Arena, Constant, Source, Stream, Table, Versions};
+use rayon::prelude::*;
+use rows::{Arena, Constant, Cursor, Source, Stream, Table, Versions};
 use stream::Segment;
 
 create_exception!(
@@ -544,7 +545,7 @@ struct Read {
 }
 
 impl Versions for Read {
-    fn fill(&mut self, rows: &[u32], out: &mut Arena) -> format::Result<()> {
+    fn fill(&self, rows: &[u32], out: &mut Arena) -> format::Result<()> {
         for &r in rows {
             out.push(self.versions.get(r as usize));
         }
@@ -591,7 +592,7 @@ impl PyVersions {
 }
 
 impl Versions for PyVersions {
-    fn fill(&mut self, rows: &[u32], out: &mut Arena) -> format::Result<()> {
+    fn fill(&self, rows: &[u32], out: &mut Arena) -> format::Result<()> {
         Python::attach(|py| self.fill_py(py, rows, out)).map_err(|e| Error::Callback(Box::new(e)))
     }
 }
@@ -633,11 +634,9 @@ fn pack<'py>(
 /// A keyed write's content, sorted by key (unless it arrived sorted) and
 /// read a key at a time: every key is the group of rows that carry it, and
 /// its version is computed as the reader reaches it (docs/row-digest.md).
-#[pyclass(module = "solera._native")]
+#[pyclass(module = "solera._native", frozen)]
 struct Rows {
-    table: Option<Table>,
-    len: usize,
-    presorted: bool,
+    table: Arc<Table>,
 }
 
 impl Rows {
@@ -645,14 +644,25 @@ impl Rows {
         py: Python<'_>,
         keys: Box<dyn sort::Keys + Send>,
         versions: Box<dyn Versions>,
+        empty: Arena,
     ) -> PyResult<Rows> {
-        let table = py.detach(|| Table::new(keys, versions)).map_err(to_py)?;
+        let table = py
+            .detach(|| Table::new(keys, versions, empty))
+            .map_err(to_py)?;
         Ok(Rows {
-            len: table.len(),
-            presorted: table.presorted(),
-            table: Some(table),
+            table: Arc::new(table),
         })
     }
+}
+
+/// Keys written with no rows, packed; none of them may be a key of the rows.
+fn empty_keys(keys: &[Bound<'_, PyAny>]) -> PyResult<Arena> {
+    let mut out = Arena::default();
+    for k in keys {
+        row_key(k, &mut out.data)?;
+        out.ends.push(out.data.len());
+    }
+    Ok(out)
 }
 
 #[pymethods]
@@ -661,14 +671,17 @@ impl Rows {
     /// version is the group of the key's row digests, without the key column
     /// and the `exclude`d ones, or with `revision` that column's text, which
     /// the key's rows must share.
+    /// `empty` are keys written with no rows: each the empty group
+    /// (docs/per-key-processing.md §6).
     #[staticmethod]
-    #[pyo3(signature = (rows, key, revision=None, exclude=vec![]))]
+    #[pyo3(signature = (rows, key, revision=None, exclude=vec![], empty=vec![]))]
     fn records(
         py: Python<'_>,
         rows: Bound<'_, PyList>,
         key: &str,
         revision: Option<&str>,
         exclude: Vec<String>,
+        empty: Vec<Bound<'_, PyAny>>,
     ) -> PyResult<Rows> {
         let records = Records::new(key, revision, exclude);
         let (mut w, names) = (pyvalue::Walker::new(py)?, records.names(py));
@@ -695,7 +708,7 @@ impl Rows {
             versions,
             rows: revision.is_none(),
         };
-        Rows::new(py, Box::new(keys), Box::new(versions))
+        Rows::new(py, Box::new(keys), Box::new(versions), empty_keys(&empty)?)
     }
 
     /// `(key, value)` pairs (a `keyed=True` output): the version is `value(v)`.
@@ -706,6 +719,7 @@ impl Rows {
             py,
             Box::new(keys),
             Box::new(PyVersions::Values(items.unbind())),
+            Arena::default(),
         )
     }
 
@@ -717,6 +731,7 @@ impl Rows {
             py,
             Box::new(keys),
             Box::new(PyVersions::Pairs(items.unbind())),
+            Arena::default(),
         )
     }
 
@@ -724,7 +739,12 @@ impl Rows {
     #[staticmethod]
     fn keys(py: Python<'_>, keys: Bound<'_, PyList>, version: &[u8]) -> PyResult<Rows> {
         let packed = pack(py, &keys, |k| Ok(k.clone()))?;
-        Rows::new(py, Box::new(packed), Box::new(Constant(version.to_vec())))
+        Rows::new(
+            py,
+            Box::new(packed),
+            Box::new(Constant(version.to_vec())),
+            Arena::default(),
+        )
     }
 
     /// Arrow data (any object with `__arrow_c_stream__`), read in place: keys
@@ -732,13 +752,14 @@ impl Rows {
     /// else each key's group of row digests without the `exclude`d columns
     /// (`arrow.rs`).
     #[staticmethod]
-    #[pyo3(signature = (data, key, revision=None, exclude=vec![]))]
+    #[pyo3(signature = (data, key, revision=None, exclude=vec![], empty=vec![]))]
     fn arrow(
         py: Python<'_>,
         data: Bound<'_, PyAny>,
         key: &str,
         revision: Option<&str>,
         exclude: Vec<String>,
+        empty: Vec<Bound<'_, PyAny>>,
     ) -> PyResult<Rows> {
         let batches = arrow_batches(py, &data)?;
         let keys = arrow::keys(&batches, key, false).map_err(to_py)?;
@@ -747,39 +768,78 @@ impl Rows {
             Some(r) => Box::new(arrow::Revision::new(&batches, r).map_err(to_py)?),
             None => Box::new(arrow::RowDigest::new(batches, &records.skip).map_err(to_py)?),
         };
-        Rows::new(py, keys, versions)
+        Rows::new(py, keys, versions, empty_keys(&empty)?)
     }
 
     /// Rows, not keys.
     fn __len__(&self) -> usize {
-        self.len
+        self.table.len()
     }
 
     /// Whether the keys arrived sorted, so no sort ran.
     #[getter]
     fn presorted(&self) -> bool {
-        self.presorted
+        self.table.presorted()
     }
 
-    /// Every key and its version, in key order — for a patch, which checks
-    /// its keys one by one. Uses the rows up.
-    fn entries<'py>(
-        &mut self,
-        py: Python<'py>,
-    ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyList>)> {
-        let table = self
-            .table
-            .take()
-            .ok_or_else(|| PyValueError::new_err("rows already used"))?;
-        let mut src = Source::Table(table);
+    /// Every key and its version, in key order. Rows are read, never used
+    /// up: every pass computes the versions it reaches.
+    fn entries<'py>(&self, py: Python<'py>) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyList>)> {
+        let mut c = Cursor::new(self.table.clone());
         let (keys, versions) = (PyList::empty(py), PyList::empty(py));
-        while src.state().map_err(to_py)? == stream::State::Ready {
-            let (k, v) = src.entry();
+        while c.read().map_err(to_py)? {
+            let (k, v) = c.entry();
             keys.append(PyBytes::new(py, k))?;
             versions.append(PyBytes::new(py, v))?;
-            src.advance();
         }
         Ok((keys, versions))
+    }
+
+    /// The digest of every `(key, version)`, in key order: the content's
+    /// identity. Free once a pass has read every key, as a replacement does.
+    fn digest<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let table = self.table.clone();
+        let d = py.detach(|| table.content()).map_err(to_py)?;
+        Ok(PyBytes::new(py, &d))
+    }
+
+    /// The rows of each of `keys`, as indices into what the rows were made
+    /// from, each key's in their order there: `(rows, ends)`, key `i`'s rows
+    /// at `rows[ends[i - 1]:ends[i]]`. A key written with no rows has none;
+    /// a key the write does not hold is a `KeyError`.
+    fn find<'py>(
+        &self,
+        py: Python<'py>,
+        keys: Vec<Bound<'py, PyAny>>,
+    ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyList>)> {
+        let packed = empty_keys(&keys)?;
+        let table = self.table.clone();
+        let found: Vec<Option<Vec<u32>>> = py.detach(|| {
+            (0..packed.len())
+                .into_par_iter()
+                .map(|i| table.find(packed.get(i)))
+                .collect()
+        });
+        let (rows, ends) = (PyList::empty(py), PyList::empty(py));
+        let mut n = 0usize;
+        for (i, f) in found.into_iter().enumerate() {
+            let Some(f) = f else {
+                return Err(PyKeyError::new_err(keys[i].clone().unbind()));
+            };
+            n += f.len();
+            for r in f {
+                rows.append(r)?;
+            }
+            ends.append(n)?;
+        }
+        Ok((rows, ends))
+    }
+
+    /// Whether the write holds `key` (with rows, or as an empty group).
+    fn __contains__(&self, key: Bound<'_, PyAny>) -> PyResult<bool> {
+        let mut k = Vec::new();
+        row_key(&key, &mut k)?;
+        Ok(self.table.find(&k).is_some())
     }
 }
 
@@ -874,7 +934,7 @@ fn chunk(
             return Ok((keys, versions));
         };
         let schema = first.schema();
-        let (kn, mut v): (String, Box<dyn Versions>) = match records {
+        let (kn, v): (String, Box<dyn Versions>) = match records {
             Some(Records {
                 key,
                 revision: None,
@@ -973,19 +1033,15 @@ impl SortedRun {
     }
 
     /// Every key of `rows` at its version, in key order, and the removes of
-    /// `removes`. Uses the rows up.
+    /// `removes`. Reads the rows, which stay usable.
     #[staticmethod]
     #[pyo3(signature = (rows, removes=vec![]))]
     fn from_rows(
         py: Python<'_>,
-        mut rows: PyRefMut<'_, Rows>,
+        rows: PyRef<'_, Rows>,
         removes: Vec<PyBackedBytes>,
     ) -> PyResult<SortedRun> {
-        let table = rows
-            .table
-            .take()
-            .ok_or_else(|| PyValueError::new_err("rows already used"))?;
-        let mut src = Source::Table(table);
+        let mut src = Source::Table(Box::new(Cursor::new(rows.table.clone())));
         sorted_run(py.detach(|| run::SortedRun::from_source(&mut src, &slices(&removes))))
     }
 
@@ -1206,7 +1262,7 @@ impl Job {
     #[pyo3(signature = (rows, runs, *, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864, collect=0, key=None, revision=None, exclude=vec![], generation=0))]
     #[allow(clippy::too_many_arguments)]
     fn replace(
-        rows: Option<PyRefMut<'_, Rows>>,
+        rows: Option<PyRef<'_, Rows>>,
         runs: usize,
         block_size: usize,
         level: u32,
@@ -1221,11 +1277,7 @@ impl Job {
         generation: u64,
     ) -> PyResult<Job> {
         let src = match rows {
-            Some(mut r) => Source::Table(
-                r.table
-                    .take()
-                    .ok_or_else(|| PyValueError::new_err("rows already used"))?,
-            ),
+            Some(r) => Source::Table(Box::new(Cursor::new(r.table.clone()))),
             None => Source::Stream(Stream::new(key.is_some() && revision.is_none())),
         };
         let o = options(block_size, level, bits_per_item, k, codec);

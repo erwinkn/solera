@@ -1,11 +1,16 @@
-//! The written content of a full replacement, as the merge-join reads it: in
-//! key order, each row's version computed only when the join reaches it.
+//! A write's content, as the key index and its store read it: in key order,
+//! each key the group of rows that carry it.
 //!
 //! A `Table` holds every key in place (an Arrow column, or keys packed once)
-//! plus the permutation that sorts them — none when they arrive sorted. A
-//! `Stream` is fed sorted chunks and holds one at a time.
+//! plus the permutation that sorts them — none when they arrive sorted — and
+//! is shared: each pass over it is a `Cursor`, computing versions as it
+//! reaches them, and `find` gives the rows of chosen keys. A `Stream` is fed
+//! sorted chunks and holds one at a time.
 
 use std::collections::VecDeque;
+use std::sync::{Arc, OnceLock};
+
+use xxhash_rust::xxh3::Xxh3Default;
 
 use rayon::prelude::*;
 
@@ -66,7 +71,7 @@ impl Keys for Arena {
 /// Either they are row digests (`rows`), folded into each key's `group`, or
 /// they are final, and every row of a key must have the same one.
 pub trait Versions: Send + Sync {
-    fn fill(&mut self, rows: &[u32], out: &mut Arena) -> Result<()>;
+    fn fill(&self, rows: &[u32], out: &mut Arena) -> Result<()>;
 
     fn rows(&self) -> bool {
         false
@@ -77,7 +82,7 @@ pub trait Versions: Send + Sync {
 pub struct Constant(pub Vec<u8>);
 
 impl Versions for Constant {
-    fn fill(&mut self, rows: &[u32], out: &mut Arena) -> Result<()> {
+    fn fill(&self, rows: &[u32], out: &mut Arena) -> Result<()> {
         for _ in rows {
             out.push(&self.0);
         }
@@ -86,7 +91,9 @@ impl Versions for Constant {
 }
 
 /// The rows of one key, read one at a time: their version is the group of
-/// their row digests (`fold`), else the version they all share.
+/// their row digests (`fold`), else the version they all share. A marker
+/// stands for a key written with no rows: it adds none, and a key that has
+/// only markers is the empty group, whatever its revision would have been.
 #[derive(Default)]
 pub struct Group {
     pub key: Vec<u8>,
@@ -106,7 +113,10 @@ impl Group {
         self.rows = 0;
     }
 
-    fn add(&mut self, version: &[u8]) -> Result<()> {
+    fn add(&mut self, version: &[u8], marker: bool) -> Result<()> {
+        if marker {
+            return Ok(());
+        }
         if self.fold {
             let d = version
                 .try_into()
@@ -125,7 +135,7 @@ impl Group {
     }
 
     fn finish(&mut self) {
-        if self.fold {
+        if self.fold || self.rows == 0 {
             self.version.clear();
             self.version
                 .extend_from_slice(&digest::group(&mut self.digests));
@@ -133,44 +143,65 @@ impl Group {
     }
 }
 
+/// Keys written with no rows, after the rows' own: their markers' keys.
+struct Marked {
+    keys: Box<dyn Keys + Send>,
+    empty: Arena,
+}
+
+impl Keys for Marked {
+    fn len(&self) -> usize {
+        self.keys.len() + self.empty.len()
+    }
+    fn key(&self, i: usize) -> &[u8] {
+        match i.checked_sub(self.keys.len()) {
+            None => self.keys.key(i),
+            Some(j) => self.empty.get(j),
+        }
+    }
+}
+
 /// Versions computed a window of rows at a time, in key order.
 const WINDOW: usize = 1 << 14;
 
-/// Written rows, read a key — a group of rows — at a time, in key order.
+/// A write's rows, sorted once and shared by every pass over them.
 pub struct Table {
     keys: Box<dyn Keys + Send>,
     order: Option<Vec<u32>>,
     versions: Box<dyn Versions>,
-    // The next rows in key order, keys and versions side by side: rows sit in
-    // any order in memory, so they are gathered a window at a time, on every core.
-    wkeys: Arena,
-    wvers: Arena,
-    start: usize,
-    pos: usize,
-    group: Group,
-    ready: bool,
+    /// Rows below are the write's; the rest are markers of empty groups.
+    real: usize,
+    /// The digest of every `(key, version)`, once a pass has read them all.
+    content: OnceLock<Digest>,
 }
 
 impl Table {
-    /// Sorts the keys unless they arrive sorted.
-    pub fn new(keys: Box<dyn Keys + Send>, versions: Box<dyn Versions>) -> Result<Table> {
+    /// Sorts the keys unless they arrive sorted; `empty` are keys written
+    /// with no rows, none of them a key of the rows.
+    pub fn new(
+        keys: Box<dyn Keys + Send>,
+        versions: Box<dyn Versions>,
+        empty: Arena,
+    ) -> Result<Table> {
+        let real = keys.len();
+        let keys: Box<dyn Keys + Send> = if empty.is_empty() {
+            keys
+        } else {
+            Box::new(Marked { keys, empty })
+        };
         let order = (!sort::is_sorted(&*keys)).then(|| sort::order(&*keys));
         Ok(Table {
             keys,
             order,
             versions,
-            wkeys: Arena::default(),
-            wvers: Arena::default(),
-            start: 0,
-            pos: 0,
-            group: Group::default(),
-            ready: false,
+            real,
+            content: OnceLock::new(),
         })
     }
 
-    /// Rows, not keys.
+    /// The write's rows, not keys or markers.
     pub fn len(&self) -> usize {
-        self.keys.len()
+        self.real
     }
 
     pub fn is_empty(&self) -> bool {
@@ -182,37 +213,153 @@ impl Table {
         self.order.is_none()
     }
 
+    /// The row at sorted position `p`.
+    #[inline]
+    fn row(&self, p: usize) -> u32 {
+        self.order.as_ref().map_or(p as u32, |o| o[p])
+    }
+
+    /// The first sorted position whose key is not below `key`.
+    fn lower(&self, key: &[u8]) -> usize {
+        let (mut lo, mut hi) = (0, self.keys.len());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.keys.key(self.row(mid) as usize) < key {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    /// The rows of `key`, in the order the write had them; None when the
+    /// write does not hold the key (an empty group holds it, with no rows).
+    pub fn find(&self, key: &[u8]) -> Option<Vec<u32>> {
+        let mut p = self.lower(key);
+        let mut rows = Vec::new();
+        let mut held = false;
+        while p < self.keys.len() && self.keys.key(self.row(p) as usize) == key {
+            let r = self.row(p);
+            held = true;
+            if (r as usize) < self.real {
+                rows.push(r);
+            }
+            p += 1;
+        }
+        rows.sort_unstable();
+        held.then_some(rows)
+    }
+
+    /// The digest of every `(key, version)` in key order, reading them all
+    /// unless a pass already has.
+    pub fn content(self: &Arc<Table>) -> Result<Digest> {
+        if let Some(d) = self.content.get() {
+            return Ok(*d);
+        }
+        let mut c = Cursor::new(self.clone());
+        while c.read()? {}
+        Ok(*self
+            .content
+            .get()
+            .expect("a whole pass records the content"))
+    }
+}
+
+/// One pass over a `Table`, a key at a time.
+pub struct Cursor {
+    table: Arc<Table>,
+    // The next rows in key order, keys and versions side by side: rows sit in
+    // any order in memory, so they are gathered a window at a time, on every core.
+    wrows: Vec<u32>,
+    wkeys: Arena,
+    wvers: Arena,
+    start: usize,
+    pos: usize,
+    group: Group,
+    ready: bool,
+    hash: Xxh3Default,
+}
+
+impl Cursor {
+    pub fn new(table: Arc<Table>) -> Cursor {
+        Cursor {
+            table,
+            wrows: Vec::new(),
+            wkeys: Arena::default(),
+            wvers: Arena::default(),
+            start: 0,
+            pos: 0,
+            group: Group::default(),
+            ready: false,
+            hash: Xxh3Default::new(),
+        }
+    }
+
+    pub fn table(&self) -> &Arc<Table> {
+        &self.table
+    }
+
     /// Makes the window hold row `pos`.
     fn fill(&mut self) -> Result<()> {
         if self.pos < self.start + self.wkeys.len() {
             return Ok(());
         }
-        let end = (self.pos + WINDOW).min(self.len());
-        let rows: Vec<u32> = match &self.order {
-            Some(o) => o[self.pos..end].to_vec(),
-            None => (self.pos as u32..end as u32).collect(),
-        };
+        let t = &*self.table;
+        let end = (self.pos + WINDOW).min(t.keys.len());
+        self.wrows.clear();
+        self.wrows.extend((self.pos..end).map(|p| t.row(p)));
         self.wkeys.clear();
-        gather(&*self.keys, &rows, &mut self.wkeys);
+        gather(&*t.keys, &self.wrows, &mut self.wkeys);
         self.wvers.clear();
-        self.versions.fill(&rows, &mut self.wvers)?;
+        let real: Vec<u32> = self
+            .wrows
+            .iter()
+            .copied()
+            .filter(|&r| (r as usize) < t.real)
+            .collect();
+        if real.len() == self.wrows.len() {
+            t.versions.fill(&self.wrows, &mut self.wvers)?;
+        } else {
+            // Markers have no version of their own: an empty one keeps the window aligned.
+            let mut found = Arena::default();
+            t.versions.fill(&real, &mut found)?;
+            let mut j = 0;
+            for &r in &self.wrows {
+                if (r as usize) < t.real {
+                    self.wvers.push(found.get(j));
+                    j += 1;
+                } else {
+                    self.wvers.push(b"");
+                }
+            }
+        }
         self.start = self.pos;
         Ok(())
     }
 
     /// Reads the next key's rows into `group`; false past the last.
-    fn group(&mut self) -> Result<bool> {
-        if self.pos >= self.len() {
+    pub fn read(&mut self) -> Result<bool> {
+        let n = self.table.keys.len();
+        if self.pos >= n {
+            if self.pos == n && self.table.content.get().is_none() {
+                let d = self.hash.digest128().to_le_bytes();
+                let _ = self.table.content.set(d);
+            }
+            self.pos = n + 1; // recorded once
             return Ok(false);
         }
         self.fill()?;
-        let fold = self.versions.rows();
+        let fold = self.table.versions.rows();
+        let real = self.table.real;
         self.group
             .start(self.wkeys.get(self.pos - self.start), fold);
         loop {
-            self.group.add(self.wvers.get(self.pos - self.start))?;
+            let i = self.pos - self.start;
+            self.group
+                .add(self.wvers.get(i), self.wrows[i] as usize >= real)?;
             self.pos += 1;
-            if self.pos >= self.len() {
+            if self.pos >= n {
                 break;
             }
             self.fill()?;
@@ -221,7 +368,16 @@ impl Table {
             }
         }
         self.group.finish();
+        for part in [&self.group.key, &self.group.version] {
+            self.hash.update(&(part.len() as u64).to_le_bytes());
+            self.hash.update(part);
+        }
         Ok(true)
+    }
+
+    /// The current key and its version, after `read` returned true.
+    pub fn entry(&self) -> (&[u8], &[u8]) {
+        (&self.group.key, &self.group.version)
     }
 }
 
@@ -323,7 +479,7 @@ impl Stream {
                 self.group.start(key, self.fold);
                 self.open = true;
             }
-            self.group.add(v.get(self.pos))?;
+            self.group.add(v.get(self.pos), false)?;
             self.pos += 1;
         }
     }
@@ -331,7 +487,7 @@ impl Stream {
 
 /// The new side of a replacement.
 pub enum Source {
-    Table(Table),
+    Table(Box<Cursor>),
     Stream(Stream),
 }
 
@@ -340,7 +496,7 @@ impl Source {
         match self {
             Source::Table(t) => {
                 if !t.ready {
-                    if !t.group()? {
+                    if !t.read()? {
                         return Ok(State::Done);
                     }
                     t.ready = true;
