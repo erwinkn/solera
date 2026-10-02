@@ -416,9 +416,10 @@ async def _store_outputs(
     Planning compares each keyed output's write with its key index as pinned
     in the spec, and writes the changes as the batch's delta file: a write
     that changes nothing is not stored at all and keeps the head. Then
-    `fence(intents)` takes the attempt's write fence, listing those delta
-    files — the keys this attempt is about to change — and only then do the
-    stores write. An engine that finds the fence taken by a worker that then
+    `fence(intents, gated)` begins writing: on stores that take a gate
+    (all but `immutable` ones), it takes the attempt's gate first, listing
+    their delta files — the keys this attempt is about to change — and only
+    then do the stores write. An engine that finds the fence taken by a worker that then
     died keeps the outputs unsettled, and their intents, for the next attempt
     to repair (`_repair`). Returns `{name: entry}` and the cursor."""
 
@@ -601,9 +602,10 @@ async def _store_outputs(
                 elements = (set(info.get("elements") or ()) - set(p["removes"])) | set(p["new"])
             plan["elements"] = sorted(elements)
 
+    gated = {n for n, plan in plans.items() if getattr(plan["store"], "writes", "overwrite") != "immutable"}
     try:
-        if plans:  # the gate is taken only by a worker about to write (docs/lifecycle.md §2.4)
-            await fence(intents)
+        if plans:  # only by a worker about to write; a gate only for stores that take one (§2.4, §9.6)
+            await fence({n: i for n, i in intents.items() if n in gated}, bool(gated))
     except Aborted:
         # The engine has discarded this attempt's delta files; these came after.
         import obstore
@@ -1055,18 +1057,21 @@ async def _execute(
 ) -> dict | None:
     """Run the attempt: its result, or `None` once the engine ended it."""
 
-    async def fence(intents: dict):
-        """Take the gate (docs/lifecycle.md §2.4) before the first store
-        write — unless a cancel was requested: then stop, writing nothing.
-        A gate already there means the engine ended this attempt."""
+    async def fence(intents: dict, gated: bool):
+        """Begin writing — unless a cancel was requested: then stop, writing
+        nothing. Writing to a store that takes a gate, take it first
+        (docs/lifecycle.md §2.4): one already there means the engine ended
+        this attempt. From here on, a requested cancel drains."""
 
         if control["stopped"]:
             raise _Stop()
-        body = lifecycle.gate(lifecycle.WRITING, invocation, intents)
-        try:
-            await create(objects, f"{base}{lifecycle.GATE}", body)
-        except AlreadyExistsError:
-            raise Aborted(spec["attempt"]) from None
+        if gated:
+            try:
+                await create(
+                    objects, f"{base}{lifecycle.GATE}", lifecycle.gate(lifecycle.WRITING, invocation, intents)
+                )
+            except AlreadyExistsError:
+                raise Aborted(spec["attempt"]) from None
         control["writing"] = True
         timeline.add("writing")
 

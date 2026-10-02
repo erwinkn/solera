@@ -9,7 +9,7 @@ import pytest
 from obstore.exceptions import AlreadyExistsError
 from solera import lifecycle
 from solera.executors import Environment
-from solera.sdk import Output, Project, Ref, Retry, asset
+from solera.sdk import Output, Project, Ref, Result, Retry, asset
 from solera.stores import FileStore, Keys, Patch, Written
 from solera_server.engine import Engine
 from solera_server.placements.inline import InlinePlacement
@@ -736,5 +736,32 @@ async def test_an_attempt_that_wrote_nothing_still_leaves_a_gate(tmp_path):
         )
         gates.append((result["writes"], gate["state"]))
     assert gates == [("complete", "writing"), ("none", "closed")]
+    await engine.stop()
+    await state.close()
+
+
+async def test_only_stores_that_take_a_gate_get_one(tmp_path):
+    """Review P3-9: an attempt writing only immutable outputs creates no
+    `.writing` (§9.6: no gate, no intents); one writing an overwrite store
+    does, listing only that store's intents."""
+
+    @asset(outputs=Output("scores", keyed=True))
+    def scores():
+        return {"a": 1}
+
+    @asset(outputs=[Output("plain", keyed=True), Output("legacy", keyed=True, store="old")])
+    def both():
+        return Result({"plain": {"a": 1}, "legacy": {"a": 1}})
+
+    project = Project(assets=[scores, both], stores={"old": Overwriting()})
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = engine_for(state, project, placement="inline")
+    await engine.initialize()
+    for target, gated in (("scores", None), ("both", ["legacy"])):
+        detail = await engine.run_until((await engine.submit([target]))["id"], 10)
+        assert detail["request"]["status"] == "succeeded"
+        attempt = detail["attempts"][detail["tasks"][0]["id"]][0]["id"]
+        gate = await state.get_object(f"{state.attempt_path(detail['request']['id'], attempt)}.writing")
+        assert (sorted(json.loads(gate)["intents"]) if gate else None) == gated
     await engine.stop()
     await state.close()
