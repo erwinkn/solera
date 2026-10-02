@@ -317,9 +317,8 @@ class Planner:
         asks for every scope to build (bounded)."""
 
         info = self.manifest["assets"][asset]
-        edges = list(info["inputs"].values()) + [{"kind": "dep", "output": d} for d in info["deps"]]
         out = []
-        for edge in edges:
+        for edge in edges_of(info):
             output, owner = edge["output"], self.owner(edge["output"])
             up_dims = self.dims(owner)
             if edge["kind"] in {"all_partitions", "dep"} and owner is not None:
@@ -340,8 +339,21 @@ class Planner:
 
     def missing(self, asset: str, scope: str, planned: dict) -> bool:
         """Whether (asset, scope) reads an input never written that the run
-        doesn't build — preparing it would fail. A fan-in reads what there is."""
+        doesn't build — preparing it would fail. A fan-in reads what there is,
+        so it is missing only when there is nothing: no upstream head agrees
+        with its shared keys (a complete one, for `AllPartitions`)."""
 
+        info = self.manifest["assets"][asset]
+        for edge in edges_of(info):
+            owner = self.owner(edge["output"])
+            if edge["kind"] not in {"all_partitions", "dep"} or owner is None:
+                continue
+            up_dims = self.dims(owner)
+            pinned, free = self.shared(info, scope, up_dims)
+            if not free or any(self.matches(up_dims, s, pinned) for s in planned.get(owner, ())):
+                continue
+            if not self.fan_in(info, scope, edge["output"], complete=edge["kind"] == "all_partitions"):
+                return True
         for kind, output, owner, up_scope, fan_in in self.reads(asset, scope):
             if kind == "all_partitions" or fan_in or up_scope in planned.get(owner, ()):
                 continue
@@ -488,8 +500,7 @@ class Planner:
 
         for task in tasks.values():
             info = self.manifest["assets"][task["asset"]]
-            edges = list(info["inputs"].values()) + [{"kind": "dep", "output": d} for d in info["deps"]]
-            edges += [
+            edges = edges_of(info) + [
                 {"kind": "dep", "output": d["output"]}
                 for d in self.dims(task["asset"]).values()
                 if d["kind"] == "set"
@@ -509,6 +520,12 @@ class Planner:
                     if self.matches(up_dims, up_scope, pinned):
                         task["deps"].append(dep_id)
                         task["status"], task["queued_at"] = "waiting", None
+
+
+def edges_of(asset: dict) -> list[dict]:
+    """An asset's inputs, then its deps as edges of kind `dep`."""
+
+    return list(asset["inputs"].values()) + [{"kind": "dep", "output": d} for d in asset["deps"]]
 
 
 def same_dim(a: dict, b: dict) -> bool:

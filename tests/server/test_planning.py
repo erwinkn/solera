@@ -164,6 +164,52 @@ def test_the_planner_takes_its_view_as_arguments():
     assert not heads  # a projection is read, never installed
 
 
+def test_an_empty_fan_in_is_missing():
+    """A fan-in — `AllPartitions`, or a dep across a dimension the consumer
+    lacks — with no upstream head at all counts as missing: under
+    `skip_missing_inputs` its scope waits for the first one. Otherwise it
+    runs over nothing, as before."""
+    day, site = StaticPartitions(["d1", "d2"]), StaticPartitions(["east", "west"])
+
+    @asset(partitions={"day": day, "site": site})
+    def readings(ctx):
+        return []
+
+    @asset(partitions={"day": day}, deps=["readings"])
+    def report(ctx):
+        return []
+
+    @asset(partitions={"day": day}, inputs={"readings": AllPartitions()})
+    def rollup(ctx, readings: dict[str, list]):
+        return []
+
+    manifest = Project(assets=[readings, report, rollup]).manifest
+    heads: dict = {}
+    now = dt.datetime(2026, 10, 2, tzinfo=UTC).timestamp()
+    planner = Planner(
+        manifest,
+        lambda o, s: heads.get((o, s)),
+        lambda o: [(s, h) for (out, s), h in heads.items() if out == o],
+        now,
+    )
+
+    def planned(target, **kw):
+        run = planner.plan_run([target], partitions="all", **kw)
+        return (
+            None if run is None else sorted(t["scope"] for t in run["tasks"].values() if t["asset"] == target)
+        )
+
+    for target in ("report", "rollup"):
+        assert planned(target, skip_missing_inputs=True) is None
+        assert planned(target) == ["d1", "d2"]  # unchanged without the flag
+        assert planned(target, skip_missing_inputs=True, upstream=True) == ["d1", "d2"]  # the run builds them
+    heads[("readings", "day=d1,site=west")] = {"complete": False}
+    assert planned("report", skip_missing_inputs=True) == ["d1"]  # one head of its day is enough
+    assert planned("rollup", skip_missing_inputs=True) is None  # AllPartitions reads complete heads
+    heads[("readings", "day=d1,site=west")] = {"complete": True}
+    assert planned("rollup", skip_missing_inputs=True) == ["d1"]
+
+
 async def test_a_source_change_fans_out_over_a_partitioned_consumer(state):  # noqa: F811
     @asset(
         partitions={"site": StaticPartitions(["a", "b"])},

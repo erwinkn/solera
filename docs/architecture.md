@@ -498,9 +498,10 @@ runs. It does not wait for Paris. To wait for every site, submit with
 `upstream=True`: the run builds every `readings` scope of the day, and
 `report` starts only once they all succeed (a failure blocks it). Only an
 upstream build lists the domain, refused past `MAX_SCOPES`.
-`skip_missing_inputs` (§9) is no barrier here: it skips scopes whose inputs
-were never written at all, and a fan-in reads what there is, so it never
-counts as missing.
+`skip_missing_inputs` (§9) waits only for the first: a fan-in that finds no
+upstream head at all — no `readings` for the day, or for `AllPartitions` no
+complete one — counts as missing, so `report` is skipped until one exists.
+Without the flag it runs over nothing.
 
 `Incremental` requires no upstream-only dimensions (a broadcast `Incremental`
 diffs the same delta log per consumer key).
@@ -641,7 +642,8 @@ input must have a head (sources synthesize theirs). With
 `skip_missing_inputs=True`, a scope reading an input that was never written
 (and that the run doesn't build, with `upstream=True`) is left out rather
 than run to fail, and a tick left with nothing is skipped: a weekly digest
-over an index nobody has built yet waits for it. Toggles are keyed by
+over an index nobody has built yet waits for it. A fan-in (§7) is missing
+when no upstream head agrees with the scope at all; one is enough to run. Toggles are keyed by
 name; renaming an asset rekeys its attached automations.
 
 ## 10. Execution
