@@ -265,3 +265,41 @@ def test_an_explicit_selection_is_linear():
         missing=bool,
     )
     assert len(picked) == 80_000 and time.perf_counter() - start < 3.0  # ~25 s when quadratic
+
+
+# -- registration × delivery obligations ------------------------------------------------
+
+
+async def test_a_removed_consumer_lets_go_of_its_upstreams_log(state):  # noqa: F811
+    """Review round 5, engine #3 and system #2: `gone` and `keep` read
+    `feed` incrementally. `gone` is removed: its watermark goes with it, so
+    the log of `feed`'s later batches is kept only as long as `keep` needs
+    it."""
+
+    rows = [{"id": "a"}]
+
+    @asset(outputs=Output("feed", key="id"))
+    def feed():
+        return list(rows)
+
+    @asset(inputs={"feed": Incremental()})
+    def gone(feed: list):
+        return []
+
+    @asset(inputs={"feed": Incremental()})
+    def keep(feed: list):
+        return []
+
+    engine = make_engine(state, Project(assets=[feed, gone, keep]))
+    await engine.initialize()
+    assert status_of(await drive(engine, await engine.submit(["gone", "keep"], upstream=True))) == "succeeded"
+    await engine.stop()
+
+    engine = make_engine(state, Project(assets=[feed, keep]))
+    await engine.initialize()
+    assert sorted(k[0] for k in state.model.watermarks) == ["keep"]
+    for key in ("b", "c", "d"):
+        rows.append({"id": key})
+        await drive(engine, await engine.submit(["keep"], upstream=True))
+        engine.upkeep.truncate()
+    assert state.model.indexes[("feed", "")].log == ()

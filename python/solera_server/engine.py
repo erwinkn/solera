@@ -49,7 +49,7 @@ from solera.keys.io import ObjectIO
 from solera.sdk import digest
 
 from . import delivery, history, planning
-from .attempts import POOL_OFFERED_GRACE, Attempts, Live, worker_report
+from .attempts import POOL_OFFERED_GRACE, Attempts, Live, current_names, worker_report
 from .history import MAX_METADATA, History, RunFilter
 from .keyservice import KeyService, cache_root
 from .model import TERMINAL_RUN, commit_of
@@ -462,9 +462,12 @@ class Engine(Attempts, Sensors, Views):
             event["reason"] = str(reason)[:200]
         if writes is not None:
             event["writes"] = writes
-        for field in ("discarded", "discard_unresolved", "discarded_files"):  # data garbage (§9.8)
-            if (worker or {}).get(field):
-                event[field] = worker[field]
+        prepared = (task.get("launched") or {}).get("prepared") or {}
+        for field in ("discarded", "discard_unresolved"):  # data garbage (§9.8)
+            if worker.get(field):
+                event[field] = current_names(prepared, worker[field])
+        if worker.get("discarded_files"):
+            event["discarded_files"] = worker["discarded_files"]
         if worker.get("read"):
             event["read"] = worker["read"]  # what its inputs' reads saw, for lineage
         if keys:
@@ -785,11 +788,14 @@ class Engine(Attempts, Sensors, Views):
         outputs = {}
         for output in asset["outputs"]:
             name, head = output["name"], heads[output["name"]]
+            # An output moved to another store since its head was written: nothing
+            # of that store's is the new one's, so the write is a first one there.
+            moved = head is not None and head["ref"].get("store") != output["store"]
             info = {
                 # The committed head it writes over — its ref says where the content
                 # is — and whether the write starts it over: a first write, or a full run.
                 "head": head,
-                "reset": reset or head is None,
+                "reset": reset or head is None or moved,
                 # The contract it is launched under: settled, failed and cleaned up
                 # by it, whatever is served by then.
                 "contract": {
@@ -803,7 +809,14 @@ class Engine(Attempts, Sensors, Views):
                 info["aliases"] = list(asset["aliases"])
             if output.get("incremental"):
                 info["batch"] = int((head or {}).get("batch", -1)) + 1
-            if output.get("key") is not None:
+            if moved:
+                info["moved"] = True
+            if output.get("key") is not None and moved:
+                # Its key index names the old store's objects: it starts over too, at
+                # a prefix of its own, and the commit replaces it (`Model._commit_keys`).
+                current = self.m.index(name, scope)
+                info["index"] = IndexState(prefix=f"{current.prefix}{info['batch']:012d}/").to_json()
+            elif output.get("key") is not None:
                 info["index"] = self.m.index(name, scope).pinned().to_json()
                 if (name, scope) in self.m.unsettled:
                     info["unsettled"] = self.m.unsettled[(name, scope)]
@@ -1353,7 +1366,7 @@ class Engine(Attempts, Sensors, Views):
         for output, info in (prepared.get("outputs") or {}).items():
             if commit_of(self.m.heads.get((output, task["scope"]))) != commit_of(info["head"]):
                 raise Conflict(f"output {output} head changed since this attempt was claimed")
-        outputs = result.get("outputs") or {}
+        outputs = current_names(prepared, result.get("outputs") or {})
         # Settled under the contract it was launched with, not today's manifest.
         declared = {name: info["contract"] for name, info in (prepared.get("outputs") or {}).items()}
         # Where each keyed Incremental page ended decides the next watermark.
@@ -1398,9 +1411,11 @@ class Engine(Attempts, Sensors, Views):
                     raise Conflict(f"keyed output {name}: the result carries no key delta", retryable=False)
                 head["batch"] = int((before or {}).get("batch", -1))
                 if delta is not None:
-                    if delta["files"]:
+                    if delta["files"] or info.get("moved"):
                         head["batch"] = int(info["batch"])
                     keys[name] = {**delta, "batch": head["batch"]}
+                    if info.get("moved"):
+                        keys[name]["prefix"] = info["prefix"]  # a key index of its own
                 if "elements" in info:
                     head["elements"] = entry.get("elements", info["elements"])
             elif decl.get("incremental"):

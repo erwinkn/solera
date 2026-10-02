@@ -929,3 +929,76 @@ async def test_an_adopted_attempt_fails_under_the_contract_it_was_launched_with(
     assert [i["attempt"] for i in state.model.unsettled[("remote", "")]] == [attempt]
     await engine.stop()
     await state.close()
+
+
+async def test_a_rename_moves_a_launched_attempt_with_its_scope(tmp_path):
+    """Review round 5, engine #1 and system #1: `remote` is launched, then
+    renamed `renamed` and submitted again. One writer owns the scope: the
+    new attempt waits for the one in flight, which commits — under its
+    launched name, as its worker knows it — into `renamed`'s head."""
+
+    url = tmp_path.as_uri()
+    state = await State.open(url, "test", flush_interval=0.001)
+    engine = engine_for(state, REMOTE)
+    await engine.initialize()
+    run, attempt = await launched(engine, ["remote"])
+    served = Project(
+        assets=[asset(executor=Fake("fake")(), aliases=["remote"])(renamed)],
+        executors=[Fake("fake")],
+        default_store=Gated(),
+    )
+    state, engine = await restart(state, engine, url, served)
+    await engine.initialize()
+    again = await engine.submit(["renamed"])
+    for _ in range(10):
+        await engine.tick()
+        await asyncio.sleep(0.02)
+    assert Remote.launches == [attempt] and list(state.model.locks) == [("renamed", "")]
+    await finish_as_worker(state, run["id"], attempt, "remote")
+    assert (await engine.run_until(run["id"], 10))["request"]["status"] == "succeeded"
+    assert list(state.model.heads) == [("renamed", "")]
+    assert state.model.heads[("renamed", "")]["attempt"] == attempt
+    await until(engine, lambda: len(Remote.launches) == 2)  # the scope is free: the new one runs
+    await finish_as_worker(state, again["id"], Remote.launches[1], "renamed")
+    assert (await engine.run_until(again["id"], 10))["request"]["status"] == "succeeded"
+    await engine.stop()
+    await state.close()
+
+
+def renamed():
+    return [{"ok": True}]
+
+
+async def test_a_removed_assets_launched_attempt_is_not_retried(tmp_path):
+    """Review round 5, system #2: `doomed` is launched with a retry left,
+    then removed. Its attempt fails retryably: the task is not queued again
+    for an asset no project declares, but ends canceled, saying why, and
+    its run ends."""
+
+    @asset(executor=Fake("fake")(), retries=Retry(1))
+    def doomed():
+        return [{"ok": True}]
+
+    @asset(executor=Fake("fake")())
+    def other():
+        return [{"ok": True}]
+
+    first = Project(assets=[doomed], executors=[Fake("fake")], default_store=Gated())
+    url = tmp_path.as_uri()
+    state = await State.open(url, "test", flush_interval=0.001)
+    engine = engine_for(state, first)
+    await engine.initialize()
+    run, attempt = await launched(engine, ["doomed"])
+    state, engine = await restart(state, engine, url, Project(assets=[other], executors=[Fake("fake")]))
+    await engine.initialize()
+    base = state.attempt_path(run["id"], attempt)
+    await state.create_object(f"{base}.worker", json.dumps({"invocation": "w"}).encode())
+    error = {"type": "ValueError", "message": "boom", "retryable": True}
+    result = {"invocation": "w", "status": "failed", "writes": "none", "error": error}
+    await state.create_object(f"{base}.result", json.dumps(result).encode())
+    detail = await engine.run_until(run["id"], 10)
+    [task] = (await engine.history.tasks(run=run["id"]))["tasks"]
+    assert (task["status"], task["error"]) == ("canceled", "asset 'doomed' is no longer in the project")
+    assert detail["request"]["status"] == "failed" and Remote.launches == [attempt]
+    await engine.stop()
+    await state.close()

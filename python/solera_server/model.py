@@ -444,8 +444,9 @@ class Model:
             self.epoch += 1
         self.revision, self.manifest, self.project = e["revision"], manifest, e.get("project")
         self._consumed = self._consumed_outputs(manifest)
-        renamed = self._apply_aliases(manifest)
-        self._reconcile_tasks(manifest, renamed, e["at"])
+        renamed, output_map = self._apply_aliases(manifest)
+        self._reconcile_tasks(manifest, renamed, output_map, e["at"])
+        self._unsubscribe()
         automations = {}
         for name, auto in manifest["automations"].items():
             existing = self.automations.get(name)
@@ -476,44 +477,93 @@ class Model:
                     "n": self.applied,
                 }
 
-    def _reconcile_tasks(self, manifest: dict, renamed: dict[str, list[str]], at: float) -> None:
-        """Outstanding work under a new project: a task not yet launched of a
-        renamed asset carries on under its new name; one of an asset that is
-        gone is canceled, saying why — its dependents blocked, its run rolled
-        up — so no queued task names an asset the manifest lacks. A launched
-        attempt settles under the contract it was launched with."""
+    def _reconcile_tasks(self, manifest: dict, renamed: dict, output_map: dict, at: float) -> None:
+        """Outstanding work under a new project. A task of a renamed asset
+        carries on under its new name: its scope lock, and a launched
+        attempt's output records — which keep the contract and the places
+        it was launched with, and the names its worker knows them by
+        (`as`) — go with it, so one writer owns the scope, and its commit
+        lands under the new names. A task not yet launched of an asset that
+        is gone is canceled, saying why — its dependents blocked, its run
+        rolled up; a launched one settles its attempt first, then ends the
+        same way (`_ready`): no task is ever queued for an asset the
+        manifest lacks."""
 
         new_name = {old: new for new, olds in renamed.items() for old in olds}
         for run in list(self.runs.values()):
             if run["status"] in TERMINAL_RUN:
                 continue
             for tid, task in sorted(run["tasks"].items()):
-                if task["status"] in TERMINAL_TASK or task.get("launched") or tid in self.claims:
+                if task["status"] in TERMINAL_TASK:
                     continue
-                old = task["asset"]
+                old, scope = task["asset"], task["scope"]
                 if old in new_name:
-                    bucket = self.pending.get((old, task["scope"]))
-                    if bucket is not None:
+                    new = task["asset"] = new_name[old]
+                    bucket = self.pending.get((old, scope))
+                    if bucket is not None and tid in bucket:
                         bucket.discard(tid)
                         if not bucket:
-                            del self.pending[(old, task["scope"])]
-                    task["asset"] = new_name[old]
-                    self.pending.setdefault((task["asset"], task["scope"]), set()).add(tid)
-                elif old not in manifest["assets"]:
-                    task["status"], task["error"] = "canceled", f"asset {old!r} is no longer in the project"
-                    task.pop("held", None)
-                    self._stop_clock(task, at)
-                    self.unfinished.pop(tid, None)
-                    self._finished(run, task, "canceled", None, at)
+                            del self.pending[(old, scope)]
+                        self.pending.setdefault((new, scope), set()).add(tid)
+                    if (old, scope) in self.locks:
+                        self.locks[(new, scope)] = self.locks.pop((old, scope))
+                    launched = task.get("launched")
+                    if launched is not None:
+                        outputs = launched["prepared"].get("outputs") or {}
+                        launched["prepared"]["outputs"] = {
+                            output_map.get(n, n): {**info, "as": info.get("as", n)}
+                            if n in output_map
+                            else info
+                            for n, info in outputs.items()
+                        }
+                        if launched["attempt"] in self.pool:
+                            self.pool[launched["attempt"]]["asset"] = new
+                elif old not in manifest["assets"] and not task.get("launched") and tid not in self.claims:
+                    self._retire(run, task, at)
 
-    def _apply_aliases(self, manifest) -> dict[str, list[str]]:
+    def _retire(self, run: dict, task: dict, at: float) -> None:
+        """End a task whose asset is no longer in the project: canceled, saying why."""
+
+        task["status"], task["error"] = "canceled", f"asset {task['asset']!r} is no longer in the project"
+        task.pop("held", None)
+        self._stop_clock(task, at)
+        self.queue.pop(task["id"], None)
+        self.unfinished.pop(task["id"], None)
+        self._finished(run, task, "canceled", None, at)
+
+    def _subscribed(self, asset: str, edge: str, wm: dict) -> bool:
+        """Whether the project still declares the Incremental edge a
+        watermark keeps the delivery of: the same asset, parameter and
+        upstream output."""
+
+        spec = ((self.manifest or {}).get("assets") or {}).get(asset, {}).get("inputs", {}).get(edge) or {}
+        return spec.get("kind") == "incremental" and spec.get("output") == wm.get("output")
+
+    def _unsubscribe(self, asset: str | None = None, scope: str | None = None) -> None:
+        """Retire the delivery obligations of edges the project no longer
+        declares (a removed consumer, a renamed parameter, another
+        upstream): their watermarks, which would keep the upstream's delta
+        log and pin its files for good. A scope with an attempt in flight
+        keeps them until it settles: that attempt still reads them. With
+        `asset` and `scope`, only that scope's — one whose attempt ended."""
+
+        live = {(t["asset"], t["scope"]) for tid in self.claims if (t := self.task(tid)) is not None}
+        for key in list(self.watermarks):
+            owner, edge, at = key
+            if asset is not None and (owner, at) != (asset, scope):
+                continue
+            if (owner, at) not in live and not self._subscribed(owner, edge, self.watermarks[key]):
+                del self.watermarks[key]
+
+    def _apply_aliases(self, manifest) -> tuple[dict[str, list[str]], dict[str, str]]:
         """Move everything held under an asset's former names to its current
         one (§2): cursors, watermarks, outcomes, pending automation entries,
         an Each asset's failure records and failure
         index, and — for outputs named after the asset — heads,
         key indexes, unsettled intents and pending discards. A new name never
         releases a write domain. An index keeps its files where they are (its
-        `prefix`). Returns `{asset: [aliases]}` for the automations to follow."""
+        `prefix`). Returns `{asset: [aliases]}`, for the automations and tasks
+        to follow, and the outputs renamed with their assets, `{old: new}`."""
 
         assets = {n: a for n, a in manifest["assets"].items() if a.get("aliases")}
         renamed = {}
@@ -521,7 +571,7 @@ class Model:
             renamed[name] = [a for a in info["aliases"] if a not in manifest["assets"]]
         asset_map = {old: new for new, olds in renamed.items() for old in olds}
         if not asset_map:
-            return renamed
+            return renamed, {}
         outputs = manifest["outputs"]
         output_map = {
             old: new
@@ -557,7 +607,7 @@ class Model:
                 wm["output"] = output_map[wm["output"]]
         for auto in self.automations.values():
             auto["pending"] = [[asset_map.get(a, a), s] for a, s in auto.get("pending") or []]
-        return renamed
+        return renamed, output_map
 
     def _on_RunSubmitted(self, e):
         run = e["run"]
@@ -679,6 +729,7 @@ class Model:
             return
         claim = self.claimed(e["attempt"]) or {}
         self._release_claim(task["id"], e["attempt"])
+        self._unsubscribe(task["asset"], task["scope"])  # what it read under an edge since removed
         outcome, at = e["outcome"], e["finished_at"]
         prepared, execution = {}, {}
         launched = task.get("launched")
@@ -846,7 +897,8 @@ class Model:
             else:
                 self.cursors[(asset, scope)] = commit["cursor"]
         for edge, wm in commit.get("watermarks", {}).items():
-            self.watermarks[(asset, edge, scope)] = wm
+            if self._subscribed(asset, edge, wm):  # an edge removed while it ran keeps no delivery
+                self.watermarks[(asset, edge, scope)] = wm
         if "failures" in commit:
             self._failures(asset, scope, commit["failures"])
         for row in commit.get("key_outcomes") or ():
@@ -914,8 +966,12 @@ class Model:
 
     def _ready(self, run: dict, task: dict, at: float, delay: float = 0.0) -> None:
         """Queue a task to run from `at + delay`: its wait starts then,
-        unless its run is paused."""
+        unless its run is paused. A task whose asset left the project while
+        its attempt ran — a retry, a next page — is retired instead."""
 
+        if self.manifest is not None and task["asset"] not in self.manifest["assets"]:
+            self._retire(run, task, at)
+            return
         due = at + delay
         task["status"] = "queued"
         task["ready_at"] = due
@@ -1001,11 +1057,21 @@ class Model:
         The head carries the index's live key count."""
 
         if keys is not None:
-            index = self.index(output, scope)
-            if keys["files"]:
-                index = index.committed(
-                    keys["batch"], DeltaFiles.from_json(keys), keep_log=output in self._consumed
-                )
+            index, delta = self.index(output, scope), DeltaFiles.from_json(keys)
+            keep_log = output in self._consumed
+            if keys.get("prefix", index.prefix) != index.prefix:
+                # The output moved to another store: its index starts over at a prefix
+                # of its own, and every file of the old one — and the intents of what
+                # dead attempts meant to write in the old store — goes once no reader
+                # pins it.
+                fresh = IndexState(prefix=keys["prefix"]).committed(keys["batch"], delta, keep_log=keep_log)
+                if (output, scope) in self.indexes:
+                    self._replace_index((output, scope), fresh)
+                for intent in self.unsettled.pop((output, scope), ()):
+                    self.garbage.extend([index.path(f["name"]), self.applied] for f in intent["files"])
+                index = fresh
+            elif keys["files"]:
+                index = index.committed(keys["batch"], delta, keep_log=keep_log)
             self.indexes[(output, scope)] = index
         index = self.indexes.get((output, scope))
         if index is not None:
@@ -1048,7 +1114,7 @@ class Model:
         output starts over — its earlier batches."""
 
         if keys and keys.get("files"):
-            prefix = self.index(output, scope).prefix
+            prefix = keys.get("prefix") or self.index(output, scope).prefix  # a moved output's own
             self._collect(
                 output,
                 scope,

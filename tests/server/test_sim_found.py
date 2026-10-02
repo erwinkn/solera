@@ -11,7 +11,6 @@ from ..conftest import whole
 from .test_engine import drive, make_engine, state, status_of  # noqa: F401
 
 
-@pytest.mark.xfail(strict=True, reason="sim finding: a keyed output's index survives a change of store")
 async def test_a_keyed_output_moved_to_another_store_stays_readable(state, tmp_path):  # noqa: F811
     """An output moved to another store keeps its key index; the next write
     resolved against it stores only the keys that changed, so a key it did
@@ -49,7 +48,6 @@ def _ref(head):
     return Ref(**{k: head["ref"][k] for k in ("output", "store", "handle", "version", "partition", "meta")})
 
 
-@pytest.mark.xfail(strict=True, reason="sim finding: a removed asset's launched attempt re-queues its task")
 async def test_a_removed_assets_last_attempt_ends_its_run(state, monkeypatch):  # noqa: F811
     """§11: an attempt launched before its asset was removed settles under
     the contract it was launched with. When it commits a page and asks for
@@ -91,9 +89,9 @@ async def test_a_removed_assets_last_attempt_ends_its_run(state, monkeypatch):  
         tasks = state.model.runs[run["id"]]["tasks"].values()
         raise AssertionError(f"the run never ends: {[(t['status'], t.get('held')) for t in tasks]}") from None
     assert status_of(detail) in {"succeeded", "failed", "canceled"}
+    assert [k for k in state.model.watermarks if k[0] == "pages"] == []  # its delivery ends with it
 
 
-@pytest.mark.xfail(strict=True, reason="sim finding: an attempt launched before a rename never settles")
 async def test_an_attempt_launched_before_a_rename_settles(state, monkeypatch):  # noqa: F811
     """docs/object-store-state.md §2: a rename moves heads, indexes and
     outcomes to the new name; an attempt launched under the old name still

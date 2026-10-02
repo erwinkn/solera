@@ -60,10 +60,20 @@ def _names(value) -> dict[str, list[str]]:
 
 def worker_output(info: dict) -> dict:
     """An output's launch record as its worker sees it: the committed head
-    only as its ref (`before`), where the content is."""
+    only as its ref (`before`), where the content is — none for an output
+    moved to another store, where it writes as if for the first time."""
 
-    head = info["head"]
+    head = None if info.get("moved") else info["head"]
     return {**{k: v for k, v in info.items() if k != "head"}, "before": head["ref"] if head else None}
+
+
+def current_names(prepared: dict, by_output: dict) -> dict:
+    """What a worker reports by output, under the outputs' current names: it
+    knows them by the names it was launched with (`as`), which a rename
+    while it ran has since moved (§2)."""
+
+    names = {info.get("as", name): name for name, info in (prepared.get("outputs") or {}).items()}
+    return {names.get(name, name): value for name, value in by_output.items()}
 
 
 def worker_report(worker: dict | None) -> dict:
@@ -359,7 +369,10 @@ class Attempts:
                 return False
             return live.cancel is None or live.cancel.phase != "forced"
 
-        resolved = {o["name"]: prepared(o["name"]) for o, _ in outputs_asked}
+        asked = current_names(
+            launched.get("prepared") or {}, {o["name"]: o["name"] for o, _ in outputs_asked}
+        )
+        resolved = {name: prepared(current) for current, name in asked.items()}  # by the worker's names
         return await self.keys.resolve(attempt, body, resolved.get, still_live, self.m.applied)
 
     def attempt_lines(self, attempt: str) -> list[str] | None:
@@ -812,8 +825,9 @@ class Attempts:
             writes, gate = await self._gate(task["run"], attempt, lifecycle.ABORTED)
         if result is not None:
             writes = result.get("writes", writes)
-        unsettled = (
-            (gate or {}).get("intents") or {} if (gate or {}).get("state") == lifecycle.WRITING else {}
+        unsettled = current_names(
+            prepared,
+            (gate or {}).get("intents") or {} if (gate or {}).get("state") == lifecycle.WRITING else {},
         )
         worker = result if result is not None else self._last_report(attempt)
         claim = self.m.claimed(attempt)
