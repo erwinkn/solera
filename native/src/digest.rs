@@ -7,7 +7,7 @@
 
 use std::fmt::Write as _;
 
-use xxhash_rust::xxh3::xxh3_128;
+use xxhash_rust::xxh3::{xxh3_128, Xxh3Default};
 
 use crate::format::{put_varint, Error, Result};
 
@@ -42,7 +42,41 @@ pub enum Scalar<'a> {
     Interval(i32, i32, i64),
 }
 
-fn put_len(out: &mut Vec<u8>, b: &[u8]) {
+/// `i`, then `n` as decimal text.
+pub fn int(out: &mut Vec<u8>, n: i64) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    let mut u = n.unsigned_abs();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (u % 10) as u8;
+        u /= 10;
+        if u == 0 {
+            break;
+        }
+    }
+    let digits = &buf[i..];
+    out.push(b'i');
+    out.push((digits.len() + (n < 0) as usize) as u8);
+    if n < 0 {
+        out.push(b'-');
+    }
+    out.extend_from_slice(digits);
+}
+
+/// `s`, then `s` with its length.
+pub fn str(out: &mut Vec<u8>, s: &[u8]) {
+    out.push(b's');
+    put_len(out, s);
+}
+
+/// `f`, then the canonical bits of `x`.
+pub fn float(out: &mut Vec<u8>, x: f64) {
+    out.push(b'f');
+    out.extend_from_slice(&float_bits(x).to_le_bytes());
+}
+
+pub fn put_len(out: &mut Vec<u8>, b: &[u8]) {
     put_varint(out, b.len() as u64);
     out.extend_from_slice(b);
 }
@@ -78,28 +112,25 @@ impl Scalar<'_> {
         match self {
             Scalar::Null => out.push(b'n'),
             Scalar::Bool(b) => out.extend_from_slice(&[b'o', *b as u8]),
-            Scalar::Int(i) => {
-                out.push(b'i');
-                put_len(out, i.to_string().as_bytes());
-            }
+            Scalar::Int(i) => match i64::try_from(*i) {
+                Ok(n) => int(out, n),
+                Err(_) => {
+                    out.push(b'i');
+                    put_len(out, i.to_string().as_bytes());
+                }
+            },
             Scalar::BigInt(s) => {
                 out.push(b'i');
                 put_len(out, s.as_bytes());
             }
-            Scalar::Float(f) => {
-                out.push(b'f');
-                out.extend_from_slice(&float_bits(*f).to_le_bytes());
-            }
+            Scalar::Float(f) => float(out, *f),
             Scalar::Decimal(unscaled, scale) => {
                 let (digits, exp) = normalize(unscaled, *scale);
                 out.push(b'e');
                 put_len(out, digits.as_bytes());
                 put_varint(out, ((exp << 1) ^ (exp >> 63)) as u64);
             }
-            Scalar::Str(s) => {
-                out.push(b's');
-                put_len(out, s);
-            }
+            Scalar::Str(s) => str(out, s),
             Scalar::Bytes(b) => {
                 out.push(b'b');
                 put_len(out, b);
@@ -298,13 +329,22 @@ impl Entries {
 // -- digests ----------------------------------------------------------------------------
 
 fn digest(production: u8, body: &[&[u8]]) -> Digest {
-    let mut buf = Vec::with_capacity(2 + body.iter().map(|b| b.len()).sum::<usize>());
-    buf.push(VERSION);
-    buf.push(production);
+    let mut h = Xxh3Default::new();
+    h.update(&[VERSION, production]);
     for b in body {
-        buf.extend_from_slice(b);
+        h.update(b);
     }
-    xxh3_128(&buf).to_le_bytes()
+    h.digest128().to_le_bytes()
+}
+
+/// What `row(r)` digests before the record: a row's buffer starts with it,
+/// so the record is hashed where it was written (`framed`).
+pub const ROW: [u8; 2] = [VERSION, b'R'];
+
+/// `row(r)` of a buffer holding `ROW` and then an encoded record.
+pub fn framed(buf: &[u8]) -> Digest {
+    debug_assert!(buf.starts_with(&ROW));
+    xxh3_128(buf).to_le_bytes()
 }
 
 /// `row(r)` of an encoded record.

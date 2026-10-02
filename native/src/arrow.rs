@@ -425,28 +425,44 @@ impl RowDigest {
         })
     }
 
-    fn digest(&self, row: usize, buf: &mut Vec<u8>, e: &mut Entries) -> Result<Digest> {
+    /// The row's record, its fields already in name order: each value is
+    /// encoded into `values`, then the ones not null are framed into `buf`.
+    fn digest(&self, row: usize, buf: &mut Vec<u8>, values: &mut Values) -> Result<Digest> {
         let (c, j) = self.at.locate(row);
         let b = &self.batches[c];
-        e.clear();
-        for (name, i) in &self.columns {
-            value(b.column(*i).as_ref(), j, e.name(name))?;
-            e.end();
+        let (data, spans) = values;
+        data.clear();
+        spans.clear();
+        for (k, (_, i)) in self.columns.iter().enumerate() {
+            let start = data.len();
+            value(b.column(*i).as_ref(), j, data)?;
+            if &data[start..] != b"n" {
+                spans.push((k, start, data.len()));
+            }
         }
         buf.clear();
-        e.write(buf, true)?;
-        Ok(digest::row(buf))
+        buf.extend_from_slice(&digest::ROW);
+        buf.push(b'r');
+        crate::format::put_varint(buf, spans.len() as u64);
+        for &(k, start, end) in spans.iter() {
+            digest::put_len(buf, &self.columns[k].0);
+            buf.extend_from_slice(&data[start..end]);
+        }
+        Ok(digest::framed(buf))
     }
 }
+
+/// A row's encoded values, and the column, start and end of each not null.
+type Values = (Vec<u8>, Vec<(usize, usize, usize)>);
 
 impl Versions for RowDigest {
     fn fill(&mut self, rows: &[u32], out: &mut Arena) -> Result<()> {
         let parts: Vec<Vec<Digest>> = rows
             .par_chunks(1024)
             .map(|c| {
-                let (mut buf, mut e) = (Vec::new(), Entries::default());
+                let (mut buf, mut values) = (Vec::new(), Values::default());
                 c.iter()
-                    .map(|&r| self.digest(r as usize, &mut buf, &mut e))
+                    .map(|&r| self.digest(r as usize, &mut buf, &mut values))
                     .collect()
             })
             .collect::<Result<_>>()?;

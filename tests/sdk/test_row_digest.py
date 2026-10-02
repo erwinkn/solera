@@ -284,3 +284,77 @@ def test_duplicate_names_are_errors_even_when_null():
         )
         with pytest.raises(ValueError, match="appears twice"):
             arrow(pa.table({"id": ["k"], "s": struct}))
+
+
+# -- the dict fast path ----------------------------------------------------------------------
+
+
+class Moment(dt.datetime):
+    """A datetime subclass: read through its attributes, as before the fast path."""
+
+
+def general(row: dict) -> bytes:
+    """`row(r)` through the general walk: a mapping that is not a dict, a
+    datetime that is not exactly one."""
+
+    from types import MappingProxyType
+
+    def slow(v):
+        if type(v) is dt.datetime:
+            fields = (v.year, v.month, v.day, v.hour, v.minute, v.second, v.microsecond)
+            return Moment(*fields, v.tzinfo, fold=v.fold)
+        return v
+
+    return _native.row_digest(MappingProxyType({k: slow(v) for k, v in row.items()}), "id")
+
+
+def test_the_dict_fast_path_digests_as_the_general_walk():
+    class NoOffset(dt.tzinfo):
+        def utcoffset(self, _):
+            return None
+
+    new_york = ZoneInfo("America/New_York")
+    values = [
+        None, True, False, 0, -1, 2**63 - 1, -(2**63), 2**63, -(2**64), 10**40,
+        0.0, -0.0, math.nan, math.inf, 1e300, "", "é", "x" * 200, b"raw", [1, None], {"a": None, "b": 2},
+        dt.datetime(2026, 3, 1, 12, 30, 5, 7), dt.datetime.min, dt.datetime.max,
+        dt.datetime(2026, 3, 1, 12, tzinfo=dt.UTC),
+        dt.datetime(2026, 3, 1, 12, tzinfo=dt.timezone(dt.timedelta(hours=2))),
+        dt.datetime(2021, 11, 7, 1, 30, tzinfo=new_york),
+        dt.datetime(2021, 11, 7, 1, 30, fold=1, tzinfo=new_york),
+        dt.datetime(1, 1, 1, tzinfo=dt.timezone(dt.timedelta(hours=-5))),
+        dt.datetime(2026, 3, 1, tzinfo=NoOffset()),
+        dt.date(2026, 3, 1), dt.timedelta(days=-3, microseconds=5), D("1.50"),
+    ]  # fmt: skip
+    rows = [{"id": i, "v": v, "w": 1} for i, v in enumerate(values)]
+    # Shapes that change from row to row, names in another order, equal names as other objects.
+    rows += [
+        {"id": 100, "w": 1, "v": 2},
+        {"id": 101, "a": 1},
+        {"id": 102},
+        {"".join(["i", "d"]): 103, "".join("v"): 1, "w": None},
+        {"id": 104, "v": 1, "w": 1},
+    ]
+    assert _native.row_digests(rows, "id") == b"".join(general(r) for r in rows)
+    assert _native.row_digests(rows) == b"".join(_native.row_digest(r) for r in rows)
+    for bad in ({"id": 1, 2: "x"}, {"id": 1, "\ud800": 1}, {"id": 1, "v": "\ud800"}, {"id": 1, "v": {1}}):
+        with pytest.raises(ValueError):
+            _native.row_digests([{"id": 0, "v": 1}, bad], "id")
+
+
+def test_a_row_changed_while_it_is_read_is_no_crash():
+    """A value's own code (a tzinfo's `utcoffset`) may change the row it is
+    in: the walk holds what it has yet to encode."""
+
+    rows = []
+
+    class Clears(dt.tzinfo):
+        def utcoffset(self, _):
+            for row in rows:
+                row.clear()
+            return dt.timedelta(0)
+
+    at = dt.datetime(2026, 1, 1, tzinfo=Clears())
+    rows += [{"a": at, "b": "x" * 50, "c": [1, 2], "id": i} for i in range(3)]
+    expected = _native.row_digest({"a": dt.datetime(2026, 1, 1, tzinfo=dt.UTC), "b": "x" * 50, "c": [1, 2]})
+    assert _native.row_digests(rows[:1], "id") == expected

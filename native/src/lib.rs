@@ -486,40 +486,67 @@ impl Records {
         }
     }
 
+    /// The key and revision columns' names, as Python strings made once.
+    fn names<'py>(&self, py: Python<'py>) -> Names<'py> {
+        (
+            PyString::new(py, &self.key),
+            self.revision.as_deref().map(|r| PyString::new(py, r)),
+        )
+    }
+
     /// Appends a mapping row's key, and its version: its digest, or its revision's text.
     fn read<'py>(
         &self,
         w: &mut pyvalue::Walker<'py>,
+        names: &Names<'py>,
         row: &Bound<'py, PyAny>,
         keys: Option<&mut Vec<u8>>,
         version: &mut Vec<u8>,
     ) -> PyResult<()> {
         if let Some(keys) = keys {
-            let k = field(row, &self.key)?.ok_or_else(|| PyKeyError::new_err(self.key.clone()))?;
+            let k = field(row, &names.0)?.ok_or_else(|| PyKeyError::new_err(self.key.clone()))?;
             row_key(&k, keys)?;
         }
-        match &self.revision {
-            None => {
-                let skip: Vec<&str> = self.skip.iter().map(String::as_str).collect();
-                version.extend_from_slice(&w.row(row, &skip)?);
-            }
-            Some(rev) => {
-                let v = field(row, rev)?.ok_or_else(|| {
+        match (&self.revision, &names.1) {
+            (Some(rev), Some(name)) => {
+                let v = field(row, name)?.ok_or_else(|| {
                     PyValueError::new_err(format!(
                         "a row lacks the declared revision field {rev:?}"
                     ))
                 })?;
                 w.render(&v, version)?;
             }
+            _ => version.extend_from_slice(&w.row(row, &self.skip)?),
         }
         Ok(())
     }
 }
 
-/// Python rows' versions, a window of rows at a time under the GIL.
+type Names<'py> = (Bound<'py, PyString>, Option<Bound<'py, PyString>>);
+
+/// Versions read with the keys, in the rows' own order — the order they lie
+/// in memory, where reading them in key order would miss the cache at every
+/// row — and handed out in key order.
+struct Read {
+    versions: Arena,
+    rows: bool,
+}
+
+impl Versions for Read {
+    fn fill(&mut self, rows: &[u32], out: &mut Arena) -> format::Result<()> {
+        for &r in rows {
+            out.push(self.versions.get(r as usize));
+        }
+        Ok(())
+    }
+
+    fn rows(&self) -> bool {
+        self.rows
+    }
+}
+
+/// `(key, …)` pairs' versions, a window of rows at a time under the GIL.
 enum PyVersions {
-    /// Mappings: their digests, or their revision column's text.
-    Records(Py<PyList>, Records),
     /// `(key, value)` pairs: `value(v)`.
     Values(Py<PyList>),
     /// `(key, version)` pairs: the version as given.
@@ -531,14 +558,6 @@ impl PyVersions {
         let mut w = pyvalue::Walker::new(py)?;
         let mut buf = Vec::new();
         match self {
-            PyVersions::Records(list, records) => {
-                let list = list.bind(py);
-                for &r in rows {
-                    buf.clear();
-                    records.read(&mut w, &list.get_item(r as usize)?, None, &mut buf)?;
-                    out.push(&buf);
-                }
-            }
             PyVersions::Values(list) => {
                 let list = list.bind(py);
                 for &r in rows {
@@ -564,14 +583,13 @@ impl Versions for PyVersions {
     fn fill(&mut self, rows: &[u32], out: &mut Arena) -> format::Result<()> {
         Python::attach(|py| self.fill_py(py, rows, out)).map_err(|e| Error::Callback(Box::new(e)))
     }
-
-    fn rows(&self) -> bool {
-        matches!(self, PyVersions::Records(_, r) if r.revision.is_none())
-    }
 }
 
 /// `row[name]` of a mapping row, None when it has no such field.
-fn field<'py>(row: &Bound<'py, PyAny>, name: &str) -> PyResult<Option<Bound<'py, PyAny>>> {
+fn field<'py>(
+    row: &Bound<'py, PyAny>,
+    name: &Bound<'py, PyString>,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
     match row.cast::<PyDict>() {
         Ok(d) => d.get_item(name),
         Err(_) => match row.get_item(name) {
@@ -641,18 +659,31 @@ impl Rows {
         revision: Option<&str>,
         exclude: Vec<String>,
     ) -> PyResult<Rows> {
-        let mut keys = Arena::default();
+        let records = Records::new(key, revision, exclude);
+        let (mut w, names) = (pyvalue::Walker::new(py)?, records.names(py));
+        let (mut keys, mut versions) = (Arena::default(), Arena::default());
         keys.ends.reserve(rows.len());
+        versions.ends.reserve(rows.len());
         for (i, row) in rows.iter().enumerate() {
-            let k = field(&row, key)?.ok_or_else(|| PyKeyError::new_err(key.to_string()))?;
-            row_key(&k, &mut keys.data)?;
+            records.read(
+                &mut w,
+                &names,
+                &row,
+                Some(&mut keys.data),
+                &mut versions.data,
+            )?;
             keys.ends.push(keys.data.len());
+            versions.ends.push(versions.data.len());
             if i % 65536 == 65535 {
                 py.detach(|| ()); // let other threads run: this loop holds the GIL
             }
         }
         keys.data.shrink_to_fit();
-        let versions = PyVersions::Records(rows.unbind(), Records::new(key, revision, exclude));
+        versions.data.shrink_to_fit();
+        let versions = Read {
+            versions,
+            rows: revision.is_none(),
+        };
         Rows::new(py, Box::new(keys), Box::new(versions))
     }
 
@@ -766,6 +797,23 @@ fn row_digest<'py>(
     ))
 }
 
+/// `row(r)` of every row, without its `key` column: 16 bytes each, concatenated.
+#[pyfunction]
+#[pyo3(signature = (rows, key=None))]
+fn row_digests<'py>(
+    py: Python<'py>,
+    rows: Bound<'py, PyList>,
+    key: Option<&str>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let mut w = pyvalue::Walker::new(py)?;
+    let skip: Vec<&str> = key.into_iter().collect();
+    let mut out = Vec::with_capacity(rows.len() * 16);
+    for r in rows.iter() {
+        out.extend_from_slice(&w.row(&r, &skip)?);
+    }
+    Ok(PyBytes::new(py, &out))
+}
+
 /// `group(rows)`: the version of a key whose rows these are.
 #[pyfunction]
 #[pyo3(signature = (rows, key=None))]
@@ -851,6 +899,7 @@ fn chunk(
         return Ok((keys, versions));
     }
     let mut w = pyvalue::Walker::new(py)?;
+    let names = records.map(|r| r.names(py));
     for item in obj.try_iter()? {
         let item = item?;
         match records {
@@ -858,9 +907,13 @@ fn chunk(
                 key_of(&item.get_item(0)?, &mut keys.data)?;
                 key_of(&item.get_item(1)?, &mut versions.data)?;
             }
-            Some(records) => {
-                records.read(&mut w, &item, Some(&mut keys.data), &mut versions.data)?
-            }
+            Some(records) => records.read(
+                &mut w,
+                names.as_ref().unwrap(),
+                &item,
+                Some(&mut keys.data),
+                &mut versions.data,
+            )?,
         }
         keys.ends.push(keys.data.len());
         versions.ends.push(versions.data.len());
@@ -1350,6 +1403,7 @@ fn solera_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Snapshot>()?;
     m.add_function(wrap_pyfunction!(encode, m)?)?;
     m.add_function(wrap_pyfunction!(row_digest, m)?)?;
+    m.add_function(wrap_pyfunction!(row_digests, m)?)?;
     m.add_function(wrap_pyfunction!(group_digest, m)?)?;
     m.add_function(wrap_pyfunction!(value_digest, m)?)?;
     m.add_function(wrap_pyfunction!(revision_text, m)?)?;
