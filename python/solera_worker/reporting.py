@@ -17,7 +17,7 @@ import socket
 import threading
 import time
 
-from obstore.exceptions import AlreadyExistsError, NotFoundError
+from obstore.exceptions import NotFoundError
 from solera import lifecycle
 from solera.lifecycle import Cancel, Ended
 from solera.objects import create
@@ -113,7 +113,11 @@ class LogShipper:
     create-only chunks, `{attempt}.log.{n:06d}`, every 30 s or 1 MB; never
     joined. At the end, the lines not yet in a chunk travel inside the
     result (`tail`) when they are under 64 KB, else as one last chunk. Past
-    `LOG_CAP` a truncation marker is written and shipping stops."""
+    `LOG_CAP` a truncation marker is written and shipping stops.
+
+    A chunk is sealed — its number, bytes and lines fixed — before it is
+    written, and lines logged meanwhile start the next one: a write retried
+    after an unknown outcome rewrites exactly what may have landed."""
 
     def __init__(self, objects, base: str, channel=None, invocation: str | None = None):
         self.objects, self.base, self.channel, self.invocation = objects, base, channel, invocation
@@ -122,6 +126,7 @@ class LogShipper:
         self.live: list[str] = []  # lines not yet sent live
         self.live_offset = 0  # the offset of live[0]
         self.chunks: list[list] = []
+        self.sealed: tuple[int, bytes, list] | None = None  # the chunk being written
         self.size = self.lines = 0
         self.truncated = False
         self._chunked_at = time.monotonic()
@@ -160,25 +165,28 @@ class LogShipper:
             member = gzip.compress(lines[0][1].encode(), mtime=0)
         return member, lines
 
-    async def chunk(self):
-        """Write the pending lines as the next chunk."""
+    async def chunk(self) -> bool:
+        """Seal the pending lines as the next chunk, unless one is sealed
+        already, and write it. False if the write failed: the sealed chunk
+        is written again next time, with the same bytes."""
 
         async with self._lock:
-            if not self.pending:
-                return
-            lines = self.pending
-            member, lines = self._member(lines)
-            n = len(self.chunks)
+            if self.sealed is None:
+                if not self.pending:
+                    return True
+                member, lines = self._member(self.pending)
+                self.pending, self.pending_bytes = [], 0
+                self.sealed = (len(self.chunks), member, lines)
+            n, member, lines = self.sealed
             try:
                 await create(self.objects, f"{self.base}{lifecycle.chunk(n)}", member)
-            except AlreadyExistsError:  # cannot be: one invocation writes these names
-                raise
             except Exception:
-                return  # kept pending: the next flush tries again
-            self.pending, self.pending_bytes = [], 0
+                return False
+            self.sealed = None
             self.chunks.append([n, len(lines), lines[0][0]])
             self.size += len(member)
             self._chunked_at = time.monotonic()
+            return True
 
     async def send_live(self):
         if self.channel is None or not self.live:
@@ -196,14 +204,17 @@ class LogShipper:
         while True:
             await asyncio.sleep(LOG_LIVE_SECONDS)
             await self.send_live()
-            if self.pending and time.monotonic() - self._chunked_at >= LOG_CHUNK_SECONDS:
+            if self.sealed or (self.pending and time.monotonic() - self._chunked_at >= LOG_CHUNK_SECONDS):
                 await self.chunk()
 
     async def finish(self) -> dict:
         """The log's index for the result: its chunks and its tail. Never
-        raises: the log does not change an attempt's outcome."""
+        raises: the log does not change an attempt's outcome. Lines it
+        could not write are counted as `lost`."""
 
         await self.send_live()
+        if self.sealed is not None:
+            await self.chunk()
         tail = None
         async with self._lock:
             if self.pending and not self.truncated:
@@ -213,10 +224,12 @@ class LogShipper:
                     self.pending = []
         if self.pending:
             await self.chunk()
-        return {
+        index = {
             "chunks": self.chunks,
             "tail": tail,
             "lines": self.lines,
             "bytes": self.size,
             "truncated": self.truncated,
         }
+        lost = len(self.sealed[2] if self.sealed else ()) + len(self.pending)
+        return {**index, "lost": lost} if lost else index

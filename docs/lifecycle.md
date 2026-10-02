@@ -111,6 +111,11 @@ usage, the log index, and what is known of the attempt's writes:
   holds the lines written after the last chunk, gzipped, when they are
   under 64 KB (§13). Chunks are never joined: the console reads "the last
   200 lines" from the tail and the last few chunks.
+- A chunk is sealed (its number, bytes and lines fixed) before it is
+  written; lines logged meanwhile start the next. A write retried after an
+  unknown outcome sends the same bytes, which the create-only write takes
+  as its own. Lines the worker could not write at all are counted in
+  `log.lost`: the log never keeps a result from being published.
 
 ### 2.2 The cancel record
 
