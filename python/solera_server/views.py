@@ -45,7 +45,7 @@ class Views:
         for (asset, scope), ids in self.m.pending.items():
             if ids:
                 running.setdefault(asset, set()).add(scope)
-        out = {}
+        planner, out = self.planner(), {}
         for asset in assets:
             outputs = self.manifest["assets"][asset]["outputs"]
             scoped: dict[str, dict] = {}
@@ -54,10 +54,10 @@ class Views:
             recorded, pending = outcomes.get(asset) or {}, running.get(asset) or set()
             scopes = set(scoped) | set(recorded) | pending
             if every:
-                listed = set(await self._scopes(asset, "all"))
+                listed = set(self._scopes(asset, "all"))
                 scopes, current = scopes | listed, listed.__contains__
             else:
-                current = planning.membership(self._dims(asset), self._now(), self._elements)
+                current = planning.membership(self._dims(asset), planner.time, planner.elements)
             rows = out[asset] = []
             for scope in sorted(scopes):
                 head, record = scoped.get(scope), recorded.get(scope)
@@ -98,10 +98,10 @@ class Views:
         names = list(self.manifest["assets"])
         statuses = await self.scope_statuses(names, every=False)
         owner = {o["name"]: a for a in names for o in self.manifest["assets"][a]["outputs"]}
-        out = {}
+        planner, out = self.planner(), {}
         for name in names:
             counts = Counter(row["status"] for row in statuses[name])
-            total = planning.size(self._dims(name), self._now(), self._elements)
+            total = planning.size(self._dims(name), planner.time, planner.elements)
             missing = total - counts["complete"] - counts["failed"] - counts["running"]
             out[name] = {
                 "partitions": {
@@ -311,7 +311,7 @@ class Views:
 
         info = self.manifest["assets"][asset]
         edges = [*info["inputs"].items(), *((d, {"kind": "dep", "output": d}) for d in info["deps"])]
-        current = set(await self._scopes(asset, "all"))
+        current = set(self._scopes(asset, "all"))
         marked: dict[str, set] = {}
         for a, param, scope in self.m.watermarks:
             if a == asset:
@@ -395,7 +395,7 @@ class Views:
         if edge not in keyed:
             raise ValueError(f"{asset} has no keyed Incremental edge {edge!r}")
         spec, is_each = keyed[edge], keyed[edge].get("each") is not None
-        if scope not in await self._scopes(asset, [scope]) and (asset, edge, scope) not in self.m.watermarks:
+        if scope not in self._scopes(asset, [scope]) and (asset, edge, scope) not in self.m.watermarks:
             raise KeyError(f"{asset}/{scope}")
         output = spec["output"]
         where = self._edge_scope(asset, edge, spec, scope)

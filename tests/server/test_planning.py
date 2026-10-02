@@ -8,8 +8,10 @@ import time
 import httpx
 import pytest
 from solera.sdk import (
+    AllPartitions,
     Automation,
     OnChange,
+    Output,
     Project,
     Source,
     StaticPartitions,
@@ -17,9 +19,16 @@ from solera.sdk import (
     asset,
 )
 from solera_server.api import create_app
-from solera_server.planning import MAX_SCOPES, enumerate_scopes, membership, select_scopes, size
+from solera_server.planning import (
+    MAX_SCOPES,
+    Planner,
+    enumerate_scopes,
+    membership,
+    select_scopes,
+    size,
+)
 
-from .test_engine import make_engine, state  # noqa: F401
+from .test_engine import drive, make_engine, state  # noqa: F401
 
 UTC = dt.UTC
 
@@ -88,6 +97,71 @@ def test_membership_and_size_agree_with_the_enumeration():
     assert size({}, now, elements) == 1
     big = {d: {"kind": "static", "keys": [f"{d}{i}" for i in range(1000)]} for d in "ab"}
     assert size(big, now, elements) == 1_000_000 > MAX_SCOPES  # counted, not listed
+
+
+async def test_a_fan_in_reads_the_heads_that_exist(state):  # noqa: F811
+    """Engine review round 2 #7: an AllPartitions read over a million-scope
+    domain pins the heads that exist and agree with the consumer's shared keys
+    — it never lists the domain. Building upstream does, and is refused."""
+    seen = {}
+    a = StaticPartitions([f"a{i}" for i in range(1000)])
+    b = StaticPartitions([f"b{i}" for i in range(1000)])
+
+    @asset(partitions={"a": a, "b": b})
+    def grid(ctx):
+        return [{"at": ctx.partition}]
+
+    @asset(inputs={"grid": AllPartitions()})
+    def rollup(grid: dict[str, list]):
+        seen["rollup"] = sorted(grid)
+        return [{"n": len(grid)}]
+
+    @asset(partitions={"a": a}, inputs={"grid": AllPartitions()})
+    def by_a(ctx, grid: dict[str, list]):
+        seen[ctx.partition] = sorted(grid)
+        return [{"n": len(grid)}]
+
+    project = Project(assets=[grid, rollup, by_a])
+    engine = make_engine(state, project)
+    await engine.initialize()
+    await drive(engine, await engine.submit(["grid"], partitions=["a=a7,b=b9", "a=a8,b=b1"]))
+    start = time.perf_counter()
+    assert (await drive(engine, await engine.submit(["rollup"])))["request"]["status"] == "succeeded"
+    assert (await drive(engine, await engine.submit(["by_a"], partitions=["a7"])))["request"]["status"] == (
+        "succeeded"
+    )
+    assert time.perf_counter() - start < 5.0
+    assert seen == {"rollup": ["a=a7,b=b9", "a=a8,b=b1"], "a7": ["b9"]}  # keyed by the collapsed dims
+    with pytest.raises(ValueError, match=f"more than {MAX_SCOPES}"):
+        await engine.submit(["rollup"], upstream=True)  # a build lists the domain: bounded
+
+
+def test_the_planner_takes_its_view_as_arguments():
+    """Engine review round 2 #9: planning is a synchronous function of the
+    manifest, the heads, the time and the heads a sensor's commits will
+    install — no engine, no context variable."""
+
+    @asset(outputs=Output("raw", key="id"))
+    def raw():
+        return []
+
+    @asset(partitions=TimePartitions(start="2026-09-01", every="1d"), inputs={"raw": "raw"})
+    def daily(ctx, raw: list):
+        return []
+
+    manifest = Project(assets=[raw, daily]).manifest
+    heads: dict = {}
+    now = dt.datetime(2026, 10, 2, 12, tzinfo=UTC).timestamp()
+
+    def planner(projected=None):
+        return Planner(manifest, lambda o, s: heads.get((o, s)), lambda o: [], now, projected)
+
+    assert planner().plan_run(["daily"], skip_missing_inputs=True) is None  # `raw` was never written
+    projected = {("raw", ""): {"complete": True, "ref": {"version": "v1"}}}
+    run = planner(projected).plan_run(["daily"], skip_missing_inputs=True, sensor="watch")
+    assert [t["scope"] for t in run["tasks"].values()] == ["2026-10-01"]  # `latest` at `now`
+    assert run["sensor"] == "watch" and run["created_at"] == now
+    assert not heads  # a projection is read, never installed
 
 
 async def test_a_source_change_fans_out_over_a_partitioned_consumer(state):  # noqa: F811

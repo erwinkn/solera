@@ -532,25 +532,28 @@ async def test_a_host_on_old_code_waits_then_starts_afresh(tmp_path):
 
 
 async def test_a_decision_under_way_keeps_its_claim_and_pin(tmp_path, monkeypatch):
-    """Astra review 2, P1-2: the first post pauses while planning its run.
-    Meanwhile its claim and reader pin hold: no other tick is dispatched
-    (which could roll the cursor back), expiry leaves it, and a duplicate
-    post waits for the decision and gets its answer."""
+    """Astra review 2, P1-2: the first post pauses while preparing its
+    commit (planning itself is synchronous: it never yields). Meanwhile its
+    claim and reader pin hold: no other tick is dispatched (which could roll
+    the cursor back), expiry leaves it, and a duplicate post waits for the
+    decision and gets its answer."""
 
     monkeypatch.setattr(engine_sensors, "POST_GRACE", 0.0)
     project = feed_project(timeout=0.05)
     state, engine = await open_engine(tmp_path, project)
     tick = await dispatch(engine, "watch")
     paused, go = asyncio.Event(), asyncio.Event()
-    plan = engine._plan_run
+    prepare = engine._prepare_commit
 
     async def slow(*args, **kw):
         paused.set()
         await go.wait()
-        return await plan(*args, **kw)
+        return await prepare(*args, **kw)
 
-    monkeypatch.setattr(engine, "_plan_run", slow)
-    outcome = Tick(cursor="older", runs=[RunRequest("ingest")]).to_json()
+    monkeypatch.setattr(engine, "_prepare_commit", slow)
+    outcome = Tick(
+        cursor="older", commits=[Commit("feed", version="v9")], runs=[RunRequest("ingest")]
+    ).to_json()
     first = asyncio.create_task(engine.sensor_post("watch", tick["tick"], outcome))
     await paused.wait()
     pin = state.model.ticks["watch"]["pin"]

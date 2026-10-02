@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import contextvars
 import logging
 import math
 import os
@@ -29,7 +28,6 @@ SENSOR_MAP_MAX = 1_000_000  # keys of a full map the engine resolves itself (§1
 HOST_TOKEN = "sensors"  # what the local host's token signs (§5.2)
 # Heads a planner sees in place of the model's: a tick's prepared source
 # commits, for the runs it requests in the same decision (§11.4).
-PROJECTED: contextvars.ContextVar[dict | None] = contextvars.ContextVar("projected", default=None)
 
 
 class Sensors:
@@ -234,21 +232,19 @@ class Sensors:
                     prepared.append(event)
             # The runs are planned against the heads the commits will install —
             # a partition set's new elements — never the model's until recorded.
-            projected = PROJECTED.set({(e["source"], ""): e["head"] for e in prepared})
-            try:
-                for n, request in enumerate(runs):
-                    run = await self._plan_run(
-                        request["targets"],
-                        request.get("partitions") or "latest",
-                        config=request.get("config"),
-                        keys=request.get("keys"),
-                        sensor=name,
-                        by=by,
-                        tags={**(request.get("tags") or {}), **tags},
-                    )
-                    planned.append((f"{claim['tick']}/{n}", run))
-            finally:
-                PROJECTED.reset(projected)
+            projected = {(e["source"], ""): e["head"] for e in prepared}
+            for n, request in enumerate(runs):
+                run = self._plan_run(
+                    request["targets"],
+                    request.get("partitions") or "latest",
+                    config=request.get("config"),
+                    keys=request.get("keys"),
+                    projected=projected,  # planned over the heads the commits will install
+                    sensor=name,
+                    by=by,
+                    tags={**(request.get("tags") or {}), **tags},
+                )
+                planned.append((f"{claim['tick']}/{n}", run))
             if any(self.m.heads.get((source, "")) != head for source, head in heads.items()):
                 raise self.Conflict("a source moved while the tick was applied")
         except BaseException:

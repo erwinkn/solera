@@ -397,6 +397,32 @@ async def test_run_keys_override(state):
     assert seen[-1] == ["a", "b"]
 
 
+async def test_a_paged_full_override_resumes_its_pass(state):
+    """Engine review round 2 #2: `keys={"files": "full"}` starts one pass per
+    run and its later pages resume it — the first page is not served again."""
+    seen = []
+
+    @asset(outputs=Output("files", key="id"))
+    def files():
+        return [{"id": k, "v": 1} for k in "abc"]
+
+    @asset(inputs={"files": Incremental(page_size=2)})
+    def consumer(ctx, files: list):
+        changes = ctx.changes["files"]
+        seen.append((sorted(r["id"] for r in files), changes.full, changes.page))
+        return []
+
+    project = Project(assets=[files, consumer])
+    engine = make_engine(state, project)
+    await engine.initialize()
+    await drive(engine, await engine.submit(["consumer"], upstream=True))
+    for _ in range(2):  # a second override starts a pass of its own
+        seen.clear()
+        detail = await drive(engine, await engine.submit(["consumer"], keys={"files": "full"}), timeout=10)
+        assert status_of(detail) == "succeeded"
+        assert seen == [(["a", "b"], True, 0), (["c"], True, 1)]
+
+
 async def test_deps_are_pinned_but_unbound(state):
     """§5: deps are pinned into lineage and the fingerprint but bind no
     parameter."""
