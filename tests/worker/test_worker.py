@@ -314,7 +314,9 @@ async def test_a_pool_attempt_runs_in_a_child_of_the_warm_worker(state, tmp_path
     import sys
 
     imports = tmp_path / "imports.txt"
-    recorded = f"open({str(imports)!r}, 'a').write('imported\\n')\n"  # each import of the project leaves a line
+    recorded = (
+        f"open({str(imports)!r}, 'a').write('imported\\n')\n"  # each import of the project leaves a line
+    )
     entrypoint = write_project(tmp_path, recorded + source)
     monkeypatch.setenv("SOLERA_PROJECT", entrypoint)
     engine = make_engine(state, entrypoint, heartbeat_seconds=0.2)
