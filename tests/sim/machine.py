@@ -85,6 +85,7 @@ class Simulation(RuleBasedStateMachine):
         self.data_root = self.tmp / "data"
         self.variant = Variant(items_store=store, alt="table" if store == "file" else store)
         self.schema = None
+        self.renames = 0
         if "pg" in (store, self.variant.alt):
             self.schema = postgres.fresh_schema()
             world.pg = postgres.Ledger()
@@ -301,6 +302,8 @@ class Simulation(RuleBasedStateMachine):
         old = world.slot
         if change is not None:
             self.variant = VARIANTS[change](self.variant)
+        self.renames += change == "rename"
+            self.renames += change == "rename"
             self.project = self._build()
         self._ensure_engine(self.project)
 
@@ -320,6 +323,7 @@ class Simulation(RuleBasedStateMachine):
 
         self.trace.append(f"redeploy({change!r}, clean={clean})")
         self.variant = VARIANTS[change](self.variant)
+        self.renames += change == "rename"
         self.project = self._build()
         world = self.world
         self._run(world.stop() if clean else world.crash())
@@ -421,6 +425,7 @@ class Simulation(RuleBasedStateMachine):
         if world is None or world.engine is None:
             return
         engine = world.engine
+
         async def check():
             for (output, scope), head in list(engine.m.heads.items()):
                 if head["ref"].get("meta", {}).get("external") or (output, scope) not in engine.m.indexes:
@@ -547,6 +552,8 @@ class Simulation(RuleBasedStateMachine):
                 raise Violation(f"items {stage}: {items} != {want} (feed {self.feed})")
             copy = await keyed_content(engine, project, variant.copy_name, whole=True)
             if copy != expected_copy(want, variant):
+                if automated and self.renames >= 2:
+                    self._known("F12", f"{variant.copy_name} stale after {self.renames} renames")
                 raise Violation(f"{variant.copy_name} {stage}: {copy} != {expected_copy(want, variant)}")
             checks = await keyed_content(engine, project, "checks", whole=True)
             if checks != expected_checks(want):
