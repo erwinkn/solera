@@ -38,23 +38,20 @@ def demo(tmp_path, monkeypatch):
         project=PROJECT,
         insecure=True,
     )
+    # The server is handed its socket, bound here: no other process can take
+    # the port between choosing it and listening on it.
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error"))
-    thread = threading.Thread(target=server.run, daemon=True)
+    server = uvicorn.Server(uvicorn.Config(app, log_level="error"))
+    thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
     thread.start()
-    base = f"http://127.0.0.1:{port}"
-    for _ in range(400):
-        try:
-            if httpx.get(f"{base}/healthz", timeout=1).status_code == 200:
-                break
-        except Exception:
-            time.sleep(0.05)
-    else:
-        raise RuntimeError("server did not start")
-    yield base
+    deadline = time.monotonic() + 120
+    while not server.started:  # the engine initialized, and the socket listening
+        # A startup that failed ends the thread, its error logged above.
+        assert thread.is_alive(), "the server exited while starting"
+        assert time.monotonic() < deadline, "the server is still starting after 120 s"
+        time.sleep(0.01)
+    yield f"http://127.0.0.1:{sock.getsockname()[1]}"
     server.should_exit = True
     thread.join(timeout=10)
 
