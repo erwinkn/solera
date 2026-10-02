@@ -350,7 +350,8 @@ alone, or each page would erase the ones before it.
 
 **`deps=`** are unbound inputs: planned, pinned into lineage, part of the
 interpretation fingerprint (§6), watched by `AutoRefresh`, bound to no
-parameter.
+parameter. A dep across upstream-only dimensions pins the heads that
+exist, like `AllPartitions` (§7).
 
 ### Sources
 
@@ -478,6 +479,28 @@ declaration, or the same key-set output):
   `AllPartitions()`, which yields `dict[key, T]` over those dimensions,
   resolved to **keys with committed heads at pin time**, never a barrier on
   missing keys.
+
+A **dep** across upstream-only dimensions needs no `AllPartitions`: it
+collapses the same way, pinning every head that exists and agrees with the
+consumer's shared keys.
+
+```python
+@asset(partitions={"day": daily, "site": "sites"})
+def readings(ctx): ...
+
+@asset(partitions={"day": daily}, deps=["readings"])
+def report(ctx): ...
+```
+
+`report` for `2026-10-01` pins whichever `readings` of that day have
+committed heads — say Richmond and Oslo, while Paris has none yet — and
+runs. It does not wait for Paris. To wait for every site, submit with
+`upstream=True`: the run builds every `readings` scope of the day, and
+`report` starts only once they all succeed (a failure blocks it). Only an
+upstream build lists the domain, refused past `MAX_SCOPES`.
+`skip_missing_inputs` (§9) is no barrier here: it skips scopes whose inputs
+were never written at all, and a fan-in reads what there is, so it never
+counts as missing.
 
 `Incremental` requires no upstream-only dimensions (a broadcast `Incremental`
 diffs the same delta log per consumer key).
