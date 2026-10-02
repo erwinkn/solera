@@ -524,11 +524,9 @@ class Simulation(RuleBasedStateMachine):
                 raise Violation(f"items {stage}: {items} != {want} (feed {self.feed})")
             copy = await keyed_content(engine, project, variant.copy_name, whole=True)
             if copy != expected_copy(want, variant):
-                self._owed(variant.copy_name, "items", automated)
                 raise Violation(f"{variant.copy_name} {stage}: {copy} != {expected_copy(want, variant)}")
             checks = await keyed_content(engine, project, "checks", whole=True)
             if checks != expected_checks(want):
-                self._owed("checks", "item", automated)
                 raise Violation(f"checks {stage}: {checks} != {expected_checks(want)}")
             outside = {
                 k: v[0].decode() for k, v in (await index_entries(engine.state, "outside", "")).items()
@@ -556,16 +554,6 @@ class Simulation(RuleBasedStateMachine):
                     raise Violation(f"tally {stage}: {tally} for {len(rows)} rows of log")
 
         self._run(check())
-
-    def _owed(self, asset: str, edge: str, automated: bool) -> None:
-        """F6's signature: after automations alone, a consumer's watermark is
-        still behind its upstream's head, with no delivery under way."""
-
-        m = self.world.engine.m
-        wm = m.watermark(asset, edge, "") or {}
-        head = (m.heads.get(("items", "")) or {}).get("batch", -1)
-        if automated and wm and wm.get("next", 0) <= head and not wm.get("delivery"):
-            self._known("F6", f"{asset}'s watermark is at {wm.get('next')}, items at batch {head}")
 
     def _check_replay(self) -> None:
         """The journal alone rebuilds the engine's state."""

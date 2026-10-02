@@ -162,13 +162,38 @@ set iterated by product code may order differently in another process. A
 replay in the same process is exact; across processes it is the same run with
 possibly another interleaving of equal-time events.
 
+## Stores: the generated kit
+
+The named scenarios of `solera.testing.stores` (`docs/stores.md`) are the
+readable spec of a store; `solera.testing.storemachine` is its generated
+counterpart, for store authors as much as for Solera's own stores. It plays
+the engine for one output per run: attempts with growing generations
+(acquiring first on a fenced store), writes that commit or are abandoned,
+calls retried, stale writers and duplicate invocations, readers that pin and
+read later, by-key loads as `Each` does them, discards of what nothing
+references, and an incremental output's batches — appended, retried, reset,
+rewritten by a stale writer. After every step the committed content, every
+pinned read and every batch range must read back as the engine's key index
+says. Example: `begin; write(commits=False); begin; stale_write` — the
+second attempt holds the slice, so a fenced store must refuse the first.
+
+```python
+from solera.testing.storemachine import stateful
+
+TestMyStore = stateful(lambda: Harness(MyStore(dsn), fresh_output)).TestCase
+```
+
+`tests/sdk/test_store_machine.py` runs it against FileStore, PostgresStore,
+the example SQL store, S3Store and the simulation's table store (30 runs
+each; ten times that with `--slow`).
+
 ## Findings
 
 | # | Finding | Severity | Status |
 |---|---|---|---|
 | F1 | `Incremental(exclude="k1*")` with a string is split into characters: `*` excludes every key (`include=` wraps a string) | P3 | fixed in c521d9b — `test_one_exclude_pattern_is_a_pattern_not_its_characters` |
 | F2 | A keyed output moved to another store keeps its key index: the next write stores only the changed keys there, and the others become unreadable | P1 | fixed in 59812c4 — `test_a_keyed_output_moved_to_another_store_stays_readable` |
-| F3 | `Each` loads its upstream as `dict[str, T]`; the store contract, the conformance kit and `examples/json_table_store.py` do not say or do so, and `Each` over such a store fails every key | P2 | doc and example fixed in 217c8f4; the kit's by-key scenario is Phase 2 |
+| F3 | `Each` loads its upstream as `dict[str, T]`; the store contract, the conformance kit and `examples/json_table_store.py` do not say or do so, and `Each` over such a store fails every key | P2 | doc and example fixed in 217c8f4; by-key loads checked by the store machine (`read_by_key`) |
 | F4 | A removed asset's launched attempt that asks for more pages, or fails retryably, re-queues a task no manifest can place: its run never ends | P1 | fixed in 59812c4 — `test_a_removed_assets_last_attempt_ends_its_run` |
 | F5 | An attempt launched before a rename settles into a head that moved and an output the manifest no longer names: its claim is never released, its run never ends | P1 | fixed in 59812c4 — `test_an_attempt_launched_before_a_rename_settles` |
 | F6 | A run that finishes an interrupted full delivery ends there though the upstream moved: the `OnChange` firing it ran for delivers nothing of its change | P1 | fixed in 1cad0bd — `test_a_change_made_during_a_full_delivery_reaches_downstream` |
