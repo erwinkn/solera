@@ -313,12 +313,17 @@ be ref-annotated.
 
 **The parameter is the selection.** Under `Incremental` the value arrives
 filtered to the delivered keys or batches; `ctx.changes[name]` carries the
-rest — `deleted` keys, the `batches` range, and where the page sits in its
-delivery. A full delivery (the whole head, after a reset) may span many
-pages of `batch_size`: `reset` is set on its **first page only** — the
-signal to start over — `full` on every page of it, and `final` on the last
-page of any delivery. A consumer that rebuilds wipes on `reset`, never on
-`full`, or each page would erase the ones before it.
+rest — `deleted` keys, the `window` of upstream batches, `full` on every
+page of a full delivery (the whole head, after a reset), and where the page
+sits in its delivery, which may span many pages of `batch_size`: `batch` is
+its 0-based index (exact), `batches` how many pages the delivery was
+planned to take when it started — a plan, which edge patterns or an
+approximate key count can make an estimate — `first` is `batch == 0`, and
+`final` is set when the delivery has actually run out, never inferred from
+`batches`. The plan is kept on the edge's watermark while the delivery
+continues, for keyed and unkeyed upstreams, delta windows and full
+deliveries alike. A consumer that rebuilds wipes when `full and first` —
+never on `full` alone, or each page would erase the ones before it.
 
 **`deps=`** are unbound inputs: planned, pinned into lineage, part of the
 interpretation fingerprint (§6), watched by `AutoRefresh`, bound to no

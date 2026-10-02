@@ -1158,24 +1158,25 @@ async def test_ondeploy_two_registrations_fire_latest_once(state):
     assert auto["last_revision"] == project_b.manifest["revision"]
 
 
-async def test_a_paged_full_delivery_resets_on_its_first_page_only(state):
-    """A full delivery spans pages of `batch_size`: `reset` on the first, `full`
-    on all, `final` on the last — so a consumer that rebuilds on `reset`
-    keeps every page (§5)."""
+async def test_a_delivery_says_where_each_page_sits(state):
+    """A delivery spans pages of `batch_size`: `batch` is the page's index,
+    `batches` the plan, `first` is batch 0, `final` the delivery running out —
+    for full deliveries, delta windows and batch-mode upstreams (§5)."""
 
     from solera.stores import Patch
 
     pages, rebuilt = [], {"keys": []}
+    content = {f"k{i}": 1 for i in range(7)}
 
     @asset(outputs=Output("files", key="id"))
     def files():
-        return [{"id": f"k{i}", "v": 1} for i in range(7)]
+        return [{"id": k, "v": v} for k, v in content.items()]
 
     @asset(inputs={"files": Incremental(batch_size=3)})
     def consumer(ctx, files: list):
         ch = ctx.changes["files"]
-        pages.append((ch.reset, ch.full, ch.final))
-        if ch.reset:
+        pages.append((ch.batch, ch.batches, ch.first, ch.final))
+        if ch.full and ch.first:
             rebuilt["keys"] = []
         rebuilt["keys"] += [r["id"] for r in files]
         return [{"n": len(files)}]
@@ -1189,16 +1190,50 @@ async def test_a_paged_full_delivery_resets_on_its_first_page_only(state):
     @asset(inputs={"log": Incremental(batch_size=1)})
     def tail(ctx, log: list):
         ch = ctx.changes["log"]
-        batch_pages.append((ch.reset, ch.final))
+        batch_pages.append((ch.batch, ch.batches, ch.first, ch.final, list(ch.window)))
         return [{"n": len(log)}]
 
     project = Project(assets=[files, consumer, log, tail])
     engine = make_engine(state, project)
     await engine.initialize()
     await drive(engine, await engine.submit(["consumer"], upstream=True))
-    assert pages == [(True, True, False), (False, True, False), (False, True, True)]
+    assert pages == [(0, 3, True, False), (1, 3, False, False), (2, 3, False, True)]
     assert sorted(rebuilt["keys"]) == [f"k{i}" for i in range(7)]
+    # A delta window of four changed keys: two pages.
+    pages.clear()
+    for key in ("k0", "k2", "k4", "k6"):
+        content[key] = 2
+    await drive(engine, await engine.submit(["consumer"], upstream=True))
+    assert pages == [(0, 2, True, False), (1, 2, False, True)]
     for _ in range(3):
         await drive(engine, await engine.submit(["log"]))
     await drive(engine, await engine.submit(["tail"]))
-    assert batch_pages == [(True, False), (False, False), (False, True)]
+    assert batch_pages == [(0, 3, True, False, [0]), (1, 3, False, False, [1]), (2, 3, False, True, [2])]
+
+
+async def test_the_page_plan_is_an_estimate_but_final_is_not(state):
+    """Patterns filter keys after the plan is made: the delivery takes the
+    pages it takes, and its last one still says `final` — delivered empty if
+    the patterns left nothing in it."""
+
+    pages = []
+
+    @asset(outputs=Output("files", key="id"))
+    def files():
+        return [{"id": f"k{i}", "v": 1} for i in range(7)]
+
+    @asset(inputs={"files": Incremental(batch_size=3, include=["k0", "k1", "k2", "k3"])})
+    def consumer(ctx, files: list):
+        ch = ctx.changes["files"]
+        pages.append((ch.batch, ch.batches, ch.final, sorted(r["id"] for r in files)))
+        return [{"n": len(files)}]
+
+    project = Project(assets=[files, consumer])
+    engine = make_engine(state, project)
+    await engine.initialize()
+    await drive(engine, await engine.submit(["consumer"], upstream=True))
+    assert pages == [
+        (0, 3, False, ["k0", "k1", "k2"]),
+        (1, 3, False, ["k3"]),
+        (2, 3, True, []),  # nothing matched, but the consumer is told the delivery ended
+    ]

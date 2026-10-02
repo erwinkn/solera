@@ -209,7 +209,7 @@ async def test_compaction_truncation_and_garbage(state):
     @asset(inputs={"items": Incremental(batch_size=7)})
     def mirror(ctx, items: list):
         changes = ctx.changes["items"]
-        if changes.full:
+        if changes.full and changes.first:
             seen.clear()
         for row in items:
             seen[row["id"]] = row["v"]

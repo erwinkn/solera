@@ -350,9 +350,10 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline):
                 args[param] = await store.load(ref, t, Batches(lo, hi))
                 changes[param] = Changes(
                     rows=args[param],
-                    batches=range(lo, hi + 1),
+                    window=range(lo, hi + 1),
                     full=full,
-                    reset=full,  # an unkeyed reset delivery marks its first page only
+                    batch=int(ch.get("batch") or 0),
+                    batches=int(ch.get("batches_planned") or 1),
                     final=not ch.get("more"),
                 )
                 timeline.add("loaded", param, _rows(args[param]))
@@ -368,9 +369,9 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline):
                 deleted=deleted,
                 full=full,
                 upserted=tuple(sorted(upserted)),
-                # Pages of a full delivery all say `full`; only the first resets.
-                reset=full and ch.get("after") is None and "keys" not in ch,
-                final=after is None,
+                batch=int(ch.get("batch") or 0),
+                batches=int(ch.get("batches_planned") or 1),
+                final=after is None,  # the delivery ran out: never inferred from `batches`
             )
             delivered[param] = {"after": after, "upserted": sorted(upserted), "deleted": list(deleted)}
             timeline.add("loaded", param, _rows(args[param]))
@@ -383,7 +384,10 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline):
     # Every keyed page held keys, and the edges' patterns took none of them: nothing
     # to call the producer with.
     filtered = bool(windows) and all(not w.upserted and not w.deleted for w in windows)
-    delivered["*filtered"] = filtered and any(w.read for w in windows)
+    # ...unless the page ends a delivery that already had pages: its consumer is owed
+    # `final`, even with nothing in it (§5).
+    ending = any(c.final and c.batch > 0 for c in changes.values() if c.window is None)
+    delivered["*filtered"] = filtered and any(w.read for w in windows) and not ending
     return args, changes, delivered
 
 

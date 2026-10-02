@@ -33,7 +33,16 @@ from obstore.exceptions import AlreadyExistsError
 from solera.failures import lower
 from solera.ids import ulid, ulid_time
 from solera.keys import Rows, SortedRun
-from solera.keys.index import DeltaFiles, FileInfo, KeyIndex, Options, delta_keys, key_bytes, key_str
+from solera.keys.index import (
+    DeltaFiles,
+    FileInfo,
+    IndexState,
+    KeyIndex,
+    Options,
+    delta_keys,
+    key_bytes,
+    key_str,
+)
 from solera.keys.io import ObjectIO
 from solera.sdk import TimePartitions, canonical_partition, digest, split_partition
 
@@ -80,6 +89,12 @@ def check_tags(tags) -> dict[str, str]:
         if len(key) > 64 or len(value) > 256:
             raise ValueError("A tag name is at most 64 characters, its value at most 256")
     return dict(sorted(tags.items()))
+
+
+def _pages(keys: int, limit: int) -> int:
+    """Pages of `limit` a delivery of `keys` is planned to take: at least one."""
+
+    return max(1, -(-int(keys) // max(1, int(limit))))
 
 
 class Engine(Attempts, Sensors, Views):
@@ -1187,9 +1202,24 @@ class Engine(Attempts, Sensors, Views):
             reset = reset or int(wm["batch"]) < first
             lo = first if reset else int(wm["batch"])
             hi = min(head_batch, lo + limit - 1)
-            pin = {"ref": ref, "changes": {"batches": [lo, hi], "full": reset, "more": hi < head_batch}}
+            # Where this page sits in its delivery: planned when the delivery starts,
+            # kept on the watermark while it continues (§5).
+            if not reset and (wm or {}).get("page") is not None:
+                page, pages = int(wm["page"]), int(wm["pages"])
+            else:
+                page, pages = 0, _pages(head_batch - lo + 1, limit)
+            more = hi < head_batch
+            changes = {
+                "batches": [lo, hi],
+                "full": reset,
+                "more": more,
+                "batch": page,
+                "batches_planned": pages,
+            }
             update = {**base, "batch": max(lo, hi + 1), "after": None, "full": False}
-            return pin, {"update": update, "more": hi < head_batch}, hi < lo
+            if more:
+                update.update(page=page + 1, pages=pages)
+            return {"ref": ref, "changes": changes}, {"update": update, "more": more}, hi < lo
 
         index = self.m.index(output, up_scope)
         patterns = edge.get("patterns")
@@ -1210,6 +1240,10 @@ class Engine(Attempts, Sensors, Views):
         if rescope is not None:
             base["patterns"], base["rescope"] = rescope["from"], rescope
             if not wm.get("full") and int(wm["batch"]) > rescope["cutover"]:
+                if rescope["after"] is not None and wm.get("page") is not None:
+                    page, pages = int(wm["page"]), int(wm["pages"])
+                else:
+                    page, pages = 0, _pages(IndexState.from_json(rescope["snapshot"]).count, limit)
                 pin = {
                     "ref": ref,
                     "index": rescope["snapshot"],
@@ -1217,9 +1251,12 @@ class Engine(Attempts, Sensors, Views):
                         "rescope": {"from": rescope["from"], "to": rescope["to"]},
                         "after": rescope["after"],
                         "limit": limit,
+                        "batch": page,
+                        "batches_planned": pages,
                     },
                 }
-                return pin, {**base, "diff": True, "batch": int(wm["batch"])}, False
+                plan = {**base, "diff": True, "batch": int(wm["batch"]), "page": page, "pages": pages}
+                return pin, plan, False
             head_batch = min(head_batch, rescope["cutover"])  # finish: under the old patterns
         empty = False
         if reset:
@@ -1246,7 +1283,19 @@ class Engine(Attempts, Sensors, Views):
         if base.get("rescope") is not None:
             empty = False  # the transition has its diff still to do
         pinned = index.pinned() if window["full"] else index.pinned(window["from"], window["to"])
-        pin = {"ref": ref, "index": pinned.to_json(), "changes": {**window, "limit": limit}}
+        # Where this page sits in its delivery (§5): planned when the delivery starts —
+        # the keys in the whole index or in the window's delta files, by `batch_size`,
+        # an estimate when patterns filter or a count is inexact — and kept on the
+        # watermark while the delivery continues.
+        if window["after"] is not None and wm is not None and wm.get("page") is not None:
+            page, pages = int(wm["page"]), int(wm["pages"])
+        else:
+            keys = (
+                pinned.count if window["full"] else sum(f.entries for _, files in pinned.log for f in files)
+            )
+            page, pages = 0, _pages(keys, limit)
+        changes = {**window, "limit": limit, "batch": page, "batches_planned": pages}
+        pin = {"ref": ref, "index": pinned.to_json(), "changes": changes}
         if not window["full"] and not empty and self.keys is not None:
             # The first page of the pinned window, from summaries in memory (§7 of
             # docs/resolved-commits.md): the worker then reads no delta file.
@@ -1255,7 +1304,7 @@ class Engine(Attempts, Sensors, Views):
                 pin["changes"]["inline"] = inline
         if base["patterns"] is not None:
             pin["patterns"] = base["patterns"]  # the worker filters the page, inlined or read
-        plan = {**base, **window}
+        plan = {**base, **window, "page": page, "pages": pages}
         if not window["full"]:  # a window paged over attempts holds its first page's reader pin
             plan["pin"] = wm.get("pin") if window["after"] is not None and wm else claim_pin
         return pin, plan, empty
@@ -1437,12 +1486,22 @@ class Engine(Attempts, Sensors, Views):
         commit.update({"due": due, "epoch_min": epoch_min})
         return commit, more, watermark
 
-    @staticmethod
-    def _watermark(plan: dict, after: str | None) -> dict:
+    @classmethod
+    def _watermark(cls, plan: dict, after: str | None) -> dict:
         """The watermark after delivering a keyed plan's page, which ended at
-        `after` (`None`: the window is done). A delta window delivered over
-        several attempts keeps the reader pin of the attempt that began it:
-        its later pages still read versions as of then (docs/lifecycle.md §9.8)."""
+        `after` (`None`: the window is done). A delivery that continues keeps
+        its page plan: the next page's index, and how many it planned (§5)."""
+
+        wm = cls._next_watermark(plan, after)
+        if after is not None and plan.get("pages") is not None:
+            wm.update(page=int(plan["page"]) + 1, pages=int(plan["pages"]))
+        return wm
+
+    @staticmethod
+    def _next_watermark(plan: dict, after: str | None) -> dict:
+        """The watermark a keyed plan's page leads to. A delta window delivered
+        over several attempts keeps the reader pin of the attempt that began
+        it: its later pages still read versions as of then (lifecycle.md §9.8)."""
 
         base = {k: plan[k] for k in ("output", "up", "fingerprint")}
         if plan.get("pass") is not None:  # the run whose reset began this pass

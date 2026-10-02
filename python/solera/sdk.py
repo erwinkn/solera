@@ -434,27 +434,36 @@ class AllPartitions(In):
 @dataclass(frozen=True)
 class Changes:
     """What an `Incremental` edge delivered to a parameter (§5.1): the delivered
-    `rows` (same object the parameter received), the removed `deleted` keys
-    (keyed upstreams), the delivered `batches` range (batch-mode upstreams),
-    `upserted` — the delivered key list for keyed upstreams — and where the
-    page sits in its delivery. A full delivery may span many pages:
+    `rows` (same object the parameter received), the removed `deleted` keys and
+    the delivered `upserted` keys (keyed upstreams), the upstream batches it
+    covers as a `window` range (batch-mode upstreams), whether it is part of a
+    `full` delivery (the whole head after a reset, not a delta), and where the
+    page sits in its delivery, which may span many pages of `batch_size`:
 
-    - `reset`: the first page of a full delivery — start over now; what was
-      built from this edge before is superseded. Never set on later pages.
-    - `full`: the page belongs to a full delivery (the whole head, not a
-      delta); on a keyed upstream every page of it says so.
-    - `final`: no page of this delivery follows.
+    - `batch`: this page's 0-based index within its delivery — exact;
+    - `batches`: how many pages the delivery was planned to take when it
+      started (its keys, or batches, by `batch_size`). A plan, not a promise:
+      when the edge's patterns filter keys, or the upstream's key count is
+      approximate, the delivery may end earlier or later;
+    - `first`: `batch == 0` — on a full delivery, the moment to start over;
+    - `final`: no page of this delivery follows — known from the delivery
+      itself running out, never from `batches`.
 
-    A consumer that rebuilds wipes on `reset`, appends every page, and
-    swaps or finalizes on `final`."""
+    A consumer that rebuilds wipes when `full and first`, appends every page,
+    and swaps or finalizes on `final`."""
 
     rows: Any = ()
     deleted: tuple = ()
-    batches: range | None = None
+    window: range | None = None
     full: bool = False
     upserted: tuple = ()
-    reset: bool = False
+    batch: int = 0
+    batches: int = 1
     final: bool = True
+
+    @property
+    def first(self) -> bool:
+        return self.batch == 0
 
 
 # ---------------------------------------------------------------------------
