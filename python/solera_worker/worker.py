@@ -77,6 +77,7 @@ from solera.stores import (
 )
 
 from . import each
+from .observed import Observed
 from .reporting import LogShipper, Reporter
 
 
@@ -198,10 +199,20 @@ class Ctx:
     """The `ctx` argument handed to producers (§2)."""
 
     def __init__(
-        self, spec, asset: Asset, project: Project, objects, changes, shipper, timeline, keys_io=None
+        self,
+        spec,
+        asset: Asset,
+        project: Project,
+        objects,
+        changes,
+        shipper,
+        timeline,
+        keys_io=None,
+        observed=None,
     ):
         self._objects, self._shipper, self._timeline = objects, shipper, timeline
         self._keys_io = keys_io
+        self._observed = observed if observed is not None else Observed(spec, project)
         # The pinned key indexes of keyed inputs, for whole reads of immutable stores.
         self._indexes: dict[tuple, dict] = {}
         for pin in spec["inputs"].values():
@@ -271,7 +282,7 @@ class Ctx:
     async def load(self, ref: Ref, t):
         store = self._stores[ref.store]
         index = self._indexes.get((ref.output, ref.partition))
-        value = await _load_whole(store, ref, t, self._keys_io, index)
+        value = await _load_whole(self._observed, store, ref, t, self._keys_io, index)
         self._timeline.add("loaded", ref.output, _rows(value), optional=True)
         return value
 
@@ -307,14 +318,14 @@ class Ctx:
         return out
 
 
-async def _resolve_inputs(spec, project, asset, keys_io, timeline):
+async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Observed):
     """Load each pin by annotation; build call args + ctx.changes (§5, §10).
 
     An Incremental edge over a keyed upstream reads its page from the pinned
     key index — the pending deltas in `[from, to]`, or the whole index for a
     full delivery — and loads just those keys. `delivered` reports where the
     page ended, for the engine's watermark (§6). Each input loaded is a
-    `loaded` event."""
+    `loaded` event; `observed` records what each read saw."""
 
     manifest_asset = project.manifest["assets"][asset.name]
     edges = manifest_asset["inputs"]
@@ -338,7 +349,7 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline):
                     out[key] = ref
                     continue
                 store = project.stores[ref.store]
-                out[key] = await _load_whole(store, ref, inner, keys_io, indexes.get(key))
+                out[key] = await _load_whole(observed, store, ref, inner, keys_io, indexes.get(key))
             args[param] = out
             timeline.add("loaded", param)
             continue
@@ -349,7 +360,7 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline):
             full = bool(ch.get("full"))
             if "batches" in ch:
                 lo, hi = (int(v) for v in ch["batches"])
-                args[param] = await store.load(ref, t, Batches(lo, hi))
+                args[param] = await observed.load(store, ref, t, Batches(lo, hi))
                 changes[param] = Changes(
                     rows=args[param],
                     full=full,
@@ -365,7 +376,7 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline):
             window = await each.read_window(pin, keys_io)
             windows.append(window)
             upserted, deleted, after = window.upserted, window.deleted, window.after
-            args[param] = await store.load(ref, t, Keys(upserted))
+            args[param] = await observed.load(store, ref, t, Keys(upserted))
             changes[param] = Changes(
                 rows=args[param],
                 deleted=deleted,
@@ -382,7 +393,7 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline):
         if pin.get("load", "data") == "ref":  # decided at registration, as the engine read for it
             args[param] = ref
         else:
-            args[param] = await _load_whole(store, ref, t, keys_io, pin.get("index"))
+            args[param] = await _load_whole(observed, store, ref, t, keys_io, pin.get("index"))
             timeline.add("loaded", param, _rows(args[param]))
     # Every keyed page held keys, and the edges' patterns took none of them: nothing
     # to call the producer with.
@@ -391,14 +402,14 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline):
     return args, changes, delivered
 
 
-async def _load_whole(store, ref, t, keys_io, index_json):
+async def _load_whole(observed: Observed, store, ref, t, keys_io, index_json):
     """A whole read. From an immutable store, a keyed one names its objects
     from the live entries of its pinned index (`Keys`), since a listing would
     also show superseded and abandoned ones (docs/lifecycle.md §9.8): it is
     loaded a page of the index at a time, and the pages put together."""
 
     if index_json is None or store.writes != "immutable":
-        return await store.load(ref, t, None)
+        return await observed.load(store, ref, t, None)
     index = KeyIndex(keys_io, None, IndexState.from_json(index_json))
     paged = _plain(t)  # a type of the store's own (a DataFrame): one read, which the store makes
     parts, entries, after = [], {}, None
@@ -1154,13 +1165,14 @@ async def _execute(
         failed["error"]["build"] = project.manifest.get("build")  # how this host computed its revision
         return failed
     asset = project.assets[spec["asset"]]
+    observed = Observed(spec, project)
     try:
         # Index files straight from the store, but for the reads the engine answered at
         # `start` (docs/resolved-commits.md §7); small writes are the engine's too.
         keys_io = ObjectIO(objects, served=control.get("reads"))
-        args, changes, delivered = await _resolve_inputs(spec, project, asset, keys_io, timeline)
+        args, changes, delivered = await _resolve_inputs(spec, project, asset, keys_io, timeline, observed)
         filtered = delivered.pop("*filtered", False)
-        ctx = Ctx(spec, asset, project, objects, changes, shipper, timeline, keys_io)
+        ctx = Ctx(spec, asset, project, objects, changes, shipper, timeline, keys_io, observed)
         signature = inspect.signature(asset.fn)
         if "ctx" in signature.parameters:
             args["ctx"] = ctx
@@ -1171,6 +1183,7 @@ async def _execute(
         if page is not None:
             control["drain"] = asyncio.Event()
             ran = await each.run(spec, project, asset, *page, args, ctx, keys_io, timeline, control)
+            await observed.close()
             if "abort" in ran:
                 return _user_failed(ran["abort"], project)
             value = Result(outputs=ran["values"])
@@ -1180,6 +1193,7 @@ async def _execute(
             # nothing to see, and the page commits only its watermark (per-key §11).
             return {"status": "succeeded", "skipped": True, "outputs": {}, "delivered": delivered}
         else:
+            await observed.close()  # the inputs' moment ends: a long producer holds no snapshot
             timeline.add("computing")
             value = asset.fn(**args)
             if inspect.isawaitable(value):
@@ -1203,6 +1217,8 @@ async def _execute(
             if values and "ref" in outputs.get(name, {}):
                 outputs[name]["metadata"] = values
         result = {"status": "succeeded", "outputs": outputs, "delivered": delivered}
+        if read := observed.report():
+            result["read"] = read
         if page is not None:
             # A drained page commits what finished (docs/lifecycle.md §7). Its interrupted
             # keys follow the cancel record it is sealed with, as latched now — after its
@@ -1226,6 +1242,9 @@ async def _execute(
         return _failed(error, getattr(error, "retryable", False))
     except Exception as error:
         return _user_failed(error, project)
+    finally:
+        with contextlib.suppress(Exception):  # a reader that will not close holds nothing we need
+            await observed.close()
 
 
 async def _discard_after(answer, spec, project, objects, channel, invocation) -> None:

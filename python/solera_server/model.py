@@ -677,10 +677,13 @@ class Model:
         task = run["tasks"].get(e["task"]) if run else None
         if task is None:
             return
+        claim = self.claimed(e["attempt"]) or {}
         self._release_claim(task["id"], e["attempt"])
         outcome, at = e["outcome"], e["finished_at"]
         prepared, execution = {}, {}
         launched = task.get("launched")
+        # The generation its writes carry (§9.7): the heads it installs record it.
+        generation = (launched or {}).get("pin", claim.get("pin"))
         if (launched or {}).get("attempt") == e["attempt"]:
             del task["launched"]
             prepared = launched["prepared"]
@@ -719,22 +722,22 @@ class Model:
         self._tried(run, task, summary)
         if commit and outcome in ("canceled", "failed"):
             # A drained Each page: what finished commits (docs/lifecycle.md §7).
-            self._install(task, commit, e, prepared)
+            self._install(task, commit, e, prepared, generation)
         if task["status"] in TERMINAL_TASK:
             # Its run was canceled while it ran. An attempt that was already
             # writing still commits: its data landed (§8).
             if outcome == "succeeded" and commit:
-                self._install(task, commit, e, prepared)
+                self._install(task, commit, e, prepared, generation)
             return
         if outcome == "succeeded":
-            self._install(task, commit or {}, e, prepared)
+            self._install(task, commit or {}, e, prepared, generation)
             if e.get("more"):
                 self._ready(run, task, at)
             else:
                 task["status"] = "succeeded"
                 self._finished(run, task, "succeeded", e["attempt"], at)
         elif outcome == "skipped":
-            self._install(task, commit or {}, e, prepared)
+            self._install(task, commit or {}, e, prepared, generation)
             task["status"] = "skipped"
             self._finished(run, task, "skipped", e["attempt"], at)
         elif outcome == "failed":
@@ -805,14 +808,19 @@ class Model:
         self._event(run, closing, end, tid, attempt, reason=e.get("reason"))
         return times
 
-    def _install(self, task: dict, commit: dict, e: dict, prepared: dict) -> None:
+    def _install(
+        self, task: dict, commit: dict, e: dict, prepared: dict, generation: int | None = None
+    ) -> None:
         """Install a commit: heads, key indexes, cursor, watermarks — under the
         contract its attempt was launched with (`prepared`). Each output
         version it makes enters the history, with what it was built from
-        (its `lineage`: `[output, scope, version, param]`)."""
+        (its `lineage`, with what its reads saw: `history.read_lineage`). A
+        head records the generation that wrote it (`generation`), which a
+        read of a store that reads the current rows compares with its own."""
 
         asset, scope, at = task["asset"], task["scope"], e["finished_at"]
-        reads, contracts = prepared.get("lineage") or [], prepared.get("outputs") or {}
+        reads = history.read_lineage(prepared.get("lineage"), e.get("read"))
+        contracts = prepared.get("outputs") or {}
         changed = []
         for name, head in commit.get("heads", {}).items():
             before = self.heads.get((name, scope))
@@ -821,6 +829,8 @@ class Model:
             if contracts[name]["contract"]["writes"] == "immutable":
                 self._superseded(name, scope, before, head, (commit.get("keys") or {}).get(name))
             self.heads[(name, scope)] = {**head, "run": e["run"], "attempt": e["attempt"], "at": at}
+            if generation is not None:
+                self.heads[(name, scope)]["generation"] = int(generation)
             self._commit_keys(name, scope, (commit.get("keys") or {}).get(name))
             if name in commit.get("settled", ()):
                 # The commit's delta took in what the dead attempts left (§8):

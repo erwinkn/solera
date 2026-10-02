@@ -226,27 +226,38 @@ class PostgresStore:
     # -- generations (docs/lifecycle.md §9.7) -------------------------------------
 
     def _fence_table(self, cur) -> None:
-        if cur.execute("SELECT to_regclass(%s) IS NOT NULL AS ok", (FENCE_TABLE,)).fetchone()["ok"]:
+        """The fence rows: per slice, the generation that holds it, and the one
+        whose write transaction last changed it (`written`), which a read
+        reports (`reads`)."""
+
+        if cur.execute(
+            "SELECT 1 FROM information_schema.columns WHERE table_schema = %s AND table_name = %s "
+            "AND column_name = 'written'",
+            tuple(FENCE_TABLE.split(".")),
+        ).fetchone():
             return
         cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (FENCE_TABLE,))
         cur.execute(
             f"CREATE TABLE IF NOT EXISTS {FENCE_TABLE} (relid oid NOT NULL, part text NOT NULL, "
-            "generation bigint NOT NULL, invocation text NOT NULL, PRIMARY KEY (relid, part))"
+            "generation bigint NOT NULL, invocation text NOT NULL, written bigint, PRIMARY KEY (relid, part))"
         )
+        cur.execute(f"ALTER TABLE {FENCE_TABLE} ADD COLUMN IF NOT EXISTS written bigint")
 
-    def _take(self, cur, relid: int, scope: Scope) -> None:
+    def _take(self, cur, relid: int, scope: Scope, write: bool = False) -> None:
         """Take `scope`'s generation for (relid, partition), holding the row's
         lock until the transaction ends. Postgres locks the conflicting row
         even when the `WHERE` refuses the update, so a newer acquisition waits
-        for an older writer's open transaction."""
+        for an older writer's open transaction. A `write` transaction also
+        marks the slice written by its generation, as it commits."""
 
+        written = ", written = EXCLUDED.written" if write else ""
         taken = cur.execute(
-            f"INSERT INTO {FENCE_TABLE} VALUES (%s, %s, %s, %s) ON CONFLICT (relid, part) "
-            f"DO UPDATE SET generation = EXCLUDED.generation, invocation = EXCLUDED.invocation "
+            f"INSERT INTO {FENCE_TABLE} VALUES (%s, %s, %s, %s, %s) ON CONFLICT (relid, part) "
+            f"DO UPDATE SET generation = EXCLUDED.generation, invocation = EXCLUDED.invocation{written} "
             f"WHERE {FENCE_TABLE}.generation < EXCLUDED.generation "
             f"OR ({FENCE_TABLE}.generation = EXCLUDED.generation AND {FENCE_TABLE}.invocation = EXCLUDED.invocation) "
             "RETURNING invocation",
-            (relid, scope.partition, scope.generation, scope.invocation),
+            (relid, scope.partition, scope.generation, scope.invocation, scope.generation if write else None),
         ).fetchone()
         if taken is None:
             raise StoreError(
@@ -276,7 +287,7 @@ class PostgresStore:
         if scope is None or scope.generation is None:
             return
         self._fence_table(cur)
-        self._take(cur, self._relid(cur, table), scope)
+        self._take(cur, self._relid(cur, table), scope, write=True)
 
     async def acquire(self, scope: Scope) -> None:
         """Take the attempt's generation for the slice it writes, in a
@@ -679,9 +690,37 @@ class PostgresStore:
             return ref
         return await asyncio.to_thread(self._load, ref, t, selection)
 
-    def _load(self, ref: Ref, t, selection: Keys | Batches | None) -> Any:
+    @contextlib.asynccontextmanager
+    async def reads(self):
+        """An attempt's reads of this store, at one moment (docs/stores.md,
+        "What a read sees"): every load of the reader runs in one REPEATABLE
+        READ, READ ONLY transaction, and returns with the generation whose
+        write last changed its slice, read in the same snapshot."""
+
+        import psycopg
+
+        conn = await asyncio.to_thread(self._connect)
+        conn.read_only, conn.isolation_level = True, psycopg.IsolationLevel.REPEATABLE_READ
+        try:
+            yield _Reader(self, conn)
+        finally:
+            await asyncio.to_thread(conn.close)
+
+    def _written(self, cur, ref: Ref) -> int | None:
+        """The generation whose write transaction last changed `ref`'s slice,
+        as the transaction's snapshot sees it; None if none was fenced."""
+
+        if not cur.execute("SELECT to_regclass(%s) IS NOT NULL AS ok", (FENCE_TABLE,)).fetchone()["ok"]:
+            return None
+        found = cur.execute(
+            f"SELECT written FROM {FENCE_TABLE} WHERE relid = to_regclass(%s) AND part = %s",
+            ((ref.handle or {}).get("table"), ref.partition),
+        ).fetchone()
+        return None if found is None or found["written"] is None else int(found["written"])
+
+    def _load(self, ref: Ref, t, selection: Keys | Batches | None, conn=None) -> Any:
         handle = ref.handle or {}
-        with self._connect() as conn, conn.cursor() as cur:
+        with contextlib.nullcontext(conn) if conn else self._connect() as conn, conn.cursor() as cur:
             table = handle.get("table") or _qname(handle.get("schema", "public"), handle["name"])
             where = dict(handle.get("where") or {})
             sql, params = f"SELECT * FROM {table}", []
@@ -896,6 +935,25 @@ def _inferred(sql_type: str | None) -> str:
     literal Postgres never typed (`unknown`), text."""
 
     return "text" if sql_type in (None, "unknown") else sql_type
+
+
+class _Reader:
+    """`PostgresStore.reads()`: loads in one snapshot, one at a time."""
+
+    def __init__(self, store: PostgresStore, conn):
+        self.store, self.conn, self.lock = store, conn, asyncio.Lock()
+
+    async def load(self, ref: Ref, t, selection: Keys | Batches | None) -> tuple[Any, int | None]:
+        if isinstance(t, type) and issubclass(t, Ref):
+            return ref, None  # nothing read: the producer reads it itself
+
+        def work():
+            with self.conn.cursor() as cur:
+                written = self.store._written(cur, ref)
+            return self.store._load(ref, t, selection, self.conn), written
+
+        async with self.lock:
+            return await asyncio.to_thread(work)
 
 
 def _sql_type(decl: str) -> str:

@@ -432,8 +432,8 @@ input versions built this version of `revenue`".
 | `tasks` | task of a finished run | `asset`, `scope`, `status`, `started_at`, `finished_at`, `attempts`, `duration`, `wait` (seconds it could have run but didn't), `deps`, `max_attempts`, `retry_delay`, `retry_backoff`, `executor` (of its last attempt) |
 | `attempts` | attempt | `task`, `n`, `outcome`, `started_at`, `finished_at`, `duration`, `preparing`, `provisioning`, `importing`, `loading`, `computing`, `writing`, `settling` (seconds per phase, below), `peak_memory` (bytes; only in a process of its own), `cpu_seconds`, `error`, `executor`, `cpu`, `memory`, `gpu` (requested; all null if it never launched), `options` (map: its other placement options, e.g. `image`), `outputs` (map: output → version committed), `keys` (map: an `Each` attempt's keys by outcome) |
 | `run_events` | moment of a run | `n` (its order in the run), `at`, `type`, `task` and `attempt` (null for the run's own events), `by`, `name`, `reason`, `until`, `rows` — the timeline, below |
-| `materializations` | output version a commit installed | `output`, `scope`, `version`, `run`, `attempt`, `at`, `batch`, `added`, `removed`, `added_keys`, `removed_keys` (a source commit's keys, up to 1,000), `rows`, `metadata` (JSON) |
-| `lineage` | input version an output version was read from | `output`, `scope`, `version`, `input`, `input_scope`, `input_version`, `param` |
+| `materializations` | output version a commit installed | `output`, `scope`, `version`, `run`, `attempt`, `at`, `batch`, `added`, `removed`, `added_keys`, `removed_keys` (a source commit's keys, up to 1,000), `rows`, `metadata` (JSON), `generation` (the writing attempt's) |
+| `lineage` | input version an output version was read from, and what a current read saw (stores.md, "What a read sees") | `output`, `scope`, `version`, `input`, `input_scope`, `input_version`, `param`, `input_generation`, `read` (JSON `{generation, keys?, key_count?, mixed?}`, null for a snapshot store) |
 | `key_outcomes` | key an `Each` attempt processed | `run`, `attempt` (`attempts.id`), `asset`, `scope`, `key`, `revision`, `outcome` (`ok`, `removed`, `unmatched`, `rejected`, `failed`, `retrying`, `canceled`, `timed_out`), `error`, `duration`, `at` — per-key-processing.md §10 |
 
 A run where every task was skipped — it launched nothing and wrote
@@ -617,7 +617,7 @@ count of a keyed output, else the length of a returned list.
 | finished tasks | `GET /tasks?asset=&status=&run=&since=&before=` | |
 | p50/p95 duration and wait, failure counts, compute hours, per asset and per executor | `GET /stats?since=&asset=&scope=` | |
 | an asset's versions and their metadata | `GET /assets/{name}/history?output=&scope=&before=` | |
-| what a version was built from, or what was built from it | `GET /outputs/{name}/lineage?scope=&version=&direction=upstream\|downstream&depth=5` | |
+| what a version was built from, or what was built from it | `GET /outputs/{name}/lineage?scope=&version=&direction=upstream\|downstream&depth=5` | each edge's `read`: `{exact: true}`, or `{exact: false, pinned_generation, generation, version, keys?}` — the generation a current read saw, what it committed, and a page's key versions as read |
 | every asset at a glance: scopes by status, newest outcome, failing keys, unsettled scopes | `GET /assets:status` → `{assets: {name: {partitions, partitioned, last, failures, unsettled, updated_at}}}` | |
 | an `Each` asset's failing keys, and each scope's failure record | `GET /assets/{name}/failures?scope=&outcome=&after=&limit=100` → `{scopes, keys, epoch, now, next}` | |
 | what an `Each` asset's keys came to, newest first | `GET /assets/{name}/key-outcomes?scope=&key=&q=&outcome=&run=&before=&limit=100` → `{outcomes, next}` | |

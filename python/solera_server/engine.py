@@ -465,6 +465,8 @@ class Engine(Attempts, Sensors, Views):
         for field in ("discarded", "discard_unresolved", "discarded_files"):  # data garbage (§9.8)
             if (worker or {}).get(field):
                 event[field] = worker[field]
+        if worker.get("read"):
+            event["read"] = worker["read"]  # what its inputs' reads saw, for lineage
         if keys:
             event["keys"] = keys  # an Each attempt's keys by outcome
         self.state.record(event)
@@ -758,6 +760,16 @@ class Engine(Attempts, Sensors, Views):
             inputs[param] = pin
             plans[param] = plan
             all_empty = all_empty and empty
+        # The generation that wrote each pinned head: a read of a store that reads
+        # the current rows says whether it saw that one (docs/stores.md, "What a read sees").
+        for pin in inputs.values():
+            if pin.get("ref") and (generation := self._generation_of(pin["ref"])) is not None:
+                pin["generation"] = generation
+            generations = {
+                k: g for k, r in (pin.get("refs") or {}).items() if (g := self._generation_of(r)) is not None
+            }
+            if generations:
+                pin["generations"] = generations
         claim = self.m.claimed(attempt) if attempt is not None else None
         if claim is not None:
             # Keep the delta log this attempt reads until it finishes (§6).
@@ -807,7 +819,15 @@ class Engine(Attempts, Sensors, Views):
             pin = inputs.get(edge.param) or {}
             refs = [pin["ref"]] if pin.get("ref") else list((pin.get("refs") or {}).values())
             for ref in refs:
-                lineage.append([edge.output, ref.get("partition") or "", ref.get("version"), edge.param])
+                lineage.append(
+                    [
+                        edge.output,
+                        ref.get("partition") or "",
+                        ref.get("version"),
+                        edge.param,
+                        self._generation_of(ref),
+                    ]
+                )
         return {
             "version": asset["version"],
             "domains": self._domains(inputs, outputs, task),
@@ -893,6 +913,12 @@ class Engine(Attempts, Sensors, Views):
                 return dict(source["head"])
             raise Retryable(f"input {output!r} has no head for scope {up_scope!r}")
         return head["ref"]
+
+    def _generation_of(self, ref: dict) -> int | None:
+        """The generation whose commit installed `ref`, while it is its head."""
+
+        head = self.m.heads.get((ref.get("output"), ref.get("partition") or ""))
+        return head.get("generation") if head is not None and head["ref"] == ref else None
 
     def _whole_index(self, output: str, ref: dict) -> dict | None:
         """The pinned key index a whole read of a keyed output on an immutable

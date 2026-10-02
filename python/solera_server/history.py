@@ -8,7 +8,7 @@ Eight tables, each row about one:
     tasks             task of a finished run: timings, retries, executor
     attempts          attempt of a finished run: its phases, and the versions it committed
     materializations  output version a commit installed, with its metadata
-    lineage           input version an output version was built from
+    lineage           input version an output version was built from, and what its read saw
     key_outcomes      key an Each attempt processed: what it came to (per-key-processing.md §10)
     ticks             sensor tick (lifecycle.md §11): buffered, never journaled
 
@@ -158,6 +158,7 @@ TABLES = {
             "rows": "BIGINT",
             "complete": "BOOLEAN",
             "metadata": "VARCHAR",  # JSON object
+            "generation": "BIGINT",  # the writing attempt's (lifecycle.md §9.7)
         },
     ),
     "lineage": Table(
@@ -174,6 +175,11 @@ TABLES = {
             "input_scope": "VARCHAR",
             "input_version": "VARCHAR",
             "param": "VARCHAR",
+            # A store that reads the current rows (docs/stores.md, "What a read sees"):
+            # the pinned head's generation, and what the read saw — JSON
+            # {generation, keys?, mixed?}. Null for a snapshot store: the pin, exactly.
+            "input_generation": "BIGINT",
+            "read": "VARCHAR",
         },
     ),
     # Sensor ticks (docs/lifecycle.md §11.5): buffered in memory, never
@@ -499,12 +505,49 @@ def materialization(
         "rows": count if count is not None else rows,
         "complete": bool(complete),
         "metadata": metadata or None,
+        "generation": head.get("generation"),
     }
+
+
+def _read(output, scope, pinned, read, committed) -> dict:
+    """A lineage edge's read, for the API: `{"exact": true}` when it read the
+    pinned version, else the pinned generation, the generation it saw and
+    what that one committed (`version`, None until it does — or if it never
+    did), and the versions of the keys it read, when it read a page."""
+
+    if not read:
+        return {"exact": True}
+    seen = json.loads(read)
+    generation = seen.get("generation")
+    if generation is not None and generation == pinned:
+        return {"exact": True, "generation": generation}
+    out = {"exact": False, "pinned_generation": pinned, "generation": generation}
+    if seen.get("mixed"):
+        out["mixed"] = True
+    if generation is not None:
+        out["version"] = committed.get((output, scope, generation))
+    for k in ("keys", "key_count"):
+        if k in seen:
+            out[k] = seen[k]
+    return out
+
+
+def read_lineage(pinned, read) -> list[list]:
+    """What an attempt was built from: its spec's pins, `[output, scope,
+    version, param, generation]` (§8), each with what the worker's read of
+    it saw (`read`, from a store that reads the current rows) — or None."""
+
+    seen = {(r["output"], r["scope"]): r for r in read or ()}
+    out = []
+    for output, scope, version, param, *generation in pinned or ():
+        observed = seen.get((output, scope))
+        out.append([output, scope, version, param, (generation or [None])[0], observed])
+    return out
 
 
 def lineage(output, scope, head, reads) -> list[dict]:
     """One row per input version the attempt behind `head` read: `reads`
-    holds `[output, scope, version, param]` as pinned in its spec (§8)."""
+    as `read_lineage` gives them."""
 
     base = {
         "output": output,
@@ -514,9 +557,17 @@ def lineage(output, scope, head, reads) -> list[dict]:
         "attempt": head.get("attempt"),
         "at": head["at"],
     }
-    return [
-        {**base, "input": i, "input_scope": s, "input_version": v, "param": p} for i, s, v, p in reads or ()
-    ]
+    rows = []
+    for i, s, v, p, *more in reads or ():
+        generation, observed = (*more, None, None)[:2]
+        row = {**base, "input": i, "input_scope": s, "input_version": v, "param": p}
+        row["input_generation"] = generation
+        if observed is not None:
+            row["read"] = json.dumps(
+                {k: observed[k] for k in ("generation", "keys", "key_count", "mixed") if k in observed}
+            )
+        rows.append(row)
+    return rows
 
 
 # -- filters ------------------------------------------------------------------------------
@@ -1072,7 +1123,11 @@ class History:
         """The versions `output@scope:version` was built from (or, with
         `downstream`, those built from it), `depth` steps out: `edges` go from
         input to output, and `nodes` say when and by which run each version
-        was made."""
+        was made. An edge's `read` says what the read saw: `exact` — the
+        pinned version, from a snapshot store or the generation it pinned —
+        or, from a store that read newer rows, the generation it saw (and the
+        version that generation committed, once it did), with the versions
+        of the keys it read when it read a page of them."""
 
         made, read = ("output", "scope", "version"), ("input", "input_scope", "input_version")
         near, far = (read, made) if downstream else (made, read)
@@ -1085,7 +1140,8 @@ class History:
                 FROM lineage l JOIN walk w ON {join}
                 WHERE w.depth < ?
             )
-            SELECT DISTINCT l.input, l.input_scope, l.input_version, l.output, l.scope, l.version, l.param, l.run
+            SELECT DISTINCT l.input, l.input_scope, l.input_version, l.output, l.scope, l.version, l.param, l.run,
+                l.input_generation, l.read
             FROM lineage l JOIN walk w ON {join}
             WHERE w.depth < ?
         """
@@ -1093,8 +1149,19 @@ class History:
         def work(con):
             edges = con.execute(sql, [output, scope, version, depth, depth]).fetchall()
             keys = {(output, scope, version)}
-            for i, i_s, i_v, o, s, v, _, _ in edges:
+            for i, i_s, i_v, o, s, v, *_ in edges:
                 keys.update({(i, i_s, i_v), (o, s, v)})
+            # What the generations a read saw, newer than its pin, committed.
+            seen = {(e[0], e[1], json.loads(e[9])["generation"]) for e in edges if e[9]}
+            committed = {}
+            if seen := {k for k in seen if k[2] is not None}:
+                con.execute("CREATE TEMP TABLE seen (output VARCHAR, scope VARCHAR, generation BIGINT)")
+                con.executemany("INSERT INTO seen VALUES (?, ?, ?)", sorted(seen))
+                for o, s, g, v in con.execute(
+                    "SELECT m.output, m.scope, m.generation, m.version FROM materializations m "
+                    "JOIN seen USING (output, scope, generation)"
+                ).fetchall():
+                    committed[(o, s, g)] = v
             nodes = {}
             if keys:
                 con.execute("CREATE TEMP TABLE wanted (output VARCHAR, scope VARCHAR, version VARCHAR)")
@@ -1106,9 +1173,9 @@ class History:
                     )
                 ):
                     nodes[(row["output"], row["scope"], row["version"])] = row
-            return edges, keys, nodes
+            return edges, keys, nodes, committed
 
-        edges, keys, nodes = await self.query(work, ("lineage", "materializations"), live=False)
+        edges, keys, nodes, committed = await self.query(work, ("lineage", "materializations"), live=False)
         m = self.m
         out_nodes = []
         for key in sorted(keys, key=lambda k: (k[0], k[1], k[2] or "")):
@@ -1126,8 +1193,9 @@ class History:
                     "to": {"output": o, "scope": s, "version": v},
                     "param": p,
                     "run": r,
+                    "read": _read(i, i_s, pinned, read, committed),
                 }
-                for i, i_s, i_v, o, s, v, p, r in edges
+                for i, i_s, i_v, o, s, v, p, r, pinned, read in edges
             ],
         }
 

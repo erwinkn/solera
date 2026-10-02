@@ -270,7 +270,8 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
     ref = Ref.from_json(pin["ref"])
     store = project.stores[ref.store]
     t = typing.get_type_hints(asset.fn).get(param)
-    loaded = await store.load(ref, dict[str, t], Keys(page.upserted)) if page.upserted else {}
+    loaded = await ctx._observed.load(store, ref, dict[str, t], Keys(page.upserted)) if page.upserted else {}
+    await ctx._observed.close()  # the inputs' moment ends before the calls
     up = project.manifest["outputs"][ref.output]
     textual = bool(up.get("revision") or up.get("source") or up.get("partition_set"))
 

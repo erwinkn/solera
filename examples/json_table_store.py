@@ -1,17 +1,20 @@
 """A fenced SQL store in one page (docs/stores.md, "Recipe: a SQL table"):
 each output is a PostgreSQL table of JSON rows, one row per input row,
 with its key and batch alongside. `fence()` at the top of every write
-transaction, and as `acquire`, is all the fencing it needs. Each call's
-transaction runs on a thread, off the worker's event loop. The
-conformance kit (`solera.testing.stores`) checks it like any store."""
+transaction, and as `acquire`, is all the fencing it needs; `reads`
+reads an attempt's inputs at one moment, each with the generation that
+wrote what it read (`written()`). Each call's transaction runs on a
+thread, off the worker's event loop. The conformance kit
+(`solera.testing.stores`) checks it like any store."""
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
 import psycopg
 from psycopg.types.json import Jsonb
-from solera.fencing import fence, fence_table
+from solera.fencing import fence, fence_table, written
 from solera.sdk import Ref, digest
 from solera.stores import Batches, KeyedWrite, Keys, Written, takes
 
@@ -58,7 +61,7 @@ class JsonTableStore:
             prior = None  # a full run keeps nothing of the content
         conn, cur = self._transaction(out)
         with conn:
-            fence(cur, scope, table)  # before this transaction changes anything
+            fence(cur, scope, table, write=True)  # before this transaction changes anything
             if out.key is None:  # an unkeyed incremental output: a batch of rows
                 rows = list(write.rows)
                 # The batch replaces itself (a retried call writes it again); with no
@@ -96,9 +99,36 @@ class JsonTableStore:
             return Written(Ref(out.name, "", {}, write.version(prior), scope.partition))
 
     async def load(self, ref, t, selection) -> list[dict]:
-        return await asyncio.to_thread(self._load, ref, selection)
+        def work():
+            with psycopg.connect(self.dsn) as conn:
+                return self._load(conn, ref, selection)
 
-    def _load(self, ref, selection) -> list[dict]:
+        return await asyncio.to_thread(work)
+
+    @contextlib.asynccontextmanager
+    async def reads(self):
+        """One snapshot for an attempt's reads: each load, with the generation
+        that wrote what it read."""
+
+        conn = await asyncio.to_thread(psycopg.connect, self.dsn)
+        conn.isolation_level, conn.read_only = psycopg.IsolationLevel.REPEATABLE_READ, True
+        lock = asyncio.Lock()
+
+        class Reader:
+            async def load(_, ref, t, selection):
+                def work():
+                    rows = self._load(conn, ref, selection)
+                    return rows, written(conn.cursor(), f'"rows_{ref.output}"', ref.partition)
+
+                async with lock:  # one connection: one load at a time
+                    return await asyncio.to_thread(work)
+
+        try:
+            yield Reader()
+        finally:
+            await asyncio.to_thread(conn.close)
+
+    def _load(self, conn, ref, selection) -> list[dict]:
         sql, params = f'SELECT row FROM "rows_{ref.output}" WHERE part = %s', [ref.partition]
         if isinstance(selection, Keys):
             sql, params = sql + " AND k = ANY(%s)", [*params, sorted(selection.revisions)]
@@ -106,5 +136,4 @@ class JsonTableStore:
             sql, params = sql + " AND batch BETWEEN %s AND %s", [*params, selection.lo, selection.hi]
         elif (ref.handle or {}).get("batch") is not None:
             sql, params = sql + " AND batch <= %s", [*params, ref.handle["batch"]]
-        with psycopg.connect(self.dsn) as conn:
-            return [r[0] for r in conn.execute(sql, params).fetchall()]
+        return [r[0] for r in conn.execute(sql, params).fetchall()]

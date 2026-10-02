@@ -344,6 +344,36 @@ async def a_newer_writer_waits_for_an_open_older_one(h: Harness) -> None:
         await write(h, out, [{"id": "a", "v": "0"}], 5, Ledger(), first)
 
 
+# -- stores that read the current rows (`reads`) -------------------------------------------
+
+
+async def a_read_reports_the_generation_it_saw(h: Harness) -> None:
+    """Writer 3 wrote two outputs, {a: 1} and {b: 1}; writer 5 acquired the
+    first and wrote nothing. A reader reads the first: a=1, generation 3 —
+    an acquisition is no write. Writer 7 writes both and commits; the
+    reader, at its one moment, still reads b=1 and a=1, generation 3 each:
+    what it reports is what it read. A new reader reads generation 7's."""
+
+    first, second = keyed(h), keyed(h)
+    one = await write(h, first, [{"id": "a", "v": "1"}], 3, Ledger())
+    two = await write(h, second, [{"id": "b", "v": "1"}], 3, Ledger())
+    await h.store.acquire(scope(first, 5))
+    async with h.store.reads() as reader:
+        assert await _read(reader, one) == ([("a", "1")], 3)
+        one = await write(h, first, [{"id": "a", "v": "2"}], 7, Ledger(), one)
+        two = await write(h, second, [{"id": "b", "v": "2"}], 7, Ledger(), two)
+        assert await _read(reader, two) == ([("b", "1")], 3)
+        assert await _read(reader, one) == ([("a", "1")], 3)
+    async with h.store.reads() as reader:
+        assert await _read(reader, one) == ([("a", "2")], 7)
+        assert await _read(reader, two) == ([("b", "2")], 7)
+
+
+async def _read(reader, ref: Ref) -> tuple[list[tuple[str, str]], int | None]:
+    found, generation = await reader.load(ref, list[dict], None)
+    return sorted((str(r["id"]), str(r["v"])) for r in found), generation
+
+
 @contextlib.contextmanager
 def _refused():
     try:
@@ -371,10 +401,12 @@ FENCED = [
     the_next_attempt_replaces_what_a_dead_writer_left,
     a_newer_writer_waits_for_an_open_older_one,
 ]
+READS = [a_read_reports_the_generation_it_saw]
 
 
 def scenarios(store: Any) -> list[Callable]:
-    """The scenarios a store (or its class) must pass: every store's, and
-    its kind's."""
+    """The scenarios a store (or its class) must pass: every store's, its
+    kind's, and a current-read store's (`reads`)."""
 
-    return EVERY + {"immutable": IMMUTABLE, "fenced": FENCED}[store.writes]
+    found = EVERY + {"immutable": IMMUTABLE, "fenced": FENCED}[store.writes]
+    return found + (READS if callable(getattr(store, "reads", None)) else [])

@@ -107,7 +107,7 @@ HARNESSES = {"file": file_harness, "s3": s3_harness, "postgres": postgres_harnes
 
 
 def cases():
-    from solera.testing.stores import EVERY, FENCED, IMMUTABLE
+    from solera.testing.stores import EVERY, FENCED, IMMUTABLE, READS
 
     for name, kind in (
         ("file", "immutable"),
@@ -115,7 +115,8 @@ def cases():
         ("postgres", "fenced"),
         ("example", "fenced"),
     ):
-        for scenario in EVERY + (IMMUTABLE if kind == "immutable" else FENCED):
+        # A fenced store here reads the current rows: it reports what it read (`reads`).
+        for scenario in EVERY + (IMMUTABLE if kind == "immutable" else FENCED + READS):
             yield pytest.param(name, scenario, id=f"{name}-{scenario.__name__}")
 
 

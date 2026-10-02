@@ -300,7 +300,10 @@ in a column; two kinds, or only nulls, want `columns=`; what it inferred
 is logged once — and one a `Sql` SELECT creates by the SELECT's own
 types. It stores what was hashed: a value its column would read back as
 another type — `42` into a text column — is a write error. Its transactions run on a thread,
-off the worker's event loop.
+off the worker's event loop. An attempt reads its inputs from it at one
+moment, a REPEATABLE READ snapshot, and each read says which
+generation's write it saw; lineage records it beside the pinned one
+(stores.md, "What a read sees").
 
 Secrets travel via `env:` indirection in store and resource config, resolved
 in the harness. The manifest records each store's name and `Store.version`

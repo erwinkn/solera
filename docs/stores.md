@@ -47,6 +47,10 @@ class Store(Protocol):
     async def migrate(self, output, migrations, scope=None) -> list[str]: ...  # optional
     def can_migrate(self, t, output) -> bool: ...              # optional: else can_store
     def prepare(self, write, output) -> Prepared: ...          # optional: types of its own
+    def reads(self) -> AsyncContextManager[Reader]: ...       # optional: a store of current rows
+
+class Reader(Protocol):                                        # what `reads()` yields
+    async def load(self, ref, t, selection) -> tuple[Any, int | None]: ...  # value, generation written
 ```
 
 **`Scope`** — what a write belongs to:
@@ -216,7 +220,28 @@ a load returns the rows as they are now. So a run can read two outputs at
 different moments, and a row changed after the run pinned it is read in
 its newer form — and delivered again with the change that made it, a
 harmless repeat. Fencing makes writes safe; it does not make reads
-repeatable.
+repeatable — so such a store says what it read, with `reads()`:
+
+- **One moment.** `async with store.reads() as reader:` — every
+  `reader.load(ref, t, selection)` runs in one snapshot (PostgresStore: a
+  REPEATABLE READ, READ ONLY transaction), so an attempt's inputs from the
+  store are read together. The harness opens it for the inputs and closes
+  it before the producer runs: a long producer holds no snapshot.
+- **The generation it saw.** Each load returns `(value, generation)`: the
+  generation whose write transaction last changed the slice, read in the
+  same snapshot. Keep it beside the fence: set it in every write
+  transaction, as it commits — never in `acquire`, which writes nothing
+  (an acquisition is no version: reporting it would claim one never
+  read). `solera.fencing` does both: `fence(cur, scope, domain,
+  write=True)` in a write, `written(cur, domain, partition)` in a read.
+  None if no fenced write changed the slice.
+
+The engine records it as lineage. A snapshot store's read is the pinned
+version, exactly. A current read that saw the pinned head's generation is
+exact too; one that saw another records the pinned generation, the one
+read, and — for a page of keys (`Keys`) — each key's version as read, so
+lineage never claims a version that was not read. The conformance kit's
+`READS` scenario checks a store that defines `reads()`.
 
 ## Recipes
 
