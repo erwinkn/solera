@@ -546,21 +546,23 @@ physical snapshot size and distinct block reads:
   stream instead. The tails already read are not repeated: streaming reads
   index parts and data segments.
 
-Both constants come from one grid, run cold, warm-worker and warm-engine:
+Both constants come from one grid (`bench/keys/bench.py --suites
+crossover,steady`, `bench/keys/results.md`): indexes of 1M, 10M and 100M
+keys, fresh and in steady state; patches of 1K–1M keys with 0%, 50% and
+100% rewritten unchanged; each route forced. The objective is wall time,
+with requests tipping close calls toward streaming, which issues an order
+of magnitude fewer:
 
-| Variable | Values |
-|---|---|
-| index size | 1M, 10M, 100M; fresh and steady state |
-| patch size | 1K, 10K, 100K, 1M keys |
-| share rewritten unchanged | 0%, 50%, 100% |
-| path | sparse, streaming, forced each way |
-| report | GETs, bytes, wall time, CPU seconds, peak memory |
-
-What we have suggests where they land, from other measurements: 1M keys
-into 10M (10% density) took 7.0 s reading the level whole and 8.4 s
-through the filters; 100K keys at 100M with half unchanged took 17.4 s
-and 7,395 GETs through the filters, where a streaming read of that index
-is 371 GETs.
+- **`stream_density` = 2%.** Under it the sparse reader wins: 1M keys
+  into 100M (1%) take 11 s against 15 s streamed. Over it streaming does:
+  1M keys into 10M (10%) take 2.9 s streamed, 8.4 s sparse — the sparse
+  reader's cost per written key is mostly CPU (~9 µs in Python), the
+  stream's per index entry.
+- **`stream_reads` = 16.** The two routes take the same time where the
+  exact reads number about 24 per streamed segment (100M steady, 100K
+  keys half unchanged: 11,878 reads in 13.7 s, against 436 segments in
+  22.4 s; 10M fresh, 10K: 831 reads in 1.7 s, 34 segments in 1.4 s);
+  16 gives streaming the close calls, saving the requests.
 
 ## 7. Inlined downstream changes
 
@@ -800,9 +802,9 @@ The follow-up review agrees with all three.
 
 ## 14. Open questions
 
-1. **Thresholds.** `stream_density`, `stream_reads`, `resolve_max_keys`,
-   `resolve_max_entries` and `resolve_timeout` from the grid of §6; the
-   absolute caps stay regardless.
+1. **Thresholds.** `stream_density` and `stream_reads` are measured (§6);
+   `resolve_max_keys`, `resolve_max_entries` and `resolve_timeout` still
+   come from the warm grid; the absolute caps stay regardless.
 2. **Engine capacity.** No rate threshold is credible before the local
    form is measured. Resolves, retry pages and compaction have separate
    threads; if offloading becomes necessary, the cache and all its readers

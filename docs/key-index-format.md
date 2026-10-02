@@ -122,3 +122,41 @@ when they read the filters, and each block's CRC before decoding it.
 A file with no entries has no blocks; each of its filters has `nbits = 512`, and
 its index has empty `min_key` and `max_key` and `blocks = 0`. Writers only
 produce one for an empty delta.
+
+## Garbage files (`.kg`, version 1)
+
+A compaction of an index whose output is on an immutable store
+(`lifecycle.md` §9.8) also writes, beside its `.kx` outputs, the entries
+its merge dropped that name an object: every live entry passed over for a
+newer entry of the same key, at another version or locator. A key may
+appear several times — a merge can drop its entries from more than one
+input — which a `.kx` file cannot hold, so these are a format of their
+own. Tombstones name no object and are never listed; an entry whose
+version and locator equal the surviving entry's is the same object and is
+not listed either.
+
+```
+file   := block* footer
+block  := length u32 · crc32 u32 · bytes      length and CRC-32 of the compressed bytes
+entry  := key (varint len + bytes) · version (varint len + bytes) · locator varint
+```
+
+A block's bytes decompress (the footer's codec) to consecutive entries,
+in key order across the file; writers close a block once its entries reach
+64 KiB, and a file once its blocks reach the compaction's file size, so a
+compaction may write several. Footer, fixed 24 bytes at the end:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | magic `CKG1` |
+| 4 | 2 | format version, `1` |
+| 6 | 1 | codec: `0` none, `1` zlib |
+| 7 | 1 | reserved, `0` |
+| 8 | 8 | entries |
+| 16 | 4 | blocks |
+| 20 | 4 | magic `CKG1` |
+
+Readers verify both magics, the version, each block's CRC, and that the
+blocks and entries they read match the footer. Garbage files are named
+`g{stamp}-{n:04d}.kg` beside the compaction's outputs; the compaction's
+result lists them, and they are deleted once their objects are.

@@ -294,3 +294,39 @@ def test_rejects_the_previous_format_version(impl):
     data[-44:-42] = (1).to_bytes(2, "little")
     with pytest.raises(impl.FormatError, match="version"):
         impl.parse_footer(bytes(data[-48:]))
+
+
+def test_garbage_files_cross_decode():
+    """docs/key-index-format.md § Garbage files: a key may repeat, at the
+    versions a compaction dropped; each implementation reads the other's."""
+
+    rng = random.Random(11)
+    keys = sorted(f"k{rng.randrange(5000):05d}".encode() for _ in range(20_000))  # repeats
+    versions = [rng.randbytes(16) for _ in keys]
+    locators = [rng.randrange(1 << 40) for _ in keys]
+    data = _python.encode_garbage(keys, versions, locators)
+    assert _native.decode_garbage(data) == (keys, versions, bytes(len(keys)), locators)
+    bad = bytearray(data)
+    bad[20] ^= 1
+    for impl in (_python, _native):
+        with pytest.raises(ValueError):
+            impl.decode_garbage(bytes(bad))
+
+
+def test_a_compaction_names_every_object_it_drops():
+    """Every live entry a merge drops for a newer one of its key — from any
+    run, so a key can appear at several versions — goes to the garbage files;
+    tombstones and the entries that win do not."""
+
+    l2 = _native.encode_file([b"a", b"b", b"c"], [b"1", b"1", b"1"], b"\x00\x00\x00", locators=[1, 1, 1])
+    l1 = _native.encode_file([b"a", b"b"], [b"2", b"2"], b"\x00\x01", locators=[2, 2])  # b deleted
+    l0 = _native.encode_file([b"a", b"c"], [b"3", b"1"], b"\x00\x00", locators=[3, 1])  # c unchanged
+    job = _native.Job.compact(3, drop_deleted=True, garbage=True)
+    garbage = []
+    files = drive(job, [[l0], [l1], [l2]], on_garbage=garbage.append)
+    _, k, v, _ = decode_all(_native, files[0])
+    assert list(zip(k, v, strict=True)) == [(b"a", b"3"), (b"c", b"1")]
+    [g] = garbage
+    ks, vs, _, locs = _python.decode_garbage(g)
+    assert list(zip(ks, vs, locs, strict=True)) == [(b"a", b"2", 2), (b"a", b"1", 1), (b"b", b"1", 1)]
+    assert job.garbage == 3

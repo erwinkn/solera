@@ -199,7 +199,7 @@ class Upkeep:
             return
         if result is None:
             return
-        added, removed = result
+        added, removed, _garbage = result  # garbage is not asked for until stores declare their kinds
         if current is None or not set(removed) <= {f.name for f in current.files}:
             created = [f.name for f in added if f.name not in removed]
             await self._delete([index.path(n) for n in created])

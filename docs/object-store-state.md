@@ -317,18 +317,17 @@ for the state it pinned, and commits landing while it runs keep their
 its exact count back unless one of those commits was itself inexact.
 Deltas themselves are always exact; only the count is approximate.
 
-**Read strategy.** Newest first, levels up to 32 MB — two range reads, no
-more than a tail and a block — are read whole, all at once. From the
-first larger level on, the reader fetches the tails of the files that
-could hold the written keys and runs the filters; only then, knowing
-which keys need an exact read, does it choose per level between reading
-their blocks (consecutive blocks are one range read) and reading the rest
-of those files whole. It estimates each combination from request rounds,
-transfer (500 MB/s in all, 80 MB/s per request) and CPU (decoding and
-filter checks at the measured rates); the one with
-the fewest requests that fits a latency budget (default 2 s) wins, else
-the fastest. An exact read only goes to files whose key filter matched,
-all levels at once, and each key takes its newest entry.
+**Read strategy** (`resolved-commits.md` §6). A patch whose run holds
+more than 2% of the index's physical entries streams the whole index —
+every level in 8 MB segments, merged with the sorted run. Otherwise the
+sparse reader: newest first, levels up to 32 MB — two range reads, no
+more than a tail and a block — are read whole, all at once; from the
+first larger level on, it fetches the tails of the files that could hold
+the written keys and runs the filters, and reads blocks only for the keys
+they cannot clear, in the files whose key filter matched, all levels at
+once, each key taking its newest entry. If those block reads would number
+more than 16 per streamed segment, it streams instead. An `exact` read
+(failure indexes) takes no "changed" verdict from a pair filter.
 
 **Full replacement.** A bare return of every row must compare every live
 key, so it reads the whole index — as a stream, never whole. The written

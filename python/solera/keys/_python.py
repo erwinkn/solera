@@ -534,3 +534,74 @@ def merge_range(runs: list, codec: int, after, upto, drop_deleted: bool):
         flags.append(f)
         locators.append(loc)
     return keys, versions, bytes(flags), locators
+
+
+# -- garbage files ------------------------------------------------------------------------
+
+GARBAGE_MAGIC = b"CKG1"
+GARBAGE_VERSION = 1
+GARBAGE_FOOTER = struct.Struct("<4sHBBQI4s")  # 24 bytes
+GARBAGE_BLOCK = 64 * 1024
+
+
+def encode_garbage(
+    keys: list[bytes], versions: list[bytes], locators: list[int], *, codec=CODEC_ZLIB, level=1
+):
+    """One garbage file (docs/key-index-format.md § Garbage files) holding the
+    entries in order; a key may repeat."""
+
+    out, block, blocks = bytearray(), bytearray(), 0
+
+    def close():
+        nonlocal block, blocks
+        if block:
+            data = _compress(bytes(block), codec, level)
+            out.extend(struct.pack("<II", len(data), zlib.crc32(data)))
+            out.extend(data)
+            blocks += 1
+            block = bytearray()
+
+    for key, version, locator in zip(keys, versions, locators, strict=True):
+        _put_bytes(block, key)
+        _put_bytes(block, version)
+        put_varint(block, locator)
+        if len(block) >= GARBAGE_BLOCK:
+            close()
+    close()
+    out.extend(
+        GARBAGE_FOOTER.pack(GARBAGE_MAGIC, GARBAGE_VERSION, codec, 0, len(keys), blocks, GARBAGE_MAGIC)
+    )
+    return bytes(out)
+
+
+def decode_garbage(data):
+    """Every entry of a garbage file: keys, versions, deleted flags (all 0), locators."""
+
+    data = memoryview(data)
+    if len(data) < GARBAGE_FOOTER.size:
+        raise FormatError("garbage file too short")
+    m1, version, codec, _, entries, blocks, m2 = GARBAGE_FOOTER.unpack(data[-GARBAGE_FOOTER.size :])
+    if m1 != GARBAGE_MAGIC or m2 != GARBAGE_MAGIC:
+        raise FormatError("bad garbage file magic")
+    if version != GARBAGE_VERSION:
+        raise FormatError(f"unsupported garbage file version {version}")
+    body = data[: -GARBAGE_FOOTER.size]
+    keys, versions, locators, pos, seen = [], [], [], 0, 0
+    while pos < len(body):
+        n, crc = struct.unpack_from("<II", body, pos)
+        blk = body[pos + 8 : pos + 8 + n]
+        if len(blk) != n or zlib.crc32(blk) != crc:
+            raise FormatError("garbage block checksum mismatch")
+        pos += 8 + n
+        seen += 1
+        raw, p = _decompress(blk, codec), 0
+        while p < len(raw):
+            key, p = _get_bytes(raw, p)
+            ver, p = _get_bytes(raw, p)
+            loc, p = get_varint(raw, p)
+            keys.append(key)
+            versions.append(ver)
+            locators.append(loc)
+    if seen != blocks or len(keys) != entries:
+        raise FormatError("garbage file counts do not match its footer")
+    return keys, versions, bytes(len(keys)), locators

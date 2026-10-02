@@ -24,6 +24,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from urllib.parse import quote
 
+from .. import _native
 from ..ids import ulid
 from . import (
     FOOTER_SIZE,
@@ -58,6 +59,12 @@ def key_bytes(key: str) -> bytes:
 _s, _b = key_str, key_bytes
 
 
+def digest(data: bytes) -> str:
+    """A file's content digest: XXH3-128, hex."""
+
+    return _native.content_digest(data)
+
+
 def index_prefix(output: str, scope: str) -> str:
     """Where a new index's files go: `keys/{output}/{scope}/` (`_` for the
     unpartitioned scope). An index keeps its prefix when its output is renamed."""
@@ -75,6 +82,7 @@ class FileInfo:
     size: int
     tail: int  # bytes from the start of the filters to the end of the file
     index: int  # bytes from the start of the block index to the end of the file
+    digest: str = ""  # XXH3-128 of the file's bytes, hex: what a cached copy is checked against
 
     def to_json(self) -> dict:
         return {
@@ -86,12 +94,21 @@ class FileInfo:
             "size": self.size,
             "tail": self.tail,
             "index": self.index,
+            "digest": self.digest,
         }
 
     @classmethod
     def from_json(cls, d: dict) -> FileInfo:
         return cls(
-            d["name"], d["level"], _b(d["min"]), _b(d["max"]), d["entries"], d["size"], d["tail"], d["index"]
+            d["name"],
+            d["level"],
+            _b(d["min"]),
+            _b(d["max"]),
+            d["entries"],
+            d["size"],
+            d["tail"],
+            d["index"],
+            d["digest"],
         )
 
     @classmethod
@@ -107,6 +124,7 @@ class FileInfo:
             len(data),
             len(data) - footer["filters_offset"],
             len(data) - footer["index_offset"],
+            digest(data),
         )
 
 
@@ -280,18 +298,37 @@ class Options:
     k: int = 10
     max_file_bytes: int = 64 * 2**20
     whole_threshold: int = 2 * RANGE  # levels this small are read whole: no more requests than tail + block
-    latency_budget: float = 2.0  # seconds; the read strategy's tie-breaker
-    concurrency: int = 64
-    # Planning estimates: a remote store, and this implementation's CPU (bench/keys/results.md).
-    request_latency: float = 0.03
-    bandwidth: float = 500e6  # all requests together
-    connection_bandwidth: float = 80e6  # one request
-    decode_rate: float = 4.5e6  # entries per second
-    check_rate: float = 0.4e6  # keys through a file's filters per second
+    small_file: int = (
+        2 * 2**20
+    )  # files this small are read whole: cheaper to transfer than a second round trip
+    # When a patch streams the whole index instead of reading blocks (docs/resolved-commits.md §6,
+    # from bench/keys/bench.py's crossover grid, where each breaks even in wall time at about 2% and
+    # 24 reads per segment; streaming's far fewer requests tip close calls its way): its run is over
+    # this share of the entries...
+    stream_density: float = 0.02
+    # ...or, after the filters, its exact reads need more blocks than this many per streamed segment.
+    stream_reads: float = 16.0
     l0_max_files: int = 8
     l0_max_bytes: int = 64 * 2**20
     level_base: int = 64 * 2**20
     fanout: int = 10
+
+
+@dataclass(frozen=True)
+class GarbageFile:
+    """A compaction's garbage file (docs/key-index-format.md § Garbage files):
+    the entries it dropped, for an immutable store to discard."""
+
+    name: str
+    entries: int
+    size: int
+
+    def to_json(self) -> dict:
+        return {"name": self.name, "entries": self.entries, "size": self.size}
+
+    @classmethod
+    def from_json(cls, d: dict) -> GarbageFile:
+        return cls(d["name"], d["entries"], d["size"])
 
 
 # -- reading ------------------------------------------------------------------------
@@ -333,25 +370,6 @@ class _Parsed:
         return blocks[run[0]][1], blocks[run[-1]][1] + blocks[run[-1]][2]
 
 
-@dataclass(frozen=True)
-class Cost:
-    """What a set of reads costs: requests, bytes, the largest request, and
-    entries to decode."""
-
-    requests: int = 0
-    nbytes: int = 0
-    largest: int = 0
-    entries: int = 0
-
-    def __add__(self, other: Cost) -> Cost:
-        return Cost(
-            self.requests + other.requests,
-            self.nbytes + other.nbytes,
-            max(self.largest, other.largest),
-            self.entries + other.entries,
-        )
-
-
 class KeyIndex:
     """I/O over one index. `state` is the pinned `IndexState` to read."""
 
@@ -361,6 +379,7 @@ class KeyIndex:
         self.state = state
         self.o = options or Options()
         self._parsed: dict[str, _Parsed] = {}
+        self.route = ""  # how the last resolve read the index: "sparse" or "stream"
 
     def path(self, name: str) -> str:
         return f"{self.prefix}{name}.kx"
@@ -371,7 +390,7 @@ class KeyIndex:
         """Read whole at once rather than tail, then blocks: mostly tail anyway, or
         cheaper to transfer than a second round trip."""
 
-        return f.size <= 2 * f.tail or f.size <= self.o.request_latency * self.o.connection_bandwidth
+        return f.size <= 2 * f.tail or f.size <= self.o.small_file
 
     async def _open(self, f: FileInfo, *, data: bool = False, filters: bool = True) -> _Parsed:
         """A parsed file: its block index, plus its filters when `filters`, plus
@@ -420,29 +439,94 @@ class KeyIndex:
         await asyncio.gather(*(fetch(r) for r in p.runs(wanted)))
         return out
 
-    def _estimate(self, cost: Cost, checks: int = 0) -> float:
-        """Seconds for `cost`, plus `checks` filter checks: request rounds, transfer, and CPU."""
-
-        o = self.o
-        transfer = max(cost.nbytes / o.bandwidth, cost.largest / o.connection_bandwidth)
-        rounds = math.ceil(cost.requests / o.concurrency) * o.request_latency
-        return rounds + transfer + cost.entries / o.decode_rate + checks / o.check_rate
-
     # -- a commit's delta ----------------------------------------------------------------
 
-    async def changes(
-        self, keys: list[bytes], versions: list[bytes], removes: list[bytes] = (), *, generation: int = 0
-    ) -> Delta:
-        """Which entries of a patch change the index: upsert `keys` at
-        `versions`, delete `removes`, written by `generation`. A full
-        replacement is `replace`."""
+    async def resolve(
+        self,
+        keys: list[bytes],
+        versions: list[bytes],
+        removes: list[bytes] = (),
+        *,
+        batch: int,
+        attempt: str,
+        generation: int = 0,
+        exact: bool = False,
+        collect: int = 0,
+    ) -> tuple[DeltaFiles, tuple[list[bytes], list[bytes]] | None]:
+        """A patch's delta, written as the batch's files: upsert `keys` at
+        `versions` and delete `removes`, by `generation`
+        (docs/resolved-commits.md §6). A small patch reads only what it must —
+        the sparse reader; a dense one, or one whose exact reads would touch
+        too many blocks, streams the whole index instead. With `exact`, every
+        live key's entry is read — no filter decides a change — so the counts
+        are exact and every changed key names its predecessor. Returns the
+        files and, up to `collect` keys, the written and the deleted keys
+        (None past it). A full replacement is `replace`."""
 
+        keys, versions, removes = self._sorted(keys, versions, removes)
+        entries = sum(f.entries for f in self.state.files)
+        if entries and len(keys) + len(removes) > self.o.stream_density * entries:
+            return await self._stream(keys, versions, removes, batch, attempt, generation, collect)
+        delta = await self._patch(keys, versions, removes, generation, exact=exact, switch=True)
+        if delta is None:
+            return await self._stream(keys, versions, removes, batch, attempt, generation, collect)
+        self.route = "sparse"
+        files = await self.write(batch, attempt, delta)
+        listed = None
+        if len(delta) <= collect:
+            listed = (
+                [k for k, d in zip(delta.keys, delta.deleted, strict=True) if not d],
+                [k for k, d in zip(delta.keys, delta.deleted, strict=True) if d],
+            )
+        return files, listed
+
+    async def changes(
+        self,
+        keys: list[bytes],
+        versions: list[bytes],
+        removes: list[bytes] = (),
+        *,
+        generation: int = 0,
+        exact: bool = False,
+    ) -> Delta:
+        """A patch's delta in memory, through the sparse reader whatever its size."""
+
+        keys, versions, removes = self._sorted(keys, versions, removes)
+        return await self._patch(keys, versions, removes, generation, exact=exact, switch=False)
+
+    async def get(self, keys: list[bytes]) -> dict[bytes, tuple[bytes, int]]:
+        """The live entries of `keys` — `(version, locator)` — read exactly."""
+
+        keys = sorted(set(keys))
+        known = (await self._find(keys, {}, exact=True, switch=False))[0]
+        return {k: (v, loc) for k, (live, v, loc) in known.items() if live}
+
+    def _sorted(self, keys, versions, removes):
         keys, versions, _ = sort_entries(list(keys), list(versions), bytes(len(keys)))
-        keys, versions = list(keys), list(versions)
         removes = sorted(set(removes))
         if removes and set(removes) & set(keys):
             raise ValueError("a key cannot be both written and removed")
-        return await self._patch(keys, versions, removes, generation)
+        return list(keys), list(versions), removes
+
+    async def _stream(self, keys, versions, removes, batch, attempt, generation, collect):
+        """The streaming merge-join of a patch with every level."""
+
+        self.route = "stream"
+        run = sorted(
+            [(k, v, 0) for k, v in zip(keys, versions, strict=True)] + [(k, b"", 1) for k in removes]
+        )
+        runs = self.state.newest_first()
+        job = Job.patch(
+            [e[0] for e in run],
+            [e[1] for e in run],
+            bytes(e[2] for e in run),
+            len(runs),
+            **self._writer(),
+            collect=collect,
+            generation=generation,
+        )
+        files = await self._run(job, runs, lambda n: f"{batch:012d}-{attempt}.{n:04d}", 0)
+        return DeltaFiles(files, job.added, job.removed, True), job.collected()
 
     async def replace(
         self,
@@ -488,7 +572,9 @@ class KeyIndex:
             "max_file_bytes": o.max_file_bytes,
         }
 
-    async def _run(self, job: Job, runs, name=None, level: int = 0, rows=None) -> list[FileInfo]:
+    async def _run(
+        self, job: Job, runs, name=None, level: int = 0, rows=None, on_garbage=None
+    ) -> list[FileInfo]:
         """Drive a streaming job over `runs`; its files are written as `name(n)`, at `level`."""
 
         files: dict[int, FileInfo] = {}
@@ -497,70 +583,33 @@ class KeyIndex:
             await self.io.write(self.path(name(n)), data)
             files[n] = FileInfo.describe(name(n), level, data)
 
-        await jobs.run(job, self.io, self.path, runs, put, None if isinstance(rows, Rows) else rows)
+        await jobs.run(
+            job, self.io, self.path, runs, put, None if isinstance(rows, Rows) else rows, on_garbage
+        )
         return [files[n] for n in sorted(files)]
 
     async def _patch(
-        self, keys: list[bytes], versions: list[bytes], removes: list[bytes], generation: int
-    ) -> Delta:
+        self,
+        keys: list[bytes],
+        versions: list[bytes],
+        removes: list[bytes],
+        generation: int,
+        *,
+        exact: bool,
+        switch: bool,
+    ) -> Delta | None:
+        """The sparse reader's delta; None when `switch` and streaming would read less."""
+
         want = dict(zip(keys, versions, strict=True))
-        unresolved = sorted(set(keys) | set(removes))
-        known: dict[bytes, tuple] = {}  # key -> (live, version, locator), read exactly
-        absent: set[bytes] = set()  # keys no file holds
-        exact = True
-        levels = self.state.newest_first()
-        # Newest first, levels are read whole — exact answers, no filters — up to the first
-        # one too big to; from there every level goes through its filters, since "definitely
-        # changed" must hold across every level that could hold the key.
-        n = next((i for i, level in enumerate(levels) if not self._read_whole(level)), len(levels))
-        whole, filtered = levels[:n], levels[n:]
-
-        # 1. The whole levels, fetched at once and then consulted newest first.
-        candidates = [self._candidates(level, unresolved) for level in whole]
-        await asyncio.gather(
-            *(
-                self._open(f, data=True)
-                for level, c in zip(whole, candidates, strict=True)
-                for f in level
-                if f.name in c
-            )
-        )
-        for level in whole:
-            if not unresolved:
-                break
-            found = await self._exact(level, self._candidates(level, unresolved))
-            known.update(found)
-            unresolved = [k for k in unresolved if k not in found]
-
-        # 2. The rest through their filters; only "maybe" keys get block reads.
-        if unresolved and filtered:
-            verdicts, holders, spent = await self._filter(filtered, unresolved, want)
-            maybe = []
-            for key in unresolved:
-                verdict = verdicts[key]
-                if verdict == "absent":
-                    absent.add(key)
-                elif verdict == "changed":
-                    # Live at another version — or, behind a false-positive key
-                    # filter, not there at all: counted as an existing key.
-                    exact = False
-                    known[key] = (True, None, None)
-                else:
-                    maybe.append(key)
-            if maybe:
-                found = await self._resolve(filtered, holders, maybe, spent)
-                known.update(found)
-                absent.update(k for k in maybe if k not in found)
-        else:
-            absent.update(unresolved)
-
+        found = await self._find(sorted(set(keys) | set(removes)), want, exact=exact, switch=switch)
+        if found is None:
+            return None
+        known, inferred = found
         out_k, out_v, out_d, out_p = [], [], bytearray(), []
         added = removed = 0
         rm = set(removes)
         for key in sorted(set(keys) | rm):
-            live, version, locator = (
-                (False, None, None) if key in absent else known.get(key, (False, None, None))
-            )
+            live, version, locator = known.get(key, (False, None, None))
             before = (version, locator) if live and version is not None else None
             if key in rm:
                 if live:
@@ -578,7 +627,79 @@ class KeyIndex:
             out_d.append(0)
             out_p.append(before)
             added += 0 if live else 1
-        return Delta(out_k, out_v, bytes(out_d), added, removed, exact, [generation] * len(out_k), out_p)
+        return Delta(
+            out_k, out_v, bytes(out_d), added, removed, not inferred, [generation] * len(out_k), out_p
+        )
+
+    async def _find(self, keys: list[bytes], want: dict, *, exact: bool, switch: bool):
+        """`(live, version, locator)` of every key some file holds — the
+        version None where the filters alone said "live at another version"
+        — and whether any was so inferred. Newest first, levels small enough
+        are read whole, all at once; from the first larger one on, every
+        level goes through its filters, since "definitely changed" must hold
+        across every level that could hold the key. Only keys the filters
+        cannot clear get block reads, in the files whose key filter matched,
+        all levels at once. With `switch`, None once those reads would touch
+        more blocks than streaming the index costs segments × `stream_reads`."""
+
+        known: dict[bytes, tuple] = {}
+        inferred = False
+        levels = self.state.newest_first()
+        n = next((i for i, level in enumerate(levels) if not self._read_whole(level)), len(levels))
+        whole, filtered = levels[:n], levels[n:]
+        unresolved = keys
+
+        # 1. The whole levels, fetched at once and then consulted newest first.
+        await asyncio.gather(
+            *(
+                self._open(f, data=True)
+                for level in whole
+                for f in level
+                if f.name in self._candidates(level, unresolved)
+            )
+        )
+        for level in whole:
+            if not unresolved:
+                break
+            found = await self._exact(level, self._candidates(level, unresolved))
+            known.update(found)
+            unresolved = [k for k in unresolved if k not in found]
+        if not unresolved or not filtered:
+            return known, inferred
+
+        # 2. The rest through their filters.
+        verdicts, holders = await self._filter(filtered, unresolved, want)
+        maybe = []
+        for key in unresolved:
+            verdict = verdicts[key]
+            if verdict == "changed" and not exact:
+                # Live at another version — or, behind a false-positive key
+                # filter, not there at all: counted as an existing key.
+                inferred = True
+                known[key] = (True, None, None)
+            elif verdict != "absent":
+                maybe.append(key)
+        if not maybe:
+            return known, inferred
+
+        # 3. Exact reads of the rest, in every file whose key filter matched them.
+        wanted = set(maybe)
+        needs = []
+        for level in filtered:
+            for f in level:
+                ks = [k for k in holders.get(f.name, ()) if k in wanted]
+                if ks:
+                    needs.append((self._parsed[f.name], ks))
+        if switch:
+            reads = sum(len({p.block_of(k) for k in ks} - {-1}) for p, ks in needs)
+            size = sum(f.size for f in self.state.files)
+            if reads > self.o.stream_reads * math.ceil(size / jobs.SEGMENT):
+                return None
+        parts = await asyncio.gather(*(self._lookup(p, ks) for p, ks in needs))
+        for part in parts:  # newest first
+            for key, entry in part.items():
+                known.setdefault(key, entry)
+        return known, inferred
 
     def _candidates(self, level: list[FileInfo], keys: list[bytes]) -> dict[str, list[bytes]]:
         """Per file of a level, the sorted keys inside its key range."""
@@ -602,13 +723,13 @@ class KeyIndex:
 
         return sum(f.size for f in level) <= self.o.whole_threshold
 
-    async def _exact(self, level, candidates) -> dict[bytes, tuple[bool, bytes]]:
+    async def _exact(self, level, candidates) -> dict[bytes, tuple[bool, bytes, int]]:
         by_name = {f.name: f for f in level}
 
         async def one(name: str, keys: list[bytes]):
             return await self._lookup(await self._open(by_name[name], data=True), keys)
 
-        found: dict[bytes, tuple[bool, bytes]] = {}
+        found: dict[bytes, tuple[bool, bytes, int]] = {}
         for part in await asyncio.gather(*(one(name, keys) for name, keys in candidates.items())):
             found.update(part)
         return found
@@ -637,8 +758,7 @@ class KeyIndex:
         "absent" (no key filter matches), "changed" (a written key that no pair
         filter and no tombstone filter matches: live, at another version), or
         "maybe" (needs an exact read). Also returns, per file, the keys its key
-        filter matched — the only files an exact read of them needs — and the
-        estimated seconds this took."""
+        filter matched — the only files an exact read of them needs."""
 
         key_hit = dict.fromkeys(keys, False)
         pair_hit = dict.fromkeys(keys, False)
@@ -649,10 +769,6 @@ class KeyIndex:
             by_name = {f.name: f for f in level}
             per_file += [(by_name[n], ks) for n, ks in self._candidates(level, keys).items()]
         parsed = await asyncio.gather(*(self._open(f) for f, _ in per_file))
-        tails = [f.tail for f, _ in per_file]
-        spent = self._estimate(
-            Cost(len(tails), sum(tails), max(tails, default=0)), sum(len(ks) for _, ks in per_file)
-        )
         for p, (_, ks) in zip(parsed, per_file, strict=True):
             nb, kk, bits = p.tail["key_filter"]
             held = [k for k, h in zip(ks, bloom_check_keys(bits, nb, kk, ks), strict=True) if h]
@@ -679,81 +795,7 @@ class KeyIndex:
                 out[k] = "changed"
             else:
                 out[k] = "maybe"
-        return out, holders, spent
-
-    async def _resolve(self, levels, holders, maybe, spent: float) -> dict[bytes, tuple[bool, bytes]]:
-        """Exact lookups of `maybe` keys in every file whose key filter matched
-        them, all levels at once; each key's newest entry wins. Per level, the
-        planner reads just the blocks, or the rest of its files whole."""
-
-        wanted = set(maybe)
-        needs = []  # per level, newest first: (parsed file, keys to look up)
-        for level in levels:
-            row = []
-            for f in level:
-                ks = [k for k in holders.get(f.name, ()) if k in wanted]
-                if ks:
-                    row.append((self._parsed[f.name], ks))
-            needs.append(row)
-        rest = self._plan_reads(needs, spent)
-
-        async def one(p, ks, whole):
-            if whole:
-                await self._open(p.info, data=True)
-            return await self._lookup(p, ks)
-
-        found: dict[bytes, tuple[bool, bytes]] = {}
-        parts = await asyncio.gather(
-            *(one(p, ks, whole) for row, whole in zip(needs, rest, strict=True) for p, ks in row)
-        )
-        for part in parts:  # newest first
-            for key, entry in part.items():
-                found.setdefault(key, entry)
-        return found
-
-    def _plan_reads(self, needs, spent: float) -> list[bool]:
-        """Per level: read the rest of its files whole (True), or only the blocks
-        the lookups need (False)? Both decode the same blocks; they differ in
-        requests and bytes. The combination with the fewest requests that fits
-        the latency budget wins, else the fastest. The `spent` seconds — tails
-        and filter checks — count toward the budget."""
-
-        best = None
-        for combo, cost in self._read_options(needs):
-            total = spent + self._estimate(cost)
-            rank = (0, cost.requests, total) if total <= self.o.latency_budget else (1, total, cost.requests)
-            if best is None or rank < best[0]:
-                best = (rank, combo)
-        return list(best[1])
-
-    def _read_options(self, needs):
-        """Every way to read `needs` (per level: files and their keys), level by
-        level blocks or rest, with its cost."""
-
-        per_level = []
-        for row in needs:
-            blocks = rest = Cost()
-            for p, ks in row:
-                wanted = {p.block_of(k) for k in ks} - {-1}
-                entries = sum(p.tail["blocks"][i][3] for i in wanted)
-                if p.data is not None:  # read whole already
-                    blocks, rest = blocks + Cost(entries=entries), rest + Cost(entries=entries)
-                    continue
-                spans = [p.span(r) for r in p.runs(wanted)]
-                blocks += Cost(
-                    len(spans),
-                    sum(e - s for s, e in spans),
-                    max((e - s for s, e in spans), default=0),
-                    entries,
-                )
-                size = p.info.size - p.info.tail
-                rest += Cost(math.ceil(size / RANGE), size, min(size, RANGE), entries)
-            per_level.append((blocks, rest))
-        for combo in itertools.product((False, True), repeat=len(needs)):
-            cost = Cost()
-            for whole, options in zip(combo, per_level, strict=True):
-                cost += options[whole]
-            yield combo, cost
+        return out, holders
 
     # -- writing ------------------------------------------------------------------------
 
@@ -911,8 +953,13 @@ class KeyIndex:
             return [pick] + [g for g in below if g.max >= pick.min and g.min <= pick.max], n + 1
         return None
 
-    async def compact(self, plan=None) -> tuple[list[FileInfo], list[str]] | None:
-        """Run one compaction; returns (added files, removed names) for `IndexState.compacted`."""
+    async def compact(
+        self, plan=None, *, garbage: bool = False
+    ) -> tuple[list[FileInfo], list[str], list[GarbageFile]] | None:
+        """Run one compaction; returns the added files and removed names for
+        `IndexState.compacted`, and with `garbage` the garbage files listing
+        every entry the merge dropped that names an object — what an
+        immutable store discards (docs/key-index-format.md § Garbage files)."""
 
         plan = plan or self.plan_compaction()
         if plan is None:
@@ -920,18 +967,33 @@ class KeyIndex:
         inputs, out_level = plan
         if out_level > self.state.depth:
             # The deepest level moves down whole: nothing below it to merge with.
-            return [replace(f, level=out_level) for f in inputs], [f.name for f in inputs]
+            return [replace(f, level=out_level) for f in inputs], [f.name for f in inputs], []
         drop = out_level >= self.state.depth  # nothing older below: tombstones can go
         # Runs, newest first: each level-0 file alone, a deeper level's files together.
         runs = []
         for lv, group in itertools.groupby(inputs, lambda f: f.level):
             group = list(group)
             runs += [[f] for f in group] if lv == 0 else [group]
-        job = Job.compact(len(runs), drop_deleted=drop, **self._writer())
+        job = Job.compact(len(runs), drop_deleted=drop, garbage=garbage, **self._writer())
         # A level-0 file is as recent as its newest input: level 0 orders by name, and delta
         # names start with their batch.
         stamp = ulid() if out_level else f"{inputs[0].name.split('-', 1)[0]}-c{ulid()}"
+        dropped: dict[int, GarbageFile] = {}
+
+        async def put_garbage(n: int, data: bytes):
+            name = f"g{stamp}-{n:04d}"
+            await self.io.write(self.garbage_path(name), data)
+            entries = int.from_bytes(data[-16:-8], "little")
+            dropped[n] = GarbageFile(name, entries, len(data))
+
         added = await self._run(
-            job, runs, lambda n: f"c{stamp}-{n:04d}" if out_level else f"{stamp}.{n:04d}", out_level
+            job,
+            runs,
+            lambda n: f"c{stamp}-{n:04d}" if out_level else f"{stamp}.{n:04d}",
+            out_level,
+            on_garbage=put_garbage,
         )
-        return added, [f.name for f in inputs]
+        return added, [f.name for f in inputs], [dropped[n] for n in sorted(dropped)]
+
+    def garbage_path(self, name: str) -> str:
+        return f"{self.prefix}{name}.kg"

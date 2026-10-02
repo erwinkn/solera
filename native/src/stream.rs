@@ -24,13 +24,13 @@ const DELETED: u8 = 1;
 const PREDECESSOR: u8 = 2;
 
 /// One encoded entry, its byte strings as ranges of the block.
-struct Fields {
-    shared: usize,
-    suffix: (usize, usize),
-    version: (usize, usize),
-    flags: u8,
-    locator: u64,
-    predecessor: Option<((usize, usize), u64)>,
+pub(crate) struct Fields {
+    pub shared: usize,
+    pub suffix: (usize, usize),
+    pub version: (usize, usize),
+    pub flags: u8,
+    pub locator: u64,
+    pub predecessor: Option<((usize, usize), u64)>,
 }
 
 fn range(buf: &[u8], pos: &mut usize) -> Result<(usize, usize)> {
@@ -43,7 +43,7 @@ fn range(buf: &[u8], pos: &mut usize) -> Result<(usize, usize)> {
     Ok((start, start + n))
 }
 
-fn read_entry(raw: &[u8], pos: &mut usize) -> Result<Fields> {
+pub(crate) fn read_entry(raw: &[u8], pos: &mut usize) -> Result<Fields> {
     let shared = get_varint(raw, pos)? as usize;
     let suffix = range(raw, pos)?;
     let version = range(raw, pos)?;
@@ -71,7 +71,7 @@ fn read_entry(raw: &[u8], pos: &mut usize) -> Result<Fields> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn write_entry(
+pub(crate) fn write_entry(
     out: &mut Vec<u8>,
     shared: usize,
     suffix: &[u8],
@@ -222,6 +222,12 @@ impl Run {
         self.ended = true;
     }
 
+    /// A block decoded elsewhere (a local file's); `last` when no more will come.
+    pub fn push_block(&mut self, b: Block, last: bool) {
+        self.ready.push_back(b);
+        self.ended = last;
+    }
+
     pub fn state(&mut self) -> Result<State> {
         loop {
             match self.ready.front() {
@@ -285,6 +291,7 @@ pub struct Merge {
     heap: Vec<usize>,
     pending: Vec<usize>,
     cur: (usize, usize),
+    shadowed: Vec<(usize, usize)>,
 }
 
 impl Merge {
@@ -294,6 +301,7 @@ impl Merge {
             heap: Vec::with_capacity(runs),
             pending: (0..runs).rev().collect(),
             cur: (usize::MAX, 0),
+            shadowed: Vec::new(),
         }
     }
 
@@ -369,12 +377,14 @@ impl Merge {
         self.runs[r].pos += 1;
         self.pending.push(r);
         // Older entries for the same key are shadowed.
+        self.shadowed.clear();
         while let Some(&o) = self.heap.first() {
             let run = &self.runs[o];
             if run.block().key(run.pos) != self.key() {
                 break;
             }
             self.pop();
+            self.shadowed.push((o, self.runs[o].pos));
             self.runs[o].pos += 1;
             self.pending.push(o);
         }
@@ -399,6 +409,15 @@ impl Merge {
     #[inline]
     pub fn locator(&self) -> u64 {
         self.runs[self.cur.0].block().locator(self.cur.1)
+    }
+
+    /// The older entries of the current key the merge passed over, newest
+    /// first: `(version, deleted, locator)`. Readable until the next call.
+    pub fn shadowed(&self) -> impl Iterator<Item = (&[u8], bool, u64)> {
+        self.shadowed.iter().map(|&(r, i)| {
+            let b = self.runs[r].block();
+            (b.version(i), b.deleted(i), b.locator(i))
+        })
     }
 }
 

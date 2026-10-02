@@ -13,8 +13,9 @@ Suites (`--suites`, all by default):
 - scan: a full scan of the index (the recount), in 100K-key pages.
 - load: an initial load of every key, unsorted, through `KeyIndex.replace` (`bulk.py` measures
   the bulk operations' memory, each in a process of its own).
-- crossover: the read strategy forced each way (whole levels; tails, then blocks; tails, then the
-  rest of each file) against the planner's pick.
+- crossover: patches resolved by the sparse reader and by streaming, forced, against `resolve`'s
+  pick, over a grid of sizes and unchanged shares — on the fresh index, and with `steady` also on
+  the steady-state one (docs/resolved-commits.md §6).
 - steady: the upper levels filled as steady-state writes leave them, then commits and one
   compaction of each kind.
 
@@ -30,6 +31,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import random
 import resource
@@ -160,7 +162,7 @@ async def build(io: ObjectIO, prefix: str, n: int, opts: Options, sample_every: 
     # Let the planner place it: the deepest level moves down (no rewrite) until it fits.
     idx = KeyIndex(io, prefix, state, opts)
     while (plan := idx.plan_compaction()) is not None:
-        added, removed = await idx.compact(plan)
+        added, removed, _ = await idx.compact(plan)
         state = state.compacted(added, removed)
         idx = KeyIndex(io, prefix, state, opts)
     return state, sample, big, time.perf_counter() - t
@@ -180,16 +182,34 @@ def fmt_s(x: float) -> str:
     return f"{x * 1000:.0f} ms" if x < 1 else f"{x:.1f} s"
 
 
+def _rss(field: str) -> int:
+    """`VmRSS` or `VmHWM` (the peak since the last reset) of this process, in bytes."""
+
+    with open("/proc/self/status") as f:
+        for line in f:
+            if line.startswith(field + ":"):
+                return int(line.split()[1]) * 1024
+    return 0
+
+
 async def measure(label, io: ObjectIO, fn):
     io.metrics.reset()
-    t = time.perf_counter()
+    try:
+        with open("/proc/self/clear_refs", "w") as f:
+            f.write("5")  # reset the peak to the current RSS
+    except OSError:
+        pass
+    rss = _rss("VmRSS")
+    t, cpu = time.perf_counter(), time.process_time()
     out = await fn()
-    dt = time.perf_counter() - t
+    dt, cpu = time.perf_counter() - t, time.process_time() - cpu
     m = io.metrics.snapshot()
     cost = m["gets"] * GET_PRICE + m["puts"] * PUT_PRICE
     return {
         "op": label,
         "wall": dt,
+        "cpu": cpu,
+        "rss_gb": max(0, _rss("VmHWM") - rss) / 2**30,
         "gets": m["gets"],
         "puts": m["puts"],
         "mb_in": m["bytes_in"] / 1e6,
@@ -209,71 +229,47 @@ def levels(state: IndexState) -> dict[int, tuple[int, float, int]]:
     return dict(sorted(out.items()))
 
 
-# -- the read strategy, forced ---------------------------------------------------------------
+# -- the read routes, forced (docs/resolved-commits.md §6) ----------------------------------
+
+ROUTES = {
+    "sparse": {"stream_density": math.inf, "stream_reads": math.inf},
+    "stream": {"stream_density": 0.0},
+    "resolve": {},
+}
+GRID = (1_000, 10_000, 100_000, 1_000_000)
+SHARES = (0.0, 0.5, 1.0)
 
 
-class Strategy(KeyIndex):
-    """A KeyIndex that reads every level whole (`force="whole"`), or reads the tails and
-    then only the blocks (`"blocks"`) or the rest of each file (`"rest"`), or does as the
-    planner decides (`force=None`); records the route taken and the planner's estimates."""
-
-    def __init__(self, *args, force: str | None = None, **kw):
-        super().__init__(*args, **kw)
-        self.force = force
-        self.route = "whole"
-        self.estimates: dict[str, float] = {}
-
-    def _read_whole(self, level):
-        return self.force == "whole" or (self.force is None and super()._read_whole(level))
-
-    async def _filter(self, levels, keys, want):
-        self.route = "tails only"
-        return await super()._filter(levels, keys, want)
-
-    def _plan_reads(self, needs, spent):
-        options = dict(self._read_options(needs))
-        n = len(needs)
-        self.estimates = {w: spent + self._estimate(options[(w == "rest",) * n]) for w in ("blocks", "rest")}
-        if self.force in ("blocks", "rest"):
-            rest = [self.force == "rest"] * n
-        else:
-            rest = super()._plan_reads(needs, spent)
-        self.route = "tails, then " + ("rest" if all(rest) else "blocks" if not any(rest) else "mixed")
-        return rest
-
-
-async def crossover(prefix, state, big, opts, cold) -> list[dict]:
-    """Every written key changed, then half of them rewritten unchanged — the case the
-    filters can't clear."""
+async def grid(prefix, state, sample, opts, cold, label, sizes=GRID) -> list[dict]:
+    """A patch of k sampled keys, a share of them rewritten unchanged — what the
+    filters cannot clear — resolved by the sparse reader, by streaming, and as
+    `resolve` decides; each writes its delta."""
 
     rng = random.Random(30)
     rows = []
-    for k, same_share in (
-        (1_000, 0.0),
-        (10_000, 0.0),
-        (100_000, 0.0),
-        (1_000_000, 0.0),
-        (1_000, 0.5),
-        (10_000, 0.5),
-        (100_000, 0.5),
-    ):
-        if k > len(big) // 2:
+    for k in sizes:
+        if k > len(sample) // 2:
             continue
-        items = sorted(rng.sample(big, k))
-        keys = [key_of(i) for i, _ in items]
-        vers = [v if rng.random() < same_share else rng.randbytes(16) for _, v in items]
-        row = {"k": k, "unchanged": same_share}
-        for force in (None, "whole", "blocks", "rest"):
-            io = cold()
-            idx = Strategy(io, prefix, state, opts, force=force)
-            r = await measure(
-                f"{k} random keys changed", io, lambda idx=idx, keys=keys, vers=vers: idx.changes(keys, vers)
-            )
-            r.pop("out")
-            row[force or "planner"] = r
-            if force is None:
-                row["picked"], row["estimates"] = idx.route, idx.estimates
-        rows.append(row)
+        for share in SHARES:
+            items = sorted(rng.sample(sample, k))
+            keys = [key_of(i) for i, _ in items]
+            vers = [v if rng.random() < share else rng.randbytes(16) for _, v in items]
+            row = {"state": label, "k": k, "unchanged": share}
+            for route, o in ROUTES.items():
+                io, n = cold(), len(rows)
+                idx = KeyIndex(io, prefix, state, replace(opts, **o))
+                r = await measure(
+                    f"{k} keys, {route}",
+                    io,
+                    lambda idx=idx, keys=keys, vers=vers, n=n, route=route: idx.resolve(
+                        keys, vers, batch=10**9, attempt=f"grid-{label}-{n}-{route}"
+                    ),
+                )
+                r.pop("out")
+                row[route] = r
+                if route == "resolve":
+                    row["picked"] = idx.route
+            rows.append(row)
     return rows
 
 
@@ -334,7 +330,7 @@ def push_plan(state: IndexState, lv: int):
     return [pick, *overlap(pick)], lv + 1
 
 
-async def steady(n, prefix, state, sample, opts, cold) -> tuple[list[dict], dict]:
+async def steady(n, prefix, state, sample, opts, cold, with_grid=False) -> tuple[list[dict], dict]:
     """The index as steady-state writes leave it — upper levels filled, level 0 one delta
     short of a compaction, holding on average half the merged level-0 file it pushes into
     level 1 — then operations on it and one compaction of each kind. Checks afterwards that
@@ -388,7 +384,7 @@ async def steady(n, prefix, state, sample, opts, cold) -> tuple[list[dict], dict
     async def compact(io, plan=None):
         nonlocal st
         out = await KeyIndex(io, prefix, st, opts).compact(plan)
-        st = st.compacted(*out)
+        st = st.compacted(*out[:2])
         return None
 
     rows = []
@@ -415,6 +411,8 @@ async def steady(n, prefix, state, sample, opts, cold) -> tuple[list[dict], dict
             lambda io=io: KeyIndex(io, prefix, st, opts).recount(),
         )
     )
+    if with_grid:  # the sample's versions are current: unchanged rewrites are real
+        shape["grid"] = await grid(prefix, st, list(current.items()), opts, cold, "steady", GRID[:3])
     io = cold()
     rows.append(
         await measure("steady: commit: 1K random changes + delta write", io, lambda io=io: commit(io))
@@ -601,7 +599,7 @@ async def _run_size(n: int, prefix: str, args) -> dict:
             nonlocal s2
             idx = KeyIndex(io, prefix, s2, opts)
             out = await idx.compact()
-            s2 = s2.compacted(*out)
+            s2 = s2.compacted(*out[:2])
             return out
 
         rows.append(await measure("compaction: 8 delta files", io, compact))
@@ -669,10 +667,12 @@ async def _run_size(n: int, prefix: str, args) -> dict:
             shutil.rmtree(cache_dir, ignore_errors=True)
 
     if "crossover" in args.suites:
-        result["crossover"] = await crossover(prefix, state, big, opts, cold)
+        result["crossover"] = await grid(prefix, state, big, opts, cold, "fresh")
 
     if "steady" in args.suites:
-        steady_rows, result["shape"] = await steady(n, prefix, state, sample, opts, cold)
+        steady_rows, result["shape"] = await steady(
+            n, prefix, state, sample, opts, cold, with_grid="crossover" in args.suites
+        )
         rows += steady_rows
 
     for r in rows:
@@ -735,23 +735,24 @@ def report(results, args):
 
             print(f"| {res['info']['n']:,} | {fmt(res['shape']['before'])} | {fmt(res['shape']['after'])} |")
 
-    crossed = [res for res in results if res.get("crossover")]
-    if crossed:
-        print("\nRead strategy, forced each way (cold; wall · GETs · MB read):\n")
-        print(
-            "| Keys | Written keys | Unchanged | Whole levels | Tails, then blocks | Tails, then rest | "
-            "Planner picks | Planner's estimate, blocks / rest |"
-        )
-        print("|---|---|---|---|---|---|---|---|")
-        for res in crossed:
-            for row in res["crossover"]:
-                est = row["estimates"]
-                estimate = f"{fmt_s(est['blocks'])} / {fmt_s(est['rest'])}" if est else "—"
-                print(
-                    f"| {res['info']['n']:,} | {row['k']:,} | {row.get('unchanged', 0):.0%} | {cell(row['whole'])} | "
-                    f"{cell(row['blocks'])} | {cell(row['rest'])} | {row['picked']}: "
-                    f"{cell(row['planner'])} | {estimate} |"
-                )
+    grids = [
+        (res, row)
+        for res in results
+        for row in (res.get("crossover") or []) + (res.get("shape", {}).get("grid") or [])
+    ]
+    if grids:
+        print("\nPatches, each route forced (cold; wall · GETs · MB read · CPU · added peak RSS):\n")
+        print("| Keys | Index | Patch | Unchanged | Sparse | Stream | `resolve` picks |")
+        print("|---|---|---|---|---|---|---|")
+        for res, row in grids:
+            print(
+                f"| {res['info']['n']:,} | {row['state']} | {row['k']:,} | {row['unchanged']:.0%} | "
+                f"{gcell(row['sparse'])} | {gcell(row['stream'])} | {row['picked']}: {fmt_s(row['resolve']['wall'])} |"
+            )
+
+
+def gcell(r: dict) -> str:
+    return f"{fmt_s(r['wall'])} · {r['gets']} GET · {r['mb_in']:.1f} MB · {fmt_s(r['cpu'])} · {r['rss_gb']:.2f} GB"
 
 
 def jsonable(results):

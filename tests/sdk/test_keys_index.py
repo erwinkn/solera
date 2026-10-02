@@ -28,86 +28,158 @@ def small_options(**kw):
 
 
 def filtered_options(**kw):
-    # Nothing is small enough to read whole, and whole-level reads never fit the budget:
-    # every level beyond level 0 goes through its filters.
-    return small_options(whole_threshold=0, request_latency=10.0, **kw)
+    # Nothing is small enough to read whole: every level beyond level 0 goes through its filters.
+    return small_options(whole_threshold=0, small_file=0, **kw)
+
+
+def streamed_options(**kw):
+    # Every patch streams the whole index.
+    return small_options(stream_density=0.0, **kw)
+
+
+def switching_options(**kw):
+    # Patches go through the filters, then stream as soon as one block needs reading.
+    return small_options(whole_threshold=0, small_file=0, stream_reads=0.0, **kw)
 
 
 class Harness:
-    def __init__(self, options, *, cache=None):
+    """Commits against a dict, and keeps every object a write created —
+    `(key, version, locator)`, the generation being the batch — to check that
+    each one superseded is named for collection exactly once it is: by the
+    delta that superseded it, or by a compaction's garbage."""
+
+    def __init__(self, options, *, cache=None, exact=False):
         self.io = ObjectIO(MemoryStore(), cache=cache)
         self.options = options
+        self.exact = exact
         self.state = IndexState()
-        self.model: dict[bytes, bytes] = {}
+        self.model: dict[bytes, tuple[bytes, int]] = {}  # key -> (version, locator)
         self.batch = 0
+        self.created: set[tuple] = set()
+        self.named: set[tuple] = set()  # superseded objects a delta or a garbage file named
+        self.routes: list[str] = []
 
     def index(self):
         return KeyIndex(self.io, "keys/out/p", self.state, self.options)
 
+    async def _read(self, idx, files):
+        return [
+            e for f in files for e in _python.iter_file(await self.io.read_whole(idx.path(f.name), f.size))
+        ]
+
     async def commit(self, keys, versions, removes=(), replace=False):
         before = dict(self.model)
         idx = self.index()
+        gen = self.batch + 1
         if replace:
-            # Streamed out as files: read them back.
             items = list(zip(keys, versions, strict=True))
             random.Random(len(items)).shuffle(items)
-            rows = Rows.pairs(items)
-            files, changed = await idx.replace(rows, self.batch, f"a{self.batch}", collect=10**6)
-            written = [
-                e[:3]
-                for f in files.files
-                for e in _python.iter_file(await self.io.read_whole(idx.path(f.name), f.size))
-            ]
-            delta = Delta(
-                [k for k, _, _ in written],
-                [v for _, v, _ in written],
-                bytes(d for _, _, d in written),
-                files.added,
-                files.removed,
-                files.exact,
+            files, changed = await idx.replace(
+                Rows.pairs(items), self.batch, f"a{self.batch}", collect=10**6, generation=gen
             )
-            assert changed == ([k for k, _, d in written if not d], [k for k, _, d in written if d])
         else:
-            delta = await idx.changes(keys, versions, removes)
-            files = await idx.write(self.batch, f"a{self.batch}", delta)
+            files, changed = await idx.resolve(
+                keys,
+                versions,
+                removes,
+                batch=self.batch,
+                attempt=f"a{self.batch}",
+                generation=gen,
+                exact=self.exact,
+                collect=10**6,
+            )
+            if self.state.files:
+                self.routes.append(idx.route)
+        written = await self._read(idx, files.files)
+        delta = Delta(
+            [e[0] for e in written],
+            [e[1] for e in written],
+            bytes(e[2] for e in written),
+            files.added,
+            files.removed,
+            files.exact,
+            [e[3] for e in written],
+            [e[4] for e in written],
+        )
+        assert changed == ([e[0] for e in written if not e[2]], [e[0] for e in written if e[2]])
         # What the dict says changed.
         if replace:
-            after = dict(zip(keys, versions, strict=True))
+            after = {k: (v, gen) for k, v in zip(keys, versions, strict=True)}
         else:
             after = dict(before)
-            after.update(zip(keys, versions, strict=True))
+            after.update((k, (v, gen)) for k, v in zip(keys, versions, strict=True))
             for k in removes:
                 after.pop(k, None)
-        expect = {k: v for k, v in after.items() if before.get(k) != v}
+        for k in after:
+            if k in before and before[k][0] == after[k][0]:
+                after[k] = before[k]  # rewritten unchanged: the object stays
+        expect = {k: v for k, (v, _) in after.items() if k not in before or before[k][0] != v}
         expect_rm = {k for k in before if k not in after}
         got = {k: v for k, v, d in zip(delta.keys, delta.versions, delta.deleted, strict=True) if not d}
         got_rm = {k for k, d in zip(delta.keys, delta.deleted, strict=True) if d}
         assert got == expect, "upserts"
         assert got_rm == expect_rm, "removals"
         assert delta.keys == sorted(delta.keys)
+        assert all(loc == gen for loc in delta.locators)
+        for k, p in zip(delta.keys, delta.predecessors, strict=True):
+            if p is not None:
+                assert k in before and p == before[k], "a predecessor names what the key held"
+                self.named.add((k, *p))
+            elif k in before and (self.exact or replace or idx.route == "stream"):
+                raise AssertionError(f"{k!r}: its old entry was read, so its predecessor is named")
         if delta.exact:
             assert delta.added - delta.removed == len(after) - len(before)
+        if self.exact:
+            assert delta.exact
+        self.created |= {(k, v, loc) for k, (v, loc) in after.items()}
         self.state = self.state.committed(self.batch, files, keep_log=True)
         self.batch += 1
         self.model = after
         return delta
 
+    async def _compact(self, plan=None):
+        idx = self.index()
+        out = await idx.compact(plan, garbage=True)
+        if out is None:
+            return False
+        added, removed, garbage = out
+        live = {(k, v, loc) for k, (v, loc) in self.model.items()}
+        for g in garbage:
+            ks, vs, _, locs = _python.decode_garbage(
+                await self.io.read_whole(idx.garbage_path(g.name), g.size)
+            )
+            assert len(ks) == g.entries
+            dropped = set(zip(ks, vs, locs, strict=True))
+            assert not dropped & live, "garbage never names a live object"
+            assert dropped <= self.created
+            self.named |= dropped
+        self.state = self.state.compacted(added, removed)
+        return True
+
     async def compact_all(self):
-        while True:
-            idx = self.index()
-            out = await idx.compact()
-            if out is None:
-                return
-            self.state = self.state.compacted(*out)
+        while await self._compact():
+            pass
+
+    async def collapse(self):
+        """One merge of every file into the deepest level: every shadowed entry is dropped."""
+
+        files = [f for level in self.state.newest_first() for f in level]
+        if len(files) > 1:
+            await self._compact((files, self.state.depth))
+
+    def check_collection(self):
+        live = {(k, v, loc) for k, (v, loc) in self.model.items()}
+        assert self.created - live <= self.named, "every superseded object is named once dropped"
+        assert not self.named & live
 
     async def check(self):
         idx = self.index()
         seen, after = {}, None
         while True:
-            keys, versions, _, after = await idx.page(after, 97)
-            for k, v in zip(keys, versions, strict=True):
+            keys, versions, locators, after = await idx.page(after, 97)
+            for k, v, loc in zip(keys, versions, locators, strict=True):
                 assert k not in seen
-                seen[k] = v
+                seen[k] = (v, loc)
             if after is None:
                 break
         assert seen == self.model
@@ -130,11 +202,19 @@ def ver(rng):
 
 
 @pytest.mark.parametrize(
-    "options", [small_options(), filtered_options()], ids=["whole-reads", "filtered-reads"]
+    "options, exact",
+    [
+        (small_options(), False),
+        (filtered_options(), False),
+        (filtered_options(), True),
+        (streamed_options(), False),
+        (switching_options(), False),
+    ],
+    ids=["whole-reads", "filtered-reads", "exact-reads", "streamed", "switching"],
 )
-async def test_random_workload_matches_a_dict(options):
+async def test_random_workload_matches_a_dict(options, exact):
     rng = random.Random(7)
-    h = Harness(options)
+    h = Harness(options, exact=exact)
     universe = 3000
     for step in range(60):
         op = rng.random()
@@ -154,6 +234,13 @@ async def test_random_workload_matches_a_dict(options):
     await h.compact_all()
     await h.check()
     assert h.state.depth >= 2  # the workload exercised more than one level
+    await h.collapse()
+    await h.check()
+    h.check_collection()
+    if options.stream_density == 0:
+        assert set(h.routes) == {"stream"}
+    if options.stream_reads == 0:
+        assert {"sparse", "stream"} <= set(h.routes)  # filters cleared some patches, others streamed
 
 
 async def test_unchanged_rewrite_is_an_empty_delta():
@@ -278,13 +365,13 @@ async def test_level_0_files_are_read_at_once():
     assert h.io.peak >= 7  # six deltas and level 1, not one after another
 
 
-async def test_the_planner_reads_blocks_or_the_rest_once_it_knows_how_many():
-    """The tails first; then, knowing which keys the filters could not clear,
-    the fewest requests: their blocks when there are few, else the rest of
-    each file in one read."""
+async def test_a_patch_reads_blocks_or_streams():
+    """docs/resolved-commits.md §6: the sparse reader reads tails, then only
+    the blocks of keys the filters cannot clear; a patch dense enough, or one
+    whose exact reads would touch more blocks than streaming the index costs,
+    streams instead."""
 
-    # Everything goes through the filters, and every plan fits the latency budget.
-    h = Harness(small_options(whole_threshold=0, request_latency=0.0, l0_max_files=100))
+    h = Harness(filtered_options(l0_max_files=100, stream_reads=2.0))
     rng = random.Random(4)
     ks = [key(i) for i in range(4000)]
     vs = [rng.randbytes(16) for _ in ks]  # incompressible: data outweighs filters
@@ -293,27 +380,43 @@ async def test_the_planner_reads_blocks_or_the_rest_once_it_knows_how_many():
     assert len(files) >= 3 and all(f.size > 2 * f.tail for f in files)
     probe, same = ks[::60], vs[::60]  # every few blocks: no two consecutive
 
-    # All changed: the filters clear nearly every key, so only tails and a false positive's block.
-    h.io.metrics.reset()
-    delta = await h.index().changes(probe, [b"v2"] * len(probe))
-    assert len(delta) == len(probe)
-    assert h.io.metrics.gets <= len(files) + 2
-
-    # All rewritten unchanged: every key needs its block, scattered over each file.
+    # All changed: the filters clear nearly every key — tails and a false positive's block.
     idx = h.index()
     h.io.metrics.reset()
-    delta = await idx.changes(probe, same)
-    assert len(delta) == 0
-    parsed = [idx._parsed[f.name] for f in files]
-    runs = sum(len(p.runs({p.block_of(k) for k in probe} - {-1})) for p in parsed)
-    assert runs > len(files) and h.io.metrics.gets == 2 * len(files)  # tails, then the rest
+    delta = await idx.changes(probe, [b"v2"] * len(probe))
+    assert len(delta) == len(probe) and not delta.exact
+    assert h.io.metrics.gets <= len(files) + 2
+
+    # Exact: every key's entry is read, so the count is exact and predecessors are named.
+    delta = await h.index().changes(probe, [b"v2"] * len(probe), exact=True)
+    assert delta.exact and all(p is not None for p in delta.predecessors)
+
+    # All rewritten unchanged: every key needs its block, more than streaming costs.
+    idx = h.index()
+    files_out, _ = await idx.resolve(probe, same, batch=9, attempt="x")
+    assert idx.route == "stream" and not files_out.files
+
+    # Dense: more of the index than `stream_density` streams at once.
+    idx = KeyIndex(h.io, "keys/out/p", h.state, filtered_options(stream_density=0.01))
+    h.io.metrics.reset()
+    await idx.resolve(ks[::50], [b"v3"] * 80, batch=9, attempt="y")
+    assert idx.route == "stream" and h.io.metrics.gets == len(h.state.files)  # each file once, no tail first
+
+
+async def test_get_reads_prior_records_exactly():
+    h = Harness(filtered_options())
+    ks = [key(i) for i in range(2000)]
+    await h.commit(ks, [b"v1"] * len(ks))
+    await h.commit(ks[:10], [b"v2"] * 10, ks[10:20])
+    got = await h.index().get(ks[:30] + [b"zz-absent"])
+    assert got == {**{k: (b"v2", 2) for k in ks[:10]}, **{k: (b"v1", 1) for k in ks[20:30]}}
 
 
 async def test_a_full_scan_reads_each_block_once():
     """Pages overlap in the files they read — a small file spans every page —
     but a scan never fetches the same block twice."""
 
-    h = Harness(small_options(request_latency=0.0, l0_max_files=100))
+    h = Harness(small_options(small_file=0, l0_max_files=100))
     rng = random.Random(5)
     ks = [key(i) for i in range(3000)]
     await h.commit(ks, [rng.randbytes(16) for _ in ks])
@@ -405,5 +508,5 @@ async def test_locators_and_predecessors():
     state = state.committed(2, await idx.write(2, "w3", delta), keep_log=True)
     keys, versions, locators, _ = await KeyIndex(io, None, state).page(None, 10)
     assert list(zip(keys, versions, locators, strict=True)) == [(b"a", b"2", 30), (b"d", b"1", 20)]
-    added, removed = await KeyIndex(io, None, state).compact((state.level(0) + state.level(1), 1))
+    added, removed, _ = await KeyIndex(io, None, state).compact((state.level(0) + state.level(1), 1))
     assert [e[3:] for e in await entries(added)] == [(30, None), (20, None)]

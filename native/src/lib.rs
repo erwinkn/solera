@@ -11,6 +11,7 @@
 pub mod arrow;
 pub mod digest;
 pub mod format;
+pub mod garbage;
 pub mod jobs;
 mod pyvalue;
 pub mod rows;
@@ -28,7 +29,7 @@ use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::{PyBytes, PyCapsule, PyDict, PyList, PyString};
 
 use format::{Error, Options};
-use jobs::{Compact, Count, Replace, Step};
+use jobs::{Compact, Count, Patch, Replace, Step};
 use rows::{Arena, Constant, Source, Stream, Table, Versions};
 use stream::Segment;
 
@@ -326,6 +327,19 @@ fn merge_range<'py>(
         list_of_bytes(py, &k)?,
         list_of_bytes(py, &v)?,
         PyBytes::new(py, &f),
+        l,
+    ))
+}
+
+/// Every entry of a garbage file (docs/key-index-format.md § Garbage files):
+/// keys, versions, locators.
+#[pyfunction]
+fn decode_garbage<'py>(py: Python<'py>, data: &[u8]) -> PyResult<Merged<'py>> {
+    let (k, v, l) = garbage::decode(data).map_err(to_py)?;
+    Ok((
+        list_of_bytes(py, &k)?,
+        list_of_bytes(py, &v)?,
+        PyBytes::new(py, &vec![0u8; l.len()]),
         l,
     ))
 }
@@ -790,6 +804,7 @@ fn chunk(
 
 enum Kind {
     Replace(Box<Replace>),
+    Patch(Box<Patch>),
     Compact(Box<Compact>),
     Count(Count),
 }
@@ -797,7 +812,8 @@ enum Kind {
 /// A streaming job over an index's runs (see the module documentation).
 /// `step()` returns `("run", r)` when run `r` needs `feed` or `end`,
 /// `("rows", None)` when a streamed replacement needs `feed_rows` or
-/// `end_rows`, `("file", data)` for each file written, and `None` when done.
+/// `end_rows`, `("file", data)` for each file written, `("garbage", data)`
+/// for each garbage file a compaction writes, and `None` when done.
 #[pyclass(module = "solera._native")]
 struct Job {
     kind: Kind,
@@ -808,6 +824,7 @@ impl Job {
     fn merge(&mut self) -> &mut stream::Merge {
         match &mut self.kind {
             Kind::Replace(j) => &mut j.merge,
+            Kind::Patch(j) => &mut j.merge,
             Kind::Compact(j) => &mut j.merge,
             Kind::Count(j) => &mut j.merge,
         }
@@ -817,6 +834,15 @@ impl Job {
         match &mut self.kind {
             Kind::Replace(j) => Ok(j),
             _ => Err(PyTypeError::new_err("not a replacement")),
+        }
+    }
+
+    /// A replacement's or a patch's counts and collected keys.
+    fn delta(&self) -> PyResult<(u64, u64, u64, &jobs::Collected)> {
+        match &self.kind {
+            Kind::Replace(j) => Ok((j.added, j.removed, j.changed, &j.collected)),
+            Kind::Patch(j) => Ok((j.added, j.removed, j.changed, &j.collected)),
+            _ => Err(PyTypeError::new_err("not a replacement or a patch")),
         }
     }
 }
@@ -869,14 +895,68 @@ impl Job {
         })
     }
 
-    /// Merges `runs` (newest first) into new files; `drop_deleted` when
-    /// nothing older lies below.
+    /// The merge-join of a patch — sorted `keys`, their `versions`, and a
+    /// `deleted` flag per key for removes — against `runs` existing runs,
+    /// newest first. At most `collect` changed keys are kept for `collected`.
+    /// Written entries carry `generation` as their locator.
     #[staticmethod]
-    #[pyo3(signature = (runs, *, drop_deleted, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864))]
+    #[pyo3(signature = (keys, versions, deleted, runs, *, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864, collect=0, generation=0))]
+    #[allow(clippy::too_many_arguments)]
+    fn patch(
+        keys: Vec<PyBackedBytes>,
+        versions: Vec<PyBackedBytes>,
+        deleted: PyBackedBytes,
+        runs: usize,
+        block_size: usize,
+        level: u32,
+        bits_per_item: u64,
+        k: u8,
+        codec: u8,
+        max_file_bytes: usize,
+        collect: usize,
+        generation: u64,
+    ) -> PyResult<Job> {
+        if versions.len() != keys.len() || deleted.len() != keys.len() {
+            return Err(PyValueError::new_err(
+                "keys, versions and deleted must have the same length",
+            ));
+        }
+        let (mut ka, mut va) = (Arena::default(), Arena::default());
+        for (i, (key, v)) in keys.iter().zip(&versions).enumerate() {
+            if i > 0 && key.as_ref() <= keys[i - 1].as_ref() {
+                return Err(PyValueError::new_err(
+                    "patch keys must be sorted and unique",
+                ));
+            }
+            ka.push(key);
+            va.push(v);
+        }
+        let o = options(block_size, level, bits_per_item, k, codec);
+        Ok(Job {
+            records: None,
+            kind: Kind::Patch(Box::new(Patch::new(
+                ka,
+                va,
+                deleted.iter().map(|&d| d != 0).collect(),
+                runs,
+                o,
+                max_file_bytes,
+                collect,
+                generation,
+            ))),
+        })
+    }
+
+    /// Merges `runs` (newest first) into new files; `drop_deleted` when
+    /// nothing older lies below; with `garbage`, the entries it drops that
+    /// name objects go to garbage files.
+    #[staticmethod]
+    #[pyo3(signature = (runs, *, drop_deleted, garbage=false, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864))]
     #[allow(clippy::too_many_arguments)]
     fn compact(
         runs: usize,
         drop_deleted: bool,
+        garbage: bool,
         block_size: usize,
         level: u32,
         bits_per_item: u64,
@@ -890,6 +970,7 @@ impl Job {
             kind: Kind::Compact(Box::new(Compact::new(
                 runs,
                 drop_deleted,
+                garbage,
                 o,
                 max_file_bytes,
             ))),
@@ -941,13 +1022,19 @@ impl Job {
         let kind = &mut self.kind;
         let (step, file) = py
             .detach(|| {
-                let (step, writer) = match kind {
-                    Kind::Replace(j) => (j.step()?, Some(&mut j.writer)),
-                    Kind::Compact(j) => (j.step()?, Some(&mut j.writer)),
-                    Kind::Count(j) => (j.step()?, None),
+                let step = match kind {
+                    Kind::Replace(j) => j.step()?,
+                    Kind::Patch(j) => j.step()?,
+                    Kind::Compact(j) => j.step()?,
+                    Kind::Count(j) => j.step()?,
                 };
-                let file = match step {
-                    Step::File => writer.and_then(|w| w.files.pop_front()),
+                let file = match (&step, kind) {
+                    (Step::File, Kind::Replace(j)) => j.writer.files.pop_front(),
+                    (Step::File, Kind::Patch(j)) => j.writer.files.pop_front(),
+                    (Step::File, Kind::Compact(j)) => j.writer.files.pop_front(),
+                    (Step::Garbage, Kind::Compact(j)) => {
+                        j.garbage.as_mut().and_then(|g| g.files.pop_front())
+                    }
                     _ => None,
                 };
                 Ok((step, file))
@@ -957,24 +1044,35 @@ impl Job {
             Step::Run(r) => Some(("run", r.into_pyobject(py)?.into_any())),
             Step::Rows => Some(("rows", py.None().into_bound(py))),
             Step::File => Some(("file", PyBytes::new(py, &file.unwrap()).into_any())),
+            Step::Garbage => Some(("garbage", PyBytes::new(py, &file.unwrap()).into_any())),
             Step::Done => None,
         })
     }
 
-    /// A replacement's counts: new live keys, deleted keys, changed versions.
+    /// A replacement's or a patch's counts: new live keys, deleted keys,
+    /// changed versions.
     #[getter]
-    fn added(&mut self) -> PyResult<u64> {
-        Ok(self.replacement()?.added)
+    fn added(&self) -> PyResult<u64> {
+        Ok(self.delta()?.0)
     }
 
     #[getter]
-    fn removed(&mut self) -> PyResult<u64> {
-        Ok(self.replacement()?.removed)
+    fn removed(&self) -> PyResult<u64> {
+        Ok(self.delta()?.1)
     }
 
     #[getter]
-    fn changed(&mut self) -> PyResult<u64> {
-        Ok(self.replacement()?.changed)
+    fn changed(&self) -> PyResult<u64> {
+        Ok(self.delta()?.2)
+    }
+
+    /// Entries a compaction wrote to garbage files.
+    #[getter]
+    fn garbage(&self) -> PyResult<u64> {
+        match &self.kind {
+            Kind::Compact(j) => Ok(j.garbage.as_ref().map_or(0, |g| g.total)),
+            _ => Err(PyTypeError::new_err("not a compaction")),
+        }
     }
 
     /// A count's live keys.
@@ -986,17 +1084,27 @@ impl Job {
         }
     }
 
-    /// A replacement's written keys and deleted keys, or None past `collect`.
+    /// A replacement's or a patch's written keys and deleted keys, or None
+    /// past `collect`.
     fn collected<'py>(
-        &mut self,
+        &self,
         py: Python<'py>,
     ) -> PyResult<Option<(Bound<'py, PyList>, Bound<'py, PyList>)>> {
-        let c = &self.replacement()?.collected;
+        let c = self.delta()?.3;
         match (&c.upserts, &c.removes) {
             (Some(u), Some(r)) => Ok(Some((arena_list(py, u)?, arena_list(py, r)?))),
             _ => Ok(None),
         }
     }
+}
+
+// -- content digests ---------------------------------------------------------------------
+
+/// A file's content digest: XXH3-128, as hex.
+#[pyfunction]
+fn content_digest(py: Python<'_>, data: PyBackedBytes) -> String {
+    let h = py.detach(|| xxhash_rust::xxh3::xxh3_128(&data));
+    format!("{h:032x}")
 }
 
 #[pymodule]
@@ -1020,6 +1128,8 @@ fn solera_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_index, m)?)?;
     m.add_function(wrap_pyfunction!(parse_tail, m)?)?;
     m.add_function(wrap_pyfunction!(check_block, m)?)?;
+    m.add_function(wrap_pyfunction!(decode_garbage, m)?)?;
+    m.add_function(wrap_pyfunction!(content_digest, m)?)?;
     m.add_function(wrap_pyfunction!(encode, m)?)?;
     m.add_function(wrap_pyfunction!(row_digest, m)?)?;
     m.add_function(wrap_pyfunction!(group_digest, m)?)?;
