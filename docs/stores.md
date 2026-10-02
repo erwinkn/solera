@@ -15,7 +15,7 @@ An attempt W1 can still write after the engine gave up on it: it lost its
 connection but runs on, it paused (GC, a VM migration), a request it sent
 is still queued at the backend, or it was started twice. Meanwhile its
 retry W2 commits. If W1's late write lands, the store holds something the
-engine never committed — a key regressed to an old version, a deleted key
+engine never committed — a key regressed to older rows, a deleted key
 back, a batch replaced.
 
 Waiting longer only makes that less likely. So every store guarantees it
@@ -23,8 +23,8 @@ cannot happen, in one of two ways — its **kind**:
 
 | Kind | How a late writer is made harmless | Implement | A read sees |
 |---|---|---|---|
-| `immutable` | It writes only names no other attempt uses. A late write creates an object nothing references; the engine has it deleted later. | `discard` | exactly the pinned version |
-| `fenced` | Every write checks, atomically, that its attempt still holds the slice. A newer attempt takes it first (`acquire`), so the older one is refused. | `acquire` | the current rows |
+| `immutable` | It writes only names no other attempt uses. A late write creates an object nothing references; the engine has it deleted later. | `discard` | exactly the pinned generation |
+| `fenced` | Every write checks, atomically, that its attempt still holds the slice. A newer attempt takes it first (`acquire`), so the older one is refused. | `acquire`, `keys` | the current rows |
 
 There is no third kind: registration refuses a store that declares
 anything else, or lacks the method its kind needs.
@@ -44,6 +44,7 @@ class Store(Protocol):
 
     async def discard(self, scope, prior, items) -> None: ...   # immutable
     async def acquire(self, scope, prior) -> None: ...          # fenced
+    def keys(self, ref, among) -> Iterable[list[str]]: ...      # fenced
     async def migrate(self, output, migrations, scope=None, prior=None) -> list[str]: ...  # optional
     def prepare(self, write, output) -> Prepared: ...          # optional: types of its own
     def reads(self) -> AsyncContextManager[Reader]: ...       # optional: a store of current rows
@@ -56,7 +57,7 @@ class Reader(Protocol):                                        # what `reads()` 
 
 | Field | Meaning |
 |---|---|
-| `output` | the `Output` declaration: `name`, `key`, `revision`, `incremental`, `config` |
+| `output` | the `Output` declaration: `name`, `key`, `incremental`, `config` |
 | `partition` | the partition key, `""` for an unpartitioned output |
 | `batch` | for an incremental output, the batch number the engine assigned |
 | `reset` | the write starts the content over (a `full` run): keep nothing of `prior` |
@@ -65,8 +66,9 @@ class Reader(Protocol):                                        # what `reads()` 
 | `invocation` | which process runs the attempt: an attempt started twice has one generation and two invocations, and only the first to claim it may write |
 
 **`store(write, prior, scope) -> Written(ref)`** applies a write and
-returns a ref to the new content, with a `version` that changes when the
-content does. `prior` is the committed head: where the content is — a
+returns a ref to the new content; the worker stamps the ref with the
+attempt's generation, its version (`versions.md`). A store that wrote
+nothing returns `prior`. `prior` is the committed head: where the content is — a
 renamed output's objects, or table, stay where they were, so every ref to
 them stays readable; the declaration names the place only of a first
 write — and what the write builds on, unless `scope.reset`, when nothing
@@ -77,12 +79,14 @@ too, to find the same place.
 - An unkeyed incremental output's write is a `Patch` of rows: append it as
   batch `scope.batch` — or, reset, start the batches over at it.
 - A keyed output's write arrives as a `KeyedWrite`, already resolved
-  against the engine's key index. A store reads it four ways: `whole` —
+  against the engine's key index. A store reads it three ways: `whole` —
   the write is the scope's entire content, so clear the scope first;
-  `pages()` — the keys to write, a page at a time, each `(key, version,
-  rows)`, only that page taken from the write (`iter_pages()` for a store
-  writing on a thread of its own); `removes` — the keys to delete; and
-  `version(prior)`. Every other key stays as it is. A key with zero rows
+  `pages()` — the keys to write, a page at a time, each `(key, rows)`,
+  only that page taken from the write (`iter_pages()` for a store
+  writing on a thread of its own); and `removes` — the keys to delete.
+  Every other key stays as it is. An immutable store writes a key at
+  most once per generation (a retried call, the same bytes): the
+  generation names its object. A key with zero rows
   does not exist. Plain values (a list of rows, a `Patch`) may also arrive
   outside the engine: `KeyedWrite.of(store, write, output, prior)` turns
   them into one. A store reading values of its own type defines
@@ -93,17 +97,17 @@ the store takes — see **Values a store takes** below. Without it, the
 store takes plain Python.
 
 **`load(ref, t, selection)`** materializes `t` (`list[dict]`, a DataFrame,
-…). `selection` is `None` (everything), `Keys` (key → `(version,
-locator)`: only those keys) or `Batches(lo, hi)`. An immutable store needs
-`Keys` to find a keyed output's objects — the locator is the generation
-that wrote each key. With `Keys`, `t` may be `dict[str, T]`
+…). `selection` is `None` (everything), `Keys` (key → the generation that
+last wrote it: only those keys) or `Batches(lo, hi)`. An immutable store
+needs `Keys` to find a keyed output's objects, which it names by those
+generations. With `Keys`, `t` may be `dict[str, T]`
 (`solera.stores.by_key_type(t)` is `T`): each key's rows on their own, as
 `T` — how `Each` reads a page — and a key with no rows absent, since it
 does not exist. `can_load` says which `t` a store loads, by key or not;
 say only what `load` does.
 
 **`discard(scope, prior, items)`** (immutable) deletes objects nothing reads
-any more. `items` name them: `("key", key, version_hex, locator)`,
+any more. `items` name them: `("key", key, generation)`,
 `("path", path)`, `("value", generation)`, `("batch", n, generation)`, or
 `("batches", lo, hi)`. The engine names only objects no reader pins;
 deleting a name twice, or one never written, must be harmless.
@@ -113,6 +117,12 @@ deleting a name twice, or one never written, must be harmless.
 before the attempt reads anything from the store. It must wait for an older writer's open
 transaction on the slice, and refuse (`StoreError`) when a newer
 generation, or another invocation of this generation, holds it.
+
+**`keys(ref, among)`** (fenced) yields the keys `ref`'s slice holds now —
+among `among`, or all of them for None — in sorted chunks, by their
+bytes; never a value. A repair asks it after a dead writer (which of the
+keys it meant to change landed), and so does the reconciliation of a
+`Sql` write that died (every key the slice holds), `versions.md` §5.
 
 **Errors.** Raise `WriteError` for a malformed write (duplicate keys, a
 wrong shape), `StoreError` for anything else the store refuses. A store
@@ -149,7 +159,7 @@ producer's return annotation.
   ```
 
 - **A type of your own:** build the `Prepared` yourself — native `Rows`
-  of its keys and versions, and `take(indices)`, the rows it stores:
+  of its keys, and `take(indices)`, the rows it stores:
 
   ```python
   from solera.keys import Rows
@@ -166,13 +176,12 @@ producer's return annotation.
   key)` takes column lists, `Rows.arrow(data, key)` anything with
   `__arrow_c_stream__`, without making a dict per row.
 
-What a store stores must digest as what `prepare` hashed
-(docs/row-digest.md): take the stored rows from the same reading, and
-refuse a value your backend would read back as another value — another
-type, or rounded. PostgresStore refuses 42 in a text column, and, in the
-columns versions digest (every one, or a keyed output's key and
-`revision`), `Decimal("1.234")` in a `numeric(6,2)`, a float a `real`
-would narrow, nanoseconds in a timestamp, and padding a `char(n)` adds.
+Nothing reads a row's values but the store: a backend may coerce a data
+column as its types say (declared columns are the user's contract). A key
+is the exception — the index lists it, so the store must hold it as
+itself: refuse a key your backend would read back as another (PostgresStore
+fails the write when a key's canonical text, `key::text`, is not the key
+it was given, e.g. `1.0` in a `numeric` key column).
 
 ## The invariants
 
@@ -185,7 +194,7 @@ A store of either kind:
    written with zero rows is gone.
 2. **An attempt's repeated write is one write.** The same attempt —
    generation and invocation — writing the same content again (a retried
-   call) leaves the same content and version.
+   call) leaves the same content and objects.
 
 An `immutable` store:
 
@@ -193,7 +202,7 @@ An `immutable` store:
    attempt's generation (or another value no other attempt uses), and
    writes are create-only. So nothing an attempt writes can replace what
    another wrote.
-4. **A pinned read returns its version.** A ref and selection read before a
+4. **A pinned read returns its generation's content.** A ref and selection read before a
    newer commit return the same content after it.
 5. **Discard deletes only what it names.** Discarding superseded names, an
    abandoned attempt's names, or names never written leaves every object a
@@ -219,8 +228,8 @@ A `fenced` store:
 
 ## What a read sees
 
-An immutable store keeps every version until no reader pins it, so a
-run reads exactly the versions it pinned. A fenced store keeps one copy:
+An immutable store keeps every generation until no reader pins it, so a
+run reads exactly the generations it pinned. A fenced store keeps one copy:
 a load returns the rows as they are now. So a run can read two outputs at
 different moments, and a row changed after the run pinned it is read in
 its newer form — and delivered again with the change that made it, a
@@ -236,17 +245,19 @@ repeatable — so such a store says what it read, with `reads()`:
   generation whose write transaction last changed the slice, read in the
   same snapshot. Keep it beside the fence: set it in every write
   transaction, as it commits — never in `acquire`, which writes nothing
-  (an acquisition is no version: reporting it would claim one never
-  read). `solera.fencing` does both: `fence(cur, scope, domain,
-  write=True)` in a write, `written(cur, domain, partition)` in a read.
-  None if no fenced write changed the slice.
+  (an acquisition writes no content: reporting it would claim content
+  never read). A write that changes no row still sets it: the harness
+  gives a fenced store an empty write only to repair a dead writer's,
+  and the slice must then read as the repair's (`versions.md` §5).
+  `solera.fencing` does both: `fence(cur, scope, domain, write=True)` in
+  a write, `written(cur, domain, partition)` in a read. None if no fenced
+  write changed the slice.
 
 The engine records it as lineage, which names what was read: a snapshot
-store's read is the pinned version; a current read is the version its
-generation committed — the pinned one, or a newer one, with each key's
-version as read for a page of keys (`Keys`) — or flagged `uncommitted`
-when no attempt committed what it read, so lineage never claims a
-version that was not read. The conformance kit's
+store's read is the pinned generation; a current read is the generation
+it saw — the pinned one, or a newer one — flagged `uncommitted` when no
+attempt committed it, so lineage never claims content that was not read
+(`versions.md` §6). The conformance kit's
 `READS` scenario checks a store that defines `reads()`.
 
 ## Recipes
@@ -299,7 +310,8 @@ function can turn back (a `SET ROLE` can: a function may `RESET ROLE`).
 
 Write a keyed output page by page: for `whole`, clear the slice first;
 then for each of `write.pages()`, delete its keys and insert their rows
-(or `MERGE`); then delete `removes`. A complete
+(or `MERGE`); then delete `removes`. `keys(ref, among)` is a `SELECT
+DISTINCT` of the key column over the slice, through a server-side cursor. A complete
 example, which passes the conformance kit, is
 [`examples/json_table_store.py`](../examples/json_table_store.py).
 
@@ -309,12 +321,12 @@ Name each object with the writing attempt's generation and write it
 create-only:
 
 ```
-{output}/{partition}/{key}/{version}.{generation}.json   a key at a version
+{output}/{partition}/{key}/{generation}.json             a key, as a generation wrote it
 {output}/{partition}@{generation}.json                  a value
 {output}/{partition}/{batch:012d}/{generation}.json      a batch
 ```
 
-A keyed load computes names from `Keys` (`(version, locator)` → the
+A keyed load computes names from `Keys` (each key's generation → the
 object), never by listing. Batches: several attempts may write batch n
 (a retry reuses its number); the committed one is the highest generation.
 `discard` deletes the names it is given. FileStore and S3Store
@@ -322,7 +334,7 @@ object), never by listing. Batches: several attempts may write batch n
 
 ### A key-value store: conditional puts
 
-Either kind works. Immutable: keys like `{key}@{version}.{generation}`,
+Either kind works. Immutable: keys like `{key}@{generation}`,
 written with put-if-absent, read through `Keys`. Fenced: keep a fence
 record per partition and make every write conditional on it — a
 transaction or compare-and-set that checks the fence record holds
@@ -339,21 +351,24 @@ highest generation: an abandoned attempt's records are then never read.
 ## Scenarios
 
 The conformance kit runs these sequences against your store. Each states
-the exact outcome. (`gN` is generation N; content is `{key: version}`.)
+the exact outcome. (`gN` is generation N; content is `{key: v}`, a row
+`{"id": key, "v": v}`.)
 
 | Kind | Scenario | Sequence | Expected |
 |---|---|---|---|
 | all | a replacement is the scope's whole content | g1 writes {a:1, b:1}; g2 replaces with {b:1, c:1} | the scope holds b:1, c:1 |
 | all | a patch changes only its keys | g1 writes {a:1, b:1, d:1}; g2 patches b:2, c:1, removes a | b:2, c:1, d:1 |
 | all | an empty replacement holds no key | g1 writes {a:1}; g2 replaces with zero rows | nothing |
-| all | a write repeated by its attempt lands once | g4 writes {a:1, b:1}; g4 (same invocation) writes it again | same version; a:1, b:1 |
+| all | a write repeated by its attempt lands once | g4 writes {a:1, b:1}; g4 (same invocation) writes it again | same ref; a:1, b:1 |
 | all | batches append and load by range | g1 appends batch 3 {a}; g2 batch 4 {b} | whole: a, b; `Batches(4, 4)`: b |
+| all | a replacement resolved writes its keys and removes the rest | g1 writes {a:1, b:1, c:1}; g2 replaces with {a:1, b:2}, resolved against the index | a and b at g2; c removed; a:1, b:2 |
 | immutable | a pinned read returns its version | g5 writes {a:1}, pin; g9 writes {a:2} | the pin reads a:1; the new ref a:2 |
 | immutable | discarding never takes what is read | g5 writes {a:1}; g7 writes b (never committed); g9 writes {a:2}; discard a@g5, b@g7 and a name never written, twice | the new ref reads a:2 |
 | fenced | a stale writer is refused | g5 writes {a:1}; g9 acquires, writes {a:2}; g5 writes {a:0} | g5 refused (`StoreError`); a:2 |
 | fenced | one generation admits one invocation | g5 writes; g9 acquires as x; g9 as y acquires, then writes | y refused both times; x acquiring again succeeds; x's write stands |
 | fenced | a first write acquires | g3 acquires an empty slice, writes {a:1}; g2 writes | g2 refused; a:1 |
 | fenced | the next attempt replaces what a dead writer left | g1 writes {a:1}; g5's patch of c lands, then g5 dies; g9 acquires, replaces with {a:2, b:1}; g5 patches again | a:2, b:1 (c gone); g5 refused |
+| fenced | a scope says which keys it holds | g1 writes {a, b, é, B}; g5's patch of c lands, then g5 dies | `keys(ref, None)`: B, a, b, c, é (by bytes); among given keys, only those held |
 | fenced | a newer writer waits for an open older one | g5's write transaction is open; g9 acquires | g9 waits until g5 commits, then takes the slice; g5's next write refused |
 
 The last scenario needs a hook only you can write: `Harness.hold(scope)`,
@@ -383,7 +398,7 @@ async def test_my_store_conforms(harness, scenario):
 
 `output(**decl)` must return a fresh output on your store each call
 (scenarios never share data), accepting the declarations the scenarios use:
-`key="id", revision="v"` (rows `{"id", "v"}` keyed by `id`),
+`key="id"` (rows `{"id", "v"}` keyed by `id`),
 `incremental=True` (batches of rows), or none. The scenarios drive the
 store as the engine does — keyed writes as `KeyedWrite`s resolved against a
 key index the kit keeps, keyed loads through `Keys` — and raise

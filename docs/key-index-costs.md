@@ -33,8 +33,8 @@ column and under **Measured**, which compares the two.
 
 | Parameter | Value (model) | Measured (`bench/keys/results.md`) |
 |---|---|---|
-| Entry size | ~40 B raw (24 B key, 16 B version), ~20 B compressed | 29 B with filters on random ids with 16-byte row digests; 51 B on UUIDs; 24 B on sequential ids, 11 B with short revisions |
-| Filters | per file, a Bloom filter of keys and one of `(key, version)` pairs, 14 bits per item each (~3.5 B per entry); 0.2% false positives per check | 3.5 B per entry; 0.35% false positives per check |
+| Entry size | ~40 B raw (24 B key, 16 B version), ~20 B compressed | format v3 (`versions.md`), a generation per entry and no content version: 8–9 B with filters on random ids; 34 B on UUIDs; 6 B on sequential ids. A source's 16-byte versions add ~18 B (27 B on random ids) |
+| Filters | per file, a Bloom filter of keys and one of `(key, version)` pairs, 14 bits per item each (~3.5 B per entry); 0.2% false positives per check (the model, before format v3) | two filters, keys and tombstones: 1.75 B per entry; 0.35% false positives per check |
 | Block | 64 KB raw, ~1,640 entries, ~32 KB compressed | ~2,400 entries, ~60 KB compressed on random ids |
 | Compacted file cap | 64 MB | files split at ~95 MB compressed |
 | Level structure | level 0: up to 8 delta files; deeper levels 10× apart (about 4 levels at 100M keys); upper levels ≈ 11% of the bottom level | 3 levels at 100M; level 0 merges in itself until it holds a tenth of level 1 |
@@ -54,18 +54,20 @@ but not bottom-level blocks.
 
 ## How the filters work
 
-A commit needs to know, for each written `(key, version)`, whether it is a
-real change. Every index file carries two Bloom filters: one of its keys,
-one of its `(key, version)` pairs. A Bloom filter answers "definitely not
-present" or "maybe present".
+Every key written is a change (`versions.md`), so a commit needs the
+index only to tell new keys from existing ones — the count — and to find
+a source key's version to compare. Every index file carries two Bloom
+filters: one of its keys, one of its deleted keys. A Bloom filter answers
+"definitely not present" or "maybe present".
 
-- A pair that is **definitely absent** from every file that could hold the
-  key is a real change: the key's current `(key, version)` is always
-  present in some file, so this can't be it. No block is read.
-- A pair that is **maybe present** — an unchanged rewrite, or a false
-  positive — gets the exact block lookup.
-- The key filter tells new keys from existing ones for the key count, and
-  lets exact lookups skip files that don't hold the key.
+- A key **no key filter** of any file that could hold it matches is new.
+  No block is read.
+- A key some key filter matches and **no tombstone filter** does is live:
+  an update. No block is read — unless the write carries a payload (a
+  source's version), which only the entry can be compared with.
+- Anything else — a key that may be deleted, a false positive, a
+  version to compare — gets the exact block lookup, which also lets
+  lookups skip files that don't hold the key.
 
 The **key count** becomes "exact after each recount, and within the
 filters' false-positive rate in between": a new key that a key filter
@@ -102,12 +104,13 @@ steady state cost ~$14.40–14.60 at 1.5 s per commit; it now takes 0.8 s.
 
 Where the model was wrong:
 
-- **Entries are bigger than assumed**: 27–29 B with filters on random
-  12-digit ids, 51 B on UUIDs, 24 B on sequential ids (prefix compression),
-  and 11 B on sequential ids with short declared revisions. A row digest is
-  16 bytes; until 2026-09-30 it was a 64-character SHA-256 hex digest, which
-  made those 68.5 B, 91 B and 63 B. Sizes and transfer scale accordingly;
-  request counts barely move.
+- **Entries were bigger than assumed** while they carried a content
+  version: 27–29 B with filters on random 12-digit ids, 51 B on UUIDs,
+  24 B on sequential ids. Format v3 (`versions.md`) drops the content version and
+  the pair filter: 8–9 B on random ids, 34 B on UUIDs, 6 B on sequential
+  ids, with ~18 B more for a source's 16-byte versions. Sizes and
+  transfer scale accordingly; request counts barely move, except a cold
+  source commit with versions, which reads every touched key's entry.
 - **Filters false-positive 0.35% of the time**, not 0.2%: keeping an
   item's 10 bits inside one 512-bit block costs ~1.8× over independent bits.
 - **Compaction rewrote far more than assumed** while every level-0 merge

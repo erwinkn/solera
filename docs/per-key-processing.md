@@ -10,8 +10,8 @@ text. It adds an `Each` edge (an asset written
 for one key, run over every changed key), keys that hold many rows,
 per-key outcomes with user-classified errors, key patterns on edges, and
 observable sources. It builds on the engine cache, the HTTP resolver,
-engine-served reads of `resolved-commits.md`, the canonical row digest of
-`row-digest.md`, and on the worker → engine HTTP channel and attempt
+engine-served reads of `resolved-commits.md`, the versions of
+`versions.md`, and on the worker → engine HTTP channel and attempt
 objects of `lifecycle.md` (being written): `{attempt}.spec`, the
 `{attempt}.worker` invocation claim, `{attempt}.result`, and the
 `{attempt}.writing` fence.
@@ -53,7 +53,8 @@ An asset declares how to process **one key**; `Each` runs it over every
 changed key of a keyed upstream, `concurrency` at a time, `page_size` keys
 per attempt, and hands each output's store one `Patch({key: value})`.
 Every key is a group: it holds all the rows that carry it, one or many,
-and its version is a digest of the multiset of those rows. Errors raised for one key are classified by the
+and its version is the generation of the write that last wrote it
+(`versions.md`). Errors raised for one key are classified by the
 Solera exception the user's error subclasses — `Rejected`, `Failed`,
 `Transient`, `Abort` — and a key that did not succeed lands in the edge's
 **failure index**, a key index of its own, so it is visible, retried on a
@@ -61,15 +62,15 @@ bounded schedule, and never blocks the keys behind it. `include` and
 `exclude` patterns on an edge select keys by name; the worker evaluates
 them on every page it reads. A `Source` subclass with `observe()` is
 polled by a sensor and committed like the commit API. Throughout, the engine sees
-keys and revisions only.
+keys, generations and sources' versions only.
 
 ## 3. What the engine sees
 
 | Piece | Lives in | Knows |
 |---|---|---|
-| Key indexes, watermarks, the failure index, key patterns | engine | key strings, versions (opaque bytes), outcome classes |
+| Key indexes, watermarks, the failure index, key patterns | engine | key strings, generations, payloads (opaque bytes), outcome classes |
 | The per-key loop, concurrency, error classification | worker | a page of keys; each key's value is opaque |
-| Splitting a page into per-key values; turning a write into `(key, version)` rows; stamping the key column; replacing a key's rows | store | its own types |
+| Splitting a page into per-key values; reading a write's keys; stamping the key column; replacing a key's rows | store | its own types |
 | SharePoint, samples, what counts as unprocessable | user code | everything else |
 
 The keyed dictionary stays the one shape the core understands: `Each`
@@ -101,7 +102,7 @@ def sharepoint_events(ctx, graph: GraphClient):
 
 @asset(
     outputs=Output("sharepoint_files", store="postgres", schema="sharepoint",
-                   key="path", revision="ctag", partition_column="site"),
+                   key="path", partition_column="site"),
     partitions=sites,
     inputs={"events": Incremental("sharepoint_events")},
     automations=AutoRefresh(),
@@ -164,7 +165,7 @@ Each(output=None, *, include=None, exclude=None, page_size=100, concurrency=16, 
 - **The parameter is one key's value**, loaded through the upstream store
   as part of a page: the worker asks `store.load(ref, dict[str, T],
   Keys(page))` and the store splits the page by key. `ctx.key` and
-  `ctx.revision` name the key and its upstream version.
+  `ctx.generation` name the key and its upstream version.
 - **`page_size`** is keys per attempt, which is keys per commit: it bounds
   how much work a crash throws away. **`concurrency`** is keys in flight
   within an attempt: a semaphore for an `async` function, a pool of
@@ -286,24 +287,11 @@ Uniqueness inside a group is the store's business (`primary_key`).
 as written. An index has one entry per key: 3,000 files of 200,000 rows
 are 3,000 entries.
 
-**The version of a key** is one rule, the group production of the
-canonical digest grammar (`row-digest.md`), so Python and Arrow
-input agree and the definition is versioned with the grammar:
-
-```
-group(rows) = XXH3-128( grammar header ‖ "G" ‖ varint(n) ‖ sorted(row(r₁) … row(rₙ)) )
-row(r)      = the canonical 16-byte row digest of r without the key column
-```
-
-| Case | Version |
-|---|---|
-| the same rows in another order | the same: a group is a multiset, as a table is |
-| a row duplicated | different: a multiset counts |
-| the key column present or not in the returned rows | the same: it is excluded |
-| a key with one row | `group([row])` — the same rule, no special case |
-| a key given no rows (`Patch({k: []})`, or an `Each` call returning none) | no version: a key with zero rows does not exist, so the patch removes it (a replacement simply leaves it out) |
-| a declared `revision=` column | its value, verbatim, which every row of the group must share; else a write error |
-| a `keyed=True` output | the canonical digest of its one value (it holds values, not rows) |
+**The version of a key** is the generation of the write that last wrote
+it (`versions.md`): every key a write gives rows is a change, whatever
+the rows; nothing hashes them. A key given no rows (`Patch({k: []})`, or
+an `Each` call returning none) does not exist, so the patch removes it (a
+replacement simply leaves it out).
 
 "Processed, produced nothing" is not output content: a key's existence is
 its rows. That a key was processed is recorded by its outcome
@@ -311,35 +299,28 @@ its rows. That a key was processed is recorded by its outcome
 the index and every store hold only keys with rows, so no store has to
 tell an empty group from an absent key — a table cannot.
 
-The byte grammar — row digests, the group production, its header and
-version — is specified next to the native code in `row-digest.md` (being
-written with `Rows` grouping); this section states only what stores and
-the engine rely on, and the two must stay in agreement. Moving one-row keys from a row digest to `group([row])` changes
-every existing version once, together with the grammar's own version.
-
 ## 7. A write is read once, and stays columnar
 
-A keyed write feeds the key index its `(key, version)` entries, and its
-store the groups of the keys that changed. Its store reads it once —
+A keyed write feeds the key index its keys, and its store the groups of
+the keys it writes. Its store reads it once —
 `Store.prepare(write, output) -> Prepared`, for the types the store takes;
 by default `solera.stores.prepare`, plain Python — after the producer returns and before
 anything resolves or writes, and that one reading is carried through
 resolution, repair and storage:
 
 - `rows`, native `Rows`: keys read in place from Arrow or packed once,
-  sorted, each the group of the rows that carry it, versions computed
-  natively — never a per-key Python object, which keeps 100M keys under
+  sorted, each the group of the rows that carry it — only the key of a
+  row is read, never a per-key Python object, which keeps 100M keys under
   1 GB (`key-index-costs.md`). Rows are read, not used up: the
-  resolution's join, the engine's request, a patch's `SortedRun` and the
-  store's version (`Rows.digest`, every key and version) read the same ones.
+  resolution's join, the engine's request and a patch's `SortedRun` read
+  the same ones.
 - `take(indices)`: the write's rows as the store persists them, from the
-  same reading that was hashed, so what is stored digests as it was
-  hashed. Asked to write some keys, a store takes only their groups
+  same reading. Asked to write some keys, a store takes only their groups
   (`Prepared.groups`, from `Rows.find`'s row indices): a 100K-row
   DataFrame with one changed key reads one group.
 
-The store gets a `KeyedWrite`: the prepared write, the keys to write each
-at the version the index will hold, the keys to delete, whether it is the
+The store gets a `KeyedWrite`: the prepared write, the keys to write, the
+keys to delete, whether it is the
 scope's whole content, and the producer's `value` for a store that writes
 it as it is.
 
@@ -356,32 +337,23 @@ The framework knows no DataFrame or Arrow type: the default reads plain
 Python, and a store taking more reads it itself — FileStore, S3Store and
 PostgresStore through `solera.stores.frames`, which imports a library only
 for a value of its own type. A worker whose outputs are lists of dicts
-imports neither pandas, pyarrow nor DuckDB. A store adds the columns it stamps on every row with
-`stamped(output)`, which a row's digest leaves out (PostgresStore's
-partition column).
+imports neither pandas, pyarrow nor DuckDB.
 
-**`Sql` writes have two paths**, because the rows never pass through the
-worker (built; the `md5` per-row versions are gone):
+**`Sql` writes** never pass through the worker: once the statement has
+written, the store reports the keys the slice holds (`keys(ref, None)`,
+`SELECT DISTINCT key … ORDER BY key` through a server-side cursor), and
+the harness replaces the index with them, every key at the attempt's
+generation. No row is read back.
 
-| Output declares | The store reports | Versions |
-|---|---|---|
-| `revision="col"` | `SELECT key, col … ORDER BY key` through a server-side cursor | native code checks that every row of a key carries the same value, else a write error; the version is that value's text (`row-digest.md` § Revisions) — the same rule as rows from Python or Arrow |
-| no `revision` | the written rows themselves, typed, in key order (`SELECT * … ORDER BY key` through a cursor; PostgresStore hands over chunks of row mappings, since pyarrow is not a runtime dependency — Arrow chunks are accepted too) | the same canonical row digests and group production as any other write, computed natively |
-
-The first path is the cheap one: one short value per row. The second
-reads back every written row, which a large `Sql` replacement pays in
-transfer; declaring a revision column avoids it.
-
-- `Rows` is the only currency: an opaque native handle of keys and
-  versions, sorted and grouped natively. Neither the worker nor the
-  engine sees a row.
+- `Rows` is the only currency: an opaque native handle of keys, sorted
+  and grouped natively. Neither the worker nor the engine sees a row.
 - **Grouping is native**: `Rows` sorts by key with the existing
-  permutation, digests rows in parallel, and folds each run of equal keys
-  into `group(…)`; a key given no rows is no key at all.
-- **Patches move off `key_map`** onto the same `Rows` (removes as a packed
-  key list). That is also what the HTTP resolver needs — the worker's
-  sorted run of `(key, version, deleted)` — so one path serves
-  replacement, patch, resolve and merge-join.
+  permutation and folds each run of equal keys into one group; a key
+  given no rows is no key at all.
+- **Patches** use the same `Rows` (removes as a packed key list). That is
+  also what the HTTP resolver needs — the worker's sorted run of `(key,
+  payload?, deleted)` — so one path serves replacement, patch, resolve
+  and merge-join.
 - **The only per-key Python objects are an `Each` page's**: a
   `dict[key, value]` of at most `page_size` entries.
 
@@ -469,24 +441,25 @@ identity. `resolved-commits.md` and `lifecycle.md` refer here, and the
 SDK holds one implementation that the engine and the worker call — the
 engine's start reads run the worker's own code.
 
-**An entry** is `key → version`, the version packing what a retry needs:
+**An entry** is `key → payload`, the entry's payload (`key-index-format.md`)
+packing what a retry needs:
 
 ```
 outcome u8 · tries varint · epoch varint · forced varint · since varint · last varint · next_at varint
-       · until varint · revision (len, bytes) · message (len, ≤ 200 bytes)
+       · until varint · upstream varint · message (len, ≤ 200 bytes)
 ```
 
 | Field | |
 |---|---|
 | `outcome` | rejected, failed, retrying, canceled, timed out (the last two are interrupted keys, §5) |
-| `tries` | calls at this `revision`; a varint, since a record can outlive any fixed width |
+| `tries` | calls at this `upstream`; a varint, since a record can outlive any fixed width |
 | `epoch` | the project revision number (§13) the last try ran under, copied from the spec |
 | `forced` | the position of the latest forced request the last try ran under (below), copied from the spec; 0 if none |
-| `since` | first failure at this `revision` |
+| `since` | first failure at this `upstream` |
 | `last` | time of the last try: display only |
 | `next_at` | when a retrying or timed-out key is due: scheduling only |
 | `until` | when a retrying key turns failed: `since + retry_for` |
-| `revision` | the upstream version that failed |
+| `upstream` | the generation of the upstream key that failed: its version |
 | `message` | class and message of the last error |
 
 A key that succeeds, is removed upstream, or leaves the edge's patterns
@@ -509,7 +482,7 @@ intents, and an attempt that never commits leaves it as garbage.
 |---|---|
 | none → ok | nothing |
 | any → ok, removed, or unmatched | tombstone |
-| none, or a record at another `revision` → not ok | a fresh record: `tries = 1`, `since = last = now` |
+| none, or a record at another `upstream` → not ok | a fresh record: `tries = 1`, `since = last = now` |
 | retrying → `Transient` again | `tries + 1`, `since` and `until` kept, `next_at` by backoff or `retry_after`; failed once `now ≥ until` |
 | failed or rejected → the same class again | `tries + 1`, `last` updated |
 | any → interrupted by a cancel | `canceled`, `tries` unchanged, no `next_at` |
@@ -641,9 +614,9 @@ last. Neither starves and there is no fraction to tune: a retry storm of
 stopping them. When only one kind is pending, every page is that kind.
 
 A retry-eligible key whose upstream has changed since it failed is skipped
-by the retry page — the worker compares the entry's `revision` with the
-pinned upstream index — and arrives with the change window instead, so it
-is processed once, at its new revision.
+by the retry page — the worker compares the record's `upstream` with the
+key's generation in the pinned upstream index — and arrives with the
+change window instead, so it is processed once, at its new generation.
 
 **Bounds.** State is constant per scope. A systemic failure of 1M keys is a
 1M-entry index on the object store, compacted like any other. Each page
@@ -661,7 +634,7 @@ processed:
 |---|---|
 | `run`, `attempt` | `attempt` holds `attempts.id`, as `materializations.attempt` and `lineage.attempt` do |
 | `asset`, `scope`, `key` | |
-| `revision` | the upstream version it processed |
+| `generation` | the upstream key's generation it processed: its version |
 | `outcome` | `ok`, `rejected`, `failed`, `retrying`, `removed` |
 | `error` | class and message |
 | `duration` | seconds in the call |
@@ -818,7 +791,7 @@ class Feed(Source):
 | `observe()` returns | The sensor's `Tick` |
 |---|---|
 | `str` | `Commit(name, version=…)` |
-| `dict[str, str]`, or Arrow data with key and revision columns | `Commit(name, keys=…)`: the full map |
+| `dict[str, str]`, or Arrow data with key and version columns | `Commit(name, keys=…)`: the full map, each key at its version |
 | `Observed(upsert, remove, cursor)` | `Commit(name, upsert=…, remove=…)` and `cursor=` |
 | `None` | nothing |
 
@@ -952,7 +925,9 @@ is below the current one.
 **Harder.**
 
 - The canonical digest grammar must define the group production, which
-  is now every key's version, and be versioned (§6) — done, `row-digest.md`.
+  is now every key's version, and be versioned (§6) — done, then
+  superseded: a key's version is a generation (`versions.md`), and the
+  grammar is gone.
 - `Rows` must group natively, and patches must move onto `Rows` (§7).
 - The watermark gains two positions: the rescope drain (§11) and the retry
   pass (§9).
@@ -981,9 +956,9 @@ is below the current one.
 
 | Work | What this proposal needs from it |
 |---|---|
-| Key index (`object-store-state.md` §6) | No format change. A new kind of index (`keys/@{asset}/{scope}/`, the failure index) compacted like the others; `Rows` groups every key (§6), read once as the prepared write (§7) with the digest grammar; patches build `Rows`. |
+| Key index (`object-store-state.md` §6) | No format change. A new kind of index (`keys/@{asset}/{scope}/`, the failure index) compacted like the others; `Rows` groups every key (§6), read once as the prepared write (§7); patches build `Rows`. |
 | Engine cache (`resolved-commits.md`) | New readers: retry pages, read at `start`, in v1; pattern counts at commit and failure-summary recomputation later. No new cached content beyond failure indexes. |
-| HTTP resolver (`resolved-commits.md`) | Each pages' output deltas are small resolves when the index is admitted; failure deltas are resolved locally, not by the resolver (§9 here is authoritative for the record, transitions, eligibility, pass state and forced-request identity; the engine's start reads run the same SDK functions, and its v1 has no pattern hints or summary recomputation); the worker uploads both. A sensor's full key map is resolved in-process (small) or on the host (big), not through an attempt's resolve. The grammar gains the group production. |
+| HTTP resolver (`resolved-commits.md`) | Each pages' output deltas are small resolves when the index is admitted; failure deltas are resolved locally, not by the resolver (§9 here is authoritative for the record, transitions, eligibility, pass state and forced-request identity; the engine's start reads run the same SDK functions, and its v1 has no pattern hints or summary recomputation); the worker uploads both. A sensor's full key map is resolved in-process (small) or on the host (big), not through an attempt's resolve. |
 | Attempt lifecycle (`lifecycle.md`) | The cancel record (§2.2) and write-completion evidence (§2.3), authoritative there; the two-phase cancel of §7, which §5 follows; live per-key events and key-tagged logs; per-key outcomes in `.result`. Sensors (§11) carry observable sources: `Source.observe` declares one. |
 
 ## 17. What changes in the code
@@ -991,7 +966,7 @@ is below the current one.
 - `python/solera/sdk.py`: `Each`; `include`/`exclude` on `Incremental`;
   `Output(meta=…)`; `Rejected`, `Failed`, `Transient(retry_after,
   retry_for)`, `Abort`, `Project(errors=…)`; `Source.observe` as a sensor, `Observed`;
-  `ctx.key`, `ctx.revision`, `ctx.keys(output, prefix=)`; the revision from
+  `ctx.key`, `ctx.generation`, `ctx.keys(output, prefix=)`; the revision from
   a build identity; `code_hash` removed.
 - `python/solera/stores.py`: `Patch({key: value})`; `prepare` and
   `Prepared`; no duplicate-key error.
@@ -1017,12 +992,9 @@ is below the current one.
 
 - `Each` delivers exactly what an equivalent batch asset returning
   `Patch({key: …})` writes, over random pages, deletes and failures.
-- Group versions: invariant under row order and key-column presence,
-  sensitive to duplicates; flat rows and the by-key form give the same
-  versions; Python and Arrow input give the same digests; a key given no
-  rows is removed; both `Sql` paths give the versions a Python or Arrow
-  write of the same rows gives, and a group with mixed revisions is a
-  write error.
+- Groups: flat rows and the by-key form write the same keys; a key given
+  no rows is removed; a `Sql` write's keys are the slice's. (Group
+  versions were tested here until `versions.md` replaced them.)
 - Each error class in and out of the per-key call; `errors=` mapping;
   `Transient` turning failed after its `retry_for`; failed keys retried
   once per epoch and never more.

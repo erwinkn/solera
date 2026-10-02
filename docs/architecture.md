@@ -10,7 +10,8 @@ normative for their parts: `object-store-state.md` (engine state, the key
 index, attempt files, run history, retention), `lifecycle.md` (attempts,
 the worker channel, store kinds, sensors), `per-key-processing.md` (`Each`,
 error classes, build identity), `resolved-commits.md` (the engine's
-resolver), `key-index-format.md` and `row-digest.md` (the byte formats).
+resolver), `versions.md` (what a key's version is), `key-index-format.md`
+(the byte format).
 `example/brimstone.py` is the reference example. Sections: 1 Model · 2 Assets
 · 3 Refs · 4 Stores · 5 Inputs · 6 Incrementality · 7 Partitions · 8 Runs ·
 9 Automations · 10 Execution · 11 Registration · 12 Later and non-goals.
@@ -23,8 +24,8 @@ Three rules:
    partition)`, the committed ref and its metadata, plus cursors, per-edge
    watermarks and automation state. It never moves, parses or interprets
    payloads. The one value-derived thing it keeps is each keyed output's
-   **key index** (§6): `(key, version)` entries in a format it defines,
-   computed by the harness.
+   **key index** (§6): per key, the generation that last wrote it, in a
+   format it defines, computed by the harness.
 2. **Stores own data semantics.** Where an output lives, how a write
    applies, how a load materializes, how writes stay correct under replay.
    Core defines no write semantics: a bare return value is a full
@@ -35,9 +36,12 @@ Three rules:
    partitions is a property of `inputs=`. What an output *exposes* (its
    declared key) is the output's; how it is consumed is the edge's.
 
-Corollary: **`changed` means "the committed ref's `version` changed"** and
-nothing else fires downstream work. A poll that produces identical content
-yields an identical version, no changed ref, and wakes nothing.
+Corollary: **`changed` means "the committed ref's generation changed"**
+and nothing else fires downstream work. A ref's generation is that of the
+write that made it (`versions.md`): writing is changing. A poll that finds
+nothing new writes nothing — an empty `Patch`, or the output left out of
+its `Result` — and wakes nothing; a source whose keys carry versions (an
+etag) commits only the keys whose version moved.
 
 | Term | Meaning |
 |---|---|
@@ -45,12 +49,12 @@ yields an identical version, no changed ref, and wakes nothing.
 | **output** | A named slot on a store. The thing with heads. |
 | **scope** | One partition key of an asset, or `""` when unpartitioned. |
 | **head** | The committed ref of `(output, scope)`. |
-| **ref** | A self-contained pointer into a store, with a version (§3). |
+| **ref** | A self-contained pointer into a store, with the generation that wrote it (§3). |
 | **commit** | The atomic transaction installing an attempt's result: heads, lineage, cursor, watermarks, key index deltas. |
 | **run** | A request to materialize targets. It plans **tasks**, one per `(asset, scope)`. |
 | **attempt** | One execution of a task. |
 | **cursor** | Per-scope JSON state the producer sets and receives back (§6). |
-| **key index** | The `(key, version)` entries of a keyed output's `(output, scope)`: an engine-owned log-structured index, one delta file per commit that changes it (§6, object-store-state.md §6). |
+| **key index** | The `(key, generation)` entries of a keyed output's `(output, scope)`: an engine-owned log-structured index, one delta file per commit that changes it (§6, object-store-state.md §6). |
 | **placement** | Where an attempt runs: a typed request built from a named, project-level executor (§10). |
 
 Three processes:
@@ -95,23 +99,28 @@ async def qaqc_samples(ctx, qaqc_files: pd.DataFrame, sharepoint): ...
 Resources (`Project(resources={...})`) bind by parameter name. `ctx` is
 reserved and optional.
 
-**`Output(name=None, store=None, key=None, revision=None, incremental=None,
+**`Output(name=None, store=None, key=None, incremental=None,
 migrations=(), **config)`** declares a slot: registry key (defaults to the function name
 when the asset has one output), store (default: the project's `default_store`, a `FileStore`), and
 store-specific config validated by `can_store` at registration.
 
 | Arg | Meaning |
 |---|---|
-| `keyed` | The output is a `dict[str, Any]`: its keys are the keys, its values the content. Excludes `key` and `revision`. |
+| `keyed` | The output is a `dict[str, Any]`: its keys are the keys, its values the content. Excludes `key`. |
 | `key` | Column identifying what was materialized. Declared once, here; consumers never name columns. A key holds every row that carries it — one, or the many rows parsed from one file. Independent of `primary_key` (storage identity). |
-| `revision` | Column that changes when a key's content changes; a key's rows must share it. Absent: a 16-byte digest of the key's rows (`row-digest.md`). |
 | `incremental` | The output commits in engine-numbered batches: a keyed output's changes land in its key index (object-store-state.md §6), an unkeyed one's batches in its store; `Incremental()` consumers read what arrived after their watermark. `key=` implies it. Default false — a value output is one object per version. |
 | `migrations` | Ordered `Migration(name, payload)` list owned by this output. The store applies pending ones before its first write to the output in an attempt (§4). Payload type is store-defined (`can_store`). The applied set travels in the handle (§3) and the declared list is in the fingerprint (§6). |
 | `**config` | Store-specific: `schema`, `primary_key`, `columns`, `indexes`, `partition_column`, … |
 
+A key's version is the generation of the write that last wrote it
+(`versions.md`): every key an attempt writes is a change, and nothing
+hashes its rows. A producer whose consumers should not wake writes
+nothing — a `Patch` of what changed, or an output left out of its
+`Result`.
+
 **`PartitionSet(name=None)`** is an `Output` whose value *is* a list of
-partition keys: default store, each element is its own key, revision =
-presence. It is how an asset produces a partition set (§7); it is distinct
+partition keys: default store, each element is its own key, and its
+presence is all it holds — listing an element again changes nothing. It is how an asset produces a partition set (§7); it is distinct
 from `key=`, which is about incremental consumption. Under `sources=` a `PartitionSet(name)` is fed
 from outside through the commit API (§5).
 
@@ -145,8 +154,8 @@ class Ref:
     output: str  # output name — lineage
     store: str  # store registry key
     handle: Any  # store-defined coordinates, JSON
-    version: str  # deterministic change token
     partition: str  # scope this ref is the head for
+    generation: int  # of the write that made it: its version
     meta: dict  # engine-defined: {"keys": {"object", "count"}, "external": bool}
 ```
 
@@ -155,8 +164,8 @@ class Ref:
   conveniences over the same wire form: `TableRef.table`,
   `TableRef.where`, `TableRef.sql()`.
 - **Self-contained.** A historical ref resolves without current store
-  config: everything `load` needs (table, partition slice, key and revision
-  columns, newest batch, the last applied migration as `schema`) is in the
+  config: everything `load` needs (table, partition slice, key column,
+  newest batch, the last applied migration as `schema`) is in the
   handle. Credentials never appear; `env:`
   indirection only.
 - **By reference.** Annotating an input with a `Ref` subclass hands the
@@ -170,36 +179,32 @@ class Ref:
 
 ### Version
 
-`version` is a deterministic function of `(prior.version, write)`, computed
-by the store before the write:
-
-| Write | Version |
-|---|---|
-| bare value | `H(payload)` — the store defines `H` per accepted type |
-| `Patch` | `H(prior.version ‖ H(op))` |
-| no-op (zero rows, zero keys) | `prior` unchanged |
-
-Replay-stable without hashing tables. Accepted imprecision: a `full` run or
-converging incremental writes may give different versions for identical
-content (over-eager, never wrong).
+A ref's version is its `generation`: the generation of the attempt that
+wrote it (its claim's event position, `lifecycle.md` §9.7), or a source
+commit's. A store builds refs without one and the worker stamps the
+attempt's; a store that wrote nothing returns its prior ref, and the head
+stands. A keyed output's keys carry their own generations in its key index
+(`versions.md`). Nothing hashes content: a write of identical content is
+a new version, which its consumers read again (accepted: over-eager,
+never wrong).
 
 ### What a read sees
 
-A run pins the versions it reads; whether a load returns exactly those
+A run pins the generations it reads; whether a load returns exactly those
 depends on the store's kind (`lifecycle.md` §9.6). There is no setting:
 it is what each kind can promise.
 
 - **Snapshot: FileStore and S3Store** (`immutable`). Every object is
   written once under a name no other attempt uses, so a load returns
   exactly the pinned version: a keyed load names its objects from the
-  pinned index's `(version, locator)`, a value its head's object, a batch
+  pinned index's generations, a value its head's object, a batch
   range the committed object of each batch. A newer commit does not
   change what a pinned reader sees; superseded objects stay until no
   reader pin predates them.
 - **Current data: PostgresStore and every `fenced` store.** One copy per
   row, changed in place: a load returns the rows as they are now. A consumer pinned to
-  version 12 that loads after version 13 committed reads version 13's
-  rows, so one run can see different outputs at different moments. An
+  generation 12 that loads after generation 13 committed reads generation 13's
+  rows, and lineage records 13 (`versions.md` §6), so one run can see different outputs at different moments. An
   `Incremental` edge still delivers the keys of its pinned window; a row
   changed since is read in its newer form (and delivered again with the
   window that changed it: a harmless repeat), and a row deleted since may
@@ -209,7 +214,7 @@ it is what each kind can promise.
 **Keyed outputs.** Stores keep no key maps: the engine's key index does
 (§6). The harness has a keyed write read once — by its store's `prepare`,
 or the default — and hands the store a `KeyedWrite`: the keys it changes,
-each to the version the index will hold, and the keys it removes, so a
+and the keys it removes, so a
 store reads and touches only those; a first write's or a `full` run's
 (`scope.reset`) is the slice's whole content. An
 unkeyed incremental output is a sequence of engine-numbered batches —
@@ -226,14 +231,15 @@ class Store(Protocol):
     async def store(self, write: Any, prior: Ref | None, scope: Scope) -> Written: ...
     async def load(self, ref: Ref, t: type, selection: Keys | Batches | None) -> Any: ...
     async def migrate(self, output: Output, migrations: Sequence[Migration], scope=None, prior=None) -> list[str]: ...  # optional
+    def keys(self, ref: Ref, among: Collection[str] | None) -> Iterable[list[str]]: ...  # fenced stores
 
 Scope   = (output: Output, partition: str, batch: int | None, attempt: str | None, reset: bool,
            generation: int | None, invocation: str | None)
 Prepared   = (output, rows: Rows, take: Callable, patch: bool, removes)  # a keyed write, read once
-KeyedWrite = (prepared: Prepared, upserts: Mapping[str, bytes] | DeltaKeys | None,
+KeyedWrite = (prepared: Prepared, upserts: Collection[str] | DeltaKeys | None,
               removes: frozenset[str], whole: bool, value: Any)  # what a keyed output's store gets
 Written = (ref: Ref, keys: Iterable | None)   # keys: only for Sql writes the harness never sees as rows
-Keys    = (revisions: Mapping[str, bytes])  # revisions as the key index holds them
+Keys    = (generations: Mapping[str, int])  # the generation that last wrote each key
 Batches = (lo: int, hi: int)  # load rows of batches in [lo, hi]
 ```
 
@@ -241,7 +247,7 @@ Batches = (lo: int, hi: int)  # load rows of batches in [lo, hi]
 |---|---|
 | `can_load(t, selection)` | Registration. Can you produce `t`, filtered by `Keys` when `selection` is given? `can_load(R, None)` for a `Ref` subclass `R` means "are your refs `R`". |
 | `can_store(t, output)` | Registration. Can you take values of type `t` for this `Output` declaration, and extract its declared key from them? `t` is `None` when the producer is unannotated. |
-| `store(write, prior, scope)` | Apply the write; return the new ref (version per §3). `scope.batch` is the engine-assigned batch number. A keyed output's `write` is a `KeyedWrite`, which a store reads four ways: `whole` (clear the scope first), `removes`, `pages()` — the keys to write a page at a time, each with its version and group, only that page taken from the write (`iter_pages()` for a store writing on a thread of its own) — and `version(prior)`; `value` is what the producer returned. `prior` is the committed head, where the content is; on a `full` run `scope.reset` says nothing of it is kept. Duplicate keys are a write error. For `partition_column` outputs, stamp the column with `scope.partition` and reject rows that disagree. |
+| `store(write, prior, scope)` | Apply the write; return the new ref (the worker stamps its generation, §3). `scope.batch` is the engine-assigned batch number. A keyed output's `write` is a `KeyedWrite`, which a store reads three ways: `whole` (clear the scope first), `removes`, and `pages()` — the keys to write a page at a time, each with its group, only that page taken from the write (`iter_pages()` for a store writing on a thread of its own); `value` is what the producer returned. `prior` is the committed head, where the content is; on a `full` run `scope.reset` says nothing of it is kept. Duplicate keys are a write error. For `partition_column` outputs, stamp the column with `scope.partition` and reject rows that disagree. |
 | `load(ref, t, selection)` | Materialize `t` from what the store holds now; under `Keys`, only the selected keys; under `Batches`, only batches in the range. |
 | `migrate(output, migrations)` | Optional. Apply, in declared order, every migration not yet in the store's own ledger for this output; return the applied names. Must be safe under concurrent attempts of one output (partitions share tables): take a store-level lock and re-read the ledger inside it. Where the backend is transactional, a migration and its ledger row commit together. A store without `migrate` rejects `migrations=` at registration. |
 
@@ -253,9 +259,9 @@ scenarios `solera.testing.stores` checks. Optional: `prepare(write, output) -> P
 keyed write of the types the store takes is read: its rows, natively, and
 how to take the rows it persists. The framework knows plain Python only
 (the default, `solera.stores.prepare`); DataFrames and Arrow are a store's
-to read (`solera.stores.frames`), and its `can_store` says what it takes; `stamped(output)` and `scan(ref, output, skip)` —
-the columns the store adds to every row, left out of their digests, and
-how a `Sql` write's rows are read back (row-digest.md); `shared_table`
+to read (`solera.stores.frames`), and its `can_store` says what it takes; for a
+fenced store, `keys(ref, among)` — the keys a slice holds, never a value,
+which a repair and an unknown `Sql` write's reconciliation ask (`versions.md` §5); `shared_table`
 — one table for every partition, so a partitioned output needs a
 `partition_column` (§3).
 
@@ -309,7 +315,7 @@ Secrets travel via `env:` indirection in store and resource config, resolved
 in the harness. The manifest records each store's name and `Store.version`
 (a class attribute, default `"1"`), not its construction config: a DSN or a
 grants list is deployment, not definition. Bump `version` when write, load,
-key extraction or the version recipe changes; it bumps the project revision
+or key extraction changes; it bumps the project revision
 and the interpretation fingerprint (§6) of every asset that reads or writes
 through the store. A store must keep resolving handles written by its
 earlier versions.
@@ -378,13 +384,13 @@ exist, like `AllPartitions` (§7).
 `Source(name, store=None, key=None, **handle)` declares an output with no
 producer. With a store it loads like any input; without one it is a lineage
 pointer. At registration it gets a synthesized head `{output, store,
-handle: {name, **handle}, version: digest(handle), meta.external: true}`,
+handle: {name, **handle}, meta.external: true}`,
 so pinning and fingerprinting are uniform.
 
 The **commit API** advances a source without moving data:
 
 ```python
-client.commit("pmpt_project_matrix", version="2026-09-18T21:57Z")  # unkeyed: new revision
+client.commit("pmpt_project_matrix", version="2026-09-18T21:57Z")  # unkeyed: new version
 client.commit("sharepoint_files", keys={"f1": "v3", "f2": "v1"})  # keyed: full map
 client.commit("sharepoint_files", upsert={"f1": "v4"}, remove=["f0"])  # keyed: patch
 client.commit("uploads", upsert=["u-91"], remove=["u-12"])  # PartitionSet: patch the set
@@ -392,9 +398,11 @@ client.commit("uploads", upsert=["u-91"], remove=["u-12"])  # PartitionSet: patc
 ```
 
 For a keyed source the server applies the commit as one delta batch against
-the source's key index and derives `version` from the result, so an identical
-map is not a change. `upsert` inserts a key or replaces its
-revision; `remove` deletes it.
+the source's key index, at a generation of its own (`versions.md` §2): a key
+given the version its entry holds is unchanged, so an identical map is not
+a change; a key given no version (a list) is always one. `upsert` inserts
+a key or replaces its version; `remove` deletes it. An unkeyed source's
+version is kept on its head; the same one again is no commit.
 
 A keyed source, or a `PartitionSet` listed under `sources=`, is consumable
 via `Incremental` and usable as a partition set (§7) exactly like a keyed
@@ -419,8 +427,8 @@ class Landing(Source):  # an observable source: sugar for a sensor `landing.obse
 Project(sources=[Landing("landing", key="id", observe=Every(300), bucket="in")], sensors=[new_uploads])
 ```
 
-`observe()` returns a version (`str`), a full key map, `Observed(upsert,
-remove, cursor)`, or `None`. A cursor asset (§6) still suits a poll whose
+`observe()` returns a version (`str`, for an unkeyed source), a full key
+map `{key: version}`, `Observed(upsert, remove, cursor)`, or `None`. A cursor asset (§6) still suits a poll whose
 result is itself data.
 
 ## 6. Incrementality
@@ -435,9 +443,10 @@ stores the Graph delta token.
 **`Incremental`.** Every commit that changes an incremental output gets
 the next batch number (`head.batch`). A keyed output (or keyed source) has
 a **key index** — an engine-owned log-structured merge tree of `(key,
-version)` files (object-store-state.md §6): the harness compares each write
-with it, skips the store entirely when nothing changed, and otherwise writes
-the changed entries as the batch's delta file. An unkeyed output's batches
+generation)` files (object-store-state.md §6): the harness resolves each
+write against it, skips the store entirely when the write changes nothing
+(an empty patch, a set listed again), and otherwise writes the keys it
+writes and removes, at the attempt's generation, as the batch's delta file. An unkeyed output's batches
 are its store's; `head.base` is the first batch after its last reset. The
 engine keeps a per-edge **watermark** — the consumer's position: `next`,
 the first upstream batch not yet delivered, and while a delivery is under
@@ -463,9 +472,9 @@ and the console all ask that one question.
 The **interpretation fingerprint** `H(version, store versions of the
 asset's input and output stores, migration names of the asset's outputs,
 run config, and the non-incremental inputs and deps as output, scope and
-content version)` is stored on the watermark. Where an input's objects are
-is not part of it: a value written again with the same content, at a new
-object, is the same input. A fingerprint mismatch — a `version` bump, a new
+generation)` is stored on the watermark. A whole input written again, even
+with the same content, is a new generation, so it resets the edge
+(`versions.md` §7). A fingerprint mismatch — a `version` bump, a new
 migration, or a change to any whole input — forces `full=True` on the edge: the delivery
 resets to the whole head. Code changes alone do not: the build identity
 (§11) bumps the project revision, not the fingerprint.
@@ -884,7 +893,7 @@ project = Project(
 # or Project.from_package("brimstone.assets", ...)
 ```
 
-The manifest records assets (`outputs` with `{name, store, key, revision,
+The manifest records assets (`outputs` with `{name, store, key,
 incremental, migrations, config}`, `inputs`, `deps`, `partitions`, `placement`, `retries`,
 `timeout`, `version`, load types via `typing.get_type_hints`),
 sources, automations, store names with their `Store.version`, executors

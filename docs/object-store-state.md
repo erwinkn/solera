@@ -22,7 +22,7 @@ infrastructure.
   (`solera.objects.create`). Only different bytes are another writer's.
 - **One writer per namespace.** The engine's in-memory state is the source
   of truth; storage is written to, and read only when a writer starts.
-- **The engine owns keys; stores own rows.** Every key → version index,
+- **The engine owns keys; stores own rows.** Every key → generation index,
   for assets and external sources alike, is engine-defined (§6). Stores
   never compute deltas or keep key maps, so user-written stores need no
   key logic.
@@ -47,7 +47,7 @@ Everything lives under `{root}/{namespace}/`.
 | Gate | `runs/{run}/{attempt}.writing` | the worker about to write, or the engine ending the attempt — whichever is first | create-only | `gate_days` (30) after its run (§8) |
 | Engine heartbeat | `engine/alive.json` | engine, every 30 s while runs are live | overwritten | never (one object) |
 | Attempt log | chunks `runs/{run}/{attempt}.log.{n:06d}`, every 30 s or 1 MB; the end inside the result | worker | create-only, never joined | with its run |
-| Output data | store-defined (FileStore: `{output}/{partition}/{key}/{version}.{generation}.json` under `.solera/data`, §9) | the store, inside the harness | FileStore / S3Store: created once, never overwritten; others: store-defined | FileStore / S3Store: superseded or abandoned objects, by the scope's next attempt once no reader pin predates them (§9); never expired |
+| Output data | store-defined (FileStore: `{output}/{partition}/{key}/{generation}.json` under `.solera/data`, §9) | the store, inside the harness | FileStore / S3Store: created once, never overwritten; others: store-defined | FileStore / S3Store: superseded or abandoned objects, by the scope's next attempt once no reader pin predates them (§9); never expired |
 
 **Growth.** `control/` is bounded: at most two checkpoints plus the
 journal since the older one — and one fence segment per writer that ever
@@ -238,7 +238,7 @@ Example (abridged):
 {
   "seq": 1040, "writer": 1001, "revision": "c0ffee…", "manifest": {"…": "…"},
   "heads": {"site_files": {"alpha": {
-    "ref": {"output": "site_files", "store": "default", "partition": "alpha", "version": "8f35…",
+    "ref": {"output": "site_files", "store": "default", "partition": "alpha", "generation": 184467,
             "handle": {"mode": "keyed", "path": "site_files/alpha", "key": "path"}},
     "run": "01J8ZC7Q…", "attempt": "01J8ZC7R…",
     "batch": 57, "count": 4, "complete": true, "version": "1", "at": 1790074866.0}}},
@@ -270,17 +270,19 @@ by compaction, and by the server for key listings. The engine itself only
 holds each index's `KeyIndex` record.
 
 **Structure: a log-structured merge tree of sorted files.** Every file
-holds `(key, version, deleted, locator)` entries sorted by key — the
-locator is the generation that wrote the key's object (`lifecycle.md`
-§9.8) — and a delta's entries also the predecessor `(version, locator)`
-of the key they change or delete, which compaction drops.
+holds `(key, generation, deleted, payload?)` entries sorted by key — the
+generation that last wrote the key, its version, and what an immutable
+store names its object by (`versions.md`, `lifecycle.md` §9.8); the
+optional payload is a source key's version or a failure index's record —
+and a delta's entries also the predecessor generation of the key they
+change or delete, which compaction drops.
 
 - **Level 0** holds delta files, one per commit, named by batch, and files
   merged from them. Their key ranges overlap; a file is as recent as the
   newest batch it holds, which leads its name.
 - **Levels 1+** hold compacted files with non-overlapping key ranges, each
   up to ~64 MB, each level ~10× the previous.
-- **Newest wins:** a key's current version is its entry in the newest file
+- **Newest wins:** a key's current entry is its entry in the newest file
   containing it; a `deleted` entry hides older ones.
 - **`log`** lists the delta files by batch, from the lowest consumer
   watermark to the head. A delta file stays readable while it is in the
@@ -295,15 +297,16 @@ lengths, so a reader fetches exactly what it needs with one range read:
 the tail when it checks filters, the index part when it scans, the whole
 file when it is small — then range-reads only the blocks it needs.
 
-**Filters.** Each file carries three blocked Bloom filters (14 bits per
-item, 3.5 B per entry, 0.35% false positives measured — keeping an
+**Filters.** Each file carries two blocked Bloom filters (14 bits per
+item, 1.75 B per entry, 0.35% false positives measured — keeping an
 item's bits in one 512-bit block costs ~1.8× over independent bits): its
-keys, its live `(key, version)` pairs, and its deleted keys. A written `(key, version)` that no pair filter and
-no tombstone filter matches, across every file whose key range could hold
-the key, is a real change of a live key and needs no block read: the
-key's current `(key, version)` is always present in some file. A key no
-key filter matches is new. Everything else — unchanged rewrites, keys
-that may be deleted, false positives — gets an exact lookup.
+keys and its deleted keys. Every key written is a change (`versions.md`),
+so the filters only tell added from updated: a key no key filter matches
+is new; one a key filter matches and no tombstone filter does, across
+every file whose key range could hold it, counts as an update with no
+block read. Everything else — keys that may be deleted, an upsert
+carrying a payload (a source's version, compared with the entry's) —
+gets an exact lookup.
 
 **Key count.** `KeyIndex.count` is exact while every commit's reads are
 exact, which is always the case for indexes small enough to read whole.
@@ -337,7 +340,8 @@ the written keys and runs the filters, and reads blocks only for the keys
 they cannot clear, in the files whose key filter matched, all levels at
 once, each key taking its newest entry. If those block reads would number
 more than 16 per streamed segment, it streams instead. An `exact` read
-(failure indexes) takes no "changed" verdict from a pair filter.
+(failure indexes) reads every live key's entry, counting nothing from the
+filters.
 
 **Full replacement.** A bare return of every row must compare every live
 key, so it reads the whole index — as a stream, never whole. The written
@@ -350,29 +354,24 @@ they all share, each bucket sorted as 12-byte (prefix, row) pairs on every
 core, ~4.5 B per key at the peak (bench/keys/results.md, "Sorting the written keys"). A merge-join
 then walks the sorted keys and the index's newest-wins view together, each
 level fed a segment of 8 MB of consecutive blocks at a time, a few ahead.
-A key's version — every key is the group of rows that carry it — is
-computed when the join reaches it and compared once: the text of the
-declared revision column, which the key's rows share, else the digest of
-its rows in the canonical grammar of `row-digest.md`, the same whether
-they arrive as Python values or Arrow data (Python rows a window at a time
-under the GIL, Arrow rows on every core). New keys
-and changed versions go straight into the current delta file, live keys
-not written into `deleted` entries, and each file goes to the store as it
-fills. Memory is the permutation, a few segments per level and a file or
+Every key written goes straight into the current delta file at the
+writer's generation — a source key whose version equals its entry's
+excepted — live keys not written into `deleted` entries, and each file
+goes to the store as it fills. Only keys are read: nothing of a row's
+other columns reaches the index. Memory is the permutation, a few segments per level and a file or
 two in flight: at 100M keys, 0.8 GB on top of the data for shuffled Arrow
 rows (0.4 GB sorted; 28 s), 3.4 GB for Python rows, whose keys are packed
 (`bench/keys/results.md`).
 
-A `Sql` write's store reports its rows already sorted by key, a chunk at
-a time through a server-side cursor — PostgresStore reads the key and the
-revision column, or every column without one — and the harness versions
-them as it versions any rows, so nothing is sorted or held.
+A `Sql` write's store reports the keys it holds once it wrote, already
+sorted, a chunk at a time through a server-side cursor (`keys(ref,
+None)`), and the replacement streams them, so nothing is sorted or held.
 
 **Operations.**
 
 | Operation | Who | How |
 |---|---|---|
-| Compute a delta | harness, at write time | Read the write once (`Prepared`, `per-key-processing.md` §7): its `(key, version)` entries (the declared `revision` column's text, else the 16-byte digest of the key's rows, `row-digest.md`), against the index **as pinned in the spec**. A patch is checked with the filters and the read strategy above: keep entries whose version changed, plus `deleted` entries for removed keys that may exist. A full replacement is the streaming merge-join above. Either way the result is the batch's delta files, split at ~64 MB. |
+| Compute a delta | harness, at write time | Read the write's keys once (`Prepared`, `per-key-processing.md` §7), against the index **as pinned in the spec**. A patch is checked with the filters and the read strategy above: every key it writes, at the attempt's generation, plus `deleted` entries for removed keys that may exist. A full replacement is the streaming merge-join above. Either way the result is the batch's delta files, split at ~64 MB. |
 | Commit | engine | Add the delta file to level 0 and to `log`; `count += added − removed`, and `inexact += 1` if the count change came from filters. The scope lock — one attempt per (asset, scope) from launch to settlement — guarantees the index didn't change underneath. |
 | Deliver pending deltas | harness, for an `Incremental` edge | Read the `log` files from the watermark to the head; chunk by `page_size` in key order; ask the upstream store for those rows with `Keys(…)`. |
 | Full delivery | harness | Page through the merged view of all levels from `after`, `page_size` keys at a time, and ask the store for them with `Keys(…)`. Per level, only the files covering the page are opened, and only their index parts are read — or the whole file, once, when it is small (below one request's latency worth of transfer, ~2.4 MB). A multi-page scan keeps each file's last fetched blocks for the next page, so it reads every block once. |
@@ -381,9 +380,8 @@ them as it versions any rows, so nothing is sorted or held.
 | Delete files | engine | A file in neither `files` nor `log` joins `garbage`, and is deleted once every attempt that could have pinned it has finished (`GarbageDeleted`): every attempt claimed before the event that let go of it. Both are positions in event order (`applied`), the same in every engine that replays the journal — never wall clocks, which two engines may disagree on. A delta file of an attempt that never committed is deleted when the attempt ends, unless it is an unsettled intent (§8). |
 
 Writes that never pass through the harness as rows — `Sql` materialized
-inside Postgres — are the one case where the store must report the written
-`(key, version)` pairs, sorted (above); only stores supporting such writes
-need to.
+inside Postgres — are the one case where the store must report the keys it holds once it
+wrote, sorted (above); only stores supporting such writes need to.
 
 External sources use the same index. An API commit becomes a delta file;
 for very large commits the client builds the file itself and commits a
@@ -433,11 +431,11 @@ input versions built this version of `revenue`".
 |---|---|---|
 | `runs` | finished run or source commit | `status` (`succeeded`, `failed`, `canceled`, `skipped`), `trigger` (`manual`, `automation`, `sensor`, `commit`), `automation`, `by`, `retry_of` (the run a retry ran again), `source`, `targets`, `assets`, `committed`, `tags` (map), `task_count`, `failed_count`, `error`, `config` and `keys` (JSON, as submitted) |
 | `tasks` | task of a finished run | `asset`, `scope`, `status`, `started_at`, `finished_at`, `attempts`, `duration`, `wait` (seconds it could have run but didn't), `deps`, `max_attempts`, `retry_delay`, `retry_backoff`, `executor` (of its last attempt) |
-| `attempts` | attempt | `task`, `n`, `generation` (the one its writes carried), `outcome`, `started_at`, `finished_at`, `duration`, `preparing`, `provisioning`, `importing`, `loading`, `computing`, `writing`, `settling` (seconds per phase, below), `peak_memory` (bytes; only in a process of its own), `cpu_seconds`, `error`, `executor`, `cpu`, `memory`, `gpu` (requested; all null if it never launched), `options` (map: its other placement options, e.g. `image`), `outputs` (map: output → version committed), `keys` (map: an `Each` attempt's keys by outcome) |
+| `attempts` | attempt | `task`, `n`, `generation` (the one its writes carried), `outcome`, `started_at`, `finished_at`, `duration`, `preparing`, `provisioning`, `importing`, `loading`, `computing`, `writing`, `settling` (seconds per phase, below), `peak_memory` (bytes; only in a process of its own), `cpu_seconds`, `error`, `executor`, `cpu`, `memory`, `gpu` (requested; all null if it never launched), `options` (map: its other placement options, e.g. `image`), `outputs` (the outputs it committed, each at its `generation`), `keys` (map: an `Each` attempt's keys by outcome) |
 | `run_events` | moment of a run | `n` (its order in the run), `at`, `type`, `task` and `attempt` (null for the run's own events), `by`, `name`, `reason`, `until`, `rows` — the timeline, below |
-| `materializations` | output version a commit installed | `output`, `scope`, `version`, `run`, `attempt`, `at`, `batch`, `added`, `removed`, `added_keys`, `removed_keys` (a source commit's keys, up to 1,000), `rows`, `metadata` (JSON), `generation` (the writing attempt's) |
-| `lineage` | input version an output version was read from, and what a current read saw (stores.md, "What a read sees") | `output`, `scope`, `version`, `input`, `input_scope`, `input_version`, `param`, `input_generation`, `read` (JSON `{generation, keys?, key_count?, mixed?}`, null for a snapshot store) |
-| `key_outcomes` | key an `Each` attempt processed | `run`, `attempt` (`attempts.id`), `asset`, `scope`, `key`, `revision`, `outcome` (`ok`, `removed`, `unmatched`, `rejected`, `failed`, `retrying`, `canceled`, `timed_out`), `error`, `duration`, `at` — per-key-processing.md §10 |
+| `materializations` | output version a commit installed | `output`, `scope`, `generation` (its version: the writing attempt's, or a source commit's), `run`, `attempt`, `at`, `batch`, `added`, `removed`, `added_keys`, `removed_keys` (a source commit's keys, up to 1,000), `rows`, `metadata` (JSON; an unkeyed source commit's `version`) |
+| `lineage` | input version an output version was read from, and what a current read saw (stores.md, "What a read sees") | `output`, `scope`, `generation`, `input`, `input_scope`, `input_generation` (what was pinned: the head, or a fixed delivery's generation), `param`, `read_generation` (what a read of current rows saw; null for a snapshot store's read, which is the pin, and for an external source's, which is its observation — `versions.md` §6) |
+| `key_outcomes` | key an `Each` attempt processed | `run`, `attempt` (`attempts.id`), `asset`, `scope`, `key`, `generation` (the upstream key's it processed), `outcome` (`ok`, `removed`, `unmatched`, `rejected`, `failed`, `retrying`, `canceled`, `timed_out`), `error`, `duration`, `at` — per-key-processing.md §10 |
 
 A run where every task was skipped — it launched nothing and wrote
 nothing — is recorded with status `skipped`. Listings hide skipped runs
@@ -620,7 +618,7 @@ count of a keyed output, else the length of a returned list.
 | finished tasks | `GET /tasks?asset=&status=&run=&since=&before=` | |
 | p50/p95 duration and wait, failure counts, compute hours, per asset and per executor | `GET /stats?since=&asset=&scope=` | |
 | an asset's versions and their metadata | `GET /assets/{name}/history?output=&scope=&before=` | |
-| what a version was built from, or what was built from it | `GET /outputs/{name}/lineage?scope=&version=&direction=upstream\|downstream&depth=5` | each edge's `from` is what was read: `version`, `generation`, the writer's `run`, `attempt` and `at`, and — when a current read saw a newer write — a page's `keys` as read. Flags: `uncommitted` (`{attempt, run}`: a write no attempt committed; `version` null) and `mixed` (two moments, two versions). `detail` keeps the pin (`pinned_version`, `pinned_generation`) for debugging |
+| what a version was built from, or what was built from it | `GET /outputs/{name}/lineage?scope=&generation=&direction=upstream\|downstream&depth=5` | each edge's `from` is what was read: its `generation` and the writer's `run`, `attempt` and `at`. Flag: `uncommitted` (`{attempt, run}`: a write no attempt committed). `detail` keeps the pin (`pinned_generation`) for debugging |
 | every asset at a glance: scopes by status, newest outcome, failing keys, unsettled scopes | `GET /assets:status` → `{assets: {name: {partitions, partitioned, last, failures, unsettled, updated_at}}}` | |
 | an `Each` asset's failing keys, and each scope's failure record | `GET /assets/{name}/failures?scope=&outcome=&after=&limit=100` → `{scopes, keys, epoch, now, next}` | |
 | what an `Each` asset's keys came to, newest first | `GET /assets/{name}/key-outcomes?scope=&key=&q=&outcome=&run=&before=&limit=100` → `{outcomes, next}` | |
@@ -766,8 +764,7 @@ class Store(Protocol):
   `reset`, the `attempt` id, its
   `generation` and `invocation` (`lifecycle.md` §9.7–9.8). A keyed output's write reaches the store as a
   `KeyedWrite`: read once (`prepared`), and what it changes against the
-  key index — `upserts` to write, each to the version the index will hold,
-  `removes` to delete — or `whole`, a first write or a reset (a `full`
+  key index — `upserts` to write, `removes` to delete — or `whole`, a first write or a reset (a `full`
   run): the store then writes everything and deletes whatever else
   it holds. A patch that changes 3 keys of 100,000 reaches the store as 3
   upserts, and the store reads only their groups.
@@ -775,12 +772,12 @@ class Store(Protocol):
   (§6); for everything else the harness computes keys itself.
 - **What a read sees depends on the store's kind** (`architecture.md` §3,
   `lifecycle.md` §9.6). FileStore and S3Store (`immutable`) never
-  overwrite, so a load reads exactly the version its consumer pinned; a
+  overwrite, so a load reads exactly the generation its consumer pinned; a
   superseded object lingers until no reader pin predates it. PostgresStore
   and every `fenced` store hold one copy: a load reads the
-  current rows, so a consumer pinned to version 12 that loads after
-  version 13 committed gets version 13's content, and a changed row may be
-  delivered twice. `Store.load` makes no promise beyond its kind's.
+  current rows, so a consumer pinned to generation 12 that loads after
+  generation 13 committed gets generation 13's content (and lineage says
+  13), and a changed row may be delivered twice. `Store.load` makes no promise beyond its kind's.
 - **Nothing expires.** A store holds the current content of each output,
   plus, for an immutable store, what pinned readers still need.
 
@@ -791,8 +788,8 @@ class Store(Protocol):
 ```
 rollup@184467.json                a value, by generation 184467
 site_status/alpha@184467.json     a value, partition alpha
-uploads/u-7/9c41e0d2….184467.json a keyed output: one object per key and version
-site_files/alpha/f-1/9c41….json   keyed and partitioned
+uploads/u-7/184467.pkl            a keyed output: one object per key and generation
+site_files/alpha/f-1/184467.json  keyed and partitioned
 site_events/alpha/000000000042/184467.json
                                   an unkeyed incremental output: one object per batch
 ```
@@ -800,7 +797,7 @@ site_events/alpha/000000000042/184467.json
 Every name carries the **generation** of the attempt that wrote it (its
 claim's event position), so no two attempts write one name and objects
 are created once, never overwritten (`lifecycle.md` §9.8). A keyed load
-names its objects from the index's `(version, locator)`; a whole keyed
+names its objects from the index's generations; a whole keyed
 read is paged from the pinned index. Content is JSON when it round-trips
 exactly, pickle (`.pkl`) otherwise. Keyed outputs are declared
 `Output(keyed=True)` and return `dict[str, Any]`, or rows with

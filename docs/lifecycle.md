@@ -34,7 +34,7 @@ failure indexes, sensors' sources).
 **This doc is the authority for four records the others use:** the cancel
 record (§2.2), write-completion evidence (§2.3), the sensor snapshot
 (§11.3) and accepted tick outcomes (§11.4). The key index entry's
-`(version, locator)` and the delta's predecessor are named here (§9.8) and laid
+generation and the delta's predecessor are named here (§9.8) and laid
 out in bytes in `key-index-format.md`.
 
 ## 1. The shape in one paragraph
@@ -487,16 +487,13 @@ its scope is released, and W2 commits. Then a write of W1's lands.
 
 | Store | W1's late write | Damage |
 |---|---|---|
-| keyed, one object or row per key | key `k` at W1's version | `k` regresses: the index says `v2`, the store holds `v1` |
+| keyed, one object or row per key | key `k` as W1 wrote it | `k` regresses: the index says W2 wrote it, the store holds W1's rows |
 | keyed, W1 removes `k` | deletes W2's `k` | a key the index lists is missing |
 | a value | the whole value | regresses to W1's |
 | unkeyed incremental | batch `n`, which W2 also wrote (retries reuse batch numbers) | W2's batch replaced by W1's |
 
-Two writers of the same key at the same version write the same content
-(that is the asset's revision promise), so their order does not matter.
-Only a different version landing after a newer commit does damage, and
-only on a store that writes in place — which is why such a store must be
-`fenced`.
+Only a write landing after a newer commit does damage, and only on a
+store that writes in place — which is why such a store must be `fenced`.
 
 How W1 can still write after the engine gave up on it: it lost contact but
 runs on; it paused (GC, VM migration); a request it issued is still in
@@ -581,15 +578,30 @@ silence.
 ```python
 class MyStore(Store):
     writes = "immutable"   # writes only names nothing committed references; implements discard()
-    writes = "fenced"      # implements acquire(); every write checks the generation atomically
+    writes = "fenced"      # implements acquire() and keys(); every write checks the generation atomically
 ```
 
 | Kind | Gate and intents | Repair | Scope released when the engine ends the attempt | A read sees |
 |---|---|---|---|---|
-| `immutable` | none | none: abandoned writes are unreferenced | at once | the pinned version, exactly |
-| `fenced` | gate with intents (repair, and the unknown-writes intent of `Sql`, below) | after `acquire` (`resolved-commits.md` §3) | at once: the next attempt's acquisition fences the old writer | current rows |
+| `immutable` | none | none: abandoned writes are unreferenced | at once | the pinned generation, exactly |
+| `fenced` | gate with intents (repair, and the unknown-writes intent of `Sql`, below) | after `acquire`, by presence (`versions.md` §5) | at once: the next attempt's acquisition fences the old writer | current rows |
 
-**Reads.** Only an immutable store can return a pinned version after a
+**Repair by presence.** The next attempt asks the store which of the
+dead writer's intended keys it holds (`keys(ref, among)`, never a value):
+a key present takes the repairing attempt's generation, so it counts as
+changed; one absent and live in the index gets a tombstone; one absent
+and not live, nothing. A key the repairing attempt writes or removes
+itself ends as it says. The repair always runs its write transaction,
+even with no rows of its own, so the slice reads as written by the
+repair, not by the dead writer no commit has (`versions.md` §5).
+
+```
+index         k absent (a new key)
+attempt g12   inserts k, dies after its gate; the insert did or did not land
+attempt g15   k present → k@g15         k absent → nothing
+```
+
+**Reads.** Only an immutable store can return a pinned generation after a
 newer one committed: its names are never reused. A fenced store keeps
 one copy, so its loads read current rows: a run may read two
 outputs at different moments, and a row changed since its pin is read in
@@ -604,9 +616,10 @@ gate, the next attempt cannot repair by reading named keys — there are
 none. For example, the statement deletes `a` and inserts `b`, commits, and
 the worker dies before reporting its map; the next attempt patches `c`.
 So, after acquisition (§9.7), an unknown-writes intent is settled only by
-reading the store's **whole key map for the scope** and reconciling it
-with the index: every key the index and the store disagree on joins the
-commit's delta. A full replacement may instead rewrite the whole scope,
+reading **every key the scope holds** (`keys(ref, None)`) and replacing
+the index with them, the attempt's own patch laid over: every key the
+store holds is written at the new generation, and live keys it lacks are
+deleted. Consumers take everything again. A full replacement may instead rewrite the whole scope,
 which settles it too. `resolved-commits.md` §3 carries the same branch for
 the resolver's write phases.
 
@@ -693,22 +706,22 @@ Internal to the store; the engine supplies one number.
 **Decided** (Erwin): every object the store writes has a name no other
 attempt will ever write, so deleting one can never hit something current.
 
-**Names.** The physical name carries the logical version and the
-attempt's **generation** (§9.7: the claim's event position, in the spec):
+**Names.** The physical name carries the attempt's **generation** (§9.7:
+the claim's event position, in the spec), which is also the key's version
+(`versions.md`):
 
 ```
-site_files/alpha/f-1/9c41e0d2….184467.json       a key, at its version, by generation 184467
+site_files/alpha/f-1/184467.json                 a key, as generation 184467 wrote it
 site_status/alpha@184467.json                    a value
 site_events/alpha/000000000042/184467.json       batch 42 of an append output, by generation 184467
 ```
 
 Writes are create-only. Two writers of one name are the same attempt (a
-delayed duplicate of itself), so they write the same bytes. A declared
-`revision` longer than 32 bytes is named by the first 16 bytes of its
-SHA-256 instead.
+delayed duplicate of itself), so they write the same bytes: an attempt
+writes a key at most once.
 
 **Why the generation, not the batch.** A retry reuses its predecessor's
-batch number: W1 (batch 57) dies having written `f-1/v.57`, and its retry
+batch number: W1 (batch 57) dies having written `f-1/57`, and its retry
 W2, also batch 57, may write that very name and commit it. W1's leftovers
 could then be judged only once batch 57 is committed, and only by diffing
 them against the committing delta. A generation is never reused, so an
@@ -717,19 +730,17 @@ they can go at once. It costs the same one integer per index entry.
 
 **The records.** Names are settled here; bytes in `key-index-format.md`.
 
-- **Index entry:** `(key, version, locator, deleted)`. `locator` is the
-  generation that wrote that key at that version (a varint, ~4–5 bytes
-  before compression; neighbouring entries share generations and compress
-  well). Deciding whether a write is a change still compares versions
-  only.
-- **Delta entry:** the same, plus an optional **predecessor**
-  `(version, locator)` — the entry it replaces or deletes — when the
-  writer read it. Compaction drops predecessors.
-- **Everywhere an entry travels, the locator travels with it:** resolver
-  responses (the delta file), reads answered at `start`
-  (`resolved-commits.md` §7: `.kx` files), and the
-  `Keys` selection a store receives (`{key: (revision, locator)}`).
-- It rides the `.kx` format bump of the row-digest work.
+- **Index entry:** `(key, generation, deleted, payload?)`. `generation`
+  is the one that last wrote the key (a varint, ~4–5 bytes before
+  compression; neighbouring entries share generations and compress
+  well): its version and its object's name at once.
+- **Delta entry:** the same, plus an optional **predecessor** generation
+  — the entry it replaces or deletes — when the writer read it.
+  Compaction drops predecessors.
+- **Everywhere an entry travels, the generation travels with it:**
+  resolver responses (the delta file), reads answered at `start`
+  (`resolved-commits.md` §7: `.kx` files), and the `Keys` selection a
+  store receives (`{key: generation}`).
 
 **How loads find names.** A keyed load computes every name from `Keys` and
 needs no LIST. A full load of a keyed input becomes a `Keys` selection the
@@ -742,13 +753,13 @@ of `n − 1` and `n`, one at a time, and the one that committed `n` was the
 last of them.
 
 **Predecessors.** Collecting a superseded object needs its exact name,
-so its predecessor's `(version, locator)`. `resolved-commits.md` §6
+so its predecessor's generation. `resolved-commits.md` §6
 chooses two triggers, and this section's collection follows them:
 
 - **At resolution, whenever the old entry was read** — always on the
   engine and in the streaming merge-join, and for the sparse reader's
   maybe keys — the delta names the predecessor.
-- **At compaction, for the rest.** A key the pair filter cleared has no
+- **At compaction, for the rest.** A key the filters counted live has no
   named predecessor, but its old entry is still in the index, shadowed.
   Every merge that drops an entry (shadowed, or under a bottom-level
   tombstone) emits it as data garbage, named before or not: names are
@@ -840,16 +851,16 @@ needs none, since each of its pages reads the state of its own prepare
 (`per-key-processing.md` §20). Not built: the sweep, so a worker that
 writes after its attempt ended leaves orphans.
 
-Reusing a version (`v1 → v2 → v1`) writes a new name (`f-1/v1.{g3}`):
-deleting the old `f-1/v1.{g1}` cannot touch it. That is what removes the
+Writing the same content again (`v1 → v2 → v1`) writes a new name
+(`f-1/{g3}`): deleting the old `f-1/{g1}` cannot touch it. That is what removes the
 GC lock, the dequeue-on-reuse rule and the DELETE timing assumption of the
 alternative.
 
 **Costs.** Per changed key: one PUT, as today, and one DELETE (free on
-S3) when superseded, batched. Per commit: the delta's previous-version
-columns (a few bytes per changed key). Per full load of a keyed input: a
+S3) when superseded, batched. Per commit: the delta's predecessor
+generations (a few bytes per changed key). Per full load of a keyed input: a
 read of its pinned index. In return: no gate, intents or repair for these
-stores (§9.6); readers see the version they pinned; a stale write is an
+stores (§9.6); readers see the generation they pinned; a stale write is an
 orphan.
 
 **Readable listings.** A key's directory holds its current object, plus
@@ -1038,9 +1049,10 @@ synchronous.
    all or none of it — and answer once it is durable. A tick whose
    outcome is nothing records nothing.
 
-"Unchanged" therefore means no version, no key change and no new cursor
-(review finding 9). A cursor-only tick records only `SensorAdvanced` and
-its accepted-outcome record: no delta, no new version, no consumer woken.
+"Unchanged" therefore means no new version, no key change and no new
+cursor (review finding 9). A cursor-only tick records only
+`SensorAdvanced` and its accepted-outcome record: no delta, no new
+generation, no consumer woken.
 
 **Key maps.** A small map (up to `sensor_map_max`, 1M keys) is posted as a
 sorted run in the resolver's framing (`resolved-commits.md` §4), and the
@@ -1210,7 +1222,7 @@ sources).
 | repair before the store is fenced | `Store.acquire` before repair, for fenced stores |
 | resolve through `.ask` objects (proposal) | binary `resolve` route, nothing persisted |
 | observable sources as proposed attempts without a spec | sensors: ticks in a warm host, applied through the commit and run APIs, `SensorAdvanced` for the cursor, a lossy `ticks` table |
-| `{key}.json` overwritten in place (FileStore, S3Store) | `{key}/{version}.{generation}.json`, create-only; superseded and abandoned names collected without a lock |
+| `{key}.json` overwritten in place (FileStore, S3Store) | `{key}/{generation}.json`, create-only; superseded and abandoned names collected without a lock |
 | one API token | admin token; per-attempt HMAC token from a stable secret; per-pool token |
 
 ## 15. Open questions
@@ -1220,9 +1232,9 @@ sources).
 2. **`sensor_map_max`.** Where a key map stops being posted to the engine
    and is resolved on the host instead; from the resolver's grid
    (`resolved-commits.md` §6), like its other thresholds.
-3. **Locator size.** The `.kx` bump adds a generation per entry; the
-   index benchmarks should report bytes per entry with it, at 1M–100M
-   keys, before the format is frozen.
+3. **Generation size.** Settled by format v3: one varint per entry, 8 B
+   per entry in all at 10M random ids without payloads
+   (`bench/keys/results.md`).
 4. **`gate_days`.** 30 days bounds how long a paused worker can resume and
    still be stopped by its gate. A backend-recorded revocation would
    remove the bound for stores that can keep one; none is needed for v1.

@@ -76,9 +76,11 @@ The default project is designed to make every architecture feature visible:
 | `weekly_digest` | a `@job` on a weekly `Cron` — inputs and placement, no outputs |
 | `refresh-index` | a standalone `Automation` targeting `site_feed` + `file_index` |
 
-The feed fake emits a new batch per site every few seconds, and repeated polls
-inside the same tick return identical content — an unchanged commit wakes
-nothing downstream. Run config `feed_tick_seconds` stretches the tick:
+The feed fake emits a new batch per site every few seconds, and a poll inside
+the tick its cursor already reached returns nothing: the patch is empty, nothing
+is written, and nothing downstream wakes. (Every key written is a change —
+[docs/versions.md](docs/versions.md) — so a producer that should wake nobody
+writes nothing.) Run config `feed_tick_seconds` stretches the tick:
 `--config '{"feed_tick_seconds": 300}'`.
 
 ## Walkthrough
@@ -125,9 +127,9 @@ task to see its attempt spec — `inputs.site_files` carries the pinned ref, the
 pinned key index and the window to read (a delta-log range, or the whole index
 for a first delivery); the attempt's result records the keys it delivered.
 
-Run it again inside the same feed tick: the feed returns identical events,
-the committed versions are unchanged, and `file_index` is not woken — that is
-the "no change wakes nothing" corollary. To see a changed pass, wait one tick
+Run it again inside the same feed tick: the cursor is already there, the feed
+returns no events, the empty patch writes nothing, and `file_index` is not
+woken — a key changes only when it is written. To see a changed pass, wait one tick
 (or shrink it) and let `site_feed.every.0` fire, or `run-now` it.
 
 ### 4. Incremental with `more` continuation
@@ -321,7 +323,7 @@ from solera.stores import Patch
 sites = PartitionSet("sites")
 
 
-@asset(outputs=Output("files", key="file_id", revision="version"), partitions={"site": sites})
+@asset(outputs=Output("files", key="file_id"), partitions={"site": sites})
 def site_files(ctx):
     # Patch both ways: rows upsert by key, remove deletes keys.
     return Patch(rows, remove=gone)

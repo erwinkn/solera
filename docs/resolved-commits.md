@@ -16,8 +16,8 @@ It depends on two other designs, and says where:
   (retry pages, read at `start`) follows that doc's eligibility predicate and
   transition table (§8). Its own semantics (rescoping, cancellation, retry
   pacing, sensors) belong to that doc.
-- `key-index-format.md` — entries with a locator, and deltas with
-  predecessors (the `.kx` bump of the row-digest work).
+- `key-index-format.md` — entries carrying the generation that wrote
+  them (format v3, `versions.md`), and deltas with predecessors.
 
 ## 1. Why
 
@@ -87,13 +87,13 @@ the first:
 2. **What must the store write?** Decided by the worker, by the store's
    kind (`lifecycle.md` §9.6).
 
-**`immutable` stores** (FileStore, S3Store) write each key at its version
-under a name carrying the writer's generation, `{key}/{version}.{generation}`
-(`lifecycle.md` §9.8), and never overwrite. A dead attempt leaves only
-unreferenced objects, so there are no unsettled intents and no repair: the
-store writes the delta's upserts, and the commit records the delta. The
-generation is the delta entry's **locator**; superseded objects are
-collected through their predecessors' locators (§6).
+**`immutable` stores** (FileStore, S3Store) write each key under a name
+carrying the writer's generation, `{key}/{generation}` (`lifecycle.md`
+§9.8), and never overwrite. A dead attempt leaves only unreferenced
+objects, so there are no unsettled intents and no repair: the store writes
+the delta's upserts, and the commit records the delta. The generation is
+the delta entry's own (`versions.md`); superseded objects are collected
+through their predecessors' generations (§6).
 
 **`fenced` stores** keep intents and repair, in this order:
 
@@ -187,9 +187,10 @@ resolves locally; a frame whose bounds do not hold gets `400`.
 ```
 
 - The payload is the sorted run as a `.kx` file (`key-index-format.md`):
-  `(key, version, locator, deleted)`, `deleted` for removes. Every written
-  entry's locator is `generation`, the attempt's (`lifecycle.md` §9.7), so
-  an immutable store's name for it is known. One format, one parser, the
+  `(key, generation, deleted, payload?)`, `deleted` for removes, the
+  payload a source key's version. Every written entry's generation is
+  `generation`, the attempt's (`lifecycle.md` §9.7), so an immutable
+  store's name for it is known. One format, one parser, the
   CRCs included.
 - `kind` is `patch` or `replace`: the same run means different deltas
   (`{a: 1}` against `{a: 1, b: 1}` is empty as a patch and deletes `b` as
@@ -208,7 +209,7 @@ live attempt (and rebuilds from `.spec` on adoption):
   `409` and resolves nothing — it should not be running;
 - the attempt is live and holds the scope lock for `(name, scope)`;
 - `name`, `scope`, `batch`, `generation` and `base.prefix` are the ones
-  prepared for that output, the run's locators are that generation, and
+  prepared for that output, the run's entries are at that generation, and
   `base.head_batch` is the head's batch now;
 - `kind` is allowed for the output (a `replace` of an output whose write
   can only be a patch is refused);
@@ -248,9 +249,9 @@ freeze, no response to recover and no engine-written file to clean up.
 
 - `delta`: the payload is the delta as a complete `.kx` file, ready to
   upload under the worker's own name `{batch:012d}-{attempt}`. Its entries
-  are `(key, version, locator, deleted)`, and every changed or deleted key
-  that had a live entry carries that entry's **predecessor** `(version,
-  locator)` — always, since the engine reads full entries; for an
+  are `(key, generation, deleted, payload?)`, and every changed or deleted
+  key that had a live entry carries that entry's **predecessor**
+  generation — always, since the engine reads full entries; for an
   immutable output, the names to collect once the delta commits (§6). The worker
   validates it — footer, index and block CRCs, filter CRC, its digest —
   and decodes it once for its store selection (§3); it uploads the bytes
@@ -363,9 +364,9 @@ fixed-length name whatever the scope's length; the file names its source —
 (byte layout in `native/src/local.rs`):
 
 ```
-file       magic "KXL2" · blocks · tail · footer
-blocks     per block: entries as in a `.kx` block, uncompressed (key, version, locator, deleted,
-           predecessor if any), then its restart table (offsets of full keys, every 16 entries)
+file       magic "KXL3" · blocks · tail · footer
+blocks     per block: entries as in a `.kx` block, uncompressed (key, generation, deleted,
+           payload and predecessor if any), then its restart table (offsets of full keys, every 16 entries)
 tail       source size · source digest · source path · blocks · entries · the directory: per
            block first key, last key, offset, entries length, restart count, entries, CRC-32
            of the block's entries and restart table
@@ -506,37 +507,40 @@ planner:
 2. for the larger levels, read the tails of the files whose key range
    covers a written key, all at once;
 3. classify each key with the filters: absent (no key filter matched),
-   changed (no pair or tombstone filter matched: live at another version),
-   or maybe;
+   live (a key filter matched, no tombstone filter did, and the upsert
+   carries no payload to compare: written, so changed), or maybe;
 4. read the blocks of the maybe keys, only in files whose key filter
    matched, all levels at once; each key takes its newest entry.
 
-**Its contract:** the delta is exact; the count is exact unless a pair
-filter cleared a key behind a key-filter false positive (0.35% per check),
-which increments `inexact` as today. Nothing that decides correctness —
-scheduling, skipping, "unchanged" — reads the count. Dropping the
-pair-filter shortcut would make the count exact here too, at ~1.25 block
-reads per changed key instead of ~0.01: ~1,250 more GETs for 1K keys at
-100M, ~$0.0005 per commit. Indexes over the cache budget take this path on
-every commit, so the design keeps filters and recounts (§12).
+**Its contract:** the delta is exact; the count is exact unless the
+filters counted a key live behind a key-filter false positive (0.35% per
+check), which increments `inexact` as today. Nothing that decides
+correctness — scheduling, skipping, "unchanged" — reads the count.
+Reading every live key's entry would make the count exact here too, at
+~1.25 block reads per changed key instead of ~0.01: ~1,250 more GETs for
+1K keys at 100M, ~$0.0005 per commit. Indexes over the cache budget take
+this path on every commit, so the design keeps filters and recounts (§12).
+An upsert carrying a payload (a source's version) is always read: only
+its entry says whether the version moved — at 10M keys, ~700 GETs for a
+cold 1K-key source commit with versions (`bench/keys/results.md`), which
+the engine's warm cache answers instead whenever it holds the index.
 
 **Predecessors of immutable outputs.** An immutable store collects a
-superseded object by name, `{key}/{version}.{locator}`, so someone must
-learn each changed or deleted key's previous `(version, locator)`. The
-filter shortcut cannot: for `k → v2` it knows that `k` holds some other
-version, not whether that was `k/v1.17` or `k/v1.93`. The design uses two
-triggers, each with one rule:
+superseded object by name, `{key}/{generation}`, so someone must learn
+each changed or deleted key's previous generation. The filter shortcut
+cannot: for a write of `k` it knows that `k` is live, not whether it was
+`k/17` or `k/93`. The design uses two triggers, each with one rule:
 
 - **At resolution, whenever the old entry was read.** The delta names
   the predecessor of every changed or deleted key whose resolution read
   its old entry: always on the engine, always in the streaming merge-join,
   and for the sparse reader's maybe keys. The commit's data-garbage entry
   collects those names once no reader pins them (`lifecycle.md` §9.8).
-- **At compaction, for the rest.** A key the pair filter cleared has no
+- **At compaction, for the rest.** A key the filters counted live has no
   named predecessor, but its old entry is still in the index, shadowed.
   Every merge that drops a shadowed entry — or the entry under a
-  tombstone at the bottom level — emits that entry's `(key, version,
-  locator)` as data garbage at the compaction's event position, under the
+  tombstone at the bottom level — emits that entry's `(key, generation)`
+  as data garbage at the compaction's event position, under the
   same reader-pin rule. Compaction emits every entry it drops, named
   before or not: names are never reused, so discarding a name twice is a
   no-op (`discard` ignores missing names), and no "already collected" bit
@@ -546,14 +550,14 @@ The alternatives, priced at 100M keys, 1K random changes per commit:
 
 | Choice | Cold sparse path | Collection |
 |---|---|---|
-| exact predecessors only, at resolution | the pair filter no longer decides: ~1.25 block reads per changed key, ~1,300 GETs instead of ~50, ~$0.0005 per commit | prompt |
+| exact predecessors only, at resolution | the filters no longer decide: ~1.25 block reads per changed key, ~1,300 GETs instead of ~50, ~$0.0005 per commit | prompt |
 | deferred only, at compaction | ~50 GETs | every superseded object waits until its new entry merges over the old one — for random keys mostly at the bottom level, so ~20% of keys (the upper levels' share in steady state) keep a second object, hours to days |
 | **both (chosen)** | ~50 GETs | prompt wherever the old entry was read (warm and streaming: every key); deferred only for keys the cold path's filters cleared |
 
 An index over the cache budget takes the cold path on every commit, so
 the first row would cost scenario E ~$130 a month; the second gives up
 prompt collection that the warm path gets for free. Outputs on `fenced`
-stores carry locators too but collect nothing by them.
+stores carry generations too but collect nothing by them.
 
 **Streaming merge-join**, for replacements and dense patches: the native
 job that full replacement, compaction and recount already use, extended to
@@ -565,8 +569,8 @@ yet; the patch merge adds a lookup per run key to the recount's work.
 
 The sparse reader, this join and the engine's cache (§5) decide each key
 by one rule (`native/src/delta.rs`): what the index holds — absent, live
-at a known version and locator, or live at another version as the filters
-said — against an upsert or a remove.
+at a known generation and payload, or live as the filters said — against
+an upsert (with its payload, if any) or a remove.
 
 **The crossover.** A patch goes to the sparse reader, and switches at
 most once, by two thresholds expressed in the quantities that decide it —
@@ -603,7 +607,7 @@ of magnitude fewer:
 Everything an attempt reads from an index before it computes — a full
 delivery's page, a change window, a rescope's diff, a `keys=` selection,
 an `Each` page's failure records and retry walk, an immutable store's
-locators for a whole read — a worker alone pages from the store, cold: at
+generations for a whole read — a worker alone pages from the store, cold: at
 100M keys, 20 to 37 GETs a page (`bench/keys/results.md`). The engine holds those indexes warm. So, mirroring
 `resolve` for writes, the worker asks once, at `start`, and the engine
 answers its reads; the worker then loads rows from the stores itself. One
@@ -641,7 +645,7 @@ request per step: `start` for reads, `resolve` before writing.
   reply's bound counted in `resolve_queue_bytes`), one rule for all the
   cache's work: past it a start is answered without a record, and one that
   timed out keeps its place until its native work ends. A page stays a native run from the scan to the reply. Entries travel as a sorted run's `.kx` form
-  (keys, versions, locators, deletions), so one format and one checked
+  (keys, generations, deletions, payloads), so one format and one checked
   parser serve resolves and reads.
 - **Local or nothing.** The engine reads only its local copies, never the
   store, for this. An index it does not hold stops the record at its first
@@ -718,10 +722,10 @@ to re-estimate, not this one's.
   commit at 100M, immutable outputs included, since predecessors the
   filters skip are collected at compaction (§6); a streaming patch reads
   the snapshot.
-- **Locators and predecessors.** A varint generation per entry, and a
-  predecessor `(version, locator)` per changed key in deltas until
-  compaction drops it; the bytes per entry are the format work's to
-  measure (`lifecycle.md` §15). Discards are DELETEs, free on S3, batched
+- **Generations and predecessors.** A varint generation per entry, and a
+  predecessor generation per changed key in deltas until compaction drops
+  it: 8 B per entry in all at 10M random ids without payloads, 26 B with
+  16-byte versions (`bench/keys/results.md`). Discards are DELETEs, free on S3, batched
   by 1,000; keys collected at commit are discarded a second time, as a
   no-op, when compaction drops their old entry.
 - **Network.** Requests and responses are ~40 KB and ~27 KB per 1K-key
@@ -752,7 +756,7 @@ reports both.
 - **Equivalence.** Engine-resolved and locally resolved deltas decode to
   the same entries (compressed bytes may differ); engine counts equal an
   oracle's exact counts; the cold path's counts satisfy its contract
-  (`inexact` set exactly when a pair filter decided, and `added − removed`
+  (`inexact` set exactly when the filters decided, and `added − removed`
   off by at most the keys it decided). Over random patches, removes,
   replacements, repairs and compactions between prepare and resolve.
 - **Repair.** The `a=1 → a=2 → a=1` sequence rewrites the store with an
@@ -772,11 +776,11 @@ reports both.
   fills are deduplicated; failed and canceled fills release their
   reservations; a compaction that cannot reserve demotes its index;
   pinned files survive eviction and garbage collection.
-- **Locators.** Resolver deltas, cold deltas, recorded reads and `Keys`
-  carry `(version, locator)`; every superseded object of an immutable
-  output is discarded — by its commit when the old entry was read, by the
-  compaction that drops it otherwise, including keys the pair filter
-  cleared and keys deleted at the bottom level — and none while a reader
+- **Generations.** Resolver deltas, cold deltas, recorded reads and `Keys`
+  carry generations; every superseded object of an immutable output is
+  discarded — by its commit when the old entry was read, by the
+  compaction that drops it otherwise, including keys the filters counted
+  live and keys deleted at the bottom level — and none while a reader
   pins it; a second discard is a no-op.
 - **Unknown writes.** A dead `Sql` writer that deleted `a` and inserted
   `b`: the next patch acquires, reads the store's key map, reconciles both
@@ -794,14 +798,8 @@ reports both.
 
 ## 11. Not in this design
 
-- **The canonical row digest** of the earlier proposal is independent of
-  resolution and belongs in its own spec next to its code
-  (`row-digest.md`), with the group production `per-key-processing.md`
-  defines. The first review's requirements stand for it: a versioned byte
-  grammar with framing for rows and structs, nanosecond timestamps, dates
-  distinct from timestamps, decimal normalization, missing versus null
-  fields, no automatic pickle fallback, and golden vectors across Python,
-  Arrow and SQL.
+- **A canonical row digest.** Built for a while, then removed:
+  nothing hashes user data (`versions.md`).
 - **An object-store channel** for resolves. Workers can always reach the
   engine over HTTPS; a worker that cannot simply resolves locally.
 - **Sensor publication, rescoping, cancellation and retry pacing** —

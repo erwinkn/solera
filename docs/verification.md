@@ -72,7 +72,7 @@ arguments, up to 40 per run.
 
 | Rule | Example | What it exercises |
 |---|---|---|
-| `commit_feed(op, keys, version)` | `commit_feed('replace', ['k1', 'k3'], '2')` | keyed source commits: patch, remove, full map |
+| `commit_feed(op, keys, version)` | `commit_feed('replace', ['k1', 'k3'], '2')` | keyed source commits, each key at a version: patch, remove, full map |
 | `commit_sites(op, site)` | `commit_sites('upsert', 'west')` | a partition set growing and shrinking |
 | `commit_knob()` | | an unkeyed source's new version: `OnChange` over every scope |
 | `change_outside(keys)` / `sensor_round(delay, twice)` | `sensor_round(delay=90, twice=True)` | a sensor tick posted late, or twice |
@@ -96,8 +96,9 @@ Checked after every step:
 | **No state breaks.** No engine's `State` fails applying an event (which would exit the process with code 70). | a reducer raising on a replayed event |
 | **One end per attempt.** The journal holds at most one `AttemptFinished` per attempt, and no segment lands twice with different bytes and stays (an opener whose fence lands in a hole cleanup left deletes it and opens again, by design). | a zombie engine and its successor both ending attempt `A` |
 | **Nothing is read after collection.** No live attempt or serving engine finds an index file or data object gone because garbage collection deleted it. | a delta window's reader pin not holding its files |
-| **Reads say what they read.** A PostgresStore read reports the generation that wrote the rows it loaded, the newest committed before its snapshot — never one that only acquired the slice — and the key versions an attempt reports are those of the rows it loaded. | an attempt that acquired and died surfacing as the read generation |
-| **Committed keys are readable.** Every key an immutable store's head lists loads back at its indexed version, from an object a committed attempt wrote. | a stale writer's object referenced by the index |
+| **Reads say what they read.** A PostgresStore read reports the generation that wrote the rows it loaded, the newest committed before its snapshot — never one that only acquired the slice. | an attempt that acquired and died surfacing as the read generation |
+| **Committed keys are readable.** Every key an immutable store's head lists loads back at its indexed generation, from an object a committed attempt wrote. | a stale writer's object referenced by the index |
+| **A fenced scope at rest holds its index.** A fenced store's scope that no attempt holds and no dead writer left unsettled holds exactly the keys its index lists, and, in Postgres, reads as written by its head's generation (`versions.md` §5, §9). | a repair that marks a key live with no rows, or leaves a dead attempt's generation as the slice's |
 
 Checked once the system is quiet, at the end of every run (`_converge`): faults
 off, zombies killed, a fresh change to every source, then:
