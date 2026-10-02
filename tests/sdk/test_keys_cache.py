@@ -289,7 +289,7 @@ async def test_only_the_named_object_is_installed(io, tmp_path):
     assert not again.files  # and the copy that is not it goes
 
 
-async def test_committed_deltas_are_verified_before_summaries(io, tmp_path):
+async def test_committed_deltas_are_verified_before_install(io, tmp_path):
     from solera_server.keyservice import KeyService
 
     good = _native.encode_file([b"a"], [b"good"], b"\x00")
@@ -300,9 +300,12 @@ async def test_committed_deltas_are_verified_before_summaries(io, tmp_path):
     try:
         path = f"keys/out/_/{f.name}.kx"
         await io.write(path, evil)
-        service.committed("keys/out/_/", lambda n: f"keys/out/_/{n}.kx", 1, [f], True, 0)
+        state = IndexState(prefix="keys/out/_/")
+        await asyncio.wrap_future(service._submit(asyncio.sleep(0)))
+        service.cache.admit(state)
+        service.committed("keys/out/_/", lambda n: f"keys/out/_/{n}.kx", [f], 0)
         await asyncio.sleep(0.2)
-        assert service.inline("keys/out/_/", 1, 1, None, 10) is None  # no summary of the wrong bytes
+        assert path not in service.cache.files  # not the file the commit names
         assert service.floor() == float("inf")  # its reader pin went with it
     finally:
         await service.stop()
@@ -545,25 +548,6 @@ async def test_a_background_fill_is_a_reader_pin(io, tmp_path, monkeypatch):
         await service.stop()
 
 
-def test_inline_pages_are_capped_as_serialized(tmp_path):
-    """Review 11: the cap counts the page as the spec serializes it — JSON
-    escapes included — and the cursor."""
-
-    import json
-
-    from solera_server import keyservice
-
-    service = keyservice.KeyService(None, str(tmp_path))
-    keys = sorted((f"ключ-{i:05d}-" + "€" * 40).encode() for i in range(5000))
-    service._summarize("p/", 1, [_native.encode_file(keys, [b"v" * 16] * len(keys), bytes(len(keys)))])
-    page = service.inline("p/", 1, 1, None, 5000)
-    assert page is not None and page["next"] is not None
-    assert len(json.dumps(page)) <= keyservice.INLINE_BYTES
-
-
-# -- the keys review, round 2 -------------------------------------------------------------------
-
-
 async def test_a_cache_that_cannot_start_says_so(tmp_path):
     """Round 2, finding 3: the thread's setup error reaches the caller at
     once — not a wait forever — and the service declines from then on."""
@@ -577,36 +561,6 @@ async def test_a_cache_that_cannot_start_says_so(tmp_path):
         await asyncio.wait_for(asyncio.to_thread(service.start), 5)
     assert service.loop is None and not service._running()
     assert await service.resolve("att", b"", lambda n: None, lambda: True, 0) is None
-
-
-def test_summaries_hold_runs_and_merge_only_the_page(tmp_path):
-    """Round 2, finding 7: a summary is its delta's sorted runs, accounted at
-    the bytes they hold, and replacing one gives back its size; a page
-    merges from its cursor, newest batch winning, deletions kept."""
-
-    from solera_server.keyservice import KeyService
-
-    service = KeyService(None, str(tmp_path))
-    rng = random.Random(9)
-    model: dict[bytes, tuple] = {}  # key -> (version, deleted, locator), newest batch winning
-    for b in range(4):
-        ks = sorted({key(rng.randrange(400)) for _ in range(150)})
-        dels = bytes(rng.random() < 0.2 for _ in ks)
-        vs = [b"" if d else rng.randbytes(16) for d in dels]
-        service._summarize("p/", b, [_native.encode_file(ks, vs, dels, locators=[b] * len(ks))])
-        model.update((k, (v, d, b)) for k, v, d in zip(ks, vs, dels, strict=True))
-    held = service._summary_size
-    assert held == sum(r.nbytes for runs, _ in service.summaries.values() for r in runs)
-    service._summarize("p/", 9, [_native.encode_file(sorted(model), [b"v"] * len(model), bytes(len(model)))])
-    service._summarize("p/", 9, [_native.encode_file([b"x"], [b"v"], b"\x00")])  # batch 9 again
-    assert service._summary_size == held + service.summaries[("p/", 9)][1]
-    order = sorted(model)
-    after = order[100].decode()
-    page = service.inline("p/", 0, 3, after, 50)
-    want = order[101:151]
-    assert page["next"] == want[-1].decode()
-    assert page["deleted"] == [k.decode() for k in want if model[k][1]]
-    assert page["upserted"] == {k.decode(): [model[k][0].hex(), model[k][2]] for k in want if not model[k][1]}
 
 
 async def test_admission_remembers_what_a_file_built_to(io, tmp_path):
@@ -668,7 +622,7 @@ async def test_maintenance_reads_the_engine_caches_copies(io, tmp_path):
         await service.stop()
 
 
-# -- engine-served reads (docs/resolved-commits.md §7.1) ------------------------------------------
+# -- engine-served reads (docs/resolved-commits.md §7) ------------------------------------------
 
 
 async def logged_index(io, seed=3):

@@ -319,9 +319,10 @@ Deltas themselves are always exact; only the count is approximate.
 **Engine-resolved commits** (`resolved-commits.md`). A small write is first
 offered to the engine over the attempt's channel: it answers from a cache
 of the index files on its local disk — exact, no requests — or declines,
-and the worker resolves the write itself as below. The same cache keeps
-small deltas' entries in memory, so a consumer's next page of a pending
-window can come inline in its spec.
+and the worker resolves the write itself as below. The same cache answers
+an attempt's input reads — its pages of a full delivery or a pending
+window — with its `start` reply, so a consumer reads no index file when
+the index is warm.
 
 **Read strategy** (`resolved-commits.md` §6). A patch whose run holds
 more than 2% of the index's physical entries streams the whole index —
@@ -399,7 +400,7 @@ Project(..., engine_executor=etl(cpu=2, memory="8GB"))   # not built yet; local 
 **Caching.** Index files never change once written, so a cached copy is
 never stale. The one cache of them is the engine's (`resolved-commits.md`
 §5): it answers small writes from local copies before a worker reads
-anything, and keeps small deltas' entries for inlined pages. Workers keep
+anything, and answers attempts' input reads at `start`. Workers keep
 no cache: what they read — a write the engine declines or that is too big
 for it, a full delivery's pages, `Each`'s lookups — comes from the store
 (the costs are in `bench/keys/results.md`, "Without a worker cache").

@@ -10,7 +10,7 @@ text. It adds an `Each` edge (an asset written
 for one key, run over every changed key), keys that hold many rows,
 per-key outcomes with user-classified errors, key patterns on edges, and
 observable sources. It builds on the engine cache, the HTTP resolver,
-inlined changes of `resolved-commits.md`, the canonical row digest of
+engine-served reads of `resolved-commits.md`, the canonical row digest of
 `row-digest.md`, and on the worker → engine HTTP channel and attempt
 objects of `lifecycle.md` (being written): `{attempt}.spec`, the
 `{attempt}.worker` invocation claim, `{attempt}.result`, and the
@@ -466,8 +466,8 @@ So the failing set is not a map in state: it is a **key index** per
 **This section is authoritative** for the failure record, the transition
 table, the eligibility predicate, the retry-pass state and forced-request
 identity. `resolved-commits.md` and `lifecycle.md` refer here, and the
-SDK holds one implementation that the engine, the worker and the engine
-cache's inline reader all call.
+SDK holds one implementation that the engine and the worker call — the
+engine's start reads run the worker's own code.
 
 **An entry** is `key → version`, the version packing what a retry needs:
 
@@ -500,7 +500,7 @@ failure index, and the worker needs their *prior records*, not just
 whether they changed: tries, `since` and `until` carry over. So it does
 exact point lookups of the touched keys in the pinned failure index (a
 small index is read whole; a large one costs at most a block per touched
-key, and retry pages arrive with their prior records inlined), applies
+key, answered at `start` when the engine holds the index warm), applies
 the transitions below, and uploads the delta next to its output deltas.
 It is engine metadata, not store data: it is not one of the fence's
 intents, and an attempt that never commits leaves it as garbage.
@@ -617,8 +617,7 @@ retry: {pass: 7, epoch: 12, forced_pos: 4031, after: "ICP/Results/run-17.csv",
   the outputs, failure delta and watermark — advances `after` and folds
   into the accumulators every record in the walked range *as it is after
   the page's transitions*, eligible or not. The worker computes that from
-  what it read; an inlined page carries the same range minima, computed
-  by the same function.
+  what it read, whether the store or the engine's start reply answered.
 - **Each change page** commits records too; the engine folds the ones at
   or before `after` into the accumulators (records past `after` will be
   walked). A change can only lower an accumulator or leave a stale
@@ -631,10 +630,9 @@ retry: {pass: 7, epoch: 12, forced_pos: 4031, after: "ICP/Results/run-17.csv",
   and `epoch_min` become `due_acc` and `epoch_acc`, folded with that
   page's own records, in the same commit. If anything is still eligible —
   it became due behind the walk — the next pass starts.
-- If the engine holds the index in its cache and the next eligible keys
-  number at most `inline_max`, it **inlines** them, with their prior
-  records, into `.spec`; otherwise `.spec` pins the failure index and the
-  worker pages through it with the same predicate.
+- `.spec` pins the failure index, and the worker pages through it with
+  the same predicate; when the engine holds the index warm, that walk is
+  answered with its `start` reply (`resolved-commits.md` §7).
 
 When both retries and new changes are pending, the scope **alternates**: a
 retry page, then a change page — the watermark records which kind went
@@ -724,7 +722,7 @@ from what it already holds:
    the file — it wrote or fetched it for the engine cache. On the
    maintenance thread it matches the delta's keys against each consuming
    edge's patterns and keeps, per edge and batch, the count of matching
-   keys (and the keys themselves when they fit `inline_max`). That is
+   keys. That is
    per-delta work, proportional to the commit, never to the index. Each
    count is tagged with the fingerprint of the patterns it was computed
    under, and is used only while the edge delivers under those patterns:
@@ -732,7 +730,7 @@ from what it already holds:
    new ones might match.
 3. **At prepare, from those counts.** A window whose batches all matched
    nothing advances the watermark with no attempt (the existing `skipped`
-   outcome). A window whose matches are known and few is inlined. Anything
+   outcome). Anything
    unknown — after a restart, or a delta never cached — is launched, and
    the worker filters it.
 
@@ -940,7 +938,7 @@ is below the current one.
   admitted to its cache (exact counts, no index reads on the worker), and
   the cold path otherwise. Failure deltas are always resolved by the
   worker itself (§9). The worker uploads both.
-- Inlined retries and, later, pattern hints are answered from the one
+- Retry pages, at `start`, and later pattern hints are answered from the one
   warm engine cache, which `resolved-commits` builds anyway; this proposal
   adds readers, not a cache.
 - Observable sources are sugar for sensors (`lifecycle.md` §11): no
@@ -984,8 +982,8 @@ is below the current one.
 | Work | What this proposal needs from it |
 |---|---|
 | Key index (`object-store-state.md` §6) | No format change. A new kind of index (`keys/@{asset}/{scope}/`, the failure index) compacted like the others; `Rows` groups every key (§6), read once as the prepared write (§7) with the digest grammar; patches build `Rows`. |
-| Engine cache (`resolved-commits.md`, being rewritten) | New readers: inlined retry keys in v1; pattern counts at commit and failure-summary recomputation later. No new cached content beyond failure indexes. |
-| HTTP resolver (`resolved-commits.md`) | Each pages' output deltas are small resolves when the index is admitted; failure deltas are resolved locally, not by the resolver (§9 here is authoritative for the record, transitions, eligibility, pass state and forced-request identity; the resolver's inline reader calls the same SDK functions, and its v1 has no pattern hints or summary recomputation); the worker uploads both. Inlined windows are filtered before the `inline_max` check. A sensor's full key map is resolved in-process (small) or on the host (big), not through an attempt's resolve. The grammar gains the group production. |
+| Engine cache (`resolved-commits.md`) | New readers: retry pages, read at `start`, in v1; pattern counts at commit and failure-summary recomputation later. No new cached content beyond failure indexes. |
+| HTTP resolver (`resolved-commits.md`) | Each pages' output deltas are small resolves when the index is admitted; failure deltas are resolved locally, not by the resolver (§9 here is authoritative for the record, transitions, eligibility, pass state and forced-request identity; the engine's start reads run the same SDK functions, and its v1 has no pattern hints or summary recomputation); the worker uploads both. A sensor's full key map is resolved in-process (small) or on the host (big), not through an attempt's resolve. The grammar gains the group production. |
 | Attempt lifecycle (`lifecycle.md`) | The cancel record (§2.2) and write-completion evidence (§2.3), authoritative there; the two-phase cancel of §7, which §5 follows; live per-key events and key-tagged logs; per-key outcomes in `.result`. Sensors (§11) carry observable sources: `Source.observe` declares one. |
 
 ## 17. What changes in the code
@@ -1043,7 +1041,7 @@ is below the current one.
   request for one class leaves a pending one for another intact; pass
   accumulators over several pages give the exact minima at completion,
   with change pages committed in between; retry
-  passes inline when small and page when big; retry and change pages
+  passes answered at `start` when warm and paged from the store when not; retry and change pages
   alternate when both are pending; a due key changed upstream is
   processed once.
 - Patterns: a page with no matching key ends `skipped` with its
@@ -1095,8 +1093,9 @@ Where the implementation (`solera/errors.py`, `solera/build.py`,
   drained: it reprocesses every key anyway.
 - **A retry page walks at most 100 × `page_size` records** before it ends,
   so a long stretch of keys that are not due spans several pages.
-- **Retry pages are not inlined**, though change pages are
-  (`resolved-commits.md` §7–§8): the worker pages through the failure index. Transitions read priors with an
+- **Retry and change pages alike** are answered at `start` when the
+  engine holds their indexes warm (`resolved-commits.md` §7), else the
+  worker pages through them. Transitions read priors with an
   exact `get` of the touched keys, and the failure delta is resolved locally
   (`KeyIndex.resolve(exact=True)`).
 - **Record times are the worker's clock**; eligibility compares them with
@@ -1120,8 +1119,8 @@ Where the implementation (`solera/errors.py`, `solera/build.py`,
 - **PostgresStore** loads by key only the keys that have rows;
   `can_load(dict[str, T], Keys)` holds when `can_load(T, Keys)` does.
 - **Patterns** (`solera/patterns.py`) are evaluated by Python's `re`, by
-  the worker only — on every page it reads: windows, inlined pages
-  (`resolved-commits.md` §7), full deliveries, `keys=` overrides and
+  the worker only — on every page it reads, whether the store or the
+  engine's start reply (`resolved-commits.md` §7) answers: windows, full deliveries, `keys=` overrides and
   retry pages (a due key the edge no longer takes is `unmatched`). Pages
   are formed from the keys they take, read ahead past the others until a
   page holds `page_size` keys or the delivery runs out, so no page is

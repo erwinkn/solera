@@ -185,7 +185,7 @@ class Attempts:
         answer = self._cancel_answer(live)
         spec, live.reads = live.reads, None  # answered once: a retried start reads the store
         if spec is not None and self.keys is not None:
-            # The attempt's input reads, from the engine's cache (docs/resolved-commits.md §7.1).
+            # The attempt's input reads, from the engine's cache (docs/resolved-commits.md §7).
             whole = {
                 param
                 for param, pin in spec["inputs"].items()
@@ -388,7 +388,7 @@ class Attempts:
             spec["cursor"] = prepared["cursor"]
         path = f"{lifecycle.base(task['run'], attempt)}{lifecycle.SPEC}"
         await self.state.create_object(path, json.dumps(spec).encode())
-        if self.keys is not None:  # what `start` answers its reads from (resolved-commits.md §7.1)
+        if self.keys is not None:  # what `start` answers its reads from (resolved-commits.md §7)
             live.reads = {"inputs": spec["inputs"], "outputs": spec["outputs"]}
         claim = self.m.claimed(attempt)
         if claim is None:

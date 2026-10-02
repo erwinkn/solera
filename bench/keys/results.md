@@ -849,7 +849,7 @@ processes), so only part of the local files stayed in the page cache.
 
 ## Engine-served reads (2026-10-02)
 
-docs/resolved-commits.md §7.1: at `start`, the engine answers an
+docs/resolved-commits.md §7: at `start`, the engine answers an
 attempt's input reads from its cache's local copies, and the worker reads
 no index file to find its pages. `warm.py --reads` puts a consumer behind
 the steady index by 20 commits of 5K keys (a 100K-entry change window)

@@ -466,10 +466,10 @@ async def test_renamed_asset_keeps_its_state(state):
     assert {r["id"]: r["v"] for r in loaded} == {"a": 1, "b": 2}
 
 
-async def test_small_writes_resolve_in_the_engine_and_pages_come_inline(state, monkeypatch):
+async def test_small_writes_resolve_in_the_engine_and_pages_come_with_start(state, monkeypatch):
     """docs/resolved-commits.md §4, §7: once the engine's cache holds an index,
     a small patch's delta comes from the engine — the worker reads no index
-    file — and a consumer's pending page comes inline in its spec."""
+    file — and a consumer's pending page comes with its start reply."""
 
     from solera.keys.io import ObjectIO as IO
 
@@ -497,14 +497,15 @@ async def test_small_writes_resolve_in_the_engine_and_pages_come_inline(state, m
         return out
 
     monkeypatch.setattr(KeyService, "resolve", resolve)
-    inlined, real_inline = [], KeyService.inline
+    served, real_reads = [], KeyService.reads
 
-    def inline(self, *args):
-        out = real_inline(self, *args)
-        inlined.append(out is not None)
+    async def reads_(self, spec, *args):
+        out = await real_reads(self, spec, *args)
+        if any("changes" in pin for pin in spec["inputs"].values()):  # a consumer's start
+            served.append(out is not None)
         return out
 
-    monkeypatch.setattr(KeyService, "inline", inline)
+    monkeypatch.setattr(KeyService, "reads", reads_)
     engine = engine_for(state, Project(assets=[items, mirror]))
     await engine.initialize()
     await run(engine, ["mirror"], upstream=True)
@@ -520,26 +521,25 @@ async def test_small_writes_resolve_in_the_engine_and_pages_come_inline(state, m
         monkeypatch.setattr(IO, "read", read)
         reads.clear()  # the last round's: once warm, nothing reads an index file
         await run(engine, ["items"])
+        await _warm(engine, ("items", ""))  # its delta installed: what the next start reads
         await run(engine, ["mirror"])
         monkeypatch.setattr(IO, "read", real_read)
         truth = {k: v for k, (v, _) in (await _listed(engine)).items()}
         assert seen == truth
     assert set(answers[-3:]) == {"delta"}  # warm: the engine answers
-    assert inlined[-3:] == [True] * 3  # and the consumer's pages come inline
+    assert served[-3:] == [True] * 3  # and the consumer's pages come with its start
     assert not [p for p in reads if p.endswith(".kx")]  # so nothing reads an index file
     await engine.keys.stop()
 
 
 async def test_input_reads_come_from_the_engine_once_warm(state, monkeypatch):
-    """docs/resolved-commits.md §7.1: once the engine's cache holds an index, a
-    consumer's pages — a full delivery, change windows that are not inlined —
-    come with its start reply, and its worker reads no index file to find
+    """docs/resolved-commits.md §7: once the engine's cache holds an index, a
+    consumer's pages — a full delivery, change windows — come with its start
+    reply, and its worker reads no index file to find
     them; what it delivers is what the store's pages would have."""
 
     from solera.keys.io import ObjectIO as IO
-    from solera_server import keyservice
 
-    monkeypatch.setattr(keyservice, "INLINE_MAX", 0)  # no summaries: windows are read, not inlined
     rows = {"v": [{"id": f"k{i:03d}", "v": 1} for i in range(300)]}
     seen: dict[str, dict[str, int]] = {"mirror": {}, "copy": {}}
 
@@ -570,17 +570,8 @@ async def test_input_reads_come_from_the_engine_once_warm(state, monkeypatch):
     await engine.initialize()
     await run(engine, ["mirror"], upstream=True)
 
-    async def warm():  # the fill a cold read queued, and each commit's delta, installed
-        key = ("items", "")
-        for _ in range(200):
-            files = {f"{engine.m.indexes[key].prefix}{n}.kx" for n in engine.m.indexes[key].referenced()}
-            if files <= set(engine.keys.cache.files):
-                return
-            await asyncio.wrap_future(
-                engine.keys._submit(engine.keys.cache.fill(engine.keys.io, engine.m.indexes[key]))
-            )
-            await asyncio.sleep(0.02)
-        raise AssertionError("the index never warmed")
+    async def warm():
+        await _warm(engine, ("items", ""))
 
     index_reads, real_read = [], IO.read
 
@@ -602,6 +593,20 @@ async def test_input_reads_come_from_the_engine_once_warm(state, monkeypatch):
     assert seen["copy"] == truth
     assert not [p for p in index_reads if p.endswith(".kx")]  # every page came with its start
     await engine.keys.stop()
+
+
+async def _warm(engine, key):
+    """The fill a cold read queued, and each commit's delta, installed."""
+
+    for _ in range(200):
+        files = {f"{engine.m.indexes[key].prefix}{n}.kx" for n in engine.m.indexes[key].referenced()}
+        if files <= set(engine.keys.cache.files):
+            return
+        await asyncio.wrap_future(
+            engine.keys._submit(engine.keys.cache.fill(engine.keys.io, engine.m.indexes[key]))
+        )
+        await asyncio.sleep(0.02)
+    raise AssertionError("the index never warmed")
 
 
 async def _listed(engine):

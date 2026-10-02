@@ -1148,7 +1148,7 @@ async def _execute(
     asset = project.assets[spec["asset"]]
     try:
         # Index files straight from the store, but for the reads the engine answered at
-        # `start` (docs/resolved-commits.md §7.1); small writes are the engine's too.
+        # `start` (docs/resolved-commits.md §7); small writes are the engine's too.
         keys_io = ObjectIO(objects, served=control.get("reads"))
         args, changes, delivered = await _resolve_inputs(spec, project, asset, keys_io, timeline)
         filtered = delivered.pop("*filtered", False)

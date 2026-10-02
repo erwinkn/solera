@@ -393,7 +393,7 @@ class KeyIndex:
 
     The `io` may carry `local` — the engine cache's copies by path — read in
     place of the store whenever they hold every file a read needs, and
-    `served` — a `Reads` record (docs/resolved-commits.md §7.1): answering,
+    `served` — a `Reads` record (docs/resolved-commits.md §7): answering,
     its calls are taken from it; recording, every `page`, `pending` and
     `lookup` is kept in it, and one that would need the store raises `Cold`."""
 

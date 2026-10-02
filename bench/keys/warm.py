@@ -62,7 +62,7 @@ async def timed(fn):
 
 async def served_reads(n, state, cache, sample, window, opts, cold) -> list[dict]:
     """A consumer's pages read cold by its worker, against the engine's answer
-    at start (docs/resolved-commits.md §7.1): the engine records the reads over
+    at start (docs/resolved-commits.md §7): the engine records the reads over
     its local copies, the reply goes out as JSON, and the worker's same call
     is answered from it — every step to the worker holding the page."""
 

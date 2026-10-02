@@ -1,4 +1,4 @@
-"""Index reads answered ahead (docs/resolved-commits.md §7.1).
+"""Index reads answered ahead (docs/resolved-commits.md §7).
 
 The engine runs an attempt's input reads — the worker's own code — over
 its cache's local copies, with a recording `Reads` on the `ObjectIO`:

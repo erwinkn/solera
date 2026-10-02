@@ -130,10 +130,6 @@ async def read_window(pin: dict, keys_io) -> Window:
         found = await index.lookup([key_bytes(str(k)) for k in ch["keys"]])
         upserted = {key_str(k): entry for k, entry in found.items()}
         return Window({k: e for k, e in upserted.items() if taken(k)}, (), None, len(upserted))
-    if "inline" in ch and pin.get("patterns") is None:  # the engine merged this page from its cache
-        page = ch["inline"]
-        upserted = {k: (bytes.fromhex(v), int(loc)) for k, (v, loc) in page["upserted"].items()}
-        return Window(upserted, tuple(page["deleted"]), page["next"], len(upserted) + len(page["deleted"]))
 
     def kind(entry):
         return ("delete" if entry[2] else "upsert") if taken(key_str(entry[0])) else None

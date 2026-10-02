@@ -725,8 +725,8 @@ they can go at once. It costs the same one integer per index entry.
   `(version, locator)` — the entry it replaces or deletes — when the
   writer read it. Compaction drops predecessors.
 - **Everywhere an entry travels, the locator travels with it:** resolver
-  responses (the delta file), inline pages and summaries
-  (`resolved-commits.md` §7–8: `{key: [version, locator]}`), and the
+  responses (the delta file), reads answered at `start`
+  (`resolved-commits.md` §7: `.kx` files), and the
   `Keys` selection a store receives (`{key: (revision, locator)}`).
 - It rides the `.kx` format bump of the row-digest work.
 

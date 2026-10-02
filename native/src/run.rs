@@ -219,64 +219,6 @@ impl SortedRun {
         w.finish(true)?;
         Ok(w.files.pop_front().expect("finish(true) writes a file"))
     }
-
-    /// The first entry of the newest-wins merge of `runs` (newest first) past
-    /// `after`, then the next, up to `limit`: `(run, entry)` each, and whether
-    /// any key lies past them.
-    pub fn merge(
-        runs: &[&SortedRun],
-        after: Option<&[u8]>,
-        limit: usize,
-    ) -> (Vec<(usize, usize)>, bool) {
-        let mut at: Vec<usize> = runs
-            .iter()
-            .map(|r| match after {
-                Some(a) => r.keys.partition_point_le(a),
-                None => 0,
-            })
-            .collect();
-        let mut out = Vec::new();
-        loop {
-            // The smallest head key, the newest run holding it.
-            let mut best: Option<(usize, &[u8])> = None;
-            for (r, run) in runs.iter().enumerate() {
-                if at[r] < run.len() {
-                    let k = run.key(at[r]);
-                    if best.is_none_or(|(_, b)| k < b) {
-                        best = Some((r, k));
-                    }
-                }
-            }
-            let Some((r, key)) = best else {
-                return (out, false);
-            };
-            if out.len() == limit {
-                return (out, true);
-            }
-            out.push((r, at[r]));
-            for (s, run) in runs.iter().enumerate() {
-                if at[s] < run.len() && run.key(at[s]) == key {
-                    at[s] += 1;
-                }
-            }
-        }
-    }
-}
-
-impl Arena {
-    /// How many of these sorted strings are `<= x`.
-    fn partition_point_le(&self, x: &[u8]) -> usize {
-        let (mut lo, mut hi) = (0, self.len());
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            if self.get(mid) <= x {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        lo
-    }
 }
 
 /// Upserts in key order merged with sorted removes.
@@ -356,18 +298,5 @@ mod tests {
         ));
         assert!(SortedRun::of(&[b"a"], &[b"1"], &[b"a"]).is_err());
         assert!(SortedRun::of(&[b"a", b"a"], &[b"1", b"2"], &[]).is_err());
-    }
-
-    #[test]
-    fn merge_newest_wins_from_a_cursor() {
-        let new = SortedRun::of(&[b"b", b"d"], &[b"n", b"n"], &[]).unwrap();
-        let old = SortedRun::of(&[b"a", b"b", b"c", b"e"], &[&b"o"[..]; 4], &[]).unwrap();
-        let runs = [&new, &old];
-        let (got, more) = SortedRun::merge(&runs, Some(b"a"), 3);
-        assert_eq!(got, [(0, 0), (1, 2), (0, 1)]);
-        assert!(more);
-        let (got, more) = SortedRun::merge(&runs, Some(b"d"), 3);
-        assert_eq!(got, [(1, 3)]);
-        assert!(!more);
     }
 }

@@ -34,7 +34,6 @@ use pyo3::types::{PyBool, PyBytes, PyCapsule, PyDict, PyInt, PyList, PyString};
 
 use format::{Error, Options};
 use jobs::{Compact, Count, Join, Step};
-use pyo3::types::PyTuple;
 use rayon::prelude::*;
 use rows::{Arena, Constant, Cursor, Overlay, Source, Stream, Table, Versions};
 use stream::Segment;
@@ -1252,39 +1251,6 @@ impl SortedRun {
             PyBytes::new(py, &flags),
             r.locators.clone(),
         ))
-    }
-
-    /// Up to `limit` entries of the newest-wins merge of `runs` (newest
-    /// first) past `after`: keys, versions, deleted flags, locators, and
-    /// whether any key lies past them.
-    #[staticmethod]
-    #[pyo3(signature = (runs, after, limit))]
-    fn merge<'py>(
-        py: Python<'py>,
-        runs: Vec<PyRef<'py, SortedRun>>,
-        after: Option<PyBackedBytes>,
-        limit: usize,
-    ) -> PyResult<Bound<'py, PyTuple>> {
-        let inner: Vec<&run::SortedRun> = runs.iter().map(|r| r.inner.as_ref()).collect();
-        let (picks, more) = run::SortedRun::merge(&inner, after.as_deref(), limit);
-        let keys = PyList::new(
-            py,
-            picks
-                .iter()
-                .map(|&(r, i)| PyBytes::new(py, inner[r].key(i))),
-        )?;
-        let versions = PyList::new(
-            py,
-            picks
-                .iter()
-                .map(|&(r, i)| PyBytes::new(py, inner[r].versions.get(i))),
-        )?;
-        let deleted: Vec<u8> = picks
-            .iter()
-            .map(|&(r, i)| inner[r].deleted[i] as u8)
-            .collect();
-        let locators: Vec<u64> = picks.iter().map(|&(r, i)| inner[r].locators[i]).collect();
-        (keys, versions, PyBytes::new(py, &deleted), locators, more).into_pyobject(py)
     }
 }
 

@@ -3,14 +3,9 @@ thread of their own: nothing here runs on the engine's event loop.
 
 - `resolve` answers a worker's request from the cache, or declines.
 - `committed` keeps the cache warm with what a commit installed — a delta
-  the resolver returned is a candidate already, installed without a GET —
-  and keeps small deltas' entries in memory as summaries: native sorted
-  runs, accounted at the bytes they hold.
+  the resolver returned is a candidate already, installed without a GET.
 - `installed` takes a file the engine wrote (a compaction output).
-- `inline` merges summaries into the first page of a pending window, for
-  prepare: memory only, never waiting, its work the page's, not the
-  window's.
-- `reads` answers an attempt's input reads at its `start` (§7.1): the
+- `reads` answers an attempt's input reads at its `start` (§7): the
   worker's own read code over local copies, recorded.
 
 Whatever here reads index files from the object store holds a reader pin
@@ -30,11 +25,10 @@ import math
 import os
 import tempfile
 import threading
-from collections import OrderedDict
 from urllib.parse import unquote, urlsplit
 
 from solera.keys import LocalError, SortedRun
-from solera.keys.cache import Corrupt, EngineCache, verify
+from solera.keys.cache import Corrupt, EngineCache
 from solera.keys.index import FileInfo, IndexState, KeyIndex, Options
 from solera.keys.io import ObjectIO
 from solera.keys.reads import Cold, Full, Reads
@@ -46,9 +40,6 @@ INSTALL_QUEUE = 128 * 2**20  # bytes of written files waiting to be installed: t
 READS_MAX_ENTRIES = 1_000_000  # entries one start reply's reads may carry
 READS_MAX_BYTES = 16 * 2**20  # ...and bytes, encoded
 READS_TIMEOUT = 2.0  # seconds the engine spends on them before answering without
-INLINE_MAX = 10_000  # entries of a delta kept as a summary
-INLINE_BATCHES = 64  # summaries one inlined page may merge
-INLINE_BYTES = 2**20  # serialized page
 
 
 def cache_root(objects_url: str) -> str:
@@ -74,16 +65,11 @@ class KeyService:
         disk: int = 16 * 2**30,
         candidates: int = 2**30,
         window: float = 900.0,
-        summary_bytes: int = 256 * 2**20,
         limits: Limits | None = None,
     ):
         self.objects, self.root, self.options = objects, root, options or Options()
         self.disk, self.candidates, self.window = disk, candidates, window
         self.limits = limits or Limits()
-        self.summary_bytes = summary_bytes
-        # (prefix, batch) -> (its delta's files as sorted runs, their bytes): read from any thread.
-        self.summaries: OrderedDict[tuple, tuple[list[SortedRun], int]] = OrderedDict()
-        self._summary_size = 0
         self.loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._stopped = False
@@ -233,15 +219,13 @@ class KeyService:
         finally:
             self.release(token)
 
-    def committed(
-        self, prefix: str, path, batch: int, files: list[FileInfo], keep_summary: bool, position: float
-    ) -> None:
+    def committed(self, prefix: str, path, files: list[FileInfo], position: float) -> None:
         """A commit at `position` installed `files` (a batch's delta) into the index at `prefix`."""
 
         if not self._running():
             return
         token = self.hold(position)
-        fut = self._submit(self._committed(prefix, path, batch, files, keep_summary))
+        fut = self._submit(self._committed(prefix, path, files))
         fut.add_done_callback(_logged)
         fut.add_done_callback(lambda _f: self.release(token))
 
@@ -273,7 +257,7 @@ class KeyService:
 
     async def reads(self, spec: dict, whole: set[str], position: float) -> dict | None:
         """The input reads of the attempt `spec` describes, answered from
-        local copies (docs/resolved-commits.md §7.1): a `Reads` record as JSON,
+        local copies (docs/resolved-commits.md §7): a `Reads` record as JSON,
         or None when there is nothing to answer or no time to. `whole`: the
         inputs read whole from an immutable store, paged by their locators."""
 
@@ -379,77 +363,21 @@ class KeyService:
         for key in [k for k in self.cache.candidates if f"-{attempt}." in k[0]]:
             self.cache.candidates.pop(key, None)
 
-    async def _committed(self, prefix: str, path, batch: int, files: list[FileInfo], keep_summary: bool):
-        small = keep_summary and sum(f.entries for f in files) <= INLINE_MAX
-        admitted = prefix in self.cache.indexes and self.cache.indexes[prefix].admitted
-        parts = []
+    async def _committed(self, prefix: str, path, files: list[FileInfo]):
+        if not (prefix in self.cache.indexes and self.cache.indexes[prefix].admitted):
+            for f in files:  # nothing to install: a candidate it made goes
+                self.cache.candidates.pop((path(f.name), f.size, f.digest), None)
+            return
         try:
             for f in files:
                 p = path(f.name)
-                cand = self.cache.candidates.get((p, f.size, f.digest))
-                data = cand.data if cand is not None else None
-                if not await self.cache.committed(prefix, f, p) and admitted:
+                if not await self.cache.committed(prefix, f, p):
                     # A delta the resolver did not produce: fetched once, while it is small.
-                    data = data or await self.io.read_whole(p, f.size)
-                    await self.cache.install(prefix, f, p, data)  # verified there
-                if small:
-                    data = data or await self.io.read_whole(p, f.size)
-                    verify(f, p, data)  # a summary says what the committed file holds, or nothing
-                    parts.append(data)
-            if small:
-                self._summarize(prefix, batch, parts)
+                    await self.cache.install(
+                        prefix, f, p, await self.io.read_whole(p, f.size)
+                    )  # verified there
         except (Corrupt, ValueError) as e:
             log.warning("key cache: %s", e)
-
-    def _summarize(self, prefix: str, batch: int, parts: list[bytes]) -> None:
-        runs = [SortedRun.decode(data) for data in parts]
-        size = sum(r.nbytes for r in runs)
-        old = self.summaries.pop((prefix, batch), None)
-        if old is not None:
-            self._summary_size -= old[1]
-        self.summaries[(prefix, batch)] = (runs, size)
-        self._summary_size += size
-        while self._summary_size > self.summary_bytes and self.summaries:
-            _, old = self.summaries.popitem(last=False)
-            self._summary_size -= old[1]
-
-    # -- inline pages (§7) -----------------------------------------------------------------
-
-    def inline(self, prefix: str, lo: int, hi: int, after: str | None, limit: int) -> dict | None:
-        """The first page of the pending window `[lo, hi]` past `after`, merged
-        from summaries — newest batch winning, deletions kept — or None when a
-        batch has none, or the page would be too big."""
-
-        if hi < lo or hi - lo + 1 > INLINE_BATCHES:
-            return None
-        parts = [self.summaries.get((prefix, b)) for b in range(hi, lo - 1, -1)]  # newest first
-        if any(p is None for p in parts):
-            return None
-        start = after.encode("utf-8", "surrogateescape") if after is not None else None
-        # A batch's files never overlap: each is a run of its own, at its batch's rank.
-        runs = [r for p in parts for r in p[0]]
-        keys, versions, deleted, locators, more = SortedRun.merge(runs, start, limit)
-        # The page's size as the spec serializes it (`json.dumps`, its default separators):
-        # with `next` null; a cursor replaces that with a key.
-        upserted, removed, size, last = {}, [], len(json.dumps(inline_page({}, [], None))), None
-        for k, v, d, loc in zip(keys, versions, deleted, locators, strict=True):
-            key = k.decode("utf-8", "surrogateescape")
-            entry = len(json.dumps(key) if d else json.dumps({key: [v.hex(), loc]})[1:-1]) + 2
-            if size + entry + len(json.dumps(key)) > INLINE_BYTES:  # this key may be the cursor
-                if last is None:
-                    return None  # the first entry alone is too big: no page that advances
-                return inline_page(upserted, removed, last)
-            size += entry
-            if d:
-                removed.append(key)
-            else:
-                upserted[key] = [v.hex(), loc]
-            last = key
-        return inline_page(upserted, removed, last if more else None)
-
-
-def inline_page(upserted: dict, deleted: list, nxt) -> dict:
-    return {"upserted": upserted, "deleted": deleted, "next": nxt}
 
 
 def _logged(fut: concurrent.futures.Future) -> None:

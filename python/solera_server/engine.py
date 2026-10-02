@@ -463,17 +463,14 @@ class Engine(Attempts, Sensors, Views):
             self.keys.ended(claim["attempt"])
 
     def _cache_commit(self, name: str, scope: str, keys: dict | None) -> None:
-        """Keep the engine's cache warm with what a commit installed (§5), and a
-        summary of a small delta for inlined pages (§7)."""
+        """Keep the engine's cache warm with what a commit installed (§5)."""
 
         if not keys or not keys.get("files"):
             return
         index = self.m.indexes.get((name, scope))
         if index is not None:
             files = [FileInfo.from_json(f) for f in keys["files"]]
-            batch = int(keys["batch"])
-            logged = bool(index.log) and index.log[-1][0] == batch  # a consumer will read it
-            self.keys.committed(index.prefix, index.path, batch, files, logged, self.m.applied)
+            self.keys.committed(index.prefix, index.path, files, self.m.applied)
 
     # -- dispatch ---------------------------------------------------------------
 
@@ -1044,14 +1041,8 @@ class Engine(Attempts, Sensors, Views):
             window["to"] = current["to"]
         changes = {**window, "limit": limit, "page": current["page"], "pages": current["pages"]}
         pin = {"ref": ref, "index": pinned.to_json(), "changes": changes}
-        if not whole and not empty and self.keys is not None:
-            # The first page of the pinned window, from summaries in memory (§7 of
-            # docs/resolved-commits.md): the worker then reads no delta file.
-            inline = self.keys.inline(index.prefix, current["from"], current["to"], current["at"], limit)
-            if inline is not None:
-                pin["changes"]["inline"] = inline
         if carried["patterns"] is not None:
-            pin["patterns"] = carried["patterns"]  # the worker filters the page, inlined or read
+            pin["patterns"] = carried["patterns"]  # the worker filters the page
         else:
             carried.pop("patterns")
         return pin, {"kind": "keys", "watermark": carried, "delivery": current}, empty

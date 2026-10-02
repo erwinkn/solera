@@ -3,8 +3,9 @@
 Status: **built** (decision D4); §14 lists where the code departs from the
 text. How a keyed write learns what it changed (`object-store-state.md` §6,
 "Compute a delta"): the engine answers from a warm cache of the key index,
-and the worker resolves locally when it cannot. Also how a downstream
-attempt receives small pending windows inline.
+and the worker resolves locally when it cannot. Also how an attempt's
+index reads — its input pages — are answered from the same cache at
+`start`.
 
 It depends on two other designs, and says where:
 
@@ -12,7 +13,7 @@ It depends on two other designs, and says where:
   claim that admits one invocation (§4), and the store kinds `immutable`
   and `fenced` (§9.6, `stores.md`), which decide the repair rules of §3.
 - `per-key-processing.md` — the failure index, whose one v1 reader here
-  (inlined retry pages) follows that doc's eligibility predicate and
+  (retry pages, read at `start`) follows that doc's eligibility predicate and
   transition table (§8). Its own semantics (rescoping, cancellation, retry
   pacing, sensors) belong to that doc.
 - `key-index-format.md` — entries with a locator, and deltas with
@@ -56,8 +57,8 @@ own delta file and follows its store's write rules — repair, gate, fencing
 — exactly as if it had computed the delta itself. If the engine cannot be
 reached, declines or is too slow, the worker resolves locally: a sparse
 reader for small patches, a streaming merge-join for replacements and
-dense patches. There is no read planner. The same cache inlines small
-pending windows into downstream specs and serves the per-key readers.
+dense patches. There is no read planner. The same cache answers an
+attempt's input reads at `start`, the per-key readers' included.
 
 Correctness never depends on the resolver: its answer is a pure function
 of the pinned snapshot and the request, the worker can compute the same
@@ -336,7 +337,7 @@ the engine checks again.
 
 ## 5. The engine cache
 
-One cache serves every reader on the engine: resolves, inlined windows,
+One cache serves every reader on the engine: resolves, input reads at `start`,
 compaction (which reads what it just wrote), recounts, and the per-key
 readers (§8). It runs on maintenance threads, never on the engine's event
 loop. A compaction or a recount of an index the cache holds warm pins its
@@ -405,7 +406,7 @@ read fails with `corrupt`.
   entries across its levels — not 100M — at ~40 B decompressed: ~5 GB
   (estimated from the steady-state level sizes).
 - memory: directories of every local file (~0.01 B per entry: ~1.3 MB
-  at 100M) and the summaries of §7 (256 MB). Blocks are read through the
+  at 100M). Blocks are read through the
   OS page cache — no block LRU of our own; §9 measures both warmths.
   Filters are not cached: a warm reader never needs them.
 
@@ -597,57 +598,13 @@ of magnitude fewer:
   22.6 s; 10M fresh, 10K: 831 reads in 2.0 s, 34 segments in 1.4 s);
   16 gives streaming the close calls, saving the requests.
 
-## 7. Inlined downstream changes
+## 7. Engine-served reads
 
-When the engine prepares an attempt whose `Incremental` edge reads a keyed
-upstream, it can put the first page of the pending window in the spec
-instead of making the worker read deltas:
-
-```json
-"changes": {"from": 56, "to": 57, "after": null, "limit": 10000, "full": false,
-            "inline": {"upserted": {"alpha-file-2": ["3f9c…", 184467]}, "deleted": ["alpha-file-7"],
-                       "next": null}}
-```
-
-An upserted key carries its `(version, locator)`, as a paged window's
-does: the worker hands them to the load as `Keys({key: (revision,
-locator)})` (`lifecycle.md` §9.8), and an immutable store computes every
-name without a LIST.
-
-- **The pinned window, nothing newer.** The page merges exactly the delta
-  files of batches `from…to` in the spec's pinned log, newest batch
-  winning per key. A batch 58 committed after prepare is not in it, even
-  though the engine holds it.
-- **The same paging as `pending`.** Keys `> after`, at most `limit`, in key
-  order, tombstones kept as deletions. `next` is the continuation cursor
-  (`null` when the window is exhausted); the worker reports `delivered` as
-  for a paged window, and the next attempt continues from `next` — inlined
-  or not.
-- **A byte cap.** At most `inline_max_bytes` (1 MB) of serialized page; a
-  page that reaches it ends early with `next` set. If the first entry
-  alone exceeds the cap, the window is not inlined at all — an empty page
-  with a cursor would not advance.
-- **Bounded work in prepare.** Prepare reads only RAM. At commit, on a
-  maintenance thread, the engine keeps for each committed delta of at most
-  `inline_max` entries (10K) its sorted entries as a **summary** — native
-  sorted runs, accounted at the bytes they hold — within `cache_ram`,
-  preferably until the consumers' watermarks pass the batch; the budget
-  evicts the oldest first. A window is inlined only when every batch in it
-  has a summary and it spans at most `inline_max_batches` (64) summaries:
-  then prepare merges them from the cursor, newest batch winning, and
-  stops at the page (a binary search per summary, then a k-way merge of
-  `limit` entries), so its work is the page's, not the window's. Anything
-  else — after a restart, a big batch, a lagging consumer with thousands
-  of batches — goes out as today, and the worker pages the window.
-
-### 7.1 Engine-served reads
-
-Inline pages cover a small window's first page. Everything else an
-attempt reads from an index before it computes — a full delivery's page,
-a larger change window, a rescope's diff, a `keys=` selection, an `Each`
-page's failure records and retry walk, an immutable store's locators for
-a whole read — the worker pages from the store, cold: at 100M keys, 9 to
-649 GETs a page. The engine holds those indexes warm. So, mirroring
+Everything an attempt reads from an index before it computes — a full
+delivery's page, a change window, a rescope's diff, a `keys=` selection,
+an `Each` page's failure records and retry walk, an immutable store's
+locators for a whole read — a worker alone pages from the store, cold: at
+100M keys, 20 to 37 GETs a page (`bench/keys/results.md`). The engine holds those indexes warm. So, mirroring
 `resolve` for writes, the worker asks once, at `start`, and the engine
 answers its reads; the worker then loads rows from the stores itself. One
 request per step: `start` for reads, `resolve` before writing.
@@ -675,7 +632,14 @@ request per step: `start` for reads, `resolve` before writing.
   store, for this. An index it does not hold stops the record at its first
   call and queues a fill, as a `cold` resolve does. Cache off, no spec in
   memory (an attempt launched before a restart), a timeout: no record, and
-  the worker reads the store as before.
+  the worker reads the store as before. So does a start that comes before
+  the commit it reads has been installed: the read is cold, and fills it.
+- **One mechanism.** An earlier design also put a small window's first
+  page in the spec, merged at prepare from in-memory summaries of small
+  deltas. Recorded reads made it redundant, and it is gone: prepare reads
+  nothing, and a window is answered at `start` when its index is warm —
+  an index refused admission is read from the store, small windows
+  included.
 - **Delta files stay while logged.** A change window reads delta files
   that compaction has merged out of the levels; the cache retires a delta
   only when collection deletes it, so a warm index answers its windows
@@ -692,23 +656,16 @@ from each commit and made exact by completed retry passes, and retry-pass
 identity. This doc implements none of that differently; it calls the same
 SDK predicate.
 
-In v1 the cache has **one** per-key reader: the **inlined retry page**.
-When a scope has retries and its failure index is warm, a maintenance
-thread selects the next page of entries after the pass position that
-satisfy `eligible`, at most `inline_max`, with their prior records, and
-holds it for prepare, under §7's caps:
-
-- it carries its **input identity** — (failure index prefix, its head
-  batch, the pass identity of the per-key doc, the pass position
-  `retry.after`) — and is discarded rather than published if any of them
-  moved while it was computed, and ignored by prepare unless they all
-  match the scope's current ones;
-- prepare never waits for it: without a matching page, `.spec` pins the
-  failure index and the worker pages it with the same predicate.
+In v1 the cache's per-key reader is the start read (§7): an `Each`
+attempt's retry page — the walk of its failure index from the pass
+position, keeping the keys `eligible` says are due, then their upstream
+entries — is the worker's own read code, recorded over local copies like
+any input read, and bound the same way to the failure index the spec
+pins. Without a record, the worker walks the failure index itself.
 
 Failure deltas are not resolved here: the worker resolves them locally,
-with exact lookups of prior records (per-key doc §9), and an inlined page
-already carries the prior records of its keys.
+with exact lookups of prior records (per-key doc §9) — answered at
+`start` too, when the failure index is warm.
 
 Not in v1, and not to be built from this doc: engine-side pattern skip
 hints (pattern match counts per committed delta), and coalesced
@@ -800,7 +757,7 @@ reports both.
   fills are deduplicated; failed and canceled fills release their
   reservations; a compaction that cannot reserve demotes its index;
   pinned files survive eviction and garbage collection.
-- **Locators.** Resolver deltas, cold deltas, inlined pages and `Keys`
+- **Locators.** Resolver deltas, cold deltas, recorded reads and `Keys`
   carry `(version, locator)`; every superseded object of an immutable
   output is discarded — by its commit when the old entry was read, by the
   compaction that drops it otherwise, including keys the pair filter
@@ -809,14 +766,12 @@ reports both.
 - **Unknown writes.** A dead `Sql` writer that deleted `a` and inserted
   `b`: the next patch acquires, reads the store's key map, reconciles both
   keys and only then clears the intent; a replacement overwrites instead.
-- **Retry pages.** An inlined retry page computed against an older failure
-  head or pass position is discarded; prepare without a matching page
-  pins the failure index instead of waiting; canceled keys are never
-  selected by themselves (the per-key predicate).
-- **Inlining.** Inlined pages equal `pending` pages for the same pinned
-  window, including a later batch that must not leak in, tombstones, the
-  byte cap, an oversized first entry (no inline), the summary cap, and
-  the continuation cursor.
+- **Retry pages.** Recorded against the pinned failure index only;
+  canceled keys are never selected by themselves (the per-key predicate).
+- **Start reads.** Local pages, windows and lookups equal the store's from
+  any cursor; a record answers only its own calls on its own pinned
+  snapshot; its bounds stop it; a cold or corrupt index stops it and is
+  filled.
 - **Benchmarks.** The crossover grid of §6; warm resolves at 1K/10K/100K
   keys into 1M/10M/100M against the cold-worker and warm-worker baselines
   — time to delta end to end, engine CPU, RSS, cache disk, with the page
@@ -886,7 +841,7 @@ here.
 | The cache | `EngineCache` (`solera/keys/cache.py`) |
 | Framing, validation, deduplication, declines | `Resolver`, `request`, `answers` (`solera/keys/resolver.py`) |
 | The route | `POST /api/projects/{p}/attempts/{a}/resolve` (`api.py`), `Engine.attempt_resolve` (`attempts.py`), the channels' `resolve` |
-| The thread, write-through, summaries, inline pages, source commits | `KeyService` (`solera_server/keyservice.py`); `Engine._cache_commit`, `_resolve_source`, `_incremental_plan` |
+| The thread, write-through, start reads, source commits | `KeyService` (`solera_server/keyservice.py`), `solera/keys/reads.py`; `Engine._cache_commit`, `_resolve_source`, `attempt_start` |
 
 Differences:
 
