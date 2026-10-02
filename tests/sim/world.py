@@ -326,6 +326,7 @@ class World:
         self.steps = 0
         self._saved: list = []
         self.on_record: Callable | None = None  # events an engine applied, as it applies them
+        self.pg = None  # a postgres.Ledger, when the project writes to Postgres
 
     # -- running ------------------------------------------------------------------------
 
@@ -350,7 +351,12 @@ class World:
             if world.on_record is not None:
                 world.on_record(events)
 
-        patches = [
+        patches = []
+        if self.pg is not None:
+            from . import postgres
+
+            patches += postgres.patches(self.pg, actor.get)
+        patches += [
             (worker_mod, "Reporter", reporter),
             (engine_mod, "KeyService", keys),
             (State, "_exit", staticmethod(exit_)),

@@ -30,6 +30,7 @@ class Journal:
     launched: dict[str, dict] = field(default_factory=dict)  # attempt -> AttemptLaunched
     problems: list[str] = field(default_factory=list)
     applied_commits: set = field(default_factory=set)  # attempts some engine committed in memory
+    reads: list = field(default_factory=list)  # AttemptFinished events that report what their reads saw
 
     def landed(self, path: str, data: bytes) -> None:
         if "/control/journal/" not in path:

@@ -45,7 +45,8 @@ from .stores import Database, TableStore
 
 @dataclass(frozen=True)
 class Variant:
-    items_store: str = "file"  # "file" | "table"
+    items_store: str = "file"  # "file" | "table" | "pg"
+    alt: str = "table"  # the store `items` moves to from FileStore
     items_version: str = "1"
     copy_name: str = "copy"  # "copy" | "mirror" (renamed, aliases=["copy"])
     summary: bool = True
@@ -59,7 +60,7 @@ class Variant:
 
 
 VARIANTS = {
-    "table": lambda v: replace(v, items_store="table" if v.items_store == "file" else "file"),
+    "table": lambda v: replace(v, items_store=v.alt if v.items_store == "file" else "file"),
     "bump": lambda v: replace(v, items_version=str(int(v.items_version) + 1)),
     "rename": lambda v: replace(v, copy_name="mirror" if v.copy_name == "copy" else "copy"),
     "summary": lambda v: replace(v, summary=not v.summary),
@@ -94,13 +95,18 @@ def f_items(v: str, version: str) -> str:
     return f"{v}.{version}"
 
 
-def build(variant: Variant, data_root, db: Database, outside: External) -> Project:
+def build(variant: Variant, data_root, db: Database, outside: External, pg: str | None = None) -> Project:
     """The project of `variant`, its FileStore under `data_root`, its table
-    store on `db`."""
+    store on `db`, and — given a schema `pg` — a PostgresStore writing there."""
 
-    items_output = Output(
-        "items", key="id", revision="v", store="db" if variant.items_store == "table" else None
-    )
+    if variant.items_store == "pg":
+        items_output = Output(
+            "items", key="id", revision="v", store="pg", schema=pg, columns={"id": "text", "v": "text"}
+        )
+    else:
+        items_output = Output(
+            "items", key="id", revision="v", store="db" if variant.items_store == "table" else None
+        )
 
     @asset(
         outputs=items_output,
@@ -185,7 +191,7 @@ def build(variant: Variant, data_root, db: Database, outside: External) -> Proje
             PartitionSet("sites"),
         ],
         sensors=[watch],
-        stores={"ext": SourceStore(data_root), "db": TableStore(db)},
+        stores={"ext": SourceStore(data_root), "db": TableStore(db), **_postgres(pg)},
         default_store=FileStore(data_root),
         build="sim",
         name="sim",
@@ -194,6 +200,16 @@ def build(variant: Variant, data_root, db: Database, outside: External) -> Proje
 
 def expected_items(feed: dict[str, str], variant: Variant) -> dict[str, str]:
     return {k: f_items(v, variant.items_version) for k, v in feed.items()}
+
+
+def _postgres(schema: str | None) -> dict:
+    if schema is None:
+        return {}
+    from solera_postgres import PostgresStore
+
+    from .postgres import DSN
+
+    return {"pg": PostgresStore(DSN)}
 
 
 def expected_checks(items: dict[str, str]) -> dict[str, str]:

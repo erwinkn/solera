@@ -21,6 +21,7 @@ from hypothesis import strategies as st
 from hypothesis.stateful import RuleBasedStateMachine, initialize, invariant, precondition, rule
 from solera.keys.index import Options
 
+from . import postgres
 from .core import EPOCH, Killed
 from .oracle import Journal, Violation, batch_rows, index_entries, keyed_content, value_content
 from .project import VARIANTS, External, Variant, build, expected_checks, expected_copy, expected_items
@@ -40,6 +41,7 @@ KEYS = ["k0", "k1", "k2", "k3", "k10", "k11"]
 SITES = ["east", "west", "north"]
 TARGETS = ["items", "copy", "per_site", "log", "tally", "summary", "checks"]
 TERMINAL = {"succeeded", "failed", "canceled", "skipped"}
+STORES = ["file", "table"] + (["pg"] if postgres.DSN else [])  # where `items` lives
 # Re-registrations the rules make. Those that trip an open finding on most
 # runs are left out until it is fixed (tests/server/test_sim_found.py);
 # SOLERA_SIM_KNOWN=1 puts them back.
@@ -68,9 +70,9 @@ class Simulation(RuleBasedStateMachine):
 
     # -- setup ----------------------------------------------------------------------------
 
-    @initialize(seed=st.integers(0, 2**16), table=st.booleans())
-    def boot(self, seed, table=False):
-        self.trace.append(f"boot(seed={seed}, table={table})")
+    @initialize(seed=st.integers(0, 2**16), store=st.sampled_from(STORES))
+    def boot(self, seed, store="file"):
+        self.trace.append(f"boot(seed={seed}, store={store!r})")
         self.world = world = World(self.tmp, seed, key_options=Options(l0_max_files=2))
         self.journal = Journal()
         world.objects.tap = self.journal.landed
@@ -78,7 +80,12 @@ class Simulation(RuleBasedStateMachine):
         self.db, self.outside = Database(), External()
         self.db.fault = self._db_fault
         self.data_root = self.tmp / "data"
-        self.variant = Variant(items_store="table" if table else "file")
+        self.variant = Variant(items_store=store, alt="table" if store == "file" else store)
+        self.schema = None
+        if "pg" in (store, self.variant.alt):
+            self.schema = postgres.fresh_schema()
+            world.pg = postgres.Ledger()
+            self._pg_checked = 0
         self.project = self._build()
         self.feed: dict[str, str] = {}  # what clients asked for, acknowledged or not
         self.sites: set[str] = set()
@@ -88,7 +95,7 @@ class Simulation(RuleBasedStateMachine):
         self._ensure_engine()
 
     def _build(self):
-        return build(self.variant, self.data_root, self.db, self.outside)
+        return build(self.variant, self.data_root, self.db, self.outside, self.schema)
 
     def _db_fault(self, kind, scope):
         if not self.world.plan.enabled:
@@ -370,6 +377,19 @@ class Simulation(RuleBasedStateMachine):
             )
 
     @invariant()
+    def reads_say_what_they_read(self):
+        """A current-read store's reads (PostgresStore): the generation each
+        reports wrote the rows it loaded, and was the newest write before its
+        snapshot; an attempt's reported key versions are those of the rows it
+        loaded (lineage of what was read)."""
+
+        world = self.world
+        if world is None or world.pg is None:
+            return
+        self._pg_checked = postgres.check(world.pg, self._pg_checked)
+        postgres.check_reported(world.pg, self.journal.reads)
+
+    @invariant()
     def committed_keys_are_readable(self):
         """Every key an immutable store's head lists reads back at its
         version, from an object a committed attempt wrote."""
@@ -406,6 +426,8 @@ class Simulation(RuleBasedStateMachine):
             if self.world is not None and sys.exc_info()[0] is None:  # not after a failed step
                 self._converge()
         finally:
+            if getattr(self, "schema", None):
+                _drop(self.schema)
             if self.world is not None:
                 STATS["examples"] += 1
                 STATS["steps"] += len([t for t in self.trace if not t.startswith(("  #", "#"))])
@@ -583,3 +605,10 @@ def _first_diff(a, b, path="") -> str:
             if x != y:
                 return _first_diff(x, y, f"{path}[{i}]")
     return f"{path}: {str(a)[:300]} != {str(b)[:300]}"
+
+
+def _drop(schema: str) -> None:
+    import psycopg
+
+    with psycopg.connect(postgres.DSN, autocommit=True) as conn:
+        conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
