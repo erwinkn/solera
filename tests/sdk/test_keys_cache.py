@@ -988,6 +988,7 @@ async def test_cancelled_work_keeps_what_it_holds_until_its_thread_ends(io, tmp_
     assert not any(f.pins for f in cache.files.values())
 
 
+@pytest.mark.skipif(not os.path.exists("/proc/self/status"), reason="reads its peak memory from /proc")
 def test_a_build_never_expands_a_blocks_keys_at_once(tmp_path):
     """Round 4: keys sharing a long prefix are rebuilt one at a time as the
     local file is written; 4,000 keys of a 32 KiB prefix (17 KB compressed)
