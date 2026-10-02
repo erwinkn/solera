@@ -46,7 +46,7 @@ from solera.keys.index import (
 from solera.keys.io import ObjectIO
 from solera.sdk import digest
 
-from . import history, planning
+from . import delivery, history, planning
 from .attempts import POOL_OFFERED_GRACE, Attempts, Live, worker_report
 from .history import MAX_METADATA, History, RunFilter
 from .keyservice import KeyService, cache_root
@@ -585,12 +585,11 @@ class Engine(Attempts, Sensors, Views):
             if self.m.claimed(attempt) is None:
                 return
             if prepared.get("skip"):
-                watermarks = {
-                    param: plan["update"] if "update" in plan else self._watermark(plan, None)
-                    for param, plan in prepared["plans"].items()
-                    if plan is not None and plan.get("update", True) is not None
+                advanced = {
+                    param: delivery.advance(plan) for param, plan in prepared["plans"].items() if plan
                 }
-                self._finish(task, claim, "skipped", commit={"watermarks": watermarks})
+                watermarks = {param: wm for param, wm in advanced.items() if wm is not None}
+                self._finish(task, claim, "skipped", commit={"watermarks": watermarks, "drained": True})
                 return
             stage = await self._launch(task, run, attempt, prepared)
             try:
@@ -746,7 +745,9 @@ class Engine(Attempts, Sensors, Views):
         if claim is not None:
             # Keep the delta log this attempt reads until it finishes (§6).
             claim["reads"] = delta_reads(plans)
-        more = any(p.get("more") for p in plans.values() if p)
+        more = any(
+            delivery.kind(p) == "batches" and delivery.continues(p, None, None) for p in plans.values() if p
+        )
         skip = bool(incremental) and all_empty and not more and not full
         # An Each asset whose keys all failed so far has no head yet: nothing to wait for.
         if skip and each_page is None and not planner.complete(task["asset"], scope):
@@ -969,10 +970,8 @@ class Engine(Attempts, Sensors, Views):
                 "page": page,
                 "pages": pages,
             }
-            update = {**base, "batch": max(lo, hi + 1), "after": None, "full": whole and more}
-            if more:
-                update.update(page=page + 1, pages=pages)
-            return {"ref": ref, "changes": changes}, {"update": update, "more": more}, hi < lo
+            plan = {"kind": "batches", **base, "lo": lo, "hi": hi, "head": head_batch, "full": whole}
+            return {"ref": ref, "changes": changes}, {**plan, "page": page, "pages": pages}, hi < lo
 
         index = self.m.index(output, up_scope)
         patterns = edge.get("patterns")
@@ -1008,7 +1007,14 @@ class Engine(Attempts, Sensors, Views):
                         "pages": pages,
                     },
                 }
-                plan = {**base, "diff": True, "batch": int(wm["batch"]), "page": page, "pages": pages}
+                plan = {
+                    "kind": "keys",
+                    **base,
+                    "diff": True,
+                    "batch": int(wm["batch"]),
+                    "page": page,
+                    "pages": pages,
+                }
                 return pin, plan, False
             head_batch = min(head_batch, rescope["cutover"])  # finish: under the old patterns
         empty = False
@@ -1057,7 +1063,7 @@ class Engine(Attempts, Sensors, Views):
                 pin["changes"]["inline"] = inline
         if base["patterns"] is not None:
             pin["patterns"] = base["patterns"]  # the worker filters the page, inlined or read
-        plan = {**base, **window, "page": page, "pages": pages}
+        plan = {"kind": "keys", **base, **window, "page": page, "pages": pages}
         if not window["full"]:  # a window paged over attempts holds its first page's reader pin
             plan["pin"] = wm.get("pin") if window["after"] is not None and wm else claim_pin
         return pin, plan, empty
@@ -1136,7 +1142,11 @@ class Engine(Attempts, Sensors, Views):
             }
             if wm.get("patterns") is not None:
                 pin["patterns"] = wm["patterns"]
-            return pin, {"update": wm, "each": {"kind": "reconcile", "changes": changes}}, False
+            return (
+                pin,
+                {"kind": "held", "watermark": wm, "each": {"kind": "reconcile", "changes": changes}},
+                False,
+            )
         if kind == "retry":
             if retry is None:
                 retry = {
@@ -1156,11 +1166,16 @@ class Engine(Attempts, Sensors, Views):
             }
             if (wm or {}).get("patterns") is not None:
                 pin["patterns"] = wm["patterns"]  # a due key the edge no longer takes goes
-            return pin, {"update": wm, "each": {"kind": "retry", "pass": retry, "changes": changes}}, False
+            plan = {
+                "kind": "held",
+                "watermark": wm,
+                "each": {"kind": "retry", "pass": retry, "changes": changes},
+            }
+            return pin, plan, False
         pin = {**pin, "each": each}
         page = {"kind": "changes", "retries": retries, "pass": retry}
         # A keys= override is a one-off selection: no watermark moves (plan None).
-        plan = {"update": None, "each": page} if plan is None else {**plan, "each": page}
+        plan = {"kind": "held", "watermark": None, "each": page} if plan is None else {**plan, "each": page}
         return pin, plan, empty
 
     def _each_commit(self, task, plan: dict, result: dict) -> tuple[dict, bool, dict | None]:
@@ -1200,7 +1215,7 @@ class Engine(Attempts, Sensors, Views):
         )
         if page["kind"] == "reconcile":
             after = delivered.get("after")
-            wm = dict(plan["update"])
+            wm = dict(delivery.advance(plan))
             if after is None:
                 wm.pop("reconcile", None)
             else:
@@ -1238,60 +1253,6 @@ class Engine(Attempts, Sensors, Views):
             )
         commit.update({"due": due, "epoch_min": epoch_min})
         return commit, more, watermark
-
-    @classmethod
-    def _watermark(cls, plan: dict, after: str | None) -> dict:
-        """The watermark after delivering a keyed plan's page, which ended at
-        `after` (`None`: the window is done). A delivery that continues keeps
-        its page plan: the next page's index, and how many it planned (§5)."""
-
-        wm = cls._next_watermark(plan, after)
-        if after is not None and plan.get("pages") is not None:
-            wm.update(page=int(plan["page"]) + 1, pages=int(plan["pages"]))
-        return wm
-
-    @staticmethod
-    def _next_watermark(plan: dict, after: str | None) -> dict:
-        """The watermark a keyed plan's page leads to. A delta window delivered
-        over several attempts keeps the reader pin of the attempt that began
-        it: its later pages still read versions as of then (lifecycle.md §9.8)."""
-
-        base = {k: plan[k] for k in ("output", "up", "fingerprint")}
-        if plan.get("pass") is not None:  # the run whose reset began this pass
-            base["pass"] = plan["pass"]
-        if plan.get("cleanup") and plan["full"]:  # a full Each delivery owes a cleanup (§11)
-            base["cleanup"] = True
-        if plan.get("patterns") is not None:  # what the edge delivers under (per-key §11)
-            base["patterns"] = plan["patterns"]
-        rescope = plan.get("rescope")
-        if plan.get("diff"):  # a rescope's membership diff (per-key §11)
-            if after is None:  # done: the new patterns from the cutover on
-                done = {**base, "batch": plan["batch"], "after": None, "full": False}
-                done.pop("patterns", None)
-                return {**done, "patterns": rescope["to"]} if rescope["to"] is not None else done
-            return {
-                **base,
-                "batch": plan["batch"],
-                "after": None,
-                "full": False,
-                "rescope": {**rescope, "after": after},
-            }
-        if rescope is not None:
-            base["rescope"] = rescope
-        if plan["full"]:
-            if after is None:
-                done = {**base, "batch": plan["from"], "after": None, "full": False}
-                done.pop("cleanup", None)
-                if plan.get("each") is not None and plan.get("cleanup"):
-                    # An Each output may hold keys the delivery no longer names — gone
-                    # upstream, or left out by the patterns: reconcile them next (§11).
-                    done["reconcile"] = {"after": None}
-                return done
-            return {**base, "batch": plan["from"], "after": after, "full": True}
-        if after is None:
-            return {**base, "batch": max(plan["from"], plan["to"] + 1), "after": None, "full": False}
-        paged = {**base, "batch": plan["from"], "until": plan["to"], "after": after, "full": False}
-        return {**paged, "pin": plan["pin"]} if plan.get("pin") is not None else paged
 
     def _due_discards(self, output: str, scope: str, attempt: str | None) -> list[dict]:
         """The data garbage of an immutable output's scope that no reader can
@@ -1380,22 +1341,14 @@ class Engine(Attempts, Sensors, Views):
                 if reconciled is not None:
                     watermarks[param] = reconciled
                     continue
-            if "update" in plan:
-                if plan["update"] is not None:
-                    watermarks[param] = plan["update"]
-                continue
-            if param not in delivered:
-                raise Conflict(f"input {param}: the result reports no delivery", retryable=False)
-            after = delivered[param].get("after")
-            watermarks[param] = self._watermark(plan, after)
-            # A pattern transition that finished its old-pattern changes has its diff to do;
-            # a full Each delivery that finished has its cleanup to do.
-            more = (
-                more
-                or after is not None
-                or (plan.get("rescope") is not None and not plan.get("diff"))
-                or "reconcile" in watermarks[param]
-            )
+            after = None
+            if delivery.kind(plan) == "keys":  # a key page reports where it stopped
+                if param not in delivered:
+                    raise Conflict(f"input {param}: the result reports no delivery", retryable=False)
+                after = delivered[param].get("after")
+            if (wm := delivery.advance(plan, after)) is not None:
+                watermarks[param] = wm
+            more = more or delivery.continues(plan, after, wm)
         heads, keys = {}, {}
         for name, entry in outputs.items():
             if name not in declared:

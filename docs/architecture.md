@@ -437,7 +437,12 @@ head, or the whole index for a full delivery — and the harness reads one
 page of it (`page_size` keys), loads those keys with `Keys(…)`, and reports
 where the page ended (`after`); for an unkeyed one the engine plans a
 `Batches(lo, hi)` range. Each page commits with its watermark update;
-`more` re-queues the task; `complete := not more` on the head.
+`more` re-queues the task. Whether the delivery drained is the scope's
+(`drained := not more` on its progress), not its outputs': a last page may
+write none of them, and the scope is complete all the same. A scope is
+**complete** when each of its outputs has a head and its delivery drained —
+a job, once a run of it succeeded. Selection (`"missing"`), `AllPartitions`
+and the console all ask that one question.
 
 The **interpretation fingerprint** `H(version, store versions of the
 asset's input and output stores, migration names of the asset's outputs,
@@ -531,7 +536,7 @@ A run is `{targets, partitions, mode, upstream, config, keys}`:
 | Field | Meaning |
 |---|---|
 | `targets` | assets (or outputs) to materialize |
-| `partitions` | `[k…]` · `"all"` (current key set) · `"missing"` (no complete head) · `"latest"` (newest window of each time dimension, every key of the others) · default `"latest"`. Explicit keys are checked part by part, so they never depend on the size of the domain; any other selection is counted before it is listed — `"latest"` across every non-time dimension — and past 100,000 scopes the request is refused, never truncated. So is a run past 100,000 tasks once `upstream=True` adds its upstream work |
+| `partitions` | `[k…]` · `"all"` (current key set) · `"missing"` (not complete, §6) · `"latest"` (newest window of each time dimension, every key of the others) · default `"latest"`. Explicit keys are checked part by part, so they never depend on the size of the domain; any other selection is counted before it is listed — `"latest"` across every non-time dimension — and past 100,000 scopes the request is refused, never truncated. So is a run past 100,000 tasks once `upstream=True` adds its upstream work |
 | `mode` | `incremental` (default) or `full` |
 | `upstream` | also plan the upstream closure; default false: **targets only, inputs pinned to current heads**, so a rebuild never re-polls an external system |
 | `config` | JSON passed as `ctx.config` |
@@ -554,7 +559,7 @@ attempt, so exactly one side wins (object-store-state.md §8). Outcomes:
 | Outcome | Meaning |
 |---|---|
 | `succeeded` | committed |
-| `skipped` | every `Incremental` edge was already at its head (empty diff) and heads are complete: no harness launched, nothing changes |
+| `skipped` | every `Incremental` edge was already at its head (empty diff) and the scope is complete: no harness launched, nothing changes |
 | `failed` | retryable → `retries=` applies with backoff; non-retryable (revision mismatch, version-mismatch without `on_version_change="full"`) → task fails |
 | `canceled` | run canceled before the attempt began writing; an attempt already writing is committed instead |
 
