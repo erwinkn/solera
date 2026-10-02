@@ -319,8 +319,9 @@ class Upkeep:
 
         async with self.retiring:
             runs = [(r, s) for r, s in runs if r not in self.m.runs and r not in self.m.retired]
-            files = [r for r, status in runs if status != "skipped"]  # a skipped run launched nothing
-            self.history.delete([r for r, _ in runs], files)
+            # Every run's directory: a skipped run may have launched (an attempt
+            # whose patterns took no key), and listing an empty one costs a LIST.
+            self.history.delete([r for r, _ in runs], [r for r, _ in runs])
         await self.purge()
 
     async def purge(self) -> None:

@@ -256,3 +256,26 @@ async def test_runs_kept_forever_do_not_crowd_out_expired_ones(state, clock):
     assert await engine.history.expired({"daily": clock.now - 86400}, None, limit=2) == [(gone, "succeeded")]
     await engine.upkeep.sweep()
     assert await history_ids(engine) == kept
+
+
+async def test_pruning_a_skipped_run_deletes_what_its_attempt_wrote(state, clock):
+    """Review round 2, engine #6: a consumer whose patterns take none of
+    the keys launches, then reports skipped. Pruning it removes its spec,
+    claim and result with its history."""
+
+    @asset(outputs=Output("items", keyed=True))
+    def items():
+        return {"x": 1}
+
+    @asset(inputs={"items": Incremental(include=["z*"])})
+    def picky(items: dict) -> int:
+        return len(items)
+
+    engine = engine_for(state, Project(assets=[items, picky]), clock)
+    await engine.initialize()
+    await run(engine, ["items"])
+    skipped = await run(engine, ["picky"])
+    assert (await engine.run_detail(skipped))["request"]["status"] in ("skipped", "succeeded")
+    assert skipped in await run_dirs(state)
+    await engine.prune(asset="picky")
+    assert skipped not in await run_dirs(state)
