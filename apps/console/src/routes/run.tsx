@@ -712,15 +712,22 @@ function SpecTab({ run, attempt }: { run: string; attempt: Attempt }) {
   );
 }
 
+/** What an incremental pin delivers, in the spec's own terms: pages of keys, or a batch range. */
 function windowOf(changes: Record<string, Json>): string {
-  if (changes.full) return "full delivery";
-  if (changes.retry) return "retry page";
-  if (changes.reconcile) return "cleanup page";
-  if (Array.isArray(changes.batches)) return `batches ${changes.batches.join("–")}`;
-  if (changes.from !== undefined)
-    return `batches ${String(changes.from)}–${String(changes.to)}${changes.after ? ` after ${String(changes.after)}` : ""}, ${String(changes.limit)} keys a page`;
-  if (changes.keys) return "explicit keys";
-  return "";
+  const page =
+    typeof changes.page === "number"
+      ? `page ${changes.page + 1}${typeof changes.pages === "number" ? ` of ${changes.pages}` : ""}`
+      : null;
+  const parts: string[] = [];
+  if (changes.full) parts.push("full delivery");
+  else if (changes.retry) parts.push("retry page");
+  else if (changes.reconcile) parts.push("cleanup page");
+  else if (changes.keys) parts.push("explicit keys");
+  else if (Array.isArray(changes.batches)) parts.push(`batches ${changes.batches.join("–")}`);
+  else if (changes.from !== undefined) parts.push(`batches ${String(changes.from)}–${String(changes.to)}`);
+  if (page) parts.push(page);
+  if (typeof changes.limit === "number") parts.push(`${changes.limit} keys a page`);
+  return parts.join(" · ");
 }
 
 function EventsTab({ run, attempt, live }: { run: string; attempt: Attempt; live: boolean }) {

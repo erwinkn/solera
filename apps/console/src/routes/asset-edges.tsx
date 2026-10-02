@@ -168,19 +168,23 @@ function ScopeRow({ s }: { s: EdgeScope }) {
         {s.head_batch != null ? `batch ${count(s.head_batch)}` : "—"}
       </Td>
       <Td>
-        <span className="flex items-center gap-2">
-          <span className="h-1.5 w-20 overflow-hidden rounded-full bg-sunken" aria-hidden>
-            <span
-              className={cn("block h-full rounded-full", lag ? "bg-warn" : "bg-ok")}
-              style={{
-                width: `${head + 1 > 0 ? (100 * Math.max(0, done)) / (head + 1) : 100}%`,
-              }}
-            />
+        {s.state === "never" && !s.head_batch ? (
+          <span className="text-xs text-fg-subtle">—</span>
+        ) : (
+          <span className="flex items-center gap-2">
+            <span className="h-1.5 w-20 overflow-hidden rounded-full bg-sunken" aria-hidden>
+              <span
+                className={cn("block h-full rounded-full", lag ? "bg-warn" : "bg-ok")}
+                style={{
+                  width: `${head + 1 > 0 ? (100 * Math.max(0, done)) / (head + 1) : 100}%`,
+                }}
+              />
+            </span>
+            <span className={cn("text-xs tabular", lag ? "font-medium text-warn-fg" : "text-fg-subtle")}>
+              {lag ? plural(lag, "batch", "batches") : "none"}
+            </span>
           </span>
-          <span className={cn("text-xs tabular", lag ? "font-medium text-warn-fg" : "text-fg-subtle")}>
-            {lag ? plural(lag, "batch", "batches") : "none"}
-          </span>
-        </span>
+        )}
       </Td>
       <Td className="max-w-64 truncate font-mono text-xs text-fg-muted">{position ?? "—"}</Td>
     </Tr>
