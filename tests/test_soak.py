@@ -168,6 +168,9 @@ async def test_soak(tmp_path, monkeypatch):
     for (output, scope), index in state.model.indexes.items():
         assert len(index.files) <= 2 * engine.key_options.l0_max_files, (output, scope, len(index.files))
         referenced = {index.path(n) for n in index.referenced()}
+        referenced |= {
+            p for p in state.model.discard_reads() if p.startswith(index.prefix)
+        }  # pending discards
         on_disk = {str(p.relative_to(root)) for p in (root / index.prefix).glob("*.kx")}
         assert on_disk == referenced, (output, scope, sorted(on_disk - referenced)[:5])
     assert _count(root, "deltas") == 0, "delta files live in the key index (§6)"

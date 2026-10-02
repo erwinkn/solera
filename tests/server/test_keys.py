@@ -243,8 +243,9 @@ async def test_compaction_truncation_and_garbage(state):
     watermark = state.model.watermarks[("mirror", "items", "")]
     assert watermark["batch"] == head_batch + 1
     assert all(batch >= watermark["batch"] for batch, _ in index.log)  # truncated behind it
-    assert not state.model.garbage
-    assert on_disk(state, index) == {index.path(n) for n in index.referenced()}
+    read = state.model.discard_reads()  # kept for the discards still pending (docs/lifecycle.md §9.8)
+    assert {path for path, _ in state.model.garbage} <= read
+    assert on_disk(state, index) == {index.path(n) for n in index.referenced()} | read
     listed = await engine.list_keys("items")
     assert listed["keys"] == {k: str(v) for k, v in sorted(truth.items())}
 

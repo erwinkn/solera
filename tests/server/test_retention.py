@@ -247,7 +247,9 @@ async def test_a_deleted_runs_gates_outlive_it(state, clock):
     from obstore.exceptions import AlreadyExistsError
     from solera import lifecycle
 
-    engine = engine_for(state, PLAIN, clock)
+    from tests.server.test_fence import Overwriting
+
+    engine = engine_for(state, Project(assets=[plain], default_store=Overwriting()), clock)  # gated
     await engine.initialize()
     gone = await run(engine, ["plain"])
     await engine.history.lake.flush(force=True)

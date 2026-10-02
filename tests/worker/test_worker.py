@@ -76,7 +76,8 @@ project = Project(assets=[feed, consumer])
     assert json.loads(log.splitlines()[0])["message"] == "consumed"
     paths = await state.list_objects(f"runs/{detail['request']['id']}/")
     names = {p.rsplit("/", 1)[-1] for p in paths if p.rsplit("/", 1)[-1].startswith(attempt)}
-    assert names == {f"{attempt}{s}" for s in (".spec", ".worker", ".writing", ".result")}  # no log object
+    # no log object, and no gate: a FileStore is immutable (docs/lifecycle.md §9.6)
+    assert names == {f"{attempt}{s}" for s in (".spec", ".worker", ".result")}
 
 
 async def test_revision_mismatch_writes_failed_result(state, tmp_path):

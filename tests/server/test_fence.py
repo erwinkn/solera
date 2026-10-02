@@ -572,7 +572,7 @@ async def test_a_create_whose_response_was_lost_is_its_own(tmp_path, monkeypatch
     def scores():
         return {"a": 1, "b": 2}
 
-    project = Project(assets=[scores])
+    project = Project(assets=[scores], default_store=Overwriting())  # a store that takes a gate
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = engine_for(state, project, placement="inline")
     await engine.initialize()
