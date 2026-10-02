@@ -312,6 +312,14 @@ impl Local {
         self.dir.len()
     }
 
+    /// The first block a scan of the keys past `key` reads: the one `key`
+    /// would be in, or the first.
+    fn block_from(&self, key: &[u8]) -> usize {
+        self.dir
+            .partition_point(|d| d.first.as_slice() <= key)
+            .saturating_sub(1)
+    }
+
     /// The block that could hold `key`, or None.
     fn block_of(&self, key: &[u8]) -> Option<usize> {
         let i = self.dir.partition_point(|d| d.first.as_slice() <= key);
@@ -512,6 +520,43 @@ impl Snapshot {
             feed: Feed::new(self.runs.len()),
         }
     }
+
+    /// Up to `limit` entries of the merged snapshot past `after` —
+    /// deletions dropped with `drop_deleted` — and the cursor to continue
+    /// from: the last one's key, or None when nothing lies past it. Each
+    /// run is read from the block holding `after`.
+    pub fn scan(&self, after: Option<&[u8]>, limit: usize, drop_deleted: bool) -> Result<Scan> {
+        let mut m = self.merge();
+        if let Some(a) = after {
+            m.feed.seek(self, a);
+        }
+        let mut out = Scan::default();
+        while m.advance()? {
+            let e = &m.merge;
+            if after.is_some_and(|a| e.key() <= a) || (drop_deleted && e.deleted()) {
+                continue;
+            }
+            if out.keys.len() == limit {
+                out.next = out.keys.last().cloned();
+                break;
+            }
+            out.keys.push(e.key().to_vec());
+            out.versions.push(e.version().to_vec());
+            out.deleted.push(e.deleted() as u8);
+            out.locators.push(e.locator());
+        }
+        Ok(out)
+    }
+}
+
+/// A page of a scan: entries, and the cursor past them (None: the end).
+#[derive(Default)]
+pub struct Scan {
+    pub keys: Vec<Vec<u8>>,
+    pub versions: Vec<Vec<u8>>,
+    pub deleted: Vec<u8>,
+    pub locators: Vec<u64>,
+    pub next: Option<Vec<u8>>,
 }
 
 /// Feeds a `Merge` the decoded blocks of a snapshot's runs, one at a time.
@@ -523,6 +568,19 @@ impl Feed {
     pub fn new(runs: usize) -> Feed {
         Feed {
             next: vec![(0, 0); runs],
+        }
+    }
+
+    /// Starts every run at the block holding `key`: a scan of the keys past it.
+    fn seek(&mut self, snap: &Snapshot, key: &[u8]) {
+        for (r, run) in snap.runs.iter().enumerate() {
+            let fi = run
+                .partition_point(|f| f.min().is_some_and(|m| m <= key))
+                .saturating_sub(1);
+            self.next[r] = match run.get(fi) {
+                Some(f) => (fi, f.block_from(key)),
+                None => (0, 0),
+            };
         }
     }
 

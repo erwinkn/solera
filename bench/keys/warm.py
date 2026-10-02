@@ -116,9 +116,8 @@ async def run_size(n: int, args) -> list[dict]:
             row["store"] = (wall, cpu, io.metrics.gets, io.metrics.bytes_in / 1e6)
             io = cold()
             with cache.pin(state) as pin:
-                again, wall, cpu = await timed(
-                    lambda io=io, pin=pin: KeyIndex(io, None, state, opts).recount(pin.handles)
-                )
+                io.local = pin.handles
+                again, wall, cpu = await timed(lambda io=io: KeyIndex(io, None, state, opts).recount())
             assert again == live, (again, live)
             row["local"] = (wall, cpu, io.metrics.gets, io.metrics.bytes_in / 1e6)
             rows.append(row)

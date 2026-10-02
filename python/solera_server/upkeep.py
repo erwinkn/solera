@@ -173,12 +173,10 @@ class Upkeep:
 
         def work():
             async def go(local):
-                keys = KeyIndex(ObjectIO(objects), None, index, options)
+                keys = KeyIndex(ObjectIO(objects, local=local), None, index, options)
                 if service is not None:
                     keys.on_write = lambda path, f, data: service.installed(index.prefix, f, path, data)
-                if recount:
-                    return await keys.recount(local)
-                return await keys.compact(garbage=garbage, local=local)
+                return await (keys.recount() if recount else keys.compact(garbage=garbage))
 
             # One warm copy serves every engine reader: an index the engine's cache
             # holds is read from its local files, the store otherwise.
@@ -241,8 +239,9 @@ class Upkeep:
             event["garbage"] = [g.to_json() for g in dropped]
         self.state.record(event)
         if self.keys is not None:  # published: no new snapshot reads its inputs
-            moved = {f.name for f in added}
-            self.keys.retired([index.path(n) for n in removed if n not in moved])
+            # ...but a delta still in the log stays for change windows, until collected.
+            kept = {f.name for f in added} | (self.m.indexes.get(key) or current).referenced()
+            self.keys.retired([index.path(n) for n in removed if n not in kept])
 
     # -- garbage ---------------------------------------------------------------------
 
@@ -264,6 +263,8 @@ class Upkeep:
         await self.state.durable()  # a replay must never reference them again
         await self._delete(due)
         self.state.record({"type": "GarbageDeleted", "paths": due})
+        if self.keys is not None:  # what the engine's cache held of them goes too
+            self.keys.retired(due)
 
     async def _delete(self, paths: list[str]) -> None:
         from obstore.exceptions import NotFoundError

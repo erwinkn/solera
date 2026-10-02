@@ -10,6 +10,8 @@ thread of their own: nothing here runs on the engine's event loop.
 - `inline` merges summaries into the first page of a pending window, for
   prepare: memory only, never waiting, its work the page's, not the
   window's.
+- `reads` answers an attempt's input reads at its `start` (§7.1): the
+  worker's own read code over local copies, recorded.
 
 Whatever here reads index files from the object store holds a reader pin
 (`hold`) at the event position it read the index at, until its reads are
@@ -33,12 +35,16 @@ from urllib.parse import unquote, urlsplit
 
 from solera.keys import SortedRun
 from solera.keys.cache import Corrupt, EngineCache, verify
-from solera.keys.index import FileInfo, IndexState, Options
+from solera.keys.index import FileInfo, IndexState, KeyIndex, Options
 from solera.keys.io import ObjectIO
+from solera.keys.reads import Cold, Full, Reads
 from solera.keys.resolver import Limits, Prepared, Resolver
 
 log = logging.getLogger(__name__)
 
+READS_MAX_ENTRIES = 1_000_000  # entries one start reply's reads may carry
+READS_MAX_BYTES = 16 * 2**20  # ...and bytes, encoded
+READS_TIMEOUT = 2.0  # seconds the engine spends on them before answering without
 INLINE_MAX = 10_000  # entries of a delta kept as a summary
 INLINE_BATCHES = 64  # summaries one inlined page may merge
 INLINE_BYTES = 2**20  # serialized page
@@ -239,6 +245,69 @@ class KeyService:
 
     async def _unpin(self, pin) -> None:
         pin.__exit__(None, None, None)
+
+    async def reads(self, spec: dict, whole: set[str], position: float) -> dict | None:
+        """The input reads of the attempt `spec` describes, answered from
+        local copies (docs/resolved-commits.md §7.1): a `Reads` record as JSON,
+        or None when there is nothing to answer or no time to. `whole`: the
+        inputs read whole from an immutable store, paged by their locators."""
+
+        if not self._running():
+            return None
+        token = self.hold(position)
+        try:
+            fut = self._submit(self._reads(spec, whole, position))
+            try:
+                return await asyncio.wait_for(asyncio.wrap_future(fut), READS_TIMEOUT)
+            except TimeoutError:
+                fut.cancel()
+            except Exception as e:  # the worker reads the store instead
+                log.warning("key cache reads: %s", e)
+            return None
+        finally:
+            self.release(token)
+
+    async def _reads(self, spec: dict, whole: set[str], position: float) -> dict | None:
+        from solera_worker import each
+        from solera_worker.worker import REPAIR_PAGE
+
+        states = {}  # what the reads may touch: inputs, failure indexes, outputs (reconcile pages)
+        for pin in (spec.get("inputs") or {}).values():
+            for js in (pin.get("index"), (pin.get("each") or {}).get("failures")):
+                if js:
+                    states[json.dumps(js, sort_keys=True)] = IndexState.from_json(js)
+        for info in (spec.get("outputs") or {}).values():
+            if info.get("index"):
+                states[json.dumps(info["index"], sort_keys=True)] = IndexState.from_json(info["index"])
+        pins = [self.cache.held(st) for st in states.values()]
+        reads = Reads(recording=True, max_entries=READS_MAX_ENTRIES, max_bytes=READS_MAX_BYTES)
+        io = ObjectIO(None, local={p: h for pin in pins for p, h in pin.handles.items()}, served=reads)
+        cold = False
+        try:
+            for param, pin in (spec.get("inputs") or {}).items():
+                try:
+                    if "each" in pin:
+                        await each.read_page(spec, pin, io)
+                    elif "changes" in pin:
+                        await each.read_window(pin, io)
+                    elif param in whole and pin.get("index"):
+                        index, after = KeyIndex(io, None, IndexState.from_json(pin["index"])), None
+                        while True:
+                            *_, after = await index.page(after, REPAIR_PAGE)
+                            if after is None:
+                                break
+                except Cold:
+                    cold = True  # this input's later reads go to the store; fetch it for the next
+        except Full:
+            pass  # the rest go to the store
+        finally:
+            for pin in pins:
+                pin.__exit__(None, None, None)
+        if cold:
+            for st in states.values():
+                if st.files:
+                    self.resolver._background_fill(st, position)
+        return reads.to_json() if len(reads) else None
 
     def installed(self, prefix: str, f: FileInfo, path: str, data: bytes) -> None:
         self._fire(lambda: self.cache.install(prefix, f, path, data))

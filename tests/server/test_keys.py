@@ -294,10 +294,10 @@ async def test_a_commit_during_the_recount_keeps_it(state, monkeypatch):
     started, release = threading.Event(), threading.Event()
     recount, counted = KeyIndex.recount, []
 
-    async def slow_recount(self, local=None):
+    async def slow_recount(self):
         started.set()
         await asyncio.to_thread(release.wait, 10)
-        counted.append(await recount(self, local))
+        counted.append(await recount(self))
         return counted[-1]
 
     monkeypatch.setattr(KeyIndex, "recount", slow_recount)
@@ -527,6 +527,80 @@ async def test_small_writes_resolve_in_the_engine_and_pages_come_inline(state, m
     assert set(answers[-3:]) == {"delta"}  # warm: the engine answers
     assert inlined[-3:] == [True] * 3  # and the consumer's pages come inline
     assert not [p for p in reads if p.endswith(".kx")]  # so nothing reads an index file
+    await engine.keys.stop()
+
+
+async def test_input_reads_come_from_the_engine_once_warm(state, monkeypatch):
+    """docs/resolved-commits.md §7.1: once the engine's cache holds an index, a
+    consumer's pages — a full delivery, change windows that are not inlined —
+    come with its start reply, and its worker reads no index file to find
+    them; what it delivers is what the store's pages would have."""
+
+    from solera.keys.io import ObjectIO as IO
+    from solera_server import keyservice
+
+    monkeypatch.setattr(keyservice, "INLINE_MAX", 0)  # no summaries: windows are read, not inlined
+    rows = {"v": [{"id": f"k{i:03d}", "v": 1} for i in range(300)]}
+    seen: dict[str, dict[str, int]] = {"mirror": {}, "copy": {}}
+
+    @asset(outputs=Output("items", key="id", revision="v"))
+    def items():
+        return Patch(rows["v"])
+
+    def consumer(name):
+        def fn(ctx, items: list):
+            for row in items:
+                seen[name][row["id"]] = row["v"]
+            for key in ctx.changes["items"].deleted:
+                seen[name].pop(key, None)
+            return [{"n": len(items)}]
+
+        fn.__name__ = name
+        return asset(inputs={"items": Incremental(batch_size=100)})(fn)
+
+    served, real_reads = [], KeyService.reads
+
+    async def reads(self, spec, whole, position):
+        out = await real_reads(self, spec, whole, position)
+        served.append(out is not None)
+        return out
+
+    monkeypatch.setattr(KeyService, "reads", reads)
+    engine = engine_for(state, Project(assets=[items, consumer("mirror"), consumer("copy")]))
+    await engine.initialize()
+    await run(engine, ["mirror"], upstream=True)
+
+    async def warm():  # the fill a cold read queued, and each commit's delta, installed
+        key = ("items", "")
+        for _ in range(200):
+            files = {f"{engine.m.indexes[key].prefix}{n}.kx" for n in engine.m.indexes[key].referenced()}
+            if files <= set(engine.keys.cache.files):
+                return
+            await asyncio.wrap_future(
+                engine.keys._submit(engine.keys.cache.fill(engine.keys.io, engine.m.indexes[key]))
+            )
+            await asyncio.sleep(0.02)
+        raise AssertionError("the index never warmed")
+
+    index_reads, real_read = [], IO.read
+
+    async def read(self, path, start, end, size):
+        index_reads.append(path)
+        return await real_read(self, path, start, end, size)
+
+    for n in range(3):
+        rows["v"] = [{"id": f"k{i:03d}", "v": n + 2} for i in range(n, 300, 5)]
+        await run(engine, ["items"])
+        await warm()
+        monkeypatch.setattr(IO, "read", read)
+        served.clear()
+        await run(engine, ["mirror"] if n < 2 else ["mirror", "copy"])  # copy: a full delivery
+        monkeypatch.setattr(IO, "read", real_read)
+        assert served and all(served)
+        truth = {k: v for k, (v, _) in (await _listed(engine)).items()}
+        assert seen["mirror"] == truth
+    assert seen["copy"] == truth
+    assert not [p for p in index_reads if p.endswith(".kx")]  # every page came with its start
     await engine.keys.stop()
 
 

@@ -82,6 +82,10 @@ class _Index:
     files: set[str] = field(default_factory=set)
 
 
+def _logged(state: IndexState) -> list[FileInfo]:
+    return [f for _, files in state.log for f in files]
+
+
 class Corrupt(Exception):
     """A file's bytes are not the object its `FileInfo` names."""
 
@@ -264,12 +268,15 @@ class EngineCache:
         return ix.admitted
 
     def need(self, state: IndexState) -> int:
-        """Room an index needs: its snapshot, and one compaction's overlap (its largest level)."""
+        """Room an index needs: its snapshot and its logged deltas, and one
+        compaction's overlap (its largest level)."""
 
         levels: dict[int, int] = {}
         for f in state.files:
             levels[f.level] = levels.get(f.level, 0) + self._estimate(state.path(f.name), f)
-        return sum(levels.values()) + max(levels.values(), default=0)
+        held = {f.name for f in state.files}
+        logged = sum(self._estimate(state.path(f.name), f) for f in _logged(state) if f.name not in held)
+        return sum(levels.values()) + logged + max(levels.values(), default=0)
 
     def demote(self, prefix: str) -> None:
         ix = self.indexes.get(prefix)
@@ -293,6 +300,19 @@ class EngineCache:
                 if f.pins == 0:
                     self._drop(path)
 
+    def held(self, state: IndexState) -> Pin:
+        """Whatever of the snapshot's files and logged deltas the cache holds,
+        pinned: a reader that takes what is local and does without the rest."""
+
+        now, files = self.clock(), []
+        for f in {**{f.name: f for f in _logged(state)}, **{f.name: f for f in state.files}}.values():
+            local = self._present(state.path(f.name), f)
+            if local is not None:
+                local.pins += 1
+                local.used = now
+                files.append(local)
+        return Pin(self, files, [])
+
     def pin(self, state: IndexState) -> Pin | None:
         """The snapshot's local files, newest run first, pinned; None unless warm."""
 
@@ -315,12 +335,14 @@ class EngineCache:
     # -- filling ------------------------------------------------------------------------
 
     async def fill(self, io: ObjectIO, state: IndexState) -> bool:
-        """Fetch every missing file of an admitted index, once each however many
-        readers ask; True when the snapshot is warm."""
+        """Fetch every missing file of an admitted index — its snapshot, and
+        the deltas its log holds — once each however many readers ask; True
+        when the snapshot is warm."""
 
         if not self.admit(state):
             return False
-        missing = [f for f in state.files if self._present(state.path(f.name), f) is None]
+        wanted = {**{f.name: f for f in _logged(state)}, **{f.name: f for f in state.files}}
+        missing = [f for f in wanted.values() if self._present(state.path(f.name), f) is None]
         await asyncio.gather(*(self._fill_one(io, state.prefix, state.path(f.name), f) for f in missing))
         return self.warm(state)
 

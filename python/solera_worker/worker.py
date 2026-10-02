@@ -46,6 +46,7 @@ from solera.keys.index import (
     key_str,
 )
 from solera.keys.io import ObjectIO
+from solera.keys.reads import Reads
 from solera.keys.resolver import Ask, answers, request
 from solera.lifecycle import Cancel, Ended
 from solera.objects import create
@@ -1013,6 +1014,7 @@ async def run_attempt(
         try:
             answer = await channel.start({**claim})
             started = Cancel.from_json(answer.get("cancel"))
+            control["reads"] = Reads.from_json(answer.get("reads"))  # the engine's answers to its reads
         except Ended:
             return ENDED
         except Exception:
@@ -1176,7 +1178,9 @@ async def _execute(
         return failed
     asset = project.assets[spec["asset"]]
     try:
-        keys_io = ObjectIO(objects)  # index files straight from the store: small writes are the engine's
+        # Index files straight from the store, but for the reads the engine answered at
+        # `start` (docs/resolved-commits.md §7.1); small writes are the engine's too.
+        keys_io = ObjectIO(objects, served=control.get("reads"))
         args, changes, delivered = await _resolve_inputs(spec, project, asset, keys_io, timeline)
         filtered = delivered.pop("*filtered", False)
         ctx = Ctx(spec, asset, project, objects, changes, shipper, timeline, keys_io)

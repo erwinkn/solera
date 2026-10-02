@@ -640,11 +640,12 @@ async def test_maintenance_reads_the_engine_caches_copies(io, tmp_path):
         assert pin is not None
         cold = await KeyIndex(io, None, state, OPTS).recount()
         gets = io.metrics.gets
-        idx = KeyIndex(io, None, state, OPTS)
-        assert await idx.recount(pin.handles) == cold and idx.local_reads and io.metrics.gets == gets
+        held = ObjectIO(io.store, metrics=io.metrics, local=pin.handles)
+        idx = KeyIndex(held, None, state, OPTS)
+        assert await idx.recount() == cold and idx.local_reads and io.metrics.gets == gets
         plan = (state.level(0) + state.level(1), 1) if state.level(0) else (state.level(1), 2)
-        local, gets = KeyIndex(io, None, state, OPTS), io.metrics.gets
-        added, _, _ = await local.compact(plan, garbage=True, local=pin.handles)
+        local = KeyIndex(held, None, state, OPTS)
+        added, _, _ = await local.compact(plan, garbage=True)
         assert local.local_reads and io.metrics.gets == gets
         stored, _, _ = await KeyIndex(io, None, state, OPTS).compact(plan, garbage=True)
 
@@ -652,9 +653,114 @@ async def test_maintenance_reads_the_engine_caches_copies(io, tmp_path):
             return decoded([await io.read_whole(state.path(f.name), f.size) for f in files])
 
         assert await read(added) == await read(stored)
-        partial = dict(list(pin.handles.items())[1:])
-        idx = KeyIndex(io, None, state, OPTS)
-        assert await idx.recount(partial) == cold and not idx.local_reads
+        partial = ObjectIO(io.store, local=dict(list(pin.handles.items())[1:]))
+        idx = KeyIndex(partial, None, state, OPTS)
+        assert await idx.recount() == cold and not idx.local_reads
         service.unpin(pin)
     finally:
         await service.stop()
+
+
+# -- engine-served reads (docs/resolved-commits.md §7.1) ------------------------------------------
+
+
+async def logged_index(io, seed=3):
+    """An index over several levels whose log holds every batch, deletions included."""
+
+    rng = random.Random(seed)
+    state = IndexState(prefix="keys/out/_/")
+    for b in range(10):
+        ks = sorted({key(rng.randrange(2000)) for _ in range(2000 if b == 0 else 200)})
+        rm = sorted({key(rng.randrange(2000)) for _ in range(40)} - set(ks)) if b else []
+        files, _ = await KeyIndex(io, None, state, OPTS).resolve(
+            SortedRun.of(ks, [rng.randbytes(8) for _ in ks], rm), batch=b, attempt=f"w{b}", generation=b + 1
+        )
+        state = state.committed(b, files, keep_log=True)
+        while (out := await KeyIndex(io, None, state, OPTS).compact()) is not None:
+            state = state.compacted(*out[:2])
+    return state
+
+
+async def test_local_reads_are_the_stores(io, tmp_path):
+    """Pages, pending windows and lookups over the cache's local copies equal
+    the store's, from any cursor."""
+
+    from solera.keys.reads import Cold, Reads
+
+    state = await logged_index(io)
+    assert state.depth >= 1 and len(state.log) == 10
+    cache = EngineCache(str(tmp_path))
+    assert await cache.fill(io, state)
+    pin = cache.held(state)
+    assert len(pin.handles) == len(state.referenced())  # the logged deltas too
+    local = ObjectIO(None, local=pin.handles)
+    rng = random.Random(4)
+
+    async def walk(read, after, limit):
+        """Every entry from `after` on, a page at a time: a page may end early
+        with a cursor (the store's does at a file it has not read), never skip."""
+
+        out = []
+        while True:
+            *entries, after = await read(after, limit)
+            assert len(entries[0]) <= limit
+            out += list(zip(*entries, strict=True))
+            if after is None:
+                return out
+
+    for _ in range(12):
+        after = rng.choice([None, key(rng.randrange(2100))])
+        limit = rng.choice([7, 100, 5000])
+        lo = rng.randrange(10)
+        hi = rng.randrange(lo, 10)
+        cold, warm = KeyIndex(io, None, state, OPTS), KeyIndex(local, None, state, OPTS)
+        assert await walk(warm.page, after, limit) == await walk(cold.page, after, limit)
+        assert await walk(
+            lambda a, n, w=warm, lo=lo, hi=hi: w.pending(lo, hi, a, n), after, limit
+        ) == await walk(lambda a, n, c=cold, lo=lo, hi=hi: c.pending(lo, hi, a, n), after, limit)
+        probe = [key(rng.randrange(2100)) for _ in range(50)]
+        assert await warm.lookup(probe) == await cold.lookup(probe)
+    # Recording reads only local copies: one it does not hold is `Cold`.
+    partial = ObjectIO(None, local=dict(list(pin.handles.items())[1:]), served=Reads(recording=True))
+    with pytest.raises(Cold):
+        await KeyIndex(partial, None, state, OPTS).page(None, 10)
+    pin.__exit__(None, None, None)
+
+
+async def test_a_record_answers_its_calls_and_nothing_else(io, tmp_path):
+    """The engine records, the worker answers from the record: the same
+    results with no GET, for the same pinned index and arguments only; a
+    record stops at its bounds."""
+
+    from solera.keys.reads import Full, Reads
+
+    state = await logged_index(io)
+    cache = EngineCache(str(tmp_path))
+    assert await cache.fill(io, state)
+    pin = cache.held(state)
+    reads = Reads(recording=True, max_entries=10**6, max_bytes=2**24)
+    engine = KeyIndex(ObjectIO(None, local=pin.handles, served=reads), None, state, OPTS)
+    page = await engine.page(None, 300)
+    window = await engine.pending(3, 9, None, 300)
+    found = await engine.lookup([key(i) for i in range(0, 2100, 9)])
+    import json
+
+    served = Reads.from_json(json.loads(json.dumps(reads.to_json())))
+    worker_io = ObjectIO(io.store, metrics=io.metrics, served=served)
+    gets = io.metrics.gets
+    worker = KeyIndex(worker_io, None, state, OPTS)
+    assert await worker.page(None, 300) == page
+    assert await worker.pending(3, 9, None, 300) == window
+    assert await worker.lookup([key(i) for i in range(0, 2100, 9)]) == found
+    assert io.metrics.gets == gets
+    await worker.page(page[3], 300)  # not recorded: the store
+    assert io.metrics.gets > gets
+    other = state.pinned(3, 9)  # another snapshot: never answered from this one's record
+    gets = io.metrics.gets
+    assert await KeyIndex(worker_io, None, other, OPTS).pending(3, 9, None, 300) == window
+    assert io.metrics.gets > gets
+    small = Reads(recording=True, max_entries=100, max_bytes=2**24)
+    with pytest.raises(Full):
+        await KeyIndex(ObjectIO(None, local=pin.handles, served=small), None, state, OPTS).page(None, 300)
+    assert len(small) == 0
+    pin.__exit__(None, None, None)

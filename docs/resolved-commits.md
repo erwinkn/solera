@@ -631,6 +631,47 @@ name without a LIST.
   else — after a restart, a big batch, a lagging consumer with thousands
   of batches — goes out as today, and the worker pages the window.
 
+### 7.1 Engine-served reads
+
+Inline pages cover a small window's first page. Everything else an
+attempt reads from an index before it computes — a full delivery's page,
+a larger change window, a rescope's diff, a `keys=` selection, an `Each`
+page's failure records and retry walk, an immutable store's locators for
+a whole read — the worker pages from the store, cold: at 100M keys, 9 to
+649 GETs a page. The engine holds those indexes warm. So, mirroring
+`resolve` for writes, the worker asks once, at `start`, and the engine
+answers its reads; the worker then loads rows from the stores itself. One
+request per step: `start` for reads, `resolve` before writing.
+
+- **The same code, recorded.** The engine runs the worker's own read code
+  (`each.read_window`, `each.read_page`, the whole-read pager) on the
+  attempt's spec, over its cache's local copies, and records every index
+  call — `page`, `pending` or `lookup`, its arguments — with its result.
+  The worker runs the same code with the record in front of the store: a
+  call recorded for the same pinned index and arguments is answered from
+  it, any other goes to the store. Same code and pins make the same calls,
+  so the record is consumed in order; it replaces reads and never decides
+  what is read.
+- **Bound to the attempt and its pins.** The record rides the reply to the
+  `start` of the attempt's admitted invocation (`lifecycle.md` §5), and an
+  entry names its index by the digest of the pinned state in the spec —
+  the files and log the spec pins, never the engine's current index.
+- **Bounded.** At most `reads_max_entries` (1M) entries and
+  `reads_max_bytes` (16 MB) encoded per reply, within `reads_timeout`
+  (2 s): the record stops at the first call past them, and the worker's
+  later calls read the store. Entries travel as a sorted run's `.kx` form
+  (keys, versions, locators, deletions), so one format and one checked
+  parser serve resolves and reads.
+- **Local or nothing.** The engine reads only its local copies, never the
+  store, for this. An index it does not hold stops the record at its first
+  call and queues a fill, as a `cold` resolve does. Cache off, no spec in
+  memory (an attempt launched before a restart), a timeout: no record, and
+  the worker reads the store as before.
+- **Delta files stay while logged.** A change window reads delta files
+  that compaction has merged out of the levels; the cache retires a delta
+  only when collection deletes it, so a warm index answers its windows
+  locally, and a fill fetches its logged deltas too.
+
 ## 8. Readers for per-key processing
 
 `per-key-processing.md` is authoritative for everything about failures:

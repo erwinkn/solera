@@ -64,6 +64,7 @@ class Live:
     lines: deque = field(default_factory=lambda: deque(maxlen=LIVE_LINES))
     log_offset: int = 0
     fresh: bool = False  # launched by this engine process: its first `start` binds unread
+    reads: dict | None = None  # its spec's inputs and outputs, until `start` reads them
 
     def heard(self, now: float, via: str) -> None:
         self.reported, self.via = now, via
@@ -125,7 +126,24 @@ class Attempts:
         await self._bind(attempt, live, body["invocation"], start=True)
         live.heard(asyncio.get_running_loop().time(), "channel")
         self._stir(attempt)
-        return self._cancel_answer(live)
+        answer = self._cancel_answer(live)
+        spec, live.reads = live.reads, None  # answered once: a retried start reads the store
+        if spec is not None and self.keys is not None:
+            # The attempt's input reads, from the engine's cache (docs/resolved-commits.md §7.1).
+            whole = {
+                param
+                for param, pin in spec["inputs"].items()
+                if "changes" not in pin
+                and pin.get("index")
+                and ((self.manifest.get("stores") or {}).get((pin.get("ref") or {}).get("store")) or {}).get(
+                    "writes"
+                )
+                == "immutable"
+            }
+            reads = await self.keys.reads(spec, whole, self.m.applied)
+            if reads is not None:
+                answer["reads"] = reads
+        return answer
 
     async def attempt_beat(self, attempt: str, body: dict) -> dict:
         live = self._live(attempt)
@@ -257,7 +275,8 @@ class Attempts:
         claim = self.m.claimed(attempt)
         if claim is None:
             raise LostOwnership(attempt)
-        self.live.setdefault(attempt, Live()).fresh = True
+        live = self.live.setdefault(attempt, Live())
+        live.fresh = True
         spec = {
             "attempt": attempt,
             "revision": self.manifest["revision"],
@@ -278,6 +297,8 @@ class Attempts:
             spec["cursor"] = prepared["cursor"]
         path = f"{lifecycle.base(task['run'], attempt)}{lifecycle.SPEC}"
         await self.state.create_object(path, json.dumps(spec).encode())
+        if self.keys is not None:  # what `start` answers its reads from (resolved-commits.md §7.1)
+            live.reads = {"inputs": spec["inputs"], "outputs": spec["outputs"]}
         claim = self.m.claimed(attempt)
         if claim is None:
             raise LostOwnership(attempt)  # canceled while the spec was written

@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import bisect
 import itertools
+import json
 import math
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
@@ -43,6 +44,7 @@ from . import (
     parse_tail,
 )
 from .io import RANGE, ObjectIO
+from .reads import Cold
 
 # -- engine-held state ---------------------------------------------------------------
 
@@ -398,7 +400,13 @@ class _Parsed:
 
 
 class KeyIndex:
-    """I/O over one index. `state` is the pinned `IndexState` to read."""
+    """I/O over one index. `state` is the pinned `IndexState` to read.
+
+    The `io` may carry `local` — the engine cache's copies by path — read in
+    place of the store whenever they hold every file a read needs, and
+    `served` — a `Reads` record (docs/resolved-commits.md §7.1): answering,
+    its calls are taken from it; recording, every `page`, `pending` and
+    `lookup` is kept in it, and one that would need the store raises `Cold`."""
 
     def __init__(self, io: ObjectIO, prefix: str | None, state: IndexState, options: Options | None = None):
         self.io = io
@@ -408,6 +416,7 @@ class KeyIndex:
         self._parsed: dict[str, _Parsed] = {}
         self.route = ""  # how the last resolve read the index: "sparse" or "stream"
         self.local_reads = False  # whether the last streaming job read local copies
+        self._identity: str | None = None
         self.on_write = None  # called with (path, FileInfo, bytes) for every file written
 
     def path(self, name: str) -> str:
@@ -528,8 +537,51 @@ class KeyIndex:
         level at once; the filters only skip files that cannot hold a key."""
 
         keys = sorted(set(keys))
-        known = (await self._find(keys, {}, exact=True, switch=False))[0]
-        return {k: (v, loc) for k, (live, v, loc) in known.items() if live}
+
+        async def store():
+            known = (await self._find(keys, {}, exact=True, switch=False))[0]
+            return {k: (v, loc) for k, (live, v, loc) in known.items() if live}
+
+        async def local(snap):
+            hits = await asyncio.to_thread(snap.get, keys)
+            return {k: (h[0], h[2]) for k, h in zip(keys, hits, strict=True) if h is not None and not h[1]}
+
+        return await self._read("lookup", (keys,), self.state.newest_first(), local, store)
+
+    # -- reads: local copies, a record, or the store ----------------------------------------
+
+    @property
+    def identity(self) -> str:
+        """The pinned state's digest: what a recorded read is bound to."""
+
+        if self._identity is None:
+            self._identity = digest(json.dumps(self.state.to_json(), sort_keys=True).encode())
+        return self._identity
+
+    def _snapshot(self, levels: list[list[FileInfo]]):
+        """The local copies of `levels` as a snapshot, if the `io` holds them all."""
+
+        local = getattr(self.io, "local", None)
+        if not local or not all(self.path(f.name) in local for level in levels for f in level):
+            return None
+        return _native.Snapshot([[local[self.path(f.name)] for f in level] for level in levels])
+
+    async def _read(self, call: str, args: tuple, levels, local, store):
+        served = getattr(self.io, "served", None)
+        if served is not None and not served.recording:
+            hit = served.answer(self.identity, call, args)
+            if hit is not None:
+                return hit
+        snap = self._snapshot(levels)
+        if snap is not None:
+            out = await local(snap)
+        elif served is not None and served.recording:
+            raise Cold(call)
+        else:
+            out = await store()
+        if served is not None and served.recording:
+            served.record(self.identity, call, args, out)
+        return out
 
     async def _stream(self, run: SortedRun, batch, attempt, generation, collect):
         """The streaming merge-join of a patch with every level."""
@@ -588,11 +640,13 @@ class KeyIndex:
         }
 
     async def _run(
-        self, job: Job, runs, name=None, level: int = 0, rows=None, on_garbage=None, local=None
+        self, job: Job, runs, name=None, level: int = 0, rows=None, on_garbage=None
     ) -> list[FileInfo]:
         """Drive a streaming job over `runs`; its files are written as `name(n)`, at
-        `level`. With `local` — the engine cache's files by path — and every
-        file of `runs` in it, the job reads those, not the store."""
+        `level`. When the `io`'s local copies hold every file of `runs`, the
+        job reads those, not the store."""
+
+        local = getattr(self.io, "local", None)
 
         files: dict[int, FileInfo] = {}
 
@@ -861,10 +915,19 @@ class KeyIndex:
         """One page of the full delivery: live keys > `after`, their versions and
         locators, and the next cursor (`None` when done)."""
 
-        keys, versions, _, locators, nxt = await self._scan(
-            self.state.newest_first(), after, limit, drop_deleted=True
-        )
-        return keys, versions, locators, nxt
+        levels = self.state.newest_first()
+
+        async def store():
+            keys, versions, _, locators, nxt = await self._scan(levels, after, limit, drop_deleted=True)
+            return keys, versions, locators, nxt
+
+        async def local(snap):
+            keys, versions, _, locators, nxt = await asyncio.to_thread(
+                snap.scan, after, limit, drop_deleted=True
+            )
+            return keys, versions, locators, nxt
+
+        return await self._read("page", (after, limit), levels, local, store)
 
     async def pending(self, first_batch: int, last_batch: int, after: bytes | None, limit: int):
         """Changes in batches `[first_batch, last_batch]`, newest winning, keys > `after`:
@@ -876,14 +939,22 @@ class KeyIndex:
             raise LookupError(f"delta log no longer holds batches {missing[:5]}")
         # Each batch is a level of its own: its files (a split delta) never overlap.
         levels = [list(logged[b]) for b in range(last_batch, first_batch - 1, -1)]
-        return await self._scan(levels, after, limit, drop_deleted=False)
 
-    async def recount(self, local: dict | None = None) -> int:
+        async def store():
+            return await self._scan(levels, after, limit, drop_deleted=False)
+
+        async def local(snap):
+            return await asyncio.to_thread(snap.scan, after, limit, drop_deleted=False)
+
+        args = (first_batch, last_batch, after, limit)
+        return await self._read("pending", args, levels, local, store)
+
+    async def recount(self) -> int:
         """Count live keys exactly: one streaming pass over the whole index,
-        over `local` copies when they hold it (`_run`)."""
+        over the `io`'s local copies when they hold it (`_run`)."""
 
         job = Job.count(len(runs := self.state.newest_first()))
-        await self._run(job, runs, local=local)
+        await self._run(job, runs)
         return job.live
 
     # -- compaction ------------------------------------------------------------------------
@@ -925,13 +996,13 @@ class KeyIndex:
         return None
 
     async def compact(
-        self, plan=None, *, garbage: bool = False, local: dict | None = None
+        self, plan=None, *, garbage: bool = False
     ) -> tuple[list[FileInfo], list[str], list[GarbageFile]] | None:
         """Run one compaction; returns the added files and removed names for
         `IndexState.compacted`, and with `garbage` the garbage files listing
         every entry the merge dropped that names an object — what an
         immutable store discards (docs/key-index-format.md § Garbage files).
-        Its inputs are read from `local` copies when they hold them (`_run`)."""
+        Its inputs are read from the `io`'s local copies when they hold them."""
 
         plan = plan or self.plan_compaction()
         if plan is None:
@@ -964,7 +1035,6 @@ class KeyIndex:
             lambda n: f"c{stamp}-{n:04d}" if out_level else f"{stamp}.{n:04d}",
             out_level,
             on_garbage=put_garbage,
-            local=local,
         )
         return added, [f.name for f in inputs], [dropped[n] for n in sorted(dropped)]
 

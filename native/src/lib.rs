@@ -1655,6 +1655,37 @@ impl Snapshot {
         Ok(delta_files(py, &d))
     }
 
+    /// Up to `limit` entries of the merged snapshot past `after` — deletions
+    /// dropped with `drop_deleted` — as `KeyIndex`'s scans return them: keys,
+    /// versions, deleted flags, locators, and the cursor (None at the end).
+    #[pyo3(signature = (after, limit, *, drop_deleted))]
+    #[allow(clippy::type_complexity)]
+    fn scan<'py>(
+        &self,
+        py: Python<'py>,
+        after: Option<PyBackedBytes>,
+        limit: usize,
+        drop_deleted: bool,
+    ) -> PyResult<(
+        Bound<'py, PyList>,
+        Bound<'py, PyList>,
+        Bound<'py, PyBytes>,
+        Vec<u64>,
+        Option<Bound<'py, PyBytes>>,
+    )> {
+        let inner = &self.inner;
+        let s = py
+            .detach(|| inner.scan(after.as_deref(), limit, drop_deleted))
+            .map_err(to_py)?;
+        Ok((
+            list_of_bytes(py, &s.keys)?,
+            list_of_bytes(py, &s.versions)?,
+            PyBytes::new(py, &s.deleted),
+            s.locators,
+            s.next.map(|n| PyBytes::new(py, &n)),
+        ))
+    }
+
     /// The newest entry of each key — `(version, deleted, locator)` — or None.
     #[allow(clippy::type_complexity)]
     fn get<'py>(
