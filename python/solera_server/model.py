@@ -428,6 +428,7 @@ class Model:
         self.revision, self.manifest, self.project = e["revision"], manifest, e.get("project")
         self._consumed = self._consumed_outputs(manifest)
         renamed = self._apply_aliases(manifest)
+        self._reconcile_tasks(manifest, renamed, e["at"])
         automations = {}
         for name, auto in manifest["automations"].items():
             existing = self.automations.get(name)
@@ -457,6 +458,36 @@ class Model:
                     "version": None,
                     "n": self.applied,
                 }
+
+    def _reconcile_tasks(self, manifest: dict, renamed: dict[str, list[str]], at: float) -> None:
+        """Outstanding work under a new project: a task not yet launched of a
+        renamed asset carries on under its new name; one of an asset that is
+        gone is canceled, saying why — its dependents blocked, its run rolled
+        up — so no queued task names an asset the manifest lacks. A launched
+        attempt settles under the contract it was launched with."""
+
+        new_name = {old: new for new, olds in renamed.items() for old in olds}
+        for run in list(self.runs.values()):
+            if run["status"] in TERMINAL_RUN:
+                continue
+            for tid, task in sorted(run["tasks"].items()):
+                if task["status"] in TERMINAL_TASK or task.get("launched") or tid in self.claims:
+                    continue
+                old = task["asset"]
+                if old in new_name:
+                    bucket = self.pending.get((old, task["scope"]))
+                    if bucket is not None:
+                        bucket.discard(tid)
+                        if not bucket:
+                            del self.pending[(old, task["scope"])]
+                    task["asset"] = new_name[old]
+                    self.pending.setdefault((task["asset"], task["scope"]), set()).add(tid)
+                elif old not in manifest["assets"]:
+                    task["status"], task["error"] = "canceled", f"asset {old!r} is no longer in the project"
+                    task.pop("held", None)
+                    self._stop_clock(task, at)
+                    self.unfinished.pop(tid, None)
+                    self._finished(run, task, "canceled", None, at)
 
     def _apply_aliases(self, manifest) -> dict[str, list[str]]:
         """Move everything held under an asset's former names to its current

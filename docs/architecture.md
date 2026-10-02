@@ -644,7 +644,7 @@ the run's own vocabulary (§8): `partitions`, `mode`, `upstream`, `config`,
 | `name` | required; key for toggles | derived `{asset}.{trigger}.{index}` |
 | `targets` | required: assets, singleton or list | the asset |
 | `trigger` | required | required |
-| `partitions` | `"latest"` · `"missing"` · `"all"` · `[k…]`; default `"latest"` for `Every`/`Cron`, the projection of the changed scope for `OnChange` — a source has no dimensions, so its change reaches every scope of the target (bounded like `"all"`). Named partitions run as named, whatever changed. A firing is one run over every target, so a target that reads another waits for it. A change whose target scope has an attempt running stays pending until that attempt ends: it pinned its inputs before the change | same |
+| `partitions` | `"latest"` · `"missing"` · `"all"` · `[k…]`; default `"latest"` for `Every`/`Cron`, the projection of the changed scope for `OnChange` — a source has no dimensions, so its change reaches every scope of the target (bounded like `"all"`). Named partitions run as named, whatever changed. A firing is one run over every target, so a target that reads another waits for it. A change stays pending — never consumed — while a scope it is owed is claimed or queued in any run (that work would not see it, and the firing could not order after it), and while a target reading the change through `AllPartitions` cannot see it yet: a delivery under way is read once it completes | same |
 | `enabled` | default `True` | default `True` |
 
 | Trigger | Fires |
@@ -887,6 +887,11 @@ project must agree on it — an image without `.git` should set
 because it was computed by another method (git against a file hash) makes
 the engine log a warning that says so. The engine counts the revisions it serves: the **revision
 epoch**.
+
+Registering a project reconciles the work outstanding under the last one: a
+task not yet launched of a renamed asset carries on under its new name; one
+of an asset that is gone is canceled, with why, and its run rolls up. A
+launched attempt settles under the contract it was launched with.
 
 Registration errors:
 

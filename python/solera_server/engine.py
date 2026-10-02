@@ -490,8 +490,15 @@ class Engine(Attempts, Sensors, Views):
             run = self.m.runs[self.m.task_run[task_id]]
             if run["status"] == "canceled" or run.get("paused"):
                 continue
-            spec = self.manifest["assets"][task["asset"]]["placement"]
-            placement = self.registry.build(spec)
+            try:
+                spec = self.manifest["assets"][task["asset"]]["placement"]
+                placement = self.registry.build(spec)
+            except Exception as error:  # this task's, not the pass's: the others still dispatch
+                log.exception("task %s cannot be placed", task_id)
+                held[task_id] = ["invalid", str(error)[:200]]
+                if task.get("held") == held[task_id]:
+                    del held[task_id]
+                continue
             executor = spec["executor"]
             limit = getattr(placement, "max_concurrent", None)
             is_pool = spec["kind"] == "Pool"
@@ -887,7 +894,11 @@ class Engine(Attempts, Sensors, Views):
 
         if not edge.fan_in:
             head = planner.head(edge.output, edge.scope)
-            return {"": head["ref"]} if head is not None and head["complete"] else {}
+            return (
+                {"": head["ref"]}
+                if head is not None and planner.head_complete(edge.output, edge.scope)
+                else {}
+            )
         return {edge.key(s): h["ref"] for s, h in planner.fan_in(edge, complete=True).items()}
 
     def _incremental_plan(self, task, param, edge, ref, up_scope, fingerprint, run, full, claim_pin=None):
@@ -1779,7 +1790,10 @@ class Engine(Attempts, Sensors, Views):
         `partitions`, if it names them, else every changed upstream scope's
         projection onto the target (§7); planned together, a target that
         reads another waits for it. The changes it covers leave the pending
-        set with it."""
+        set with it. A change waits — pending, never consumed — while work it
+        is owed is already claimed or queued (that work would not see it, and
+        the firing could not order after it), and while a target cannot read
+        it yet (`Planner.visible`)."""
 
         planner, explicit = self.planner(), auto.get("partitions")
         consumed, selected = [], {}
@@ -1787,9 +1801,9 @@ class Engine(Attempts, Sensors, Views):
             named = {t: planner.scopes(t, explicit) for t in auto["targets"]} if explicit else None
             for producer, scope in (list(p) for p in auto["pending"]):
                 owed = named or {t: planner.reach(producer, scope, t) for t in auto["targets"]}
-                if any(self._scope_active_claim(t, s) for t, scopes in owed.items() for s in scopes):
-                    # A running attempt pinned its inputs before this change: it cannot cover
-                    # it. The change stays pending until that attempt ends, then fires.
+                if any(self._scope_active(t, s) for t, scopes in owed.items() for s in scopes):
+                    continue
+                if not all(planner.visible(producer, scope, t) for t in owed):
                     continue
                 consumed.append([producer, scope])
                 for target, scopes in owed.items():
@@ -2025,9 +2039,7 @@ class Engine(Attempts, Sensors, Views):
         view = dict(head)
         view["commit"] = f"{head['run']}/{head['attempt']}" if head.get("attempt") else None
         owner = head.get("asset")
-        view["complete"] = owner is None or self.planner().drained(
-            owner, head["ref"].get("partition") or "", [head]
-        )
+        view["complete"] = owner is None or self.planner().drained(owner, head["ref"].get("partition") or "")
         return view
 
     def outcome_view(self, record: dict) -> dict:

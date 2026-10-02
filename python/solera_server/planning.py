@@ -151,13 +151,14 @@ def select_scopes(
     wanted = list(dict.fromkeys(selection or ()))
     if not dims:
         return [""] if "" in wanted else []
-    member, out = membership(dims, now, elements), []
+    member, out, seen = membership(dims, now, elements), [], set()
     for key in wanted:
         try:
             scope = canonical(dims, key)
         except (ValueError, KeyError):
             continue
-        if scope not in out and member(scope):
+        if scope not in seen and member(scope):  # two spellings may name one scope
+            seen.add(scope)
             out.append(scope)
     return out
 
@@ -256,12 +257,11 @@ class Planner:
         heads.update({scope: h for (o, scope), h in self.projected.items() if o == output})
         return heads
 
-    def drained(self, asset: str, scope: str, heads: Iterable[dict]) -> bool:
-        """Whether the scope's last commit finished its delivery — its outputs'
-        `heads` say so of a scope committed before progress was kept."""
+    def drained(self, asset: str, scope: str) -> bool:
+        """Whether the scope's last commit finished its delivery."""
 
         record = self._progress(asset, scope)
-        return record["drained"] if record is not None else all(h.get("complete", True) for h in heads)
+        return record is not None and record["drained"]
 
     def complete(self, asset: str, scope: str) -> bool:
         """Whether a scope is complete (§7): each of its outputs has a head,
@@ -269,16 +269,15 @@ class Planner:
         A job, which has no output, once a run of it succeeded. The one answer
         for selection, fan-in and the views."""
 
-        heads = [self.head(o["name"], scope) for o in self.manifest["assets"][asset]["outputs"]]
-        if any(h is None for h in heads):
-            return False
-        return (bool(heads) or self._progress(asset, scope) is not None) and self.drained(asset, scope, heads)
+        outputs = self.manifest["assets"][asset]["outputs"]
+        return all(self.head(o["name"], scope) is not None for o in outputs) and self.drained(asset, scope)
 
-    def head_complete(self, output: str, scope: str, head: dict) -> bool:
-        """Whether a head is of a complete delivery: a source's always is."""
+    def head_complete(self, output: str, scope: str) -> bool:
+        """Whether an output's head at `scope` is of a complete delivery: a
+        source's always is."""
 
         owner = self.owner(output)
-        return owner is None or self.drained(owner, scope, [head])
+        return owner is None or self.drained(owner, scope)
 
     def elements(self, output: str) -> list[str] | None:
         """A set dimension's current keys: the element list its head carries (§7)."""
@@ -330,6 +329,17 @@ class Planner:
                     pinned[t_name] = parts[p_name]
                     break
         return pinned
+
+    def visible(self, producer: str | None, scope: str, target: str) -> bool:
+        """Whether `target` can read a change of `producer` at `scope` yet:
+        `AllPartitions` reads complete deliveries only, so a change made by a
+        delivery still under way is not, until that delivery drains."""
+
+        if producer is None:
+            return True
+        inputs = self.manifest["assets"][target]["inputs"].values()
+        whole = any(e["kind"] == "all_partitions" and self.owner(e["output"]) == producer for e in inputs)
+        return not whole or self.drained(producer, scope)
 
     def reach(self, producer: str | None, scope: str, target: str) -> list[str]:
         """The target scopes a change of `producer` at `scope` reaches (§7,
@@ -395,7 +405,7 @@ class Planner:
                     groups.setdefault(tuple(parts[n] for n in names), {})[up_scope] = head
             self._groups[(edge.output, names)] = groups
         heads = groups.get(tuple(edge.pinned[n] for n in names)) or {}
-        return {s: h for s, h in heads.items() if not complete or self.head_complete(edge.output, s, h)}
+        return {s: h for s, h in heads.items() if not complete or self.head_complete(edge.output, s)}
 
     def spread(self, edge: Edge) -> list[str]:
         """Every upstream scope an edge could read: for a fan-in, the domain
