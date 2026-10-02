@@ -314,13 +314,18 @@ def run_rows(run: dict, *, live: bool = False) -> dict[str, list[dict]]:
     """A run's rows in `runs` and `tasks` (its attempts wrote theirs as they
     ended). `live` describes a run still in progress: no finish time."""
 
-    tasks = run["tasks"]
-    task_rows = []
+    return {"runs": [run_row(run, live=live)], "tasks": task_rows(run)}
+
+
+def task_rows(run: dict) -> list[dict]:
+    """A run's rows in `tasks`."""
+
+    tasks, rows = run["tasks"], []
     for tid in sorted(tasks):
         task = tasks[tid]
         launched = (task.get("launched") or {}).get("execution")
         retry = task.get("retry") or {}
-        task_rows.append(
+        rows.append(
             {
                 "id": tid,
                 "run": run["id"],
@@ -341,17 +346,23 @@ def run_rows(run: dict, *, live: bool = False) -> dict[str, list[dict]]:
                 "executor": launched["executor"] if launched else task.get("executor"),
             }
         )
+    return rows
+
+
+def run_row(run: dict, *, live: bool = False) -> dict:
+    """A run's row in `runs`: its tasks summed up, none of their rows built."""
+
+    tasks = run["tasks"].values()
     status = run["status"]
-    quiet = all(
-        t["status"] == "skipped" and set(t.get("outcomes") or ()) <= {"skipped"} for t in tasks.values()
-    )
+    quiet = all(t["status"] == "skipped" and set(t.get("outcomes") or ()) <= {"skipped"} for t in tasks)
     if live:
         status = "paused" if run.get("paused") else status
     elif status == "succeeded" and quiet:
         status = "skipped"  # it launched nothing and wrote nothing
-    failed = [r for r in task_rows if r["status"] in BAD_TASK]
+    failed = [t for t in tasks if t["status"] in BAD_TASK]
+    erred = min((t for t in failed if t.get("error")), key=lambda t: t["id"], default=None)
     partitions = run.get("partitions")
-    row = {
+    return {
         "id": run["id"],
         "created_at": run["created_at"],
         "finished_at": None if live else run.get("updated_at"),
@@ -362,8 +373,8 @@ def run_rows(run: dict, *, live: bool = False) -> dict[str, list[dict]]:
         "retry_of": run.get("retry_of"),
         "source": None,
         "targets": list(run.get("targets") or ()),
-        "assets": sorted({t["asset"] for t in tasks.values()}),
-        "committed": sorted({t["asset"] for t in tasks.values() if t["status"] == "succeeded"}),
+        "assets": sorted({t["asset"] for t in tasks}),
+        "committed": sorted({t["asset"] for t in tasks if t["status"] == "succeeded"}),
         "mode": run.get("mode"),
         "partitions": partitions
         if isinstance(partitions, str) or partitions is None
@@ -372,11 +383,10 @@ def run_rows(run: dict, *, live: bool = False) -> dict[str, list[dict]]:
         "tags": dict(run.get("tags") or {}),
         "task_count": len(tasks),
         "failed_count": len(failed),
-        "error": next((r["error"] for r in failed if r["error"]), None),
+        "error": erred["error"] if erred is not None else None,
         "config": _json(run.get("config")),
         "keys": _json(run.get("keys")),
     }
-    return {"runs": [row], "tasks": task_rows}
 
 
 def run_record(rows: dict[str, list[dict]], events: int = 0) -> dict:
@@ -694,15 +704,19 @@ class History:
         live: bool = True,
     ):
         """Run `work(con)` against a view per table — with, if `live`, the
-        runs in progress. Files outside `since`/`until`, or unable to hold
-        `run`, are left out."""
+        runs in progress (only `run`, given one), in only the tables asked
+        for. Files outside `since`/`until`, or unable to hold `run`, are left
+        out."""
 
         extra = {table: self.lake.unwritten(table) for table in VOLATILE}
         if live:
             m = self.m
-            for run_id in list(m.runs):
-                for table, rows in run_rows(m.runs[run_id], live=True).items():
-                    extra.setdefault(table, []).extend(rows)
+            runs = [m.runs[run]] if run in m.runs else [] if run is not None else list(m.runs.values())
+            if "runs" in tables:
+                extra.setdefault("runs", []).extend(run_row(r, live=True) for r in runs)
+            if "tasks" in tables:
+                for r in runs:
+                    extra.setdefault("tasks", []).extend(task_rows(r))
         return await self.lake.query(work, tables, since=since, until=until, key=run, extra=extra)
 
     async def run(self, run_id: str) -> dict | None:

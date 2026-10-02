@@ -160,6 +160,31 @@ async def test_live_runs_are_listed(state, clock):
     assert [(r["id"], r["status"]) for r in listed] == [(submitted["id"], "paused")]
 
 
+async def test_a_query_builds_only_the_live_rows_it_reads(state, clock, monkeypatch):
+    """Review round 4, engine #7: listing runs builds no task rows, and the
+    tasks of one run build only that run's."""
+
+    from solera_server import history
+
+    built = []
+
+    def task_rows(run):
+        built.append(run["id"])
+        return rows(run)
+
+    rows = history.task_rows
+    monkeypatch.setattr(history, "task_rows", task_rows)
+    engine = engine_for(state, clock)
+    await engine.initialize()
+    paused = [await engine.submit(["orders"]) for _ in range(2)]
+    for submitted in paused:
+        await engine.pause(submitted["id"])
+    listed = (await engine.list_runs(RunFilter()))["runs"]
+    assert sorted(r["id"] for r in listed) == sorted(r["id"] for r in paused) and built == []
+    found = await engine.history.tasks(run=paused[0]["id"])
+    assert [t["asset"] for t in found["tasks"]] == ["orders"] and built == [paused[0]["id"]]
+
+
 async def test_a_run_reads_the_same_once_archived(state, clock):
     engine = engine_for(state, clock)
     await engine.initialize()
