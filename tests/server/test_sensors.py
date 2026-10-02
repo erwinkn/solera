@@ -682,3 +682,42 @@ async def test_an_engines_own_host_stops_once_its_engine_is_gone(tmp_path):
     )
     assert code == ORPHANED
     await state.close()
+
+
+async def test_a_host_with_every_slot_taken_still_stops_once_its_engine_is_gone(tmp_path, monkeypatch):
+    """Both slots run a sensor with an hour's timeout when the engine dies:
+    the host notices within its `watch`, drains briefly and returns, not
+    once a sensor ends."""
+
+    release, entered = threading.Event(), []
+
+    @sensor(every=1, timeout=3600)
+    def first(ctx):
+        entered.append("first")
+        release.wait(10)
+
+    @sensor(every=1, timeout=3600)
+    def second(ctx):
+        entered.append("second")
+        release.wait(10)
+
+    project = Project(sensors=[first, second])
+    state, engine = await open_engine(tmp_path, project)
+    host = asyncio.create_task(
+        run_sensor_host(
+            LocalSensorChannel(engine),
+            project,
+            "local",
+            concurrency=2,
+            parent=os.getppid(),
+            watch=0.01,
+            drain=0.1,
+        )
+    )
+    await until(lambda: len(entered) == 2)
+    await asyncio.sleep(0.05)  # the host is waiting on its sensors
+    assert not host.done()
+    monkeypatch.setattr(os, "getppid", lambda: 1)  # reparented: the engine is gone
+    assert await asyncio.wait_for(host, 2) == ORPHANED
+    release.set()
+    await state.close()

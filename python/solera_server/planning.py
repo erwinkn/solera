@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import datetime as dt
 from collections.abc import Callable
+from functools import partial
 from itertools import product
 
 from solera.sdk import MAX_PARTITION_KEYS, TimePartitions, canonical_partition, split_partition
@@ -55,14 +56,22 @@ def _size(dim: dict, now: dt.datetime, elements) -> int:
     return len(elements(dim["output"]) or ())
 
 
+def size(dims: dict, now: dt.datetime, elements) -> int:
+    """How many scopes `dims` spans, counted per dimension — never enumerated.
+    A cron time dimension is counted only to just past `MAX_SCOPES`."""
+
+    total = 1
+    for dim in dims.values():
+        total *= _size(dim, now, elements)
+    return total
+
+
 def enumerate_scopes(dims: dict, now: dt.datetime, elements, *, what: str = "") -> list[str]:
     """Every scope of `dims`, in dimension order — refused past `MAX_SCOPES`."""
 
     if not dims:
         return [""]
-    total = 1
-    for dim in dims.values():
-        total *= _size(dim, now, elements)
+    total = size(dims, now, elements)
     if total > MAX_SCOPES:
         raise ValueError(
             f"{what or 'the selection'} spans {total} partitions, more than {MAX_SCOPES}: "
@@ -72,27 +81,33 @@ def enumerate_scopes(dims: dict, now: dt.datetime, elements, *, what: str = "") 
     return [canonical_partition(dims, dict(zip(dims, combo, strict=True))) for combo in product(*keys)]
 
 
-def member(dims: dict, scope: str, now: dt.datetime, elements) -> bool:
-    """Whether `scope` is a current partition: each of its parts a member of
-    its dimension — checked part by part, never by enumeration."""
+def membership(dims: dict, now: dt.datetime, elements) -> Callable[[str], bool]:
+    """Whether a scope is one `enumerate_scopes` would list: canonical, each
+    of its parts a member of its dimension — checked part by part, never by
+    enumeration. Each dimension's members are read once, for any number of
+    scopes."""
 
-    try:
-        parts = split_partition(dims, scope) if len(dims) > 1 else {next(iter(dims)): scope}
-    except (ValueError, KeyError):
-        return False
+    if not dims:
+        return lambda scope: scope == ""
+    checks = {}
     for name, dim in dims.items():
-        value = parts.get(name)
-        if value is None:
-            return False
-        if dim["kind"] == "static":
-            ok = value in {str(k) for k in dim["keys"]}
-        elif dim["kind"] == "time":
-            ok = time_partitions(dim).contains(value, now)
+        if dim["kind"] == "time":
+            checks[name] = partial(time_partitions(dim).contains, as_of=now)
+        elif dim["kind"] == "static":
+            checks[name] = {str(k) for k in dim["keys"]}.__contains__
         else:
-            ok = value in set(elements(dim["output"]) or ())
-        if not ok:
+            checks[name] = set(elements(dim["output"]) or ()).__contains__
+
+    def member(scope: str) -> bool:
+        try:
+            parts = split_partition(dims, scope)
+        except ValueError:
             return False
-    return True
+        return canonical_partition(dims, parts) == scope and all(
+            check(parts[name]) for name, check in checks.items()
+        )
+
+    return member
 
 
 def select_scopes(
@@ -127,12 +142,12 @@ def select_scopes(
     wanted = list(dict.fromkeys(selection or ()))
     if not dims:
         return [""] if "" in wanted else []
-    out = []
+    member, out = membership(dims, now, elements), []
     for key in wanted:
         try:
             scope = canonical(dims, key)
         except (ValueError, KeyError):
             continue
-        if scope not in out and member(dims, scope, now, elements):
+        if scope not in out and member(scope):
             out.append(scope)
     return out

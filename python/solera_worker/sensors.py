@@ -92,6 +92,7 @@ async def run_sensor_host(
     stale_wait: float = 30.0,
     drain: float = 5.0,
     parent: int | None = None,
+    watch: float = 1.0,
 ) -> int:
     """Run ticks until `max_ticks` ran, one overran, or the engine serves
     another revision (then after `stale_wait`: a host started afresh loads
@@ -99,15 +100,19 @@ async def run_sensor_host(
     `drain` seconds after it stops asking are left: their claims expire,
     and the sensors tick again on the next host. An engine's own host is
     given its `parent` and stops once that process is gone: an engine that
-    was killed outright never shut it down, and nothing else would."""
+    was killed outright never shut it down, and nothing else would. It
+    looks every `watch` seconds, whatever it waits on — every slot may be
+    taken by a sensor that runs for its whole timeout."""
 
     revision = project.manifest["revision"]
     build = (project.manifest.get("build") or {}).get("source")
     host = host or f"{socket.gethostname()}:{os.getpid()}"
     running: set[asyncio.Task] = set()
-    ran, overran = 0, asyncio.Event()
+    ran, overran, orphaned = 0, False, False
+    stop = asyncio.Event()  # a tick overran, or the parent is gone: every wait below races it
 
     async def one(tick: dict) -> None:
+        nonlocal overran
         sensor = project.sensors[tick["sensor"]]
         try:
             value = await _call(sensor, project, SensorContext(tick), tick["timeout"])
@@ -115,7 +120,8 @@ async def run_sensor_host(
                 raise TypeError(f"{sensor.name} returned {type(value).__name__}, not a Tick or None")
             outcome = value.to_json() if value is not None else {}
         except TimeoutError:
-            overran.set()  # the engine drops it; its thread runs on, so this host goes
+            overran = True  # the engine drops it; its thread runs on, so this host goes
+            stop.set()
             return
         except Exception as error:
             outcome = {"error": "".join(traceback.format_exception_only(error)).strip()}
@@ -128,42 +134,48 @@ async def run_sensor_host(
             except Exception:
                 await asyncio.sleep(0.5 * 2**attempt)
 
-    orphaned = False
-    while ran < max_ticks and not overran.is_set():
-        if parent is not None and os.getppid() != parent:
-            orphaned = True
-            break
-        slots = min(concurrency - len(running), max_ticks - ran)
-        if slots <= 0:
-            await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
-            continue
-        poll, gave_up = (
-            asyncio.create_task(channel.next(executor, revision, host, slots, build)),
-            asyncio.create_task(overran.wait()),
-        )
-        await asyncio.wait({poll, gave_up}, return_when=asyncio.FIRST_COMPLETED)
-        gave_up.cancel()
-        if not poll.done():  # a tick overran: stop asking
-            poll.cancel()
-            break
-        try:
-            answer = poll.result()
-        except Exception:
-            await asyncio.sleep(1.0)  # the engine may be restarting
-            continue
-        if answer["revision"] != revision:  # the engine serves other code: start afresh, later
-            await asyncio.sleep(stale_wait)
-            break
-        for tick in answer["ticks"]:
-            ran += 1
-            task = asyncio.create_task(one(tick))
-            running.add(task)
-            task.add_done_callback(running.discard)
+    async def watch_parent() -> None:
+        nonlocal orphaned
+        while os.getppid() == parent:
+            await asyncio.sleep(watch)
+        orphaned = True
+        stop.set()
+
+    stopped = asyncio.create_task(stop.wait())
+    watcher = asyncio.create_task(watch_parent()) if parent is not None else None
+    try:
+        while ran < max_ticks and not stop.is_set():
+            slots = min(concurrency - len(running), max_ticks - ran)
+            if slots <= 0:
+                await asyncio.wait({*running, stopped}, return_when=asyncio.FIRST_COMPLETED)
+                continue
+            poll = asyncio.create_task(channel.next(executor, revision, host, slots, build))
+            await asyncio.wait({poll, stopped}, return_when=asyncio.FIRST_COMPLETED)
+            if not poll.done():  # stopping: stop asking
+                poll.cancel()
+                break
+            try:
+                answer = poll.result()
+            except Exception:
+                await asyncio.wait({stopped}, timeout=1.0)  # the engine may be restarting
+                continue
+            if answer["revision"] != revision:  # the engine serves other code: start afresh, later
+                await asyncio.wait({stopped}, timeout=stale_wait)
+                break
+            for tick in answer["ticks"]:
+                ran += 1
+                task = asyncio.create_task(one(tick))
+                running.add(task)
+                task.add_done_callback(running.discard)
+    finally:
+        stopped.cancel()
+        if watcher is not None:
+            watcher.cancel()
     if running:
         await asyncio.wait(running, timeout=drain)
         for task in running:
             task.cancel()
-    return ORPHANED if orphaned else OVERRAN if overran.is_set() else 0
+    return ORPHANED if orphaned else OVERRAN if overran else 0
 
 
 async def _call(sensor, project: Project, ctx: SensorContext, timeout: float):

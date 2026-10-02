@@ -17,7 +17,7 @@ from solera.sdk import (
     asset,
 )
 from solera_server.api import create_app
-from solera_server.planning import MAX_SCOPES, select_scopes
+from solera_server.planning import MAX_SCOPES, enumerate_scopes, membership, select_scopes, size
 
 from .test_engine import make_engine, state  # noqa: F401
 
@@ -67,6 +67,27 @@ def test_one_explicit_scope_never_enumerates_the_domain():
     assert select_scopes(
         hourly, ["2026-10-01T22:00"], now=now, elements=lambda o: None, missing=lambda s: True
     )
+
+
+def test_membership_and_size_agree_with_the_enumeration():
+    dims = {
+        "day": {"kind": "time", "start": "2026-09-28", "every": "1d", "format": "%Y-%m-%d"},
+        "site": {"kind": "set", "output": "sites"},
+        "tier": {"kind": "static", "keys": ["a,b", "c"]},
+    }
+    now, elements = dt.datetime(2026, 10, 2, tzinfo=UTC), {"sites": ["Richmond", "Oslo"]}.get
+    listed = enumerate_scopes(dims, now, elements)
+    member = membership(dims, now, elements)
+    assert size(dims, now, elements) == len(listed) == 4 * 2 * 2 and all(member(s) for s in listed)
+    assert member("day=2026-09-28,site=Oslo,tier=a%2Cb")
+    assert not member("day=2026-10-02,site=Oslo,tier=c")  # its window is still open
+    assert not member("day=2026-09-28,site=Paris,tier=c")
+    assert not member("site=Oslo,day=2026-09-28,tier=c")  # not canonical: never listed
+    assert not member("day=2026-09-28,site=Oslo,tier=a,b") and not member("day=2026-09-28")
+    assert membership({}, now, elements)("") and not membership({}, now, elements)("x")
+    assert size({}, now, elements) == 1
+    big = {d: {"kind": "static", "keys": [f"{d}{i}" for i in range(1000)]} for d in "ab"}
+    assert size(big, now, elements) == 1_000_000 > MAX_SCOPES  # counted, not listed
 
 
 async def test_a_source_change_fans_out_over_a_partitioned_consumer(state):  # noqa: F811

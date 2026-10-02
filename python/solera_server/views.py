@@ -9,10 +9,11 @@ import asyncio
 import json
 from collections import Counter
 
-from solera.failures import NAMES, Record, eligible
+from solera.failures import GONE, NAMES, OK, Record, eligible
 from solera.keys.index import KeyIndex, key_bytes, key_str
 from solera.patterns import Matcher
 
+from . import planning
 from .model import BAD_OUTCOME
 from .state import Conflict
 
@@ -23,13 +24,16 @@ PAGE = 1000  # entries read from a failure index at a time
 class Views:
     # -- partitions and assets (§7, §8) -------------------------------------------------
 
-    async def scope_statuses(self, assets: list[str]) -> dict[str, list[dict]]:
+    async def scope_statuses(self, assets: list[str], *, every: bool = True) -> dict[str, list[dict]]:
         """Each scope of each asset, by status: `complete` (its head is),
         `running` (a task is pending), `failed` (its last outcome failed, was
         canceled or blocked), `missing`, or `retired` (no longer a current
         key). A job has no head: it is complete when its last outcome
-        succeeded. From heads, scope outcomes and the pending index, one
-        pass over each — never a task scan."""
+        succeeded. `every` lists every current scope, enumerated — refused
+        past `MAX_SCOPES`; else only the scopes with a record (a head, an
+        outcome or a pending task), the domain never enumerated. From heads,
+        scope outcomes and the pending index, one pass over each — never a
+        task scan."""
 
         heads: dict[str, dict] = {}
         for (output, scope), head in self.m.heads.items():
@@ -44,23 +48,28 @@ class Views:
         out = {}
         for asset in assets:
             outputs = self.manifest["assets"][asset]["outputs"]
-            current = set(await self._scopes(asset, "all"))
             scoped: dict[str, dict] = {}
             for output in outputs:  # a scope's head: its last declared output's, among those it has
                 scoped.update(heads.get(output["name"]) or {})
-            recorded = outcomes.get(asset) or {}
+            recorded, pending = outcomes.get(asset) or {}, running.get(asset) or set()
+            scopes = set(scoped) | set(recorded) | pending
+            if every:
+                listed = set(await self._scopes(asset, "all"))
+                scopes, current = scopes | listed, listed.__contains__
+            else:
+                current = planning.membership(self._dims(asset), self._now(), self._elements)
             rows = out[asset] = []
-            for scope in sorted(current | set(scoped) | set(recorded)):
+            for scope in sorted(scopes):
                 head, record = scoped.get(scope), recorded.get(scope)
                 last = (record or {}).get("outcome")
                 done = head["complete"] if head else not outputs and last in ("succeeded", "skipped")
                 status = (
                     "retired"
-                    if scope not in current
+                    if not current(scope)
                     else "complete"
                     if done
                     else "running"
-                    if scope in running.get(asset, ())
+                    if scope in pending
                     else "failed"
                     if last in BAD_OUTCOME
                     else "missing"
@@ -81,17 +90,25 @@ class Views:
         by status — `total` counts the current ones, `retired` those past
         them — its newest outcome, an `Each` asset's failing keys by class
         (null for any other), its held scopes, the scopes of its outputs a
-        dead writer left unsettled, and when an output last changed."""
+        dead writer left unsettled, and when an output last changed. Counted
+        from the dimensions and the scopes with a record, so a domain too big
+        to list still rolls up: `missing` is every current scope not
+        otherwise counted."""
 
         names = list(self.manifest["assets"])
-        statuses = await self.scope_statuses(names)
+        statuses = await self.scope_statuses(names, every=False)
         owner = {o["name"]: a for a in names for o in self.manifest["assets"][a]["outputs"]}
         out = {}
         for name in names:
             counts = Counter(row["status"] for row in statuses[name])
-            partitions = {s: counts[s] for s in ("complete", "missing", "failed", "running", "retired")}
+            total = planning.size(self._dims(name), self._now(), self._elements)
+            missing = total - counts["complete"] - counts["failed"] - counts["running"]
             out[name] = {
-                "partitions": {"total": sum(partitions.values()) - partitions["retired"], **partitions},
+                "partitions": {
+                    "total": total,
+                    "missing": missing,
+                    **{s: counts[s] for s in ("complete", "failed", "running", "retired")},
+                },
                 "partitioned": bool(self._dims(name)),
                 "last": None,
                 "failures": {} if self._each_edge(name) else None,
@@ -351,9 +368,10 @@ class Views:
         - `removed`: the upstream no longer holds it, and it was processed
           once or an output still does (its removal may be undelivered);
         - `absent`: the upstream does not hold it, and nothing shows it did;
-        - `ok`: processed at the upstream's current revision — a `key_outcomes`
-          row says so, or the edge is caught up (a row expires with its run,
-          and a plain Incremental edge records none);
+        - `ok`: processed at the upstream's current revision — its newest
+          `ok`, `removed` or `unmatched` row is an `ok` at that revision, or
+          the edge is caught up (a row expires with its run, and a plain
+          Incremental edge records none);
         - `pending`: the upstream holds a revision the edge has not
           delivered yet.
 
@@ -377,7 +395,7 @@ class Views:
         if edge not in keyed:
             raise ValueError(f"{asset} has no keyed Incremental edge {edge!r}")
         spec, is_each = keyed[edge], keyed[edge].get("each") is not None
-        if scope not in await self._scopes(asset, "all") and (asset, edge, scope) not in self.m.watermarks:
+        if scope not in await self._scopes(asset, [scope]) and (asset, edge, scope) not in self.m.watermarks:
             raise KeyError(f"{asset}/{scope}")
         output = spec["output"]
         where = self._edge_scope(asset, edge, spec, scope)
@@ -389,11 +407,19 @@ class Views:
             indexes.append((f"@{asset}", scope))
         upstream, *held = await asyncio.gather(*(self._lookup(o, s, key) for o, s in indexes))
         failing = held.pop() if is_each else None
-        last = last_ok = None
+        last = last_ok = kept = None
         if is_each:
             last = await self._newest_outcome(asset, scope, key)
-            ok = last is None or last["outcome"] == "ok"
-            last_ok = last if ok else await self._newest_outcome(asset, scope, key, ["ok"])
+            # The outputs keep what the newest `ok` delivered, unless a `removed` or `unmatched` came since.
+            settled = (
+                last
+                if last is None or last["outcome"] in GONE
+                else await self._newest_outcome(asset, scope, key, list(GONE))
+            )
+            if settled is not None and settled["outcome"] == OK:
+                kept = last_ok = settled
+            elif settled is not None:
+                last_ok = await self._newest_outcome(asset, scope, key, [OK])
         wm = self.m.watermarks.get((asset, edge, scope))
         served = wm.get("patterns") if wm is not None else spec.get("patterns")
         matcher = Matcher(served)
@@ -412,7 +438,7 @@ class Views:
             verdict = "failing"
         elif upstream is None:
             verdict = "removed" if last is not None or any(present.values()) else "absent"
-        elif (last_ok is not None and last_ok["revision"] == revision) or where["state"] == "caught_up":
+        elif (kept is not None and kept["revision"] == revision) or where["state"] == "caught_up":
             verdict = "ok"
         else:
             verdict = "pending"

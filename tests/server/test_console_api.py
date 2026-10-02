@@ -274,6 +274,29 @@ async def test_explain_says_why_a_key_is_or_is_not_there(world):
     assert consume.json()["last"] is None and consume.json()["outputs"] == {}
 
 
+async def test_explain_a_key_restored_after_its_removal_is_pending(world):
+    engine, client, base, content, _ = world
+    await run(engine, ["parse"], upstream=True)
+    original = content.pop("a.csv")
+    await run(engine, ["parse"], upstream=True)  # the removal is delivered: no row holds it
+    content["a.csv"] = original  # back as it was: the revision of its last `ok`
+    await run(engine, ["files"])
+
+    async def explain(key):
+        response = await client.get(f"{base}/assets/parse/explain", params={"key": key})
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    restored = await explain("a.csv")
+    assert restored["last"]["outcome"] == "removed"
+    assert restored["last_ok"]["revision"] == restored["upstream_revision"]  # matches, but is history
+    assert restored["outputs"]["samples"]["present"] is False and restored["edge_state"] == "behind"
+    assert restored["verdict"] == "pending"
+    await run(engine, ["parse"])
+    delivered = await explain("a.csv")
+    assert delivered["verdict"] == "ok" and delivered["outputs"]["samples"]["present"] is True
+
+
 async def test_edges_report_every_scope_and_its_lag(world):
     engine, client, base, _, parts = world
     await run(engine, ["files", "parted"], partitions="all")
@@ -310,6 +333,48 @@ async def test_edges_report_every_scope_and_its_lag(world):
     assert each["kind"] == "each" and each["concurrency"] == 16
     assert each["patterns"]["exclude"] == [["drafts", {"glob": "draft-*"}]]
     assert [s["state"] for s in each["scopes"]] == ["never"]
+
+
+async def test_a_domain_too_big_to_list_still_rolls_up(tmp_path):
+    grid = {d: StaticPartitions([f"{d}{i}" for i in range(1000)]) for d in "ab"}  # 1,000,000 scopes
+
+    @asset(outputs=Output("rows", keyed=True), partitions=grid)
+    def rows(ctx):
+        return {"k1": {"text": "1"}, "k2": {"text": "2"}}
+
+    @asset(inputs={"row": Each("rows")}, outputs=Output("cells", key="path"), partitions=grid)
+    def cells(row: dict):
+        return [{"value": int(row["text"])}]
+
+    state, engine = await open_engine(tmp_path, Project(assets=[rows, cells], name="grid"))
+    app = create_app(engine=engine, insecure=True)
+    app.state.engine = engine
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        base, scope = "/api/projects/grid", "a=a7,b=b9"
+        await run(engine, ["rows"], partitions=[scope])
+        await run(engine, ["cells"], partitions=[scope])
+
+        response = await client.get(f"{base}/assets:status")
+        assert response.status_code == 200, response.text
+        for name in ("rows", "cells"):
+            assert response.json()["assets"][name]["partitions"] == {
+                "total": 1_000_000,
+                "complete": 1,
+                "missing": 999_999,
+                "failed": 0,
+                "running": 0,
+                "retired": 0,
+            }
+        explained = await client.get(f"{base}/assets/cells/explain", params={"key": "k1", "scope": scope})
+        assert explained.status_code == 200, explained.text
+        assert explained.json()["verdict"] == "ok"
+        other = {"key": "k1", "scope": "a=a8,b=b9"}  # a current scope, never run
+        assert (await client.get(f"{base}/assets/cells/explain", params=other)).json()["verdict"] == "absent"
+        ghost = {"key": "k1", "scope": "a=a7,b=b1000"}
+        assert (await client.get(f"{base}/assets/cells/explain", params=ghost)).status_code == 404
+        # Listing every scope stays bounded: refused, as an `all` run would be.
+        assert (await client.get(f"{base}/partitions/rows")).status_code == 400
+    await state.close()
 
 
 async def test_holds_empty_then_held(world, tmp_path):
