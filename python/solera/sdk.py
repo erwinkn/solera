@@ -31,10 +31,6 @@ class RegistrationError(ValueError):
     """A project declaration violates §11."""
 
 
-class UnresolvedAnnotation:
-    pass
-
-
 def digest(value: Any) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()

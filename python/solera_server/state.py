@@ -60,10 +60,6 @@ def esc(value) -> str:
     return quote(str(value), safe="")
 
 
-def unesc(value: str) -> str:
-    return unquote(value)
-
-
 def open_store(url: str, namespace: str):
     """The object store rooted at `{url}/{namespace}`, and the URL workers use for it."""
 
@@ -246,12 +242,6 @@ class State:
         async for batch in obstore.list(self.objects, prefix=prefix):
             out.extend(meta["path"] for meta in batch)
         return sorted(out)
-
-    async def list_object_meta(self, prefix: str) -> list[dict]:
-        out = []
-        async for batch in obstore.list(self.objects, prefix=prefix):
-            out.extend(dict(meta) for meta in batch)
-        return sorted(out, key=lambda m: m["path"])
 
     async def delete_objects(self, keys: list[str]):
         for i in range(0, len(keys), 1000):

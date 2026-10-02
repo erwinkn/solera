@@ -12,9 +12,7 @@ worker would already hold (the kernel's peak counter is reset first).
 Input shapes: `list` is Python `(key, version)` pairs (`Rows.pairs`;
 versions the MD5 of the key); `arrow` is a pyarrow Table of `k` and `v`
 columns, read in place. `digest.py` measures digesting rows. Rows arrive shuffled unless `sorted`.
-Keys are `cust-%013d` with random gaps, as in bench.py. The same script
-runs against the pre-streaming code (`KeyIndex.changes(..., replace=True)`)
-for the before figures; `--cases` picks what applies.
+Keys are `cust-%013d` with random gaps, as in bench.py.
 
 Uses bench.py's server (`--s3`, default the local MinIO) and latency model.
 """
@@ -32,15 +30,11 @@ import time
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from solera.keys import Rows  # noqa: E402
 from solera.keys.index import IndexState, KeyIndex, Options  # noqa: E402
 from solera.keys.io import ObjectIO  # noqa: E402
 
 import bench as B  # noqa: E402
-
-try:
-    from solera.keys import Rows
-except ImportError:  # the pre-streaming code
-    Rows = None
 
 CASES = (
     "load-list",
@@ -65,10 +59,6 @@ def keys_sql(n: int, shuffled: bool, changed: bool) -> str:
 
 def version(key: bytes) -> bytes:
     return hashlib.md5(key).digest()
-
-
-def changed_version(key: bytes) -> bytes:
-    return hashlib.md5(key + b"x").digest() if key.endswith(b"00") else hashlib.md5(key).digest()
 
 
 def arrow_table(n: int, shuffled: bool, changed: bool):
@@ -119,19 +109,11 @@ async def one(case: str, n: int, prefix: str, state_file: str | None, args) -> d
 
     # The input, before measuring.
     if case.endswith("-list"):
-        ks = key_list(n, shuffled=True)
-        if Rows is None:
-            vs = [version(k) for k in ks]
-        else:
-            pairs = [(k, version(k)) for k in ks]
-            del ks
+        pairs = [(k, version(k)) for k in key_list(n, shuffled=True)]
     elif "-arrow" in case:
         table = arrow_table(n, shuffled=not case.endswith("sorted"), changed=False)
 
     async def run():
-        if case.endswith("-list") and Rows is None:
-            delta = await idx.changes(ks, vs, replace=True)
-            return await idx.write(2, case, delta)
         if case.endswith("-list"):
             rows = Rows.pairs(pairs)
         elif "-arrow" in case:
@@ -185,20 +167,10 @@ async def build(n: int, prefix: str, path: str) -> None:
     io = ObjectIO(B.store())
     opts = Options()
     idx = KeyIndex(io, prefix, IndexState(), opts)
-    if Rows is not None:
-        files, _ = await idx.replace(Rows.arrow(arrow_table(n, False, False), "k", "v"), 0, "build")
-    else:
-        ks = key_list(n, shuffled=False)
-        files = await idx.write(0, "build", await idx.changes(ks, [version(k) for k in ks], replace=True))
+    files, _ = await idx.replace(Rows.arrow(arrow_table(n, False, False), "k", "v"), 0, "build")
     state = IndexState().committed(0, files, keep_log=False)
     idx = KeyIndex(io, prefix, state, opts)
-    if Rows is not None:
-        files, _ = await idx.replace(Rows.arrow(arrow_table(n, False, True), "k", "v"), 1, "delta")
-    else:
-        ks = key_list(n, shuffled=False)
-        files = await idx.write(
-            1, "delta", await idx.changes(ks, [changed_version(k) for k in ks], replace=True)
-        )
+    files, _ = await idx.replace(Rows.arrow(arrow_table(n, False, True), "k", "v"), 1, "delta")
     state = state.committed(1, files, keep_log=False)
     with open(path, "w") as f:
         json.dump(state.to_json(), f)

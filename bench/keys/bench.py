@@ -524,7 +524,7 @@ async def _run_size(n: int, prefix: str, args) -> dict:
         io = cold()
         idx = KeyIndex(io, prefix, state, opts)
         start = key_of(sample[len(sample) // 2][0])
-        ck, cv, _, _ = await idx.page(start, 1000)
+        ck, _, _, _ = await idx.page(start, 1000)
         io = cold()
 
         async def clustered(io=io):

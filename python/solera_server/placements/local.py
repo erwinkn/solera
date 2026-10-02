@@ -163,7 +163,7 @@ class LocalPlacement:
             os.kill(run["pid"], signal.SIGKILL)
 
 
-async def load_manifest(project: str, *, timeout: float = 60, log_limit: int = 8 * 1024 * 1024):
+async def load_manifest(project: str, *, timeout: float = 60):
     """`manifest` runs through Local only, at server start (§10)."""
 
     env = _env()

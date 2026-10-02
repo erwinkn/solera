@@ -22,7 +22,6 @@ NAMES = {
     CANCELED: "canceled",
     TIMED_OUT: "timed_out",
 }
-CODES = {name: code for code, name in NAMES.items()}
 MESSAGE_MAX = 200  # bytes of an error message kept with its record
 
 # What a per-key call came to — the outcome a transition takes.

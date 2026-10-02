@@ -69,10 +69,6 @@ class LakeState:
             "seq": self.seq,
         }
 
-    def buffered(self, table: str) -> list[dict]:
-        names = list(self.schema[table].columns)
-        return [dict(zip(names, values, strict=True)) for _, values in self.rows.get(table, ())]
-
     def append(self, table: str, row: dict) -> None:
         self.seq += 1
         self.rows.setdefault(table, []).append([self.seq, [row.get(c) for c in self.schema[table].columns]])

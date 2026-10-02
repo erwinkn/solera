@@ -59,9 +59,6 @@ class Environment:
             raise RegistrationError(f"{self.kind}: invalid executor name {name!r}")
         self.name, self.config = name, config
 
-    def _options(self, **options: Any) -> dict:
-        return {k: v for k, v in options.items() if v is not None}
-
     def _check(self, options: dict, allowed: set[str]) -> dict:
         unknown = set(options) - allowed
         if unknown:

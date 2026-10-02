@@ -157,10 +157,6 @@ def _is_dataframe_type(t: Any) -> bool:
     )
 
 
-def _is_list_of_dicts(t: Any) -> bool:
-    return typing.get_origin(t) is list and typing.get_args(t) == (dict,)
-
-
 def _rows(value: Any, output_name: str) -> list[dict]:
     """Coerce a write payload into a row list."""
 

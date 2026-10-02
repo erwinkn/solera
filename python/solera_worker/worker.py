@@ -195,7 +195,7 @@ class Ctx:
     def __init__(
         self, spec, asset: Asset, project: Project, objects, changes, shipper, timeline, keys_io=None
     ):
-        self._spec, self._objects, self._shipper, self._timeline = spec, objects, shipper, timeline
+        self._objects, self._shipper, self._timeline = objects, shipper, timeline
         self._keys_io = keys_io
         # The pinned key indexes of keyed inputs, for whole reads of immutable stores.
         self._indexes: dict[tuple, dict] = {}
@@ -440,7 +440,7 @@ async def _store_outputs(
     else:
         raise StoreError(f"{asset.name}: multi-output assets must return Result(outputs={{...}})")
 
-    def scope_of(name: str, plan: dict) -> Scope:
+    def scope_of(plan: dict) -> Scope:
         info = plan["info"]
         return Scope(
             output=plan["output"],
@@ -467,7 +467,7 @@ async def _store_outputs(
             "prior": priors.get(name),
         }
         if getattr(plan["store"], "writes", "overwrite") == "fenced":
-            await plan["store"].acquire(scope_of(name, plan))
+            await plan["store"].acquire(scope_of(plan))
 
     # Plan: what each keyed write changes, as delta files. Small writes are
     # resolved by the engine from its cache, all of an attempt's in one request
@@ -634,13 +634,13 @@ async def _store_outputs(
                     f"{output.name}: store {store_name!r} has no migrate for declared migrations"
                 )
             try:
-                applied = await writes.call(migrate(output, output.migrations, scope=scope_of(name, plan)))
+                applied = await writes.call(migrate(output, output.migrations, scope=scope_of(plan)))
             except StoreError:
                 raise
             except Exception as error:
                 raise StoreError(f"{output.name}: migration failed: {error}") from error
             schema = applied[-1] if applied else output.migrations[-1].name
-        written = await writes.call(store.store(value, prior, scope_of(name, plan)))
+        written = await writes.call(store.store(value, prior, scope_of(plan)))
         entry = {}
         if "index" in plan and isinstance(value, Sql):
             if written.keys is None:
@@ -965,7 +965,7 @@ async def run_attempt(
             result = {"status": "canceled"}  # requested before the gate: nothing written
         if result is None or control["forced"]:
             return ENDED
-        await _publish(objects, base, spec, result, invocation, writes, control["cancel"], timeline, shipper)
+        await _publish(objects, base, result, invocation, writes, control["cancel"], timeline, shipper)
         flusher.cancel()
         if channel is not None:
             with contextlib.suppress(Exception):
@@ -1032,7 +1032,7 @@ def _user_failed(error: BaseException, project: Project) -> dict:
 PUBLISH_TRIES = 6
 
 
-async def _publish(objects, base, spec, result, invocation, writes, cancel, timeline, shipper) -> None:
+async def _publish(objects, base, result, invocation, writes, cancel, timeline, shipper) -> None:
     """Seal the result once and create `.result` with exactly those bytes,
     retried as they are: a failure to publish never changes what is
     published. A worker that cannot publish raises, and the engine treats
