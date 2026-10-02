@@ -441,3 +441,51 @@ async def test_failed_scope_reports_complete_after_success(client, base, engine)
     parts = (await client.get(f"{base}/partitions/flaky")).json()["partitions"]
     done = next(p for p in parts if p["scope"] == "2026-09-19")
     assert done["status"] == "complete" and done["last_outcome"] == "succeeded"
+
+
+POOLED = """
+from solera.executors import Pool
+from solera.sdk import Project, asset
+
+
+@asset(executor=Pool("gpu")())
+def trained():
+    return 1
+
+
+project = Project(assets=[trained], name="pooled")
+"""
+
+
+async def test_a_pool_worker_starts_with_the_pool_token_alone(tmp_path, monkeypatch):
+    """Review P2-6: the pool token reaches only the pool's routes, so a
+    worker names its project from its own manifest rather than asking the
+    admin-only diagnostics, and polls with that token."""
+
+    import asyncio
+
+    from solera_worker.worker import load_project, run_pool
+
+    (tmp_path / "pooled.py").write_text(POOLED)
+    monkeypatch.setenv("SOLERA_PROJECT", str(tmp_path / "pooled.py"))
+    monkeypatch.setenv("SOLERA_POOL_TOKEN", "pool")
+    project = load_project(str(tmp_path / "pooled.py"))
+    state = await State.open((tmp_path / "state").as_uri(), "test", flush_interval=0.001)
+    engine = Engine(state, project.manifest, clock=state.clock)
+    await engine.initialize()
+    app = create_app(engine=engine, token="admin")
+    app.state.engine = engine
+    client = httpx.AsyncClient
+
+    def routed(**kw):
+        return client(transport=httpx.ASGITransport(app=app), **kw)
+
+    monkeypatch.setattr(httpx, "AsyncClient", routed)
+    worker = asyncio.create_task(run_pool("gpu", "http://test", "pool"))
+    for _ in range(200):
+        if engine.pollers:
+            break
+        await asyncio.sleep(0.02)
+    worker.cancel()
+    assert [p["pools"] for p in engine.pollers.values()] == [["gpu"]]
+    await state.close()

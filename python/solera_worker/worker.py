@@ -1188,21 +1188,17 @@ async def _discard_due(spec, project, asset, objects, writes) -> dict:
 async def run_pool(pool: str, server: str, token: str | None = None, *, project: str | None = None):
     """Pull path (docs/lifecycle.md §10): ask the engine which attempts wait
     on this pool, claim one by creating its `.worker`, run it, repeat. The
-    claim decides between workers; discovery is only a hint."""
+    claim decides between workers; discovery is only a hint. `project` is
+    the project's name, by default its manifest's: a pool token reaches the
+    pool's routes and nothing else."""
 
     import httpx
 
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     capacity = {"cpu": os.cpu_count(), "memory": None, "gpu": None}
     host = f"{socket.gethostname()}:{os.getpid()}"
+    project = project or load_project(os.environ["SOLERA_PROJECT"]).manifest["name"]
     async with httpx.AsyncClient(base_url=server, headers=headers, timeout=60) as client:
-        while project is None:
-            try:
-                response = await client.get("/api/diagnostics")
-                response.raise_for_status()
-                project = response.json()["project"]
-            except httpx.HTTPError:
-                await asyncio.sleep(1.0)
         print(f"[pool] {host} polls pool {pool!r}", flush=True)
         while True:
             try:
@@ -1257,6 +1253,7 @@ async def main():
         raise SystemExit(code)
     if mode == "pool":
         options = dict(zip(rest[::2], rest[1::2], strict=True))
-        await run_pool(options["--pool"], options["--server"].rstrip("/"), options.get("--token"))
+        token = options.get("--token") or os.getenv("SOLERA_POOL_TOKEN") or os.getenv("SOLERA_API_TOKEN")
+        await run_pool(options["--pool"], options["--server"].rstrip("/"), token)
         return
     raise SystemExit(f"unknown mode: {mode}")

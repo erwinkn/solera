@@ -206,7 +206,8 @@ async def _dispatch(args, parser):
             parser.error("solera worker pool needs --server or SOLERA_SERVER_URL")
         from solera_worker.worker import run_pool
 
-        await run_pool(args.name, args.server.rstrip("/"), token=os.getenv("SOLERA_API_TOKEN"))
+        token = os.getenv("SOLERA_POOL_TOKEN") or os.getenv("SOLERA_API_TOKEN")
+        await run_pool(args.name, args.server.rstrip("/"), token=token)
         return
 
     if args.command == "migrate":
