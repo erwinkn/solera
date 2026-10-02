@@ -418,8 +418,6 @@ class Simulation(RuleBasedStateMachine):
         if world is None or world.engine is None:
             return
         engine = world.engine
-        committed = self.journal.committed_generations()
-
         async def check():
             for (output, scope), head in list(engine.m.heads.items()):
                 if head["ref"].get("meta", {}).get("external") or (output, scope) not in engine.m.indexes:
@@ -428,7 +426,9 @@ class Simulation(RuleBasedStateMachine):
                 if getattr(store, "writes", None) != "immutable" or output == "sites":
                     continue
                 await keyed_content(engine, self.project, output, scope)
-                for key, (_, locator) in (await index_entries(engine.state, output, scope)).items():
+                entries = await index_entries(engine.state, output, scope)
+                committed = self.journal.committed_generations()  # after the reads: commits land meanwhile
+                for key, (_, locator) in entries.items():
                     if locator and locator not in committed:
                         raise Violation(
                             f"{output}[{scope!r}] key {key}: its object was written by generation {locator}, "
