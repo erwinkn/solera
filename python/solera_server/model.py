@@ -498,17 +498,6 @@ class Model:
                 self._event(run, "ready", at, task["id"])
         self._roll_up(run["id"], at)
 
-    def _on_RunReopened(self, e):
-        run = e["run"]
-        # Its history rows describe how it ended, and it is running again.
-        # Its events stay: the timeline goes on.
-        self.history.forget({run["id"]}, e["at"], history.RUN_TABLES)
-        if run["id"] in self.runs:
-            self._unindex_run(run["id"])
-        self.runs[run["id"]] = run
-        self._index_run(run["id"], run)
-        self._roll_up(run["id"], e["at"])
-
     def _on_RunControlled(self, e):
         run = self.runs.get(e["run"])
         if run is None:
@@ -549,30 +538,6 @@ class Model:
             # committed (§8).
             self._unindex_run(run["id"])
             self._index_run(run["id"], run)
-        elif action == "retry":
-            # Failed tasks run again; blocked ones wait on their dependencies again.
-            self._event(run, "retried", at, by=by)
-            for task in run["tasks"].values():
-                if task["status"] == "failed":
-                    task["retried"] = task.get("retried", 0) + 1
-                    self._ready(run, task, at)
-                elif task["status"] == "blocked":
-                    task["status"] = "waiting"
-            run["status"] = "running"
-            run["paused"] = False
-            self._unindex_run(run["id"])
-            self._index_run(run["id"], run)
-            for tid, counter in list(self.unfinished.items()):
-                task = run["tasks"].get(tid)
-                if task is None or task["status"] != "waiting" or counter["left"] > 0:
-                    continue
-                del self.unfinished[tid]
-                if counter["bad"]:
-                    task["status"] = "blocked"
-                    self._finished(run, task, "blocked", None, at)
-                else:
-                    self._ready(run, task, at)
-            self._roll_up(run["id"], at)
 
     def _on_TasksHeld(self, e):
         """Why tasks ready to run are not claimed (`[reason, name]`): the
@@ -717,7 +682,7 @@ class Model:
             self._finished(run, task, "skipped", e["attempt"], at)
         elif outcome == "failed":
             failures = sum(1 for a in task["attempts"] if a["outcome"] == "failed")
-            allowed = task["max_attempts"] * (1 + task.get("retried", 0))
+            allowed = task["max_attempts"]
             transient = e.get("retry_for") is not None
             if transient:
                 # A Transient error retries past `retries=`, for its `retry_for`

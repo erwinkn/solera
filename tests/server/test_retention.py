@@ -203,42 +203,6 @@ async def test_a_run_retires_for_good_before_its_files_go(tmp_path, state, clock
     await again.close()
 
 
-async def test_a_run_reopened_while_chosen_for_deletion_is_kept(state, clock):
-    """Retention picks a run, and a retry reopens it before its deletion
-    begins: it is kept. A retry that is reading the run when its deletion
-    begins finishes reopening it first."""
-
-    import asyncio
-
-    engine = engine_for(state, PLAIN, clock)
-    await engine.initialize()
-    first, second = await run(engine, ["plain"]), await run(engine, ["plain"])
-    await engine.history.lake.flush(force=True)
-
-    await engine.retry(first)
-    await engine.upkeep.delete_runs([(first, "succeeded")])
-    assert first in state.model.runs and first in await run_dirs(state)
-
-    read, reading, release = engine.history.run, asyncio.Event(), asyncio.Event()
-
-    async def slow(run_id):
-        found = await read(run_id)
-        reading.set()
-        await release.wait()
-        return found
-
-    engine.history.run = slow
-    retry = asyncio.create_task(engine.retry(second))
-    await reading.wait()
-    deletion = asyncio.create_task(engine.upkeep.delete_runs([(second, "succeeded")]))
-    await asyncio.sleep(0.05)
-    release.set()
-    await asyncio.gather(retry, deletion)
-    assert second in state.model.runs and second in await run_dirs(state)
-    assert state.model.retired == []
-    await engine.stop()
-
-
 async def test_a_deleted_runs_gates_outlive_it(state, clock):
     """docs/lifecycle.md §2.4: deleting a run keeps its gates, so a worker
     that resumes after its run is gone cannot take its gate and write.

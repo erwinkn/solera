@@ -65,6 +65,7 @@ TABLES = {
             "trigger": "VARCHAR",  # manual | automation | sensor | commit
             "automation": "VARCHAR",
             "by": "VARCHAR",
+            "retry_of": "VARCHAR",  # the finished run an explicit retry ran again
             "source": "VARCHAR",
             "targets": "VARCHAR[]",
             "assets": "VARCHAR[]",
@@ -100,7 +101,6 @@ TABLES = {
             "max_attempts": "INTEGER",
             "retry_delay": "DOUBLE",  # seconds; no retry policy if null
             "retry_backoff": "VARCHAR",
-            "retried": "INTEGER",  # times the run was retried with it failed
             "executor": "VARCHAR",  # where its last attempt ran
         },
     ),
@@ -211,7 +211,6 @@ TABLES["key_outcomes"] = Table(
         "at": "DOUBLE",
     },
 )
-RUN_TABLES = ("runs", "tasks", "attempts")  # replaced when a run is reopened; its events stay
 MAX_METADATA = 64 << 10  # bytes of JSON per output version
 
 
@@ -302,7 +301,6 @@ def run_rows(run: dict, *, live: bool = False) -> dict[str, list[dict]]:
                 "max_attempts": task["max_attempts"],
                 "retry_delay": retry.get("delay"),
                 "retry_backoff": retry.get("backoff"),
-                "retried": task.get("retried", 0),
                 "executor": ran[-1] if ran else None,
             }
         )
@@ -346,6 +344,7 @@ def run_rows(run: dict, *, live: bool = False) -> dict[str, list[dict]]:
         "trigger": "automation" if run.get("automation") else "sensor" if run.get("sensor") else "manual",
         "automation": run.get("automation"),
         "by": run.get("by"),
+        "retry_of": run.get("retry_of"),
         "source": None,
         "targets": list(run.get("targets") or ()),
         "assets": sorted({t["asset"] for t in tasks.values()}),
@@ -394,7 +393,7 @@ def run_record(rows: dict[str, list[dict]], events: int = 0) -> dict:
         attempts.setdefault(a["task"], []).append(attempt)
     tasks = {}
     for t in rows["tasks"]:
-        tasks[t["id"]] = task = {
+        tasks[t["id"]] = {
             "id": t["id"],
             "run": row["id"],
             "asset": t["asset"],
@@ -408,8 +407,6 @@ def run_record(rows: dict[str, list[dict]], events: int = 0) -> dict:
             "wait": t["wait"],
             "attempts": attempts.get(t["id"], []),
         }
-        if t["retried"]:
-            task["retried"] = t["retried"]
     partitions = row["partitions"]
     return {
         "id": row["id"],
@@ -421,6 +418,7 @@ def run_record(rows: dict[str, list[dict]], events: int = 0) -> dict:
         "keys": None if row["keys"] is None else json.loads(row["keys"]),
         "automation": row["automation"],
         "by": row["by"],
+        **({"retry_of": row["retry_of"]} if row.get("retry_of") else {}),
         "tags": dict(row["tags"] or {}),
         "status": "succeeded" if row["status"] == "skipped" else row["status"],
         "paused": False,

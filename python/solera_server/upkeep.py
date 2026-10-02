@@ -63,9 +63,7 @@ class Upkeep:
         self.gate_days = gate_days
         self._alive = -math.inf
         self._task: asyncio.Task | None = None
-        # Held while runs are retired, and by a retry while it reopens one:
-        # a run is never reopened between being chosen and being retired.
-        self.retiring = asyncio.Lock()
+        self.retiring = asyncio.Lock()  # one retirement at a time
         self._purging = asyncio.Lock()
 
     @property
@@ -307,8 +305,7 @@ class Upkeep:
     async def delete_runs(self, runs: list[tuple[str, str | None]]) -> None:
         """Delete finished runs, `(id, status)`. Retirement comes first and
         is for good: `RunsDeleted` drops their history and is made durable
-        before any of their files go, so a replaced engine deletes nothing.
-        A run reopened since it was chosen is kept."""
+        before any of their files go, so a replaced engine deletes nothing."""
 
         async with self.retiring:
             runs = [(r, s) for r, s in runs if r not in self.m.runs and r not in self.m.retired]

@@ -3,7 +3,7 @@ flushed to Parquet, merged, hidden when deleted, and queried with DuckDB."""
 
 import pytest
 from solera.sdk import In, Output, Project, Result, Retry, Source, asset
-from solera_server.engine import Engine
+from solera_server.engine import Conflict, Engine
 from solera_server.history import History, RunFilter, bucket_for, execution
 from solera_server.placements.inline import InlinePlacement
 from solera_server.state import State
@@ -172,16 +172,12 @@ async def test_a_run_reads_the_same_once_archived(state, clock):
 
     state.record = spy
     failed = await run(engine, clock, ["revenue"], upstream=True, config={"fail": True}, tags={"env": "prod"})
-    await engine.retry(failed["id"])
-    await engine.run_until(failed["id"], 60)
     commit = await engine.commit_source("uploads", upsert=["a", "b"], by="api")
     state.record = record
     before = details[failed["id"]]
-    assert [t["retried"] for t in before["tasks"] if t["asset"] == "revenue"] == [1]
-    # Reopened, the run went on counting its events.
     events = await engine.history.events(failed["id"])
     assert [e["n"] for e in events] == list(range(1, len(events) + 1))
-    assert [e["type"] for e in events if e["task"] is None] == ["submitted", "failed", "retried", "failed"]
+    assert [e["type"] for e in events if e["task"] is None] == ["submitted", "failed"]
     assert {a.get("executor") for t in before["attempts"].values() for a in t} == {"local"}
     assert await engine.run_detail(failed["id"]) == before
     record = await engine.history.run(commit["run"])
@@ -388,3 +384,35 @@ async def test_stats(state, clock):
     # Unpartitioned tasks have the empty scope; a partition narrows to its own.
     assert (await engine.history.stats(asset="orders", scope=""))["assets"] == [by["orders"]]
     assert (await engine.history.stats(asset="orders", scope="2026-01-01"))["assets"] == []
+
+
+async def test_a_retry_is_a_new_run_and_the_old_one_stays_as_it_ended(state, clock):
+    """D1: retrying a finished run submits its failed, canceled and blocked
+    work as a new run with `retry_of`; the old run, archived or not, reads
+    as it did. A run still in progress, or with nothing failed, refuses."""
+
+    engine = engine_for(state, clock)
+    await engine.initialize()
+    failed = await run(engine, clock, ["revenue"], upstream=True, config={"fail": True}, tags={"env": "prod"})
+    before = await engine.run_detail(failed["id"])
+    assert failed["id"] not in state.model.runs  # archived
+    owed = {(t["asset"], t["scope"]) for t in before["tasks"] if t["status"] in ("failed", "blocked")}
+    assert owed
+    retried = await engine.retry(failed["id"], by="ops")
+    assert retried["id"] != failed["id"]
+    again = state.model.runs[retried["id"]]
+    assert (
+        again["retry_of"] == failed["id"]
+        and again["config"] == {"fail": True}
+        and again["tags"] == {"env": "prod"}
+    )
+    assert {(t["asset"], t["scope"]) for t in again["tasks"].values()} == owed
+    with pytest.raises(Conflict, match="not finished"):
+        await engine.retry(retried["id"])
+    await engine.run_until(retried["id"], 60)
+    assert await engine.run_detail(failed["id"]) == before
+    [row] = (await engine.list_runs(RunFilter(), limit=1))["runs"]
+    assert row["id"] == retried["id"] and row["retry_of"] == failed["id"]
+    ok = await run(engine, clock, ["orders"])
+    with pytest.raises(Conflict, match="nothing to retry"):
+        await engine.retry(ok["id"])

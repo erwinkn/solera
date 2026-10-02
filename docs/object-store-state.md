@@ -176,7 +176,6 @@ status are derived inside `apply`; they are not events.
 | `AutomationChanged` | `name`, `enabled` | |
 | `AutomationFired` | `name`, `at`, `run` | clears its pending set |
 | `RunArchived` | `run`, `at` | drops a finished run from memory; its rows join the pending history (§7) |
-| `RunReopened` | `run`, `at` | a retry brings a finished run back; its history rows are dropped until it ends again |
 | `HistoryFlushed` | `files` {table: file}, `upto` {table: row seq} | installs one Parquet file per table and drops the rows it holds |
 | `HistoryCompacted` | `changes` [{`table`, `removed` [path], `added?` file}], `at` | swaps merged or purged files in; the removed ones become garbage |
 | `RunsDeleted` | `runs`, `files`, `at` | retires runs for good: drops their pending rows, hides them in files that may hold them, and queues the directories of `files` (runs that launched anything) for deletion (§11) |
@@ -435,8 +434,8 @@ input versions built this version of `revenue`".
 
 | Table | One row per | Notable columns |
 |---|---|---|
-| `runs` | finished run or source commit | `status` (`succeeded`, `failed`, `canceled`, `skipped`), `trigger` (`manual`, `automation`, `commit`), `automation`, `by`, `source`, `targets`, `assets`, `committed`, `tags` (map), `task_count`, `failed_count`, `error`, `config` and `keys` (JSON, as submitted) |
-| `tasks` | task of a finished run | `asset`, `scope`, `status`, `started_at`, `finished_at`, `attempts`, `duration`, `wait` (seconds it could have run but didn't), `deps`, `max_attempts`, `retry_delay`, `retry_backoff`, `retried`, `executor` (of its last attempt) |
+| `runs` | finished run or source commit | `status` (`succeeded`, `failed`, `canceled`, `skipped`), `trigger` (`manual`, `automation`, `sensor`, `commit`), `automation`, `by`, `retry_of` (the run a retry ran again), `source`, `targets`, `assets`, `committed`, `tags` (map), `task_count`, `failed_count`, `error`, `config` and `keys` (JSON, as submitted) |
+| `tasks` | task of a finished run | `asset`, `scope`, `status`, `started_at`, `finished_at`, `attempts`, `duration`, `wait` (seconds it could have run but didn't), `deps`, `max_attempts`, `retry_delay`, `retry_backoff`, `executor` (of its last attempt) |
 | `attempts` | attempt | `task`, `n`, `outcome`, `started_at`, `finished_at`, `duration`, `preparing`, `provisioning`, `importing`, `loading`, `computing`, `writing`, `settling` (seconds per phase, below), `peak_memory` (bytes; only in a process of its own), `cpu_seconds`, `error`, `executor`, `cpu`, `memory`, `gpu` (requested; all null if it never launched), `options` (map: its other placement options, e.g. `image`), `outputs` (map: output → version committed), `keys` (map: an `Each` attempt's keys by outcome) |
 | `run_events` | moment of a run | `n` (its order in the run), `at`, `type`, `task` and `attempt` (null for the run's own events), `by`, `name`, `reason`, `until`, `rows` — the timeline, below |
 | `materializations` | output version a commit installed | `output`, `scope`, `version`, `run`, `attempt`, `at`, `batch`, `added`, `removed`, `added_keys`, `removed_keys` (a source commit's keys, up to 1,000), `rows`, `metadata` (JSON) |
@@ -454,7 +453,7 @@ lists the keys it changed (up to 1,000; past that, only counted). The
 source's head points at it (`head.run`).
 
 **No run documents.** The tables are the record: a finished run's detail
-— and the run a retry reopens — is rebuilt from its `runs`, `tasks` and
+— is rebuilt from its `runs`, `tasks` and
 `attempts` rows (a source commit's from its `runs` and `materializations`
 rows), and reads the same as it did while the run was live. Only what has
 no shape of its own stays JSON: a run's `config` and `keys`, and output
@@ -521,8 +520,12 @@ while it has live runs; the next engine to start reads it, and records an
 `outage` for each live run from then to now.
 
 Run events are appended as they happen, not when the run finishes: a live
-run's timeline is queryable, and a reopened run keeps its events and
-numbers the new ones after them.
+run's timeline is queryable.
+
+**A finished run never changes.** Retrying it (`POST runs/{run}/retry`)
+submits a new run of its failed and canceled tasks' scopes, and of those
+it blocked, with `retry_of` naming it; a run in progress cannot be
+retried. Retries inside a running task are its attempts.
 
 **Where rows come from.** Rows are born inside `apply`, from the events
 that finish things: `RunArchived` yields a run's `runs`, `tasks` and
@@ -879,11 +882,8 @@ first: `RunsDeleted` hides the run from the history for good and lists it
 in `retired`; once that is durable, `DELETE runs/{run}/`, then
 `RunsPurged`. An engine replaced meanwhile cannot make `RunsDeleted`
 durable, so it deletes nothing; an engine that stops between the two picks
-the deletion up again from `retired`. A retry reopens a run only while
-holding the same lock retirement takes, and retirement skips runs that are
-active: so a run is never reopened after it was chosen for deletion and
-before it is retired, and a retired run — gone from the history — is never
-reopened, nor its directory reused.
+the deletion up again from `retired`. Retirement skips runs that are
+active, and a finished run never becomes active again.
 
 For example, with `site_feed` at `Retention(days=1)` and `file_index` at
 `Retention(runs=90)`: a two-day-old run of only `site_feed` goes; a

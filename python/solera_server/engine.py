@@ -325,6 +325,7 @@ class Engine(Attempts, Sensors):
         skip_missing_inputs=False,
         by=None,
         tags=None,
+        retry_of=None,
     ):
         """A run request becomes one task per (asset, scope) (§8). `by` says
         who asked (the API or CLI, or what the caller names); automation runs
@@ -347,6 +348,7 @@ class Engine(Attempts, Sensors):
             skip_missing_inputs=skip_missing_inputs,
             by=by,
             tags=tags,
+            retry_of=retry_of,
         )
         if run is None:
             return None
@@ -370,6 +372,7 @@ class Engine(Attempts, Sensors):
         skip_missing_inputs=False,
         by=None,
         tags=None,
+        retry_of=None,
     ) -> dict | None:
         """The run a request becomes, without submitting it; `None` if the
         skips leave nothing."""
@@ -387,7 +390,10 @@ class Engine(Attempts, Sensors):
         assets = {}
         for target in targets:
             name = self._asset_of(target)
-            assets[name] = await self._scopes(name, partitions)
+            # A map names each asset's own scopes (a retry's).
+            assets[name] = await self._scopes(
+                name, partitions[name] if isinstance(partitions, dict) else partitions
+            )
         if upstream:
             queue = [(n, s) for n, scopes in assets.items() for s in scopes]
             seen = set(queue)
@@ -458,6 +464,7 @@ class Engine(Attempts, Sensors):
             "keys": keys,
             "automation": automation,
             **({"sensor": sensor} if sensor else {}),
+            **({"retry_of": retry_of} if retry_of else {}),
             "by": by,
             "tags": tags,
             "status": "running",
@@ -2096,15 +2103,31 @@ class Engine(Attempts, Sensors):
         return self._run_view(self.m.runs[run_id])
 
     async def retry(self, run_id: str, by: str | None = None):
-        if run_id not in self.m.runs:
-            async with self.upkeep.retiring:  # nothing retires it between reading and reopening it
-                archived = None if run_id in self.m.retired else await self.history.run(run_id)
-                if archived is None or "source" in archived:
-                    raise KeyError(run_id)
-                if run_id not in self.m.runs:  # reopened while we read it
-                    self.state.record({"type": "RunReopened", "run": archived, "at": self.clock()})
-        self._control(run_id, "retry", by)
-        return self._run_view(self.m.runs[run_id])
+        """Run a finished run's failed and canceled work again, with what it
+        blocked, as a new run linked to it (`retry_of`): the run stays as it
+        ended. Retries inside a running task are attempts, not this."""
+
+        run = self.m.runs.get(run_id) or await self.history.run(run_id)
+        if run is None or "source" in run:
+            raise KeyError(run_id)
+        if run["status"] not in TERMINAL_RUN:
+            raise Conflict(f"run {run_id} has not finished", retryable=False)
+        scopes: dict[str, list[str]] = {}
+        for task in sorted(run["tasks"].values(), key=lambda t: t["id"]):
+            if task["status"] in ("failed", "canceled", "blocked"):
+                scopes.setdefault(task["asset"], []).append(task["scope"])
+        if not scopes:
+            raise Conflict(f"run {run_id} has nothing to retry", retryable=False)
+        return await self.submit(
+            sorted(scopes),
+            partitions=scopes,
+            mode=run.get("mode") or "incremental",
+            config=run.get("config"),
+            keys=run.get("keys"),
+            by=by,
+            tags=run.get("tags"),
+            retry_of=run_id,
+        )
 
     # -- finished runs -------------------------------------------------------------------
 
