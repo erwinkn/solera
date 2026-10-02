@@ -245,3 +245,27 @@ export function ErrorNote({ error, title = "Couldn't load this" }: { error: unkn
     </div>
   );
 }
+
+/** The footer of a paged list: how much is shown, and a way to the next page. */
+export function LoadMore({
+  query,
+  shown,
+}: {
+  query: { hasNextPage: boolean; isFetchingNextPage: boolean; fetchNextPage: () => unknown };
+  shown?: string;
+}) {
+  if (!query.hasNextPage) return null;
+  return (
+    <div className="flex items-center justify-between gap-3 border-t border-line px-4 py-2.5 text-xs text-fg-subtle">
+      <span className="tabular">{shown}</span>
+      <button
+        type="button"
+        onClick={() => query.fetchNextPage()}
+        disabled={query.isFetchingNextPage}
+        className="pressable h-7 rounded-sm border-theme border-line-strong bg-surface px-2.5 text-xs font-medium text-fg hover:bg-surface-2 disabled:opacity-50"
+      >
+        {query.isFetchingNextPage ? "Loading…" : "Load more"}
+      </button>
+    </div>
+  );
+}

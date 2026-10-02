@@ -323,9 +323,9 @@ function Heads({
                       to="/assets/$asset/history"
                       params={{ asset }}
                       search={{
-                        scope: s || undefined,
-                        output,
                         version: head.ref.version,
+                        vout: output,
+                        vscope: s || undefined,
                       }}
                       className="hover:underline"
                     >

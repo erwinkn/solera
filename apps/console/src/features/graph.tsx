@@ -260,7 +260,7 @@ function Node({ node, status }: { node: GraphNode; status: AssetStatus | undefin
       </span>
       {node.kind === "source" ? (
         <span className="text-xs text-fg-subtle">external source</span>
-      ) : p && p.total > 1 ? (
+      ) : p && status?.partitioned ? (
         <SegmentBar
           className="h-1.5"
           parts={[
@@ -288,7 +288,7 @@ function Node({ node, status }: { node: GraphNode; status: AssetStatus | undefin
       <span className="flex items-center gap-2 text-2xs text-fg-subtle">
         <span className="truncate">
           {KIND_LABEL[node.kind]}
-          {p && p.total > 1 && ` · ${p.complete}/${p.total - p.retired} partitions`}
+          {p && status?.partitioned && ` · ${p.complete}/${p.total} partitions`}
         </span>
         <span className="ml-auto flex shrink-0 items-center gap-1.5">
           {failing > 0 && (

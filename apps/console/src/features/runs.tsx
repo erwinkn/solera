@@ -214,6 +214,7 @@ const STACK: { status: string; tone: Tone }[] = [
   { status: "skipped", tone: "idle" },
   { status: "canceled", tone: "idle" },
   { status: "failed", tone: "fail" },
+  { status: "paused", tone: "wait" },
   { status: "queued", tone: "wait" },
   { status: "running", tone: "run" },
 ];
@@ -233,18 +234,27 @@ export function RunHistogram({
   height?: number;
 }) {
   const now = useNow();
+  if (data.since == null || data.bars.length === 0) {
+    return (
+      <p className="flex items-center justify-center text-xs text-fg-subtle" style={{ height }}>
+        No runs in this window
+      </p>
+    );
+  }
+  const since = data.since;
   const totals = data.bars.map((b) => Object.values(b.counts).reduce((a, n) => a + n, 0));
   const max = Math.max(1, ...totals);
-  const slots = Math.max(1, Math.ceil((data.until - data.since) / data.bucket));
+  // Never more columns than the server could have asked for: a bad span can't allocate the world.
+  const slots = Math.min(500, Math.max(1, Math.ceil((data.until - since) / data.bucket)));
   const byT = new Map(data.bars.map((b) => [b.t, b]));
   const columns = Array.from({ length: slots }, (_, i) => {
-    const t = data.since + i * data.bucket;
+    const t = since + i * data.bucket;
     return { t, counts: byT.get(t)?.counts ?? {} };
   });
   const present = STACK.filter((s) => data.bars.some((b) => (b.counts[s.status] ?? 0) > 0));
   return (
     <figure className="flex flex-col gap-2">
-      <div className="flex items-end gap-[2px]" style={{ height }}>
+      <div className="flex items-end justify-between gap-[2px]" style={{ height }}>
         {columns.map(({ t, counts }) => {
           const total = Object.values(counts).reduce((a, n) => a + n, 0);
           const parts = STACK.filter((s) => (counts[s.status] ?? 0) > 0);
@@ -293,7 +303,7 @@ export function RunHistogram({
         })}
       </div>
       <figcaption className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-2xs text-fg-subtle tabular">
-        <span>{dateTime(data.since, now)}</span>
+        <span>{dateTime(since, now)}</span>
         <span className="flex flex-wrap items-center gap-3">
           {present.map((s) => (
             <span key={s.status} className="inline-flex items-center gap-1">

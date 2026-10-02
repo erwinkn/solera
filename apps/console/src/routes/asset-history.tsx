@@ -6,7 +6,7 @@ import type { Lineage, Materialization } from "@/api/types";
 import { cn } from "@/lib/cn";
 import { compact, shortId } from "@/lib/format";
 import { Button } from "@/ui/button";
-import { Empty, Hash, Skeleton, Time } from "@/ui/data";
+import { Empty, ErrorNote, Hash, Skeleton, Time } from "@/ui/data";
 import { Select } from "@/ui/form";
 import { Card, CardHeader } from "@/ui/layout";
 import { Table, TableScroll, Td, Th, Tr } from "@/ui/table";
@@ -15,7 +15,7 @@ const route = getRouteApi("/assets/$asset/history");
 
 export function AssetHistory() {
   const { asset: name } = route.useParams();
-  const { scope, output, version } = route.useSearch();
+  const { scope, output, version, vout, vscope } = route.useSearch();
   const navigate = route.useNavigate();
   const project = useProject();
   const manifest = useManifest();
@@ -25,9 +25,15 @@ export function AssetHistory() {
     placeholderData: keepPreviousData,
   });
   const rows = history.data?.pages.flatMap((p) => p.materializations) ?? [];
-  const selected = version
-    ? rows.find((r) => r.version === version && (!output || r.output === output))
-    : undefined;
+  const only = outputs.length === 1 ? outputs[0]!.name : undefined;
+  const selectedOutput = vout ?? output ?? only;
+  const selected =
+    version && selectedOutput ? { output: selectedOutput, scope: vscope ?? scope ?? "", version } : undefined;
+  const isSelected = (m: Materialization) =>
+    !!selected &&
+    m.version === selected.version &&
+    m.output === selected.output &&
+    m.scope === selected.scope;
 
   if (outputs.length === 0) {
     return (
@@ -68,7 +74,11 @@ export function AssetHistory() {
             )
           }
         />
-        {!history.data ? (
+        {history.isError ? (
+          <div className="px-4 pb-4">
+            <ErrorNote error={history.error} />
+          </div>
+        ) : !history.data ? (
           <Skeleton className="mx-4 mb-4 h-40" />
         ) : rows.length === 0 ? (
           <Empty compact title="No versions yet">
@@ -94,7 +104,7 @@ export function AssetHistory() {
                   <VersionRow
                     key={`${m.output}/${m.scope}/${m.version}/${m.at}`}
                     m={m}
-                    selected={m === selected}
+                    selected={isSelected(m)}
                     showOutput={outputs.length > 1 && !output}
                     showScope={!scope}
                   />
@@ -140,7 +150,8 @@ function VersionRow({
           search={(s) => ({
             ...s,
             version: selected ? undefined : m.version,
-            output: s.output,
+            vout: selected ? undefined : m.output,
+            vscope: selected ? undefined : m.scope || undefined,
           })}
           replace
           className="after:absolute after:inset-0 after:content-['']"
@@ -185,7 +196,7 @@ function VersionRow({
   );
 }
 
-function LineagePanel({ selected }: { selected?: Materialization }) {
+function LineagePanel({ selected }: { selected?: { output: string; scope: string; version: string } }) {
   const project = useProject();
   const up = useQuery({
     ...q.lineage(project, selected?.output ?? "", selected?.scope ?? "", selected?.version, "upstream"),
@@ -248,9 +259,9 @@ function LineageList({ title, icon, lineage }: { title: string; icon: React.Reac
                   to="/assets/$asset/history"
                   params={{ asset: n.asset }}
                   search={{
-                    output: n.output,
-                    scope: n.scope || undefined,
                     version: n.version,
+                    vout: n.output,
+                    vscope: n.scope || undefined,
                   }}
                   className="font-medium text-fg hover:underline"
                 >

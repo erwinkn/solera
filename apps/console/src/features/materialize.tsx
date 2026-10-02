@@ -81,7 +81,7 @@ function RunForm({ initial, scope, onDone }: { initial: string[]; scope?: string
     .map((t) => t.split("=") as [string, string | undefined]);
   const tagError = tagPairs.some(([k, v]) => !k || v === undefined) ? "Tags are name=value pairs." : null;
   const keys = picked
-    .split(/[\n,]/)
+    .split("\n")
     .map((k) => k.trim())
     .filter(Boolean);
   const invalid =
@@ -174,7 +174,7 @@ function RunForm({ initial, scope, onDone }: { initial: string[]; scope?: string
             <>
               <Textarea
                 aria-label="Partition keys"
-                placeholder={"alpha, bravo\nday=2026-09-01,site=alpha"}
+                placeholder={"alpha\nday=2026-09-01,site=alpha  (one per line)"}
                 value={picked}
                 onChange={(e) => setPicked(e.target.value)}
                 className="min-h-16"
@@ -190,8 +190,8 @@ function RunForm({ initial, scope, onDone }: { initial: string[]; scope?: string
                         onClick={() =>
                           setPicked(
                             keys.includes(p.scope)
-                              ? keys.filter((k) => k !== p.scope).join(", ")
-                              : [...keys, p.scope].join(", "),
+                              ? keys.filter((k) => k !== p.scope).join("\n")
+                              : [...keys, p.scope].join("\n"),
                           )
                         }
                         className={cn(

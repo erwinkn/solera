@@ -1,5 +1,6 @@
 import type { CSSProperties } from "react";
 import { Link } from "@tanstack/react-router";
+import { ACTIVE_ATTEMPT } from "@/api/queries";
 import { PHASES, type Attempt, type Phase, type RunEvent, type Task } from "@/api/types";
 import { useNow } from "@/lib/clock";
 import { cn } from "@/lib/cn";
@@ -11,8 +12,8 @@ import { StatusIcon } from "@/ui/status";
 /**
  * Attempt phases (docs/object-store-state.md §7): from one milestone to the
  * next — claimed → launched → booted → imported → computing → computed →
- * finished → the engine's end. A categorical palette validated for colour-
- * vision deficiency in this order; every use pairs it with names.
+ * finished → the engine's end. Colours (themes.css): the overhead before the
+ * work as one ramp, computing as the accent; every use pairs them with names.
  */
 export const PHASE_LABEL: Record<Phase, string> = {
   preparing: "Preparing",
@@ -27,7 +28,7 @@ export const phaseColor = (phase: Phase): CSSProperties => ({
   backgroundColor: `var(--ph-${PHASES.indexOf(phase) + 1})`,
 });
 
-const ACTIVE = new Set(["preparing", "launched", "provisioning", "claimed", "running"]);
+const ACTIVE = ACTIVE_ATTEMPT;
 
 export function phasesOf(attempt: Attempt): { phase: Phase; seconds: number }[] {
   return PHASES.map((phase) => ({
@@ -145,8 +146,16 @@ export function Waterfall({
       ),
   );
   const span = Math.max(0.001, latest - start);
-  const ticks = niceTicks(span);
-  const x = (t: number) => `${(100 * Math.min(Math.max(t - start, 0), span)) / span}%`;
+  const intervals = Object.values(attempts)
+    .flat()
+    .filter((a) => a.started_at != null)
+    .map(
+      (a) =>
+        [a.started_at!, a.finished_at ?? (ACTIVE.has(a.status) ? now : a.started_at!)] as [number, number],
+    );
+  const scale = timeScale(start, start + span, intervals);
+  const pos = (t: number) => scale.at(t);
+  const x = (t: number) => `${pos(t)}%`;
   const marks = events.filter((e) => e.task === null && MARKS[e.type]);
   const across = (
     <>
@@ -174,13 +183,26 @@ export function Waterfall({
       <div className="grid grid-cols-[minmax(9rem,14rem)_minmax(0,1fr)] gap-x-3 border-b border-line pb-1.5 text-2xs text-fg-subtle tabular">
         <span className="pl-4">Task</span>
         <div className={cn("relative mr-4 h-4", marks.length > 0 && "mt-5")}>
-          {ticks.map((t) => (
+          {scale.ticks.map((tick) => (
             <span
-              key={t}
-              className="absolute -translate-x-1/2 first:translate-x-0"
-              style={{ left: `${(100 * t) / span}%` }}
+              key={tick.pos}
+              className={cn(
+                "absolute",
+                tick.pos > 92 ? "-translate-x-full" : tick.pos > 2 && "-translate-x-1/2",
+              )}
+              style={{ left: `${tick.pos}%` }}
             >
-              {duration(t)}
+              {tick.label}
+            </span>
+          ))}
+          {scale.breaks.map((b) => (
+            <span
+              key={b.pos}
+              title={`${duration(b.seconds)} with no attempt running, compressed`}
+              className="absolute -translate-x-1/2 text-fg-subtle"
+              style={{ left: `${b.pos + b.width / 2}%` }}
+            >
+              ⫽
             </span>
           ))}
           {marks.map((m) => (
@@ -188,9 +210,7 @@ export function Waterfall({
               key={m.n}
               className={cn(
                 "absolute -top-4 rounded-xs px-1 font-medium whitespace-nowrap",
-                (m.at - start) / span > 0.7
-                  ? "-translate-x-full"
-                  : (m.at - start) / span > 0.1 && "-translate-x-1/2",
+                pos(m.at) > 70 ? "-translate-x-full" : pos(m.at) > 10 && "-translate-x-1/2",
                 MARKS[m.type]!.label,
               )}
               style={{ left: x(m.at) }}
@@ -228,12 +248,20 @@ export function Waterfall({
                 </span>
               </Link>
               <div className="relative mr-4 h-8">
-                {ticks.map((t) => (
+                {scale.ticks.map((tick) => (
                   <span
-                    key={t}
+                    key={tick.pos}
                     aria-hidden
                     className="absolute inset-y-0 w-px bg-line"
-                    style={{ left: `${(100 * t) / span}%` }}
+                    style={{ left: `${tick.pos}%` }}
+                  />
+                ))}
+                {scale.breaks.map((b) => (
+                  <span
+                    key={b.pos}
+                    aria-hidden
+                    className="absolute inset-y-0 bg-[repeating-linear-gradient(120deg,var(--line)_0_1px,transparent_1px_5px)]"
+                    style={{ left: `${b.pos}%`, width: `${b.width}%` }}
                   />
                 ))}
                 {across}
@@ -265,8 +293,8 @@ export function Waterfall({
                 {list.map((attempt) => {
                   if (attempt.started_at == null) return null;
                   const stop = attempt.finished_at ?? (ACTIVE.has(attempt.status) ? now : attempt.started_at);
-                  const left = (100 * (attempt.started_at - start)) / span;
-                  const width = Math.max(0.6, (100 * (stop - attempt.started_at)) / span);
+                  const left = pos(attempt.started_at);
+                  const width = Math.max(0.6, pos(stop) - left);
                   const active =
                     selected.attempt === attempt.id ||
                     (isSelected && !selected.attempt && attempt === list[list.length - 1]);
@@ -312,12 +340,73 @@ const MARKS: Record<string, { text: string; line: string; label: string }> = {
   outage: { text: "engine down", line: "border-idle", label: "bg-idle-soft text-idle-fg" },
 };
 
-function niceTicks(span: number): number[] {
-  const steps = [
-    0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 21600, 43200, 86400,
+const BREAK = 4; // percent of the axis a compressed gap takes
+
+/**
+ * The run's clock, with the waits squeezed out. Spans when attempts run keep
+ * their proportions; a gap with nothing running that is long next to the
+ * work (a retry's backoff, a queue) collapses to a fixed sliver, marked, so
+ * the attempts are what you see. Labels give real elapsed time.
+ */
+export function timeScale(start: number, end: number, intervals: [number, number][]) {
+  const span = Math.max(end - start, 0.001);
+  const merged: [number, number][] = [];
+  for (const [a, b] of intervals
+    .map(([a, b]) => [Math.max(a, start), Math.min(Math.max(a, b), end)] as [number, number])
+    .sort((p, q) => p[0] - q[0])) {
+    const last = merged[merged.length - 1];
+    if (last && a <= last[1]) last[1] = Math.max(last[1], b);
+    else merged.push([a, b]);
+  }
+  const active = merged.reduce((sum, [a, b]) => sum + (b - a), 0);
+  const long = Math.max(0.5, active * 0.25);
+  // Pieces of the axis in time order: real spans, and gaps long enough to compress.
+  const pieces: { from: number; to: number; squeezed: boolean }[] = [];
+  let cursor = start;
+  for (const [a, b] of [...merged, [end, end] as [number, number]]) {
+    if (a > cursor) pieces.push({ from: cursor, to: a, squeezed: active > 0 && a - cursor > long });
+    if (b > a) pieces.push({ from: a, to: b, squeezed: false });
+    cursor = Math.max(cursor, b);
+  }
+  const squeezed = pieces.filter((p) => p.squeezed).length;
+  const real = pieces.filter((p) => !p.squeezed).reduce((sum, p) => sum + (p.to - p.from), 0) || span;
+  const share = 100 - BREAK * squeezed;
+  let offset = 0;
+  const placed = pieces.map((p) => {
+    const width = p.squeezed ? BREAK : (share * (p.to - p.from)) / real;
+    const piece = { ...p, pos: offset, width };
+    offset += width;
+    return piece;
+  });
+  const at = (t: number) => {
+    if (t <= start) return 0;
+    const piece = placed.find((p) => t <= p.to) ?? placed[placed.length - 1];
+    if (!piece) return Math.min(100, (100 * (t - start)) / span);
+    const within = piece.to > piece.from ? (t - piece.from) / (piece.to - piece.from) : 0;
+    return Math.min(100, piece.pos + piece.width * Math.min(1, within));
+  };
+  // Labels: the start, where time resumes after each break, and the end — none crowding another.
+  const ticks: { pos: number; label: string }[] = [];
+  const candidates = [
+    start,
+    ...placed.filter((_, i) => i > 0 && placed[i - 1]!.squeezed).map((piece) => piece.from),
+    end,
   ];
-  const step = steps.find((s) => span / s <= 6) ?? 86400;
-  const out: number[] = [];
-  for (let t = 0; t <= span + 1e-9; t += step) out.push(Number(t.toFixed(3)));
-  return out;
+  for (const t of candidates) {
+    const p = at(t);
+    if (ticks.every((k) => Math.abs(k.pos - p) > 9)) ticks.push({ pos: p, label: duration(t - start) });
+  }
+  if (squeezed === 0) {
+    // No breaks: plain round ticks read better.
+    ticks.length = 0;
+    const steps = [
+      0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 21600, 43200, 86400,
+    ];
+    const step = steps.find((x) => span / x <= 6) ?? 86400;
+    for (let t = 0; t <= span + 1e-9; t += step) ticks.push({ pos: (100 * t) / span, label: duration(t) });
+  }
+  const breaks = placed
+    .filter((p) => p.squeezed)
+    .map((p) => ({ pos: p.pos, width: p.width, seconds: p.to - p.from }));
+  return { at, ticks, breaks };
 }

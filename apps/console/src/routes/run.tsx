@@ -1,8 +1,8 @@
 import type { ReactNode } from "react";
 import { useQuery, useSuspenseQuery } from "@tanstack/react-query";
 import { getRouteApi, Link } from "@tanstack/react-router";
-import { Ban, CirclePause, CirclePlay, Ellipsis, RotateCcw, Trash2 } from "lucide-react";
-import { ACTIVE_ATTEMPT, ACTIVE_RUN, q, useProject } from "@/api/queries";
+import { Ban, CirclePause, CirclePlay, RotateCcw, Trash2 } from "lucide-react";
+import { ACTIVE_ATTEMPT, ACTIVE_RUN, q, runIsLive, useProject } from "@/api/queries";
 import { useDeleteRun, useRetryRun, useRunAction } from "@/api/mutations";
 import type { Attempt, AttemptError, Json, RunDetail, RunEvent, Task } from "@/api/types";
 import { PartitionsLabel, TriggerLabel } from "@/features/runs";
@@ -12,10 +12,11 @@ import { useNow } from "@/lib/clock";
 import { cn } from "@/lib/cn";
 import { bytes, duration, firstLine, plural, shortHash, shortId } from "@/lib/format";
 import { label, tone, toneSoft } from "@/lib/status";
-import { Button, IconButton } from "@/ui/button";
+import { Button } from "@/ui/button";
+import { rove } from "@/ui/form";
 import { CopyButton, Elapsed, Empty, ErrorNote, Id, JsonView, Skeleton, Time } from "@/ui/data";
 import { Card, CardHeader, Crumb, Fact, Facts, Meta, Page, PageHeader } from "@/ui/layout";
-import { Confirm, Menu, MenuItem, Tooltip } from "@/ui/overlay";
+import { Confirm, Tooltip } from "@/ui/overlay";
 import { StatusBadge, StatusIcon } from "@/ui/status";
 
 const route = getRouteApi("/runs/$run");
@@ -35,11 +36,15 @@ export function Run() {
   const project = useProject();
   const { data } = useSuspenseQuery(q.run(project, id));
   const { request, tasks, attempts } = data;
-  const live = ACTIVE_RUN.has(request.status);
+  const live = runIsLive(data);
   const events = useQuery(q.runEvents(project, id, live)).data;
   const end = live ? null : (request.finished_at ?? request.updated_at);
 
-  const task = tasks.find((t) => t.id === search.task) ?? defaultTask(tasks);
+  // A link may name only an attempt (from a key outcome, a hold): its task owns it.
+  const owner = search.attempt
+    ? tasks.find((t) => attempts[t.id]?.some((a) => a.id === search.attempt))
+    : undefined;
+  const task = tasks.find((t) => t.id === search.task) ?? owner ?? defaultTask(tasks);
   const taskAttempts = task ? (attempts[task.id] ?? []) : [];
   const attempt = taskAttempts.find((a) => a.id === search.attempt) ?? taskAttempts[taskAttempts.length - 1];
   const failed = tasks.filter((t) => tone(t.status) === "fail");
@@ -208,27 +213,19 @@ function RunActions({ detail }: { detail: RunDetail }) {
           Retry
         </Button>
       )}
-      {!live && (
-        <Menu
+      {!runIsLive(detail) && (
+        <Confirm
           trigger={
-            <IconButton label="More actions">
-              <Ellipsis />
-            </IconButton>
+            <Button variant="ghost" icon={<Trash2 />}>
+              Delete
+            </Button>
           }
-        >
-          <Confirm
-            trigger={
-              <MenuItem danger icon={<Trash2 />}>
-                Delete run…
-              </MenuItem>
-            }
-            title="Delete this run?"
-            description="Its attempt files, logs and history rows go. Heads, key indexes and cursors stay: current state never depends on runs."
-            action="Delete run"
-            danger
-            onConfirm={() => remove.mutate(request.id)}
-          />
-        </Menu>
+          title="Delete this run?"
+          description="Its attempt files, logs and history rows go. Heads, key indexes and cursors stay: current state never depends on runs."
+          action="Delete run"
+          danger
+          onConfirm={() => remove.mutate(request.id)}
+        />
       )}
     </>
   );
@@ -284,12 +281,18 @@ function TaskPanel({
         }
         actions={
           attempts.length > 1 && (
-            <div role="tablist" aria-label="Attempts" className="flex gap-1">
+            <div
+              role="tablist"
+              aria-label="Attempts"
+              className="flex gap-1"
+              onKeyDown={(e) => rove(e, "tab")}
+            >
               {attempts.map((a) => (
                 <Link
                   key={a.id}
                   role="tab"
                   aria-selected={a.id === attempt?.id}
+                  tabIndex={a.id === attempt?.id ? 0 : -1}
                   to="/runs/$run"
                   params={{ run }}
                   search={(s) => ({ ...s, task: task.id, attempt: a.id })}
@@ -318,14 +321,20 @@ function TaskPanel({
         </Empty>
       ) : (
         <>
-          <AttemptSummary run={run} attempt={attempt} />
-          <div role="tablist" aria-label="Attempt details" className="flex gap-1 border-b border-line px-4">
+          <AttemptSummary run={run} attempt={attempt} live={live} />
+          <div
+            role="tablist"
+            aria-label="Attempt details"
+            className="flex gap-1 border-b border-line px-4"
+            onKeyDown={(e) => rove(e, "tab")}
+          >
             {tabs.map((t) => (
               <button
                 key={t.id}
                 role="tab"
                 type="button"
                 aria-selected={tab === t.id}
+                tabIndex={tab === t.id ? 0 : -1}
                 onClick={() =>
                   navigate({
                     search: (s) => ({
@@ -381,7 +390,7 @@ function errorOf(error: Attempt["error"]): AttemptError | null {
   return typeof error === "string" ? { message: error } : error;
 }
 
-function AttemptSummary({ run, attempt }: { run: string; attempt: Attempt }) {
+function AttemptSummary({ run, attempt, live }: { run: string; attempt: Attempt; live: boolean }) {
   const now = useNow();
   const end = attempt.finished_at ?? (ACTIVE_ATTEMPT.has(attempt.status) ? now : (attempt.started_at ?? now));
   const error = errorOf(attempt.error);
@@ -468,7 +477,7 @@ function AttemptSummary({ run, attempt }: { run: string; attempt: Attempt }) {
         </div>
       )}
 
-      <CancelNote run={run} attempt={attempt} />
+      <CancelNote run={run} attempt={attempt} live={live} />
       {/* A cancel's "error" is the cancel itself, which the note above explains. */}
       {error && error.message !== "canceled" && <ErrorBlock error={error} run={run} attempt={attempt} />}
     </div>
@@ -487,11 +496,11 @@ const REASON: Record<string, string> = {
  * to stop, a worker drains — finished work is written and committed — or,
  * past the grace period, the engine aborts it and nothing of it commits.
  */
-function CancelNote({ run, attempt }: { run: string; attempt: Attempt }) {
+function CancelNote({ run, attempt, live }: { run: string; attempt: Attempt; live: boolean }) {
   const project = useProject();
   const ended = ["canceled", "aborted", "timed_out"].includes(attempt.status);
   const result = useQuery({ ...q.attemptResult(project, run, attempt.id), enabled: ended }).data;
-  const closing = useQuery({ ...q.runEvents(project, run, false), enabled: ended }).data?.find(
+  const closing = useQuery({ ...q.runEvents(project, run, live), enabled: ended }).data?.find(
     (e) => e.attempt === attempt.id && (e.type === "aborted" || e.type === "canceled"),
   );
   if (!ended && !result?.cancel) return null;

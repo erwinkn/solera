@@ -42,10 +42,10 @@ export function Health() {
 }
 
 function Engine() {
-  const health = useQuery(q.health()).data;
+  const { data: health, isError } = useQuery(q.health());
   const { data: d } = useSuspenseQuery(q.diagnostics());
   const manifest = useManifest();
-  const ok = health?.ok !== false;
+  const ok = !isError && health?.ok !== false;
   return (
     <Card>
       <CardHeader

@@ -25,16 +25,31 @@ export function failingKeys(status: AssetStatus | undefined): number {
 
 const route = getRouteApi("/");
 const BARS = { "6h": 72, "24h": 48, "7d": 56 } as const;
+const WORDS = { "6h": "the last 6 hours", "24h": "the last day", "7d": "the last week" } as const;
 
 export function Overview() {
-  const { activity = "24h" } = route.useSearch();
+  const { activity } = route.useSearch();
   const project = useProject();
   const manifest = useManifest();
   const diagnostics = useQuery(q.diagnostics()).data;
   const active = useInfiniteQuery(q.runs(project, { status: ["running", "queued"] }, 8)).data;
   const failed = useInfiniteQuery(q.runs(project, { status: ["failed"], range: "24h" }, 5)).data;
   const day = useInfiniteQuery(q.runs(project, { range: "24h" }, 1)).data;
-  const histogram = useQuery(q.runHistogram(project, { range: activity }, BARS[activity])).data;
+  // By default the window fits the project: everything when it is younger than a
+  // day (a fresh project isn't one bar), the last day once it is older.
+  const whole = useQuery({ ...q.runHistogram(project, {}, 48), enabled: !activity }).data;
+  const young = !!whole && (whole.since == null || whole.until - whole.since <= 86400);
+  const range = activity ?? (young ? undefined : "24h");
+  const windowed = useQuery({
+    ...q.runHistogram(project, { range }, BARS[range ?? "24h"]),
+    enabled: !!range,
+  }).data;
+  const histogram = range ? windowed : whole;
+  const period = range
+    ? WORDS[range]
+    : whole?.since != null
+      ? "the project's life so far"
+      : "the project's life";
   const status = useQuery(q.assetStatus(project)).data;
   const holds = useQuery(q.holds(project)).data;
 
@@ -111,7 +126,14 @@ export function Overview() {
           detail={
             holds
               ? operator
-                ? "holds, unsettled writes, stuck discards, idle pools"
+                ? [
+                    holds.holds.length && plural(holds.holds.length, "held scope"),
+                    holds.unsettled.length && `${holds.unsettled.length} unsettled`,
+                    holds.discards.length && `${holds.discards.length} stuck`,
+                    starved.length && plural(starved.length, "idle pool"),
+                  ]
+                    .filter(Boolean)
+                    .join(", ")
                 : "nothing held, stuck or starved"
               : undefined
           }
@@ -121,20 +143,25 @@ export function Overview() {
       <Card>
         <CardHeader
           title="Activity"
-          description={`Runs started in the last ${activity === "7d" ? "week" : activity === "6h" ? "6 hours" : "day"}, by outcome. Select a column to see its runs.`}
+          description={`Runs started in ${period}, by outcome. Select a column to see its runs.`}
           actions={
             <Segmented
               size="sm"
               label="Activity range"
-              value={activity}
+              value={activity ?? "fit"}
               onChange={(value) =>
                 navigate({
                   to: "/",
-                  search: { activity: value === "24h" ? undefined : value },
+                  search: { activity: value === "fit" ? undefined : value },
                   replace: true,
                 })
               }
               options={[
+                {
+                  value: "fit",
+                  label: "Fit",
+                  title: "Everything while the project is young, then the last day",
+                },
                 { value: "6h", label: "6h" },
                 { value: "24h", label: "24h" },
                 { value: "7d", label: "7d" },
@@ -312,9 +339,15 @@ function AttentionAssets({ status }: { status: Record<string, AssetStatus> | und
           {rows.slice(0, 8).map(({ name, s, keys }) => (
             <li key={name}>
               <Link
-                to={keys ? "/assets/$asset/keys" : "/assets/$asset/partitions"}
+                to={
+                  keys
+                    ? "/assets/$asset/keys"
+                    : s.partitioned
+                      ? "/assets/$asset/partitions"
+                      : "/assets/$asset"
+                }
                 params={{ asset: name }}
-                className="grid grid-cols-[minmax(0,1fr)_6rem_auto] items-center gap-4 px-4 py-2 hover:bg-surface-2"
+                className="grid grid-cols-[minmax(0,1fr)_9rem_6.5rem] items-center gap-4 px-4 py-2 hover:bg-surface-2"
               >
                 <span className="flex min-w-0 flex-col gap-0.5">
                   <span className="truncate text-sm font-medium text-fg">{name}</span>
@@ -327,32 +360,25 @@ function AttentionAssets({ status }: { status: Record<string, AssetStatus> | und
                     {s.held > 0 && <Flag tone="warn">{s.held} held</Flag>}
                   </span>
                 </span>
-                <SegmentBar
-                  parts={[
-                    {
-                      tone: "ok",
-                      value: s.partitions.complete,
-                      label: "complete",
-                    },
-                    {
-                      tone: "run",
-                      value: s.partitions.running,
-                      label: "running",
-                    },
-                    {
-                      tone: "fail",
-                      value: s.partitions.failed,
-                      label: "failed",
-                    },
-                    {
-                      tone: "idle",
-                      value: s.partitions.missing,
-                      label: "missing",
-                    },
-                  ]}
-                />
+                {s.partitioned ? (
+                  <span className="flex flex-col gap-1">
+                    <SegmentBar
+                      parts={[
+                        { tone: "ok", value: s.partitions.complete, label: "complete" },
+                        { tone: "run", value: s.partitions.running, label: "running" },
+                        { tone: "fail", value: s.partitions.failed, label: "failed" },
+                        { tone: "idle", value: s.partitions.missing, label: "missing" },
+                      ]}
+                    />
+                    <span className="text-2xs text-fg-subtle tabular">
+                      {s.partitions.complete}/{s.partitions.total} partitions complete
+                    </span>
+                  </span>
+                ) : (
+                  <span />
+                )}
                 <span className="text-xs text-fg-subtle">
-                  <Time at={s.updated_at} />
+                  updated <Time at={s.updated_at} />
                 </span>
               </Link>
             </li>

@@ -51,15 +51,29 @@ const p = (project: string) => `/projects/${encodeURIComponent(project)}`;
 const enc = encodeURIComponent;
 
 export const ACTIVE_RUN = new Set(["queued", "running", "waiting"]);
+/** An attempt that can still change: preparing, launched, waiting for a pool worker, running. */
 export const ACTIVE_ATTEMPT = new Set([
   "preparing",
   "launched",
   "provisioning",
+  "claimable",
   "claimed",
   "running",
   "queued",
   "waiting",
 ]);
+
+/**
+ * Whether a run can still change. A canceled run is marked at once, while
+ * its launched attempts may still be draining: it is live until they end.
+ */
+export function runIsLive(detail: RunDetail | undefined): boolean {
+  if (!detail) return true;
+  return (
+    ACTIVE_RUN.has(detail.request.status) ||
+    Object.values(detail.attempts).some((list) => list.some((a) => ACTIVE_ATTEMPT.has(a.status)))
+  );
+}
 
 export type RunFilter = {
   status?: string[];
@@ -177,6 +191,7 @@ export const q = {
         }),
       initialPageParam: undefined as string | undefined,
       getNextPageParam: (page) => page.next ?? undefined,
+      refetchInterval: LIST,
     }),
 
   failures: (project: string, name: string, filter: { scope?: string; outcome?: string[] }) =>
@@ -217,13 +232,13 @@ export const q = {
       refetchInterval: LIST,
     }),
 
-  explain: (project: string, name: string, key: string, scope: string) =>
+  explain: (project: string, name: string, key: string, scope: string, edge?: string) =>
     queryOptions({
-      queryKey: ["assets", name, "explain", scope, key],
+      queryKey: ["assets", name, "explain", scope, key, edge ?? null],
       queryFn: ({ signal }) =>
         api<Explain>(`${p(project)}/assets/${enc(name)}/explain`, {
           signal,
-          query: { key, scope },
+          query: { key, scope, edge },
         }),
       refetchInterval: LIST,
     }),
@@ -316,20 +331,21 @@ export const q = {
     queryOptions({
       queryKey: ["runs", id],
       queryFn: ({ signal }) => api<RunDetail>(`${p(project)}/runs/${enc(id)}`, { signal }),
-      refetchInterval: (query) =>
-        query.state.data && !ACTIVE_RUN.has(query.state.data.request.status) ? false : SECOND,
+      refetchInterval: (query) => (runIsLive(query.state.data) ? SECOND : false),
     }),
 
+  /** `live` is in the key: when the run ends, the key changes and the final events are read once. */
   runEvents: (project: string, id: string, live: boolean) =>
     queryOptions({
-      queryKey: ["runs", id, "events"],
+      queryKey: ["runs", id, "events", live],
       queryFn: ({ signal }) => api<RunEvent[]>(`${p(project)}/runs/${enc(id)}/events`, { signal }),
       refetchInterval: live ? SECOND : false,
     }),
 
   attemptLogs: (project: string, run: string, attempt: Attempt, tail: number | null) =>
     queryOptions({
-      queryKey: ["attempts", run, attempt.id, "logs", tail],
+      // The status is in the key: an attempt that ends gets one last, complete read.
+      queryKey: ["attempts", run, attempt.id, "logs", tail, ACTIVE_ATTEMPT.has(attempt.status)],
       queryFn: async ({ signal }) =>
         parseLog(
           await apiText(`${p(project)}/runs/${enc(run)}/attempts/${enc(attempt.id)}/logs`, {

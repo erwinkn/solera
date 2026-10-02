@@ -55,15 +55,17 @@
   --idle-soft: #f1f1f3;
   --idle-fg: #52525b;
 
-  /* attempt phases, in order: preparing … settling. A categorical set validated for
-     color-vision deficiency in this adjacency order on both surfaces; same in both themes. */
-  --ph-1: #4a3aa7;
-  --ph-2: #e87ba4;
-  --ph-3: #eda100;
-  --ph-4: #008300;
+  /* attempt phases, preparing … settling. The overhead before the work (preparing →
+     loading) is one ordinal ramp, validated light→dark; computing is the one accent;
+     writing a muted warm; settling shares preparing's tone: both are the engine's own
+     bookkeeping. Every use names the phases, so colour never carries them alone. */
+  --ph-1: #a9b6c8;
+  --ph-2: #8c9cb3;
+  --ph-3: #71839e;
+  --ph-4: #566a88;
   --ph-5: #2a78d6;
-  --ph-6: #eb6834;
-  --ph-7: #1baf7a;
+  --ph-6: #c2622f;
+  --ph-7: #a9b6c8;
 
   /* type */
   --font-ui: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
@@ -156,13 +158,13 @@
   --idle-soft: #eee3cf;
   --idle-fg: #5f4d3d;
 
-  --ph-1: #4a3aa7;
-  --ph-2: #e87ba4;
-  --ph-3: #eda100;
-  --ph-4: #008300;
-  --ph-5: #2a78d6;
-  --ph-6: #eb6834;
-  --ph-7: #1baf7a;
+  --ph-1: #b8a685;
+  --ph-2: #9c8865;
+  --ph-3: #806b48;
+  --ph-4: #64502f;
+  --ph-5: #136f63;
+  --ph-6: #cf7a2a;
+  --ph-7: #b8a685;
 
   --font-ui: "Bricolage Grotesque Variable", ui-sans-serif, system-ui, sans-serif;
   --font-head: "Fraunces Variable", ui-serif, Georgia, serif;

@@ -8,7 +8,7 @@ import type { Manifest, SourceDecl } from "@/api/types";
 import { RunsTable } from "@/features/runs";
 import { count, plural } from "@/lib/format";
 import { Button } from "@/ui/button";
-import { Empty, Hash, Skeleton, Time } from "@/ui/data";
+import { Empty, ErrorNote, Hash, LoadMore, Skeleton, Time } from "@/ui/data";
 import { Field, Input, Segmented, Textarea } from "@/ui/form";
 import { Card, CardHeader, Crumb, Fact, Facts, Page, PageHeader } from "@/ui/layout";
 import { Table, TableScroll, Td, Th, Tr } from "@/ui/table";
@@ -135,7 +135,8 @@ export function Source() {
   const source = manifest.sources[name];
   const head = useQuery(q.heads(project, name)).data?.[0];
   const sensors = useQuery(q.sensors(project)).data?.sensors.filter((s) => s.commits.includes(name)) ?? [];
-  const commits = useInfiniteQuery(q.runs(project, { source: [name] }, 20)).data;
+  const commitQuery = useInfiniteQuery(q.runs(project, { source: [name] }, 20));
+  const commits = commitQuery.data;
   if (!source)
     return (
       <Page>
@@ -208,18 +209,25 @@ export function Source() {
               title="Commits"
               description="Each commit that changed something is a run with no tasks"
             />
-            {!commits ? (
+            {commitQuery.isError ? (
+              <div className="px-4 pb-4">
+                <ErrorNote error={commitQuery.error} />
+              </div>
+            ) : !commits ? (
               <Skeleton className="mx-4 mb-4 h-24" />
             ) : (
-              <RunsTable
-                compact
-                runs={commits.pages.flatMap((p) => p.runs)}
-                empty={
-                  <Empty compact title="No commits yet">
-                    Its head is the one synthesized at registration.
-                  </Empty>
-                }
-              />
+              <>
+                <RunsTable
+                  compact
+                  runs={commits.pages.flatMap((p) => p.runs)}
+                  empty={
+                    <Empty compact title="No commits yet">
+                      Its head is the one synthesized at registration.
+                    </Empty>
+                  }
+                />
+                <LoadMore query={commitQuery} />
+              </>
             )}
           </Card>
         </div>
@@ -239,12 +247,12 @@ function SourceKeys({ name }: { name: string }) {
         title="Keys"
         description={keys.data ? plural(keys.data.pages[0]?.total ?? 0, "key") : undefined}
       />
-      {!keys.data ? (
-        keys.isError ? (
-          <Empty compact title="No keys yet" />
-        ) : (
-          <Skeleton className="mx-4 mb-4 h-20" />
-        )
+      {keys.isError ? (
+        <div className="px-4 pb-4">
+          <ErrorNote error={keys.error} title="Couldn't read the key index" />
+        </div>
+      ) : !keys.data ? (
+        <Skeleton className="mx-4 mb-4 h-20" />
       ) : entries.length === 0 ? (
         <Empty compact title="No keys yet" />
       ) : (
@@ -267,6 +275,7 @@ function SourceKeys({ name }: { name: string }) {
           </Table>
         </TableScroll>
       )}
+      <LoadMore query={keys} shown={`${entries.length} shown`} />
     </Card>
   );
 }
@@ -276,14 +285,22 @@ function CommitForm({ name, kind }: { name: string; kind: Kind }) {
   const commit = useCommitSource();
   const [action, setAction] = useState<"upsert" | "remove">("upsert");
   const [text, setText] = useState("");
+  // Keys are one per line, never split on commas (a key may hold one); a pair splits
+  // at its first "=", so a revision keeps its own. An unkeyed version is taken verbatim.
   const items = text
-    .split(/[\n,]/)
+    .split("\n")
     .map((t) => t.trim())
     .filter(Boolean);
-  const pairs =
-    kind === "keyed" ? items.map((i) => i.split("=").map((x) => x.trim()) as [string, string?]) : [];
+  const pairs: [string, string | undefined][] =
+    kind === "keyed"
+      ? items.map((i) => {
+          const at = i.indexOf("=");
+          return at < 0 ? [i, undefined] : [i.slice(0, at).trim(), i.slice(at + 1).trim()];
+        })
+      : [];
   const invalid =
-    items.length === 0 || (kind === "keyed" && action === "upsert" && pairs.some(([, v]) => !v));
+    (kind === "unkeyed" ? !text.trim() : items.length === 0) ||
+    (kind === "keyed" && action === "upsert" && pairs.some(([, v]) => !v));
   return (
     <Card className="self-start">
       <CardHeader title="Commit" description="Advance this source through the commit API" />
@@ -294,7 +311,7 @@ function CommitForm({ name, kind }: { name: string; kind: Kind }) {
           if (invalid) return;
           const body =
             kind === "unkeyed"
-              ? { source: name, version: items[0] }
+              ? { source: name, version: text.trim() }
               : action === "remove"
                 ? { source: name, remove: items }
                 : {

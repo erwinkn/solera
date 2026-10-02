@@ -210,17 +210,27 @@ function Nav({ onNavigate }: { onNavigate?: () => void }) {
 }
 
 function EngineStatus() {
-  const health = useQuery(q.health()).data;
+  const { data: health, isError } = useQuery(q.health());
   const diagnostics = useQuery(q.diagnostics()).data;
-  const healthy = health?.ok ?? true;
-  const tone: Tone = !health ? "idle" : !healthy ? "fail" : diagnostics?.last_error ? "warn" : "ok";
-  const text = !health
-    ? "Connecting…"
-    : !healthy
-      ? "Engine unavailable"
-      : diagnostics?.last_error
-        ? "Engine degraded"
-        : "Engine healthy";
+  // A failed check is an answer too: the engine is unreachable, whatever it said before.
+  const healthy = !isError && (health?.ok ?? true);
+  const tone: Tone = isError
+    ? "fail"
+    : !health
+      ? "idle"
+      : !healthy
+        ? "fail"
+        : diagnostics?.last_error
+          ? "warn"
+          : "ok";
+  const text =
+    !health && !isError
+      ? "Connecting…"
+      : !healthy
+        ? "Engine unavailable"
+        : diagnostics?.last_error
+          ? "Engine degraded"
+          : "Engine healthy";
   return (
     <Link
       to="/health"

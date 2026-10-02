@@ -231,8 +231,18 @@ function nextTry(k: FailureKey, now: number): ReactNode {
 
 // -- explain ----------------------------------------------------------------------
 
+/** The edges `explain` can answer for: keyed incremental ones, an Each edge first. */
+function explainable(asset: AssetDecl): string[] {
+  return Object.entries(asset.inputs)
+    .filter(([, e]) => e.kind === "incremental")
+    .sort(([, a], [, b]) => Number(!!b.each) - Number(!!a.each))
+    .map(([param]) => param);
+}
+
 function ExplainKey({ name, asset }: { name: string; asset: AssetDecl }) {
-  const { key, scope } = route.useSearch();
+  const { key, scope, edge } = route.useSearch();
+  const edges = explainable(asset);
+  const chosenEdge = edge ?? edges[0];
   const navigate = route.useNavigate();
   const project = useProject();
   const partitions = useQuery({
@@ -243,7 +253,7 @@ function ExplainKey({ name, asset }: { name: string; asset: AssetDecl }) {
     scope ?? (asset.partitions ? partitions?.find((p) => p.status !== "retired")?.scope : "");
   const [draft, setDraft] = useState(key ?? "");
   const answer = useQuery({
-    ...q.explain(project, name, key ?? "", effectiveScope ?? ""),
+    ...q.explain(project, name, key ?? "", effectiveScope ?? "", chosenEdge),
     enabled: !!key && effectiveScope !== undefined,
   });
 
@@ -271,6 +281,20 @@ function ExplainKey({ name, asset }: { name: string; asset: AssetDecl }) {
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
         />
+        {edges.length > 1 && (
+          <Select
+            aria-label="Edge"
+            className="w-auto font-mono text-xs"
+            value={chosenEdge}
+            onChange={(e) => navigate({ search: (s) => ({ ...s, edge: e.target.value }), replace: true })}
+          >
+            {edges.map((param) => (
+              <option key={param} value={param}>
+                through {param}
+              </option>
+            ))}
+          </Select>
+        )}
         {asset.partitions && (
           <span className="text-xs text-fg-subtle">
             in <span className="font-mono">{effectiveScope ?? "…"}</span>
@@ -317,7 +341,11 @@ function Answer({ explain: e }: { explain: Explain }) {
         Waiting: {e.upstream} has revision <Rev value={e.upstream_revision} />, not processed yet
       </>
     ),
-    removed: <>Removed upstream: {e.upstream} no longer has it, so its rows are gone</>,
+    removed: Object.values(e.outputs).some((o) => o.present) ? (
+      <>Removed upstream: {e.upstream} no longer has it; its rows go when the removal is delivered</>
+    ) : (
+      <>Removed upstream: {e.upstream} no longer has it, and its rows are gone</>
+    ),
     absent: (
       <>
         Unknown: {e.upstream}
@@ -454,7 +482,11 @@ function KeyOutcomes({ name }: { name: string }) {
           />
         }
       />
-      {!outcomes.data ? (
+      {outcomes.isError ? (
+        <div className="px-4 pb-4">
+          <ErrorNote error={outcomes.error} />
+        </div>
+      ) : !outcomes.data ? (
         <Skeleton className="mx-4 mb-4 h-24" />
       ) : rows.length === 0 ? (
         <Empty compact title="No outcomes">
@@ -586,6 +618,10 @@ function LiveKeys({ name, asset }: { name: string; asset: AssetDecl }) {
           {keys.error.message.includes("found")
             ? "This output has no head for this partition yet."
             : keys.error.message}
+        </Empty>
+      ) : effectiveScope === undefined && partitions ? (
+        <Empty compact title="No complete partition yet">
+          Pick a partition above to read what its index holds.
         </Empty>
       ) : !keys.data ? (
         <Skeleton className="mx-4 mb-4 h-24" />

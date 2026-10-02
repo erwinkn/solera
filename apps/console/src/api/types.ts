@@ -440,7 +440,8 @@ export type Facets = Record<"status" | "trigger" | "automation" | "by" | "source
 
 export interface Histogram {
   bucket: number;
-  since: number;
+  /** null when no run matches. */
+  since: number | null;
   until: number;
   bars: { t: number; counts: Record<string, number> }[];
 }

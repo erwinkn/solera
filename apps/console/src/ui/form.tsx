@@ -1,4 +1,4 @@
-import type { ComponentProps, ReactNode } from "react";
+import type { ComponentProps, KeyboardEvent, ReactNode } from "react";
 import { Switch as BaseSwitch } from "@base-ui/react/switch";
 import { Search } from "lucide-react";
 import { cn } from "@/lib/cn";
@@ -102,6 +102,27 @@ export function Switch({
   );
 }
 
+/**
+ * Arrow keys (and Home/End) move between the options of a radio group or a
+ * tab list, selecting as they go: one tab stop for the whole group.
+ */
+export function rove(event: KeyboardEvent<HTMLElement>, role: "radio" | "tab") {
+  const step: Record<string, number> = { ArrowRight: 1, ArrowDown: 1, ArrowLeft: -1, ArrowUp: -1 };
+  if (!(event.key in step) && event.key !== "Home" && event.key !== "End") return;
+  const items = [...event.currentTarget.querySelectorAll<HTMLElement>(`[role="${role}"]`)];
+  const at = items.indexOf(document.activeElement as HTMLElement);
+  if (at < 0 || items.length === 0) return;
+  const next =
+    event.key === "Home"
+      ? 0
+      : event.key === "End"
+        ? items.length - 1
+        : (at + step[event.key]! + items.length) % items.length;
+  event.preventDefault();
+  items[next]!.focus();
+  items[next]!.click();
+}
+
 /** A row of mutually exclusive options. Buttons, so it works without the URL too. */
 export function Segmented<T extends string>({
   value,
@@ -120,6 +141,7 @@ export function Segmented<T extends string>({
     <div
       role="radiogroup"
       aria-label={label}
+      onKeyDown={(e) => rove(e, "radio")}
       className="inline-flex shrink-0 rounded-sm border-theme border-line-strong bg-sunken p-0.5"
     >
       {options.map((option) => (
@@ -128,6 +150,7 @@ export function Segmented<T extends string>({
           type="button"
           role="radio"
           aria-checked={option.value === value}
+          tabIndex={option.value === value ? 0 : -1}
           title={option.title}
           onClick={() => onChange(option.value)}
           className={cn(

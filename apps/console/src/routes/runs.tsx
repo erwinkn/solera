@@ -31,7 +31,7 @@ export function filterOf(search: RunSearch): RunFilter {
   };
 }
 
-const STATUSES = ["running", "queued", "failed", "succeeded", "canceled", "skipped"];
+const STATUSES = ["running", "queued", "paused", "failed", "succeeded", "canceled", "skipped"];
 
 export function Runs() {
   const search = route.useSearch();
