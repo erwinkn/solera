@@ -17,6 +17,7 @@ from solera.sdk import (
     Output,
     Project,
     RegistrationError,
+    Result,
     Source,
     StaticPartitions,
     TableRef,
@@ -188,6 +189,27 @@ def test_store_must_accept_output_type():
 
     with pytest.raises(RegistrationError, match="cannot store"):
         Project(assets=[bad])
+
+
+def test_patch_and_result_annotations_say_nothing_of_the_payload():
+    """§4/§11: `Patch` and `Result` are envelopes: annotating a producer's
+    return with them (or a union holding one) registers, as it runs."""
+
+    from solera.stores import Patch
+
+    @asset(outputs=Output("rows", key="id"))
+    def patch() -> Patch:
+        return Patch([])
+
+    @asset(outputs=Output("more", key="id"))
+    def result() -> Result:
+        return Result({"more": []})
+
+    @asset(outputs=Output("either", key="id"))
+    def either() -> list[dict] | Patch:
+        return []
+
+    Project(assets=[patch, result, either])
 
 
 def test_unannotated_store_bound_input():

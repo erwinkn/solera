@@ -632,3 +632,53 @@ async def test_collection_waits_for_the_engines_own_readers(state):
     assert await state.get_object(path) is None
     if engine.keys is not None:
         await engine.keys.stop()
+
+
+async def test_an_empty_replacement_of_a_big_index_clears_it(state, monkeypatch):
+    """Clearing a keyed output whose index is past what the engine resolves
+    (`RESOLVE_ENTRIES`, here 1) streams an empty replacement: every key goes."""
+
+    from solera_worker import worker
+
+    monkeypatch.setattr(worker, "RESOLVE_ENTRIES", 1)
+    rows = [{"id": "a", "n": 1}, {"id": "b", "n": 2}]
+
+    @asset(outputs=Output("items", key="id"))
+    def items():
+        return list(rows)
+
+    engine = engine_for(state, Project(assets=[items]))
+    await engine.initialize()
+    await run(engine, ["items"])
+    rows.clear()
+    await run(engine, ["items"])
+    assert (await engine.list_keys("items"))["keys"] == {}
+
+
+async def test_a_whole_keyed_read_is_loaded_a_page_at_a_time(state, monkeypatch):
+    """A whole read of an immutable store's keyed output names its objects
+    from the pinned index, a page at a time (`REPAIR_PAGE`, here 2), and puts
+    the pages together: never one selection of every key."""
+
+    from solera_worker import worker
+
+    monkeypatch.setattr(worker, "REPAIR_PAGE", 2)
+    seen = {}
+
+    @asset(outputs=Output("items", key="id"))
+    def items():
+        return [{"id": f"k{i}", "n": i} for i in range(5)]
+
+    @asset(outputs=Output("by_value", keyed=True))
+    def by_value():
+        return {f"v{i}": i for i in range(5)}
+
+    @asset
+    def reader(items: list[dict], by_value: dict):
+        seen["items"], seen["by_value"] = items, by_value
+
+    engine = engine_for(state, Project(assets=[items, by_value, reader]))
+    await engine.initialize()
+    await run(engine, ["items", "by_value", "reader"])
+    assert sorted(r["n"] for r in seen["items"]) == list(range(5))
+    assert seen["by_value"] == {f"v{i}": i for i in range(5)}

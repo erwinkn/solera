@@ -623,13 +623,28 @@ class FileStore:
         batch `n` all ran between the commits of `n - 1` and `n`, one at a
         time, and the one that committed `n` was the last of them."""
 
+        import obstore
+
+        objects = self._objects()
+        # Listed from `lo` on: an object store lists in key order, so it stops past
+        # `hi`; a local directory comes in any order, and is read to its end.
+        ordered = type(objects).__name__ != "LocalStore"
         best: dict[int, tuple[int, str]] = {}
-        for name in await self._keys(base):
-            batch, _, generation = name.partition(".")
-            if batch.isdigit() and generation.isdigit() and lo <= int(batch) <= hi:
+        async for chunk in obstore.list(objects, prefix=f"{base}/", offset=f"{base}/{lo:012d}"):
+            for meta in chunk:
+                name = meta["path"][len(base) + 1 :]
+                if "/" in name or not name.endswith((".json", ".pkl")):
+                    continue
+                batch, _, generation = unquote(name.rsplit(".", 1)[0]).partition(".")
+                if not (batch.isdigit() and generation.isdigit()) or int(batch) < lo:
+                    continue
+                if int(batch) > hi:
+                    if ordered:
+                        return {b: n for b, (_, n) in best.items()}
+                    continue
                 if int(generation) >= best.get(int(batch), (-1, ""))[0]:
-                    best[int(batch)] = (int(generation), f"{base}/{name}")
-        return {b: name for b, (_, name) in best.items()}
+                    best[int(batch)] = (int(generation), f"{base}/{batch}.{generation}")
+        return {b: n for b, (_, n) in best.items()}
 
     # -- objects ----------------------------------------------------------------
 
@@ -692,13 +707,20 @@ class FileStore:
 
     @staticmethod
     async def _many(fn, items) -> list:
-        limit = asyncio.Semaphore(PARALLEL)
+        """`fn` of each item, `PARALLEL` at a time, results in order: a fixed
+        set of workers takes the items one by one, so a million items never
+        become a million waiting tasks."""
 
-        async def one(item):
-            async with limit:
-                return await fn(item)
+        items = list(items)
+        results: list = [None] * len(items)
+        todo = iter(enumerate(items))
 
-        return await asyncio.gather(*(one(item) for item in items))
+        async def worker():
+            for i, item in todo:
+                results[i] = await fn(item)
+
+        await asyncio.gather(*(worker() for _ in range(min(PARALLEL, len(items)))))
+        return results
 
     @staticmethod
     def _ref(scope, handle, version) -> ObjectRef:

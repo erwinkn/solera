@@ -226,3 +226,50 @@ def test_the_default_path(tmp_path, monkeypatch):
     assert Path(store._objects().prefix) == tmp_path / ".solera" / "data"
     monkeypatch.setenv("SOLERA_DATA", str(tmp_path / "elsewhere"))
     assert Path(store._objects().prefix) == tmp_path / "elsewhere"
+
+
+async def test_one_batch_is_read_without_listing_the_history(store, monkeypatch):
+    """A consumer reading the newest batch lists from that batch on, not the
+    output's whole history (§6: hot-path work does not grow with history)."""
+
+    import obstore
+
+    out = Output("events", incremental=True)
+    ref = None
+    for batch in range(200):
+        ref = (
+            await store.store(Patch([{"e": batch}]), ref, scope(out, batch=batch, generation=batch + 1))
+        ).ref
+    listed = []
+    real = obstore.list
+
+    def counting(*args, **kwargs):
+        async def chunks():
+            async for chunk in real(*args, **kwargs):
+                listed.extend(chunk)
+                yield chunk
+
+        return chunks()
+
+    monkeypatch.setattr(obstore, "list", counting)
+    assert await store.load(ref, None, Batches(199, 199)) == [{"e": 199}]
+    assert len(listed) <= 2, len(listed)
+
+
+async def test_many_objects_are_never_many_tasks_at_once(store):
+    """`PARALLEL` requests in flight, from as many workers: a large write or
+    read never holds a task per object."""
+
+    import asyncio
+
+    from solera.stores import PARALLEL
+
+    seen = []
+
+    async def one(i):
+        seen.append(len(asyncio.all_tasks()))
+        await asyncio.sleep(0)
+        return i
+
+    assert await store._many(one, range(5000)) == list(range(5000))
+    assert max(seen) <= PARALLEL + 5, max(seen)

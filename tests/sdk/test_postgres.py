@@ -626,3 +626,30 @@ async def test_a_partitions_first_write_waits_for_a_migration(store):
     with store._connect() as conn, conn.cursor() as cur:
         rows = cur.execute(f"SELECT id, site FROM {table} ORDER BY id").fetchall()
     assert [(r["id"], r["site"]) for r in rows] == [("a", "p1"), ("b", "p2")]
+
+
+async def test_a_missing_grant_role_is_skipped_without_aborting_the_write(store):
+    """§4: grants are deployment sugar. A role this database lacks is skipped
+    before its GRANT could abort the write's transaction; one it has is granted."""
+
+    import psycopg
+
+    role = f"r_{uuid.uuid4().hex[:10]}"
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        conn.execute(f'CREATE ROLE "{role}"')
+    try:
+        from solera_postgres import PostgresStore
+
+        granting = PostgresStore(DSN, grants=[f"missing_{role}", role])
+        out = output(key="id")
+        written = await granting.store([{"id": "a", "n": 1}], None, scope(out))
+        assert await granting.load(written.ref, list[dict], None) == [{"id": "a", "n": 1}]
+        with psycopg.connect(DSN) as conn:
+            allowed = conn.execute(
+                "SELECT has_table_privilege(%s, %s, 'SELECT')", (role, out.name)
+            ).fetchone()
+        assert allowed == (True,)
+    finally:
+        with psycopg.connect(DSN, autocommit=True) as conn:
+            conn.execute(f'DROP OWNED BY "{role}"')
+            conn.execute(f'DROP ROLE "{role}"')

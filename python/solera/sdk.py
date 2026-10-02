@@ -9,6 +9,7 @@ import json
 import os
 import re
 import sys
+import types
 import typing
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -161,6 +162,19 @@ def _literal(value: Any) -> str:
     if isinstance(value, (int, float)):
         return repr(value)
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def _payload_type(t: Any) -> Any:
+    """What a producer's return annotation says its store receives: nothing
+    known when it is, or may be, a `Result` or a `Patch` — envelopes around
+    a payload, not its type (§4)."""
+
+    from .stores import Patch
+
+    args = typing.get_args(t) if typing.get_origin(t) in (typing.Union, types.UnionType) else (t,)
+    if any(isinstance(a, type) and issubclass(a, (Result, Patch)) for a in args):
+        return None
+    return t
 
 
 def is_ref_type(t: Any) -> bool:
@@ -1430,7 +1444,7 @@ class Project:
                 store = self.stores[record["store"]]
                 each = any(isinstance(e, Each) for e in info["edges"].values())
                 # An Each producer returns one key's value: the output holds them all.
-                t = return_t if len(asset.outputs) == 1 and not each else None
+                t = _payload_type(return_t) if len(asset.outputs) == 1 and not each else None
                 if not store.can_store(t, output):
                     raise RegistrationError(
                         f"{name}: store {record['store']} cannot store output {output.name} "

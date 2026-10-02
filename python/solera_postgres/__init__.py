@@ -165,11 +165,15 @@ class PostgresStore:
             cur.execute(
                 f"CREATE INDEX IF NOT EXISTS {_ident(table_name + '_' + '_'.join(index))} ON {table} ({cols})"
             )
+        # Grants are deployment sugar: a role this database lacks is skipped, before
+        # its GRANT could fail and abort the write's transaction; any other failure is real.
+        present = {
+            r["rolname"]
+            for r in cur.execute("SELECT rolname FROM pg_roles WHERE rolname = ANY(%s)", (list(self.grants),))
+        }
         for role in self.grants:
-            try:
+            if role in present:
                 cur.execute(f"GRANT SELECT ON {table} TO {_ident(role)}")
-            except Exception:
-                pass  # grants are deployment sugar; a missing role is not fatal
         self._fence(cur, table, scope)  # before this transaction changes any row
         return table
 

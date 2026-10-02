@@ -28,6 +28,7 @@ import sys
 import time
 import traceback
 import typing
+from collections.abc import Mapping
 from pathlib import Path
 
 from obstore.exceptions import AlreadyExistsError
@@ -266,7 +267,7 @@ class Ctx:
     async def load(self, ref: Ref, t):
         store = self._stores[ref.store]
         index = self._indexes.get((ref.output, ref.partition))
-        value = await store.load(ref, t, await _whole(store, self._keys_io, index))
+        value = await _load_whole(store, ref, t, self._keys_io, index)
         self._timeline.add("loaded", ref.output, _rows(value), optional=True)
         return value
 
@@ -332,7 +333,7 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline):
                     out[key] = ref
                     continue
                 store = project.stores[ref.store]
-                out[key] = await store.load(ref, inner, await _whole(store, keys_io, indexes.get(key)))
+                out[key] = await _load_whole(store, ref, inner, keys_io, indexes.get(key))
             args[param] = out
             timeline.add("loaded", param)
             continue
@@ -362,7 +363,7 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline):
         if t is not None and is_ref_type(t):
             args[param] = ref
         else:
-            args[param] = await store.load(ref, t, await _whole(store, keys_io, pin.get("index")))
+            args[param] = await _load_whole(store, ref, t, keys_io, pin.get("index"))
             timeline.add("loaded", param, _rows(args[param]))
     # Every keyed page held keys, and the edges' patterns took none of them: nothing
     # to call the producer with.
@@ -371,21 +372,38 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline):
     return args, changes, delivered
 
 
-async def _whole(store, keys_io, index_json) -> Keys | None:
-    """A whole keyed read from an immutable store, as the `Keys` selection
-    of every live entry of its pinned index: such a store names objects from
-    `(version, locator)`, and a listing would also show superseded and
-    abandoned ones (docs/lifecycle.md §9.8). `None` for any other read."""
+async def _load_whole(store, ref, t, keys_io, index_json):
+    """A whole read. From an immutable store, a keyed one names its objects
+    from the live entries of its pinned index (`Keys`), since a listing would
+    also show superseded and abandoned ones (docs/lifecycle.md §9.8): it is
+    loaded a page of the index at a time, and the pages put together."""
 
     if index_json is None or getattr(store, "writes", "overwrite") != "immutable":
-        return None
+        return await store.load(ref, t, None)
     index = KeyIndex(keys_io, None, IndexState.from_json(index_json))
-    entries, after = {}, None
+    parts, after = [], None
     while True:
         keys, versions, locators, after = await index.page(after, REPAIR_PAGE)
-        entries.update({key_str(k): (v, loc) for k, v, loc in zip(keys, versions, locators, strict=True)})
+        entries = {key_str(k): (v, loc) for k, v, loc in zip(keys, versions, locators, strict=True)}
+        parts.append(await store.load(ref, t, Keys(entries)))
         if after is None:
-            return Keys(entries)
+            return _together(parts)
+
+
+def _together(parts: list):
+    """Pages of one read as one value: dicts merged, lists joined, frames concatenated."""
+
+    if len(parts) == 1:
+        return parts[0]
+    if all(isinstance(p, Mapping) for p in parts):
+        return {k: v for p in parts for k, v in p.items()}
+    if all(isinstance(p, list) for p in parts):
+        return [item for p in parts for item in p]
+    if type(parts[0]).__name__ == "DataFrame":
+        import pandas as pd
+
+        return pd.concat(parts, ignore_index=True)
+    raise StoreError(f"cannot put pages of {type(parts[0]).__name__} together")
 
 
 def _dict_inner(t):
@@ -549,7 +567,7 @@ async def _store_outputs(
             if answer is not None:
                 p["files"], p["changed"] = await _upload(index, p["batch"], spec["attempt"], answer)
             elif replace:
-                rows = p.get("rows") or Rows.pairs(list(zip(*p["run"][:2], strict=True)))
+                rows = p["rows"] if "rows" in p else Rows.pairs(list(zip(*p["run"][:2], strict=True)))
                 try:
                     p["files"], p["changed"] = await index.replace(
                         rows, p["batch"], spec["attempt"], collect=LISTED, generation=p["generation"]
