@@ -293,7 +293,10 @@ class Prepared:
 @dataclass(frozen=True)
 class KeyedWrite:
     """A keyed output's write as its store takes it: read once
-    (`prepared`), resolved against the key index (§4, §6).
+    (`prepared`), resolved against the key index (§4, §6). A store needs
+    four things of it: whether it is the scope's `whole` content (clear the
+    scope first), its `removes`, its `pages()` — the keys to write, each with
+    its version and group — and the `version` of what it writes.
 
     `upserts` are the keys to write, each at the version the index will
     hold: a mapping; a `solera.keys.index.DeltaKeys` reading them from the
@@ -324,11 +327,37 @@ class KeyedWrite:
         return cls(prepared, removes=frozenset(prepared.removes), value=write)
 
     async def pages(self, size: int = 100_000):
-        """The keys to write, sorted, a page at a time: `(key, version, group)` each."""
+        """The keys to write, sorted, a page at a time: `(key, version, group)`
+        each. Only a page's groups are taken from the write at once."""
 
-        async for page in _selected(self.upserts, self.prepared, size):
-            groups = await asyncio.to_thread(self.prepared.groups, [k for k, _ in page])
-            yield [(k, v, g) for (k, v), g in zip(page, groups, strict=True)]
+        if self.upserts is None or isinstance(self.upserts, Mapping):
+            pages = self.iter_pages(size)
+            while (page := await asyncio.to_thread(next, pages, None)) is not None:
+                yield page
+            return
+        async for page in self.upserts.pages(size):
+            yield await asyncio.to_thread(self._grouped, page)
+
+    def iter_pages(self, size: int = 100_000):
+        """`pages()`, for a store that writes on a thread of its own. Not for
+        a `DeltaKeys` selection: only immutable stores get one, and they
+        page it asynchronously."""
+
+        if self.upserts is None:
+            from .keys.index import key_str
+
+            for keys, versions in self.prepared.rows.pages(size):
+                yield self._grouped(list(zip(map(key_str, keys), versions, strict=True)))
+        elif isinstance(self.upserts, Mapping):
+            entries = sorted(self.upserts.items())
+            for i in range(0, len(entries), size):
+                yield self._grouped(entries[i : i + size])
+        else:
+            raise StoreError(f"{self.prepared.output.name}: a delta's selection is paged asynchronously")
+
+    def _grouped(self, page: list) -> list:
+        groups = self.prepared.groups([k for k, _ in page])
+        return [(k, v, g) for (k, v), g in zip(page, groups, strict=True)]
 
     def version(self, prior: Ref | None) -> str:
         return self.prepared.version(prior)
@@ -884,24 +913,6 @@ class S3Store(FileStore):
 
             self._stores[""] = obstore.store.from_url(resolve_env(self.url), **resolve_env(self.options))
         return self._stores[""]
-
-
-async def _selected(upserts, prepared: Prepared, size: int = 100_000):
-    """The keys a keyed write writes, each with its version, sorted, a page at
-    a time: every key of the write, the listed ones, or the pages of a
-    delta's selection."""
-
-    if upserts is None:
-        entries = await asyncio.to_thread(prepared.entries)
-        for i in range(0, len(entries), size):
-            yield entries[i : i + size]
-    elif isinstance(upserts, Mapping):
-        entries = sorted(upserts.items())
-        for i in range(0, len(entries), size):
-            yield entries[i : i + size]
-    else:
-        async for page in upserts.pages(size):
-            yield page
 
 
 def _digest(value: Any) -> str:

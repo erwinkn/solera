@@ -13,7 +13,9 @@ driver installed; only `store`/`load` need it (in the harness).
 
 from __future__ import annotations
 
+import asyncio
 import re
+from collections.abc import Callable, Iterable
 from typing import Any
 
 from solera.sdk import KEYS, Output, Ref, TableRef, digest
@@ -137,10 +139,15 @@ class PostgresStore:
         self,
         cur,
         output: Output,
-        rows: list[dict] | None = None,
+        rows: Callable[[], Iterable[dict]] | None = None,
         scope: Scope | None = None,
         inferred: dict | None = None,
-    ):
+    ) -> dict[str, str]:
+        """The table, created if missing, under the transaction's fence; its
+        columns' types. A table the write creates takes the declared columns,
+        then those of a `Sql` SELECT (`inferred`), then those of the write's
+        rows (`rows()`, read only then), from every value not null."""
+
         table, schema, table_name = self._table(output)
         indexes = self._indexes(output)
         names = [table_name + "_" + "_".join(index) for index in indexes]
@@ -157,11 +164,9 @@ class PostgresStore:
         declared, pk = self._declared_shape(output)
         declared = {**(inferred or {}), **declared}
         columns = dict(declared)
-        if rows:
-            for row in rows:
-                for column, value in row.items():
-                    columns.setdefault(column, _column_type(value))
         existed = cur.execute(exists, (schema, table_name)).fetchone()
+        if not existed and rows is not None:
+            columns = {**_column_types(output.name, rows(), declared), **declared}
         defs = [f"{_ident(c)} {_sql_type(t)}" for c, t in (columns or {"value": "jsonb"}).items()]
         if pk:
             defs.append(f"PRIMARY KEY ({', '.join(_ident(c) for c in pk)})")
@@ -183,7 +188,14 @@ class PostgresStore:
             if role in present:
                 cur.execute(f"GRANT SELECT ON {table} TO {_ident(role)}")
         self._fence(cur, table, scope)  # before this transaction changes any row
-        return table
+        return {
+            r["column_name"]: r["data_type"]
+            for r in cur.execute(
+                "SELECT column_name, data_type FROM information_schema.columns "
+                "WHERE table_schema = %s AND table_name = %s",
+                (schema, table_name),
+            )
+        }
 
     # -- generations (docs/lifecycle.md §9.7) -------------------------------------
 
@@ -248,6 +260,9 @@ class PostgresStore:
 
         if scope.generation is None:
             return
+        await asyncio.to_thread(self._acquire, scope)
+
+    def _acquire(self, scope: Scope) -> None:
         table, _, _ = self._table(scope.output)
         with self._connect() as conn, conn.cursor() as cur:
             self._domain(cur, table)
@@ -309,10 +324,14 @@ class PostgresStore:
     # -- writes ---------------------------------------------------------------
 
     async def store(self, write, prior: Ref | None, scope: Scope) -> Written:
+        """The write, in one transaction on a thread of its own: the worker's
+        event loop goes on meanwhile. Canceled, the transaction still ends as
+        it would have — under its fence, and counted as uncertain until then."""
+
         import psycopg
 
         try:
-            return self._store(write, prior, scope)
+            return await asyncio.to_thread(self._store, write, prior, scope)
         except psycopg.IntegrityError as e:  # the data breaks the table's constraints (`primary_key`)
             raise WriteError(f"{scope.output.name}: {e}") from e
 
@@ -379,29 +398,15 @@ class PostgresStore:
                 cur.execute(f"ALTER TABLE {_qname(schema, alias)} RENAME TO {_ident(output.name)}")
                 return
 
-    def _stamp(self, output, rows: list[dict], scope) -> list[dict]:
-        """Rows with the partition column set to the scope's; a row that says
-        another partition is a write error."""
-
-        if partition_col := output.config.get("partition_column"):
-            for row in rows:
-                if partition_col in row and str(row[partition_col]) != scope.partition:
-                    raise WriteError(
-                        f"{output.name}: row {partition_col}={row[partition_col]!r} disagrees "
-                        f"with scope {scope.partition!r}"
-                    )
-                row[partition_col] = scope.partition
-        return rows
-
     def _apply_replace(self, cur, output, write, scope, table, slice_where):
         """An unkeyed output's whole content: its version is the multiset of
         its rows (docs/row-digest.md), before the store stamps them."""
 
         rows = _coerce_rows(write)
         version = _rows_version(rows, [])
-        self._ensure(cur, output, self._stamp(output, rows, scope), scope)
+        types = self._ensure(cur, output, lambda: rows, scope)
         self._delete_slice(cur, table, slice_where)
-        self._insert(cur, table, rows)
+        self._insert(cur, output, table, rows, types, self._stamps(output, scope))
         return version
 
     def _apply_batch(self, cur, output, write: Patch, scope, table, slice_where, prior, batch):
@@ -417,42 +422,43 @@ class PostgresStore:
         if not rows and prior is not None:
             return None
         version = _rows_version(rows, [prior.version if prior else ""])
-        for i, row in enumerate(self._stamp(output, rows, scope)):
-            row[BATCH_COLUMN] = batch
-            row[SEQ_COLUMN] = i
-        self._ensure(cur, output, rows, scope)
+        rows = [{**row, SEQ_COLUMN: i} for i, row in enumerate(rows)]
+        types = self._ensure(cur, output, lambda: rows, scope)
         self._delete_slice(cur, table, slice_where if prior is None else {**slice_where, BATCH_COLUMN: batch})
-        self._insert(cur, table, rows)
+        self._insert(cur, output, table, rows, types, {**self._stamps(output, scope), BATCH_COLUMN: batch})
         return version
 
     def _apply_keyed(self, cur, output, write: KeyedWrite, scope, table, slice_where, prior):
         """Every key is the group of rows that carry it. A whole write is the
-        slice's content; otherwise only the keys it writes change — their
-        rows replaced by their groups — and its removes go, every other row
-        untouched."""
+        slice's content: cleared, then written; otherwise only the keys it
+        writes change — their rows replaced by their groups, a page at a
+        time — and its removes go, every other row untouched."""
 
-        prepared = write.prepared
-        if not write.whole and write.upserts is None and not write.removes:
-            if not len(prepared.rows) and not prepared.entries():
-                return None  # a patch of nothing: the prior stands
+        if not write.whole and write.upserts is None and not write.removes and not len(write.prepared.rows):
+            return None  # a patch of nothing: the prior stands
+        types = self._ensure(cur, output, lambda: write.prepared.take(None), scope)
+        stamps = self._stamps(output, scope)
         if write.whole:
-            rows = self._stamp(output, [dict(r) for r in prepared.take(None)], scope)
-            self._ensure(cur, output, rows, scope)
             self._delete_slice(cur, table, slice_where)
-        else:
-            keys = sorted(write.upserts) if write.upserts is not None else [k for k, _ in prepared.entries()]
-            groups = prepared.groups(keys)
-            rows = self._stamp(output, [dict(row) for group in groups for row in group], scope)
-            self._ensure(cur, output, rows, scope)
-            gone = sorted(set(keys) | set(write.removes))
-            if gone:
-                cur.execute(
-                    f"DELETE FROM {table} WHERE {self._where_sql(slice_where)} "
-                    f"AND {_ident(output.key)}::text = ANY(%s)",
-                    ([slice_where[k] for k in sorted(slice_where)] + [gone]),
-                )
-        self._insert(cur, table, rows)
+        for page in write.iter_pages():
+            if not write.whole:
+                self._delete_keys(cur, output, table, slice_where, [key for key, _, _ in page])
+            self._insert(cur, output, table, [row for _, _, group in page for row in group], types, stamps)
+        if write.removes and not write.whole:
+            self._delete_keys(cur, output, table, slice_where, sorted(write.removes))
         return write.version(prior)
+
+    def _stamps(self, output, scope) -> dict:
+        """The columns the store sets on every row: the partition's."""
+
+        column = output.config.get("partition_column")
+        return {column: scope.partition} if column else {}
+
+    def _delete_keys(self, cur, output, table, slice_where, keys: list[str]) -> None:
+        cur.execute(
+            f"DELETE FROM {table} WHERE {self._where_sql(slice_where)} AND {_ident(output.key)}::text = ANY(%s)",
+            [slice_where[k] for k in sorted(slice_where)] + [keys],
+        )
 
     def _apply_sql(self, cur, output, write: Sql, scope, table, slice_where, prior):
         """Materialize a SELECT into the slice, or run a statement verbatim. The
@@ -569,6 +575,10 @@ class PostgresStore:
         (docs/lifecycle.md §9.7). An operator's migration (no scope) only
         takes its turn."""
 
+        return await asyncio.to_thread(self._migrate, output, migrations, scope)
+
+    def _migrate(self, output: Output, migrations, scope: Scope | None) -> list[str]:
+
         with self._connect() as conn, conn.cursor() as cur:
             self._ensure_ledger(cur)
         applied = []
@@ -615,6 +625,9 @@ class PostgresStore:
     async def load(self, ref: Ref, t, selection: Keys | Batches | None) -> Any:
         if isinstance(t, type) and issubclass(t, Ref):
             return ref
+        return await asyncio.to_thread(self._load, ref, t, selection)
+
+    def _load(self, ref: Ref, t, selection: Keys | Batches | None) -> Any:
         handle = ref.handle or {}
         with self._connect() as conn, conn.cursor() as cur:
             table = handle.get("table") or _qname(handle.get("schema", "public"), handle["name"])
@@ -662,15 +675,23 @@ class PostgresStore:
         params = [where[k] for k in sorted(where)]
         cur.execute(f"DELETE FROM {table} WHERE {self._where_sql(where)}", params)
 
-    def _insert(self, cur, table, rows: list[dict]):
-        """Rows, by `COPY`: every column any row has, missing ones null."""
+    def _insert(self, cur, output, table, rows: list[dict], types: dict, stamps: dict):
+        """Rows, by `COPY`: every column any row has, missing ones null, and
+        the `stamps` the store sets on every row. A value its column would read
+        back as another type — so as another digest — is a write error."""
 
         if not rows:
             return
-        columns = sorted({c for r in rows for c in r})
-        with cur.copy(f"COPY {table} ({', '.join(_ident(c) for c in columns)}) FROM STDIN") as copy:
+        for column, value in stamps.items():
+            if any(column in row and str(row[column]) != str(value) for row in rows):
+                raise WriteError(f"{output.name}: a row's {column} disagrees with {value!r}")
+        columns = sorted({c for r in rows for c in r} - set(stamps))
+        _check_types(output.name, rows, columns, types)
+        constant = list(stamps.values())
+        names = ", ".join(_ident(c) for c in [*columns, *stamps])
+        with cur.copy(f"COPY {table} ({names}) FROM STDIN") as copy:
             for row in rows:
-                copy.write_row([row.get(c) for c in columns])
+                copy.write_row([row.get(c) for c in columns] + constant)
 
 
 def _coerce_rows(write: Any) -> list[dict]:
@@ -699,9 +720,44 @@ def _rows_version(rows: list[dict], before: list) -> str:
     return digest([*before, content])
 
 
-def _column_type(value: Any) -> str:
-    """The column a value's type makes, for a table its first write creates:
-    one that reads it back as the same value (docs/row-digest.md)."""
+# A value's kind: what a column reads it back as, so what its digest is
+# (docs/row-digest.md). A column of one kind holds values of that kind only.
+_KINDS = {
+    "boolean": "boolean",
+    "bigint": "integer",
+    "integer": "integer",
+    "smallint": "integer",
+    "double precision": "float",
+    "real": "float",
+    "numeric": "decimal",
+    "text": "text",
+    "character varying": "text",
+    "character": "text",
+    "timestamp with time zone": "instant",
+    "timestamp without time zone": "timestamp",
+    "date": "date",
+    "time without time zone": "time",
+    "interval": "interval",
+    "bytea": "bytes",
+}
+# The column a table the write creates gives each kind.
+_COLUMNS = {
+    "boolean": "boolean",
+    "integer": "bigint",
+    "float": "double precision",
+    "decimal": "numeric",
+    "text": "text",
+    "instant": "timestamptz",
+    "timestamp": "timestamp",
+    "date": "date",
+    "time": "time",
+    "interval": "interval",
+    "bytes": "bytea",
+}
+
+
+def _kind(value: Any) -> str | None:
+    """A Python value's kind; None for one the store cannot type."""
 
     import datetime as dt
     from decimal import Decimal
@@ -709,13 +765,15 @@ def _column_type(value: Any) -> str:
     if isinstance(value, bool):
         return "boolean"
     if isinstance(value, int):
-        return "bigint"
+        return "integer"
     if isinstance(value, float):
-        return "double precision"
+        return "float"
     if isinstance(value, Decimal):
-        return "numeric"
+        return "decimal"
+    if isinstance(value, str):
+        return "text"
     if isinstance(value, dt.datetime):
-        return "timestamp" if value.tzinfo is None else "timestamptz"
+        return "timestamp" if value.utcoffset() is None else "instant"
     if isinstance(value, dt.date):
         return "date"
     if isinstance(value, dt.time):
@@ -723,8 +781,52 @@ def _column_type(value: Any) -> str:
     if isinstance(value, dt.timedelta):
         return "interval"
     if isinstance(value, bytes | bytearray | memoryview):
-        return "bytea"
-    return "text"
+        return "bytes"
+    if type(value).__module__ == "numpy" and hasattr(value, "dtype"):
+        return {"b": "boolean", "i": "integer", "u": "integer", "f": "float"}.get(value.dtype.kind)
+    return None
+
+
+def _column_types(name: str, rows: Iterable[dict], declared: dict) -> dict[str, str]:
+    """The columns a table the write creates gets for the undeclared ones:
+    each from the kind of every value not null it holds. Two kinds in one
+    column, or none at all (only nulls), want a declaration."""
+
+    kinds: dict[str, set] = {}
+    for row in rows:
+        for column, value in row.items():
+            if column in declared:
+                continue
+            found = kinds.setdefault(column, set())
+            if value is not None:
+                found.add(_kind(value))
+    columns = {}
+    for column, found in kinds.items():
+        if len(found) != 1 or None in found:
+            what = "only nulls" if not found else " and ".join(sorted(k or "untyped" for k in found))
+            raise WriteError(
+                f"{name}: column {column!r} holds {what}: declare its type, "
+                f"Output(..., columns={{{column!r}: ...}})"
+            )
+        columns[column] = _COLUMNS[found.pop()]
+    return columns
+
+
+def _check_types(name: str, rows: list[dict], columns: list[str], types: dict) -> None:
+    """Every value is of its column's kind: a column reading it back as
+    another — 42 as "42" — would store another digest than the one hashed."""
+
+    for column in columns:
+        want = _KINDS.get(types.get(column, ""))
+        if want is None:
+            continue  # a column the store does not type (json, arrays, …): taken as it is
+        for row in rows:
+            value = row.get(column)
+            if value is not None and (got := _kind(value)) != want:
+                raise WriteError(
+                    f"{name}: column {column!r} is {types[column]}, but a row holds {got or type(value).__name__}"
+                    f" {value!r}: it would read back as another value"
+                )
 
 
 def _inferred(sql_type: str | None) -> str:

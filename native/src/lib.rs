@@ -632,6 +632,34 @@ fn pack<'py>(
     Ok(keys)
 }
 
+/// A pass over `Rows`, a page of keys and versions at a time (`Rows.pages`).
+#[pyclass(module = "solera._native")]
+struct Pages {
+    cursor: Cursor,
+    size: usize,
+}
+
+#[pymethods]
+impl Pages {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn __next__<'py>(
+        &mut self,
+        py: Python<'py>,
+    ) -> PyResult<Option<(Bound<'py, PyList>, Bound<'py, PyList>)>> {
+        let (keys, versions) = (PyList::empty(py), PyList::empty(py));
+        while keys.len() < self.size && self.cursor.read().map_err(to_py)? {
+            let (k, v) = self.cursor.entry();
+            keys.append(PyBytes::new(py, k))?;
+            versions.append(PyBytes::new(py, v))?;
+        }
+        Ok((!keys.is_empty()).then_some((keys, versions)))
+    }
+}
+
 /// A keyed write's content, sorted by key (unless it arrived sorted) and
 /// read a key at a time: every key is the group of rows that carry it, and
 /// its version is computed as the reader reaches it (docs/row-digest.md).
@@ -863,6 +891,18 @@ impl Rows {
             versions.append(PyBytes::new(py, v))?;
         }
         Ok((keys, versions))
+    }
+
+    /// Every key and its version, in key order, `size` at a time: `(keys,
+    /// versions)` per page, computed as the pass reaches them.
+    fn pages(&self, size: usize) -> PyResult<Pages> {
+        if size == 0 {
+            return Err(PyValueError::new_err("a page holds at least one key"));
+        }
+        Ok(Pages {
+            cursor: Cursor::new(self.table.clone()),
+            size,
+        })
     }
 
     /// The digest of every `(key, version)`, in key order: the content's
@@ -1924,6 +1964,7 @@ fn solera_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(revision_text, m)?)?;
     m.add("DIGEST_VERSION", digest::VERSION)?;
     m.add_class::<Rows>()?;
+    m.add_class::<Pages>()?;
     m.add_class::<Job>()?;
     Ok(())
 }

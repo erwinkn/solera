@@ -241,7 +241,7 @@ Batches = (lo: int, hi: int)  # load rows of batches in [lo, hi]
 |---|---|
 | `can_load(t, selection)` | Registration. Can you produce `t`, filtered by `Keys` when `selection` is given? `can_load(R, None)` for a `Ref` subclass `R` means "are your refs `R`". |
 | `can_store(t, output)` | Registration. Can you take values of type `t` for this `Output` declaration, and extract its declared key from them? `t` is `None` when the producer is unannotated. |
-| `store(write, prior, scope)` | Apply the write; return the new ref (version per §3). `scope.batch` is the engine-assigned batch number. A keyed output's `write` is a `KeyedWrite`: write its `upserts` (each key's group from `prepared.groups`, at the version given; `None`: every key of the write) and delete its `removes`, or with `whole` make the write the scope's whole content; `value` is what the producer returned. `prior` is withheld on a `full` run. Duplicate keys are a write error. For `partition_column` outputs, stamp the column with `scope.partition` and reject rows that disagree. |
+| `store(write, prior, scope)` | Apply the write; return the new ref (version per §3). `scope.batch` is the engine-assigned batch number. A keyed output's `write` is a `KeyedWrite`, which a store reads four ways: `whole` (clear the scope first), `removes`, `pages()` — the keys to write a page at a time, each with its version and group, only that page taken from the write (`iter_pages()` for a store writing on a thread of its own) — and `version(prior)`; `value` is what the producer returned. `prior` is withheld on a `full` run. Duplicate keys are a write error. For `partition_column` outputs, stamp the column with `scope.partition` and reject rows that disagree. |
 | `load(ref, t, selection)` | Materialize `t` from what the store holds now; under `Keys`, only the selected keys; under `Batches`, only batches in the range. |
 | `migrate(output, migrations)` | Optional. Apply, in declared order, every migration not yet in the store's own ledger for this output; return the applied names. Must be safe under concurrent attempts of one output (partitions share tables): take a store-level lock and re-read the ledger inside it. Where the backend is transactional, a migration and its ledger row commit together. A store without `migrate` rejects `migrations=` at registration. |
 
@@ -291,6 +291,13 @@ the store, works out what changed, against the key index (§6):
 | `FileStore(path=None)` (default, built in) | anything: JSON when it round-trips, pickle otherwise. One file per value, partition, key or batch under `.solera/data` next to the project file (or `$SOLERA_DATA`) | `ObjectRef` |
 | `S3Store(url, **options)` | the same, in a bucket | `ObjectRef` |
 | `PostgresStore` | `DataFrame`, `GeoDataFrame`, `list[dict]`; `Sql` | `TableRef` |
+
+PostgresStore stores what was hashed: a table a write creates types each
+undeclared column by the kind of every value not null in it (two kinds,
+or only nulls, want `columns=`), one a `Sql` SELECT creates by the SELECT's
+own types, and a value its column would read back as another type — `42`
+into a text column — is a write error. Its transactions run on a thread,
+off the worker's event loop.
 
 Secrets travel via `env:` indirection in store and resource config, resolved
 in the harness. The manifest records each store's name and `Store.version`

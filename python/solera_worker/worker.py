@@ -510,8 +510,14 @@ async def _store_outputs(
         if o.files is None:
             await _resolve(o, spec, engine.get(name))
         if not o.files.files and o.info.get("exists") and not o.unsettled:
-            entries[name] = {"unchanged": True}
-            del outs[name]
+            if not _schema_due(o):
+                entries[name] = {"unchanged": True}
+                del outs[name]
+                continue
+            # No data to write, but migrations to apply: through the gate, then
+            # the same content under the new schema (§4).
+            o.schema_only = True
+            intents[name] = o.files.to_json()
             continue
         intents[name] = o.files.to_json()
         o.write = dataclasses.replace(_keyed_write(o, keys_io), value=o.value)
@@ -547,6 +553,11 @@ async def _store_outputs(
             except Exception as error:
                 raise StoreError(f"{output.name}: migration failed: {error}") from error
             schema = applied[-1] if applied else output.migrations[-1].name
+        if o.schema_only:
+            ref = o.head()
+            handle = {**(ref.handle or {}), "schema": schema}
+            entries[name] = {"ref": dataclasses.replace(ref, handle=handle).to_json(), "keys": intents[name]}
+            continue
         written = await writes.call(store.store(o.write or o.value, o.prior, scope))
         entry = {}
         if o.index is not None and o.sql:
@@ -607,10 +618,16 @@ class _Out:
     changed: tuple | None = None  # ({key: version}, [removed key]), or None past LISTED
     write: KeyedWrite | None = None
     elements: list[str] | None = None
+    schema_only: bool = False  # unchanged content, migrations to apply
 
     @property
     def kind(self) -> str:
         return self.store.writes
+
+    def head(self) -> Ref:
+        """The committed ref: the prior, or — a full run withholds it — the head."""
+
+        return self.prior if self.prior is not None else Ref.from_json(self.info["head"])
 
     @property
     def sql(self) -> bool:
@@ -649,6 +666,15 @@ class _Out:
                 len(self.prepared.rows) + live <= RESOLVE_ENTRIES and len(self.prepared.rows) <= RESOLVE_KEYS
             )
         return len(self.run) <= RESOLVE_KEYS
+
+
+def _schema_due(o: _Out) -> bool:
+    """Whether the output declares migrations its head's schema does not
+    show applied: then an unchanged write still migrates (§4)."""
+
+    if not o.output.migrations:
+        return False
+    return (o.head().handle or {}).get("schema") != o.output.migrations[-1].name
 
 
 async def _prepare(o: _Out, spec, keys_io) -> None:

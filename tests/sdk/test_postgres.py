@@ -754,3 +754,48 @@ async def test_rows_first_written_keep_their_types(store):
 
 def patch_removes(store, patch, out):
     return prepare_for(store, patch, out).removes
+
+
+async def test_a_column_s_type_is_every_value_s_not_the_first(store):
+    """§4: a table the write creates types each column by every value not
+    null in it, so a null then 42 is a bigint holding 42 — stored as hashed.
+    Two kinds in one column, or only nulls, want a declaration; a value its
+    existing column would read back as another type is refused."""
+
+    out = output(key="id")
+    rows = [{"id": "a", "n": None}, {"id": "b", "n": 42}]
+    written = await store.store(rows, None, scope(out))
+    back = sorted(await store.load(written.ref, list[dict], None), key=lambda r: r["id"])
+    assert back == rows
+    assert dict(prepare_for(store, back, out).entries()) == dict(prepare_for(store, rows, out).entries())
+    with pytest.raises(WriteError, match="declare its type"):
+        await store.store([{"id": "a", "n": 1}, {"id": "b", "n": "x"}], None, scope(output(key="id")))
+    with pytest.raises(WriteError, match="only nulls"):
+        await store.store([{"id": "a", "n": None}], None, scope(output(key="id")))
+    declared = output(key="id", columns={"n": "text"})
+    await store.store([{"id": "a", "n": None}], None, scope(declared))
+    with pytest.raises(WriteError, match="read back as another value"):
+        await store.store([{"id": "a", "n": 42}], None, scope(declared))
+
+
+async def test_a_write_waits_on_a_thread_not_on_the_event_loop(store):
+    """A store call's transaction runs on a thread of its own: while the
+    database works, the worker's event loop goes on (cancellation, logs,
+    async producers)."""
+
+    import asyncio
+    import time
+
+    out = output(key="id")
+    late = []
+
+    async def tick():
+        start = time.perf_counter()
+        await asyncio.sleep(0.02)
+        late.append(time.perf_counter() - start)
+
+    ticking = asyncio.create_task(tick())
+    await asyncio.sleep(0)  # the tick is asleep before the write starts
+    await store.store(Sql("SELECT 'a'::text AS id, pg_sleep(0.4)::text AS slept"), None, scope(out))
+    await ticking
+    assert late[0] < 0.2, late

@@ -362,3 +362,16 @@ async def test_a_store_reads_its_own_types(store):
         {"id": "a", "amount": 1},
         {"id": "b", "amount": 2},
     ]
+
+
+def test_a_write_with_no_selection_is_paged_natively():
+    """`KeyedWrite.iter_pages`: every key of the write, a page at a time, with
+    its version and group — never every entry at once."""
+
+    out = Output("t", key="id")
+    rows = [{"id": f"k{i}", "n": i} for i in range(5)]
+    write = KeyedWrite(prepare(rows, out), whole=True)
+    pages = list(write.iter_pages(2))
+    assert [len(p) for p in pages] == [2, 2, 1]
+    versions = dict(prepare(rows, out).entries())
+    assert [(k, v, g) for p in pages for k, v, g in p] == [(r["id"], versions[r["id"]], [r]) for r in rows]

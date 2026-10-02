@@ -1291,3 +1291,33 @@ async def test_pages_read_ahead_past_keys_the_patterns_leave_out(state):
     assert calls == [(0, ["k03", "k04"], False), (1, ["k17", "k18"], False), (2, ["k29"], True)]
     detail = await drive(engine, await engine.submit(["none"]))
     assert "none" not in calls and task_statuses(detail)["none"] == "skipped"
+
+
+async def test_an_unchanged_keyed_write_still_applies_its_migrations(state):
+    """§4: schema is not data. A migration added to a keyed output whose rows
+    did not change is applied all the same, and the head's handle says so."""
+    from solera.sdk import Migration
+
+    store = MigratingStore()
+
+    def project_with(migrations):
+        @asset(outputs=Output("files", key="id", store="mig", migrations=migrations))
+        def files():
+            return [{"id": "a", "v": 1}]
+
+        return Project(assets=[files], stores={"mig": store})
+
+    engine = make_engine(state, project_with([]))
+    await engine.initialize()
+    await drive(engine, await engine.submit(["files"]))
+    before = head(state, "files")
+    engine2 = make_engine(state, project_with([Migration("m1", lambda o, p: None)]))
+    await engine2.initialize()
+    detail = await drive(engine2, await engine2.submit(["files"]))
+    assert task_statuses(detail)["files"] == "succeeded"
+    assert store.calls == ["files"]
+    after = head(state, "files")
+    assert after["ref"]["handle"]["schema"] == "m1"
+    assert after["ref"]["version"] == before["ref"]["version"] and after["batch"] == before["batch"]
+    await drive(engine2, await engine2.submit(["files"]))
+    assert store.calls == ["files"]  # applied, and known to be: not asked again

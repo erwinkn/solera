@@ -241,7 +241,7 @@ def leach(
     xrf: pd.DataFrame,
 ):
     """The resource tier lives on the asset; no job indirection."""
-    max_workers = min(ctx.execution.memory // int(6e9), os.cpu_count())
+    max_workers = min(ctx.execution["placement"]["memory"] // int(6e9), os.cpu_count())
     tables = compute_leach(
         max_workers,
         project_team_map=project_team_map,
@@ -269,7 +269,7 @@ def site_health(ctx, change_events: TableRef) -> Sql:
     """In-database: a TableRef in, a statement out; no row enters the harness.
     The store materializes the SELECT into ops.site_health for this site."""
     return Sql(
-        f"SELECT status, count(*) AS n FROM {change_events.table} WHERE {change_events.where} GROUP BY status"
+        f"SELECT status, count(*) AS n FROM {change_events.table} WHERE {change_events.where_sql()} GROUP BY status"
     )
 
 
@@ -278,9 +278,9 @@ def site_health(ctx, change_events: TableRef) -> Sql:
     inputs={"site_health": AllPartitions()},
     automations=AutoRefresh(),
 )
-def fleet_dashboard(ctx, site_health: dict[str, TableRef]) -> pd.DataFrame:
+async def fleet_dashboard(ctx, site_health: dict[str, TableRef]) -> pd.DataFrame:
     """Partitioned upstream, unpartitioned consumer: the site dimension is collapsed."""
-    frames = [ctx.load(ref, pd.DataFrame).assign(site=site) for site, ref in site_health.items()]
+    frames = [(await ctx.load(ref, pd.DataFrame)).assign(site=site) for site, ref in site_health.items()]
     return pd.concat(frames)
 
 
@@ -290,10 +290,10 @@ def fleet_dashboard(ctx, site_health: dict[str, TableRef]) -> pd.DataFrame:
     inputs={"qaqc_samples": AllPartitions()},
     automations=AutoRefresh(),
 )
-def region_rollup(ctx, qaqc_samples: dict[str, TableRef]) -> pd.DataFrame:
+async def region_rollup(ctx, qaqc_samples: dict[str, TableRef]) -> pd.DataFrame:
     """Static partitions over a site-partitioned input."""
     frames = [
-        ctx.load(ref, pd.DataFrame)
+        await ctx.load(ref, pd.DataFrame)
         for site, ref in qaqc_samples.items()
         if site_region(site) == ctx.partition
     ]
