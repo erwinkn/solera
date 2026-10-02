@@ -30,6 +30,7 @@ from ..ids import ulid
 from . import (
     FOOTER_SIZE,
     Job,
+    LimitError,
     Rows,
     SortedRun,
     check_block,
@@ -40,7 +41,7 @@ from . import (
     parse_tail,
 )
 from .io import RANGE, ObjectIO
-from .reads import Cold
+from .reads import Cold, Full
 from .threads import in_thread
 
 # -- engine-held state ---------------------------------------------------------------
@@ -389,6 +390,16 @@ class _Parsed:
         return blocks[run[0]][1], blocks[run[-1]][1] + blocks[run[-1]][2]
 
 
+async def _scan_local(snap, after, limit: int, keep_deleted: bool, ceiling: int):
+    """A page of local copies as a native run, and its cursor; past `ceiling`
+    bytes of keys and versions, `Full` — the page could not be kept."""
+
+    try:
+        return await in_thread(snap.scan, after, limit, drop_deleted=not keep_deleted, max_bytes=ceiling)
+    except LimitError as e:
+        raise Full(str(e)) from e
+
+
 class KeyIndex:
     """I/O over one index. `state` is the pinned `IndexState` to read.
 
@@ -527,9 +538,11 @@ class KeyIndex:
             run = SortedRun.of(keys, [b""] * len(keys))
             return (await self._find(run, exact=True, switch=False)).live()
 
-        async def local(snap):
+        async def local(snap, _ceiling):
             hits = await in_thread(snap.get, keys)
-            return {k: (h[0], h[2]) for k, h in zip(keys, hits, strict=True) if h is not None and not h[1]}
+            return {
+                k: (h[0], h[2]) for k, h in zip(keys, hits, strict=True) if h is not None and not h[1]
+            }, None
 
         return await self._read("lookup", (keys,), self.state.newest_first(), local, store)
 
@@ -557,15 +570,21 @@ class KeyIndex:
             hit = served.answer(self.identity, call, args)
             if hit is not None:
                 return hit
+        recording = served is not None and served.recording
         snap = self._snapshot(levels)
+        if recording and snap is None:
+            raise Cold(call)  # first: a cold index is fetched for the next start
+        if recording:
+            served.admit(call, args)  # `Full` before any reading: the record could not keep it
+        page = None
         if snap is not None:
-            out = await local(snap)
-        elif served is not None and served.recording:
+            out, page = await local(snap, served.decoded_left() if recording else 2**64 - 1)
+        elif recording:
             raise Cold(call)
         else:
             out = await store()
-        if served is not None and served.recording:
-            await in_thread(served.record, self.identity, call, args, out)  # encoded off the loop
+        if recording:  # encoded off the loop, from the native page where there is one
+            await in_thread(served.record, self.identity, call, args, out, page)
         return out
 
     async def _stream(self, run: SortedRun, batch, attempt, generation, collect):
@@ -805,9 +824,10 @@ class KeyIndex:
             keys, versions, _, locators, nxt = await self._scan(levels, after, limit, drop_deleted=True)
             return keys, versions, locators, nxt
 
-        async def local(snap):
-            keys, versions, _, locators, nxt = await in_thread(snap.scan, after, limit, drop_deleted=True)
-            return keys, versions, locators, nxt
+        async def local(snap, ceiling):
+            page, nxt = await _scan_local(snap, after, limit, False, ceiling)
+            keys, versions, _, locators = page.entries()
+            return (keys, versions, locators, nxt), page
 
         return await self._read("page", (after, limit), levels, local, store)
 
@@ -825,8 +845,9 @@ class KeyIndex:
         async def store():
             return await self._scan(levels, after, limit, drop_deleted=False)
 
-        async def local(snap):
-            return await in_thread(snap.scan, after, limit, drop_deleted=False)
+        async def local(snap, ceiling):
+            page, nxt = await _scan_local(snap, after, limit, True, ceiling)
+            return (*page.entries(), nxt), page
 
         args = (first_batch, last_batch, after, limit)
         return await self._read("pending", args, levels, local, store)

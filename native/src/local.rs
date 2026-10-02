@@ -575,41 +575,41 @@ impl Snapshot {
     }
 
     /// Up to `limit` entries of the merged snapshot past `after` —
-    /// deletions dropped with `drop_deleted` — and the cursor to continue
-    /// from: the last one's key, or None when nothing lies past it. Each
-    /// run is read from the block holding `after`.
-    pub fn scan(&self, after: Option<&[u8]>, limit: usize, drop_deleted: bool) -> Result<Scan> {
+    /// deletions dropped with `drop_deleted` — as a sorted run, and the
+    /// cursor to continue from: the last one's key, or None when nothing
+    /// lies past it. Each run is read from the block holding `after`; past
+    /// `max_bytes` of keys and versions, an `Error::Limit`.
+    pub fn scan(
+        &self,
+        after: Option<&[u8]>,
+        limit: usize,
+        drop_deleted: bool,
+        max_bytes: u64,
+    ) -> Result<(SortedRun, Option<Vec<u8>>)> {
         let mut m = self.merge();
         if let Some(a) = after {
             m.feed.seek(self, a);
         }
-        let mut out = Scan::default();
+        let mut page = SortedRun::default();
         while m.advance()? {
             let e = &m.merge;
             if after.is_some_and(|a| e.key() <= a) || (drop_deleted && e.deleted()) {
                 continue;
             }
-            if out.keys.len() == limit {
-                out.next = out.keys.last().cloned();
-                break;
+            if page.len() == limit {
+                let last = page.key(page.len() - 1).to_vec();
+                return Ok((page.shrink(), Some(last)));
             }
-            out.keys.push(e.key().to_vec());
-            out.versions.push(e.version().to_vec());
-            out.deleted.push(e.deleted() as u8);
-            out.locators.push(e.locator());
+            if (page.keys.data.len() + page.versions.data.len() + e.key().len() + e.version().len())
+                as u64
+                > max_bytes
+            {
+                return Err(Error::Limit(format!("a page over {max_bytes} bytes")));
+            }
+            page.push(e.key(), e.version(), e.deleted(), e.locator())?;
         }
-        Ok(out)
+        Ok((page.shrink(), None))
     }
-}
-
-/// A page of a scan: entries, and the cursor past them (None: the end).
-#[derive(Default)]
-pub struct Scan {
-    pub keys: Vec<Vec<u8>>,
-    pub versions: Vec<Vec<u8>>,
-    pub deleted: Vec<u8>,
-    pub locators: Vec<u64>,
-    pub next: Option<Vec<u8>>,
 }
 
 /// Feeds a `Merge` the decoded blocks of a snapshot's runs, one at a time.

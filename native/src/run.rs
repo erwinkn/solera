@@ -65,7 +65,7 @@ impl SortedRun {
     }
 
     /// Gives back what building over-allocated: a run is held as long as it is read.
-    fn shrink(mut self) -> SortedRun {
+    pub(crate) fn shrink(mut self) -> SortedRun {
         self.keys.data.shrink_to_fit();
         self.keys.ends.shrink_to_fit();
         self.versions.data.shrink_to_fit();
@@ -75,7 +75,13 @@ impl SortedRun {
         self
     }
 
-    fn push(&mut self, key: &[u8], version: &[u8], deleted: bool, locator: u64) -> Result<()> {
+    pub(crate) fn push(
+        &mut self,
+        key: &[u8],
+        version: &[u8],
+        deleted: bool,
+        locator: u64,
+    ) -> Result<()> {
         if let Some(last) = self.keys.len().checked_sub(1) {
             if key <= self.keys.get(last) {
                 let what = if key == self.keys.get(last) {

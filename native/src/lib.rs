@@ -500,6 +500,7 @@ fn arrow_batches(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Vec<RecordB
         ArrowArrayStreamReader::try_new(stream)
             .map_err(|e| PyValueError::new_err(e.to_string()))?,
     );
+    arrow::unique_columns(&arrow_array::RecordBatchReader::schema(&reader.0)).map_err(to_py)?;
     py.detach(move || reader.0.collect::<Result<Vec<_>, _>>())
         .map_err(|e| PyValueError::new_err(e.to_string()))
 }
@@ -1902,9 +1903,9 @@ impl Snapshot {
     }
 
     /// Up to `limit` entries of the merged snapshot past `after` — deletions
-    /// dropped with `drop_deleted` — as `KeyIndex`'s scans return them: keys,
-    /// versions, deleted flags, locators, and the cursor (None at the end).
-    #[pyo3(signature = (after, limit, *, drop_deleted))]
+    /// dropped with `drop_deleted` — as a `SortedRun`, and the cursor (None at
+    /// the end); past `max_bytes` of keys and versions, `LimitError`.
+    #[pyo3(signature = (after, limit, *, drop_deleted, max_bytes=u64::MAX))]
     #[allow(clippy::type_complexity)]
     fn scan<'py>(
         &self,
@@ -1912,23 +1913,17 @@ impl Snapshot {
         after: Option<PyBackedBytes>,
         limit: usize,
         drop_deleted: bool,
-    ) -> PyResult<(
-        Bound<'py, PyList>,
-        Bound<'py, PyList>,
-        Bound<'py, PyBytes>,
-        Vec<u64>,
-        Option<Bound<'py, PyBytes>>,
-    )> {
+        max_bytes: u64,
+    ) -> PyResult<(SortedRun, Option<Bound<'py, PyBytes>>)> {
         let inner = &self.inner;
-        let s = py
-            .detach(|| inner.scan(after.as_deref(), limit, drop_deleted))
+        let (page, next) = py
+            .detach(|| inner.scan(after.as_deref(), limit, drop_deleted, max_bytes))
             .map_err(to_py)?;
         Ok((
-            list_of_bytes(py, &s.keys)?,
-            list_of_bytes(py, &s.versions)?,
-            PyBytes::new(py, &s.deleted),
-            s.locators,
-            s.next.map(|n| PyBytes::new(py, &n)),
+            SortedRun {
+                inner: Arc::new(page),
+            },
+            next.map(|n| PyBytes::new(py, &n)),
         ))
     }
 

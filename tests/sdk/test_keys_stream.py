@@ -300,3 +300,25 @@ def test_one_join_whatever_the_content_comes_as():
     patch = _native.Job.patch(run, len(runs), max_file_bytes=4096, **OPTS)
     assert content(drive(patch, runs, ())) == [e for e in expected(live, written) if not e[2]]
     assert patch.removed == 0
+
+
+@pytest.mark.parametrize("twice", ["id", "rev", "other"])
+def test_arrow_columns_named_twice_are_refused(twice):
+    """Review round 5: a column named twice — the key, the revision, one the
+    digest leaves out — is refused where Arrow data comes in, before any
+    column is chosen: else the key reads one and a store keeps the other."""
+
+    names = ["id", "rev", "other", twice]
+    table = pa.Table.from_arrays(
+        [pa.array(["a"]), pa.array(["v"]), pa.array([1]), pa.array(["b"])], names=names
+    )
+    for build in (
+        lambda: _native.Rows.arrow(table, "id", revision="rev"),
+        lambda: _native.Rows.arrow(table, "id", exclude=[twice]),
+        lambda: _native.Rows.arrow(table, "id"),
+    ):
+        with pytest.raises(ValueError, match="appears twice"):
+            build()
+    job = _native.Job.replace(None, 0, key="id", **OPTS)
+    with pytest.raises(ValueError, match="appears twice"):
+        job.feed_rows(table)

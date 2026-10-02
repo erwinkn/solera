@@ -81,6 +81,38 @@ class _Index:
     used: float = 0.0
     admitted: bool = False
     files: set[str] = field(default_factory=set)
+    bytes: int = 0  # of its local files
+
+
+class _Candidates(OrderedDict):
+    """Candidates, oldest first, with their bytes kept as they come and go."""
+
+    def __init__(self):
+        super().__init__()
+        self.bytes = 0
+
+    def __setitem__(self, key, c):
+        old = super().get(key)
+        self.bytes += c.size - (old.size if old is not None else 0)
+        super().__setitem__(key, c)
+
+    def __delitem__(self, key):
+        self.bytes -= super().__getitem__(key).size
+        super().__delitem__(key)
+
+    def pop(self, key, *default):
+        if key in self:
+            self.bytes -= super().__getitem__(key).size
+        return super().pop(key, *default)
+
+    def popitem(self, last=True):
+        key, c = super().popitem(last=last)
+        self.bytes -= c.size
+        return key, c
+
+    def clear(self):
+        super().clear()
+        self.bytes = 0
 
 
 def _logged(state: IndexState) -> list[FileInfo]:
@@ -132,7 +164,8 @@ class EngineCache:
         os.makedirs(root, exist_ok=True)
         self.files: dict[str, _File] = {}
         self.indexes: dict[str, _Index] = {}
-        self.candidates: OrderedDict[tuple, _Candidate] = OrderedDict()
+        self.candidates: _Candidates = _Candidates()  # (path, size, digest) -> _Candidate
+        self._file_bytes = 0  # of every local file
         self.reserved = 0
         self._fills: dict[str, asyncio.Future] = {}
         self._builds = asyncio.Semaphore(builds)
@@ -160,11 +193,9 @@ class EngineCache:
 
     @property
     def used(self) -> int:
-        return (
-            sum(f.size for f in self.files.values())
-            + sum(c.size for c in self.candidates.values())
-            + self.reserved
-        )
+        """Bytes taken: kept as files and candidates come and go, never summed."""
+
+        return self._file_bytes + self.candidates.bytes + self.reserved
 
     def _local(self, path: str) -> str:
         """A local file's name: a fixed-length hash of its object's path, whatever
@@ -177,7 +208,10 @@ class EngineCache:
 
     def _add(self, f: _File) -> None:
         self.files[f.path] = f
-        self.indexes.setdefault(f.prefix, _Index()).files.add(f.path)
+        ix = self.indexes.setdefault(f.prefix, _Index())
+        ix.files.add(f.path)
+        ix.bytes += f.size
+        self._file_bytes += f.size
 
     def _evict(self, need: int, keep: str | None = None) -> bool:
         """Make `need` bytes free: candidates past their budget, then retired
@@ -185,7 +219,7 @@ class EngineCache:
         Never pinned files or an active index's."""
 
         now = self.clock()
-        while self.candidates and sum(c.size for c in self.candidates.values()) > self.candidate_budget:
+        while self.candidates and self.candidates.bytes > self.candidate_budget:
             self.candidates.popitem(last=False)
         if self.used + need <= self.disk:
             return True
@@ -210,9 +244,11 @@ class EngineCache:
         f = self.files.pop(path, None)
         if f is None:
             return
+        self._file_bytes -= f.size
         ix = self.indexes.get(f.prefix)
         if ix is not None:
             ix.files.discard(path)
+            ix.bytes -= f.size
         with contextlib.suppress(OSError):
             os.unlink(f.local)
 
@@ -251,8 +287,12 @@ class EngineCache:
         ix.used = now
         if ix.admitted:
             return True
-        active = self._active(now)
-        others = sum(f.size for f in self.files.values() if f.prefix in active and f.prefix != state.prefix)
+        # The active indexes' bytes, kept per index: one pass over indexes, none over files.
+        others = sum(
+            o.bytes
+            for p, o in self.indexes.items()
+            if o.admitted and now - o.used <= self.window and p != state.prefix
+        )
         if self.need(state) + others + self.candidate_budget <= self.disk:
             ix.admitted = True
         return ix.admitted

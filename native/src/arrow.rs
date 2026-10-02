@@ -397,6 +397,18 @@ pub struct RowDigest {
     at: Chunks,
 }
 
+/// Arrow data's top-level column names, each once: a name twice would let
+/// the key, the revision or a digest read one column while a store keeps
+/// the other. Checked where Arrow data comes in, before any is chosen.
+pub fn unique_columns(schema: &arrow_schema::Schema) -> Result<()> {
+    let mut names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    names.sort_unstable();
+    if let Some(w) = names.windows(2).find(|w| w[0] == w[1]) {
+        return err(format!("column {:?} appears twice", w[0]));
+    }
+    Ok(())
+}
+
 impl RowDigest {
     pub fn new(batches: Vec<RecordBatch>, skip: &[String]) -> Result<RowDigest> {
         let mut columns: Vec<(Vec<u8>, usize)> = match batches.first() {
@@ -410,13 +422,7 @@ impl RowDigest {
                 .collect(),
             None => Vec::new(),
         };
-        columns.sort();
-        if let Some(w) = columns.windows(2).find(|w| w[0].0 == w[1].0) {
-            return err(format!(
-                "column {:?} appears twice",
-                String::from_utf8_lossy(&w[0].0)
-            ));
-        }
+        columns.sort(); // names are unique: `unique_columns` at ingestion
         let at = Chunks::new(batches.iter().map(|b| b.num_rows()));
         Ok(RowDigest {
             batches,

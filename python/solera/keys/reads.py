@@ -54,10 +54,13 @@ def _key(identity: str, call: str, args: tuple) -> str:
 class Reads:
     """A record of index reads: `recording` on the engine, answering on the worker."""
 
-    def __init__(self, *, recording: bool = False, max_entries: int = 0, max_bytes: int = 0):
+    def __init__(
+        self, *, recording: bool = False, max_entries: int = 0, max_bytes: int = 0, max_decoded: int = 0
+    ):
         self.recording = recording
         self.max_entries, self.max_bytes = max_entries, max_bytes
-        self.entries = self.bytes = 0
+        self.max_decoded = max_decoded or 4 * max_bytes  # keys and versions read, before encoding
+        self.entries = self.bytes = self.decoded = 0
         self.calls: dict[str, dict] = {}
 
     def __len__(self) -> int:
@@ -65,14 +68,33 @@ class Reads:
 
     # -- the engine's side -----------------------------------------------------------
 
-    def record(self, identity: str, call: str, args: tuple, result) -> None:
-        """Keep `result`; `Full` once it would pass the bounds — its entries
-        checked before anything is encoded, its bytes after."""
+    def admit(self, call: str, args: tuple) -> None:
+        """`Full` before a call is read when what it may return — its limit, or
+        the keys it looks up — cannot fit what is left of the record."""
+
+        asked = len(args[0]) if call == "lookup" else args[-1]
+        if self.entries + asked > self.max_entries:
+            raise Full(call)
+
+    def decoded_left(self) -> int:
+        """Bytes of keys and versions a read may still decode for this record."""
+
+        return max(0, self.max_decoded - self.decoded)
+
+    def record(self, identity: str, call: str, args: tuple, result, page=None) -> None:
+        """Keep `result` — from the native `page` (a `SortedRun`) when there is
+        one, encoded as it is; `Full` once it would pass the bounds, its
+        entries checked before anything is encoded, its bytes after."""
 
         entries = len(result) if call == "lookup" else len(result[0])
         if self.entries + entries > self.max_entries:
             raise Full(call)
-        if call == "lookup":
+        if page is not None:
+            keys = result[0]
+            run = page.encode()
+            nxt = result[-1]
+            self.decoded += page.nbytes
+        elif call == "lookup":
             keys = sorted(result)
             run = encode_file(
                 keys,

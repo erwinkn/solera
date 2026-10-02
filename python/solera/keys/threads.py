@@ -20,7 +20,7 @@ async def in_thread(fn, /, *args, **kwargs):
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:
-            cancelled = cancelled or not task.done()
+            cancelled = True  # the caller's, even when the work ended in the same turn
         except BaseException:  # the work's own error: taken from the task below
             pass
     if cancelled:

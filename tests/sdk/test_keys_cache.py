@@ -843,19 +843,26 @@ async def test_installs_waiting_are_bounded_in_bytes(io, tmp_path, monkeypatch):
         await service.stop()
 
 
-def test_admission_finds_the_active_indexes_once(tmp_path, monkeypatch):
-    """Round 3: admission computes the active set once, not once per file."""
+def test_admission_finds_the_active_indexes_once(tmp_path):
+    """Rounds 3 and 5: admission counts the active indexes' bytes from their
+    own totals — never a walk of every cached file — and gets them right."""
 
-    cache = EngineCache(str(tmp_path))
-    calls = []
-    real = cache._active
-    monkeypatch.setattr(cache, "_active", lambda now: (calls.append(now), real(now))[1])
+    cache = EngineCache(str(tmp_path), disk=50 * 4096 + 2**30 + 8192, candidates=2**30)
     for i in range(50):
         cache._add(_file_stub(f"keys/out/p{i}/f.kx", f"keys/out/p{i}/"))
         cache.indexes[f"keys/out/p{i}/"].admitted = True
-    calls.clear()
-    cache.admit(IndexState(prefix="keys/out/new/"))
-    assert len(calls) == 1
+        cache.indexes[f"keys/out/p{i}/"].used = cache.clock()
+
+    class Unwalkable(dict):
+        def values(self):
+            raise AssertionError("admission walked the files")
+
+        items = __iter__ = values
+
+    cache.files = Unwalkable(cache.files)
+    assert cache.admit(IndexState(prefix="keys/out/new/"))  # 50 × 4 KiB beside it: fits
+    cache.disk = 50 * 4096 + 2**30 - 1
+    assert not cache.admit(IndexState(prefix="keys/out/newer/"))  # one byte short
 
 
 def _file_stub(path, prefix):
@@ -1050,4 +1057,162 @@ async def test_a_fan_in_whole_read_is_read_ahead_member_by_member(io, tmp_path):
         as_ref = {"refs": {"x": {}, "y": {}}, "load": "ref"}
         assert await service.reads({"inputs": {"members": as_ref}}, 0) is None
     finally:
+        await service.stop()
+
+
+# -- review round 5 ---------------------------------------------------------------------------
+
+
+async def test_a_cancel_as_the_work_ends_is_not_lost(monkeypatch):
+    """Round 5: a caller cancelled in the turn its thread's work completes
+    still sees the cancellation."""
+
+    import time
+
+    from solera.keys import threads
+
+    real = asyncio.to_thread
+    owner: list[asyncio.Task] = []
+
+    async def finishing(fn, *args, **kwargs):
+        out = await real(fn, *args, **kwargs)
+        owner[0].cancel()  # as the work completes, before its caller resumes
+        return out
+
+    monkeypatch.setattr(threads.asyncio, "to_thread", finishing)
+    owner.append(asyncio.ensure_future(threads.in_thread(time.sleep, 0.01)))
+    with pytest.raises(asyncio.CancelledError):
+        await owner[0]
+
+
+async def test_a_closed_streaming_reader_owns_no_fetch(io):
+    """Round 5: closing a run's reader cancels and awaits every fetch it
+    started, the one waiting for room in its queue too."""
+
+    from solera.keys import jobs
+
+    gate = asyncio.Event()
+
+    class Slow(ObjectIO):
+        async def read(self, path, start, end, size):
+            await gate.wait()
+            return await super().read(path, start, end, size)
+
+    state = await built_index(io, commits=1)
+    files = [f for level in state.newest_first() for f in level] * 4  # more segments than the queue holds
+    reader = jobs._Run(Slow(io.store), state.path, files)
+    await asyncio.sleep(0.05)
+    assert reader.queue.full() and len(reader.fetches) > reader.queue.qsize()  # one waits for room
+    await reader.close()
+    assert not reader.fetches and reader.producer.done()
+
+
+async def test_cache_totals_are_kept_not_summed(io, tmp_path):
+    """Round 5: what the cache holds is counted as files and candidates come
+    and go — a small commit does not sum the whole cache — and the counts
+    stay what a full sum gives."""
+
+    state = await built_index(io, commits=3)
+    cache = EngineCache(str(tmp_path))
+    assert await cache.fill(io, state)
+
+    def recount():
+        files = sum(f.size for f in cache.files.values())
+        per_index = {p: sum(cache.files[q].size for q in ix.files) for p, ix in cache.indexes.items()}
+        return files + sum(c.size for c in cache.candidates.values()) + cache.reserved, per_index
+
+    rng = random.Random(3)
+    for i in range(40):
+        op = rng.random()
+        if op < 0.4:
+            cache.offer(f"keys/out/_/cand{i}.kx", rng.randbytes(rng.randrange(1, 5000)))
+        elif op < 0.6 and cache.candidates:
+            cache.candidates.pop(next(iter(cache.candidates)))
+        elif op < 0.8 and cache.files:
+            cache.corrupt(rng.choice(list(cache.files)))
+        else:
+            await cache.fill(io, state)
+        total, per_index = recount()
+        assert cache.used == total
+        assert all(cache.indexes[p].bytes == b for p, b in per_index.items())
+    cache.candidates.clear()
+    assert cache.used == recount()[0]
+
+
+async def test_a_page_the_record_cannot_keep_is_never_read(io, tmp_path, monkeypatch):
+    """Round 5: a call whose page could not fit what is left of the record
+    is refused before anything is scanned or decoded."""
+
+    from solera.keys import index as index_module
+    from solera.keys.reads import Full, Reads
+
+    scanned = []
+    real = index_module._scan_local
+
+    async def spy(*args):
+        scanned.append(args)
+        return await real(*args)
+
+    monkeypatch.setattr(index_module, "_scan_local", spy)
+    state = await built_index(io, commits=1)
+    cache = EngineCache(str(tmp_path))
+    assert await cache.fill(io, state)
+    with cache.held(state) as pin:
+        reads = Reads(recording=True, max_entries=1000, max_bytes=2**24)
+        idx = KeyIndex(ObjectIO(None, local=pin.handles, served=reads), None, state, OPTS)
+        with pytest.raises(Full):
+            await idx.page(None, 1100)
+        assert not scanned
+        small = Reads(recording=True, max_entries=10**6, max_bytes=2**24, max_decoded=100)
+        with pytest.raises(Full):  # the decoded ceiling: stopped in the scan, not after it
+            await KeyIndex(ObjectIO(None, local=pin.handles, served=small), None, state, OPTS).page(None, 500)
+
+
+async def test_start_reads_are_admitted_and_hold_their_room(io, tmp_path, monkeypatch):
+    """Round 5: start reads compute two at a time and queue at most eight;
+    one that timed out keeps its place until its native work ends."""
+
+    import threading
+
+    from solera.keys import index as index_module
+    from solera.keys.threads import in_thread
+    from solera_server import keyservice
+
+    monkeypatch.setattr(keyservice, "READS_TIMEOUT", 0.2)
+    go, lock, running, peak = threading.Event(), threading.Lock(), [0], [0]
+    real = index_module._scan_local
+
+    async def gated(*args):
+        def wait():
+            with lock:
+                running[0] += 1
+                peak[0] = max(peak[0], running[0])
+            go.wait(5)
+            with lock:
+                running[0] -= 1
+
+        await in_thread(wait)
+        return await real(*args)
+
+    monkeypatch.setattr(index_module, "_scan_local", gated)
+    state = await built_index(io, commits=1)
+    service = keyservice.KeyService(io.store, str(tmp_path))
+    service.start()
+    try:
+        assert await asyncio.wrap_future(service._submit(service.cache.fill(service.io, state)))
+        spec = {
+            "inputs": {"x": {"index": state.to_json(), "changes": {"full": True, "after": None, "limit": 50}}}
+        }
+        outs = await asyncio.gather(*(service.reads(spec, 0) for _ in range(16)))
+        assert outs == [None] * 16  # timed out, or turned away
+        assert peak[0] <= keyservice.READS_CONCURRENCY
+        assert 0 < service._reading <= keyservice.READS_QUEUE  # still theirs: the threads run
+        go.set()
+        for _ in range(250):
+            if not service._reading:
+                break
+            await asyncio.sleep(0.02)
+        assert service._reading == 0
+    finally:
+        go.set()
         await service.stop()

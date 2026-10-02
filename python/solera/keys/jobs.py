@@ -23,18 +23,27 @@ UPLOADS = 2  # files uploading at once
 
 
 class _Run:
-    """Segments of one run's files, in key order, fetched `AHEAD` at a time."""
+    """Segments of one run's files, in key order, fetched `AHEAD` at a time.
+    It owns every fetch it starts, queued or waiting for room: `close`
+    cancels them all and waits for them to end."""
 
     def __init__(self, io: ObjectIO, path: Callable[[str], str], files: list):
         self.io, self.path, self.files = io, path, files
         self.queue: asyncio.Queue = asyncio.Queue(AHEAD)
+        self.fetches: set[asyncio.Task] = set()
         self.producer = asyncio.ensure_future(self._produce())
+
+    def _start(self, coro) -> asyncio.Task:
+        task = asyncio.ensure_future(coro)
+        self.fetches.add(task)
+        task.add_done_callback(self.fetches.discard)
+        return task
 
     async def _produce(self):
         try:
             for f in self.files:
                 if f.size <= SEGMENT:
-                    await self.queue.put(asyncio.ensure_future(self._whole(f)))
+                    await self.queue.put(self._start(self._whole(f)))
                     continue
                 part = await self.io.read(self.path(f.name), f.size - f.index, f.size, f.size)
                 idx = _native.parse_index(part, f.size)
@@ -44,7 +53,7 @@ class _Run:
                     j, start = i + 1, blocks[i][1]
                     while j < len(blocks) and blocks[j][1] + blocks[j][2] - start <= SEGMENT:
                         j += 1
-                    await self.queue.put(asyncio.ensure_future(self._fetch(f, blocks[i:j], idx["codec"])))
+                    await self.queue.put(self._start(self._fetch(f, blocks[i:j], idx["codec"])))
                     i = j
             await self.queue.put(None)
         except Exception as e:  # surfaces at the next read
@@ -66,12 +75,11 @@ class _Run:
             raise item
         return None if item is None else await item
 
-    def close(self):
-        self.producer.cancel()
-        while not self.queue.empty():
-            item = self.queue.get_nowait()
-            if isinstance(item, asyncio.Future):
-                item.cancel()
+    async def close(self):
+        tasks = [self.producer, *self.fetches]
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def run(
@@ -125,7 +133,7 @@ async def run(
                     n += 1
         await asyncio.gather(*uploads)
     finally:
-        for r in readers:
-            r.close()
+        await asyncio.gather(*(r.close() for r in readers))
         for t in uploads:
             t.cancel()
+        await asyncio.gather(*uploads, return_exceptions=True)  # none outlives the job
