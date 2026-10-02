@@ -447,14 +447,12 @@ class PostgresStore:
                 )
         else:
             self._ensure(cur, output, scope=scope)
+            relid = self._relid(cur, table)
             cur.execute(write.stmt)
-            _, schema, table_name = self._table(output)
-            exists = cur.execute(
-                "SELECT 1 FROM information_schema.tables WHERE table_schema = %s AND table_name = %s",
-                (schema, table_name),
-            ).fetchone()
-            if not exists:
-                raise WriteError(f"{output.name}: Sql statement must leave {table} in place")
+            if self._relid(cur, table) != relid:  # rolled back: its fence would not follow it
+                raise WriteError(
+                    f"{output.name}: a Sql statement must keep {table} itself; replace it through a Migration"
+                )
         keys = self._sorted_rows(table, output, slice_where) if output.key else None
         return digest([prior.version if prior else "", digest(write.stmt)]), keys
 
@@ -512,10 +510,18 @@ class PostgresStore:
             "at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (output, name))"
         )
 
-    async def migrate(self, output: Output, migrations) -> list[str]:
+    async def migrate(self, output: Output, migrations, scope: Scope | None = None) -> list[str]:
         """Apply pending migrations in declared order; each migration and its
         ledger row commit in one transaction under an advisory lock keyed on
-        the output, so concurrent attempts apply each exactly once (§4)."""
+        the output, so concurrent attempts apply each exactly once (§4).
+
+        A migration changes the whole table, so before it changes anything
+        its transaction takes the attempt's own slice — an older attempt's
+        migration is refused, a newer attempt's acquisition waits for it to
+        commit — and locks every other slice's fence row, in partition
+        order: it runs between writers, never under one
+        (docs/lifecycle.md §9.7). An operator's migration (no scope) only
+        takes its turn."""
 
         with self._connect() as conn, conn.cursor() as cur:
             self._ensure_ledger(cur)
@@ -533,6 +539,13 @@ class PostgresStore:
                 if done:
                     applied.append(migration.name)
                     continue
+                if before is not None:
+                    self._fence_table(cur)
+                    if scope is not None and scope.generation is not None:
+                        self._take(cur, before, scope)
+                    cur.execute(
+                        f"SELECT 1 FROM {FENCE_TABLE} WHERE relid = %s ORDER BY part FOR UPDATE", (before,)
+                    )
                 if isinstance(migration.payload, str):
                     cur.execute(migration.payload)
                 elif callable(migration.payload):

@@ -631,7 +631,7 @@ async def _store_outputs(
                     f"{output.name}: store {store_name!r} has no migrate for declared migrations"
                 )
             try:
-                applied = await writes.call(migrate(output, output.migrations))
+                applied = await writes.call(migrate(output, output.migrations, scope=scope_of(name, plan)))
             except StoreError:
                 raise
             except Exception as error:

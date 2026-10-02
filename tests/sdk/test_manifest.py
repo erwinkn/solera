@@ -432,5 +432,5 @@ class Migrating(FileStore):
     def can_store(self, t, output):
         return t is not str and super().can_store(t, output)
 
-    async def migrate(self, output, migrations):
+    async def migrate(self, output, migrations, scope=None):
         return [m.name for m in migrations]

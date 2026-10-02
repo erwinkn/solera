@@ -433,3 +433,125 @@ async def test_reconciliation_streams_the_slice_and_digests_rows_as_written(stor
     ]
     assert got == [(b"b", new["b"], 0), (b"c", b"", 1)]  # `a` is unchanged
     assert new["b"] == store.key_rows([{"id": "b", "x": 2}], out).entries()[1][0]
+
+
+def in_thread(coroutine) -> tuple:
+    """Run `coroutine` on a thread of its own; returns (thread, done, errors)."""
+
+    import asyncio
+    import threading
+
+    done, errors = threading.Event(), []
+
+    def run():
+        try:
+            asyncio.run(coroutine)
+        except Exception as error:
+            errors.append(error)
+        done.set()
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    return thread, done, errors
+
+
+async def test_a_migration_runs_between_acquisitions_never_under_one(store):
+    """Review P1-1: attempt 5 is inside its migration when attempt 9
+    acquires. The acquisition waits for the migration to commit, so 9's
+    repair reads never precede 5's last change; then 5 is refused."""
+
+    import threading
+
+    from solera.sdk import Migration
+
+    out = output(key="id", revision="v")
+    first = await store.store([{"id": "a", "v": "1"}], None, fenced(out, 5))
+    table, _, _ = store._table(out)
+    inside, go = threading.Event(), threading.Event()
+
+    def backfill(cur):
+        inside.set()
+        assert go.wait(10)
+        cur.execute(f"UPDATE {table} SET v = 'migrated'")
+
+    migrating, migrated, errors = in_thread(
+        store.migrate(out, [Migration("backfill", backfill)], fenced(out, 5))
+    )
+    assert inside.wait(10)
+    acquiring, acquired, _ = in_thread(store.acquire(fenced(out, 9)))
+    assert not acquired.wait(0.5)  # waits behind the migration
+    go.set()
+    assert migrated.wait(10) and acquired.wait(10) and not errors
+    migrating.join()
+    acquiring.join()
+    assert await store.load(first.ref, list[dict], None) == [{"id": "a", "v": "migrated"}]
+    with pytest.raises(StoreError, match="newer attempt"):
+        await store.store([{"id": "a", "v": "late"}], first.ref, fenced(out, 5))
+
+
+async def test_an_older_attempts_migration_is_refused(store):
+    """Once attempt 9 holds the slice, attempt 5's migration changes nothing
+    and records nothing."""
+
+    from solera.sdk import Migration
+
+    out = output(key="id", revision="v")
+    first = await store.store([{"id": "a", "v": "1"}], None, fenced(out, 5))
+    table, _, _ = store._table(out)
+    await store.acquire(fenced(out, 9))
+    with pytest.raises(StoreError, match="newer attempt"):
+        await store.migrate(out, [Migration("stale", f"UPDATE {table} SET v = 'stale'")], fenced(out, 5))
+    assert await store.load(first.ref, list[dict], None) == [{"id": "a", "v": "1"}]
+    assert await store.migrate(
+        out, [Migration("stale", f"UPDATE {table} SET v = 'new'")], fenced(out, 9)
+    ) == ["stale"]
+
+
+async def test_a_migration_waits_for_every_slices_open_writer(store):
+    """A migration changes every partition's rows: it waits for an open
+    write transaction of another partition's slice, not just its own."""
+
+    from solera.sdk import Migration
+
+    out = output(key="id", revision="v", partition_column="site")
+    first = await store.store(
+        [{"id": "a", "v": "1"}], None, scope(out, partition="p1", generation=4, invocation="i")
+    )
+    await store.store([{"id": "b", "v": "1"}], None, scope(out, partition="p2", generation=3, invocation="i"))
+    table, _, _ = store._table(out)
+    conn = store._connect()
+    cur = conn.cursor()
+    store._fence(cur, table, scope(out, partition="p2", generation=3, invocation="i"))  # p2's writer, open
+    p1 = scope(out, partition="p1", generation=4, invocation="i")
+    migrating, migrated, errors = in_thread(
+        store.migrate(out, [Migration("all", f"UPDATE {table} SET v = 'm'")], p1)
+    )
+    assert not migrated.wait(0.5)
+    cur.execute(f"UPDATE {table} SET v = '2' WHERE id = 'b'")
+    conn.commit()
+    assert migrated.wait(10) and not errors
+    migrating.join()
+    conn.close()
+    assert await store.load(first.ref, list[dict], None) == [{"id": "a", "v": "m", "site": "p1"}]
+
+
+async def test_a_sql_write_cannot_replace_its_table(store):
+    """Review P1-2: a `Sql` statement that swaps its relation for a new one
+    (a new OID, no fence row) is rolled back; a stale writer stays refused."""
+
+    name = f"t_{uuid.uuid4().hex[:12]}"
+    out = output(name, key="id", revision="v")
+    first = await store.store([{"id": "a", "v": "1"}], None, fenced(out, 4))
+    table, _, _ = store._table(out)
+    with store._connect() as conn, conn.cursor() as cur:
+        relid = store._relid(cur, table)
+    swap = (
+        f'CREATE TABLE public."{name}_new" AS SELECT * FROM public."{name}"; '
+        f'DROP TABLE public."{name}"; ALTER TABLE public."{name}_new" RENAME TO "{name}"'
+    )
+    with pytest.raises(WriteError, match="through a Migration"):
+        await store.store(Sql(swap), first.ref, fenced(out, 9))
+    with store._connect() as conn, conn.cursor() as cur:
+        assert store._relid(cur, table) == relid
+    with pytest.raises(StoreError, match="newer attempt"):
+        await store.store([{"id": "a", "v": "0"}], first.ref, fenced(out, 3))

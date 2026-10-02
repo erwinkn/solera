@@ -655,11 +655,18 @@ Internal to the store; the engine supplies one number.
   fence row exists from the table's first moment. A second attempt
   arriving meanwhile waits on the lock, finds the table, and acquires as
   usual.
-- **Migrations that replace a relation** (create, copy, drop, rename) give
-  the table a new OID. The migration moves the fence row to the new OID in
-  the same transaction, under the same advisory lock, so the write domain
-  keeps its generation; a migration that runs while an older writer holds
-  the row waits for it, as an acquisition does.
+- **Migrations** change the whole table, so each runs between writers,
+  never under one. Before it changes anything, its transaction takes the
+  attempt's own slice (an older attempt's migration is refused; a newer
+  attempt's acquisition waits for it to commit) and locks every other
+  slice's fence row in partition order, waiting for their open write
+  transactions. One that **replaces the relation** (create, copy, drop,
+  rename) gives the table a new OID; it moves the fence rows to the new OID
+  in the same transaction, so the write domain keeps its generations. An
+  operator's `solera migrate` has no generation: it only takes its turn.
+- **Only a migration may replace the relation.** A `Sql` statement that
+  leaves a new OID behind is rolled back with an error: a fence row would
+  not follow it.
 - **Cost**: one indexed upsert per acquisition and one row lock per write
   transaction; a takeover waits for at most one older transaction.
 

@@ -187,7 +187,7 @@ class MigStore(FileStore):
     def can_store(self, t, output):
         return t is Callable or super().can_store(t, output)
 
-    async def migrate(self, output, migrations):
+    async def migrate(self, output, migrations, scope=None):
         with open(os.environ["MIGRATE_LOG"], "a") as f:
             f.write("migrate\\n")
         for m in migrations:

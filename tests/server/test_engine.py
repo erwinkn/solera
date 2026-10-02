@@ -1023,7 +1023,7 @@ class MigratingStore(FileStore):
 
         return t is Callable or super().can_store(t, output)
 
-    async def migrate(self, output, migrations):
+    async def migrate(self, output, migrations, scope=None):
         self.calls.append(output.name)
         return [m.name for m in migrations]
 
