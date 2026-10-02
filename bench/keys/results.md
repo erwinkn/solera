@@ -883,6 +883,117 @@ and parsed, and the worker's same call is answered from it.
   parallel, and the reply's 2 MB costs about what they do. Its GETs go to
   zero all the same.
 
+## A Railway bucket, measured from Railway (2026-10-02)
+
+Railway Buckets (S3-compatible, served by Tigris at `t3.storageapi.dev`),
+probed and benchmarked from a temporary service in the bucket's region
+(bucket `sjc`, service `us-west2`, 8 vCPU, 24 GB), nothing injected. Both
+were deleted afterwards. Requests are free on Railway (storage
+$0.015/GB-month, API operations and egress free), so a GET count no
+longer costs money: it costs latency only.
+
+**Conditional writes.** `bench/railway/probe.py`: `If-None-Match: *` —
+the second PUT is 412 and the first write stays, on CompleteMultipartUpload
+too; `If-Match` with the current ETag succeeds and a stale one is 412;
+24 clients racing one create: exactly one winner, 20 rounds of 20;
+read-after-write (new and overwrite), list-after-write and
+list-after-delete all consistent; ranges and multipart work; obstore's
+create and update modes behave as against S3. The store conformance kit,
+journal fencing, filestore and the private-store worker test pass against
+the bucket (85 passed; the Postgres cases skipped).
+
+**The network** (`bench/railway/net.py`, through obstore, 200 requests
+each, the second of two runs):
+
+| Request | p50 | p95 | p99 |
+|---|---|---|---|
+| GET 1 KB | 6.2 ms | 12.1 ms | 23.1 ms |
+| GET range of 100 B | 6.5 ms | 16.1 ms | 28.2 ms |
+| HEAD | 5.8 ms | 15.2 ms | 57.1 ms |
+| PUT 1 KB | 12.4 ms | 31.8 ms | 242.7 ms |
+| PUT 1 KB, create-if-absent | 12.3 ms | 22.3 ms | 36.3 ms |
+| LIST, one page | 16.8 ms | 29.0 ms | 47.2 ms |
+
+| Throughput | |
+|---|---|
+| one connection, 64 KiB range reads of a 256 MiB object | p50 18.9 ms each (3 MB/s) |
+| one connection, 1 MiB reads | p50 25.4 ms (41 MB/s) |
+| one connection, 8 MiB reads | p50 57.7 ms (145 MB/s) |
+| one connection, 64 MiB reads | p50 638 ms (105 MB/s) |
+| one GET of 256 MiB | 158 MB/s |
+| one PUT of 64 MiB | 252 MB/s |
+| 8 / 32 parallel 8 MiB reads | 252 / 490 MB/s |
+| 64 parallel 4 MiB / 16 MiB reads | 534 / 1,512 MB/s |
+
+Against the injected assumptions (30 ms a request, 80 MB/s a
+connection): a small request is ~5× faster (6 ms p50; a range of a large
+object ~19 ms), a connection is ~1.3–2× faster (105–158 MB/s), and 64
+parallel reads reach 0.5–1.5 GB/s. The tables below are therefore what the
+key index costs there; the earlier sections' injected numbers are the
+slower bound.
+
+**The key index from Railway** (`bench/railway/bench.sh`: `bench.py` and
+`warm.py --reads --recount`, `--latency 0 --bandwidth 0`). Every path to
+the delta uploaded; in brackets, the engine's resolve alone. ("SSD only"
+needs `sudo` to drop the page cache, which the container has not.)
+
+| Keys | Write, half unchanged | Cold worker | Engine |
+|---|---|---|---|
+| 1,000,000 | 1K keys | 283 ms · 29 GET · 35 MB | 46 ms · 0 GET (13 ms) |
+| 1,000,000 | 10K keys | 765 ms · 29 GET | 253 ms · 0 GET (148 ms) |
+| 1,000,000 | 100K keys | 893 ms · 32 GET | 265 ms · 0 GET (170 ms) |
+| 10,000,000 | 1K keys | 1.1 s · 349 GET · 68 MB | 57 ms · 0 GET (20 ms) |
+| 10,000,000 | 10K keys | 2.3 s · 100 GET | 169 ms · 0 GET (123 ms) |
+| 10,000,000 | 100K keys | 6.4 s · 100 GET | 1.6 s · 0 GET (1.5 s) |
+| 100,000,000 | 1K keys | 1.3 s · 426 GET · 467 MB | 70 ms · 0 GET (33 ms) |
+| 100,000,000 | 10K keys | 3.8 s · 3,387 GET | 257 ms · 0 GET (193 ms) |
+| 100,000,000 | 100K keys | 29.4 s · 520 GET | 1.8 s · 0 GET (1.6 s) |
+
+| Keys | Read | Cold worker | Engine-served |
+|---|---|---|---|
+| 1,000,000 | full delivery, first 10K-key page | 200 ms · 29 GET | 25 ms · 0 GET |
+| 1,000,000 | 100K-key page, mid-index | 160 ms · 29 GET | 89 ms · 0 GET |
+| 1,000,000 | 50K page of a 20-commit window | 111 ms · 20 GET | 56 ms · 0 GET |
+| 10,000,000 | full delivery, first 10K-key page | 360 ms · 31 GET | 21 ms · 0 GET |
+| 10,000,000 | 100K-key page, mid-index | 534 ms · 33 GET | 111 ms · 0 GET |
+| 10,000,000 | 50K page of a 20-commit window | 120 ms · 20 GET | 64 ms · 0 GET |
+| 100,000,000 | full delivery, first 10K-key page | 357 ms · 33 GET | 25 ms · 0 GET |
+| 100,000,000 | 100K-key page, mid-index | 1.0 s · 37 GET | 151 ms · 0 GET |
+| 100,000,000 | 50K page of a 20-commit window | 129 ms · 20 GET | 101 ms · 0 GET |
+
+| Keys | Engine fill | Recount from the store | Recount over local copies |
+|---|---|---|---|
+| 1,000,000 | 491 ms · 29 GET · 35 MB | 391 ms · 32 GET | 123 ms · 0 GET |
+| 10,000,000 | 1.9 s · 48 GET · 352 MB | 1.9 s · 69 GET | 1.5 s · 0 GET |
+| 100,000,000 | 18.2 s · 241 GET · 3.5 GB | 21.8 s · 456 GET | 16.1 s · 0 GET |
+
+`bench.py`, selected rows (the full tables are in the run's logs; their
+shape matches the follow-up's above):
+
+| Operation | 1,000,000 | 10,000,000 | 100,000,000 |
+|---|---|---|---|
+| build (initial index) | 1.6 s | 11.6 s | 136 s, 4.6 GB peak RSS |
+| 1K random keys changed | 206 ms · 2 GET | 206 ms · 5 GET | 977 ms · 34 GET |
+| steady: 1K random keys, half unchanged | 253 ms · 9 GET | 1.0 s · 229 GET | 5.5 s · 308 GET |
+| steady: full-delivery page of 10K keys | 67 ms · 9 GET | 210 ms · 14 GET | 350 ms · 18 GET |
+| steady: commit, 1K changes + delta write | 384 ms · 9 GET · 1 PUT | 348 ms · 12 GET · 1 PUT | 964 ms · 52 GET · 1 PUT |
+| steady: full scan (recount) | 173 ms · 12 GET | 1.8 s · 49 GET | 17.6 s · 436 GET |
+| steady: compaction into the deepest level | — | 2.0 s · 11 GET | 4.8 s · 49 GET |
+
+- **The engine's numbers move little** — they read no requests: a 1K-key
+  write at 100M is 70 ms here, 113–149 ms on the VM, the difference
+  the upload's PUT (12 ms against 30 ms injected) and the machine.
+- **A cold worker is faster here, but not by the requests alone.** At 1M
+  and 10M a 1K-key write is 283 ms and 1.1 s against 494 ms and 1.0 s on
+  the VM; at 100M 1.3 s against 1.4 s: its 426 GETs are parallel, so the
+  6 ms request matters less than the 467 MB they carry and the CPU that
+  decodes them. The 100K-key write at 100M is 29 s either way — CPU.
+- **Requests are free here**, so GET counts cost latency only: the
+  engine's advantage on Railway is time (an order of magnitude on writes
+  and on full-delivery pages) and load on the bucket, not money. A change
+  window's page gains least (101 ms against 129 ms at 100M): its delta
+  files are small and read in parallel.
+
 ## Python rows: the native walk against tuned pure Python (2026-10-02)
 
 Is the native digest of `list[dict]` held back by FFI? The 2.1–3.6 µs a row
