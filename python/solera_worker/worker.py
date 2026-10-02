@@ -1382,10 +1382,10 @@ async def _forked(stage: dict, server: str, project: Project) -> int:
 
 
 def _child(stage: dict, server: str, project: Project) -> None:
-    code = LOST
-    try:
-        code = asyncio.run(
-            run_attempt(
+    async def attempt():
+        code = LOST
+        try:
+            code = await run_attempt(
                 stage["objects"],
                 stage["attempt"],
                 project,
@@ -1394,10 +1394,13 @@ def _child(stage: dict, server: str, project: Project) -> None:
                 pool=True,
                 own_process=True,
             )
-        )
-    except BaseException:
-        traceback.print_exc()
-    _exit(code)
+        except BaseException:
+            traceback.print_exc()
+        # Here, not once asyncio.run returns: it would first wait for the
+        # executor's threads, a call the attempt gave up on among them.
+        _exit(code)
+
+    asyncio.run(attempt())
 
 
 def _exit(code: int) -> None:

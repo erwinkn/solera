@@ -285,14 +285,35 @@ async def test_a_local_attempt_ends_its_process_once_published(state, tmp_path, 
         raise AssertionError("the worker outlived its result")
 
 
-async def test_a_pool_attempt_runs_in_a_child_of_the_warm_worker(state, tmp_path, monkeypatch):
+ABANDONED_CALL = """
+import asyncio, time
+from solera.executors import Pool
+from solera.sdk import Project, asset
+
+@asset(executor=Pool("ingest")())
+async def lingering() -> int:
+    # A blocking call the attempt gave up on, in the event loop's executor.
+    asyncio.get_running_loop().run_in_executor(None, time.sleep, 60)
+    return 1
+
+project = Project(assets=[lingering])
+"""
+
+
+@pytest.mark.parametrize(
+    "source",
+    [LINGERING.format(executor='(executor=Pool("ingest")())'), ABANDONED_CALL],
+    ids=["thread", "executor-call"],
+)
+async def test_a_pool_attempt_runs_in_a_child_of_the_warm_worker(state, tmp_path, monkeypatch, source):
     """D5: the pool worker forks a child per attempt from its imported
-    project; the child ends with its attempt, threads it left included."""
+    project; the child ends with its attempt, threads it left included — a
+    call left in the loop's executor too (review round 3, #3)."""
 
     import subprocess
     import sys
 
-    entrypoint = write_project(tmp_path, LINGERING.format(executor='(executor=Pool("ingest")())'))
+    entrypoint = write_project(tmp_path, source)
     monkeypatch.setenv("SOLERA_PROJECT", entrypoint)
     engine = make_engine(state, entrypoint, heartbeat_seconds=0.2)
     await engine.initialize()
