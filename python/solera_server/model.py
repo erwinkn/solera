@@ -184,7 +184,7 @@ class Model:
         self.pool: dict[str, dict] = {}  # attempt id -> pool work
         # sensor -> the tick dispatched and not yet decided: {tick, cursor, snapshot, pin, ...}
         self.ticks: dict[str, dict] = {}
-        self.readers: dict[object, int] = {}  # the engine's own index readers: their pins
+        self.readers: dict[object, tuple] = {}  # the engine's own readers: (position, domains)
         self._reindex()
 
     def _reindex(self) -> None:
@@ -311,28 +311,51 @@ class Model:
         self.locks[(task["asset"], task["scope"])] = attempt
         self.queue.pop(task_id, None)
 
-    def pin_floor(self, but: str | None = None) -> float:
-        """The oldest reader pin (docs/lifecycle.md §9.8): of the attempts
-        claimed (but attempt `but`), the delta windows delivered over several
-        attempts, the rescope drains reading one snapshot over several
-        attempts (per-key-processing.md §11), and the sensor ticks in flight.
-        What was let go of at or before it is read by no one."""
+    def pins(self, but: str | None = None) -> list[tuple[int, tuple[str, ...] | None]]:
+        """Every reader pin (docs/lifecycle.md §9.8): its event position, and
+        the index prefixes of the output scopes it reads — `None`, all of
+        them. The attempts claimed (but attempt `but`), by what they read and
+        write (`None` while one prepares); the delta windows delivered over
+        several attempts and the rescope drains reading one snapshot over
+        several (per-key-processing.md §11), by their upstream; the sensor
+        ticks in flight, by their sources; the engine's own readers."""
 
-        pins = [c["pin"] for c in self.claims.values() if c["attempt"] != but and "pin" in c]
-        pins += [wm["pin"] for wm in self.watermarks.values() if wm.get("pin") is not None]
-        pins += [wm["rescope"]["pin"] for wm in self.watermarks.values() if wm.get("rescope")]
-        pins += [t["pin"] for t in self.ticks.values()]
-        pins += self.readers.values()
-        return min(pins, default=math.inf)
+        out = [
+            (c["pin"], c.get("domains")) for c in self.claims.values() if c["attempt"] != but and "pin" in c
+        ]
+        for wm in self.watermarks.values():
+            upstream = (self.index(wm["output"], wm.get("up") or "").prefix,) if wm.get("output") else None
+            if wm.get("pin") is not None:
+                out.append((wm["pin"], upstream))
+            if wm.get("rescope"):
+                out.append((wm["rescope"]["pin"], upstream))
+        for tick in self.ticks.values():
+            out.append(
+                (tick["pin"], tuple(self.index(source, "").prefix for source in tick.get("snapshot") or ()))
+            )
+        out += self.readers.values()
+        return out
+
+    def pin_floor(self, but: str | None = None, path: str | None = None, pins=None) -> float:
+        """The oldest pin of a reader that may read `path` (any reader, with
+        none): what was let go of at or before it is read by no one. One slow
+        reader holds back only what it reads."""
+
+        pins = self.pins(but) if pins is None else pins
+        return min(
+            (n for n, domains in pins if domains is None or path is None or path.startswith(tuple(domains))),
+            default=math.inf,
+        )
 
     @contextlib.contextmanager
-    def reading(self):
-        """Pin what the index state holds now for as long as the block reads
-        it — an engine listing, a source commit's resolution: files let go of
-        from here on wait for it. Memory only, like the reads."""
+    def reading(self, *domains: str):
+        """Pin what the index state holds now — of `domains` (index prefixes,
+        `history/`), all of it with none — for as long as the block reads it:
+        an engine listing, a source commit's resolution, a history query.
+        Memory only, like the reads."""
 
         token = object()
-        self.readers[token] = self.applied
+        self.readers[token] = (self.applied, tuple(domains) or None)
         try:
             yield
         finally:
@@ -359,6 +382,7 @@ class Model:
             "status": status,
             "launched": True,
             "reads": delta_reads(launched["prepared"].get("plans") or {}),
+            "domains": tuple(launched["prepared"].get("domains") or ()),
         }
         self.attempts[attempt] = task["id"]
         self.locks[(task["asset"], task["scope"])] = attempt

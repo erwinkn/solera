@@ -816,9 +816,14 @@ code, so workers discard, twice over:
   `AttemptFinished` then removes them.
 
 Deleting a name twice is no harm, and only the index files an
-acknowledged entry names become garbage. Due means no live claim of
-another attempt, no paged-window watermark, no sensor tick and no engine
-reader pin predates the entry. A delta file
+acknowledged entry names become garbage. Due means no reader pin that
+may read the entry's output scope predates it: pins are per output scope,
+each named by its index prefix. An attempt's claim names the scopes it
+reads and writes (every scope, while it is still preparing); a paged
+window or a rescope drain its upstream; a sensor tick its sources; an
+engine reader what it reads (`history/` for a history query). Index and
+history files are collected by the same rule, by their paths, so one slow
+reader holds back only what it reads. A delta file
 a pending entry reads is kept, even once the index let go of it, until the
 entry is done. An entry whose files cannot be read stays pending; after
 three such attempts it is `stuck`: no longer handed out, listed in

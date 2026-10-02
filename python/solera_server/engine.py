@@ -786,6 +786,7 @@ class Engine(Attempts, Sensors, Views):
                 lineage.append([edge.output, ref.get("partition") or "", ref.get("version"), edge.param])
         return {
             "version": asset["version"],
+            "domains": self._domains(inputs, outputs, task),
             "inputs": inputs,
             "lineage": lineage,
             "baseline": baseline,
@@ -806,6 +807,31 @@ class Engine(Attempts, Sensors, Views):
             },
         }
 
+    def _domains(self, inputs: dict, outputs: dict, task: dict) -> list[str]:
+        """What an attempt reads, as reader pins name it: the index prefix of
+        every output scope it reads or writes — a value's or a batch
+        output's too, whose data its scope's garbage names — and of any index
+        its pins name (a failure index). Collection elsewhere waits for no
+        attempt that reads none of it."""
+
+        found = {self.m.index(name, task["scope"]).prefix for name in outputs}
+
+        def walk(value) -> None:
+            if isinstance(value, dict):
+                if isinstance(value.get("prefix"), str):
+                    found.add(value["prefix"])
+                if isinstance(value.get("output"), str) and "version" in value:  # a ref
+                    found.add(self.m.index(value["output"], value.get("partition") or "").prefix)
+                for item in value.values():
+                    walk(item)
+            elif isinstance(value, list):
+                for item in value:
+                    walk(item)
+
+        walk(inputs)
+        walk(outputs)
+        return sorted(found)
+
     @staticmethod
     def _durable(prepared: dict) -> dict:
         """What settling an attempt needs of its preparation, kept on its task
@@ -821,7 +847,17 @@ class Engine(Attempts, Sensors, Views):
             outputs[name] = info
         kept = {
             k: prepared.get(k)
-            for k in ("version", "baseline", "plans", "more", "full", "prior", "lineage", "failures")
+            for k in (
+                "version",
+                "domains",
+                "baseline",
+                "plans",
+                "more",
+                "full",
+                "prior",
+                "lineage",
+                "failures",
+            )
         }
         return {**kept, "outputs": outputs}
 
@@ -1266,7 +1302,7 @@ class Engine(Attempts, Sensors, Views):
         entries = self.m.discards.get((output, scope))
         if not entries:
             return []
-        floor = self.m.pin_floor(but=attempt)
+        floor = self.m.pin_floor(but=attempt, path=self.m.index(output, scope).prefix)
         return [e for e in entries if e["n"] <= floor and not e.get("stuck")][:DISCARDS]
 
     def _fingerprint(self, asset, run, pinned):
@@ -1528,7 +1564,7 @@ class Engine(Attempts, Sensors, Views):
                 [key_bytes(v) for v in new.values()],
                 [key_bytes(k) for k in removes],
             )
-            with self.m.reading():  # the index it resolves against outlives compaction meanwhile
+            with self.m.reading(self.m.index(name, "").prefix):  # outlives compaction meanwhile
                 pinned = self.m.index(name, "").pinned()
                 index = KeyIndex(self._key_io(), None, pinned, self.key_options)
                 files = await self._resolve_source(index, pinned, sorted_run, replace, batch, attempt)
@@ -1624,7 +1660,7 @@ class Engine(Attempts, Sensors, Views):
         if state is None:
             return {"total": 0, "exact": True, "keys": {}, "next": None}
         start = key_bytes(after) if after is not None else None
-        with self.m.reading():  # its files outlive compaction until the page is read
+        with self.m.reading(state.prefix):  # its files outlive compaction until the page is read
             index = KeyIndex(self._key_io(), None, state.pinned(), self.key_options)
             keys, versions, _, nxt = await index.page(start, offset + limit)
         return {

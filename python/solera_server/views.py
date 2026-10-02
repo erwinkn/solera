@@ -172,7 +172,7 @@ class Views:
             if state is None:
                 continue
             cursor = key_bytes(start[1]) if start is not None and scope == start[0] else None
-            with self.m.reading():  # the scope's files outlive compaction until its walk ends (aclose)
+            with self.m.reading(state.prefix):  # its files outlive compaction until the walk ends (aclose)
                 index = KeyIndex(self._key_io(), None, state.pinned(), self.key_options)
                 while True:
                     keys, versions, _, cursor = await index.page(cursor, PAGE)
@@ -340,7 +340,7 @@ class Views:
         state = self.m.indexes.get((output, scope))
         if state is None:
             return None
-        with self.m.reading():
+        with self.m.reading(state.prefix):
             found = await KeyIndex(self._key_io(), None, state.pinned(), self.key_options).lookup(
                 [key_bytes(key)]
             )

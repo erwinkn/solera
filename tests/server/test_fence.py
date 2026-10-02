@@ -659,10 +659,10 @@ async def test_garbage_waits_for_attempts_claimed_before_it_whatever_the_clocks(
     run, attempt = await launched(engine, ["remote"])
     state, engine = await restart(state, engine, url, REMOTE)
     await engine.initialize()
-    path = "history/runs/merged-away.parquet"
-    await state.put_object(path, b"rows")
-    removed = {"table": "runs", "removed": [path], "added": None}
-    state.record({"type": "HistoryCompacted", "changes": [removed], "at": time.time()})
+    path = f"{state.model.index('remote', '').prefix}merged-away.kx"  # a file of what it writes
+    await state.put_object(path, b"entries")
+    state.record({"type": "AutomationChanged", "name": "none", "enabled": True})  # a later position
+    state.model.garbage.append([path, state.model.applied])
     await engine.upkeep.collect()
     assert await state.get_object(path) is not None  # the attempt may still read it
     await finish_as_worker(state, run["id"], attempt, "remote")

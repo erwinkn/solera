@@ -251,10 +251,16 @@ class Upkeep:
 
         if not self.m.garbage:
             return
-        oldest, read = self.m.pin_floor(), self.m.discard_reads()  # pending discards still read them
-        if self.keys is not None:  # and the engine's own fills and fetches of index files
-            oldest = min(oldest, self.keys.floor())
-        due = [path for path, n in self.m.garbage if n <= oldest and path not in read]
+        pins, read = self.m.pins(), self.m.discard_reads()  # pending discards still read them
+        # The engine's own fills and fetches of index files hold back index files only.
+        cache = self.keys.floor() if self.keys is not None else math.inf
+
+        def due_now(path: str, n: int) -> bool:
+            if path in read or (path.startswith("keys/") and n > cache):
+                return False
+            return n <= self.m.pin_floor(path=path, pins=pins)
+
+        due = [path for path, n in self.m.garbage if due_now(path, n)]
         if not due:
             return
         await self.state.durable()  # a replay must never reference them again

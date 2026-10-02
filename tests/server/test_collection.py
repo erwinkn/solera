@@ -388,3 +388,59 @@ async def test_a_run_is_settled_before_its_worker_has_discarded(tmp_path, data, 
     go.set()
     await worker_finished()
     assert objects(data, "scores") == await named(state, "scores")
+
+
+async def test_a_slow_reader_holds_back_only_what_it_reads(tmp_path):
+    """Review round 2, system #6 and engine #8: pins are per output scope.
+    An attempt reading `scores` holds back `scores`' garbage only, not
+    another output's nor the history's; a claim still preparing holds
+    back everything; a history query holds back only history files."""
+
+    project = Project(assets=[scores_project().assets["scores"]])
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = engine_for(state, project)
+    await engine.initialize()
+    m = state.model
+    mine, other = m.index("scores", "").prefix, m.index("elsewhere", "").prefix
+    garbage = [f"{mine}a.kx", f"{other}b.kx", "history/runs/c.parquet"]
+    for path in garbage:
+        await state.create_object(path, b"x")
+    m.applied += 1
+    m.garbage += [[path, m.applied] for path in garbage]
+    m.claims["t"] = {"attempt": "r", "pin": m.applied - 1, "domains": (mine,)}  # an attempt reading scores
+    await engine.upkeep.collect()
+    assert [g[0] for g in m.garbage] == [f"{mine}a.kx"]
+    m.claims["t"]["domains"] = None  # still preparing: it may read anything
+    m.garbage += [[f"{other}d.kx", m.applied]]
+    await state.create_object(f"{other}d.kx", b"x")
+    await engine.upkeep.collect()
+    assert sorted(g[0] for g in m.garbage) == sorted([f"{mine}a.kx", f"{other}d.kx"])
+    del m.claims["t"]
+    with m.reading("history/"):  # a history query: index files are not its
+        await engine.upkeep.collect()
+    assert m.garbage == []
+    await state.close()
+
+
+async def test_a_pool_job_with_no_inputs_pins_only_its_output(tmp_path):
+    """Engine #8: a launched attempt's pin names what it reads and writes;
+    one with no inputs, nothing else of the namespace."""
+
+    from solera.executors import Pool
+
+    @asset(executor=Pool("jobs")(), outputs=Output("made", keyed=True))
+    def lonely():
+        return {"a": 1}
+
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = engine_for(state, Project(assets=[lonely]))
+    await engine.initialize()
+    await engine.submit(["lonely"])
+    for _ in range(100):
+        await engine.tick()
+        if state.model.pool:
+            break
+        await asyncio.sleep(0.02)
+    [claim] = state.model.claims.values()
+    assert claim["domains"] == (state.model.index("made", "").prefix,)
+    await state.close()

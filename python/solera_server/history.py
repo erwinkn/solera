@@ -639,7 +639,7 @@ class History:
             name="History",
             clock=clock,
             volatile=VOLATILE,
-            pin=lambda: state.model.reading(),
+            pin=lambda: state.model.reading("history/"),
             **lake,
         )
         self.clock = self.lake.clock
