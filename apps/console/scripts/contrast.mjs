@@ -69,6 +69,8 @@ for (const [name, ...selectors] of [
   ["blueprint", '[data-theme="blueprint"]'],
   ["ledger", '[data-theme="ledger"]'],
   ["signal", '[data-theme="signal"]'],
+  ["signal-ink", '[data-theme="signal-ink"]'],
+  ["signal-tint", '[data-theme="signal-tint"]'],
   ["night", '[data-theme="night"]'],
   ["arc", '[data-theme="arc"]'],
   ["obsidian", '[data-theme="obsidian"]'],
@@ -77,6 +79,8 @@ for (const [name, ...selectors] of [
   // The navigation's own scope: a black slab in Brutal, a blue one in Signal.
   ["brutal navigation", '[data-theme="brutal"]', '[data-theme="brutal"] [data-chrome]'],
   ["signal navigation", '[data-theme="signal"]', '[data-theme="signal"] [data-chrome]'],
+  ["signal-ink navigation", '[data-theme="signal-ink"]', '[data-theme="signal-ink"] [data-chrome]'],
+  ["signal-tint navigation", '[data-theme="signal-tint"]', '[data-theme="signal-tint"] [data-chrome]'],
 ]) {
   const t = Object.assign({}, theme(":root,"), ...selectors.map(theme));
   const resolve = (v) => (v?.startsWith("var(--") ? t[v.slice(6, -1)] : v);

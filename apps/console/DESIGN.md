@@ -115,9 +115,17 @@ reach, density, how live is drawn, and the signature element.
 |---|---|---|
 | **Blueprint** (light) | the console as a technical drawing | cool white paper with a faint cobalt grid under everything, blue-grey hairlines, cobalt instead of ultramarine; condensed capitals reach table heads and labels; cards numbered like the sections of a spec; a thing running now wears a registration ring, not a glow |
 | **Ledger** (light) | a printed ledger; the blue is the one wet ink | warm cream paper, warm black; the blue held to the primary action, running and focus (active item and links are ink); condensed capitals for page titles only, small tracked capitals for card titles, sans labels and figures; tighter spacing, every other row ruled, a double rule under the masthead; nothing pulses but the running dot |
-| **Signal** (light) | the power rail: the blue becomes the navigation | white paper; the navigation is a solid ultramarine slab with white type (its own token scope), the page beside it is monochrome; figures very tall and narrow; a flat blue halo for live |
+| **Signal** (light) | the power rail: the blue becomes the navigation | white paper; the navigation is a solid blue slab with white type (its own token scope), the page beside it is monochrome; figures very tall and narrow; a flat blue halo for live. Picked, then softened after PostHog (below). Two siblings, **Signal · Ink** and **Signal · Tint**, keep the page and try a darker slab and a pale one with dark type |
 | **Night** (dark) | the same current with the lights off | neutral near-black, paper-white ink, the ultramarine lifted to carry on black and allowed to glow; the rest as Voltage |
-| **Arc** (dark) | the arc in the dark | deep navy paper, blue-white ink, white for the action and one phosphor cyan for live with a real glow; card titles drop to a tracked mono, the Reactor way |
+| **Arc** (dark) | the arc in the dark | deep navy paper, blue-white ink, white for the action and one phosphor cyan for live with a real glow; card titles drop to a tracked mono, the Reactor way. Picked, then softened after PostHog (below) |
+
+Signal and Arc were picked, one for day and one for night, and softened in
+PostHog's spirit without leaving the square voice: 4px on controls and
+chips (`r-sm`, `r-pill`), 6px on panels (`r-md`, `r-lg`), outlines a step
+heavier in place of shadows, a 1px outline and a 2px bottom lip on buttons
+(`shadow-button` as a translucent ink under the button, `press-y` 2px so it
+presses flat), a calmer focus ring, and easing a touch longer. Signal's
+blue moved from pure ultramarine to a cobalt ink, a step less saturated.
 
 Three structural tokens came with them, each defaulting off in `:root`:
 `card-number` (a counter before card titles, with `card-number-color`),
