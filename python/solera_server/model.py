@@ -5,8 +5,8 @@ The model is plain data changed only by `apply(event)`, so replaying the
 journal reproduces it exactly. It has three layers:
 
 - **Durable**: the project, heads, key indexes, cursors, watermarks,
-  per-scope outcomes, automation state, active runs (tasks nested inside,
-  each launched attempt on its task), unsettled outputs, idempotency
+  per-scope outcomes and delivery progress, automation state, active runs
+  (tasks nested inside, each launched attempt on its task), unsettled outputs, idempotency
   receipts, files awaiting deletion, and the run history's files and the
   rows not yet flushed to them (§7). `snapshot()` serializes exactly this,
   and `restore()` loads it.
@@ -123,6 +123,7 @@ class Model:
                 "cursors": _nest(self.cursors, 2),
                 "watermarks": _nest(self.watermarks, 3),
                 "outcomes": _nest(self.outcomes, 2),
+                "progress": _nest(self.progress, 2),
                 "unsettled": _nest(self.unsettled, 2),
                 "discards": _nest(self.discards, 2),
                 "failures": _nest(self.failures, 2),
@@ -156,6 +157,9 @@ class Model:
         self.cursors: dict[tuple, object] = _flatten(snap.get("cursors"), 2)
         self.watermarks: dict[tuple, dict] = _flatten(snap.get("watermarks"), 3)
         self.outcomes: dict[tuple, dict] = _flatten(snap.get("outcomes"), 2)
+        # (asset, scope) -> {"drained": bool}: whether its last commit finished the
+        # delivery it was on — the scope's completeness, whatever its outputs wrote
+        self.progress: dict[tuple, dict] = _flatten(snap.get("progress"), 2)
         # (output, scope) -> intents of attempts that died while writing it (§8)
         self.unsettled: dict[tuple, list] = _flatten(snap.get("unsettled"), 2)
         # (output, scope) -> data garbage of an immutable store, each entry at the
@@ -435,7 +439,6 @@ class Model:
                     "run": None,
                     "attempt": None,
                     "at": e["at"],
-                    "complete": True,
                     "asset": None,
                     "version": None,
                     "n": self.applied,
@@ -476,6 +479,7 @@ class Model:
         move(self.indexes, output_map, 0)
         move(self.cursors, asset_map, 0)
         move(self.outcomes, asset_map, 0)
+        move(self.progress, asset_map, 0)
         move(self.watermarks, asset_map, 0)
         # An Each asset's failure record and its index (`@asset`), whose files stay
         # under their prefix; retry-pass state and forced positions go with them.
@@ -759,6 +763,8 @@ class Model:
                 index = self.index(name, scope)
                 for intent in self.unsettled.pop((name, scope), ()):
                     self.garbage.extend([index.path(f["name"]), self.applied] for f in intent["files"])
+        if "drained" in commit:
+            self.progress[(asset, scope)] = {"drained": bool(commit["drained"])}
         if "cursor" in commit:
             if commit["cursor"] is None:
                 self.cursors.pop((asset, scope), None)
@@ -785,6 +791,7 @@ class Model:
                     keys=(commit.get("keys") or {}).get(name),
                     rows=(commit.get("rows") or {}).get(name),
                     metadata=(commit.get("metadata") or {}).get(name),
+                    complete=commit.get("drained", True),
                 ),
             )
             for row in history.lineage(name, scope, head, reads):

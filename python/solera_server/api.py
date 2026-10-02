@@ -297,6 +297,7 @@ def create_app(
         if name not in runtime.manifest["outputs"]:
             raise KeyError(name)
         out = []
+        planner = runtime.planner()
         for scope, head in runtime.m.heads_of(name):
             owner = head.get("asset")
             cursor = owner is not None and runtime.m.cursors.get((owner, scope)) is not None
@@ -307,7 +308,7 @@ def create_app(
                     "version": head.get("version"),
                     "key_count": head.get("count"),
                     "batch": head.get("batch"),
-                    "complete": head["complete"],
+                    "complete": planner.head_complete(name, scope, head),
                     "cursor": cursor,
                     "at": head["at"],
                     "commit": runtime.head_view(head)["commit"],

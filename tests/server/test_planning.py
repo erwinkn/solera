@@ -159,7 +159,7 @@ def test_the_planner_takes_its_view_as_arguments():
         return Planner(manifest, lambda o, s: heads.get((o, s)), lambda o: [], now, projected)
 
     assert planner().plan_run(["daily"], skip_missing_inputs=True) is None  # `raw` was never written
-    projected = {("raw", ""): {"complete": True, "ref": {"version": "v1"}}}
+    projected = {("raw", ""): {"ref": {"version": "v1"}}}
     run = planner(projected).plan_run(["daily"], skip_missing_inputs=True, sensor="watch")
     assert [t["scope"] for t in run["tasks"].values()] == ["2026-10-01"]  # `latest` at `now`
     assert run["sensor"] == "watch" and run["created_at"] == now
@@ -186,7 +186,7 @@ def test_an_empty_fan_in_is_missing():
         return []
 
     manifest = Project(assets=[readings, report, rollup]).manifest
-    heads: dict = {}
+    heads, progress = {}, {}
     now = dt.datetime(2026, 10, 2, tzinfo=UTC).timestamp()
 
     def planned(target, **kw):
@@ -195,6 +195,7 @@ def test_an_empty_fan_in_is_missing():
             lambda o, s: heads.get((o, s)),
             lambda o: [(s, h) for (out, s), h in heads.items() if out == o],
             now,
+            progress=lambda a, s: progress.get((a, s)),
         )
         run = planner.plan_run([target], partitions="all", **kw)
         return (
@@ -205,10 +206,11 @@ def test_an_empty_fan_in_is_missing():
         assert planned(target, skip_missing_inputs=True) is None
         assert planned(target) == ["d1", "d2"]  # unchanged without the flag
         assert planned(target, skip_missing_inputs=True, upstream=True) == ["d1", "d2"]  # the run builds them
-    heads[("readings", "day=d1,site=west")] = {"complete": False}
+    heads[("readings", "day=d1,site=west")] = {"asset": "readings"}
+    progress[("readings", "day=d1,site=west")] = {"drained": False}  # a delivery under way
     assert planned("report", skip_missing_inputs=True) == ["d1"]  # one head of its day is enough
     assert planned("rollup", skip_missing_inputs=True) is None  # AllPartitions reads complete heads
-    heads[("readings", "day=d1,site=west")] = {"complete": True}
+    progress[("readings", "day=d1,site=west")] = {"drained": True}
     assert planned("rollup", skip_missing_inputs=True) == ["d1"]
 
 

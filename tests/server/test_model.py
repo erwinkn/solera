@@ -110,7 +110,7 @@ async def test_commit_installs_heads_cursor_watermarks_and_pends_onchange(state,
     assert detail["request"]["status"] == "succeeded"
     m = state.model
     assert m.heads[("files", "")]["run"] == detail["request"]["id"]
-    assert m.heads[("consumer", "")]["complete"] is True
+    assert m.progress[("consumer", "")] == {"drained": True}
     assert m.watermarks[("consumer", "files", "")]["batch"] == 1
     # files changed and consumer watches it: the change pended, and the next tick
     # (run_until ticks) fired the OnChange automation and consumed it — without a

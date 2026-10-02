@@ -389,6 +389,50 @@ async def test_stats(state, clock):
     assert (await engine.history.stats(asset="orders", scope="2026-01-01"))["assets"] == []
 
 
+async def test_a_retry_asks_for_the_work_it_selects(state, clock):
+    """Review round 3 (system B4): a retry's request is built from the tasks
+    it reruns — a key override for an edge none of them reads is left out,
+    and each asset's scopes are kept as a map, live and in the history."""
+    from solera.sdk import Incremental, StaticPartitions
+
+    @asset(outputs=Output("log", key="id"))
+    def log():
+        return [{"id": "a"}]
+
+    @asset(inputs={"log": Incremental()})
+    def digest(log: list):
+        return [{"n": len(log)}]
+
+    @asset(partitions=StaticPartitions(["east", "west"]), inputs={"digest": In()}, retries=Retry(n=0))
+    def site(ctx, digest: list):
+        if ctx.partition == "west" and ctx.config.get("fail"):
+            raise RuntimeError("west is down")
+        return [{"site": ctx.partition}]
+
+    project = Project(assets=[log, digest, site])
+    engine = Engine(
+        state,
+        project.manifest,
+        placements={"Local": lambda s, c: InlinePlacement(c, project)},
+        clock=clock,
+        eval_interval=0.01,
+    )
+    await engine.initialize()
+    failed = await run(
+        engine, clock, ["site"], partitions="all", upstream=True, config={"fail": True}, keys={"log": "full"}
+    )
+    assert failed["status"] == "failed"
+    retried = await engine.retry(failed["id"], by="ops")
+    request = state.model.runs[retried["id"]]
+    assert request["keys"] is None  # `digest` succeeded: no retried task reads `log`
+    assert request["partitions"] == {"site": ["west"]}
+    clock.now += 60
+    await engine.run_until(retried["id"], 60)
+    assert (await engine.run_detail(retried["id"]))["request"]["partitions"] == {"site": ["west"]}
+    [row] = (await engine.list_runs(RunFilter(), limit=1))["runs"]
+    assert row["id"] == retried["id"] and row["partitions"] == {"site": ["west"]}
+
+
 async def test_a_retry_is_a_new_run_and_the_old_one_stays_as_it_ended(state, clock):
     """D1: retrying a finished run submits its failed, canceled and blocked
     work as a new run with `retry_of`; the old run, archived or not, reads

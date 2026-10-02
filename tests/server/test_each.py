@@ -614,3 +614,29 @@ async def test_none_is_no_change_and_removal_is_explicit(state):  # noqa: F811
     got = await rows_of(engine, project, "samples")
     assert {k: v[0]["v"] for k, v in got.items()} == {"a": 1, "c": 1}  # a unchanged, b removed, c kept
     assert (await records(engine, "parse"))["c"].outcome == FAILED
+
+
+async def test_a_last_page_that_writes_nothing_still_completes_the_scope(state):  # noqa: F811
+    """Review round 3 (system B1): one key a page, `a` writes rows, `b`
+    fails — so the last page writes no output. The delivery drained all the
+    same: the scope is complete, kept out of `missing`, and its head is
+    unchanged — the version and provenance `a`'s page installed."""
+
+    def parse(ctx, file: dict):
+        if ctx.key == "b.csv":
+            raise ValueError("unparseable")
+        return [{"value": 1}]
+
+    project = files_project({"a.csv": {"text": "1"}, "b.csv": {"text": "2"}}, parse, page_size=1)
+    engine = make_engine(state, project)
+    await engine.initialize()
+    detail = await drive(engine, await engine.submit(["parse"], upstream=True))
+    assert status_of(detail) == "succeeded"
+    written = engine.m.heads[("samples", "")]
+    task = next(t for t in detail["tasks"] if t["asset"] == "parse")
+    assert written["attempt"] == detail["attempts"][task["id"]][0]["id"]  # a's page wrote it
+    assert engine.m.progress[("parse", "")] == {"drained": True}
+    planner = engine.planner()
+    assert planner.complete("parse", "") and planner.scopes("parse", "missing") == []
+    assert engine.head_view(written)["complete"] is True
+    assert (await records(engine, "parse"))["b.csv"].outcome == FAILED

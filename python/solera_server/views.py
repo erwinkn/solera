@@ -61,7 +61,7 @@ class Views:
             for scope in sorted(scopes):
                 head, record = scoped.get(scope), recorded.get(scope)
                 last = (record or {}).get("outcome")
-                done = head["complete"] if head else not outputs and last in ("succeeded", "skipped")
+                done = planner.complete(asset, scope)
                 status = (
                     "retired"
                     if not current(scope)

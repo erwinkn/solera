@@ -132,7 +132,7 @@ async def test_bare_return_and_commit(state):
     assert status_of(detail) == "succeeded"
     installed = head(state, "numbers")
     assert installed["ref"]["output"] == "numbers" and installed["ref"]["version"]
-    assert installed["complete"] is True
+    assert state.model.progress[("numbers", "")] == {"drained": True}
     assert installed["run"] == run["id"] and installed["attempt"]
 
 
@@ -367,7 +367,7 @@ async def test_incremental_batching_and_more(state):
     detail = await drive(engine, await engine.submit(["consumer"], upstream=True))
     assert status_of(detail) == "succeeded"
     assert batches == [["k0", "k1"], ["k2", "k3"], ["k4"]]
-    assert head(state, "consumer")["complete"] is True
+    assert state.model.progress[("consumer", "")] == {"drained": True}
     task = [t for t in detail["tasks"] if t["asset"] == "consumer"][0]
     assert len(detail["attempts"][task["id"]]) == 3  # three batches, three attempts
 
@@ -1186,8 +1186,10 @@ async def test_ondeploy_two_registrations_fire_latest_once(state):
 
 async def test_a_delivery_says_where_each_page_sits(state):
     """A delivery spans pages of `page_size`: `page` is the page's index,
-    `pages` the plan, `first` is page 0, `final` the delivery running out —
-    for full deliveries, delta windows and batch-mode upstreams (§5)."""
+    `pages` the plan, `first` is page 0, `final` the delivery running out,
+    and `full` holds on every page of a full delivery — for keyed full
+    deliveries, delta windows and batch-mode upstreams (§5; review round 3,
+    system B5)."""
 
     from solera.stores import Patch
 
@@ -1201,7 +1203,7 @@ async def test_a_delivery_says_where_each_page_sits(state):
     @asset(inputs={"files": Incremental(page_size=3)})
     def consumer(ctx, files: list):
         ch = ctx.changes["files"]
-        pages.append((ch.page, ch.pages, ch.first, ch.final))
+        pages.append((ch.page, ch.pages, ch.first, ch.final, ch.full))
         if ch.full and ch.first:
             rebuilt["keys"] = []
         rebuilt["keys"] += [r["id"] for r in files]
@@ -1216,25 +1218,33 @@ async def test_a_delivery_says_where_each_page_sits(state):
     @asset(inputs={"log": Incremental(page_size=1)})
     def tail(ctx, log: list):
         ch = ctx.changes["log"]
-        batch_pages.append((ch.page, ch.pages, ch.first, ch.final, list(ch.upstream.batches)))
+        batch_pages.append((ch.page, ch.pages, ch.first, ch.final, list(ch.upstream.batches), ch.full))
         return [{"n": len(log)}]
 
     project = Project(assets=[files, consumer, log, tail])
     engine = make_engine(state, project)
     await engine.initialize()
     await drive(engine, await engine.submit(["consumer"], upstream=True))
-    assert pages == [(0, 3, True, False), (1, 3, False, False), (2, 3, False, True)]
+    assert pages == [(0, 3, True, False, True), (1, 3, False, False, True), (2, 3, False, True, True)]
     assert sorted(rebuilt["keys"]) == [f"k{i}" for i in range(7)]
     # A delta window of four changed keys: two pages.
     pages.clear()
     for key in ("k0", "k2", "k4", "k6"):
         content[key] = 2
     await drive(engine, await engine.submit(["consumer"], upstream=True))
-    assert pages == [(0, 2, True, False), (1, 2, False, True)]
+    assert pages == [(0, 2, True, False, False), (1, 2, False, True, False)]
     for _ in range(3):
         await drive(engine, await engine.submit(["log"]))
     await drive(engine, await engine.submit(["tail"]))
-    assert batch_pages == [(0, 3, True, False, [0]), (1, 3, False, False, [1]), (2, 3, False, True, [2])]
+    assert batch_pages == [
+        (0, 3, True, False, [0], True),
+        (1, 3, False, False, [1], True),
+        (2, 3, False, True, [2], True),
+    ]
+    batch_pages.clear()
+    await drive(engine, await engine.submit(["log"]))
+    await drive(engine, await engine.submit(["tail"]))
+    assert batch_pages == [(0, 1, True, True, [3], False)]  # then a delta
 
 
 async def test_the_page_plan_is_an_estimate_but_final_is_not(state):

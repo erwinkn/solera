@@ -223,9 +223,10 @@ class Edge:
 class Planner:
     """Planning over one view: `manifest`; `head(output, scope)` and
     `heads_of(output)` — the committed heads, with `projected` heads (what a
-    sensor's commits will install) over them; and `now` (epoch seconds). The
-    view is read as of each call; what a call derives from it (heads by
-    output, set members) is kept for the planner's life — one operation's."""
+    sensor's commits will install) over them; `progress(asset, scope)`, a
+    scope's delivery progress; and `now` (epoch seconds). The view is read as
+    of each call; what a call derives from it (heads by output, set members)
+    is kept for the planner's life — one operation's."""
 
     def __init__(
         self,
@@ -234,10 +235,11 @@ class Planner:
         heads_of: Callable[[str], Iterable[tuple[str, dict]]],
         now: float,
         projected: Mapping[tuple[str, str], dict] | None = None,
+        progress: Callable[[str, str], dict | None] = lambda asset, scope: None,
     ):
         self.manifest, self.now = manifest, now
         self.projected = dict(projected or {})
-        self._head, self._heads_of = head, heads_of
+        self._head, self._heads_of, self._progress = head, heads_of, progress
         self.time = dt.datetime.fromtimestamp(now, dt.UTC)
         self._groups: dict[tuple, dict] = {}
 
@@ -253,6 +255,30 @@ class Planner:
         heads = dict(self._heads_of(output))
         heads.update({scope: h for (o, scope), h in self.projected.items() if o == output})
         return heads
+
+    def drained(self, asset: str, scope: str, heads: Iterable[dict]) -> bool:
+        """Whether the scope's last commit finished its delivery — its outputs'
+        `heads` say so of a scope committed before progress was kept."""
+
+        record = self._progress(asset, scope)
+        return record["drained"] if record is not None else all(h.get("complete", True) for h in heads)
+
+    def complete(self, asset: str, scope: str) -> bool:
+        """Whether a scope is complete (§7): each of its outputs has a head,
+        and its delivery drained — however many of them its last pages wrote.
+        A job, which has no output, once a run of it succeeded. The one answer
+        for selection, fan-in and the views."""
+
+        heads = [self.head(o["name"], scope) for o in self.manifest["assets"][asset]["outputs"]]
+        if any(h is None for h in heads):
+            return False
+        return (bool(heads) or self._progress(asset, scope) is not None) and self.drained(asset, scope, heads)
+
+    def head_complete(self, output: str, scope: str, head: dict) -> bool:
+        """Whether a head is of a complete delivery: a source's always is."""
+
+        owner = self.owner(output)
+        return owner is None or self.drained(owner, scope, [head])
 
     def elements(self, output: str) -> list[str] | None:
         """A set dimension's current keys: the element list its head carries (§7)."""
@@ -369,7 +395,7 @@ class Planner:
                     groups.setdefault(tuple(parts[n] for n in names), {})[up_scope] = head
             self._groups[(edge.output, names)] = groups
         heads = groups.get(tuple(edge.pinned[n] for n in names)) or {}
-        return {s: h for s, h in heads.items() if h["complete"] or not complete}
+        return {s: h for s, h in heads.items() if not complete or self.head_complete(edge.output, s, h)}
 
     def spread(self, edge: Edge) -> list[str]:
         """Every upstream scope an edge could read: for a fan-in, the domain
@@ -407,14 +433,13 @@ class Planner:
         return all(parts.get(name) == value for name, value in edge.pinned.items())
 
     def scopes(self, asset: str, selection) -> list[str]:
-        outputs = self.manifest["assets"][asset]["outputs"]
-
-        def missing(scope: str) -> bool:
-            heads = [self.head(o["name"], scope) for o in outputs]
-            return not heads or any(h is None or not h["complete"] for h in heads)
-
         return select_scopes(
-            self.dims(asset), selection, now=self.time, elements=self.elements, missing=missing, what=asset
+            self.dims(asset),
+            selection,
+            now=self.time,
+            elements=self.elements,
+            missing=lambda scope: not self.complete(asset, scope),
+            what=asset,
         )
 
     def asset_of(self, name: str) -> str:

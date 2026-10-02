@@ -360,7 +360,12 @@ class Engine(Attempts, Sensors, Views):
         clock."""
 
         return planning.Planner(
-            self.manifest, lambda o, s: self.m.heads.get((o, s)), self.m.heads_of, self.clock(), projected
+            self.manifest,
+            lambda o, s: self.m.heads.get((o, s)),
+            self.m.heads_of,
+            self.clock(),
+            projected,
+            lambda a, s: self.m.progress.get((a, s)),
         )
 
     def _plan_run(
@@ -744,12 +749,8 @@ class Engine(Attempts, Sensors, Views):
         more = any(p.get("more") for p in plans.values() if p)
         skip = bool(incremental) and all_empty and not more and not full
         # An Each asset whose keys all failed so far has no head yet: nothing to wait for.
-        if skip and each_page is None:
-            for output in asset["outputs"]:
-                head = baseline[output["name"]]
-                if head is None or not head["complete"]:
-                    skip = False
-                    break
+        if skip and each_page is None and not planner.complete(task["asset"], scope):
+            skip = False
         prior = {name: head["ref"] for name, head in baseline.items() if head is not None}
         cursor = self.m.cursors.get((task["asset"], scope))
         if full and each_page is None:
@@ -918,21 +919,21 @@ class Engine(Attempts, Sensors, Views):
             reset = reset or int(wm["batch"]) < first
             lo = first if reset else int(wm["batch"])
             hi = min(head_batch, lo + limit - 1)
-            # Where this page sits in its delivery: planned when the delivery starts,
-            # kept on the watermark while it continues (§5).
+            # Where this page sits in its delivery, and whether the delivery is a full
+            # one: decided when it starts, kept on the watermark until its last page (§5).
             if not reset and (wm or {}).get("page") is not None:
-                page, pages = int(wm["page"]), int(wm["pages"])
+                page, pages, whole = int(wm["page"]), int(wm["pages"]), bool(wm.get("full"))
             else:
-                page, pages = 0, _pages(head_batch - lo + 1, limit)
+                page, pages, whole = 0, _pages(head_batch - lo + 1, limit), reset
             more = hi < head_batch
             changes = {
                 "batches": [lo, hi],
-                "full": reset,
+                "full": whole,
                 "more": more,
                 "page": page,
                 "pages": pages,
             }
-            update = {**base, "batch": max(lo, hi + 1), "after": None, "full": False}
+            update = {**base, "batch": max(lo, hi + 1), "after": None, "full": whole and more}
             if more:
                 update.update(page=page + 1, pages=pages)
             return {"ref": ref, "changes": changes}, {"update": update, "more": more}, hi < lo
@@ -1373,7 +1374,7 @@ class Engine(Attempts, Sensors, Views):
                 ref = entry.get("ref")
                 if ref is None or ref["partition"] != task["scope"]:
                     raise Conflict(f"output {name}: ref scope != {task['scope']!r}", retryable=False)
-            head = {"ref": ref, "complete": not more, "asset": task["asset"], "version": prepared["version"]}
+            head = {"ref": ref, "asset": task["asset"], "version": prepared["version"]}
             if decl.get("key") is not None:
                 delta = entry.get("keys")
                 if delta is None and not entry.get("unchanged"):
@@ -1398,7 +1399,9 @@ class Engine(Attempts, Sensors, Views):
             # nor does a page whose keys the edge's patterns all left out.
             if prepared["baseline"].get(name) is None and failures is None and not result.get("skipped"):
                 raise Conflict(f"omitted output {name} has no head to keep (§2)", retryable=False)
-        commit = {"heads": heads, "watermarks": watermarks}
+        # Whether the delivery is done is the scope's, not its outputs': a last page
+        # may write none of them (§7).
+        commit = {"heads": heads, "watermarks": watermarks, "drained": not more}
         if failures is not None:
             commit["failures"] = failures
             if result.get("key_outcomes"):
@@ -1497,7 +1500,6 @@ class Engine(Attempts, Sensors, Views):
             "ref": ref,
             "run": run_id,
             "attempt": None,
-            "complete": True,
             "asset": None,
             "version": None,
         }
@@ -1894,12 +1896,21 @@ class Engine(Attempts, Sensors, Views):
                 scopes.setdefault(task["asset"], []).append(task["scope"])
         if not scopes:
             raise Conflict(f"run {run_id} has nothing to retry", retryable=False)
+        # The request is the selected work's: key overrides only for the edges it reads.
+        read = {
+            e["output"]
+            for asset in scopes
+            if asset in self.manifest["assets"]
+            for e in self.manifest["assets"][asset]["inputs"].values()
+            if e["kind"] == "incremental"
+        }
+        keys = {output: k for output, k in (run.get("keys") or {}).items() if output in read}
         return await self.submit(
             sorted(scopes),
             partitions=scopes,
             mode=run.get("mode") or "incremental",
             config=run.get("config"),
-            keys=run.get("keys"),
+            keys=keys or None,
             by=by,
             tags=run.get("tags"),
             retry_of=run_id,
@@ -2041,8 +2052,15 @@ class Engine(Attempts, Sensors, Views):
         }
 
     def head_view(self, head: dict) -> dict:
+        """A head as the API shows it: with its commit, and whether it is of a
+        complete delivery — its scope's progress says (§7)."""
+
         view = dict(head)
         view["commit"] = f"{head['run']}/{head['attempt']}" if head.get("attempt") else None
+        owner = head.get("asset")
+        view["complete"] = owner is None or self.planner().drained(
+            owner, head["ref"].get("partition") or "", [head]
+        )
         return view
 
     def outcome_view(self, record: dict) -> dict:

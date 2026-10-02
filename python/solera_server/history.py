@@ -460,10 +460,13 @@ def commit_row(run: dict, at: float) -> dict:
     }
 
 
-def materialization(output, asset, scope, head, *, keys=None, rows=None, metadata=None, listed=None) -> dict:
+def materialization(
+    output, asset, scope, head, *, keys=None, rows=None, metadata=None, listed=None, complete=True
+) -> dict:
     """The row of an output version a commit installed: `head` is the head
     as installed, `keys` the commit's key delta for the output, `listed` a
-    source commit's record, which lists the keys it changed."""
+    source commit's record, which lists the keys it changed; `complete`
+    whether the commit drained its scope's delivery."""
 
     listed = listed or {}
 
@@ -484,7 +487,7 @@ def materialization(output, asset, scope, head, *, keys=None, rows=None, metadat
         "added_keys": listed.get("upserted") if isinstance(listed.get("upserted"), list) else None,
         "removed_keys": listed.get("deleted") if isinstance(listed.get("deleted"), list) else None,
         "rows": count if count is not None else rows,
-        "complete": bool(head.get("complete", True)),
+        "complete": bool(complete),
         "metadata": metadata or None,
     }
 
