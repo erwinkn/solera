@@ -206,7 +206,9 @@ class Lake:
         `flush_rows` of them or the oldest has waited `flush_seconds`."""
 
         lake = self.held()
-        pending = {t: rows for t, rows in lake.rows.items() if rows}
+        pending = {
+            t: list(rows) for t, rows in lake.rows.items() if rows
+        }  # this batch: rows may come meanwhile
         volatile = {t: list(rows) for t, rows in self.volatile.items() if rows}
         count = sum(len(rows) for rows in pending.values()) + sum(len(rows) for rows in volatile.values())
         if not count:

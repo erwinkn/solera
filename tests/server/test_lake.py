@@ -123,3 +123,31 @@ async def test_a_flush_during_the_download_neither_hides_nor_repeats_a_row(tmp_p
     go.set()
     assert await pending == [("a", 1), ("b", 2)]
     assert await lake.query(rows, ("events",)) == [("a", 1), ("b", 2)]
+
+
+async def test_rows_arriving_during_an_upload_do_not_void_it(tmp_path):
+    """Review round 2, system #1: `b` is buffered while `a`'s file uploads.
+    The file is installed, and `b` waits for the next flush; a row
+    forgotten during the upload still voids it."""
+
+    store = Store(tmp_path)
+    lake = Lake(store, SCHEMA, lambda: store.lake, name="Log")
+    create, during = store.create_object, []
+
+    async def uploading(path, data):
+        await create(path, data)
+        for change in during:
+            change()
+
+    store.create_object = uploading
+    store.lake.append("events", {"run": "a", "at": 1.0, "n": 1})
+    during.append(lambda: store.lake.append("events", {"run": "b", "at": 2.0, "n": 2}))
+    await lake.flush(force=True)
+    assert len(store.lake.files["events"]) == 1 and [values[0] for _, values in store.lake.rows["events"]] == ["b"]
+    during[:] = [lambda: store.lake.forget({"b"}, at=3.0)]
+    store.lake.append("events", {"run": "c", "at": 3.0, "n": 3})
+    await lake.flush(force=True)
+    assert len(store.lake.files["events"]) == 1  # `b` went meanwhile: that file is not installed
+    during.clear()
+    await lake.flush(force=True)
+    assert await lake.query(rows, ("events",)) == [("a", 1), ("c", 3)]
