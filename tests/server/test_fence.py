@@ -819,6 +819,35 @@ async def test_a_malformed_worker_result_is_settled_without_its_bad_parts(tmp_pa
     await state.close()
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"scope": "", "discarded": ["not-a-map"]},
+        {"scope": "", "discarded": {"remote": "1.0"}},
+        {"scope": "", "discard_unresolved": {"remote": [1]}},
+        {"scope": "", "discarded": {"remote": ["1.0"]}, "discarded_files": "x"},
+        {"discarded": {"remote": ["1.0"]}},
+        ["not", "a", "report"],
+    ],
+)
+async def test_a_malformed_discard_report_is_refused(tmp_path, world, body):
+    """Review round 5, engine #4: a worker's discard acknowledgement is
+    checked whole at the boundary. A malformed one is refused, and the
+    state is neither broken nor changed; it used to reach the reducer,
+    which broke the state and ended the process."""
+
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = engine_for(state, REMOTE)
+    await engine.initialize()
+    _, attempt = await launched(engine, ["remote"])
+    applied = state.model.applied
+    with pytest.raises(ValueError):
+        await engine.attempt_discarded(attempt, body)
+    assert state.model.applied == applied and not state.poisoned and world.exits == []
+    await engine.stop()
+    await state.close()
+
+
 async def test_an_event_its_reducer_cannot_apply_ends_the_process(tmp_path, world):
     """Review round 3, B5, and Erwin's decision: should a reducer raise
     half-way anyway, the model is no longer the journal's. Nothing more is

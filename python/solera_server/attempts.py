@@ -58,6 +58,32 @@ def _names(value) -> dict[str, list[str]]:
     return {str(k): [str(i) for i in v] for k, v in value.items() if isinstance(v, list)}
 
 
+def discard_report(body) -> dict:
+    """A worker's discard acknowledgement as the model applies it: its
+    `scope`, and by output the entry ids it discarded (`discarded`) or
+    could not read the names of (`discard_unresolved`), and the index files
+    it deleted (`discarded_files`)."""
+
+    if not isinstance(body, dict) or not isinstance(body.get("scope"), str):
+        raise ValueError("a discard report names its scope")
+    out = {"scope": body["scope"]}
+    for name in ("discarded", "discard_unresolved"):
+        value = body.get(name)
+        if value is None:
+            continue
+        if not isinstance(value, dict) or not all(
+            isinstance(v, list) and all(isinstance(i, str) for i in v) for v in value.values()
+        ):
+            raise ValueError(f"{name}: entry ids by output")
+        out[name] = value
+    files = body.get("discarded_files")
+    if files is not None:
+        if not isinstance(files, list) or not all(isinstance(f, str) for f in files):
+            raise ValueError("discarded_files: a list of paths")
+        out["discarded_files"] = files
+    return out
+
+
 def worker_output(info: dict) -> dict:
     """An output's launch record as its worker sees it: the committed head
     only as its ref (`before`), where the content is — none for an output
@@ -311,15 +337,15 @@ class Attempts:
                     due[name] = {"discard": entries, "before": head["ref"]}
         return {"discard": due, "scope": task["scope"]} if due else {}
 
-    async def attempt_discarded(self, attempt: str, body: dict) -> None:
-        """A worker's acknowledgement of what it discarded after its commit."""
+    async def attempt_discarded(self, attempt: str, body) -> None:
+        """A worker's acknowledgement of what it discarded after its commit,
+        checked whole before anything is recorded: one that is malformed is
+        refused (`ValueError`), and no reducer ever sees it."""
 
         self._serving()
-        if body.get("discarded") or body.get("discard_unresolved"):
-            fields = ("discarded", "discard_unresolved", "discarded_files")
-            self.state.record(
-                {"type": "DiscardsDone", "scope": body["scope"], **{k: body[k] for k in fields if k in body}}
-            )
+        report = discard_report(body)
+        if report.get("discarded") or report.get("discard_unresolved"):
+            self.state.record({"type": "DiscardsDone", **report})
 
     async def attempt_resolve(self, attempt: str, body: bytes) -> bytes | None:
         """A small write's delta from the engine's cache (docs/resolved-commits.md
