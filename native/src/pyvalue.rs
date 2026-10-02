@@ -23,6 +23,8 @@ pub struct Walker<'py> {
     pool: Vec<Entries>,                             // one per nesting depth
     buf: Vec<u8>,
     plan: Plan,
+    // A column row's encoded values, and the column, start and end of each not null.
+    cells: (Vec<u8>, Vec<(usize, usize, usize)>),
 }
 
 /// The columns of the rows last read, sorted once: a write's rows share
@@ -113,6 +115,21 @@ fn value_err(e: crate::format::Error) -> PyErr {
     }
 }
 
+/// pyarrow's month-day-nanosecond interval — what its Arrow arrays hold,
+/// read back as Python — as the interval Arrow digests it as.
+fn interval(v: &Bound<'_, PyAny>) -> PyResult<Option<(i32, i32, i64)>> {
+    // A struct sequence pyarrow makes in C: its module reads `builtins`.
+    let py = v.py();
+    if v.get_type().name()? != "MonthDayNano" || !v.hasattr(intern!(py, "nanoseconds"))? {
+        return Ok(None);
+    }
+    Ok(Some((
+        v.getattr(intern!(py, "months"))?.extract()?,
+        v.getattr(intern!(py, "days"))?.extract()?,
+        v.getattr(intern!(py, "nanoseconds"))?.extract()?,
+    )))
+}
+
 fn int_attr(v: &Bound<'_, PyAny>, name: &Bound<'_, PyString>) -> PyResult<i64> {
     v.getattr(name)?.extract()
 }
@@ -141,6 +158,7 @@ impl<'py> Walker<'py> {
             pool: Vec::new(),
             buf: Vec::new(),
             plan: Plan::default(),
+            cells: Default::default(),
         })
     }
 
@@ -327,6 +345,8 @@ impl<'py> Walker<'py> {
                 s.push(char::from(b'0' + d.extract::<u8>()?));
             }
             f(Scalar::Decimal(s, -exp));
+        } else if let Some((months, days, ns)) = interval(v)? {
+            f(Scalar::Interval(months, days, ns));
         } else if let Some(item) = self.foreign(v)? {
             match item {
                 // A builtin bool, int or float: classified above, so this ends.
@@ -438,6 +458,57 @@ impl<'py> Walker<'py> {
         }
         let d = digest::framed(&buf);
         self.buf = buf;
+        res.map(|_| d)
+    }
+
+    /// `row(r)` of row `i` of `columns`: each `(len(name) ‖ name, values)`,
+    /// in name order, the columns left out already gone. Its values that are
+    /// not null make the record, as a mapping of them would.
+    pub fn column_row(
+        &mut self,
+        columns: &[(Vec<u8>, Bound<'py, PyList>)],
+        i: usize,
+    ) -> PyResult<Digest> {
+        let (mut values, mut spans) = std::mem::take(&mut self.cells);
+        values.clear();
+        spans.clear();
+        let mut res = Ok(());
+        for (c, (_, column)) in columns.iter().enumerate() {
+            let v = match column.get_item(i) {
+                Ok(v) => v,
+                Err(e) => {
+                    res = Err(e);
+                    break;
+                }
+            };
+            if v.is_none() {
+                continue;
+            }
+            let start = values.len();
+            if !unsafe { fast(v.as_ptr(), &mut values) } {
+                if let Err(e) = self.value(&v, &mut values, 1) {
+                    res = Err(e);
+                    break;
+                }
+                if &values[start..] == b"n" {
+                    values.truncate(start);
+                    continue;
+                }
+            }
+            spans.push((c, start, values.len()));
+        }
+        let mut buf = std::mem::take(&mut self.buf);
+        buf.clear();
+        buf.extend_from_slice(&digest::ROW);
+        buf.push(b'r');
+        crate::format::put_varint(&mut buf, spans.len() as u64);
+        for &(c, a, b) in &spans {
+            buf.extend_from_slice(&columns[c].0);
+            buf.extend_from_slice(&values[a..b]);
+        }
+        let d = digest::framed(&buf);
+        self.buf = buf;
+        self.cells = (values, spans);
         res.map(|_| d)
     }
 

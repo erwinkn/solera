@@ -36,7 +36,7 @@ use format::{Error, Options};
 use jobs::{Compact, Count, Join, Step};
 use pyo3::types::PyTuple;
 use rayon::prelude::*;
-use rows::{Arena, Constant, Cursor, Source, Stream, Table, Versions};
+use rows::{Arena, Constant, Cursor, Overlay, Source, Stream, Table, Versions};
 use stream::Segment;
 
 create_exception!(
@@ -712,6 +712,90 @@ impl Rows {
         Rows::new(py, Box::new(keys), Box::new(versions), empty_keys(&empty)?)
     }
 
+    /// Rows read a column at a time — a DataFrame through pandas alone, no
+    /// Arrow: `columns[i]` holds column `names[i]`'s value of every row, None
+    /// where it is missing. A row digests as the mapping of its values not
+    /// null would (`records`).
+    #[staticmethod]
+    #[pyo3(signature = (names, columns, key, revision=None, exclude=vec![], empty=vec![]))]
+    #[allow(clippy::too_many_arguments)]
+    fn columns(
+        py: Python<'_>,
+        names: Vec<String>,
+        columns: Vec<Bound<'_, PyList>>,
+        key: &str,
+        revision: Option<&str>,
+        exclude: Vec<String>,
+        empty: Vec<Bound<'_, PyAny>>,
+    ) -> PyResult<Rows> {
+        if names.len() != columns.len() {
+            return Err(PyValueError::new_err("a name for every column"));
+        }
+        let mut sorted: Vec<&String> = names.iter().collect();
+        sorted.sort();
+        if let Some(w) = sorted.windows(2).find(|w| w[0] == w[1]) {
+            return Err(PyValueError::new_err(format!(
+                "column {:?} appears twice",
+                w[0]
+            )));
+        }
+        let n = columns.first().map_or(0, |c| c.len());
+        if columns.iter().any(|c| c.len() != n) {
+            return Err(PyValueError::new_err("columns of different lengths"));
+        }
+        let at = |name: &str| names.iter().position(|c| c == name);
+        let k = at(key).ok_or_else(|| PyKeyError::new_err(key.to_string()))?;
+        let (mut keys, mut versions) = (Arena::default(), Arena::default());
+        keys.ends.reserve(n);
+        versions.ends.reserve(n);
+        let mut w = pyvalue::Walker::new(py)?;
+        let records = Records::new(key, revision, exclude);
+        let mut order: Vec<usize> = (0..names.len())
+            .filter(|&c| !records.skip.contains(&names[c]))
+            .collect();
+        order.sort_by(|&a, &b| names[a].as_bytes().cmp(names[b].as_bytes()));
+        let cells: Vec<(Vec<u8>, Bound<'_, PyList>)> = order
+            .iter()
+            .map(|&c| {
+                let mut head = Vec::new();
+                digest::put_len(&mut head, names[c].as_bytes());
+                (head, columns[c].clone())
+            })
+            .collect();
+        let rev = match revision {
+            Some(r) => Some(at(r).ok_or_else(|| {
+                PyValueError::new_err(format!("a row lacks the declared revision field {r:?}"))
+            })?),
+            None => None,
+        };
+        for i in 0..n {
+            row_key(&columns[k].get_item(i)?, &mut keys.data)?;
+            keys.ends.push(keys.data.len());
+            match rev {
+                Some(r) => {
+                    let v = columns[r].get_item(i)?;
+                    if v.is_none() {
+                        return Err(PyValueError::new_err(format!(
+                            "a row lacks the declared revision field {:?}",
+                            names[r]
+                        )));
+                    }
+                    w.render(&v, &mut versions.data)?;
+                }
+                None => versions.data.extend_from_slice(&w.column_row(&cells, i)?),
+            }
+            versions.ends.push(versions.data.len());
+            if i % 65536 == 65535 {
+                py.detach(|| ()); // let other threads run: this loop holds the GIL
+            }
+        }
+        let versions = Read {
+            versions,
+            rows: revision.is_none(),
+        };
+        Rows::new(py, Box::new(keys), Box::new(versions), empty_keys(&empty)?)
+    }
+
     /// `(key, value)` pairs (a `keyed=True` output): the version is `value(v)`.
     #[staticmethod]
     fn values(py: Python<'_>, items: Bound<'_, PyList>) -> PyResult<Rows> {
@@ -834,6 +918,31 @@ impl Rows {
             ends.append(n)?;
         }
         Ok((rows, ends))
+    }
+
+    /// The version of each of `keys`, from its rows alone; a key the write
+    /// does not hold is a `KeyError`.
+    fn versions<'py>(
+        &self,
+        py: Python<'py>,
+        keys: Vec<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let packed = empty_keys(&keys)?;
+        let table = self.table.clone();
+        let found: Vec<format::Result<Option<Vec<u8>>>> = py.detach(|| {
+            (0..packed.len())
+                .into_par_iter()
+                .map(|i| table.version(packed.get(i)))
+                .collect()
+        });
+        let out = PyList::empty(py);
+        for (i, f) in found.into_iter().enumerate() {
+            match f.map_err(to_py)? {
+                Some(v) => out.append(PyBytes::new(py, &v))?,
+                None => return Err(PyKeyError::new_err(keys[i].clone().unbind())),
+            }
+        }
+        Ok(out)
     }
 
     /// Whether the write holds `key` (with rows, or as an empty group).
@@ -1339,9 +1448,11 @@ impl Job {
     /// the key and `exclude`d columns, folded into each key's group, or the
     /// `revision` a key's rows share. At most
     /// `collect` changed keys are kept for `collected`. Written entries carry
-    /// `generation` as their locator.
+    /// `generation` as their locator. A streamed replacement may take an
+    /// `overlay`: a run whose upserts stand in for the stream's entries of
+    /// their keys, and whose removes drop them.
     #[staticmethod]
-    #[pyo3(signature = (rows, runs, *, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864, collect=0, key=None, revision=None, exclude=vec![], generation=0))]
+    #[pyo3(signature = (rows, runs, *, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864, collect=0, key=None, revision=None, exclude=vec![], generation=0, overlay=None))]
     #[allow(clippy::too_many_arguments)]
     fn replace(
         rows: Option<PyRef<'_, Rows>>,
@@ -1357,10 +1468,20 @@ impl Job {
         revision: Option<String>,
         exclude: Vec<String>,
         generation: u64,
+        overlay: Option<PyRef<'_, SortedRun>>,
     ) -> PyResult<Job> {
-        let src = match rows {
-            Some(r) => Source::Table(Box::new(Cursor::new(r.table.clone()))),
-            None => Source::Stream(Stream::new(key.is_some() && revision.is_none())),
+        let src = match (rows, overlay) {
+            (Some(r), None) => Source::Table(Box::new(Cursor::new(r.table.clone()))),
+            (None, None) => Source::Stream(Stream::new(key.is_some() && revision.is_none())),
+            (None, Some(run)) => Source::Overlay(Box::new(Overlay::new(
+                Stream::new(key.is_some() && revision.is_none()),
+                run.inner.clone(),
+            ))),
+            (Some(_), Some(_)) => {
+                return Err(PyValueError::new_err(
+                    "an overlay goes over a streamed replacement",
+                ))
+            }
         };
         let o = options(block_size, level, bits_per_item, k, codec);
         Ok(Job {
@@ -1477,14 +1598,14 @@ impl Job {
 
     fn feed_rows(&mut self, py: Python<'_>, rows: Bound<'_, PyAny>) -> PyResult<()> {
         let (k, v) = chunk(py, &rows, self.records.as_ref())?;
-        match &mut self.join()?.src {
-            Source::Stream(s) => s.feed(k, v).map_err(to_py),
-            _ => Err(PyTypeError::new_err("not a streamed replacement")),
+        match self.join()?.src.stream() {
+            Some(s) => s.feed(k, v).map_err(to_py),
+            None => Err(PyTypeError::new_err("not a streamed replacement")),
         }
     }
 
     fn end_rows(&mut self) -> PyResult<()> {
-        if let Source::Stream(s) = &mut self.join()?.src {
+        if let Some(s) = self.join()?.src.stream() {
             s.end();
         }
         Ok(())

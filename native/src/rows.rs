@@ -252,6 +252,23 @@ impl Table {
         held.then_some(rows)
     }
 
+    /// The version of `key`, from its rows alone; None when the write does
+    /// not hold it.
+    pub fn version(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let Some(rows) = self.find(key) else {
+            return Ok(None);
+        };
+        let mut versions = Arena::default();
+        self.versions.fill(&rows, &mut versions)?;
+        let mut g = Group::default();
+        g.start(key, self.versions.rows());
+        for i in 0..versions.len() {
+            g.add(versions.get(i), false)?;
+        }
+        g.finish();
+        Ok(Some(g.version))
+    }
+
     /// The digest of every `(key, version)` in key order, reading them all
     /// unless a pass already has.
     pub fn content(self: &Arc<Table>) -> Result<Digest> {
@@ -486,12 +503,87 @@ impl Stream {
     }
 }
 
-/// The written side of a merge-join: rows, sorted chunks as they stream, or
-/// a sorted run (whose entries may be removes).
+/// A stream with a sorted run laid over it: the run's upserts in place of
+/// the stream's entries of their keys, and its removes gone — a patch over
+/// what a store holds, read back a chunk at a time.
+pub struct Overlay {
+    pub base: Stream,
+    run: Arc<SortedRun>,
+    i: usize,
+    current: Option<bool>, // Some(true): the run's entry `i`; Some(false): the base's
+}
+
+impl Overlay {
+    pub fn new(base: Stream, run: Arc<SortedRun>) -> Overlay {
+        Overlay {
+            base,
+            run,
+            i: 0,
+            current: None,
+        }
+    }
+
+    fn state(&mut self) -> Result<State> {
+        loop {
+            if self.current.is_some() {
+                return Ok(State::Ready);
+            }
+            let base = self.base.state()?;
+            if base == State::Starved {
+                return Ok(State::Starved);
+            }
+            let ready = base == State::Ready;
+            if self.i >= self.run.len() {
+                if !ready {
+                    return Ok(State::Done);
+                }
+                self.current = Some(false);
+                continue;
+            }
+            let key = self.run.key(self.i);
+            if ready && self.base.group.key.as_slice() < key {
+                self.current = Some(false);
+                continue;
+            }
+            if ready && self.base.group.key.as_slice() == key {
+                self.base.ready = false; // the run's entry stands for it
+                continue;
+            }
+            if self.run.write(self.i).is_none() {
+                self.i += 1; // a remove: nothing of the key stays
+                continue;
+            }
+            self.current = Some(true);
+        }
+    }
+
+    fn entry(&self) -> (&[u8], &[u8]) {
+        match self.current {
+            Some(true) => (
+                self.run.key(self.i),
+                self.run.write(self.i).expect("an upsert"),
+            ),
+            _ => (&self.base.group.key, &self.base.group.version),
+        }
+    }
+
+    fn advance(&mut self) {
+        match self.current.take() {
+            Some(true) => self.i += 1,
+            Some(false) => self.base.ready = false,
+            None => {}
+        }
+    }
+}
+
+/// The written side of a merge-join: rows, sorted chunks as they stream
+/// (with a run laid over them, or not), or a sorted run (whose entries may
+/// be removes).
 pub enum Source {
     Table(Box<Cursor>),
     Stream(Stream),
     Run(Arc<SortedRun>, usize),
+    Overlay(Box<Overlay>),
 }
 
 impl Source {
@@ -512,17 +604,14 @@ impl Source {
                 Ok(State::Ready)
             }
             Source::Stream(s) => s.state(),
+            Source::Overlay(o) => o.state(),
         }
     }
 
     /// The current key; only when `state` is `Ready`.
     #[inline]
     pub fn key(&self) -> &[u8] {
-        match self {
-            Source::Table(t) => &t.group.key,
-            Source::Stream(s) => &s.group.key,
-            Source::Run(run, i) => run.key(*i),
-        }
+        self.entry().0
     }
 
     /// The current write: its version, or None for a remove.
@@ -540,6 +629,7 @@ impl Source {
             Source::Table(t) => (&t.group.key, &t.group.version),
             Source::Stream(s) => (&s.group.key, &s.group.version),
             Source::Run(run, i) => (run.key(*i), run.versions.get(*i)),
+            Source::Overlay(o) => o.entry(),
         }
     }
 
@@ -548,6 +638,16 @@ impl Source {
             Source::Table(t) => t.ready = false,
             Source::Stream(s) => s.ready = false,
             Source::Run(_, i) => *i += 1,
+            Source::Overlay(o) => o.advance(),
+        }
+    }
+
+    /// The stream fed sorted chunks, if this is one.
+    pub fn stream(&mut self) -> Option<&mut Stream> {
+        match self {
+            Source::Table(_) | Source::Run(..) => None,
+            Source::Stream(s) => Some(s),
+            Source::Overlay(o) => Some(&mut o.base),
         }
     }
 }
