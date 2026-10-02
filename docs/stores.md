@@ -118,20 +118,21 @@ write — and says so in `can_store`, which registration checks against the
 producer's return annotation.
 
 - **Plain Python only:** define no `prepare`; `can_store` returns
-  `solera.stores.takes_plain(t)`.
+  `solera.stores.takes(t, output)` — the forms the framework defines, per
+  kind of output, once.
 - **DataFrames and Arrow:** `solera.stores.frames` reads them, importing
   pandas or pyarrow only for a value of their type. FileStore, S3Store
   and PostgresStore use it:
 
   ```python
-  from solera.stores import frames, takes_plain
+  from solera.stores import frames, takes
 
   class MyStore:
       def prepare(self, write, output):
           return frames.prepare(write, output)
 
       def can_store(self, t, output):
-          return takes_plain(t) or frames.can_store(t)
+          return takes(t, output, frames=True)
   ```
 
 - **A type of your own:** build the `Prepared` yourself — native `Rows`

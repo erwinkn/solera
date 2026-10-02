@@ -13,7 +13,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 from solera.fencing import fence, fence_table
 from solera.sdk import Ref, digest
-from solera.stores import Batches, KeyedWrite, Keys, Written, takes_plain
+from solera.stores import Batches, KeyedWrite, Keys, Written, takes
 
 
 class JsonTableStore:
@@ -26,7 +26,7 @@ class JsonTableStore:
         return True
 
     def can_store(self, t, output) -> bool:
-        return takes_plain(t)  # rows as Python: it defines no `prepare` of its own
+        return takes(t, output, values=False)  # rows as Python: it defines no `prepare` of its own
 
     def _table(self, output) -> str:
         return f'"rows_{output.name}"'
@@ -59,6 +59,14 @@ class JsonTableStore:
             fence(cur, scope, table)  # before this transaction changes anything
             if out.key is None:  # an unkeyed incremental output: a batch of rows
                 rows = list(write.rows)
+                # The batch replaces itself (a retried call writes it again); with no
+                # prior (a full run) the batches start over.
+                if prior is None:
+                    cur.execute(f"DELETE FROM {table} WHERE part = %s", (scope.partition,))
+                else:
+                    cur.execute(
+                        f"DELETE FROM {table} WHERE part = %s AND batch = %s", (scope.partition, scope.batch)
+                    )
                 cur.executemany(
                     f"INSERT INTO {table} VALUES (%s, NULL, %s, %s)",
                     [(scope.partition, scope.batch, Jsonb(r)) for r in rows],

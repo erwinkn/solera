@@ -35,6 +35,7 @@ from solera.stores import (
     by_key_type,
     frames,
     resolve_env,
+    takes,
 )
 
 log = logging.getLogger("solera.postgres")
@@ -101,7 +102,12 @@ class PostgresStore:
     def can_store(self, t, output) -> bool:
         if output.is_partition_set or output.key == KEYS:
             return False  # partition sets and dict outputs live on the default store
-        return True  # DataFrame / list[dict] / Patch / Sql / unannotated
+        return t is Sql or takes(t, output, frames=True, values=False)  # rows, DataFrames, Arrow
+
+    def can_migrate(self, t, output) -> bool:
+        """A migration is SQL, or a callable taking a cursor."""
+
+        return t is str or t is Callable
 
     # -- plumbing -----------------------------------------------------------
 
@@ -146,9 +152,9 @@ class PostgresStore:
         scope: Scope | None = None,
         inferred: dict | None = None,
         kinds: Mapping[str, str | None] | None = None,
-    ) -> dict[str, str]:
+    ) -> dict[str, dict]:
         """The table, created if missing, under the transaction's fence; its
-        columns' types. A table the write creates takes the declared columns,
+        columns' types, exactly (`information_schema.columns`). A table the write creates takes the declared columns,
         then those of a `Sql` SELECT (`inferred`), then the write's: each
         column's kind as its reader knows it (`kinds`: a DataFrame's dtypes,
         an Arrow schema), else the kind of every value not null in it
@@ -206,9 +212,10 @@ class PostgresStore:
                 cur.execute(f"GRANT SELECT ON {table} TO {_ident(role)}")
         self._fence(cur, table, scope)  # before this transaction changes any row
         return {
-            r["column_name"]: r["data_type"]
+            r["column_name"]: r
             for r in cur.execute(
-                "SELECT column_name, data_type FROM information_schema.columns "
+                "SELECT column_name, data_type, numeric_precision, numeric_scale, datetime_precision, "
+                "character_maximum_length FROM information_schema.columns "
                 "WHERE table_schema = %s AND table_name = %s",
                 (schema, table_name),
             )
@@ -698,7 +705,9 @@ class PostgresStore:
     def _insert(self, cur, output, table, rows: list[dict], types: dict, stamps: dict):
         """Rows, by `COPY`: every column any row has, missing ones null, and
         the `stamps` the store sets on every row. A value its column would read
-        back as another type — so as another digest — is a write error."""
+        back as another type is a write error; so, in a column the output's
+        versions digest, is one it would read back otherwise at all —
+        rounded, narrowed, truncated, padded."""
 
         if not rows:
             return
@@ -706,7 +715,7 @@ class PostgresStore:
             if any(column in row and str(row[column]) != str(value) for row in rows):
                 raise WriteError(f"{output.name}: a row's {column} disagrees with {value!r}")
         columns = sorted({c for r in rows for c in r} - set(stamps))
-        _check_types(output.name, rows, columns, types)
+        _check_types(output.name, rows, columns, types, _digested(output, columns))
         constant = list(stamps.values())
         names = ", ".join(_ident(c) for c in [*columns, *stamps])
         with cur.copy(f"COPY {table} ({names}) FROM STDIN") as copy:
@@ -788,21 +797,73 @@ def _column_types(name: str, rows: Iterable[dict], declared: dict) -> dict[str, 
     return columns
 
 
-def _check_types(name: str, rows: list[dict], columns: list[str], types: dict) -> None:
+def _digested(output: Output, columns: list[str]) -> set[str]:
+    """The columns the output's versions digest: a keyed output with a
+    revision, its key and revision; any other, every row's column (the
+    stamped ones are no row's)."""
+
+    if output.key is not None and output.revision:
+        return {output.key, output.revision}
+    return set(columns)
+
+
+def _check_types(name: str, rows: list[dict], columns: list[str], types: dict, exact: set[str]) -> None:
     """Every value is of its column's kind: a column reading it back as
-    another — 42 as "42" — would store another digest than the one hashed."""
+    another — 42 as "42" — would store another digest than the one hashed.
+    In the columns versions digest (`exact`), a value must read back as it
+    is (`_kept`): not rounded to a numeric's scale, a real's 32 bits or a
+    timestamp's microseconds."""
 
     for column in columns:
-        want = _KINDS.get(types.get(column, ""))
+        meta = types.get(column) or {}
+        want = _KINDS.get(meta.get("data_type", ""))
         if want is None:
             continue  # a column the store does not type (json, arrays, …): taken as it is
         for row in rows:
             value = row.get(column)
-            if value is not None and (got := frames.kind_of(value)) != want:
+            if value is None:
+                continue
+            if (got := frames.kind_of(value)) != want:
                 raise WriteError(
-                    f"{name}: column {column!r} is {types[column]}, but a row holds {got or type(value).__name__}"
-                    f" {value!r}: it would read back as another value"
+                    f"{name}: column {column!r} is {meta['data_type']}, but a row holds "
+                    f"{got or type(value).__name__} {value!r}: it would read back as another value"
                 )
+            if column in exact and (lost := _kept(value, meta)) is not None:
+                raise WriteError(f"{name}: column {column!r} would store {value!r} {lost}")
+
+
+def _kept(value: Any, meta: dict) -> str | None:
+    """How a column would alter `value` — None when it keeps it exactly."""
+
+    import struct
+
+    kind = meta["data_type"]
+    if kind == "numeric" and meta.get("numeric_scale") is not None and value.is_finite():
+        if value.normalize().as_tuple().exponent < -meta["numeric_scale"]:
+            return f"rounded to {meta['numeric_scale']} places"
+    if kind == "real":
+        try:
+            if struct.unpack("<f", struct.pack("<f", value))[0] != value and value == value:
+                return "narrowed to 32 bits"
+        except OverflowError:
+            return "out of a 32-bit float's range"
+    if kind in (
+        "timestamp with time zone",
+        "timestamp without time zone",
+        "time without time zone",
+        "interval",
+    ):
+        if getattr(value, "nanosecond", 0) or getattr(value, "nanoseconds", 0):
+            return "without its nanoseconds"
+        places = meta.get("datetime_precision")
+        micros = value.microseconds if kind == "interval" else value.microsecond
+        if places is not None and places < 6 and micros % 10 ** (6 - places):
+            return f"rounded to {places} fractional digits"
+    if kind == "character" and meta.get("character_maximum_length") not in (None, len(value)):
+        return f"padded to {meta['character_maximum_length']} characters"
+    if kind == "character varying" and (n := meta.get("character_maximum_length")) and len(value) > n:
+        return f"cut to {n} characters"
+    return None
 
 
 def _inferred(sql_type: str | None) -> str:

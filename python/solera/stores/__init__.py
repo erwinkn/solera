@@ -158,11 +158,37 @@ def encode(value: Any) -> tuple[bytes, str]:
     return pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL), "pkl"
 
 
-def takes_plain(t: Any) -> bool:
-    """What the default `prepare` reads, for a store's `can_store`: plain
-    Python — unannotated, a list or a dict (of rows, values or elements)."""
+def takes(t: Any, output: Output, *, frames: bool = False, values: bool = True) -> bool:
+    """Whether a producer annotated `t` returns a write `output` can take: the
+    forms the framework defines, once, for a store's `can_store` (which
+    registration asks). A `keyed=True` output takes a dict of values; a
+    keyed rows output rows — a list of mappings — or rows by key, a dict of
+    lists of them; a partition set its elements, a list or a set; an
+    unkeyed incremental output a batch of rows, a list; any other output a
+    value, anything — unless not `values`, for a store of rows only.
+    `frames`: a DataFrame or an Arrow table wherever rows go. Unannotated
+    (`t` None) is anything: what a write holds is checked when it is read."""
 
-    return t is None or t in (list, dict, Mapping) or typing.get_origin(t) in (list, dict, Mapping)
+    if t is None:
+        return True
+    origin = typing.get_origin(t) or t
+    listed = origin in (list, Sequence)
+    rows = listed or (frames and _frames_can(t))
+    if output.key == KEYS:
+        return origin in (dict, Mapping)
+    if output.is_partition_set:
+        return listed or origin in (set, frozenset)
+    if output.key is not None:
+        return rows or origin in (dict, Mapping)
+    if output.incremental:
+        return rows
+    return values or rows
+
+
+def _frames_can(t: Any) -> bool:
+    from .frames import can_store
+
+    return can_store(t)
 
 
 def key_text(value: Any) -> str:

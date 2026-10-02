@@ -218,11 +218,11 @@ def test_a_dataframe_needs_a_store_that_reads_dataframes():
     return a DataFrame into a store of plain rows fails at registration."""
 
     import pandas as pd
-    from solera.stores import takes_plain
+    from solera.stores import takes
 
     class PlainStore(FileStore):
         def can_store(self, t, output):
-            return takes_plain(t)
+            return takes(t, output)
 
     @asset(outputs=Output("rows", key="id", store="plain"))
     def rows() -> pd.DataFrame:
@@ -236,6 +236,35 @@ def test_a_dataframe_needs_a_store_that_reads_dataframes():
         return [{"id": "a"}]
 
     Project(assets=[listed], stores={"plain": PlainStore()})
+
+
+def test_the_write_forms_are_one_rule_for_every_store():
+    """§4: what a producer may return is defined once (`solera.stores.takes`):
+    rows by key register on a keyed output; a store of rows refuses a value
+    that is not rows."""
+
+    from solera_postgres import PostgresStore
+
+    @asset(outputs=Output("files", key="id"))
+    def by_key() -> dict[str, list[dict]]:
+        return {"a": [{"n": 1}]}
+
+    Project(assets=[by_key])  # FileStore: rows by key are rows
+    for t in (int, str, object):
+
+        @asset(outputs=Output("table", store="pg"))
+        def scalar():
+            return 1
+
+        scalar.fn.__annotations__["return"] = t
+        with pytest.raises(RegistrationError, match="cannot store output table"):
+            Project(assets=[scalar], stores={"pg": PostgresStore("postgresql://unused")})
+
+    @asset(outputs=Output("table", store="pg"))
+    def table() -> list[dict]:
+        return [{"n": 1}]
+
+    Project(assets=[table], stores={"pg": PostgresStore("postgresql://unused")})
 
 
 def test_unannotated_store_bound_input():

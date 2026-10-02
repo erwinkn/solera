@@ -77,13 +77,28 @@ async def write(
     *,
     remove=(),
     patch: bool = False,
+    changed: bool = False,
     invocation: str = "i",
 ) -> Ref:
     """Write `rows` to a keyed output as the harness would — the scope's whole
     content, or (`patch`) its keys and `remove` — and record in `ledger`
-    what the index then holds."""
+    what the index then holds. With `changed`, a replacement is resolved
+    against the ledger as the worker resolves it against the index: only
+    the keys whose version changed are written, the ones gone removed, and
+    an unchanged key stays where it is, at its old locator."""
 
     store = h.store
+    if changed:
+        prepared = prepare_for(store, rows, out)
+        current = dict(prepared.entries())
+        upserts = {k: v for k, v in current.items() if ledger.entries.get(k, (None,))[0] != v}
+        gone = frozenset(set(ledger.entries) - set(current))
+        keyed = KeyedWrite(prepared, upserts=upserts, removes=gone, value=rows)
+        written = await store.store(keyed, prior, scope(out, generation, invocation))
+        for key in gone:
+            del ledger.entries[key]
+        ledger.entries.update({k: (v, generation) for k, v in upserts.items()})
+        return written.ref
     if patch:
         prepared = prepare_for(store, Patch(rows, remove=list(remove)), out)
         upserts = dict(prepared.entries())
@@ -101,12 +116,14 @@ async def write(
     return written.ref
 
 
-async def rows(h: Harness, ref: Ref, selection) -> set[tuple[str, str]]:
+async def rows(h: Harness, ref: Ref, selection) -> list[tuple[str, str]]:
+    """The rows a load gives, as a sorted multiset: a duplicate row shows."""
+
     found = await h.store.load(ref, list[dict], selection)
-    return {(str(r["id"]), str(r["v"])) for r in found}
+    return sorted((str(r["id"]), str(r["v"])) for r in found)
 
 
-async def now(h: Harness, ref: Ref, ledger: Ledger) -> set[tuple[str, str]]:
+async def now(h: Harness, ref: Ref, ledger: Ledger) -> list[tuple[str, str]]:
     """The scope's content as a reader of `ref` gets it: an immutable store's
     through the keys the index names; a fenced store's whole, as it is."""
 
@@ -126,9 +143,9 @@ async def a_replacement_is_the_scopes_whole_content(h: Harness) -> None:
 
     out, ledger = keyed(h), Ledger()
     first = await write(h, out, [{"id": "a", "v": "1"}, {"id": "b", "v": "1"}], 1, ledger)
-    assert await now(h, first, ledger) == {("a", "1"), ("b", "1")}
+    assert await now(h, first, ledger) == [("a", "1"), ("b", "1")]
     second = await write(h, out, [{"id": "b", "v": "1"}, {"id": "c", "v": "1"}], 2, ledger, first)
-    assert await now(h, second, ledger) == {("b", "1"), ("c", "1")}
+    assert await now(h, second, ledger) == [("b", "1"), ("c", "1")]
 
 
 async def a_patch_changes_only_its_keys(h: Harness) -> None:
@@ -141,7 +158,7 @@ async def a_patch_changes_only_its_keys(h: Harness) -> None:
     )
     rows_b_c = [{"id": "b", "v": "2"}, {"id": "c", "v": "1"}]
     second = await write(h, out, rows_b_c, 2, ledger, first, remove=["a"], patch=True)
-    assert await now(h, second, ledger) == {("b", "2"), ("c", "1"), ("d", "1")}
+    assert await now(h, second, ledger) == [("b", "2"), ("c", "1"), ("d", "1")]
 
 
 async def an_empty_replacement_holds_no_key(h: Harness) -> None:
@@ -150,7 +167,7 @@ async def an_empty_replacement_holds_no_key(h: Harness) -> None:
     out, ledger = keyed(h), Ledger()
     first = await write(h, out, [{"id": "a", "v": "1"}], 1, ledger)
     second = await write(h, out, [], 2, ledger, first)
-    assert ledger.entries == {} and await now(h, second, ledger) == set()
+    assert ledger.entries == {} and await now(h, second, ledger) == []
 
 
 async def a_write_repeated_by_its_attempt_lands_once(h: Harness) -> None:
@@ -162,7 +179,7 @@ async def a_write_repeated_by_its_attempt_lands_once(h: Harness) -> None:
     first = await write(h, out, content, 4, ledger)
     again = await write(h, out, content, 4, ledger)
     assert again.version == first.version
-    assert await now(h, again, ledger) == {("a", "1"), ("b", "1")}
+    assert await now(h, again, ledger) == [("a", "1"), ("b", "1")]
 
 
 async def batches_append_and_load_by_range(h: Harness) -> None:
@@ -172,8 +189,43 @@ async def batches_append_and_load_by_range(h: Harness) -> None:
     out = h.output(incremental=True)
     first = await h.store.store(Patch([{"id": "a", "v": "1"}]), None, scope(out, 1, batch=3))
     second = await h.store.store(Patch([{"id": "b", "v": "1"}]), first.ref, scope(out, 2, batch=4))
-    assert await rows(h, second.ref, None) == {("a", "1"), ("b", "1")}
-    assert await rows(h, second.ref, Batches(4, 4)) == {("b", "1")}
+    assert await rows(h, second.ref, None) == [("a", "1"), ("b", "1")]
+    assert await rows(h, second.ref, Batches(4, 4)) == [("b", "1")]
+
+
+async def a_batch_written_again_lands_once(h: Harness) -> None:
+    """Batch 3, written twice by its attempt (a retried call): its rows once."""
+
+    out = h.output(incremental=True)
+    first = await h.store.store(Patch([{"id": "a", "v": "1"}]), None, scope(out, 1, batch=3))
+    again = await h.store.store(Patch([{"id": "a", "v": "1"}]), None, scope(out, 1, batch=3))
+    second = await h.store.store(Patch([{"id": "b", "v": "1"}]), first.ref, scope(out, 2, batch=4))
+    second = await h.store.store(Patch([{"id": "b", "v": "1"}]), first.ref, scope(out, 2, batch=4))
+    assert await rows(h, again.ref, None) == [("a", "1")]
+    assert await rows(h, second.ref, None) == [("a", "1"), ("b", "1")]
+
+
+async def a_full_run_starts_the_batches_over(h: Harness) -> None:
+    """Batch 3, then batch 4 with no prior (a full run): only batch 4."""
+
+    out = h.output(incremental=True)
+    await h.store.store(Patch([{"id": "a", "v": "1"}]), None, scope(out, 1, batch=3))
+    reset = await h.store.store(Patch([{"id": "b", "v": "1"}]), None, scope(out, 2, batch=4))
+    assert await rows(h, reset.ref, None) == [("b", "1")]
+
+
+async def a_replacement_writes_only_what_changed(h: Harness) -> None:
+    """{a, b, c}, then the replacement {a, b at 2} as the worker resolves it:
+    b written, c removed, a untouched — and still read, at its first
+    locator."""
+
+    out, ledger = keyed(h), Ledger()
+    first = await write(h, out, [{"id": k, "v": "1"} for k in "abc"], 1, ledger)
+    second = await write(
+        h, out, [{"id": "a", "v": "1"}, {"id": "b", "v": "2"}], 2, ledger, first, changed=True
+    )
+    assert ledger.entries["a"][1] == 1  # a was not written again
+    assert await now(h, second, ledger) == [("a", "1"), ("b", "2")]
 
 
 # -- immutable stores ----------------------------------------------------------------------
@@ -187,8 +239,8 @@ async def a_pinned_read_returns_its_version(h: Harness) -> None:
     first = await write(h, out, [{"id": "a", "v": "1"}], 5, ledger)
     pinned = ledger.keys()
     second = await write(h, out, [{"id": "a", "v": "2"}], 9, ledger, first)
-    assert await rows(h, first, pinned) == {("a", "1")}
-    assert await now(h, second, ledger) == {("a", "2")}
+    assert await rows(h, first, pinned) == [("a", "1")]
+    assert await now(h, second, ledger) == [("a", "2")]
 
 
 async def discarding_never_takes_what_is_read(h: Harness) -> None:
@@ -206,7 +258,7 @@ async def discarding_never_takes_what_is_read(h: Harness) -> None:
     items.append(("key", "z", b"never".hex(), 8))
     for _ in range(2):
         await h.store.discard(scope(out, 10), second, items)
-    assert await now(h, second, ledger) == {("a", "2")}
+    assert await now(h, second, ledger) == [("a", "2")]
 
 
 # -- fenced stores -------------------------------------------------------------------------
@@ -222,7 +274,7 @@ async def a_stale_writer_is_refused(h: Harness) -> None:
     second = await write(h, out, [{"id": "a", "v": "2"}], 9, ledger, first)
     with _refused():
         await write(h, out, [{"id": "a", "v": "0"}], 5, Ledger(), first)
-    assert await now(h, second, ledger) == {("a", "2")}
+    assert await now(h, second, ledger) == [("a", "2")]
 
 
 async def one_generation_admits_one_invocation(h: Harness) -> None:
@@ -239,7 +291,7 @@ async def one_generation_admits_one_invocation(h: Harness) -> None:
         await write(h, out, [{"id": "a", "v": "0"}], 9, Ledger(), first, invocation="y")
     await h.store.acquire(scope(out, 9, "x"))
     second = await write(h, out, [{"id": "a", "v": "2"}], 9, ledger, first, invocation="x")
-    assert await now(h, second, ledger) == {("a", "2")}
+    assert await now(h, second, ledger) == [("a", "2")]
 
 
 async def a_first_write_acquires(h: Harness) -> None:
@@ -251,7 +303,7 @@ async def a_first_write_acquires(h: Harness) -> None:
     first = await write(h, out, [{"id": "a", "v": "1"}], 3, ledger)
     with _refused():
         await write(h, out, [{"id": "a", "v": "0"}], 2, Ledger(), first)
-    assert await now(h, first, ledger) == {("a", "1")}
+    assert await now(h, first, ledger) == [("a", "1")]
 
 
 async def the_next_attempt_replaces_what_a_dead_writer_left(h: Harness) -> None:
@@ -264,7 +316,7 @@ async def the_next_attempt_replaces_what_a_dead_writer_left(h: Harness) -> None:
     await write(h, out, [{"id": "c", "v": "1"}], 5, Ledger(), first, patch=True)  # landed, never committed
     await h.store.acquire(scope(out, 9))
     second = await write(h, out, [{"id": "a", "v": "2"}, {"id": "b", "v": "1"}], 9, ledger, first)
-    assert await now(h, second, ledger) == {("a", "2"), ("b", "1")}
+    assert await now(h, second, ledger) == [("a", "2"), ("b", "1")]
     with _refused():
         await write(h, out, [{"id": "c", "v": "2"}], 5, Ledger(), first, patch=True)
 
@@ -304,6 +356,9 @@ EVERY = [
     an_empty_replacement_holds_no_key,
     a_write_repeated_by_its_attempt_lands_once,
     batches_append_and_load_by_range,
+    a_batch_written_again_lands_once,
+    a_full_run_starts_the_batches_over,
+    a_replacement_writes_only_what_changed,
 ]
 IMMUTABLE = [a_pinned_read_returns_its_version, discarding_never_takes_what_is_read]
 FENCED = [

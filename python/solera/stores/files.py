@@ -9,8 +9,6 @@ import hashlib
 import json
 import os
 import pickle
-import typing
-from collections.abc import Mapping
 from typing import Any
 from urllib.parse import unquote
 
@@ -33,6 +31,7 @@ from . import (
     encode,
     frames,
     resolve_env,
+    takes,
 )
 
 
@@ -89,15 +88,7 @@ class FileStore:
         return True
 
     def can_store(self, t, output) -> bool:
-        if t is None:
-            return True
-        if output.key == KEYS:
-            return t in (dict, Mapping) or (
-                typing.get_origin(t) in (dict, Mapping) and typing.get_args(t)[:1] == (str,)
-            )
-        if output.incremental:  # rows, elements or batches: a list
-            return t is list or typing.get_origin(t) is list or frames.can_store(t)
-        return True  # a value: anything
+        return takes(t, output, frames=True)  # every form, DataFrames and Arrow too
 
     def prepare(self, write, output) -> Prepared:
         """Keyed writes of plain Python, DataFrames and Arrow (`frames`)."""

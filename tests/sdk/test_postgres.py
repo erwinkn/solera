@@ -866,3 +866,32 @@ async def test_a_dataframe_s_table_is_typed_by_its_dtypes_and_logged(store, capl
     later = pd.DataFrame({"id": ["c"], "x": [1.5], "n": [3]})
     written = await store.store(later, written.ref, scope(out))
     assert await store.load(written.ref, list[dict], None) == [{"id": "c", "x": 1.5, "n": 3}]
+
+
+async def test_a_value_its_column_would_alter_is_refused(store):
+    """What a write hashes is what the table holds: a value its column would
+    round (numeric(6,2)), narrow (real) or truncate (timestamp, to
+    microseconds) is refused, so no version is recorded for content the
+    store never held. Values the columns keep read back to the same digests."""
+
+    import datetime as dt
+
+    import pandas as pd
+
+    out = output(key="id", columns={"d": "numeric(6,2)", "r": "real", "at": "timestamp(3)"})
+    exact = [{"id": "a", "d": D("1.2"), "r": 1.5, "at": dt.datetime(2026, 1, 1, 0, 0, 0, 123000)}]
+    written = await store.store(exact, None, scope(out))
+    back = await store.load(written.ref, list[dict], None)
+    assert dict(prepare_for(store, back, out).entries()) == dict(prepare_for(store, exact, out).entries())
+    lossy = {
+        "rounded to 2 places": {"d": D("1.234")},
+        "narrowed to 32 bits": {"r": 1.234567890123},
+        "without its nanoseconds": {"at": pd.Timestamp("2026-01-01T00:00:00.000000123")},
+        "rounded to 3 fractional digits": {"at": dt.datetime(2026, 1, 1, 0, 0, 0, 123400)},
+    }
+    for lost, value in lossy.items():
+        with pytest.raises(WriteError, match=lost):
+            await store.store([{**exact[0], **value}], written.ref, scope(out))
+    # A revision is all the versions digest: other columns may round as they do.
+    revised = output(key="id", revision="v", columns={"d": "numeric(6,2)"})
+    await store.store([{"id": "a", "v": "1", "d": D("1.234")}], None, scope(revised))
