@@ -60,6 +60,54 @@ async def timed(fn):
     return out, time.perf_counter() - t, time.process_time() - cpu
 
 
+async def served_reads(n, state, cache, sample, window, opts, cold) -> list[dict]:
+    """A consumer's pages read cold by its worker, against the engine's answer
+    at start (docs/resolved-commits.md §7.1): the engine records the reads over
+    its local copies, the reply goes out as JSON, and the worker's same call
+    is answered from it — every step to the worker holding the page."""
+
+    import json
+
+    from solera.keys.reads import Reads
+    from solera_server.keyservice import READS_MAX_BYTES, READS_MAX_ENTRIES
+
+    middle = bench.key_of(sorted(sample)[len(sample) // 2][0])
+    lo, hi = window
+    pinned = state.pinned(lo, hi)
+    calls = [
+        ("full delivery: first page, 10K keys", state, lambda ix: ix.page(None, 10_000)),
+        ("full delivery: a page of 100K keys, mid-index", state, lambda ix: ix.page(middle, 100_000)),
+        (
+            f"change window of {hi - lo + 1} commits (100K entries): a page of 50K",
+            pinned,
+            lambda ix: ix.pending(lo, hi, None, 50_000),
+        ),
+    ]
+    rows = []
+    with cache.held(state) as pin:
+        for label, st, call in calls:
+            row = {"n": n, "op": label}
+            io = cold()
+            want, wall, cpu = await timed(lambda io=io, st=st, call=call: call(KeyIndex(io, None, st, opts)))
+            row["cold"] = (wall, cpu, io.metrics.gets, io.metrics.bytes_in / 1e6)
+
+            async def served(st=st, call=call):
+                reads = Reads(recording=True, max_entries=READS_MAX_ENTRIES, max_bytes=READS_MAX_BYTES)
+                await call(KeyIndex(ObjectIO(None, local=pin.handles, served=reads), None, st, opts))
+                body = json.dumps(reads.to_json())
+                wio = cold()
+                wio.served = Reads.from_json(json.loads(body))
+                got = await call(KeyIndex(wio, None, st, opts))
+                return got, len(body), wio.metrics.gets
+
+            (got, size, gets), wall, cpu = await timed(served)
+            assert got[0][: len(want[0])] == want[0], label  # the store's page may stop sooner
+            row["engine"] = (wall, cpu, gets, size / 1e6)
+            rows.append(row)
+            print(row, flush=True)
+    return rows
+
+
 async def run_size(n: int, args) -> list[dict]:
     prefix = f"{args.prefix}n{n}/"
     bench.clear_prefix(prefix)
@@ -87,6 +135,20 @@ async def run_size(n: int, args) -> list[dict]:
             )
             state = state.committed(b + 1, files, keep_log=False)
             current.update((i, v) for (i, _), v in zip(items, vers, strict=True))
+        window = None
+        if args.reads:  # a consumer behind by 20 commits of 5K keys: its change window
+            for b in range(8, 28):
+                items = sorted(rng.sample(list(current.items()), 5000))
+                vers = [rng.randbytes(16) for _ in items]
+                files, _ = await KeyIndex(setup, None, state, opts).resolve(
+                    SortedRun.of([bench.key_of(i) for i, _ in items], vers),
+                    batch=b,
+                    attempt="setup",
+                    generation=b,
+                )
+                state = state.committed(b, files, keep_log=True)
+                current.update((i, v) for (i, _), v in zip(items, vers, strict=True))
+            window = (8, 27)
 
         def cold():
             return ObjectIO(bench.store(), latency=args.latency, bandwidth=args.bandwidth)
@@ -108,6 +170,8 @@ async def run_size(n: int, args) -> list[dict]:
                 "disk_gb": disk / 1e9,
             }
         )
+        if args.reads:
+            rows += await served_reads(n, state, cache, sample, window, opts, cold)
         if args.recount:
             # The engine's recount: from the store, then over the cache's local copies.
             row = {"n": n, "op": "recount"}
@@ -180,6 +244,7 @@ async def main():
     ap.add_argument("--s3", default=os.environ.get("SOLERA_TEST_S3", ""))
     ap.add_argument("--prefix", default=None)
     ap.add_argument("--recount", action="store_true", help="also the engine's recount, store against local")
+    ap.add_argument("--reads", action="store_true", help="also input reads, cold against engine-served")
     ap.add_argument("--patches", default="1e3,1e4,1e5", help="patch sizes; empty for none")
     args = ap.parse_args()
     base = bench.configure(args.s3) if args.s3 else ""
@@ -191,7 +256,7 @@ async def main():
     print("| Keys | Patch | Cold worker | Engine, page cache | Engine, SSD only |")
     print("|---|---|---|---|---|")
     for r in rows:
-        if r["op"] in ("engine fill", "recount"):
+        if r["op"] in ("engine fill", "recount") or "engine_resolve" not in r:
             continue
         print(
             f"| {r['n']:,} | {r['op']} | {cell(r.get('cold'))} | "
@@ -206,6 +271,12 @@ async def main():
                 f"| {r['n']:,} | {bench.fmt_s(r['wall'])} · {r['gets']} GET · {r['mb']:.0f} MB · "
                 f"CPU {bench.fmt_s(r['cpu'])} | {r['disk_gb']:.2f} GB |"
             )
+    if args.reads:
+        print("\n| Keys | Read | Cold worker | Engine-served (reply MB) |")
+        print("|---|---|---|---|")
+        for r in rows:
+            if "engine" in r and "engine_resolve" not in r:
+                print(f"| {r['n']:,} | {r['op']} | {cell(r['cold'])} | {cell(r['engine'])} |")
     if args.recount:
         print("\n| Keys | Recount from the store | Recount over the cache's local copies |")
         print("|---|---|---|")

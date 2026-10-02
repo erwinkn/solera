@@ -847,6 +847,42 @@ processes), so only part of the local files stayed in the page cache.
   (The follow-up's 241.7 s and 3,029 GETs above were a differently shaped
   steady index, before the streaming recount's later changes.)
 
+## Engine-served reads (2026-10-02)
+
+docs/resolved-commits.md §7.1: at `start`, the engine answers an
+attempt's input reads from its cache's local copies, and the worker reads
+no index file to find its pages. `warm.py --reads` puts a consumer behind
+the steady index by 20 commits of 5K keys (a 100K-entry change window)
+and measures each read cold — the worker paging the store, 30 ms and
+80 MB/s injected — against the engine's answer end to end: the engine
+records the read over its local files, the reply is serialized to JSON
+and parsed, and the worker's same call is answered from it.
+
+    uv run python bench/keys/warm.py --s3 http://solera:solera-bench-secret@127.0.0.1:9100/solera-test --sizes 1e7,1e8 --reads --patches ""
+
+| Keys | Read | Cold worker | Engine-served (reply MB) |
+|---|---|---|---|
+| 1,000,000 | full delivery: first page, 10K keys | 150 ms · 29 GET · 5.7 MB · CPU 92 ms | 24 ms · 0 GET · 0.4 MB · CPU 18 ms |
+| 1,000,000 | full delivery: a page of 100K keys, mid-index | 230 ms · 29 GET · 8.0 MB · CPU 130 ms | 139 ms · 0 GET · 3.9 MB · CPU 125 ms |
+| 1,000,000 | change window of 20 commits (100K entries): a page of 50K | 119 ms · 20 GET · 5.0 MB · CPU 84 ms | 77 ms · 0 GET · 2.0 MB · CPU 80 ms |
+| 10,000,000 | full delivery: first page, 10K keys | 206 ms · 31 GET · 4.5 MB · CPU 94 ms | 20 ms · 0 GET · 0.4 MB · CPU 16 ms |
+| 10,000,000 | full delivery: a page of 100K keys, mid-index | 295 ms · 33 GET · 11.4 MB · CPU 217 ms | 121 ms · 0 GET · 3.8 MB · CPU 134 ms |
+| 10,000,000 | change window of 20 commits (100K entries): a page of 50K | 126 ms · 20 GET · 3.6 MB · CPU 86 ms | 110 ms · 0 GET · 2.0 MB · CPU 110 ms |
+| 100,000,000 | full delivery: first page, 10K keys | 189 ms · 33 GET · 4.8 MB · CPU 127 ms | 30 ms · 0 GET · 0.4 MB · CPU 28 ms |
+| 100,000,000 | full delivery: a page of 100K keys, mid-index | 441 ms · 37 GET · 16.4 MB · CPU 424 ms | 118 ms · 0 GET · 3.7 MB · CPU 131 ms |
+| 100,000,000 | change window of 20 commits (100K entries): a page of 50K | 135 ms · 20 GET · 3.6 MB · CPU 79 ms | 65 ms · 0 GET · 2.0 MB · CPU 67 ms |
+
+- **No GETs.** A page costs the worker no index reads; the cold worker's
+  20–37 are a page's index parts and blocks, fetched in parallel.
+- **A full-delivery page** of 10K keys takes 20–30 ms instead of 150–206
+  ms at every size; a page of 100K keys 118–139 ms instead of 230–441 ms,
+  most of it encoding the reply (3.7–3.9 MB of `.kx` in base64 JSON) and
+  decoding it.
+- **A change window's page** gains least, 65–110 ms against 119–135 ms:
+  its 20 delta files are small, so the cold worker's reads are few and
+  parallel, and the reply's 2 MB costs about what they do. Its GETs go to
+  zero all the same.
+
 ## Python rows: the native walk against tuned pure Python (2026-10-02)
 
 Is the native digest of `list[dict]` held back by FFI? The 2.1–3.6 µs a row
