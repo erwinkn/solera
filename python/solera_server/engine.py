@@ -716,7 +716,7 @@ class Engine(Attempts, Sensors, Views):
                 )
                 if any(i is not None for i in indexes.values()):
                     inputs[param]["indexes"] = {k: i for k, i in indexes.items() if i is not None}
-                pinned[param] = refs
+                pinned[param] = {k: self._logical(output, r) for k, r in refs.items()}
             elif edge.kind == "dep":
                 # Across upstream-only dimensions, a dep pins the heads that exist and
                 # agree with this scope's keys; otherwise its one projected head (§7).
@@ -728,14 +728,14 @@ class Engine(Attempts, Sensors, Views):
                 # A bound partition set pins into lineage, but it is the dimension — not
                 # interpretation: adding a key must not invalidate existing ones.
                 if not edge.set_dim:
-                    pinned[param] = refs
+                    pinned[param] = {k: self._logical(output, r) for k, r in refs.items()}
             elif edge.kind == "incremental":
                 incremental.append(edge)
             else:
                 inputs[param] = {"ref": self._pin_at(output, edge.scope), "load": load}
                 if load == "data" and (index := self._whole_index(output, inputs[param]["ref"])) is not None:
                     inputs[param]["index"] = index
-                pinned[param] = inputs[param]["ref"]
+                pinned[param] = self._logical(output, inputs[param]["ref"])
         fingerprint = self._fingerprint(asset, run, pinned)
         if full and run["mode"] == "full" and incremental:
             # This run's reset began the pass every edge is on: resume it, page by page.
@@ -1308,10 +1308,19 @@ class Engine(Attempts, Sensors, Views):
         floor = self.m.pin_floor(but=attempt, path=self.m.index(output, scope).prefix)
         return [e for e in entries if e["n"] <= floor and not e.get("stuck")][:DISCARDS]
 
+    @staticmethod
+    def _logical(output: str, ref: dict) -> list:
+        """A pinned input as interpretation sees it: which output, which
+        scope, which content version — never where its objects are. A value
+        written again unchanged, under a name of its own, is the same input."""
+
+        return [output, ref.get("partition") or "", ref.get("version")]
+
     def _fingerprint(self, asset, run, pinned):
         """H(version, store versions of input+output stores, run config,
-        refs of non-Incremental inputs and deps) — per-key interpretation
-        state; a change resets the edge's watermark (§2.2, §6)."""
+        the non-Incremental inputs and deps, as `_logical` sees them) —
+        per-key interpretation state; a change resets the edge's watermark
+        (§2.2, §6)."""
 
         stores = set()
         for output in asset["outputs"]:

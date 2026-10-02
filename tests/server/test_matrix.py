@@ -303,3 +303,38 @@ async def test_a_removed_consumer_lets_go_of_its_upstreams_log(state):  # noqa: 
         await drive(engine, await engine.submit(["keep"], upstream=True))
         engine.upkeep.truncate()
     assert state.model.indexes[("feed", "")].log == ()
+
+
+# -- an unchanged rewrite × interpretation ----------------------------------------------
+
+
+async def test_an_unchanged_value_rewritten_keeps_its_readers_deliveries(state):  # noqa: F811
+    """Review round 5, system #4: `settings` is written again with the same
+    content, at a new object (FileStore names a value by its generation).
+    Its version is the same, so a reader of `feed` that also reads it keeps
+    its watermark: nothing changed in `feed`, nothing is delivered again."""
+
+    calls = []
+
+    @asset(outputs=Output("feed", key="id"))
+    def feed():
+        return [{"id": "a"}]
+
+    @asset
+    def settings():
+        return {"rate": 2}
+
+    @asset(inputs={"feed": Incremental(), "settings": "settings"})
+    def reader(feed: list, settings: dict):
+        calls.append(len(feed))
+        return []
+
+    engine = make_engine(state, Project(assets=[feed, settings, reader]))
+    await engine.initialize()
+    refs = []
+    for _ in range(3):
+        assert status_of(await drive(engine, await engine.submit(["reader"], upstream=True))) == "succeeded"
+        ref = state.model.heads[("settings", "")]["ref"]
+        refs.append((ref["handle"]["path"], ref["version"]))
+    assert len({path for path, _ in refs}) == 3 and len({version for _, version in refs}) == 1
+    assert calls == [1]

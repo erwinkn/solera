@@ -455,9 +455,11 @@ and the console all ask that one question.
 
 The **interpretation fingerprint** `H(version, store versions of the
 asset's input and output stores, migration names of the asset's outputs,
-run config, refs of non-incremental inputs and deps)` is stored on the
-watermark. A fingerprint mismatch — a `version` bump, a new migration, or a
-change to any whole input — forces `full=True` on the edge: the delivery
+run config, and the non-incremental inputs and deps as output, scope and
+content version)` is stored on the watermark. Where an input's objects are
+is not part of it: a value written again with the same content, at a new
+object, is the same input. A fingerprint mismatch — a `version` bump, a new
+migration, or a change to any whole input — forces `full=True` on the edge: the delivery
 resets to the whole head. Code changes alone do not: the build identity
 (§11) bumps the project revision, not the fingerprint.
 
