@@ -496,22 +496,8 @@ def test_duplicate_migration_names_rejected():
         Project(assets=[bad], stores={"pg": PostgresStore("env:DATABASE_URL")})
 
 
-def test_migration_payload_must_pass_can_store():
-    """§4/§11: a payload the store cannot store is a registration error."""
-
-    @asset(outputs=Output("x", store="blobs", migrations=[Migration("m", "SELECT 1")]))
-    def bad() -> bytes:
-        return b""
-
-    with pytest.raises(RegistrationError, match="can_store"):
-        Project(assets=[bad], stores={"blobs": Migrating()})
-
-
 class Migrating(FileStore):
-    """A store that runs callable migrations only."""
-
-    def can_store(self, t, output):
-        return t is not str and super().can_store(t, output)
+    """A store that runs migrations."""
 
     async def migrate(self, output, migrations, scope=None, prior=None):
         return [m.name for m in migrations]

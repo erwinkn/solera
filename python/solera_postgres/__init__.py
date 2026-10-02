@@ -115,11 +115,6 @@ class PostgresStore:
             return False  # partition sets and dict outputs live on the default store
         return t is Sql or takes(t, output, frames=True, values=False)  # rows, DataFrames, Arrow
 
-    def can_migrate(self, t, output) -> bool:
-        """A migration is SQL, or a callable taking a cursor."""
-
-        return t is str or t is Callable
-
     # -- plumbing -----------------------------------------------------------
 
     def _connect(self):

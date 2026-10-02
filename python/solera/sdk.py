@@ -1488,15 +1488,6 @@ class Project:
                             f"{name}: output {output.name} declares migrations but store "
                             f"{record['store']!r} has no migrate (§4)"
                         )
-                    for migration in output.migrations:
-                        payload_t = Callable if callable(migration.payload) else type(migration.payload)
-                        # A migration's payload is no write: a store says what it takes of one.
-                        can = getattr(store, "can_migrate", None) or store.can_store
-                        if not can(payload_t, output):
-                            raise RegistrationError(
-                                f"{name}: migration {migration.name!r} payload "
-                                f"({payload_t}) fails can_store on store {record['store']!r} (§4)"
-                            )
                 if (
                     partitioned
                     and getattr(store, "shared_table", False)

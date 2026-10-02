@@ -83,8 +83,8 @@ def example_store(fenced=True):
     return module.JsonTableStore(DSN)
 
 
-def example_harness(tmp_path):
-    store = example_store()
+def example_harness(tmp_path, store=None):
+    store = store or example_store()
 
     @contextlib.asynccontextmanager
     async def hold(scope):
@@ -123,14 +123,9 @@ def cases():
 
 @pytest.mark.parametrize(("store", "scenario"), list(cases()))
 async def test_shipped_stores_conform(store, scenario, tmp_path):
-    from solera.testing.stores import Unverified
-
     harness = HARNESSES[store](tmp_path)
     assert scenario in scenarios(harness.store)
-    try:
-        await scenario(harness)
-    except Unverified as unverified:
-        pytest.skip(str(unverified))
+    await scenario(harness)
 
 
 async def test_the_kit_catches_a_store_that_forgets_its_fence():
@@ -140,14 +135,12 @@ async def test_the_kit_catches_a_store_that_forgets_its_fence():
     from solera.testing.stores import a_stale_writer_is_refused
 
     with pytest.raises(AssertionError, match="accepted a write it must refuse"):
-        await a_stale_writer_is_refused(Harness(example_store(fenced=False), fresh("example")))
+        await a_stale_writer_is_refused(example_harness(None, example_store(fenced=False)))
 
 
-async def test_a_scenario_the_harness_cannot_run_is_unverified(tmp_path):
-    """Without `Harness.hold`, the open-transaction scenario proves nothing:
-    it says so, rather than passing."""
+def test_a_fenced_stores_harness_holds_a_transaction():
+    """The waiting scenario needs `Harness.hold`: a fenced store's harness
+    without one is refused, rather than a scenario passing untested."""
 
-    from solera.testing.stores import Unverified, a_newer_writer_waits_for_an_open_older_one
-
-    with pytest.raises(Unverified, match="Harness.hold"):
-        await a_newer_writer_waits_for_an_open_older_one(Harness(example_store(), fresh("example")))
+    with pytest.raises(ValueError, match="needs hold"):
+        Harness(example_store(), fresh("example"))

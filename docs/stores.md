@@ -45,7 +45,6 @@ class Store(Protocol):
     async def discard(self, scope, prior, items) -> None: ...   # immutable
     async def acquire(self, scope, prior) -> None: ...          # fenced
     async def migrate(self, output, migrations, scope=None, prior=None) -> list[str]: ...  # optional
-    def can_migrate(self, t, output) -> bool: ...              # optional: else can_store
     def prepare(self, write, output) -> Prepared: ...          # optional: types of its own
     def reads(self) -> AsyncContextManager[Reader]: ...       # optional: a store of current rows
 
@@ -286,9 +285,9 @@ Declare the table's columns (`Output(..., columns={"n": "bigint"})`, and
 migrations to change them): a table a write creates from inferred types
 holds what that first write happened to show. PostgresStore infers them
 when undeclared — from a DataFrame's schema, else from every value not
-null — refuses a column it cannot type, and logs what it inferred.
-`can_migrate` says what a migration's payload may be (PostgresStore:
-SQL text or a callable), when it is not a write.
+null — refuses a column it cannot type, and logs what it inferred. A
+migration's payload is the store's own business (PostgresStore: SQL
+text, or a callable taking a cursor): `migrate` refuses one it cannot run.
 
 SQL a user hands the store for a write must not reach past the scope the
 engine fenced and records. PostgresStore's `Sql` is a query, never a

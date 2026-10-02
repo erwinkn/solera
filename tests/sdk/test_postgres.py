@@ -990,3 +990,15 @@ async def test_an_integer_key_is_read_through_an_index(store):
         )
     assert "Index" in plan and "Seq Scan" not in plan, plan
     assert await store.load(written.ref, list[dict], Keys({"42": (b"", 0)})) == [{"id": 42, "v": "x"}]
+
+
+async def test_a_migration_it_cannot_run_is_refused_when_it_runs(store):
+    """A migration's payload is the store's business: PostgresStore runs SQL
+    text or a callable taking a cursor, and refuses anything else as it
+    runs — registration does not type it."""
+
+    from solera.sdk import Migration
+
+    out = output(key="id", migrations=[Migration("odd", 42)])
+    with pytest.raises(StoreError, match="SQL string or a callable"):
+        await store.migrate(out, out.migrations)

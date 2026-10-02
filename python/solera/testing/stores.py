@@ -17,9 +17,7 @@ the kit needs no test framework. With pytest:
 The kit drives the store as the harness does: keyed writes arrive as a
 `KeyedWrite`, resolved against what the engine's key index would hold
 (the kit keeps that `Ledger` itself), keyed loads name their keys, and an
-unkeyed output's value arrives as it is, a plain list. A scenario that
-needs what the harness cannot give (`Harness.hold`) raises `Unverified`:
-not a pass — with pytest, `pytest.skip` it."""
+unkeyed output's value arrives as it is, a plain list."""
 
 from __future__ import annotations
 
@@ -38,18 +36,18 @@ class Harness:
     """What a scenario needs of the store under test. `output(**decl)` makes
     a fresh `Output` on it — a new name each call, so scenarios never share
     data — with the declaration given (`key="id", revision="v"`,
-    `incremental=True`, or none). `hold(scope)`, optional for a fenced
-    store, is an async context manager that opens a write transaction of
-    `scope` holding its fence until the block ends, then commits it: the
-    waiting scenario runs only with one."""
+    `incremental=True`, or none). `hold(scope)`, which a fenced store's
+    harness must give, is an async context manager that opens a write
+    transaction of `scope` holding its fence until the block ends, then
+    commits it: a newer writer waits for it."""
 
     store: Any
     output: Callable[..., Output]
     hold: Callable[[Scope], Any] | None = None
 
-
-class Unverified(Exception):
-    """A scenario the harness could not run: it proves nothing either way."""
+    def __post_init__(self):
+        if self.store.writes == "fenced" and self.hold is None:
+            raise ValueError("a fenced store's Harness needs hold: a write transaction held open")
 
 
 @dataclass
@@ -367,11 +365,8 @@ async def the_next_attempt_replaces_what_a_dead_writer_left(h: Harness) -> None:
 
 async def a_newer_writer_waits_for_an_open_older_one(h: Harness) -> None:
     """Writer 5's transaction is open: writer 9's acquisition waits for it to
-    commit, then takes over; writer 5's next write is refused. (Needs
-    `Harness.hold`.)"""
+    commit, then takes over; writer 5's next write is refused."""
 
-    if h.hold is None:
-        raise Unverified("needs Harness.hold: a write transaction held open")
     out, ledger = keyed(h), Ledger()
     first = await write(h, out, [{"id": "a", "v": "1"}], 5, ledger)
     async with h.hold(scope(out, 5)):
