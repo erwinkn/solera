@@ -1,5 +1,4 @@
 import asyncio
-import contextlib
 from types import SimpleNamespace
 
 import pytest
@@ -23,10 +22,13 @@ def pytest_collection_modifyitems(config, items):
 
 @pytest.fixture(autouse=True)
 async def world(monkeypatch):
-    """Every engine and state a test makes, torn down after it in order:
-    engines stopped (their key services' threads with them), then states
-    closed. A state that breaks would exit the process: here its exit codes
-    are recorded in `world.exits` instead."""
+    """Every engine and state a test makes on its own event loop (a server
+    thread's loop tears down its own), torn down after it in order: engines
+    stopped (their key services' threads with them), then states
+    closed. A failure tearing down is the test's, unless the test expects
+    it: it names its type in `world.expected`. A state that breaks would
+    exit the process: here its exit codes are recorded in `world.exits`
+    instead."""
 
     from solera_server.engine import Engine
     from solera_server.state import State
@@ -34,26 +36,39 @@ async def world(monkeypatch):
     engines, states = [], []
     init, open_state = Engine.__init__, State.open
 
+    loop = asyncio.get_running_loop()
+
     def made(self, *args, **kw):
         init(self, *args, **kw)
-        engines.append(self)
+        try:
+            mine = asyncio.get_running_loop() is loop
+        except RuntimeError:  # made outside any loop: the test's
+            mine = True
+        if mine:
+            engines.append(self)
 
     async def opened(*args, **kw):
         state = await open_state(*args, **kw)
-        states.append(state)
+        if asyncio.get_running_loop() is loop:
+            states.append(state)
         return state
 
     monkeypatch.setattr(Engine, "__init__", made)
     monkeypatch.setattr(State, "open", opened)
     exits: list[int] = []
     monkeypatch.setattr(State, "_exit", staticmethod(exits.append))
-    yield SimpleNamespace(engines=engines, states=states, exits=exits)
-    for engine in engines:
-        with contextlib.suppress(Exception):
-            await engine.stop()
-    for state in states:
-        with contextlib.suppress(Exception):
-            await state.close()
+    world = SimpleNamespace(engines=engines, states=states, exits=exits, expected=())
+    yield world
+    errors = []
+    for close in [engine.stop for engine in engines] + [state.close for state in states]:
+        try:
+            await close()
+        except world.expected:
+            pass
+        except Exception as error:
+            errors.append(error)
+    if errors:
+        raise errors[0]
 
 
 async def worker_finished() -> None:
