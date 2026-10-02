@@ -71,7 +71,7 @@ TABLES = {
             "assets": "VARCHAR[]",
             "committed": "VARCHAR[]",
             "mode": "VARCHAR",
-            "partitions": "VARCHAR",  # a named selection, or a JSON list of scopes
+            "partitions": "VARCHAR",  # a named selection, or JSON: a list of scopes, or each asset's
             "upstream": "BOOLEAN",
             "tags": "MAP(VARCHAR, VARCHAR)",
             "task_count": "INTEGER",
@@ -413,7 +413,9 @@ def run_record(rows: dict[str, list[dict]], events: int = 0) -> dict:
     return {
         "id": row["id"],
         "targets": list(row["targets"] or ()),
-        "partitions": json.loads(partitions) if partitions and partitions.startswith("[") else partitions,
+        "partitions": json.loads(partitions)
+        if partitions and partitions.startswith(("[", "{"))
+        else partitions,
         "mode": row["mode"],
         "upstream": row["upstream"],
         "config": None if row["config"] is None else json.loads(row["config"]),
@@ -779,7 +781,7 @@ class History:
         found = found[:limit]
         for row in found:
             text = row["partitions"]
-            if text and text.startswith("["):
+            if text and text.startswith(("[", "{")):
                 row["partitions"] = json.loads(text)
         return {"runs": found, "next": found[-1]["id"] if more and found else None, "total": total}
 

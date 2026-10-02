@@ -25,7 +25,6 @@ import json
 import logging
 import math
 import secrets
-from itertools import product
 from zoneinfo import ZoneInfo
 
 from croniter import croniter
@@ -44,7 +43,7 @@ from solera.keys.index import (
     key_str,
 )
 from solera.keys.io import ObjectIO
-from solera.sdk import TimePartitions, canonical_partition, digest, split_partition
+from solera.sdk import digest
 
 from . import history, planning
 from .attempts import POOL_OFFERED_GRACE, Attempts, Live
@@ -75,20 +74,6 @@ class Retryable(RuntimeError):
 
 class NonRetryable(RuntimeError):
     """A dispatch-time failure no retry will fix (§8: full run required, …)."""
-
-
-def check_tags(tags) -> dict[str, str]:
-    """Run tags: up to 32 short string pairs."""
-
-    tags = tags or {}
-    if not isinstance(tags, dict) or len(tags) > 32:
-        raise ValueError("tags must be an object of at most 32 entries")
-    for key, value in tags.items():
-        if not isinstance(key, str) or not isinstance(value, str) or not key or "=" in key:
-            raise ValueError("tags map non-empty names without '=' to strings")
-        if len(key) > 64 or len(value) > 256:
-            raise ValueError("A tag name is at most 64 characters, its value at most 256")
-    return dict(sorted(tags.items()))
 
 
 def _pages(keys: int, limit: int) -> int:
@@ -398,32 +383,6 @@ class Engine(Attempts, Sensors, Views):
     def _scope_active(self, asset: str, scope: str) -> bool:
         return self._scope_active_claim(asset, scope) or self.m.is_pending(asset, scope)
 
-    def _asset_of(self, name: str) -> str:
-        return self.planner().asset_of(name)
-
-    def _scopes(self, asset: str, selection) -> list[str]:
-        """`partitions` selects keys from the current set (§7, §8)."""
-
-        return self.planner().scopes(asset, selection)
-
-    def _dim_keys(self, dims: dict) -> list[list[str]]:
-        return self.planner().dim_keys(dims)
-
-    def _time(self, dim: dict) -> TimePartitions:
-        return planning.time_partitions(dim)
-
-    def _dims(self, asset: str | None) -> dict:
-        return self.planner().dims(asset)
-
-    def _project(self, consumer: dict, consumer_scope: str, upstream_dims: dict) -> str:
-        try:
-            return self.planner().project(consumer, consumer_scope, upstream_dims)
-        except planning.UpstreamOnly as error:
-            raise Conflict(str(error)) from None
-
-    def _project_downstream(self, producer: str, scope: str, target: str) -> dict[str, str]:
-        return self.planner().project_downstream(producer, scope, target)
-
     # -- attempt outcomes ------------------------------------------------------------
 
     def _finish(
@@ -701,73 +660,64 @@ class Engine(Attempts, Sensors, Views):
                         f"{task['asset']}: committed version {head['version']} != declared "
                         f"{asset['version']}: a full run is required"
                     )
-        edges = list(asset["inputs"].items())
-        for dep in asset["deps"]:
-            edges.append((dep, {"kind": "dep", "output": dep}))
-        # A bound partition set pins its ref in lineage (§7).
-        for dim in self._dims(task["asset"]).values():
-            if dim["kind"] == "set" and dim["output"] not in {e["output"] for _, e in edges}:
-                # The set pins into lineage and plans upstream, but it is the
-                # dimension — not interpretation — so it stays out of the
-                # fingerprint: adding a key must not invalidate existing ones.
-                edges.append((dim["output"], {"kind": "dep", "output": dim["output"], "set_dim": True}))
+        planner = self.planner()
+        try:
+            edges = planner.edges(task["asset"], scope)
+        except planning.UpstreamOnly as error:
+            raise Conflict(str(error)) from None
         # Pass 1: pin every non-Incremental edge; their refs enter the fingerprint (§6).
         inputs, pinned = {}, {}
         incremental = []
-        for param, edge in edges:
-            output = edge["output"]
-            owner = self.manifest["outputs"][output].get("asset")
-            up_dims = self._dims(owner)
-            if edge["kind"] == "all_partitions":
-                refs = self._all_partitions(task, asset, up_dims, output)
+        for edge in edges:
+            param, output = edge.param, edge.output
+            if edge.kind == "all_partitions":
+                refs = self._all_partitions(planner, edge)
                 inputs[param] = {"refs": refs}
                 indexes = {k: self._whole_index(output, ref) for k, ref in refs.items()}
                 if any(i is not None for i in indexes.values()):
                     inputs[param]["indexes"] = {k: i for k, i in indexes.items() if i is not None}
                 pinned[param] = refs
-                continue
-            if edge["kind"] == "dep":
+            elif edge.kind == "dep":
                 # Across upstream-only dimensions, a dep pins the heads that exist and
                 # agree with this scope's keys; otherwise its one projected head (§7).
-                planner = self.planner()
-                if planner.shared(asset, scope, up_dims)[1]:
-                    refs = {
-                        k: h["ref"] for k, h in planner.fan_in(asset, scope, output, complete=False).items()
-                    }
+                if edge.fan_in:
+                    refs = {k: h["ref"] for k, h in planner.fan_in(edge, complete=False).items()}
                 else:
-                    up_scope = self._project(asset, scope, up_dims)
-                    refs = {up_scope: self._pin_at(output, up_scope)}
+                    refs = {edge.scope: self._pin_at(output, edge.scope)}
                 inputs[param] = {"refs": refs}
-                if not edge.get("set_dim"):
+                # A bound partition set pins into lineage, but it is the dimension — not
+                # interpretation: adding a key must not invalidate existing ones.
+                if not edge.set_dim:
                     pinned[param] = refs
-                continue
-            if edge["kind"] == "incremental":
-                incremental.append((param, edge, up_dims))
-                continue
-            inputs[param] = {"ref": self._pin(output, up_dims, asset, scope)}
-            if (index := self._whole_index(output, inputs[param]["ref"])) is not None:
-                inputs[param]["index"] = index
-            pinned[param] = inputs[param]["ref"]
+            elif edge.kind == "incremental":
+                incremental.append(edge)
+            else:
+                inputs[param] = {"ref": self._pin_at(output, edge.scope)}
+                if (index := self._whole_index(output, inputs[param]["ref"])) is not None:
+                    inputs[param]["index"] = index
+                pinned[param] = inputs[param]["ref"]
         fingerprint = self._fingerprint(asset, run, pinned)
         if full and run["mode"] == "full" and incremental:
             # This run's reset began the pass every edge is on: resume it, page by page.
             started = [
-                (self.m.watermarks.get((task["asset"], p, scope)) or {}).get("pass")
-                for p, _, _ in incremental
+                (self.m.watermarks.get((task["asset"], e.param, scope)) or {}).get("pass")
+                for e in incremental
             ]
             if all(s == run["id"] for s in started):
                 full = False
         # Pass 2: Incremental plans against the fingerprinted interpretation (§2.2).
         plans, all_empty, each_page = {}, True, None
-        for param, edge, up_dims in incremental:
-            up_scope = self._project(asset, scope, up_dims)
-            ref = self._pin_at(edge["output"], up_scope)
+        for edge in incremental:
+            param, up_scope = edge.param, edge.scope
+            ref = self._pin_at(edge.output, up_scope)
             claim = self.m.claimed(attempt) if attempt is not None else None
             pin, plan, empty = self._incremental_plan(
-                task, param, edge, ref, up_scope, fingerprint, run, full, (claim or {}).get("pin")
+                task, param, edge.spec, ref, up_scope, fingerprint, run, full, (claim or {}).get("pin")
             )
-            if edge.get("each") is not None:
-                pin, plan, empty = self._each_plan(task, asset, param, edge, ref, up_scope, pin, plan, empty)
+            if edge.spec.get("each") is not None:
+                pin, plan, empty = self._each_plan(
+                    task, asset, param, edge.spec, ref, up_scope, pin, plan, empty
+                )
                 each_page = pin["each"]
             inputs[param] = pin
             plans[param] = plan
@@ -813,11 +763,11 @@ class Engine(Attempts, Sensors, Views):
             outputs[name] = info
         # The input versions its outputs will be built from, for the history (§7).
         lineage = []
-        for param, edge in edges:
-            pin = inputs.get(param) or {}
+        for edge in edges:
+            pin = inputs.get(edge.param) or {}
             refs = [pin["ref"]] if pin.get("ref") else list((pin.get("refs") or {}).values())
             for ref in refs:
-                lineage.append([edge["output"], ref.get("partition") or "", ref.get("version"), param])
+                lineage.append([edge.output, ref.get("partition") or "", ref.get("version"), edge.param])
         return {
             "version": asset["version"],
             "inputs": inputs,
@@ -859,11 +809,6 @@ class Engine(Attempts, Sensors, Views):
         }
         return {**kept, "outputs": outputs}
 
-    def _pin(self, output: str, up_dims: dict, asset: dict, scope: str):
-        """Resolve one edge to its head ref; sources synthesize theirs (§5, §8)."""
-
-        return self._pin_at(output, self._project(asset, scope, up_dims))
-
     def _pin_at(self, output: str, up_scope: str):
         """Head ref for one upstream scope; sources synthesize theirs (§5, §8)."""
 
@@ -885,22 +830,17 @@ class Engine(Attempts, Sensors, Views):
             return None
         return self.m.index(output, ref.get("partition") or "").pinned().to_json()
 
-    def _all_partitions(self, task, asset, up_dims, output) -> dict:
-        """AllPartitions pins every upstream partition with a complete head
-        that agrees with this scope's shared keys, keyed by the dimensions it
-        collapses (§7) — chosen among the heads that exist, never by expanding
-        the partition domain."""
+    @staticmethod
+    def _all_partitions(planner: planning.Planner, edge: planning.Edge) -> dict:
+        """AllPartitions pins every current upstream partition with a complete
+        head that agrees with this scope's shared keys, keyed by the dimensions
+        it collapses (§7) — chosen among the heads that exist, never by
+        expanding the partition domain."""
 
-        planner = self.planner()
-        _, free = planner.shared(asset, task["scope"], up_dims)
-        if not free:
-            head = self.m.heads.get((output, self._project(asset, task["scope"], up_dims)))
+        if not edge.fan_in:
+            head = planner.head(edge.output, edge.scope)
             return {"": head["ref"]} if head is not None and head["complete"] else {}
-        refs = {}
-        for up_scope, head in planner.fan_in(asset, task["scope"], output, complete=True).items():
-            parts = split_partition(up_dims, up_scope)
-            refs[canonical_partition(free, {n: parts[n] for n in free})] = head["ref"]
-        return refs
+        return {edge.key(s): h["ref"] for s, h in planner.fan_in(edge, complete=True).items()}
 
     def _incremental_plan(self, task, param, edge, ref, up_scope, fingerprint, run, full, claim_pin=None):
         """Plan one Incremental edge from its watermark (§6): returns the pin
@@ -1802,100 +1742,82 @@ class Engine(Attempts, Sensors, Views):
         scopes = sorted(s for (a, s) in self.m.failures if a == asset and (scope is None or s == scope))
         return {"asset": asset, "classes": classes, "scopes": scopes}
 
-    async def _submit_for(self, auto, partitions, targets=None):
-        return await self.submit(
+    def _automation_run(self, auto, partitions, targets=None) -> dict | None:
+        """The run a firing becomes, in the run's own vocabulary (§9); `None`
+        if every scope is in flight or waits for its inputs."""
+
+        return self._plan_run(
             targets or auto["targets"],
-            partitions=partitions,
-            mode=auto.get("mode") or "incremental",
-            upstream=auto.get("upstream") or False,
-            config=auto.get("config"),
-            keys=auto.get("keys"),
+            partitions,
+            auto.get("mode") or "incremental",
+            auto.get("upstream") or False,
+            auto.get("config"),
+            auto.get("keys"),
             automation=auto["name"],
             skip_active=True,
             skip_missing_inputs=auto.get("skip_missing_inputs") or False,
             tags=auto.get("tags"),
         )
 
+    def _fired(self, auto, run: dict | None, **fields) -> None:
+        """Submit a firing's run and record the firing, together."""
+
+        submitted = [{"type": "RunSubmitted", "run": run, "command": None}] if run is not None else []
+        fired = {
+            "type": "AutomationFired",
+            "name": auto["name"],
+            "at": self.clock(),
+            "run": run and run["id"],
+        }
+        self.state.record(*submitted, {**fired, **fields})
+
     async def _fire(self, auto, partitions):
         run = None
         try:
-            run = await self._submit_for(auto, partitions)
+            run = self._automation_run(auto, partitions)
         except Exception as error:
             self.last_error = f"automation {auto['name']}: {error}"
-        self.state.record(
-            {"type": "AutomationFired", "name": auto["name"], "at": self.clock(), "run": run and run["id"]}
-        )
+        self._fired(auto, run)
 
     async def _fire_ondeploy(self, auto):
-        """§9: fire once for the served revision, then record it. A submit
+        """§9: fire once for the served revision, then record it. A planning
         error leaves last_revision unset so the next tick retries."""
 
         try:
-            run = await self._submit_for(auto, auto.get("partitions") or "latest")
+            run = self._automation_run(auto, auto.get("partitions") or "latest")
         except Exception as error:
             self.last_error = f"automation {auto['name']}: {error}"
             return
-        self.state.record(
-            {
-                "type": "AutomationFired",
-                "name": auto["name"],
-                "at": self.clock(),
-                "run": run and run["id"],
-                "revision": self.manifest["revision"],
-            }
-        )
+        self._fired(auto, run, revision=self.manifest["revision"])
 
     async def _fire_onchange(self, auto):
-        """Project each changed upstream scope to the target's scopes (§7, §9),
-        then drop the consumed changes from the pending set."""
+        """One run per firing (§9). Each target's scopes are the automation's
+        `partitions`, if it names them, else every changed upstream scope's
+        projection onto the target (§7); planned together, a target that
+        reads another waits for it. The changes it covers leave the pending
+        set with it."""
 
-        consumed, per_asset = [], {}
-        for producer, scope in (list(p) for p in auto["pending"]):
-            owed = {}
-            for target in auto["targets"]:
-                t_dims = self._dims(target)
-                if not t_dims:
-                    owed.setdefault(target, set()).add("")
+        planner, explicit = self.planner(), auto.get("partitions")
+        consumed, selected = [], {}
+        try:
+            named = {t: planner.scopes(t, explicit) for t in auto["targets"]} if explicit else None
+            for producer, scope in (list(p) for p in auto["pending"]):
+                owed = named or {t: planner.reach(producer, scope, t) for t in auto["targets"]}
+                if any(self._scope_active_claim(t, s) for t, scopes in owed.items() for s in scopes):
+                    # A running attempt pinned its inputs before this change: it cannot cover
+                    # it. The change stays pending until that attempt ends, then fires.
                     continue
-                # Dimensions the change pins; the target's others — all of them for an
-                # external source, which has none — expand over their current keys.
-                pinned = self._project_downstream(producer, scope, target) if producer is not None else {}
-                free = {n: d for n, d in t_dims.items() if n not in pinned}
-                dim_keys = self._dim_keys(free)
-                missing_dims = list(free)
-                for combo in product(*dim_keys) if dim_keys else [()]:
-                    merged = dict(pinned)
-                    merged.update(dict(zip(missing_dims, combo, strict=True)))
-                    owed.setdefault(target, set()).add(canonical_partition(t_dims, merged))
-            if any(self._scope_active_claim(t, s) for t, scopes in owed.items() for s in scopes):
-                # A running attempt pinned its inputs before this change: it cannot cover
-                # it. The change stays pending until that attempt ends, then fires.
-                continue
-            consumed.append([producer, scope])
-            for target, scopes in owed.items():
-                per_asset.setdefault(target, set()).update(scopes)
-        if not consumed:
-            return
-        last_run = None
-        for target, scopes in per_asset.items():
-            if not scopes:
-                continue
-            try:
-                run = await self._submit_for(auto, sorted(scopes), targets=[target])
-                if run is not None:
-                    last_run = run["id"]
-            except Exception as error:
-                self.last_error = f"automation {auto['name']}: {error}"
-                return  # the changes stay pending: the next tick replays them
-        self.state.record(
-            {
-                "type": "AutomationFired",
-                "name": auto["name"],
-                "at": self.clock(),
-                "run": last_run,
-                "consumed": consumed,
-            }
-        )
+                consumed.append([producer, scope])
+                for target, scopes in owed.items():
+                    selected.setdefault(target, set()).update(scopes)
+            if not consumed:
+                return
+            partitions = {t: sorted(scopes) for t, scopes in selected.items() if scopes}
+            run = self._automation_run(auto, partitions, sorted(partitions)) if partitions else None
+        except Exception as error:
+            self.last_error = f"automation {auto['name']}: {error}"
+            return  # the changes stay pending: the next tick replays them
+        self._fired(auto, run, consumed=consumed)
 
     async def set_automation(self, name: str, enabled: bool):
         if name not in self.m.automations:
@@ -2116,7 +2038,7 @@ class Engine(Attempts, Sensors, Views):
         }
 
     async def asset_detail(self, name: str, scope=""):
-        asset = self._asset_of(name)
+        asset = self.planner().asset_of(name)
         info = self.manifest["assets"][asset]
         heads = {
             o["name"]: [(s, self.head_view(h)) for s, h in self.m.heads_of(o["name"])]
@@ -2127,13 +2049,13 @@ class Engine(Attempts, Sensors, Views):
             for param, edge in info["inputs"].items()
             if edge["kind"] == "incremental"
         }
-        dims = self._dims(asset)
+        dims = self.planner().dims(asset)
         return {
             "asset": info,
             "heads": heads,
             "cursor": self.m.cursors.get((asset, scope)),
             "watermarks": watermarks,
-            "current_keys": self._dim_keys(dims) if dims else [],
+            "current_keys": self.planner().dim_keys(dims) if dims else [],
             "unsettled": {
                 o["name"]: sorted(s for (n, s) in self.m.unsettled if n == o["name"]) for o in info["outputs"]
             },

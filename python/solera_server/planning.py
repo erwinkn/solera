@@ -6,15 +6,16 @@ nothing awaited.
 
 A selection is answered without enumerating the partition domain unless it
 asks for the whole of it: one explicit scope checks each of its parts'
-membership, `latest` builds only the latest time window, and only `all` and
-`missing` list every combination — up to `MAX_SCOPES`, past which they are an
-error rather than a silent truncation.
+membership. Any other is counted before it is listed — `latest` holds each
+time dimension at its latest window and lists the rest — and refused past
+`MAX_SCOPES` rather than silently truncated.
 """
 
 from __future__ import annotations
 
 import datetime as dt
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
+from dataclasses import dataclass, field
 from functools import partial
 from itertools import product
 
@@ -69,19 +70,27 @@ def size(dims: dict, now: dt.datetime, elements) -> int:
     return total
 
 
-def enumerate_scopes(dims: dict, now: dt.datetime, elements, *, what: str = "") -> list[str]:
-    """Every scope of `dims`, in dimension order — refused past `MAX_SCOPES`."""
+def enumerate_scopes(
+    dims: dict, now: dt.datetime, elements, *, pinned: Mapping[str, str] | None = None, what: str = ""
+) -> list[str]:
+    """Every scope of `dims` — those in `pinned` held at one key each — in
+    dimension order: counted first, refused past `MAX_SCOPES`."""
 
     if not dims:
         return [""]
-    total = size(dims, now, elements)
+    pinned = pinned or {}
+    free = {name: dim for name, dim in dims.items() if name not in pinned}
+    total = size(free, now, elements)
     if total > MAX_SCOPES:
         raise ValueError(
             f"{what or 'the selection'} spans {total} partitions, more than {MAX_SCOPES}: "
-            "select partitions explicitly, or the latest"
+            "select partitions explicitly"
         )
-    keys = [dim_keys(dim, now, elements) for dim in dims.values()]
-    return [canonical_partition(dims, dict(zip(dims, combo, strict=True))) for combo in product(*keys)]
+    keys = [dim_keys(dim, now, elements) for dim in free.values()]
+    return [
+        canonical_partition(dims, {**pinned, **dict(zip(free, combo, strict=True))})
+        for combo in product(*keys)
+    ]
 
 
 def membership(dims: dict, now: dt.datetime, elements) -> Callable[[str], bool]:
@@ -131,17 +140,14 @@ def select_scopes(
         return enumerate_scopes(dims, now, elements, what=what)
     if selection == "missing":
         return [s for s in enumerate_scopes(dims, now, elements, what=what) if missing(s)]
-    if selection == "latest":
-        if not dims:
-            return [""]
-        chosen = []
-        for dim in dims.values():
+    if selection == "latest":  # each time dimension at its latest window; the others in full
+        pinned = {}
+        for name, dim in dims.items():
             if dim["kind"] == "time":
-                latest = time_partitions(dim).latest(now)
-                chosen.append([latest] if latest else [])
-            else:
-                chosen.append(dim_keys(dim, now, elements))
-        return [canonical_partition(dims, dict(zip(dims, combo, strict=True))) for combo in product(*chosen)]
+                if (latest := time_partitions(dim).latest(now)) is None:
+                    return []
+                pinned[name] = latest
+        return enumerate_scopes(dims, now, elements, pinned=pinned, what=what)
     wanted = list(dict.fromkeys(selection or ()))
     if not dims:
         return [""] if "" in wanted else []
@@ -175,10 +181,51 @@ def check_tags(tags) -> dict[str, str]:
     return dict(sorted(tags.items()))
 
 
+COLLAPSING = frozenset({"all_partitions", "dep"})  # edge kinds that may read across free dimensions
+
+
+@dataclass(frozen=True)
+class Edge:
+    """One read of a scope (§5, §7): an input, a dep, or the dep a
+    partition-set dimension implies (`set_dim`: lineage, never the
+    fingerprint). Of the owner's dimensions `dims`, the consumer shares
+    `pinned` — at its scope's keys — and lacks `free`. A fan-in (an
+    `AllPartitions` or a dep with free dimensions) reads the heads that
+    exist across them; any other edge reads its one projected `scope`."""
+
+    param: str
+    kind: str
+    output: str
+    owner: str | None
+    dims: dict
+    pinned: dict
+    free: dict
+    spec: dict = field(compare=False, repr=False)
+    set_dim: bool = False
+
+    @property
+    def fan_in(self) -> bool:
+        return bool(self.free)
+
+    @property
+    def scope(self) -> str | None:
+        """The one upstream scope it reads; None for a fan-in."""
+
+        return None if self.free else canonical_partition(self.dims, self.pinned) if self.dims else ""
+
+    def key(self, up_scope: str) -> str:
+        """A fan-in head's key: its parts on the collapsed dimensions."""
+
+        parts = split_partition(self.dims, up_scope)
+        return canonical_partition(self.free, {name: parts[name] for name in self.free})
+
+
 class Planner:
     """Planning over one view: `manifest`; `head(output, scope)` and
     `heads_of(output)` — the committed heads, with `projected` heads (what a
-    sensor's commits will install) over them; and `now` (epoch seconds)."""
+    sensor's commits will install) over them; and `now` (epoch seconds). The
+    view is read as of each call; what a call derives from it (heads by
+    output, set members) is kept for the planner's life — one operation's."""
 
     def __init__(
         self,
@@ -192,6 +239,7 @@ class Planner:
         self.projected = dict(projected or {})
         self._head, self._heads_of = head, heads_of
         self.time = dt.datetime.fromtimestamp(now, dt.UTC)
+        self._groups: dict[tuple, dict] = {}
 
     # -- heads -------------------------------------------------------------------
 
@@ -240,17 +288,6 @@ class Planner:
                 free[name] = dim
         return pinned, free
 
-    def project(self, consumer: dict, consumer_scope: str, upstream_dims: dict) -> str:
-        """The projection rule (§7): shared dims take the consumer key;
-        consumer-only dims broadcast away; upstream-only dims must be collapsed."""
-
-        if not upstream_dims:
-            return ""
-        pinned, free = self.shared(consumer, consumer_scope, upstream_dims)
-        if free:
-            raise UpstreamOnly(f"upstream-only dimension {next(iter(free))!r} requires AllPartitions")
-        return canonical_partition(upstream_dims, pinned)
-
     def project_downstream(self, producer: str | None, scope: str, target: str) -> dict[str, str]:
         """Shared dims pinned by a changed scope of `producer`; the target's
         others are left for the caller to expand (§7, §9). A source (`None`)
@@ -268,99 +305,106 @@ class Planner:
                     break
         return pinned
 
-    def matches(self, upstream_dims: dict, up_scope: str, pinned: dict) -> bool:
-        """Whether an upstream scope agrees with the consumer's shared keys."""
+    def reach(self, producer: str | None, scope: str, target: str) -> list[str]:
+        """The target scopes a change of `producer` at `scope` reaches (§7,
+        §9): the dimensions it shares pinned, the others — every one, for a
+        source — over their current keys. Bounded by `MAX_SCOPES`."""
 
-        if not pinned:
-            return True
-        try:
-            parts = split_partition(upstream_dims, up_scope)
-        except (ValueError, KeyError):
-            return False
-        return all(parts.get(name) == value for name, value in pinned.items())
+        pinned = self.project_downstream(producer, scope, target)
+        return enumerate_scopes(
+            self.dims(target), self.time, self.elements, pinned=pinned, what=f"a change reaching {target}"
+        )
 
-    def fan_in(self, consumer: dict, scope: str, output: str, *, complete: bool) -> dict[str, dict]:
-        """The upstream heads a scope reads across the upstream-only dimensions
-        it lacks — `AllPartitions`, a dep — chosen among the heads that exist
-        and agree with its shared keys: never by expanding the domain. Keyed by
-        the upstream scope."""
+    # -- edges -------------------------------------------------------------------
 
-        up_dims = self.dims(self.owner(output))
-        pinned, _ = self.shared(consumer, scope, up_dims)
-        return {
-            up_scope: head
-            for up_scope, head in sorted(self.heads_of(output).items())
-            if self.matches(up_dims, up_scope, pinned) and (head["complete"] or not complete)
-        }
-
-    def spread(self, consumer: dict, scope: str, upstream_dims: dict) -> list[str]:
-        """Every upstream scope a scope could read across its upstream-only
-        dimensions: the domain, enumerated — only to build upstream work, and
-        refused past `MAX_SCOPES`."""
-
-        pinned, free = self.shared(consumer, scope, upstream_dims)
-        if not free:
-            return [canonical_partition(upstream_dims, pinned)] if upstream_dims else [""]
-        free_scopes = enumerate_scopes(free, self.time, self.elements, what="an upstream build")
-        out = []
-        for free_scope in free_scopes:
-            parts = split_partition(free, free_scope) if len(free) > 1 else {next(iter(free)): free_scope}
-            out.append(canonical_partition(upstream_dims, {**pinned, **parts}))
-        return out
-
-    # -- reads -------------------------------------------------------------------
-
-    def reads(self, asset: str, scope: str, *, build: bool = False) -> list[tuple]:
-        """`(kind, output, owner, upstream scope, fan_in)` for every edge, dep
-        and partition-set dimension of (asset, scope). A fan-in read — across
-        upstream-only dimensions — names the heads that exist, unless `build`
-        asks for every scope to build (bounded)."""
+    def edges(self, asset: str, scope: str) -> list[Edge]:
+        """What (asset, scope) reads: its inputs, its deps, then the partition
+        sets its dimensions are bound to. An edge that is no fan-in may not
+        lack an upstream dimension (`UpstreamOnly`)."""
 
         info = self.manifest["assets"][asset]
+        named = list(info["inputs"].items()) + [(d, {"kind": "dep", "output": d}) for d in info["deps"]]
+        outputs = {spec["output"] for _, spec in named}
+        named += [
+            (d["output"], {"kind": "dep", "output": d["output"], "set_dim": True})
+            for d in self.dims(asset).values()
+            if d["kind"] == "set" and d["output"] not in outputs
+        ]
         out = []
-        for edge in edges_of(info):
-            output, owner = edge["output"], self.owner(edge["output"])
-            up_dims = self.dims(owner)
-            if edge["kind"] in {"all_partitions", "dep"} and owner is not None:
-                _, free = self.shared(info, scope, up_dims)
-                if free:
-                    scopes = (
-                        self.spread(info, scope, up_dims)
-                        if build
-                        else self.fan_in(info, scope, output, complete=False)
-                    )
-                    out.extend((edge["kind"], output, owner, s, True) for s in scopes)
-                    continue
-            out.append((edge["kind"], output, owner, self.project(info, scope, up_dims), False))
-        for dim in self.dims(asset).values():
-            if dim["kind"] == "set" and self.owner(dim["output"]) is not None:
-                out.append(("dep", dim["output"], self.owner(dim["output"]), "", False))
+        for param, spec in named:
+            owner = self.owner(spec["output"])
+            dims = self.dims(owner)
+            pinned, free = self.shared(info, scope, dims)
+            if free and spec["kind"] not in COLLAPSING:
+                raise UpstreamOnly(f"upstream-only dimension {next(iter(free))!r} requires AllPartitions")
+            out.append(
+                Edge(
+                    param,
+                    spec["kind"],
+                    spec["output"],
+                    owner,
+                    dims,
+                    pinned,
+                    free,
+                    spec,
+                    bool(spec.get("set_dim")),
+                )
+            )
         return out
 
-    def missing(self, asset: str, scope: str, planned: dict) -> bool:
+    def fan_in(self, edge: Edge, *, complete: bool) -> dict[str, dict]:
+        """The heads a fan-in reads, by upstream scope: among those that exist,
+        the current partitions — a retired one's head is kept, never read —
+        that agree with its shared keys (`complete` ones only, for
+        `AllPartitions`). Never by expanding the domain: the owner's heads are
+        grouped by their shared keys once per planner."""
+
+        names = tuple(sorted(edge.pinned))
+        groups = self._groups.get((edge.output, names))
+        if groups is None:
+            member, groups = membership(edge.dims, self.time, self.elements), {}
+            for up_scope, head in sorted(self.heads_of(edge.output).items()):
+                if member(up_scope):
+                    parts = split_partition(edge.dims, up_scope)
+                    groups.setdefault(tuple(parts[n] for n in names), {})[up_scope] = head
+            self._groups[(edge.output, names)] = groups
+        heads = groups.get(tuple(edge.pinned[n] for n in names)) or {}
+        return {s: h for s, h in heads.items() if h["complete"] or not complete}
+
+    def spread(self, edge: Edge) -> list[str]:
+        """Every upstream scope an edge could read: for a fan-in, the domain
+        across its free dimensions, enumerated — only to build upstream work,
+        and bounded by `MAX_SCOPES`."""
+
+        if not edge.fan_in:
+            return [edge.scope]
+        return enumerate_scopes(
+            edge.dims, self.time, self.elements, pinned=edge.pinned, what="an upstream build"
+        )
+
+    def missing(self, asset: str, scope: str, planned: Mapping[str, Collection[str]]) -> bool:
         """Whether (asset, scope) reads an input never written that the run
         doesn't build — preparing it would fail. A fan-in reads what there is,
-        so it is missing only when there is nothing: no upstream head agrees
-        with its shared keys (a complete one, for `AllPartitions`)."""
+        so it is missing only when there is nothing: no current upstream head
+        agrees with its shared keys (a complete one, for `AllPartitions`)."""
 
-        info = self.manifest["assets"][asset]
-        for edge in edges_of(info):
-            owner = self.owner(edge["output"])
-            if edge["kind"] not in {"all_partitions", "dep"} or owner is None:
-                continue
-            up_dims = self.dims(owner)
-            pinned, free = self.shared(info, scope, up_dims)
-            if not free or any(self.matches(up_dims, s, pinned) for s in planned.get(owner, ())):
-                continue
-            if not self.fan_in(info, scope, edge["output"], complete=edge["kind"] == "all_partitions"):
-                return True
-        for kind, output, owner, up_scope, fan_in in self.reads(asset, scope):
-            if kind == "all_partitions" or fan_in or up_scope in planned.get(owner, ()):
-                continue
-            source = owner is None and output in self.manifest["sources"] and up_scope == ""
-            if not source and self.head(output, up_scope) is None:
-                return True
+        for edge in self.edges(asset, scope):
+            built = planned.get(edge.owner) or () if edge.owner is not None else ()
+            if edge.fan_in:
+                if any(self._agrees(edge, s) for s in built):
+                    continue
+                if not self.fan_in(edge, complete=edge.kind == "all_partitions"):
+                    return True
+            elif edge.kind != "all_partitions" and edge.scope not in built:
+                source = edge.owner is None and edge.output in self.manifest["sources"] and edge.scope == ""
+                if not source and self.head(edge.output, edge.scope) is None:
+                    return True
         return False
+
+    @staticmethod
+    def _agrees(edge: Edge, up_scope: str) -> bool:
+        parts = split_partition(edge.dims, up_scope)
+        return all(parts.get(name) == value for name, value in edge.pinned.items())
 
     def scopes(self, asset: str, selection) -> list[str]:
         outputs = self.manifest["assets"][asset]["outputs"]
@@ -401,8 +445,9 @@ class Planner:
         retry_of=None,
     ) -> dict | None:
         """The run a request becomes, without submitting it; `None` if the
-        skips leave nothing. `active(asset, scope)` says whether a scope is in
-        flight, for `skip_active`."""
+        skips leave nothing. `partitions` selects every target's scopes, or —
+        a map — each one's own. `active(asset, scope)` says whether a scope is
+        in flight, for `skip_active`. A run is at most `MAX_SCOPES` tasks."""
 
         if isinstance(targets, str):
             targets = [targets]
@@ -414,22 +459,31 @@ class Planner:
         if not isinstance(config, dict):
             raise ValueError("config must be a JSON object")
         tags = check_tags(tags)
-        assets: dict[str, list[str]] = {}
+        assets: dict[str, set[str]] = {}
         for target in targets:
             name = self.asset_of(target)
-            # A map names each asset's own scopes (a retry's).
-            assets[name] = self.scopes(name, partitions[name] if isinstance(partitions, dict) else partitions)
+            selection = (
+                partitions.get(target, partitions.get(name)) if isinstance(partitions, dict) else partitions
+            )
+            assets.setdefault(name, set()).update(self.scopes(name, selection))
         if upstream:
             queue = [(n, s) for n, scopes in assets.items() for s in scopes]
             seen = set(queue)
             while queue:
                 name, scope = queue.pop()
-                for _, _, owner, up_scope, _ in self.reads(name, scope, build=True):
-                    if owner is None or (owner, up_scope) in seen:
+                for edge in self.edges(name, scope):
+                    if edge.owner is None:
                         continue
-                    seen.add((owner, up_scope))
-                    assets.setdefault(owner, []).append(up_scope)
-                    queue.append((owner, up_scope))
+                    for up_scope in self.spread(edge):
+                        if (edge.owner, up_scope) in seen:
+                            continue
+                        seen.add((edge.owner, up_scope))
+                        if len(seen) > MAX_SCOPES:
+                            raise ValueError(
+                                f"the run spans more than {MAX_SCOPES} tasks: select fewer partitions"
+                            )
+                        assets.setdefault(edge.owner, set()).add(up_scope)
+                        queue.append((edge.owner, up_scope))
         if keys:
             incremental_outputs = {
                 e["output"]
@@ -441,22 +495,22 @@ class Planner:
             if unknown:
                 raise ValueError(f"keys= names no Incremental edge: {sorted(unknown)}")
         if skip_active:
-            for name in list(assets):
-                assets[name] = [s for s in assets[name] if not active(name, s)]
-            if not any(assets.values()):
-                return None  # §9: the tick is skipped — every scope is in flight
+            for name in assets:
+                assets[name] = {s for s in assets[name] if not active(name, s)}
         if skip_missing_inputs:
             while dropped := [
                 (n, s) for n, scopes in assets.items() for s in scopes if self.missing(n, s, assets)
             ]:
                 for name, scope in dropped:
-                    assets[name].remove(scope)
-            if not any(assets.values()):
-                return None  # nothing can run until its inputs are written
+                    assets[name].discard(scope)
+        if (skip_active or skip_missing_inputs) and not any(assets.values()):
+            return None  # §9: every scope is in flight, or can't run until its inputs are written
+        if sum(len(scopes) for scopes in assets.values()) > MAX_SCOPES:
+            raise ValueError(f"the run spans more than {MAX_SCOPES} tasks: select fewer partitions")
         run_id = ulid(self.now)
         tasks = {}
         for name, scopes in assets.items():
-            for scope in sorted(set(scopes)):
+            for scope in sorted(scopes):
                 task_id = f"{run_id}/{name}:{scope}"
                 tasks[task_id] = {
                     "id": task_id,
@@ -475,7 +529,7 @@ class Planner:
         return {
             "id": run_id,
             "targets": sorted(assets),
-            "partitions": partitions if isinstance(partitions, str) else list(partitions),
+            "partitions": partitions if isinstance(partitions, (str, dict)) else list(partitions),
             "mode": mode,
             "upstream": bool(upstream),
             "config": config,
@@ -493,39 +547,36 @@ class Planner:
             "tasks": tasks,
         }
 
-    def _order(self, tasks: dict, assets: dict) -> None:
-        """A task waits for the run's tasks it reads: the projected scope of
-        each edge, or — across upstream-only dimensions — every scope of the
-        owner in this run that agrees with its shared keys."""
+    def _order(self, tasks: dict, assets: Mapping[str, set[str]]) -> None:
+        """A task waits for the run's tasks it reads: the one scope an edge
+        projects to, looked up; or — a fan-in — the owner's scopes in this run
+        that agree with its shared keys, grouped by them once per owner and
+        set of shared dimensions. Linear in tasks plus links."""
 
+        groups: dict[tuple, dict] = {}
         for task in tasks.values():
-            info = self.manifest["assets"][task["asset"]]
-            edges = edges_of(info) + [
-                {"kind": "dep", "output": d["output"]}
-                for d in self.dims(task["asset"]).values()
-                if d["kind"] == "set"
-            ]
-            for edge in edges:
-                owner = self.owner(edge["output"])
-                if owner is None or owner not in assets:
+            deps = {}
+            for edge in self.edges(task["asset"], task["scope"]):
+                planned = assets.get(edge.owner)
+                if not planned:
                     continue
-                up_dims = self.dims(owner)
-                pinned, free = self.shared(info, task["scope"], up_dims) if up_dims else ({}, {})
-                if edge.get("kind") not in ("all_partitions", "dep") and free:
-                    continue  # registration forbids it; preparation says so
-                for up_scope in sorted(set(assets[owner])):
-                    dep_id = f"{task['run']}/{owner}:{up_scope}"
-                    if dep_id == task["id"] or dep_id in task["deps"]:
-                        continue
-                    if self.matches(up_dims, up_scope, pinned):
-                        task["deps"].append(dep_id)
-                        task["status"], task["queued_at"] = "waiting", None
-
-
-def edges_of(asset: dict) -> list[dict]:
-    """An asset's inputs, then its deps as edges of kind `dep`."""
-
-    return list(asset["inputs"].values()) + [{"kind": "dep", "output": d} for d in asset["deps"]]
+                if edge.fan_in:
+                    names = tuple(sorted(edge.pinned))
+                    if (edge.owner, names) not in groups:
+                        grouped = groups[(edge.owner, names)] = {}
+                        for up_scope in sorted(planned):
+                            parts = split_partition(edge.dims, up_scope)
+                            grouped.setdefault(tuple(parts[n] for n in names), []).append(up_scope)
+                    ups = groups[(edge.owner, names)].get(tuple(edge.pinned[n] for n in names), ())
+                else:
+                    ups = (edge.scope,) if edge.scope in planned else ()
+                for up_scope in ups:
+                    dep_id = f"{task['run']}/{edge.owner}:{up_scope}"
+                    if dep_id != task["id"]:
+                        deps[dep_id] = None
+            if deps:
+                task["deps"] = list(deps)
+                task["status"], task["queued_at"] = "waiting", None
 
 
 def same_dim(a: dict, b: dict) -> bool:

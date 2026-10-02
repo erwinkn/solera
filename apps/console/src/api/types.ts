@@ -414,13 +414,17 @@ export interface RunRow {
   assets: string[];
   committed: string[] | null;
   mode: string;
-  partitions: string[] | string | null;
+  partitions: Partitions | null;
   upstream: boolean;
   tags: Record<string, string>;
   task_count: number | null;
   failed_count: number | null;
   error: string | null;
 }
+
+/** A run's selection: a named one, a list of scopes, or each asset's own (an
+ * OnChange firing, a retry). Its JSON text, from the history. */
+export type Partitions = string | string[] | Record<string, string[]>;
 
 export interface RunPage {
   runs: RunRow[];
@@ -446,7 +450,7 @@ export interface Histogram {
 export interface RunRequest {
   id: string;
   targets: string[];
-  partitions: string[] | string;
+  partitions: Partitions;
   mode: string;
   upstream: boolean;
   config: Json;

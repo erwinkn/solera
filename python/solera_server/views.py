@@ -15,7 +15,6 @@ from solera.patterns import Matcher
 
 from . import planning
 from .model import BAD_OUTCOME
-from .state import Conflict
 
 SCAN = 100  # a failure listing reads at most this many entries per key it returns
 PAGE = 1000  # entries read from a failure index at a time
@@ -54,10 +53,10 @@ class Views:
             recorded, pending = outcomes.get(asset) or {}, running.get(asset) or set()
             scopes = set(scoped) | set(recorded) | pending
             if every:
-                listed = set(self._scopes(asset, "all"))
+                listed = set(planner.scopes(asset, "all"))
                 scopes, current = scopes | listed, listed.__contains__
             else:
-                current = planning.membership(self._dims(asset), planner.time, planner.elements)
+                current = planning.membership(planner.dims(asset), planner.time, planner.elements)
             rows = out[asset] = []
             for scope in sorted(scopes):
                 head, record = scoped.get(scope), recorded.get(scope)
@@ -101,7 +100,7 @@ class Views:
         planner, out = self.planner(), {}
         for name in names:
             counts = Counter(row["status"] for row in statuses[name])
-            total = planning.size(self._dims(name), planner.time, planner.elements)
+            total = planning.size(planner.dims(name), planner.time, planner.elements)
             missing = total - counts["complete"] - counts["failed"] - counts["running"]
             out[name] = {
                 "partitions": {
@@ -109,7 +108,7 @@ class Views:
                     "missing": missing,
                     **{s: counts[s] for s in ("complete", "failed", "running", "retired")},
                 },
-                "partitioned": bool(self._dims(name)),
+                "partitioned": bool(planner.dims(name)),
                 "last": None,
                 "failures": {} if self._each_edge(name) else None,
                 "unsettled": 0,
@@ -263,10 +262,9 @@ class Views:
         wm = self.m.watermarks.get((asset, param, scope))
         up_scope = (wm or {}).get("up")
         if up_scope is None:
-            up_dims = self._dims(self.manifest["outputs"][edge["output"]].get("asset"))
             try:
-                up_scope = self._project(self.manifest["assets"][asset], scope, up_dims)
-            except (Conflict, ValueError, KeyError):
+                up_scope = next(e.scope for e in self.planner().edges(asset, scope) if e.param == param)
+            except (ValueError, KeyError, StopIteration):
                 up_scope = None
         head = self.m.heads.get((edge["output"], up_scope)) if up_scope is not None else None
         head_batch = int(head.get("batch", -1)) if head is not None else None
@@ -307,7 +305,7 @@ class Views:
 
         info = self.manifest["assets"][asset]
         edges = [*info["inputs"].items(), *((d, {"kind": "dep", "output": d}) for d in info["deps"])]
-        current = set(self._scopes(asset, "all"))
+        current = set(self.planner().scopes(asset, "all"))
         marked: dict[str, set] = {}
         for a, param, scope in self.m.watermarks:
             if a == asset:
@@ -391,7 +389,10 @@ class Views:
         if edge not in keyed:
             raise ValueError(f"{asset} has no keyed Incremental edge {edge!r}")
         spec, is_each = keyed[edge], keyed[edge].get("each") is not None
-        if scope not in self._scopes(asset, [scope]) and (asset, edge, scope) not in self.m.watermarks:
+        if (
+            scope not in self.planner().scopes(asset, [scope])
+            and (asset, edge, scope) not in self.m.watermarks
+        ):
             raise KeyError(f"{asset}/{scope}")
         output = spec["output"]
         where = self._edge_scope(asset, edge, spec, scope)

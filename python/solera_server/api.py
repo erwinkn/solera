@@ -334,10 +334,10 @@ def create_app(
     async def partitions(p: str, name: str, request: Request):
         runtime = await project_engine(request, p)
         try:
-            asset = runtime._asset_of(name)
+            asset = runtime.planner().asset_of(name)
         except ValueError:
             raise KeyError(name) from None
-        if not runtime._dims(asset):
+        if not runtime.planner().dims(asset):
             raise ValueError(f"{asset} is unpartitioned")
         return {"asset": asset, "partitions": (await runtime.scope_statuses([asset]))[asset]}
 

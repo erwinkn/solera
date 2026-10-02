@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
 import { CalendarClock, GitCommitHorizontal, Hand, Radar, RotateCcw } from "lucide-react";
-import type { Histogram, RunRow } from "@/api/types";
+import type { Histogram, Partitions, RunRow } from "@/api/types";
 import { cn } from "@/lib/cn";
 import { clock, count, dateTime, firstLine, plural, shortId } from "@/lib/format";
 import { label, toneSolid, type Tone } from "@/lib/status";
@@ -60,14 +60,22 @@ export function TriggerLabel({
   );
 }
 
+/** A run's selection as a name or a list of scopes; each asset's own read
+ * as `asset scope`, or unpartitioned when none has a scope. */
 export function partitionsOf(partitions: RunRow["partitions"]): string[] | string {
-  if (Array.isArray(partitions)) return partitions;
-  if (typeof partitions === "string" && partitions.startsWith("[")) {
+  if (typeof partitions === "string" && (partitions.startsWith("[") || partitions.startsWith("{"))) {
     try {
-      return JSON.parse(partitions) as string[];
+      return partitionsOf(JSON.parse(partitions) as Partitions);
     } catch {
       return partitions;
     }
+  }
+  if (Array.isArray(partitions)) return partitions;
+  if (partitions && typeof partitions === "object") {
+    const scoped = Object.entries(partitions).flatMap(([asset, scopes]) =>
+      scopes.filter((scope) => scope !== "").map((scope) => `${asset} ${scope}`),
+    );
+    return scoped.length > 0 ? scoped : [""];
   }
   return partitions ?? "";
 }

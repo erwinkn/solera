@@ -1,5 +1,6 @@
 """Planning (engine review thr_e77mqir977 #2, #4, #5; system review
-thr_t6wbrkikak #3, #4): which scopes a request or a change selects."""
+thr_t6wbrkikak #3, #4; review round 3): which scopes a request or a change
+selects, what each reads, and the order a run's tasks take."""
 
 import asyncio
 import datetime as dt
@@ -12,6 +13,7 @@ from solera.sdk import (
     Automation,
     OnChange,
     Output,
+    PartitionSet,
     Project,
     Source,
     StaticPartitions,
@@ -186,14 +188,14 @@ def test_an_empty_fan_in_is_missing():
     manifest = Project(assets=[readings, report, rollup]).manifest
     heads: dict = {}
     now = dt.datetime(2026, 10, 2, tzinfo=UTC).timestamp()
-    planner = Planner(
-        manifest,
-        lambda o, s: heads.get((o, s)),
-        lambda o: [(s, h) for (out, s), h in heads.items() if out == o],
-        now,
-    )
 
     def planned(target, **kw):
+        planner = Planner(  # one per operation: it reads the view once
+            manifest,
+            lambda o, s: heads.get((o, s)),
+            lambda o: [(s, h) for (out, s), h in heads.items() if out == o],
+            now,
+        )
         run = planner.plan_run([target], partitions="all", **kw)
         return (
             None if run is None else sorted(t["scope"] for t in run["tasks"].values() if t["asset"] == target)
@@ -208,6 +210,142 @@ def test_an_empty_fan_in_is_missing():
     assert planned("rollup", skip_missing_inputs=True) is None  # AllPartitions reads complete heads
     heads[("readings", "day=d1,site=west")] = {"complete": True}
     assert planned("rollup", skip_missing_inputs=True) == ["d1"]
+
+
+async def test_a_fan_in_reads_only_current_partitions(state):  # noqa: F811
+    """Review round 3 (engine B2, system B2): a retired partition's head is
+    kept for inspection but no fan-in reads it — not AllPartitions, not a
+    dep across the dimension, not a missing-input check."""
+    members, seen = {"keys": ["east", "west"]}, {}
+
+    @asset(outputs=PartitionSet("sites"))
+    def sites():
+        return members["keys"]
+
+    @asset(partitions="sites")
+    def per_site(ctx):
+        return [{"site": ctx.partition}]
+
+    @asset(inputs={"per_site": AllPartitions()})
+    def rollup(per_site: dict[str, list]):
+        seen["rollup"] = sorted(per_site)
+        return [{"n": len(per_site)}]
+
+    project = Project(assets=[sites, per_site, rollup])
+    engine = make_engine(state, project)
+    await engine.initialize()
+    await drive(engine, await engine.submit(["sites"]))
+    await drive(engine, await engine.submit(["rollup"], upstream=True, partitions="all"))
+    assert seen["rollup"] == ["east", "west"]
+    members["keys"] = ["east"]  # west retires
+    await drive(engine, await engine.submit(["sites"]))
+    await drive(engine, await engine.submit(["rollup"]))
+    assert seen["rollup"] == ["east"]
+    assert state.model.heads.get(("per_site", "west")) is not None  # kept, not read
+    members["keys"] = ["north"]  # only retired partitions have heads now
+    await drive(engine, await engine.submit(["sites"]))
+    assert await engine.submit(["rollup"], skip_missing_inputs=True) is None
+
+
+def test_latest_and_changes_are_counted_before_they_are_listed():
+    """Review round 3 (system B3, engine P2): `latest` holds time dimensions
+    at their latest window but lists the others in full, and a change
+    reaches every scope it does not pin — both refused past `MAX_SCOPES`, as
+    `all` is, before a scope is built."""
+    big = StaticPartitions([f"k{i}" for i in range(400)])
+
+    @asset(partitions={"a": big, "b": big})
+    def grid(ctx):
+        return []
+
+    @asset(partitions={"day": TimePartitions(start="2026-09-01", every="1d"), "a": big})
+    def daily(ctx):
+        return []
+
+    manifest = Project(assets=[grid, daily], sources=[Source("feed")]).manifest
+    now = dt.datetime(2026, 10, 2, tzinfo=UTC).timestamp()
+    planner = Planner(manifest, lambda o, s: None, lambda o: [], now)
+    start = time.perf_counter()
+    for selection in ("all", "latest"):
+        with pytest.raises(ValueError, match=f"160000 partitions, more than {MAX_SCOPES}"):
+            planner.plan_run(["grid"], partitions=selection)
+    with pytest.raises(ValueError, match=f"more than {MAX_SCOPES}"):
+        planner.reach(None, "", "grid")  # a source change reaches every scope
+    assert time.perf_counter() - start < 1.0  # refused before listing
+    assert len(planner.reach("grid", "a=k1,b=k2", "daily")) == 31  # `a` pinned, every day listed
+    assert len(planner.plan_run(["daily"])["tasks"]) == 400  # the latest day, every `a`
+
+
+async def test_an_onchange_firing_is_one_run_in_order(state):  # noqa: F811
+    """Review round 3 (engine B1): a firing is one run over every target, so
+    a target that reads another waits for it; an automation that names
+    `partitions` runs those, not the change's projection."""
+    order = []
+
+    @asset(partitions=StaticPartitions(["a", "b"]), deps=["feed"])
+    def root(ctx):
+        order.append(("root", ctx.partition))
+        return [{"p": ctx.partition}]
+
+    @asset(partitions=StaticPartitions(["a", "b"]), inputs={"root": "root"})
+    def downstream(ctx, root: list):
+        order.append(("downstream", ctx.partition))
+        return root
+
+    automation = Automation("both", targets=["root", "downstream"], trigger=OnChange("feed"))
+    only_a = Automation("only_a", targets=["root"], trigger=OnChange("feed"), partitions=["a"], enabled=False)
+    project = Project(assets=[root, downstream], sources=[Source("feed")], automations=[automation, only_a])
+    engine = make_engine(state, project)
+    await engine.initialize()
+    await engine.commit_source("feed", version="v1")
+    await engine.tick()
+    fired = state.model.automations["both"]
+    assert not fired["pending"] and fired["last_run"]
+    run = await drive(engine, {"id": fired["last_run"]})
+    assert run["request"]["status"] == "succeeded"
+    assert {t["asset"] for t in run["tasks"]} == {"root", "downstream"}  # one run
+    assert order.index(("root", "a")) < order.index(("downstream", "a"))
+    assert run["request"]["partitions"] == {"downstream": ["a", "b"], "root": ["a", "b"]}
+    await engine.set_automation("both", False)
+    await engine.set_automation("only_a", True)
+    await engine.commit_source("feed", version="v2")
+    await engine.tick()
+    run = state.model.runs[state.model.automations["only_a"]["last_run"]]
+    assert sorted(t["scope"] for t in run["tasks"].values()) == ["a"]
+
+
+def test_linking_a_run_is_linear():
+    """Review round 3 (P1): a one-to-one edge links each task by lookup, a
+    fan-in through one grouping per edge shape — not by scanning every
+    upstream scope for every task."""
+    keys = StaticPartitions([f"k{i:05d}" for i in range(4000)])
+    sites = StaticPartitions(["east", "west"])
+
+    @asset(partitions={"k": keys, "site": sites})
+    def raw(ctx):
+        return []
+
+    @asset(partitions={"k": keys}, inputs={"raw": AllPartitions()})
+    def cooked(ctx, raw: dict[str, list]):
+        return []
+
+    @asset(partitions={"k": keys}, inputs={"cooked": "cooked"})
+    def served(ctx, cooked: list):
+        return []
+
+    manifest = Project(assets=[raw, cooked, served]).manifest
+    planner = Planner(
+        manifest, lambda o, s: None, lambda o: [], dt.datetime(2026, 10, 2, tzinfo=UTC).timestamp()
+    )
+    start = time.perf_counter()
+    run = planner.plan_run(["served"], partitions="all", upstream=True)
+    assert time.perf_counter() - start < 3.0  # 12,000 tasks; ~10 s when quadratic
+    tasks = run["tasks"]
+    assert len(tasks) == 16000
+    served_7 = tasks[f"{run['id']}/served:k00007"]
+    cooked_7 = tasks[f"{run['id']}/cooked:k00007"]
+    assert served_7["deps"] == [cooked_7["id"]]
+    assert cooked_7["deps"] == [f"{run['id']}/raw:k=k00007,site=east", f"{run['id']}/raw:k=k00007,site=west"]
 
 
 async def test_a_source_change_fans_out_over_a_partitioned_consumer(state):  # noqa: F811
