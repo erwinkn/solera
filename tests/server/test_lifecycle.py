@@ -96,13 +96,13 @@ async def test_a_loser_exits_once_the_engine_says_the_attempt_ended(tmp_path):
 async def test_a_loser_without_a_channel_exits_on_a_terminal_gate(tmp_path):
     """With no channel, the objects tell it: the engine aborted the gate."""
 
-    from .test_fence import Overwriting
+    from .test_fence import Gated
 
     @asset(executor=Fake("fake")(), retries=Retry(0))
     def items():
         return [{"a": 1}]
 
-    project = Project(assets=[items], executors=[Fake("fake")], default_store=Overwriting())
+    project = Project(assets=[items], executors=[Fake("fake")], default_store=Gated())
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = engine_for(state, project, cancel_grace=0.1)
     await engine.initialize()
@@ -275,78 +275,9 @@ async def test_a_long_log_is_chunks_and_a_tail(tmp_path, monkeypatch):
     await state.close()
 
 
-async def strict_hold(tmp_path):
-    """A strict overwrite store whose writer dies mid-write: the attempt ends
-    `uncertain` and its scope is held, the retry with it."""
-
-    from .test_fence import LiveStore
-
-    class Strict(LiveStore):
-        strict = True
-
-    live = Strict()
-    writes = [[{"id": "a", "v": 1}], [{"id": "a", "v": 2}, {"id": "b", "v": 2}], [{"id": "a", "v": 2}]]
-
-    @asset(outputs=Output("items", key="id", revision="v", store="live"), retries=Retry(1, delay=0))
-    def items():
-        return writes.pop(0)
-
-    project = Project(assets=[items], stores={"live": live})
-    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
-    engine = engine_for(state, project, placement="inline", heartbeat_seconds=0.1)
-    await engine.initialize()
-    await engine.run_until((await engine.submit(["items"]))["id"], 10)
-    live.die = 1
-    run = await engine.submit(["items"])
-    await until(engine, lambda: ("items", "") in state.model.holds)
-    hold = state.model.holds[("items", "")]
-    assert hold["mode"] == "strict"
-    task = state.model.task(next(iter(state.model.runs[run["id"]]["tasks"])))
-    await until(engine, lambda: task.get("held") == ["uncertain", hold["attempt"]])
-    return engine, state, run, hold, live
-
-
-async def test_a_strict_scope_waits_for_an_operator(tmp_path):
-    """Strict: no grace. The scope stays held however long; an operator's
-    release lets the retry run, and its write settles what the dead writer
-    left."""
-
-    engine, state, run, hold, live = await strict_hold(tmp_path)
-    for _ in range(20):
-        await engine.tick()
-        await asyncio.sleep(0.05)
-    assert ("items", "") in state.model.holds
-    engine.release_scope("items", "", "ops@example.com")
-    detail = await engine.run_until(run["id"], 15)
-    assert detail["request"]["status"] == "succeeded"
-    events = await engine.history.events(run["id"])
-    assert [e["reason"] for e in events if e["type"] == "released"] == ["operator:ops@example.com"]
-    assert live.rows == {"a": {"id": "a", "v": 2}}  # the retry's replacement, whatever the dead one left
-    await engine.stop()
-    await state.close()
-
-
-async def test_a_strict_scope_is_released_by_the_writers_late_result(tmp_path):
-    """The writer was not dead after all: its result arrives, sealed after
-    its store calls returned (`complete`). That establishes completion, and
-    the scope is released."""
-
-    engine, state, run, hold, live = await strict_hold(tmp_path)
-    late = {"invocation": "late", "status": "succeeded", "writes": "complete", "outputs": {}}
-    await state.create_object(
-        f"{lifecycle.base(hold['run'], hold['attempt'])}.result", json.dumps(late).encode()
-    )
-    detail = await engine.run_until(run["id"], 15)
-    assert detail["request"]["status"] == "succeeded"
-    events = await engine.history.events(run["id"])
-    assert [e["reason"] for e in events if e["type"] == "released"] == ["result"]
-    await engine.stop()
-    await state.close()
-
-
-async def test_a_fenced_stores_scope_is_released_at_once(tmp_path):
-    """A fenced store needs no grace (§9.6): the retry's acquisition fences
-    the dead writer. Its scope is not held, and each attempt acquires a
+async def test_a_fenced_store_runs_its_retry_at_once(tmp_path):
+    """A dead writer on a fenced store (§9.6): the retry runs at once, its
+    acquisition fencing the dead writer out, and each attempt acquires a
     higher generation than the last, before it reads anything."""
 
     from .test_fence import LiveStore
@@ -376,43 +307,34 @@ async def test_a_fenced_stores_scope_is_released_at_once(tmp_path):
     detail = await engine.run_until((await engine.submit(["items"]))["id"], 15)
     assert detail["request"]["status"] == "succeeded"
     assert [a["status"] for a in detail["attempts"][detail["tasks"][0]["id"]]] == ["failed", "succeeded"]
-    events = await engine.history.events(detail["request"]["id"])
-    assert not [e for e in events if e["type"] == "released"]  # never held
     (first, one), (second, other) = live.acquired
     assert second > first and one != other
     await engine.stop()
     await state.close()
 
 
-async def test_a_renamed_asset_keeps_its_strict_hold(tmp_path):
-    """Review P1-3: renaming an asset (`aliases=`) moves its hold, its
-    unsettled intents and its pending discards with it. The writer it waits
-    for may still write the same data under either name, so the new name's
-    run stays held until an operator releases it."""
+async def test_a_renamed_asset_keeps_what_its_scope_owes(tmp_path):
+    """Review P1-3: renaming an asset (`aliases=`) moves its unsettled
+    intents and its pending discards with it: a new name never lets a dead
+    writer's keys go unrepaired, nor its garbage go uncollected."""
 
-    engine, state, run, hold, live = await strict_hold(tmp_path)
-    await engine.cancel(run["id"])
-    await engine.stop()
+    @asset(outputs=Output("items", key="id", revision="v"))
+    def items():
+        return [{"id": "a", "v": 1}]
+
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = engine_for(state, Project(assets=[items]), placement="inline")
+    await engine.initialize()
     m = state.model
-    assert ("items", "") in m.unsettled
+    m.unsettled[("items", "")] = [{"files": [], "run": "r", "attempt": "dead"}]
     m.discards[("items", "")] = [{"n": 1, "id": "1.0", "kind": "items", "items": [["path", "x"]]}]
 
-    @asset(outputs=Output(key="id", revision="v", store="live"), aliases=["items"])
+    @asset(outputs=Output(key="id", revision="v"), aliases=["items"])
     def catalog():
         return [{"id": "a", "v": 3}]
 
-    project = Project(assets=[catalog], stores={"live": live})
-    engine = engine_for(state, project, placement="inline", heartbeat_seconds=0.1)
+    engine = engine_for(state, Project(assets=[catalog]), placement="inline")
     await engine.initialize()
-    assert ("items", "") not in m.holds and m.holds[("catalog", "")]["attempt"] == hold["attempt"]
-    assert ("catalog", "") in m.unsettled and ("items", "") not in m.unsettled
+    assert m.unsettled[("catalog", "")][0]["attempt"] == "dead" and ("items", "") not in m.unsettled
     assert [d["n"] for d in m.discards[("catalog", "")]] == [1] and ("items", "") not in m.discards
-    renamed = await engine.submit(["catalog"])
-    task = m.task(next(iter(m.runs[renamed["id"]]["tasks"])))
-    await until(engine, lambda: task.get("held") == ["uncertain", hold["attempt"]])
-    assert task["status"] == "queued" and not task.get("tries")
-    engine.release_scope("catalog", "", "ops@example.com")
-    detail = await engine.run_until(renamed["id"], 15)
-    assert detail["request"]["status"] == "succeeded"
-    await engine.stop()
     await state.close()

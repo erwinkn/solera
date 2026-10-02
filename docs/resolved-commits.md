@@ -9,8 +9,8 @@ attempt receives small pending windows inline.
 It depends on two other designs, and says where:
 
 - `lifecycle.md` — the worker → engine HTTPS channel (§5), the `.worker`
-  claim that admits one invocation (§4), and the store kinds `immutable`,
-  `fenced` and `overwrite` (§9.6), which decide the repair rules of §3.
+  claim that admits one invocation (§4), and the store kinds `immutable`
+  and `fenced` (§9.6, `stores.md`), which decide the repair rules of §3.
 - `per-key-processing.md` — the failure index, whose one v1 reader here
   (inlined retry pages) follows that doc's eligibility predicate and
   transition table (§8). Its own semantics (rescoping, cancellation, retry
@@ -94,9 +94,7 @@ store writes the delta's upserts, and the commit records the delta. The
 generation is the delta entry's **locator**; superseded objects are
 collected through their predecessors' locators (§6).
 
-**`fenced` and `overwrite` stores** keep intents and repair, in this
-order — the order matters for `fenced` stores, and is today's for
-`overwrite`:
+**`fenced` stores** keep intents and repair, in this order:
 
 ```
 1. acquire       fenced: the store's generation for (output, scope), before reading anything
@@ -106,7 +104,7 @@ order — the order matters for `fenced` stores, and is today's for
                  an unknown-writes intent: the store's whole key map, reconciled (below)
 3. resolve       the repaired run — by the engine or locally
 4. upload        the delta file, create-only
-5. gate          the attempt's `.writing` gate with its intents (both kinds keep it, lifecycle §9.6)
+5. gate          the attempt's `.writing` gate with its intents (lifecycle §9.6)
 6. write         under the store's checks: fenced, every transaction checks the generation
 ```
 
@@ -330,7 +328,7 @@ the engine checks again.
 |---|---|
 | Engine unreachable, restarting, or slow | Local resolve after the timeout; same delta, possibly an inexact count (§6) |
 | Worker dies after the response, before the gate | Nothing to clean on the engine; the uploaded delta is the worker's and is discarded at attempt end as today |
-| Worker dies after the gate | Unsettled intents and repair (overwrite, fenced); nothing for immutable stores |
+| Worker dies after the gate | Unsettled intents and repair (fenced); nothing for immutable stores |
 | Attempt canceled while a resolve runs | By the cancel record (`lifecycle.md` §2.2): a draining attempt still resolves; once the record is `forced`, or the attempt ended, a resolve checks that when it starts and between chunks, and stops, releasing its pins |
 | Compaction commits during a resolve | The resolve keeps the file set it pinned; garbage collection waits for the pin |
 | A second invocation of the attempt | `409`: the engine admits one invocation (lifecycle §4) |
@@ -548,7 +546,7 @@ The alternatives, priced at 100M keys, 1K random changes per commit:
 An index over the cache budget takes the cold path on every commit, so
 the first row would cost scenario E ~$130 a month; the second gives up
 prompt collection that the warm path gets for free. Outputs on `fenced`
-and `overwrite` stores carry locators too but collect nothing by them.
+stores carry locators too but collect nothing by them.
 
 **Streaming merge-join**, for replacements and dense patches: the native
 job that full replacement, compaction and recount already use, extended to

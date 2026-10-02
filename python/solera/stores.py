@@ -104,29 +104,28 @@ class Store(Protocol):
     and Arrow data — and `stamped(output)`, the columns it adds to every
     row itself, which a row's digest leaves out (docs/row-digest.md).
 
-    `writes` says how it writes, which decides what the engine may do once
-    it gave up on a writer (docs/lifecycle.md §9.6): `"immutable"` (it only
-    ever writes names nothing committed references; it implements
-    `discard`), `"fenced"` (it implements `acquire`, and every write checks
-    the generation atomically), or `"overwrite"`, the default (a scope whose
-    writer may still write is held `late_write_grace` seconds, or — with
-    `strict` — until the writer's completion is established).
+    `writes` says how a writer the engine gave up on is kept from writing
+    over a newer one — every store declares one (docs/stores.md):
+    `"immutable"`, it writes only names no other attempt uses, and
+    implements `discard`; or `"fenced"`, it implements `acquire`, and every
+    write checks the attempt's generation atomically (`solera.fencing`).
 
-    It also says what a load sees (docs/architecture.md §3): an immutable
-    store returns exactly the version a ref and selection pin; a fenced or
-    overwrite store returns its current rows, so a reader may see a newer
-    version than it pinned."""
+    It also says what a load sees (docs/stores.md): an immutable store
+    returns exactly the version a ref and selection pin; a fenced store its
+    current rows, so a reader may see a newer version than it pinned.
+    `solera.testing.stores` checks a store against the contract."""
 
     version: str = "1"
     ref_type: type[Ref] = Ref
-    writes: str = "overwrite"
-    strict: bool = False
-    late_write_grace: float = 120.0
+    writes: str  # "immutable" or "fenced"
 
     def can_load(self, t: type | None, selection: type | None) -> bool: ...
     def can_store(self, t: type | None, output: Output) -> bool: ...
     async def store(self, write: Any, prior: Ref | None, scope: Scope) -> Written: ...
     async def load(self, ref: Ref, t: type, selection: Keys | Batches | None) -> Any: ...
+
+    # immutable: async def discard(self, scope: Scope, prior: Ref | None, items: list) -> None
+    # fenced:    async def acquire(self, scope: Scope) -> None
 
 
 def resolve_env(value: Any) -> Any:

@@ -196,17 +196,15 @@ it is what each kind can promise.
   range the committed object of each batch. A newer commit does not
   change what a pinned reader sees; superseded objects stay until no
   reader pin predates them.
-- **Current data: PostgresStore** (`fenced`) **and stores that overwrite**
-  (`overwrite`, the default for user stores). One copy per row, changed in
-  place: a load returns the rows as they are now. A consumer pinned to
+- **Current data: PostgresStore and every `fenced` store.** One copy per
+  row, changed in place: a load returns the rows as they are now. A consumer pinned to
   version 12 that loads after version 13 committed reads version 13's
   rows, so one run can see different outputs at different moments. An
   `Incremental` edge still delivers the keys of its pinned window; a row
   changed since is read in its newer form (and delivered again with the
   window that changed it: a harmless repeat), and a row deleted since may
   be missing. Writers are safe all the same: a fenced store refuses an
-  older attempt's writes, an overwrite store's attempts take the write
-  gate (`lifecycle.md` §9.5–§9.9).
+  older attempt's writes (`stores.md`).
 
 **Keyed outputs.** Stores keep no key maps: the engine's key index does
 (§6). The harness has a keyed write read once — by its store's `prepare`,
@@ -247,10 +245,11 @@ Batches = (lo: int, hi: int)  # load rows of batches in [lo, hi]
 | `load(ref, t, selection)` | Materialize `t` from what the store holds now; under `Keys`, only the selected keys; under `Batches`, only batches in the range. |
 | `migrate(output, migrations)` | Optional. Apply, in declared order, every migration not yet in the store's own ledger for this output; return the applied names. Must be safe under concurrent attempts of one output (partitions share tables): take a store-level lock and re-read the ledger inside it. Where the backend is transactional, a migration and its ledger row commit together. A store without `migrate` rejects `migrations=` at registration. |
 
-Optional attributes and methods, with defaults: `writes`, `strict`,
-`late_write_grace`, `acquire(scope)` and `discard(scope, prior, items)` —
-how the store writes and what the engine may do once a writer is gone
-(lifecycle.md §9.6–§9.9); `prepare(write, output) -> Prepared` — how a
+Every store declares `writes`: `"immutable"`, implementing `discard(scope,
+prior, items)`, or `"fenced"`, implementing `acquire(scope)` — how a writer
+the engine gave up on is kept from writing over a newer one. `stores.md`
+is the contract, with its invariants, recipes per backend and the
+scenarios `solera.testing.stores` checks. Optional: `prepare(write, output) -> Prepared` — how a
 keyed write of any type is read: its rows, natively, and how to take the
 rows it persists (the default, `solera.stores.prepare`, reads lists of
 mappings, pandas DataFrames and Arrow data, importing only the library of

@@ -157,13 +157,8 @@ def _main():
     runs_prune.add_argument("--asset", help="Only runs of this asset")
     runs_prune.add_argument("--keep", type=int, help="Keep the N newest matching runs")
     runs_prune.add_argument("--dry-run", action="store_true")
-    scopes = commands.add_parser(
-        "scopes", help="Scopes held for an uncertain writer (docs/lifecycle.md §9.9)"
-    )
+    scopes = commands.add_parser("scopes", help="An output scope's data garbage (docs/lifecycle.md §9.8)")
     scopes_sub = scopes.add_subparsers(dest="scopes_command", required=True)
-    release = scopes_sub.add_parser("release", help="Release a scope held for an uncertain writer")
-    release.add_argument("asset")
-    release.add_argument("scope", nargs="?", default="")
     discards = scopes_sub.add_parser("discards", help="An output scope's data garbage, and the stuck entries")
     discards.add_argument("output")
     discards.add_argument("scope", nargs="?", default="")
@@ -431,11 +426,6 @@ async def _remote(args, parser):
             response = await client.post(f"{base}/assets/{args.asset}/keys:retry", json=body)
             response.raise_for_status()
             print(json.dumps(response.json(), indent=2))
-        elif args.command == "scopes":
-            body = {"asset": args.asset, "scope": args.scope, "by": "cli"}
-            response = await client.post(f"{base}/scopes:release", json=body)
-            response.raise_for_status()
-            print(json.dumps(response.json(), indent=2))
         elif args.command == "runs" and args.runs_command == "delete":
             response = await client.delete(f"{base}/runs/{args.run_id}")
             response.raise_for_status()
@@ -514,8 +504,6 @@ async def _local(args, parser):
             runs = await runtime.submit_retries(args.asset, found["scopes"], "cli") if found["scopes"] else []
             found["runs"] = [(await runtime.run_until(r["id"]))["request"]["status"] for r in runs]
             print(json.dumps(found, indent=2))
-        elif args.command == "scopes":
-            print(json.dumps(runtime.release_scope(args.asset, args.scope, "cli"), indent=2))
         elif args.command == "runs" and args.runs_command == "delete":
             await runtime.delete_run(args.run_id)
             print(json.dumps({"deleted": [args.run_id]}, indent=2))

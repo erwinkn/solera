@@ -617,12 +617,12 @@ count of a keyed output, else the length of a returned list.
 | p50/p95 duration and wait, failure counts, compute hours, per asset and per executor | `GET /stats?since=&asset=&scope=` | |
 | an asset's versions and their metadata | `GET /assets/{name}/history?output=&scope=&before=` | |
 | what a version was built from, or what was built from it | `GET /outputs/{name}/lineage?scope=&version=&direction=upstream\|downstream&depth=5` | |
-| every asset at a glance: scopes by status, newest outcome, failing keys, held and unsettled scopes | `GET /assets:status` → `{assets: {name: {partitions, partitioned, last, failures, held, unsettled, updated_at}}}` | |
+| every asset at a glance: scopes by status, newest outcome, failing keys, unsettled scopes | `GET /assets:status` → `{assets: {name: {partitions, partitioned, last, failures, unsettled, updated_at}}}` | |
 | an `Each` asset's failing keys, and each scope's failure record | `GET /assets/{name}/failures?scope=&outcome=&after=&limit=100` → `{scopes, keys, epoch, now, next}` | |
 | what an `Each` asset's keys came to, newest first | `GET /assets/{name}/key-outcomes?scope=&key=&q=&outcome=&run=&before=&limit=100` → `{outcomes, next}` | |
 | why a key is, or is not, in an asset's output (per-key-processing.md §10) | `GET /assets/{name}/explain?key=&scope=&edge=` → `{verdict, patterns, failure, last, last_ok, …}` | |
 | an asset's input edges, with every scope's watermark, lag and state | `GET /assets/{name}/edges` | |
-| scopes held for an uncertain writer, unsettled outputs, stuck discards (lifecycle.md §9.8, §9.9) | `GET /holds` | `solera scopes release`, `solera scopes discards` |
+| unsettled outputs, stuck discards (lifecycle.md §9.6, §9.8) | `GET /holds` | `solera scopes discards` |
 
 Filter fields combine with AND; repeating one field (`status=failed&status=canceled`)
 matches any of its values. A facet counts its values with every *other*
@@ -755,7 +755,7 @@ class Store(Protocol):
     def can_load(self, t, selection) -> bool
     async def store(self, write, prior, scope) -> Written   # Written(ref, keys?)
     async def load(self, ref, t, selection) -> Any          # selection: None | Keys | Batches
-    writes: str = "overwrite"                               # or "immutable", "fenced" (lifecycle.md §9.6)
+    writes: str                                             # "immutable" or "fenced" (stores.md)
 ```
 
 - `Scope` carries the engine-assigned `batch`, the `attempt` id, its
@@ -773,7 +773,7 @@ class Store(Protocol):
   `lifecycle.md` §9.6). FileStore and S3Store (`immutable`) never
   overwrite, so a load reads exactly the version its consumer pinned; a
   superseded object lingers until no reader pin predates it. PostgresStore
-  (`fenced`) and user stores (`overwrite`) hold one copy: a load reads the
+  and every `fenced` store hold one copy: a load reads the
   current rows, so a consumer pinned to version 12 that loads after
   version 13 committed gets version 13's content, and a changed row may be
   delivered twice. `Store.load` makes no promise beyond its kind's.

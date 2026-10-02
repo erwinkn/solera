@@ -124,7 +124,6 @@ class Model:
                 "watermarks": _nest(self.watermarks, 3),
                 "outcomes": _nest(self.outcomes, 2),
                 "unsettled": _nest(self.unsettled, 2),
-                "holds": _nest(self.holds, 2),
                 "discards": _nest(self.discards, 2),
                 "failures": _nest(self.failures, 2),
                 "automations": self.automations,
@@ -159,9 +158,6 @@ class Model:
         self.outcomes: dict[tuple, dict] = _flatten(snap.get("outcomes"), 2)
         # (output, scope) -> intents of attempts that died while writing it (§8)
         self.unsettled: dict[tuple, list] = _flatten(snap.get("unsettled"), 2)
-        # (asset, scope) -> the ended attempt whose writes may still land on an
-        # overwrite store: no attempt runs there until it is released (docs/lifecycle.md §9.9)
-        self.holds: dict[tuple, dict] = _flatten(snap.get("holds"), 2)
         # (output, scope) -> data garbage of an immutable store, each entry at the
         # event position that let go of it: for the scope's next attempt to discard
         # once no reader pins it (docs/lifecycle.md §9.8)
@@ -448,7 +444,7 @@ class Model:
     def _apply_aliases(self, manifest) -> dict[str, list[str]]:
         """Move everything held under an asset's former names to its current
         one (§2): cursors, watermarks, outcomes, pending automation entries,
-        holds on its scopes, an Each asset's failure records and failure
+        an Each asset's failure records and failure
         index, and — for outputs named after the asset — heads,
         key indexes, unsettled intents and pending discards. A new name never
         releases a write domain. An index keeps its files where they are (its
@@ -481,7 +477,6 @@ class Model:
         move(self.cursors, asset_map, 0)
         move(self.outcomes, asset_map, 0)
         move(self.watermarks, asset_map, 0)
-        move(self.holds, asset_map, 0)
         # An Each asset's failure record and its index (`@asset`), whose files stay
         # under their prefix; retry-pass state and forced positions go with them.
         move(self.failures, asset_map, 0)
@@ -603,19 +598,6 @@ class Model:
         self._claimed(run, task, e["attempt"], e["started_at"])
         self._event(run, "launched", e["at"], task["id"], e["attempt"], name=e["execution"]["executor"])
 
-    def _on_ScopeReleased(self, e):
-        """A held scope runs again: the grace passed, the writer's result
-        established its completion, or an operator released it."""
-
-        hold = self.holds.get((e["asset"], e["scope"]))
-        if hold is None or hold["attempt"] != e["attempt"]:
-            return
-        del self.holds[(e["asset"], e["scope"])]
-        run = self.runs.get(hold["run"])
-        if run is not None:
-            task = run["tasks"].get(f"{hold['run']}/{e['asset']}:{e['scope']}")
-            self._event(run, "released", e["at"], task and task["id"], e["attempt"], reason=e["by"])
-
     def _on_AttemptPlaced(self, e):
         """Where a launched attempt runs: its placement handle (§10)."""
 
@@ -649,13 +631,6 @@ class Model:
         self._discarded(task["scope"], e)
         if launched is not None and not e.get("commit"):
             self._abandoned(task["scope"], e["attempt"], launched)
-        if e.get("hold"):
-            self.holds[(task["asset"], task["scope"])] = {
-                "attempt": e["attempt"],
-                "run": e["run"],
-                "mode": e["hold"],
-                "at": at,
-            }
         usage = (e.get("worker") or {}).get("usage") or {}
         summary = {
             "id": e["attempt"],

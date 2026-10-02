@@ -138,9 +138,6 @@ class Engine(Attempts, Sensors, Views):
         # they report through `.worker` alone.
         self.engine_url = engine_url
         self.pool_offered_grace = pool_offered_grace
-        self.late_write_grace: dict[str, float] = {}  # per asset, overriding its stores' (tests)
-        self._held_since: dict[tuple, float] = {}
-        self._held_looked: dict[tuple, float] = {}
         self.secret: bytes | None = None  # signs attempt tokens; stable across restarts
         self.live: dict[str, Live] = {}  # attempt id -> what its worker reported
         self.pollers: dict[str, dict] = {}  # pool workers that asked for work lately
@@ -297,7 +294,6 @@ class Engine(Attempts, Sensors, Views):
         """One evaluation pass: adoption, dispatch, automations, archiving."""
 
         self._adopt()
-        await self._release_holds()
         self._dispatch_due()
         self._sensor_sweep()
         await self._automation_tick()
@@ -446,7 +442,6 @@ class Engine(Attempts, Sensors, Views):
         end=None,
         reason=None,
         writes=None,
-        hold=None,
         retry_for=None,
         keys=None,
     ):
@@ -489,8 +484,6 @@ class Engine(Attempts, Sensors, Views):
         for field in ("discarded", "discard_unresolved", "discarded_files"):  # data garbage (§9.8)
             if (worker or {}).get(field):
                 event[field] = worker[field]
-        if hold is not None:
-            event["hold"] = hold
         if keys:
             event["keys"] = keys  # an Each attempt's keys by outcome
         self.state.record(event)
@@ -536,11 +529,8 @@ class Engine(Attempts, Sensors, Views):
             limit = getattr(placement, "max_concurrent", None)
             is_pool = spec["kind"] == "Pool"
             holder = self.m.locks.get((task["asset"], task["scope"]))
-            hold = self.m.holds.get((task["asset"], task["scope"]))
             if holder is not None and self.m.claimed(holder) is not None:
                 held[task_id] = ["lock", holder]
-            elif hold is not None:  # an uncertain writer may still write there (docs/lifecycle.md §9.9)
-                held[task_id] = ["uncertain", hold["attempt"]]
             elif not is_pool and engine_used >= self.concurrency:
                 held[task_id] = ["engine", None]
             elif limit is not None and executor_used.get(executor, 0) >= limit:

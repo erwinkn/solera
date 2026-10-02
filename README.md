@@ -300,7 +300,6 @@ solera migrate [OUTPUT...]                   apply pending output migrations loc
 solera commit SOURCE [--version V] [--keys JSON] [--upsert JSON] [--remove K]
 solera worker pool NAME [--server URL]       claim and run pool tasks
 solera worker sensors NAME [--server URL]    host the sensors of Pool(NAME)
-solera scopes release ASSET [SCOPE]          release a scope held for an uncertain writer
 solera scopes discards OUTPUT [SCOPE] [--clear]  pending and stuck data garbage
 solera selftest                              storage conformance probe
 ```

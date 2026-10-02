@@ -126,7 +126,7 @@ async def test_assets_status_rolls_up_every_asset(world):
     }
     assert parse["partitioned"] is False and parse["failures"] == {"rejected": 1, "failed": 1}
     assert parse["last"]["outcome"] == "succeeded" and parse["last"]["attempt"].count("/") == 1
-    assert parse["held"] == 0 and parse["unsettled"] == 0 and parse["updated_at"]
+    assert parse["unsettled"] == 0 and parse["updated_at"]
     assert status["files"]["failures"] is None  # no Each edge
     consume = status["consume"]
     assert consume["partitioned"] and consume["partitions"]["total"] == 2
@@ -377,33 +377,9 @@ async def test_a_domain_too_big_to_list_still_rolls_up(tmp_path):
     await state.close()
 
 
-async def test_holds_empty_then_held(world, tmp_path):
+async def test_what_an_operator_may_clear_starts_empty(world):
     engine, client, base, *_ = world
-    assert (await client.get(f"{base}/holds")).json() == {"holds": [], "unsettled": [], "discards": []}
-
-    from .test_lifecycle import strict_hold
-
-    held, state, _, hold, _ = await strict_hold(tmp_path / "held")
-    app = create_app(engine=held, insecure=True)
-    app.state.engine = held
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as other:
-        found = (await other.get(f"/api/projects/{held.manifest['name']}/holds")).json()
-    [shown] = found["holds"]
-    assert shown == {
-        "asset": "items",
-        "scope": "",
-        "attempt": hold["attempt"],
-        "run": hold["run"],
-        "mode": "strict",
-        "at": hold["at"],
-        "grace": None,
-        "releases_at": None,
-    }
-    assert found["discards"] == []
-    for entry in found["unsettled"]:
-        assert entry["output"] == "items" and all(i["attempt"] == hold["attempt"] for i in entry["intents"])
-    await held.stop()
-    await state.close()
+    assert (await client.get(f"{base}/holds")).json() == {"unsettled": [], "discards": []}
 
 
 async def test_automations_say_when_they_next_fire(tmp_path):

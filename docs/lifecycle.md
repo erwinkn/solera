@@ -7,7 +7,7 @@ in place. In order: the records of §2 (`solera/lifecycle.py`), attempt
 objects and claims (§2–§4), the channel (§5: `solera_server/attempts.py`,
 `solera_worker/channel.py`), heartbeats as evidence (§6), the two-phase
 cancel (§7), the clocks (§8), retained gates (§2.4), Pool (§10), store
-kinds and their release rules (§9.5–§9.9), PostgresStore generation
+kinds (§9.5–§9.6; `stores.md`), PostgresStore generation
 fencing (§9.7), FileStore / S3Store unique names and their collection
 (§9.8), and sensors (§11: `solera_server/sensors.py`,
 `solera_worker/sensors.py`).
@@ -16,9 +16,9 @@ It is the attempt protocol — attempt files, heartbeats, the pool, and the
 write-safety rules — that `object-store-state.md` §8 and `architecture.md`
 §10 summarize. It settles
 D2–D4, and D1 as Erwin decided it after the review: heartbeats are evidence
-only, built-in stores are exact, user overwrite stores choose between a
-bounded wait and holding the scope. Observations are sensors (§11), which
-are not attempts at all.
+only, and every store is exact: `immutable` or `fenced` (round-2
+decision 2 dropped the `overwrite` kind, its grace and its holds).
+Observations are sensors (§11), which are not attempts at all.
 
 It assumes what is built: fence segments kept for good and carrying a
 writer nonce, create-only writes that recognize their own bytes
@@ -63,7 +63,7 @@ engine                                   object store                         wo
                                                                               Store.acquire (fenced)
   ◀──────────────────────────────────────────────── POST attempts/A/resolve  (small keyed writes)
                                          keys/…/12-A.kx   ◀── deltas
-                                         runs/R/A.writing ◀── gate (fenced, overwrite)
+                                         runs/R/A.writing ◀── gate (fenced stores)
                                          output data      ◀── store writes
                                          runs/R/A.log.000000…  ◀── log chunks
                                          runs/R/A.result  ◀── create-only, sealed
@@ -83,7 +83,7 @@ token.
 |---|---|---|---|
 | `{attempt}.spec` | engine, before `AttemptLaunched` | create-only, immutable | what to run: today's `spec`, plus `engine` (HTTPS URL), `token` (§5.2), `generation` (§9.7) |
 | `{attempt}.worker` | the invocation that claims it | created once; then overwritten only by its owner, only while HTTP fails (§6) | the claim `{"invocation", "host", "pid", "at"}`; later also `{"seq", "timeline", "usage"}` |
-| `{attempt}.writing` | worker before its first store write, or engine to abort or close | create-only | the gate: `writing` (with `invocation` and intents), `aborted` or `closed`; only for attempts with outputs on `fenced` and `overwrite` stores (§9.6). Outlives its run (§2.4) |
+| `{attempt}.writing` | worker before its first store write, or engine to abort or close | create-only | the gate: `writing` (with `invocation` and intents), `aborted` or `closed`; only for attempts with outputs on `fenced` stores (§9.6). Outlives its run (§2.4) |
 | `{attempt}.log.{n:06d}` | worker | create-only, immutable | a gzip member of the log, flushed every 30 s or 1 MB; a short log has none (§13) |
 | `{attempt}.result` | worker | create-only, immutable, sealed bytes | the outcome; its existence means the worker is done |
 
@@ -175,8 +175,8 @@ claim and its gate are gone, so it could claim again, take a new gate and
 write — and a `fenced` store that never saw its generation would accept
 it. So the gate is the attempt's **tombstone**:
 
-- When the engine ends an attempt with outputs on `fenced` or `overwrite`
-  stores and no gate exists, it creates one, `closed` (create-only; a
+- When the engine ends an attempt with outputs on `fenced` stores and no
+  gate exists, it creates one, `closed` (create-only; a
   `writing` found there is the worker's and stands).
 - Retention deletes a run's directory **except its gates**, which it keeps
   for `gate_days` (30) beyond the run. (A `fenced` store also refuses an
@@ -218,8 +218,7 @@ ECS, engine up throughout.
 9. **Plan** each keyed output (`resolved-commits.md` §3): repair reads
    (and the full reconciliation of an unknown-writes intent, §9.6),
    resolve (`POST attempts/A/resolve`, or locally), upload the delta file.
-10. **Gate**: create `A.writing` with the intents (fenced and overwrite
-    stores only). A gate already there — `aborted` or `closed` — means the
+10. **Gate**: create `A.writing` with the intents (fenced stores only). A gate already there — `aborted` or `closed` — means the
     engine ended the attempt: write nothing (§2.4).
 11. **Write**: the store's transactions check generation `g` (§9.7).
 12. **Seal**: build the result once, `PUT A.result` create-only, retried
@@ -475,9 +474,11 @@ timeout, never cut it short. Built.
 
 ## 9. Writes the engine gave up on (D1)
 
-**Decided** (Erwin, after the follow-up review): no lease protocol;
-built-in stores are exact; user overwrite stores default to a bounded wait
-and may opt into holding the scope. §9.8 is held.
+**Decided** (Erwin): no lease protocol, and every store is exact. A store
+writes only names no other attempt uses (`immutable`), or every write of
+its checks the attempt's generation (`fenced`); there is no third kind.
+The contract an implementer follows, its invariants and the scenarios that
+check them are in `stores.md`.
 
 ### 9.1 The hazard
 
@@ -494,7 +495,8 @@ its scope is released, and W2 commits. Then a write of W1's lands.
 Two writers of the same key at the same version write the same content
 (that is the asset's revision promise), so their order does not matter.
 Only a different version landing after a newer commit does damage, and
-only on a store that overwrites in place.
+only on a store that writes in place — which is why such a store must be
+`fenced`.
 
 How W1 can still write after the engine gave up on it: it lost contact but
 runs on; it paused (GC, VM migration); a request it issued is still in
@@ -544,62 +546,56 @@ Not a ladder of safety levels: each is a different contract.
 
 | Contract | What it guarantees | Chosen for |
 |---|---|---|
-| Detect and retry | at-least-once execution; late writes possible | user `overwrite` stores, by default (§9.9) |
-| Hold on uncertainty | no late write can follow a release, at the price of scopes blocked until completion is established | user `overwrite` stores, opt-in (`strict`) |
+| Detect and retry | at-least-once execution; late writes possible | **dropped**: a write in flight past any wait can still land after the next commit |
+| Hold on uncertainty | no late write can follow a release, at the price of scopes blocked until completion is established | **dropped** with it: an approximation of what a store can guarantee itself |
 | Self-fencing leases | risk reduction under timing and authority assumptions | **rejected**: the review showed it fails without exceeding its own margins (a superseded engine still granting renewals; a failed result bypassing the drain; renewals by `.worker` defeating cancel) |
 | Generation checked by the store | exact exclusion of older writers, when acquisition precedes reads | PostgresStore (§9.7); user stores declaring `fenced` |
 | Immutable outputs | stale writes are unreferenced garbage; pinned reads | FileStore, S3Store (§9.8); user stores declaring `immutable` |
 
 ### 9.4 The decision in one paragraph
 
-A store declares how it writes: `immutable`, `fenced` or `overwrite` (the
-default). Built-in stores are exact: FileStore and S3Store are
-`immutable`, PostgresStore is `fenced`. Their scopes are released as soon
-as the engine ends an attempt, whatever happened to its worker, and their
-workers keep writing through an engine outage. A user `overwrite` store
-gets at-least-once retries after a bounded wait, each such release marked
-in the history; or, opted into `strict`, its scope stays blocked until the
-attempt's completion is established.
+A store declares how it writes: `immutable` or `fenced`; registration
+refuses anything else, and a store that does not implement `discard` or
+`acquire`, respectively. FileStore and S3Store are `immutable`,
+PostgresStore is `fenced`, and a SQL store gets fencing in one line
+(`solera.fencing.fence`). Scopes are released as soon as the engine ends
+an attempt, whatever happened to its worker, and workers keep writing
+through an engine outage: a writer the engine gave up on can no longer
+change what a newer one committed.
 
 ### 9.5 Knowing whether writes completed
 
-The release rules below read one thing: the attempt's write-completion
-evidence, `none`, `complete` or `uncertain`, defined in §2.3. Two of its
+What the next attempt must repair reads one thing: the attempt's
+write-completion evidence, `none`, `complete` or `uncertain`, defined in
+§2.3. Two of its
 rules carry the weight here. **Any store exception after the gate is
 uncertain**: a client that timed out after one second may see its request
 finish at the backend five seconds later, and a store author cannot be
-asked to tell the two apart; so a failed result after the gate does not
-release a scope early (review finding 2). And **the engine classifies an
+asked to tell the two apart; so a failed result after the gate leaves its
+intents for the next attempt to repair. And **the engine classifies an
 attempt without a result from its gate**, never from progress or
 silence.
 
-### 9.6 Store kinds and their release rules
+### 9.6 Store kinds
 
 ```python
 class MyStore(Store):
     writes = "immutable"   # writes only names nothing committed references; implements discard()
     writes = "fenced"      # implements acquire(); every write checks the generation atomically
-    writes = "overwrite"   # the default: gate, intents, repair; released by policy (§9.9)
 ```
 
-| Kind | Gate and intents | Repair | Released when the engine ends the attempt with `writes: uncertain` | A read sees |
+| Kind | Gate and intents | Repair | Scope released when the engine ends the attempt | A read sees |
 |---|---|---|---|---|
 | `immutable` | none | none: abandoned writes are unreferenced | at once | the pinned version, exactly |
 | `fenced` | gate with intents (repair, and the unknown-writes intent of `Sql`, below) | after `acquire` (`resolved-commits.md` §3) | at once: the next attempt's acquisition fences the old writer | current rows |
-| `overwrite`, default | gate with intents | as today | after `late_write_grace` (§9.9), marked in the history | current rows |
-| `overwrite`, `strict` | gate with intents | as today | when completion is established (§9.9) | current rows |
 
 **Reads.** Only an immutable store can return a pinned version after a
-newer one committed: its names are never reused. A fenced or overwrite
-store keeps one copy, so its loads read current rows: a run may read two
+newer one committed: its names are never reused. A fenced store keeps
+one copy, so its loads read current rows: a run may read two
 outputs at different moments, and a row changed since its pin is read in
 its newer form and delivered again with its own change, a harmless repeat
 (`architecture.md` §3, "What a read sees"). Fencing makes writes safe; it
 does not make reads repeatable. No setting changes this.
-
-With `writes: none` or `complete`, every kind releases at once. An
-attempt whose outputs use several stores follows the strictest rule among
-them.
 
 **Unknown writes** (`Sql`). A `Sql` write's keys are known only from the
 key map the store reports after it committed, so its gate records an
@@ -854,37 +850,6 @@ orphan.
 superseded ones until collection catches up (minutes, behind the oldest
 reader pin). `solera data get OUTPUT KEY` resolves the current one.
 
-### 9.9 User `overwrite` stores
-
-**Default: retry after a bounded wait.** When an attempt ends with
-`writes: uncertain`, the scope stays blocked for `late_write_grace` (2
-min by default, per store) after the last evidence of the worker — its
-last report or the provider's exit, whichever is later — and is then
-released. The next attempt repairs the intents as today. This is the
-at-least-once contract of Airflow and Dagster, with a documented risk:
-a write still in flight after the grace can land after the next commit.
-Every such release is recorded on the attempt (`released: "grace"`) and
-shown in the console, so the rare case is visible and countable. *As
-built*, the grace runs from when the engine first sees the hold, on its
-monotonic clock, so an engine restart starts it again: later than the
-worker's last evidence, never earlier.
-
-**Opt-in: `strict`.** `Project(stores={"crm": CrmStore(strict=True)})`, or
-`strict = True` on the class. The scope stays blocked, visibly ("waiting
-for an uncertain writer"), until one of two things happens:
-
-- the worker's own result arrives, sealed after its store calls returned
-  (`writes: complete`), even late;
-- an operator runs `solera scopes release OUTPUT SCOPE`, recorded with who
-  released it.
-
-A worker that never returns never releases a strict scope on its own; that
-is the contract's point. There is no store hook in v1 (decided): asking a
-backend whether requests are pending cannot tell that no later request of
-the attempt will be accepted — a worker paused between two calls has
-none pending. The attempt's gate is retained (§2.4), so a worker that
-resumes after a release finds it and writes nothing more.
-
 ## 10. Pool
 
 ```
@@ -915,9 +880,9 @@ memory and rebuilds them after a restart from the journal and `.worker`:
   gate (§2.3), never from what `.worker` showed: the claimant may have
   taken the gate and entered a store call without reporting again. The
   engine's `aborted` create wins → `none`; it finds `writing` → `uncertain`,
-  and the store kind's release rule applies (a strict scope stays
-  blocked); S3 cannot answer → the engine cannot establish `none`, and
-  retries before releasing anything.
+  and its intents wait for the next attempt's repair; S3 cannot answer →
+  the engine cannot establish `none`, and retries before releasing
+  anything.
 - **The runtime clock** starts at the claim when HTTP is unavailable: a
   claimant that computes through an outage, reporting by `.worker`, is
   running, not provisioning.
@@ -1189,7 +1154,7 @@ Two choices of this design keep a short attempt cheap:
   chunk. An attempt shorter than 30 s that logs a little writes no log
   object at all; its lines were live over HTTP meanwhile.
 
-| Per attempt | Today (counted from the code) | Target, `immutable` store | Target, `fenced`/`overwrite` |
+| Per attempt | Today (counted from the code) | Target, `immutable` store | Target, `fenced` |
 |---|---|---|---|
 | Engine PUTs | spec · journal: launch, placed, finished = 4 | spec · journal: launch, finished = 3 | 3 |
 | Engine GETs | beats while provisioning ~1, result 1 = 2 | result 1 | 1 |
@@ -1229,7 +1194,7 @@ sources).
 | log chunks joined at the end, chunks deleted | immutable chunks every 30 s / 1 MB, indexed from the result; live lines over HTTP |
 | Pool: register, claim, renew, complete; in-memory leases; `AttemptClaimed` | long-poll discovery; `.worker` claim; four states; claim expiry into a new attempt |
 | cancel read from the fence by every beat; engine aborts at once | two-phase cancel: requested and drained, then forced |
-| any presumed death releases the scope (R1) | per store kind: `immutable` and `fenced` at once, `overwrite` after a bounded wait or held (`strict`) |
+| any presumed death releases the scope (R1) | every store is `immutable` or `fenced`: released at once, the older writer unable to write |
 | a failed result releases the scope | a failure after the gate is uncertain completion; an attempt without a result is classified from its gate (§2.3) |
 | gates deleted with their run | gates retained `gate_days` beyond it as tombstones; an attempt that took none gets a `closed` one (§2.4) |
 | cancel and timeout indistinguishable to the worker | a latched cancel record with phase and reason, carried into the result (§2.2) |
@@ -1241,20 +1206,14 @@ sources).
 
 ## 15. Open questions
 
-1. **`late_write_grace`.** 2 minutes is an operational value, not a bound;
-   per-store overrides let a store with known client and server timeouts
-   pick its own.
-2. **`cancel_grace`.** 60 s by default; per asset, since a page of
+1. **`cancel_grace`.** 60 s by default; per asset, since a page of
    16 concurrent calls into a slow API may need longer to drain.
-3. **Strict stores during an engine outage.** A worker on a strict store
-   keeps writing on its launch authorization; nothing changes for it. An
-   attempt ended uncertain stays blocked across the restart, as recorded.
-4. **`sensor_map_max`.** Where a key map stops being posted to the engine
+2. **`sensor_map_max`.** Where a key map stops being posted to the engine
    and is resolved on the host instead; from the resolver's grid
    (`resolved-commits.md` §6), like its other thresholds.
-5. **Locator size.** The `.kx` bump adds a generation per entry; the
+3. **Locator size.** The `.kx` bump adds a generation per entry; the
    index benchmarks should report bytes per entry with it, at 1M–100M
    keys, before the format is frozen.
-6. **`gate_days`.** 30 days bounds how long a paused worker can resume and
+4. **`gate_days`.** 30 days bounds how long a paused worker can resume and
    still be stopped by its gate. A backend-recorded revocation would
    remove the bound for stores that can keep one; none is needed for v1.

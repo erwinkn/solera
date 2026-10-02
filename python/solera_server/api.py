@@ -554,12 +554,6 @@ def create_app(
         body = await request.json()
         return runtime.clear_discards(body["output"], body.get("scope", ""), body.get("by") or "api")
 
-    @app.post("/api/projects/{p}/scopes:release")
-    async def release_scope(p: str, request: Request):
-        runtime = await project_engine(request, p)
-        body = await request.json()
-        return runtime.release_scope(body["asset"], body.get("scope", ""), body.get("by") or "api")
-
     @app.post("/api/projects/{p}/assets/{name}/keys:retry")
     async def retry_keys(p: str, name: str, request: Request):
         runtime = await project_engine(request, p)

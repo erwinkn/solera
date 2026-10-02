@@ -1639,17 +1639,24 @@ class Project:
             for name, s in self.sources.items()
         }
         for name, store in self.stores.items():
-            if getattr(store, "writes", "overwrite") not in ("immutable", "fenced", "overwrite"):
+            # How a store keeps a writer the engine gave up on from writing over a
+            # newer one (docs/stores.md): it writes only names no one else uses, or
+            # every write checks the attempt's generation.
+            writes = getattr(store, "writes", None)
+            needs = {"immutable": "discard", "fenced": "acquire"}.get(writes)
+            if needs is None:
                 raise RegistrationError(
-                    f"store {name!r}: writes must be 'immutable', 'fenced' or 'overwrite' (docs/lifecycle.md §9.6)"
+                    f"store {name!r}: writes must be 'immutable' or 'fenced' (docs/stores.md)"
+                )
+            if not callable(getattr(store, needs, None)):
+                raise RegistrationError(
+                    f"store {name!r}: a {writes} store implements {needs}() (docs/stores.md)"
                 )
         store_records = {
             name: {
                 "version": getattr(store, "version", "1"),
                 "ref": getattr(getattr(store, "ref_type", None), "kind", None) or "ref",
-                "writes": getattr(store, "writes", "overwrite"),
-                "strict": bool(getattr(store, "strict", False)),
-                "late_write_grace": float(getattr(store, "late_write_grace", 120.0)),
+                "writes": store.writes,
             }
             for name, store in self.stores.items()
         }

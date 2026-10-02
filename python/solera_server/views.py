@@ -112,7 +112,6 @@ class Views:
                 "partitioned": bool(self._dims(name)),
                 "last": None,
                 "failures": {} if self._each_edge(name) else None,
-                "held": 0,
                 "unsettled": 0,
                 "updated_at": None,
             }
@@ -133,9 +132,6 @@ class Views:
             if (failures := (out.get(asset) or {}).get("failures")) is not None:
                 for name, n in (record.get("counts") or {}).items():
                     failures[name] = failures.get(name, 0) + n
-        for asset, _ in self.m.holds:
-            if asset in out:
-                out[asset]["held"] += 1
         for output, _ in self.m.unsettled:
             if (entry := out.get(owner.get(output))) is not None:
                 entry["unsettled"] += 1
@@ -468,32 +464,13 @@ class Views:
             "verdict": verdict,
         }
 
-    # -- holds (docs/lifecycle.md §9.6, §9.8, §9.9) -----------------------------------------
+    # -- what an operator may clear (docs/lifecycle.md §9.6, §9.8) -----------------------------------------
 
     def holds_view(self) -> dict:
-        """What holds scopes back, and what only an operator can clear:
-        scopes held for an uncertain writer — `grace` the seconds a grace hold
-        lasts (its asset's longest `late_write_grace`), `releases_at` when it
-        ends on this engine's clock (null for a strict hold, or one not yet
-        timed); outputs left unsettled by writers that died, with each
-        intent's files; and the scopes whose data garbage has stuck entries."""
+        """What an operator may need to clear: outputs left unsettled by
+        writers that died, with each intent's files, for the next attempt's
+        repair; and the scopes whose data garbage has stuck entries."""
 
-        loop = asyncio.get_running_loop().time()
-        holds = []
-        for (asset, scope), hold in sorted(self.m.holds.items()):
-            grace = since = None
-            if hold["mode"] == "grace" and asset in self.manifest["assets"]:
-                grace = self._grace(asset)
-                since = self._held_since.get((asset, scope, hold["attempt"]))
-            holds.append(
-                {
-                    "asset": asset,
-                    "scope": scope,
-                    **{k: hold.get(k) for k in ("attempt", "run", "mode", "at")},
-                    "grace": grace,
-                    "releases_at": None if since is None else self.clock() + max(0.0, grace - (loop - since)),
-                }
-            )
         unsettled = [
             {
                 "output": output,
@@ -514,4 +491,4 @@ class Views:
             for (output, scope), entries in sorted(self.m.discards.items())
             if any(e.get("stuck") for e in entries)
         ]
-        return {"holds": holds, "unsettled": unsettled, "discards": discards}
+        return {"unsettled": unsettled, "discards": discards}

@@ -397,7 +397,7 @@ async def _load_whole(store, ref, t, keys_io, index_json):
     also show superseded and abandoned ones (docs/lifecycle.md §9.8): it is
     loaded a page of the index at a time, and the pages put together."""
 
-    if index_json is None or getattr(store, "writes", "overwrite") != "immutable":
+    if index_json is None or store.writes != "immutable":
         return await store.load(ref, t, None)
     index = KeyIndex(keys_io, None, IndexState.from_json(index_json))
     parts, after = [], None
@@ -610,7 +610,7 @@ class _Out:
 
     @property
     def kind(self) -> str:
-        return getattr(self.store, "writes", "overwrite")
+        return self.store.writes
 
     @property
     def sql(self) -> bool:
@@ -1239,7 +1239,7 @@ async def _discard_due(spec, project, asset, objects, writes) -> dict:
 
     for name, info in (spec.get("outputs") or {}).items():
         store = project.stores[declared[name]["store"]]
-        if not info.get("discard") or getattr(store, "writes", "overwrite") != "immutable":
+        if not info.get("discard") or store.writes != "immutable":
             continue
         items, done = [], []
         for entry in info["discard"]:

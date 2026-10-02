@@ -22,11 +22,14 @@ class Fake(Environment):
     kind = "Fake"
 
 
-class Overwriting(FileStore):
-    """FileStore's layout, declared `overwrite`: its attempts take a gate, so
-    the tests below can watch it (docs/lifecycle.md §9.6)."""
+class Gated(FileStore):
+    """FileStore's layout, declared `fenced`: its attempts take a gate and
+    intents, so the tests below can watch them (docs/lifecycle.md §9.6)."""
 
-    writes = "overwrite"
+    writes = "fenced"
+
+    async def acquire(self, scope):
+        pass
 
 
 class Remote:
@@ -119,7 +122,7 @@ def remote():
     return [{"ok": True}]
 
 
-REMOTE = Project(assets=[remote], executors=[Fake("fake")], default_store=Overwriting())
+REMOTE = Project(assets=[remote], executors=[Fake("fake")], default_store=Gated())
 
 
 async def test_a_restarted_engine_adopts_and_commits_a_launched_attempt(tmp_path):
@@ -398,14 +401,15 @@ class LiveStore(FileStore):
     wrote is visible. `die` makes the next write land its first n rows, then
     kills the worker."""
 
-    writes = "overwrite"
-
-    late_write_grace = 0.2  # a dead writer's scope is released this soon (docs/lifecycle.md §9.9)
+    writes = "fenced"
 
     def __init__(self):
         super().__init__()
         self.rows: dict[str, dict] = {}
         self.die: int | None = None
+
+    async def acquire(self, scope):
+        pass
 
     def can_load(self, t, selection):
         return True
@@ -470,8 +474,6 @@ async def test_a_worker_that_dies_writing_leaves_its_output_unsettled_and_the_re
     watcher.cancel()
     assert detail["request"]["status"] == "succeeded", detail
     assert seen == [{("items", ""): 1}]  # the dead attempt left `items` unsettled
-    events = await engine.history.events(detail["request"]["id"])
-    assert [e["reason"] for e in events if e["type"] == "released"] == ["grace"]  # held, then released
     assert state.model.unsettled == {}  # the retry's commit settled it
     assert live.rows == {"a": {"id": "a", "v": 2}, "b": {"id": "b", "v": 1}, "c": {"id": "c", "v": 1}}
     assert state.model.heads[("items", "")]["count"] == 3
@@ -496,7 +498,7 @@ async def test_an_aborted_worker_writes_nothing(tmp_path):
     def quick():
         return [{"id": "a"}]
 
-    project = Project(assets=[slow, quick], executors=[Fake("fake")], default_store=Overwriting())
+    project = Project(assets=[slow, quick], executors=[Fake("fake")], default_store=Gated())
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = engine_for(state, project)
     await engine.initialize()
@@ -545,7 +547,7 @@ async def test_a_dead_immutable_write_leaves_nothing_to_repair(tmp_path, data, m
     assert detail["request"]["status"] == "succeeded", detail
     first, second = detail["attempts"][detail["tasks"][0]["id"]]
     assert first["status"] == "failed" and second["status"] == "succeeded"
-    assert state.model.unsettled == {} and state.model.holds == {}
+    assert state.model.unsettled == {}
     ref = Ref.from_json(state.model.heads[("scores", "")]["ref"])
     assert await project.stores["default"].load(ref, None, await whole(state, "scores")) == {"a": 1, "b": 1}
     await engine.stop()
@@ -577,7 +579,7 @@ async def test_a_create_whose_response_was_lost_is_its_own(tmp_path, monkeypatch
     def scores():
         return {"a": 1, "b": 2}
 
-    project = Project(assets=[scores], default_store=Overwriting())  # a store that takes a gate
+    project = Project(assets=[scores], default_store=Gated())  # a store that takes a gate
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = engine_for(state, project, placement="inline")
     await engine.initialize()
@@ -626,7 +628,6 @@ async def test_a_result_that_fails_to_publish_stays_what_it_was(tmp_path, monkey
     project = Project(assets=[scores])
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = engine_for(state, project, placement="inline")
-    engine.late_write_grace["scores"] = 0  # a dead writer's scope is held, briefly (§9.9)
     await engine.initialize()
     detail = await engine.run_until((await engine.submit(["scores"]))["id"], 10)
     [attempt] = detail["attempts"][detail["tasks"][0]["id"]]
@@ -727,7 +728,7 @@ async def test_an_attempt_that_wrote_nothing_still_leaves_a_gate(tmp_path):
         calls.append(1)
         return {"a": 1}
 
-    project = Project(assets=[same], default_store=Overwriting())
+    project = Project(assets=[same], default_store=Gated())
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = engine_for(state, project, placement="inline")
     await engine.initialize()
@@ -758,7 +759,7 @@ async def test_only_stores_that_take_a_gate_get_one(tmp_path):
     def both():
         return Result({"plain": {"a": 1}, "legacy": {"a": 1}})
 
-    project = Project(assets=[scores, both], stores={"old": Overwriting()})
+    project = Project(assets=[scores, both], stores={"old": Gated()})
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = engine_for(state, project, placement="inline")
     await engine.initialize()
@@ -785,7 +786,7 @@ async def test_an_adopted_attempt_commits_under_the_contract_it_was_launched_wit
     v2 = Project(
         assets=[asset(executor=Fake("fake")(), version="2")(remote.fn)],
         executors=[Fake("fake")],
-        default_store=Overwriting(),
+        default_store=Gated(),
     )
     state, engine = await restart(state, engine, url, v2)
     await engine.initialize()
