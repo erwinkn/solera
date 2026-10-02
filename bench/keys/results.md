@@ -737,47 +737,52 @@ and the fill.
     uv run python bench/keys/warm.py --s3 http://solera:solera-bench-secret@127.0.0.1:9100/solera-test --sizes 1e6,1e7,1e8
 
 Each index in steady state (upper levels filled, seven deltas in level 0);
-patches of random keys, half rewritten unchanged; every route writes its
-delta. "Engine" is the resolver's whole request — framing, validation, the
-lookups, the delta — without HTTP; "SSD only" ran after dropping the page
-cache. The warm worker reads through a disk cache holding every file.
+patches of random keys, half rewritten unchanged. Every path ends at the
+same line, the delta uploaded (one PUT, 30 ms injected): the cold and warm
+workers resolve and upload; the engine path builds the worker's run and
+request, runs the resolver's whole answer — framing, validation, the
+lookups, the delta — and uploads; in brackets, its resolve alone. HTTP is
+not in it (below). "SSD only" ran after dropping the page cache. The warm
+worker reads through a disk cache holding every file. (An earlier version
+of this table stopped the engine's clock at the resolve, before the
+upload: the milestone 4 review's finding 12.)
 
 | Keys | Patch | Cold worker | Warm worker | Engine, page cache | Engine, SSD only |
 |---|---|---|---|---|---|
-| 1,000,000 | 1,000 keys, half unchanged | 442 ms · 9 GET · 29.6 MB · CPU 161 ms | 150 ms · 0 GET · 0.0 MB · CPU 113 ms | 22 ms · 0 GET · 0.0 MB · CPU 22 ms | 61 ms · 0 GET · 0.0 MB · CPU 31 ms |
-| 1,000,000 | 10,000 keys, half unchanged | 518 ms · 9 GET · 29.6 MB · CPU 228 ms | 230 ms · 0 GET · 0.0 MB · CPU 171 ms | 154 ms · 0 GET · 0.3 MB · CPU 153 ms | 128 ms · 0 GET · 0.3 MB · CPU 130 ms |
-| 1,000,000 | 100,000 keys, half unchanged | 642 ms · 12 GET · 26.1 MB · CPU 653 ms | 407 ms · 0 GET · 0.0 MB · CPU 538 ms | 205 ms · 0 GET · 3.0 MB · CPU 203 ms | 173 ms · 0 GET · 3.0 MB · CPU 197 ms |
-| 10,000,000 | 1,000 keys, half unchanged | 820 ms · 524 GET · 77.9 MB · CPU 453 ms | 233 ms · 0 GET · 0.0 MB · CPU 197 ms | 27 ms · 0 GET · 0.0 MB · CPU 26 ms | 197 ms · 0 GET · 0.0 MB · CPU 46 ms |
-| 10,000,000 | 10,000 keys, half unchanged | 3.3 s · 60 GET · 349.3 MB · CPU 5.6 s | 2.7 s · 0 GET · 0.0 MB · CPU 4.7 s | 366 ms · 0 GET · 0.3 MB · CPU 171 ms | 385 ms · 0 GET · 0.3 MB · CPU 187 ms |
-| 10,000,000 | 100,000 keys, half unchanged | 4.0 s · 60 GET · 349.3 MB · CPU 6.0 s | 3.5 s · 0 GET · 0.0 MB · CPU 5.7 s | 1.6 s · 0 GET · 3.0 MB · CPU 1.6 s | 1.6 s · 0 GET · 3.0 MB · CPU 1.7 s |
-| 100,000,000 | 1,000 keys, half unchanged | 966 ms · 649 GET · 478.0 MB · CPU 684 ms | 413 ms · 0 GET · 0.0 MB · CPU 357 ms | 325 ms · 0 GET · 0.0 MB · CPU 58 ms | 425 ms · 0 GET · 0.0 MB · CPU 66 ms |
-| 100,000,000 | 10,000 keys, half unchanged | 5.3 s · 5154 GET · 790.5 MB · CPU 3.9 s | 3.4 s · 0 GET · 0.0 MB · CPU 2.0 s | 1.8 s · 0 GET · 0.3 MB · CPU 362 ms | 1.8 s · 0 GET · 0.3 MB · CPU 391 ms |
-| 100,000,000 | 100,000 keys, half unchanged | 25.8 s · 480 GET · 3462.3 MB · CPU 48.7 s | 24.9 s · 0 GET · 0.0 MB · CPU 46.8 s | 4.4 s · 0 GET · 3.0 MB · CPU 1.8 s | 3.9 s · 0 GET · 3.0 MB · CPU 1.8 s |
+| 1,000,000 | 1,000 keys, half unchanged | 419 ms · 9 GET · 29.6 MB · CPU 137 ms | 152 ms · 0 GET · 0.0 MB · CPU 116 ms | 53 ms · 0 GET · 0.0 MB · CPU 18 ms (16 ms) | 86 ms · 0 GET · 0.0 MB · CPU 18 ms (47 ms) |
+| 1,000,000 | 10,000 keys, half unchanged | 511 ms · 9 GET · 29.6 MB · CPU 207 ms | 217 ms · 0 GET · 0.0 MB · CPU 174 ms | 192 ms · 0 GET · 0.3 MB · CPU 156 ms (143 ms) | 220 ms · 0 GET · 0.3 MB · CPU 179 ms (168 ms) |
+| 1,000,000 | 100,000 keys, half unchanged | 580 ms · 12 GET · 26.1 MB · CPU 594 ms | 356 ms · 0 GET · 0.0 MB · CPU 534 ms | 278 ms · 0 GET · 3.0 MB · CPU 273 ms (147 ms) | 279 ms · 0 GET · 3.0 MB · CPU 276 ms (149 ms) |
+| 10,000,000 | 1,000 keys, half unchanged | 852 ms · 524 GET · 77.9 MB · CPU 444 ms | 249 ms · 0 GET · 0.0 MB · CPU 208 ms | 57 ms · 0 GET · 0.0 MB · CPU 20 ms (20 ms) | 215 ms · 0 GET · 0.0 MB · CPU 46 ms (176 ms) |
+| 10,000,000 | 10,000 keys, half unchanged | 2.6 s · 60 GET · 349.3 MB · CPU 4.5 s | 2.5 s · 0 GET · 0.0 MB · CPU 5.2 s | 414 ms · 0 GET · 0.3 MB · CPU 180 ms (363 ms) | 457 ms · 0 GET · 0.3 MB · CPU 186 ms (407 ms) |
+| 10,000,000 | 100,000 keys, half unchanged | 3.7 s · 60 GET · 349.3 MB · CPU 5.8 s | 3.2 s · 0 GET · 0.0 MB · CPU 5.4 s | 1.8 s · 0 GET · 3.0 MB · CPU 1.7 s (1.7 s) | 1.8 s · 0 GET · 3.0 MB · CPU 1.8 s (1.7 s) |
+| 100,000,000 | 1,000 keys, half unchanged | 1.1 s · 649 GET · 478.0 MB · CPU 908 ms | 438 ms · 0 GET · 0.0 MB · CPU 399 ms | 113 ms · 0 GET · 0.0 MB · CPU 48 ms (76 ms) | 451 ms · 0 GET · 0.0 MB · CPU 60 ms (409 ms) |
+| 100,000,000 | 10,000 keys, half unchanged | 5.3 s · 5154 GET · 790.5 MB · CPU 4.5 s | 3.4 s · 0 GET · 0.0 MB · CPU 2.1 s | 1.8 s · 0 GET · 0.3 MB · CPU 368 ms (1.8 s) | 1.8 s · 0 GET · 0.3 MB · CPU 408 ms (1.8 s) |
+| 100,000,000 | 100,000 keys, half unchanged | 23.2 s · 480 GET · 3462.3 MB · CPU 47.4 s | 25.5 s · 0 GET · 0.0 MB · CPU 52.0 s | 4.4 s · 0 GET · 3.0 MB · CPU 2.1 s (4.2 s) | 3.7 s · 0 GET · 3.0 MB · CPU 1.9 s (3.6 s) |
 
 | Keys | Engine fill: time · GETs · MB read · CPU | Local files on disk |
 |---|---|---|
-| 1,000,000 | 478 ms · 9 GET · 30 MB · CPU 223 ms | 0.03 GB |
-| 10,000,000 | 1.2 s · 28 GET · 349 MB · CPU 2.7 s | 0.35 GB |
-| 100,000,000 | 5.9 s · 221 GET · 3461 MB · CPU 26.3 s | 3.42 GB |
+| 1,000,000 | 476 ms · 9 GET · 30 MB · CPU 259 ms | 0.03 GB |
+| 10,000,000 | 2.0 s · 28 GET · 349 MB · CPU 2.6 s | 0.35 GB |
+| 100,000,000 | 18.2 s · 221 GET · 3461 MB · CPU 25.8 s | 3.42 GB |
 
-- **1K keys** — the scenario-E write — take 22–27 ms on the engine at 1M
-  and 10M keys, against 150–233 ms for a warm worker and 442–820 ms (9–524
-  GETs) cold. At 100M they take 325 ms, of which 58 ms is CPU: the rest is
-  waiting on the disk for ~3,000 small random reads, since the 3.4 GB of
-  local files do not stay in this machine's page cache beside the
-  benchmark's other caches — about a warm worker's time, still with none of
-  the cold worker's 649 GETs.
+- **1K keys** — the scenario-E write — take 53–57 ms end to end on the
+  engine at 1M and 10M keys (16–20 ms of it the resolve), against 152–249
+  ms for a warm worker and 419–852 ms (9–524 GETs) cold. At 100M: 113 ms
+  with the local files in the page cache (76 ms resolving), 451 ms when the
+  ~3,000 small reads go to the disk — then about a warm worker's 438 ms,
+  still with none of the cold worker's 649 GETs.
 - **The local block size decides that wait.** With the source's 64 KiB
-  blocks decompressed whole (~100 KB), the same 1K-key resolve at 100M took
-  438 ms and was slower than the warm worker; at 1M it took 35 ms against
-  22 ms now.
+  blocks decompressed whole (~100 KB), the 1K-key resolve at 100M took
+  438 ms and was slower than the warm worker.
 - **Point lookups or a merge.** A lookup costs ~2.5 µs, a merge ~120 ns per
   entry of the snapshot; the engine merges only past one lookup per 16
   entries. Merging at 128 entries per lookup made the 100K-key resolve at
   100M take 15.3 s (all 125M entries decoded) against 4.4 s by lookups.
-- **The fill** reads each file once — 221 GETs and 3.5 GB at 100M, 5.9 s —
-  and writes 3.4 GB of local files: about the compressed size, not the
-  ~5 GB the design estimated, since the local form keeps prefix sharing.
+- **The fill** reads each file once — 221 GETs and 3.5 GB at 100M — and
+  writes 3.4 GB of local files: about the compressed size, not the ~5 GB
+  the design estimated, since the local form keeps prefix sharing. It takes
+  18.2 s since at most two whole files are fetched or built at once (the
+  review's finding 2 bounds that memory); unbounded, it took 5.9 s.
 - **HTTP** adds ~0.75 ms median (2.5 ms p95) for a 40 KB request and a
   27 KB response on localhost (uvicorn, httpx).
 

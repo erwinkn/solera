@@ -857,9 +857,12 @@ Differences:
   reads one, and at 100M keys the read, not the CPU, is most of a warm
   resolve (`bench/keys/results.md`, "The engine's warm resolver").
 
-Measured against §9's projections (results.md): a 1K-key resolve takes
-22–27 ms on the engine at 1M–10M keys, as projected; at 100M, 325 ms on
-this machine, 58 ms of it CPU — the rest disk waits, the page cache not
-holding the 3.4 GB of local files (open question 3: it needs to). The fill
-of a 100M-key steady snapshot reads 221 GETs and 3.5 GB in 5.9 s; its local
-files take 3.4 GB, not ~5 GB. HTTP adds under a millisecond.
+Measured against §9's projections (results.md), every path to the delta
+uploaded: a 1K-key write takes 53–57 ms through the engine at 1M–10M keys
+(16–20 ms of it resolving), about the projection plus the upload; at 100M,
+113 ms with the local files in the page cache and 451 ms from the disk —
+then a warm worker's time (438 ms), with no GETs (open question 3: the hot
+blocks need to stay in RAM). The fill of a 100M-key steady snapshot reads
+221 GETs and 3.5 GB, in 18.2 s with at most two whole files in memory at
+once; its local files take 3.4 GB, not ~5 GB. HTTP adds under a
+millisecond.
