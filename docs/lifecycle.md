@@ -791,7 +791,9 @@ code, so the scope's **next attempt** discards: the engine puts the due
 entries (at most 64) in the spec's output info, and the worker, after its
 own store call succeeds, discards them and reports which in its result;
 `AttemptFinished` then removes them. Due means no live claim of another
-attempt and no paged-window watermark pin predates the entry. Until a
+attempt and no paged-window watermark pin predates the entry. A delta file
+a pending entry reads is kept, even once the index let go of it, until the
+entry is done; an entry whose file cannot be read stays pending. Until a
 scope runs again its garbage waits, which costs only storage. An
 abandoned attempt's keyed names come from listing its own delta files
 (`{batch:012d}-{attempt}*` under the index prefix, complete because

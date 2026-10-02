@@ -176,3 +176,35 @@ async def test_a_reader_pin_holds_collection_back(tmp_path):
     assert [d["n"] for d in engine._due_discards("scores", "", "me")] == [10]
     assert [d["n"] for d in engine._due_discards("scores", "", "r")] == [10]  # its own claim reads none of it
     await state.close()
+
+
+async def test_a_delta_a_pending_discard_reads_outlives_its_index(tmp_path, data):
+    """Review P2-7: compaction lets go of a delta file whose entry is still
+    queued: index cleanup keeps the file until the entry is done. And an
+    entry whose file is missing is not acknowledged as done."""
+
+    @asset(outputs=Output("scores", keyed=True))
+    def scores():
+        return {"a": 1}
+
+    project = Project(assets=[scores])
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = engine_for(state, project)
+    await engine.initialize()
+    await run(engine, ["scores"])
+    m = state.model
+    prefix = m.indexes[("scores", "")].prefix
+    path = f"{prefix}held.kx"
+    await state.create_object(path, b"delta")
+    m.discards[("scores", "")] = [{"n": 1, "kind": "delta", "prefix": prefix, "files": ["held"]}]
+    m.garbage.append([path, 1])  # the index let go of it
+    await engine.upkeep.collect()
+    assert await state.get_object(path) == b"delta" and [path, 1] in m.garbage
+    m.discards[("scores", "")][0]["files"] = ["gone"]  # its names cannot be read
+    await run(engine, ["scores"])
+    assert [d["files"] for d in m.discards[("scores", "")]] == [["gone"]]  # still pending
+    del m.discards[("scores", "")]
+    await engine.upkeep.collect()
+    assert await state.get_object(path) is None
+    await engine.stop()
+    await state.close()

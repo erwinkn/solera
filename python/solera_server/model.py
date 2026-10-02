@@ -864,6 +864,19 @@ class Model:
         record = (manifest.get("outputs") or {}).get(output) or {}
         return ((manifest.get("stores") or {}).get(record.get("store")) or {}).get("writes") == "immutable"
 
+    def discard_reads(self) -> set[str]:
+        """The index files pending discard entries still read (their delta
+        files name the predecessors): kept until the entries are done, even
+        once the index lets go of them."""
+
+        return {
+            f"{d['prefix']}{name}.kx"
+            for entries in self.discards.values()
+            for d in entries
+            if d["kind"] == "delta"
+            for name in d["files"]
+        }
+
     def _collect(self, output: str, scope: str, entry: dict) -> None:
         self.discards.setdefault((output, scope), []).append({"n": self.applied, **entry})
 

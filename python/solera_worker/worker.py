@@ -1140,22 +1140,25 @@ async def _discard_due(spec, project, asset, objects, writes) -> dict:
         items, done = [], []
         for entry in info["discard"]:
             kind, prefix = entry["kind"], entry.get("prefix") or ""
-            if kind == "delta":  # each changed key's predecessor
-                for f in entry["files"]:
-                    data = await read(f"{prefix}{f}.kx")
-                    for key, _, _, _, before in iter_file(data) if data else ():
-                        if before is not None:
-                            items.append(("key", key_str(key), before[0].hex(), before[1]))
-            elif kind == "sidecar":  # entries a compaction dropped
-                for f in entry["files"]:
-                    data = await read(f"{prefix}{f}.kg")
-                    if data:
+            if kind in ("delta", "sidecar"):  # what a commit's delta, or a compaction, let go of
+                found = [
+                    await read(f"{prefix}{f}.{'kx' if kind == 'delta' else 'kg'}") for f in entry["files"]
+                ]
+                if any(data is None for data in found):
+                    continue  # the names are not known: the entry stays pending
+                for data in found:
+                    if kind == "delta":
+                        for key, _, _, _, before in iter_file(data):
+                            if before is not None:
+                                items.append(("key", key_str(key), before[0].hex(), before[1]))
+                    else:
                         keys, versions, _, locators = decode_garbage(data)
                         items += [
                             ("key", key_str(k), v.hex(), loc)
                             for k, v, loc in zip(keys, versions, locators, strict=True)
                         ]
-                    files.append(f"{prefix}{f}.kg")
+                if kind == "sidecar":
+                    files += [f"{prefix}{f}.kg" for f in entry["files"]]
             elif kind == "abandoned":  # all an uncommitted attempt wrote carries its generation
                 generation = entry["generation"]
                 if "prefix" in entry:  # keyed: its delta files name every object it could have written
@@ -1175,6 +1178,8 @@ async def _discard_due(spec, project, asset, objects, writes) -> dict:
             else:
                 items += [tuple(i) for i in entry["items"]]
             done.append(entry["n"])
+        if not done:
+            continue
         scope = Scope(output=decls[name], partition=spec["partition"], attempt=spec["attempt"])
         head = Ref.from_json(info["head"]) if info.get("head") else None  # where its objects live
         await writes.call(store.discard(scope, head, items))

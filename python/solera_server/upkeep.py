@@ -236,7 +236,8 @@ class Upkeep:
         if not self.m.garbage:
             return
         oldest = min((c["pin"] for c in self.m.claims.values()), default=math.inf)
-        due = [path for path, n in self.m.garbage if n <= oldest]
+        read = self.m.discard_reads()  # pending discards still read them
+        due = [path for path, n in self.m.garbage if n <= oldest and path not in read]
         if not due:
             return
         await self.state.durable()  # a replay must never reference them again
