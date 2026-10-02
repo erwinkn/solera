@@ -530,6 +530,19 @@ def create_app(
         body = await request.json()
         return runtime.release_scope(body["asset"], body.get("scope", ""), body.get("by") or "api")
 
+    @app.post("/api/projects/{p}/assets/{name}/keys:retry")
+    async def retry_keys(p: str, name: str, request: Request):
+        runtime = await project_engine(request, p)
+        body = await request.json()
+        found = runtime.retry_keys(
+            name, body.get("classes") or ["failed"], body.get("scope"), body.get("by") or "api"
+        )
+        if found["scopes"]:
+            await runtime.submit(
+                [name], partitions=found["scopes"], skip_active=True, by=body.get("by") or "api"
+            )
+        return found
+
     # -- the worker channel (docs/lifecycle.md §5) ----------------------------------------
 
     @app.post("/api/projects/{p}/attempts/{attempt}/start")

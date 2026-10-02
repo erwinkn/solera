@@ -2,7 +2,8 @@
 
 Brimstone-flavored: SharePoint sites polled through Microsoft Graph delta
 feeds, a keyed output used as the site partition set, an externally fed
-upload set, incremental Excel ingestion keyed by file_id, Postgres and blob
+upload set, per-file Excel ingestion keyed by file_id (an `Each` edge: one
+call per changed workbook, its failures kept per key), Postgres and blob
 outputs, multi-dimensional partitions, sized executors, a job, and both
 automation styles.
 
@@ -14,14 +15,15 @@ from __future__ import annotations
 import os
 
 import pandas as pd
+from solera.errors import Rejected
 from solera.executors import AWSECS, Pool
 from solera.sdk import (
     AllPartitions,
     Automation,
     AutoRefresh,
     Cron,
+    Each,
     Every,
-    Incremental,
     Migration,
     OnDeploy,
     Output,
@@ -148,14 +150,20 @@ def graph_delta(ctx, graph: GraphClient):
     )
 
 
+class Unprocessable(Rejected):
+    """A workbook that is bad on purpose — empty, a template: kept as a
+    rejected key until the file changes, never retried blindly."""
+
+
 @asset(
     outputs=Output(
         "qaqc_samples",
         store="postgres",
         schema="qaqc",
-        primary_key=["sample_id"],
+        # Every file_id is the group of its workbook's samples.
+        key="file_id",
+        primary_key=["file_id", "sample_id"],
         partition_column="site",
-        indexes=[["file_id"]],
         # Schema owned by the output: the store applies pending ones before
         # its first write, keeps the ledger in Postgres, and a new entry
         # reprocesses every key (it enters the interpretation fingerprint).
@@ -167,19 +175,20 @@ def graph_delta(ctx, graph: GraphClient):
         ],
     ),
     partitions=sites,
-    inputs={"qaqc_files": Incremental()},
+    inputs={"workbook": Each("qaqc_files", concurrency=8)},
     version="2",  # bump to reprocess every key; code changes alone do not
     automations=AutoRefresh(),
 )
-async def qaqc_samples(ctx, qaqc_files: list[dict], sharepoint: SharePointClient):
-    """qaqc_files arrives filtered to the file_ids whose version changed for this site."""
-    frames = []
-    for row in qaqc_files:
-        df = read_qaqc_excel(await sharepoint.read(row["file_id"]))
-        df["file_id"] = row["file_id"]
-        frames.append(df)  # the store stamps `site` from the scope
-    changes = ctx.changes["qaqc_files"]
-    return Patch(pd.concat(frames) if frames else pd.DataFrame(), remove=changes.deleted)
+async def qaqc_samples(ctx, workbook: list[dict], sharepoint: SharePointClient) -> pd.DataFrame:
+    """One changed workbook of this site: its samples. Solera runs it for every
+    file_id whose version changed, eight at a time, writes all of them in one
+    store write, and removes the samples of deleted workbooks; the store
+    stamps `file_id` and `site`. A workbook that raises is recorded as a
+    failing key, and the others still commit."""
+    raw = await sharepoint.read(ctx.key)
+    if not raw:
+        raise Unprocessable("empty workbook")
+    return read_qaqc_excel(raw)
 
 
 # ---------------------------------------------------------------------------

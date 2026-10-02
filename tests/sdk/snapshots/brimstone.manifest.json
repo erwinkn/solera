@@ -449,10 +449,13 @@
         "qaqc_samples.onchange.0"
       ],
       "deps": [],
-      "doc": "qaqc_files arrives filtered to the file_ids whose version changed for this site.",
+      "doc": "One changed workbook of this site: its samples. Solera runs it for every\nfile_id whose version changed, eight at a time, writes all of them in one\nstore write, and removes the samples of deleted workbooks; the store\nstamps `file_id` and `site`. A workbook that raises is recorded as a\nfailing key, and the others still commit.",
       "inputs": {
-        "qaqc_files": {
+        "workbook": {
           "batch_size": 100,
+          "each": {
+            "concurrency": 8
+          },
           "kind": "incremental",
           "meta": null,
           "output": "qaqc_files"
@@ -462,19 +465,15 @@
       "outputs": [
         {
           "config": {
-            "indexes": [
-              [
-                "file_id"
-              ]
-            ],
             "partition_column": "site",
             "primary_key": [
+              "file_id",
               "sample_id"
             ],
             "schema": "qaqc"
           },
-          "incremental": false,
-          "key": null,
+          "incremental": true,
+          "key": "file_id",
           "migrations": [
             "0001_analyst",
             "0002_measured_tz"
@@ -509,19 +508,21 @@
       "timeout": 3600,
       "types": {
         "params": {
-          "qaqc_files": {
+          "sharepoint": {
+            "class": "brimstone.SharePointClient"
+          },
+          "workbook": {
             "args": [
               {
                 "class": "builtins.dict"
               }
             ],
             "generic": "list"
-          },
-          "sharepoint": {
-            "class": "brimstone.SharePointClient"
           }
         },
-        "return": null
+        "return": {
+          "class": "pandas.core.frame.DataFrame"
+        }
       },
       "version": "2"
     },
@@ -1236,19 +1237,15 @@
     "qaqc_samples": {
       "asset": "qaqc_samples",
       "config": {
-        "indexes": [
-          [
-            "file_id"
-          ]
-        ],
         "partition_column": "site",
         "primary_key": [
+          "file_id",
           "sample_id"
         ],
         "schema": "qaqc"
       },
-      "incremental": false,
-      "key": null,
+      "incremental": true,
+      "key": "file_id",
       "migrations": [
         "0001_analyst",
         "0002_measured_tz"
@@ -1376,7 +1373,7 @@
     }
   },
   "retention": null,
-  "revision": "ab64d8faa8aea1fca4bd00dce39efe171839ecc29bb91304af55fc99e9d33567",
+  "revision": "30bda7f9419f0c1b5f2c89cdfbfd2155f4d112212d47b1cf550725a264fc136d",
   "sensors": {},
   "sources": {
     "leach_crosswalk": {

@@ -270,7 +270,9 @@ def test_demo_postgres_migrations_and_ondeploy(tmp_path):
     assert migrated.returncode == 0, migrated.stderr
     with psycopg.connect(dsn) as conn:
         applied = set(conn.execute("SELECT output, name FROM solera_migrations").fetchall())
-    expected = {o for o in ("site_events", "site_files", "file_index", "fleet_status", "site_status")}
+    expected = {
+        o for o in ("site_events", "site_files", "file_index", "file_checks", "fleet_status", "site_status")
+    }
     assert {o for o, name in applied if name == "baseline"} == expected
     with psycopg.connect(dsn) as conn:
         logged = {r[0] for r in conn.execute("SELECT output FROM demo_migrations").fetchall()}

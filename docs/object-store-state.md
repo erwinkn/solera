@@ -206,6 +206,7 @@ State
   runs         {run: Run}                          # active, or finished and not yet archived
   history      {files: {table: [File]}, rows: {table: [[seq, row], …]}, seq, imported}   # §7
   unsettled    {output: {scope: [Intent, …]}}      # keyed outputs a dead writer may have half-written (§8)
+  failures     {asset: {scope: Failures}}          # an Each asset's failing keys (per-key-processing.md §9)
   garbage      [[path, n], …]                      # index and history files nothing references since event n
   retired      [run, …]                            # deleted runs whose directories are still to delete (§11)
 ```
@@ -213,6 +214,7 @@ State
 | Type | Fields | Bounded by |
 |---|---|---|
 | `Head` | `ref` (from the store), `run`, `attempt` (may point at a deleted run), `batch` (incremental outputs: the last batch that changed it, −1 before any), `base` (unkeyed incremental outputs: the first batch after the last reset), `count` (keyed: live keys), `elements?` (partition sets and set dimensions), `complete`, `version` (declared asset version), `asset`, `at` | outputs × partitions |
+| `Failures` | `batch` (the failure index's last batch), `counts` {outcome: keys}, `due` and `epoch_min` (lower bounds), `retry?` {`pass`, `epoch`, `forced_pos`, `after`, `due_acc`, `epoch_acc`}, `passes`, `done_forced`, `last` (`changes` or `retry`), `forced` {class: position} — its index is `indexes["@asset"][scope]` (per-key-processing.md §9) | Each assets × partitions |
 | `KeyIndex` | `prefix` (where its files live — kept across renames), `count`, `inexact` (commits since the last recount whose count came from filters; the count is exact at 0), `files` [{`name`, `level`, `min`, `max`, `entries`, `size`, `tail`, `index`}], `log` [[`batch`, [file]], …] — see §6 | a few dozen files per index |
 | `Watermark` | `batch` (first batch not fully delivered; during a full drain, the head's batch + 1 when the drain began, so changes made while draining arrive afterwards as deltas), `until` (the last batch of a delta window being delivered in pages), `after` (last key delivered inside the window or the full drain), `full` (a full drain is in progress), `fingerprint`, `output` and `up` (the upstream index it reads) | edges × partitions |
 | `Outcome` | `outcome`, `run`, `attempt`, `at` | assets × partitions |
@@ -436,10 +438,11 @@ input versions built this version of `revenue`".
 |---|---|---|
 | `runs` | finished run or source commit | `status` (`succeeded`, `failed`, `canceled`, `skipped`), `trigger` (`manual`, `automation`, `commit`), `automation`, `by`, `source`, `targets`, `assets`, `committed`, `tags` (map), `task_count`, `failed_count`, `error`, `config` and `keys` (JSON, as submitted) |
 | `tasks` | task of a finished run | `asset`, `scope`, `status`, `started_at`, `finished_at`, `attempts`, `duration`, `wait` (seconds it could have run but didn't), `deps`, `max_attempts`, `retry_delay`, `retry_backoff`, `retried`, `executor` (of its last attempt) |
-| `attempts` | attempt | `task`, `n`, `outcome`, `started_at`, `finished_at`, `duration`, `preparing`, `provisioning`, `importing`, `loading`, `computing`, `writing`, `settling` (seconds per phase, below), `peak_memory` (bytes; only in a process of its own), `cpu_seconds`, `error`, `executor`, `cpu`, `memory`, `gpu` (requested; all null if it never launched), `options` (map: its other placement options, e.g. `image`), `outputs` (map: output → version committed) |
+| `attempts` | attempt | `task`, `n`, `outcome`, `started_at`, `finished_at`, `duration`, `preparing`, `provisioning`, `importing`, `loading`, `computing`, `writing`, `settling` (seconds per phase, below), `peak_memory` (bytes; only in a process of its own), `cpu_seconds`, `error`, `executor`, `cpu`, `memory`, `gpu` (requested; all null if it never launched), `options` (map: its other placement options, e.g. `image`), `outputs` (map: output → version committed), `keys` (map: an `Each` attempt's keys by outcome) |
 | `run_events` | moment of a run | `n` (its order in the run), `at`, `type`, `task` and `attempt` (null for the run's own events), `by`, `name`, `reason`, `until`, `rows` — the timeline, below |
 | `materializations` | output version a commit installed | `output`, `scope`, `version`, `run`, `attempt`, `at`, `batch`, `added`, `removed`, `added_keys`, `removed_keys` (a source commit's keys, up to 1,000), `rows`, `metadata` (JSON) |
 | `lineage` | input version an output version was read from | `output`, `scope`, `version`, `input`, `input_scope`, `input_version`, `param` |
+| `key_outcomes` | key an `Each` attempt processed | `run`, `attempt` (`attempts.id`), `asset`, `scope`, `key`, `revision`, `outcome` (`ok`, `removed`, `unmatched`, `rejected`, `failed`, `retrying`, `canceled`, `timed_out`), `error`, `duration`, `at` — per-key-processing.md §10 |
 
 A run where every task was skipped — it launched nothing and wrote
 nothing — is recorded with status `skipped`. Listings hide skipped runs

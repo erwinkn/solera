@@ -476,6 +476,28 @@ class Attempts:
             )
             return
         status = result.get("status")
+        if status == "canceled" and "failures" in result:
+            # A drained Each page (docs/lifecycle.md §7): what finished commits, as one
+            # decision with its interrupted keys and its watermark.
+            reason = (result.get("cancel") or {}).get("reason") or "user"
+            user = reason == "user"
+            try:
+                await self.commit_attempt(
+                    attempt,
+                    prepared,
+                    result,
+                    outcome="canceled" if user else "failed",
+                    error="canceled" if user else reason,
+                    retryable=not user,
+                    delay=0.0 if user else self._retry_delay(task),
+                )
+            except LostOwnership:
+                return
+            except self.Conflict as error:
+                await self._fail(
+                    task_id, attempt, str(error), retryable=True, result=result, reason="conflict"
+                )
+            return
         if status == "canceled":
             reason = (result.get("cancel") or {}).get("reason") or "user"
             user = reason == "user"
@@ -718,6 +740,11 @@ class Attempts:
             if info.get("prefix") is None or name in keep or self.m.immutable(name):
                 continue  # an immutable output's are collected with what they name (§9.8)
             prefix = f"{info['prefix']}{int(info['batch']):012d}-{attempt}"
+            with contextlib.suppress(Exception):
+                await self.state.delete_objects(await self.state.list_objects(prefix))
+        failures = prepared.get("failures")
+        if failures is not None:  # an Each page's failure delta (docs/per-key-processing.md §9)
+            prefix = f"{failures['prefix']}{int(failures['batch']):012d}-{attempt}"
             with contextlib.suppress(Exception):
                 await self.state.delete_objects(await self.state.list_objects(prefix))
 

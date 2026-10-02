@@ -555,3 +555,31 @@ async def test_a_sql_write_cannot_replace_its_table(store):
         assert store._relid(cur, table) == relid
     with pytest.raises(StoreError, match="newer attempt"):
         await store.store([{"id": "a", "v": "0"}], first.ref, fenced(out, 3))
+
+
+async def test_by_key_patch_stamps_keys_and_keeps_empty_groups(store):
+    """docs/per-key-processing.md §6: `Patch({key: rows})` stamps the key
+    column; a key given no rows loses its old rows and stays live; a keyed
+    load hands each selected key its group, an empty one included."""
+
+    import pandas as pd
+
+    out = output(key="path")
+    first = await store.store(
+        Patch({"a.csv": pd.DataFrame({"n": [1, 2]}), "b.csv": pd.DataFrame({"n": [3]})}), None, scope(out)
+    )
+    second = await store.store(
+        Patch({"b.csv": pd.DataFrame({"n": []}), "c.csv": [{"n": 4}]}, remove=["a.csv"]),
+        first.ref,
+        scope(out, upserts=frozenset({"b.csv", "c.csv"}), removes=frozenset({"a.csv"})),
+    )
+    rows = await store.load(second.ref, list[dict], None)
+    assert sorted((r["path"], r["n"]) for r in rows) == [("c.csv", 4)]
+    selection = Keys({k: (b"", 0) for k in ("b.csv", "c.csv")})
+    groups = await store.load(second.ref, dict[str, pd.DataFrame], selection)
+    assert list(groups) == ["b.csv", "c.csv"]
+    assert groups["b.csv"].empty and set(groups["b.csv"].columns) == {"path", "n"}
+    assert groups["c.csv"]["n"].tolist() == [4]
+    with pytest.raises(WriteError, match="carries"):
+        await store.store(Patch({"d.csv": [{"path": "other", "n": 1}]}), second.ref, scope(out))
+    assert store.can_load(dict[str, pd.DataFrame], Keys) and not store.can_load(dict[str, pd.DataFrame], None)

@@ -361,6 +361,31 @@ class Incremental(In):
         return {**super().spec(param), "batch_size": self.batch_size}
 
 
+class Each(Incremental):
+    """An asset written for one key, run over every changed key of a keyed
+    upstream (docs/per-key-processing.md §5): the parameter receives one
+    key's value, `ctx.key` names it, and every output is keyed by it.
+    `batch_size` keys make one attempt and one commit; `concurrency` of them
+    run at once. A key whose call raises is recorded in the asset's failure
+    index and retried by its class (§8, §9); it never blocks the others."""
+
+    def __init__(
+        self,
+        output: str | None = None,
+        *,
+        batch_size: int = 100,
+        concurrency: int = 16,
+        meta: dict | None = None,
+    ):
+        super().__init__(output, batch_size=batch_size, meta=meta)
+        if concurrency < 1:
+            raise RegistrationError("Each concurrency must be positive")
+        self.concurrency = concurrency
+
+    def spec(self, param: str) -> dict:
+        return {**super().spec(param), "each": {"concurrency": self.concurrency}}
+
+
 class AllPartitions(In):
     """Collapse the upstream dimensions this asset lacks (§5, §7)."""
 
@@ -1138,11 +1163,32 @@ class Project:
     def _edge(self, value, param, asset_name) -> In:
         if isinstance(value, str):
             value = In(value)
-        if type(value) not in (In, Incremental, AllPartitions):
+        if type(value) not in (In, Incremental, Each, AllPartitions):
             raise RegistrationError(
-                f"{asset_name}: inputs[{param!r}] must be a str or one of In/Incremental/AllPartitions"
+                f"{asset_name}: inputs[{param!r}] must be a str or one of In/Incremental/Each/AllPartitions"
             )
         return value
+
+    @staticmethod
+    def _check_each(name: str, asset: Asset, info: dict, param: str, upstream: dict) -> None:
+        """An Each edge (docs/per-key-processing.md §5): one per asset, over a
+        keyed upstream, the asset's only Incremental edge, and every output
+        keyed by the input's key."""
+
+        if upstream["key"] is None:
+            raise RegistrationError(f"{name}: Each edge {param!r} needs a keyed upstream")
+        others = [p for p, e in info["edges"].items() if p != param and isinstance(e, Incremental)]
+        if others:
+            raise RegistrationError(
+                f"{name}: an Each asset reads its other inputs whole; {others[0]!r} is Incremental"
+            )
+        if not asset.outputs:
+            raise RegistrationError(f"{name}: an Each asset needs outputs")
+        for output in asset.outputs:
+            if output.key is None or output.is_partition_set:
+                raise RegistrationError(
+                    f"{name}: output {output.name} of an Each asset must be keyed (key= or keyed=True)"
+                )
 
     def _build(self) -> dict:
         for store_name in self.stores:
@@ -1223,6 +1269,8 @@ class Project:
                         f"{name}: {output_name} has upstream-only dimensions {sorted(missing)}; "
                         "collapse them with AllPartitions() (§7)"
                     )
+                if isinstance(edge, Each):
+                    self._check_each(name, asset, info, param, upstream)
                 if isinstance(edge, Incremental):
                     if missing:
                         raise RegistrationError(
@@ -1241,7 +1289,8 @@ class Project:
                         raise RegistrationError(f"{name}: store-bound input {param!r} is unannotated (§11)")
                     Keys, Batches = _selection_classes()
                     selection = Keys if upstream["key"] is not None else Batches
-                    if not store.can_load(annotation, selection):
+                    loaded = dict[str, annotation] if isinstance(edge, Each) else annotation
+                    if not store.can_load(loaded, selection):
                         raise RegistrationError(
                             f"{name}: store {upstream['store']} cannot load {annotation} "
                             f"under {selection.__name__}"
@@ -1275,7 +1324,9 @@ class Project:
             for output in asset.outputs:
                 record = outputs[output.name]
                 store = self.stores[record["store"]]
-                t = return_t if len(asset.outputs) == 1 else None
+                each = any(isinstance(e, Each) for e in info["edges"].values())
+                # An Each producer returns one key's value: the output holds them all.
+                t = return_t if len(asset.outputs) == 1 and not each else None
                 if not store.can_store(t, output):
                     raise RegistrationError(
                         f"{name}: store {record['store']} cannot store output {output.name} "

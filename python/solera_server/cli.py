@@ -124,6 +124,16 @@ def main():
     discards.add_argument("scope", nargs="?", default="")
     discards.add_argument("--clear", action="store_true", help="Forget the stuck entries; their objects stay")
 
+    keys = commands.add_parser(
+        "keys", help="An Each asset's failing keys (per-key-processing.md §9)", parents=[common]
+    )
+    keys_sub = keys.add_subparsers(dest="keys_command", required=True)
+    keys_retry = keys_sub.add_parser("retry", help="Retry an Each asset's failing keys now")
+    keys_retry.add_argument("asset")
+    keys_retry.add_argument("--partition", default=None, help="One scope only")
+    for name in ("failed", "rejected", "canceled", "retrying", "timed-out", "all"):
+        keys_retry.add_argument(f"--{name}", action="store_true")
+
     run_show = commands.add_parser("run-show", help="Show a run's tasks and attempts", parents=[common])
     run_show.add_argument("run_id")
 
@@ -319,6 +329,13 @@ def _prune_payload(args):
     return {"before": before, "asset": args.asset, "keep": args.keep, "dry_run": args.dry_run}
 
 
+def _key_classes(args) -> list[str]:
+    """`solera keys retry --failed --rejected …`; `--failed` when none is given."""
+
+    names = ("failed", "rejected", "canceled", "retrying", "timed_out", "all")
+    return [n for n in names if getattr(args, n)] or ["failed"]
+
+
 def _commit_payload(args):
     keys = json.loads(args.keys) if args.keys else None
     upsert = json.loads(args.upsert) if args.upsert else None
@@ -364,6 +381,11 @@ async def _remote(args, parser):
             response.raise_for_status()
             heads = [h for h in response.json()["heads"] if h["scope"] == args.scope]
             print(json.dumps(heads[0]["discards"] if heads else None, indent=2))
+        elif args.command == "keys":
+            body = {"classes": _key_classes(args), "scope": args.partition, "by": "cli"}
+            response = await client.post(f"{base}/assets/{args.asset}/keys:retry", json=body)
+            response.raise_for_status()
+            print(json.dumps(response.json(), indent=2))
         elif args.command == "scopes":
             body = {"asset": args.asset, "scope": args.scope, "by": "cli"}
             response = await client.post(f"{base}/scopes:release", json=body)
@@ -442,6 +464,15 @@ async def _local(args, parser):
                 else runtime.scope_discards(args.output, args.scope)
             )
             print(json.dumps(view, indent=2))
+        elif args.command == "keys":
+            found = runtime.retry_keys(args.asset, _key_classes(args), args.partition, "cli")
+            if found["scopes"]:
+                run = await runtime.submit(
+                    [args.asset], partitions=found["scopes"], skip_active=True, by="cli"
+                )
+                if run is not None:
+                    found["run"] = (await runtime.run_until(run["id"]))["request"]["status"]
+            print(json.dumps(found, indent=2))
         elif args.command == "scopes":
             print(json.dumps(runtime.release_scope(args.asset, args.scope, "cli"), indent=2))
         elif args.command == "runs" and args.runs_command == "delete":

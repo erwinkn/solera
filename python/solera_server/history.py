@@ -1,7 +1,7 @@
 """Run history (docs/object-store-state.md §7): what ran and what it made, as
 Parquet files on the object store, queried with DuckDB.
 
-Six tables, each row about one:
+Eight tables, each row about one:
 
     run_events        thing that happened to a run, one of its tasks or attempts
     runs              finished run or source commit: how it was asked for, how it ended
@@ -9,6 +9,8 @@ Six tables, each row about one:
     attempts          attempt of a finished run: its phases, and the versions it committed
     materializations  output version a commit installed, with its metadata
     lineage           input version an output version was built from
+    key_outcomes      key an Each attempt processed: what it came to (per-key-processing.md §10)
+    ticks             sensor tick (lifecycle.md §11): buffered, never journaled
 
 `run_events` is the timeline: the engine's events and the worker's, appended
 as they are applied. The timings in `runs`, `tasks` and `attempts` summarize
@@ -133,6 +135,7 @@ TABLES = {
             "gpu": "INTEGER",  # requested; a named GPU type counts one
             "options": "MAP(VARCHAR, VARCHAR)",  # its other placement options: image, GPU type
             "outputs": "MAP(VARCHAR, VARCHAR)",  # output -> the version it committed
+            "keys": "MAP(VARCHAR, BIGINT)",  # an Each attempt's keys by outcome: ok, failed…
         },
     ),
     "materializations": Table(
@@ -192,6 +195,22 @@ TABLES = {
 }
 VOLATILE = ("ticks",)  # tables whose rows are never journaled
 TICKS_KEPT = 86400.0  # seconds a tick row is kept
+TABLES["key_outcomes"] = Table(
+    "run",
+    "at",
+    {
+        "run": "VARCHAR",
+        "attempt": "VARCHAR",  # attempts.id
+        "asset": "VARCHAR",
+        "scope": "VARCHAR",
+        "key": "VARCHAR",
+        "revision": "VARCHAR",  # the upstream version it processed: its text, or a digest's hex
+        "outcome": "VARCHAR",  # ok, removed, unmatched, rejected, failed, retrying, canceled, timed_out
+        "error": "VARCHAR",  # class and message
+        "duration": "DOUBLE",  # seconds in the call
+        "at": "DOUBLE",
+    },
+)
 RUN_TABLES = ("runs", "tasks", "attempts")  # replaced when a run is reopened; its events stay
 MAX_METADATA = 64 << 10  # bytes of JSON per output version
 
@@ -305,6 +324,7 @@ def run_rows(run: dict, *, live: bool = False) -> dict[str, list[dict]]:
                     **{k: a.get(k) for k in EXECUTION},
                     "options": a.get("options") or {},
                     "outputs": a.get("outputs") or {},
+                    "keys": a.get("keys") or {},
                 }
             )
     status = run["status"]
@@ -369,6 +389,8 @@ def run_record(rows: dict[str, list[dict]], events: int = 0) -> dict:
             attempt["error"] = a["error"]
         if a["outputs"]:
             attempt["outputs"] = dict(a["outputs"])
+        if a.get("keys"):
+            attempt["keys"] = dict(a["keys"])
         attempts.setdefault(a["task"], []).append(attempt)
     tasks = {}
     for t in rows["tasks"]:

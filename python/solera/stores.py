@@ -27,7 +27,11 @@ class WriteError(StoreError):
 
 @dataclass(frozen=True)
 class Patch:
-    """Partial write: replace the named keys, delete `remove` (§4)."""
+    """Partial write: replace the named keys, delete `remove` (§4). For a
+    keyed rows output, `rows` is the rows themselves, carrying their key
+    column, or — by key — `{key: rows}`: each key's group, the key column
+    stamped by the store, an empty group a live key with no rows
+    (docs/per-key-processing.md §6)."""
 
     rows: Any
     remove: Any = ()
@@ -202,6 +206,42 @@ def key_text(value: Any) -> str:
     raise WriteError(f"a key must be a str or an int, not {type(value).__name__}")
 
 
+def by_key(write: Any, output: Output) -> tuple[Any, list[str]] | None:
+    """A by-key write of a keyed rows output — `{key: rows}` — as flat rows
+    with the key column stamped, and the keys whose group is empty; `None`
+    for any other write. Rows that carry the key column already must agree
+    with their key. DataFrames stay a DataFrame, so their values keep their
+    Arrow digests (docs/row-digest.md); anything else becomes a list of dicts."""
+
+    if output.key in (None, KEYS) or output.is_partition_set or not isinstance(write, Mapping):
+        return None
+    column, frames, rows, empty = output.key, [], [], []
+    for key, group in write.items():
+        if not isinstance(key, str):
+            raise WriteError(f"{output.name}: a by-key write takes str keys, got {type(key).__name__}")
+        if _is_dataframe(group):
+            if column in group.columns and (group[column].astype(str) != key).any():
+                raise WriteError(f"{output.name}: rows of {key!r} carry another {column!r}")
+            if len(group):
+                frames.append(group.assign(**{column: key}))
+            else:
+                empty.append(key)
+            continue
+        found = _rows(group, output.name)
+        for row in found:
+            if column in row and key_text(row[column]) != key:
+                raise WriteError(f"{output.name}: a row of {key!r} carries {column}={row[column]!r}")
+            row[column] = key
+        rows.extend(found)
+        if not found:
+            empty.append(key)
+    if frames and not rows:
+        import pandas as pd
+
+        return pd.concat(frames, ignore_index=True), empty
+    return rows + [r for f in frames for r in f.to_dict(orient="records")], empty
+
+
 def entries(output: Output, value: Any) -> dict[str, Any]:
     """A keyed write's content as `key -> entry` (§4): a `keyed=True`
     output's dict, a partition set's elements, or rows grouped by their key
@@ -218,6 +258,10 @@ def entries(output: Output, value: Any) -> dict[str, Any]:
             )
         return dict(value)
     result: dict[str, list] = {}
+    flat = by_key(value, output)
+    if flat is not None:
+        value = flat[0]
+        result.update((k, []) for k in flat[1])
     for row in _rows(value, output.name):
         if output.key not in row:
             raise WriteError(f"{output.name}: row lacks the declared key column {output.key!r}")
@@ -249,6 +293,9 @@ def key_rows(write: Any, output: Output, exclude: tuple[str, ...] = ()):
             if not isinstance(write, Mapping) or not all(isinstance(k, str) for k in write):
                 raise WriteError(f"{name}: a keyed output takes dict[str, Any], got {type(write).__name__}")
             return Rows.values(list(write.items()))
+        flat = by_key(write, output)
+        if flat is not None:
+            return _with_empty(key_rows(flat[0], output, exclude), flat[1])
         if _is_dataframe(write):
             import duckdb
 
@@ -264,6 +311,23 @@ def key_rows(write: Any, output: Output, exclude: tuple[str, ...] = ()):
         raise WriteError(f"{name}: row lacks the declared key column {output.key!r}") from e
     except ValueError as e:  # a key that is not one, Arrow data without the columns, a value with no digest
         raise WriteError(f"{name}: {e}") from e
+
+
+def _with_empty(rows, empty: list[str]):
+    """`rows`, and keys whose group is empty at the empty group's version —
+    whatever `revision=` says, since no row carries one (per-key §6)."""
+
+    if not empty:
+        return rows
+    from ._native import group_digest
+    from .keys import Rows
+    from .keys.index import key_bytes
+
+    keys, versions = rows.entries()
+    pairs = list(zip(keys, versions, strict=True))
+    nothing = group_digest([])
+    pairs += [(key_bytes(k), nothing) for k in empty]
+    return Rows.pairs(sorted(pairs))
 
 
 def store_key_rows(store: Store, write: Any, output: Output):
@@ -538,6 +602,9 @@ class FileStore:
             content = {k: v for k, v in zip(keys, found, strict=True) if v is not MISSING}
             if handle.get("key") == KEYS:
                 return content
+            inner = by_key_type(t)
+            if inner is not MISSING:  # dict[str, T]: each key's group, as T
+                return {k: _materialize(rows, inner) for k, rows in content.items()}
             return _materialize([row for rows in content.values() for row in rows], t)
         value = await self._get(base)
         if value is MISSING:
@@ -677,6 +744,15 @@ async def _pages(upserts, content: dict):
 
 def _digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, separators=(",", ":")).encode()).hexdigest()
+
+
+def by_key_type(t: Any) -> Any:
+    """`T` of a `dict[str, T]` load — each key's group on its own, as `Each`
+    reads a page (per-key §5) — else `MISSING`."""
+
+    if typing.get_origin(t) in (dict, Mapping) and typing.get_args(t)[:1] == (str,):
+        return typing.get_args(t)[1]
+    return MISSING
 
 
 def _materialize(items: list, t):

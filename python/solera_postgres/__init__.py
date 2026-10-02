@@ -18,6 +18,7 @@ from typing import Any
 
 from solera.sdk import KEYS, Output, Ref, TableRef, digest
 from solera.stores import (
+    MISSING,
     Batches,
     Keys,
     Patch,
@@ -26,6 +27,8 @@ from solera.stores import (
     StoreError,
     WriteError,
     Written,
+    by_key,
+    by_key_type,
     key_rows,
     key_text,
     resolve_env,
@@ -73,6 +76,9 @@ class PostgresStore:
     def can_load(self, t, selection) -> bool:
         if t is None:
             return selection is None
+        inner = by_key_type(t)
+        if inner is not MISSING:  # dict[str, T]: a keyed read, each key's group as T (per-key §5)
+            return selection is not None and inner is not None and self.can_load(inner, selection)
         if getattr(t, "__module__", "").split(".")[0] in ("pandas", "geopandas") and getattr(
             t, "__name__", ""
         ) in ("DataFrame", "GeoDataFrame"):
@@ -363,8 +369,10 @@ class PostgresStore:
         if not output.incremental:
             raise WriteError(f"{output.name}: Patch requires an incremental output")
         remove = {_key(output, k) for k in write.remove}
-        rows = _coerce_rows(write.rows)
-        if not rows and not remove and prior is not None:
+        rows = _coerce_rows(write.rows, output)
+        flat = by_key(write.rows, output)
+        empty = flat[1] if flat is not None else []  # keys written with no rows (per-key §6)
+        if not rows and not remove and not empty and prior is not None:
             return None
         self._ensure(cur, output, rows, scope)
         partition_col = output.config.get("partition_column")
@@ -394,7 +402,7 @@ class PostgresStore:
                 row[partition_col] = scope.partition
         # Every key is the group of rows that carry it: a patch replaces the
         # rows of the keys it writes, all of them, and drops the keys it removes.
-        written = _keys(output, rows)
+        written = _keys(output, rows) + empty
         inserted = rows
         if prior is None:
             # No prior (a first write or a full run): the patch is the whole state.
@@ -405,7 +413,7 @@ class PostgresStore:
                 raise StoreError(
                     f"{output.name}: asked to write keys the patch does not hold: {sorted(missing)[:5]}"
                 )
-            inserted = [r for r, k in zip(rows, written, strict=True) if k in keys]
+            inserted = [r for r, k in zip(rows, written, strict=False) if k in keys]
             gone = set(keys) | (scope.removes if scope.removes is not None else remove)
             if gone:
                 cur.execute(
@@ -414,7 +422,16 @@ class PostgresStore:
                 )
         self._insert(cur, table, inserted)
         return digest(
-            [prior.version if prior else "", digest({"rows": _canon(rows), "remove": sorted(remove)})]
+            [
+                prior.version if prior else "",
+                digest(
+                    {
+                        "rows": _canon(rows),
+                        "remove": sorted(remove),
+                        **({"empty": sorted(empty)} if empty else {}),
+                    }
+                ),
+            ]
         )
 
     def _apply_sql(self, cur, output, write: Sql, scope, table, slice_where, prior):
@@ -593,10 +610,19 @@ class PostgresStore:
                 params.append(sorted(selection.revisions))
             if clauses:
                 sql += " WHERE " + " AND ".join(clauses)
-            rows = cur.execute(sql, params).fetchall()
+            found = cur.execute(sql, params)
+            rows = found.fetchall()
+            columns = [d.name for d in found.description or ()]
             if handle.get("batch") is not None:
                 internal = {BATCH_COLUMN, SEQ_COLUMN}
                 rows = [{k: v for k, v in r.items() if k not in internal} for r in rows]
+        inner = by_key_type(t)
+        if inner is not MISSING and isinstance(selection, Keys):
+            # Each selected key's group, an empty one included (per-key §6).
+            groups: dict[str, list] = {k: [] for k in sorted(selection.revisions)}
+            for row in rows:
+                groups.setdefault(str(row[handle["key"]]), []).append(row)
+            return {k: _materialize(g, inner, columns) for k, g in groups.items()}
         return _materialize(rows, t)
 
     # -- row helpers ----------------------------------------------------------
@@ -638,9 +664,12 @@ def _key(output: Output, value) -> str:
         raise WriteError(f"{output.name}: {e}") from None
 
 
-def _coerce_rows(write: Any) -> list[dict]:
+def _coerce_rows(write: Any, output: Output | None = None) -> list[dict]:
     if write is None:
         return []
+    flat = by_key(write, output) if output is not None else None
+    if flat is not None:
+        return _coerce_rows(flat[0])
     if type(write).__name__ in ("DataFrame", "GeoDataFrame") and type(write).__module__.split(".")[0] in (
         "pandas",
         "geopandas",
@@ -674,7 +703,7 @@ def _sql_type(decl: str) -> str:
     return re.sub(r"\bstring\b", "text", str(decl))
 
 
-def _materialize(rows: list[dict], t):
+def _materialize(rows: list[dict], t, columns: list[str] | None = None):
     import typing
 
     if (
@@ -689,5 +718,5 @@ def _materialize(rows: list[dict], t):
     ) in ("DataFrame", "GeoDataFrame"):
         import pandas as pd
 
-        return pd.DataFrame(rows)
+        return pd.DataFrame(rows, columns=columns if not rows and columns else None)
     return rows

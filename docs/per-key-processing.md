@@ -1,6 +1,10 @@
-# Per-key processing — proposal
+# Per-key processing
 
-Status: **proposed**, not built. It adds an `Each` edge (an asset written
+Status: **§5–§10 and §13 built** (error classes, build identity, `Each`,
+groups by key, the failure index, retry passes, forced retries, the drain on
+cancel, `key_outcomes`); §11 (patterns) in progress; §12 follows
+`lifecycle.md` §11 (sensors). §20 records where the build departs from this
+text. It adds an `Each` edge (an asset written
 for one key, run over every changed key), keys that hold many rows,
 per-key outcomes with user-classified errors, key patterns on edges, and
 observable sources. It builds on the engine cache, the HTTP resolver,
@@ -1047,3 +1051,46 @@ is below the current one.
    alternation runs small retry attempts between full change pages. Each
    costs a whole attempt; acceptable as is, or should a retry page wait
    until it is full or its oldest key has waited long enough?
+
+## 20. As built
+
+Where the implementation (`solera/errors.py`, `solera/build.py`,
+`solera/failures.py`, `solera_worker/each.py`, the engine's `_each_plan` and
+`_each_commit`) departs from or adds to the text above:
+
+- **The value of a key** is what the upstream store hands out for it under
+  `dict[str, T]`: for a rows upstream, its group — `file: list[dict]`, one
+  row for a file inventory; for `keyed=True`, its value.
+- **An output a call omits, or returns as `None`,** holds nothing for that
+  key: the key is removed from it. `[]` is an empty group: a live key.
+- **An output with nothing to write is left out of the commit;** an `Each`
+  page whose keys all failed makes no head yet, and an `Each` asset skips
+  without heads when nothing is pending.
+- **Transient errors at the attempt level** count `retry_for` from the
+  task's first transient failure (`transient_since` on the task), past
+  `retries=`.
+- **A change page that leaves keys due at once** continues its run with a
+  retry page; a completed retry pass never continues its run by itself, so
+  `retry_after=0` costs one retry per run, not a loop.
+- **A full delivery** (a reset, or a `full` run) defers retries until it is
+  drained: it reprocesses every key anyway.
+- **A retry page walks at most 100 × `batch_size` records** before it ends,
+  so a long stretch of keys that are not due spans several pages.
+- **Retry pages are never inlined yet**: the engine cache is not built; the
+  worker pages through the failure index. Transitions read priors with an
+  exact `get` of the touched keys, and the failure delta is resolved locally
+  (`KeyIndex.resolve(exact=True)`).
+- **Record times are the worker's clock**; eligibility compares them with
+  the engine's `now` in the spec. Skew moves when a key retries, never
+  whether (§9).
+- **Forced retries**: `solera keys retry ASSET [--failed|--rejected|
+  --canceled|--retrying|--timed-out|--all] [--partition P]`, or
+  `POST /api/projects/{p}/assets/{name}/keys:retry`, records
+  `KeysRetryRequested` and submits a run for the scopes concerned at once;
+  only scopes with a failure record take the request.
+- **The retry clock** starts a run for a scope with keys due when the asset
+  has any enabled automation and the scope is idle.
+- **The build identity outside git** hashes the project directory's Python
+  files only (data written next to a project would otherwise change it).
+- **PostgresStore** loads an empty group as an empty DataFrame with the
+  table's columns; `can_load(dict[str, T], Keys)` holds when `can_load(T, Keys)` does.

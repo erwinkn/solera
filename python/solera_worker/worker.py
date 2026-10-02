@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import dataclasses
 import importlib
 import importlib.util
@@ -70,6 +71,7 @@ from solera.stores import (
     store_key_rows,
 )
 
+from . import each
 from .reporting import LogShipper, Reporter
 
 
@@ -222,6 +224,17 @@ class Ctx:
         self._stores = project.stores
         self._outputs = [o.name or asset.name for o in asset.outputs]
         self._metadata: dict[str, dict] = {}
+        # An Each call's key and its upstream version (docs/per-key-processing.md §5).
+        self.key: str | None = None
+        self.revision: str | None = None
+
+    def _for_key(self, key: str, revision: str) -> Ctx:
+        """The `ctx` of one Each call: the same attempt, its key named, its log
+        lines tagged with it."""
+
+        one = copy.copy(self)
+        one.key, one.revision = key, revision
+        return one
 
     def _window(self, project, asset):
         declared = project.manifest["assets"][asset.name]["partitions"]
@@ -244,6 +257,8 @@ class Ctx:
         return windows or None
 
     def log(self, message: str, level: str = "info", **fields):
+        if self.key is not None:
+            fields = {"key": self.key, **fields}
         entry = {"at": time.time(), "level": level, "message": str(message), "fields": fields}
         json.dumps(entry, allow_nan=False)
         self._shipper.append(entry)
@@ -302,7 +317,7 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline):
     args, changes, delivered = {}, {}, {}
     for name, pin in spec["inputs"].items():
         edge = edges.get(name)
-        if edge is None:  # a dep pin: recorded, never bound
+        if edge is None or "each" in pin:  # a dep pin: recorded, never bound; an Each page: per key
             continue
         param = name
         t = hints.get(param)
@@ -912,6 +927,9 @@ async def run_attempt(
         control["cancel"] = record
         if record.phase == "forced":
             on_ended()
+        elif control.get("drain") is not None:
+            # An Each page drains (per-key §5): no key starts, finished ones are stored.
+            loop.call_soon_threadsafe(control["drain"].set)
         elif not control["writing"] and not control["stopped"]:
             control["stopped"] = True  # requested: stop computing; a writer drains instead
             loop.call_soon_threadsafe(execution.cancel)
@@ -1096,11 +1114,20 @@ async def _execute(
         for name, resource in project.resources.items():
             if name in signature.parameters:
                 args[name] = resolve_env(resource)  # env: secrets resolve in the harness (§5)
-        timeline.add("computing")
-        value = asset.fn(**args)
-        if inspect.isawaitable(value):
-            value = await value
-        timeline.add("computed")
+        page = next(((p, pin) for p, pin in spec["inputs"].items() if "each" in pin), None)
+        if page is not None:
+            control["drain"] = asyncio.Event()
+            ran = await each.run(spec, project, asset, *page, args, ctx, keys_io, timeline, control)
+            if "abort" in ran:
+                return _user_failed(ran["abort"], project)
+            value = Result(outputs=ran["values"])
+            delivered[page[0]] = ran["delivered"]
+        else:
+            timeline.add("computing")
+            value = asset.fn(**args)
+            if inspect.isawaitable(value):
+                value = await value
+            timeline.add("computed")
         metadata = ctx._recorded(value)
         outputs, cursor = await _store_outputs(
             spec,
@@ -1119,6 +1146,10 @@ async def _execute(
             if values and "ref" in outputs.get(name, {}):
                 outputs[name]["metadata"] = values
         result = {"status": "succeeded", "outputs": outputs, "delivered": delivered}
+        if page is not None:
+            # A drained page commits what finished (docs/lifecycle.md §7).
+            result["status"] = "canceled" if ran["drained"] else "succeeded"
+            result.update({k: ran[k] for k in ("failures", "key_outcomes", "keys")})
         result.update(await _discard_due(spec, project, asset, objects, writes))
         if cursor is not UNSET:
             result["cursor"] = cursor

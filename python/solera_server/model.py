@@ -99,6 +99,7 @@ class Model:
                 "unsettled": _nest(self.unsettled, 2),
                 "holds": _nest(self.holds, 2),
                 "discards": _nest(self.discards, 2),
+                "failures": _nest(self.failures, 2),
                 "automations": self.automations,
                 "sensors": self.sensors,
                 "runs": self.runs,
@@ -138,6 +139,9 @@ class Model:
         # event position that let go of it: for the scope's next attempt to discard
         # once no reader pins it (docs/lifecycle.md §9.8)
         self.discards: dict[tuple, list] = _flatten(snap.get("discards"), 2)
+        # (asset, scope) -> an Each asset's failure record (docs/per-key-processing.md §9):
+        # its index lives in `indexes` under ("@asset", scope)
+        self.failures: dict[tuple, dict] = _flatten(snap.get("failures"), 2)
         self.automations: dict[str, dict] = snap.get("automations") or {}
         # sensor -> {cursor, accepted}: the last tick that changed something (docs/lifecycle.md §11.4)
         self.sensors: dict[str, dict] = snap.get("sensors") or {}
@@ -656,6 +660,11 @@ class Model:
                 name: h["ref"].get("version") for name, h in commit.get("heads", {}).items()
             }
         task["attempts"].append(summary)
+        if e.get("keys"):
+            summary["keys"] = e["keys"]
+        if commit and outcome in ("canceled", "failed"):
+            # A drained Each page: what finished commits (docs/lifecycle.md §7).
+            self._install(task, commit, e, reads)
         if task["status"] in TERMINAL_TASK:
             # Its run was canceled while it ran. An attempt that was already
             # writing still commits: its data landed (§8).
@@ -687,6 +696,9 @@ class Model:
             else:
                 task["status"] = "failed"
                 self._finished(run, task, "failed", e["attempt"], at)
+        elif outcome == "canceled" and commit:
+            task["status"] = "canceled"  # a drained page the user stopped: it does not resume
+            self._finished(run, task, "canceled", e["attempt"], at)
         elif outcome == "canceled":
             self._ready(run, task, at)
         else:
@@ -747,6 +759,13 @@ class Model:
                 self.cursors[(asset, scope)] = commit["cursor"]
         for edge, wm in commit.get("watermarks", {}).items():
             self.watermarks[(asset, edge, scope)] = wm
+        if "failures" in commit:
+            self._failures(asset, scope, commit["failures"])
+        for row in commit.get("key_outcomes") or ():
+            self._record(
+                "key_outcomes",
+                {**row, "run": e["run"], "attempt": e["attempt"], "asset": asset, "scope": scope, "at": at},
+            )
         for name in changed:
             head = self.heads[(name, scope)]
             self._record(
@@ -764,6 +783,32 @@ class Model:
             for row in history.lineage(name, scope, head, reads):
                 self._record("lineage", row)
         self._pend_onchange(asset, scope, changed)
+
+    def _failures(self, asset: str, scope: str, f: dict) -> None:
+        """An Each page's commit to its failure record: the failure index's
+        delta, and the counts, bounds and retry-pass state the engine worked
+        out from it (docs/per-key-processing.md §9)."""
+
+        record = self.failures.setdefault((asset, scope), {"batch": -1, "forced": {}})
+        keys = f.get("keys") or {}
+        if keys.get("files"):
+            name = f"@{asset}"
+            index = self.index(name, scope).committed(f["batch"], DeltaFiles.from_json(keys), keep_log=False)
+            self.indexes[(name, scope)] = index
+            record["batch"] = f["batch"]
+        for field in ("counts", "due", "epoch_min", "retry", "passes", "done_forced", "last"):
+            if field in f:
+                record[field] = f[field]
+
+    def _on_KeysRetryRequested(self, e):
+        """`solera retry ASSET --failed …`: a forced request, identified by its
+        position in the event order, for each class it names
+        (docs/per-key-processing.md §9)."""
+
+        for (asset, scope), record in self.failures.items():
+            if asset == e["asset"] and (e.get("scope") is None or e["scope"] == scope):
+                for name in e["classes"]:
+                    record.setdefault("forced", {})[name] = self.applied
 
     def _pend_onchange(self, asset: str | None, scope: str, changed: list[str]) -> None:
         if not changed:

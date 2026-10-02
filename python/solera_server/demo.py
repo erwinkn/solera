@@ -13,12 +13,14 @@ import hashlib
 import os
 import time
 
+from solera.errors import Rejected
 from solera.executors import Pool
 from solera.sdk import (
     AllPartitions,
     Automation,
     AutoRefresh,
     Cron,
+    Each,
     Every,
     Incremental,
     Migration,
@@ -219,6 +221,43 @@ def file_index(ctx, site_files: list[dict]):
 
 
 # ---------------------------------------------------------------------------
+# Per-file processing: an Each edge runs one call per changed file, four at a
+# time; every file's rows go to the store in one write per page, and a file
+# that raises is kept in the asset's failure index, per key, while the others
+# commit (docs/per-key-processing.md §5, §9).
+# ---------------------------------------------------------------------------
+
+
+class Unreadable(Rejected):
+    """A file that is bad on purpose: rejected until it changes."""
+
+
+@asset(
+    outputs=Output(
+        "file_checks",
+        store=RELATIONAL,
+        key="file_id",
+        partition_column="site",
+        migrations=postgres_migrations("file_checks"),
+    ),
+    partitions={"site": sites},
+    inputs={"file": Each("site_files", batch_size=4, concurrency=4)},
+    automations=AutoRefresh(),
+)
+async def file_checks(ctx, file: list[dict]):
+    """One changed file: a row per check. The fourth file of a site is
+    unreadable on odd feed ticks — watch it come and go as a rejected key."""
+    [row] = file
+    if row["file_id"].endswith("-file-3") and int(row["version"].lstrip("t")) % 2:
+        raise Unreadable(f"{row['path']}: no header row")
+    ctx.log("checked", path=row["path"])
+    return [
+        {"check": "status", "value": row["status"]},
+        {"check": "version", "value": row["version"]},
+    ]
+
+
+# ---------------------------------------------------------------------------
 # site × day: two dimensions; deps= on a plain Source gives the digest job
 # lineage and change-watching without loading it. The output is a text.
 # ---------------------------------------------------------------------------
@@ -365,6 +404,7 @@ project = Project(
         sites,
         site_feed,
         file_index,
+        file_checks,
         site_digest,
         fleet_index,
         site_status,

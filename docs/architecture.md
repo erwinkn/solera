@@ -240,7 +240,7 @@ the engine, computes the resulting delta:
 
 | Write | Semantics |
 |---|---|
-| `Patch(rows, remove=())` | after the write, the scope's rows for the keys present in `rows` (read from the declared `key` column) are exactly these; keys in `remove` are gone; every other key is untouched. On an unkeyed incremental output the rows are one new batch and `remove` is not allowed. |
+| `Patch(rows, remove=())` | after the write, the scope's rows for the keys present in `rows` (read from the declared `key` column) are exactly these; keys in `remove` are gone; every other key is untouched. On an unkeyed incremental output the rows are one new batch and `remove` is not allowed. By key, `Patch({key: rows})`: each key's group, its key column stamped by the store; a key given no rows is a live key with an empty group (per-key-processing.md §6). |
 | `Sql(stmt)` | PostgresStore only. The output *is* the table `{schema}.{table}` (`table` defaults to the output name, `schema` to `public`): a `SELECT` is materialized into it as a replace; any other statement runs verbatim and must leave that table in place. Returns an ordinary `TableRef`, loadable downstream. Version `H(prior.version ‖ H(stmt))`. |
 
 ### Shipped stores
@@ -276,12 +276,15 @@ deps = ["usgs_3dep_tiles"]  # pinned, watched, not loaded
 Every value is an `In` or a `str` (sugar for `In(output)`). `In(output=None,
 *, meta=None)` is the edge base class: `output` defaults to the parameter
 name, `meta` is free-form JSON recorded on the edge in the manifest. The
-engine knows exactly three edge kinds; user subclasses are rejected.
+engine knows exactly three edge kinds; user subclasses are rejected (`Each`
+is an `Incremental` edge to the engine, with a failure index).
+
 
 | Value | Meaning |
 |---|---|
 | `In(output=None, meta=None)` | whole value (or ref) of the output at its pinned head |
 | `Incremental(output=None, batch_size=100, meta=None)` | receive only what changed since this consumer's watermark — upserted/deleted keys on a keyed upstream, new batches on an unkeyed one (§6) |
+| `Each(output=None, *, batch_size=100, concurrency=16, meta=None)` | an `Incremental` edge on a keyed upstream whose producer is written for **one key**: the parameter is that key's value (a rows upstream: its group), `ctx.key` its key. The worker calls it for every changed key of a page, `concurrency` at a time, stores the keys that succeeded as one `Patch({key: value})` per output, and keeps the ones that raised in the asset's failure index, retried by their error class; deleted keys lose their rows without a call. One per asset, its other inputs whole, every output keyed. per-key-processing.md §5–§10 |
 | `AllPartitions(output=None, meta=None)` | receive every partition of the upstream dimensions this asset lacks (§7) |
 
 **By value or by reference.** The annotation decides. `T` loads through the
