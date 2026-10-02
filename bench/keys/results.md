@@ -1094,3 +1094,103 @@ already is Arrow.
 CPython from 3.12). Built per version instead, the `datetime` is read from
 its struct (0.16 → 0.05 µs) and the row costs 0.34 µs, not 0.48. That
 would mean a wheel per Python version, so it is left as a choice.
+
+## Versions are generations: format v3 (2026-10-02)
+
+`docs/versions.md`: an entry is `(key, generation, deleted, payload?)` —
+no content version, no pair filter, and an optional payload (a source's
+version, a failure record). Earlier sections measured 16-byte row
+digests on every entry; `digest.py` and `pyrows.py`, which measured
+digesting, are deleted with the digest. `bench.py --payload N` gives every
+entry an N-byte payload: without one (the default) the index is a derived
+output's, where every write is a change, so the unchanged-share rows only
+run with one. "Before" is `dbf1070` (16-byte digests), same machine and
+latency model (30 ms per request, 80 MB/s per connection, 64 in parallel).
+
+
+#### 1,000,000 keys
+
+| | Before (16 B digests) | After, no payload (derived) | After, 16 B versions (source) |
+|---|---|---|---|
+| build_s | 1.3 s | 0.8 s | 1.3 s |
+| bytes | 29.2 MB | 8.8 MB | 26.8 MB |
+| b_per_entry | 29.2 B | 8.8 B | 26.8 B |
+| filter_b_per_entry | 3.51 B | 1.75 B | 1.76 B |
+| 100 random keys changed | 335 ms · 2G · 29.2 MB | 191 ms · 1G · 8.8 MB | 335 ms · 2G · 26.8 MB |
+| 1K random keys changed | 456 ms · 2G · 29.2 MB | 228 ms · 1G · 8.8 MB | 422 ms · 2G · 26.8 MB |
+| 1K random keys, half unchanged | 432 ms · 2G · 29.2 MB | — | 383 ms · 2G · 26.8 MB |
+| 1K clustered keys changed | 312 ms · 2G · 29.2 MB | 164 ms · 1G · 8.8 MB | 271 ms · 2G · 26.8 MB |
+| 1K new keys inserted | 454 ms · 2G · 29.2 MB | 246 ms · 1G · 8.8 MB | 398 ms · 2G · 26.8 MB |
+| 100K random keys changed | 717 ms · 2G · 29.2 MB | 468 ms · 1G · 8.8 MB | 767 ms · 2G · 26.8 MB |
+| full-delivery page of 10K keys | 79 ms · 2G · 0.3 MB | 74 ms · 2G · 0.1 MB | 83 ms · 2G · 0.3 MB |
+| commit: 1K random changes + delta write | 528 ms · 2G · 29.2 MB | 274 ms · 1G · 8.8 MB | 468 ms · 2G · 26.8 MB |
+| compaction: 8 delta files | 92 ms · 8G · 0.4 MB | 85 ms · 8G · 0.1 MB | 80 ms · 8G · 0.2 MB |
+| full replacement, 1% changed | 701 ms · 5G · 25.7 MB | 682 ms · 2G · 7.1 MB | 664 ms · 4G · 25.1 MB |
+| initial load: every key, unsorted | 1.7 s · 0G · 0.0 MB | 480 ms · 0G · 0.0 MB | 1.6 s · 0G · 0.0 MB |
+| full scan (recount), 100K-key pages | 293 ms · 5G · 25.7 MB | 226 ms · 2G · 7.1 MB | 327 ms · 4G · 25.1 MB |
+| steady: 1K random keys changed | 452 ms · 9G · 31.1 MB | 335 ms · 8G · 9.4 MB | 466 ms · 9G · 28.4 MB |
+| steady: 1K random keys, half unchanged | 491 ms · 9G · 31.1 MB | — | 494 ms · 9G · 28.4 MB |
+| steady: full-delivery page of 10K keys | 108 ms · 9G · 2.1 MB | 83 ms · 9G · 0.7 MB | 105 ms · 9G · 1.9 MB |
+| steady: full scan (recount), 100K-key pages | 357 ms · 12G · 27.6 MB | 299 ms · 9G · 7.6 MB | 389 ms · 11G · 26.6 MB |
+| steady: commit: 1K random changes + delta write | 518 ms · 9G · 31.1 MB | 361 ms · 8G · 9.4 MB | 512 ms · 9G · 28.4 MB |
+| steady: compaction: level 0, 8 files | 153 ms · 8G · 1.9 MB | 118 ms · 8G · 0.6 MB | 154 ms · 8G · 1.6 MB |
+| steady: compaction: level 0, a tenth of level 1, into level 1 | 1.1 s · 7G · 28.9 MB | 585 ms · 4G · 8.1 MB | 1.0 s · 6G · 28.0 MB |
+
+#### 10,000,000 keys
+
+| | Before (16 B digests) | After, no payload (derived) | After, 16 B versions (source) |
+|---|---|---|---|
+| build_s | 10.8 s | 7.3 s | 10.7 s |
+| bytes | 283.8 MB | 79.6 MB | 257.6 MB |
+| b_per_entry | 28.4 B | 8.0 B | 25.8 B |
+| filter_b_per_entry | 3.51 B | 1.75 B | 1.76 B |
+| 100 random keys changed | 232 ms · 3G · 35.1 MB | 135 ms · 3G · 17.5 MB | 274 ms · 97G · 23.5 MB |
+| 1K random keys changed | 285 ms · 5G · 35.2 MB | 134 ms · 3G · 17.5 MB | 802 ms · 728G · 70.2 MB |
+| 1K random keys, half unchanged | 689 ms · 450G · 65.2 MB | — | 822 ms · 713G · 69.6 MB |
+| 1K clustered keys changed | 252 ms · 2G · 12.5 MB | 126 ms · 1G · 6.2 MB | 158 ms · 2G · 6.3 MB |
+| 1K new keys inserted | 229 ms · 3G · 35.1 MB | 133 ms · 3G · 17.5 MB | 172 ms · 4G · 17.7 MB |
+| 100K random keys changed | 890 ms · 346G · 58.4 MB | 462 ms · 3G · 17.5 MB | 2.0 s · 20G · 257.6 MB |
+| full-delivery page of 10K keys | 87 ms · 4G · 0.7 MB | 78 ms · 4G · 0.2 MB | 87 ms · 4G · 0.7 MB |
+| commit: 1K random changes + delta write | 305 ms · 6G · 35.3 MB | 167 ms · 3G · 17.5 MB | 888 ms · 711G · 69.5 MB |
+| compaction: 8 delta files | 91 ms · 8G · 0.3 MB | 80 ms · 8G · 0.1 MB | 95 ms · 8G · 0.2 MB |
+| full replacement, 1% changed | 4.6 s · 34G · 248.8 MB | 3.7 s · 12G · 62.1 MB | 4.6 s · 34G · 240.1 MB |
+| initial load: every key, unsorted | 14.7 s · 0G · 0.0 MB | 4.8 s · 0G · 0.0 MB | 16.6 s · 0G · 0.0 MB |
+| full scan (recount), 100K-key pages | 1.3 s · 34G · 248.8 MB | 662 ms · 12G · 62.1 MB | 1.3 s · 34G · 240.1 MB |
+| steady: 1K random keys changed | 487 ms · 11G · 46.7 MB | 183 ms · 7G · 1.9 MB | 812 ms · 404G · 50.8 MB |
+| steady: 1K random keys, half unchanged | 773 ms · 229G · 60.2 MB | — | 790 ms · 390G · 49.7 MB |
+| steady: full-delivery page of 10K keys | 104 ms · 14G · 1.6 MB | 116 ms · 15G · 2.3 MB | 93 ms · 14G · 1.4 MB |
+| steady: full scan (recount), 100K-key pages | 2.3 s · 49G · 309.5 MB | 2.6 s · 28G · 114.5 MB | 2.2 s · 50G · 304.5 MB |
+| steady: commit: 1K random changes + delta write | 559 ms · 12G · 46.7 MB | 204 ms · 7G · 1.9 MB | 753 ms · 407G · 50.7 MB |
+| steady: compaction: level 0, 8 files | 261 ms · 8G · 3.7 MB | 196 ms · 8G · 2.0 MB | 237 ms · 8G · 3.7 MB |
+| steady: compaction: level 0, a tenth of level 1, into level 1 | 2.2 s · 10G · 64.0 MB | 2.8 s · 11G · 54.2 MB | 2.1 s · 11G · 67.8 MB |
+| steady: compaction: a level-1 file into level 2 | 2.1 s · 11G · 74.4 MB | 3.1 s · 20G · 113.1 MB | 2.0 s · 11G · 72.2 MB |
+
+- **A derived output's index is 3.3× smaller** (8.0–8.8 B per entry against
+  28.4–29.2 B) and everything that reads it whole moves with it: an initial
+  load of 10M keys 14.7 s → 4.8 s, a recount 1.3 s → 0.66 s, a full
+  replacement reads 62 MB instead of 249 MB.
+- **A patch of a derived output reads less and never more**: the filters
+  decide every key with no block read (1K random keys at 10M: 3 GETs
+  against 5). Rows rewritten unchanged used to need exact reads — 450
+  GETs at 10M for half of 1K keys — and are now simply changes.
+- **A cold source commit with versions pays for the pair filter's
+  removal.** Only the entry says whether a version moved, so each touched
+  key's block is read: 1K random keys at 10M, 728 GETs and 802 ms against
+  5 GETs and 285 ms, and 100K keys stream the index (2.0 s against 0.9 s).
+  `versions.md` §3 accepted this. Source commits are prepared by the
+  engine, which answers them from its warm cache whenever it holds the
+  index (`resolved-commits.md` §4), so the cold path is the exception.
+- With 16-byte versions, entries are 26–27 B: the payload costs what the
+  digest did, less the second filter (1.75 B per entry saved).
+- The steady state's level-1 push at 10M grew (2.1 s → 3.1 s): the filled
+  upper levels hold ~3× more entries in the same bytes, so a pushed file
+  overlaps more of the level below. Bytes per operation are the target
+  sizes', as before.
+
+`params.py` (1M entries, total per entry with filters): random ids 11.4 B
+without a payload, 29.7 B with 16 random bytes; UUIDs 33.7 B / 52.4 B;
+sequential ids 5.9 B / 24.0 B, 11.8 B with short versions. Two filters
+are 1.75 B per entry at 14 bits per item, 0.35% false positives measured.
+`cpu.py 1000000` (path-like keys): native encode 2.38M entries/s, decode
+5.79M/s, merge 5.73M/s without payloads (1.85M, 3.81M and 3.80M with 16
+bytes).

@@ -8,6 +8,11 @@ on a cold reader (no cache) unless marked warm. `--latency` adds a fixed delay
 per request and `--bandwidth` a per-connection transfer rate, to model S3 on
 top of a local server. Results print as Markdown.
 
+Each entry carries the generation that wrote it and, with `--payload N`, an N-byte
+payload — a source's version. Without one (the default, a derived output's keys)
+every write of a key changes it, so the unchanged-share rows and grid columns run only
+with a payload (docs/versions.md).
+
 Suites (`--suites`, all by default):
 - base: the operations recorded in results.md, in the same order and with the same keys.
 - scan: a full scan of the index (the recount), in 100K-key pages.
@@ -55,6 +60,23 @@ S3 = {
 }
 GET_PRICE, PUT_PRICE = 0.40 / 1e6, 5.0 / 1e6
 SUITES = ("base", "scan", "load", "crossover", "steady")
+PAYLOAD = 0  # bytes of payload per entry (`--payload`): 0 for none
+
+
+def version(rng: random.Random) -> bytes | None:
+    """A new payload, or None without them."""
+
+    return rng.randbytes(PAYLOAD) if PAYLOAD else None
+
+
+def run_of(keys: list[bytes], payloads: list) -> K.SortedRun:
+    return K.SortedRun.of(keys, payloads if PAYLOAD else None)
+
+
+def shares() -> tuple[float, ...]:
+    """Unchanged shares to measure: only a payload can say a key is unchanged."""
+
+    return SHARES if PAYLOAD else (0.0,)
 
 
 def configure(url: str) -> str:
@@ -137,8 +159,8 @@ class Keyspace:
 
 
 async def build(io: ObjectIO, prefix: str, n: int, opts: Options, sample_every: int, big_every: int):
-    """The index as bottom-level files; returns its state, a sample of (id, version),
-    a bigger sample for bulk operations, and the build time."""
+    """The index as bottom-level files, every entry at generation 1; returns its state,
+    a sample of (id, payload), a bigger sample for bulk operations, and the build time."""
 
     t = time.perf_counter()
     files, sample, big, entries = [], [], [], 0
@@ -146,15 +168,17 @@ async def build(io: ObjectIO, prefix: str, n: int, opts: Options, sample_every: 
     rng = random.Random(1)
     for n_chunk, ids in enumerate(Keyspace(n).chunks(per_file)):
         keys = [key_of(i) for i in ids]
-        versions = [rng.randbytes(16) for _ in ids]
-        data = K.encode_file(keys, versions, bytes(len(keys)), level=opts.level)
+        payloads = [version(rng) for _ in ids]
+        data = K.encode_file(
+            keys, [1] * len(keys), bytes(len(keys)), payloads=payloads if PAYLOAD else None, level=opts.level
+        )
         name = f"c-build-{n_chunk:05d}"
         await io.write(f"{prefix}{name}.kx", data)
         files.append(FileInfo.describe(name, 1, data))
         for j in range(0, len(ids), sample_every):
-            sample.append((ids[j], versions[j]))
+            sample.append((ids[j], payloads[j]))
         for j in range(0, len(ids), big_every):
-            big.append((ids[j], versions[j]))
+            big.append((ids[j], payloads[j]))
         entries += len(keys)
     state = IndexState(count=entries, files=tuple(files))
     # Let the planner place it: the deepest level moves down (no rewrite) until it fits.
@@ -166,14 +190,18 @@ async def build(io: ObjectIO, prefix: str, n: int, opts: Options, sample_every: 
     return state, sample, big, time.perf_counter() - t
 
 
-def all_entries(n: int) -> tuple[list[bytes], list[bytes]]:
-    """Every key with the version the build gave it."""
+def all_entries(n: int) -> tuple[list[bytes], list]:
+    """Every key with the payload the build gave it."""
 
     ks_all = []
     for ids in Keyspace(n).chunks(1_000_000):
         ks_all += [key_of(i) for i in ids]
     vr = random.Random(1)
-    return ks_all, [vr.randbytes(16) for _ in ks_all]
+    return ks_all, [version(vr) for _ in ks_all]
+
+
+def rows_of(keys: list[bytes], payloads: list) -> Rows:
+    return Rows.pairs(list(zip(keys, payloads, strict=True))) if PAYLOAD else Rows.keys(keys)
 
 
 def fmt_s(x: float) -> str:
@@ -235,12 +263,12 @@ ROUTES = {
     "resolve": {},
 }
 GRID = (1_000, 10_000, 100_000, 1_000_000)
-SHARES = (0.0, 0.5, 1.0)
+SHARES = (0.0, 0.5, 1.0)  # with a payload
 
 
 async def grid(prefix, state, sample, opts, cold, label, sizes=GRID) -> list[dict]:
-    """A patch of k sampled keys, a share of them rewritten unchanged — what the
-    filters cannot clear — resolved by the sparse reader, by streaming, and as
+    """A patch of k sampled keys, a share of them rewritten unchanged (with a payload) —
+    what the filters cannot clear — resolved by the sparse reader, by streaming, and as
     `resolve` decides; each writes its delta."""
 
     rng = random.Random(30)
@@ -248,10 +276,10 @@ async def grid(prefix, state, sample, opts, cold, label, sizes=GRID) -> list[dic
     for k in sizes:
         if k > len(sample) // 2:
             continue
-        for share in SHARES:
+        for share in shares():
             items = sorted(rng.sample(sample, k))
             keys = [key_of(i) for i, _ in items]
-            vers = [v if rng.random() < share else rng.randbytes(16) for _, v in items]
+            vers = [v if rng.random() < share else version(rng) for _, v in items]
             row = {"state": label, "k": k, "unchanged": share}
             for route, o in ROUTES.items():
                 io, n = cold(), len(rows)
@@ -260,7 +288,7 @@ async def grid(prefix, state, sample, opts, cold, label, sizes=GRID) -> list[dic
                     f"{k} keys, {route}",
                     io,
                     lambda idx=idx, keys=keys, vers=vers, n=n, route=route: idx.resolve(
-                        K.SortedRun.of(keys, vers), batch=10**9, attempt=f"grid-{label}-{n}-{route}"
+                        run_of(keys, vers), batch=10**9, attempt=f"grid-{label}-{n}-{route}", generation=2
                     ),
                 )
                 r.pop("out")
@@ -276,8 +304,9 @@ async def grid(prefix, state, sample, opts, cold, label, sizes=GRID) -> list[dic
 
 async def fill_upper(io, prefix, n, opts, depth, per_entry, current, fill=0.95) -> list[FileInfo]:
     """Levels 1 .. depth-1 as steady-state writes leave them: level L holds `fill` of its
-    target size (`level_base · fanout^(L-1)`) in newer versions of random existing keys,
-    split into files the way compaction splits them. Updates `current` (id -> version)."""
+    target size (`level_base · fanout^(L-1)`) in newer writes of random existing keys, at
+    generation 10 - L, split into files the way compaction splits them. Updates `current`
+    (id -> (generation, payload))."""
 
     rng = random.Random(20)
     share = {
@@ -285,29 +314,30 @@ async def fill_upper(io, prefix, n, opts, depth, per_entry, current, fill=0.95) 
         for lv in range(1, depth)
     }
     files: list[FileInfo] = []
-    pending = {lv: ([], []) for lv in share}
+    pending = {lv: ([], [], []) for lv in share}
     raw = dict.fromkeys(share, 0)
 
     async def flush(lv):
-        ks, vs = pending[lv]
+        ks, gs, vs = pending[lv]
         if ks:
-            data = K.encode_file(ks, vs, bytes(len(ks)), level=opts.level)
+            data = K.encode_file(ks, gs, bytes(len(ks)), payloads=vs if PAYLOAD else None, level=opts.level)
             name = f"u{lv}-{len(files):05d}"
             await io.write(f"{prefix}{name}.kx", data)
             files.append(FileInfo.describe(name, lv, data))
-        pending[lv] = ([], [])
+        pending[lv] = ([], [], [])
         raw[lv] = 0
 
     for ids in Keyspace(n).chunks(1_000_000):
-        for lv in sorted(share, reverse=True):  # deeper first: the newest version ends up in `current`
+        for lv in sorted(share, reverse=True):  # deeper first: the newest write ends up in `current`
             for j in sorted(rng.sample(range(len(ids)), round(share[lv] * len(ids)))):
-                ks, vs = pending[lv]
-                key, v = key_of(ids[j]), rng.randbytes(16)
+                ks, gs, vs = pending[lv]
+                key, v = key_of(ids[j]), version(rng)
                 ks.append(key)
+                gs.append(10 - lv)
                 vs.append(v)
-                raw[lv] += len(key) + len(v) + 4
+                raw[lv] += len(key) + PAYLOAD + 4
                 if ids[j] in current:
-                    current[ids[j]] = v
+                    current[ids[j]] = (10 - lv, v)
                 if raw[lv] >= 2 * opts.max_file_bytes:  # compaction's split
                     await flush(lv)
     for lv in share:
@@ -332,10 +362,10 @@ async def steady(n, prefix, state, sample, opts, cold, with_grid=False) -> tuple
     """The index as steady-state writes leave it — upper levels filled, level 0 one delta
     short of a compaction, holding on average half the merged level-0 file it pushes into
     level 1 — then operations on it and one compaction of each kind. Checks afterwards that
-    every key kept its newest version."""
+    every key kept its newest write."""
 
     setup = ObjectIO(store())
-    current = dict(sample)
+    current = {i: (1, v) for i, v in sample}  # id -> (generation, payload)
     t = time.perf_counter()
     per_entry = sum(f.size for f in state.files) / n
     upper = await fill_upper(setup, prefix, n, opts, state.depth, per_entry, current)
@@ -344,29 +374,39 @@ async def steady(n, prefix, state, sample, opts, cold, with_grid=False) -> tuple
     batch = 1
 
     def pick(k):
-        return sorted(rng.sample(list(current.items()), k))
+        """k sampled keys, each with its current payload."""
+
+        return sorted((i, v) for i, (_, v) in rng.sample(list(current.items()), k))
 
     async def fill_l0(name):
-        """A level-0 file of newer versions of sampled keys: half the size at which
+        """A level-0 file of newer writes of sampled keys: half the size at which
         level 0 merges into level 1."""
 
         nonlocal st
         l1 = sum(f.size for f in st.level(1))
         items = pick(min(len(current), round(l1 / opts.fanout / 2 / per_entry)))
-        vers = [rng.randbytes(16) for _ in items]
-        data = K.encode_file([key_of(i) for i, _ in items], vers, bytes(len(items)), level=opts.level)
+        vers = [version(rng) for _ in items]
+        g = 100 + batch
+        data = K.encode_file(
+            [key_of(i) for i, _ in items],
+            [g] * len(items),
+            bytes(len(items)),
+            payloads=vers if PAYLOAD else None,
+            level=opts.level,
+        )
         await setup.write(f"{prefix}{name}.kx", data)
         st = replace(st, files=st.files + (FileInfo.describe(name, 0, data),))
-        current.update((i, v) for (i, _), v in zip(items, vers, strict=True))
+        current.update((i, (g, v)) for (i, _), v in zip(items, vers, strict=True))
 
     async def commit(io):
         nonlocal st, batch
         items = pick(1000)
-        vers = [rng.randbytes(16) for _ in items]
+        vers = [version(rng) for _ in items]
         idx = KeyIndex(io, prefix, st, opts)
-        delta = await idx.changes(K.SortedRun.of([key_of(i) for i, _ in items], vers))
+        g = 100 + batch
+        delta = await idx.changes(run_of([key_of(i) for i, _ in items], vers), generation=g)
         st = st.committed(batch, await idx.write(batch, f"steady{batch}", delta), keep_log=False)
-        current.update((i, v) for (i, _), v in zip(items, vers, strict=True))
+        current.update((i, (g, v)) for (i, _), v in zip(items, vers, strict=True))
         batch += 1
 
     await fill_l0(f"{0:012d}-fill")
@@ -376,9 +416,9 @@ async def steady(n, prefix, state, sample, opts, cold, with_grid=False) -> tuple
 
     async def changes(io, k, same_share=0.0):
         items = pick(k)
-        vers = [v if rng.random() < same_share else rng.randbytes(16) for _, v in items]
+        vers = [v if rng.random() < same_share else version(rng) for _, v in items]
         return await KeyIndex(io, prefix, st, opts).changes(
-            K.SortedRun.of([key_of(i) for i, _ in items], vers)
+            run_of([key_of(i) for i, _ in items], vers), generation=10**6
         )
 
     async def compact(io, plan=None):
@@ -390,10 +430,11 @@ async def steady(n, prefix, state, sample, opts, cold, with_grid=False) -> tuple
     rows = []
     io = cold()
     rows.append(await measure("steady: 1K random keys changed", io, lambda io=io: changes(io, 1000)))
-    io = cold()
-    rows.append(
-        await measure("steady: 1K random keys, half unchanged", io, lambda io=io: changes(io, 1000, 0.5))
-    )
+    if PAYLOAD:
+        io = cold()
+        rows.append(
+            await measure("steady: 1K random keys, half unchanged", io, lambda io=io: changes(io, 1000, 0.5))
+        )
     io = cold()
     after = key_of(sorted(current)[len(current) // 3])
     rows.append(
@@ -411,8 +452,9 @@ async def steady(n, prefix, state, sample, opts, cold, with_grid=False) -> tuple
             lambda io=io: KeyIndex(io, prefix, st, opts).recount(),
         )
     )
-    if with_grid:  # the sample's versions are current: unchanged rewrites are real
-        shape["grid"] = await grid(prefix, st, list(current.items()), opts, cold, "steady", GRID[:3])
+    if with_grid:  # the sample's payloads are current: unchanged rewrites are real
+        sampled = [(i, v) for i, (_, v) in current.items()]
+        shape["grid"] = await grid(prefix, st, sampled, opts, cold, "steady", GRID[:3])
     io = cold()
     rows.append(
         await measure("steady: commit: 1K random changes + delta write", io, lambda io=io: commit(io))
@@ -443,13 +485,11 @@ async def steady(n, prefix, state, sample, opts, cold, with_grid=False) -> tuple
         )
     shape["after"] = levels(st)
 
-    # The compactions kept each key's newest version: rewriting current versions changes nothing.
+    # The compactions kept each key's newest write.
     items = pick(1000)
-    delta = await KeyIndex(setup, prefix, st, opts).changes(
-        K.SortedRun.of([key_of(i) for i, _ in items], [v for _, v in items])
-    )
-    if len(delta):
-        raise AssertionError(f"steady: {len(delta)} of 1,000 unchanged keys changed after the compactions")
+    got = await KeyIndex(setup, prefix, st, opts).lookup([key_of(i) for i, _ in items])
+    if lost := [i for i, _ in items if got.get(key_of(i)) != current[i]]:
+        raise AssertionError(f"steady: {len(lost)} of 1,000 keys lost their newest write in the compactions")
     if n <= 10_000_000 and (count := await KeyIndex(setup, prefix, st, opts).recount()) != n:
         raise AssertionError(f"steady: counted {count:,} keys after the compactions, expected {n:,}")
     return rows, shape
@@ -502,9 +542,9 @@ async def _run_size(n: int, prefix: str, args) -> dict:
     async def changes(io, items, *, same_share=0.0):
         items = sorted(items)
         keys = [key_of(i) for i, _ in items]
-        vers = [v if rng.random() < same_share else rng.randbytes(16) for _, v in items]
+        vers = [v if rng.random() < same_share else version(rng) for _, v in items]
         idx = KeyIndex(io, prefix, state, opts)
-        return await idx.changes(K.SortedRun.of(keys, vers))
+        return await idx.changes(run_of(keys, vers), generation=2)
 
     if "base" in args.suites:
         for label, k, share in (
@@ -512,6 +552,8 @@ async def _run_size(n: int, prefix: str, args) -> dict:
             ("1K random keys changed", 1000, 0.0),
             ("1K random keys, half unchanged", 1000, 0.5),
         ):
+            if share and not PAYLOAD:
+                continue
             io = cold()
             rows.append(
                 await measure(
@@ -529,7 +571,7 @@ async def _run_size(n: int, prefix: str, args) -> dict:
 
         async def clustered(io=io):
             idx = KeyIndex(io, prefix, state, opts)
-            return await idx.changes(K.SortedRun.of(ck, [rng.randbytes(16) for _ in ck]))
+            return await idx.changes(run_of(ck, [version(rng) for _ in ck]), generation=2)
 
         rows.append(await measure("1K clustered keys changed", io, clustered))
 
@@ -539,7 +581,7 @@ async def _run_size(n: int, prefix: str, args) -> dict:
         async def inserts(io=io):
             idx = KeyIndex(io, prefix, state, opts)
             ks = sorted(key_of(i) + b"-new" for i, _ in pick(1000))
-            return await idx.changes(K.SortedRun.of(ks, [rng.randbytes(16) for _ in ks]))
+            return await idx.changes(run_of(ks, [version(rng) for _ in ks]), generation=2)
 
         rows.append(await measure("1K new keys inserted", io, inserts))
 
@@ -570,7 +612,7 @@ async def _run_size(n: int, prefix: str, args) -> dict:
             idx = KeyIndex(io, prefix, s2, opts)
             items = sorted(pick(1000))
             delta = await idx.changes(
-                K.SortedRun.of([key_of(i) for i, _ in items], [rng.randbytes(16) for _ in items])
+                run_of([key_of(i) for i, _ in items], [version(rng) for _ in items]), generation=2 + batch
             )
             files = await idx.write(batch, f"bench{batch}", delta)
             s2 = s2.committed(batch, files, keep_log=True)
@@ -593,15 +635,16 @@ async def _run_size(n: int, prefix: str, args) -> dict:
     if n <= args.max_replace and ("base" in args.suites or "load" in args.suites):
         ks_all, vs_all = all_entries(n)
         if "base" in args.suites:
+            # With a payload, 1% of the keys change; without, every key is written again.
             for j in rng.sample(range(len(ks_all)), len(ks_all) // 100):
-                vs_all[j] = b"changed-version!"
+                vs_all[j] = version(rng)
             io = cold()
             rows.append(
                 await measure(
-                    "full replacement, 1% changed",
+                    "full replacement, 1% changed" if PAYLOAD else "full replacement, every key written",
                     io,
                     lambda io=io: KeyIndex(io, prefix, state, opts).replace(
-                        Rows.pairs(list(zip(ks_all, vs_all, strict=True))), 1, "replace"
+                        rows_of(ks_all, vs_all), 1, "replace", generation=2
                     ),
                 )
             )
@@ -615,7 +658,7 @@ async def _run_size(n: int, prefix: str, args) -> dict:
 
             async def load(io=io):
                 idx = KeyIndex(io, f"{prefix}load/", IndexState(), opts)
-                return await idx.replace(Rows.pairs(list(zip(ks, vs, strict=True))), 0, "load")
+                return await idx.replace(rows_of(ks, vs), 0, "load", generation=1)
 
             rows.append(await measure("initial load: every key, unsorted", io, load))
             del ks, vs
@@ -662,7 +705,8 @@ def report(results, args):
     injected = [f"{args['latency'] * 1000:.0f} ms per request"] if args["latency"] else []
     injected += [f"{args['bandwidth'] / 1e6:.0f} MB/s per connection"] if args["bandwidth"] else []
     print(
-        f"\n### Key index benchmark ({args['impl']}, {', '.join(injected) or 'nothing injected'}, 64 in parallel)\n"
+        f"\n### Key index benchmark ({args['impl']}, {args.get('payload', 0)} B payloads, "
+        f"{', '.join(injected) or 'nothing injected'}, 64 in parallel)\n"
     )
     print(
         "| Keys | Build | Build rate | Index size | Per entry (incl. filters) | Filters per entry | Files | Levels | Peak RSS |"
@@ -738,9 +782,12 @@ async def main():
     ap.add_argument("--s3", default=os.environ.get("SOLERA_TEST_S3", ""))
     ap.add_argument("--prefix", default=None)
     ap.add_argument("--suites", default=",".join(SUITES))
+    ap.add_argument("--payload", type=int, default=0, help="bytes of payload per entry")
     ap.add_argument("--json", default=None, help="save the results here")
     ap.add_argument("--render", nargs="*", default=None, help="print a report from saved results")
     args = ap.parse_args()
+    global PAYLOAD
+    PAYLOAD = args.payload
     if args.render:
         saved = [json.load(open(p)) for p in args.render]
         report([res for s in saved for res in s["results"]], saved[0]["args"])
@@ -753,7 +800,7 @@ async def main():
         t = time.perf_counter()
         results.append(await run_size(n, args))
         print(f"[{n:,} keys done in {time.perf_counter() - t:.0f} s]", flush=True)
-    meta = {"impl": "native", "latency": args.latency, "bandwidth": args.bandwidth}
+    meta = {"impl": "native", "latency": args.latency, "bandwidth": args.bandwidth, "payload": args.payload}
     if args.json:
         with open(args.json, "w") as f:
             json.dump({"args": meta, "results": jsonable(results)}, f, indent=1, default=str)

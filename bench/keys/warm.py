@@ -5,7 +5,8 @@
 
 Each index is built as `bench.py` builds it, then given its steady-state
 shape (upper levels filled, seven deltas in level 0). For patches of 1K,
-10K and 100K random keys, half rewritten unchanged, it measures:
+10K and 100K random keys of a source (16-byte versions), half rewritten
+unchanged, it measures:
 
 - cold worker: `KeyIndex.resolve`, reading the store (workers keep no
   cache of index files: a write the engine declines pays this);
@@ -44,6 +45,8 @@ from solera.keys.io import ObjectIO  # noqa: E402
 from solera.keys.resolver import Ask, Prepared, Resolver, answers, request  # noqa: E402
 
 import bench  # noqa: E402
+
+bench.PAYLOAD = 16  # a source's keys: a patch's unchanged versions are what the filters cannot clear
 
 
 def drop_page_cache() -> bool:
@@ -119,35 +122,35 @@ async def run_size(n: int, args) -> list[dict]:
         state, sample, _, _ = await bench.build(
             setup, prefix, n, opts, max(1, n // 200_000), max(1, n // 2_000_000)
         )
-        current = dict(sample)
+        current = {i: (1, v) for i, v in sample}  # id -> (generation, version)
         per_entry = sum(f.size for f in state.files) / n
         upper = await bench.fill_upper(setup, prefix, n, opts, state.depth, per_entry, current)
         state = replace(state, files=state.files + tuple(upper), prefix=prefix)
         rng = random.Random(21)
         for b in range(7):  # level 0 as steady state leaves it
-            items = sorted(rng.sample(list(current.items()), 1000))
+            items = sorted((i, v) for i, (_, v) in rng.sample(list(current.items()), 1000))
             vers = [rng.randbytes(16) for _ in items]
             files, _ = await KeyIndex(setup, None, state, opts).resolve(
                 SortedRun.of([bench.key_of(i) for i, _ in items], vers),
                 batch=b + 1,
                 attempt="setup",
-                generation=b + 1,
+                generation=100 + b,
             )
             state = state.committed(b + 1, files, keep_log=False)
-            current.update((i, v) for (i, _), v in zip(items, vers, strict=True))
+            current.update((i, (100 + b, v)) for (i, _), v in zip(items, vers, strict=True))
         window = None
         if args.reads:  # a consumer behind by 20 commits of 5K keys: its change window
             for b in range(8, 28):
-                items = sorted(rng.sample(list(current.items()), 5000))
+                items = sorted((i, v) for i, (_, v) in rng.sample(list(current.items()), 5000))
                 vers = [rng.randbytes(16) for _ in items]
                 files, _ = await KeyIndex(setup, None, state, opts).resolve(
                     SortedRun.of([bench.key_of(i) for i, _ in items], vers),
                     batch=b,
                     attempt="setup",
-                    generation=b,
+                    generation=100 + b,
                 )
                 state = state.committed(b, files, keep_log=True)
-                current.update((i, v) for (i, _), v in zip(items, vers, strict=True))
+                current.update((i, (100 + b, v)) for (i, _), v in zip(items, vers, strict=True))
             window = (8, 27)
 
         def cold():
@@ -189,14 +192,14 @@ async def run_size(n: int, args) -> list[dict]:
         resolver = Resolver(cache, cold(), opts)
 
         for k in (int(float(x)) for x in args.patches.split(",") if x):
-            items = sorted(rng.sample(list(current.items()), min(k, len(current))))
+            items = sorted((i, v) for i, (_, v) in rng.sample(list(current.items()), min(k, len(current))))
             keys = [bench.key_of(i) for i, _ in items]
             vers = [v if rng.random() < 0.5 else rng.randbytes(16) for _, v in items]
             row = {"n": n, "op": f"{len(keys):,} keys, half unchanged"}
             io = cold()
             (files, _), wall, cpu = await timed(
                 lambda io=io, keys=keys, vers=vers, k=k: KeyIndex(io, None, state, opts).resolve(
-                    SortedRun.of(keys, vers), batch=99, attempt=f"c{k}"
+                    SortedRun.of(keys, vers), batch=99, attempt=f"c{k}", generation=1
                 )
             )
             row["cold"] = (wall, cpu, io.metrics.gets, io.metrics.bytes_in / 1e6)

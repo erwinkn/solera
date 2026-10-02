@@ -2,8 +2,9 @@
 
     uv run python bench/keys/params.py [--n 1e6]
 
-Entry size and compression by key and version shape, the Bloom filters'
-false-positive rate by bits per item, and the block size trade-off, against
+Entry size and compression by key and payload shape (every entry also carries
+the generation that wrote it), the Bloom filters' false-positive rate by bits per
+item, and the block size trade-off, against
 the assumptions in docs/key-index-costs.md. Uses the native extension when
 it is installed. Results print as Markdown.
 """
@@ -17,7 +18,6 @@ import time
 import uuid
 
 from solera import keys as K
-from solera._native import value_digest
 from solera.keys import CODEC_NONE, parse_footer, parse_tail
 
 
@@ -41,12 +41,17 @@ KEYS = {
         {f"site-{rng.randrange(10**12):012d}/file-{i}".encode() for i in range(n)}
     ),
 }
-VERSIONS = {
-    "row digest (the default; bench, model)": lambda n, rng: [
-        value_digest({"id": i, "value": rng.random()}) for i in range(n)
-    ],
+PAYLOADS = {
+    "none (a derived output's keys)": lambda n, rng: None,
+    "16 random bytes (a digest version)": lambda n, rng: [rng.randbytes(16) for _ in range(n)],
     "short revision `%d`": lambda n, rng: [b"%d" % rng.randrange(10**6) for _ in range(n)],
 }
+
+
+def generations(n: int, rng: random.Random) -> list[int]:
+    """Generations as commits leave them: a few thousand distinct, small."""
+
+    return [rng.randrange(1, 5000) for _ in range(n)]
 
 
 def layout(data: bytes) -> dict:
@@ -62,23 +67,24 @@ def layout(data: bytes) -> dict:
 
 
 def entry_sizes(n: int):
-    print(f"\n### Entry size by key and version shape ({n:,} entries)\n")
+    print(f"\n### Entry size by key and payload shape ({n:,} entries)\n")
     print(
-        "| Keys | Versions | Raw | Prefix-encoded | Blocks (zlib) | Compression | Filters | Index | "
+        "| Keys | Payloads | Raw | Prefix-encoded | Blocks (zlib) | Compression | Filters | Index | "
         "**Total per entry** | Entries per block | Block, compressed |"
     )
     print("|---|---|---|---|---|---|---|---|---|---|---|")
     for kname, kgen in KEYS.items():
         keys = kgen(n, random.Random(0))
         m = len(keys)
-        for vname, vgen in VERSIONS.items():
+        gens = generations(m, random.Random(2))
+        for vname, vgen in PAYLOADS.items():
             if vname.startswith("short") and not kname.startswith("sequential"):
                 continue  # short revisions: one row is enough
-            vers = vgen(m, random.Random(1))
-            raw = sum(map(len, keys)) + sum(map(len, vers))
+            payloads = vgen(m, random.Random(1))
+            raw = sum(map(len, keys)) + sum(map(len, payloads or []))
             dele = bytes(m)
-            plain = layout(K.encode_file(keys, vers, dele, codec=CODEC_NONE))
-            data = K.encode_file(keys, vers, dele)
+            plain = layout(K.encode_file(keys, gens, dele, payloads=payloads, codec=CODEC_NONE))
+            data = K.encode_file(keys, gens, dele, payloads=payloads)
             lay = layout(data)
             print(
                 f"| {kname} | {vname} | {raw / m:.1f} B | {plain['blocks'] / m:.1f} B | {lay['blocks'] / m:.1f} B | "
@@ -102,45 +108,39 @@ def bloom_theory(bits: int, k: int) -> tuple[float, float]:
 def false_positives(n: int, probes: int):
     print(f"\n### Bloom filter false positives ({n:,} items per filter, {probes:,} absent probes)\n")
     print(
-        "| Bits per item | k | Filter bytes per entry (3 filters) | Key filter FP | Pair filter FP (changed version) | "
+        "| Bits per item | k | Filter bytes per entry (2 filters) | Key filter FP | "
         "Theory, standard | Theory, 512-bit blocked |"
     )
-    print("|---|---|---|---|---|---|---|")
+    print("|---|---|---|---|---|---|")
     rng = random.Random(3)
     keys = random_ids(n, rng)
-    vers = [rng.randbytes(16) for _ in keys]
+    gens = generations(n, rng)
     absent = [b"absent-%013d" % rng.randrange(10**13) for _ in range(probes)]
-    probe_keys = [keys[rng.randrange(n)] for _ in range(probes)]
-    other = [rng.randbytes(16) for _ in range(probes)]
     for bits, k in ((8, 6), (10, 7), (12, 8), (14, 10), (16, 11), (20, 14)):
-        data = K.encode_file(keys, vers, bytes(n), bits_per_item=bits, k=k)
+        data = K.encode_file(keys, gens, bytes(n), bits_per_item=bits, k=k)
         lay = layout(data)
         nb, kk, fbits = lay["tail"]["key_filter"]
         fp_key = sum(K.bloom_check_keys(fbits, nb, kk, absent)) / probes
-        nb, kk, fbits = lay["tail"]["pair_filter"]
-        fp_pair = sum(K.bloom_check_pairs(fbits, nb, kk, probe_keys, other)) / probes
         std, blk = bloom_theory(bits, k)
         mark = " (default)" if (bits, k) == (14, 10) else ""
-        print(
-            f"| {bits}{mark} | {k} | {lay['filters'] / n:.2f} B | {fp_key:.3%} | {fp_pair:.3%} | "
-            f"{std:.3%} | {blk:.3%} |"
-        )
+        print(f"| {bits}{mark} | {k} | {lay['filters'] / n:.2f} B | {fp_key:.3%} | {std:.3%} | {blk:.3%} |")
 
 
 def block_sizes(n: int):
-    print(f"\n### Block size ({n:,} entries: random ids, row digests)\n")
+    print(f"\n### Block size ({n:,} entries: random ids)\n")
     print(
-        "| Versions | Block (raw) | Total per entry | Blocks per entry | Index part | Entries per block | "
+        "| Payloads | Block (raw) | Total per entry | Blocks per entry | Index part | Entries per block | "
         "Block, compressed | Encode | Decode one block |"
     )
     print("|---|---|---|---|---|---|---|---|---|")
     rng = random.Random(4)
     keys = random_ids(n, rng)
-    for vname, vgen in list(VERSIONS.items())[:1]:
-        vers = vgen(n, random.Random(5))
+    gens = generations(n, random.Random(6))
+    for vname, vgen in list(PAYLOADS.items())[:2]:
+        payloads = vgen(n, random.Random(5))
         for bs in (4, 16, 32, 64, 128, 256):
             t = time.perf_counter()
-            data = K.encode_file(keys, vers, bytes(n), block_size=bs * 1024)
+            data = K.encode_file(keys, gens, bytes(n), payloads=payloads, block_size=bs * 1024)
             enc = time.perf_counter() - t
             lay = layout(data)
             blocks = lay["tail"]["blocks"]

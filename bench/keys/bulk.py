@@ -3,15 +3,14 @@
     uv run python bench/keys/bulk.py --sizes 1e6,1e7,1e8 --latency 0.03
 
 The operations that touch every key: an initial load, a full replacement
-(1% of versions changed), a compaction that rewrites the bottom level, and a
-recount. The index they run on holds every key in level 1 and, in level 0,
-a delta changing 1% of versions; the replacement writes them back. Each runs in a process of its own after its input exists, and
+(every key written again: a derived output's keys carry no payload), a
+compaction that rewrites the bottom level, and a recount. The index they run on
+holds every key in level 1 and, in level 0, a patch of 1% of them. Each runs in a process of its own after its input exists, and
 reports the peak resident memory it added on top of that input — the data a
 worker would already hold (the kernel's peak counter is reset first).
 
-Input shapes: `list` is Python `(key, version)` pairs (`Rows.pairs`;
-versions the MD5 of the key); `arrow` is a pyarrow Table of `k` and `v`
-columns, read in place. `digest.py` measures digesting rows. Rows arrive shuffled unless `sorted`.
+Input shapes: `list` is a Python list of keys (`Rows.keys`); `arrow` is a pyarrow
+Table with a `k` column, read in place. Rows arrive shuffled unless `sorted`.
 Keys are `cust-%013d` with random gaps, as in bench.py.
 
 Uses bench.py's server (`--s3`, default the local MinIO) and latency model.
@@ -21,7 +20,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import json
 import os
 import subprocess
@@ -30,7 +28,7 @@ import time
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from solera.keys import Rows  # noqa: E402
+from solera.keys import Rows, SortedRun  # noqa: E402
 from solera.keys.index import IndexState, KeyIndex, Options  # noqa: E402
 from solera.keys.io import ObjectIO  # noqa: E402
 
@@ -47,32 +45,25 @@ CASES = (
 )
 
 
-def keys_sql(n: int, shuffled: bool, changed: bool) -> str:
+def keys_sql(n: int, shuffled: bool, where: str = "true") -> str:
     gap = max(2, 10**12 // n)
     key = f"'cust-' || lpad((i * {gap} + hash(i) % {gap})::varchar, 13, '0')"
-    version = "unhex(md5(k))"
-    if changed:  # 1% of versions: keys whose id ends in 00
-        version = "CASE WHEN k LIKE '%00' THEN unhex(md5(k || 'x')) ELSE unhex(md5(k)) END"
     order = "ORDER BY hash(i * 7 + 3)" if shuffled else "ORDER BY i"
-    return f"SELECT k, {version} AS v FROM (SELECT i, {key} AS k FROM range({n}) t(i)) {order}"
+    return f"SELECT k FROM (SELECT i, {key} AS k FROM range({n}) t(i)) WHERE {where} {order}"
 
 
-def version(key: bytes) -> bytes:
-    return hashlib.md5(key).digest()
-
-
-def arrow_table(n: int, shuffled: bool, changed: bool):
+def arrow_table(n: int, shuffled: bool):
     import duckdb
 
     con = duckdb.connect()
     con.execute("SET preserve_insertion_order = true")
-    return con.sql(keys_sql(n, shuffled, changed)).fetch_arrow_table()
+    return con.sql(keys_sql(n, shuffled)).fetch_arrow_table()
 
 
-def key_list(n: int, shuffled: bool) -> list[bytes]:
+def key_list(n: int, shuffled: bool, where: str = "true") -> list[bytes]:
     import duckdb
 
-    rel = duckdb.connect().sql(f"SELECT k FROM ({keys_sql(n, shuffled, False)})")
+    rel = duckdb.connect().sql(keys_sql(n, shuffled, where))
     out = []
     while chunk := rel.fetchmany(1_000_000):
         out += [k.encode() for (k,) in chunk]
@@ -104,22 +95,21 @@ async def one(case: str, n: int, prefix: str, state_file: str | None, args) -> d
     state = IndexState.from_json(json.load(open(state_file))) if state_file else IndexState()
     load = case.startswith("load")
     idx = KeyIndex(io, f"{prefix}{case}/" if load else prefix, state, opts)
-    # A replacement writes every key at its first version: the 1% the index's delta changed revert.
-    changed = case.startswith("replace")
+    replacing = case.startswith("replace")
 
     # The input, before measuring.
     if case.endswith("-list"):
-        pairs = [(k, version(k)) for k in key_list(n, shuffled=True)]
+        keys = key_list(n, shuffled=True)
     elif "-arrow" in case:
-        table = arrow_table(n, shuffled=not case.endswith("sorted"), changed=False)
+        table = arrow_table(n, shuffled=not case.endswith("sorted"))
 
     async def run():
         if case.endswith("-list"):
-            rows = Rows.pairs(pairs)
+            rows = Rows.keys(keys)
         elif "-arrow" in case:
-            rows = Rows.arrow(table, "k", "v")
-        if load or changed:
-            files, _ = await idx.replace(rows, 2, case)
+            rows = Rows.arrow(table, "k")
+        if load or replacing:
+            files, _ = await idx.replace(rows, 2, case, generation=3)
             return files
         if case == "compact":
             return await idx.compact((state.level(0) + state.level(1), 1))
@@ -152,8 +142,7 @@ async def one(case: str, n: int, prefix: str, state_file: str | None, args) -> d
         files = out.files
         result["files"] = len(files)
         result["entries"] = sum(f.entries for f in files)
-        expect = n // 100 if changed else n
-        assert abs(result["entries"] - expect) < max(10, expect // 20), (result["entries"], expect)
+        assert abs(result["entries"] - n) < max(10, n // 20), (result["entries"], n)
     return result
 
 
@@ -162,15 +151,17 @@ async def one(case: str, n: int, prefix: str, state_file: str | None, args) -> d
 
 async def build(n: int, prefix: str, path: str) -> None:
     """The index the replacement, compaction and recount run on: every key at
-    its first version in level 1, then a 1%-changed replacement's delta in level 0."""
+    generation 1 in level 1, then a patch of 1% of them (ids ending in 00) at
+    generation 2 in level 0."""
 
     io = ObjectIO(B.store())
     opts = Options()
     idx = KeyIndex(io, prefix, IndexState(), opts)
-    files, _ = await idx.replace(Rows.arrow(arrow_table(n, False, False), "k", "v"), 0, "build")
+    files, _ = await idx.replace(Rows.arrow(arrow_table(n, False), "k"), 0, "build", generation=1)
     state = IndexState().committed(0, files, keep_log=False)
     idx = KeyIndex(io, prefix, state, opts)
-    files, _ = await idx.replace(Rows.arrow(arrow_table(n, False, True), "k", "v"), 1, "delta")
+    patch = SortedRun.of(key_list(n, False, "k LIKE '%00'"))
+    files, _ = await idx.resolve(patch, batch=1, attempt="delta", generation=2)
     state = state.committed(1, files, keep_log=False)
     with open(path, "w") as f:
         json.dump(state.to_json(), f)
