@@ -45,7 +45,7 @@ STORES = ["file", "table"] + (["pg"] if postgres.DSN else [])  # where `items` l
 # Re-registrations the rules make. Those that trip an open finding on most
 # runs are left out until it is fixed (tests/server/test_sim_found.py);
 # SOLERA_SIM_KNOWN=1 puts them back.
-KNOWN: dict[str, str] = {}  # change -> the finding it trips, while open
+KNOWN = {"table": "a consumer keeps a key its upstream dropped when it moved store (F9)"}
 CHANGES = sorted(set(VARIANTS) - (set() if os.environ.get("SOLERA_SIM_KNOWN") else set(KNOWN)))
 
 fates = st.one_of(
