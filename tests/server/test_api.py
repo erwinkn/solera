@@ -340,6 +340,22 @@ async def test_worker_pull_path_and_channel(engine):
         assert sent.json() == again.json() == {"offset": 2}  # a retried batch is not shown twice
         assert engine.attempt_lines(stage["attempt"]) == lines
 
+        # The resolver's route (docs/resolved-commits.md §4): binary, versioned, the attempt's own.
+        from solera.keys import resolver
+
+        ask = resolver.Ask("nope", "", "patch", 0, 1, "keys/nope/_/", -1, b"", 0)
+        body = resolver.request("mine", [ask])
+        assert (await client.post(f"{routes}/resolve", content=body)).status_code == 401
+        old = await client.post(f"{routes}/resolve", content=b"\x09" + body[1:], headers=token)
+        assert old.status_code == 415
+        stranger = await client.post(
+            f"{routes}/resolve", content=resolver.request("theirs", [ask]), headers=token
+        )
+        assert stranger.status_code == 409
+        answered = await client.post(f"{routes}/resolve", content=body, headers=token)
+        assert answered.headers["content-type"] == resolver.CONTENT_TYPE
+        assert resolver.answers(answered.content)["nope"][0]["reason"] == "not_live"  # no such keyed output
+
         other = lifecycle.token(engine.secret, "another-attempt")
         forged = await client.post(
             f"{routes}/beat",
