@@ -134,7 +134,11 @@ async def test_failed_precondition_changes_nothing(state, clock):
     await settle(engine_on(state, clock), (await engine.submit(["files"]))["id"])
     _, task_id, attempt = await held(engine, ["files"])
     before = durable(state.model)
-    prepared = {"inputs": {}, "baseline": {"files": None}, "scope_complete": True}  # a stale baseline
+    contract = {"store": "default", "writes": "immutable", "key": None, "incremental": False}
+    prepared = {
+        "inputs": {},
+        "outputs": {"files": {"head": None, "reset": True, "contract": contract}},
+    }  # stale
     ref = {"output": "files", "store": "default", "handle": {}, "version": "v2", "partition": "", "meta": {}}
     with pytest.raises(Conflict):
         engine.commit_attempt(attempt, prepared, {"outputs": {"files": ref}})
@@ -152,7 +156,7 @@ async def test_an_aborted_attempt_can_no_longer_commit(state, clock):
             break
     assert state.model.task(task_id)["last"]["outcome"] == "canceled"
     with pytest.raises(LostOwnership):
-        engine.commit_attempt(attempt, {"inputs": {}, "baseline": {}}, {"outputs": {}})
+        engine.commit_attempt(attempt, {"inputs": {}, "outputs": {}}, {"outputs": {}})
 
 
 async def test_a_moved_input_still_commits(state, clock):

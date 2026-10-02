@@ -678,10 +678,9 @@ class Engine(Attempts, Sensors, Views):
         asset = self.manifest["assets"][task["asset"]]
         scope = task["scope"]
         full = run["mode"] == "full"
-        baseline = {}
+        heads = {}
         for output in asset["outputs"]:
-            head = self.m.heads.get((output["name"], scope))
-            baseline[output["name"]] = head
+            head = heads[output["name"]] = self.m.heads.get((output["name"], scope))
             if (
                 not full
                 and head is not None
@@ -785,11 +784,11 @@ class Engine(Attempts, Sensors, Views):
         cursor = None if reset else self.m.cursors.get((task["asset"], scope))
         outputs = {}
         for output in asset["outputs"]:
-            name, head = output["name"], baseline[output["name"]]
+            name, head = output["name"], heads[output["name"]]
             info = {
-                # Where its content is (`before`, the committed ref), and whether the
-                # write starts it over: a first write, or a full run.
-                "before": head["ref"] if head is not None else None,
+                # The committed head it writes over — its ref says where the content
+                # is — and whether the write starts it over: a first write, or a full run.
+                "head": head,
                 "reset": reset or head is None,
                 # The contract it is launched under: settled, failed and cleaned up
                 # by it, whatever is served by then.
@@ -833,7 +832,6 @@ class Engine(Attempts, Sensors, Views):
             "domains": self._domains(inputs, outputs, task),
             "inputs": inputs,
             "lineage": lineage,
-            "baseline": baseline,
             "plans": plans,
             "more": more,
             "full": full,
@@ -893,7 +891,6 @@ class Engine(Attempts, Sensors, Views):
             for k in (
                 "version",
                 "domains",
-                "baseline",
                 "plans",
                 "more",
                 "full",
@@ -1353,8 +1350,8 @@ class Engine(Attempts, Sensors, Views):
         # next attempt's fingerprint. Refusing here would only strand a write
         # a shared-table store has already made.
         # Output heads must be unchanged since the claim.
-        for output, baseline in prepared["baseline"].items():
-            if commit_of(self.m.heads.get((output, task["scope"]))) != commit_of(baseline):
+        for output, info in (prepared.get("outputs") or {}).items():
+            if commit_of(self.m.heads.get((output, task["scope"]))) != commit_of(info["head"]):
                 raise Conflict(f"output {output} head changed since this attempt was claimed")
         outputs = result.get("outputs") or {}
         # Settled under the contract it was launched with, not today's manifest.
@@ -1384,8 +1381,8 @@ class Engine(Attempts, Sensors, Views):
         for name, entry in outputs.items():
             if name not in declared:
                 raise Conflict(f"result names undeclared output {name!r}", retryable=False)
-            decl, before = declared[name], prepared["baseline"].get(name)
-            info = (prepared.get("outputs") or {}).get(name) or {}
+            info = prepared["outputs"][name]
+            decl, before = info["contract"], info["head"]
             if entry.get("unchanged"):
                 if before is None:
                     raise Conflict(f"output {name}: unchanged, but there is no head", retryable=False)
@@ -1417,7 +1414,7 @@ class Engine(Attempts, Sensors, Views):
         for name in set(declared) - set(outputs):
             # An Each page whose keys all failed writes nothing, and makes no head yet;
             # nor does a page whose keys the edge's patterns all left out.
-            if prepared["baseline"].get(name) is None and failures is None and not result.get("skipped"):
+            if prepared["outputs"][name]["head"] is None and failures is None and not result.get("skipped"):
                 raise Conflict(f"omitted output {name} has no head to keep (§2)", retryable=False)
         # Whether the delivery is done is the scope's, not its outputs': a last page
         # may write none of them (§7).

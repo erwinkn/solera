@@ -58,6 +58,14 @@ def _names(value) -> dict[str, list[str]]:
     return {str(k): [str(i) for i in v] for k, v in value.items() if isinstance(v, list)}
 
 
+def worker_output(info: dict) -> dict:
+    """An output's launch record as its worker sees it: the committed head
+    only as its ref (`before`), where the content is."""
+
+    head = info["head"]
+    return {**{k: v for k, v in info.items() if k != "head"}, "before": head["ref"] if head else None}
+
+
 def worker_report(worker: dict | None) -> dict:
     """What a worker's result or report may put in an event, as values the
     model applies with no parsing (review round 3, B5): its timeline
@@ -418,7 +426,7 @@ class Attempts:
             "asset": task["asset"],
             "partition": task["scope"],
             "run": {"id": task["run"], "config": run.get("config") or {}},
-            "outputs": prepared["outputs"],
+            "outputs": {name: worker_output(info) for name, info in prepared["outputs"].items()},
             "inputs": prepared["inputs"],
             "execution": self.manifest["assets"][task["asset"]]["placement"],
             "heartbeat": self.heartbeat_seconds,
