@@ -845,3 +845,44 @@ async def test_an_event_its_reducer_cannot_apply_ends_the_process(tmp_path, worl
     replayed = await State.open(url, "test", writer=False)  # what the restart replays
     assert replayed.model.applied == state.model.applied - 1  # all but the failed event: it was never written
     assert state.journal.written == state.journal.appended
+
+
+async def test_a_replaced_engine_stops_acting(tmp_path):
+    """Review round 4, engine #1: engine A launched an attempt; engine B
+    took the namespace over. Once A finds itself replaced, it neither
+    aborts the attempt when its timeout passes (no gate, no cancel) nor
+    answers its worker: B owns it."""
+
+    from solera_server.state import Unavailable
+
+    class Watching(Remote):
+        canceled: list = []
+
+        async def cancel(self, run):
+            self.canceled.append(run["id"])
+
+    @asset(executor=Fake("fake")(), timeout=0.2, retries=Retry(0))
+    def brief():
+        return [{"ok": True}]
+
+    project = Project(assets=[brief], executors=[Fake("fake")], default_store=Gated())
+    url = tmp_path.as_uri()
+    state = await State.open(url, "test", flush_interval=0.001)
+    engine = engine_for(state, project, worker=Watching, cancel_grace=0.1)
+    await engine.initialize()
+    run, attempt = await launched(engine, ["brief"])
+    base = state.attempt_path(run["id"], attempt)
+    await state.create_object(f"{base}.worker", json.dumps({"invocation": "w"}).encode())  # it runs
+    await engine.start()
+    successor = await State.open(url, "test", flush_interval=0.001)  # B takes the namespace over
+    with contextlib.suppress(Unavailable):
+        state.record({"type": "AutomationChanged", "name": "none", "enabled": True})
+        await state.durable()  # A's next write collides with B's fence
+    assert state.poisoned
+    await asyncio.sleep(1.0)  # A's timeout and cancel grace pass
+    assert await state.get_object(f"{base}.writing") is None and Watching.canceled == []
+    with pytest.raises(Unavailable):
+        await engine.attempt_beat(attempt, {"invocation": "w", "seq": 1})
+    assert successor.model.claimed(attempt) is not None  # B still owns it, and adopts it
+    await engine.stop()
+    await successor.close()

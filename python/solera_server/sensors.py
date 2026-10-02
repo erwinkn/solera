@@ -101,6 +101,7 @@ class Sensors:
         none: it is told the current one — and warned, once, when `build`
         says it computed its revision another way than the engine did."""
 
+        self._serving()
         loop = asyncio.get_running_loop()
         known = self.sensor_hosts.get(host) or {}
         if revision != self.manifest["revision"] and not known.get("warned"):
@@ -170,6 +171,7 @@ class Sensors:
         saw a source since moved, `ValueError` for one that asks what it
         may not. Either way nothing of it is applied."""
 
+        self._serving()
         if not isinstance(outcome, dict):
             raise ValueError("a tick's outcome is a JSON object")
         claim = self.m.ticks.get(name)

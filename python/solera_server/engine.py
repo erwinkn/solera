@@ -241,6 +241,13 @@ class Engine(Attempts, Sensors, Views):
             except asyncio.CancelledError:
                 pass
             self.runner = None
+        await self._halt()
+
+    async def _halt(self) -> None:
+        """Stop acting: the sensor host, the attempts' watchers, upkeep. The
+        workers themselves keep running; whoever owns the namespace next
+        adopts them."""
+
         await self._stop_sensor_host()
         if self.inflight:
             # Launched attempts keep running: the next engine adopts them.
@@ -260,6 +267,11 @@ class Engine(Attempts, Sensors, Views):
         with time: retries, schedules, timeouts."""
 
         while not self._stopping:
+            if self.state.poisoned:  # replaced (or broken): its successor owns everything now
+                log.warning("this engine lost the namespace's writer ownership: it stops acting")
+                self._stopping = True
+                await self._halt()
+                return
             self.state.changed.clear()
             try:
                 await self.tick()
@@ -597,6 +609,7 @@ class Engine(Attempts, Sensors, Views):
                 return
             stage = await self._launch(task, run, attempt, prepared)
             try:
+                self._authority()  # `_launch` awaited: still ours?
                 handle = await placement.launch(stage)
             except Exception as error:
                 await self._fail(task_id, attempt, f"launch: {error}", retryable=True, reason="launch")
@@ -631,6 +644,7 @@ class Engine(Attempts, Sensors, Views):
             if handle is None and callable(getattr(placement, "resume", None)):
                 stage = {"attempt": attempt, "run": task["run"], "objects": self.state.objects_url}
                 try:
+                    self._authority()
                     handle = await placement.resume(stage)
                     self._placed(attempt, handle)
                 except Exception:

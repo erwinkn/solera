@@ -22,7 +22,7 @@ from solera import errors, lifecycle
 from solera.build import method_note
 from solera.lifecycle import Cancel, Ended
 
-from .state import LostOwnership
+from .state import LostOwnership, Unavailable
 
 log = logging.getLogger(__name__)
 
@@ -139,6 +139,23 @@ class Attempts:
             raise Ended("ended")
         return self.live.setdefault(attempt, Live())
 
+    def _authority(self) -> None:
+        """This engine still owns the namespace: checked right before every
+        external effect — a launch, a cancel, a gate, a deletion — and
+        again after each await, since a successor may take over meanwhile.
+        A replaced engine changes nothing its successor owns."""
+
+        if self.state.poisoned:
+            raise LostOwnership("this engine was replaced: its successor owns the namespace")
+
+    def _serving(self) -> None:
+        """A worker's request reaches an engine that still owns the
+        namespace; a replaced one answers 503 — never 409, which would tell
+        a worker its successor still wants to stop writing."""
+
+        if self.state.poisoned:
+            raise Unavailable("this engine was replaced; ask again: its successor answers")
+
     def _stir(self, attempt: str) -> None:
         self._stirred.setdefault(attempt, asyncio.Event()).set()
 
@@ -178,6 +195,7 @@ class Attempts:
     # -- the channel's handlers (§5) ---------------------------------------------------
 
     async def attempt_start(self, attempt: str, body: dict) -> dict:
+        self._serving()
         live = self._live(attempt)
         await self._bind(attempt, live, body["invocation"], start=True)
         live.heard(asyncio.get_running_loop().time(), "channel")
@@ -192,6 +210,7 @@ class Attempts:
         return answer
 
     async def attempt_beat(self, attempt: str, body: dict) -> dict:
+        self._serving()
         live = self._live(attempt)
         await self._bind(attempt, live, body["invocation"])
         if int(body.get("seq", 0)) > live.seq:  # a retried or reordered beat changes nothing
@@ -201,6 +220,7 @@ class Attempts:
         return self._cancel_answer(live)
 
     async def attempt_logs(self, attempt: str, body: dict) -> dict:
+        self._serving()
         live = self._live(attempt)
         await self._bind(attempt, live, body["invocation"])
         offset, lines = int(body["offset"]), list(body["lines"])
@@ -212,6 +232,7 @@ class Attempts:
         return {"offset": live.log_offset}
 
     async def attempt_finished(self, attempt: str, body: dict) -> dict:
+        self._serving()
         live = self._live(attempt)
         await self._bind(attempt, live, body["invocation"])
         task_id = self.m.attempts.get(attempt)
@@ -246,6 +267,7 @@ class Attempts:
     async def attempt_discarded(self, attempt: str, body: dict) -> None:
         """A worker's acknowledgement of what it discarded after its commit."""
 
+        self._serving()
         if body.get("discarded") or body.get("discard_unresolved"):
             fields = ("discarded", "discard_unresolved", "discarded_files")
             self.state.record(
@@ -257,6 +279,7 @@ class Attempts:
         §4), or None when the engine keeps no cache. Every output is checked
         against what the engine prepared for the attempt, never trusted."""
 
+        self._serving()
         from solera.keys.resolver import MAX_BODY, Malformed, Prepared, _outputs, unframe
 
         live = self._live(attempt)
@@ -313,6 +336,7 @@ class Attempts:
         oldest first; waits up to `wait` seconds for one. A hint: workers
         that get the same attempt race for its claim."""
 
+        self._serving()
         loop = asyncio.get_running_loop()
         self.pollers[host] = {"id": host, "pools": [pool], "capacity": capacity, "seen_at": self.clock()}
         deadline = loop.time() + max(0.0, min(wait, 30.0))
@@ -710,6 +734,7 @@ class Attempts:
 
         path = f"{lifecycle.base(run_id, attempt)}{lifecycle.GATE}"
         for retry in range(6):
+            self._authority()
             try:
                 await self.state.create_object(path, lifecycle.gate(state))
                 return lifecycle.NONE, None
@@ -787,11 +812,13 @@ class Attempts:
             if info.get("prefix") is None or name in keep or self.m.immutable(name):
                 continue  # an immutable output's are collected with what they name (§9.8)
             prefix = f"{info['prefix']}{int(info['batch']):012d}-{attempt}"
+            self._authority()
             with contextlib.suppress(Exception):
                 await self.state.delete_objects(await self.state.list_objects(prefix))
         failures = prepared.get("failures")
         if failures is not None:  # an Each page's failure delta (docs/per-key-processing.md §9)
             prefix = f"{failures['prefix']}{int(failures['batch']):012d}-{attempt}"
+            self._authority()
             with contextlib.suppress(Exception):
                 await self.state.delete_objects(await self.state.list_objects(prefix))
 
@@ -813,6 +840,7 @@ class Attempts:
         return delay
 
     async def _cancel(self, placement, handle):
+        self._authority()
         with contextlib.suppress(Exception):
             await placement.cancel(handle)
         with contextlib.suppress(Exception):
