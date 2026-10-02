@@ -46,7 +46,7 @@ def store(request, tmp_path):
         return MemoryStore()
     if not S3_URL:
         pytest.skip("set SOLERA_TEST_S3 to run against an S3-compatible server")
-    from urllib.parse import urlsplit
+    from urllib.parse import unquote, urlsplit
 
     from obstore.store import S3Store
 
@@ -55,9 +55,9 @@ def store(request, tmp_path):
     return S3Store(
         bucket,
         prefix=f"journal-test-{uuid.uuid4().hex}",
-        endpoint=f"{u.scheme}://{u.hostname}:{u.port}",
-        access_key_id=u.username,
-        secret_access_key=u.password,
+        endpoint=f"{u.scheme}://{u.netloc.rpartition('@')[2]}",
+        access_key_id=unquote(u.username),
+        secret_access_key=unquote(u.password),
         region="us-east-1",
         client_options={"allow_http": True},
     )

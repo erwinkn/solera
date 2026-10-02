@@ -5,7 +5,7 @@ against the shipped stores, and against a minimal SQL store fenced with
 import contextlib
 import os
 import uuid
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 import pytest
 from solera.sdk import Output
@@ -30,9 +30,9 @@ def s3_harness(tmp_path):
     u = urlsplit(S3_URL)
     store = S3Store(
         f"s3://{u.path.strip('/')}/conformance-{uuid.uuid4().hex}",
-        endpoint=f"{u.scheme}://{u.hostname}:{u.port}",
-        access_key_id=u.username,
-        secret_access_key=u.password,
+        endpoint=f"{u.scheme}://{u.netloc.rpartition('@')[2]}",
+        access_key_id=unquote(u.username),
+        secret_access_key=unquote(u.password),
         region="us-east-1",
         client_options={"allow_http": True},
     )

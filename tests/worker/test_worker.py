@@ -428,15 +428,15 @@ async def test_a_local_worker_reaches_state_on_a_private_object_store(tmp_path, 
     credentials stay out."""
 
     import uuid
-    from urllib.parse import urlsplit
+    from urllib.parse import unquote, urlsplit
 
     url = os.environ.get("SOLERA_TEST_S3")
     if not url:
         pytest.skip("set SOLERA_TEST_S3 to run against an S3-compatible server")
     u = urlsplit(url)
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", u.username)
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", u.password)
-    monkeypatch.setenv("AWS_ENDPOINT", f"{u.scheme}://{u.hostname}:{u.port}")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", unquote(u.username))
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", unquote(u.password))
+    monkeypatch.setenv("AWS_ENDPOINT", f"{u.scheme}://{u.netloc.rpartition('@')[2]}")
     monkeypatch.setenv("AWS_ALLOW_HTTP", "true")
     monkeypatch.setenv("AWS_REGION", "us-east-1")
     monkeypatch.setenv("GH_TOKEN", "not for workers")
