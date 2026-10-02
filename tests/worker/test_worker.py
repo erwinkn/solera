@@ -457,3 +457,72 @@ def test_the_sdk_and_worker_import_graph_holds_no_server_or_dataframe_library():
     done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
     assert done.returncode == 0, done.stderr
     assert done.stdout.strip() == ""
+
+
+SERVED = """
+from solera.sdk import Project, asset
+
+@asset
+def tiny() -> int:
+    return 1
+
+project = Project(assets=[tiny], name="served")
+"""
+
+
+def test_a_served_engine_keeps_nothing_of_finished_local_workers(tmp_path, monkeypatch):
+    """Review round 3, B3: workers that report `finished` over HTTP are
+    settled before their process exits; the placement still reaps each one,
+    and keeps nothing of it once settled."""
+
+    import contextlib
+    import socket
+    import threading
+    import time
+
+    import httpx
+    import uvicorn
+    from solera_server.api import create_app
+    from solera_server.placements import local
+
+    (tmp_path / "served.py").write_text(SERVED)
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    base = f"http://127.0.0.1:{port}"
+    app = create_app(
+        state_url=(tmp_path / "state").as_uri(),
+        project=str(tmp_path / "served.py"),
+        insecure=True,
+        engine_url=base,
+    )
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error"))
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    try:
+        for _ in range(400):
+            with contextlib.suppress(httpx.HTTPError):
+                if httpx.get(f"{base}/healthz", timeout=1).status_code == 200:
+                    break
+            time.sleep(0.05)
+        for _ in range(3):
+            run = httpx.post(
+                f"{base}/api/projects/served/runs", json={"targets": ["tiny"]}, timeout=10
+            ).json()
+            deadline = time.monotonic() + 60
+            while (
+                httpx.get(f"{base}/api/projects/served/runs/{run['id']}", timeout=10).json()["request"][
+                    "status"
+                ]
+                != "succeeded"
+            ):
+                assert time.monotonic() < deadline
+                time.sleep(0.1)
+        deadline = time.monotonic() + 20
+        while local._running or local._tails or local._exits:
+            assert time.monotonic() < deadline, (len(local._running), len(local._tails), len(local._exits))
+            time.sleep(0.1)
+    finally:
+        server.should_exit = True
+        thread.join(timeout=20)

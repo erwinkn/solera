@@ -34,8 +34,22 @@ OBJECT_STORE_ENV = (
     *("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "AWS_CONTAINER_CREDENTIALS_FULL_URI"),
     "AWS_CONTAINER_AUTHORIZATION_TOKEN",
 )
-_running: dict[str, asyncio.subprocess.Process] = {}  # launch id -> this process's child
-_tails: dict[str, list[bytearray]] = {}
+_running: dict[str, asyncio.subprocess.Process] = {}  # launch id -> this process's child, until it exits
+_tails: dict[str, list[bytearray]] = {}  # launch id -> its output's last bytes, until it exits
+_exits: dict[str, asyncio.Future] = {}  # launch id -> how it ended, until read or released
+
+
+async def _reap(launch: str, process) -> None:
+    """Reap a child this process started, however its attempt was settled:
+    its registrations go, and how it ended waits for `wait` — or for no
+    one, once the engine released it."""
+
+    await process.wait()
+    _running.pop(launch, None)
+    ended = {"code": process.returncode, "reason": None, "meta": {"log": _process_log(launch)}}
+    done = _exits.get(launch)
+    if done is not None and not done.done():
+        done.set_result(ended)
 
 
 def _env(objects_url: str | None = None) -> dict:
@@ -122,6 +136,8 @@ class LocalPlacement:
         launch = uuid.uuid4().hex
         _running[launch] = process
         _tails[launch] = tails
+        _exits[launch] = asyncio.get_running_loop().create_future()
+        asyncio.create_task(_reap(launch, process))
         return {
             "launch": launch,
             "pid": process.pid,
@@ -132,15 +148,15 @@ class LocalPlacement:
 
     async def wait(self, run: dict, timeout: float) -> dict | None:
         launch = run.get("launch")
-        process = _running.get(launch)
-        if process is not None:
-            # Our own child: its exit wakes us.
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(process.wait(), timeout)
-            if process.returncode is None:
+        done = _exits.get(launch)
+        if done is not None:
+            # Our own child: its reaper says how it ended.
+            try:
+                ended = await asyncio.wait_for(asyncio.shield(done), timeout)
+            except TimeoutError:
                 return None
-            del _running[launch]
-            return {"code": process.returncode, "reason": None, "meta": {"log": _process_log(launch)}}
+            _exits.pop(launch, None)
+            return ended
         # Adopted after a restart, so not our child: watch whether it lives.
         deadline = time.monotonic() + timeout
         while True:
@@ -154,6 +170,13 @@ class LocalPlacement:
                 return None
             await asyncio.sleep(min(0.2, remaining))
 
+    def release(self, run: dict) -> None:
+        """The engine is done with this launch: how it ended goes once known."""
+
+        done = _exits.get(run.get("launch"))
+        if done is not None:
+            done.add_done_callback(lambda _: _exits.pop(run.get("launch"), None))
+
     async def cancel(self, run: dict) -> None:
         launch = run.get("launch")
         process = _running.get(launch)
@@ -164,9 +187,7 @@ class LocalPlacement:
                 await asyncio.wait_for(process.wait(), 5)
             with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(process.pid, signal.SIGKILL)
-            _running.pop(launch, None)
-            _process_log(launch)
-            return
+            return  # its reaper cleans up
         # Adopted: signal only the very process the handle names, checked each time.
         if not await _same(run):
             return

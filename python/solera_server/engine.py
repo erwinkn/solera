@@ -589,12 +589,20 @@ class Engine(Attempts, Sensors, Views):
                 return
             self._placed(attempt, handle)
             await self._watch(task_id, attempt, placement, handle)
+            self._released(placement, handle)
         except LostOwnership:
             return
         except Exception as error:  # never leave a claim behind
             await self._crashed(task_id, attempt, error)
         finally:
             self.m.release(task_id, attempt)
+
+    @staticmethod
+    def _released(placement, handle) -> None:
+        """Settled: what the placement kept of the launch may go."""
+
+        if handle is not None and callable(getattr(placement, "release", None)):
+            placement.release(handle)
 
     async def _resume(self, task_id: str, attempt: str, placement):
         """An adopted attempt: wait for it and settle it, as `_attempt` would
@@ -614,6 +622,7 @@ class Engine(Attempts, Sensors, Views):
                 except Exception:
                     log.exception("attempt %s: resuming its placement failed", attempt)
             await self._watch(task_id, attempt, placement, handle, adopted=True)
+            self._released(placement, handle)
         except LostOwnership:
             return
         except Exception as error:
