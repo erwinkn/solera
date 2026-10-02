@@ -229,3 +229,30 @@ async def test_a_deleted_runs_gates_outlive_it(state, clock):
     await engine.upkeep.sweep()
     assert await state.list_objects(f"runs/{gone}/") == []
     assert await state.list_objects("control/gates/") == []
+
+
+async def test_runs_kept_forever_do_not_crowd_out_expired_ones(state, clock):
+    """Review round 2, engine #5: the candidates are counted after each
+    asset's horizon applies, so older runs of an asset kept forever never
+    fill the page that the expired run of another asset is due on."""
+
+    @asset(retention=Retention(forever=True))
+    def keep() -> int:
+        return 1
+
+    @asset(retention=Retention(days=1))
+    def daily() -> int:
+        return 1
+
+    engine = engine_for(state, Project(assets=[keep, daily]), clock)
+    await engine.initialize()
+    kept = []
+    for _ in range(3):
+        clock.now += 60
+        kept.append(await run(engine, ["keep"]))
+    clock.now += 60
+    gone = await run(engine, ["daily"])
+    clock.now += 2 * 86400
+    assert await engine.history.expired({"daily": clock.now - 86400}, None, limit=2) == [(gone, "succeeded")]
+    await engine.upkeep.sweep()
+    assert await history_ids(engine) == kept

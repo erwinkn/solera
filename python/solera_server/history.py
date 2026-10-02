@@ -1136,17 +1136,39 @@ class History:
 
         return dict(await self.query(work, ("runs",), live=False))
 
-    async def older_than(self, moment: float, limit: int = 10_000) -> list[tuple[str, float, list[str], str]]:
-        """Finished runs created before `moment`, oldest first:
-        `(id, created_at, assets, status)`."""
+    async def expired(
+        self, horizons: dict[str, float], default: float | None, limit: int = 10_000
+    ) -> list[tuple[str, str]]:
+        """Finished runs every asset they ran has let go of — created before
+        its horizon in `horizons` (an asset absent keeps everything) — or,
+        for a run of no asset, before `default`: `(id, status)`, oldest
+        first. The limit counts only those: runs kept never crowd them out."""
+
+        if not horizons and default is None:
+            return []
+        latest = max([*horizons.values(), *([default] if default is not None else [])])
 
         def work(con):
+            con.execute("CREATE TEMP TABLE horizons (asset VARCHAR, horizon DOUBLE)")
+            if horizons:
+                con.executemany("INSERT INTO horizons VALUES (?, ?)", list(horizons.items()))
             return con.execute(
-                "SELECT id, created_at, assets, status FROM runs WHERE created_at < ? ORDER BY id LIMIT ?",
-                [moment, limit],
+                """
+                WITH candidates AS (SELECT id, created_at, assets, status FROM runs WHERE created_at < ?),
+                kept AS (
+                    SELECT DISTINCT c.id FROM candidates c, unnest(c.assets) AS u(asset)
+                    LEFT JOIN horizons h ON h.asset = u.asset
+                    WHERE h.horizon IS NULL OR c.created_at >= h.horizon
+                )
+                SELECT id, status FROM candidates
+                WHERE id NOT IN (SELECT id FROM kept)
+                  AND (len(assets) > 0 OR (? IS NOT NULL AND created_at < ?))
+                ORDER BY id LIMIT ?
+                """,
+                [latest, default, default, limit],
             ).fetchall()
 
-        return await self.query(work, ("runs",), until=moment, live=False)
+        return await self.query(work, ("runs",), until=latest, live=False)
 
     async def prunable(self, *, before=None, asset=None, keep=None) -> list[tuple[str, str]]:
         """Finished runs created before `before`, of `asset` if given, except

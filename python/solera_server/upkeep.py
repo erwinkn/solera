@@ -308,17 +308,9 @@ class Upkeep:
         keeps = {name: int(p["runs"]) for name, p in policies.items() if p and p.get("runs")}
         nth = await self.history.nth_newest(keeps)
         horizons = {name: self._horizon(p, nth.get(name)) for name, p in policies.items()}
-        finite = [h for h in horizons.values() if h is not None]
         default = self._horizon(self.m.policy(None), None)
-        if not finite and default is None:
-            return
-        latest = max(finite + ([default] if default is not None else []))
-        doomed = []
-        for run_id, created, assets, status in await self.history.older_than(latest):
-            bounds = [horizons.get(a) for a in assets] if assets else [default]
-            if all(h is not None and created < h for h in bounds):
-                doomed.append((run_id, status))
-        await self.delete_runs(doomed)
+        finite = {name: h for name, h in horizons.items() if h is not None}
+        await self.delete_runs(await self.history.expired(finite, default))
 
     async def delete_runs(self, runs: list[tuple[str, str | None]]) -> None:
         """Delete finished runs, `(id, status)`. Retirement comes first and
