@@ -14,6 +14,7 @@ driver installed; only `store`/`load` need it (in the harness).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 from collections.abc import Callable, Iterable, Mapping
@@ -64,18 +65,19 @@ def _qname(schema: str, table: str) -> str:
     return f"{_ident(schema)}.{_ident(table)}"
 
 
-def _is_select(stmt: str) -> bool:
-    return stmt.lstrip().split(None, 1)[0].lower() in ("select", "with", "values")
-
-
 class PostgresStore:
     version = "1"
     ref_type = TableRef
     shared_table = True
     writes = "fenced"
 
-    def __init__(self, dsn: str, grants: list[str] | tuple = ()):
-        self.dsn, self.grants = dsn, tuple(grants)
+    def __init__(self, dsn: str, grants: list[str] | tuple = (), sql_read_only: bool = False):
+        """`grants`: roles given SELECT on every table the store creates.
+        `sql_read_only`: a `Sql` query runs in a READ ONLY transaction of its
+        own, so not even a function it calls can write; its rows stream
+        through the worker, from one connection's COPY into the other's."""
+
+        self.dsn, self.grants, self.sql_read_only = dsn, tuple(grants), sql_read_only
 
     # -- registration -------------------------------------------------------
 
@@ -488,18 +490,38 @@ class PostgresStore:
         )
 
     def _apply_sql(self, cur, output, write: Sql, scope, table, slice_where, prior):
-        """Materialize a SELECT into the slice, or run a statement verbatim. The
-        harness never sees these rows, so a keyed output reports the slice's
-        rows, sorted, for the harness to version (§6, §9)."""
+        """Materialize a query into the slice. The query is never a statement
+        of its own: the store embeds it in one, `INSERT INTO t SELECT … FROM
+        (<query>) _src`, prepared (the extended protocol), so UPDATE, DELETE,
+        DDL and data-modifying CTEs do not parse, and a second statement is
+        refused. What remains is a function the query calls, which must not
+        write; `sql_read_only` makes sure. The harness never sees these rows,
+        so a keyed output reports the slice's rows, sorted, for the harness to
+        version (§6, §9)."""
 
-        if _is_select(write.stmt):
-            probe = cur.execute(f"SELECT * FROM ({write.stmt}) _probe LIMIT 0")
+        import psycopg
+        from psycopg import sql
+
+        # On a line of its own: a trailing `--` comment ends with the query.
+        query = f"(\n{write.stmt}\n) _src"
+        partition_col = output.config.get("partition_column")
+        with contextlib.ExitStack() as stack:
+            source = cur
+            if self.sql_read_only:  # the query reads at its own snapshot, writing nothing
+                reader = stack.enter_context(psycopg.connect(resolve_env(self.dsn)))
+                reader.read_only, reader.isolation_level = True, psycopg.IsolationLevel.REPEATABLE_READ
+                source = stack.enter_context(reader.cursor())
+            try:
+                probe = source.execute(f"SELECT * FROM {query} LIMIT 0", prepare=True)
+            except (psycopg.errors.SyntaxError, psycopg.errors.FeatureNotSupported) as e:
+                raise WriteError(
+                    f"{output.name}: a Sql write is one query — a SELECT, VALUES or TABLE — the store "
+                    f"materializes; change rows through the output's writes, the table through a "
+                    f"Migration ({str(e).splitlines()[0]})"
+                ) from e
             described = [(d.name, d.type_code) for d in probe.description]
-            columns = [name for name, _ in described]
-            partition_col = output.config.get("partition_column")
-            if partition_col and partition_col not in columns:
-                columns.append(partition_col)
-            # The SELECT's own column types, for a table it creates; declared ones win.
+            columns = [name for name, _ in described if name != partition_col]
+            # The query's own column types, for a table it creates; declared ones win.
             types = {
                 r["oid"]: r["t"]
                 for r in cur.execute(
@@ -510,25 +532,26 @@ class PostgresStore:
             inferred = {name: _inferred(types.get(oid)) for name, oid in described}
             self._ensure(cur, output, scope=scope, inferred=inferred)
             self._delete_slice(cur, table, slice_where)
-            select_cols = ", ".join(_ident(c) for c in columns if c != partition_col)
-            if partition_col:
+            selected = ", ".join(_ident(c) for c in columns)
+            into = ", ".join(_ident(c) for c in [*columns, *([partition_col] if partition_col else [])])
+            stamp = f", {sql.Literal(scope.partition).as_string(source)}" if partition_col else ""
+            if not self.sql_read_only:
                 cur.execute(
-                    f"INSERT INTO {table} ({select_cols}, {_ident(partition_col)}) "
-                    f"SELECT {select_cols}, %s FROM ({write.stmt}) _src",
-                    (scope.partition,),
+                    f"INSERT INTO {table} ({into}) SELECT {selected}{stamp} FROM {query}", prepare=True
                 )
             else:
-                cur.execute(
-                    f"INSERT INTO {table} ({select_cols}) SELECT {select_cols} FROM ({write.stmt}) _src"
-                )
-        else:
-            self._ensure(cur, output, scope=scope)
-            relid = self._relid(cur, table)
-            cur.execute(write.stmt)
-            if self._relid(cur, table) != relid:  # rolled back: its fence would not follow it
-                raise WriteError(
-                    f"{output.name}: a Sql statement must keep {table} itself; replace it through a Migration"
-                )
+                try:
+                    with (
+                        source.copy(f"COPY (SELECT {selected}{stamp} FROM {query}) TO STDOUT") as rows,
+                        cur.copy(f"COPY {table} ({into}) FROM STDIN") as copy,
+                    ):
+                        for data in rows:
+                            copy.write(data)
+                except psycopg.errors.ReadOnlySqlTransaction as e:
+                    raise WriteError(
+                        f"{output.name}: a Sql query must not write, nor any function it calls "
+                        f"({str(e).splitlines()[0]})"
+                    ) from e
         keys = self._sorted_rows(table, output, slice_where) if output.key else None
         return digest([prior.version if prior else "", digest(write.stmt)]), keys
 

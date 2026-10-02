@@ -266,7 +266,7 @@ def leach(
     automations=AutoRefresh(),
 )
 def site_health(ctx, change_events: TableRef) -> Sql:
-    """In-database: a TableRef in, a statement out; no row enters the harness.
+    """In-database: a TableRef in, a query out; no row enters the harness.
     The store materializes the SELECT into ops.site_health for this site."""
     return Sql(
         f"SELECT status, count(*) AS n FROM {change_events.table} WHERE {change_events.where_sql()} GROUP BY status"

@@ -255,6 +255,14 @@ null — refuses a column it cannot type, and logs what it inferred.
 `can_migrate` says what a migration's payload may be (PostgresStore:
 SQL text or a callable), when it is not a write.
 
+SQL a user hands the store for a write must not reach past the scope the
+engine fenced and records. PostgresStore's `Sql` is a query, never a
+statement: it is embedded in the store's own `INSERT … SELECT … FROM
+(<query>) _src` and prepared, so DML, DDL and a second statement do not
+parse; only a function the query calls could still write, and
+`sql_read_only=True` reads the query in a READ ONLY transaction, which no
+function can turn back (a `SET ROLE` can: a function may `RESET ROLE`).
+
 Write a keyed output page by page: for `whole`, clear the slice first;
 then for each of `write.pages()`, delete its keys and insert their rows
 (or `MERGE`); then delete `removes`. A complete

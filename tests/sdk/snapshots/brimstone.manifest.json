@@ -618,7 +618,7 @@
         "site_health.onchange.0"
       ],
       "deps": [],
-      "doc": "In-database: a TableRef in, a statement out; no row enters the harness.\nThe store materializes the SELECT into ops.site_health for this site.",
+      "doc": "In-database: a TableRef in, a query out; no row enters the harness.\nThe store materializes the SELECT into ops.site_health for this site.",
       "inputs": {
         "change_events": {
           "kind": "in",
@@ -1383,7 +1383,7 @@
     }
   },
   "retention": null,
-  "revision": "2679404cc2a39c956f687293be57241624f0c7e50d2e2689943fb8f88e6a386c",
+  "revision": "f83c507d86e32b1b44031a1db1d25a529a829f8ab95faceb37a68a1bcbfeb068",
   "sensors": {},
   "sources": {
     "leach_crosswalk": {

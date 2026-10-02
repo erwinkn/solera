@@ -681,9 +681,10 @@ Internal to the store; the engine supplies one number.
   rename) gives the table a new OID; it moves the fence rows to the new OID
   in the same transaction, so the write domain keeps its generations. An
   operator's `solera migrate` has no generation: it only takes its turn.
-- **Only a migration may replace the relation.** A `Sql` statement that
-  leaves a new OID behind is rolled back with an error: a fence row would
-  not follow it.
+- **Only a migration may replace the relation, or touch another slice.**
+  A `Sql` write is a query the store materializes into its own slice,
+  never a statement: one that would update, delete or replace anything is
+  refused before it runs (architecture.md, "Writes").
 - **Cost**: one indexed upsert per acquisition and one row lock per write
   transaction; a takeover waits for at most one older transaction.
 

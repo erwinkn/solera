@@ -302,8 +302,8 @@ async def test_migration_can_reconcile_drift(store):
     assert written.ref.version
 
 
-def fenced(out, generation, invocation="i"):
-    return scope(out, generation=generation, invocation=invocation)
+def fenced(out, generation, invocation="i", partition=""):
+    return scope(out, partition, generation=generation, invocation=invocation)
 
 
 async def test_a_newer_generation_fences_older_writers(store):
@@ -550,26 +550,72 @@ async def test_a_migration_waits_for_every_slices_open_writer(store):
     assert await store.load(first.ref, list[dict], None) == [{"id": "a", "v": "m", "site": "p1"}]
 
 
-async def test_a_sql_write_cannot_replace_its_table(store):
-    """Review P1-2: a `Sql` statement that swaps its relation for a new one
-    (a new OID, no fence row) is rolled back; a stale writer stays refused."""
+async def test_a_sql_write_is_a_query_never_a_statement(store):
+    """A `Sql` write is embedded in the store's own statement, prepared, so
+    UPDATE, DELETE, DDL, a data-modifying CTE and a second statement are all
+    refused before anything changes; another partition's rows, and the
+    table itself, stay as they were. A query of any shape — a CTE, VALUES,
+    a trailing comment — is materialized."""
 
     name = f"t_{uuid.uuid4().hex[:12]}"
-    out = output(name, key="id", revision="v")
-    first = await store.store([{"id": "a", "v": "1"}], None, fenced(out, 4))
+    out = output(name, key="id", revision="v", partition_column="part")
+    other = await store.store([{"id": "b", "v": "9"}], None, fenced(out, 9, partition="b"))
+    first = await store.store([{"id": "a", "v": "1"}], None, fenced(out, 4, partition="a"))
     table, _, _ = store._table(out)
     with store._connect() as conn, conn.cursor() as cur:
         relid = store._relid(cur, table)
-    swap = (
-        f'CREATE TABLE public."{name}_new" AS SELECT * FROM public."{name}"; '
-        f'DROP TABLE public."{name}"; ALTER TABLE public."{name}_new" RENAME TO "{name}"'
-    )
-    with pytest.raises(WriteError, match="through a Migration"):
-        await store.store(Sql(swap), first.ref, fenced(out, 9))
+    refused = [
+        f"UPDATE {table} SET v = 'stale'",
+        f"DELETE FROM {table}",
+        f"DROP TABLE {table}",
+        f"WITH gone AS (DELETE FROM {table} RETURNING *) SELECT id, v FROM gone",
+        f"SELECT 'a' AS id, '2' AS v) q; UPDATE {table} SET v = 'stale'; SELECT * FROM (SELECT 1",
+        f"SELECT 'a' AS id, '2' AS v; UPDATE {table} SET v = 'stale'",
+    ]
+    for stmt in refused:
+        with pytest.raises(WriteError, match="one query"):
+            await store.store(Sql(stmt), first.ref, fenced(out, 5, partition="a"))
     with store._connect() as conn, conn.cursor() as cur:
         assert store._relid(cur, table) == relid
-    with pytest.raises(StoreError, match="newer attempt"):
-        await store.store([{"id": "a", "v": "0"}], first.ref, fenced(out, 3))
+    assert await store.load(other.ref, list[dict], None) == [{"id": "b", "v": "9", "part": "b"}]
+    assert await store.load(first.ref, list[dict], None) == [{"id": "a", "v": "1", "part": "a"}]
+    for query in [
+        "WITH x AS (SELECT 'a'::text AS id, '2'::text AS v) SELECT * FROM x",
+        "VALUES ('a'::text, '2'::text)",
+        "SELECT 'a'::text AS id, '2'::text AS v -- the newest",
+    ]:
+        if query.startswith("VALUES"):
+            query = f"SELECT column1 AS id, column2 AS v FROM ({query}) t"
+        written = await store.store(Sql(query), first.ref, fenced(out, 5, partition="a"))
+        assert await store.load(written.ref, list[dict], None) == [{"id": "a", "v": "2", "part": "a"}]
+
+
+async def test_a_read_only_sql_store_refuses_a_query_whose_function_writes():
+    """A function the query calls is the one way left for it to write;
+    `sql_read_only` reads the query in a READ ONLY transaction of its own,
+    which no function can turn back (not even through `SET ROLE`), and
+    streams its rows into the slice."""
+
+    if not DSN:
+        pytest.skip("SOLERA_TEST_DATABASE_URL is not set")
+    from solera_postgres import PostgresStore
+
+    store = PostgresStore(DSN, sql_read_only=True)
+    out = output(key="id", partition_column="part")
+    victim = output(key="id")
+    first = await store.store([{"id": "a", "v": "1"}], None, scope(victim))
+    table = first.ref.table
+    fn = f"writes_{uuid.uuid4().hex[:8]}"
+    with store._connect() as conn:
+        conn.execute(
+            f"CREATE FUNCTION {fn}() RETURNS text LANGUAGE plpgsql AS "
+            f"$$ BEGIN UPDATE {table} SET v = 'stale'; RETURN 'x'; END $$"
+        )
+    with pytest.raises(WriteError, match="must not write"):
+        await store.store(Sql(f"SELECT 'k'::text AS id, {fn}() AS v"), None, scope(out))
+    assert await store.load(first.ref, list[dict], None) == [{"id": "a", "v": "1"}]
+    written = await store.store(Sql(f"SELECT id, v FROM {table}"), None, scope(out, partition="p"))
+    assert await store.load(written.ref, list[dict], None) == [{"id": "a", "v": "1", "part": "p"}]
 
 
 async def test_by_key_patch_stamps_keys_and_removes_keys_given_no_rows(store):

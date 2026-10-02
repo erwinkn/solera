@@ -38,7 +38,9 @@ class Patch:
 
 @dataclass(frozen=True)
 class Sql:
-    """PostgresStore only: materialize a SELECT, or run a statement verbatim (§4)."""
+    """PostgresStore only: materialize a query — a SELECT, VALUES or TABLE —
+    into the output's table (§4). It is never run as a statement: UPDATE,
+    DELETE and DDL are refused; a table changes through a `Migration`."""
 
     stmt: str
 

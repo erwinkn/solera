@@ -124,9 +124,9 @@ What those stores write:
 | Patch | unknown writes | step 2 reads the store's whole key map and reconciles it (below); then as for named intents, with every key of the scope as `intended` |
 | Replacement | none | the delta's upserts and removes; the whole scope if the delta's key list was not collected |
 | Replacement | named or unknown | the whole scope, overwritten. Step 2 does not run: it would keep stray rows the replacement means to remove |
-| `Sql` | — | the statement; the store reports its rows afterwards, resolved as a replacement |
+| `Sql` | — | the query, materialized; the store reports its rows afterwards, resolved as a replacement |
 
-**Unknown writes.** A `Sql` write's intent names no keys: the statement
+**Unknown writes.** A `Sql` write's intent names no keys: the query
 can change any of them, and its key map is known only once it reports. If
 its worker dies after the gate and before reporting, the next attempt
 cannot read back "the intended keys":
