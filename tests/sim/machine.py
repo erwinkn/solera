@@ -20,6 +20,7 @@ from hypothesis import assume
 from hypothesis import strategies as st
 from hypothesis.stateful import RuleBasedStateMachine, initialize, invariant, precondition, rule
 from solera.keys.index import Options
+from solera.sdk import Ref
 
 from . import postgres
 from .core import EPOCH, Killed
@@ -91,7 +92,7 @@ class Simulation(RuleBasedStateMachine):
             world.pg = postgres.Ledger()
             self._pg_checked = 0
         self.project = self._build()
-        self.feed: dict[str, str] = {}  # what clients asked for, acknowledged or not
+        self.feed = self.outside.feed  # what clients asked for, acknowledged or not
         self.sites: set[str] = set()
         self.knob = "0"
         self.runs: list[str] = []
@@ -170,7 +171,8 @@ class Simulation(RuleBasedStateMachine):
                 self.feed.pop(k, None)
             kw = {"remove": keys}
         else:
-            self.feed = {k: version for k in keys}
+            self.feed.clear()
+            self.feed.update({k: version for k in keys})
             kw = {"keys": dict(self.feed)}
         self._request(lambda e: e.commit_source("feed", **kw), "commit")
 
@@ -392,14 +394,12 @@ class Simulation(RuleBasedStateMachine):
     def reads_say_what_they_read(self):
         """A current-read store's reads (PostgresStore): the generation each
         reports wrote the rows it loaded, and was the newest write before its
-        snapshot; an attempt's reported key versions are those of the rows it
-        loaded (lineage of what was read)."""
+        snapshot (lineage of what was read)."""
 
         world = self.world
         if world is None or world.pg is None:
             return
         self._pg_checked = postgres.check(world.pg, self._pg_checked)
-        postgres.check_reported(world.pg, self.journal.reads)
 
     def _handed_to_discard(self, attempt: str, path: str) -> bool:
         """F11's signature: the file is named by a discard entry of the attempt's spec."""
@@ -418,7 +418,7 @@ class Simulation(RuleBasedStateMachine):
     @invariant()
     def committed_keys_are_readable(self):
         """Every key an immutable store's head lists reads back at its
-        version, from an object a committed attempt wrote."""
+        generation, from an object a committed attempt wrote."""
 
         world = self.world
         if world is None or world.engine is None:
@@ -432,14 +432,49 @@ class Simulation(RuleBasedStateMachine):
                 store = self.project.stores.get(head["ref"]["store"])
                 if getattr(store, "writes", None) != "immutable" or output == "sites":
                     continue
-                await keyed_content(engine, self.project, output, scope)
+                await keyed_content(engine, self.project, output, scope, column=None)
                 entries = await index_entries(engine.state, output, scope)
                 committed = self.journal.committed_generations()  # after the reads: commits land meanwhile
-                for key, (_, locator) in entries.items():
-                    if locator and locator not in committed:
+                for key, (generation, _) in entries.items():
+                    if generation and generation not in committed:
                         raise Violation(
-                            f"{output}[{scope!r}] key {key}: its object was written by generation {locator}, "
-                            "which never committed"
+                            f"{output}[{scope!r}] key {key}: its object was written by generation "
+                            f"{generation}, which never committed"
+                        )
+
+        self._run(check())
+
+    @invariant()
+    def a_fenced_scope_at_rest_holds_its_index_keys(self):
+        """docs/versions.md §9: a fenced store's scope that no attempt holds
+        and no dead writer left unsettled holds exactly the keys its index
+        lists — a repair by presence leaves no key without rows, and no row
+        without its key — and, in Postgres, reads as written by its head's
+        generation: a repair always writes, so a dead attempt's generation,
+        which no commit has, is never what a later read reports (break 1)."""
+
+        world = self.world
+        if world is None or world.engine is None:
+            return
+        m = world.engine.m
+
+        async def check():
+            for (output, scope), head in list(m.heads.items()):
+                store = self.project.stores.get(head["ref"]["store"])
+                if getattr(store, "writes", None) != "fenced":
+                    continue
+                if (output, scope) in m.unsettled or (head.get("asset"), scope) in m.locks:
+                    continue
+                if (output, scope) in m.indexes:
+                    await keyed_content(world.engine, self.project, output, scope, whole=True, column=None)
+                if head["ref"]["store"] == "pg":
+                    ref = Ref.from_json(head["ref"])
+                    with store._connect() as conn, conn.cursor() as cur:
+                        written = store._written(cur, ref)
+                    if written is not None and written != ref.generation:
+                        raise Violation(
+                            f"{output}[{scope!r}] reads as written by generation {written}; "
+                            f"its head is generation {ref.generation}"
                         )
 
         self._run(check())
@@ -554,11 +589,11 @@ class Simulation(RuleBasedStateMachine):
                 if automated and self.renames >= 2:
                     self._known("F12", f"{variant.copy_name} stale after {self.renames} renames")
                 raise Violation(f"{variant.copy_name} {stage}: {copy} != {expected_copy(want, variant)}")
-            checks = await keyed_content(engine, project, "checks", whole=True)
+            checks = await keyed_content(engine, project, "checks", whole=True, column="w")
             if checks != expected_checks(want):
                 raise Violation(f"checks {stage}: {checks} != {expected_checks(want)}")
-            outside = {
-                k: v[0].decode() for k, v in (await index_entries(engine.state, "outside", "")).items()
+            outside = {  # each key at the version its last observation gave it
+                k: p.decode() for k, (_, p) in (await index_entries(engine.state, "outside", "")).items()
             }
             if outside != self.outside.keys:
                 raise Violation(f"outside {stage}: {outside} != {self.outside.keys}")

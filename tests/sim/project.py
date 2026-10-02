@@ -69,26 +69,31 @@ VARIANTS = {
 
 
 class External:
-    """The world outside: what the `watch` sensor observes, and which keys
-    `checks` currently fails on (a flaky API)."""
+    """The world outside: the `feed` its clients write, what the `watch`
+    sensor observes (`keys`), and which keys `checks` currently fails on (a
+    flaky API)."""
 
     def __init__(self):
+        self.feed: dict[str, str] = {}
         self.keys: dict[str, str] = {}
         self.flaky: set[str] = set()
 
 
 class SourceStore(FileStore):
-    """A keyed source's rows live elsewhere: a load answers from the
-    selection, each key with the version the index holds for it."""
+    """A keyed source's rows live elsewhere, and are read as they are now
+    (docs/versions.md §6): a load answers each selected key the outside
+    holds with its current value — which may be newer than the commit that
+    named it."""
+
+    def __init__(self, path, outside: External):
+        super().__init__(path)
+        self.outside = outside
 
     async def load(self, ref, t, selection):
+        current = self.outside.feed if ref.output == "feed" else self.outside.keys
         if isinstance(selection, Keys):
-            return [{"id": k, "v": _text(v[0])} for k, v in sorted(selection.revisions.items())]
+            return [{"id": k, "v": current[k]} for k in sorted(selection.generations) if k in current]
         return []
-
-
-def _text(version) -> str:
-    return version.decode() if isinstance(version, bytes) else str(version)
 
 
 def rebuild(changes, rows: list[dict]):
@@ -109,13 +114,9 @@ def build(variant: Variant, data_root, db: Database, outside: External, pg: str 
     store on `db`, and — given a schema `pg` — a PostgresStore writing there."""
 
     if variant.items_store == "pg":
-        items_output = Output(
-            "items", key="id", revision="v", store="pg", schema=pg, columns={"id": "text", "v": "text"}
-        )
+        items_output = Output("items", key="id", store="pg", schema=pg, columns={"id": "text", "v": "text"})
     else:
-        items_output = Output(
-            "items", key="id", revision="v", store="db" if variant.items_store == "table" else None
-        )
+        items_output = Output("items", key="id", store="db" if variant.items_store == "table" else None)
 
     @asset(
         outputs=items_output,
@@ -138,7 +139,7 @@ def build(variant: Variant, data_root, db: Database, outside: External, pg: str 
     copy_fn.__name__ = variant.copy_name
     copy = asset(
         copy_fn,
-        outputs=Output(key="id", revision="v"),
+        outputs=Output(key="id"),
         inputs={"items": Incremental(page_size=2, exclude=[variant.exclude] if variant.exclude else None)},
         automations=AutoRefresh(),
         retries=Retry(3, delay=1.0),
@@ -167,7 +168,7 @@ def build(variant: Variant, data_root, db: Database, outside: External, pg: str 
 
     @asset(
         inputs={"item": Each("items", page_size=2, concurrency=2)},
-        outputs=Output("checks", key="id", revision="w"),
+        outputs=Output("checks", key="id"),
         automations=AutoRefresh(),
         retries=Retry(3, delay=1.0),
         timeout=300,
@@ -199,7 +200,7 @@ def build(variant: Variant, data_root, db: Database, outside: External, pg: str 
             PartitionSet("sites"),
         ],
         sensors=[watch],
-        stores={"ext": SourceStore(data_root), "db": TableStore(db), **_postgres(pg)},
+        stores={"ext": SourceStore(data_root, outside), "db": TableStore(db), **_postgres(pg)},
         default_store=FileStore(data_root),
         build="sim",
         name="sim",

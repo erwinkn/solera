@@ -13,7 +13,7 @@ import copy
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from solera.sdk import Ref, digest
+from solera.sdk import Ref
 from solera.stores import MISSING, Batches, KeyedWrite, Keys, StoreError, Written, by_key_type, takes
 
 
@@ -108,29 +108,34 @@ class TableStore:
                 else:
                     rows[:] = [r for r in rows if r[1] != scope.batch]
                 rows.extend((None, scope.batch, dict(r)) for r in batch)
-                version = digest([base.version if base else "", scope.batch, batch])
-                return Written(
-                    Ref(out.name, "", {"table": table, "batch": scope.batch}, version, scope.partition)
-                )
+                return Written(Ref(out.name, "", {"table": table, "batch": scope.batch}, scope.partition))
             keyed = KeyedWrite.of(self, write, out, base)
             if keyed.whole or reset:
                 rows.clear()
             for page in keyed.iter_pages():
-                keys = {k for k, _, _ in page}
+                keys = {k for k, _ in page}
                 if not keyed.whole:
                     rows[:] = [r for r in rows if r[0] not in keys]
-                rows.extend((k, None, dict(r)) for k, _, group in page for r in group)
+                rows.extend((k, None, dict(r)) for k, group in page for r in group)
             if keyed.removes:
                 rows[:] = [r for r in rows if r[0] not in keyed.removes]
-            return Written(Ref(out.name, "", {"table": table}, keyed.version(base), scope.partition))
+            return Written(Ref(out.name, "", {"table": table}, scope.partition))
 
         return await self._transaction("store", scope, prior, body)
+
+    def keys(self, ref, among=None):
+        """The keys the slice holds — among `among`, or all — sorted by their
+        bytes: a repair's question, never a value."""
+
+        table = (ref.handle or {}).get("table") or f"rows_{ref.output}"
+        held = {r[0] for r in self.db.tables.get(table, {}).get(ref.partition, []) if r[0] is not None}
+        yield sorted((k for k in held if among is None or k in among), key=str.encode)
 
     async def load(self, ref, t, selection) -> list[dict]:
         table = (ref.handle or {}).get("table") or f"rows_{ref.output}"
         rows = self.db.tables.get(table, {}).get(ref.partition, [])
         if isinstance(selection, Keys):
-            rows = [r for r in rows if r[0] in selection.revisions]
+            rows = [r for r in rows if r[0] in selection.generations]
         elif isinstance(selection, Batches):
             rows = [r for r in rows if r[1] is not None and selection.lo <= r[1] <= selection.hi]
         elif (ref.handle or {}).get("batch") is not None:

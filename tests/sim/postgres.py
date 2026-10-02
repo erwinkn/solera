@@ -88,7 +88,7 @@ def patches(ledger: Ledger, current_actor) -> list[tuple]:
             self._sim_snapshot = ledger.tick()
         value, generation = await load_real(self, ref, t, selection)
         if not (isinstance(t, type) and t.__name__.endswith("Ref")):
-            keys = sorted(selection.revisions) if isinstance(selection, Keys) else None
+            keys = sorted(selection.generations) if isinstance(selection, Keys) else None
             table = (ref.handle or {}).get("table")
             ledger.reads.append(
                 Read(
@@ -130,33 +130,3 @@ def check(ledger: Ledger, start: int) -> int:
         if read.rows != want:
             raise Violation(f"{where} at generation {read.generation} loaded {read.rows}, which wrote {want}")
     return len(ledger.reads)
-
-
-def check_reported(ledger: Ledger, events) -> None:
-    """Every key version an attempt's result reports (`read[].keys`) is the
-    version of the row it loaded for that key, or None for a key it found missing."""
-
-    from .oracle import Violation
-
-    for event in events:
-        if event.get("type") != "AttemptFinished":
-            continue
-        for entry in event.get("read") or ():
-            if not entry.get("keys"):
-                continue
-            loaded = {
-                k: v
-                for r in ledger.reads
-                if r.who
-                and r.who[0] == "worker"
-                and r.who[1] == event["attempt"]
-                and r.part == entry.get("scope", "")
-                for k, v in r.rows
-            }
-            for key, version in entry["keys"].items():
-                want = loaded[key].encode().hex() if key in loaded else None
-                if version != want:
-                    raise Violation(
-                        f"attempt {event['attempt']} reports {entry['output']} key {key} read at {version}; "
-                        f"it loaded {loaded.get(key)}"
-                    )

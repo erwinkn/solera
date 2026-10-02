@@ -34,7 +34,6 @@ class Journal:
     )  # (seq, path, when): segments that landed again, other bytes
     now: object = None  # the world's clock
     applied_commits: set = field(default_factory=set)  # attempts some engine committed in memory
-    reads: list = field(default_factory=list)  # AttemptFinished events that report what their reads saw
 
     def landed(self, path: str, data: bytes) -> None:
         if "/control/journal/" not in path:
@@ -93,28 +92,27 @@ class Journal:
         return out
 
 
-async def index_entries(state, output: str, scope: str) -> dict[str, tuple[bytes, int]]:
-    """Every live entry of an output scope's key index: key -> (version, locator)."""
+async def index_entries(state, output: str, scope: str) -> dict[str, tuple[int, bytes | None]]:
+    """Every live entry of an output scope's key index: key -> (generation, payload)."""
 
     index = KeyIndex(ObjectIO(state.objects), None, state.model.index(output, scope).pinned())
     entries, after = {}, None
     while True:
-        keys, versions, locators, after = await index.page(after, 100_000)
-        entries.update({key_str(k): (v, loc) for k, v, loc in zip(keys, versions, locators, strict=True)})
+        keys, generations, payloads, after = await index.page(after, 100_000)
+        entries.update(zip(map(key_str, keys), zip(generations, payloads, strict=True), strict=True))
         if after is None:
             return entries
 
 
-def text(version) -> str:
-    return version.decode() if isinstance(version, bytes) else str(version)
-
-
-async def keyed_content(engine, project, output: str, scope: str = "", *, whole=False) -> dict[str, str]:
+async def keyed_content(
+    engine, project, output: str, scope: str = "", *, whole=False, column: str | None = "v"
+) -> dict[str, str | None]:
     """A keyed output's content as a reader of its head gets it: every key
-    its index holds, loaded through its store, each row's `v` checked
-    against the version the index holds. `whole` also checks a store that
-    reads current rows holds no row the index does not list (only true
-    when no writer is unsettled)."""
+    its index holds, loaded through its store at the generation the index
+    holds (docs/versions.md) — no key missing, none read twice, none the
+    index does not list. `whole` also checks a store that reads current
+    rows holds no row the index does not list (only true when no writer is
+    unsettled). Returns each key's `column`, None without one."""
 
     m = engine.state.model
     head = m.heads.get((output, scope))
@@ -123,35 +121,32 @@ async def keyed_content(engine, project, output: str, scope: str = "", *, whole=
     entries = await index_entries(engine.state, output, scope)
     store_name = head["ref"]["store"]
     store = project.stores[store_name]
-    ref = Ref(**{k: head["ref"][k] for k in ("output", "store", "handle", "version", "partition", "meta")})
+    ref = Ref.from_json(head["ref"])
     try:
-        rows = await store.load(ref, list[dict], Keys(entries))
+        rows = await store.load(ref, list[dict], Keys({k: g for k, (g, _) in entries.items()}))
     except Exception as error:
         raise Violation(
             f"{output}[{scope!r}]: its committed keys cannot be read: {type(error).__name__}: {error}"
         ) from error
-    column = (engine.manifest["outputs"].get(output) or {}).get("revision") or "v"
-    got: dict[str, str] = {}
+    got: dict[str, str | None] = {}
     for row in rows:
         k = str(row["id"])
         if k in got:
             raise Violation(f"{output}[{scope!r}]: key {k} read twice")
-        got[k] = str(row[column])
-    want = {k: text(v) for k, (v, _) in entries.items()}
-    if got != want:
-        missing = sorted(set(want) - set(got))
-        wrong = sorted(k for k in set(want) & set(got) if want[k] != got[k])
-        extra = sorted(set(got) - set(want))
+        got[k] = str(row[column]) if column is not None else None
+    if set(got) != set(entries):
+        missing = sorted(set(entries) - set(got))
+        extra = sorted(set(got) - set(entries))
         raise Violation(
             f"{output}[{scope!r}] ({store_name}): the store does not hold what the index says: "
-            f"missing {missing[:5]}, wrong {[(k, want[k], got[k]) for k in wrong[:5]]}, extra {extra[:5]}"
+            f"missing {missing[:5]}, extra {extra[:5]}"
         )
     if whole and getattr(store, "writes", None) == "fenced":
         rows = await store.load(ref, list[dict], None)
-        extra = sorted({str(r["id"]) for r in rows} - set(want))
-        if extra or len(rows) != len(want):
+        extra = sorted({str(r["id"]) for r in rows} - set(entries))
+        if extra or len(rows) != len(entries):
             raise Violation(f"{output}[{scope!r}] ({store_name}): rows nobody committed remain: {extra[:5]}")
-    return want
+    return got
 
 
 async def value_content(engine, project, output: str, scope: str = ""):
@@ -159,7 +154,7 @@ async def value_content(engine, project, output: str, scope: str = ""):
     head = m.heads.get((output, scope))
     if head is None:
         return None
-    ref = Ref(**{k: head["ref"][k] for k in ("output", "store", "handle", "version", "partition", "meta")})
+    ref = Ref.from_json(head["ref"])
     store = project.stores[head["ref"]["store"]]
     try:
         return await store.load(ref, object, None)
@@ -173,7 +168,7 @@ async def batch_rows(engine, project, output: str, scope: str = "") -> list:
     head = engine.state.model.heads.get((output, scope))
     if head is None:
         return []
-    ref = Ref(**{k: head["ref"][k] for k in ("output", "store", "handle", "version", "partition", "meta")})
+    ref = Ref.from_json(head["ref"])
     store = project.stores[head["ref"]["store"]]
     try:
         return await store.load(ref, list[dict], None)
