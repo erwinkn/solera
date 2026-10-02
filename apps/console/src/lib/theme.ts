@@ -8,6 +8,11 @@ import { createStore, useStore } from "./store";
 export const THEMES = [
   "normal",
   "voltage",
+  "blueprint",
+  "ledger",
+  "signal",
+  "night",
+  "arc",
   "obsidian",
   "workbench",
   "reactor",
@@ -22,6 +27,11 @@ export type Theme = (typeof THEMES)[number];
 export const THEME_NAMES: Record<Theme, string> = {
   normal: "Normal",
   voltage: "Voltage",
+  blueprint: "Voltage · Blueprint",
+  ledger: "Voltage · Ledger",
+  signal: "Voltage · Signal",
+  night: "Voltage · Night",
+  arc: "Voltage · Arc",
   obsidian: "Obsidian",
   workbench: "Workbench",
   reactor: "Reactor",
