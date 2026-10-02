@@ -50,7 +50,7 @@ from . import delivery, history, planning
 from .attempts import POOL_OFFERED_GRACE, Attempts, Live, worker_report
 from .history import MAX_METADATA, History, RunFilter
 from .keyservice import KeyService, cache_root
-from .model import TERMINAL_RUN, commit_of, delta_reads
+from .model import TERMINAL_RUN, commit_of
 from .placements import PlacementContext, Registry
 from .sensors import Sensors
 from .state import Conflict, LostOwnership, State
@@ -744,10 +744,8 @@ class Engine(Attempts, Sensors, Views):
         claim = self.m.claimed(attempt) if attempt is not None else None
         if claim is not None:
             # Keep the delta log this attempt reads until it finishes (§6).
-            claim["reads"] = delta_reads(plans)
-        more = any(
-            delivery.kind(p) == "batches" and delivery.continues(p, None, None) for p in plans.values() if p
-        )
+            claim["reads"] = delivery.reads(plans)
+        more = any(p["kind"] == "batches" and delivery.continues(p, None, None) for p in plans.values() if p)
         skip = bool(incremental) and all_empty and not more and not full
         # An Each asset whose keys all failed so far has no head yet: nothing to wait for.
         if skip and each_page is None and not planner.complete(task["asset"], scope):
@@ -896,22 +894,20 @@ class Engine(Attempts, Sensors, Views):
         return {edge.key(s): h["ref"] for s, h in planner.fan_in(edge, complete=True).items()}
 
     def _incremental_plan(self, task, param, edge, ref, up_scope, fingerprint, run, full, claim_pin=None):
-        """Plan one Incremental edge from its watermark (§6): returns the pin
-        for the spec, the plan the commit turns into the next watermark, and
-        whether nothing is pending.
+        """Plan one Incremental edge's page from its watermark (`delivery`):
+        returns the pin for the spec, the plan its commit `advance`s the
+        watermark by, and whether nothing is pending.
 
-        A keyed upstream is read through its key index by the harness: the
-        delta log from `wm.batch` to the head, or — for a missing watermark, a
-        fingerprint change, a `full` run, a keys='full' override, or a log that
-        no longer holds the window — the whole index, restarting from the
-        head's next batch so changes made while draining arrive afterwards as
-        deltas. Either is delivered `page_size` keys at a time; the harness
-        reports where it stopped (`after`), and a task with more to deliver is
-        queued again. A batch-mode upstream is planned here: the next
-        `page_size` batches after the watermark, all since the last reset
-        (`base`) when starting over.
-
-        Watermark: {"batch", "until"?, "after", "full", "fingerprint", "output", "up"}."""
+        A delivery under way goes on from its position. Otherwise one starts:
+        `full` for a missing watermark, a fingerprint change, a `full` run or a
+        keys='full' override; else a `delta` of the batches since `next`. A
+        keyed upstream is read through its key index by the harness — a delta
+        through the index's log, or the whole index if the log no longer holds
+        the window — `page_size` keys at a time, and the harness reports where
+        the page ended (`after`). A batch upstream is planned here,
+        `page_size` batches a page. A keyed edge whose patterns changed
+        finishes its old changes up to a cutover, then diffs membership
+        (per-key §11)."""
 
         output = edge["output"]
         keyed = self.manifest["outputs"][output].get("key") is not None
@@ -920,25 +916,21 @@ class Engine(Attempts, Sensors, Views):
         head_batch = int(head.get("batch", -1))
         override = (run.get("keys") or {}).get(output)
         wm = self.m.watermarks.get((task["asset"], param, task["scope"]))
+        first = int(head.get("base", 0))
         # A `full` run or a keys="full" override starts one pass per run, which the
-        # run's later attempts resume (`pass` on the watermark) instead of restarting.
+        # run's later attempts resume (`pass` on the watermark) instead of restarting;
+        # a batch upstream that started over past `next` is delivered again in full.
         again = override == "full" and (wm or {}).get("pass") != run["id"]
         reset = full or wm is None or wm.get("fingerprint") != fingerprint or again
-        # A reset starts a pass, which the run's later attempts resume (`pass` on the
-        # watermark) instead of starting over at every page.
-        base = {"output": output, "up": up_scope, "fingerprint": fingerprint}
-        base["pass"] = run["id"] if reset else (wm or {}).get("pass")
-        if edge.get("each") is not None:
-            # A full delivery of an Each edge ends with a cleanup of the keys it no longer
-            # names — needed only if the asset held keys when the delivery began (§11).
-            held = [o["name"] for o in self.manifest["assets"][task["asset"]]["outputs"]] + [
-                f"@{task['asset']}"
-            ]
-            base["cleanup"] = (
-                any(self.m.index(name, task["scope"]).count for name in held)
-                if reset
-                else bool((wm or {}).get("cleanup"))
-            )
+        reset = reset or (not keyed and int(wm["next"]) < first)
+        carried = {
+            "kind": "keys" if keyed else "batches",
+            "output": output,
+            "up": up_scope,
+            "fingerprint": fingerprint,
+            "pass": run["id"] if reset else wm.get("pass"),
+        }
+        current = None if reset else wm.get("delivery")
 
         # A keys= override is a one-off selection — it never moves the watermark. The
         # edge's patterns still decide which of the keys it takes (per-key §11).
@@ -952,121 +944,117 @@ class Engine(Attempts, Sensors, Views):
             return pin, None, not keys
 
         if not keyed:
-            first = int(head.get("base", 0))
-            reset = reset or int(wm["batch"]) < first
-            lo = first if reset else int(wm["batch"])
-            hi = min(head_batch, lo + limit - 1)
-            # Where this page sits in its delivery, and whether the delivery is a full
-            # one: decided when it starts, kept on the watermark until its last page (§5).
-            if not reset and (wm or {}).get("page") is not None:
-                page, pages, whole = int(wm["page"]), int(wm["pages"]), bool(wm.get("full"))
-            else:
-                page, pages, whole = 0, _pages(head_batch - lo + 1, limit), reset
-            more = hi < head_batch
+            if current is None:
+                lo = first if reset else int(wm["next"])
+                mode = "full" if reset else "delta"
+                current = {"mode": mode, "from": lo, "to": head_batch, "at": lo, "page": 0}
+                current["pages"] = _pages(head_batch - lo + 1, limit)
+            lo = int(current["at"])
+            hi = min(current["to"], lo + limit - 1)
             changes = {
                 "batches": [lo, hi],
-                "full": whole,
-                "more": more,
-                "page": page,
-                "pages": pages,
+                "full": current["mode"] == "full",
+                "more": hi < current["to"],
+                "page": current["page"],
+                "pages": current["pages"],
             }
-            plan = {"kind": "batches", **base, "lo": lo, "hi": hi, "head": head_batch, "full": whole}
-            return {"ref": ref, "changes": changes}, {**plan, "page": page, "pages": pages}, hi < lo
+            carried["next"] = current["from"] if reset else int(wm["next"])
+            plan = {"kind": "batches", "watermark": carried, "delivery": current, "hi": hi}
+            return {"ref": ref, "changes": changes}, plan, hi < lo
 
         index = self.m.index(output, up_scope)
         patterns = edge.get("patterns")
-        base["patterns"] = patterns
+        carried["next"] = None if reset else int(wm["next"])
+        carried["patterns"] = patterns
         rescope = None if reset else wm.get("rescope")
         if not reset and rescope is None and wm.get("patterns") != patterns:
             # The edge's patterns changed: cut over at the upstream's head (per-key §11).
             # Changes up to it finish under the old patterns, then membership is
             # diffed against the index as of the cutover, pinned until the diff ends.
             rescope = {
-                "from": wm.get("patterns"),
-                "to": patterns,
+                "old": wm.get("patterns"),
+                "new": patterns,
                 "cutover": head_batch,
                 "snapshot": index.pinned().to_json(),
                 "pin": claim_pin if claim_pin is not None else self.m.applied,
-                "after": None,
             }
         if rescope is not None:
-            base["patterns"], base["rescope"] = rescope["from"], rescope
-            if not wm.get("full") and int(wm["batch"]) > rescope["cutover"]:
-                if rescope["after"] is not None and wm.get("page") is not None:
-                    page, pages = int(wm["page"]), int(wm["pages"])
-                else:
-                    page, pages = 0, _pages(IndexState.from_json(rescope["snapshot"]).count, limit)
+            carried["patterns"], carried["rescope"] = rescope["old"], rescope
+            if (current is None or current["mode"] == "diff") and carried["next"] > rescope["cutover"]:
+                if current is None:
+                    count = IndexState.from_json(rescope["snapshot"]).count
+                    current = {"mode": "diff", "at": None, "page": 0, "pages": _pages(count, limit)}
                 pin = {
                     "ref": ref,
                     "index": rescope["snapshot"],
                     "changes": {
-                        "rescope": {"from": rescope["from"], "to": rescope["to"]},
-                        "after": rescope["after"],
+                        "rescope": {"from": rescope["old"], "to": rescope["new"]},
+                        "after": current["at"],
                         "limit": limit,
-                        "page": page,
-                        "pages": pages,
+                        "page": current["page"],
+                        "pages": current["pages"],
                     },
                 }
-                plan = {
-                    "kind": "keys",
-                    **base,
-                    "diff": True,
-                    "batch": int(wm["batch"]),
-                    "page": page,
-                    "pages": pages,
-                }
-                return pin, plan, False
+                if carried["patterns"] is None:
+                    carried.pop("patterns")
+                return pin, {"kind": "keys", "watermark": carried, "delivery": current}, False
             head_batch = min(head_batch, rescope["cutover"])  # finish: under the old patterns
+        each = edge.get("each") is not None
+        held = [o["name"] for o in self.manifest["assets"][task["asset"]]["outputs"]] + [f"@{task['asset']}"]
         empty = False
-        if reset:
-            window = {"full": True, "from": head_batch + 1, "after": None}
+        if current is None and reset:
+            # A full delivery of an Each edge ends with a cleanup of the keys it no
+            # longer names — needed only if the asset held keys when it began (§11).
+            current = {"mode": "full", "from": head_batch + 1, "at": None}
+            if each:
+                current["cleanup"] = any(self.m.index(name, task["scope"]).count for name in held)
             empty = index.count == 0 and not index.files
-        elif wm.get("full"):
-            window = {"full": True, "from": wm["batch"], "after": wm.get("after")}
-        elif wm.get("after") is not None:
-            window = {"full": False, "from": wm["batch"], "to": wm["until"], "after": wm["after"]}
-        else:
-            window = {"full": False, "from": wm["batch"], "to": head_batch, "after": None}
-            empty = wm["batch"] > head_batch
-        if not window["full"] and not index.covers(window["from"], window["to"]):
-            # The log no longer holds this window: deliver everything again.
-            window = {"full": True, "from": head_batch + 1, "after": None}
+        elif current is None:
+            current = {"mode": "delta", "from": carried["next"], "to": head_batch, "at": None}
+            empty = carried["next"] > head_batch
+        if current["mode"] == "delta" and not index.covers(current["from"], current["to"]):
+            # The log no longer holds this window: deliver everything again. What it held
+            # — deletions, keys the patterns now leave out — the cleanup after finds (§11).
+            current = {
+                "mode": "full",
+                "from": head_batch + 1,
+                "at": None,
+                **({"cleanup": True} if each else {}),
+            }
             empty = False
             if rescope is not None:  # a full delivery is under the new patterns: no diff left
-                base.pop("rescope")
-                base["patterns"] = patterns
-            if edge.get("each") is not None:
-                # What the lost log held — deletions, keys the patterns now leave out —
-                # is found by the cleanup after the delivery (§11).
-                base["cleanup"] = True
-        if base.get("rescope") is not None:
+                carried.pop("rescope")
+                carried["patterns"] = patterns
+        if carried.get("rescope") is not None:
             empty = False  # the transition has its diff still to do
-        pinned = index.pinned() if window["full"] else index.pinned(window["from"], window["to"])
-        # Where this page sits in its delivery (§5): planned when the delivery starts —
-        # the keys in the whole index or in the window's delta files, by `page_size`,
-        # an estimate when patterns filter or a count is inexact — and kept on the
-        # watermark while the delivery continues.
-        if window["after"] is not None and wm is not None and wm.get("page") is not None:
-            page, pages = int(wm["page"]), int(wm["pages"])
-        else:
-            keys = (
-                pinned.count if window["full"] else sum(f.entries for _, files in pinned.log for f in files)
-            )
-            page, pages = 0, _pages(keys, limit)
-        changes = {**window, "limit": limit, "page": page, "pages": pages}
+        if carried["next"] is None:
+            carried["next"] = current["from"]
+        whole = current["mode"] == "full"
+        pinned = index.pinned() if whole else index.pinned(current["from"], current["to"])
+        if "page" not in current:
+            # Where each page sits in the delivery (§5), planned when it starts: the keys
+            # in the whole index or in the window's delta files, by `page_size` — an
+            # estimate when patterns filter or a count is inexact.
+            keys = pinned.count if whole else sum(f.entries for _, files in pinned.log for f in files)
+            current = {**current, "page": 0, "pages": _pages(keys, limit)}
+            if not whole:  # a window paged over attempts holds its first page's reader pin
+                current["pin"] = claim_pin
+        window = {"full": whole, "from": current["from"], "after": current["at"]}
+        if not whole:
+            window["to"] = current["to"]
+        changes = {**window, "limit": limit, "page": current["page"], "pages": current["pages"]}
         pin = {"ref": ref, "index": pinned.to_json(), "changes": changes}
-        if not window["full"] and not empty and self.keys is not None:
+        if not whole and not empty and self.keys is not None:
             # The first page of the pinned window, from summaries in memory (§7 of
             # docs/resolved-commits.md): the worker then reads no delta file.
-            inline = self.keys.inline(index.prefix, window["from"], window["to"], window["after"], limit)
+            inline = self.keys.inline(index.prefix, current["from"], current["to"], current["at"], limit)
             if inline is not None:
                 pin["changes"]["inline"] = inline
-        if base["patterns"] is not None:
-            pin["patterns"] = base["patterns"]  # the worker filters the page, inlined or read
-        plan = {"kind": "keys", **base, **window, "page": page, "pages": pages}
-        if not window["full"]:  # a window paged over attempts holds its first page's reader pin
-            plan["pin"] = wm.get("pin") if window["after"] is not None and wm else claim_pin
-        return pin, plan, empty
+        if carried["patterns"] is not None:
+            pin["patterns"] = carried["patterns"]  # the worker filters the page, inlined or read
+        else:
+            carried.pop("patterns")
+        return pin, {"kind": "keys", "watermark": carried, "delivery": current}, empty
 
     # -- Each pages (docs/per-key-processing.md §5, §9) ------------------------------
 
@@ -1101,13 +1089,12 @@ class Engine(Attempts, Sensors, Views):
         failures = self.m.index(f"@{task['asset']}", task["scope"])
         changes = not empty
         wm = self.m.watermarks.get((task["asset"], param, task["scope"]))
+        whole = plan is not None and plan["delivery"]["mode"] == "full"
         # After a full delivery, the output's keys it no longer names go first (§11).
-        reconcile = None if (plan or {}).get("full") else (wm or {}).get("reconcile")
+        reconcile = None if whole else (wm or {}).get("reconcile")
         # A full delivery reprocesses every key, a pattern transition and its cleanup
         # decide which keys are the edge's: retries wait for them to end.
-        transition = (
-            (plan or {}).get("full") or (plan or {}).get("rescope") is not None or reconcile is not None
-        )
+        transition = whole or "rescope" in (plan or {}).get("watermark", {}) or reconcile is not None
         retries = not transition and self._has_retries(record)
         if reconcile is not None:
             kind = "reconcile"
@@ -1342,7 +1329,7 @@ class Engine(Attempts, Sensors, Views):
                     watermarks[param] = reconciled
                     continue
             after = None
-            if delivery.kind(plan) == "keys":  # a key page reports where it stopped
+            if plan["kind"] == "keys":  # a key page reports where it stopped
                 if param not in delivered:
                     raise Conflict(f"input {param}: the result reports no delivery", retryable=False)
                 after = delivered[param].get("after")

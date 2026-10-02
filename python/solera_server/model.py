@@ -31,7 +31,7 @@ import math
 
 from solera.keys.index import DeltaFiles, FileInfo, IndexState, index_prefix
 
-from . import history
+from . import delivery, history
 from .lake import LakeState
 
 TERMINAL_TASK = frozenset({"succeeded", "skipped", "failed", "blocked", "canceled"})
@@ -39,13 +39,6 @@ TERMINAL_RUN = frozenset({"succeeded", "failed", "canceled"})
 BAD_OUTCOME = frozenset({"failed", "blocked", "canceled"})
 MAX_RECEIPTS = 10_000  # idempotency receipts kept for replayed submissions
 STUCK_AFTER = 3  # misses before a discard entry is stuck (docs/lifecycle.md §9.8)
-
-
-def delta_reads(plans: dict) -> list[tuple]:
-    """The delta logs an attempt's Incremental plans read: `(output, scope,
-    first batch)` — kept until its claim goes (§6)."""
-
-    return [(p["output"], p["up"], p["from"]) for p in plans.values() if p and "from" in p]
 
 
 def _nest(flat: dict, depth: int) -> dict:
@@ -324,11 +317,8 @@ class Model:
             (c["pin"], c.get("domains")) for c in self.claims.values() if c["attempt"] != but and "pin" in c
         ]
         for wm in self.watermarks.values():
-            upstream = (self.index(wm["output"], wm.get("up") or "").prefix,) if wm.get("output") else None
-            if wm.get("pin") is not None:
-                out.append((wm["pin"], upstream))
-            if wm.get("rescope"):
-                out.append((wm["rescope"]["pin"], upstream))
+            upstream = (self.index(wm["output"], wm["up"]).prefix,)
+            out += [(pin, upstream) for pin in delivery.pins(wm)]
         for tick in self.ticks.values():
             out.append(
                 (tick["pin"], tuple(self.index(source, "").prefix for source in tick.get("snapshot") or ()))
@@ -381,7 +371,7 @@ class Model:
             "pin": launched["pin"],
             "status": status,
             "launched": True,
-            "reads": delta_reads(launched["prepared"].get("plans") or {}),
+            "reads": delivery.reads(launched["prepared"].get("plans") or {}),
             "domains": tuple(launched["prepared"].get("domains") or ()),
         }
         self.attempts[attempt] = task["id"]

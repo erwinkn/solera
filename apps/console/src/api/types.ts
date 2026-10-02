@@ -218,7 +218,7 @@ export interface AssetDetail {
   asset: AssetDecl;
   heads: Record<string, [string, Head][]>;
   cursor: Json;
-  watermarks: Record<string, Json>;
+  watermarks: Record<string, Watermark | null>;
   current_keys: string[][];
   unsettled: Record<string, string[]>;
   scopes: Record<string, ScopeOutcome>;
@@ -331,10 +331,36 @@ export interface Explain {
 
 export type EdgeState = "never" | "caught_up" | "behind" | "paging" | "full" | "rescope" | "reconcile";
 
+/** An edge's delivery progress (python/solera_server/delivery.py): `next`,
+ * the first upstream batch not yet delivered; `delivery`, one under way —
+ * its mode, boundary (`from`..`to`) and position (`at`: the last key
+ * delivered, or the next batch). */
+export interface Watermark {
+  kind: "keys" | "batches";
+  output: string;
+  up: string;
+  fingerprint: string;
+  pass?: string | null;
+  next: number;
+  delivery?: {
+    mode: "full" | "delta" | "diff";
+    from?: number;
+    to?: number;
+    at: string | number | null;
+    page: number;
+    pages: number;
+    pin?: number | null;
+    cleanup?: boolean;
+  };
+  patterns?: Json;
+  rescope?: { old: Json; new: Json; cutover: number; pin: number };
+  reconcile?: { after: string | null };
+}
+
 export interface EdgeScope {
   scope: string;
   up_scope: string;
-  watermark: Record<string, Json> | null;
+  watermark: Watermark | null;
   head_batch: number | null;
   lag: number | null;
   state: EdgeState;

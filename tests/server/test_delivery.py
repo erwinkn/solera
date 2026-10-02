@@ -1,37 +1,54 @@
 """Delivery progress (review round 3, system S1): one transition, `advance`,
-for every kind of plan — a delivery keeps its mode and page plan until its
-last page."""
+over an explicit watermark — a delivery keeps its mode, boundary and page
+plan until its last page, then `next` moves past it."""
 
-from solera_server.delivery import advance, continues
+from solera_server.delivery import advance, continues, needs, pins
 
-BASE = {"output": "log", "up": "", "fingerprint": "f", "pass": "r1"}
+CARRIED = {"output": "log", "up": "", "fingerprint": "f", "pass": "r1"}
 
 
-def test_a_batch_delivery_keeps_its_mode_to_its_last_page():
-    first = {"kind": "batches", **BASE, "lo": 0, "hi": 0, "head": 2, "full": True, "page": 0, "pages": 3}
+def test_a_batch_delivery_keeps_its_mode_to_its_boundary():
+    full = {"mode": "full", "from": 0, "to": 2, "at": 0, "page": 0, "pages": 3}
+    first = {
+        "kind": "batches",
+        "watermark": {"kind": "batches", **CARRIED, "next": 0},
+        "delivery": full,
+        "hi": 0,
+    }
     wm = advance(first)
-    assert wm == {**BASE, "batch": 1, "after": None, "full": True, "page": 1, "pages": 3}
+    assert wm["next"] == 0 and wm["delivery"] == {**full, "at": 1, "page": 1}
     assert continues(first, None, wm)
-    last = {**first, "lo": 2, "hi": 2, "page": 2}
-    assert advance(last) == {**BASE, "batch": 3, "after": None, "full": False}  # done: a delta next
-    assert not continues(last, None, advance(last))
+    last = {**first, "delivery": {**full, "at": 2, "page": 2}, "hi": 2}
+    done = advance(last)
+    assert done == {"kind": "batches", **CARRIED, "next": 3} and not continues(last, None, done)
 
 
-def test_a_key_delivery_pages_by_key():
-    full = {"kind": "keys", **BASE, "full": True, "from": 5, "after": None, "page": 0, "pages": 2}
-    wm = advance(full, "k9")
-    assert wm == {**BASE, "batch": 5, "after": "k9", "full": True, "page": 1, "pages": 2}
-    assert continues(full, "k9", wm)
-    assert advance({**full, "page": 1}, None) == {**BASE, "batch": 5, "after": None, "full": False}
-    delta = {"kind": "keys", **BASE, "full": False, "from": 5, "to": 7, "after": None, "pin": 40}
-    assert advance(delta, "k1") == {**BASE, "batch": 5, "until": 7, "after": "k1", "full": False, "pin": 40}
-    assert advance(delta, None) == {**BASE, "batch": 8, "after": None, "full": False}
+def test_a_key_delivery_pages_by_key_then_moves_next():
+    wm0 = {"kind": "keys", **CARRIED, "next": 5}
+    full = {"mode": "full", "from": 8, "at": None, "page": 0, "pages": 2, "cleanup": True}
+    plan = {"kind": "keys", "watermark": wm0, "delivery": full}
+    wm = advance(plan, "k9")
+    assert wm == {**wm0, "delivery": {**full, "at": "k9", "page": 1}} and continues(plan, "k9", wm)
+    assert needs(wm) == 8  # a full delivery resumes as deltas from its `from`
+    done = advance({**plan, "delivery": wm["delivery"]}, None)
+    assert done == {**wm0, "next": 8, "reconcile": {"after": None}}  # an Each cleanup owed
+
+    delta = {"mode": "delta", "from": 5, "to": 7, "at": None, "page": 0, "pages": 2, "pin": 40}
+    paged = advance({"kind": "keys", "watermark": wm0, "delivery": delta}, "k1")
+    assert paged["delivery"]["at"] == "k1" and pins(paged) == [40] and needs(paged) == 5
+    assert advance({"kind": "keys", "watermark": wm0, "delivery": delta}, None) == {**wm0, "next": 8}
 
 
-def test_a_held_page_moves_no_watermark_and_old_plans_still_settle():
-    kept = {**BASE, "batch": 3, "after": None, "full": False}
+def test_a_pattern_transition_ends_on_the_new_patterns():
+    rescope = {"old": ["a/**"], "new": ["b/**"], "cutover": 4, "snapshot": {}, "pin": 12}
+    wm0 = {"kind": "keys", **CARRIED, "next": 5, "patterns": ["a/**"], "rescope": rescope}
+    diff = {"mode": "diff", "at": None, "page": 0, "pages": 1}
+    assert pins(wm0) == [12]
+    done = advance({"kind": "keys", "watermark": wm0, "delivery": diff}, None)
+    assert done == {"kind": "keys", **CARRIED, "next": 5, "patterns": ["b/**"]} and pins(done) == []
+
+
+def test_a_held_page_moves_no_watermark():
+    kept = {"kind": "keys", **CARRIED, "next": 3}
     assert advance({"kind": "held", "watermark": kept}) == kept
     assert advance({"kind": "held", "watermark": None}) is None
-    # Prepared before kinds were named, settled after an upgrade.
-    assert advance({"update": kept, "more": False}) == kept
-    assert advance({**BASE, "full": False, "from": 5, "to": 7, "after": None}, None)["batch"] == 8

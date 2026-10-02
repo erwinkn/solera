@@ -26,7 +26,7 @@ from solera.keys import LocalError
 from solera.keys.index import IndexState, KeyIndex, Options
 from solera.keys.io import ObjectIO
 
-from . import history
+from . import delivery, history
 
 log = logging.getLogger(__name__)
 
@@ -115,9 +115,8 @@ class Upkeep:
 
         needed: dict[tuple, int] = {}
         for wm in self.m.watermarks.values():
-            if "up" in wm:
-                key = (wm["output"], wm["up"])
-                needed[key] = min(needed.get(key, math.inf), int(wm["batch"]))
+            key = (wm["output"], wm["up"])
+            needed[key] = min(needed.get(key, math.inf), delivery.needs(wm))
         for claim in self.m.claims.values():
             for output, up, first in claim.get("reads") or ():
                 needed[(output, up)] = min(needed.get((output, up), math.inf), int(first))

@@ -349,7 +349,7 @@ async def test_a_user_cancel_commits_finished_keys_and_leaves_the_rest_dormant(t
     assert set(await rows_of(engine, project, "rows")) == {"a"}
     found = await records(engine, "parse")
     assert {k: r.outcome for k, r in found.items()} == {"b": CANCELED, "c": CANCELED}
-    assert engine.m.watermarks[("parse", "file", "")]["after"] is None  # past the whole page
+    assert "delivery" not in engine.m.watermarks[("parse", "file", "")]  # past the whole page
     # Dormant: a later run finds nothing to do.
     release.set()
     detail = await engine.run_until((await engine.submit(["parse"]))["id"], 10)
@@ -571,10 +571,12 @@ async def test_a_rescope_pins_its_snapshot_between_attempts(state):  # noqa: F81
     await state.put_object(path, b"x")
     engine.m.garbage.append([path, engine.m.applied + 5])  # let go of after the pin below
     engine.m.watermarks[("parse", "file", "")] = {
+        "kind": "keys",
         "output": "files",
         "up": "",
-        "batch": 3,
-        "rescope": {"pin": engine.m.applied, "cutover": 2, "after": "k"},
+        "next": 3,
+        "rescope": {"pin": engine.m.applied, "cutover": 2},
+        "delivery": {"mode": "diff", "at": "k", "page": 1, "pages": 2},
     }
     await engine.upkeep.collect()
     assert await state.get_object(path) is not None

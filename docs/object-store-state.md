@@ -214,7 +214,7 @@ State
 | `Head` | `ref` (from the store), `run`, `attempt` (may point at a deleted run), `batch` (incremental outputs: the last batch that changed it, −1 before any), `base` (unkeyed incremental outputs: the first batch after the last reset), `count` (keyed: live keys), `elements?` (partition sets and set dimensions), `complete`, `version` (declared asset version), `asset`, `at` | outputs × partitions |
 | `Failures` | `batch` (the failure index's last batch), `counts` {outcome: keys}, `due` and `epoch_min` (lower bounds), `retry?` {`pass`, `epoch`, `forced_pos`, `after`, `due_acc`, `epoch_acc`}, `passes`, `done_forced`, `last` (`changes` or `retry`), `forced` {class: position} — its index is `indexes["@asset"][scope]` (per-key-processing.md §9) | Each assets × partitions |
 | `KeyIndex` | `prefix` (where its files live — kept across renames), `count`, `inexact` (commits since the last recount whose count came from filters; the count is exact at 0), `files` [{`name`, `level`, `min`, `max`, `entries`, `size`, `tail`, `index`}], `log` [[`batch`, [file]], …] — see §6 | a few dozen files per index |
-| `Watermark` | `batch` (first batch not fully delivered; during a full drain, the head's batch + 1 when the drain began, so changes made while draining arrive afterwards as deltas), `until` (the last batch of a delta window being delivered in pages), `after` (last key delivered inside the window or the full drain), `full` (a full drain is in progress), `fingerprint`, `output` and `up` (the upstream index it reads) | edges × partitions |
+| `Watermark` | `kind` (`keys` or `batches`), `next` (the first upstream batch not yet delivered), `delivery` (one under way: its `mode` — `full`, `delta`, or a pattern transition's `diff` — its boundary `from`..`to`, its position `at` — the last key delivered, or the next batch — its `page` of `pages`, a delta window's reader `pin`; a full keyed delivery's `from` is the head's batch + 1 when it began, so changes made meanwhile arrive afterwards as deltas), `fingerprint`, `output` and `up` (the upstream index it reads), and per-key `patterns`, `rescope`, `reconcile` (`python/solera_server/delivery.py`) | edges × partitions |
 | `Outcome` | `outcome`, `run`, `attempt`, `at` | assets × partitions |
 | `AutomationState` | `enabled`, `last_fired`, `last_run`, `last_revision`, `pending` (set of `[asset, scope]` for OnChange) | automations × partitions |
 | `Run` | `id`, `request` {targets, partitions, mode, config, keys, automation, tags}, `status`, `paused`, `created_at`, `events` (how many it has recorded), `tasks` {task: `Task`} | in-flight work |
@@ -247,7 +247,7 @@ Example (abridged):
               {"name": "000000000057-01J8ZC7R…", "level": 0, "min": "alpha-file-1", "max": "alpha-file-3", "entries": 2, "size": 140, "…": "…"}],
     "log": [[56, [{"name": "000000000056-01J8ZB…", "…": "…"}]], [57, [{"name": "000000000057-01J8ZC7R…", "…": "…"}]]]}}},
   "cursors": {"site_feed": {"alpha": "5921"}},
-  "watermarks": {"file_index": {"site_files": {"alpha": {"batch": 56, "after": null, "full": false, "fingerprint": "8d46…",
+  "watermarks": {"file_index": {"site_files": {"alpha": {"kind": "keys", "next": 56, "fingerprint": "8d46…",
                                                          "output": "site_files", "up": "alpha"}}}},
   "outcomes": {"file_index": {"alpha": {"outcome": "succeeded", "run": "01J8ZB3K…", "attempt": "01J8ZB3M…", "at": 1790074800.0}}},
   "automations": {"site_feed.every.0": {"enabled": true, "last_fired": 1790074866.1,

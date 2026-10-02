@@ -433,14 +433,17 @@ version)` files (object-store-state.md §6): the harness compares each write
 with it, skips the store entirely when nothing changed, and otherwise writes
 the changed entries as the batch's delta file. An unkeyed output's batches
 are its store's; `head.base` is the first batch after its last reset. The
-engine keeps a per-edge **watermark** `{batch, until?, after, full,
-fingerprint, output, up}` — the consumer's position. For a keyed upstream
-the spec pins the index and a window — the delta log from `batch` to the
-head, or the whole index for a full delivery — and the harness reads one
-page of it (`page_size` keys), loads those keys with `Keys(…)`, and reports
-where the page ended (`after`); for an unkeyed one the engine plans a
-`Batches(lo, hi)` range. Each page commits with its watermark update;
-`more` re-queues the task. Whether the delivery drained is the scope's
+engine keeps a per-edge **watermark** — the consumer's position: `next`,
+the first upstream batch not yet delivered, and while a delivery is under
+way, `delivery` `{mode, from, to, at, page, pages}`: `full` or `delta`, its
+boundary, and its position (the last key delivered, or the next batch),
+all decided when it starts and kept until its last page. For a keyed
+upstream the spec pins the index and a window — the delta log from `next`
+to the head, or the whole index for a full delivery — and the harness reads
+one page of it (`page_size` keys), loads those keys with `Keys(…)`, and
+reports where the page ended (`after`); for an unkeyed one the engine plans
+a `Batches(lo, hi)` range. Each page's commit advances the watermark by
+what it delivered (`delivery.advance`); `more` re-queues the task. Whether the delivery drained is the scope's
 (`drained := not more` on its progress), not its outputs': a last page may
 write none of them, and the scope is complete all the same. A scope is
 **complete** when each of its outputs has a head and its delivery drained —

@@ -1128,9 +1128,10 @@ Where the implementation (`solera/errors.py`, `solera/build.py`,
   empty; a delivery they take nothing from does not call the producer
   and ends `skipped`.
 - **The rescope cutover** lives on the watermark: `patterns` (what it
-  delivers under) and, during a transition, `rescope` {`from`, `to`,
-  `cutover`, `snapshot` (the upstream index as of the cutover), `pin`,
-  `after`}. The diff pages through the whole snapshot (`page_size` keys
+  delivers under) and, during a transition, `rescope` {`old`, `new`,
+  `cutover`, `snapshot` (the upstream index as of the cutover), `pin`};
+  the diff is a delivery of mode `diff`, its position the watermark's
+  `delivery.at`. The diff pages through the whole snapshot (`page_size` keys
   read per page), not only the key ranges the patterns' prefixes cover.
   A newer pattern change waits for the transition to end, then cuts over
   again. Retries wait for a transition, as for a full delivery. A window

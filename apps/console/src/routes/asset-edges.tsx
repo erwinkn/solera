@@ -142,12 +142,15 @@ function EdgeCard({ edge, scope }: { edge: Edge; scope?: string }) {
 }
 
 function ScopeRow({ s }: { s: EdgeScope }) {
-  const wm = s.watermark ?? {};
-  const delivered = typeof wm.batch === "number" ? wm.batch - 1 : null;
+  const wm = s.watermark;
+  const delivered = wm ? wm.next - 1 : null;
   const lag = s.lag ?? 0;
   const head = s.head_batch ?? 0;
   const done = head + 1 - lag;
-  const position = typeof wm.after === "string" ? `after ${wm.after}` : wm.retry ? "retry pass" : null;
+  const d = wm?.delivery;
+  const at =
+    typeof d?.at === "string" ? `after ${d.at}` : typeof d?.at === "number" ? `batch ${count(d.at)}` : null;
+  const position = d ? [at, `page ${d.page + 1} of ${d.pages}`].filter(Boolean).join(" · ") : null;
   return (
     <Tr>
       <Td className="font-mono text-xs">

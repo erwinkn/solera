@@ -244,20 +244,19 @@ class Views:
         """One scope of an Incremental edge: its watermark and how far it is
         behind the upstream head.
 
-        `watermark.batch` is the first upstream batch the edge has not yet
-        delivered: the next window runs from it to the head's `batch` (a
-        window paged over several attempts keeps it, with `until` its end and
-        `after` the last key delivered). So `lag` = head batch + 1 −
-        watermark batch: the upstream batches committed and not yet
+        `watermark.next` is the first upstream batch the edge has not yet
+        delivered (`delivery`, a delivery under way, keeps its boundary and
+        position until its last page — see `delivery`). So `lag` = head
+        batch + 1 − `next`: the upstream batches committed and not yet
         delivered in full — counted from the head's `base` for an unkeyed
         upstream, which starts over there; every batch without a watermark.
         A change of fingerprint (the asset's version, its run config, a
         pinned input) resets the edge at its next run: not shown here.
 
         `state`: `never` (no watermark), `rescope` (a pattern transition,
-        per-key §11), `full` (a full delivery in progress), `reconcile` (the
-        cleanup after a full Each delivery), `paging` (a window delivered
-        over several attempts), `behind` (lag), else `caught_up`."""
+        per-key §11), `full` (a full delivery under way), `reconcile` (the
+        cleanup after a full Each delivery), `paging` (a delta delivered over
+        several attempts), `behind` (lag), else `caught_up`."""
 
         wm = self.m.watermarks.get((asset, param, scope))
         up_scope = (wm or {}).get("up")
@@ -271,16 +270,17 @@ class Views:
         lag = 0
         if head_batch is not None:
             first = int(head.get("base", 0))
-            lag = max(0, head_batch + 1 - max(int(wm["batch"]) if wm else first, first))
+            lag = max(0, head_batch + 1 - max(int(wm["next"]) if wm else first, first))
+        mode = ((wm or {}).get("delivery") or {}).get("mode")
         if wm is None:
             state = "never"
         elif wm.get("rescope"):
             state = "rescope"
-        elif wm.get("full"):
+        elif mode == "full":
             state = "full"
         elif wm.get("reconcile") is not None:
             state = "reconcile"
-        elif wm.get("after") is not None:
+        elif mode is not None:
             state = "paging"
         else:
             state = "behind" if lag else "caught_up"

@@ -290,9 +290,8 @@ async def test_full_run_resets_watermark(state):
     await drive(engine, await engine.submit(["consumer"], upstream=True))
     first = state.model.watermarks[("consumer", "files", "")]
     assert first == {
-        "batch": 1,
-        "after": None,
-        "full": False,
+        "kind": "keys",
+        "next": 1,  # the head's next batch: nothing under way
         "fingerprint": first["fingerprint"],
         "output": "files",
         "up": "",
