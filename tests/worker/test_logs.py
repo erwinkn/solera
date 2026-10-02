@@ -92,3 +92,26 @@ async def test_a_log_that_cannot_be_written_does_not_stop_the_result(tmp_path, m
     shipper.append(entry(os.urandom(64 << 10).hex()))
     index = await shipper.finish()
     assert index["chunks"] == [] and index["lost"] == 2
+
+
+async def test_a_line_logged_while_a_chunk_compresses_is_kept(tmp_path, monkeypatch):
+    """Review round 3, #4: a synchronous Each call logs from its thread
+    while chunk 0 is being compressed (gzip releases the GIL). The line
+    goes into the next chunk or the tail, never nowhere."""
+
+    objects = LocalStore(tmp_path)
+    shipper = LogShipper(objects, "a")
+    compress, during = reporting.gzip.compress, []
+
+    def compressing(data, *args, **kw):
+        if not during:
+            during.append(True)
+            shipper.append(entry("during"))  # as a thread would, mid-compression
+        return compress(data, *args, **kw)
+
+    monkeypatch.setattr(reporting.gzip, "compress", compressing)
+    shipper.append(entry("before"))
+    assert await shipper.chunk()
+    assert await chunk_lines(objects, 0) == ["before"] and shipper.chunks[0][1] == 1
+    index = await shipper.finish()
+    assert tail_lines(index) == ["during"] and index["lines"] == 2 and "lost" not in index

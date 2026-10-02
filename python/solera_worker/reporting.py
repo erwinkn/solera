@@ -130,26 +130,43 @@ class LogShipper:
         self.size = self.lines = 0
         self.truncated = False
         self._chunked_at = time.monotonic()
-        self._lock = asyncio.Lock()
+        self._lock = asyncio.Lock()  # one chunk written at a time
+        # The buffers' one owner: lines come from the loop and from threads (a
+        # synchronous Each call), while a chunk is compressed and written.
+        self._guard = threading.Lock()
 
     def append(self, entry):
         if self.truncated:
             return
         line = json.dumps(entry, allow_nan=False) + "\n"
-        self.pending.append((entry["at"], line))
-        self.pending_bytes += len(line)
-        self.lines += 1
-        if self.channel is not None:
-            self.live.append(line)
-            if len(self.live) > LOG_LIVE_MAX:  # the channel is not keeping up: a gap, filled by the chunks
-                drop = len(self.live) - LOG_LIVE_MAX
-                del self.live[:drop]
-                self.live_offset += drop
-        if self.pending_bytes >= LOG_CHUNK_BYTES:
+        with self._guard:
+            self.pending.append((entry["at"], line))
+            self.pending_bytes += len(line)
+            self.lines += 1
+            if self.channel is not None:
+                self.live.append(line)
+                if len(self.live) > LOG_LIVE_MAX:  # the channel is not keeping up: a gap, filled by the chunks
+                    drop = len(self.live) - LOG_LIVE_MAX
+                    del self.live[:drop]
+                    self.live_offset += drop
+            full = self.pending_bytes >= LOG_CHUNK_BYTES
+        if full:
             try:
                 asyncio.get_running_loop().create_task(self.chunk())
             except RuntimeError:
                 pass  # logging from a thread: the next periodic flush ships it
+
+    def _taken(self) -> list[tuple[float, str]]:
+        """The pending lines as they are now: compressed outside the lock,
+        then `_took` removes exactly these, whatever came after."""
+
+        with self._guard:
+            return list(self.pending)
+
+    def _took(self, lines: list) -> None:
+        with self._guard:
+            del self.pending[: len(lines)]
+            self.pending_bytes -= sum(len(line) for _, line in lines)
 
     def _member(self, lines: list[tuple[float, str]]) -> tuple[bytes, list[tuple[float, str]]]:
         member = gzip.compress("".join(line for _, line in lines).encode(), compresslevel=6, mtime=0)
@@ -172,10 +189,11 @@ class LogShipper:
 
         async with self._lock:
             if self.sealed is None:
-                if not self.pending:
+                taken = self._taken()
+                if not taken:
                     return True
-                member, lines = self._member(self.pending)
-                self.pending, self.pending_bytes = [], 0
+                member, lines = self._member(taken)
+                self._took(taken)
                 self.sealed = (len(self.chunks), member, lines)
             n, member, lines = self.sealed
             try:
@@ -191,14 +209,17 @@ class LogShipper:
     async def send_live(self):
         if self.channel is None or not self.live:
             return
-        lines, offset = list(self.live), self.live_offset
+        with self._guard:
+            lines, offset = list(self.live), self.live_offset
         with contextlib.suppress(Exception):
             answer = await self.channel.logs(
                 {"invocation": self.invocation, "offset": offset, "lines": lines}
             )
-            sent = max(0, int(answer.get("offset", offset + len(lines))) - offset)
-            del self.live[:sent]
-            self.live_offset += sent
+            acknowledged = offset + max(0, int(answer.get("offset", offset + len(lines))) - offset)
+            with self._guard:  # lines dropped meanwhile moved the offset already
+                gone = max(0, acknowledged - self.live_offset)
+                del self.live[:gone]
+                self.live_offset += gone
 
     async def periodically(self):
         while True:
@@ -217,11 +238,12 @@ class LogShipper:
             await self.chunk()
         tail = None
         async with self._lock:
-            if self.pending and not self.truncated:
-                member, lines = self._member(self.pending)
+            taken = self._taken()
+            if taken and not self.truncated:
+                member, lines = self._member(taken)
                 if len(member) <= LOG_TAIL_BYTES:
                     tail = base64.b64encode(member).decode()
-                    self.pending = []
+                    self._took(taken)
         if self.pending:
             await self.chunk()
         index = {
