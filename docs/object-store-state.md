@@ -48,7 +48,7 @@ Everything lives under `{root}/{namespace}/`.
 | Gate | `runs/{run}/{attempt}.writing` | the worker about to write, or the engine ending the attempt — whichever is first | create-only | `gate_days` (30) after its run (§8) |
 | Engine heartbeat | `engine/alive.json` | engine, every 30 s while runs are live | overwritten | never (one object) |
 | Attempt log | chunks `runs/{run}/{attempt}.log.{n:06d}`, every 30 s or 1 MB; the end inside the result | worker | create-only, never joined | with its run |
-| Output data | store-defined (FileStore: `{output}/{partition}/{key}.json` under `.solera/data`, §9) | the store, inside the harness | overwritten in place | when the output no longer holds it (§9); never expired |
+| Output data | store-defined (FileStore: `{output}/{partition}/{key}/{version}.{generation}.json` under `.solera/data`, §9) | the store, inside the harness | FileStore / S3Store: created once, never overwritten; others: store-defined | FileStore / S3Store: superseded or abandoned objects, by the scope's next attempt once no reader pin predates them (§9); never expired |
 
 **Growth.** `control/` is bounded: at most two checkpoints plus the
 journal since the older one — and one fence segment per writer that ever
@@ -742,9 +742,11 @@ class Store(Protocol):
     def can_load(self, t, selection) -> bool
     async def store(self, write, prior, scope) -> Written   # Written(ref, keys?)
     async def load(self, ref, t, selection) -> Any          # selection: None | Keys | Batches
+    writes: str = "overwrite"                               # or "immutable", "fenced" (lifecycle.md §9.6)
 ```
 
-- `Scope` carries the engine-assigned `batch`, the `attempt` id and the
+- `Scope` carries the engine-assigned `batch`, the `attempt` id, its
+  `generation` and `invocation` (`lifecycle.md` §9.7–9.8) and the
   output's `aliases`. For a keyed output it also says which keys the write
   changes against the key index: `upserts` to write, `removes` to delete.
   Both are `None` when there is no prior (a first write or a `full` run):
@@ -752,32 +754,40 @@ class Store(Protocol):
   A patch that changes 3 keys of 100,000 reaches the store as 3 upserts.
 - `Written.keys` is only for writes the harness never sees as rows
   (§6); for everything else the harness computes keys itself.
-- **Reads are not pinned.** A ref names where content lives, and a load
-  reads what is there now. A consumer pinned to version 12 that loads after
-  version 13 committed gets version 13's content. Keeping one copy is what
-  lets data need no expiry; the write fence (§8) is what keeps a dead
-  attempt from writing over a live one.
+- **Reads are pinned by immutable stores only.** FileStore and S3Store
+  never overwrite, so a load reads the version its consumer pinned; a
+  superseded object lingers until no reader pin predates it. A store that
+  overwrites (PostgresStore, user stores) holds one copy: a consumer pinned
+  to version 12 that loads after version 13 committed gets version 13's
+  content.
 - **Nothing expires.** A store holds the current content of each output,
-  nothing older; the engine never deletes data.
+  plus, for an immutable store, what pinned readers still need.
 
 **FileStore**, the default, writes what an asset returns as files under
 `.solera/data` next to the project file (or `FileStore(path)`, or
 `$SOLERA_DATA`) — one object per value, partition, key or batch:
 
 ```
-rollup.json                       a value
-site_status/alpha.json            a value, partition alpha
-uploads/u-7.json                  a keyed output: one object per key
-site_files/alpha/f-1.json         keyed and partitioned
-site_events/alpha/000000000042.json
+rollup@184467.json                a value, by generation 184467
+site_status/alpha@184467.json     a value, partition alpha
+uploads/u-7/9c41e0d2….184467.json a keyed output: one object per key and version
+site_files/alpha/f-1/9c41….json   keyed and partitioned
+site_events/alpha/000000000042.184467.json
                                   an unkeyed incremental output: one object per batch
 ```
 
-Content is JSON when it round-trips exactly, pickle (`.pkl`) otherwise.
-Keyed outputs are declared `Output(keyed=True)` and return
-`dict[str, Any]`, or rows with `key="id"`. A removed key's object is
-deleted. Batches of an unkeyed incremental output accumulate until a
-`full` run starts the output over. **S3Store(url)** is the same layout in a
+Every name carries the **generation** of the attempt that wrote it (its
+claim's event position), so no two attempts write one name and objects
+are created once, never overwritten (`lifecycle.md` §9.8). A keyed load
+names its objects from the index's `(version, locator)`; a whole keyed
+read is paged from the pinned index. Content is JSON when it round-trips
+exactly, pickle (`.pkl`) otherwise. Keyed outputs are declared
+`Output(keyed=True)` and return `dict[str, Any]`, or rows with
+`key="id"`. A superseded or removed key's object, a value's previous
+object and an abandoned attempt's objects are deleted by the scope's next
+attempt (`store.discard`) once no reader pin predates them. Batches of an
+unkeyed incremental output accumulate until a `full` run starts the
+output over; a batch's committed object is its highest generation. **S3Store(url)** is the same layout in a
 bucket; `Project(default_store=S3Store("s3://…"))` makes it the default.
 
 **PostgresStore** keeps one table per output, shared by its partitions,
@@ -917,9 +927,9 @@ POST   /api/projects/{p}/runs:prune   {"before", "asset", "keep", "dry_run"}
 | skipped runs kept only in memory | recorded with status `skipped`, hidden by default |
 | pinned runs | nothing but active runs is protected; current state is independent of runs |
 | HTTP-only attempt I/O for pool workers | one uniform attempt-file channel |
-| JsonStore, BlobStore, per-attempt data objects | FileStore / S3Store: one object per value, partition, key or batch, overwritten in place |
+| JsonStore, BlobStore, per-attempt data objects | FileStore / S3Store: one object per value, partition, key version or batch, named by generation, created once |
 | `store.expire`, data retention | stores hold current content only; retention covers runs |
-| per-partition version markers in stores, `StoreConflict`, `StaleRead` | the write fence (§8); reads are not pinned (§9) |
+| per-partition version markers in stores, `StoreConflict`, `StaleRead` | the write fence (§8); store kinds (`lifecycle.md` §9.6) |
 | attempt leases and their sweeps; a restart re-queues running tasks | durable launches: the next engine adopts them (§8) |
 
 ## 13. Open questions

@@ -448,11 +448,35 @@ class FileStore:
     def key_name(cls, base: str, key: str, version: bytes, locator: int) -> str:
         return f"{base}/{_segment(key)}/{cls.version_name(version)}.{int(locator)}"
 
-    async def discard(self, names: list[str]) -> None:
+    async def discard(self, scope: Scope, prior: Ref | None, items: list) -> None:
         """Delete objects nothing reads any more (docs/lifecycle.md §9.8):
         superseded versions, and what attempts that never committed wrote.
-        Names are never reused, so a name deleted twice is no harm."""
+        `items` name them: `("key", key, version_hex, locator)`,
+        `("path", path)`, `("value", generation)`, `("batch", n, generation)`,
+        or `("batches", lo, hi)` — every object of batches lo..hi. Names are
+        never reused, so deleting one twice is no harm."""
 
+        base = self._base(scope.output, scope, prior)
+        names, ranges = [], []
+        for item in items:
+            kind = item[0]
+            if kind == "key":
+                names.append(self.key_name(base, item[1], bytes.fromhex(item[2]), item[3]))
+            elif kind == "path":
+                names.append(item[1])
+            elif kind == "value":
+                names.append(f"{base}@{int(item[1])}")
+            elif kind == "batch":
+                names.append(f"{base}/{int(item[1]):012d}.{int(item[2])}")
+            elif kind == "batches":
+                ranges.append((int(item[1]), int(item[2])))
+            else:
+                raise StoreError(f"{scope.output.name}: cannot discard {item!r}")
+        if ranges:
+            for name in await self._keys(base):
+                batch = name.partition(".")[0]
+                if batch.isdigit() and any(lo <= int(batch) <= hi for lo, hi in ranges):
+                    names.append(f"{base}/{name}")
         await self._many(lambda n: self._delete(n), names)
 
     # -- reads ------------------------------------------------------------------

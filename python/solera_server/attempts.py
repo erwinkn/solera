@@ -639,8 +639,8 @@ class Attempts:
         attempt, so nothing else can hold them (§6)."""
 
         for name, info in (prepared.get("outputs") or {}).items():
-            if info.get("prefix") is None or name in keep:
-                continue
+            if info.get("prefix") is None or name in keep or self.m.immutable(name):
+                continue  # an immutable output's are collected with what they name (§9.8)
             prefix = f"{info['prefix']}{int(info['batch']):012d}-{attempt}"
             with contextlib.suppress(Exception):
                 await self.state.delete_objects(await self.state.list_objects(prefix))

@@ -4,10 +4,11 @@ Status: **target design, partly built.** Built (milestone 1): the records
 of §2 (`solera/lifecycle.py`), the attempt objects and claims of §2–§4, the
 channel of §5 (`solera_server/attempts.py`, `solera_worker/channel.py`),
 heartbeats as evidence (§6), the two-phase cancel (§7), the clocks of §8,
-retained gates (§2.4) and Pool (§10). Not yet: store kinds and their
-release rules (§9.5–§9.9: every store is released at once for now), the
-FileStore names of §9.8, sensors (§11). Where the build departs from the
-text, it says so in place.
+retained gates (§2.4) and Pool (§10). Built (milestone 2): store kinds
+and their release rules (§9.5–§9.9), PostgresStore generation fencing
+(§9.7), and FileStore / S3Store unique names with their collection
+(§9.8) — but for the sweep. Not yet: sensors (§11). Where the build
+departs from the text, it says so in place.
 It replaces the attempt files, heartbeat, pool protocol and write-safety
 rules of `object-store-state.md` §8 and `architecture.md` §10. It settles
 D2–D4, and D1 as Erwin decided it after the review: heartbeats are evidence
@@ -678,7 +679,8 @@ site_events/alpha/000000000042.184467.json       batch 42 of an append output, b
 
 Writes are create-only. Two writers of one name are the same attempt (a
 delayed duplicate of itself), so they write the same bytes. A declared
-`revision` longer than 64 bytes is named by its XXH3-128 instead.
+`revision` longer than 32 bytes is named by the first 16 bytes of its
+SHA-256 instead.
 
 **Why the generation, not the batch.** A retry reuses its predecessor's
 batch number: W1 (batch 57) dies having written `f-1/v.57`, and its retry
@@ -772,6 +774,21 @@ shows.
   attempt about to commit has uploaded names the index does not hold yet;
   a pinned reader needs superseded ones).
 
+**As built.** The engine holds no store credentials and runs no user
+code, so the scope's **next attempt** discards: the engine puts the due
+entries (at most 64) in the spec's output info, and the worker, after its
+own store call succeeds, discards them and reports which in its result;
+`AttemptFinished` then removes them. Due means no live claim of another
+attempt and no paged-window watermark pin predates the entry. Until a
+scope runs again its garbage waits, which costs only storage. An
+abandoned attempt's keyed names come from listing its own delta files
+(`{batch:012d}-{attempt}*` under the index prefix, complete because
+deltas are uploaded before data), not from a sweep; those delta files and
+consumed compaction sidecars then go through the ordinary index garbage.
+Not built: the sweep, so a worker that writes after its attempt ended
+leaves orphans; and the rescope-drain and retry-pass pins, whose reads
+do not exist yet.
+
 Reusing a version (`v1 → v2 → v1`) writes a new name (`f-1/v1.{g3}`):
 deleting the old `f-1/v1.{g1}` cannot touch it. That is what removes the
 GC lock, the dequeue-on-reuse rule and the DELETE timing assumption of the
@@ -798,7 +815,10 @@ released. The next attempt repairs the intents as today. This is the
 at-least-once contract of Airflow and Dagster, with a documented risk:
 a write still in flight after the grace can land after the next commit.
 Every such release is recorded on the attempt (`released: "grace"`) and
-shown in the console, so the rare case is visible and countable.
+shown in the console, so the rare case is visible and countable. *As
+built*, the grace runs from when the engine first sees the hold, on its
+monotonic clock, so an engine restart starts it again: later than the
+worker's last evidence, never earlier.
 
 **Opt-in: `strict`.** `Project(stores={"crm": CrmStore(strict=True)})`, or
 `strict = True` on the class. The scope stays blocked, visibly ("waiting

@@ -95,6 +95,7 @@ class Model:
                 "outcomes": _nest(self.outcomes, 2),
                 "unsettled": _nest(self.unsettled, 2),
                 "holds": _nest(self.holds, 2),
+                "discards": _nest(self.discards, 2),
                 "automations": self.automations,
                 "runs": self.runs,
                 "receipts": list(self.receipts.items()),
@@ -126,6 +127,10 @@ class Model:
         # (asset, scope) -> the ended attempt whose writes may still land on an
         # overwrite store: no attempt runs there until it is released (docs/lifecycle.md §9.9)
         self.holds: dict[tuple, dict] = _flatten(snap.get("holds"), 2)
+        # (output, scope) -> data garbage of an immutable store, each entry at the
+        # event position that let go of it: for the scope's next attempt to discard
+        # once no reader pins it (docs/lifecycle.md §9.8)
+        self.discards: dict[tuple, list] = _flatten(snap.get("discards"), 2)
         self.automations: dict[str, dict] = snap.get("automations") or {}
         self.runs: dict[str, dict] = snap.get("runs") or {}
         self.receipts: dict[str, str] = dict(snap.get("receipts") or [])
@@ -591,6 +596,9 @@ class Model:
         for output, intent in (e.get("unsettled") or {}).items():
             intents = self.unsettled.setdefault((output, task["scope"]), [])
             intents.append({**intent, "run": e["run"], "attempt": e["attempt"]})
+        self._discarded(task["scope"], e)
+        if launched is not None and not e.get("commit"):
+            self._abandoned(task["scope"], e["attempt"], launched)
         if e.get("hold"):
             self.holds[(task["asset"], task["scope"])] = {
                 "attempt": e["attempt"],
@@ -685,6 +693,7 @@ class Model:
             before = self.heads.get((name, scope))
             if before is None or before["ref"].get("version") != head["ref"].get("version"):
                 changed.append(name)
+            self._superseded(name, scope, before, head, (commit.get("keys") or {}).get(name))
             self.heads[(name, scope)] = {**head, "run": e["run"], "attempt": e["attempt"], "at": at}
             self._commit_keys(name, scope, (commit.get("keys") or {}).get(name))
             if name in commit.get("settled", ()):
@@ -830,6 +839,75 @@ class Model:
         if index is not None:
             self.heads[(output, scope)]["count"] = index.count
 
+    # -- data garbage of immutable stores (docs/lifecycle.md §9.8) -----------------------
+
+    def immutable(self, output: str) -> bool:
+        manifest = self.manifest or {}
+        record = (manifest.get("outputs") or {}).get(output) or {}
+        return ((manifest.get("stores") or {}).get(record.get("store")) or {}).get("writes") == "immutable"
+
+    def _collect(self, output: str, scope: str, entry: dict) -> None:
+        self.discards.setdefault((output, scope), []).append({"n": self.applied, **entry})
+
+    def _superseded(
+        self, output: str, scope: str, before: dict | None, head: dict, keys: dict | None
+    ) -> None:
+        """What a commit let go of: each changed key's predecessor (named in
+        its delta files), a value's previous object, or — when an append
+        output starts over — its earlier batches."""
+
+        if not self.immutable(output):
+            return
+        if keys and keys.get("files"):
+            prefix = self.index(output, scope).prefix
+            self._collect(
+                output,
+                scope,
+                {"kind": "delta", "prefix": prefix, "files": [f["name"] for f in keys["files"]]},
+            )
+        old, new = (
+            ((before or {}).get("ref") or {}).get("handle") or {},
+            (head.get("ref") or {}).get("handle") or {},
+        )
+        if old.get("mode") in ("value", "set") and old.get("path") != new.get("path"):
+            self._collect(output, scope, {"kind": "items", "items": [["path", old["path"]]]})
+        if old.get("mode") == "batches" and new.get("mode") == "batches":
+            first, last = old["batches"]
+            if int(new["batches"][0]) > int(first):
+                self._collect(
+                    output,
+                    scope,
+                    {"kind": "items", "items": [["batches", int(first), int(new["batches"][0]) - 1]]},
+                )
+
+    def _abandoned(self, scope: str, attempt: str, launched: dict) -> None:
+        """An attempt that ended without committing: whatever it wrote on an
+        immutable store carries its generation, which no other attempt uses."""
+
+        for name, info in (launched["prepared"].get("outputs") or {}).items():
+            if self.immutable(name):
+                entry = {
+                    "kind": "abandoned",
+                    "attempt": attempt,
+                    "generation": launched["pin"],
+                    "batch": info.get("batch"),
+                }
+                if info.get("prefix") is not None:
+                    entry["prefix"] = info["prefix"]
+                self._collect(name, scope, entry)
+
+    def _discarded(self, scope: str, e: dict) -> None:
+        """A worker discarded data garbage: its entries go, and the index-side
+        files they were read from become garbage themselves."""
+
+        for output, done in (e.get("discarded") or {}).items():
+            left = [d for d in self.discards.get((output, scope), []) if d["n"] not in set(done)]
+            if left:
+                self.discards[(output, scope)] = left
+            else:
+                self.discards.pop((output, scope), None)
+        self.garbage.extend([path, self.applied] for path in e.get("discarded_files") or ())
+
     def _replace_index(self, key: tuple, index: IndexState) -> None:
         """Swap in a new index state; files it no longer references await deletion."""
 
@@ -842,6 +920,11 @@ class Model:
         key = (e["output"], e["scope"])
         if key not in self.indexes:
             return
+        if e.get("garbage"):  # the entries the merge dropped: their objects (§9.8)
+            prefix = self.indexes[key].prefix
+            self._collect(
+                *key, {"kind": "sidecar", "prefix": prefix, "files": [g["name"] for g in e["garbage"]]}
+            )
         index = self.indexes[key].compacted([FileInfo.from_json(f) for f in e["added"]], e["removed"])
         self._replace_index(key, index)
 

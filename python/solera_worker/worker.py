@@ -912,6 +912,7 @@ async def _execute(
             if values and "ref" in outputs.get(name, {}):
                 outputs[name]["metadata"] = values
         result = {"status": "succeeded", "outputs": outputs, "delivered": delivered}
+        result.update(await _discard_due(spec, project, asset, objects, writes))
         if cursor is not UNSET:
             result["cursor"] = cursor
         return result
@@ -923,6 +924,75 @@ async def _execute(
         return _failed(error, getattr(error, "retryable", False))
     except Exception as error:
         return _failed(error, True)
+
+
+async def _discard_due(spec, project, asset, objects, writes) -> dict:
+    """Discard the data garbage the engine handed this attempt (docs/
+    lifecycle.md §9.8): the objects a commit or a compaction let go of, and
+    what attempts that never committed wrote — all past every reader pin.
+    The engine runs no store code; the scope's next attempt, which has its
+    store, deletes for it. Returns what was done, for the result."""
+
+    import obstore
+    from solera.keys._python import decode_garbage, iter_file
+
+    declared = {o["name"]: o for o in project.manifest["assets"][asset.name]["outputs"]}
+    decls = {o.name or asset.name: o for o in asset.outputs}
+    discarded, files = {}, []
+
+    async def read(path: str) -> bytes | None:
+        return await _get(objects, path)
+
+    for name, info in (spec.get("outputs") or {}).items():
+        store = project.stores[declared[name]["store"]]
+        if not info.get("discard") or getattr(store, "writes", "overwrite") != "immutable":
+            continue
+        items, done = [], []
+        for entry in info["discard"]:
+            kind, prefix = entry["kind"], entry.get("prefix") or ""
+            if kind == "delta":  # each changed key's predecessor
+                for f in entry["files"]:
+                    data = await read(f"{prefix}{f}.kx")
+                    for key, _, _, _, before in iter_file(data) if data else ():
+                        if before is not None:
+                            items.append(("key", key_str(key), before[0].hex(), before[1]))
+            elif kind == "sidecar":  # entries a compaction dropped
+                for f in entry["files"]:
+                    data = await read(f"{prefix}{f}.kg")
+                    if data:
+                        keys, versions, _, locators = decode_garbage(data)
+                        items += [
+                            ("key", key_str(k), v.hex(), loc)
+                            for k, v, loc in zip(keys, versions, locators, strict=True)
+                        ]
+                    files.append(f"{prefix}{f}.kg")
+            elif kind == "abandoned":  # all an uncommitted attempt wrote carries its generation
+                generation = entry["generation"]
+                if "prefix" in entry:  # keyed: its delta files name every object it could have written
+                    stem = f"{int(entry['batch']):012d}-{entry['attempt']}"
+                    async for batch in obstore.list(objects, prefix=prefix):
+                        for meta in batch:
+                            if meta["path"][len(prefix) :].startswith(stem):
+                                data = await read(meta["path"])
+                                for key, version, deleted, _, _ in iter_file(data) if data else ():
+                                    if not deleted:
+                                        items.append(("key", key_str(key), version.hex(), generation))
+                                files.append(meta["path"])
+                elif entry.get("batch") is not None:
+                    items.append(("batch", entry["batch"], generation))
+                else:
+                    items.append(("value", generation))
+            else:
+                items += [tuple(i) for i in entry["items"]]
+            done.append(entry["n"])
+        scope = Scope(output=decls[name], partition=spec["partition"], attempt=spec["attempt"])
+        head = Ref.from_json(info["head"]) if info.get("head") else None  # where its objects live
+        await writes.call(store.discard(scope, head, items))
+        discarded[name] = done
+    out = {"discarded": discarded} if discarded else {}
+    if files:
+        out["discarded_files"] = files
+    return out
 
 
 async def run_pool(pool: str, server: str, token: str | None = None, *, project: str | None = None):

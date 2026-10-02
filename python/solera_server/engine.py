@@ -23,6 +23,7 @@ import contextlib
 import datetime as dt
 import json
 import logging
+import math
 import secrets
 from itertools import product
 from zoneinfo import ZoneInfo
@@ -50,6 +51,7 @@ TERMINAL = SUCCESS | {"failed", "blocked", "canceled"}
 HEARTBEAT_SECONDS = 10.0  # a worker beats this often (docs/lifecycle.md §6)
 PROVISION_SECONDS = 600.0  # a launched worker reports within this, or it never started
 CANCEL_GRACE = 60.0  # a requested cancel's time to drain before it is forced (§7)
+DISCARDS = 64  # data-garbage entries one attempt discards
 SOURCE_KEYS_RECORDED = 1000  # a source commit's run lists changed keys up to this many, else counts
 GRACE_SECONDS = 5.0
 
@@ -662,6 +664,9 @@ class Engine(Attempts):
             event["reason"] = str(reason)[:200]
         if writes is not None:
             event["writes"] = writes
+        for field in ("discarded", "discarded_files"):  # data garbage the worker discarded (§9.8)
+            if (worker or {}).get(field):
+                event[field] = worker[field]
         if hold is not None:
             event["hold"] = hold
         self.state.record(event)
@@ -911,8 +916,9 @@ class Engine(Attempts):
         for param, edge, up_dims in incremental:
             up_scope = self._project(asset, scope, up_dims)
             ref = self._pin_at(edge["output"], up_scope)
+            claim = self.m.claimed(attempt) if attempt is not None else None
             pin, plan, empty = self._incremental_plan(
-                task, param, edge, ref, up_scope, fingerprint, run, full
+                task, param, edge, ref, up_scope, fingerprint, run, full, (claim or {}).get("pin")
             )
             inputs[param] = pin
             plans[param] = plan
@@ -949,6 +955,8 @@ class Engine(Attempts):
                     info["unsettled"] = self.m.unsettled[(name, scope)]
                 if output.get("partition_set") or name in self._set_dims:
                     info["elements"] = list((head or {}).get("elements") or ())
+            if due := self._due_discards(name, scope, attempt):
+                info["discard"] = due
             outputs[name] = info
         # The input versions its outputs will be built from, for the history (§7).
         lineage = []
@@ -1040,7 +1048,7 @@ class Engine(Attempts):
                 refs[canonical_partition(collapsed, collapsed_parts)] = head["ref"]
         return refs
 
-    def _incremental_plan(self, task, param, edge, ref, up_scope, fingerprint, run, full):
+    def _incremental_plan(self, task, param, edge, ref, up_scope, fingerprint, run, full, claim_pin=None):
         """Plan one Incremental edge from its watermark (§6): returns the pin
         for the spec, the plan the commit turns into the next watermark, and
         whether nothing is pending.
@@ -1103,12 +1111,17 @@ class Engine(Attempts):
             empty = False
         pinned = index.pinned() if window["full"] else index.pinned(window["from"], window["to"])
         pin = {"ref": ref, "index": pinned.to_json(), "changes": {**window, "limit": limit}}
-        return pin, {**base, **window}, empty
+        plan = {**base, **window}
+        if not window["full"]:  # a window paged over attempts holds its first page's reader pin
+            plan["pin"] = wm.get("pin") if window["after"] is not None and wm else claim_pin
+        return pin, plan, empty
 
     @staticmethod
     def _watermark(plan: dict, after: str | None) -> dict:
         """The watermark after delivering a keyed plan's page, which ended at
-        `after` (`None`: the window is done)."""
+        `after` (`None`: the window is done). A delta window delivered over
+        several attempts keeps the reader pin of the attempt that began it:
+        its later pages still read versions as of then (docs/lifecycle.md §9.8)."""
 
         base = {k: plan[k] for k in ("output", "up", "fingerprint")}
         if plan["full"]:
@@ -1117,7 +1130,23 @@ class Engine(Attempts):
             return {**base, "batch": plan["from"], "after": after, "full": True}
         if after is None:
             return {**base, "batch": max(plan["from"], plan["to"] + 1), "after": None, "full": False}
-        return {**base, "batch": plan["from"], "until": plan["to"], "after": after, "full": False}
+        paged = {**base, "batch": plan["from"], "until": plan["to"], "after": after, "full": False}
+        return {**paged, "pin": plan["pin"]} if plan.get("pin") is not None else paged
+
+    def _due_discards(self, output: str, scope: str, attempt: str | None) -> list[dict]:
+        """The data garbage of an immutable output's scope that no reader can
+        still need: every entry let go of before the oldest reader pin — of the
+        attempts claimed now (but this one, which reads none of it) and of the
+        delta windows delivered over several attempts. At most `DISCARDS` of
+        them, for this attempt to discard (§9.8)."""
+
+        entries = self.m.discards.get((output, scope))
+        if not entries:
+            return []
+        pins = [c["pin"] for c in self.m.claims.values() if c["attempt"] != attempt and "pin" in c]
+        pins += [wm["pin"] for wm in self.m.watermarks.values() if wm.get("pin") is not None]
+        floor = min(pins, default=math.inf)
+        return [e for e in entries if e["n"] <= floor][:DISCARDS]
 
     def _fingerprint(self, asset, run, pinned):
         """H(version, store versions of input+output stores, run config,

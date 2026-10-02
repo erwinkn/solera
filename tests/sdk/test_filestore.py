@@ -104,9 +104,11 @@ async def test_a_keyed_output_is_one_object_per_key_and_version(store):
     current = Keys({**at(out, patch, 8).revisions})
     assert await store.load(patched.ref, None, current) == {"u-2": {"bytes": 6}}
     assert await store.load(written.ref, None, at(out, first, 5)) == first  # the old version, intact
-    old = [n.rsplit(".", 1)[0] for n in await paths(store) if ".5." in n]
-    await store.discard(old)
-    await store.discard(old)  # names are never reused: twice is no harm
+    old = [("key", k, v.hex(), loc) for k, (v, loc) in at(out, first, 5).revisions.items()]
+    await store.discard(scope(out, generation=9), patched.ref, old)
+    await store.discard(
+        scope(out, generation=9), patched.ref, old
+    )  # names are never reused: twice is no harm
     assert await store.load(patched.ref, None, current) == {"u-2": {"bytes": 6}}
     assert len(await paths(store)) == 1
 
@@ -209,7 +211,7 @@ async def test_refs_round_trip_and_gone_values_fail(store):
     written = await store.store("x", None, scope(Output("v"), generation=1))
     back = Ref.from_json(written.ref.to_json())
     assert type(back).__name__ == "ObjectRef" and back == written.ref
-    await store.discard(["v@1"])
+    await store.discard(scope(Output("v"), generation=2), written.ref, [("value", 1)])
     with pytest.raises(StoreError, match="gone"):
         await store.load(back, None, None)
 

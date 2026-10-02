@@ -165,11 +165,14 @@ class Upkeep:
 
         cache = key_cache(self.manifest.get("key_cache"), self.state.objects_url)
         options, objects = self.key_options, self.state.objects
+        # An immutable store's compaction lists what its merge dropped: those
+        # entries name objects that collection then discards (docs/lifecycle.md §9.8).
+        garbage = self.m.immutable(key[0])
 
         def work():
             async def go():
                 keys = KeyIndex(ObjectIO(objects, cache=cache), None, index, options)
-                return await (keys.recount() if recount else keys.compact())
+                return await (keys.recount() if recount else keys.compact(garbage=garbage))
 
             return asyncio.run(go())
 
@@ -199,21 +202,24 @@ class Upkeep:
             return
         if result is None:
             return
-        added, removed, _garbage = result  # garbage is not asked for until stores declare their kinds
+        added, removed, dropped = result
         if current is None or not set(removed) <= {f.name for f in current.files}:
             created = [f.name for f in added if f.name not in removed]
-            await self._delete([index.path(n) for n in created])
+            await self._delete(
+                [index.path(n) for n in created] + [f"{index.prefix}{g.name}.kg" for g in dropped]
+            )
             return
-        self.state.record(
-            {
-                "type": "IndexCompacted",
-                "output": output,
-                "scope": scope,
-                "added": [f.to_json() for f in added],
-                "removed": removed,
-                "at": self.clock(),
-            }
-        )
+        event = {
+            "type": "IndexCompacted",
+            "output": output,
+            "scope": scope,
+            "added": [f.to_json() for f in added],
+            "removed": removed,
+            "at": self.clock(),
+        }
+        if dropped:
+            event["garbage"] = [g.to_json() for g in dropped]
+        self.state.record(event)
 
     # -- garbage ---------------------------------------------------------------------
 
