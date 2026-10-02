@@ -69,6 +69,7 @@ dev = [
     "pyarrow>=25,<26",
     "xxhash>=3,<4",
     "solera[server]",
+    "hypothesis>=6.100,<7",
 ]
 
 [tool.pytest.ini_options]
