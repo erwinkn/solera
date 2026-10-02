@@ -803,17 +803,31 @@ shows.
   a pinned reader needs superseded ones).
 
 **As built.** The engine holds no store credentials and runs no user
-code, so the scope's **next attempt** discards: the engine puts the due
-entries (at most 64) in the spec's output info, and the worker, after its
-own store call succeeds, discards them and reports which in its result;
-`AttemptFinished` then removes them. Due means no live claim of another
-attempt and no paged-window watermark pin predates the entry. A delta file
+code, so workers discard, twice over:
+
+- **Right after a commit** (D8). The worker's `finished` waits until the
+  engine settled the attempt and made its commit durable; the answer
+  names the entries now due in its scope — what the commit let go of that
+  no reader pins, and what was waiting — with each output's head. The
+  worker calls `store.discard` with them and acknowledges by entry id
+  (`POST attempts/{a}/discarded`, recorded as `DiscardsDone`). So a
+  partition that never runs again keeps no garbage.
+- **By the scope's next attempt**, the fallback for whatever the first
+  missed: the engine unreachable, the worker gone before it
+  acknowledged, a reader still pinned. The engine puts the due entries (at
+  most 64) in the spec's output info, and the worker, after its own store
+  call succeeds, discards them and reports which in its result;
+  `AttemptFinished` then removes them.
+
+Deleting a name twice is no harm, and only the index files an
+acknowledged entry names become garbage. Due means no live claim of
+another attempt, no paged-window watermark, no sensor tick and no engine
+reader pin predates the entry. A delta file
 a pending entry reads is kept, even once the index let go of it, until the
 entry is done. An entry whose files cannot be read stays pending; after
 three such attempts it is `stuck`: no longer handed out, listed in
 `/api/diagnostics` and on its scope's head record, until an operator runs
-`solera scopes discards OUTPUT [SCOPE] --clear` (its objects stay). Until a
-scope runs again its garbage waits, which costs only storage. An
+`solera scopes discards OUTPUT [SCOPE] --clear` (its objects stay). An
 abandoned attempt's keyed names come from listing its own delta files
 (`{batch:012d}-{attempt}*` under the index prefix, complete because
 deltas are uploaded before data), not from a sweep; those delta files and

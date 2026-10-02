@@ -23,7 +23,9 @@ from .placements.local import load_manifest
 from .sensors import HOST_TOKEN
 from .state import LostOwnership, State, Unavailable
 
-ATTEMPT_ROUTE = re.compile(r"^/api/projects/[^/]+/attempts/([^/]+)/(start|beat|logs|resolve|finished)$")
+ATTEMPT_ROUTE = re.compile(
+    r"^/api/projects/[^/]+/attempts/([^/]+)/(start|beat|logs|resolve|finished|discarded)$"
+)
 POOL_ROUTE = re.compile(r"^/api/projects/[^/]+/pools/[^/]+/work$")
 SENSOR_ROUTE = re.compile(r"^/api/projects/[^/]+/sensors/(next|[^/]+/ticks/[^/]+)$")
 
@@ -609,10 +611,15 @@ def create_app(
             return Response(status_code=503)
         return Response(content=body, media_type=CONTENT_TYPE)
 
-    @app.post("/api/projects/{p}/attempts/{attempt}/finished", status_code=204)
+    @app.post("/api/projects/{p}/attempts/{attempt}/finished")
     async def attempt_finished(p: str, attempt: str, request: Request):
         runtime = await project_engine(request, p)
-        await runtime.attempt_finished(attempt, await request.json())
+        return await runtime.attempt_finished(attempt, await request.json())
+
+    @app.post("/api/projects/{p}/attempts/{attempt}/discarded", status_code=204)
+    async def attempt_discarded(p: str, attempt: str, request: Request):
+        runtime = await project_engine(request, p)
+        await runtime.attempt_discarded(attempt, await request.json())
         return Response(status_code=204)
 
     @app.get("/api/projects/{p}/pools/{pool}/work")

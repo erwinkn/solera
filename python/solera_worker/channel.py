@@ -23,8 +23,9 @@ class HttpChannel:
         self.base = f"{url.rstrip('/')}/api/projects/{project}/attempts/{attempt}"
         self.client = httpx.Client(headers={"Authorization": f"Bearer {token}"}, timeout=timeout)
 
-    def _post(self, route: str, body: dict) -> dict:
-        response = self.client.post(f"{self.base}/{route}", json=body)
+    def _post(self, route: str, body: dict, timeout: float | None = None) -> dict:
+        extra = {"timeout": timeout} if timeout is not None else {}
+        response = self.client.post(f"{self.base}/{route}", json=body, **extra)
         if response.status_code == 409:
             raise Ended((response.json().get("detail") or "ended") if response.content else "ended")
         response.raise_for_status()
@@ -39,8 +40,12 @@ class HttpChannel:
     async def logs(self, body: dict) -> dict:
         return await asyncio.to_thread(self._post, "logs", body)
 
-    async def finished(self, body: dict) -> None:
-        await asyncio.to_thread(self._post, "finished", body)
+    async def finished(self, body: dict) -> dict:
+        # The answer waits for the commit, to name what is due for discarding.
+        return await asyncio.to_thread(self._post, "finished", body, 30.0)
+
+    async def discarded(self, body: dict) -> None:
+        await asyncio.to_thread(self._post, "discarded", body)
 
     def _resolve(self, body: bytes) -> bytes:
         from solera.keys.resolver import CONTENT_TYPE
@@ -80,8 +85,11 @@ class LocalChannel:
     async def logs(self, body: dict) -> dict:
         return await self.engine.attempt_logs(self.attempt, body)
 
-    async def finished(self, body: dict) -> None:
-        await self.engine.attempt_finished(self.attempt, body)
+    async def finished(self, body: dict) -> dict:
+        return await self.engine.attempt_finished(self.attempt, body)
+
+    async def discarded(self, body: dict) -> None:
+        await self.engine.attempt_discarded(self.attempt, body)
 
     async def resolve(self, body: bytes) -> bytes:
         return await self.engine.attempt_resolve(self.attempt, body)

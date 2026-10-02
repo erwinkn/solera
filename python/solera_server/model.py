@@ -1020,7 +1020,13 @@ class Model:
         names it could not read counts a miss; at `STUCK_AFTER` it is
         `stuck`: kept, and shown, but no longer handed out."""
 
+        named = set()  # the index-side files the acknowledged entries read: only those become garbage
         for output, done in (e.get("discarded") or {}).items():
+            for d in self.discards.get((output, scope), []):
+                if d["id"] in done and d["kind"] == "sidecar":
+                    named |= {f"{d['prefix']}{f}.kg" for f in d["files"]}
+                elif d["id"] in done and d["kind"] == "abandoned" and "prefix" in d:
+                    named.add(f"{d['prefix']}{int(d['batch']):012d}-{d['attempt']}")
             self._drop_discards(output, scope, done)
         for output, missed in (e.get("discard_unresolved") or {}).items():
             for d in self.discards.get((output, scope), []):
@@ -1028,7 +1034,15 @@ class Model:
                     d["misses"] = d.get("misses", 0) + 1
                     if d["misses"] >= STUCK_AFTER:
                         d["stuck"] = True
-        self.garbage.extend([path, self.applied] for path in e.get("discarded_files") or ())
+        for path in e.get("discarded_files") or ():
+            if path in named or any(path.startswith(stem) for stem in named):
+                self.garbage.append([path, self.applied])
+
+    def _on_DiscardsDone(self, e):
+        """A worker discarded data garbage right after its own commit (D8):
+        as the scope's next attempt would have."""
+
+        self._discarded(e["scope"], e)
 
     def _drop_discards(self, output: str, scope: str, ids) -> None:
         left = [d for d in self.discards.get((output, scope), []) if d["id"] not in set(ids)]

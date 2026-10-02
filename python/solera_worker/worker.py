@@ -1047,7 +1047,8 @@ async def run_attempt(
         flusher.cancel()
         if channel is not None:
             with contextlib.suppress(Exception):
-                await channel.finished({"invocation": invocation})
+                answer = await channel.finished({"invocation": invocation})
+                await _discard_after(answer, spec, control.get("project"), objects, channel, invocation)
         return 1 if result["status"] == "failed" else 0
     except asyncio.CancelledError:
         if control["forced"] and not asyncio.current_task().cancelling():
@@ -1166,6 +1167,7 @@ async def _execute(
 
     try:
         project = entrypoint if isinstance(entrypoint, Project) else load_project(entrypoint)
+        control["project"] = project  # for the discards after its commit
     except Exception as error:
         return _failed(error, False)
     timeline.add("imported")
@@ -1249,6 +1251,20 @@ async def _execute(
         return _failed(error, getattr(error, "retryable", False))
     except Exception as error:
         return _user_failed(error, project)
+
+
+async def _discard_after(answer, spec, project, objects, channel, invocation) -> None:
+    """Discard what the engine says is due in this attempt's scope now that
+    its commit is durable (docs/lifecycle.md §9.8), and say so. Anything
+    that fails here leaves the entries queued for the scope's next attempt:
+    deleting a name twice is no harm."""
+
+    if not (answer or {}).get("discard") or project is None:
+        return
+    due = {"outputs": answer["discard"], "partition": spec["partition"], "attempt": spec["attempt"]}
+    done = await _discard_due(due, project, project.assets[spec["asset"]], objects, Writes())
+    if done:
+        await channel.discarded({"invocation": invocation, "scope": answer["scope"], **done})
 
 
 async def _discard_due(spec, project, asset, objects, writes) -> dict:

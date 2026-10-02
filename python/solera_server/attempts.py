@@ -27,6 +27,7 @@ from .state import LostOwnership
 log = logging.getLogger(__name__)
 
 LIVE_LINES = 10_000  # live log lines kept per attempt for the console
+AFTER_COMMIT_WAIT = 10.0  # seconds a worker's `finished` waits for its commit, for its discards
 POOL_OFFERED_GRACE = 10.0  # an offered pool attempt not started this long: look for its claim
 POOL_PAGE = 8  # attempts one discovery answer offers
 
@@ -165,11 +166,46 @@ class Attempts:
         live.log_offset += len(new)
         return {"offset": live.log_offset}
 
-    async def attempt_finished(self, attempt: str, body: dict) -> None:
+    async def attempt_finished(self, attempt: str, body: dict) -> dict:
         live = self._live(attempt)
         await self._bind(attempt, live, body["invocation"])
+        task_id = self.m.attempts.get(attempt)
         live.finished = True
         self._stir(attempt)
+        return await self._due_after(attempt, task_id)
+
+    async def _due_after(self, attempt: str, task_id: str | None) -> dict:
+        """Once the attempt is settled and its commit durable, the data
+        garbage due in its scope — what its commit let go of that no reader
+        pins, and what was waiting — for its worker to discard at once
+        (docs/lifecycle.md §9.8). Nothing if settling takes longer: the
+        scope's next attempt discards it, as ever."""
+
+        task = self.m.task(task_id or "")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + AFTER_COMMIT_WAIT
+        while task is not None and self.m.claimed(attempt) is not None and loop.time() < deadline:
+            await asyncio.sleep(0.02)
+        if task is None or self.m.claimed(attempt) is not None:
+            return {}
+        await self.state.durable()  # never delete what a replay would still name
+        due = {}
+        for output in self.manifest["assets"].get(task["asset"], {}).get("outputs") or ():
+            name, head = output["name"], self.m.heads.get((output["name"], task["scope"]))
+            if self.m.immutable(name) and head is not None:
+                entries = self._due_discards(name, task["scope"], None)
+                if entries:
+                    due[name] = {"discard": entries, "head": head["ref"]}
+        return {"discard": due, "scope": task["scope"]} if due else {}
+
+    async def attempt_discarded(self, attempt: str, body: dict) -> None:
+        """A worker's acknowledgement of what it discarded after its commit."""
+
+        if body.get("discarded") or body.get("discard_unresolved"):
+            fields = ("discarded", "discard_unresolved", "discarded_files")
+            self.state.record(
+                {"type": "DiscardsDone", "scope": body["scope"], **{k: body[k] for k in fields if k in body}}
+            )
 
     async def attempt_resolve(self, attempt: str, body: bytes) -> bytes | None:
         """A small write's delta from the engine's cache (docs/resolved-commits.md

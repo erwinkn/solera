@@ -286,7 +286,7 @@ async def test_executors_and_workers(client, base):
     assert (await client.get(f"{base}/workers")).json() == {"workers": []}  # no pool worker asked yet
 
 
-async def test_worker_pull_path_and_channel(engine):
+async def test_worker_pull_path_and_channel(engine, monkeypatch):
     """docs/lifecycle.md §5, §10: a pool worker discovers work that fits it
     (pool token), claims it by creating `.worker`, and reports on the
     attempt's routes with the attempt's own token; another invocation, or
@@ -374,9 +374,11 @@ async def test_worker_pull_path_and_channel(engine):
             headers={"Authorization": f"Bearer {other}"},
         )
         assert forged.status_code == 401
-        assert (
-            await client.post(f"{routes}/finished", json={"invocation": "mine"}, headers=token)
-        ).status_code == 204
+        from solera_server import attempts
+
+        monkeypatch.setattr(attempts, "AFTER_COMMIT_WAIT", 0.1)  # nothing settles it here
+        finished = await client.post(f"{routes}/finished", json={"invocation": "mine"}, headers=token)
+        assert finished.status_code == 200  # what is due for discarding once committed: here nothing
 
 
 async def test_console_shell_served(client):

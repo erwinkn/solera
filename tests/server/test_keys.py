@@ -638,7 +638,7 @@ async def test_too_many_changes_to_list_still_write_only_what_the_delta_names(
         if "items" in p.parts:
             objects[p.parent.name].append(p.name)
     assert len(objects["a"]) == 1, objects  # unchanged: its first object only
-    assert len(objects["b"]) == 2, objects  # changed: a new one, the old one until collected
+    assert len(objects["b"]) == 1, objects  # changed: a new one; the old one went after the commit (D8)
 
 
 async def test_a_byte_valued_key_fails_the_write_instead_of_vanishing(state):

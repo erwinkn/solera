@@ -36,10 +36,14 @@ async def named(state, output) -> set[str]:
     return {FileStore.key_name(output, k, v, loc) for k, (v, loc) in keys.revisions.items()}
 
 
-async def test_superseded_versions_go_with_the_next_attempt(tmp_path, data):
+async def no_discards_after_commit(*args):
+    return {}
+
+
+async def test_superseded_versions_go_right_after_the_commit(tmp_path, data):
     """A commit lets go of each changed key's predecessor and of a value's
-    previous object; the next attempt on the scope deletes them. A value is
-    rewritten every run, so one superseded object always awaits the next."""
+    previous object; its own worker deletes them once the commit is durable
+    (D8) — a partition that never runs again keeps no garbage."""
 
     values = iter([{"a": 1, "b": 1}, {"a": 2, "b": 1}, {"a": 2, "b": 1}])
     totals = iter([1, 2, 2])
@@ -58,12 +62,8 @@ async def test_superseded_versions_go_with_the_next_attempt(tmp_path, data):
     await engine.initialize()
     for _ in range(2):
         await run(engine, ["scores", "total"])
-    assert len(objects(data, "scores")) == 3  # a@1, a@2, b: the old `a` not yet discarded
-    first, second = sorted(data.glob("total@*"), key=lambda p: int(p.stem.split("@")[1]))
-    await run(engine, ["scores", "total"])  # unchanged, and it collects
-    assert objects(data, "scores") == await named(state, "scores")
-    assert not first.exists() and second.exists()
-    assert len(list(data.glob("total@*"))) == 2
+    assert objects(data, "scores") == await named(state, "scores")  # the old `a` already gone
+    assert len(list(data.glob("total@*"))) == 1
     assert ("scores", "") not in state.model.discards
     await engine.stop()
     await state.close()
@@ -226,6 +226,7 @@ async def test_an_entry_whose_names_cannot_be_read_gets_stuck_and_is_shown(tmp_p
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = engine_for(state, project)
     await engine.initialize()
+    engine._due_after = no_discards_after_commit  # the next attempts' path alone
     await run(engine, ["scores"])
     m = state.model
     prefix = m.indexes[("scores", "")].prefix
@@ -267,6 +268,7 @@ async def test_entries_of_one_event_are_acknowledged_one_by_one(tmp_path):
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = engine_for(state, project)
     await engine.initialize()
+    engine._due_after = no_discards_after_commit  # the next attempts' path alone
     await run(engine, ["scores"])
     m = state.model
     prefix = m.indexes[("scores", "")].prefix
@@ -286,5 +288,71 @@ async def test_entries_of_one_event_are_acknowledged_one_by_one(tmp_path):
     await run(engine, ["scores"])  # the unresolved delta and its resolved sibling
     [left] = m.discards[("scores", "")]
     assert left["kind"] == "delta" and left["misses"] == 1
+    await engine.stop()
+    await state.close()
+
+
+def scores_project():
+    values = iter([{"a": 1, "b": 1}, {"a": 2, "b": 1}, {"a": 3, "b": 1}, {"a": 3, "b": 1}])
+
+    @asset(outputs=Output("scores", keyed=True))
+    def scores():
+        return next(values)
+
+    return Project(assets=[scores])
+
+
+async def test_without_the_channel_the_next_attempt_discards(tmp_path, data, monkeypatch):
+    """D8's fallbacks: the engine unreachable when the worker says it
+    finished, or the worker gone before it acknowledges, leave the entries
+    queued; the scope's next attempt discards them (a second delete of the
+    same names is no harm)."""
+
+    from solera_worker.channel import LocalChannel
+
+    project = scores_project()
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = engine_for(state, project)
+    await engine.initialize()
+    await run(engine, ["scores"])
+    finished = LocalChannel.finished
+
+    async def unreachable(self, body):
+        await finished(self, body)
+        raise OSError("connection reset")  # its answer is lost
+
+    monkeypatch.setattr(LocalChannel, "finished", unreachable)
+    await run(engine, ["scores"])  # supersedes `a`, cannot discard
+    assert objects(data, "scores") != await named(state, "scores") and state.model.discards
+    monkeypatch.setattr(LocalChannel, "finished", finished)
+
+    async def gone(self, body):
+        raise OSError("the worker died before it acknowledged")
+
+    monkeypatch.setattr(LocalChannel, "discarded", gone)
+    await run(engine, ["scores"])  # supersedes `a` again: discards it, cannot acknowledge
+    assert objects(data, "scores") == await named(state, "scores") and state.model.discards
+    monkeypatch.undo()
+    await run(engine, ["scores"])  # deletes them again, harmlessly, and acknowledges
+    assert ("scores", "") not in state.model.discards
+    await engine.stop()
+    await state.close()
+
+
+async def test_a_reader_pin_at_commit_keeps_the_garbage_queued(tmp_path, data):
+    """D8: a reader still pinned before the commit may read what it let go
+    of: nothing is discarded after the commit; the entry stays queued."""
+
+    project = scores_project()
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = engine_for(state, project)
+    await engine.initialize()
+    await run(engine, ["scores"])
+    with state.model.reading():  # a reader of the index as it is before the commit
+        await run(engine, ["scores"])
+        assert objects(data, "scores") != await named(state, "scores")
+        assert [d["kind"] for d in state.model.discards[("scores", "")]] == ["delta"]
+    await run(engine, ["scores"])
+    assert objects(data, "scores") == await named(state, "scores")
     await engine.stop()
     await state.close()
