@@ -1331,17 +1331,19 @@ async def run_pool(pool: str, server: str, token: str | None = None, *, project:
     the project's name, by default its manifest's: a pool token reaches the
     pool's routes and nothing else.
 
-    The project is imported once; each attempt runs in a child forked from
-    this warm process, as a process of its own: a forced cancel ends the
-    child, and with it any thread the attempt left running."""
+    The project is imported once, in a forkserver; each attempt runs in a
+    child forked from that warm, threadless process, as a process of its
+    own: a forced cancel ends the child, and with it any thread the
+    attempt left running. (This process has threads — an HTTP client's
+    name lookups — and fork copies only the forking one: unsafe on macOS.)"""
 
     import httpx
 
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     capacity = {"cpu": os.cpu_count(), "memory": None, "gpu": None}
     host = f"{socket.gethostname()}:{os.getpid()}"
-    loaded = load_project(os.environ["SOLERA_PROJECT"])
-    project = project or loaded.manifest["name"]
+    project = project or load_project(os.environ["SOLERA_PROJECT"]).manifest["name"]
+    context = _attempts()
     async with httpx.AsyncClient(base_url=server, headers=headers, timeout=60) as client:
         print(f"[pool] {host} polls pool {pool!r}", flush=True)
         while True:
@@ -1357,7 +1359,7 @@ async def run_pool(pool: str, server: str, token: str | None = None, *, project:
                 await asyncio.sleep(1.0)
                 continue
             for stage in stages:
-                code = await _forked(stage, server, loaded)
+                code = await _forked(stage, server, context)
                 print(f"[pool] {stage['attempt']} exited {code}", flush=True)
                 if code != LOST:  # it ran: ask again, what waits has changed
                     break
@@ -1366,23 +1368,34 @@ async def run_pool(pool: str, server: str, token: str | None = None, *, project:
 LOST = 4  # the exit code of an attempt that could not publish: the engine treats it as dead
 
 
-async def _forked(stage: dict, server: str, project: Project) -> int:
-    """Run one pool attempt in a child of this process; its exit code. This
-    process must not have used the object store: a forked child cannot use
-    the async runtime it would have started."""
+def _attempts():
+    """Where pool attempts start: a forkserver with the project imported."""
 
     import multiprocessing
 
-    child = multiprocessing.get_context("fork").Process(
-        target=_child, args=(stage, server, project), name=f"attempt {stage['attempt']}"
+    context = multiprocessing.get_context("forkserver")
+    context.set_forkserver_preload(["solera_worker._warm"])
+    return context
+
+
+async def _forked(stage: dict, server: str | None, context=None) -> int:
+    """Run one pool attempt in a process of its own, forked from the warm
+    forkserver (`_warm`); its exit code."""
+
+    child = (context or _attempts()).Process(
+        target=_child, args=(stage, server), name=f"attempt {stage['attempt']}"
     )
     child.start()
-    while child.exitcode is None:  # polled: no thread here, so the next fork copies a quiet process
+    while child.exitcode is None:
         await asyncio.sleep(0.1)
     return child.exitcode
 
 
-def _child(stage: dict, server: str, project: Project) -> None:
+def _child(stage: dict, server: str | None) -> None:
+    from . import _warm
+
+    project = _warm.project or os.environ["SOLERA_PROJECT"]  # imported again: its error goes in the result
+
     async def attempt():
         code = LOST
         try:

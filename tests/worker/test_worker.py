@@ -313,7 +313,9 @@ async def test_a_pool_attempt_runs_in_a_child_of_the_warm_worker(state, tmp_path
     import subprocess
     import sys
 
-    entrypoint = write_project(tmp_path, source)
+    imports = tmp_path / "imports.txt"
+    recorded = f"open({str(imports)!r}, 'a').write('imported\\n')\n"  # each import of the project leaves a line
+    entrypoint = write_project(tmp_path, recorded + source)
     monkeypatch.setenv("SOLERA_PROJECT", entrypoint)
     engine = make_engine(state, entrypoint, heartbeat_seconds=0.2)
     await engine.initialize()
@@ -324,11 +326,11 @@ async def test_a_pool_attempt_runs_in_a_child_of_the_warm_worker(state, tmp_path
             break
         await asyncio.sleep(0.02)
     [stage] = await engine.pool_work("ingest", {}, "w1", 0)
-    # A fresh process, as a pool worker is: it forks before touching the object store.
+    # A pool worker's own process; its attempts start from a forkserver with the project imported.
     worker = (
         "import asyncio, json, sys\n"
-        "from solera_worker.worker import _forked, load_project\n"
-        "print(asyncio.run(_forked(json.loads(sys.argv[1]), None, load_project(sys.argv[2]))))\n"
+        "from solera_worker.worker import _forked\n"
+        "print(asyncio.run(_forked(json.loads(sys.argv[1]), None)))\n"
     )
     started = asyncio.get_running_loop().time()
     done = await asyncio.to_thread(
@@ -340,6 +342,8 @@ async def test_a_pool_attempt_runs_in_a_child_of_the_warm_worker(state, tmp_path
     )
     assert done.stdout.strip().splitlines()[-1] == "0", done.stderr
     assert asyncio.get_running_loop().time() - started < 30  # not the lingering minute
+    # Once, in the forkserver: the attempt's child started from it, warm.
+    assert imports.read_text().count("imported") == 2  # and once more here, by this test's engine
     detail = await engine.run_until(run["id"], 30)
     assert detail["request"]["status"] == "succeeded"
 

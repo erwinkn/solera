@@ -896,11 +896,13 @@ memory and rebuilds them after a restart from the journal and `.worker`:
 - **Engine down:** pool workers finish their attempts and get no new ones.
 - The handle is `{attempt, pool}`. A cancel before the claim withdraws the
   attempt from discovery and ends it; after it, cancel is §7.
-- **One process per attempt.** A pool worker imports the project once, and
-  runs each attempt it gets in a child forked from that warm process. The
-  child is the attempt's process: a forced cancel ends it, and it exits the
-  moment its result is published. The parent never uses the object store,
-  so its children can.
+- **One process per attempt.** A pool worker imports the project once, in
+  a forkserver, and runs each attempt it gets in a child forked from it.
+  The forkserver starts no thread and never uses the object store, so
+  forking from it is safe on any OS (the worker itself has threads: fork
+  copies only the forking one, which macOS does not survive) and every
+  child starts warm. The child is the attempt's process: a forced cancel
+  ends it, and it exits the moment its result is published.
 
 **Every attempt process exits at once** (`os._exit`) once its sealed
 result is published, or once it cannot be: Local, ECS and Kubernetes
