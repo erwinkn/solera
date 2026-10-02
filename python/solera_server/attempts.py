@@ -62,6 +62,7 @@ class Live:
     offered_at: float | None = None  # a pool attempt: when discovery first offered it
     lines: deque = field(default_factory=lambda: deque(maxlen=LIVE_LINES))
     log_offset: int = 0
+    fresh: bool = False  # launched by this engine process: its first `start` binds unread
 
     def heard(self, now: float, via: str) -> None:
         self.reported, self.via = now, via
@@ -98,13 +99,14 @@ class Attempts:
         return json.loads(data)["invocation"] if data else None
 
     async def _bind(self, attempt: str, live: Live, invocation: str, start: bool = False) -> None:
-        """The first `start` binds its invocation: only the claim's winner
-        sends one. Any other token, or any request after a restart, is
-        checked against the claim itself (§5.3)."""
+        """The first `start` of an attempt this engine launched binds its
+        invocation: only the claim's winner sends one. Any other token, or
+        any request after a restart, is checked against the claim itself
+        (§5.3)."""
 
         if live.invocation == invocation:
             return
-        if start and live.invocation is None:
+        if start and live.invocation is None and live.fresh:
             live.invocation = invocation
             return
         owner = await self._owner(attempt)
@@ -242,6 +244,7 @@ class Attempts:
         claim = self.m.claimed(attempt)
         if claim is None:
             raise LostOwnership(attempt)
+        self.live.setdefault(attempt, Live()).fresh = True
         spec = {
             "attempt": attempt,
             "revision": self.manifest["revision"],
@@ -356,6 +359,14 @@ class Attempts:
             provisioned_by = began + (self._left(launched, provision) if adopted else provision)
         forced_by = math.inf  # the end of a requested cancel's grace
         read_at = -math.inf
+        if adopted:  # it may have ended, or been claimed, while no engine looked: look now
+            result = await self.state.attempt_result(run_id, attempt)
+            if result is not None:
+                return await self._settle(
+                    task_id, attempt, result, {"code": None, "reason": None, "meta": {}}
+                )
+            read_at = loop.time()
+            await self._read_worker(base, live, read_at)
         poll = heartbeat / 3
         stirred = self._stirred.setdefault(attempt, asyncio.Event())
 

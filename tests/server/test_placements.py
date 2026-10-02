@@ -446,3 +446,52 @@ async def test_a_local_handle_is_only_ever_its_own_process(state, monkeypatch):
     assert await asyncio.wait_for(adopted.wait(), 5) == -15
     await placement.cancel(ours)
     assert not alive(pid)
+
+
+async def test_a_pool_attempt_that_ended_while_the_engine_was_down_settles(state):
+    """Review P1-4: a worker claims a pool attempt, the engine stops, the
+    worker finishes and exits. No worker asks for work again; the restarted
+    engine still settles the attempt from its objects."""
+
+    @asset(executor=Pool("ingest")())
+    def job():
+        return [{"ok": True}]
+
+    project = Project(assets=[job])
+    engine = make_engine(state, project, heartbeat_seconds=0.1)
+    await engine.initialize()
+    run = await engine.submit(["job"])
+    [attempt] = await pool_attempt(engine, state)
+    await engine.stop()
+    code = await run_attempt(state.objects_url, attempt, project, run=run["id"], pool=True)
+    assert code == 0
+    engine = make_engine(state, project, heartbeat_seconds=0.1)
+    await engine.initialize()
+    detail = await engine.run_until(run["id"], 5)
+    assert detail["request"]["status"] == "succeeded"
+    await engine.stop()
+
+
+async def test_after_a_restart_a_start_is_checked_against_the_claim(state):
+    """Review P3: the first `start` binds unread only for an attempt this
+    engine launched. After a restart, it must match the claim's owner."""
+
+    from solera.lifecycle import Ended
+
+    @asset(executor=Pool("ingest")())
+    def job():
+        return [{"ok": True}]
+
+    project = Project(assets=[job])
+    engine = make_engine(state, project)
+    await engine.initialize()
+    run = await engine.submit(["job"])
+    [attempt] = await pool_attempt(engine, state)
+    await state.create_object(f"{state.attempt_path(run['id'], attempt)}.worker", b'{"invocation": "owner"}')
+    await engine.stop()
+    engine = make_engine(state, project)
+    await engine.initialize()
+    with pytest.raises(Ended, match="not_owner"):
+        await engine.attempt_start(attempt, {"invocation": "intruder"})
+    await engine.attempt_start(attempt, {"invocation": "owner"})
+    assert engine.live[attempt].invocation == "owner"
