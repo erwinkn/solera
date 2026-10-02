@@ -88,7 +88,7 @@ class TableStore:
             raise StoreError(f"injected: the {kind} transaction committed, its answer was lost")
         return value
 
-    async def acquire(self, scope) -> None:
+    async def acquire(self, scope, prior=None) -> None:
         await self._transaction("acquire", scope, lambda box: None)
 
     async def store(self, write, prior, scope) -> Written:
