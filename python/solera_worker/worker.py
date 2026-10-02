@@ -834,7 +834,7 @@ async def _reconcile(o: _Out, spec):
     key list records: the store's rows as they are — streamed back sorted a
     chunk at a time by its `scan`, versioned as a `Sql` write's rows are,
     folded natively — with the patch's run laid over them (its keys' groups
-    in place of the store's, an empty group included, its removes gone),
+    in place of the store's, its removes gone),
     against the pinned index: a streamed replacement. Memory is a chunk and
     the patch."""
 

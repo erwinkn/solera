@@ -92,9 +92,8 @@ impl Versions for Constant {
 }
 
 /// The rows of one key, read one at a time: their version is the group of
-/// their row digests (`fold`), else the version they all share. A marker
-/// stands for a key written with no rows: it adds none, and a key that has
-/// only markers is the empty group, whatever its revision would have been.
+/// their row digests (`fold`), else the version they all share. A key has
+/// rows: one written with none does not exist.
 #[derive(Default)]
 pub struct Group {
     pub key: Vec<u8>,
@@ -114,10 +113,7 @@ impl Group {
         self.rows = 0;
     }
 
-    fn add(&mut self, version: &[u8], marker: bool) -> Result<()> {
-        if marker {
-            return Ok(());
-        }
+    fn add(&mut self, version: &[u8]) -> Result<()> {
         if self.fold {
             let d = version
                 .try_into()
@@ -136,28 +132,10 @@ impl Group {
     }
 
     fn finish(&mut self) {
-        if self.fold || self.rows == 0 {
+        if self.fold {
             self.version.clear();
             self.version
                 .extend_from_slice(&digest::group(&mut self.digests));
-        }
-    }
-}
-
-/// Keys written with no rows, after the rows' own: their markers' keys.
-struct Marked {
-    keys: Box<dyn Keys + Send>,
-    empty: Arena,
-}
-
-impl Keys for Marked {
-    fn len(&self) -> usize {
-        self.keys.len() + self.empty.len()
-    }
-    fn key(&self, i: usize) -> &[u8] {
-        match i.checked_sub(self.keys.len()) {
-            None => self.keys.key(i),
-            Some(j) => self.empty.get(j),
         }
     }
 }
@@ -170,39 +148,25 @@ pub struct Table {
     keys: Box<dyn Keys + Send>,
     order: Option<Vec<u32>>,
     versions: Box<dyn Versions>,
-    /// Rows below are the write's; the rest are markers of empty groups.
-    real: usize,
     /// The digest of every `(key, version)`, once a pass has read them all.
     content: OnceLock<Digest>,
 }
 
 impl Table {
-    /// Sorts the keys unless they arrive sorted; `empty` are keys written
-    /// with no rows, none of them a key of the rows.
-    pub fn new(
-        keys: Box<dyn Keys + Send>,
-        versions: Box<dyn Versions>,
-        empty: Arena,
-    ) -> Result<Table> {
-        let real = keys.len();
-        let keys: Box<dyn Keys + Send> = if empty.is_empty() {
-            keys
-        } else {
-            Box::new(Marked { keys, empty })
-        };
+    /// Sorts the keys unless they arrive sorted.
+    pub fn new(keys: Box<dyn Keys + Send>, versions: Box<dyn Versions>) -> Result<Table> {
         let order = (!sort::is_sorted(&*keys)).then(|| sort::order(&*keys));
         Ok(Table {
             keys,
             order,
             versions,
-            real,
             content: OnceLock::new(),
         })
     }
 
-    /// The write's rows, not keys or markers.
+    /// Rows, not keys.
     pub fn len(&self) -> usize {
-        self.real
+        self.keys.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -235,21 +199,16 @@ impl Table {
     }
 
     /// The rows of `key`, in the order the write had them; None when the
-    /// write does not hold the key (an empty group holds it, with no rows).
+    /// write does not hold the key.
     pub fn find(&self, key: &[u8]) -> Option<Vec<u32>> {
         let mut p = self.lower(key);
         let mut rows = Vec::new();
-        let mut held = false;
         while p < self.keys.len() && self.keys.key(self.row(p) as usize) == key {
-            let r = self.row(p);
-            held = true;
-            if (r as usize) < self.real {
-                rows.push(r);
-            }
+            rows.push(self.row(p));
             p += 1;
         }
         rows.sort_unstable();
-        held.then_some(rows)
+        (!rows.is_empty()).then_some(rows)
     }
 
     /// The version of `key`, from its rows alone; None when the write does
@@ -263,7 +222,7 @@ impl Table {
         let mut g = Group::default();
         g.start(key, self.versions.rows());
         for i in 0..versions.len() {
-            g.add(versions.get(i), false)?;
+            g.add(versions.get(i))?;
         }
         g.finish();
         Ok(Some(g.version))
@@ -330,28 +289,7 @@ impl Cursor {
         self.wkeys.clear();
         gather(&*t.keys, &self.wrows, &mut self.wkeys);
         self.wvers.clear();
-        let real: Vec<u32> = self
-            .wrows
-            .iter()
-            .copied()
-            .filter(|&r| (r as usize) < t.real)
-            .collect();
-        if real.len() == self.wrows.len() {
-            t.versions.fill(&self.wrows, &mut self.wvers)?;
-        } else {
-            // Markers have no version of their own: an empty one keeps the window aligned.
-            let mut found = Arena::default();
-            t.versions.fill(&real, &mut found)?;
-            let mut j = 0;
-            for &r in &self.wrows {
-                if (r as usize) < t.real {
-                    self.wvers.push(found.get(j));
-                    j += 1;
-                } else {
-                    self.wvers.push(b"");
-                }
-            }
-        }
+        t.versions.fill(&self.wrows, &mut self.wvers)?;
         self.start = self.pos;
         Ok(())
     }
@@ -369,13 +307,11 @@ impl Cursor {
         }
         self.fill()?;
         let fold = self.table.versions.rows();
-        let real = self.table.real;
         self.group
             .start(self.wkeys.get(self.pos - self.start), fold);
         loop {
             let i = self.pos - self.start;
-            self.group
-                .add(self.wvers.get(i), self.wrows[i] as usize >= real)?;
+            self.group.add(self.wvers.get(i))?;
             self.pos += 1;
             if self.pos >= n {
                 break;
@@ -497,7 +433,7 @@ impl Stream {
                 self.group.start(key, self.fold);
                 self.open = true;
             }
-            self.group.add(v.get(self.pos), false)?;
+            self.group.add(v.get(self.pos))?;
             self.pos += 1;
         }
     }

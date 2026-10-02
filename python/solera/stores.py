@@ -30,8 +30,8 @@ class Patch:
     """Partial write: replace the named keys, delete `remove` (§4). For a
     keyed rows output, `rows` is the rows themselves, carrying their key
     column, or — by key — `{key: rows}`: each key's group, the key column
-    stamped by the store, an empty group a live key with no rows
-    (docs/per-key-processing.md §6)."""
+    stamped by the store. A key with no rows does not exist: given none, it
+    is removed (docs/per-key-processing.md §6)."""
 
     rows: Any
     remove: Any = ()
@@ -200,7 +200,7 @@ def key_text(value: Any) -> str:
 
 def by_key(write: Any, output: Output) -> tuple[Any, list[str]] | None:
     """A by-key write of a keyed rows output — `{key: rows}` — as flat rows
-    with the key column stamped, and the keys whose group is empty; `None`
+    with the key column stamped, and the keys given no rows; `None`
     for any other write. Rows that carry the key column already must agree
     with their key. DataFrames stay a DataFrame, so their values keep their
     Arrow digests (docs/row-digest.md); anything else becomes a list of dicts."""
@@ -351,6 +351,7 @@ def prepare(write: Any, output: Output, exclude: tuple[str, ...] = ()) -> Prepar
     name = output.name
     patch = isinstance(write, Patch)
     content = write.rows if patch else write
+    empty: list[str] = []
     try:
         if output.is_partition_set:
             elements = [str(e) for e in content or ()]
@@ -363,11 +364,11 @@ def prepare(write: Any, output: Output, exclude: tuple[str, ...] = ()) -> Prepar
             items = list(content.items())
             rows, take = Rows.values(items), _taker(items)
         else:
-            payload, empty = content, []
+            payload = content
             flat = by_key(content, output)
-            if flat is not None:
+            if flat is not None:  # a key given no rows does not exist: a patch removes it
                 payload, empty = flat
-            args = (output.key, output.revision, list(exclude), empty)
+            args = (output.key, output.revision, list(exclude))
             if _is_dataframe(payload):
                 names, columns = _frame(payload, name)
                 rows = Rows.columns(names, columns, *args)
@@ -388,7 +389,8 @@ def prepare(write: Any, output: Output, exclude: tuple[str, ...] = ()) -> Prepar
                 rows, take = Rows.records(payload, *args), _taker(payload)
         removes = ()
         if patch:
-            removes = tuple(k for k in sorted(set(map(key_text, write.remove))) if k not in rows)
+            gone = set(map(key_text, write.remove)) | set(empty)
+            removes = tuple(k for k in sorted(gone) if k not in rows)
     except KeyError as e:
         raise WriteError(f"{name}: row lacks the declared key column {output.key!r}") from e
     except ValueError as e:  # a key that is not one, Arrow data without the columns, a value with no digest

@@ -301,18 +301,15 @@ row(r)      = the canonical 16-byte row digest of r without the key column
 | a row duplicated | different: a multiset counts |
 | the key column present or not in the returned rows | the same: it is excluded |
 | a key with one row | `group([row])` — the same rule, no special case |
-| a key given no rows (`Patch({k: []})`) | `group([])`, a live key with empty content — not a remove |
+| a key given no rows (`Patch({k: []})`, or an `Each` call returning none) | no version: a key with zero rows does not exist, so the patch removes it (a replacement simply leaves it out) |
 | a declared `revision=` column | its value, verbatim, which every row of the group must share; else a write error |
-| a declared `revision=` column and no rows | `group([])`: there is no value to take, so an empty group always has the empty-group version |
 | a `keyed=True` output | the canonical digest of its one value (it holds values, not rows) |
 
-An empty group keeps "processed, nothing in it" apart from "gone": the key
-stays live in the index, and downstream consumers see an upsert with no
-rows. Loading it by key returns it: `store.load(ref, dict[str, T],
-Keys([k]))` gives `{k: <empty T>}` — an empty DataFrame with the table's
-columns, `[]` for rows. A flat load (`T` alone) has no way to show an
-empty group; a consumer that must tell "empty" from "absent" loads by
-key, as `Each` does.
+"Processed, produced nothing" is not output content: a key's existence is
+its rows. That a key was processed is recorded by its outcome
+(`key_outcomes`, §10) and by the watermark that moved past it; the output,
+the index and every store hold only keys with rows, so no store has to
+tell an empty group from an absent key — a table cannot.
 
 The byte grammar — row digests, the group production, its header and
 version — is specified next to the native code in `row-digest.md` (being
@@ -351,7 +348,7 @@ it as it is.
 | `list[dict]` | `Rows.records`; taken as the dicts |
 | pandas DataFrame | column by column through pandas alone (`Rows.columns`), every missing value — NaN, NaT, None, NA — None; timestamps without nanoseconds as `datetime`s; taken as dicts of those values |
 | Arrow data | `Rows.arrow`, in place (a pyarrow stream is read once, into a table); taken through pyarrow, a map as a dict |
-| `{key: rows}` | flattened, each row stamped with its key; a key given no rows is the empty group (`Rows.records(…, empty=)`) |
+| `{key: rows}` | flattened, each row stamped with its key; a key given no rows is removed by a patch, absent from a replacement |
 | `keyed=True` dict | `Rows.values` |
 | partition set | `Rows.keys` |
 
@@ -378,8 +375,7 @@ transfer; declaring a revision column avoids it.
   engine sees a row.
 - **Grouping is native**: `Rows` sorts by key with the existing
   permutation, digests rows in parallel, and folds each run of equal keys
-  into `group(…)`; for the by-key form, keys with no rows come as a
-  separate packed list, each a marker that adds no row.
+  into `group(…)`; a key given no rows is no key at all.
 - **Patches move off `key_map`** onto the same `Rows` (removes as a packed
   key list). That is also what the HTTP resolver needs — the worker's
   sorted run of `(key, version, deleted)` — so one path serves
@@ -1023,9 +1019,8 @@ is below the current one.
   `Patch({key: …})` writes, over random pages, deletes and failures.
 - Group versions: invariant under row order and key-column presence,
   sensitive to duplicates; flat rows and the by-key form give the same
-  versions; Python and Arrow input give the same digests; empty groups are
-  live keys, load as `{k: <empty T>}`, and keep the empty-group version
-  under `revision=`; both `Sql` paths give the versions a Python or Arrow
+  versions; Python and Arrow input give the same digests; a key given no
+  rows is removed; both `Sql` paths give the versions a Python or Arrow
   write of the same rows gives, and a group with mixed revisions is a
   write error.
 - Each error class in and out of the per-key call; `errors=` mapping;
@@ -1120,8 +1115,8 @@ Where the implementation (`solera/errors.py`, `solera/build.py`,
   reads `GET /assets/{name}/failures` and `GET /assets/{name}/key-outcomes`.
 - **The build identity outside git** hashes the project directory's Python
   files only (data written next to a project would otherwise change it).
-- **PostgresStore** loads an empty group as an empty DataFrame with the
-  table's columns; `can_load(dict[str, T], Keys)` holds when `can_load(T, Keys)` does.
+- **PostgresStore** loads by key only the keys that have rows;
+  `can_load(dict[str, T], Keys)` holds when `can_load(T, Keys)` does.
 - **Patterns** (`solera/patterns.py`) are evaluated by Python's `re`, by
   the worker only — on every page it reads: windows, inlined pages
   (`resolved-commits.md` §7), full deliveries, `keys=` overrides and

@@ -645,19 +645,16 @@ impl Rows {
         py: Python<'_>,
         keys: Box<dyn sort::Keys + Send>,
         versions: Box<dyn Versions>,
-        empty: Arena,
     ) -> PyResult<Rows> {
-        let table = py
-            .detach(|| Table::new(keys, versions, empty))
-            .map_err(to_py)?;
+        let table = py.detach(|| Table::new(keys, versions)).map_err(to_py)?;
         Ok(Rows {
             table: Arc::new(table),
         })
     }
 }
 
-/// Keys written with no rows, packed; none of them may be a key of the rows.
-fn empty_keys(keys: &[Bound<'_, PyAny>]) -> PyResult<Arena> {
+/// Keys, packed.
+fn packed_keys(keys: &[Bound<'_, PyAny>]) -> PyResult<Arena> {
     let mut out = Arena::default();
     for k in keys {
         row_key(k, &mut out.data)?;
@@ -672,17 +669,14 @@ impl Rows {
     /// version is the group of the key's row digests, without the key column
     /// and the `exclude`d ones, or with `revision` that column's text, which
     /// the key's rows must share.
-    /// `empty` are keys written with no rows: each the empty group
-    /// (docs/per-key-processing.md §6).
     #[staticmethod]
-    #[pyo3(signature = (rows, key, revision=None, exclude=vec![], empty=vec![]))]
+    #[pyo3(signature = (rows, key, revision=None, exclude=vec![]))]
     fn records(
         py: Python<'_>,
         rows: Bound<'_, PyList>,
         key: &str,
         revision: Option<&str>,
         exclude: Vec<String>,
-        empty: Vec<Bound<'_, PyAny>>,
     ) -> PyResult<Rows> {
         let records = Records::new(key, revision, exclude);
         let (mut w, names) = (pyvalue::Walker::new(py)?, records.names(py));
@@ -709,7 +703,7 @@ impl Rows {
             versions,
             rows: revision.is_none(),
         };
-        Rows::new(py, Box::new(keys), Box::new(versions), empty_keys(&empty)?)
+        Rows::new(py, Box::new(keys), Box::new(versions))
     }
 
     /// Rows read a column at a time — a DataFrame through pandas alone, no
@@ -717,7 +711,7 @@ impl Rows {
     /// where it is missing. A row digests as the mapping of its values not
     /// null would (`records`).
     #[staticmethod]
-    #[pyo3(signature = (names, columns, key, revision=None, exclude=vec![], empty=vec![]))]
+    #[pyo3(signature = (names, columns, key, revision=None, exclude=vec![]))]
     #[allow(clippy::too_many_arguments)]
     fn columns(
         py: Python<'_>,
@@ -726,7 +720,6 @@ impl Rows {
         key: &str,
         revision: Option<&str>,
         exclude: Vec<String>,
-        empty: Vec<Bound<'_, PyAny>>,
     ) -> PyResult<Rows> {
         if names.len() != columns.len() {
             return Err(PyValueError::new_err("a name for every column"));
@@ -793,7 +786,7 @@ impl Rows {
             versions,
             rows: revision.is_none(),
         };
-        Rows::new(py, Box::new(keys), Box::new(versions), empty_keys(&empty)?)
+        Rows::new(py, Box::new(keys), Box::new(versions))
     }
 
     /// `(key, value)` pairs (a `keyed=True` output): the version is `value(v)`.
@@ -804,7 +797,6 @@ impl Rows {
             py,
             Box::new(keys),
             Box::new(PyVersions::Values(items.unbind())),
-            Arena::default(),
         )
     }
 
@@ -816,7 +808,6 @@ impl Rows {
             py,
             Box::new(keys),
             Box::new(PyVersions::Pairs(items.unbind())),
-            Arena::default(),
         )
     }
 
@@ -824,12 +815,7 @@ impl Rows {
     #[staticmethod]
     fn keys(py: Python<'_>, keys: Bound<'_, PyList>, version: &[u8]) -> PyResult<Rows> {
         let packed = pack(py, &keys, |k| Ok(k.clone()))?;
-        Rows::new(
-            py,
-            Box::new(packed),
-            Box::new(Constant(version.to_vec())),
-            Arena::default(),
-        )
+        Rows::new(py, Box::new(packed), Box::new(Constant(version.to_vec())))
     }
 
     /// Arrow data (any object with `__arrow_c_stream__`), read in place: keys
@@ -837,14 +823,13 @@ impl Rows {
     /// else each key's group of row digests without the `exclude`d columns
     /// (`arrow.rs`).
     #[staticmethod]
-    #[pyo3(signature = (data, key, revision=None, exclude=vec![], empty=vec![]))]
+    #[pyo3(signature = (data, key, revision=None, exclude=vec![]))]
     fn arrow(
         py: Python<'_>,
         data: Bound<'_, PyAny>,
         key: &str,
         revision: Option<&str>,
         exclude: Vec<String>,
-        empty: Vec<Bound<'_, PyAny>>,
     ) -> PyResult<Rows> {
         let batches = arrow_batches(py, &data)?;
         let keys = arrow::keys(&batches, key, false).map_err(to_py)?;
@@ -853,7 +838,7 @@ impl Rows {
             Some(r) => Box::new(arrow::Revision::new(&batches, r).map_err(to_py)?),
             None => Box::new(arrow::RowDigest::new(batches, &records.skip).map_err(to_py)?),
         };
-        Rows::new(py, keys, versions, empty_keys(&empty)?)
+        Rows::new(py, keys, versions)
     }
 
     /// Rows, not keys.
@@ -890,14 +875,14 @@ impl Rows {
 
     /// The rows of each of `keys`, as indices into what the rows were made
     /// from, each key's in their order there: `(rows, ends)`, key `i`'s rows
-    /// at `rows[ends[i - 1]:ends[i]]`. A key written with no rows has none;
-    /// a key the write does not hold is a `KeyError`.
+    /// at `rows[ends[i - 1]:ends[i]]`. A key the write does not hold is a
+    /// `KeyError`.
     fn find<'py>(
         &self,
         py: Python<'py>,
         keys: Vec<Bound<'py, PyAny>>,
     ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyList>)> {
-        let packed = empty_keys(&keys)?;
+        let packed = packed_keys(&keys)?;
         let table = self.table.clone();
         let found: Vec<Option<Vec<u32>>> = py.detach(|| {
             (0..packed.len())
@@ -927,7 +912,7 @@ impl Rows {
         py: Python<'py>,
         keys: Vec<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyList>> {
-        let packed = empty_keys(&keys)?;
+        let packed = packed_keys(&keys)?;
         let table = self.table.clone();
         let found: Vec<format::Result<Option<Vec<u8>>>> = py.detach(|| {
             (0..packed.len())
@@ -945,7 +930,7 @@ impl Rows {
         Ok(out)
     }
 
-    /// Whether the write holds `key` (with rows, or as an empty group).
+    /// Whether the write holds `key`.
     fn __contains__(&self, key: Bound<'_, PyAny>) -> PyResult<bool> {
         let mut k = Vec::new();
         row_key(&key, &mut k)?;

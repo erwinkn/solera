@@ -801,3 +801,26 @@ async def test_a_listing_holds_its_index_files_through_collection(tmp_path, monk
     await engine.upkeep.collect()  # done reading: now they go
     assert not state.model.garbage
     await state.close()
+
+
+async def test_a_key_given_no_rows_does_not_exist(state):
+    """docs/per-key-processing.md §6: a key with zero rows does not exist. A
+    by-key write gives `b` no rows: a replacement leaves it out, a patch
+    removes it — from the index, so from every consumer and store."""
+
+    value = {"v": {"a": [{"n": 1}], "b": []}}
+
+    @asset(outputs=Output("items", key="id"))
+    def items():
+        return value["v"]
+
+    engine = engine_for(state, Project(assets=[items]))
+    await engine.initialize()
+    await run(engine, ["items"])
+    assert sorted((await engine.list_keys("items"))["keys"]) == ["a"]
+    value["v"] = Patch({"b": [{"n": 2}]})
+    await run(engine, ["items"])
+    assert sorted((await engine.list_keys("items"))["keys"]) == ["a", "b"]
+    value["v"] = Patch({"b": []})
+    await run(engine, ["items"])
+    assert sorted((await engine.list_keys("items"))["keys"]) == ["a"]

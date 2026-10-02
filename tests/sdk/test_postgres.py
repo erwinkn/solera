@@ -403,7 +403,7 @@ async def test_reconciliation_streams_the_slice_and_digests_rows_as_written(stor
     back through `scan` a chunk at a time — never loaded whole — and digested
     as written rows are, without the partition column the store stamps. An
     unchanged stored row stays unchanged. A by-key patch reconciles like any:
-    its empty group is a key, with no rows."""
+    a key it gives no rows is removed."""
 
     from obstore.store import MemoryStore
     from solera.keys import _python
@@ -572,10 +572,10 @@ async def test_a_sql_write_cannot_replace_its_table(store):
         await store.store([{"id": "a", "v": "0"}], first.ref, fenced(out, 3))
 
 
-async def test_by_key_patch_stamps_keys_and_keeps_empty_groups(store):
+async def test_by_key_patch_stamps_keys_and_removes_keys_given_no_rows(store):
     """docs/per-key-processing.md §6: `Patch({key: rows})` stamps the key
-    column; a key given no rows loses its old rows and stays live; a keyed
-    load hands each selected key its group, an empty one included."""
+    column; a key given no rows does not exist — it is removed; a keyed load
+    hands each selected key that has rows its group."""
 
     import pandas as pd
 
@@ -584,17 +584,18 @@ async def test_by_key_patch_stamps_keys_and_keeps_empty_groups(store):
         Patch({"a.csv": pd.DataFrame({"n": [1, 2]}), "b.csv": pd.DataFrame({"n": [3]})}), None, scope(out)
     )
     patch = Patch({"b.csv": pd.DataFrame({"n": []}), "c.csv": [{"n": 4}]}, remove=["a.csv"])
-    selected = dict.fromkeys(["b.csv", "c.csv"], b"")
     second = await store.store(
-        KeyedWrite(prepare_for(store, patch, out), selected, frozenset({"a.csv"})), first.ref, scope(out)
+        KeyedWrite(prepare_for(store, patch, out), {"c.csv": b""}, frozenset({"a.csv", "b.csv"})),
+        first.ref,
+        scope(out),
     )
     rows = await store.load(second.ref, list[dict], None)
     assert sorted((r["path"], r["n"]) for r in rows) == [("c.csv", 4)]
     selection = Keys({k: (b"", 0) for k in ("b.csv", "c.csv")})
     groups = await store.load(second.ref, dict[str, pd.DataFrame], selection)
-    assert list(groups) == ["b.csv", "c.csv"]
-    assert groups["b.csv"].empty and set(groups["b.csv"].columns) == {"path", "n"}
+    assert list(groups) == ["c.csv"]
     assert groups["c.csv"]["n"].tolist() == [4]
+    assert patch_removes(store, patch, out) == ("a.csv", "b.csv")
     with pytest.raises(WriteError, match="carries"):
         await store.store(Patch({"d.csv": [{"path": "other", "n": 1}]}), second.ref, scope(out))
     assert store.can_load(dict[str, pd.DataFrame], Keys) and not store.can_load(dict[str, pd.DataFrame], None)
@@ -749,3 +750,7 @@ async def test_rows_first_written_keep_their_types(store):
     written = await store.store([row], None, scope(out))
     [back] = await store.load(written.ref, list[dict], None)
     assert {k: back[k] for k in row} == {**row, "b": back["b"]} and bytes(back["b"]) == row["b"]
+
+
+def patch_removes(store, patch, out):
+    return prepare_for(store, patch, out).removes

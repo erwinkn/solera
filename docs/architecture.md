@@ -277,7 +277,7 @@ the store, works out what changed, against the key index (§6):
 
 | Write | Semantics |
 |---|---|
-| `Patch(rows, remove=())` | after the write, the scope's rows for the keys present in `rows` (read from the declared `key` column) are exactly these; keys in `remove` are gone; every other key is untouched. On an unkeyed incremental output the rows are one new batch and `remove` is not allowed. By key, `Patch({key: rows})`: each key's group, its key column stamped by the store; a key given no rows is a live key with an empty group (per-key-processing.md §6). |
+| `Patch(rows, remove=())` | after the write, the scope's rows for the keys present in `rows` (read from the declared `key` column) are exactly these; keys in `remove` are gone; every other key is untouched. On an unkeyed incremental output the rows are one new batch and `remove` is not allowed. By key, `Patch({key: rows})`: each key's group, its key column stamped by the store; a key given no rows does not exist, and the patch removes it (per-key-processing.md §6). |
 | `Sql(stmt)` | PostgresStore only. The output *is* the table `{schema}.{table}` (`table` defaults to the output name, `schema` to `public`): a `SELECT` is materialized into it as a replace; any other statement runs verbatim and must leave that table in place. Returns an ordinary `TableRef`, loadable downstream. Version `H(prior.version ‖ H(stmt))`. |
 
 ### Shipped stores

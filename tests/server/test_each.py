@@ -43,7 +43,9 @@ def files_project(content, fn, **edge):
 
 async def test_one_call_per_key_many_rows_one_write(state):  # noqa: F811
     """Each key's call returns its rows; the store takes every key's group
-    in one write; a file that parses to nothing is a live, empty key."""
+    in one write. A file that parses to nothing has no key in the output —
+    a key with no rows does not exist — while its outcome says it was
+    processed."""
 
     content = {"a.csv": "1,2", "b.csv": "3", "c.csv": ""}
     calls = []
@@ -61,7 +63,6 @@ async def test_one_call_per_key_many_rows_one_write(state):  # noqa: F811
     assert {k: sorted(r["value"] for r in v) for k, v in got.items()} == {
         "a.csv": [1, 2],
         "b.csv": [3],
-        "c.csv": [],
     }
     assert all(r["path"] == k for k, v in got.items() for r in v)  # the store stamps the key
     attempt = detail["attempts"][next(t["id"] for t in detail["tasks"] if t["asset"] == "parse")][-1]

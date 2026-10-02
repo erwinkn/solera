@@ -10,7 +10,8 @@ alike: the same logical rows get the same version however they arrive.
 
 Every key is a **group**: the rows of a write that carry it. A row is
 usually alone in its group; a key whose rows come from one parsed file
-holds them all. The version of a key is:
+holds them all. A key with no rows does not exist: a patch giving a key
+none removes it. The version of a key is:
 
 | Output | Version |
 |---|---|

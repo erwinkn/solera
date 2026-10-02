@@ -644,8 +644,8 @@ class PostgresStore:
                 rows = [{k: v for k, v in r.items() if k not in internal} for r in rows]
         inner = by_key_type(t)
         if inner is not MISSING and isinstance(selection, Keys):
-            # Each selected key's group, an empty one included (per-key §6).
-            groups: dict[str, list] = {k: [] for k in sorted(selection.revisions)}
+            # Each selected key's group: a key with no rows does not exist (per-key §6).
+            groups: dict[str, list] = {}
             for row in rows:
                 groups.setdefault(str(row[handle["key"]]), []).append(row)
             return {k: _materialize(g, inner, columns) for k, g in groups.items()}
