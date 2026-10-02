@@ -4,7 +4,7 @@ import type { Json } from "@/api/types";
 import { useNow } from "@/lib/clock";
 import { cn } from "@/lib/cn";
 import { ago, duration, shortHash, shortId, stamp } from "@/lib/format";
-import { toneSolid, type Tone } from "@/lib/status";
+import { markSolid, type Tone } from "@/lib/status";
 import { Barrels } from "./art";
 import { Tooltip } from "./overlay";
 
@@ -128,7 +128,7 @@ export function SegmentBar({
           .map((p) => (
             <span
               key={p.label}
-              className={cn("h-full border-r border-surface last:border-r-0", toneSolid[p.tone])}
+              className={cn("h-full border-r border-surface last:border-r-0", markSolid[p.tone])}
               style={{ width: `${(100 * p.value) / total}%` }}
             />
           ))}

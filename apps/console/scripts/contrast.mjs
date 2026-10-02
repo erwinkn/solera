@@ -5,7 +5,10 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const css = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "src", "styles", "themes.css"), "utf8");
+const css = readFileSync(
+  join(dirname(fileURLToPath(import.meta.url)), "..", "src", "styles", "themes.css"),
+  "utf8",
+);
 
 function theme(selector) {
   const start = css.indexOf(selector + " {") >= 0 ? css.indexOf(selector + " {") : css.indexOf(selector);
@@ -28,7 +31,9 @@ const ratio = (a, b) => {
 const TEXT = 4.5;
 const MARK = 3;
 const pairs = [
-  ...["fg", "fg-muted", "fg-subtle"].flatMap((fg) => ["bg", "surface", "surface-2", "sunken"].map((bg) => [fg, bg, TEXT])),
+  ...["fg", "fg-muted", "fg-subtle"].flatMap((fg) =>
+    ["bg", "surface", "surface-2", "sunken"].map((bg) => [fg, bg, TEXT]),
+  ),
   ...["ok", "run", "wait", "warn", "fail", "idle"].flatMap((s) => [
     [`${s}-fg`, `${s}-soft`, TEXT],
     [`${s}-fg`, "surface", TEXT],
@@ -57,13 +62,18 @@ for (const [name, ...selectors] of [
   ["normal", '[data-theme="normal"]'],
   ["fun", '[data-theme="fun"]'],
   ["brutal", '[data-theme="brutal"]'],
+  ["cellar", '[data-theme="cellar"]'],
+  ["instrument", '[data-theme="instrument"]'],
+  ["observatory", '[data-theme="observatory"]'],
   // The navigation's own scope: a black slab in Brutal.
   ["brutal navigation", '[data-theme="brutal"]', '[data-theme="brutal"] [data-chrome]'],
 ]) {
   const t = Object.assign({}, theme(":root,"), ...selectors.map(theme));
   const resolve = (v) => (v?.startsWith("var(--") ? t[v.slice(6, -1)] : v);
   for (const k of Object.keys(t)) t[k] = resolve(t[k]);
-  const rows = (name.endsWith("navigation") ? navPairs : [...pairs, ["nav-active-fg", "accent-soft", TEXT]]).map(([fg, bg, min]) => {
+  const rows = (
+    name.endsWith("navigation") ? navPairs : [...pairs, ["nav-active-fg", "accent-soft", TEXT]]
+  ).map(([fg, bg, min]) => {
     const value = ratio(t[fg], t[bg]);
     if (value < min) failed++;
     return { pair: `${fg} on ${bg}`, ratio: value.toFixed(2), min, ok: value >= min ? "pass" : "FAIL" };

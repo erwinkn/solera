@@ -78,7 +78,7 @@ export function StatusDot({
       className={cn(
         "inline-block size-2 shrink-0 rounded-full",
         toneSolid[t],
-        pulse && "animate-[pulse-dot_1.6s_ease-in-out_infinite]",
+        pulse && "live-glow animate-[pulse-dot_1.6s_ease-in-out_infinite]",
         className,
       )}
     />

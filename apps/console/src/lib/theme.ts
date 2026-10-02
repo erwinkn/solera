@@ -5,8 +5,17 @@ import { createStore, useStore } from "./store";
  * spacing unit and easing reads from it (styles/themes.css). public/theme.js
  * applies the stored choice before first paint.
  */
-export const THEMES = ["normal", "fun", "brutal"] as const;
+export const THEMES = ["normal", "cellar", "instrument", "observatory", "fun", "brutal"] as const;
 export type Theme = (typeof THEMES)[number];
+
+export const THEME_NAMES: Record<Theme, string> = {
+  normal: "Normal",
+  cellar: "Cellar",
+  instrument: "Instrument",
+  observatory: "Observatory",
+  fun: "Fun",
+  brutal: "Brutal",
+};
 
 const KEY = "solera.theme";
 

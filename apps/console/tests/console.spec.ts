@@ -72,20 +72,18 @@ test("the theme switches by tokens alone and persists", async ({ page }) => {
     if (mobile(page)) await page.getByRole("button", { name: "Open navigation" }).click();
   };
   const seen = new Set([await look()]);
-  for (const theme of ["Fun", "Brutal"]) {
+  for (const theme of ["cellar", "instrument", "observatory"]) {
     await open();
-    await page.getByRole("radio", { name: theme }).click();
-    await expect(page.locator("html")).toHaveAttribute("data-theme", theme.toLowerCase());
+    await page.getByRole("combobox", { name: "Theme" }).selectOption(theme);
+    await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
     if (mobile(page)) await page.keyboard.press("Escape");
     seen.add(await look());
   }
-  expect(seen.size).toBe(3); // three looks, one component tree
+  expect(seen.size).toBe(4); // four looks, one component tree
   await page.reload();
-  await expect(page.locator("html")).toHaveAttribute("data-theme", "brutal");
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "observatory");
   await open();
-  // Arrow keys move through the options, selecting as they go.
-  await page.getByRole("radio", { name: "Brutal" }).focus();
-  await page.keyboard.press("Home");
+  await page.getByRole("combobox", { name: "Theme" }).selectOption("normal");
   await expect(page.locator("html")).toHaveAttribute("data-theme", "normal");
 });
 

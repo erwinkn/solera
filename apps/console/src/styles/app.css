@@ -34,6 +34,7 @@
   --color-ok: var(--ok);
   --color-ok-soft: var(--ok-soft);
   --color-ok-fg: var(--ok-fg);
+  --color-viz-ok: var(--viz-ok);
   --color-run: var(--run);
   --color-run-soft: var(--run-soft);
   --color-run-fg: var(--run-fg);
@@ -150,9 +151,63 @@
   filter: saturate(var(--art-saturate));
 }
 
+@utility card-title {
+  font-family: var(--card-title-font);
+  font-size: var(--card-title-size);
+  font-weight: var(--card-title-weight);
+  letter-spacing: var(--card-title-tracking);
+  text-transform: var(--card-title-case);
+  font-variation-settings: var(--head-variation);
+  line-height: 1.3;
+}
+@utility figure {
+  font-family: var(--figure-font);
+  font-weight: var(--figure-weight);
+  letter-spacing: var(--figure-tracking);
+  font-variant-numeric: tabular-nums lining-nums;
+}
+@utility label-font {
+  font-family: var(--label-font);
+  letter-spacing: var(--label-tracking);
+}
+@utility masthead {
+  border-bottom: var(--masthead-rule);
+  padding-bottom: var(--masthead-pad);
+}
+/* Registration marks at a panel's four corners, where a theme draws them. */
+@utility corner-ticks {
+  background-image:
+    linear-gradient(var(--tick), var(--tick)), linear-gradient(var(--tick), var(--tick)),
+    linear-gradient(var(--tick), var(--tick)), linear-gradient(var(--tick), var(--tick)),
+    linear-gradient(var(--tick), var(--tick)), linear-gradient(var(--tick), var(--tick)),
+    linear-gradient(var(--tick), var(--tick)), linear-gradient(var(--tick), var(--tick));
+  background-position:
+    0 0,
+    0 0,
+    100% 0,
+    100% 0,
+    0 100%,
+    0 100%,
+    100% 100%,
+    100% 100%;
+  background-size:
+    9px 2px,
+    2px 9px,
+    9px 2px,
+    2px 9px,
+    9px 2px,
+    2px 9px,
+    9px 2px,
+    2px 9px;
+  background-repeat: no-repeat;
+}
+@utility live-glow {
+  box-shadow: var(--live-glow);
+}
+
 @layer base {
   html {
-    color-scheme: light;
+    color-scheme: var(--scheme);
     -webkit-text-size-adjust: 100%;
   }
   body {

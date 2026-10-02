@@ -4,7 +4,7 @@ import { CalendarClock, GitCommitHorizontal, Hand, Radar, RotateCcw } from "luci
 import type { Histogram, Partitions, RunRow } from "@/api/types";
 import { cn } from "@/lib/cn";
 import { clock, count, dateTime, firstLine, plural, shortId } from "@/lib/format";
-import { label, toneSolid, type Tone } from "@/lib/status";
+import { label, markSolid, type Tone } from "@/lib/status";
 import { useNow } from "@/lib/clock";
 import { Elapsed, Id, Time } from "@/ui/data";
 import { Tooltip } from "@/ui/overlay";
@@ -296,7 +296,7 @@ export function RunHistogram({
                     key={part.status}
                     className={cn(
                       "w-full shrink-0",
-                      toneSolid[part.tone],
+                      markSolid[part.tone],
                       i === parts.length - 1 && "rounded-t-mark",
                     )}
                     style={{

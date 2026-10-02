@@ -1,5 +1,5 @@
 /*
- * The two themes. Each is a complete set of semantic token values; components
+ * The themes. Each is a complete set of semantic token values; components
  * only ever read these (through the Tailwind names in app.css), never a theme
  * name. Adding a theme means adding a block here — and its pairs to
  * scripts/contrast.mjs.
@@ -121,6 +121,25 @@
   --nav-divider: transparent;
   --nav-active-fg: var(--fg);
   --chrome-bg: color-mix(in srgb, var(--surface) 60%, transparent);
+  --viz-ok: var(--ok); /* success as a chart mark: often quieter than the badge */
+
+  /* structure: what a theme may change beyond colour and type */
+  --scheme: light;
+  --masthead-rule: 0 solid transparent; /* a rule under page headers */
+  --masthead-pad: 0px;
+  --card-title-font: var(--font-head);
+  --card-title-size: var(--t-base);
+  --card-title-weight: var(--head-weight);
+  --card-title-case: var(--head-case);
+  --card-title-tracking: var(--head-tracking);
+  --figure-font: var(--font-ui); /* big numbers */
+  --figure-weight: 600;
+  --figure-tracking: -0.02em;
+  --label-font: var(--font-ui); /* table heads, fact labels */
+  --label-tracking: 0.04em;
+  --tick: transparent; /* registration marks at card corners */
+  --nav-bar: transparent; /* a bar beside the active navigation item */
+  --live-glow: 0 0 0 0 transparent; /* around things running now */
   --art-opacity: 0.7;
   --art-saturate: 0;
   --art-1: var(--fg-subtle);
@@ -382,6 +401,298 @@
   --shadow-button-hover: 5px 5px 0 0 #ff90e8;
   --shadow-1: none;
   color: var(--fg);
+}
+
+/*
+ * Cellar: editorial calm. Warm paper and ink, one oxblood accent, serif
+ * titles and figures over a plain grotesk, hairline rules like a printed
+ * ledger. Named for where a solera ages.
+ */
+[data-theme="cellar"] {
+  --bg: #f6f3ed;
+  --surface: #fffdf9;
+  --surface-2: #faf6ef;
+  --sunken: #f1ece3;
+  --overlay: rgb(31 27 22 / 0.35);
+
+  --fg: #1d1915;
+  --fg-muted: #544b41;
+  --fg-subtle: #6a6054;
+  --fg-inverse: #fffdf9;
+
+  --line: #e9e2d6;
+  --line-strong: #d8cfbf;
+  --border-w: 1px;
+
+  --accent: #7b2a1c;
+  --accent-hover: #63200f;
+  --accent-fg: #fffdf9;
+  --accent-soft: #f2e7e1;
+  --select: #f6ead9;
+  --select-line: #c69a5b;
+  --focus: #7b2a1c;
+  --link: #7b2a1c;
+
+  --ok: #2e7a4b;
+  --ok-soft: #e7f1e8;
+  --ok-fg: #235f3a;
+  --viz-ok: #93b09b;
+  --run: #2f62b0;
+  --run-soft: #e8eef8;
+  --run-fg: #244f8e;
+  --wait: #775aa3;
+  --wait-soft: #efe9f5;
+  --wait-fg: #5d4386;
+  --warn: #b5770c;
+  --warn-soft: #f8eedc;
+  --warn-fg: #7a4f00;
+  --fail: #b0322a;
+  --fail-soft: #f8e6e3;
+  --fail-fg: #932a22;
+  --idle: #9d9487;
+  --idle-soft: #efebe4;
+  --idle-fg: #574f44;
+
+  --ph-1: #c4b9a8;
+  --ph-2: #a69a86;
+  --ph-3: #887c69;
+  --ph-4: #6b604f;
+  --ph-5: #2f62b0;
+  --ph-6: #a8642a;
+  --ph-7: #c4b9a8;
+
+  --font-ui: "Instrument Sans Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-head: "Newsreader Variable", ui-serif, Georgia, serif;
+  --font-code: "Geist Mono Variable", ui-monospace, monospace;
+  --head-weight: 500;
+  --head-tracking: -0.012em;
+  --head-variation: normal;
+  --head-case: none;
+  --t-2xl: 2rem;
+  --t-3xl: 2.5rem;
+
+  --r-xs: 3px;
+  --r-sm: 4px;
+  --r-md: 6px;
+  --r-lg: 8px;
+  --r-mark: 2px;
+  --shadow-1: 0 1px 0 rgb(60 40 20 / 0.04);
+  --shadow-2: 0 1px 2px rgb(60 40 20 / 0.05);
+  --shadow-3: 0 2px 6px rgb(40 25 10 / 0.06), 0 16px 40px rgb(40 25 10 / 0.12);
+  --shadow-button: 0 1px 0 rgb(60 40 20 / 0.06);
+
+  --canvas-dots: rgb(60 40 20 / 0.12);
+  --art-opacity: 0.75;
+  --art-saturate: 0.5;
+
+  --masthead-rule: 1px solid var(--line-strong);
+  --masthead-pad: 1.25rem;
+  --card-title-font: var(--font-head);
+  --card-title-size: var(--t-lg);
+  --card-title-weight: 500;
+  --figure-font: var(--font-head);
+  --figure-weight: 500;
+  --figure-tracking: -0.02em;
+  --label-tracking: 0.06em;
+  --nav-bar: var(--accent);
+}
+
+/*
+ * Instrument: the precision of lab hardware. A grey chassis with white
+ * panels, monospace silkscreen labels, registration marks at the corners,
+ * and one signal colour: orange means live, and nothing else is orange.
+ */
+[data-theme="instrument"] {
+  --bg: #e7e7e3;
+  --surface: #f9f9f7;
+  --surface-2: #f2f2ef;
+  --sunken: #ecece8;
+  --overlay: rgb(18 18 18 / 0.4);
+
+  --fg: #141414;
+  --fg-muted: #474744;
+  --fg-subtle: #5f5f5b;
+  --fg-inverse: #f9f9f7;
+
+  --line: #dadad5;
+  --line-strong: #bdbdb7;
+  --border-w: 1px;
+
+  --accent: #141414;
+  --accent-hover: #333331;
+  --accent-fg: #f9f9f7;
+  --accent-soft: #e2e2de;
+  --select: #ffe8dc;
+  --select-line: #ff5a1f;
+  --focus: #d94a10;
+  --link: #a83500;
+
+  --ok: #2a8a4a;
+  --ok-soft: #e1f0e5;
+  --ok-fg: #1c6636;
+  --viz-ok: #a5a5a0;
+  --run: #ff5a1f;
+  --run-soft: #ffe6dc;
+  --run-fg: #a33200;
+  --wait: #5b6c8d;
+  --wait-soft: #e4e8f0;
+  --wait-fg: #3d4b68;
+  --warn: #d49b00;
+  --warn-soft: #faefcf;
+  --warn-fg: #6f4e00;
+  --fail: #d7263d;
+  --fail-soft: #fbe4e7;
+  --fail-fg: #a51b2e;
+  --idle: #a3a39d;
+  --idle-soft: #ebebe8;
+  --idle-fg: #565652;
+
+  --ph-1: #c4c4bf;
+  --ph-2: #a3a39e;
+  --ph-3: #82827d;
+  --ph-4: #61615d;
+  --ph-5: #ff5a1f;
+  --ph-6: #3d4b68;
+  --ph-7: #c4c4bf;
+
+  --font-ui: "IBM Plex Sans Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-head: "IBM Plex Sans Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-code: "IBM Plex Mono", ui-monospace, monospace;
+  --head-weight: 600;
+  --head-tracking: -0.015em;
+  --head-variation: normal;
+  --head-case: none;
+
+  --r-xs: 1px;
+  --r-sm: 2px;
+  --r-md: 2px;
+  --r-lg: 3px;
+  --r-pill: 3px;
+  --r-mark: 1px;
+  --shadow-1: none;
+  --shadow-2: 0 1px 0 rgb(0 0 0 / 0.04);
+  --shadow-3: 0 10px 30px rgb(0 0 0 / 0.16);
+  --shadow-button: none;
+  --press-y: 1px;
+
+  --dur-1: 70ms;
+  --dur-2: 120ms;
+  --dur-3: 160ms;
+
+  --canvas-dots: rgb(0 0 0 / 0.06);
+  --canvas-pattern:
+    linear-gradient(var(--canvas-dots) 1px, transparent 1px),
+    linear-gradient(90deg, var(--canvas-dots) 1px, transparent 1px);
+  --canvas-size: 16px 16px;
+  --art-opacity: 0.7;
+  --art-saturate: 0;
+
+  --masthead-rule: 1.5px solid var(--fg);
+  --masthead-pad: 1rem;
+  --card-title-font: var(--font-code);
+  --card-title-size: var(--t-2xs);
+  --card-title-weight: 500;
+  --card-title-case: uppercase;
+  --card-title-tracking: 0.1em;
+  --figure-font: var(--font-code);
+  --figure-weight: 500;
+  --figure-tracking: -0.04em;
+  --label-font: var(--font-code);
+  --label-tracking: 0.08em;
+  --tick: var(--fg);
+  --nav-bar: #ff5a1f;
+}
+
+/*
+ * Observatory: dark and quiet for long shifts. Blue-black depth, light
+ * from above on every panel, status colours that glow just enough to find,
+ * an iris accent, Inter set tight.
+ */
+[data-theme="observatory"] {
+  --scheme: dark;
+  --bg: #0a0c11;
+  --surface: #11141b;
+  --surface-2: #161a23;
+  --sunken: #0d1016;
+  --overlay: rgb(0 0 0 / 0.6);
+
+  --fg: #e7e9ef;
+  --fg-muted: #a6adbd;
+  --fg-subtle: #848ca0;
+  --fg-inverse: #0a0c11;
+
+  --line: #20252f;
+  --line-strong: #2c3240;
+  --border-w: 1px;
+
+  --accent: #8e8cff;
+  --accent-hover: #a3a1ff;
+  --accent-fg: #0a0c11;
+  --accent-soft: #1c1e36;
+  --select: #1c2140;
+  --select-line: #6f74ff;
+  --focus: #a3a1ff;
+  --link: #aaa8ff;
+
+  --ok: #3ecf8e;
+  --ok-soft: #0f2a20;
+  --ok-fg: #5fe0a5;
+  --viz-ok: #2c6b57;
+  --run: #5aa9ff;
+  --run-soft: #0f2239;
+  --run-fg: #82bfff;
+  --wait: #b58cff;
+  --wait-soft: #22183a;
+  --wait-fg: #c9a9ff;
+  --warn: #f2b04c;
+  --warn-soft: #2d2311;
+  --warn-fg: #f6c46e;
+  --fail: #ff6b6b;
+  --fail-soft: #331517;
+  --fail-fg: #ff8f8f;
+  --idle: #69718a;
+  --idle-soft: #1a1e28;
+  --idle-fg: #a6adbd;
+
+  --ph-1: #3b4253;
+  --ph-2: #4d566a;
+  --ph-3: #616b82;
+  --ph-4: #77829b;
+  --ph-5: #5aa9ff;
+  --ph-6: #f2b04c;
+  --ph-7: #3b4253;
+
+  --font-ui: "Inter Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-head: "Inter Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-code: "JetBrains Mono Variable", ui-monospace, monospace;
+  --head-weight: 600;
+  --head-tracking: -0.022em;
+  --head-variation: normal;
+  --head-case: none;
+
+  --r-xs: 4px;
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --shadow-1: inset 0 1px 0 rgb(255 255 255 / 0.04);
+  --shadow-2: inset 0 1px 0 rgb(255 255 255 / 0.05), 0 1px 2px rgb(0 0 0 / 0.5);
+  --shadow-3: inset 0 1px 0 rgb(255 255 255 / 0.06), 0 20px 50px rgb(0 0 0 / 0.6);
+  --shadow-button: inset 0 1px 0 rgb(255 255 255 / 0.08);
+
+  --canvas-dots: rgb(255 255 255 / 0.07);
+  --art-opacity: 0.55;
+  --art-saturate: 0.4;
+  --art-1: #a6adbd;
+  --art-2: #2c3240;
+  --art-3: #1a1e28;
+
+  --card-title-size: var(--t-sm);
+  --card-title-weight: 600;
+  --card-title-tracking: -0.01em;
+  --figure-weight: 600;
+  --figure-tracking: -0.035em;
+  --nav-bar: var(--accent);
+  --live-glow: 0 0 0 3px rgb(90 169 255 / 0.14), 0 0 14px rgb(90 169 255 / 0.5);
 }
 
 @media (prefers-reduced-motion: reduce) {

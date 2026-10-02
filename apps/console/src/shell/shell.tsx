@@ -19,10 +19,10 @@ import {
 import { q } from "@/api/queries";
 import { cn } from "@/lib/cn";
 import { connect, disconnect, useSession } from "@/lib/session";
-import { setTheme, useTheme } from "@/lib/theme";
+import { setTheme, THEME_NAMES, THEMES, useTheme, type Theme } from "@/lib/theme";
 import { toneSoft, type Tone } from "@/lib/status";
 import { Button, IconButton } from "@/ui/button";
-import { Input, Segmented } from "@/ui/form";
+import { Input, Select } from "@/ui/form";
 import { TooltipProvider } from "@/ui/overlay";
 import { StatusDot } from "@/ui/status";
 import { Toasts } from "./toasts";
@@ -186,6 +186,7 @@ function Nav({ onNavigate }: { onNavigate?: () => void }) {
             "group flex h-8 items-center gap-2.5 rounded-sm px-2.5 text-sm text-fg-muted motion-1 transition-colors",
             "hover:bg-accent-soft hover:text-fg [&_svg]:size-4 [&_svg]:shrink-0",
             "data-[status=active]:bg-accent-soft data-[status=active]:font-medium data-[status=active]:text-[var(--nav-active-fg)]",
+            "data-[status=active]:shadow-[inset_2px_0_0_var(--nav-bar)]",
             "border-b border-[var(--nav-divider)]",
           )}
         >
@@ -247,30 +248,21 @@ function EngineStatus() {
 function ThemeSwitch() {
   const theme = useTheme();
   return (
-    <div className="flex flex-col gap-1.5 px-2.5">
+    <label className="flex items-center justify-between gap-2 px-2.5">
       <span className="text-xs text-fg-subtle">Theme</span>
-      <Segmented
-        label="Theme"
-        size="sm"
-        stretch
+      <Select
+        aria-label="Theme"
+        className="h-7 w-36 text-xs"
         value={theme}
-        onChange={setTheme}
-        options={[
-          {
-            value: "normal",
-            label: "Normal",
-          },
-          {
-            value: "fun",
-            label: "Fun",
-          },
-          {
-            value: "brutal",
-            label: "Brutal",
-          },
-        ]}
-      />
-    </div>
+        onChange={(e) => setTheme(e.target.value as Theme)}
+      >
+        {THEMES.map((t) => (
+          <option key={t} value={t}>
+            {THEME_NAMES[t]}
+          </option>
+        ))}
+      </Select>
+    </label>
   );
 }
 

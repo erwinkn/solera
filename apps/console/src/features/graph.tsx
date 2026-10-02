@@ -250,7 +250,7 @@ function Node({ node, status }: { node: GraphNode; status: AssetStatus | undefin
         <span
           className={cn(
             "grid size-6 shrink-0 place-items-center rounded-sm [&_svg]:size-3.5",
-            toneSoft[tone],
+            tone === "ok" ? "bg-sunken text-fg-muted" : toneSoft[tone],
           )}
         >
           {KIND_ICON[node.kind]}
@@ -309,7 +309,7 @@ function Node({ node, status }: { node: GraphNode; status: AssetStatus | undefin
     </>
   );
   const className =
-    "flex h-full flex-col justify-between gap-1.5 rounded-md border-theme border-line-strong bg-surface p-2.5 shadow-1 motion-2 transition-[transform,box-shadow] hover:-translate-y-px hover:shadow-2 focus-visible:outline-2";
+    "corner-ticks flex h-full flex-col justify-between gap-1.5 rounded-md border-theme border-line-strong bg-surface p-2.5 shadow-1 motion-2 transition-[transform,box-shadow] hover:-translate-y-px hover:shadow-2 focus-visible:outline-2";
   return node.kind === "source" ? (
     <Link to="/sources/$source" params={{ source: node.id }} className={cn(className, "border-dashed")}>
       {body}

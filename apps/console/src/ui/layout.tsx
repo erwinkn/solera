@@ -32,7 +32,7 @@ export function PageHeader({
   meta?: ReactNode;
 }) {
   return (
-    <header className="flex flex-col gap-3">
+    <header className="masthead flex flex-col gap-3">
       {eyebrow && (
         <nav aria-label="Breadcrumb" className="flex items-center gap-1 text-xs text-fg-subtle">
           {eyebrow}
@@ -84,7 +84,10 @@ export function Meta({ label, children }: { label: string; children: ReactNode }
 export function Card({ className, ...props }: ComponentProps<"section">) {
   return (
     <section
-      className={cn("min-w-0 rounded-lg border-theme border-line-strong bg-surface shadow-2", className)}
+      className={cn(
+        "corner-ticks min-w-0 rounded-lg border-theme border-line-strong bg-surface shadow-2",
+        className,
+      )}
       {...props}
     />
   );
@@ -114,7 +117,7 @@ export function CardHeader({
       )}
     >
       <div className="flex min-w-0 flex-col gap-0.5">
-        <h2 id={id} className={cn("font-display text-base text-fg", ident && "normal-case")}>
+        <h2 id={id} className={cn("card-title text-fg", ident && "normal-case")}>
           {title}
         </h2>
         {description && <p className="text-xs text-fg-subtle">{description}</p>}
@@ -136,7 +139,7 @@ export function Fact({
 }) {
   return (
     <div className={cn("flex min-w-0 flex-col gap-0.5", className)}>
-      <dt className="text-2xs font-medium tracking-wide text-fg-subtle uppercase">{label}</dt>
+      <dt className="label-font text-2xs font-medium text-fg-subtle uppercase">{label}</dt>
       <dd className="min-w-0 text-sm text-fg">{children}</dd>
     </div>
   );

@@ -177,7 +177,7 @@ function ScopeRow({ s }: { s: EdgeScope }) {
           <span className="flex items-center gap-2">
             <span className="h-1.5 w-20 overflow-hidden rounded-full bg-sunken" aria-hidden>
               <span
-                className={cn("block h-full rounded-full", lag ? "bg-warn" : "bg-ok")}
+                className={cn("block h-full rounded-full", lag ? "bg-warn" : "bg-viz-ok")}
                 style={{
                   width: `${head + 1 > 0 ? (100 * Math.max(0, done)) / (head + 1) : 100}%`,
                 }}

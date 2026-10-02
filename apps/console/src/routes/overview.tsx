@@ -253,7 +253,7 @@ function Vital({
   detail?: string;
 }) {
   const anchor = link(
-    "group flex min-w-0 flex-col gap-3 rounded-lg border-theme border-line-strong bg-surface p-4 shadow-2 motion-2 transition-transform hover:-translate-y-0.5",
+    "group corner-ticks flex min-w-0 flex-col gap-3 rounded-lg border-theme border-line-strong bg-surface p-4 shadow-2 motion-2 transition-transform hover:-translate-y-0.5",
   );
   return cloneElement(
     anchor,
@@ -271,7 +271,7 @@ function Vital({
       ) : (
         <span
           className={cn(
-            "text-3xl leading-none font-semibold tabular",
+            "figure text-3xl leading-none",
             value > 0 && tone !== "idle" && tone !== "ok" ? toneText[tone] : "text-fg",
           )}
         >

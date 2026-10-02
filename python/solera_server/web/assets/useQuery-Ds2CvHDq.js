@@ -1,1 +1,0 @@
-import{An as e,Mn as t}from"./layout-Djk_aL1q.js";function n(n,r){return e(n,t,r)}export{n as t};

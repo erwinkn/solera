@@ -118,6 +118,12 @@ export const toneFill: Record<Tone, string> = {
   idle: "fill-idle",
 };
 
+/**
+ * A mark in a chart: like toneSolid, but "ok" takes the theme's quieter
+ * --viz-ok, because success is the common case and shouldn't shout.
+ */
+export const markSolid: Record<Tone, string> = { ...toneSolid, ok: "bg-viz-ok" };
+
 /** Worst first: what a rollup of several states shows. */
 export const SEVERITY: Tone[] = ["fail", "warn", "run", "wait", "ok", "idle"];
 
