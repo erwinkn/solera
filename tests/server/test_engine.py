@@ -199,7 +199,7 @@ async def test_rename_and_meta_edges(state):
     await engine.initialize()
     assert engine.manifest["assets"]["with_meta"]["inputs"]["feed"]["meta"] == {"owner": "t"}
     detail = await drive(engine, await engine.submit(["consumer"], upstream=True))
-    assert status_of(detail) == "succeeded"
+    assert status_of(detail) == "succeeded", [t.get("error") for t in detail["tasks"]]
     assert seen["feed"] == [{"id": "a", "v": 1}, {"id": "b", "v": 2}]
 
 
@@ -389,7 +389,8 @@ async def test_run_keys_override(state):
     engine = make_engine(state, project)
     await engine.initialize()
     await drive(engine, await engine.submit(["consumer"], upstream=True))
-    await drive(engine, await engine.submit(["consumer"], keys={"files": {"keys": ["b"]}}))
+    detail = await drive(engine, await engine.submit(["consumer"], keys={"files": {"keys": ["b"]}}))
+    assert status_of(detail) == "succeeded", [t.get("error") for t in detail["tasks"]]
     assert seen[-1] == ["b"]
     await drive(engine, await engine.submit(["consumer"], keys={"files": "full"}))
     assert seen[-1] == ["a", "b"]

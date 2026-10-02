@@ -15,9 +15,18 @@ from solera_server.engine import Engine
 from solera_server.placements.inline import InlinePlacement
 from solera_server.state import State
 
+from tests.conftest import whole
+
 
 class Fake(Environment):
     kind = "Fake"
+
+
+class Overwriting(FileStore):
+    """FileStore's layout, declared `overwrite`: its attempts take a gate, so
+    the tests below can watch it (docs/lifecycle.md §9.6)."""
+
+    writes = "overwrite"
 
 
 class Remote:
@@ -110,7 +119,7 @@ def remote():
     return [{"ok": True}]
 
 
-REMOTE = Project(assets=[remote], executors=[Fake("fake")])
+REMOTE = Project(assets=[remote], executors=[Fake("fake")], default_store=Overwriting())
 
 
 async def test_a_restarted_engine_adopts_and_commits_a_launched_attempt(tmp_path):
@@ -388,6 +397,8 @@ class LiveStore(FileStore):
     wrote is visible. `die` makes the next write land its first n rows, then
     kills the worker."""
 
+    writes = "overwrite"
+
     late_write_grace = 0.2  # a dead writer's scope is released this soon (docs/lifecycle.md §9.9)
 
     def __init__(self):
@@ -480,7 +491,7 @@ async def test_an_aborted_worker_writes_nothing(tmp_path):
     def quick():
         return [{"id": "a"}]
 
-    project = Project(assets=[slow, quick], executors=[Fake("fake")])
+    project = Project(assets=[slow, quick], executors=[Fake("fake")], default_store=Overwriting())
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = engine_for(state, project)
     await engine.initialize()
@@ -496,11 +507,11 @@ async def test_an_aborted_worker_writes_nothing(tmp_path):
     await state.close()
 
 
-async def test_a_retry_puts_back_what_a_dead_keyed_write_half_did(tmp_path, data, monkeypatch):
-    """The dead attempt meant to change `a`, add `c` and drop `b`, and died
-    after its first object landed. The retry's content matches the index, so
-    its delta is empty — yet it rewrites the keys the dead one touched and
-    deletes the one it may have added."""
+async def test_a_dead_immutable_write_leaves_nothing_to_repair(tmp_path, data, monkeypatch):
+    """FileStore is immutable (§9.8): a worker that dies after its first
+    object landed leaves an object nothing references, under its own
+    generation. There is no gate, no unsettled intent and no hold: the
+    retry runs at once, and reads see exactly the committed versions."""
 
     values = [{"a": 1, "b": 1}, {"a": 2, "c": 1}, {"a": 1, "b": 1}]
 
@@ -511,7 +522,6 @@ async def test_a_retry_puts_back_what_a_dead_keyed_write_half_did(tmp_path, data
     project = Project(assets=[scores])
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = engine_for(state, project, placement="inline")
-    engine.late_write_grace["scores"] = 0  # a dead writer's scope is held, briefly (§9.9)
     await engine.initialize()
     assert (await engine.run_until((await engine.submit(["scores"]))["id"], 10))["request"][
         "status"
@@ -528,9 +538,11 @@ async def test_a_retry_puts_back_what_a_dead_keyed_write_half_did(tmp_path, data
     monkeypatch.setattr(FileStore, "_put", dying)
     detail = await engine.run_until((await engine.submit(["scores"]))["id"], 20)
     assert detail["request"]["status"] == "succeeded", detail
-    assert len(detail["attempts"][detail["tasks"][0]["id"]]) == 2  # it died, and the retry committed
-    assert state.model.unsettled == {}
-    assert {p.name: p.read_text() for p in (data / "scores").iterdir()} == {"a.json": "1", "b.json": "1"}
+    first, second = detail["attempts"][detail["tasks"][0]["id"]]
+    assert first["status"] == "failed" and second["status"] == "succeeded"
+    assert state.model.unsettled == {} and state.model.holds == {}
+    ref = Ref.from_json(state.model.heads[("scores", "")]["ref"])
+    assert await project.stores["default"].load(ref, None, await whole(state, "scores")) == {"a": 1, "b": 1}
     await engine.stop()
     await state.close()
 
@@ -710,7 +722,7 @@ async def test_an_attempt_that_wrote_nothing_still_leaves_a_gate(tmp_path):
         calls.append(1)
         return {"a": 1}
 
-    project = Project(assets=[same])
+    project = Project(assets=[same], default_store=Overwriting())
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = engine_for(state, project, placement="inline")
     await engine.initialize()

@@ -179,8 +179,19 @@ class Timeline:
 class Ctx:
     """The `ctx` argument handed to producers (§2)."""
 
-    def __init__(self, spec, asset: Asset, project: Project, objects, changes, shipper, timeline):
+    def __init__(
+        self, spec, asset: Asset, project: Project, objects, changes, shipper, timeline, keys_io=None
+    ):
         self._spec, self._objects, self._shipper, self._timeline = spec, objects, shipper, timeline
+        self._keys_io = keys_io
+        # The pinned key indexes of keyed inputs, for whole reads of immutable stores.
+        self._indexes: dict[tuple, dict] = {}
+        for pin in spec["inputs"].values():
+            if pin.get("index") is not None and pin.get("ref"):
+                self._indexes[(pin["ref"]["output"], pin["ref"].get("partition") or "")] = pin["index"]
+            for key, ref in (pin.get("refs") or {}).items():
+                if (pin.get("indexes") or {}).get(key) is not None:
+                    self._indexes[(ref["output"], ref.get("partition") or "")] = pin["indexes"][key]
         self.partition: str = spec["partition"]
         declared = project.manifest["assets"][asset.name]["partitions"]
         self.partitions: dict[str, str] = (
@@ -228,7 +239,8 @@ class Ctx:
 
     async def load(self, ref: Ref, t):
         store = self._stores[ref.store]
-        value = await store.load(ref, t, None)
+        index = self._indexes.get((ref.output, ref.partition))
+        value = await store.load(ref, t, await _whole(store, self._keys_io, index))
         self._timeline.add("loaded", ref.output, _rows(value), optional=True)
         return value
 
@@ -286,13 +298,14 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline):
         if "refs" in pin:  # AllPartitions
             inner = _dict_inner(t)
             out = {}
+            indexes = pin.get("indexes") or {}
             for key, ref_json in pin["refs"].items():
                 ref = Ref.from_json(ref_json)
-                out[key] = (
-                    ref
-                    if (inner is not None and is_ref_type(inner))
-                    else await project.stores[ref.store].load(ref, inner, None)
-                )
+                if inner is not None and is_ref_type(inner):
+                    out[key] = ref
+                    continue
+                store = project.stores[ref.store]
+                out[key] = await store.load(ref, inner, await _whole(store, keys_io, indexes.get(key)))
             args[param] = out
             timeline.add("loaded", param)
             continue
@@ -307,8 +320,10 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline):
                 changes[param] = Changes(rows=args[param], batches=range(lo, hi + 1), full=full)
                 timeline.add("loaded", param, _rows(args[param]))
                 continue
-            if "keys" in ch:  # a run's keys= override: a one-off selection
-                upserted, deleted, after = {str(k): (b"", 0) for k in ch["keys"]}, (), None
+            if "keys" in ch:  # a run's keys= override: a one-off selection, of the keys that exist
+                index = KeyIndex(keys_io, None, IndexState.from_json(pin["index"]))
+                found = await index.lookup([key_bytes(str(k)) for k in ch["keys"]])
+                upserted, deleted, after = {key_str(k): entry for k, entry in found.items()}, (), None
             else:
                 index = KeyIndex(keys_io, None, IndexState.from_json(pin["index"]))
                 start = key_bytes(ch["after"]) if ch.get("after") is not None else None
@@ -336,9 +351,26 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline):
         if t is not None and is_ref_type(t):
             args[param] = ref
         else:
-            args[param] = await store.load(ref, t, None)
+            args[param] = await store.load(ref, t, await _whole(store, keys_io, pin.get("index")))
             timeline.add("loaded", param, _rows(args[param]))
     return args, changes, delivered
+
+
+async def _whole(store, keys_io, index_json) -> Keys | None:
+    """A whole keyed read from an immutable store, as the `Keys` selection
+    of every live entry of its pinned index: such a store names objects from
+    `(version, locator)`, and a listing would also show superseded and
+    abandoned ones (docs/lifecycle.md §9.8). `None` for any other read."""
+
+    if index_json is None or getattr(store, "writes", "overwrite") != "immutable":
+        return None
+    index = KeyIndex(keys_io, None, IndexState.from_json(index_json))
+    entries, after = {}, None
+    while True:
+        keys, versions, locators, after = await index.page(after, REPAIR_PAGE)
+        entries.update({key_str(k): (v, loc) for k, v, loc in zip(keys, versions, locators, strict=True)})
+        if after is None:
+            return Keys(entries)
 
 
 def _dict_inner(t):
@@ -860,7 +892,7 @@ async def _execute(
     try:
         keys_io = _key_io(objects, objects_url, project)
         args, changes, delivered = await _resolve_inputs(spec, project, asset, keys_io, timeline)
-        ctx = Ctx(spec, asset, project, objects, changes, shipper, timeline)
+        ctx = Ctx(spec, asset, project, objects, changes, shipper, timeline, keys_io)
         signature = inspect.signature(asset.fn)
         if "ctx" in signature.parameters:
             args["ctx"] = ctx

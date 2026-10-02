@@ -701,6 +701,29 @@ class KeyIndex:
                 known.setdefault(key, entry)
         return known, inferred
 
+    async def lookup(self, keys: list[bytes]) -> dict[bytes, tuple[bytes, int]]:
+        """Exactly, the live `(version, locator)` of each of `keys` the index
+        holds — the newest entry wins, and a deleted key is absent. Reads only
+        the blocks that may hold them, newest level first: for selections
+        named outright (a run's `keys=`) and immutable stores' reads
+        (docs/lifecycle.md §9.8)."""
+
+        async def one(f: FileInfo, ks: list[bytes]):
+            return await self._lookup(await self._open(f, filters=False), ks)
+
+        unresolved, seen = sorted(set(keys)), {}
+        for level in self.state.newest_first():
+            if not unresolved:
+                break
+            by_name = {f.name: f for f in level}
+            parts = await asyncio.gather(
+                *(one(by_name[name], ks) for name, ks in self._candidates(level, unresolved).items())
+            )
+            for part in parts:
+                seen.update(part)
+            unresolved = [k for k in unresolved if k not in seen]
+        return {k: (v, loc) for k, (live, v, loc) in seen.items() if live}
+
     def _candidates(self, level: list[FileInfo], keys: list[bytes]) -> dict[str, list[bytes]]:
         """Per file of a level, the sorted keys inside its key range."""
 

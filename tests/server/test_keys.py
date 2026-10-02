@@ -18,6 +18,8 @@ from solera_server.engine import Engine
 from solera_server.placements.inline import InlinePlacement
 from solera_server.state import State
 
+from tests.conftest import whole
+
 
 @pytest.fixture
 async def state(tmp_path):
@@ -115,13 +117,14 @@ async def test_a_keyed_write_reaches_the_store_as_its_delta(state, data):
     engine = engine_for(state, project)
     await engine.initialize()
     await run(engine, ["scores"])
-    before = {p.name: p.stat().st_mtime_ns for p in (data / "scores").iterdir()}
+    before = {str(p.relative_to(data)) for p in (data / "scores").rglob("*.json")}
     values["v"] = {"b": 2, "c": 1}
     await run(engine, ["scores"])
-    after = {p.name: p.stat().st_mtime_ns for p in (data / "scores").iterdir()}
-    assert sorted(after) == ["b.json", "c.json"]
-    assert after["c.json"] == before["c.json"]  # unchanged: not rewritten
-    assert (data / "scores" / "b.json").read_text() == "2"
+    after = {str(p.relative_to(data)) for p in (data / "scores").rglob("*.json")}
+    [new] = after - before  # one object written: `b`'s new version; `c` untouched, `a` dropped by the index
+    assert new.startswith("scores/b/") and (data / new).read_text() == "2"
+    ref = Ref.from_json(state.model.heads[("scores", "")]["ref"])
+    assert await project.stores["default"].load(ref, None, await whole(state, "scores")) == {"b": 2, "c": 1}
 
 
 async def test_row_digests_are_16_bytes_end_to_end(state):
@@ -443,5 +446,5 @@ async def test_renamed_asset_keeps_its_state(state):
     assert m.heads[("source_feed", "")]["batch"] == 1
     assert delivered == [(True, ["a", "b"]), (False, ["b"])]  # only the change, not everything
     ref = Ref.from_json(m.heads[("source_feed", "")]["ref"])
-    loaded = await project.stores["default"].load(ref, None, None)
+    loaded = await project.stores["default"].load(ref, None, await whole(state, "source_feed"))
     assert {r["id"]: r["v"] for r in loaded} == {"a": 1, "b": 2}

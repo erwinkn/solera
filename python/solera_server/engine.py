@@ -885,6 +885,9 @@ class Engine(Attempts):
             if edge["kind"] == "all_partitions":
                 refs = await self._all_partitions(task, asset, up_dims, output)
                 inputs[param] = {"refs": refs}
+                indexes = {k: self._whole_index(output, ref) for k, ref in refs.items()}
+                if any(i is not None for i in indexes.values()):
+                    inputs[param]["indexes"] = {k: i for k, i in indexes.items() if i is not None}
                 pinned[param] = refs
                 continue
             if edge["kind"] == "dep":
@@ -899,6 +902,8 @@ class Engine(Attempts):
                 incremental.append((param, edge, up_dims))
                 continue
             inputs[param] = {"ref": self._pin(output, up_dims, asset, scope)}
+            if (index := self._whole_index(output, inputs[param]["ref"])) is not None:
+                inputs[param]["index"] = index
             pinned[param] = inputs[param]["ref"]
         fingerprint = self._fingerprint(asset, run, pinned)
         # Pass 2: Incremental plans against the fingerprinted interpretation (§2.2).
@@ -998,6 +1003,16 @@ class Engine(Attempts):
             raise Retryable(f"input {output!r} has no head for scope {up_scope!r}")
         return head["ref"]
 
+    def _whole_index(self, output: str, ref: dict) -> dict | None:
+        """The pinned key index a whole read of a keyed output on an immutable
+        store needs to name its objects (docs/lifecycle.md §9.8)."""
+
+        record = self.manifest["outputs"].get(output) or {}
+        store = self.manifest["stores"].get(record.get("store")) or {}
+        if record.get("key") is None or record.get("partition_set") or store.get("writes") != "immutable":
+            return None
+        return self.m.index(output, ref.get("partition") or "").pinned().to_json()
+
     async def _all_partitions(self, task, asset, up_dims, output) -> dict:
         """AllPartitions pins every upstream key with a complete head (§7)."""
 
@@ -1056,7 +1071,10 @@ class Engine(Attempts):
         # A keys= override is a one-off selection — it never moves the watermark.
         if isinstance(override, dict) and "keys" in override and not reset:
             keys = sorted({str(k) for k in override["keys"]})
-            return {"ref": ref, "changes": {"keys": keys, "full": False}}, None, not keys
+            pin = {"ref": ref, "changes": {"keys": keys, "full": False}}
+            if keyed:  # the keys' versions and locators, for the store to find them
+                pin["index"] = self.m.index(output, up_scope).pinned().to_json()
+            return pin, None, not keys
 
         if not keyed:
             first = int(head.get("base", 0))

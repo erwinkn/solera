@@ -16,6 +16,8 @@ from solera_server.placements import PlacementContext
 from solera_server.state import State
 from solera_worker.worker import run_attempt
 
+from tests.server.test_fence import Overwriting
+
 
 @pytest.fixture
 async def state(tmp_path):
@@ -85,7 +87,7 @@ async def test_a_dead_pool_claim_expires_into_a_new_attempt(state):
     def job():
         return [{"ok": True}]
 
-    project = Project(assets=[job])
+    project = Project(assets=[job], default_store=Overwriting())
     engine = make_engine(state, project, heartbeat_seconds=0.1, pool_offered_grace=0.1)
     await engine.initialize()
     run = await engine.submit(["job"])
@@ -118,7 +120,7 @@ async def test_a_dead_pool_claim_that_took_its_gate_is_uncertain(state):
     def job():
         return [{"ok": True}]
 
-    project = Project(assets=[job])
+    project = Project(assets=[job], default_store=Overwriting())
     engine = make_engine(state, project, heartbeat_seconds=0.1, pool_offered_grace=0.1)
     await engine.initialize()
     run = await engine.submit(["job"])
@@ -142,7 +144,7 @@ async def test_a_pool_attempt_canceled_before_its_claim_is_withdrawn(state):
     def job():
         return [{"ok": True}]
 
-    project = Project(assets=[job])
+    project = Project(assets=[job], default_store=Overwriting())
     engine = make_engine(state, project, heartbeat_seconds=0.3)
     await engine.initialize()
     run = await engine.submit(["job"])

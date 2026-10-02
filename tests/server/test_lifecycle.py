@@ -118,7 +118,9 @@ async def test_a_requested_cancel_drains_into_a_canceled_result(tmp_path):
     result = await state.attempt_result(run["id"], attempt["id"])
     assert result["status"] == "canceled" and result["writes"] == "none"
     assert result["cancel"]["phase"] == "requested" and result["cancel"]["reason"] == "user"
-    assert await state.get_object(f"{lifecycle.base(run['id'], attempt['id'])}.writing") is not None
+    assert (
+        await state.get_object(f"{lifecycle.base(run['id'], attempt['id'])}.writing") is None
+    )  # immutable: no gate
     await engine.stop()
     await state.close()
 

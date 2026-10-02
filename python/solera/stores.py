@@ -282,27 +282,31 @@ PARALLEL = 32  # object requests in flight per load or write
 
 class FileStore:
     """The default store (§4): what an asset returns, as files — one per
-    value, per partition, per key, or per batch — overwritten in place.
+    value, per key, or per batch — each written once, under a name no other
+    attempt writes (docs/lifecycle.md §9.8):
 
-        {root}/rollup.json                      a value
-        {root}/site_status/alpha.json           a value, partition alpha
-        {root}/uploads/u-7.pkl                  a keyed output: one object per key
-        {root}/site_files/alpha/f-1.json        keyed and partitioned: the key's rows
-        {root}/site_events/alpha/000000000042.json
+        {root}/rollup@184467.json               a value, by generation 184467
+        {root}/site_status/alpha@184467.json    a value, partition alpha
+        {root}/uploads/u-7/9c41e0….184467.pkl   a keyed output: one object per key and version
+        {root}/site_files/alpha/f-1/5d2a….184467.json
+                                                keyed and partitioned: the key's rows
+        {root}/site_events/alpha/000000000042.184467.json
                                                 an unkeyed incremental output: one per batch
 
-    Content is JSON when it round-trips exactly, pickle otherwise. There is
-    no history: a write replaces what it covers, and a read gets what is
-    there now, which may be newer than the version it was pinned to. A
-    keyed write touches only the keys the harness found changed (`Scope`),
-    and each file is written aside and renamed into place, so a crash never
-    leaves half of one.
+    A name carries the logical version and the writing attempt's generation
+    (`Scope.generation`), and a write is create-only: a dead writer only
+    ever leaves objects nothing references, and a reader gets exactly the
+    version it was pinned to. A keyed read names its objects from the key
+    index's `(version, locator)` (`Keys`); a range of batches keeps, per
+    batch, the highest generation, which committed it. Superseded objects
+    are deleted by `discard`, once nothing can read them.
 
-    `path` defaults to `$SOLERA_DATA`, else `.solera/data` next to the
-    project file. A key written as JSON shadows a stale pickle of it, so
-    only a pickle write has to delete its JSON twin."""
+    Content is JSON when it round-trips exactly, pickle otherwise. `path`
+    defaults to `$SOLERA_DATA`, else `.solera/data` next to the project
+    file."""
 
-    version = "1"
+    version = "2"
+    writes = "immutable"
     ref_type = ObjectRef
     shared_table = False
 
@@ -349,18 +353,20 @@ class FileStore:
         if patch and not output.incremental:
             raise WriteError(f"{output.name}: Patch requires an incremental output")
         base = self._base(output, scope, prior)
+        generation = int(scope.generation or 0)
         if output.is_partition_set:
-            return await self._store_set(write, prior, scope, base)
+            return await self._store_set(write, prior, scope, base, generation)
         if output.key is not None:
-            return await self._store_keyed(write, prior, scope, base)
+            return await self._store_keyed(write, prior, scope, base, generation)
         if output.incremental:
             if not patch:
                 raise WriteError(f"{output.name}: an unkeyed incremental output only accepts Patch writes")
-            return await self._store_batch(write, prior, scope, base)
-        version = await self._put(base, write)
-        return Written(self._ref(scope, {"mode": "value", "path": base}, version))
+            return await self._store_batch(write, prior, scope, base, generation)
+        name = f"{base}@{generation}"
+        version = await self._put(name, write)
+        return Written(self._ref(scope, {"mode": "value", "path": name, "base": base}, version))
 
-    async def _store_set(self, write, prior, scope, base) -> Written:
+    async def _store_set(self, write, prior, scope, base, generation) -> Written:
         """A partition set: its element list, as one value."""
 
         if isinstance(write, Patch):
@@ -370,39 +376,41 @@ class FileStore:
                 elements = [e for e in await self._elements(prior) if e not in drop] + elements
         else:
             elements = list(entries(scope.output, write))
-        version = await self._put(base, elements)
-        return Written(self._ref(scope, {"mode": "set", "path": base}, version))
+        name = f"{base}@{generation}"
+        version = await self._put(name, elements)
+        return Written(self._ref(scope, {"mode": "set", "path": name, "base": base}, version))
 
-    async def _store_keyed(self, write, prior, scope, base) -> Written:
-        """One object per key. A replacement — or a Patch with no prior, a
-        first write or a full run — is the whole content; a Patch changes
-        the keys it names."""
+    async def _store_keyed(self, write, prior, scope, base, generation) -> Written:
+        """One object per key and version. The harness says which keys
+        changed (`Scope.upserts`); only those are written, at the versions
+        the key index will hold. Removed keys need no write: the index stops
+        naming them, and `discard` deletes what nothing reads."""
 
         output = scope.output
         patch = isinstance(write, Patch)
         content = entries(output, write.rows if patch else write)
-        replace = not patch or prior is None
-        if scope.upserts is None:
-            upserts = list(content)
-        else:
-            upserts = [k for k in scope.upserts if k in content]
-        if scope.removes is not None:
-            removes = set(scope.removes)
-        elif replace:
-            removes = {k for k in await self._keys(base) if k not in content}
-        else:
-            removes = {str(k) for k in write.remove}
-        written = await self._many(lambda k: self._put(f"{base}/{_segment(k)}", content[k]), upserts)
-        await self._many(lambda k: self._delete(f"{base}/{_segment(k)}"), removes)
-        start = "" if replace else prior.version
-        version = _digest([start, scope.batch, sorted(zip(upserts, written, strict=True)), sorted(removes)])
+        from .keys.index import key_str
+
+        keys, versions = store_key_rows(self, write.rows if patch else write, output).entries()
+        version_of = {key_str(k): v for k, v in zip(keys, versions, strict=True)}
+        upserts = list(content) if scope.upserts is None else [k for k in scope.upserts if k in content]
+        written = await self._many(
+            lambda k: self._put(self.key_name(base, k, version_of[k], generation), content[k]), upserts
+        )
+        removes = (
+            sorted(scope.removes)
+            if scope.removes is not None
+            else sorted(str(k) for k in (write.remove if patch else ()))
+        )
+        start = "" if (not patch or prior is None) else prior.version
+        version = _digest([start, scope.batch, sorted(zip(upserts, written, strict=True)), removes])
         handle = {"mode": "keyed", "path": base, "key": output.key}
         return Written(self._ref(scope, handle, version))
 
-    async def _store_batch(self, write: Patch, prior, scope, base) -> Written:
+    async def _store_batch(self, write: Patch, prior, scope, base, generation) -> Written:
         """An unkeyed incremental write: its items, as one object per batch.
-        With no prior (a first write or a full run) the output starts over,
-        and earlier batches are deleted."""
+        With no prior (a first write or a full run) the output starts over at
+        this batch; earlier ones are no longer read, and go with `discard`."""
 
         output = scope.output
         if write.remove:
@@ -418,16 +426,34 @@ class FileStore:
             batch = scope.batch
         else:
             batch = int(prior.handle["batches"][1]) + 1 if prior is not None else 0
-        version = await self._put(f"{base}/{batch:012d}", items)
+        version = await self._put(f"{base}/{batch:012d}.{generation}", items)
         if prior is None:
-            earlier = [k for k in await self._keys(base) if k.isdigit() and int(k) < batch]
-            await self._many(lambda k: self._delete(f"{base}/{k}"), earlier)
             first = batch
         else:
             first = int(prior.handle["batches"][0])
             version = _digest([prior.version, version])
         handle = {"mode": "batches", "path": base, "batches": [first, batch]}
         return Written(self._ref(scope, handle, version))
+
+    @staticmethod
+    def version_name(version: bytes) -> str:
+        """A key's version as a file name: its hex, or — past 32 bytes, a long
+        declared revision — the hex of the first 16 bytes of its SHA-256."""
+
+        if len(version) > 32:
+            version = hashlib.sha256(version).digest()[:16]
+        return version.hex()
+
+    @classmethod
+    def key_name(cls, base: str, key: str, version: bytes, locator: int) -> str:
+        return f"{base}/{_segment(key)}/{cls.version_name(version)}.{int(locator)}"
+
+    async def discard(self, names: list[str]) -> None:
+        """Delete objects nothing reads any more (docs/lifecycle.md §9.8):
+        superseded versions, and what attempts that never committed wrote.
+        Names are never reused, so a name deleted twice is no harm."""
+
+        await self._many(lambda n: self._delete(n), names)
 
     # -- reads ------------------------------------------------------------------
 
@@ -443,13 +469,18 @@ class FileStore:
                 raise StoreError(f"{ref.output}: an unkeyed incremental output takes Batches")
             first, last = (int(b) for b in handle["batches"])
             lo, hi = (max(first, selection.lo), selection.hi) if selection is not None else (first, last)
-            batches = await self._many(lambda b: self._get(f"{base}/{b:012d}"), range(lo, hi + 1))
+            names = await self._batches(base, lo, hi)
+            batches = await self._many(self._get, [names[b] for b in sorted(names)])
             return _materialize([item for b in batches if b is not MISSING for item in b], t)
         if mode == "keyed":
-            if isinstance(selection, Batches):
-                raise StoreError(f"{ref.output}: a keyed output takes Keys, not Batches")
-            keys = list(selection.revisions) if selection is not None else sorted(await self._keys(base))
-            found = await self._many(lambda k: self._get(f"{base}/{_segment(k)}"), keys)
+            if not isinstance(selection, Keys):
+                raise StoreError(
+                    f"{ref.output}: a keyed read names its objects from the key index: it takes Keys"
+                )
+            keys = list(selection.revisions)
+            found = await self._many(
+                lambda k: self._get(self.key_name(base, k, *selection.revisions[k])), keys
+            )
             content = {k: v for k, v in zip(keys, found, strict=True) if v is not MISSING}
             if handle.get("key") == KEYS:
                 return content
@@ -469,6 +500,20 @@ class FileStore:
         value = await self._get((ref.handle or {}).get("path", ""))
         return [] if value is MISSING else list(value)
 
+    async def _batches(self, base: str, lo: int, hi: int) -> dict[int, str]:
+        """Batch `n` -> its committed object, in `[lo, hi]`: of the objects
+        named after `n`, the highest generation's. The attempts that used
+        batch `n` all ran between the commits of `n - 1` and `n`, one at a
+        time, and the one that committed `n` was the last of them."""
+
+        best: dict[int, tuple[int, str]] = {}
+        for name in await self._keys(base):
+            batch, _, generation = name.partition(".")
+            if batch.isdigit() and generation.isdigit() and lo <= int(batch) <= hi:
+                if int(generation) >= best.get(int(batch), (-1, ""))[0]:
+                    best[int(batch)] = (int(generation), f"{base}/{name}")
+        return {b: name for b, (_, name) in best.items()}
+
     # -- objects ----------------------------------------------------------------
 
     @staticmethod
@@ -476,20 +521,20 @@ class FileStore:
         """Where the scope's content lives: the prior's place, so a renamed
         output keeps its objects where they are (§2)."""
 
-        if prior is not None and "path" in (prior.handle or {}):
-            return prior.handle["path"]
+        handle = (prior.handle or {}) if prior is not None else {}
+        if "base" in handle or "path" in handle:
+            return handle.get("base") or handle["path"]
         name = _segment(output.name)
         return f"{name}/{_segment(scope.partition)}" if scope.partition else name
 
     async def _put(self, base: str, value) -> str:
-        """Write `value` at `base`; returns its revision."""
+        """Create `value` at `base`, once; returns its revision. The same name
+        written again is the same attempt's, with the same bytes."""
 
-        import obstore
+        from .objects import create
 
         data, fmt = encode(value)
-        await obstore.put_async(self._objects(), f"{base}.{fmt}", data, mode="overwrite", use_multipart=False)
-        if fmt == "pkl":
-            await self._delete(base, "json")
+        await create(self._objects(), f"{base}.{fmt}", data)
         return hashlib.sha256(data).hexdigest()
 
     async def _get(self, base: str):
@@ -516,7 +561,7 @@ class FileStore:
                 pass
 
     async def _keys(self, base: str) -> set[str]:
-        """The names of the objects in a directory: its keys or batches."""
+        """The names of the objects in a directory, without their format."""
 
         import obstore
 

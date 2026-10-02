@@ -30,6 +30,8 @@ from solera_server.engine import Engine
 from solera_server.placements.inline import InlinePlacement
 from solera_server.state import State
 
+from tests.conftest import whole
+
 BATCHES = int(os.getenv("SOLERA_SOAK_BATCHES", "500"))
 SAMPLE_EVERY = max(1, BATCHES // 10)
 
@@ -173,7 +175,7 @@ async def test_soak(tmp_path, monkeypatch):
     # The index agrees with what the store holds.
     for site in ("alpha", "bravo"):
         ref = Ref.from_json(state.model.heads[("site_files", site)]["ref"])
-        rows = await project.stores[ref.store].load(ref, None, None)
+        rows = await project.stores[ref.store].load(ref, None, await whole(state, "site_files", site))
         listed = await engine.list_keys("site_files", site)
         assert listed["total"] == len(rows) == state.model.heads[("site_files", site)]["count"]
         assert listed["keys"] == {r["file_id"]: str(r["version"]) for r in rows}
@@ -199,7 +201,10 @@ async def test_soak(tmp_path, monkeypatch):
         ref = Ref.from_json(head["ref"])
         if "path" not in (ref.handle or {}):
             continue  # lineage-only source heads carry no object payload
-        await project.stores[ref.store].load(ref, None, None)
+        keyed = ref.handle.get("mode") == "keyed"
+        await project.stores[ref.store].load(
+            ref, None, await whole(state, ref.output, ref.partition) if keyed else None
+        )
     await state.close()
 
 
@@ -284,7 +289,9 @@ async def test_soak_with_retention(tmp_path, monkeypatch):
     for head in state.model.heads.values():
         ref = Ref.from_json(head["ref"])
         if "path" in (ref.handle or {}):
-            await project.stores[ref.store].load(ref, None, None)
+            keyed = ref.handle.get("mode") == "keyed"
+            selection = await whole(state, ref.output, ref.partition) if keyed else None
+            await project.stores[ref.store].load(ref, None, selection)
 
     # A consumer added after a day of run expiry receives the full head.
     seen = {}
