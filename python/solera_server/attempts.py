@@ -607,6 +607,29 @@ class Attempts:
         self._release(asset, scope, hold, f"operator:{by}")
         return {"asset": asset, "scope": scope, "released": hold["attempt"]}
 
+    def scope_discards(self, output: str, scope: str) -> dict:
+        """An output scope's data garbage awaiting its next attempt (§9.8):
+        how much is pending, and the entries stuck — their names could not
+        be read three times — for an operator to see and clear."""
+
+        entries = self.m.discards.get((output, scope)) or []
+        stuck = [
+            {k: e[k] for k in ("n", "kind", "misses", "attempt", "files") if k in e}
+            for e in entries
+            if e.get("stuck")
+        ]
+        return {"output": output, "scope": scope, "pending": len(entries) - len(stuck), "stuck": stuck}
+
+    def clear_discards(self, output: str, scope: str, by: str) -> dict:
+        """An operator's `solera scopes discards --clear`: forget the stuck
+        entries. Their objects stay where they are."""
+
+        stuck = [e["n"] for e in self.m.discards.get((output, scope)) or [] if e.get("stuck")]
+        if stuck:
+            event = {"output": output, "scope": scope, "n": stuck, "by": by, "at": self.clock()}
+            self.state.record({"type": "DiscardsCleared", **event})
+        return {"output": output, "scope": scope, "cleared": stuck}
+
     async def _gate(self, run_id: str, attempt: str, state: str) -> tuple[str, dict | None]:
         """Create the attempt's gate as `state` (`aborted` or `closed`), or
         find the one there: the write-completion evidence it establishes

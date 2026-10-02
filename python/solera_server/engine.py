@@ -23,7 +23,6 @@ import contextlib
 import datetime as dt
 import json
 import logging
-import math
 import secrets
 from itertools import product
 from zoneinfo import ZoneInfo
@@ -42,6 +41,7 @@ from .history import MAX_METADATA, History, RunFilter
 from .keyservice import KeyService
 from .model import TERMINAL_RUN, delta_reads
 from .placements import PlacementContext, Registry
+from .sensors import Sensors
 from .state import Conflict, LostOwnership, State
 from .upkeep import ALIVE, Upkeep
 
@@ -79,7 +79,7 @@ def check_tags(tags) -> dict[str, str]:
     return dict(sorted(tags.items()))
 
 
-class Engine(Attempts):
+class Engine(Attempts, Sensors):
     Conflict = Conflict
     GRACE_SECONDS = GRACE_SECONDS
 
@@ -105,6 +105,7 @@ class Engine(Attempts):
         retention_interval: float = 60.0,
         history: History | None = None,
         resolve_cache: str | None | bool = True,
+        sensor_host=None,
     ):
         import time
 
@@ -167,6 +168,7 @@ class Engine(Attempts):
             retention_interval=retention_interval,
             keys=self.keys,
         )
+        self._sensors_init(sensor_host)
         self._set_dims = {
             dim["output"]
             for a in manifest["assets"].values()
@@ -229,6 +231,7 @@ class Engine(Attempts):
         self.runner = asyncio.create_task(self._loop())
         self.upkeep.start()
         self.history.start()
+        self._start_sensor_host()
 
     async def stop(self):
         self._stopping = True
@@ -239,6 +242,7 @@ class Engine(Attempts):
             except asyncio.CancelledError:
                 pass
             self.runner = None
+        await self._stop_sensor_host()
         if self.inflight:
             # Launched attempts keep running: the next engine adopts them.
             jobs = [t for _, t in self.inflight.values()]
@@ -279,6 +283,7 @@ class Engine(Attempts):
         self._adopt()
         await self._release_holds()
         self._dispatch_due()
+        self._sensor_sweep()
         await self._automation_tick()
         self._archive_due()
 
@@ -325,6 +330,47 @@ class Engine(Attempts):
         `skip_active` and `skip_missing_inputs` leave out the scopes already
         in flight, or with an input never written; `None` if none is left."""
 
+        if command_id and command_id in self.m.receipts:
+            return await self._run_view_of(self.m.receipts[command_id])
+        run = await self._plan_run(
+            targets,
+            partitions,
+            mode,
+            upstream,
+            config,
+            keys,
+            automation=automation,
+            skip_active=skip_active,
+            skip_missing_inputs=skip_missing_inputs,
+            by=by,
+            tags=tags,
+        )
+        if run is None:
+            return None
+        if command_id and command_id in self.m.receipts:  # submitted while we planned
+            return await self._run_view_of(self.m.receipts[command_id])
+        self.state.record({"type": "RunSubmitted", "run": run, "command": command_id})
+        return self._run_view(self.m.runs.get(run["id"]) or run)
+
+    async def _plan_run(
+        self,
+        targets,
+        partitions="latest",
+        mode="incremental",
+        upstream=False,
+        config=None,
+        keys=None,
+        *,
+        automation=None,
+        sensor=None,
+        skip_active=False,
+        skip_missing_inputs=False,
+        by=None,
+        tags=None,
+    ) -> dict | None:
+        """The run a request becomes, without submitting it; `None` if the
+        skips leave nothing."""
+
         if isinstance(targets, str):
             targets = [targets]
         if not targets:
@@ -335,9 +381,6 @@ class Engine(Attempts):
         if not isinstance(config, dict):
             raise ValueError("config must be a JSON object")
         tags = check_tags(tags)
-        m = self.m
-        if command_id and command_id in m.receipts:
-            return await self._run_view_of(m.receipts[command_id])
         assets = {}
         for target in targets:
             name = self._asset_of(target)
@@ -411,6 +454,7 @@ class Engine(Attempts):
             "config": config,
             "keys": keys,
             "automation": automation,
+            **({"sensor": sensor} if sensor else {}),
             "by": by,
             "tags": tags,
             "status": "running",
@@ -420,10 +464,7 @@ class Engine(Attempts):
             "events": 0,
             "tasks": tasks,
         }
-        if command_id and command_id in m.receipts:  # submitted while we planned
-            return await self._run_view_of(m.receipts[command_id])
-        self.state.record({"type": "RunSubmitted", "run": run, "command": command_id})
-        return self._run_view(m.runs.get(run_id) or run)
+        return run
 
     def _scope_active(self, asset: str, scope: str) -> bool:
         return self._scope_active_claim(asset, scope) or self.m.is_pending(asset, scope)
@@ -686,7 +727,7 @@ class Engine(Attempts):
             event["reason"] = str(reason)[:200]
         if writes is not None:
             event["writes"] = writes
-        for field in ("discarded", "discarded_files"):  # data garbage the worker discarded (§9.8)
+        for field in ("discarded", "discard_unresolved", "discarded_files"):  # data garbage (§9.8)
             if (worker or {}).get(field):
                 event[field] = worker[field]
         if hold is not None:
@@ -1180,18 +1221,15 @@ class Engine(Attempts):
 
     def _due_discards(self, output: str, scope: str, attempt: str | None) -> list[dict]:
         """The data garbage of an immutable output's scope that no reader can
-        still need: every entry let go of before the oldest reader pin — of the
-        attempts claimed now (but this one, which reads none of it) and of the
-        delta windows delivered over several attempts. At most `DISCARDS` of
-        them, for this attempt to discard (§9.8)."""
+        still need: every entry let go of before the oldest reader pin but this
+        attempt's own, which reads none of it. At most `DISCARDS` of them, for
+        this attempt to discard (§9.8)."""
 
         entries = self.m.discards.get((output, scope))
         if not entries:
             return []
-        pins = [c["pin"] for c in self.m.claims.values() if c["attempt"] != attempt and "pin" in c]
-        pins += [wm["pin"] for wm in self.m.watermarks.values() if wm.get("pin") is not None]
-        floor = min(pins, default=math.inf)
-        return [e for e in entries if e["n"] <= floor][:DISCARDS]
+        floor = self.m.pin_floor(but=attempt)
+        return [e for e in entries if e["n"] <= floor and not e.get("stuck")][:DISCARDS]
 
     def _fingerprint(self, asset, run, pinned):
         """H(version, store versions of input+output stores, run config,
@@ -1344,6 +1382,23 @@ class Engine(Attempts):
         `{"id", "source", "by", "batch", "upserted", "deleted"}` — or `version`
         for an unkeyed source. `by` says where the commit came from."""
 
+        head = self.m.heads.get((name, ""))
+        event, ref = await self._prepare_commit(name, version, keys, upsert, remove, by)
+        if event is None:
+            return {"changed": False, "ref": ref}
+        if self.m.heads.get((name, "")) != head:
+            await self._drop_prepared([event])
+            raise Conflict(f"source {name!r} moved while committing; retry")
+        event["at"] = self.clock()
+        self.state.record(event)
+        self._committed_keys([event])
+        return {"changed": True, "ref": ref, "run": event["run"]["id"]}
+
+    async def _prepare_commit(self, name, version, keys, upsert, remove, by, tags=None):
+        """A source commit's `SourceCommitted`, its delta file written but
+        nothing recorded, and the ref it installs; no event if it changes
+        nothing. Whoever does not record it drops it (`_drop_prepared`)."""
+
         source = self.manifest["sources"].get(name)
         if source is None:
             raise KeyError(name)
@@ -1363,12 +1418,12 @@ class Engine(Attempts):
         }
         event = {"type": "SourceCommitted", "source": name, "head": record}
         batch = None
-        run = {"id": run_id, "source": name, "by": by}
+        run = {"id": run_id, "source": name, "by": by, **({"tags": tags} if tags else {})}
         if not keyed:
             if version is None:
                 raise ValueError(f"Source {name!r} requires version=")
             if head is not None and head["ref"]["version"] == str(version):
-                return {"changed": False, "ref": head["ref"]}
+                return None, head["ref"]
             ref["version"] = str(version)
             run["version"] = ref["version"]
         else:
@@ -1401,7 +1456,7 @@ class Engine(Attempts):
                     [k for k, d in zip(delta.keys, delta.deleted, strict=True) if d],
                 )
             if not files.files:
-                return {"changed": False, "ref": ref}
+                return None, ref
             ref["version"] = digest([ref["version"], batch, [f.name for f in files.files]])
             record["batch"] = batch
             if source.get("key") == "<elements>" or name in self._set_dims:
@@ -1418,16 +1473,29 @@ class Engine(Attempts):
         meta = dict(ref.get("meta") or {})
         meta["external"] = True
         ref["meta"] = meta
-        if self.m.heads.get((name, "")) != head:
-            if "keys" in event:
-                await self.state.delete_objects([index.path(f["name"]) for f in event["keys"]["files"]])
-            raise Conflict(f"source {name!r} moved while committing; retry")
-        event["at"] = self.clock()
         event["run"] = run
-        self.state.record(event)
-        if self.keys is not None and "keys" in event:
-            self._cache_commit(name, "", event["keys"])
-        return {"changed": True, "ref": ref, "run": run_id}
+        return event, ref
+
+    def _committed_keys(self, events: list[dict]) -> None:
+        """Warm the key cache with what recorded source commits installed."""
+
+        if self.keys is not None:
+            for event in events:
+                if "keys" in event:
+                    self._cache_commit(event["source"], "", event["keys"])
+
+    async def _drop_prepared(self, events: list[dict]) -> None:
+        """Delete the delta files of prepared commits never recorded."""
+
+        paths = []
+        for event in events:
+            if "keys" in event:
+                index = KeyIndex(
+                    self._key_io(), None, self.m.index(event["source"], "").pinned(), self.key_options
+                )
+                paths += [index.path(f["name"]) for f in event["keys"]["files"]]
+        if paths:
+            await self.state.delete_objects(paths)
 
     async def _resolve_source(self, index, pinned, new, removes, replace, batch, attempt):
         """A small source commit through the warm resolver, in process

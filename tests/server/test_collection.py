@@ -208,3 +208,44 @@ async def test_a_delta_a_pending_discard_reads_outlives_its_index(tmp_path, data
     assert await state.get_object(path) is None
     await engine.stop()
     await state.close()
+
+
+async def test_an_entry_whose_names_cannot_be_read_gets_stuck_and_is_shown(tmp_path):
+    """After three attempts that could not read an entry's names, it is
+    stuck: no longer handed out, so it takes no attempt's slot; shown in
+    diagnostics and on the scope's head, until an operator clears it."""
+
+    import httpx
+    from solera_server.api import create_app
+
+    @asset(outputs=Output("scores", keyed=True))
+    def scores():
+        return {"a": 1}
+
+    project = Project(assets=[scores])
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = engine_for(state, project)
+    await engine.initialize()
+    await run(engine, ["scores"])
+    m = state.model
+    prefix = m.indexes[("scores", "")].prefix
+    m.discards[("scores", "")] = [{"n": 1, "kind": "delta", "prefix": prefix, "files": ["gone"]}]
+    for misses in (1, 2, 3):
+        await run(engine, ["scores"])
+        [entry] = m.discards[("scores", "")]
+        assert entry["misses"] == misses and entry.get("stuck", False) == (misses == 3)
+    assert engine._due_discards("scores", "", None) == []
+    app = create_app(engine=engine, insecure=True)
+    app.state.engine = engine
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        assert (await client.get("/api/diagnostics")).json()["stuck_discards"] == [
+            {"output": "scores", "scope": "", "n": 1}
+        ]
+        base = f"/api/projects/{project.manifest['name']}"
+        [head] = (await client.get(f"{base}/outputs/scores/heads")).json()["heads"]
+        assert head["discards"]["pending"] == 0 and [e["n"] for e in head["discards"]["stuck"]] == [1]
+        cleared = await client.post(f"{base}/scopes:clear-discards", json={"output": "scores", "by": "ops"})
+        assert cleared.json()["cleared"] == [1]
+    assert ("scores", "") not in m.discards
+    await engine.stop()
+    await state.close()

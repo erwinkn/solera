@@ -139,6 +139,7 @@ class Lake:
         merge_width: int = 4,
         base_rows: int = 1_000,
         final_rows: int = 1_000_000,
+        volatile: tuple[str, ...] = (),
     ):
         self.state, self.schema, self.held = state, schema, held
         # files go under `{prefix}/{table}/`; events are `{name}Flushed` and so on
@@ -163,6 +164,8 @@ class Lake:
         self.last_error: str | None = None
         self._db = None  # in-memory DuckDB mirroring the buffers
         self._mirrored: dict[str, tuple] = {}  # table -> (state, generation, first seq, last seq)
+        # rows of `volatile` tables: memory only, never journaled, until a flush writes them
+        self.volatile: dict[str, list[list]] = {table: [] for table in volatile}
 
     # -- write path ----------------------------------------------------------------------
 
@@ -191,21 +194,37 @@ class Lake:
         await asyncio.gather(*jobs, return_exceptions=True)
         self._task = None
 
+    def buffer(self, table: str, row: dict) -> None:
+        """Buffer a row of a volatile table: no event, so a crash loses it."""
+
+        self.volatile[table].append([row.get(c) for c in self.schema[table].columns])
+
+    def unwritten(self, table: str) -> list[dict]:
+        names = list(self.schema[table].columns)
+        return [dict(zip(names, values, strict=True)) for values in self.volatile.get(table, ())]
+
     async def flush(self, force: bool = False) -> None:
         """Write the buffered rows out, one file per table, once there are
         `flush_rows` of them or the oldest has waited `flush_seconds`."""
 
         lake = self.held()
         pending = {t: rows for t, rows in lake.rows.items() if rows}
-        count = sum(len(rows) for rows in pending.values())
+        volatile = {t: list(rows) for t, rows in self.volatile.items() if rows}
+        count = sum(len(rows) for rows in pending.values()) + sum(len(rows) for rows in volatile.values())
         if not count:
             return
         now = self.clock()
-        oldest = min(self._time(t, rows[0][1]) or now for t, rows in pending.items())
+        oldest = min(
+            [self._time(t, rows[0][1]) or now for t, rows in pending.items()]
+            + [self._time(t, rows[0]) or now for t, rows in volatile.items()]
+        )
         if not force and count < self.flush_rows and now - oldest < self.flush_seconds:
             return
         upto = {t: rows[-1][0] for t, rows in pending.items()}
         batches = {t: [values for _, values in rows] for t, rows in pending.items()}
+        for t, rows in volatile.items():
+            batches[t] = batches.get(t, []) + rows
+            upto.setdefault(t, 0)
         files = {}
         try:
             for table, rows in batches.items():
@@ -214,12 +233,14 @@ class Lake:
             await self._discard([f["path"] for f in files.values()])
             raise
         # Rows forgotten meanwhile must not come back with this file.
-        for table, rows in batches.items():
+        for table, rows in pending.items():
             left = sum(1 for seq, _ in self.held().rows.get(table, ()) if seq <= upto[table])
             if left != len(rows):
                 await self._discard([f["path"] for f in files.values()])
                 return
         self.state.record({"type": f"{self.name}Flushed", "files": files, "upto": upto})
+        for table, rows in volatile.items():
+            del self.volatile[table][: len(rows)]
 
     def _time(self, table: str, values: list):
         spec = self.schema[table]

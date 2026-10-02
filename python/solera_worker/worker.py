@@ -1145,7 +1145,7 @@ async def _discard_due(spec, project, asset, objects, writes) -> dict:
 
     declared = {o["name"]: o for o in project.manifest["assets"][asset.name]["outputs"]}
     decls = {o.name or asset.name: o for o in asset.outputs}
-    discarded, files = {}, []
+    discarded, unresolved, files = {}, {}, []
 
     async def read(path: str) -> bytes | None:
         return await _get(objects, path)
@@ -1161,8 +1161,9 @@ async def _discard_due(spec, project, asset, objects, writes) -> dict:
                 found = [
                     await read(f"{prefix}{f}.{'kx' if kind == 'delta' else 'kg'}") for f in entry["files"]
                 ]
-                if any(data is None for data in found):
-                    continue  # the names are not known: the entry stays pending
+                if any(data is None for data in found):  # the names are not known: it stays pending
+                    unresolved.setdefault(name, []).append(entry["n"])
+                    continue
                 for data in found:
                     if kind == "delta":
                         for key, _, _, _, before in iter_file(data):
@@ -1202,6 +1203,8 @@ async def _discard_due(spec, project, asset, objects, writes) -> dict:
         await writes.call(store.discard(scope, head, items))
         discarded[name] = done
     out = {"discarded": discarded} if discarded else {}
+    if unresolved:
+        out["discard_unresolved"] = unresolved
     if files:
         out["discarded_files"] = files
     return out
@@ -1254,7 +1257,7 @@ async def run_pool(pool: str, server: str, token: str | None = None, *, project:
 async def main():
     args = sys.argv[1:]
     if not args:
-        raise SystemExit("usage: solera_worker run|manifest|pool ...")
+        raise SystemExit("usage: solera_worker run|manifest|pool|sensors ...")
     mode, rest = args[0], args[1:]
     if mode == "manifest":
         # solera_worker manifest PROJECT OUT
@@ -1278,4 +1281,21 @@ async def main():
         token = options.get("--token") or os.getenv("SOLERA_POOL_TOKEN") or os.getenv("SOLERA_API_TOKEN")
         await run_pool(options["--pool"], options["--server"].rstrip("/"), token)
         return
+    if mode == "sensors":
+        # solera_worker sensors --pool NAME --server URL [--token T] (SOLERA_PROJECT env entrypoint)
+        from .sensors import HttpSensorChannel, run_sensor_host
+
+        options = dict(zip(rest[::2], rest[1::2], strict=True))
+        token = options.get("--token") or next(
+            filter(None, map(os.getenv, ("SOLERA_SENSOR_TOKEN", "SOLERA_POOL_TOKEN", "SOLERA_API_TOKEN"))),
+            None,
+        )
+        project = load_project(os.environ["SOLERA_PROJECT"])
+        channel = HttpSensorChannel(options["--server"].rstrip("/"), project.manifest["name"], token)
+        try:
+            await run_sensor_host(channel, project, options["--pool"])
+        finally:
+            await channel.close()
+        # Done ticking, or a tick overran on a thread that cannot be stopped: start afresh.
+        os.execv(sys.executable, [sys.executable, "-m", "solera_worker", *args])
     raise SystemExit(f"unknown mode: {mode}")

@@ -60,7 +60,7 @@ TABLES = {
             "created_at": "DOUBLE",
             "finished_at": "DOUBLE",
             "status": "VARCHAR",  # a run that wrote nothing is "skipped"
-            "trigger": "VARCHAR",  # manual | automation | commit
+            "trigger": "VARCHAR",  # manual | automation | sensor | commit
             "automation": "VARCHAR",
             "by": "VARCHAR",
             "source": "VARCHAR",
@@ -173,7 +173,25 @@ TABLES = {
             "param": "VARCHAR",
         },
     ),
+    # Sensor ticks (docs/lifecycle.md §11.5): buffered in memory, never
+    # journaled; what a tick caused is a run tagged with it, kept with runs.
+    "ticks": Table(
+        "sensor",
+        "started_at",
+        {
+            "sensor": "VARCHAR",
+            "tick": "VARCHAR",
+            "started_at": "DOUBLE",
+            "ended_at": "DOUBLE",
+            "host": "VARCHAR",
+            "outcome": "VARCHAR",  # skipped | advanced | committed | requested | refused | failed
+            "error": "VARCHAR",
+            "runs": "VARCHAR[]",  # the runs it requested
+        },
+    ),
 }
+VOLATILE = ("ticks",)  # tables whose rows are never journaled
+TICKS_KEPT = 86400.0  # seconds a tick row is kept
 RUN_TABLES = ("runs", "tasks", "attempts")  # replaced when a run is reopened; its events stay
 MAX_METADATA = 64 << 10  # bytes of JSON per output version
 
@@ -305,7 +323,7 @@ def run_rows(run: dict, *, live: bool = False) -> dict[str, list[dict]]:
         "created_at": run["created_at"],
         "finished_at": None if live else run.get("updated_at"),
         "status": status,
-        "trigger": "automation" if run.get("automation") else "manual",
+        "trigger": "automation" if run.get("automation") else "sensor" if run.get("sensor") else "manual",
         "automation": run.get("automation"),
         "by": run.get("by"),
         "source": None,
@@ -409,7 +427,7 @@ def commit_row(run: dict, at: float) -> dict:
         "mode": "commit",
         "partitions": None,
         "upstream": False,
-        "tags": {},
+        "tags": run.get("tags") or {},
         "task_count": 0,
         "failed_count": 0,
         "error": None,
@@ -587,7 +605,9 @@ class History:
 
     def __init__(self, state, *, clock=None, **lake):
         self.state = state
-        self.lake = Lake(state, TABLES, lambda: state.model.history, name="History", clock=clock, **lake)
+        self.lake = Lake(
+            state, TABLES, lambda: state.model.history, name="History", clock=clock, volatile=VOLATILE, **lake
+        )
         self.clock = self.lake.clock
 
     @property
@@ -599,6 +619,26 @@ class History:
 
     async def stop(self) -> None:
         await self.lake.stop()
+
+    def tick(self, row: dict) -> None:
+        """A sensor tick's row: written with the next flush, lost if the
+        engine stops first."""
+
+        self.lake.buffer("ticks", row)
+
+    async def ticks(self, sensor: str, limit: int = 100) -> list[dict]:
+        """A sensor's latest tick rows, newest first."""
+
+        def work(con):
+            return _dicts(
+                con.execute(
+                    "SELECT * FROM ticks WHERE sensor = ? ORDER BY started_at DESC LIMIT ?", [sensor, limit]
+                )
+            )
+
+        return await self.lake.query(
+            work, ("ticks",), key=sensor, extra={"ticks": self.lake.unwritten("ticks")}
+        )
 
     def delete(self, runs: list[str], files: list[str] = ()) -> None:
         """Forget finished runs: their rows go now, or from the files that
@@ -623,7 +663,7 @@ class History:
         runs in progress. Files outside `since`/`until`, or unable to hold
         `run`, are left out."""
 
-        extra = {}
+        extra = {table: self.lake.unwritten(table) for table in VOLATILE}
         if live:
             m = self.m
             for run_id in list(m.runs):

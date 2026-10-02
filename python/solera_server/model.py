@@ -26,6 +26,7 @@ at its claim's position, and a file let go of at a later one waits for it.
 from __future__ import annotations
 
 import copy
+import math
 
 from solera.keys.index import DeltaFiles, FileInfo, IndexState, index_prefix
 
@@ -36,6 +37,7 @@ TERMINAL_TASK = frozenset({"succeeded", "skipped", "failed", "blocked", "cancele
 TERMINAL_RUN = frozenset({"succeeded", "failed", "canceled"})
 BAD_OUTCOME = frozenset({"failed", "blocked", "canceled"})
 MAX_RECEIPTS = 10_000  # idempotency receipts kept for replayed submissions
+STUCK_AFTER = 3  # misses before a discard entry is stuck (docs/lifecycle.md §9.8)
 
 
 def delta_reads(plans: dict) -> list[tuple]:
@@ -98,6 +100,7 @@ class Model:
                 "holds": _nest(self.holds, 2),
                 "discards": _nest(self.discards, 2),
                 "automations": self.automations,
+                "sensors": self.sensors,
                 "runs": self.runs,
                 "receipts": list(self.receipts.items()),
                 "history": self.history.to_json(),
@@ -136,6 +139,8 @@ class Model:
         # once no reader pins it (docs/lifecycle.md §9.8)
         self.discards: dict[tuple, list] = _flatten(snap.get("discards"), 2)
         self.automations: dict[str, dict] = snap.get("automations") or {}
+        # sensor -> {cursor, accepted}: the last tick that changed something (docs/lifecycle.md §11.4)
+        self.sensors: dict[str, dict] = snap.get("sensors") or {}
         self.runs: dict[str, dict] = snap.get("runs") or {}
         self.receipts: dict[str, str] = dict(snap.get("receipts") or [])
         # the run history (§7): per table, its files and the rows awaiting a flush
@@ -146,6 +151,8 @@ class Model:
         self.attempts: dict[str, str] = {}  # attempt id -> task id, while claimed
         self.locks: dict[tuple, str] = {}  # (asset, scope) -> attempt id
         self.pool: dict[str, dict] = {}  # attempt id -> pool work
+        # sensor -> the tick dispatched and not yet decided: {tick, cursor, snapshot, pin, ...}
+        self.ticks: dict[str, dict] = {}
         self._reindex()
 
     def _reindex(self) -> None:
@@ -272,6 +279,17 @@ class Model:
         self.locks[(task["asset"], task["scope"])] = attempt
         self.queue.pop(task_id, None)
 
+    def pin_floor(self, but: str | None = None) -> float:
+        """The oldest reader pin (docs/lifecycle.md §9.8): of the attempts
+        claimed (but attempt `but`), the delta windows delivered over several
+        attempts, and the sensor ticks in flight. What was let go of at or
+        before it is read by no one."""
+
+        pins = [c["pin"] for c in self.claims.values() if c["attempt"] != but and "pin" in c]
+        pins += [wm["pin"] for wm in self.watermarks.values() if wm.get("pin") is not None]
+        pins += [t["pin"] for t in self.ticks.values()]
+        return min(pins, default=math.inf)
+
     def release(self, task_id: str, attempt: str) -> None:
         """Drop the memory-only claim of an attempt that was never launched."""
 
@@ -365,6 +383,7 @@ class Model:
                         record[field] = existing.get(field, record[field])
             automations[name] = record
         self.automations = automations
+        self.sensors = {n: s for n, s in self.sensors.items() if n in (manifest.get("sensors") or {})}
         for name, source in manifest["sources"].items():
             if (name, "") not in self.heads:
                 self.heads[(name, "")] = {
@@ -375,6 +394,7 @@ class Model:
                     "complete": True,
                     "asset": None,
                     "version": None,
+                    "n": self.applied,
                 }
 
     def _apply_aliases(self, manifest) -> dict[str, list[str]]:
@@ -929,15 +949,31 @@ class Model:
 
     def _discarded(self, scope: str, e: dict) -> None:
         """A worker discarded data garbage: its entries go, and the index-side
-        files they were read from become garbage themselves."""
+        files they were read from become garbage themselves. An entry whose
+        names it could not read counts a miss; at `STUCK_AFTER` it is
+        `stuck`: kept, and shown, but no longer handed out."""
 
         for output, done in (e.get("discarded") or {}).items():
-            left = [d for d in self.discards.get((output, scope), []) if d["n"] not in set(done)]
-            if left:
-                self.discards[(output, scope)] = left
-            else:
-                self.discards.pop((output, scope), None)
+            self._drop_discards(output, scope, done)
+        for output, missed in (e.get("discard_unresolved") or {}).items():
+            for d in self.discards.get((output, scope), []):
+                if d["n"] in missed:
+                    d["misses"] = d.get("misses", 0) + 1
+                    if d["misses"] >= STUCK_AFTER:
+                        d["stuck"] = True
         self.garbage.extend([path, self.applied] for path in e.get("discarded_files") or ())
+
+    def _drop_discards(self, output: str, scope: str, ns) -> None:
+        left = [d for d in self.discards.get((output, scope), []) if d["n"] not in set(ns)]
+        if left:
+            self.discards[(output, scope)] = left
+        else:
+            self.discards.pop((output, scope), None)
+
+    def _on_DiscardsCleared(self, e):
+        """An operator gave up on stuck entries: their objects stay."""
+
+        self._drop_discards(e["output"], e["scope"], e["n"])
 
     def _replace_index(self, key: tuple, index: IndexState) -> None:
         """Swap in a new index state; files it no longer references await deletion."""
@@ -980,7 +1016,7 @@ class Model:
     def _on_SourceCommitted(self, e):
         before = self.heads.get((e["source"], ""))
         head = e["head"]
-        self.heads[(e["source"], "")] = {**head, "at": e["at"]}
+        self.heads[(e["source"], "")] = {**head, "at": e["at"], "n": self.applied}
         self._commit_keys(e["source"], "", e.get("keys"))
         run = e.get("run")
         if run is not None:
@@ -1003,6 +1039,9 @@ class Model:
             )
         if before is None or before["ref"].get("version") != head["ref"].get("version"):
             self._pend_onchange(None, "", [e["source"]])
+
+    def _on_SensorAdvanced(self, e):
+        self.sensors[e["sensor"]] = {"cursor": e.get("cursor"), "accepted": e["accepted"]}
 
     def _on_AutomationChanged(self, e):
         auto = self.automations.get(e["name"])

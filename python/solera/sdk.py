@@ -247,12 +247,49 @@ class PartitionSet(Output):
 
 
 class Source:
-    """An output with no producer (§5)."""
+    """An output with no producer (§5). With `observe=Every(…)`, a subclass's
+    `observe(ctx, …resources)` is called on that schedule and commits to the
+    source: sugar for a sensor `{name}.observe` (docs/lifecycle.md §11)."""
 
-    def __init__(self, name: str, store: str | None = None, key: str | None = None, **handle: Any):
+    def __init__(
+        self,
+        name: str,
+        store: str | None = None,
+        key: str | None = None,
+        *,
+        observe: Every | None = None,
+        executor: Any = None,
+        timeout: float = 60,
+        **handle: Any,
+    ):
         if not NAME.fullmatch(name):
             raise RegistrationError(f"Invalid source name: {name!r}")
         self.name, self.store, self.key, self.handle = name, store, key, dict(handle)
+        self.observing, self.executor, self.timeout = observe, executor, timeout
+        if observe is not None and type(self).observe is Source.observe:
+            raise RegistrationError(f"Source {name!r}: observe= needs a subclass that defines observe()")
+
+    def observe(self, ctx) -> Any:
+        """`str`: a version; a map: the full key map; `Observed`: a patch and a
+        cursor; `None`: nothing changed."""
+
+        raise NotImplementedError
+
+    def _sensor(self) -> Sensor:
+        def body(ctx, **resources):
+            return _observed(self.name, self.observe(ctx, **resources))
+
+        params = [p for p in inspect.signature(self.observe).parameters if p != "ctx"]
+        return Sensor(
+            body,
+            name=f"{self.name}.observe",
+            every=self.observing,
+            commits=[self.name],
+            executor=self.executor,
+            timeout=self.timeout,
+            params=params,
+            code=type(self).observe,
+        )
 
     @classmethod
     def _from_partition_set(cls, ps: PartitionSet) -> Source:
@@ -580,6 +617,148 @@ def AutoRefresh(**kwargs) -> Automation:
     return Automation(trigger=OnChange(), **kwargs)
 
 
+# ---------------------------------------------------------------------------
+# Sensors (docs/lifecycle.md §11)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Commit:
+    """A source commit a tick asks for, as the commit API takes it: a
+    `version`, a full `keys` map, or `upsert`/`remove`."""
+
+    source: str
+    version: str | None = None
+    keys: Mapping | list | None = None
+    upsert: Mapping | list | None = None
+    remove: list | None = None
+
+    def to_json(self) -> dict:
+        out = {"source": self.source}
+        if self.version is not None:
+            out["version"] = str(self.version)
+        for name in ("keys", "upsert"):
+            value = getattr(self, name)
+            if value is not None:
+                out[name] = (
+                    {str(k): str(v) for k, v in value.items()}
+                    if isinstance(value, Mapping)
+                    else [str(k) for k in value]
+                )
+        if self.remove is not None:
+            out["remove"] = [str(k) for k in self.remove]
+        return out
+
+
+@dataclass(frozen=True)
+class RunRequest:
+    """A run a tick submits, as the API takes it."""
+
+    targets: list[str] | str
+    partitions: str | list[str] = "latest"
+    config: dict | None = None
+    keys: dict | None = None
+    tags: dict[str, str] | None = None
+
+    def to_json(self) -> dict:
+        targets = [self.targets] if isinstance(self.targets, str) else list(self.targets)
+        out = {"targets": targets, "partitions": self.partitions}
+        for name in ("config", "keys", "tags"):
+            if getattr(self, name) is not None:
+                out[name] = getattr(self, name)
+        return out
+
+
+@dataclass(frozen=True)
+class Tick:
+    """What a sensor's tick found: a new `cursor`, source `commits`, `runs`
+    to submit; all optional. The engine applies it all or nothing."""
+
+    cursor: Any = UNSET
+    commits: list[Commit] = field(default_factory=list)
+    runs: list[RunRequest] = field(default_factory=list)
+
+    def to_json(self) -> dict:
+        out = {"commits": [c.to_json() for c in self.commits], "runs": [r.to_json() for r in self.runs]}
+        if self.cursor is not UNSET:
+            out["cursor"] = _jsonable(self.cursor, "A sensor cursor")
+        return out
+
+
+@dataclass(frozen=True)
+class Observed:
+    """What an observable source's `observe()` saw since its cursor."""
+
+    upsert: Mapping | list | None = None
+    remove: list | None = None
+    cursor: Any = UNSET
+
+
+def _observed(source: str, value: Any) -> Tick | None:
+    """The `Tick` of an `observe()` result (per-key-processing.md §12)."""
+
+    if value is None:
+        return None
+    if isinstance(value, Observed):
+        empty = not value.upsert and not value.remove
+        commits = [] if empty else [Commit(source, upsert=value.upsert or {}, remove=value.remove)]
+        return Tick(cursor=value.cursor, commits=commits)
+    if isinstance(value, str):
+        return Tick(commits=[Commit(source, version=value)])
+    if isinstance(value, Mapping):
+        return Tick(commits=[Commit(source, keys=value)])
+    raise TypeError(f"{source}.observe returned {type(value).__name__}: a str, a map, Observed or None")
+
+
+class Sensor:
+    """A check run every `every` on a sensor host: `fn(ctx, …resources)`
+    returns a `Tick` or `None`. `commits` names every source it may commit
+    to; `executor` is the host: the engine's own (`Local`, the default) or a
+    `Pool` of `solera_worker sensors` hosts."""
+
+    def __init__(
+        self,
+        fn: Callable,
+        *,
+        every: Every | int | float,
+        commits: list[str] | tuple = (),
+        executor: Any = None,
+        timeout: float = 60,
+        name: str | None = None,
+        params: list[str] | None = None,
+        code: Callable | None = None,
+    ):
+        self.fn, self.name = fn, name or fn.__name__
+        if not NAME.fullmatch(self.name):
+            raise RegistrationError(f"Invalid sensor name: {self.name!r}")
+        self.every = every if isinstance(every, Every) else Every(every)
+        self.commits = [str(c) for c in commits]
+        self.executor, self.timeout = executor, float(timeout)
+        if self.timeout <= 0:
+            raise RegistrationError(f"Sensor {self.name}: timeout must be positive")
+        self.params = (
+            params if params is not None else [p for p in inspect.signature(fn).parameters if p != "ctx"]
+        )
+        self.code = code or fn
+
+    def placement(self) -> dict:
+        from .executors import Environment, Local, Placement
+
+        executor = self.executor or Local()
+        if isinstance(executor, Environment):
+            executor = executor()
+        if not isinstance(executor, Placement) or executor.kind not in ("Local", "Pool"):
+            raise RegistrationError(f"Sensor {self.name}: its executor is Local or a Pool")
+        return executor.serialized()
+
+
+def sensor(fn=None, **decl):
+    def wrap(f):
+        return Sensor(f, **decl)
+
+    return wrap(fn) if fn is not None else wrap
+
+
 @dataclass(frozen=True)
 class Retry:
     n: int = 3
@@ -810,6 +989,7 @@ class Project:
         executors: list | None = None,
         resources: dict[str, Any] | None = None,
         automations: list[Automation] | None = None,
+        sensors: list[Sensor] | None = None,
         retention: Retention | None = None,
         key_cache: KeyCache | None = DEFAULT_KEY_CACHE,
         errors: Mapping[type, type] | None = None,
@@ -857,6 +1037,13 @@ class Project:
                 raise RegistrationError(f"Duplicate asset: {a.name}")
             self.assets[a.name] = a
         self.automations = list(automations or ())
+        self.sensors: dict[str, Sensor] = {}
+        for s in [*(sensors or ()), *(src._sensor() for src in self.sources.values() if src.observing)]:
+            if not isinstance(s, Sensor):
+                raise RegistrationError(f"Not a sensor: {s!r}")
+            if s.name in self.sensors:
+                raise RegistrationError(f"Duplicate sensor: {s.name}")
+            self.sensors[s.name] = s
         self.manifest = self._build()
 
     @classmethod
@@ -1251,6 +1438,22 @@ class Project:
                 "automations": [n for n, a in automation_records.items() if a["targets"] == [name]],
             }
 
+        sensor_records = {}
+        for name, s in self.sensors.items():
+            for source in s.commits:
+                if source not in self.sources:
+                    raise RegistrationError(f"Sensor {name}: commits= names {source!r}, not a source")
+            for param in s.params:
+                if param not in self.resources:
+                    raise RegistrationError(f"Sensor {name}: parameter {param!r} is not a resource")
+            sensor_records[name] = {
+                "name": name,
+                "every": s.every.seconds,
+                "commits": s.commits,
+                "placement": s.placement(),
+                "timeout": s.timeout,
+                "doc": inspect.cleandoc(s.code.__doc__ or ""),
+            }
         source_records = {
             name: {
                 "name": name,
@@ -1286,6 +1489,7 @@ class Project:
             "stores": store_records,
             "executors": dict(sorted(executors.items())),
             "automations": automation_records,
+            "sensors": sensor_records,
             "retention": self.retention.spec() if self.retention else None,
             "key_cache": self.key_cache.spec() if self.key_cache else None,
             "build": build_identity(self.home, self.build),

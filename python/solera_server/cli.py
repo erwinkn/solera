@@ -119,6 +119,10 @@ def main():
     release = scopes_sub.add_parser("release", help="Release a scope held for an uncertain writer")
     release.add_argument("asset")
     release.add_argument("scope", nargs="?", default="")
+    discards = scopes_sub.add_parser("discards", help="An output scope's data garbage, and the stuck entries")
+    discards.add_argument("output")
+    discards.add_argument("scope", nargs="?", default="")
+    discards.add_argument("--clear", action="store_true", help="Forget the stuck entries; their objects stay")
 
     run_show = commands.add_parser("run-show", help="Show a run's tasks and attempts", parents=[common])
     run_show.add_argument("run_id")
@@ -145,11 +149,14 @@ def main():
     commit.add_argument("--remove", action="append", default=[])
     commit.add_argument("--by", default="cli", help="Who is committing (recorded on the commit's run)")
 
-    worker = commands.add_parser("worker", help="Run a pool worker (§10)")
+    worker = commands.add_parser("worker", help="Run a pool worker (§10), or a pool's sensor host")
     worker_sub = worker.add_subparsers(dest="worker_command", required=True)
     pool = worker_sub.add_parser("pool")
     pool.add_argument("name")
     pool.add_argument("--server", default=_server_url())
+    hosts = worker_sub.add_parser("sensors", help="Run the sensors of a Pool (docs/lifecycle.md §11.2)")
+    hosts.add_argument("name")
+    hosts.add_argument("--server", default=_server_url())
 
     commands.add_parser("selftest", help="Check state and object storage connectivity")
 
@@ -203,7 +210,18 @@ async def _dispatch(args, parser):
 
     if args.command == "worker":
         if not args.server:
-            parser.error("solera worker pool needs --server or SOLERA_SERVER_URL")
+            parser.error(f"solera worker {args.worker_command} needs --server or SOLERA_SERVER_URL")
+        if args.worker_command == "sensors":  # the host replaces itself now and then: give it the process
+            command = [
+                "-m",
+                "solera_worker",
+                "sensors",
+                "--pool",
+                args.name,
+                "--server",
+                args.server.rstrip("/"),
+            ]
+            os.execv(sys.executable, [sys.executable, *command])
         from solera_worker.worker import run_pool
 
         token = os.getenv("SOLERA_POOL_TOKEN") or os.getenv("SOLERA_API_TOKEN")
@@ -336,6 +354,16 @@ async def _remote(args, parser):
             print(json.dumps(detail, indent=2))
             if detail["request"]["status"] != "succeeded":
                 raise SystemExit(1)
+        elif args.command == "scopes" and args.scopes_command == "discards" and args.clear:
+            body = {"output": args.output, "scope": args.scope, "by": "cli"}
+            response = await client.post(f"{base}/scopes:clear-discards", json=body)
+            response.raise_for_status()
+            print(json.dumps(response.json(), indent=2))
+        elif args.command == "scopes" and args.scopes_command == "discards":
+            response = await client.get(f"{base}/outputs/{args.output}/heads")
+            response.raise_for_status()
+            heads = [h for h in response.json()["heads"] if h["scope"] == args.scope]
+            print(json.dumps(heads[0]["discards"] if heads else None, indent=2))
         elif args.command == "scopes":
             body = {"asset": args.asset, "scope": args.scope, "by": "cli"}
             response = await client.post(f"{base}/scopes:release", json=body)
@@ -406,6 +434,14 @@ async def _local(args, parser):
             print(json.dumps(detail, indent=2))
             if detail["request"]["status"] != "succeeded":
                 raise SystemExit(1)
+        elif args.command == "scopes" and args.scopes_command == "discards":
+            done = runtime.clear_discards if args.clear else None
+            view = (
+                done(args.output, args.scope, "cli")
+                if done
+                else runtime.scope_discards(args.output, args.scope)
+            )
+            print(json.dumps(view, indent=2))
         elif args.command == "scopes":
             print(json.dumps(runtime.release_scope(args.asset, args.scope, "cli"), indent=2))
         elif args.command == "runs" and args.runs_command == "delete":

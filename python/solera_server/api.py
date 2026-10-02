@@ -20,10 +20,12 @@ from solera.lifecycle import Ended
 from .engine import Conflict, Engine
 from .history import TERMINAL_RUN, RunFilter
 from .placements.local import load_manifest
+from .sensors import HOST_TOKEN
 from .state import LostOwnership, State, Unavailable
 
 ATTEMPT_ROUTE = re.compile(r"^/api/projects/[^/]+/attempts/([^/]+)/(start|beat|logs|resolve|finished)$")
 POOL_ROUTE = re.compile(r"^/api/projects/[^/]+/pools/[^/]+/work$")
+SENSOR_ROUTE = re.compile(r"^/api/projects/[^/]+/sensors/(next|[^/]+/ticks/[^/]+)$")
 
 
 class RunInput(BaseModel):
@@ -108,6 +110,11 @@ def create_app(
             return secret is not None and lifecycle.valid(secret, match.group(1), presented)
         if POOL_ROUTE.match(path) and pool_token:
             return hmac.compare_digest(presented.encode(), pool_token.encode())
+        if SENSOR_ROUTE.match(path):  # sensor hosts: the pool token, or the local host's own
+            if pool_token and hmac.compare_digest(presented.encode(), pool_token.encode()):
+                return True
+            secret = request.app.state.engine.secret
+            return secret is not None and lifecycle.valid(secret, HOST_TOKEN, presented)
         return False
 
     @app.middleware("http")
@@ -191,6 +198,13 @@ def create_app(
             "active_runs": sum(1 for r in runtime.m.runs.values() if r["status"] not in TERMINAL_RUN),
             "postgres": bool(os.environ.get("DATABASE_URL")),
             "last_error": runtime.failing,
+            # data garbage whose names could not be read: see and clear with `solera scopes discards`
+            "stuck_discards": [
+                {"output": output, "scope": scope, "n": e["n"]}
+                for (output, scope), entries in runtime.m.discards.items()
+                for e in entries
+                if e.get("stuck")
+            ],
         }
 
     # -- project reads ---------------------------------------------------------
@@ -234,6 +248,7 @@ def create_app(
                     "cursor": cursor,
                     "at": head["at"],
                     "commit": runtime.head_view(head)["commit"],
+                    "discards": runtime.scope_discards(name, scope),
                 }
             )
         return {"output": name, "heads": out}
@@ -503,6 +518,12 @@ def create_app(
             raise KeyError(f"{run_id}/{attempt}: no result yet")
         return result
 
+    @app.post("/api/projects/{p}/scopes:clear-discards")
+    async def clear_discards(p: str, request: Request):
+        runtime = await project_engine(request, p)
+        body = await request.json()
+        return runtime.clear_discards(body["output"], body.get("scope", ""), body.get("by") or "api")
+
     @app.post("/api/projects/{p}/scopes:release")
     async def release_scope(p: str, request: Request):
         runtime = await project_engine(request, p)
@@ -555,6 +576,38 @@ def create_app(
         capacity = {k: float(query[k]) for k in ("cpu", "memory", "gpu") if k in query}
         host = query.get("host") or (request.client.host if request.client else "worker")
         return {"work": await runtime.pool_work(pool, capacity, host, wait)}
+
+    # -- sensors (docs/lifecycle.md §11) ---------------------------------------------
+
+    @app.get("/api/projects/{p}/sensors")
+    async def sensors(p: str, request: Request):
+        runtime = await project_engine(request, p)
+        return {"sensors": runtime.sensor_views(), "hosts": list(runtime.sensor_hosts.values())}
+
+    @app.get("/api/projects/{p}/sensors/next")
+    async def sensors_next(
+        p: str,
+        request: Request,
+        executor: str,
+        revision: str,
+        slots: int = Query(4, ge=0, le=64),
+        wait: float = Query(30, ge=0, le=30),
+    ):
+        runtime = await project_engine(request, p)
+        host = request.query_params.get("host") or (request.client.host if request.client else "host")
+        return await runtime.sensor_next(executor, revision, host, slots, wait)
+
+    @app.post("/api/projects/{p}/sensors/{sensor}/ticks/{tick}")
+    async def sensor_tick(p: str, sensor: str, tick: str, request: Request):
+        runtime = await project_engine(request, p)
+        return await runtime.sensor_post(sensor, tick, await request.json())
+
+    @app.get("/api/projects/{p}/sensors/{sensor}/ticks")
+    async def sensor_ticks(p: str, sensor: str, request: Request, limit: int = Query(100, ge=1, le=1000)):
+        runtime = await project_engine(request, p)
+        if sensor not in runtime.manifest.get("sensors", {}):
+            raise KeyError(sensor)
+        return {"ticks": await runtime.history.ticks(sensor, limit)}
 
     # -- automations -------------------------------------------------------------
 

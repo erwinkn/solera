@@ -25,6 +25,8 @@ from solera.ids import ulid
 from solera.keys.index import IndexState, KeyIndex, Options
 from solera.keys.io import ObjectIO, key_cache
 
+from . import history
+
 log = logging.getLogger(__name__)
 
 GATES = "control/gates/"  # per day, the gates of runs deleted that day (docs/lifecycle.md §2.4)
@@ -228,15 +230,15 @@ class Upkeep:
     # -- garbage ---------------------------------------------------------------------
 
     async def collect(self) -> None:
-        """Delete the files nothing references, once no attempt claimed
-        before they were let go of is still running. Both are positions in
-        the model's event order, never wall clocks: two engines' clocks may
-        disagree, the order they replay may not."""
+        """Delete the files nothing references, once no reader pinned before
+        they were let go of — an attempt, a paged delta window, a sensor
+        tick — still reads. Both are positions in the model's event order,
+        never wall clocks: two engines' clocks may disagree, the order they
+        replay may not."""
 
         if not self.m.garbage:
             return
-        oldest = min((c["pin"] for c in self.m.claims.values()), default=math.inf)
-        read = self.m.discard_reads()  # pending discards still read them
+        oldest, read = self.m.pin_floor(), self.m.discard_reads()  # pending discards still read them
         due = [path for path, n in self.m.garbage if n <= oldest and path not in read]
         if not due:
             return
@@ -280,6 +282,7 @@ class Upkeep:
             return
         self._swept = now
         await self.expire_gates()
+        self.expire_ticks()
         policies = {name: self.m.policy(name) for name in self.manifest["assets"]}
         keeps = {name: int(p["runs"]) for name, p in policies.items() if p and p.get("runs")}
         nth = await self.history.nth_newest(keeps)
@@ -322,6 +325,21 @@ class Upkeep:
                     note = f"{GATES}{day}/{ulid(self.clock())}.json"
                     await self.state.create_object(note, json.dumps(gates).encode())
                 self.state.record({"type": "RunsPurged", "runs": [run_id]})
+
+    def expire_ticks(self) -> None:
+        """Drop the `ticks` files whose newest row is over a day old
+        (docs/lifecycle.md §11.5)."""
+
+        if self.history.lake.job is not None:  # a merge may be reading them
+            return
+        horizon = self.clock() - history.TICKS_KEPT
+        old = [
+            f["path"]
+            for f in self.m.history.files.get("ticks", ())
+            if f["at"][1] is not None and f["at"][1] < horizon
+        ]
+        if old:
+            self.state.record({"type": "HistoryCompacted", "changes": [{"table": "ticks", "removed": old}]})
 
     async def expire_gates(self) -> None:
         """Delete the gates retired runs left, `gate_days` after the day

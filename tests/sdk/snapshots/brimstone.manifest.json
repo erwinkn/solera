@@ -1376,7 +1376,8 @@
     }
   },
   "retention": null,
-  "revision": "b52ad204ce5e96654aa0487893fa0d1ebc4b6893094a840991e48a9b742b05cf",
+  "revision": "ab64d8faa8aea1fca4bd00dce39efe171839ecc29bb91304af55fc99e9d33567",
+  "sensors": {},
   "sources": {
     "leach_crosswalk": {
       "handle": {

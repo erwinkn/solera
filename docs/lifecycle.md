@@ -7,8 +7,9 @@ heartbeats as evidence (§6), the two-phase cancel (§7), the clocks of §8,
 retained gates (§2.4) and Pool (§10). Built (milestone 2): store kinds
 and their release rules (§9.5–§9.9), PostgresStore generation fencing
 (§9.7), and FileStore / S3Store unique names with their collection
-(§9.8) — but for the sweep. Not yet: sensors (§11). Where the build
-departs from the text, it says so in place.
+(§9.8) — but for the sweep. Built (milestone 5): sensors (§11:
+`solera_server/sensors.py`, `solera_worker/sensors.py`), but for host-side
+map resolution. Where the build departs from the text, it says so in place.
 It replaces the attempt files, heartbeat, pool protocol and write-safety
 rules of `object-store-state.md` §8 and `architecture.md` §10. It settles
 D2–D4, and D1 as Erwin decided it after the review: heartbeats are evidence
@@ -795,7 +796,10 @@ own store call succeeds, discards them and reports which in its result;
 `AttemptFinished` then removes them. Due means no live claim of another
 attempt and no paged-window watermark pin predates the entry. A delta file
 a pending entry reads is kept, even once the index let go of it, until the
-entry is done; an entry whose file cannot be read stays pending. Until a
+entry is done. An entry whose files cannot be read stays pending; after
+three such attempts it is `stuck`: no longer handed out, listed in
+`/api/diagnostics` and on its scope's head record, until an operator runs
+`solera scopes discards OUTPUT [SCOPE] --clear` (its objects stay). Until a
 scope runs again its garbage waits, which costs only storage. An
 abandoned attempt's keyed names come from listing its own delta files
 (`{batch:012d}-{attempt}*` under the index prefix, complete because
@@ -1068,6 +1072,33 @@ and the `ticks` table.
 between ticks, and a body that hangs holds a host thread: hosts are
 restarted when ticks overrun or after `host_max_ticks` (10,000). A host
 on an old revision gets no ticks.
+
+### 11.7 As built
+
+- **API and records** as above, with `SensorAdvanced {sensor, cursor,
+  accepted}` one event: the cursor and the accepted-outcome record
+  together. A tick commits at most once per source.
+- **Maps travel as JSON** in the posted `Tick`, and the engine resolves
+  them against the snapshot's index as it does API commits. Host-side
+  resolution of bigger maps and delta references are not built: a full map
+  over `sensor_map_max` (1M keys) fails its tick.
+- **Due at once after a restart**, not at the next interval: a sensor's
+  next tick is memory-only, and a restart is rare enough that an early
+  tick costs nothing.
+- **Tick outcomes** are `skipped`, `advanced` (cursor only), `committed`,
+  `requested`, `refused` (a stale snapshot) and `failed` (it raised, timed
+  out, or asked for what it may not).
+- **Tick rows all expire after a day.** What a tick caused outlives them:
+  its runs carry the tags `sensor` and `tick`, its source commits `by:
+  "sensor NAME"`.
+- **Hosts.** A host runs up to 4 ticks at once, each body on a daemon
+  thread. After a tick overruns, or after 10,000 ticks, a
+  `solera_worker sensors` process re-executes itself; the engine keeps its
+  local one running, with backoff, beside a served engine (one with an
+  engine URL), and authenticates it with a token signed by the engine
+  secret. Pool hosts use the pool token.
+- **Reader pins.** A tick's pin joins the claims' and the paged windows'
+  in one floor, which both data and index garbage respect.
 
 ## 12. Engine restart, attempt by attempt
 

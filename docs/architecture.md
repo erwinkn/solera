@@ -323,8 +323,30 @@ revision; `remove` deletes it.
 
 A keyed source, or a `PartitionSet` listed under `sources=`, is consumable
 via `Incremental` and usable as a partition set (§7) exactly like a keyed
-output, so a system that *pushes* can feed the graph directly. Systems that must be *polled* belong in the graph: a cursor asset
-(§6) is the platform-native sensor and needs no service outside solera.
+output, so a system that *pushes* can feed the graph directly.
+
+A system that must be *polled* gets a **sensor** (`lifecycle.md` §11): a
+check run every interval on a long-lived sensor host, which may commit to
+the sources it declares and request runs, all or nothing, and keeps a
+cursor. Ticks that find nothing record nothing.
+
+```python
+@sensor(every=60, commits=["uploads"], executor=Pool("sensors"))  # default: the engine's own host
+def new_uploads(ctx, s3: S3Client) -> Tick | None:
+    page = s3.list_since(ctx.cursor)
+    return Tick(cursor=page.token, commits=[Commit("uploads", upsert={o.key: o.etag for o in page.objects})],
+                runs=[RunRequest(["ingest"])])
+
+class Landing(Source):  # an observable source: sugar for a sensor `landing.observe`
+    def observe(self, ctx, s3: S3Client) -> dict[str, str]:
+        return {o.key: o.etag for o in s3.list(self.handle["bucket"])}
+
+Project(sources=[Landing("landing", key="id", observe=Every(300), bucket="in")], sensors=[new_uploads])
+```
+
+`observe()` returns a version (`str`), a full key map, `Observed(upsert,
+remove, cursor)`, or `None`. A cursor asset (§6) still suits a poll whose
+result is itself data.
 
 ## 6. Incrementality
 
