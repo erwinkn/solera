@@ -137,6 +137,10 @@ impl Block {
                 return fmt_err("bad shared prefix length");
             }
             let key = keys.len();
+            // Expanded keys count against the limit too: shared prefixes multiply them.
+            if (raw.len() + key + f.shared + (f.suffix.1 - f.suffix.0)) as u64 > limit {
+                return Err(Error::Limit(format!("more than {limit} bytes decoded")));
+            }
             keys.extend_from_within(prev..prev + f.shared);
             keys.extend_from_slice(&raw[f.suffix.0..f.suffix.1]);
             prev = key;

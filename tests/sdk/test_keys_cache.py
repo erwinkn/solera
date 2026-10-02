@@ -897,14 +897,14 @@ async def test_a_corrupt_copy_recovers_through_start_reads(io, tmp_path):
     service.start()
     try:
         await asyncio.wrap_future(service._submit(service.cache.fill(service.io, state)))
-        assert await service.reads(spec, set(), 0) is not None
+        assert await service.reads(spec, 0) is not None
         local = service.cache.files[state.path(state.files[0].name)].local
         data = bytearray(open(local, "rb").read())
         data[10] ^= 0xFF
         open(local, "wb").write(bytes(data))
-        assert await service.reads(spec, set(), 0) is None
+        assert await service.reads(spec, 0) is None
         for _ in range(200):
-            if (record := await service.reads(spec, set(), 0)) is not None:
+            if (record := await service.reads(spec, 0)) is not None:
                 break
             await asyncio.sleep(0.02)
         assert record is not None  # refetched, warm again
@@ -926,3 +926,128 @@ def test_a_record_refuses_entries_before_encoding(monkeypatch):
     with pytest.raises(reads_module.Full):
         reads.record("i", "page", (None, 11), (keys, [b"v"] * 11, [0] * 11, None))
     assert not encoded
+
+
+# -- review round 4 ---------------------------------------------------------------------------
+
+
+async def test_cancelled_work_keeps_what_it_holds_until_its_thread_ends(io, tmp_path, monkeypatch):
+    """Round 4: cancelling a resolve — once, or again and again — leaves its
+    semaphore, queued bytes and pin held while its native thread computes;
+    with concurrency 1, one thread computes at a time."""
+
+    import threading
+
+    from solera.keys import resolver as resolver_module
+
+    state = await built_index(io, commits=2)
+    cache = EngineCache(str(tmp_path))
+    await cache.fill(io, state)
+    resolver = Resolver(cache, io, OPTS, Limits(concurrency=1))
+    go, running, peak = threading.Event(), [0], [0]
+    lock = threading.Lock()
+    real = resolver_module._native.Snapshot
+
+    class Gated:
+        def __init__(self, runs):
+            self.inner = real(runs)
+
+        def resolve(self, *args, **kwargs):
+            with lock:
+                running[0] += 1
+                peak[0] = max(peak[0], running[0])
+            go.wait(5)
+            try:
+                return self.inner.resolve(*args, **kwargs)
+            finally:
+                with lock:
+                    running[0] -= 1
+
+    monkeypatch.setattr(resolver_module._native, "Snapshot", Gated)
+    runs = [SortedRun.of([key(i)], [b"v%d" % i]) for i in range(3)]
+    tasks = [
+        asyncio.ensure_future(resolver.compute(prepared(state), "patch", r, "keys/out/_/x.kx")) for r in runs
+    ]
+    await asyncio.sleep(0.1)
+    for _ in range(3):  # cancelled, and cancelled again
+        for t in tasks:
+            t.cancel()
+        await asyncio.sleep(0.05)
+    assert running[0] == 1 and resolver._queued > 0  # the one computing still holds its room
+    assert any(f.pins for f in cache.files.values())  # and its pin
+    go.set()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    assert peak[0] == 1 and resolver._queued == 0
+    assert not any(f.pins for f in cache.files.values())
+
+
+def test_a_build_never_expands_a_blocks_keys_at_once(tmp_path):
+    """Round 4: keys sharing a long prefix are rebuilt one at a time as the
+    local file is written; 4,000 keys of a 32 KiB prefix (17 KB compressed)
+    stop at a 1 MiB ceiling without expanding to ~130 MiB first. Measured in
+    a process that never held the keys."""
+
+    import subprocess
+    import sys
+
+    keys = [b"p" * 32768 + b"%06d" % i for i in range(4000)]
+    (tmp_path / "source.kx").write_bytes(_native.encode_file(keys, [b"v"] * len(keys), bytes(len(keys))))
+    del keys
+    # The peak of this address space (VmHWM): a child's ru_maxrss carries its parent's.
+    script = f"""
+from solera import _native
+def peak():
+    return int(next(x for x in open("/proc/self/status") if x.startswith("VmHWM")).split()[1])
+data = open({str(tmp_path / "source.kx")!r}, "rb").read()
+before = peak()
+try:
+    _native.build_local(data, "x", bytes(16), {str(tmp_path / "capped")!r}, 2**20)
+except _native.LimitError:
+    pass
+print((peak() - before) // 1024)
+"""
+    out = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=True)
+    grown_mib = int(out.stdout)
+    assert grown_mib < 16, grown_mib
+
+
+async def test_a_page_reads_one_entry_past_itself(io, tmp_path):
+    """Round 4: a full page asks for what it lacks and one more, so its
+    record holds the page and the one entry that says another follows —
+    not a second page."""
+
+    from solera.keys.reads import Reads
+    from solera_worker import each
+
+    state = await built_index(io, commits=1)
+    cache = EngineCache(str(tmp_path))
+    assert await cache.fill(io, state)
+    with cache.held(state) as pin:
+        reads = Reads(recording=True, max_entries=10**6, max_bytes=2**24)
+        spec_pin = {"index": state.to_json(), "changes": {"full": True, "after": None, "limit": 100}}
+        window = await each.read_window(spec_pin, ObjectIO(None, local=pin.handles, served=reads))
+    assert len(window.upserted) == 100 and window.after is not None
+    assert reads.entries == 101
+
+
+async def test_a_fan_in_whole_read_is_read_ahead_member_by_member(io, tmp_path):
+    """Round 4: an AllPartitions input loaded whole pins each member's index;
+    the start read pages every one of them, as the worker's whole read will."""
+
+    from solera.keys.reads import Reads
+    from solera_server.keyservice import KeyService
+
+    a = await built_index(io, commits=1, seed=1)
+    b = await built_index_at(io, IndexState(prefix="keys/other/_/"))
+    service = KeyService(io.store, str(tmp_path))
+    service.start()
+    try:
+        for st in (a, b):
+            assert await asyncio.wrap_future(service._submit(service.cache.fill(service.io, st)))
+        pin = {"refs": {"x": {}, "y": {}}, "load": "data", "indexes": {"x": a.to_json(), "y": b.to_json()}}
+        record = Reads.from_json(await service.reads({"inputs": {"members": pin}}, 0))
+        assert len(record) == 2  # a page of each member's locators
+        as_ref = {"refs": {"x": {}, "y": {}}, "load": "ref"}
+        assert await service.reads({"inputs": {"members": as_ref}}, 0) is None
+    finally:
+        await service.stop()

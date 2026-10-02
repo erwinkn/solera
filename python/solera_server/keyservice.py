@@ -255,17 +255,18 @@ class KeyService:
     async def _unpin(self, pin) -> None:
         pin.__exit__(None, None, None)
 
-    async def reads(self, spec: dict, whole: set[str], position: float) -> dict | None:
+    async def reads(self, spec: dict, position: float) -> dict | None:
         """The input reads of the attempt `spec` describes, answered from
         local copies (docs/resolved-commits.md §7): a `Reads` record as JSON,
-        or None when there is nothing to answer or no time to. `whole`: the
-        inputs read whole from an immutable store, paged by their locators."""
+        or None when there is nothing to answer or no time to. An input the
+        worker loads whole names its pinned indexes (`index`, or `indexes` per
+        fan-in member): those are paged, as its whole read pages them."""
 
         if not self._running():
             return None
         token = self.hold(position)
         try:
-            fut = self._submit(self._reads(spec, whole, position))
+            fut = self._submit(self._reads(spec, position))
             try:
                 return await asyncio.wait_for(asyncio.wrap_future(fut), READS_TIMEOUT)
             except TimeoutError:
@@ -276,13 +277,17 @@ class KeyService:
         finally:
             self.release(token)
 
-    async def _reads(self, spec: dict, whole: set[str], position: float) -> dict | None:
+    async def _reads(self, spec: dict, position: float) -> dict | None:
         from solera_worker import each
         from solera_worker.worker import REPAIR_PAGE
 
         states = {}  # what the reads may touch: inputs, failure indexes, outputs (reconcile pages)
         for pin in (spec.get("inputs") or {}).values():
-            for js in (pin.get("index"), (pin.get("each") or {}).get("failures")):
+            for js in (
+                pin.get("index"),
+                (pin.get("each") or {}).get("failures"),
+                *(pin.get("indexes") or {}).values(),
+            ):
                 if js:
                     states[json.dumps(js, sort_keys=True)] = IndexState.from_json(js)
         for info in (spec.get("outputs") or {}).values():
@@ -293,18 +298,19 @@ class KeyService:
         io = ObjectIO(None, local={p: h for pin in pins for p, h in pin.handles.items()}, served=reads)
         cold = False
         try:
-            for param, pin in (spec.get("inputs") or {}).items():
+            for pin in (spec.get("inputs") or {}).values():
                 try:
                     if "each" in pin:
                         await each.read_page(spec, pin, io)
                     elif "changes" in pin:
                         await each.read_window(pin, io)
-                    elif param in whole and pin.get("index"):
-                        index, after = KeyIndex(io, None, IndexState.from_json(pin["index"])), None
-                        while True:
-                            *_, after = await index.page(after, REPAIR_PAGE)
-                            if after is None:
-                                break
+                    elif pin.get("load") == "data":  # a whole read: its locators, a page at a time
+                        for js in [pin["index"]] if pin.get("index") else (pin.get("indexes") or {}).values():
+                            index, after = KeyIndex(io, None, IndexState.from_json(js)), None
+                            while True:
+                                *_, after = await index.page(after, REPAIR_PAGE)
+                                if after is None:
+                                    break
                 except Cold:
                     cold = True  # this input's later reads go to the store; fetch it for the next
                 except LocalError as e:

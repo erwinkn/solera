@@ -693,10 +693,13 @@ class Engine(Attempts, Sensors, Views):
         incremental = []
         for edge in edges:
             param, output = edge.param, edge.output
+            load = (asset["inputs"].get(param) or {}).get("load", "data")  # registration decided it
             if edge.kind == "all_partitions":
                 refs = self._all_partitions(planner, edge)
-                inputs[param] = {"refs": refs}
-                indexes = {k: self._whole_index(output, ref) for k, ref in refs.items()}
+                inputs[param] = {"refs": refs, "load": load}
+                indexes = (
+                    {k: self._whole_index(output, ref) for k, ref in refs.items()} if load == "data" else {}
+                )
                 if any(i is not None for i in indexes.values()):
                     inputs[param]["indexes"] = {k: i for k, i in indexes.items() if i is not None}
                 pinned[param] = refs
@@ -715,8 +718,8 @@ class Engine(Attempts, Sensors, Views):
             elif edge.kind == "incremental":
                 incremental.append(edge)
             else:
-                inputs[param] = {"ref": self._pin_at(output, edge.scope)}
-                if (index := self._whole_index(output, inputs[param]["ref"])) is not None:
+                inputs[param] = {"ref": self._pin_at(output, edge.scope), "load": load}
+                if load == "data" and (index := self._whole_index(output, inputs[param]["ref"])) is not None:
                     inputs[param]["index"] = index
                 pinned[param] = inputs[param]["ref"]
         fingerprint = self._fingerprint(asset, run, pinned)

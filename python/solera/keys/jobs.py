@@ -15,6 +15,7 @@ from collections.abc import Awaitable, Callable, Iterable
 
 from .. import _native
 from .io import ObjectIO
+from .threads import in_thread
 
 SEGMENT = 8 * 2**20  # bytes of consecutive blocks per read
 AHEAD = 3  # segments read ahead per run
@@ -97,7 +98,7 @@ async def run(
     uploads: set[asyncio.Future] = set()
     n = g = 0
     try:
-        while (step := await asyncio.to_thread(job.step)) is not None:
+        while (step := await in_thread(job.step)) is not None:
             kind, x = step
             if kind == "run":
                 seg = await readers[x].next()
@@ -106,7 +107,7 @@ async def run(
                 else:
                     job.feed(x, *seg)
             elif kind == "rows":
-                chunk = await asyncio.to_thread(next, chunks, None)
+                chunk = await in_thread(next, chunks, None)
                 if chunk is None:
                     job.end_rows()
                 else:

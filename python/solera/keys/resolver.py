@@ -31,6 +31,7 @@ from .._native import LimitError, LocalError, SortedRun
 from .cache import EngineCache
 from .index import IndexState, Options
 from .io import ObjectIO
+from .threads import in_thread
 
 log = logging.getLogger(__name__)
 
@@ -249,7 +250,7 @@ class Resolver:
                     return {**declined, "reason": "not_live"}, None
                 if isinstance(run, bytes):
                     try:
-                        run = await asyncio.to_thread(
+                        run = await in_thread(
                             SortedRun.decode, run, max_entries=max(most, 0), max_bytes=lim.max_decoded
                         )
                     except LimitError:
@@ -264,7 +265,7 @@ class Resolver:
                     return {**declined, "reason": "invalid"}, None
                 snap = _native.Snapshot(pin.runs)
                 try:
-                    files, added, removed, changed = await asyncio.to_thread(
+                    files, added, removed, changed = await in_thread(
                         snap.resolve,
                         run,
                         replace=kind == "replace",

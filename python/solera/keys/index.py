@@ -34,13 +34,14 @@ from . import (
     SortedRun,
     check_block,
     jobs,
-    merge_range,
+    merge_page,
     parse_footer,
     parse_index,
     parse_tail,
 )
 from .io import RANGE, ObjectIO
 from .reads import Cold
+from .threads import in_thread
 
 # -- engine-held state ---------------------------------------------------------------
 
@@ -508,7 +509,7 @@ class KeyIndex:
         sparse = await self._find(run, exact=exact, switch=switch)
         if sparse is None:
             return None
-        (files, added, removed, _), listed = await asyncio.to_thread(
+        (files, added, removed, _), listed = await in_thread(
             sparse.delta, generation=generation, collect=collect, **self._writer()
         )
         return Delta(files, added, removed, not sparse.inferred, listed)
@@ -527,7 +528,7 @@ class KeyIndex:
             return (await self._find(run, exact=True, switch=False)).live()
 
         async def local(snap):
-            hits = await asyncio.to_thread(snap.get, keys)
+            hits = await in_thread(snap.get, keys)
             return {k: (h[0], h[2]) for k, h in zip(keys, hits, strict=True) if h is not None and not h[1]}
 
         return await self._read("lookup", (keys,), self.state.newest_first(), local, store)
@@ -564,7 +565,7 @@ class KeyIndex:
         else:
             out = await store()
         if served is not None and served.recording:
-            await asyncio.to_thread(served.record, self.identity, call, args, out)  # encoded off the loop
+            await in_thread(served.record, self.identity, call, args, out)  # encoded off the loop
         return out
 
     async def _stream(self, run: SortedRun, batch, attempt, generation, collect):
@@ -689,9 +690,7 @@ class KeyIndex:
                     continue
                 p = self._parsed[f.name]
                 got = await self._blocks(p, sparse.blocks(p.firsts, lo=lo, hi=hi))
-                await asyncio.to_thread(
-                    sparse.read, list(got.items()), p.tail["codec"], p.firsts, lo=lo, hi=hi
-                )
+                await in_thread(sparse.read, list(got.items()), p.tail["codec"], p.firsts, lo=lo, hi=hi)
         if not sparse.unknown or not filtered:
             return sparse
 
@@ -717,7 +716,7 @@ class KeyIndex:
                 return None
         fetched = await asyncio.gather(*(self._blocks(p, blocks) for _, p, blocks in needs))
         for (i, p, _), got in zip(needs, fetched, strict=True):  # newest first: its entry wins
-            await asyncio.to_thread(sparse.read, list(got.items()), p.tail["codec"], p.firsts, file=i)
+            await in_thread(sparse.read, list(got.items()), p.tail["codec"], p.firsts, file=i)
         return sparse
 
     def _read_whole(self, level: list[FileInfo]) -> bool:
@@ -787,23 +786,14 @@ class KeyIndex:
             if p.data is None:
                 p.window = got  # the next page starts in it: a file never pays for the same block twice
         codecs = [p.tail["codec"] for p in parsed]  # each file's own
-        keys, versions, deleted, locators = merge_range(runs, codecs, after, None, False)
-        out_k, out_v, out_d, out_l = [], [], bytearray(), []
-        cursor = after
-        for i, key in enumerate(keys):
-            if bound is not None and key >= bound:
-                return out_k, out_v, bytes(out_d), out_l, cursor
-            cursor = key
-            if drop_deleted and deleted[i]:
-                continue
-            out_k.append(key)
-            out_v.append(versions[i])
-            out_d.append(deleted[i])
-            out_l.append(locators[i])
-            if len(out_k) == limit:
-                more = i + 1 < len(keys) or bound is not None
-                return out_k, out_v, bytes(out_d), out_l, cursor if more else None
-        return out_k, out_v, bytes(out_d), out_l, cursor if bound is not None else None
+        # Natively, off the loop: the merge stops at the page, never building the rest.
+        keys, versions, deleted, locators, last, more = await in_thread(
+            merge_page, runs, codecs, after, bound, limit, drop_deleted
+        )
+        cursor = last if last is not None else after
+        if len(keys) == limit:  # full: more past it, or past the fetched blocks
+            return keys, versions, deleted, locators, cursor if more or bound is not None else None
+        return keys, versions, deleted, locators, cursor if bound is not None else None
 
     async def page(self, after: bytes | None, limit: int):
         """One page of the full delivery: live keys > `after`, their versions and
@@ -816,9 +806,7 @@ class KeyIndex:
             return keys, versions, locators, nxt
 
         async def local(snap):
-            keys, versions, _, locators, nxt = await asyncio.to_thread(
-                snap.scan, after, limit, drop_deleted=True
-            )
+            keys, versions, _, locators, nxt = await in_thread(snap.scan, after, limit, drop_deleted=True)
             return keys, versions, locators, nxt
 
         return await self._read("page", (after, limit), levels, local, store)
@@ -838,7 +826,7 @@ class KeyIndex:
             return await self._scan(levels, after, limit, drop_deleted=False)
 
         async def local(snap):
-            return await asyncio.to_thread(snap.scan, after, limit, drop_deleted=False)
+            return await in_thread(snap.scan, after, limit, drop_deleted=False)
 
         args = (first_batch, last_batch, after, limit)
         return await self._read("pending", args, levels, local, store)

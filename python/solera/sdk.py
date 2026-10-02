@@ -177,6 +177,15 @@ def _payload_type(t: Any) -> Any:
     return t
 
 
+def _load_intent(edge, annotation) -> str:
+    """What an input receives: its store's data ("data"), or a `Ref` to it
+    ("ref") — decided once, from its annotation, and carried in its pin so the
+    worker that loads it and the engine that reads ahead for it agree."""
+
+    t = _dict_arg(annotation) if edge.kind == "all_partitions" else annotation
+    return "ref" if t is not None and is_ref_type(t) else "data"
+
+
 def is_ref_type(t: Any) -> bool:
     return inspect.isclass(t) and issubclass(t, Ref)
 
@@ -1596,7 +1605,10 @@ class Project:
             executors[placement["executor"]] = executor
             manifest_assets[name] = {
                 "outputs": [o.spec(asset.name) for o in asset.outputs],
-                "inputs": {p: e.spec(p) for p, e in info["edges"].items()},
+                "inputs": {
+                    p: {**e.spec(p), "load": _load_intent(e, hints_by_asset[name].get(p))}
+                    for p, e in info["edges"].items()
+                },
                 "deps": info["deps"],
                 "partitions": {"dims": info["dims"]} if info["dims"] else None,
                 "placement": placement,

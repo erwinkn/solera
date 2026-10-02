@@ -60,7 +60,6 @@ from solera.sdk import (
     Result,
     TimePartitions,
     Upstream,
-    is_ref_type,
     split_partition,
 )
 from solera.stores import (
@@ -332,9 +331,10 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline):
             inner = _dict_inner(t)
             out = {}
             indexes = pin.get("indexes") or {}
+            as_ref = pin.get("load", "data") == "ref"  # decided at registration, as the engine read for it
             for key, ref_json in pin["refs"].items():
                 ref = Ref.from_json(ref_json)
-                if inner is not None and is_ref_type(inner):
+                if as_ref:
                     out[key] = ref
                     continue
                 store = project.stores[ref.store]
@@ -379,7 +379,7 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline):
             delivered[param] = {"after": after, "upserted": sorted(upserted), "deleted": list(deleted)}
             timeline.add("loaded", param, _rows(args[param]))
             continue
-        if t is not None and is_ref_type(t):
+        if pin.get("load", "data") == "ref":  # decided at registration, as the engine read for it
             args[param] = ref
         else:
             args[param] = await _load_whole(store, ref, t, keys_io, pin.get("index"))

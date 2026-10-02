@@ -360,6 +360,51 @@ fn merge_range<'py>(
     ))
 }
 
+/// A bounded page of the merged view (`format::merge_page`): keys, versions,
+/// deleted flags, locators, the last key examined, and whether more follow.
+#[pyfunction]
+#[pyo3(signature = (runs, codecs, after, bound, limit, drop_deleted))]
+#[allow(clippy::type_complexity)]
+fn merge_page<'py>(
+    py: Python<'py>,
+    runs: Vec<Vec<PyBackedBytes>>,
+    codecs: Vec<u8>,
+    after: Option<PyBackedBytes>,
+    bound: Option<PyBackedBytes>,
+    limit: usize,
+    drop_deleted: bool,
+) -> PyResult<(
+    Bound<'py, PyList>,
+    Bound<'py, PyList>,
+    Bound<'py, PyBytes>,
+    Vec<u64>,
+    Option<Bound<'py, PyBytes>>,
+    bool,
+)> {
+    let page = py
+        .detach(|| {
+            let runs: Vec<Vec<&[u8]>> = runs.iter().map(|r| slices(r)).collect();
+            format::merge_page(
+                &runs,
+                &codecs,
+                after.as_deref(),
+                bound.as_deref(),
+                limit,
+                drop_deleted,
+            )
+        })
+        .map_err(to_py)?;
+    let (k, v, f, l) = page.entries;
+    Ok((
+        list_of_bytes(py, &k)?,
+        list_of_bytes(py, &v)?,
+        PyBytes::new(py, &f),
+        l,
+        page.last.map(|k| PyBytes::new(py, &k)),
+        page.more,
+    ))
+}
+
 /// Every entry of a garbage file (docs/key-index-format.md § Garbage files):
 /// keys, versions, locators.
 #[pyfunction]
@@ -1929,6 +1974,7 @@ fn solera_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sort_entries, m)?)?;
     m.add_function(wrap_pyfunction!(lookup, m)?)?;
     m.add_function(wrap_pyfunction!(merge_range, m)?)?;
+    m.add_function(wrap_pyfunction!(merge_page, m)?)?;
     m.add_function(wrap_pyfunction!(filter_nbits, m)?)?;
     m.add_function(wrap_pyfunction!(parse_footer, m)?)?;
     m.add_function(wrap_pyfunction!(parse_index, m)?)?;

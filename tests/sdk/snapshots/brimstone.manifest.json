@@ -10,6 +10,7 @@
       "inputs": {
         "site_health": {
           "kind": "all_partitions",
+          "load": "ref",
           "meta": null,
           "output": "site_health"
         }
@@ -204,31 +205,37 @@
       "inputs": {
         "leach_crosswalk": {
           "kind": "in",
+          "load": "data",
           "meta": null,
           "output": "leach_crosswalk"
         },
         "pmpt_project_matrix": {
           "kind": "in",
+          "load": "data",
           "meta": null,
           "output": "pmpt_project_matrix"
         },
         "project_team_map": {
           "kind": "in",
+          "load": "data",
           "meta": null,
           "output": "project_team_map"
         },
         "sample_id_crosswalk": {
           "kind": "in",
+          "load": "data",
           "meta": null,
           "output": "sample_id_crosswalk"
         },
         "xrd_profex": {
           "kind": "in",
+          "load": "data",
           "meta": null,
           "output": "xrd_profex"
         },
         "xrf": {
           "kind": "in",
+          "load": "data",
           "meta": null,
           "output": "xrf"
         }
@@ -377,11 +384,13 @@
       "inputs": {
         "psa_data": {
           "kind": "in",
+          "load": "data",
           "meta": null,
           "output": "psa_data"
         },
         "psa_samples": {
           "kind": "in",
+          "load": "data",
           "meta": null,
           "output": "psa_samples"
         }
@@ -456,6 +465,7 @@
             "concurrency": 8
           },
           "kind": "incremental",
+          "load": "data",
           "meta": null,
           "output": "qaqc_files",
           "page_size": 100
@@ -536,6 +546,7 @@
       "inputs": {
         "qaqc_samples": {
           "kind": "all_partitions",
+          "load": "ref",
           "meta": null,
           "output": "qaqc_samples"
         }
@@ -611,6 +622,7 @@
       "inputs": {
         "change_events": {
           "kind": "in",
+          "load": "ref",
           "meta": null,
           "output": "change_events"
         }
@@ -729,6 +741,7 @@
       "inputs": {
         "fleet_dashboard": {
           "kind": "in",
+          "load": "ref",
           "meta": null,
           "output": "fleet_dashboard"
         }
@@ -1370,7 +1383,7 @@
     }
   },
   "retention": null,
-  "revision": "b98d9c56806329aa37fb939ea18ef73796d06fc09936a5f182286e5ab4976956",
+  "revision": "2679404cc2a39c956f687293be57241624f0c7e50d2e2689943fb8f88e6a386c",
   "sensors": {},
   "sources": {
     "leach_crosswalk": {

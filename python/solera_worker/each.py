@@ -64,24 +64,26 @@ class Window:
 
 async def _fill(chunk, start: bytes | None, limit: int, kind) -> tuple[list, str | None, int]:
     """A page of `limit` entries that `kind` takes, read ahead past the ones
-    it does not: `chunk(after)` returns `(entries, next)` — entries as
-    `(key, version, deleted, locator)` in key order past `after`, and where
-    to go on (None: exhausted). Past a full page it looks on for one more
-    entry it takes, so that a page is `final` exactly when nothing follows
-    and no delivery ends on an empty page (§5). Returns the page's entries,
-    where the next page starts (None: this one is final), and how many
-    entries were read."""
+    it does not: `chunk(after, n)` returns `(entries, next)` — at most `n`
+    entries as `(key, version, deleted, locator)` in key order past `after`,
+    and where to go on (None: exhausted). Past a full page it looks on for
+    one more entry it takes, so that a page is `final` exactly when nothing
+    follows and no delivery ends on an empty page (§5); each chunk asks for
+    what the page still lacks and that one more, no further. Returns the
+    page's entries, where the next page starts (None: this one is final),
+    and how many entries were read."""
 
     page, cursor, read, last = [], start, 0, None
     while True:
-        entries, nxt = await chunk(cursor)
+        entries, nxt = await chunk(cursor, limit - len(page) + 1)
         read += len(entries)
         for entry in entries:
-            if kind(entry) is None:
+            taken = kind(entry)
+            if taken is None:
                 continue
             if len(page) == limit:  # one more is taken: the page is full, not final
                 return page, key_str(last), read
-            page.append((kind(entry), entry))
+            page.append((taken, entry))
             last = entry[0]
         if nxt is None:
             return page, None, read
@@ -103,14 +105,12 @@ async def read_window(pin: dict, keys_io) -> Window:
     limit = int(ch.get("limit") or 1)
     start = key_bytes(ch["after"]) if ch.get("after") is not None else None
 
-    async def whole(after):
-        keys, versions, locators, nxt = await index.page(after, limit)
+    async def whole(after, n):
+        keys, versions, locators, nxt = await index.page(after, n)
         return list(zip(keys, versions, bytes(len(keys)), locators, strict=True)), nxt
 
-    async def window(after):
-        keys, versions, flags, locators, nxt = await index.pending(
-            int(ch["from"]), int(ch["to"]), after, limit
-        )
+    async def window(after, n):
+        keys, versions, flags, locators, nxt = await index.pending(int(ch["from"]), int(ch["to"]), after, n)
         return list(zip(keys, versions, flags, locators, strict=True)), nxt
 
     if "rescope" in ch:

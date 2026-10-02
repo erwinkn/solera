@@ -560,8 +560,8 @@ async def test_input_reads_come_from_the_engine_once_warm(state, monkeypatch):
 
     served, real_reads = [], KeyService.reads
 
-    async def reads(self, spec, whole, position):
-        out = await real_reads(self, spec, whole, position)
+    async def reads(self, spec, position):
+        out = await real_reads(self, spec, position)
         served.append(out is not None)
         return out
 
@@ -766,6 +766,47 @@ async def test_a_whole_keyed_read_is_loaded_a_page_at_a_time(state, monkeypatch)
     await run(engine, ["items", "by_value", "reader"])
     assert sorted(r["n"] for r in seen["items"]) == list(range(5))
     assert seen["by_value"] == {f"v{i}": i for i in range(5)}
+
+
+async def test_load_intent_is_decided_once(state, monkeypatch):
+    """Review round 4: registration decides what an input receives; its pin
+    carries that, the worker loads by it, and the engine reads ahead for it
+    alone — a `Ref` input pins no index and is read for by nobody."""
+
+    seen, specs = {}, []
+
+    @asset(outputs=Output("items", key="id"))
+    def items():
+        return [{"id": f"k{i}", "n": i} for i in range(5)]
+
+    @asset
+    def by_ref(items: Ref):
+        seen["ref"] = items
+
+    @asset
+    def by_data(items: list[dict]):
+        seen["data"] = items
+
+    real = KeyService.reads
+
+    async def reads(self, spec, position):
+        specs.append(spec)
+        return await real(self, spec, position)
+
+    monkeypatch.setattr(KeyService, "reads", reads)
+    project = Project(assets=[items, by_ref, by_data])
+    inputs = project.manifest["assets"]
+    assert inputs["by_ref"]["inputs"]["items"]["load"] == "ref"
+    assert inputs["by_data"]["inputs"]["items"]["load"] == "data"
+    engine = engine_for(state, project)
+    await engine.initialize()
+    await run(engine, ["items", "by_ref", "by_data"])
+    assert isinstance(seen["ref"], Ref) and sorted(r["n"] for r in seen["data"]) == list(range(5))
+    pins = [s["inputs"]["items"] for s in specs if "items" in s["inputs"]]
+    ref_pin = next(p for p in pins if p["load"] == "ref")
+    data_pin = next(p for p in pins if p["load"] == "data")
+    assert "index" not in ref_pin and "index" in data_pin  # an immutable store's whole read
+    await engine.keys.stop()
 
 
 async def test_a_listing_holds_its_index_files_through_collection(tmp_path, monkeypatch):

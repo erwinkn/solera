@@ -31,7 +31,8 @@ use std::sync::Arc;
 use crate::delta::{Delta, Old};
 use crate::format::Options;
 use crate::format::{
-    fmt_err, get_bytes, parse_index, put_bytes, shared_prefix, slice_at, Error, Result,
+    decompress_at_most, fmt_err, get_bytes, parse_index, put_bytes, shared_prefix, slice_at, Error,
+    Result,
 };
 use crate::jobs::{Join, Step};
 use crate::rows::Source;
@@ -176,22 +177,34 @@ pub fn build(kx: &[u8], source: &str, digest: &[u8], out: &Path, max_bytes: u64)
             return fmt_err("block checksum mismatch");
         }
         // A source block decompresses to no more than the file may hold.
-        let b = Block::decode_at_most(raw, idx.footer.codec, max_bytes)?;
-        for i in 0..b.len() {
+        // Each entry as it is read, one key rebuilt at a time: a source block's
+        // shared prefixes are never all expanded at once.
+        let data = decompress_at_most(raw, idx.footer.codec, max_bytes)?;
+        let (mut pos, mut key) = (0usize, Vec::new());
+        while pos < data.len() {
+            let f = read_entry(&data, &mut pos)?;
+            if f.shared > key.len() {
+                return fmt_err("bad shared prefix length");
+            }
+            key.truncate(f.shared);
+            key.extend_from_slice(&data[f.suffix.0..f.suffix.1]);
+            if key.len() as u64 > max_bytes {
+                return Err(Error::Limit(format!("a key over {max_bytes} bytes")));
+            }
             local.push(
-                b.key(i),
-                b.version(i),
-                b.deleted(i),
-                b.locator(i),
-                b.predecessor(i),
+                &key,
+                &data[f.version.0..f.version.1],
+                f.flags & 1 != 0,
+                f.locator,
+                f.predecessor.map(|((a, b), l)| (&data[a..b], l)),
             );
             if local.buf.len() >= LOCAL_BLOCK {
                 let (bytes, d) = local.close(w.written);
                 w.write(&bytes)?;
                 dir.push(d);
             }
+            total += 1;
         }
-        total += b.len() as u64;
     }
     if local.entries > 0 {
         let (bytes, d) = local.close(w.written);

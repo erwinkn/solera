@@ -46,6 +46,7 @@ from dataclasses import dataclass, field
 from .. import _native
 from .index import FileInfo, IndexState, digest
 from .io import ObjectIO
+from .threads import in_thread
 
 GROWTH = 2.0  # local bytes per compressed data byte, reserved before a build (extended if it needs more)
 RETIRED = 10_000  # paths of retired files remembered, so a fill finishing late does not keep one
@@ -95,19 +96,6 @@ def verify(f: FileInfo, path: str, data: bytes) -> None:
 
     if len(data) != f.size or digest(data) != f.digest:
         raise Corrupt(f"{path}: {len(data)} bytes that do not match its size and digest")
-
-
-async def _in_thread(fn):
-    """`fn` on a thread; if the caller is canceled, it still waits for the
-    thread, which runs on regardless, before letting the cancel through."""
-
-    task = asyncio.ensure_future(asyncio.to_thread(fn))
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        with contextlib.suppress(BaseException):
-            await task
-        raise
 
 
 class Pin:
@@ -385,9 +373,7 @@ class EngineCache:
             while True:  # written as built, into the room held: past it, more room or none
                 ceiling = reserved + extra
                 try:
-                    size = await _in_thread(
-                        lambda c=ceiling: _native.build_local(data, path, digest_, tmp, c)
-                    )
+                    size = await in_thread(lambda c=ceiling: _native.build_local(data, path, digest_, tmp, c))
                     break
                 except _native.LimitError:
                     self._built(path, f, ceiling + 1)  # at least this: what the next admission counts
@@ -399,7 +385,7 @@ class EngineCache:
                 except ValueError as e:
                     raise Corrupt(f"{path}: {e}") from e
             self._built(path, f, size)
-            handle = await _in_thread(lambda: _native.LocalFile(tmp))
+            handle = await in_thread(lambda: _native.LocalFile(tmp))
             # Published only if no other copy got there first and the file still matters.
             if path in self.files or path in self._retired:
                 return path in self.files

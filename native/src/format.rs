@@ -578,6 +578,83 @@ pub fn merge_range(
     Ok(out)
 }
 
+/// A page of a bounded merge: its entries, the last key it examined
+/// (returned or dropped as deleted), and whether another follows it.
+pub struct Page {
+    pub entries: Merged,
+    pub last: Option<Vec<u8>>,
+    pub more: bool,
+}
+
+/// Up to `limit` entries of the newest-wins merge of `runs` (newest first,
+/// each a file's consecutive blocks, in that file's codec) with keys past
+/// `after` and before `bound`, deletions dropped with `drop_deleted`. Blocks
+/// are decoded one at a time as the merge reaches them, and the merge stops
+/// at the page: the entries past it are never built.
+pub fn merge_page(
+    runs: &[Vec<&[u8]>],
+    codecs: &[u8],
+    after: Option<&[u8]>,
+    bound: Option<&[u8]>,
+    limit: usize,
+    drop_deleted: bool,
+) -> Result<Page> {
+    if codecs.len() != runs.len() {
+        return Err(Error::Value("a codec per run".into()));
+    }
+    let mut m = Merge::new(runs.len());
+    for ((r, blocks), &codec) in runs.iter().enumerate().zip(codecs) {
+        let mut data = Vec::new();
+        let mut metas = Vec::new();
+        for b in blocks {
+            metas.push((data.len(), b.len(), crc32fast::hash(b)));
+            data.extend_from_slice(b);
+        }
+        let data: Bytes = Arc::new(data);
+        for meta in metas {
+            // A block a segment: decoded when the merge needs it, not 32 ahead.
+            m.runs[r].feed(Segment {
+                data: data.clone(),
+                blocks: vec![meta],
+                codec,
+            });
+        }
+        m.runs[r].end();
+    }
+    let mut page = Page {
+        entries: (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+        last: None,
+        more: false,
+    };
+    loop {
+        match m.next_key()? {
+            Next::Entry => {
+                let key = m.key();
+                if after.is_some_and(|a| key <= a) {
+                    continue;
+                }
+                if bound.is_some_and(|b| key >= b) {
+                    return Ok(page);
+                }
+                if page.entries.0.len() == limit {
+                    page.more = true;
+                    return Ok(page);
+                }
+                page.last = Some(key.to_vec());
+                if drop_deleted && m.deleted() {
+                    continue;
+                }
+                page.entries.0.push(key.to_vec());
+                page.entries.1.push(m.version().to_vec());
+                page.entries.2.push(m.deleted() as u8);
+                page.entries.3.push(m.locator());
+            }
+            Next::Need(_) => unreachable!("every run is fed whole"),
+            Next::End => return Ok(page),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

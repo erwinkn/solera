@@ -617,7 +617,16 @@ request per step: `start` for reads, `resolve` before writing.
   call recorded for the same pinned index and arguments is answered from
   it, any other goes to the store. Same code and pins make the same calls,
   so the record is consumed in order; it replaces reads and never decides
-  what is read.
+  what is read. Which inputs are read whole is no guess either: registration
+  records what each input receives (`load`: its data, or a `Ref`), the pin
+  carries it, and an input loaded whole pins the indexes its read pages —
+  one, or one per fan-in member; a `Ref` pins none, and nobody reads for it.
+- **Bounded work.** A page is merged natively, block by block, and stops
+  at itself — the entries past it are never built — off the event loop,
+  the GIL released; a page of 10K keys over 64 delta runs takes 33 ms. A
+  full page reads one entry past itself to know another follows, not a
+  second page. Work cancelled by a timeout keeps what it holds — its
+  semaphore, reservation and pins — until its thread ends.
 - **Bound to the attempt and its pins.** The record rides the reply to the
   `start` of the attempt's admitted invocation (`lifecycle.md` §5), and an
   entry names its index by the digest of the pinned state in the spec —

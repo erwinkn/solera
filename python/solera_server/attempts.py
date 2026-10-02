@@ -186,17 +186,7 @@ class Attempts:
         spec, live.reads = live.reads, None  # answered once: a retried start reads the store
         if spec is not None and self.keys is not None:
             # The attempt's input reads, from the engine's cache (docs/resolved-commits.md §7).
-            whole = {
-                param
-                for param, pin in spec["inputs"].items()
-                if "changes" not in pin
-                and pin.get("index")
-                and ((self.manifest.get("stores") or {}).get((pin.get("ref") or {}).get("store")) or {}).get(
-                    "writes"
-                )
-                == "immutable"
-            }
-            reads = await self.keys.reads(spec, whole, self.m.applied)
+            reads = await self.keys.reads(spec, self.m.applied)
             if reads is not None:
                 answer["reads"] = reads
         return answer
