@@ -770,3 +770,29 @@ async def test_only_stores_that_take_a_gate_get_one(tmp_path):
         assert (sorted(json.loads(gate)["intents"]) if gate else None) == gated
     await engine.stop()
     await state.close()
+
+
+async def test_an_adopted_attempt_commits_under_the_contract_it_was_launched_with(tmp_path):
+    """Review round 2, engine #1: launched as version 1, settled after a
+    restart that serves version 2. What it wrote is version 1's output, so
+    its head says version 1 — and the next run rebuilds it as version 2."""
+
+    url = tmp_path.as_uri()
+    state = await State.open(url, "test", flush_interval=0.001)
+    engine = engine_for(state, REMOTE)
+    await engine.initialize()
+    run, attempt = await launched(engine, ["remote"])
+    v2 = Project(
+        assets=[asset(executor=Fake("fake")(), version="2")(remote.fn)],
+        executors=[Fake("fake")],
+        default_store=Overwriting(),
+    )
+    state, engine = await restart(state, engine, url, v2)
+    await engine.initialize()
+    await engine.tick()
+    await finish_as_worker(state, run["id"], attempt, "remote")
+    detail = await engine.run_until(run["id"], 10)
+    assert detail["request"]["status"] == "succeeded"
+    assert state.model.heads[("remote", "")]["version"] == "1"
+    await engine.stop()
+    await state.close()

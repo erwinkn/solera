@@ -804,7 +804,8 @@ class Engine(Attempts, Sensors, Views):
         outputs = {}
         for output in asset["outputs"]:
             name, head = output["name"], baseline[output["name"]]
-            info = {"exists": head is not None}
+            # The contract it is launched under: settled by it, whatever is served by then.
+            info = {"exists": head is not None, "decl": {k: output.get(k) for k in ("key", "incremental")}}
             if head is not None:
                 info["head"] = head["ref"]
             if name == task["asset"] and asset.get("aliases"):
@@ -828,6 +829,7 @@ class Engine(Attempts, Sensors, Views):
             for ref in refs:
                 lineage.append([edge["output"], ref.get("partition") or "", ref.get("version"), param])
         return {
+            "version": asset["version"],
             "inputs": inputs,
             "lineage": lineage,
             "baseline": baseline,
@@ -862,7 +864,8 @@ class Engine(Attempts, Sensors, Views):
                 info["prefix"] = index["prefix"]
             outputs[name] = info
         kept = {
-            k: prepared.get(k) for k in ("baseline", "plans", "more", "full", "prior", "lineage", "failures")
+            k: prepared.get(k)
+            for k in ("version", "baseline", "plans", "more", "full", "prior", "lineage", "failures")
         }
         return {**kept, "outputs": outputs}
 
@@ -1380,8 +1383,8 @@ class Engine(Attempts, Sensors, Views):
             if self.m.heads.get((output, task["scope"])) != baseline:
                 raise Conflict(f"output {output} head changed since this attempt was claimed")
         outputs = result.get("outputs") or {}
-        asset = self.manifest["assets"][task["asset"]]
-        declared = {o["name"]: o for o in asset["outputs"]}
+        # Settled under the contract it was launched with, not today's manifest.
+        declared = {name: info["decl"] for name, info in (prepared.get("outputs") or {}).items()}
         # Where each keyed Incremental page ended decides the next watermark.
         delivered = result.get("delivered") or {}
         watermarks, more = {}, bool(prepared.get("more"))
@@ -1425,7 +1428,7 @@ class Engine(Attempts, Sensors, Views):
                 ref = entry.get("ref")
                 if ref is None or ref["partition"] != task["scope"]:
                     raise Conflict(f"output {name}: ref scope != {task['scope']!r}", retryable=False)
-            head = {"ref": ref, "complete": not more, "asset": task["asset"], "version": asset["version"]}
+            head = {"ref": ref, "complete": not more, "asset": task["asset"], "version": prepared["version"]}
             if decl.get("key") is not None:
                 delta = entry.get("keys")
                 if delta is None and not entry.get("unchanged"):
