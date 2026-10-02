@@ -1032,10 +1032,6 @@
       "kind": "Local"
     }
   },
-  "key_cache": {
-    "max_bytes": 8589934592,
-    "path": null
-  },
   "name": "default",
   "outputs": {
     "change_events": {
@@ -1374,7 +1370,7 @@
     }
   },
   "retention": null,
-  "revision": "3e730e92fb92803abb9ffbe41bf8d66ce7211e16aee5f87b846e46240c60c993",
+  "revision": "d7d1a9d3da54a68ef0d4267cc67be64e926cf39a065010a14476b50d6083ccae",
   "sensors": {},
   "sources": {
     "leach_crosswalk": {

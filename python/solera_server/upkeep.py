@@ -23,7 +23,7 @@ import time
 
 from solera.ids import ulid
 from solera.keys.index import IndexState, KeyIndex, Options
-from solera.keys.io import ObjectIO, key_cache
+from solera.keys.io import ObjectIO
 
 from . import history
 
@@ -165,7 +165,6 @@ class Upkeep:
         """One compaction or recount, run on a worker thread with its own event
         loop so merging never blocks the engine."""
 
-        cache = key_cache(self.manifest.get("key_cache"), self.state.objects_url)
         options, objects, service = self.key_options, self.state.objects, self.keys
         # An immutable store's compaction lists what its merge dropped: those
         # entries name objects that collection then discards (docs/lifecycle.md §9.8).
@@ -173,7 +172,7 @@ class Upkeep:
 
         def work():
             async def go():
-                keys = KeyIndex(ObjectIO(objects, cache=cache), None, index, options)
+                keys = KeyIndex(ObjectIO(objects), None, index, options)
                 if service is not None:
                     keys.on_write = lambda path, f, data: service.installed(index.prefix, f, path, data)
                 return await (keys.recount() if recount else keys.compact(garbage=garbage))

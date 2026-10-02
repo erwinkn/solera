@@ -11,7 +11,7 @@ import pytest
 from obstore.store import MemoryStore
 from solera.keys import Rows, SortedRun, _python
 from solera.keys.index import IndexState, KeyIndex, Options
-from solera.keys.io import DiskCache, ObjectIO
+from solera.keys.io import ObjectIO
 
 
 @dataclass
@@ -76,8 +76,8 @@ class Harness:
     each one superseded is named for collection exactly once it is: by the
     delta that superseded it, or by a compaction's garbage."""
 
-    def __init__(self, options, *, cache=None, exact=False):
-        self.io = ObjectIO(MemoryStore(), cache=cache)
+    def __init__(self, options, *, exact=False):
+        self.io = ObjectIO(MemoryStore())
         self.options = options
         self.exact = exact
         self.state = IndexState()
@@ -330,18 +330,6 @@ async def test_large_first_commit_goes_straight_to_level_one_and_splits():
     assert {f.level for f in h.state.files} == {1}
     assert len(h.state.files) > 1  # split at max_file_bytes
     await h.check()
-
-
-async def test_disk_cache_serves_repeat_reads(tmp_path):
-    h = Harness(filtered_options(), cache=DiskCache(str(tmp_path), max_bytes=1 << 30))
-    ks = [key(i) for i in range(3000)]
-    await h.commit(ks, [b"v1"] * len(ks))
-    h.io.metrics.reset()
-    await h.index().changes(run(ks[:50], [b"v2"] * 50))
-    first = h.io.metrics.gets
-    await h.index().changes(run(ks[50:100], [b"v2"] * 50))
-    assert h.io.metrics.gets == first == 0  # written through the cache on commit: never fetched
-    assert h.io.metrics.cache_hits > 0
 
 
 async def test_pages_read_only_the_block_indexes_they_need():

@@ -89,7 +89,7 @@ levels filled the way steady-state random writes leave them.
 | 1K clustered keys changed | 12 GETs | 1 GET, 0.2 s | |
 | 1K new keys inserted | — | 29 GETs, 0.5 s | |
 | 100K random keys changed | 845 GETs, 1.6 s | 376 GETs, 1.3 s | |
-| 1K random, disk cache warm | 10 GETs | 0 GETs, 0.3 s (CPU) | |
+| 1K random, engine cache warm | 10 GETs | 0 GETs, 57 ms, the delta uploaded | |
 | Full-delivery page of 10K keys | 12 GETs | 2 GETs, 0.3 MB, 0.1 s | 14 GETs, 1.4 MB, 0.1 s |
 | Full scan (recount), 100K-key pages | ~150 GETs (§6) | 1,077 GETs, 122 s | 3,029 GETs, 242 s |
 
@@ -280,16 +280,19 @@ Without filters that is ~1,000 small reads per commit, 270M a month.
 |---|---|---|---|---|---|
 | E0. exact lookups only, cold worker | 259,200 | $109.14 | $6.69 | $115.89 | 1.0 s |
 | E. with filters, cold worker | 259,200 | $6.92 | $6.69 | $13.67 | 815 ms |
-| E1. with filters + index files cached on local disk | 259,200 | $1.33 | $6.69 | $8.07 | 50 ms |
+| E1. with filters, resolved by the engine's cache | 259,200 | $1.33 | $6.69 | $8.07 | 113 ms |
 | E2. same changes committed every 10 min (60K per commit), cold | 4,320 | $0.96 | $0.11 | $1.13 | 1.4 s |
 
 - **E, filters:** each commit reads every file's tail — footer, block
   index and filters, ~390 MB in ~55 reads — and then only the handful of
   blocks for keys the filters can't clear.
-- **E1, local disk cache:** index files never change once written, so a
-  cached copy is never stale and needs no invalidation. The `Local`
-  placement shares one bounded cache across attempts (`Project(key_cache=…)`);
-  after the first commit, only new delta files are downloaded.
+- **E1, the engine's cache:** index files never change once written, so a
+  cached copy is never stale and needs no invalidation. The engine keeps
+  them on its local disk and answers a small write from them
+  (`resolved-commits.md`); after its first fill, only new delta files are
+  downloaded, and those it mostly wrote itself. Measured end to end at
+  100M keys, the delta uploaded: 113 ms (`bench/keys/results.md`).
+  Workers keep no cache of their own.
 - **E2, batching:** most workloads with 100M keys don't need 10-second
   freshness.
 
@@ -299,8 +302,9 @@ Without filters that is ~1,000 small reads per commit, 270M a month.
    keys per index and stays cheap beyond that.
 2. **Filters in every index file from the start**, with the cost-aware
    read strategy.
-3. **`Project(key_cache=…)`**, on by default for the `Local` placement
-   when the engine's machine has a writable directory, with a size cap.
+3. **The engine's cache of index files** (`resolved-commits.md`), on by
+   default when its machine has a writable directory, with a disk budget;
+   workers read the store.
 4. **Native code, streaming, for large indexes**, for CPU and memory
    rather than request cost: 100M-key sorts and full comparisons take
    seconds, and hold a permutation of the written rows and a few buffers,

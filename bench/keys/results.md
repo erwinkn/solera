@@ -795,6 +795,50 @@ engine installs that delta from the bytes it returned (no GET), and a
 consumer's page comes inline in its spec (no GET): scenario E's projected
 15.5 GET-equivalents a commit, compaction included.
 
+## Without a worker cache (2026-10-02)
+
+Decision D6 removed the workers' disk cache of index files (`key_cache`,
+`DiskCache`): the engine's cache answers small writes, and workers read
+the store. The engine's path does not touch a worker's cache, so this
+re-run of `warm.py` checks that it did not move, and puts numbers on what
+the cold paths cost now. Same command as above. The host was shared and
+loaded (load average ~20 on 8 cores, 16 of 31 GB used by other
+processes), so only part of the local files stayed in the page cache.
+
+| Keys | Patch | Cold worker | Engine, page cache | Engine, SSD only |
+|---|---|---|---|---|
+| 1,000,000 | 1,000 keys, half unchanged | 494 ms · 9 GET · 29.6 MB · CPU 133 ms | 62 ms · 0 GET · 0.0 MB · CPU 10 ms (10 ms) | 100 ms · 0 GET · 0.0 MB · CPU 14 ms (50 ms) |
+| 1,000,000 | 10,000 keys, half unchanged | 601 ms · 9 GET · 29.6 MB · CPU 181 ms | 231 ms · 0 GET · 0.3 MB · CPU 138 ms (164 ms) | 197 ms · 0 GET · 0.3 MB · CPU 140 ms (142 ms) |
+| 1,000,000 | 100,000 keys, half unchanged | 541 ms · 12 GET · 26.1 MB · CPU 309 ms | 341 ms · 0 GET · 3.0 MB · CPU 264 ms (180 ms) | 527 ms · 0 GET · 3.0 MB · CPU 246 ms (312 ms) |
+| 10,000,000 | 1,000 keys, half unchanged | 1.0 s · 524 GET · 77.9 MB · CPU 358 ms | 61 ms · 0 GET · 0.0 MB · CPU 18 ms (16 ms) | 299 ms · 0 GET · 0.0 MB · CPU 29 ms (217 ms) |
+| 10,000,000 | 10,000 keys, half unchanged | 4.0 s · 60 GET · 349.3 MB · CPU 3.2 s | 446 ms · 0 GET · 0.3 MB · CPU 148 ms (390 ms) | 531 ms · 0 GET · 0.3 MB · CPU 138 ms (417 ms) |
+| 10,000,000 | 100,000 keys, half unchanged | 4.0 s · 60 GET · 349.3 MB · CPU 4.1 s | 2.2 s · 0 GET · 3.0 MB · CPU 1.7 s (2.0 s) | 2.1 s · 0 GET · 3.0 MB · CPU 1.8 s (1.9 s) |
+| 100,000,000 | 1,000 keys, half unchanged | 1.4 s · 649 GET · 478.0 MB · CPU 771 ms | 149 ms · 0 GET · 0.0 MB · CPU 30 ms (97 ms) | 541 ms · 0 GET · 0.0 MB · CPU 69 ms (452 ms) |
+| 100,000,000 | 10,000 keys, half unchanged | 7.2 s · 5154 GET · 790.5 MB · CPU 3.6 s | 3.2 s · 0 GET · 0.3 MB · CPU 369 ms (3.1 s) | 3.1 s · 0 GET · 0.3 MB · CPU 350 ms (3.0 s) |
+| 100,000,000 | 100,000 keys, half unchanged | 34.4 s · 480 GET · 3462.3 MB · CPU 31.2 s | 5.6 s · 0 GET · 3.0 MB · CPU 1.4 s (5.5 s) | 6.1 s · 0 GET · 3.0 MB · CPU 1.4 s (5.9 s) |
+
+- **The commit path did not move.** A 1K-key write through a warm engine
+  takes 61–62 ms at 1M and 10M (53–57 ms before) and 149 ms at 100M (113
+  ms), with no GETs; its CPU is the same or lower (10–30 ms, from 18–48).
+  The wall-time differences at 10M–100M are disk reads: the CPU column
+  matches the earlier run, the page cache did not hold the 3.4 GB of
+  local files on this loaded host, and the 10K-key rows at 100M wait on
+  reads in both columns (3.2 s and 3.1 s).
+- **What a write the engine does not answer costs** — declined (cold,
+  busy, too big, unreachable), over `resolve_max_keys`, or with the
+  engine's cache off: a cold worker's resolve. 1K keys: 0.5–1.4 s and
+  9–649 GETs (78–478 MB) at 1M–100M, where a worker's warm disk cache took
+  152–438 ms and no GETs. 100K keys at 100M: 23–34 s and 480 GETs either
+  way; the cache saved requests, not the CPU, which dominates.
+- **Other cold readers**, from the follow-up's tables above: a
+  full-delivery page of 10K keys, 80–110 ms and 2–14 GETs; `Each`'s and
+  failure indexes' lookups, a sparse read like the 1K-key rows. The
+  engine's own recount reads the store too: 241.7 s and 3,029 GETs for a
+  steady 100M index, where the disk cache made a repeat 42.6 s of CPU.
+  Recounts follow inexact commits and are rare, and the engine's cache
+  holds the same files in local form: a recount over its `Snapshot`
+  instead of the store is the follow-up if they become frequent.
+
 ## Python rows: the native walk against tuned pure Python (2026-10-02)
 
 Is the native digest of `list[dict]` held back by FFI? The 2.1–3.6 µs a row

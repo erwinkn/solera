@@ -394,21 +394,13 @@ project-level setting to offload it to an executor is planned, not built:
 Project(..., engine_executor=etl(cpu=2, memory="8GB"))   # not built yet; local today
 ```
 
-**Local disk cache.** Index files never change once written, so a cached
-copy is never stale and needs no invalidation. Attempts on the `Local`
-placement share one bounded disk cache of index files, keyed by file
-name, evicting least recently used:
-
-```python
-Project(..., key_cache=KeyCache(max_size="8GB", path=None))   # the default
-Project(..., key_cache=None)                                   # disabled
-```
-
-It is on by default whenever the engine's machine has a writable data
-directory; `path=None` means a directory next to the engine's `file://`
-state, or a temporary directory for `s3://` state. It is what keeps
-frequent scattered writes into very large indexes cheap; see
-`key-index-costs.md`. Remote placements start cold unless given a volume.
+**Caching.** Index files never change once written, so a cached copy is
+never stale. The one cache of them is the engine's (`resolved-commits.md`
+§5): it answers small writes from local copies before a worker reads
+anything, and keeps small deltas' entries for inlined pages. Workers keep
+no cache: what they read — a write the engine declines or that is too big
+for it, a full delivery's pages, `Each`'s lookups — comes from the store
+(the costs are in `bench/keys/results.md`, "Without a worker cache").
 
 **Implementation.** The file format is ours (no Parquet). The per-key
 work — encoding, decoding, sorting, merging, lookups over fetched bytes —

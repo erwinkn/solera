@@ -35,8 +35,6 @@ import math
 import os
 import random
 import resource
-import shutil
-import tempfile
 import time
 import uuid
 from dataclasses import replace
@@ -47,7 +45,7 @@ from obstore.store import S3Store
 from solera import keys as K
 from solera.keys import Rows
 from solera.keys.index import FileInfo, IndexState, KeyIndex, Options
-from solera.keys.io import DiskCache, ObjectIO
+from solera.keys.io import ObjectIO
 
 S3 = {
     "endpoint": "http://127.0.0.1:9100",
@@ -551,22 +549,6 @@ async def _run_size(n: int, prefix: str, args) -> dict:
                 await measure("100K random keys changed", io, lambda io=io: changes(io, pick(100_000)))
             )
 
-        # Warm: a local disk cache that already holds every file.
-        cache_dir = tempfile.mkdtemp(prefix="solera-bench-cache-")
-        try:
-            cache = DiskCache(cache_dir, max_bytes=size * 2 + (1 << 30))
-            io = ObjectIO(store(), latency=args.latency, bandwidth=args.bandwidth, cache=cache)
-            await changes(io, pick(1000))  # warms the cache
-            for f in state.files:
-                await io.read_whole(f"{prefix}{f.name}.kx", f.size)
-            rows.append(
-                await measure(
-                    "1K random keys changed, disk cache warm", io, lambda io=io: changes(io, pick(1000))
-                )
-            )
-        finally:
-            shutil.rmtree(cache_dir, ignore_errors=True)
-
         # A full-delivery page and a pending read.
         io = cold()
         after = key_of(sample[len(sample) // 3][0])
@@ -649,26 +631,6 @@ async def _run_size(n: int, prefix: str, args) -> dict:
                 lambda io=io: KeyIndex(io, prefix, state, opts).recount(),
             )
         )
-        # The engine recounts through its disk cache (`key_cache`): once downloaded, CPU only.
-        cache_dir = tempfile.mkdtemp(prefix="solera-bench-cache-")
-        try:
-            io = ObjectIO(
-                store(),
-                latency=args.latency,
-                bandwidth=args.bandwidth,
-                cache=DiskCache(cache_dir, max_bytes=size * 2 + (1 << 30)),
-            )
-            for f in state.files:
-                await io.read_whole(f"{prefix}{f.name}.kx", f.size)
-            rows.append(
-                await measure(
-                    "full scan (recount), disk cache warm",
-                    io,
-                    lambda io=io: KeyIndex(io, prefix, state, opts).recount(),
-                )
-            )
-        finally:
-            shutil.rmtree(cache_dir, ignore_errors=True)
 
     if "crossover" in args.suites:
         result["crossover"] = await grid(prefix, state, big, opts, cold, "fresh")

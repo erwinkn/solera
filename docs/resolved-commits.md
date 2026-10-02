@@ -33,7 +33,7 @@ Measured at 100M keys in steady state (`bench/keys/results.md`, MinIO with
 |---|---|---|---|
 | cold worker: lookup | 48 | 445 MB | 765 ms |
 | cold worker: lookup + delta PUT | 50 + 1 PUT | 446 MB | 817 ms |
-| warm worker (its disk cache holds every file): lookup | 0 | 0 | 311 ms, decoding compressed blocks |
+| warm worker (a disk cache holding every file, since removed): lookup | 0 | 0 | 311 ms, decoding compressed blocks |
 
 Most of the 445 MB is the tail of every file — its filters — fetched again
 on every commit to answer a question about 1,000 keys. A warm worker
@@ -42,7 +42,9 @@ removes the requests but still decodes a 64 KB block per lookup, and only
 every index file come into existence: it writes compaction outputs and
 commits every delta. Index files are immutable, so a copy it keeps is
 never stale. The question this design must answer by measurement is how
-much a warm engine beats both rows above, not only the first.
+much a warm engine beats both rows above, not only the first. It does
+(§14), and workers now keep no cache of index files: the engine's is the
+one.
 
 ## 2. The design in one paragraph
 
@@ -810,7 +812,8 @@ The follow-up review agrees with all three.
    move together into `engine_executor` (`object-store-state.md` §6),
    rather than a second cache-owning service.
 3. **Page cache vs SSD.** Whether a 100M-key index needs its hot blocks in
-   RAM (a bigger `cache_ram`) to beat a warm worker, or SSD reads suffice.
+   RAM (a bigger `cache_ram`) to stay well ahead of a cold worker, or SSD
+   reads suffice.
 4. **With `lifecycle.md`:** settled there — the route (§5.1),
    `Store.acquire` (§9.7), and failure deltas staying out of the gate's
    intents (§9.6); sensors (§11 there) need no attempt validation. Its
@@ -836,14 +839,18 @@ Differences:
 
 - **Checksums are CRC-32**, as in `.kx` files, not CRC32C.
 - **No block LRU of our own**: blocks are read through the OS page cache,
-  and a resolve keeps the blocks it read for its other keys.
+  and a resolve keeps, per run, the block it read last: its keys come
+  sorted, so it never needs an earlier one.
 - **The engine reads a patch by point lookups** while they number under 32
   per block of the snapshot (a lookup reads one block, ~10 µs from the page
   cache; a merge decodes every entry, ~0.4 ms per block), else by a merge.
 - **Where the cache lives**: `Engine(resolve_cache=...)`: by default beside
-  the `Local` placements' `key_cache`, as `{its path}-engine`, with its
-  `max_bytes` as the disk budget; `None` or `False` turns the resolver off
-  (every request is answered `503`; workers resolve themselves).
+  `file://` state (`{its directory}/.key-cache/{its name}`) or in a
+  temporary directory for remote state, with a 16 GB disk budget; `None` or
+  `False` turns the resolver off (every request is answered `503`; workers
+  resolve themselves). A directory that cannot be made turns it off too,
+  with a warning. It is the only cache of index files: workers read the
+  store.
 - **Admission happens on the first decline**: a resolve against a snapshot
   not warm declines `cold` and queues a fill of the index, which admits it.
   An empty index is warm: the first write of an output is answered.
@@ -858,8 +865,9 @@ Measured against §9's projections (results.md), every path to the delta
 uploaded: a 1K-key write takes 53–57 ms through the engine at 1M–10M keys
 (16–20 ms of it resolving), about the projection plus the upload; at 100M,
 113 ms with the local files in the page cache and 451 ms from the disk —
-then a warm worker's time (438 ms), with no GETs (open question 3: the hot
-blocks need to stay in RAM). The fill of a 100M-key steady snapshot reads
+then what a worker's disk cache gave (438 ms), with no GETs (open question
+3: the hot blocks need to stay in RAM). A write the engine does not answer
+pays a cold worker's resolve (results.md, "Without a worker cache"). The fill of a 100M-key steady snapshot reads
 221 GETs and 3.5 GB, in 18.2 s with at most two whole files in memory at
 once; its local files take 3.4 GB, not ~5 GB. HTTP adds under a
 millisecond.

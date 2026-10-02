@@ -940,35 +940,6 @@ class Retention:
         return {"days": self.days, "runs": self.runs, "forever": self.forever}
 
 
-_SIZE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([KMGT]?)B?\s*$", re.IGNORECASE)
-
-
-def _bytes(value: int | str) -> int:
-    if isinstance(value, int):
-        return value
-    match = _SIZE.fullmatch(str(value))
-    if not match:
-        raise RegistrationError(f"Invalid size: {value!r}")
-    return int(float(match[1]) * 1024 ** " KMGT".index((match[2] or " ").upper()))
-
-
-@dataclass(frozen=True)
-class KeyCache:
-    """A local disk cache of key index files (docs/object-store-state.md §6),
-    shared by the engine and attempts on its machine. Index files never
-    change, so a cached copy is never stale. `path=None`: next to `file://`
-    state, else a temporary directory."""
-
-    max_size: int | str = "8GB"
-    path: str | None = None
-
-    def spec(self) -> dict:
-        return {"max_bytes": _bytes(self.max_size), "path": self.path}
-
-
-DEFAULT_KEY_CACHE = KeyCache()
-
-
 # ---------------------------------------------------------------------------
 # Partition key encoding (§7)
 # ---------------------------------------------------------------------------
@@ -1126,7 +1097,6 @@ class Project:
         automations: list[Automation] | None = None,
         sensors: list[Sensor] | None = None,
         retention: Retention | None = None,
-        key_cache: KeyCache | None = DEFAULT_KEY_CACHE,
         errors: Mapping[type, type] | None = None,
         build: str | None = None,
         name: str = "default",
@@ -1148,7 +1118,6 @@ class Project:
             raise RegistrationError(str(error)) from None
         self.name = name
         self.retention = retention
-        self.key_cache = key_cache
         self.assets: dict[str, Asset] = {}
         self.stores = {DEFAULT_STORE: default_store or FileStore(), **(stores or {})}
         home = self.home = _caller_dir()
@@ -1660,7 +1629,6 @@ class Project:
             "automations": automation_records,
             "sensors": sensor_records,
             "retention": self.retention.spec() if self.retention else None,
-            "key_cache": self.key_cache.spec() if self.key_cache else None,
             "build": build_identity(self.home, self.build),
             # How user errors are classified changes what failures become (per-key §8).
             "errors": describe_errors(self.errors),

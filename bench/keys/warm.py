@@ -1,4 +1,4 @@
-"""The engine's warm resolver against the cold and warm workers
+"""The engine's warm resolver against a worker resolving cold
 (docs/resolved-commits.md §9–§10), at 1M–100M keys.
 
     uv run python bench/keys/warm.py --s3 http://user:secret@127.0.0.1:9100/bucket --sizes 1e6,1e7,1e8
@@ -7,8 +7,8 @@ Each index is built as `bench.py` builds it, then given its steady-state
 shape (upper levels filled, seven deltas in level 0). For patches of 1K,
 10K and 100K random keys, half rewritten unchanged, it measures:
 
-- cold worker: `KeyIndex.resolve` with nothing cached;
-- warm worker: the same through a disk cache holding every file (`key_cache`);
+- cold worker: `KeyIndex.resolve`, reading the store (workers keep no
+  cache of index files: a write the engine declines pays this);
 - engine: the worker's run and request built, the resolver's whole answer
   — framing, validation, the lookup over the cache's local files, the
   delta — and the delta uploaded by the worker, with the files in the page
@@ -40,7 +40,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from solera.keys import SortedRun  # noqa: E402
 from solera.keys.cache import EngineCache  # noqa: E402
 from solera.keys.index import KeyIndex, Options  # noqa: E402
-from solera.keys.io import DiskCache, ObjectIO  # noqa: E402
+from solera.keys.io import ObjectIO  # noqa: E402
 from solera.keys.resolver import Ask, Prepared, Resolver, answers, request  # noqa: E402
 
 import bench  # noqa: E402
@@ -111,11 +111,6 @@ async def run_size(n: int, args) -> list[dict]:
             }
         )
         resolver = Resolver(cache, cold(), opts)
-        # The warm worker's disk cache.
-        wcache = DiskCache(os.path.join(tmp, "worker"), max_bytes=200 * 2**30)
-        wio = ObjectIO(bench.store(), latency=args.latency, bandwidth=args.bandwidth, cache=wcache)
-        for f in state.files:
-            await wio.read_whole(state.path(f.name), f.size)
 
         for k in SIZES:
             items = sorted(rng.sample(list(current.items()), min(k, len(current))))
@@ -129,13 +124,6 @@ async def run_size(n: int, args) -> list[dict]:
                 )
             )
             row["cold"] = (wall, cpu, io.metrics.gets, io.metrics.bytes_in / 1e6)
-            wio.metrics.reset()
-            _, wall, cpu = await timed(
-                lambda keys=keys, vers=vers, k=k: KeyIndex(wio, None, state, opts).resolve(
-                    SortedRun.of(keys, vers), batch=99, attempt=f"w{k}"
-                )
-            )
-            row["warm_worker"] = (wall, cpu, wio.metrics.gets, wio.metrics.bytes_in / 1e6)
             p = Prepared("", 100, 1, state, 99, True)
             for label in ("engine", "engine_ssd"):
                 if label == "engine_ssd" and not drop_page_cache():
@@ -186,13 +174,13 @@ async def main():
     for n in (int(float(x)) for x in args.sizes.split(",")):
         rows += await run_size(n, args)
     print("\nEvery path to the delta uploaded; in brackets, the engine's resolve alone.\n")
-    print("| Keys | Patch | Cold worker | Warm worker | Engine, page cache | Engine, SSD only |")
-    print("|---|---|---|---|---|---|")
+    print("| Keys | Patch | Cold worker | Engine, page cache | Engine, SSD only |")
+    print("|---|---|---|---|---|")
     for r in rows:
         if r["op"] == "engine fill":
             continue
         print(
-            f"| {r['n']:,} | {r['op']} | {cell(r.get('cold'))} | {cell(r.get('warm_worker'))} | "
+            f"| {r['n']:,} | {r['op']} | {cell(r.get('cold'))} | "
             f"{cell(r.get('engine'))} ({bench.fmt_s(r.get('engine_resolve', 0))}) | "
             f"{cell(r.get('engine_ssd'))} ({bench.fmt_s(r.get('engine_ssd_resolve', 0))}) |"
         )

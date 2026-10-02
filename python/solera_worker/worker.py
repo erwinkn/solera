@@ -44,7 +44,7 @@ from solera.keys.index import (
     key_bytes,
     key_str,
 )
-from solera.keys.io import ObjectIO, key_cache
+from solera.keys.io import ObjectIO
 from solera.keys.resolver import Ask, answers, request
 from solera.lifecycle import Cancel, Ended
 from solera.objects import create
@@ -853,10 +853,6 @@ async def _versions(output, rows) -> dict[str, bytes]:
     return dict(zip(map(key_str, keys), versions, strict=True))
 
 
-def _key_io(objects, objects_url: str, project: Project) -> ObjectIO:
-    return ObjectIO(objects, cache=key_cache(project.manifest.get("key_cache"), objects_url))
-
-
 class Writes:
     """Write-completion evidence (docs/lifecycle.md §2.3): `none` until a
     store call starts; `uncertain` while one runs, or if one raised or was
@@ -1114,7 +1110,7 @@ async def _execute(
         return failed
     asset = project.assets[spec["asset"]]
     try:
-        keys_io = _key_io(objects, objects_url, project)
+        keys_io = ObjectIO(objects)  # index files straight from the store: small writes are the engine's
         args, changes, delivered = await _resolve_inputs(spec, project, asset, keys_io, timeline)
         filtered = delivered.pop("*filtered", False)
         ctx = Ctx(spec, asset, project, objects, changes, shipper, timeline, keys_io)

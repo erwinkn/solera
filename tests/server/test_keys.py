@@ -396,19 +396,24 @@ async def test_partition_set_elements_ride_on_the_head(state):
     assert head["elements"] == ["east"] and head["count"] == 1 and head["batch"] == 0
 
 
-async def test_key_cache_holds_index_files(state, tmp_path):
-    """§6: attempts and the engine share a disk cache of index files."""
+async def test_only_the_engine_caches_index_files(state, tmp_path):
+    """D6: workers read index files from the store; the one cache of them is
+    the engine's, in local form, beside `file://` state."""
+
+    from solera_server.keyservice import cache_root
 
     @asset(outputs=Output("items", key="id"))
     def items():
         return [{"id": "a"}]
 
     project = Project(assets=[items])
+    assert "key_cache" not in project.manifest
     engine = engine_for(state, project)
     await engine.initialize()
     await run(engine, ["items"])
-    cached = list((tmp_path / ".key-cache" / "test").iterdir())
-    assert any(p.name.endswith(".kx") for p in cached)
+    root = tmp_path / ".key-cache" / "test"
+    assert cache_root(state.objects_url) == str(root)
+    assert not [p for p in root.rglob("*") if p.name.endswith(".kx")]  # no worker copies
 
 
 async def test_renamed_asset_keeps_its_state(state):
@@ -694,7 +699,7 @@ async def test_a_listing_holds_its_index_files_through_collection(tmp_path, monk
     from solera.sdk import Source
     from solera_server.engine import Engine
 
-    project = Project(sources=[Source("uploads", key="id")], key_cache=None)  # every read reaches the store
+    project = Project(sources=[Source("uploads", key="id")])
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = Engine(
         state, project.manifest, clock=state.clock, key_options=Options(l0_max_files=2), resolve_cache=False

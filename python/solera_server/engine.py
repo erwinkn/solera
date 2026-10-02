@@ -34,13 +34,13 @@ from solera.failures import lower
 from solera.ids import ulid, ulid_time
 from solera.keys import Rows, SortedRun
 from solera.keys.index import DeltaFiles, FileInfo, KeyIndex, Options, delta_keys, key_bytes, key_str
-from solera.keys.io import ObjectIO, key_cache
+from solera.keys.io import ObjectIO
 from solera.sdk import TimePartitions, canonical_partition, digest, split_partition
 
 from . import history, planning
 from .attempts import POOL_OFFERED_GRACE, Attempts, Live
 from .history import MAX_METADATA, History, RunFilter
-from .keyservice import KeyService
+from .keyservice import KeyService, cache_root
 from .model import TERMINAL_RUN, delta_reads
 from .placements import PlacementContext, Registry
 from .sensors import PROJECTED, Sensors
@@ -147,18 +147,13 @@ class Engine(Attempts, Sensors, Views):
         self._firing: set[str] = set()
         self.key_options = key_options or Options()
         self._io: ObjectIO | None = None
-        # The key cache and resolver (docs/resolved-commits.md §4–§5): beside the
-        # Local placements' cache, or where `resolve_cache` says; None or False: off.
+        # The key cache and resolver (docs/resolved-commits.md §4–§5): where
+        # `resolve_cache` says, else beside `file://` state or in a temporary
+        # directory; None or False: off.
         self.keys: KeyService | None = None
         if resolve_cache:
-            root = resolve_cache if isinstance(resolve_cache, str) else None
-            if root is None:
-                local = key_cache(manifest.get("key_cache"), state.objects_url)
-                root = f"{local.path}-engine" if local is not None else None
-            if root is not None:
-                spec = manifest.get("key_cache") or {}
-                disk = int(spec.get("max_bytes") or 16 * 2**30)
-                self.keys = KeyService(state.objects, root, options=self.key_options, disk=disk)
+            root = resolve_cache if isinstance(resolve_cache, str) else cache_root(state.objects_url)
+            self.keys = KeyService(state.objects, root, options=self.key_options)
         self.history = history or History(state, clock=self.clock)
         self.upkeep = Upkeep(
             state,
@@ -1840,8 +1835,7 @@ class Engine(Attempts, Sensors, Views):
 
     def _key_io(self) -> ObjectIO:
         if self._io is None:
-            cache = key_cache(self.manifest.get("key_cache"), self.state.objects_url)
-            self._io = ObjectIO(self.state.objects, cache=cache)
+            self._io = ObjectIO(self.state.objects)
         return self._io
 
     async def list_keys(self, output: str, scope: str = "", *, after=None, offset=0, limit=1000) -> dict:

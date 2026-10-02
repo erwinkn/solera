@@ -20,12 +20,16 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import hashlib
 import itertools
 import json
 import logging
 import math
+import os
+import tempfile
 import threading
 from collections import OrderedDict
+from urllib.parse import unquote, urlsplit
 
 from solera.keys import SortedRun
 from solera.keys.cache import Corrupt, EngineCache, verify
@@ -38,6 +42,19 @@ log = logging.getLogger(__name__)
 INLINE_MAX = 10_000  # entries of a delta kept as a summary
 INLINE_BATCHES = 64  # summaries one inlined page may merge
 INLINE_BYTES = 2**20  # serialized page
+
+
+def cache_root(objects_url: str) -> str:
+    """Where the engine keeps its key cache by default: beside `file://`
+    state (`{its directory}/.key-cache/{its name}`), else in a temporary
+    directory named after the store."""
+
+    u = urlsplit(objects_url)
+    if u.scheme == "file":
+        path = unquote(u.path).rstrip("/")
+        return os.path.join(os.path.dirname(path), ".key-cache", os.path.basename(path))
+    name = hashlib.sha256(objects_url.encode()).hexdigest()[:16]
+    return os.path.join(tempfile.gettempdir(), "solera-key-cache", name)
 
 
 class KeyService:
