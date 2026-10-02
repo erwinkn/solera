@@ -19,6 +19,7 @@ from solera.sdk import Project, Tick
 from solera.stores import resolve_env
 
 OVERRAN = 3  # the exit code of a host that gave up on a tick
+ORPHANED = 4  # the exit code of an engine's own host whose engine is gone
 
 
 class SensorContext:
@@ -90,12 +91,15 @@ async def run_sensor_host(
     host=None,
     stale_wait: float = 30.0,
     drain: float = 5.0,
+    parent: int | None = None,
 ) -> int:
     """Run ticks until `max_ticks` ran, one overran, or the engine serves
     another revision (then after `stale_wait`: a host started afresh loads
     the code as it is now); returns the exit code. Ticks still running
     `drain` seconds after it stops asking are left: their claims expire,
-    and the sensors tick again on the next host."""
+    and the sensors tick again on the next host. An engine's own host is
+    given its `parent` and stops once that process is gone: an engine that
+    was killed outright never shut it down, and nothing else would."""
 
     revision = project.manifest["revision"]
     build = (project.manifest.get("build") or {}).get("source")
@@ -124,7 +128,11 @@ async def run_sensor_host(
             except Exception:
                 await asyncio.sleep(0.5 * 2**attempt)
 
+    orphaned = False
     while ran < max_ticks and not overran.is_set():
+        if parent is not None and os.getppid() != parent:
+            orphaned = True
+            break
         slots = min(concurrency - len(running), max_ticks - ran)
         if slots <= 0:
             await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
@@ -155,7 +163,7 @@ async def run_sensor_host(
         await asyncio.wait(running, timeout=drain)
         for task in running:
             task.cancel()
-    return OVERRAN if overran.is_set() else 0
+    return ORPHANED if orphaned else OVERRAN if overran.is_set() else 0
 
 
 async def _call(sensor, project: Project, ctx: SensorContext, timeout: float):

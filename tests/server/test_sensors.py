@@ -4,6 +4,7 @@ applied all or nothing — refused when a source moved, answered again when
 retried, recorded not at all when nothing changed."""
 
 import asyncio
+import os
 import socket
 import threading
 import time
@@ -30,7 +31,7 @@ from solera_server.api import create_app
 from solera_server.engine import Conflict, Engine
 from solera_server.placements.inline import InlinePlacement
 from solera_server.state import State
-from solera_worker.sensors import OVERRAN, LocalSensorChannel, run_sensor_host
+from solera_worker.sensors import ORPHANED, OVERRAN, LocalSensorChannel, run_sensor_host
 
 
 async def open_engine(tmp_path, project, *, host=False, **kw) -> tuple[State, Engine]:
@@ -661,4 +662,23 @@ async def test_an_overrun_does_not_wait_for_other_sensors(tmp_path, monkeypatch)
     assert code == OVERRAN and asyncio.get_running_loop().time() - started < 3
     assert "slow" in state.model.ticks  # left to expire
     release.set()
+    await state.close()
+
+
+async def test_an_engines_own_host_stops_once_its_engine_is_gone(tmp_path):
+    """An engine killed outright never stops the host it started in its own
+    session: the host notices its parent is gone and exits, rather than
+    polling a dead engine forever."""
+
+    @sensor(every=1)
+    def quiet(ctx):
+        return None
+
+    project = Project(sensors=[quiet])
+    state, engine = await open_engine(tmp_path, project)
+    gone = os.getppid() + 1_000_000  # no process's parent: as if reparented
+    code = await asyncio.wait_for(
+        run_sensor_host(LocalSensorChannel(engine), project, "local", parent=gone), 5
+    )
+    assert code == ORPHANED
     await state.close()

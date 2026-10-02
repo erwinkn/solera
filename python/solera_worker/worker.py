@@ -1334,8 +1334,8 @@ async def main():
         await run_pool(options["--pool"], options["--server"].rstrip("/"), token)
         return
     if mode == "sensors":
-        # solera_worker sensors --pool NAME --server URL [--token T] (SOLERA_PROJECT env entrypoint)
-        from .sensors import HttpSensorChannel, run_sensor_host
+        # solera_worker sensors --pool NAME --server URL [--token T] [--parent PID] (SOLERA_PROJECT env entrypoint)
+        from .sensors import ORPHANED, HttpSensorChannel, run_sensor_host
 
         options = dict(zip(rest[::2], rest[1::2], strict=True))
         token = options.get("--token") or next(
@@ -1344,10 +1344,13 @@ async def main():
         )
         project = load_project(os.environ["SOLERA_PROJECT"])
         channel = HttpSensorChannel(options["--server"].rstrip("/"), project.manifest["name"], token)
+        parent = int(options["--parent"]) if "--parent" in options else None
         try:
-            await run_sensor_host(channel, project, options["--pool"])
+            code = await run_sensor_host(channel, project, options["--pool"], parent=parent)
         finally:
             await channel.close()
+        if code == ORPHANED:  # the engine that started this host is gone
+            raise SystemExit(0)
         # Done ticking, or a tick overran on a thread that cannot be stopped: start afresh.
         os.execv(sys.executable, [sys.executable, "-m", "solera_worker", *args])
     raise SystemExit(f"unknown mode: {mode}")

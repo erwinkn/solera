@@ -348,6 +348,8 @@ class Sensors:
             "local",
             "--server",
             self.engine_url,
+            "--parent",  # its own session outlives an engine killed outright: it watches for that
+            str(os.getpid()),
             env=env,
             start_new_session=True,
         )
