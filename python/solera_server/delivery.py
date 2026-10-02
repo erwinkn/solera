@@ -82,16 +82,21 @@ def advance(plan: dict, after: str | None = None) -> dict | None:
 
 
 def continues(plan: dict, after: str | None, wm: dict | None) -> bool:
-    """Whether the task has more of the delivery to do after this page: a
-    delivery not done, a pattern transition's diff still owed, a cleanup
-    begun."""
+    """Whether the task has more to deliver after this page: a delivery not
+    done, a pattern transition's diff still owed, a cleanup begun — or a
+    delivery done behind the upstream `head` the page was planned against.
+    A delivery's boundary is fixed when it starts, so one resumed after the
+    upstream moved (a full delivery interrupted, then a change it was fired
+    for) ends short of that change: the task goes on to it, as a delta."""
 
     if plan["kind"] in ("held", "selection"):
         return False
-    if plan["kind"] == "batches":
-        return plan["hi"] < plan["delivery"]["to"]
+    # Behind: known only once the page's watermark is (`wm`, after `advance`).
+    behind = wm is not None and "delivery" not in wm and int(wm["next"]) <= int(plan.get("head", -1))
     wm = wm or {}
-    return after is not None or "rescope" in wm or "reconcile" in wm
+    if plan["kind"] == "batches":
+        return plan["hi"] < plan["delivery"]["to"] or behind
+    return after is not None or "rescope" in wm or "reconcile" in wm or behind
 
 
 def selects(plans: dict) -> bool:

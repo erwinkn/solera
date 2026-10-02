@@ -139,9 +139,6 @@ async def test_an_attempt_launched_before_a_rename_settles(state, monkeypatch): 
     assert status_of(await drive(engine, await engine.submit(["new"], mode="full"))) == "succeeded"
 
 
-@pytest.mark.xfail(
-    strict=True, reason="sim finding: a firing that resumes a full delivery drops its own change"
-)
 async def test_a_change_made_during_a_full_delivery_reaches_downstream(state):  # noqa: F811
     """§6, §9: a full keyed delivery begun at batch 0 delivers what changed
     meanwhile afterwards, as a delta. Interrupted after its first page, then

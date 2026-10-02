@@ -449,7 +449,11 @@ to the head, or the whole index for a full delivery — and the harness reads
 one page of it (`page_size` keys), loads those keys with `Keys(…)`, and
 reports where the page ended (`after`); for an unkeyed one the engine plans
 a `Batches(lo, hi)` range. Each page's commit advances the watermark by
-what it delivered (`delivery.advance`); `more` re-queues the task. Whether the delivery drained is the scope's
+what it delivered (`delivery.advance`); `more` re-queues the task. A
+delivery's boundary is fixed when it starts, so one that ends behind the
+head its last page was planned against — interrupted, then resumed after
+the upstream moved — goes on in the same task to what was committed
+meanwhile: the scope drains only once it has caught up. Whether the delivery drained is the scope's
 (`drained := not more` on its progress), not its outputs': a last page may
 write none of them, and the scope is complete all the same. A scope is
 **complete** when each of its outputs has a head and its delivery drained —

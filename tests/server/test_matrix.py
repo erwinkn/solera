@@ -338,3 +338,51 @@ async def test_an_unchanged_value_rewritten_keeps_its_readers_deliveries(state):
         refs.append((ref["handle"]["path"], ref["version"]))
     assert len({path for path, _ in refs}) == 3 and len({version for _, version in refs}) == 1
     assert calls == [1]
+
+
+# -- OnChange × an interrupted delivery, for Each -----------------------------------------
+
+
+async def test_an_each_delivery_resumed_by_a_firing_takes_its_change(state):  # noqa: F811
+    """As test_sim_found's keyed case, for an Each edge: a full delivery cut
+    short after its first key, the upstream changing, the firing resuming it
+    — the change is delivered, and only then is the scope drained."""
+    from solera.sdk import AutoRefresh, Each
+
+    content, calls = {"a": "1", "b": "1"}, []
+
+    @asset(outputs=Output("items", key="id", revision="v"))
+    def items():
+        return [{"id": k, "v": v} for k, v in content.items()]
+
+    @asset(
+        inputs={"item": Each("items", page_size=1)},
+        outputs=Output("out", key="id"),
+        automations=AutoRefresh(),
+    )
+    def out(ctx, item: list):
+        calls.append((ctx.key, item[0]["v"]))
+        return [{"v": item[0]["v"]}]
+
+    project = Project(assets=[items, out])
+    engine = make_engine(state, project)
+    await engine.initialize()
+    await engine.set_automation("out.onchange.0", False)
+    await drive(engine, await engine.submit(["items"]))
+    run = await engine.submit(["out"])
+    while (state.model.watermarks.get(("out", "item", "")) or {}).get("delivery", {}).get("page") != 1:
+        await engine.tick()
+        await asyncio.sleep(0.01)
+    await engine.cancel(run["id"])
+    await drive(engine, run)
+    await engine.set_automation("out.onchange.0", True)
+    content.update({"a": "2", "b": "2"})
+    await drive(engine, await engine.submit(["items"]))
+    for _ in range(200):
+        await engine.tick()
+        busy = any(r["status"] not in ("succeeded", "failed", "canceled") for r in state.model.runs.values())
+        if not busy and not state.model.automations["out.onchange.0"]["pending"]:
+            break
+        await asyncio.sleep(0.01)
+    assert ("a", "2") in calls and ("b", "2") in calls
+    assert state.model.progress[("out", "")] == {"drained": True}

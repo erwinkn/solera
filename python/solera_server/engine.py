@@ -979,7 +979,7 @@ class Engine(Attempts, Sensors, Views):
         keyed = self.manifest["outputs"][output].get("key") is not None
         limit = int(edge.get("page_size") or 100)
         head = self.m.heads.get((output, up_scope)) or {}
-        head_batch = int(head.get("batch", -1))
+        head_batch = latest = int(head.get("batch", -1))  # `latest`: the head this page is planned against
         override = (run.get("keys") or {}).get(output)
         wm = self.m.watermarks.get((task["asset"], param, task["scope"]))
         if isinstance(override, dict) and "keys" in override:
@@ -1024,7 +1024,7 @@ class Engine(Attempts, Sensors, Views):
                 "pages": current["pages"],
             }
             carried["next"] = current["from"] if reset else int(wm["next"])
-            plan = {"kind": "batches", "watermark": carried, "delivery": current, "hi": hi}
+            plan = {"kind": "batches", "watermark": carried, "delivery": current, "hi": hi, "head": latest}
             return {"ref": ref, "changes": changes}, plan, hi < lo
 
         index = self.m.index(output, up_scope)
@@ -1062,7 +1062,7 @@ class Engine(Attempts, Sensors, Views):
                 }
                 if carried["patterns"] is None:
                     carried.pop("patterns")
-                return pin, {"kind": "keys", "watermark": carried, "delivery": current}, False
+                return pin, {"kind": "keys", "watermark": carried, "delivery": current, "head": latest}, False
             head_batch = min(head_batch, rescope["cutover"])  # finish: under the old patterns
         each = edge.get("each") is not None
         held = [o["name"] for o in self.manifest["assets"][task["asset"]]["outputs"]] + [f"@{task['asset']}"]
@@ -1113,7 +1113,7 @@ class Engine(Attempts, Sensors, Views):
             pin["patterns"] = carried["patterns"]  # the worker filters the page
         else:
             carried.pop("patterns")
-        return pin, {"kind": "keys", "watermark": carried, "delivery": current}, empty
+        return pin, {"kind": "keys", "watermark": carried, "delivery": current, "head": latest}, empty
 
     # -- Each pages (docs/per-key-processing.md §5, §9) ------------------------------
 
