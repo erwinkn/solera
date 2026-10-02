@@ -371,6 +371,8 @@ class Simulation(RuleBasedStateMachine):
             elif op.who[0] == "engine" and world.slots[op.who[1]] is not world.slot:
                 continue  # a zombie engine
             when, by = op.gone
+            if op.who[0] == "worker" and self._handed_to_discard(op.who[1], op.path):
+                self._known("F11", f"{op.who} read a delta its discard entry names, deleted at t={when:g}")
             raise Violation(
                 f"{op.who} read {op.path.removeprefix(str(self.tmp))} at t={op.at:g}, "
                 f"deleted at t={when:g} by {by}"
@@ -388,6 +390,20 @@ class Simulation(RuleBasedStateMachine):
             return
         self._pg_checked = postgres.check(world.pg, self._pg_checked)
         postgres.check_reported(world.pg, self.journal.reads)
+
+    def _handed_to_discard(self, attempt: str, path: str) -> bool:
+        """F11's signature: the file is named by a discard entry of the attempt's spec."""
+
+        launched = self.journal.launched.get(attempt)
+        if launched is None or self.world.engine is None:
+            return False
+        spec = self._run(self.world.engine.state.attempt_spec(launched["run"], attempt)) or {}
+        name = path.rsplit("/", 1)[-1].removesuffix(".kx")
+        return any(
+            name in entry.get("files", ())
+            for out in (spec.get("outputs") or {}).values()
+            for entry in out.get("discard") or ()
+        )
 
     @invariant()
     def committed_keys_are_readable(self):
