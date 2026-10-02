@@ -250,10 +250,12 @@ see the exit, find no result, and fail the attempt while the owner is
 still computing; and a Kubernetes Job is complete as soon as one pod
 succeeds. So:
 
-- **The loser waits for the owner to finish**: it polls for `A.result`
-  every 30 s (one GET each; rare, since duplicates are), or until any
-  request to the engine answers `409 ended`, then exits 0. It never writes
-  anything, not even a log.
+- **The loser waits for the owner to finish**: every 30 s (rare, since
+  duplicates are) it looks for `A.result` and a terminal gate (`aborted`
+  or `closed`: the engine has ended the attempt), and asks the engine with
+  a beat. It exits 0 on any of them, or on `409 ended`; `409 not_owner`
+  means the attempt is live under its owner, and it waits on. It never
+  writes anything, not even a log.
 - **The engine treats a provider exit as the owner's only if the owner has
   also fallen silent.** On an exit without a result, the engine checks the
   bound invocation's last report: one within three beat intervals means

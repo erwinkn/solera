@@ -57,6 +57,68 @@ async def test_a_duplicate_invocation_waits_for_the_owner_and_writes_nothing(tmp
     await state.close()
 
 
+async def test_a_loser_exits_once_the_engine_says_the_attempt_ended(tmp_path):
+    """Review P2-8: the owner died; no result will come. While the attempt
+    is live the engine answers the loser `not_owner` and it waits; once the
+    engine ends the attempt it answers `ended`, and the loser exits."""
+
+    @asset(executor=Fake("fake")(), outputs=Output("items", keyed=True), retries=Retry(0))
+    def items():
+        return {"a": 1}
+
+    project = Project(assets=[items], executors=[Fake("fake")])
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = engine_for(state, project, cancel_grace=0.1)
+    await engine.initialize()
+    run, attempt = await launched(engine, ["items"])
+    await state.create_object(f"{lifecycle.base(run['id'], attempt)}.worker", b'{"invocation": "dead"}')
+    loser = asyncio.create_task(
+        run_attempt(
+            state.objects_url,
+            attempt,
+            project,
+            run=run["id"],
+            channel=LocalChannel(engine, attempt),
+            loser_poll=0.05,
+        )
+    )
+    for _ in range(10):
+        await engine.tick()
+        await asyncio.sleep(0.02)
+    assert not loser.done()  # `not_owner`: the attempt is live
+    await engine.cancel(run["id"])
+    await until(engine, loser.done)
+    assert await loser == 0 and await state.attempt_result(run["id"], attempt) is None
+    await engine.stop()
+    await state.close()
+
+
+async def test_a_loser_without_a_channel_exits_on_a_terminal_gate(tmp_path):
+    """With no channel, the objects tell it: the engine aborted the gate."""
+
+    from .test_fence import Overwriting
+
+    @asset(executor=Fake("fake")(), retries=Retry(0))
+    def items():
+        return [{"a": 1}]
+
+    project = Project(assets=[items], executors=[Fake("fake")], default_store=Overwriting())
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = engine_for(state, project, cancel_grace=0.1)
+    await engine.initialize()
+    run, attempt = await launched(engine, ["items"])
+    base = lifecycle.base(run["id"], attempt)
+    await state.create_object(f"{base}.worker", b'{"invocation": "dead"}')
+    loser = asyncio.create_task(
+        run_attempt(state.objects_url, attempt, project, run=run["id"], loser_poll=0.05)
+    )
+    await engine.cancel(run["id"])
+    await until(engine, loser.done)
+    assert json.loads(await state.get_object(f"{base}.writing"))["state"] == "aborted"
+    await engine.stop()
+    await state.close()
+
+
 class Duplicate(Remote):
     """The relaunched handle names a duplicate, which exits at once."""
 

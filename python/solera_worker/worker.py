@@ -893,16 +893,16 @@ async def run_attempt(
     spec = json.loads(data)
     invocation = secrets.token_hex(8)
     claim = {"invocation": invocation, "host": socket.gethostname(), "pid": os.getpid(), "at": time.time()}
-    try:
-        await create(objects, f"{base}{lifecycle.WORKER}", json.dumps(claim).encode())
-    except AlreadyExistsError:
-        if not pool:
-            await _await_owner(objects, base, loser_poll)
-        return 0
     if channel is None and (engine_url or spec.get("engine")):
         from .channel import HttpChannel
 
         channel = HttpChannel(engine_url or spec["engine"], spec["project"], attempt, spec["token"])
+    try:
+        await create(objects, f"{base}{lifecycle.WORKER}", json.dumps(claim).encode())
+    except AlreadyExistsError:
+        if not pool:
+            await _await_owner(objects, base, loser_poll, channel, invocation)
+        return 0
     loop = asyncio.get_running_loop()
     control = {"cancel": None, "writing": False, "stopped": False, "forced": False}
 
@@ -969,13 +969,25 @@ async def run_attempt(
             channel.close()
 
 
-async def _await_owner(objects, base: str, poll: float) -> None:
-    """A losing invocation: wait until the owner's result exists, or the
-    attempt's objects are gone, before exiting."""
+async def _await_owner(objects, base: str, poll: float, channel=None, invocation: str = "") -> None:
+    """A losing invocation: wait until the attempt is over before exiting —
+    the owner's result exists, the engine closed or aborted its gate, the
+    engine says `ended` (`not_owner` is no news), or its objects are gone."""
 
     while await _get(objects, f"{base}{lifecycle.SPEC}") is not None:
         if await _get(objects, f"{base}{lifecycle.RESULT}") is not None:
             return
+        gate = await _get(objects, f"{base}{lifecycle.GATE}")
+        if gate is not None and json.loads(gate)["state"] in (lifecycle.ABORTED, lifecycle.CLOSED):
+            return
+        if channel is not None:
+            try:
+                await asyncio.to_thread(channel.beat, {"invocation": invocation, "seq": 0})
+            except Ended as answer:
+                if answer.reason != "not_owner":
+                    return
+            except Exception:
+                pass  # the engine is unreachable: the objects decide
         await asyncio.sleep(poll)
 
 
