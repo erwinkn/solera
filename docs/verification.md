@@ -22,7 +22,7 @@ seed replays the same run, request for request.
 | Channel | `SimChannel`: each call runs as a request of whichever engine serves now, answered once durable (the API middleware's rule) | HTTPS to a stable engine URL |
 | Heartbeats | the worker's `Reporter`, beating from a task instead of a thread | a thread |
 | Key cache | the engine's `KeyService` on the simulation's loop instead of its own thread | a thread with its own loop |
-| Stores | FileStore (`immutable`) and `TableStore` (`fenced`, `tests/sim/stores.py`): an in-memory database whose transactions take the slice's fence and can stay open or lose their answer | FileStore, S3Store, PostgresStore |
+| Stores | FileStore (`immutable`); `TableStore` (`fenced`, `tests/sim/stores.py`): an in-memory database whose transactions take the slice's fence and can stay open or lose their answer; and, with `SOLERA_TEST_DATABASE_URL`, a real PostgresStore in a schema of its own per run, every transaction and read recorded (`tests/sim/postgres.py`) | FileStore, S3Store, PostgresStore |
 | Sensor host | a rule that polls `sensor_next` and posts each tick's outcome, late or twice | `solera_worker sensors` |
 | Clients | rules calling the engine's API; a failed call is an unknown outcome | the API, the CLI |
 
@@ -96,6 +96,7 @@ Checked after every step:
 | **No state breaks.** No engine's `State` fails applying an event (which would exit the process with code 70). | a reducer raising on a replayed event |
 | **One end per attempt.** The journal holds at most one `AttemptFinished` per attempt, and no segment lands twice with different bytes. | a zombie engine and its successor both ending attempt `A` |
 | **Nothing is read after collection.** No live attempt or serving engine finds an index file or data object gone because garbage collection deleted it. | a delta window's reader pin not holding its files |
+| **Reads say what they read.** A PostgresStore read reports the generation that wrote the rows it loaded, the newest committed before its snapshot — never one that only acquired the slice — and the key versions an attempt reports are those of the rows it loaded. | an attempt that acquired and died surfacing as the read generation |
 | **Committed keys are readable.** Every key an immutable store's head lists loads back at its indexed version, from an object a committed attempt wrote. | a stale writer's object referenced by the index |
 
 Checked once the system is quiet, at the end of every run (`_converge`): faults
@@ -112,7 +113,8 @@ off, zombies killed, a fresh change to every source, then:
 ## Running it
 
 ```bash
-uv run pytest tests/sim -q                       # the CI budget: 20 runs, about 30 s
+uv run pytest tests/sim -q                       # the CI budget: 20 runs, about 20 s
+SOLERA_TEST_DATABASE_URL=postgresql://… uv run pytest tests/sim -q   # items may also live in Postgres
 uv run pytest tests/sim -q --slow                # 400 runs with shrinking: tens of minutes
 SOLERA_SIM_EXAMPLES=2000 SOLERA_SIM_STEPS=60 uv run pytest tests/sim -q --slow
 SOLERA_SIM_KNOWN=1 uv run pytest tests/sim -q    # do not set open findings aside
@@ -166,7 +168,7 @@ possibly another interleaving of equal-time events.
 |---|---|---|---|
 | F1 | `Incremental(exclude="k1*")` with a string is split into characters: `*` excludes every key (`include=` wraps a string) | P3 | open |
 | F2 | A keyed output moved to another store keeps its key index: the next write stores only the changed keys there, and the others become unreadable | P1 | fixed in 59812c4 — `test_a_keyed_output_moved_to_another_store_stays_readable` |
-| F3 | `Each` loads its upstream as `dict[str, T]`; the store contract, the conformance kit and `examples/json_table_store.py` do not say or do so, and `Each` over such a store fails every key | P2 | open |
+| F3 | `Each` loads its upstream as `dict[str, T]`; the store contract, the conformance kit and `examples/json_table_store.py` do not say or do so, and `Each` over such a store fails every key | P2 | doc and example fixed in 217c8f4; the kit's by-key scenario is Phase 2 |
 | F4 | A removed asset's launched attempt that asks for more pages, or fails retryably, re-queues a task no manifest can place: its run never ends | P1 | fixed in 59812c4 — `test_a_removed_assets_last_attempt_ends_its_run` |
 | F5 | An attempt launched before a rename settles into a head that moved and an output the manifest no longer names: its claim is never released, its run never ends | P1 | fixed in 59812c4 — `test_an_attempt_launched_before_a_rename_settles` |
 | F6 | A run that finishes an interrupted full delivery ends there though the upstream moved: the `OnChange` firing it ran for delivers nothing of its change | P1 | open — `test_a_change_made_during_a_full_delivery_reaches_downstream` |
