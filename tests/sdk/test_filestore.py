@@ -12,9 +12,8 @@ from urllib.parse import urlsplit
 
 import pandas as pd
 import pytest
-from solera.keys.index import key_str
 from solera.sdk import KEYS, Output, PartitionSet, Ref, RegistrationError
-from solera.stores import Batches, FileStore, Keys, Patch, S3Store, StoreError, WriteError, store_key_rows
+from solera.stores import Batches, FileStore, Keys, Patch, S3Store, StoreError, WriteError, prepare
 
 from tests.conftest import scope
 
@@ -51,8 +50,7 @@ async def paths(store) -> list[str]:
 def at(out, content, generation, keys=None) -> Keys:
     """The `Keys` a key index would hold after writing `content` at `generation`."""
 
-    found, versions = store_key_rows(FileStore(), content, out).entries()
-    entries = {key_str(k): (v, generation) for k, v in zip(found, versions, strict=True)}
+    entries = {k: (v, generation) for k, v in prepare(content, out).entries()}
     return Keys({k: e for k, e in entries.items() if keys is None or k in keys})
 
 
@@ -116,13 +114,15 @@ async def test_a_keyed_output_is_one_object_per_key_and_version(store):
 async def test_a_keyed_write_touches_only_what_the_harness_says(store):
     out = Output("uploads", keyed=True)
     content = {"a": 1, "b": 20, "c": 3}
-    only = scope(out, upserts=frozenset({"b"}), removes=frozenset({"a"}), generation=3)
+    versions = dict(prepare(content, out).entries())
+    only = scope(out, upserts={"b": versions["b"]}, removes=frozenset({"a"}), generation=3)
     await store.store(content, None, only)
     # `c` is in the write but not in upserts: the harness knows it is there already.
     assert [p.split("/")[1] for p in await paths(store)] == ["b"]
+    assert [p.split("/")[2] for p in await paths(store)] == [f"{versions['b'].hex()}.3.json"]
     # A requested key the write does not hold is an error, never a silent skip.
     with pytest.raises(StoreError, match="zzz"):
-        await store.store(content, None, scope(out, upserts=frozenset({"b", "zzz"}), generation=4))
+        await store.store(content, None, scope(out, upserts={"b": versions["b"], "zzz": b"1"}, generation=4))
 
 
 async def test_a_keyed_output_takes_a_dict_of_str(store):
@@ -273,3 +273,29 @@ async def test_many_objects_are_never_many_tasks_at_once(store):
 
     assert await store._many(one, range(5000)) == list(range(5000))
     assert max(seen) <= PARALLEL + 5, max(seen)
+
+
+async def test_a_prepared_write_is_read_once_and_only_its_selection_taken(store, monkeypatch):
+    """§4, §6: the harness reads a keyed write once (`Prepared`); the store
+    reads no more of it than the groups of the keys it is asked to write —
+    a DataFrame of many keys with one changed is one group, not every row."""
+
+    import solera.stores as stores
+
+    out = Output("frame", key="id")
+    frame = pd.DataFrame({"id": [f"k{i}" for i in range(1000)], "n": range(1000)})
+    prepared = prepare(frame, out)
+    versions = dict(prepared.entries())
+    taken = []
+    real = stores._take
+
+    def counting(payload, rows):
+        taken.append(len(payload) if rows is None else len(rows))
+        return real(payload, rows)
+
+    monkeypatch.setattr(stores, "_take", counting)
+    monkeypatch.setattr(stores, "prepare", lambda *a, **k: pytest.fail("the store read the write again"))
+    selected = scope(out, upserts={"k7": versions["k7"]}, generation=2, prepared=prepared)
+    written = await store.store(frame, None, selected)
+    assert taken == [1]
+    assert await store.load(written.ref, None, Keys({"k7": (versions["k7"], 2)})) == [{"id": "k7", "n": 7}]

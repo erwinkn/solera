@@ -320,28 +320,37 @@ written with `Rows` grouping); this section states only what stores and
 the engine rely on, and the two must stay in agreement. Moving one-row keys from a row digest to `group([row])` changes
 every existing version once, together with the grammar's own version.
 
-## 7. Key extraction belongs to stores, and stays columnar
+## 7. A write is read once, and stays columnar
 
-A write's `(key, version)` rows feed the key index. Today the worker
-extracts them with `solera.stores.key_rows` for replacements — native
-`Rows` built from Arrow in place or from packed Python keys, never a
-per-key Python object, which is what keeps 100M keys under 1 GB
-(`key-index-costs.md`) — and with `key_map`, a `dict[str, bytes]`, for
-patches. Stores own data shape, so the extraction becomes a store hook
-that returns the native form:
+A keyed write feeds the key index its `(key, version)` entries, and its
+store the groups of the keys that changed. The harness reads it once,
+`solera.stores.prepare` → `Prepared`, and carries that through resolution,
+repair and storage:
 
-```python
-class Store(Protocol):
-    ...
-    def key_rows(self, write: Any, output: Output) -> Rows: ...   # optional
-```
+- `rows`, native `Rows`: keys read in place from Arrow or packed once,
+  sorted, each the group of the rows that carry it, versions computed
+  natively — never a per-key Python object, which keeps 100M keys under
+  1 GB (`key-index-costs.md`). Rows are read, not used up: the
+  resolution's join, the engine's request and the store's version (the
+  digest of every key and version, `Rows.digest`) all read the same ones.
+- `payload`: the write as returned, flattened, in its own types. The
+  store, asked to write some keys (`Scope.upserts`, each to the version
+  the index will hold), reads only their groups (`Prepared.groups`, from
+  `Rows.find`'s row indices) and converts them to its own serialization
+  then: a 100K-row DataFrame with one changed key reads one group.
 
-| Store | `key_rows` |
+| Write | Read as |
 |---|---|
-| default (absent) | `solera.stores.key_rows`: `list[dict]`, `dict`, DataFrame (through DuckDB), anything with `__arrow_c_stream__` |
-| PostgresStore | the default for flat rows; for `Patch({key: frames})`, the concatenated Arrow table it is about to insert, through `Rows.arrow(table, key, revision)` |
-| a custom store for a custom type | builds `Rows.arrow(…)` from its own columnar form, or `Rows.records(…)` |
-| `Sql` writes | after writing, the store reports the content sorted by key, by one of two paths (below) |
+| `list[dict]` | `Rows.records` |
+| DataFrame | through DuckDB, `Rows.arrow`; groups by `iloc` |
+| Arrow data | `Rows.arrow`, in place (a stream is read once, into a table) |
+| `{key: rows}` | flattened, each row stamped with its key; a key given no rows is the empty group (`Rows.records(…, empty=)`) |
+| `keyed=True` dict | `Rows.values` |
+| partition set | `Rows.keys` |
+
+A store adapts the reading with `stamped(output)`: the columns it adds to
+every row itself, which a row's digest leaves out (PostgresStore's
+partition column).
 
 **`Sql` writes have two paths**, because the rows never pass through the
 worker (built; the `md5` per-row versions are gone):
@@ -361,10 +370,7 @@ transfer; declaring a revision column avoids it.
 - **Grouping is native**: `Rows` sorts by key with the existing
   permutation, digests rows in parallel, and folds each run of equal keys
   into `group(…)`; for the by-key form, keys with no rows come as a
-  separate packed list. Built: `Rows.records`, `Rows.arrow`, `Rows.values`
-  (`keyed=True`), `Rows.pairs` and `Rows.keys`, grouping natively, and
-  `Store.key_rows`; not yet the by-key `Patch({key: frames})` form or its
-  empty groups.
+  separate packed list, each a marker that adds no row.
 - **Patches move off `key_map`** onto the same `Rows` (removes as a packed
   key list). That is also what the HTTP resolver needs — the worker's
   sorted run of `(key, version, deleted)` — so one path serves
@@ -950,9 +956,9 @@ is below the current one.
 
 **Obsolete**, from the earlier draft of this proposal.
 
-- `Store.keys(write, output) -> dict[str, str]`: replaced by
-  `Store.key_rows → Rows` (§7). A dict per write is the Python-object path
-  that cost ~45 GB at 100M keys.
+- `Store.keys(write, output) -> dict[str, str]`: replaced by the prepared
+  write (§7). A dict per write is the Python-object path that cost ~45 GB
+  at 100M keys.
 - "The engine reads small delta files to filter": replaced by evaluation
   at commit from the cache (§11).
 - A failing set as a map in engine state: replaced by the failure index
@@ -970,7 +976,7 @@ is below the current one.
 
 | Work | What this proposal needs from it |
 |---|---|
-| Key index (`object-store-state.md` §6) | No format change. A new kind of index (`keys/@{asset}/{scope}/`, the failure index) compacted like the others; `Rows` groups every key (§6), with `Store.key_rows` and the digest grammar — the native thread's current work; patches build `Rows`. |
+| Key index (`object-store-state.md` §6) | No format change. A new kind of index (`keys/@{asset}/{scope}/`, the failure index) compacted like the others; `Rows` groups every key (§6), read once as the prepared write (§7) with the digest grammar; patches build `Rows`. |
 | Engine cache (`resolved-commits.md`, being rewritten) | New readers: inlined retry keys in v1; pattern counts at commit and failure-summary recomputation later. No new cached content beyond failure indexes. |
 | HTTP resolver (`resolved-commits.md`) | Each pages' output deltas are small resolves when the index is admitted; failure deltas are resolved locally, not by the resolver (§9 here is authoritative for the record, transitions, eligibility, pass state and forced-request identity; the resolver's inline reader calls the same SDK functions, and its v1 has no pattern hints or summary recomputation); the worker uploads both. Inlined windows are filtered before the `inline_max` check. A sensor's full key map is resolved in-process (small) or on the host (big), not through an attempt's resolve. The grammar gains the group production. |
 | Attempt lifecycle (`lifecycle.md`) | The cancel record (§2.2) and write-completion evidence (§2.3), authoritative there; the two-phase cancel of §7, which §5 follows; live per-key events and key-tagged logs; per-key outcomes in `.result`. Sensors (§11) carry observable sources: `Source.observe` declares one. |
@@ -982,9 +988,9 @@ is below the current one.
   retry_for)`, `Abort`, `Project(errors=…)`; `Source.observe` as a sensor, `Observed`;
   `ctx.key`, `ctx.revision`, `ctx.keys(output, prefix=)`; the revision from
   a build identity; `code_hash` removed.
-- `python/solera/stores.py`: `Patch({key: value})`; the `key_rows` hook;
-  no duplicate-key error.
-- `python/solera_postgres`: group writes, `key_rows` for by-key patches,
+- `python/solera/stores.py`: `Patch({key: value})`; `prepare` and
+  `Prepared`; no duplicate-key error.
+- `python/solera_postgres`: group writes from the prepared write,
   keyed loads as `dict[str, T]`.
 - `python/solera_worker/worker.py`: the per-key loop, classification,
   outcomes, the failure delta, retry and rescope pages, partial commits on

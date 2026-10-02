@@ -221,12 +221,12 @@ def test_keyed_values_and_no_fallback():
 
 
 def test_keys_are_str_or_int_everywhere():
-    """One key rule for native extraction, store grouping and removals: a
+    """One key rule for native extraction, a store's reading and removals: a
     `str`, or an `int` as its decimal text. Anything else — bytes included —
     is refused before anything is written."""
 
     from solera.sdk import Output
-    from solera.stores import WriteError, entries, key_rows, key_text
+    from solera.stores import Patch, WriteError, key_rows, key_text, prepare
 
     assert python([{"id": 7}]).keys() == {b"7"} and key_text(7) == "7"
     out = Output("t", key="id")
@@ -236,7 +236,7 @@ def test_keys_are_str_or_int_everywhere():
         with pytest.raises(WriteError, match="a key must be a str or an int"):
             key_rows([{"id": bad}], out)
         with pytest.raises(WriteError, match="a key must be a str or an int"):
-            entries(out, [{"id": bad}])
+            prepare(Patch([], remove=[bad]), out)
     with pytest.raises(ValueError, match="strings or integers"):
         _native.Rows.arrow(pa.table({"id": pa.array([b"b"], pa.binary())}), "id")
 

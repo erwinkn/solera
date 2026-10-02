@@ -191,9 +191,11 @@ creates `{attempt}.writing`, so an aborted attempt writes nothing and a
 writing one is always committed.
 
 **Keyed outputs.** Stores keep no key maps: the engine's key index does
-(§6). The harness tells the store which keys a write changes
-(`Scope.upserts`, `Scope.removes`), so a store may touch only those; with
-no prior (a first write or a `full` run) the write replaces the slice. An
+(§6). The harness reads a keyed write once (`Scope.prepared`) and tells
+the store which keys it changes, each to the version the index will hold
+(`Scope.upserts`, `Scope.removes`), so a store reads and touches only
+those; with no prior (a first write or a `full` run) the write replaces
+the slice. An
 unkeyed incremental output is a sequence of engine-numbered batches —
 `scope.batch` gives the next one, and a `full` run (`prior=None`) starts
 the partition over. A sink that cannot delete makes writes idempotent on
@@ -210,7 +212,8 @@ class Store(Protocol):
     async def migrate(self, output: Output, migrations: Sequence[Migration]) -> list[str]: ...  # optional
 
 Scope   = (output: Output, partition: str, batch: int | None, attempt: str | None, aliases: tuple,
-           upserts: frozenset[str] | None, removes: frozenset[str] | None)
+           upserts: Mapping[str, bytes] | DeltaKeys | None, removes: frozenset[str] | None,
+           prepared: Prepared | None)   # a keyed write, read once (per-key-processing.md §7)
 Written = (ref: Ref, keys: Iterable | None)   # keys: only for Sql writes the harness never sees as rows
 Keys    = (revisions: Mapping[str, bytes])  # revisions as the key index holds them
 Batches = (lo: int, hi: int)  # load rows of batches in [lo, hi]
@@ -227,9 +230,9 @@ Batches = (lo: int, hi: int)  # load rows of batches in [lo, hi]
 Optional attributes and methods, with defaults: `writes`, `strict`,
 `late_write_grace`, `acquire(scope)` and `discard(scope, prior, items)` —
 how the store writes and what the engine may do once a writer is gone
-(lifecycle.md §9.6–§9.9); `key_rows(write, output)`, `scan(ref, output,
-skip)` and `stamped(output)` — how a write's rows become keys and versions,
-and how a `Sql` write's rows are read back (row-digest.md); `shared_table`
+(lifecycle.md §9.6–§9.9); `stamped(output)` and `scan(ref, output, skip)`
+— the columns the store adds to every row, left out of their digests, and
+how a `Sql` write's rows are read back (row-digest.md); `shared_table`
 — one table for every partition, so a partitioned output needs a
 `partition_column` (§3).
 

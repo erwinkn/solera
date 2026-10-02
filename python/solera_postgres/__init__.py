@@ -27,10 +27,8 @@ from solera.stores import (
     StoreError,
     WriteError,
     Written,
-    by_key,
     by_key_type,
-    key_rows,
-    key_text,
+    prepare_for,
     resolve_env,
 )
 
@@ -321,12 +319,19 @@ class PostgresStore:
             keys = None
             if isinstance(write, Sql):
                 version, keys = self._apply_sql(cur, output, write, scope, table, slice_where, prior)
+            elif output.key is not None:
+                if isinstance(write, Patch) and not output.incremental:
+                    raise WriteError(f"{output.name}: Patch requires an incremental output")
+                prepared = scope.prepared or prepare_for(self, write, output)
+                version = self._apply_keyed(cur, output, prepared, scope, table, slice_where, prior)
+                if version is None:
+                    return Written(prior)
             elif isinstance(write, Patch):
-                version = self._apply_patch(cur, output, write, scope, table, slice_where, prior, batch)
+                version = self._apply_batch(cur, output, write, scope, table, slice_where, prior, batch)
                 if version is None:
                     return Written(prior)
             else:
-                if output.incremental and output.key is None:
+                if output.incremental:
                     raise WriteError(
                         f"{output.name}: an unkeyed incremental output only accepts Patch writes"
                     )
@@ -364,8 +369,10 @@ class PostgresStore:
                 cur.execute(f"ALTER TABLE {_qname(schema, alias)} RENAME TO {_ident(output.name)}")
                 return
 
-    def _apply_replace(self, cur, output, write, scope, table, slice_where):
-        rows = _coerce_rows(write)
+    def _stamp(self, output, rows: list[dict], scope) -> list[dict]:
+        """Rows with the partition column set to the scope's; a row that says
+        another partition is a write error."""
+
         if partition_col := output.config.get("partition_column"):
             for row in rows:
                 if partition_col in row and str(row[partition_col]) != scope.partition:
@@ -374,81 +381,70 @@ class PostgresStore:
                         f"with scope {scope.partition!r}"
                     )
                 row[partition_col] = scope.partition
-        if output.key is not None:
-            _keys(output, rows)
-        self._ensure(cur, output, rows, scope)
+        return rows
+
+    def _apply_replace(self, cur, output, write, scope, table, slice_where):
+        """An unkeyed output's whole content: its version is the multiset of
+        its rows (docs/row-digest.md), before the store stamps them."""
+
+        rows = _coerce_rows(write)
+        version = _rows_version(rows, [])
+        self._ensure(cur, output, self._stamp(output, rows, scope), scope)
         self._delete_slice(cur, table, slice_where)
         self._insert(cur, table, rows)
-        return digest(rows)
+        return version
 
-    def _apply_patch(self, cur, output, write: Patch, scope, table, slice_where, prior, batch):
+    def _apply_batch(self, cur, output, write: Patch, scope, table, slice_where, prior, batch):
+        """An unkeyed incremental output's batch: its rows stamped with the
+        batch columns, in place of this batch's (a retry's) — or, with no
+        prior (a full run), of every batch."""
+
         if not output.incremental:
             raise WriteError(f"{output.name}: Patch requires an incremental output")
-        remove = {_key(output, k) for k in write.remove}
-        rows = _coerce_rows(write.rows, output)
-        flat = by_key(write.rows, output)
-        empty = flat[1] if flat is not None else []  # keys written with no rows (per-key §6)
-        if not rows and not remove and not empty and prior is not None:
+        if write.remove:
+            raise WriteError(f"{output.name}: remove is not allowed on an unkeyed incremental output")
+        rows = _coerce_rows(write.rows)
+        if not rows and prior is not None:
             return None
+        version = _rows_version(rows, [prior.version if prior else ""])
+        for i, row in enumerate(self._stamp(output, rows, scope)):
+            row[BATCH_COLUMN] = batch
+            row[SEQ_COLUMN] = i
         self._ensure(cur, output, rows, scope)
-        partition_col = output.config.get("partition_column")
-        if output.key is None:
-            # Batch mode: stamp the batch columns, replace this batch's rows.
-            if remove:
-                raise WriteError(f"{output.name}: remove is not allowed on an unkeyed incremental output")
-            for i, row in enumerate(rows):
-                row[BATCH_COLUMN] = batch
-                row[SEQ_COLUMN] = i
-                if partition_col:
-                    row[partition_col] = scope.partition
-            if prior is None:
-                # A full run replaces the slice: supersede every prior batch.
-                self._delete_slice(cur, table, slice_where)
-            else:
-                self._delete_slice(cur, table, {**slice_where, BATCH_COLUMN: batch})
-            self._insert(cur, table, rows)
-            return digest([prior.version if prior else "", digest({"rows": _canon(rows), "remove": []})])
+        self._delete_slice(cur, table, slice_where if prior is None else {**slice_where, BATCH_COLUMN: batch})
+        self._insert(cur, table, rows)
+        return version
 
-        for row in rows:
-            if partition_col:
-                if partition_col in row and str(row[partition_col]) != scope.partition:
-                    raise WriteError(
-                        f"{output.name}: row {partition_col}={row[partition_col]!r} disagrees with scope"
-                    )
-                row[partition_col] = scope.partition
-        # Every key is the group of rows that carry it: a patch replaces the
-        # rows of the keys it writes, all of them, and drops the keys it removes.
-        written = _keys(output, rows) + empty
-        inserted = rows
-        if prior is None:
-            # No prior (a first write or a full run): the patch is the whole state.
+    def _apply_keyed(self, cur, output, prepared, scope, table, slice_where, prior):
+        """Every key is the group of rows that carry it. With no selection —
+        a first write, a full run, or more changes than the harness lists —
+        a replacement is the slice's whole content; otherwise only the
+        selected keys change: their rows replaced by their groups, removed
+        keys' rows gone, every other row untouched. A patch with no selection
+        changes its own keys and removes."""
+
+        nothing = not len(prepared.rows) and not prepared.removes and not prepared.entries()
+        if prepared.patch and prior is not None and nothing:
+            return None  # the prior stands
+        if prior is None or (scope.upserts is None and not prepared.patch):
+            rows = self._stamp(output, [dict(r) for r in prepared.all_rows()], scope)
+            self._ensure(cur, output, rows, scope)
             self._delete_slice(cur, table, slice_where)
         else:
-            keys = scope.upserts if scope.upserts is not None else written
-            if missing := set(keys) - set(written):
-                raise StoreError(
-                    f"{output.name}: asked to write keys the patch does not hold: {sorted(missing)[:5]}"
-                )
-            inserted = [r for r, k in zip(rows, written, strict=False) if k in keys]
-            gone = set(keys) | (scope.removes if scope.removes is not None else remove)
+            keys = sorted(scope.upserts) if scope.upserts is not None else [k for k, _ in prepared.entries()]
+            groups = prepared.groups(keys)
+            rows = self._stamp(output, [dict(row) for group in groups for row in group], scope)
+            self._ensure(cur, output, rows, scope)
+            removes = scope.removes if scope.removes is not None else prepared.removes
+            gone = sorted(set(keys) | set(removes))
             if gone:
                 cur.execute(
-                    f"DELETE FROM {table} WHERE {self._where_sql(slice_where)} AND {_ident(output.key)}::text = ANY(%s)",
-                    ([slice_where[k] for k in sorted(slice_where)] + [sorted(gone)]),
+                    f"DELETE FROM {table} WHERE {self._where_sql(slice_where)} "
+                    f"AND {_ident(output.key)}::text = ANY(%s)",
+                    ([slice_where[k] for k in sorted(slice_where)] + [gone]),
                 )
-        self._insert(cur, table, inserted)
-        return digest(
-            [
-                prior.version if prior else "",
-                digest(
-                    {
-                        "rows": _canon(rows),
-                        "remove": sorted(remove),
-                        **({"empty": sorted(empty)} if empty else {}),
-                    }
-                ),
-            ]
-        )
+        self._insert(cur, table, rows)
+        return prepared.version(prior)
 
     def _apply_sql(self, cur, output, write: Sql, scope, table, slice_where, prior):
         """Materialize a SELECT into the slice, or run a statement verbatim. The
@@ -495,9 +491,6 @@ class PostgresStore:
 
         column = output.config.get("partition_column")
         return (column,) if column and column != output.key else ()
-
-    def key_rows(self, write, output: Output):
-        return key_rows(write, output, self.stamped(output))
 
     def scan(self, ref: Ref, output: Output, skip=()):
         """A slice's rows as they are, sorted by key, a chunk at a time — as a
@@ -661,28 +654,9 @@ class PostgresStore:
             )
 
 
-def _keys(output: Output, rows: list[dict]) -> list[str]:
-    """Each row's key; a row without the key column is a write error."""
-
-    try:
-        return [_key(output, row[output.key]) for row in rows]
-    except KeyError:
-        raise WriteError(f"{output.name}: row lacks the declared key column {output.key!r}") from None
-
-
-def _key(output: Output, value) -> str:
-    try:
-        return key_text(value)
-    except WriteError as e:
-        raise WriteError(f"{output.name}: {e}") from None
-
-
-def _coerce_rows(write: Any, output: Output | None = None) -> list[dict]:
+def _coerce_rows(write: Any) -> list[dict]:
     if write is None:
         return []
-    flat = by_key(write, output) if output is not None else None
-    if flat is not None:
-        return _coerce_rows(flat[0])
     if type(write).__name__ in ("DataFrame", "GeoDataFrame") and type(write).__module__.split(".")[0] in (
         "pandas",
         "geopandas",
@@ -693,13 +667,17 @@ def _coerce_rows(write: Any, output: Output | None = None) -> list[dict]:
     raise WriteError(f"Expected rows (list[dict] or DataFrame), got {type(write).__name__}")
 
 
-def _canon(value):
-    if type(value).__name__ in ("DataFrame", "GeoDataFrame") and type(value).__module__.split(".")[0] in (
-        "pandas",
-        "geopandas",
-    ):
-        return value.to_dict(orient="records")
-    return value
+def _rows_version(rows: list[dict], before: list) -> str:
+    """A version from rows as a multiset (`group`, docs/row-digest.md) and
+    what comes before them (a prior version)."""
+
+    from solera._native import group_digest
+
+    try:
+        content = group_digest(rows).hex()
+    except ValueError as e:
+        raise WriteError(str(e)) from e
+    return digest([*before, content])
 
 
 def _column_type(value: Any) -> str:

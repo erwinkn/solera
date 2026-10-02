@@ -30,10 +30,11 @@ import traceback
 import typing
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 from obstore.exceptions import AlreadyExistsError
 from solera import errors, lifecycle
-from solera.keys import Rows, SortedRun
+from solera.keys import SortedRun
 from solera.keys.index import (
     DeltaFiles,
     DeltaKeys,
@@ -52,6 +53,7 @@ from solera.sdk import (
     UNSET,
     Asset,
     Changes,
+    Output,
     Project,
     Ref,
     Result,
@@ -63,13 +65,14 @@ from solera.stores import (
     Batches,
     Keys,
     Patch,
+    Prepared,
     Scope,
     Sql,
     StoreError,
     WriteError,
     key_text,
+    prepare_for,
     resolve_env,
-    store_key_rows,
 )
 
 from . import each
@@ -470,192 +473,62 @@ async def _store_outputs(
     else:
         raise StoreError(f"{asset.name}: multi-output assets must return Result(outputs={{...}})")
 
-    def scope_of(plan: dict) -> Scope:
-        info = plan["info"]
-        return Scope(
-            output=plan["output"],
-            partition=spec["partition"],
-            batch=info.get("batch"),
-            attempt=spec["attempt"],
-            aliases=tuple(info.get("aliases") or ()),
-            upserts=plan.get("upserts"),
-            removes=plan.get("removes"),
-            generation=spec.get("generation"),
-            invocation=invocation,
-        )
-
     # Acquire: a fenced store's generation, before anything reads the store —
     # repair included (docs/lifecycle.md §9.7).
-    plans, intents, entries = {}, {}, {}
-    for name in values:
+    outs: dict[str, _Out] = {}
+    for name, value in values.items():
         if name not in decls:
             raise StoreError(f"{asset.name}: returned undeclared output {name!r}")
-        plan = plans[name] = {
-            "output": decls[name],
-            "store": project.stores[declared[name]["store"]],
-            "info": pinned.get(name) or {},
-            "prior": priors.get(name),
-        }
-        if getattr(plan["store"], "writes", "overwrite") == "fenced":
-            await plan["store"].acquire(scope_of(plan))
+        store = project.stores[declared[name]["store"]]
+        o = outs[name] = _Out(name, decls[name], store, pinned.get(name) or {}, priors.get(name), value)
+        if o.kind == "fenced":
+            await store.acquire(o.scope(spec, invocation))
 
-    # Plan: what each keyed write changes, as delta files. Small writes are
-    # resolved by the engine from its cache, all of an attempt's in one request
-    # (docs/resolved-commits.md §4); the rest, and any it declines, here.
-    asks, pending = [], {}
-    for name, value in values.items():
-        plan = plans[name]
-        output, store, info, prior = plan["output"], plan["store"], plan["info"], plan["prior"]
-        if info.get("index") is None:
-            if isinstance(value, Sql) and output.incremental:
-                raise WriteError(f"{output.name}: Sql writes need a keyed output")
+    # Prepare and resolve: each keyed write read once, and compared with its key
+    # index as pinned in the spec; its changes are the batch's delta file. Small
+    # writes are resolved by the engine from its cache, all of an attempt's in one
+    # request (docs/resolved-commits.md §4); the rest, and any it declines, here.
+    for o in outs.values():
+        await _prepare(o, spec, keys_io)
+    asks = [_ask_for(o, spec) for o in outs.values() if o.asks()]
+    engine = await _ask_engine(channel, invocation, asks)
+    intents, entries = {}, {}
+    for name, o in list(outs.items()):
+        if o.index is None:
             continue
-        index = plan["index"] = KeyIndex(keys_io, None, IndexState.from_json(info["index"]))
-        if isinstance(value, Sql):
-            if output.is_partition_set:
-                raise WriteError(f"{output.name}: Sql writes need a table output")
+        if o.sql:
             # Rows the harness never sees: the store reports the whole new key
             # map once it wrote, so its delta comes after — and needs no repair.
             # Unknown writes: if this attempt dies after its gate, no key list says what landed
             # (docs/lifecycle.md §9.6): the next attempt reconciles the whole slice.
             intents[name] = {**DeltaFiles([], 0, 0, True).to_json(), "unknown": True}
             continue
-        patch = isinstance(value, Patch)
-        # With no prior (a first write, or a full run) a Patch is the whole content.
-        replace = not patch or prior is None
-        content = value.rows if patch else value
-        unsettled = info.get("unsettled") or []
-        batch, attempt = int(info["batch"]), spec["attempt"]
-        generation = int(spec.get("generation") or 0)  # each entry's locator (lifecycle.md §9.8)
-        rows = await asyncio.to_thread(store_key_rows, store, content, output)
-        p = pending[name] = {
-            "replace": replace,
-            "content": content,
-            "unsettled": unsettled,
-            "batch": batch,
-            "generation": generation,
-            "own": (set(), set()),
-            "intended": set(),
-        }
-        live = int(info["index"].get("count", 0))
-        if replace:
-            if len(rows) + live <= RESOLVE_ENTRIES and len(rows) <= RESOLVE_KEYS:
-                p["run"] = await asyncio.to_thread(SortedRun.from_rows, rows)
-            else:
-                p["rows"] = rows
-            continue
-        new = await _versions(output, rows)
-        try:
-            # Once, for every reader below: each key once, in order.
-            removes = sorted({k for k in map(key_text, value.remove) if k not in new})
-        except WriteError as e:
-            raise WriteError(f"{output.name}: {e}") from None
-        own = p["own"] = (set(new), set(removes))
-        p["new"], p["removes"] = new, removes
-        if any(intent.get("unknown") for intent in unsettled):
-            # A dead Sql writer's keys are unknown (docs/resolved-commits.md §3): the index
-            # takes the whole store as it is, with this patch on top, and the store
-            # writes this patch's keys, every one.
-            p["files"], _ = await _reconcile(
-                output, store, prior, index, content, new, removes, batch, attempt, generation
-            )
-            p["changed"], p["intended"] = None, own[0] | own[1]
-            continue
-        if unsettled:
-            p["intended"] = set(await _intended(info, keys_io, unsettled))
-            new, removes = await _repair(output, store, prior, p["intended"] - own[0] - own[1], new, removes)
-            p["new"], p["removes"] = new, removes
-        p["run"] = SortedRun.of(
-            [key_bytes(k) for k in new], list(new.values()), [key_bytes(k) for k in removes]
-        )
-    for name, p in pending.items():
-        if "run" in p and len(p["run"]) <= RESOLVE_KEYS:
-            asks.append(_ask_for(name, p, plans[name], spec))
-    engine = await _ask_engine(channel, invocation, asks)
-    for name, p in pending.items():
-        plan, info, output = plans[name], plans[name]["info"], plans[name]["output"]
-        index, replace, own, intended = plan["index"], p["replace"], p["own"], p["intended"]
-        if "files" not in p:
-            answer = engine.get(name)
-            if answer is not None:
-                p["files"], p["changed"] = await _upload(index, p["batch"], spec["attempt"], answer)
-            elif replace:
-                rows = (
-                    p["rows"] if "rows" in p else Rows.pairs(list(zip(*p["run"].entries()[:2], strict=True)))
-                )
-                try:
-                    p["files"], p["changed"] = await index.replace(
-                        rows, p["batch"], spec["attempt"], collect=LISTED, generation=p["generation"]
-                    )
-                except ValueError as e:  # a value with no digest, found as the join reaches it
-                    raise WriteError(f"{output.name}: {e}") from e
-            else:
-                p["files"], p["changed"] = await index.resolve(
-                    p["run"],
-                    batch=p["batch"],
-                    attempt=spec["attempt"],
-                    generation=p["generation"],
-                    collect=LISTED,
-                )
-        files, changed, unsettled = p["files"], p["changed"], p["unsettled"]
-        if not files.files and info.get("exists") and not unsettled:
+        if o.files is None:
+            await _resolve(o, spec, engine.get(name))
+        if not o.files.files and o.info.get("exists") and not o.unsettled:
             entries[name] = {"unchanged": True}
-            del plans[name]
+            del outs[name]
             continue
-        plan["keys"] = intents[name] = files.to_json()
-        if getattr(plan["store"], "writes", "overwrite") == "immutable":
-            # Every object it writes must be named by an index entry, or nothing ever
-            # collects it: exactly the keys the delta writes, paged from its files
-            # when there are too many to list (docs/lifecycle.md §9.8).
-            if changed is None:
-                plan["upserts"] = DeltaKeys(keys_io, index.prefix, tuple(files.files))
-            else:
-                plan["upserts"] = frozenset(map(key_str, changed[0]))
-                plan["removes"] = frozenset(map(key_str, changed[1]))
-        elif plan["prior"] is not None and not (replace and (changed is None or unsettled)):
-            # The store writes only what changes: the delta, and for a patch whatever a
-            # dead attempt may have left half-done among its keys. A replacement with
-            # more changes than it lists, or with dead attempts', rewrites the scope;
-            # a patch with more than it lists writes all of its own keys.
-            if changed is None:
-                plan["upserts"], plan["removes"] = frozenset(own[0]), frozenset(own[1])
-            else:
-                upserted, deleted = ({key_str(k) for k in keys} for keys in changed)
-                if replace:
-                    plan["upserts"], plan["removes"] = frozenset(upserted), frozenset(deleted)
-                else:
-                    plan["upserts"] = frozenset((upserted & own[0]) | (own[0] & intended))
-                    plan["removes"] = frozenset(deleted | (own[1] & intended))
-        if output.is_partition_set:
-            if replace:
-                elements = {str(e) for e in p["content"] or ()}
-            else:
-                elements = (set(info.get("elements") or ()) - set(p["removes"])) | set(p["new"])
-            plan["elements"] = sorted(elements)
+        intents[name] = o.files.to_json()
+        _select(o, keys_io)
 
-    gated = {n for n, plan in plans.items() if getattr(plan["store"], "writes", "overwrite") != "immutable"}
+    gated = {n for n, o in outs.items() if o.kind != "immutable"}
     try:
-        if plans:  # only by a worker about to write; a gate only for stores that take one (§2.4, §9.6)
+        if outs:  # only by a worker about to write; a gate only for stores that take one (§2.4, §9.6)
             await fence({n: i for n, i in intents.items() if n in gated}, bool(gated))
     except Aborted:
         # The engine has discarded this attempt's delta files; these came after.
         import obstore
 
-        paths = [plans[n]["index"].path(f["name"]) for n, files in intents.items() for f in files["files"]]
+        paths = [outs[n].index.path(f["name"]) for n, files in intents.items() for f in files["files"]]
         with contextlib.suppress(Exception):
             await obstore.delete_async(objects, paths)
         raise
 
     # Write: nothing reaches a store before the fence is ours.
-    for name, plan in plans.items():
-        value, output, store, info, prior = (
-            values[name],
-            plan["output"],
-            plan["store"],
-            plan["info"],
-            plan["prior"],
-        )
-        store_name = declared[name]["store"]
+    for name, o in outs.items():
+        output, store, store_name = o.output, o.store, declared[name]["store"]
+        scope = o.scope(spec, invocation)
         schema = None
         if output.migrations:
             migrate = getattr(store, "migrate", None)
@@ -664,37 +537,37 @@ async def _store_outputs(
                     f"{output.name}: store {store_name!r} has no migrate for declared migrations"
                 )
             try:
-                applied = await writes.call(migrate(output, output.migrations, scope=scope_of(plan)))
+                applied = await writes.call(migrate(output, output.migrations, scope=scope))
             except StoreError:
                 raise
             except Exception as error:
                 raise StoreError(f"{output.name}: migration failed: {error}") from error
             schema = applied[-1] if applied else output.migrations[-1].name
-        written = await writes.call(store.store(value, prior, scope_of(plan)))
+        written = await writes.call(store.store(o.value, o.prior, scope))
         entry = {}
-        if "index" in plan and isinstance(value, Sql):
+        if o.index is not None and o.sql:
             if written.keys is None:
                 raise StoreError(f"{output.name}: store {store_name!r} reported no keys for a Sql write")
-            files, _ = await plan["index"].replace(
+            files, _ = await o.index.replace(
                 written.keys,
-                int(info["batch"]),
+                int(o.info["batch"]),
                 spec["attempt"],
                 key=output.key,
                 revision=output.revision,
                 generation=int(spec.get("generation") or 0),
             )
             entry["keys"] = files.to_json()
-        elif "index" in plan:
-            entry["keys"] = plan["keys"]
-            if "elements" in plan:
-                entry["elements"] = plan["elements"]
+        elif o.index is not None:
+            entry["keys"] = intents[name]
+            if o.elements is not None:
+                entry["elements"] = o.elements
         if written.ref is None:
             continue
         ref = dataclasses.replace(written.ref, store=store_name)
         if schema is not None:
             ref = dataclasses.replace(ref, handle={**(ref.handle or {}), "schema": schema})
         entry["ref"] = ref.to_json()
-        rows = _rows(value)
+        rows = _rows(o.value)
         if rows is not None:
             entry["rows"] = rows
         entries[name] = entry
@@ -709,16 +582,196 @@ RESOLVE_ENTRIES = 2_000_000  # ...and for a replacement, its keys plus the live 
 RESOLVE_TIMEOUT = 5.0  # seconds the worker waits for the engine before resolving itself
 
 
-def _ask_for(name: str, p: dict, plan: dict, spec: dict) -> Ask:
+@dataclasses.dataclass
+class _Out:
+    """One output's write in an attempt, as the phases leave it: read once
+    (`prepared`), its patch's keys checked against what dead attempts left
+    (`new`, `removes`), resolved against its key index (`files`, and up to
+    `LISTED` keys what `changed`), and what its store is asked to write
+    (`upserts`, `selected`)."""
+
+    name: str
+    output: Output
+    store: Any
+    info: dict  # the spec's pin of the output
+    prior: Ref | None
+    value: Any
+    index: KeyIndex | None = None
+    prepared: Prepared | None = None
+    own: tuple[set, set] = (set(), set())  # a patch's own keys and removes
+    new: dict[str, bytes] = dataclasses.field(default_factory=dict)  # ...with repair's, to their versions
+    removes: list[str] = dataclasses.field(default_factory=list)
+    intended: set[str] = dataclasses.field(default_factory=set)  # keys dead attempts meant to change
+    files: DeltaFiles | None = None
+    changed: tuple | None = None  # ({key: version}, [removed key]), or None past LISTED
+    upserts: Any = None  # the store's selection (`Scope.upserts`, `Scope.removes`)
+    selected: frozenset[str] | None = None
+    elements: list[str] | None = None
+
+    @property
+    def kind(self) -> str:
+        return getattr(self.store, "writes", "overwrite")
+
+    @property
+    def sql(self) -> bool:
+        return isinstance(self.value, Sql)
+
+    @property
+    def replace(self) -> bool:
+        """A full replacement: a bare write, or with no prior (a first write or
+        a full run) a Patch, which is then the whole content."""
+
+        return not isinstance(self.value, Patch) or self.prior is None
+
+    @property
+    def unsettled(self) -> list:
+        return self.info.get("unsettled") or []
+
+    def scope(self, spec, invocation) -> Scope:
+        return Scope(
+            output=self.output,
+            partition=spec["partition"],
+            batch=self.info.get("batch"),
+            attempt=spec["attempt"],
+            aliases=tuple(self.info.get("aliases") or ()),
+            upserts=self.upserts,
+            removes=self.selected,
+            generation=spec.get("generation"),
+            invocation=invocation,
+            prepared=self.prepared,
+        )
+
+    def run(self) -> SortedRun:
+        """What a patch writes and removes, for a resolve."""
+
+        return SortedRun.of(
+            [key_bytes(k) for k in self.new], list(self.new.values()), [key_bytes(k) for k in self.removes]
+        )
+
+    def asks(self) -> bool:
+        """Whether the engine is asked to resolve this write (small enough)."""
+
+        if self.prepared is None or self.files is not None:
+            return False
+        if self.replace:
+            live = int(self.info["index"].get("count", 0))
+            return (
+                len(self.prepared.rows) + live <= RESOLVE_ENTRIES and len(self.prepared.rows) <= RESOLVE_KEYS
+            )
+        return len(self.new) + len(self.removes) <= RESOLVE_KEYS
+
+
+async def _prepare(o: _Out, spec, keys_io) -> None:
+    """Read a keyed write once (`solera.stores.Prepared`); for a patch, its
+    keys and versions, and what dead attempts left in the store: repaired
+    key by key (`_repair`), or — after an unknown `Sql` write — reconciled
+    whole (`_reconcile`), which resolves the write too."""
+
+    if o.info.get("index") is None:
+        if o.sql and o.output.incremental:
+            raise WriteError(f"{o.output.name}: Sql writes need a keyed output")
+        return
+    o.index = KeyIndex(keys_io, None, IndexState.from_json(o.info["index"]))
+    if o.sql:
+        if o.output.is_partition_set:
+            raise WriteError(f"{o.output.name}: Sql writes need a table output")
+        return
+    o.prepared = await asyncio.to_thread(prepare_for, o.store, o.value, o.output)
+    if o.replace:
+        return
+    o.new = dict(await _entries(o.output, o.prepared))
+    o.removes = list(o.prepared.removes)
+    o.own = (set(o.new), set(o.removes))
+    if any(intent.get("unknown") for intent in o.unsettled):
+        # A dead Sql writer's keys are unknown (docs/resolved-commits.md §3): the index
+        # takes the whole store as it is, with this patch on top, and the store
+        # writes this patch's keys, every one.
+        o.files, _ = await _reconcile(o, spec)
+        o.intended = o.own[0] | o.own[1]
+        return
+    if o.unsettled:
+        o.intended = set(await _intended(o.info, keys_io, o.unsettled))
+        await _repair(o, o.intended - o.own[0] - o.own[1])
+
+
+async def _entries(output, prepared: Prepared) -> list[tuple[str, bytes]]:
+    try:
+        return await asyncio.to_thread(prepared.entries)
+    except ValueError as e:  # a value with no digest
+        raise WriteError(f"{output.name}: {e}") from e
+
+
+async def _resolve(o: _Out, spec, answer) -> None:
+    """The write's delta: the engine's answer, uploaded as this attempt's
+    own; or a replacement streamed against the whole index; or a patch."""
+
+    batch, attempt = int(o.info["batch"]), spec["attempt"]
+    generation = int(spec.get("generation") or 0)  # each entry's locator (lifecycle.md §9.8)
+    if answer is not None:
+        o.files, o.changed = await _upload(o.index, batch, attempt, answer)
+    elif o.replace:
+        try:
+            o.files, o.changed = await o.index.replace(
+                o.prepared.rows, batch, attempt, collect=LISTED, generation=generation
+            )
+        except ValueError as e:  # a value with no digest, found as the join reaches it
+            raise WriteError(f"{o.output.name}: {e}") from e
+    else:
+        o.files, o.changed = await o.index.resolve(
+            o.run(), batch=batch, attempt=attempt, generation=generation, collect=LISTED
+        )
+
+
+def _select(o: _Out, keys_io) -> None:
+    """What the store is asked to write: each key to its version, and the
+    keys to delete — `None`, everything in the write."""
+
+    changed = o.changed
+    if o.kind == "immutable":
+        # Every object it writes must be named by an index entry, or nothing ever
+        # collects it: exactly the keys the delta writes, paged from its files
+        # when there are too many to list (docs/lifecycle.md §9.8).
+        if changed is None:
+            o.upserts = DeltaKeys(keys_io, o.index.prefix, tuple(o.files.files))
+        else:
+            o.upserts = {key_str(k): v for k, v in changed[0].items()}
+            o.selected = frozenset(map(key_str, changed[1]))
+    elif o.prior is not None and not (o.replace and (changed is None or o.unsettled)):
+        # The store writes only what changes: the delta, and for a patch whatever a
+        # dead attempt may have left half-done among its keys. A replacement with
+        # more changes than it lists, or with dead attempts', rewrites the scope;
+        # a patch with more than it lists writes all of its own keys.
+        own, intended = o.own, o.intended
+        if changed is None:
+            o.upserts, o.selected = {k: o.new[k] for k in own[0]}, frozenset(own[1])
+        else:
+            upserted = {key_str(k): v for k, v in changed[0].items()}
+            deleted = {key_str(k) for k in changed[1]}
+            if o.replace:
+                o.upserts, o.selected = upserted, frozenset(deleted)
+            else:
+                keys = (set(upserted) & own[0]) | (own[0] & intended)
+                o.upserts = {k: o.new[k] for k in keys}
+                o.selected = frozenset(deleted | (own[1] & intended))
+    if o.output.is_partition_set:
+        if o.replace:
+            o.elements = sorted(set(o.prepared.payload))
+        else:
+            o.elements = sorted((set(o.info.get("elements") or ()) - set(o.removes)) | set(o.new))
+
+
+def _ask_for(o: _Out, spec: dict) -> Ask:
+    run = SortedRun.from_rows(o.prepared.rows) if o.replace else o.run()
+    batch = int(o.info["batch"])
     return Ask(
-        name,
+        o.name,
         spec["partition"],
-        "replace" if p["replace"] else "patch",
-        p["batch"],
-        p["generation"],
-        plan["info"]["index"]["prefix"],
-        p["batch"] - 1,
-        p["run"],
+        "replace" if o.replace else "patch",
+        batch,
+        int(spec.get("generation") or 0),
+        o.info["index"]["prefix"],
+        batch - 1,
+        run,
     )
 
 
@@ -767,102 +820,100 @@ async def _intended(info, keys_io, unsettled) -> list[str]:
             return found
 
 
-async def _repair(output, store, prior, left, new, removes):
+async def _repair(o: _Out, left) -> None:
     """Take in what dead attempts left in the store (§8). Keys this patch
     writes or removes end as it says either way; the others (`left`) are
     read back, and the index learns what landed as part of this commit's
-    delta. Returns the key map and removes to check against the index."""
+    delta."""
 
-    new, removes, left = dict(new), list(removes), sorted(left)
+    left = sorted(left)
     for i in range(0, len(left), REPAIR_PAGE):
         page = left[i : i + REPAIR_PAGE]
-        loaded = await store.load(prior, None, Keys(dict.fromkeys(page, (b"", 0))))
-        found = await _versions(output, await asyncio.to_thread(store_key_rows, store, loaded, output))
-        new.update(found)
-        removes.extend(k for k in page if k not in found)
-    return new, removes
+        loaded = await o.store.load(o.prior, None, Keys(dict.fromkeys(page, (b"", 0))))
+        found = dict(
+            await _entries(o.output, await asyncio.to_thread(prepare_for, o.store, loaded, o.output))
+        )
+        o.new.update(found)
+        o.removes.extend(k for k in page if k not in found)
 
 
-async def _reconcile(output, store, prior, index, content, new, removes, batch, attempt, generation):
+async def _reconcile(o: _Out, spec):
     """The delta of a patch over a store a dead `Sql` writer changed in ways no
     key list records: the store's rows as they are — streamed back sorted a
-    chunk at a time by its `scan`, read as a `Sql` write reports them — with
-    this patch's rows in place of their keys' and its removes gone, against
-    the pinned index: a streamed replacement. Memory is a chunk and the patch."""
+    chunk at a time by its `scan`, versioned as a `Sql` write's rows are —
+    with this patch's keys in place of theirs (an empty group included) and
+    its removes gone, against the pinned index: a streamed replacement.
+    Memory is a chunk and the patch."""
 
-    skip = set(new) | set(removes)
-    patch = sorted(
-        ((key_bytes(key_text(r[output.key])), r) for r in _rows_of(output, content)), key=lambda e: e[0]
-    )
+    output, store = o.output, o.store
+    skip = sorted(set(o.new) | set(o.removes))
     scan = getattr(store, "scan", None)
     if scan is not None:
-        chunks = scan(prior, output, sorted(skip))
+        chunks = scan(o.prior, output, skip)
     else:  # a store that cannot stream its rows back: read them whole
-        loaded = _rows_of(output, await store.load(prior, None, None))
-        chunks = [
-            sorted(
-                (r for r in loaded if key_text(r[output.key]) not in skip),
-                key=lambda r: key_bytes(key_text(r[output.key])),
-            )
-        ]
-    stamped = getattr(store, "stamped", None)
-    return await index.replace(
-        _merged(chunks, patch, output.key),
-        batch,
-        attempt,
+        chunks = [await store.load(o.prior, None, None)]
+    patch = sorted(((key_bytes(k), v) for k, v in o.new.items()), key=lambda e: e[0])
+    return await o.index.replace(
+        _merged(_scanned(chunks, o, set(skip)), patch),
+        int(o.info["batch"]),
+        spec["attempt"],
         collect=LISTED,
-        key=output.key,
-        revision=output.revision,
-        exclude=tuple(stamped(output)) if stamped else (),
-        generation=generation,
+        generation=int(spec.get("generation") or 0),
     )
 
 
-def _rows_of(output, value) -> list:
-    """Rows as dicts, from whatever `key_rows` takes: lists of dicts, pandas
-    DataFrames, and Arrow (anything with `__arrow_c_stream__`)."""
+def _scanned(chunks, o: _Out, skip: set[str]):
+    """The `(key bytes, version)` of a store's rows, sorted, a chunk at a time
+    but those of keys in `skip`. A key's rows may go on in the next chunk, so
+    each chunk's last key waits for it."""
+
+    key, carry = o.output.key, []
+    for chunk in chunks:
+        rows = carry + [r for r in _rows_list(o.output, chunk) if key_text(r[key]) not in skip]
+        if not rows:
+            carry = []
+            continue
+        last, cut = key_text(rows[-1][key]), len(rows)
+        while cut and key_text(rows[cut - 1][key]) == last:
+            cut -= 1
+        done, carry = rows[:cut], rows[cut:]
+        if done:
+            yield [(key_bytes(k), v) for k, v in prepare_for(o.store, done, o.output).entries()]
+    if carry:
+        yield [(key_bytes(k), v) for k, v in prepare_for(o.store, carry, o.output).entries()]
+
+
+def _rows_list(output, value) -> list:
+    """Rows as mappings, from lists of mappings, DataFrames or Arrow data."""
 
     if value is None:
         return []
-    if type(value).__name__ == "DataFrame" and type(value).__module__.startswith("pandas"):
+    if isinstance(value, list):
+        return value
+    if type(value).__name__ == "DataFrame":
         return value.to_dict(orient="records")
     if hasattr(value, "__arrow_c_stream__"):
         import pyarrow as pa
 
         return pa.table(value).to_pylist()
-    if not isinstance(value, list):
-        raise WriteError(
-            f"{output.name}: expected rows (list[dict] or DataFrame), got {type(value).__name__}"
-        )
-    return value
+    raise WriteError(f"{output.name}: expected rows (list[dict] or DataFrame), got {type(value).__name__}")
 
 
-def _merged(chunks, patch: list, key: str):
-    """Row chunks sorted by key, with `patch` — `(key bytes, row)`, sorted, of
-    keys the chunks do not hold — merged in."""
+def _merged(scanned, patch: list):
+    """Sorted `(key, version)` chunks with `patch` — sorted, of keys they do
+    not hold — merged in."""
 
     i = 0
-    for chunk in chunks:
+    for chunk in scanned:
         out = []
-        for row in chunk:
-            at = key_bytes(key_text(row[key]))
-            while i < len(patch) and patch[i][0] < at:
-                out.append(patch[i][1])
+        for entry in chunk:
+            while i < len(patch) and patch[i][0] < entry[0]:
+                out.append(patch[i])
                 i += 1
-            out.append(row)
+            out.append(entry)
         yield out
     if i < len(patch):
-        yield [row for _, row in patch[i:]]
-
-
-async def _versions(output, rows) -> dict[str, bytes]:
-    """A patch's keys and versions — few enough to check one by one."""
-
-    try:
-        keys, versions = await asyncio.to_thread(rows.entries)
-    except ValueError as e:  # a value with no digest
-        raise WriteError(f"{output.name}: {e}") from e
-    return dict(zip(map(key_str, keys), versions, strict=True))
+        yield patch[i:]
 
 
 class Writes:
@@ -968,7 +1019,7 @@ async def run_attempt(
     shipper = LogShipper(objects, base, channel, invocation)
     writes = Writes()
     execution = asyncio.create_task(
-        _execute(objects, objects_url, base, spec, entrypoint, timeline, shipper, writes, invocation, control)
+        _execute(objects, base, spec, entrypoint, timeline, shipper, writes, invocation, control)
     )
     reporter = Reporter(
         objects, base, invocation, channel, spec.get("heartbeat", 10), timeline, on_cancel, on_ended
@@ -1086,7 +1137,7 @@ async def _publish(objects, base, result, invocation, writes, cancel, timeline, 
 
 
 async def _execute(
-    objects, objects_url, base, spec, entrypoint, timeline, shipper, writes, invocation, control
+    objects, base, spec, entrypoint, timeline, shipper, writes, invocation, control
 ) -> dict | None:
     """Run the attempt: its result, or `None` once the engine ended it."""
 

@@ -9,7 +9,7 @@ import json
 import os
 import pickle
 import typing
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 from urllib.parse import quote, unquote
@@ -69,8 +69,9 @@ class Scope:
     incremental outputs, `attempt` the writing attempt's id, `aliases` the
     output's former names.
 
-    For a keyed output the harness says which keys the write changes against
-    the key index: `upserts` are the keys to write, `removes` the keys to
+    For a keyed output the harness reads the write once (`prepared`) and
+    says which keys it changes against the key index: `upserts` are the keys
+    to write, each to the version the index will hold, `removes` the keys to
     delete. A store may write only those; `None` means unknown — everything
     in the write, and for a replacement, every key not in it goes. Past
     what fits in a list, an immutable store's `upserts` is a
@@ -83,12 +84,13 @@ class Scope:
     batch: int | None = None
     attempt: str | None = None
     aliases: tuple = ()
-    upserts: Any = None  # frozenset[str], a `DeltaKeys`, or None
+    upserts: Any = None  # Mapping[str, bytes], a `DeltaKeys`, or None
     removes: frozenset[str] | None = None
     # The attempt's generation and invocation, for a `fenced` store to check
     # (docs/lifecycle.md §9.7); `None` outside an attempt.
     generation: int | None = None
     invocation: str | None = None
+    prepared: Prepared | None = None
 
 
 @dataclass(frozen=True)
@@ -107,11 +109,8 @@ class Written:
 
 @runtime_checkable
 class Store(Protocol):
-    """A store may also define `key_rows(write, output) -> solera.keys.Rows`:
-    a keyed write's content — the whole write, or a `Patch`'s rows — for the
-    key index, read from the store's own types (§6, docs/row-digest.md).
-    Without it, `key_rows` below reads lists of dicts, dicts, DataFrames and
-    Arrow data.
+    """A store may also define `stamped(output)`: columns it adds to every
+    row itself, which a row's digest leaves out (docs/row-digest.md).
 
     `writes` says how it writes, which decides what the engine may do once
     it gave up on a writer (docs/lifecycle.md §9.6): `"immutable"` (it only
@@ -238,99 +237,146 @@ def by_key(write: Any, output: Output) -> tuple[Any, list[str]] | None:
     return rows + [r for f in frames for r in f.to_dict(orient="records")], empty
 
 
-def entries(output: Output, value: Any) -> dict[str, Any]:
-    """A keyed write's content as `key -> entry` (§4): a `keyed=True`
-    output's dict, a partition set's elements, or rows grouped by their key
-    column — every key holds the list of rows that carry it."""
+@dataclass(frozen=True)
+class Prepared:
+    """A keyed write, read once for the key index and for its store (§4, §6).
 
-    if output.is_partition_set:
-        return {str(e): str(e) for e in value or ()}
-    if output.key == KEYS:
-        if value is None:
-            return {}
-        if not isinstance(value, Mapping) or not all(isinstance(k, str) for k in value):
-            raise WriteError(
-                f"{output.name}: a keyed output takes dict[str, Any], got {type(value).__name__}"
-            )
-        return dict(value)
-    result: dict[str, list] = {}
-    flat = by_key(value, output)
-    if flat is not None:
-        value = flat[0]
-        result.update((k, []) for k in flat[1])
-    for row in _rows(value, output.name):
-        if output.key not in row:
-            raise WriteError(f"{output.name}: row lacks the declared key column {output.key!r}")
+    `rows` holds its keys, sorted, each the group of rows that carry it,
+    with versions computed natively (`solera.keys.Rows`, docs/row-digest.md):
+    the key index reads it to work out what changed, and the store, asked to
+    write some keys, reads their groups from `payload` (`groups`) — what the
+    producer returned, flattened, kept in its own types until the store
+    serializes it: rows (a list of mappings, a DataFrame or an Arrow table),
+    a `keyed=True` output's `(key, value)` items, or a partition set's
+    elements. A `Patch` also names the keys it `removes`, none it writes."""
+
+    output: Output
+    payload: Any
+    rows: Any
+    patch: bool = False
+    removes: tuple[str, ...] = ()
+
+    def groups(self, keys: Sequence[str]) -> list:
+        """Each key's group, as its store writes it: the list of its rows as
+        mappings, a `keyed=True` output's value, or a partition set's element."""
+
         try:
-            result.setdefault(key_text(row[output.key]), []).append(row)
-        except WriteError as e:
-            raise WriteError(f"{output.name}: {e}") from None
-    return result
+            rows, ends = self.rows.find(list(keys))
+        except KeyError as e:
+            raise StoreError(
+                f"{self.output.name}: asked to write key {e.args[0]!r}, which the write does not hold"
+            ) from None
+        if self.output.is_partition_set:
+            return list(keys)
+        if self.output.key == KEYS:
+            return [self.payload[r][1] for r in rows]
+        picked = _take(self.payload, rows)
+        return [picked[a:b] for a, b in zip([0, *ends], ends, strict=False)]
+
+    def all_rows(self) -> list[dict]:
+        """Every row of a rows output, as mappings."""
+
+        return _take(self.payload, None)
+
+    def entries(self) -> list[tuple[str, bytes]]:
+        """Every key and its version, in key order."""
+
+        from .keys.index import key_str
+
+        keys, versions = self.rows.entries()
+        return list(zip(map(key_str, keys), versions, strict=True))
+
+    def version(self, prior: Ref | None) -> str:
+        """The written ref's version (§3): a replacement's is its content's,
+        every key and version; a patch's, its prior's and its own content's
+        and removes. Free once the key index has read the write."""
+
+        content = self.rows.digest().hex()
+        if self.patch and prior is not None:
+            return _digest([prior.version, content, list(self.removes)])
+        return _digest(["rows", content])
 
 
-def key_rows(write: Any, output: Output, exclude: tuple[str, ...] = ()):
-    """A keyed write's content for the key index (`solera.keys.Rows`), every
-    key the group of rows that carry it, with versions computed natively as
-    the index reaches each key (docs/row-digest.md). Arrow data (anything
-    with `__arrow_c_stream__`) is read in place; a DataFrame becomes Arrow
-    through DuckDB. A row's digest leaves out its key column and the
-    `exclude`d ones — columns its store adds, so a row digests the same as
-    written and as read back."""
+def _take(payload: Any, rows: list[int] | None) -> list:
+    """Rows of `payload` as mappings — those at `rows`, in that order, or all."""
+
+    if isinstance(payload, list):
+        return payload if rows is None else [payload[r] for r in rows]
+    if _is_dataframe(payload):
+        return (payload if rows is None else payload.iloc[rows]).to_dict(orient="records")
+    return (payload if rows is None else payload.take(rows)).to_pylist()  # an Arrow table
+
+
+def prepare(write: Any, output: Output, exclude: tuple[str, ...] = ()) -> Prepared:
+    """A keyed write — the whole content, or a `Patch` — read once
+    (`Prepared`): lists of mappings, by-key mappings (`{key: rows}`), pandas
+    DataFrames (made Arrow through DuckDB), Arrow data, a `keyed=True`
+    output's dict, a partition set's elements. A row's digest leaves out
+    its key column and the `exclude`d ones — columns its store adds, so a
+    row digests the same as written and as read back."""
 
     from .keys import Rows
 
     name = output.name
+    patch = isinstance(write, Patch)
+    content = write.rows if patch else write
     try:
         if output.is_partition_set:
-            return Rows.keys([str(e) for e in write or ()], b"1")
-        if output.key == KEYS:
-            if write is None:
-                write = {}
-            if not isinstance(write, Mapping) or not all(isinstance(k, str) for k in write):
-                raise WriteError(f"{name}: a keyed output takes dict[str, Any], got {type(write).__name__}")
-            return Rows.values(list(write.items()))
-        flat = by_key(write, output)
-        if flat is not None:
-            return _with_empty(key_rows(flat[0], output, exclude), flat[1])
-        if _is_dataframe(write):
-            import duckdb
+            payload = [str(e) for e in content or ()]
+            rows = Rows.keys(payload, b"1")
+        elif output.key == KEYS:
+            if content is None:
+                content = {}
+            if not isinstance(content, Mapping) or not all(isinstance(k, str) for k in content):
+                raise WriteError(f"{name}: a keyed output takes dict[str, Any], got {type(content).__name__}")
+            payload = list(content.items())
+            rows = Rows.values(payload)
+        else:
+            payload, empty = content, []
+            flat = by_key(content, output)
+            if flat is not None:
+                payload, empty = flat
+            if _is_dataframe(payload):
+                import duckdb
 
-            write = duckdb.connect().from_df(write)
-        if hasattr(write, "__arrow_c_stream__"):
-            return Rows.arrow(write, output.key, output.revision, list(exclude))
-        if write is None:
-            write = []
-        if not isinstance(write, list) or not all(isinstance(r, Mapping) for r in write):
-            raise WriteError(f"{name}: expected rows (list[dict] or DataFrame), got {type(write).__name__}")
-        return Rows.records(write, output.key, output.revision, list(exclude))
+                rows = Rows.arrow(
+                    duckdb.connect().from_df(payload), output.key, output.revision, list(exclude), empty
+                )
+            elif hasattr(payload, "__arrow_c_stream__"):
+                import pyarrow as pa
+
+                if not isinstance(payload, pa.Table):  # a stream reads once: hold it
+                    payload = pa.table(payload)
+                rows = Rows.arrow(payload, output.key, output.revision, list(exclude), empty)
+            else:
+                if payload is None:
+                    payload = []
+                if not isinstance(payload, list) or not all(isinstance(r, Mapping) for r in payload):
+                    raise WriteError(
+                        f"{name}: expected rows (list[dict] or DataFrame), got {type(payload).__name__}"
+                    )
+                rows = Rows.records(payload, output.key, output.revision, list(exclude), empty)
+        removes = ()
+        if patch:
+            removes = tuple(k for k in sorted(set(map(key_text, write.remove))) if k not in rows)
     except KeyError as e:
         raise WriteError(f"{name}: row lacks the declared key column {output.key!r}") from e
     except ValueError as e:  # a key that is not one, Arrow data without the columns, a value with no digest
         raise WriteError(f"{name}: {e}") from e
+    return Prepared(output, payload, rows, patch, removes)
 
 
-def _with_empty(rows, empty: list[str]):
-    """`rows`, and keys whose group is empty at the empty group's version —
-    whatever `revision=` says, since no row carries one (per-key §6)."""
+def prepare_for(store: Any, write: Any, output: Output) -> Prepared:
+    """`prepare`, leaving out the columns `store` adds itself (`stamped`)."""
 
-    if not empty:
-        return rows
-    from ._native import group_digest
-    from .keys import Rows
-    from .keys.index import key_bytes
-
-    keys, versions = rows.entries()
-    pairs = list(zip(keys, versions, strict=True))
-    nothing = group_digest([])
-    pairs += [(key_bytes(k), nothing) for k in empty]
-    return Rows.pairs(sorted(pairs))
+    stamped = getattr(store, "stamped", None)
+    return prepare(write, output, tuple(stamped(output)) if stamped is not None else ())
 
 
-def store_key_rows(store: Store, write: Any, output: Output):
-    """`store.key_rows`, or the default `key_rows`."""
+def key_rows(write: Any, output: Output, exclude: tuple[str, ...] = ()):
+    """A keyed write's `solera.keys.Rows` (`prepare`)."""
 
-    own = getattr(store, "key_rows", None)
-    return own(write, output) if own is not None else key_rows(write, output)
+    return prepare(write, output, exclude).rows
 
 
 def remove_empty_dirs(objects, prefixes) -> None:
@@ -438,7 +484,8 @@ class FileStore:
         if output.is_partition_set:
             return await self._store_set(write, prior, scope, base, generation)
         if output.key is not None:
-            return await self._store_keyed(write, prior, scope, base, generation)
+            prepared = scope.prepared or await asyncio.to_thread(prepare_for, self, write, output)
+            return await self._store_keyed(prepared, prior, scope, base, generation)
         if output.incremental:
             if not patch:
                 raise WriteError(f"{output.name}: an unkeyed incremental output only accepts Patch writes")
@@ -450,52 +497,32 @@ class FileStore:
     async def _store_set(self, write, prior, scope, base, generation) -> Written:
         """A partition set: its element list, as one value."""
 
-        if isinstance(write, Patch):
-            elements = list(entries(scope.output, write.rows))
-            if prior is not None:
-                drop = {str(k) for k in write.remove} | set(elements)
-                elements = [e for e in await self._elements(prior) if e not in drop] + elements
-        else:
-            elements = list(entries(scope.output, write))
+        elements = (scope.prepared or prepare(write, scope.output)).payload
+        if isinstance(write, Patch) and prior is not None:
+            drop = {key_text(k) for k in write.remove} | set(elements)
+            elements = [e for e in await self._elements(prior) if e not in drop] + elements
         name = f"{base}@{generation}"
         version = await self._put(name, elements)
         return Written(self._ref(scope, {"mode": "set", "path": name, "base": base}, version))
 
-    async def _store_keyed(self, write, prior, scope, base, generation) -> Written:
+    async def _store_keyed(self, prepared: Prepared, prior, scope, base, generation) -> Written:
         """One object per key and version. The harness says which keys
-        changed (`Scope.upserts`) — listed, or paged from the commit's delta
-        files when there are too many to list; only those are written, at
-        the versions the key index will hold, so no object goes unnamed.
-        Removed keys need no write: the index stops naming them, and
-        `discard` deletes what nothing reads."""
+        changed, each to its version (`Scope.upserts`) — listed, or paged
+        from the commit's delta files when there are too many to list; only
+        their groups are read from the write and written, named by the
+        versions the key index will hold, so no object goes unnamed. Removed
+        keys need no write: the index stops naming them, and `discard`
+        deletes what nothing reads."""
 
-        output = scope.output
-        patch = isinstance(write, Patch)
-        rows = write.rows if patch else write
-        content = entries(output, rows)
-        from .keys.index import key_str
+        async def put(entry) -> None:
+            (key, version), group = entry
+            await self._put(self.key_name(base, key, version, generation), group)
 
-        keys, versions = store_key_rows(self, rows, output).entries()
-        version_of = {key_str(k): v for k, v in zip(keys, versions, strict=True)}
-
-        async def put(key: str) -> str:
-            if key not in content:
-                raise StoreError(f"{output.name}: asked to write key {key!r}, which the write does not hold")
-            return await self._put(self.key_name(base, key, version_of[key], generation), content[key])
-
-        start = "" if (not patch or prior is None) else prior.version
-        digest = hashlib.sha256(json.dumps([start, scope.batch]).encode())
-        async for page in _pages(scope.upserts, content):
-            for key, revision in zip(page, await self._many(put, page), strict=True):
-                digest.update(json.dumps([key, revision]).encode())
-        removes = (
-            sorted(scope.removes)
-            if scope.removes is not None
-            else sorted(key_text(k) for k in (write.remove if patch else ()))
-        )
-        version = _digest([digest.hexdigest(), removes])
-        handle = {"mode": "keyed", "path": base, "key": output.key}
-        return Written(self._ref(scope, handle, version))
+        async for page in _selected(scope.upserts, prepared):
+            groups = await asyncio.to_thread(prepared.groups, [k for k, _ in page])
+            await self._many(put, zip(page, groups, strict=True))
+        handle = {"mode": "keyed", "path": base, "key": scope.output.key}
+        return Written(self._ref(scope, handle, prepared.version(prior)))
 
     async def _store_batch(self, write: Patch, prior, scope, base, generation) -> Written:
         """An unkeyed incremental write: its items, as one object per batch.
@@ -747,17 +774,22 @@ class S3Store(FileStore):
         return self._stores[""]
 
 
-async def _pages(upserts, content: dict):
-    """The keys a keyed write writes, sorted, a page at a time: every key of
-    the content, the listed ones, or the pages of a delta's selection."""
+async def _selected(upserts, prepared: Prepared, size: int = 100_000):
+    """The keys a keyed write writes, each with its version, sorted, a page at
+    a time: every key of the write, the listed ones, or the pages of a
+    delta's selection."""
 
     if upserts is None:
-        yield sorted(content)
-    elif isinstance(upserts, (set, frozenset)):
-        yield sorted(upserts)
+        entries = await asyncio.to_thread(prepared.entries)
+        for i in range(0, len(entries), size):
+            yield entries[i : i + size]
+    elif isinstance(upserts, Mapping):
+        entries = sorted(upserts.items())
+        for i in range(0, len(entries), size):
+            yield entries[i : i + size]
     else:
-        async for page in upserts.pages():
-            yield [k for k, _ in page]
+        async for page in upserts.pages(size):
+            yield page
 
 
 def _digest(value: Any) -> str:

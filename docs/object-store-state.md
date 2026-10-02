@@ -368,7 +368,7 @@ them as it versions any rows, so nothing is sorted or held.
 
 | Operation | Who | How |
 |---|---|---|
-| Compute a delta | harness, at write time | Extract `(key, version)` from the written rows with the store's `key_rows` (the declared `revision` column's text, else the 16-byte digest of the key's rows, `row-digest.md`), against the index **as pinned in the spec**. A patch is checked with the filters and the read strategy above: keep entries whose version changed, plus `deleted` entries for removed keys that may exist. A full replacement is the streaming merge-join above. Either way the result is the batch's delta files, split at ~64 MB. |
+| Compute a delta | harness, at write time | Read the write once (`Prepared`, `per-key-processing.md` §7): its `(key, version)` entries (the declared `revision` column's text, else the 16-byte digest of the key's rows, `row-digest.md`), against the index **as pinned in the spec**. A patch is checked with the filters and the read strategy above: keep entries whose version changed, plus `deleted` entries for removed keys that may exist. A full replacement is the streaming merge-join above. Either way the result is the batch's delta files, split at ~64 MB. |
 | Commit | engine | Add the delta file to level 0 and to `log`; `count += added − removed`, and `inexact += 1` if the count change came from filters. The scope lock — one attempt per (asset, scope) from launch to settlement — guarantees the index didn't change underneath. |
 | Deliver pending deltas | harness, for an `Incremental` edge | Read the `log` files from the watermark to the head; chunk by `batch_size` in key order; ask the upstream store for those rows with `Keys(…)`. |
 | Full delivery | harness | Page through the merged view of all levels from `after`, `batch_size` keys at a time, and ask the store for them with `Keys(…)`. Per level, only the files covering the page are opened, and only their index parts are read — or the whole file, once, when it is small (below one request's latency worth of transfer, ~2.4 MB). A multi-page scan keeps each file's last fetched blocks for the next page, so it reads every block once. |
@@ -758,11 +758,13 @@ class Store(Protocol):
 
 - `Scope` carries the engine-assigned `batch`, the `attempt` id, its
   `generation` and `invocation` (`lifecycle.md` §9.7–9.8) and the
-  output's `aliases`. For a keyed output it also says which keys the write
-  changes against the key index: `upserts` to write, `removes` to delete.
-  Both are `None` when there is no prior (a first write or a `full` run):
-  the store then writes everything and deletes whatever else it holds.
-  A patch that changes 3 keys of 100,000 reaches the store as 3 upserts.
+  output's `aliases`. For a keyed output it also carries the write, read
+  once (`prepared`), and says which keys it changes against the key index:
+  `upserts` to write, each to the version the index will hold, `removes` to
+  delete. Both are `None` when there is no prior (a first write or a
+  `full` run): the store then writes everything and deletes whatever else
+  it holds. A patch that changes 3 keys of 100,000 reaches the store as 3
+  upserts, and the store reads only their groups.
 - `Written.keys` is only for writes the harness never sees as rows
   (§6); for everything else the harness computes keys itself.
 - **Reads are pinned by immutable stores only.** FileStore and S3Store

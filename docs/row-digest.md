@@ -124,15 +124,17 @@ one key with different revisions.
 
 ## Where versions come from
 
-Stores hand the worker a write's content as native `Rows`
-(`Store.key_rows`, default `solera.stores.key_rows`): `Rows.records` for
+The harness reads a keyed write once as native `Rows`
+(`solera.stores.prepare`, `per-key-processing.md` §7): `Rows.records` for
 Python rows, `Rows.arrow` for Arrow data (a pandas DataFrame through
-DuckDB), `Rows.values` for `keyed=True`, `Rows.keys` for partition sets.
-Keys are sorted natively, each run of equal keys is folded into one
-version, and no per-key Python object is made. A patch's keys, versions
-and removes become one `SortedRun`, native through every resolver — the
-sparse reader, the streaming patch, the engine's cache — and encoded only
-to cross the wire.
+DuckDB), `Rows.values` for `keyed=True`, `Rows.keys` for partition sets;
+a store leaves out the columns it adds (`Store.stamped`). Keys are sorted
+natively, each run of equal keys is folded into one version, and no
+per-key Python object is made. A patch's keys, versions and removes
+become one `SortedRun`, native through every resolver — the sparse
+reader, the streaming patch, the engine's cache — and encoded only to
+cross the wire. The store's version (`Rows.digest()`, every key and
+version) and the groups it writes (`Rows.find`) read the same `Rows`.
 
 A `Sql` write's rows never pass through the worker: after writing, its
 store reads them back sorted by key — the key and the revision column, or

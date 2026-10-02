@@ -402,37 +402,51 @@ async def test_reconciliation_streams_the_slice_and_digests_rows_as_written(stor
     """After a dead `Sql` writer, a patch reconciles the whole slice: read
     back through `scan` a chunk at a time — never loaded whole — and digested
     as written rows are, without the partition column the store stamps. An
-    unchanged stored row stays unchanged."""
+    unchanged stored row stays unchanged. A by-key patch reconciles like any:
+    its empty group is a key, with no rows."""
 
     from obstore.store import MemoryStore
     from solera.keys import _python
     from solera.keys.index import IndexState, KeyIndex
     from solera.keys.io import ObjectIO
+    from solera.stores import prepare_for
     from solera_worker import worker
 
     out = output(key="id", partition_column="site")
-    rows = [{"id": "a", "x": 1}, {"id": "c", "x": 3}]
+    rows = [{"id": "a", "x": 1}, {"id": "c", "x": 3}, {"id": "e", "x": 5}]
     written = await store.store(rows, None, scope(out, partition="oakland"))
     io = ObjectIO(MemoryStore())
     state = IndexState(prefix="keys/")
-    files, _ = await KeyIndex(io, None, state).replace(store.key_rows(rows, out), 0, "w1")
+    files, _ = await KeyIndex(io, None, state).replace(prepare_for(store, rows, out).rows, 0, "w1")
     state = state.committed(0, files, keep_log=True)
 
     async def no_load(*args, **kwargs):
         raise AssertionError("reconciliation streams the slice, it never loads it whole")
 
     monkeypatch.setattr(store, "load", no_load)
-    patch = [{"id": "b", "x": 2, "site": "oakland"}]  # a row may carry the stamped column, or not
-    keys, versions = store.key_rows(patch, out).entries()
-    new = dict(zip((k.decode() for k in keys), versions, strict=True))
-    delta, _ = await worker._reconcile(
-        out, store, written.ref, KeyIndex(io, None, state), patch, new, ["c"], 1, "w2", 2
-    )
-    got = [
-        e[:3] for f in delta.files for e in _python.iter_file(await io.read_whole(state.path(f.name), f.size))
-    ]
-    assert got == [(b"b", new["b"], 0), (b"c", b"", 1)]  # `a` is unchanged
-    assert new["b"] == store.key_rows([{"id": "b", "x": 2}], out).entries()[1][0]
+    monkeypatch.setattr("solera_postgres.KEY_CHUNK", 1)  # every key's rows in a chunk of their own
+    # A row may carry the stamped column, or not.
+    for attempt, patch in enumerate(
+        (
+            Patch([{"id": "b", "x": 2, "site": "oakland"}], remove=["c"]),
+            Patch({"b": [{"x": 2}], "d": []}, remove=["c"]),
+        )
+    ):
+        o = worker._Out("t", out, store, {"batch": 1, "unsettled": [{"unknown": True}]}, written.ref, patch)
+        o.index = KeyIndex(io, None, state)
+        o.prepared = prepare_for(store, patch, out)
+        o.new, o.removes = dict(o.prepared.entries()), list(o.prepared.removes)
+        delta, _ = await worker._reconcile(o, {"attempt": f"w{attempt + 2}", "generation": attempt + 2})
+        got = [
+            e[:3]
+            for f in delta.files
+            for e in _python.iter_file(await io.read_whole(state.path(f.name), f.size))
+        ]
+        expected = [(b"b", o.new["b"], 0), (b"c", b"", 1)]  # `a` and `e` are unchanged
+        if "d" in o.new:
+            expected.insert(2, (b"d", o.new["d"], 0))
+        assert got == expected
+        assert o.new["b"] == dict(prepare_for(store, [{"id": "b", "x": 2}], out).entries())["b"]
 
 
 def in_thread(coroutine) -> tuple:
@@ -653,3 +667,48 @@ async def test_a_missing_grant_role_is_skipped_without_aborting_the_write(store)
         with psycopg.connect(DSN, autocommit=True) as conn:
             conn.execute(f'DROP OWNED BY "{role}"')
             conn.execute(f'DROP ROLE "{role}"')
+
+
+async def test_versions_come_from_the_row_grammar(store):
+    """§3: a write's version is computed from what its rows are
+    (docs/row-digest.md), so decimals and timestamps — keyed or not, rows or
+    a DataFrame — are versioned like any value, and equal content keeps its
+    version."""
+
+    import datetime as dt
+    from decimal import Decimal
+
+    import pandas as pd
+
+    rows = [{"id": "a", "v": Decimal("1.2"), "at": dt.datetime(2026, 1, 1, tzinfo=dt.UTC)}]
+    keyed = output(key="id", columns={"v": "numeric", "at": "timestamptz"})
+    first = await store.store(rows, None, scope(keyed))
+    again = await store.store([dict(r) for r in rows], first.ref, scope(keyed))
+    assert again.ref.version == first.ref.version
+    changed = await store.store([{**rows[0], "v": Decimal("1.3")}], first.ref, scope(keyed))
+    assert changed.ref.version != first.ref.version
+    plain = output(columns={"v": "numeric", "at": "timestamptz"})
+    await store.store(rows, None, scope(plain))
+    frame = pd.DataFrame({"id": ["a", "b"], "at": pd.to_datetime(["2026-01-01", "2026-01-02"], utc=True)})
+    await store.store(frame, None, scope(output(key="id")))
+
+
+async def test_a_replacement_writes_only_the_keys_it_is_asked_to(store):
+    """§4: with a selection, a replacement changes only the selected keys —
+    content and key events never disagree; with none, it is the whole slice."""
+
+    out = output(key="id", revision="r")
+    first = await store.store(
+        [{"id": "a", "r": "1", "v": 10}, {"id": "b", "r": "1", "v": 20}, {"id": "c", "r": "1", "v": 30}],
+        None,
+        scope(out),
+    )
+    later = [{"id": "a", "r": "1", "v": 999}, {"id": "b", "r": "2", "v": 21}]
+    written = await store.store(later, first.ref, scope(out, upserts={"b": b"2"}, removes=frozenset({"c"})))
+    got = sorted((r["id"], r["v"]) for r in await store.load(written.ref, list[dict], None))
+    assert got == [("a", 10), ("b", 21)]  # `a` was not selected: its row stays
+    whole = await store.store(later, written.ref, scope(out))
+    assert sorted((r["id"], r["v"]) for r in await store.load(whole.ref, list[dict], None)) == [
+        ("a", 999),
+        ("b", 21),
+    ]
