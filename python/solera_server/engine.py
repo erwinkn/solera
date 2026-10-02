@@ -995,10 +995,14 @@ class Engine(Attempts, Sensors, Views):
         first = int(head.get("base", 0))
         # A `full` run or a keys="full" override starts one pass per run, which the
         # run's later attempts resume (`pass` on the watermark) instead of restarting;
-        # a batch upstream that started over past `next` is delivered again in full.
+        # a batch upstream that started over since the edge last read it (its `base`
+        # past a delivery's start, or at or past `next`: a reset always lands past the
+        # batches that existed) is delivered again in full.
         again = override == "full" and (wm or {}).get("pass") != run["id"]
         reset = full or wm is None or wm.get("fingerprint") != fingerprint or again
-        reset = reset or (not keyed and int(wm["next"]) < first)
+        if not reset and not keyed:
+            under_way = wm.get("delivery")
+            reset = int(under_way["from"]) < first if under_way else int(wm["next"]) <= first
         carried = {
             "kind": "keys" if keyed else "batches",
             "output": output,

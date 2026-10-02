@@ -230,7 +230,6 @@ async def test_a_slow_new_writer_never_fences_into_a_deleted_segment(tmp_path):
         await add(a, sa, "x", 1)
 
 
-@pytest.mark.xfail(strict=True, reason="sim finding: a reset at the consumer's next batch reads as a delta")
 async def test_a_batch_upstream_reset_right_after_a_delivery_is_delivered_in_full(state):  # noqa: F811
     """§6: a `full` run starts an unkeyed incremental output over at a new
     `base`; a consumer that read batches before it must be told (`full`),
