@@ -505,13 +505,16 @@ def _run_entries(run: list, codec: int, after, upto):
             yield k, v, f, loc
 
 
-def merge_range(runs: list, codec: int, after, upto, drop_deleted: bool):
+def merge_range(runs: list, codecs: list[int], after, upto, drop_deleted: bool):
     """The newest-wins merged view of `runs` (newest first; each a list of one
-    file's consecutive blocks) over keys in `(after, upto]`; `None` bounds are
-    open. Returns keys, versions, deleted flags and locators."""
+    file's consecutive blocks, in that file's codec) over keys in `(after,
+    upto]`; `None` bounds are open. Returns keys, versions, deleted flags and
+    locators."""
 
+    if len(codecs) != len(runs):
+        raise ValueError("a codec per run")
     heap = []
-    iters = [_run_entries(run, codec, after, upto) for run in runs]
+    iters = [_run_entries(run, codec, after, upto) for run, codec in zip(runs, codecs, strict=True)]
     for rank, it in enumerate(iters):
         for k, v, f, loc in it:
             heap.append((k, rank, v, f, loc, it))

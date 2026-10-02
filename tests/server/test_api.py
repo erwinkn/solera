@@ -341,9 +341,9 @@ async def test_worker_pull_path_and_channel(engine):
         assert engine.attempt_lines(stage["attempt"]) == lines
 
         # The resolver's route (docs/resolved-commits.md §4): binary, versioned, the attempt's own.
-        from solera.keys import resolver
+        from solera.keys import SortedRun, resolver
 
-        ask = resolver.Ask("nope", "", "patch", 0, 1, "keys/nope/_/", -1, b"", 0)
+        ask = resolver.Ask("nope", "", "patch", 0, 1, "keys/nope/_/", -1, SortedRun.of([], []))
         body = resolver.request("mine", [ask])
         assert (await client.post(f"{routes}/resolve", content=body)).status_code == 401
         old = await client.post(f"{routes}/resolve", content=b"\x09" + body[1:], headers=token)

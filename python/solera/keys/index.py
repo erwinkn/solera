@@ -30,19 +30,17 @@ from . import (
     FOOTER_SIZE,
     Job,
     Rows,
+    SortedRun,
     bloom_check_keys,
     bloom_check_pairs,
     bloom_check_tombstones,
     check_block,
-    decode_block,
     jobs,
     lookup,
     merge_range,
     parse_footer,
     parse_index,
     parse_tail,
-    sort_entries,
-    write_files,
 )
 from .io import RANGE, ObjectIO
 
@@ -66,17 +64,12 @@ def digest(data: bytes) -> str:
     return _native.content_digest(data)
 
 
-def delta_keys(data: bytes) -> tuple[list[bytes], list[bytes]]:
-    """A delta file's written keys and deleted keys."""
+def delta_keys(data: bytes) -> tuple[dict[bytes, bytes], list[bytes]]:
+    """A delta file's written keys, `{key: version}`, and its deleted keys."""
 
-    idx = parse_index(data, len(data))
-    upserted, deleted = [], []
-    for _, off, size, _, crc in idx["blocks"]:
-        check_block(data[off : off + size], crc)
-        keys, _, flags, _, _ = decode_block(data[off : off + size], idx["codec"])
-        for k, d in zip(keys, flags, strict=True):
-            (deleted if d else upserted).append(k)
-    return upserted, deleted
+    keys, versions, deleted, _ = SortedRun.decode(data).entries()
+    written = {k: v for k, v, d in zip(keys, versions, deleted, strict=True) if not d}
+    return written, [k for k, d in zip(keys, deleted, strict=True) if d]
 
 
 def index_prefix(output: str, scope: str) -> str:
@@ -265,23 +258,19 @@ class IndexState:
 
 @dataclass(frozen=True)
 class Delta:
-    """A commit's delta: entries sorted by key (`deleted` 1 for removals), and
-    how the live key count changes. `exact` is false when a count change was
-    inferred from a filter rather than read. Each entry's locator is the
-    writer's generation; its predecessor is the key's `(version, locator)`
-    before, where it was read (None for a new key, or one a filter cleared)."""
+    """A patch's delta, encoded but not yet written: its `.kx` files, and how
+    the live key count changes. `exact` is false when a count change was
+    inferred from a filter rather than read. `listed`: up to the `collect`
+    asked for, the written keys, `{key: version}`, and the deleted keys."""
 
-    keys: list[bytes]
-    versions: list[bytes]
-    deleted: bytes
+    files: list[bytes]
     added: int
     removed: int
     exact: bool
-    locators: list[int] = field(default_factory=list)
-    predecessors: list = field(default_factory=list)
+    listed: tuple[dict[bytes, bytes], list[bytes]] | None = None
 
     def __len__(self) -> int:
-        return len(self.keys)
+        return sum(parse_footer(d[-FOOTER_SIZE:])["entries"] for d in self.files)
 
 
 @dataclass(frozen=True)
@@ -295,11 +284,13 @@ class DeltaKeys:
     files: tuple[FileInfo, ...]
 
     async def pages(self, size: int = 100_000):
+        """Pages of the written keys, as `str`, with their versions: `[(key, version)]`."""
+
         index = KeyIndex(self.io, self.prefix, IndexState(log=((0, self.files),), prefix=self.prefix))
         after = None
         while self.files:
-            keys, _, deleted, _, after = await index.pending(0, 0, after, size)
-            page = [key_str(k) for k, d in zip(keys, deleted, strict=True) if not d]
+            keys, versions, deleted, _, after = await index.pending(0, 0, after, size)
+            page = [(key_str(k), v) for k, v, d in zip(keys, versions, deleted, strict=True) if not d]
             if page:
                 yield page
             if after is None:
@@ -480,56 +471,53 @@ class KeyIndex:
 
     async def resolve(
         self,
-        keys: list[bytes],
-        versions: list[bytes],
-        removes: list[bytes] = (),
+        run: SortedRun,
         *,
         batch: int,
         attempt: str,
         generation: int = 0,
         exact: bool = False,
         collect: int = 0,
-    ) -> tuple[DeltaFiles, tuple[list[bytes], list[bytes]] | None]:
-        """A patch's delta, written as the batch's files: upsert `keys` at
-        `versions` and delete `removes`, by `generation`
-        (docs/resolved-commits.md §6). A small patch reads only what it must —
-        the sparse reader; a dense one, or one whose exact reads would touch
-        too many blocks, streams the whole index instead. With `exact`, every
-        live key's entry is read — no filter decides a change — so the counts
-        are exact and every changed key names its predecessor. Returns the
-        files and, up to `collect` keys, the written and the deleted keys
-        (None past it). A full replacement is `replace`."""
+    ) -> tuple[DeltaFiles, tuple[dict[bytes, bytes], list[bytes]] | None]:
+        """A patch's delta — `run`'s upserts and removes, by `generation` —
+        written as the batch's files (docs/resolved-commits.md §6). A small
+        patch reads only what it must — the sparse reader; a dense one, or
+        one whose exact reads would touch too many blocks, streams the whole
+        index instead; an empty index reads nothing. With `exact`, every live
+        key's entry is read — no filter decides a change — so the counts are
+        exact and every changed key names its predecessor. Returns the files
+        and, up to `collect` keys, the written keys, `{key: version}`, and
+        the deleted keys (None past it). A full replacement is `replace`."""
 
-        keys, versions, removes = self._sorted(keys, versions, removes)
         entries = sum(f.entries for f in self.state.files)
-        if entries and len(keys) + len(removes) > self.o.stream_density * entries:
-            return await self._stream(keys, versions, removes, batch, attempt, generation, collect)
-        delta = await self._patch(keys, versions, removes, generation, exact=exact, switch=True)
+        if entries and len(run) > self.o.stream_density * entries:
+            return await self._stream(run, batch, attempt, generation, collect)
+        delta = await self._sparse(run, generation, exact=exact, collect=collect, switch=True)
         if delta is None:
-            return await self._stream(keys, versions, removes, batch, attempt, generation, collect)
+            return await self._stream(run, batch, attempt, generation, collect)
         self.route = "sparse"
-        files = await self.write(batch, attempt, delta)
-        listed = None
-        if len(delta) <= collect:
-            listed = (
-                [k for k, d in zip(delta.keys, delta.deleted, strict=True) if not d],
-                [k for k, d in zip(delta.keys, delta.deleted, strict=True) if d],
-            )
-        return files, listed
+        return await self.write(batch, attempt, delta), delta.listed
 
-    async def changes(
-        self,
-        keys: list[bytes],
-        versions: list[bytes],
-        removes: list[bytes] = (),
-        *,
-        generation: int = 0,
-        exact: bool = False,
-    ) -> Delta:
-        """A patch's delta in memory, through the sparse reader whatever its size."""
+    async def changes(self, run: SortedRun, *, generation: int = 0, exact: bool = False) -> Delta:
+        """A patch's delta through the sparse reader whatever its size, not written."""
 
-        keys, versions, removes = self._sorted(keys, versions, removes)
-        return await self._patch(keys, versions, removes, generation, exact=exact, switch=False)
+        return await self._sparse(run, generation, exact=exact, collect=0, switch=False)
+
+    async def _sparse(self, run: SortedRun, generation: int, *, exact: bool, collect: int, switch: bool):
+        """The sparse reader's delta; None when `switch` and streaming would read less."""
+
+        found, inferred = {}, False
+        if self.state.files:
+            keys, versions, deleted, _ = run.entries()
+            want = {k: v for k, v, d in zip(keys, versions, deleted, strict=True) if not d}
+            got = await self._find(keys, want, exact=exact, switch=switch)
+            if got is None:
+                return None
+            found, inferred = got
+        (files, added, removed, _), listed = await asyncio.to_thread(
+            run.delta, found, generation=generation, collect=collect, **self._writer()
+        )
+        return Delta(files, added, removed, not inferred, listed)
 
     async def lookup(self, keys: list[bytes]) -> dict[bytes, tuple[bytes, int]]:
         """Exactly, the live `(version, locator)` of each of `keys` the index
@@ -542,30 +530,12 @@ class KeyIndex:
         known = (await self._find(keys, {}, exact=True, switch=False))[0]
         return {k: (v, loc) for k, (live, v, loc) in known.items() if live}
 
-    def _sorted(self, keys, versions, removes):
-        keys, versions, _ = sort_entries(list(keys), list(versions), bytes(len(keys)))
-        removes = sorted(set(removes))
-        if removes and set(removes) & set(keys):
-            raise ValueError("a key cannot be both written and removed")
-        return list(keys), list(versions), removes
-
-    async def _stream(self, keys, versions, removes, batch, attempt, generation, collect):
+    async def _stream(self, run: SortedRun, batch, attempt, generation, collect):
         """The streaming merge-join of a patch with every level."""
 
         self.route = "stream"
-        run = sorted(
-            [(k, v, 0) for k, v in zip(keys, versions, strict=True)] + [(k, b"", 1) for k in removes]
-        )
         runs = self.state.newest_first()
-        job = Job.patch(
-            [e[0] for e in run],
-            [e[1] for e in run],
-            bytes(e[2] for e in run),
-            len(runs),
-            **self._writer(),
-            collect=collect,
-            generation=generation,
-        )
+        job = Job.patch(run, len(runs), **self._writer(), collect=collect, generation=generation)
         files = await self._run(job, runs, lambda n: f"{batch:012d}-{attempt}.{n:04d}", 0)
         return DeltaFiles(files, job.added, job.removed, True), job.collected()
 
@@ -589,8 +559,8 @@ class KeyIndex:
         versions are written, live keys not in `rows` deleted, each entry
         located at `generation` and carrying the key's predecessor `(version,
         locator)`. The delta goes out as the batch's files as they fill.
-        Returns them and, up to `collect` keys, the written and the deleted
-        keys (None past it)."""
+        Returns them and, up to `collect` keys, the written keys, `{key:
+        version}`, and the deleted keys (None past it)."""
 
         runs = self.state.newest_first()
         job = Job.replace(
@@ -633,49 +603,6 @@ class KeyIndex:
             job, self.io, self.path, runs, put, None if isinstance(rows, Rows) else rows, on_garbage
         )
         return [files[n] for n in sorted(files)]
-
-    async def _patch(
-        self,
-        keys: list[bytes],
-        versions: list[bytes],
-        removes: list[bytes],
-        generation: int,
-        *,
-        exact: bool,
-        switch: bool,
-    ) -> Delta | None:
-        """The sparse reader's delta; None when `switch` and streaming would read less."""
-
-        want = dict(zip(keys, versions, strict=True))
-        found = await self._find(sorted(set(keys) | set(removes)), want, exact=exact, switch=switch)
-        if found is None:
-            return None
-        known, inferred = found
-        out_k, out_v, out_d, out_p = [], [], bytearray(), []
-        added = removed = 0
-        rm = set(removes)
-        for key in sorted(set(keys) | rm):
-            live, version, locator = known.get(key, (False, None, None))
-            before = (version, locator) if live and version is not None else None
-            if key in rm:
-                if live:
-                    out_k.append(key)
-                    out_v.append(b"")
-                    out_d.append(1)
-                    out_p.append(before)
-                    removed += 1
-                continue
-            v = want[key]
-            if live and version == v:
-                continue  # rewritten unchanged
-            out_k.append(key)
-            out_v.append(v)
-            out_d.append(0)
-            out_p.append(before)
-            added += 0 if live else 1
-        return Delta(
-            out_k, out_v, bytes(out_d), added, removed, not inferred, [generation] * len(out_k), out_p
-        )
 
     async def _find(self, keys: list[bytes], want: dict, *, exact: bool, switch: bool):
         """`(live, version, locator)` of every key some file holds — the
@@ -849,21 +776,11 @@ class KeyIndex:
         """Write a patch's delta as the batch's files, `{batch}-{attempt}.{n}`:
         the attempt id keeps a retried batch from colliding with its own upload."""
 
-        datas = (
-            write_files(
-                delta.keys,
-                delta.versions,
-                delta.deleted,
-                locators=delta.locators or None,
-                predecessors=delta.predecessors or None,
-                **self._writer(),
-            )
-            if delta.keys
-            else []
-        )
-        files = [FileInfo.describe(f"{batch:012d}-{attempt}.{n:04d}", 0, d) for n, d in enumerate(datas)]
+        files = [
+            FileInfo.describe(f"{batch:012d}-{attempt}.{n:04d}", 0, d) for n, d in enumerate(delta.files)
+        ]
         await asyncio.gather(
-            *(self.io.write(self.path(f.name), d) for f, d in zip(files, datas, strict=True))
+            *(self.io.write(self.path(f.name), d) for f, d in zip(files, delta.files, strict=True))
         )
         return DeltaFiles(files, delta.added, delta.removed, delta.exact)
 
@@ -914,8 +831,8 @@ class KeyIndex:
             runs.append([got[i] for i in span])
             if p.data is None:
                 p.window = got  # the next page starts in it: a file never pays for the same block twice
-        codec = parsed[0].tail["codec"] if parsed else 1
-        keys, versions, deleted, locators = merge_range(runs, codec, after, None, False)
+        codecs = [p.tail["codec"] for p in parsed]  # each file's own
+        keys, versions, deleted, locators = merge_range(runs, codecs, after, None, False)
         out_k, out_v, out_d, out_l = [], [], bytearray(), []
         cursor = after
         for i, key in enumerate(keys):

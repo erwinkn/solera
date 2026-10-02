@@ -232,10 +232,11 @@ def test_lookup(writer, reader):
 
 @pytest.mark.parametrize("writer,reader", CROSS)
 def test_merge_range(writer, reader):
-    old = writer.encode_file([b"a", b"b", b"c", b"d", b"f"], [b"1"] * 5, b"\x00" * 5, block_size=8)
+    # Each run in its own file's codec: one stored, one compressed.
+    old = writer.encode_file([b"a", b"b", b"c", b"d", b"f"], [b"1"] * 5, b"\x00" * 5, block_size=8, codec=0)
     new = writer.encode_file([b"b", b"c", b"e"], [b"2"] * 3, b"\x00\x01\x00", block_size=8)
     runs = [blocks_of(new)[1], blocks_of(old)[1]]
-    k, v, f, _ = reader.merge_range(runs, 1, None, None, False)
+    k, v, f, _ = reader.merge_range(runs, [1, 0], None, None, False)
     assert list(zip(k, v, f, strict=True)) == [
         (b"a", b"1", 0),
         (b"b", b"2", 0),
@@ -244,7 +245,7 @@ def test_merge_range(writer, reader):
         (b"e", b"2", 0),
         (b"f", b"1", 0),
     ]
-    k, _, _, _ = reader.merge_range(runs, 1, b"b", b"e", True)  # (after, upto], tombstones dropped
+    k, _, _, _ = reader.merge_range(runs, [1, 0], b"b", b"e", True)  # (after, upto], tombstones dropped
     assert k == [b"d", b"e"]
 
 
@@ -283,7 +284,7 @@ def test_locators_and_predecessors(writer, reader):
     assert got_l == locators and got_p == predecessors
     blocks = [data[off : off + size] for _, off, size, _, _ in tail["blocks"]]
     assert reader.lookup(blocks, tail["codec"], [keys[5]])[3] == [locators[5]]
-    assert reader.merge_range([blocks], tail["codec"], None, None, False)[3] == locators
+    assert reader.merge_range([blocks], [tail["codec"]], None, None, False)[3] == locators
     [merged] = merge(reader, [data], drop_deleted=False)
     assert [e[3:] for e in _python.iter_file(merged)] == [(loc, None) for loc in locators]
 
@@ -330,3 +331,54 @@ def test_a_compaction_names_every_object_it_drops():
     ks, vs, _, locs = _python.decode_garbage(g)
     assert list(zip(ks, vs, locs, strict=True)) == [(b"a", b"2", 2), (b"a", b"1", 1), (b"b", b"1", 1)]
     assert job.garbage == 3
+
+
+def test_malformed_input_raises_errors_never_panics():
+    """Whatever the bytes — mutated files and blocks, truncations, noise —
+    every parser and kernel raises a `ValueError` (`FormatError`), never a
+    Rust panic: a length is checked before it is added or sliced with."""
+
+    rng = random.Random(11)
+    keys, versions, deleted = entries(300)
+    files = [_native.encode_file(keys, versions, deleted, block_size=512, codec=c) for c in (0, 1)]
+    raw_blocks = blocks_of(files[0])[1]
+    blobs = [b"\x00" + b"\xff" * 9 + b"\x01" + b"\x00" * 10]  # a suffix length that overflows
+    for _ in range(2000):
+        base = bytearray(rng.choice(files + raw_blocks))
+        for _ in range(rng.randrange(1, 4)):
+            base[rng.randrange(len(base))] = rng.randrange(256)
+        blobs.append(bytes(base[: rng.randrange(len(base) + 1)] if rng.random() < 0.3 else base))
+        blobs.append(rng.randbytes(rng.randrange(80)))
+    parsers = [
+        lambda b: _native.decode_block(b, 0),
+        lambda b: _native.decode_block(b, 1),
+        lambda b: _native.lookup([b], 0, [b"site-1"]),
+        lambda b: _native.merge_range([[b]], [0], None, None, False),
+        lambda b: _native.SortedRun.decode(b),
+        lambda b: _native.parse_index(b, len(b)),
+        lambda b: _native.parse_index(b, len(b) // 2),  # a part longer than its file
+        lambda b: _native.parse_tail(b, len(b)),
+        lambda b: _native.decode_garbage(b),
+    ]
+    for blob in blobs:
+        for parse in parsers:
+            try:
+                parse(blob)
+            except ValueError:
+                pass
+
+
+def test_a_sorted_run_round_trips_and_checks_what_it_decodes():
+    run = _native.SortedRun.of([b"c", b"a"], [b"3", b"1"], [b"b", b"b"])
+    assert (len(run), run.upserts, run.removes) == (3, 2, 1)
+    assert run.entries()[:3] == ([b"a", b"b", b"c"], [b"1", b"", b"3"], b"\x00\x01\x00")
+    data = run.encode()
+    assert _native.SortedRun.decode(data).entries() == run.entries()
+    with pytest.raises(_native.LimitError):
+        _native.SortedRun.decode(data, max_entries=2)
+    with pytest.raises(_native.LimitError):
+        _native.SortedRun.decode(data, max_bytes=4)
+    with pytest.raises(ValueError):
+        _native.SortedRun.of([b"a"], [b"1"], [b"a"])  # written and removed
+    with pytest.raises(ValueError):
+        _native.SortedRun.of([b"a", b"a"], [b"1", b"2"])

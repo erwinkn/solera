@@ -31,7 +31,7 @@ from croniter import croniter
 from obstore.exceptions import AlreadyExistsError
 from solera.failures import lower
 from solera.ids import ulid, ulid_time
-from solera.keys import Rows
+from solera.keys import Rows, SortedRun
 from solera.keys.index import DeltaFiles, FileInfo, KeyIndex, Options, delta_keys, key_bytes, key_str
 from solera.keys.io import ObjectIO, key_cache
 from solera.sdk import TimePartitions, canonical_partition, digest, split_partition
@@ -1747,10 +1747,15 @@ class Engine(Attempts, Sensors):
                 removes, replace = [str(k) for k in remove or [] if str(k) not in new], False
             batch = int((head or {}).get("batch", -1)) + 1
             attempt = ulid(self.clock())
+            sorted_run = SortedRun.of(
+                [key_bytes(k) for k in new],
+                [key_bytes(v) for v in new.values()],
+                [key_bytes(k) for k in removes],
+            )
             with self.m.reading():  # the index it resolves against outlives compaction meanwhile
                 pinned = self.m.index(name, "").pinned()
                 index = KeyIndex(self._key_io(), None, pinned, self.key_options)
-                files = await self._resolve_source(index, pinned, new, removes, replace, batch, attempt)
+                files = await self._resolve_source(index, pinned, sorted_run, replace, batch, attempt)
                 if files is not None:
                     files, changed = files
                 elif replace:
@@ -1759,15 +1764,8 @@ class Engine(Attempts, Sensors):
                         rows, batch, attempt, collect=2 * SOURCE_KEYS_RECORDED
                     )
                 else:
-                    delta = await index.changes(
-                        [key_bytes(k) for k in new],
-                        [key_bytes(v) for v in new.values()],
-                        [key_bytes(k) for k in removes],
-                    )
-                    files = await index.write(batch, attempt, delta)
-                    changed = (
-                        [k for k, d in zip(delta.keys, delta.deleted, strict=True) if not d],
-                        [k for k, d in zip(delta.keys, delta.deleted, strict=True) if d],
+                    files, changed = await index.resolve(
+                        sorted_run, batch=batch, attempt=attempt, collect=2 * SOURCE_KEYS_RECORDED
                     )
             if not files.files:
                 return None, ref
@@ -1811,29 +1809,23 @@ class Engine(Attempts, Sensors):
         if paths:
             await self.state.delete_objects(paths)
 
-    async def _resolve_source(self, index, pinned, new, removes, replace, batch, attempt):
+    async def _resolve_source(self, index, pinned, run, replace, batch, attempt):
         """A small source commit through the warm resolver, in process
         (docs/resolved-commits.md §4): its files and changed keys, or None when
         the cache cannot answer and the commit resolves cold."""
 
-        from solera.keys import encode_file
         from solera.keys.resolver import Limits
 
         lim = Limits()
-        size = len(new) + len(removes) + (pinned.count if replace else 0)
+        size = len(run) + (pinned.count if replace else 0)
         if self.keys is None or size > (lim.max_entries if replace else lim.max_keys):
             return None
-        run = sorted(
-            [(key_bytes(k), key_bytes(v), 0) for k, v in new.items()]
-            + [(key_bytes(k), b"", 1) for k in removes]
-        )
-        data = encode_file([e[0] for e in run], [e[1] for e in run], bytes(e[2] for e in run))
         name = f"{batch:012d}-{attempt}.0000"
         answer, delta = await self.keys.direct(
-            pinned, "replace" if replace else "patch", data, 0, batch, index.path(name), self.m.applied
+            pinned, "replace" if replace else "patch", run, 0, batch, index.path(name), self.m.applied
         )
         if answer["result"] == "empty":
-            return DeltaFiles([], 0, 0, True), ([], [])
+            return DeltaFiles([], 0, 0, True), ({}, [])
         if answer["result"] != "delta":
             return None
         await index.io.write(index.path(name), delta)

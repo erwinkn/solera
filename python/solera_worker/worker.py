@@ -33,7 +33,7 @@ from pathlib import Path
 
 from obstore.exceptions import AlreadyExistsError
 from solera import errors, lifecycle
-from solera.keys import Rows, encode_file
+from solera.keys import Rows, SortedRun
 from solera.keys.index import (
     DeltaFiles,
     DeltaKeys,
@@ -528,8 +528,7 @@ async def _store_outputs(
         live = int(info["index"].get("count", 0))
         if replace:
             if len(rows) + live <= RESOLVE_ENTRIES and len(rows) <= RESOLVE_KEYS:
-                keys, versions = await asyncio.to_thread(rows.entries)
-                p["run"] = (keys, versions, [])
+                p["run"] = await asyncio.to_thread(SortedRun.from_rows, rows)
             else:
                 p["rows"] = rows
             continue
@@ -554,9 +553,11 @@ async def _store_outputs(
             p["intended"] = set(await _intended(info, keys_io, unsettled))
             new, removes = await _repair(output, store, prior, p["intended"] - own[0] - own[1], new, removes)
             p["new"], p["removes"] = new, removes
-        p["run"] = ([key_bytes(k) for k in new], list(new.values()), [key_bytes(k) for k in removes])
+        p["run"] = SortedRun.of(
+            [key_bytes(k) for k in new], list(new.values()), [key_bytes(k) for k in removes]
+        )
     for name, p in pending.items():
-        if "run" in p and len(p["run"][0]) + len(p["run"][2]) <= RESOLVE_KEYS:
+        if "run" in p and len(p["run"]) <= RESOLVE_KEYS:
             asks.append(_ask_for(name, p, plans[name], spec))
     engine = await _ask_engine(channel, invocation, asks)
     for name, p in pending.items():
@@ -567,7 +568,9 @@ async def _store_outputs(
             if answer is not None:
                 p["files"], p["changed"] = await _upload(index, p["batch"], spec["attempt"], answer)
             elif replace:
-                rows = p["rows"] if "rows" in p else Rows.pairs(list(zip(*p["run"][:2], strict=True)))
+                rows = (
+                    p["rows"] if "rows" in p else Rows.pairs(list(zip(*p["run"].entries()[:2], strict=True)))
+                )
                 try:
                     p["files"], p["changed"] = await index.replace(
                         rows, p["batch"], spec["attempt"], collect=LISTED, generation=p["generation"]
@@ -575,11 +578,8 @@ async def _store_outputs(
                 except ValueError as e:  # a value with no digest, found as the join reaches it
                     raise WriteError(f"{output.name}: {e}") from e
             else:
-                keys, versions, removes = p["run"]
                 p["files"], p["changed"] = await index.resolve(
-                    keys,
-                    versions,
-                    removes,
+                    p["run"],
                     batch=p["batch"],
                     attempt=spec["attempt"],
                     generation=p["generation"],
@@ -698,9 +698,6 @@ RESOLVE_TIMEOUT = 5.0  # seconds the worker waits for the engine before resolvin
 
 
 def _ask_for(name: str, p: dict, plan: dict, spec: dict) -> Ask:
-    keys, versions, removes = p["run"]
-    run = sorted([(k, v, 0) for k, v in zip(keys, versions, strict=True)] + [(k, b"", 1) for k in removes])
-    data = encode_file([e[0] for e in run], [e[1] for e in run], bytes(e[2] for e in run))
     return Ask(
         name,
         spec["partition"],
@@ -709,8 +706,7 @@ def _ask_for(name: str, p: dict, plan: dict, spec: dict) -> Ask:
         p["generation"],
         plan["info"]["index"]["prefix"],
         p["batch"] - 1,
-        data,
-        len(run),
+        p["run"],
     )
 
 
@@ -733,7 +729,7 @@ async def _upload(index: KeyIndex, batch: int, attempt: str, answer) -> tuple[De
 
     a, data = answer
     if data is None:
-        return DeltaFiles([], 0, 0, True), ([], [])
+        return DeltaFiles([], 0, 0, True), ({}, [])
     name = f"{batch:012d}-{attempt}.0000"
     await index.io.write(index.path(name), data)
     return DeltaFiles([FileInfo.describe(name, 0, data)], a["added"], a["removed"], True), delta_keys(data)

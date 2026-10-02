@@ -757,7 +757,7 @@ async def _pages(upserts, content: dict):
         yield sorted(upserts)
     else:
         async for page in upserts.pages():
-            yield page
+            yield [k for k, _ in page]
 
 
 def _digest(value: Any) -> str:

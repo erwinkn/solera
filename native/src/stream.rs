@@ -34,13 +34,16 @@ pub(crate) struct Fields {
 }
 
 fn range(buf: &[u8], pos: &mut usize) -> Result<(usize, usize)> {
-    let n = get_varint(buf, pos)? as usize;
+    let n = get_varint(buf, pos)?;
     let start = *pos;
-    if start + n > buf.len() {
-        return fmt_err("truncated entry");
+    let end = usize::try_from(n).ok().and_then(|n| start.checked_add(n));
+    match end {
+        Some(end) if end <= buf.len() => {
+            *pos = end;
+            Ok((start, end))
+        }
+        _ => fmt_err("truncated entry"),
     }
-    *pos += n;
-    Ok((start, start + n))
 }
 
 pub(crate) fn read_entry(raw: &[u8], pos: &mut usize) -> Result<Fields> {
@@ -250,7 +253,9 @@ impl Run {
                     let decoded: Vec<Block> = seg.blocks[*next..end]
                         .par_iter()
                         .map(|&(off, size, crc)| {
-                            let Some(raw) = data.get(off..off + size) else {
+                            let Some(raw) =
+                                off.checked_add(size).and_then(|end| data.get(off..end))
+                            else {
                                 return fmt_err("block out of bounds");
                             };
                             if crc32fast::hash(raw) != crc {

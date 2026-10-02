@@ -129,8 +129,10 @@ Stores hand the worker a write's content as native `Rows`
 Python rows, `Rows.arrow` for Arrow data (a pandas DataFrame through
 DuckDB), `Rows.values` for `keyed=True`, `Rows.keys` for partition sets.
 Keys are sorted natively, each run of equal keys is folded into one
-version, and no per-key Python object is made. A patch reads the same
-`Rows` (`Rows.entries()`).
+version, and no per-key Python object is made. A patch's keys, versions
+and removes become one `SortedRun`, native through every resolver — the
+sparse reader, the streaming patch, the engine's cache — and encoded only
+to cross the wire.
 
 A `Sql` write's rows never pass through the worker: after writing, its
 store reads them back sorted by key — the key and the revision column, or

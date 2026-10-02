@@ -5,12 +5,40 @@ compactions — must produce the delta a dict says it should, and the index
 must page back exactly the dict's content."""
 
 import random
+from dataclasses import dataclass
 
 import pytest
 from obstore.store import MemoryStore
-from solera.keys import Rows, _python
-from solera.keys.index import Delta, IndexState, KeyIndex, Options
+from solera.keys import Rows, SortedRun, _python
+from solera.keys.index import IndexState, KeyIndex, Options
 from solera.keys.io import DiskCache, ObjectIO
+
+
+@dataclass
+class Written:
+    """A delta's entries as its files hold them."""
+
+    keys: list
+    versions: list
+    deleted: bytes
+    added: int
+    removed: int
+    exact: bool
+    locators: list
+    predecessors: list
+
+    def __len__(self):
+        return len(self.keys)
+
+
+def run(keys, versions, removes=()):
+    return SortedRun.of(list(keys), list(versions), list(removes))
+
+
+def entries_of(delta):
+    """Every entry of an unwritten delta: key, version, deleted, locator, predecessor."""
+
+    return [e for d in delta.files for e in _python.iter_file(d)]
 
 
 def small_options(**kw):
@@ -79,9 +107,7 @@ class Harness:
             )
         else:
             files, changed = await idx.resolve(
-                keys,
-                versions,
-                removes,
+                run(keys, versions, removes),
                 batch=self.batch,
                 attempt=f"a{self.batch}",
                 generation=gen,
@@ -91,7 +117,7 @@ class Harness:
             if self.state.files:
                 self.routes.append(idx.route)
         written = await self._read(idx, files.files)
-        delta = Delta(
+        delta = Written(
             [e[0] for e in written],
             [e[1] for e in written],
             bytes(e[2] for e in written),
@@ -101,7 +127,7 @@ class Harness:
             [e[3] for e in written],
             [e[4] for e in written],
         )
-        assert changed == ([e[0] for e in written if not e[2]], [e[0] for e in written if e[2]])
+        assert changed == ({e[0]: e[1] for e in written if not e[2]}, [e[0] for e in written if e[2]])
         # What the dict says changed.
         if replace:
             after = {k: (v, gen) for k, v in zip(keys, versions, strict=True)}
@@ -262,7 +288,7 @@ async def test_filters_skip_block_reads_for_real_changes():
     probe = ks[::40]
     h.io.metrics.reset()
     idx = h.index()
-    delta = await idx.changes(probe, [b"v2"] * len(probe))
+    delta = await idx.changes(run(probe, [b"v2"] * len(probe)))
     assert len(delta) == len(probe) and not delta.exact  # "changed" came from filters
     tails = sum(1 for level in h.state.newest_first() for _ in level)
     # Only file tails were read (plus a block or two for rare false positives).
@@ -311,9 +337,9 @@ async def test_disk_cache_serves_repeat_reads(tmp_path):
     ks = [key(i) for i in range(3000)]
     await h.commit(ks, [b"v1"] * len(ks))
     h.io.metrics.reset()
-    await h.index().changes(ks[:50], [b"v2"] * 50)
+    await h.index().changes(run(ks[:50], [b"v2"] * 50))
     first = h.io.metrics.gets
-    await h.index().changes(ks[50:100], [b"v2"] * 50)
+    await h.index().changes(run(ks[50:100], [b"v2"] * 50))
     assert h.io.metrics.gets == first == 0  # written through the cache on commit: never fetched
     assert h.io.metrics.cache_hits > 0
 
@@ -361,7 +387,7 @@ async def test_level_0_files_are_read_at_once():
         await h.commit(ks, [b"v2"] * len(ks))
     assert len(h.state.level(0)) == 6
     h.io.peak = 0
-    await h.index().changes([key(i) for i in range(0, 2000, 50)], [b"v3"] * 40)
+    await h.index().changes(run([key(i) for i in range(0, 2000, 50)], [b"v3"] * 40))
     assert h.io.peak >= 7  # six deltas and level 1, not one after another
 
 
@@ -383,23 +409,23 @@ async def test_a_patch_reads_blocks_or_streams():
     # All changed: the filters clear nearly every key — tails and a false positive's block.
     idx = h.index()
     h.io.metrics.reset()
-    delta = await idx.changes(probe, [b"v2"] * len(probe))
+    delta = await idx.changes(run(probe, [b"v2"] * len(probe)))
     assert len(delta) == len(probe) and not delta.exact
     assert h.io.metrics.gets <= len(files) + 2
 
     # Exact: every key's entry is read, so the count is exact and predecessors are named.
-    delta = await h.index().changes(probe, [b"v2"] * len(probe), exact=True)
-    assert delta.exact and all(p is not None for p in delta.predecessors)
+    delta = await h.index().changes(run(probe, [b"v2"] * len(probe)), exact=True)
+    assert delta.exact and all(e[4] is not None for e in entries_of(delta))
 
     # All rewritten unchanged: every key needs its block, more than streaming costs.
     idx = h.index()
-    files_out, _ = await idx.resolve(probe, same, batch=9, attempt="x")
+    files_out, _ = await idx.resolve(run(probe, same), batch=9, attempt="x")
     assert idx.route == "stream" and not files_out.files
 
     # Dense: more of the index than `stream_density` streams at once.
     idx = KeyIndex(h.io, "keys/out/p", h.state, filtered_options(stream_density=0.01))
     h.io.metrics.reset()
-    await idx.resolve(ks[::50], [b"v3"] * 80, batch=9, attempt="y")
+    await idx.resolve(run(ks[::50], [b"v3"] * 80), batch=9, attempt="y")
     assert idx.route == "stream" and h.io.metrics.gets == len(h.state.files)  # each file once, no tail first
 
 
@@ -500,8 +526,8 @@ async def test_locators_and_predecessors():
     ]
     state = state.committed(1, second, keep_log=True)
     idx = KeyIndex(io, None, state)
-    delta = await idx.changes([b"a", b"d"], [b"2", b"1"], [b"b"], generation=30)
-    assert list(zip(delta.keys, delta.locators, delta.predecessors, strict=True)) == [
+    delta = await idx.changes(run([b"a", b"d"], [b"2", b"1"], [b"b"]), generation=30)
+    assert [(e[0], e[3], e[4]) for e in entries_of(delta)] == [
         (b"a", 30, (b"1", 10)),
         (b"b", 30, (b"2", 20)),
     ]
@@ -510,3 +536,21 @@ async def test_locators_and_predecessors():
     assert list(zip(keys, versions, locators, strict=True)) == [(b"a", b"2", 30), (b"d", b"1", 20)]
     added, removed, _ = await KeyIndex(io, None, state).compact((state.level(0) + state.level(1), 1))
     assert [e[3:] for e in await entries(added)] == [(30, None), (20, None)]
+
+
+async def test_pages_read_each_file_in_its_own_codec():
+    """Round 2, finding 4: a codec belongs to a file, not to its index — a
+    page merges a stored file with a compressed one."""
+
+    from solera.keys.index import FileInfo
+
+    io = ObjectIO(MemoryStore())
+    state = IndexState(prefix="keys/out/p/")
+    for n, (k, codec) in enumerate([(b"a", 0), (b"b", 1)]):
+        data = _python.encode_file([k], [b"v"], b"\x00", codec=codec)
+        name = f"{n:012d}-x.0000"
+        await io.write(state.path(name), data)
+        state = IndexState(files=(*state.files, FileInfo.describe(name, 0, data)), prefix=state.prefix)
+    idx = KeyIndex(io, None, state)
+    assert (await idx.page(None, 10))[0] == [b"a", b"b"]
+    assert await idx.lookup([b"a", b"b"]) == {b"a": (b"v", 0), b"b": (b"v", 0)}

@@ -9,6 +9,7 @@
 //! as `bytes`; flags as a `bytes` with one byte per entry.
 
 pub mod arrow;
+pub mod delta;
 pub mod digest;
 pub mod format;
 pub mod garbage;
@@ -16,6 +17,7 @@ pub mod jobs;
 pub mod local;
 mod pyvalue;
 pub mod rows;
+pub mod run;
 pub mod sort;
 pub mod stream;
 
@@ -31,6 +33,7 @@ use pyo3::types::{PyBool, PyBytes, PyCapsule, PyDict, PyInt, PyList, PyString};
 
 use format::{Error, Options};
 use jobs::{Compact, Count, Patch, Replace, Step};
+use pyo3::types::PyTuple;
 use rows::{Arena, Constant, Source, Stream, Table, Versions};
 use stream::Segment;
 
@@ -40,11 +43,18 @@ create_exception!(
     PyValueError,
     "A key index file is malformed or fails a checksum."
 );
+create_exception!(
+    _native,
+    LimitError,
+    PyValueError,
+    "Well-formed input over a limit: more entries or bytes than the caller takes."
+);
 
 fn to_py(e: Error) -> PyErr {
     match e {
         Error::Format(m) => FormatError::new_err(m),
         Error::Value(m) => PyValueError::new_err(m),
+        Error::Limit(m) => LimitError::new_err(m),
         Error::Callback(e) => match e.downcast::<PyErr>() {
             Ok(e) => *e,
             Err(e) => PyValueError::new_err(e.to_string()),
@@ -305,12 +315,13 @@ type Merged<'py> = (
     Vec<u64>,
 );
 
-/// The merged view's keys, versions, deleted flags and locators.
+/// The merged view's keys, versions, deleted flags and locators: `runs` are
+/// each a file's consecutive blocks, `codecs` each run's file's codec.
 #[pyfunction]
 fn merge_range<'py>(
     py: Python<'py>,
     runs: Vec<Vec<PyBackedBytes>>,
-    codec: u8,
+    codecs: Vec<u8>,
     after: Option<PyBackedBytes>,
     upto: Option<PyBackedBytes>,
     drop_deleted: bool,
@@ -318,7 +329,7 @@ fn merge_range<'py>(
     let runs: Vec<Vec<&[u8]>> = runs.iter().map(|r| slices(r)).collect();
     let (k, v, f, l) = format::merge_range(
         &runs,
-        codec,
+        &codecs,
         after.as_ref().map(|a| a.as_ref()),
         upto.as_ref().map(|u| u.as_ref()),
         drop_deleted,
@@ -921,6 +932,219 @@ fn chunk(
     Ok((keys, versions))
 }
 
+// -- sorted runs ------------------------------------------------------------------------
+
+/// A write's entries in key order (`run.rs`): upserts at their versions, and
+/// removes. Immutable once built, so readers share it.
+#[pyclass(module = "solera._native", frozen)]
+struct SortedRun {
+    inner: Arc<run::SortedRun>,
+}
+
+fn sorted_run(r: format::Result<run::SortedRun>) -> PyResult<SortedRun> {
+    Ok(SortedRun {
+        inner: Arc::new(r.map_err(to_py)?),
+    })
+}
+
+/// What the sparse reader found for a key: `(live, version, locator)`, the
+/// version None where the filters alone said "live at another version".
+enum Sparse {
+    Absent,
+    Live(Vec<u8>, u64),
+    Other,
+}
+
+#[pymethods]
+impl SortedRun {
+    /// Upserts of `keys` at `versions` (any order, each key once), and the
+    /// removes of `removes`; a key both written and removed is an error.
+    #[staticmethod]
+    #[pyo3(signature = (keys, versions, removes=vec![]))]
+    fn of(
+        py: Python<'_>,
+        keys: Vec<PyBackedBytes>,
+        versions: Vec<PyBackedBytes>,
+        removes: Vec<PyBackedBytes>,
+    ) -> PyResult<SortedRun> {
+        sorted_run(
+            py.detach(|| run::SortedRun::of(&slices(&keys), &slices(&versions), &slices(&removes))),
+        )
+    }
+
+    /// Every key of `rows` at its version, in key order, and the removes of
+    /// `removes`. Uses the rows up.
+    #[staticmethod]
+    #[pyo3(signature = (rows, removes=vec![]))]
+    fn from_rows(
+        py: Python<'_>,
+        mut rows: PyRefMut<'_, Rows>,
+        removes: Vec<PyBackedBytes>,
+    ) -> PyResult<SortedRun> {
+        let table = rows
+            .table
+            .take()
+            .ok_or_else(|| PyValueError::new_err("rows already used"))?;
+        let mut src = Source::Table(table);
+        sorted_run(py.detach(|| run::SortedRun::from_source(&mut src, &slices(&removes))))
+    }
+
+    /// A run from its transport form, a `.kx` file, every fact checked
+    /// (`FormatError` when one fails), decoding at most `max_entries`
+    /// entries and `max_bytes` bytes (`LimitError` past either).
+    #[staticmethod]
+    #[pyo3(signature = (data, *, max_entries=u64::MAX, max_bytes=u64::MAX))]
+    fn decode(
+        py: Python<'_>,
+        data: PyBackedBytes,
+        max_entries: u64,
+        max_bytes: u64,
+    ) -> PyResult<SortedRun> {
+        sorted_run(py.detach(|| run::SortedRun::decode(&data, max_entries, max_bytes)))
+    }
+
+    /// The transport form: one `.kx` file.
+    #[pyo3(signature = (*, block_size=65536, level=1, bits_per_item=14, k=10, codec=1))]
+    fn encode<'py>(
+        &self,
+        py: Python<'py>,
+        block_size: usize,
+        level: u32,
+        bits_per_item: u64,
+        k: u8,
+        codec: u8,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let o = options(block_size, level, bits_per_item, k, codec);
+        let out = py.detach(|| self.inner.encode(o)).map_err(to_py)?;
+        Ok(PyBytes::new(py, &out))
+    }
+
+    fn __len__(&self) -> usize {
+        self.inner.len()
+    }
+
+    #[getter]
+    fn upserts(&self) -> usize {
+        self.inner.len() - self.inner.removes()
+    }
+
+    #[getter]
+    fn removes(&self) -> usize {
+        self.inner.removes()
+    }
+
+    /// Bytes held.
+    #[getter]
+    fn nbytes(&self) -> usize {
+        self.inner.nbytes()
+    }
+
+    fn keys<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        arena_list(py, &self.inner.keys)
+    }
+
+    /// Keys, versions (empty for a remove), deleted flags, locators.
+    fn entries<'py>(&self, py: Python<'py>) -> PyResult<Merged<'py>> {
+        let r = &self.inner;
+        let flags: Vec<u8> = r.deleted.iter().map(|&d| d as u8).collect();
+        Ok((
+            arena_list(py, &r.keys)?,
+            arena_list(py, &r.versions)?,
+            PyBytes::new(py, &flags),
+            r.locators.clone(),
+        ))
+    }
+
+    /// The delta of this run over what the sparse reader `found` — per key,
+    /// `(live, version, locator)`, the version None where the filters alone
+    /// said "live at another version"; a key it lacks is absent — as `.kx`
+    /// files of about `max_file_bytes`, with added, removed, changed, and up
+    /// to `collect` changed keys (`Job.collected`).
+    #[pyo3(signature = (found, *, generation, collect=0, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864))]
+    #[allow(clippy::too_many_arguments)]
+    fn delta<'py>(
+        &self,
+        py: Python<'py>,
+        found: Bound<'py, PyDict>,
+        generation: u64,
+        collect: usize,
+        block_size: usize,
+        level: u32,
+        bits_per_item: u64,
+        k: u8,
+        codec: u8,
+        max_file_bytes: usize,
+    ) -> PyResult<(Resolved<'py>, Option<Changed<'py>>)> {
+        let r = &self.inner;
+        let mut olds = Vec::with_capacity(r.len());
+        for i in 0..r.len() {
+            let hit = found.get_item(PyBytes::new(py, r.key(i)))?;
+            olds.push(match hit {
+                None => Sparse::Absent,
+                Some(t) => {
+                    let (live, version, locator): (bool, Option<Vec<u8>>, Option<u64>) =
+                        t.extract()?;
+                    match (live, version) {
+                        (false, _) => Sparse::Absent,
+                        (true, None) => Sparse::Other,
+                        (true, Some(v)) => Sparse::Live(v, locator.unwrap_or(0)),
+                    }
+                }
+            });
+        }
+        let o = options(block_size, level, bits_per_item, k, codec);
+        let d = py
+            .detach(|| {
+                let mut d = delta::Delta::new(o, max_file_bytes, collect, generation);
+                for (i, old) in olds.iter().enumerate() {
+                    let was = match old {
+                        Sparse::Absent => delta::Old::Absent,
+                        Sparse::Live(v, l) => delta::Old::Live(v, *l),
+                        Sparse::Other => delta::Old::Other,
+                    };
+                    d.apply(r.key(i), r.write(i), was)?;
+                }
+                d.finish()?;
+                Ok(d)
+            })
+            .map_err(to_py)?;
+        Ok((delta_files(py, &d), changed(py, &d.collected)?))
+    }
+
+    /// Up to `limit` entries of the newest-wins merge of `runs` (newest
+    /// first) past `after`: keys, versions, deleted flags, locators, and
+    /// whether any key lies past them.
+    #[staticmethod]
+    #[pyo3(signature = (runs, after, limit))]
+    fn merge<'py>(
+        py: Python<'py>,
+        runs: Vec<PyRef<'py, SortedRun>>,
+        after: Option<PyBackedBytes>,
+        limit: usize,
+    ) -> PyResult<Bound<'py, PyTuple>> {
+        let inner: Vec<&run::SortedRun> = runs.iter().map(|r| r.inner.as_ref()).collect();
+        let (picks, more) = run::SortedRun::merge(&inner, after.as_deref(), limit);
+        let keys = PyList::new(
+            py,
+            picks
+                .iter()
+                .map(|&(r, i)| PyBytes::new(py, inner[r].key(i))),
+        )?;
+        let versions = PyList::new(
+            py,
+            picks
+                .iter()
+                .map(|&(r, i)| PyBytes::new(py, inner[r].versions.get(i))),
+        )?;
+        let deleted: Vec<u8> = picks
+            .iter()
+            .map(|&(r, i)| inner[r].deleted[i] as u8)
+            .collect();
+        let locators: Vec<u64> = picks.iter().map(|&(r, i)| inner[r].locators[i]).collect();
+        (keys, versions, PyBytes::new(py, &deleted), locators, more).into_pyobject(py)
+    }
+}
+
 // -- jobs -------------------------------------------------------------------------------
 
 enum Kind {
@@ -958,11 +1182,11 @@ impl Job {
         }
     }
 
-    /// A replacement's or a patch's counts and collected keys.
-    fn delta(&self) -> PyResult<(u64, u64, u64, &jobs::Collected)> {
+    /// A replacement's or a patch's delta.
+    fn delta(&self) -> PyResult<&delta::Delta> {
         match &self.kind {
-            Kind::Replace(j) => Ok((j.added, j.removed, j.changed, &j.collected)),
-            Kind::Patch(j) => Ok((j.added, j.removed, j.changed, &j.collected)),
+            Kind::Replace(j) => Ok(&j.delta),
+            Kind::Patch(j) => Ok(&j.delta),
             _ => Err(PyTypeError::new_err("not a replacement or a patch")),
         }
     }
@@ -1018,18 +1242,17 @@ impl Job {
         })
     }
 
-    /// The merge-join of a patch — sorted `keys`, their `versions`, and a
-    /// `deleted` flag per key for removes — against `runs` existing runs,
-    /// newest first. At most `collect` changed keys are kept for `collected`.
-    /// Written entries carry `generation` as their locator.
+    /// The merge-join of a sorted run against `runs` existing runs, newest
+    /// first: a patch, or with `replace` the whole new content. At most
+    /// `collect` changed keys are kept for `collected`. Written entries carry
+    /// `generation` as their locator.
     #[staticmethod]
-    #[pyo3(signature = (keys, versions, deleted, runs, *, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864, collect=0, generation=0))]
+    #[pyo3(signature = (run, runs, *, replace=false, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864, collect=0, generation=0))]
     #[allow(clippy::too_many_arguments)]
     fn patch(
-        keys: Vec<PyBackedBytes>,
-        versions: Vec<PyBackedBytes>,
-        deleted: PyBackedBytes,
+        run: PyRef<'_, SortedRun>,
         runs: usize,
+        replace: bool,
         block_size: usize,
         level: u32,
         bits_per_item: u64,
@@ -1039,34 +1262,20 @@ impl Job {
         collect: usize,
         generation: u64,
     ) -> PyResult<Job> {
-        if versions.len() != keys.len() || deleted.len() != keys.len() {
-            return Err(PyValueError::new_err(
-                "keys, versions and deleted must have the same length",
-            ));
-        }
-        let (mut ka, mut va) = (Arena::default(), Arena::default());
-        for (i, (key, v)) in keys.iter().zip(&versions).enumerate() {
-            if i > 0 && key.as_ref() <= keys[i - 1].as_ref() {
-                return Err(PyValueError::new_err(
-                    "patch keys must be sorted and unique",
-                ));
-            }
-            ka.push(key);
-            va.push(v);
-        }
         let o = options(block_size, level, bits_per_item, k, codec);
+        let job = Patch::new(
+            run.inner.clone(),
+            replace,
+            runs,
+            o,
+            max_file_bytes,
+            collect,
+            generation,
+        )
+        .map_err(to_py)?;
         Ok(Job {
             records: None,
-            kind: Kind::Patch(Box::new(Patch::new(
-                ka,
-                va,
-                deleted.iter().map(|&d| d != 0).collect(),
-                runs,
-                o,
-                max_file_bytes,
-                collect,
-                generation,
-            ))),
+            kind: Kind::Patch(Box::new(job)),
         })
     }
 
@@ -1152,8 +1361,8 @@ impl Job {
                     Kind::Count(j) => j.step()?,
                 };
                 let file = match (&step, kind) {
-                    (Step::File, Kind::Replace(j)) => j.writer.files.pop_front(),
-                    (Step::File, Kind::Patch(j)) => j.writer.files.pop_front(),
+                    (Step::File, Kind::Replace(j)) => j.delta.writer.files.pop_front(),
+                    (Step::File, Kind::Patch(j)) => j.delta.writer.files.pop_front(),
                     (Step::File, Kind::Compact(j)) => j.writer.files.pop_front(),
                     (Step::Garbage, Kind::Compact(j)) => {
                         j.garbage.as_mut().and_then(|g| g.files.pop_front())
@@ -1176,17 +1385,17 @@ impl Job {
     /// changed versions.
     #[getter]
     fn added(&self) -> PyResult<u64> {
-        Ok(self.delta()?.0)
+        Ok(self.delta()?.added)
     }
 
     #[getter]
     fn removed(&self) -> PyResult<u64> {
-        Ok(self.delta()?.1)
+        Ok(self.delta()?.removed)
     }
 
     #[getter]
     fn changed(&self) -> PyResult<u64> {
-        Ok(self.delta()?.2)
+        Ok(self.delta()?.changed)
     }
 
     /// Entries a compaction wrote to garbage files.
@@ -1207,17 +1416,10 @@ impl Job {
         }
     }
 
-    /// A replacement's or a patch's written keys and deleted keys, or None
-    /// past `collect`.
-    fn collected<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<Option<(Bound<'py, PyList>, Bound<'py, PyList>)>> {
-        let c = self.delta()?.3;
-        match (&c.upserts, &c.removes) {
-            (Some(u), Some(r)) => Ok(Some((arena_list(py, u)?, arena_list(py, r)?))),
-            _ => Ok(None),
-        }
+    /// A replacement's or a patch's written keys, `{key: version}`, and its
+    /// deleted keys, or None past `collect`.
+    fn collected<'py>(&self, py: Python<'py>) -> PyResult<Option<Changed<'py>>> {
+        changed(py, &self.delta()?.collected)
     }
 }
 
@@ -1295,6 +1497,31 @@ impl LocalFile {
 
 type Resolved<'py> = (Vec<Bound<'py, PyBytes>>, u64, u64, u64);
 
+/// Written keys with their versions, and deleted keys.
+type Changed<'py> = (Bound<'py, PyDict>, Bound<'py, PyList>);
+
+fn changed<'py>(py: Python<'py>, c: &delta::Collected) -> PyResult<Option<Changed<'py>>> {
+    match (&c.upserts, &c.removes) {
+        (Some((k, v)), Some(r)) => {
+            let written = PyDict::new(py);
+            for i in 0..k.len() {
+                written.set_item(PyBytes::new(py, k.get(i)), PyBytes::new(py, v.get(i)))?;
+            }
+            Ok(Some((written, arena_list(py, r)?)))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn delta_files<'py>(py: Python<'py>, d: &delta::Delta) -> Resolved<'py> {
+    (
+        d.writer.files.iter().map(|f| PyBytes::new(py, f)).collect(),
+        d.added,
+        d.removed,
+        d.changed,
+    )
+}
+
 /// An index as local files, newest run first, each run in key order.
 #[pyclass(module = "solera._native")]
 struct Snapshot {
@@ -1319,14 +1546,14 @@ impl Snapshot {
         self.inner.entries()
     }
 
-    /// The delta of `run` (a `.kx` file) against the snapshot, as a patch or
-    /// a `replace`ment, as `.kx` files with added, removed and changed.
+    /// The delta of a `SortedRun` against the snapshot, as a patch or a
+    /// `replace`ment: `.kx` files, with added, removed and changed.
     #[pyo3(signature = (run, *, replace, generation, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864))]
     #[allow(clippy::too_many_arguments)]
     fn resolve<'py>(
         &mut self,
         py: Python<'py>,
-        run: PyBackedBytes,
+        run: PyRef<'_, SortedRun>,
         replace: bool,
         generation: u64,
         block_size: usize,
@@ -1337,20 +1564,11 @@ impl Snapshot {
         max_file_bytes: usize,
     ) -> PyResult<Resolved<'py>> {
         let o = options(block_size, level, bits_per_item, k, codec);
-        let inner = &mut self.inner;
-        let (files, counts) = py
-            .detach(|| {
-                let mut w = stream::Writer::new(o, max_file_bytes);
-                let counts = inner.resolve(&run, replace, generation, &mut w)?;
-                Ok::<_, Error>((w.files, counts))
-            })
+        let (inner, run) = (&mut self.inner, run.inner.clone());
+        let d = py
+            .detach(|| inner.resolve(&run, replace, generation, o, max_file_bytes))
             .map_err(to_py)?;
-        Ok((
-            files.iter().map(|f| PyBytes::new(py, f)).collect(),
-            counts.0,
-            counts.1,
-            counts.2,
-        ))
+        Ok(delta_files(py, &d))
     }
 
     /// The newest entry of each key — `(version, deleted, locator)` — or None.
@@ -1382,6 +1600,8 @@ fn solera_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("CODEC_ZLIB", format::CODEC_ZLIB)?;
     m.add("FOOTER_SIZE", format::FOOTER_SIZE)?;
     m.add("FormatError", m.py().get_type::<FormatError>())?;
+    m.add("LimitError", m.py().get_type::<LimitError>())?;
+    m.add_class::<SortedRun>()?;
     m.add_function(wrap_pyfunction!(encode_file, m)?)?;
     m.add_function(wrap_pyfunction!(write_files, m)?)?;
     m.add_function(wrap_pyfunction!(decode_block, m)?)?;

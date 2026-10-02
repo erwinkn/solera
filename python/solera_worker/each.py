@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 
 from solera import errors
 from solera.failures import REMOVED, UNMATCHED, Outcome, Record, eligible, minima, transition
+from solera.keys import SortedRun
 from solera.keys.index import IndexState, KeyIndex, key_bytes, key_str
 from solera.patterns import Matcher
 from solera.sdk import UNSET, Ref, Result
@@ -441,9 +442,7 @@ async def _failures(spec, each: dict, page: Page, outcomes: dict, keys_io) -> di
             removes.append(key_bytes(key))
     index = KeyIndex(keys_io, None, IndexState.from_json(each["failures"]))
     files, _ = await index.resolve(
-        upsert_keys,
-        upsert_versions,
-        removes,
+        SortedRun.of(upsert_keys, upsert_versions, removes),
         batch=int(each["batch"]),
         attempt=spec["attempt"],
         generation=int(spec.get("generation") or 0),

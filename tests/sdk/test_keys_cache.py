@@ -5,15 +5,17 @@ admission, integrity, candidates and reservations."""
 import asyncio
 import os
 import random
+import struct
+import zlib
 
 import pytest
 from obstore.store import MemoryStore
 from solera import _native
-from solera.keys import _python
+from solera.keys import FOOTER_SIZE, SortedRun, _python
 from solera.keys.cache import Corrupt, EngineCache
 from solera.keys.index import FileInfo, IndexState, KeyIndex, Options
 from solera.keys.io import ObjectIO
-from solera.keys.resolver import Ask, Limits, Malformed, Prepared, Resolver, answers, frame, request
+from solera.keys.resolver import Ask, Limits, Malformed, Prepared, Resolver, answers, frame, request, unframe
 
 OPTS = Options(
     block_size=512,
@@ -29,13 +31,6 @@ def key(i):
     return f"k{i:06d}".encode()
 
 
-def run_file(keys, versions, removes=()):
-    entries = sorted(
-        [(k, v, 0) for k, v in zip(keys, versions, strict=True)] + [(k, b"", 1) for k in removes]
-    )
-    return _native.encode_file([e[0] for e in entries], [e[1] for e in entries], bytes(e[2] for e in entries))
-
-
 async def built_index(io, n=3000, commits=12, seed=1):
     """An index over several levels, as random commits and compactions leave it."""
 
@@ -45,7 +40,7 @@ async def built_index(io, n=3000, commits=12, seed=1):
         ks = sorted({key(rng.randrange(n)) for _ in range(n if b == 0 else 300)})
         rm = sorted({key(rng.randrange(n)) for _ in range(30)} - set(ks)) if b else []
         files, _ = await KeyIndex(io, None, state, OPTS).resolve(
-            ks, [rng.randbytes(8) for _ in ks], rm, batch=b, attempt=f"w{b}", generation=b + 1
+            SortedRun.of(ks, [rng.randbytes(8) for _ in ks], rm), batch=b, attempt=f"w{b}", generation=b + 1
         )
         state = state.committed(b, files, keep_log=False)
         while (out := await KeyIndex(io, None, state, OPTS).compact()) is not None:
@@ -58,8 +53,8 @@ def prepared(state, batch=99, generation=100, replace=True):
 
 
 def ask(state, keys, versions, removes=(), kind="patch", batch=99, generation=100):
-    run = run_file(keys, versions, removes)
-    return Ask("out", "", kind, batch, generation, state.prefix, 98, run, len(keys) + len(removes))
+    run = SortedRun.of(list(keys), list(versions), list(removes))
+    return Ask("out", "", kind, batch, generation, state.prefix, 98, run)
 
 
 async def engine_answer(resolver, state, a, invocation="inv", p=None, live=True):
@@ -101,7 +96,9 @@ async def test_engine_and_cold_resolves_agree(io, tmp_path):
                 _native.Rows.pairs(list(zip(ks, vs, strict=True))), 99, f"c{step}", generation=100
             )
         else:
-            files, _ = await idx.resolve(ks, vs, rm, batch=99, attempt=f"c{step}", generation=100, exact=True)
+            files, _ = await idx.resolve(
+                SortedRun.of(ks, vs, rm), batch=99, attempt=f"c{step}", generation=100, exact=True
+            )
         cold = decoded([await io.read_whole(state.path(f.name), f.size) for f in files.files])
         if answer["result"] == "empty":
             assert cold == [] and files.added == files.removed == 0
@@ -324,6 +321,19 @@ async def test_the_disk_budget_holds_against_the_real_size(io, tmp_path):
     assert await roomy.fill(io, state) and roomy.used <= roomy.disk
 
 
+def forged(a, *, keys=None, payload=None, digest=None):
+    """A request for `a` whose header or payload says what the caller likes."""
+
+    body = request("inv", [a])
+    header, _ = unframe(body)
+    payload = payload if payload is not None else a.run.encode()
+    o = header["outputs"][0]
+    o.update(size=len(payload), digest=digest or _native.content_digest(payload))
+    if keys is not None:
+        o["keys"] = keys
+    return frame(header, [payload])
+
+
 async def test_requests_are_checked_against_their_bytes(io, tmp_path):
     """Review 3: the digest that deduplicates and the count that limits are
     the payload's own, and a frame whose bounds do not hold is refused."""
@@ -333,19 +343,19 @@ async def test_requests_are_checked_against_their_bytes(io, tmp_path):
     await cache.fill(io, state)
     resolver = Resolver(cache, io, OPTS, Limits(max_keys=1))
     first, second = ask(state, [key(1)], [b"first"]), ask(state, [key(1)], [b"second"])
-    second.run, second.keys = second.run, 1
-    lying = request("inv", [first])
-    forged = request("inv", [second]).replace(
-        _native.content_digest(second.run).encode(), _native.content_digest(first.run).encode()
-    )
+    lying = forged(second, digest=_native.content_digest(first.run.encode()))
     got = await asyncio.gather(
-        *(resolver.resolve("att", b, lambda n: prepared(state), lambda: True) for b in (lying, forged))
+        *(
+            resolver.resolve("att", b, lambda n: prepared(state), lambda: True)
+            for b in (request("inv", [first]), lying)
+        )
     )
     assert answers(got[0])["out"][0]["result"] == "delta"
     assert answers(got[1])["out"][0]["reason"] == "invalid"  # its digest is not its bytes'
     two = ask(state, [key(1), key(2)], [b"x", b"y"])
-    two.keys = 0  # claims nothing, carries two
-    assert (await engine_answer(resolver, state, two))[0]["reason"] == "invalid"
+    claims_none = forged(two, keys=0)  # claims nothing, carries two
+    out = await resolver.resolve("att", claims_none, lambda n: prepared(state), lambda: True)
+    assert answers(out)["out"][0]["reason"] in ("invalid", "too_big")
     for bad in (
         b"\x01\xff\xff\x00\x00{}",  # a header past the end
         frame({"outputs": [{"name": "out", "offset": 0, "size": 10**6}]}, [b"x"]),  # a payload too
@@ -358,6 +368,58 @@ async def test_requests_are_checked_against_their_bytes(io, tmp_path):
             await resolver.resolve("att", bad, lambda n: prepared(state), lambda: True)
 
 
+def patched(data, *, block=None, entries=None):
+    """`data`, an uncompressed file of one block, with that block's bytes or
+    its footer's entry count replaced and every checksum made to match: what
+    a forger sends."""
+
+    data = bytearray(data)
+    foot = len(data) - FOOTER_SIZE
+    at, length = struct.unpack_from("<Q", data, foot + 28)[0], struct.unpack_from("<I", data, foot + 36)[0]
+    if block is not None:
+        [(_, off, size, _, crc)] = _python.parse_index(bytes(data), len(data))["blocks"]
+        assert len(block) == size
+        data[off : off + size] = block
+        i = data.index(struct.pack("<I", crc), at, at + length)
+        data[i : i + 4] = struct.pack("<I", zlib.crc32(block))
+        struct.pack_into("<I", data, foot + 40, zlib.crc32(bytes(data[at : at + length])))
+    if entries is not None:
+        struct.pack_into("<Q", data, foot + 8, entries)
+    return bytes(data)
+
+
+async def test_limits_hold_against_what_a_run_holds(io, tmp_path):
+    """Round 2, finding 1: a run is decoded once, every fact checked, before
+    a limit is applied to it — not its footer's word — and no output's
+    payload is another's."""
+
+    state = await built_index(io, commits=2)
+    cache = EngineCache(str(tmp_path))
+    await cache.fill(io, state)
+    resolver = Resolver(cache, io, OPTS, Limits(max_keys=1))
+
+    async def reason(body):
+        out = await resolver.resolve("att", body, lambda n: prepared(state), lambda: True)
+        return answers(out)["out"][0].get("reason")
+
+    # Two entries behind a footer that says one: never a delta of two.
+    two = ask(state, [key(1), key(2)], [b"x", b"y"])
+    assert await reason(forged(two, keys=1, payload=patched(two.run.encode(codec=0), entries=1))) == "invalid"
+    # A length that overflows when added: a decline, not a Rust panic.
+    one = ask(state, [b"k" * 20], [b"v"])
+    data = one.run.encode(codec=0)
+    size = _python.parse_index(data, len(data))["blocks"][0][2]
+    overflow = b"\x00" + b"\xff" * 9 + b"\x01" + b"\x00" * (size - 11)
+    assert await reason(forged(one, payload=patched(data, block=overflow))) == "invalid"
+    # One payload behind 32 outputs: refused before anything is copied.
+    header, payloads = unframe(request("inv", [one]))
+    header["outputs"] = [{**header["outputs"][0], "name": f"o{i}"} for i in range(32)]
+    with pytest.raises(Malformed):
+        await resolver.resolve(
+            "att", frame(header, [bytes(payloads)]), lambda n: prepared(state), lambda: True
+        )
+
+
 async def test_the_queue_is_taken_before_scheduling(io, tmp_path, monkeypatch):
     """Review 5: a burst of distinct requests holds no more than the queue's
     bytes at once, and a source commit's resolve is held to the same limit."""
@@ -366,7 +428,7 @@ async def test_the_queue_is_taken_before_scheduling(io, tmp_path, monkeypatch):
     cache = EngineCache(str(tmp_path))
     await cache.fill(io, state)
     asks = [ask(state, [key(i)], [b"v%d" % i]) for i in range(10)]
-    one = max(len(a.run) for a in asks)
+    one = max(len(a.run.encode()) for a in asks)
     resolver = Resolver(cache, io, OPTS, Limits(queue_bytes=2 * one))
     real, peak = resolver._compute, []
 

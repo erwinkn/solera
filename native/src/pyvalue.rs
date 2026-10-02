@@ -106,9 +106,9 @@ fn unsupported(v: &Bound<'_, PyAny>) -> PyErr {
 
 fn value_err(e: crate::format::Error) -> PyErr {
     match e {
-        crate::format::Error::Value(m) | crate::format::Error::Format(m) => {
-            PyValueError::new_err(m)
-        }
+        crate::format::Error::Value(m)
+        | crate::format::Error::Format(m)
+        | crate::format::Error::Limit(m) => PyValueError::new_err(m),
         crate::format::Error::Callback(e) => PyValueError::new_err(e.to_string()),
     }
 }

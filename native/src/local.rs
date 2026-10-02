@@ -20,14 +20,20 @@
 //! block      := entries (as in `.kx` blocks, uncompressed) · restart offsets (u32 each)
 //! ```
 
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::format::{file_blocks, fmt_err, get_bytes, put_bytes, shared_prefix, Error, Result};
-use crate::stream::{read_entry, write_entry, Block, Merge, Next, Writer};
+use crate::delta::{Delta, Old};
+use crate::format::Options;
+use crate::format::{
+    file_blocks, fmt_err, get_bytes, put_bytes, shared_prefix, slice_at, Error, Result,
+};
+use crate::jobs::{Patch, Step};
+use crate::run::SortedRun;
+use crate::stream::{read_entry, write_entry, Block, Merge, Next};
 
 pub const MAGIC: &[u8; 4] = b"KXL1";
 pub const VERSION: u16 = 1;
@@ -129,7 +135,7 @@ pub fn build(kx: &[u8], source: &str, digest: &[u8]) -> Result<Vec<u8>> {
     let mut total = 0u64;
     let mut local = LocalBlock::default();
     for m in &metas {
-        let Some(raw) = kx.get(m.offset as usize..(m.offset + m.size) as usize) else {
+        let Some(raw) = slice_at(kx, m.offset, m.size) else {
             return fmt_err("block out of bounds");
         };
         if crc32fast::hash(raw) != m.crc {
@@ -400,18 +406,18 @@ impl Local {
 }
 
 /// An index as local files: runs newest first, each a level-0 file alone or
-/// a deeper level's files in key order. Blocks read during one resolve are
-/// kept for its other keys.
+/// a deeper level's files in key order. Each run keeps the block it read
+/// last: a resolve's keys come sorted, so it never needs an earlier one.
 pub struct Snapshot {
     pub runs: Vec<Vec<Arc<Local>>>,
-    memo: HashMap<(usize, usize, usize), Arc<Vec<u8>>>,
+    last: Vec<Option<(usize, usize, Vec<u8>)>>, // per run: file, block, its bytes
 }
 
 impl Snapshot {
     pub fn new(runs: Vec<Vec<Arc<Local>>>) -> Snapshot {
         Snapshot {
+            last: runs.iter().map(|_| None).collect(),
             runs,
-            memo: HashMap::new(),
         }
     }
 
@@ -433,178 +439,119 @@ impl Snapshot {
             }
             let f = &run[fi - 1];
             let Some(b) = f.block_of(key) else { continue };
-            let buf = match self.memo.get(&(r, fi - 1, b)) {
-                Some(buf) => buf.clone(),
-                None => {
-                    let buf = Arc::new(f.read(b)?);
-                    self.memo.insert((r, fi - 1, b), buf.clone());
-                    buf
-                }
-            };
-            if let Some(hit) = f.find_in(b, &buf, key)? {
+            let held = matches!(&self.last[r], Some((lf, lb, _)) if (*lf, *lb) == (fi - 1, b));
+            if !held {
+                self.last[r] = Some((fi - 1, b, f.read(b)?));
+            }
+            let buf = &self.last[r].as_ref().expect("just read").2;
+            if let Some(hit) = f.find_in(b, buf, key)? {
                 return Ok(Some(hit));
             }
         }
         Ok(None)
     }
 
-    /// A patch's delta into `w`: sorted `keys` upserted at `versions`, or
-    /// removed where `deleted`. Returns added, removed, changed.
-    pub fn patch(
-        &mut self,
-        keys: &[&[u8]],
-        versions: &[&[u8]],
-        deleted: &[bool],
-        generation: u64,
-        w: &mut Writer,
-    ) -> Result<(u64, u64, u64)> {
-        let (mut added, mut removed, mut changed) = (0, 0, 0);
-        for i in 0..keys.len() {
-            let old = self.get(keys[i])?.filter(|h| !h.deleted);
-            let pred = old.as_ref().map(|h| (h.version.as_slice(), h.locator));
-            if deleted[i] {
-                if old.is_some() {
-                    w.push(keys[i], b"", true, generation, pred)?;
-                    removed += 1;
-                }
-            } else if old.is_none() {
-                w.push(keys[i], versions[i], false, generation, None)?;
-                added += 1;
-            } else if pred.unwrap().0 != versions[i] {
-                w.push(keys[i], versions[i], false, generation, pred)?;
-                changed += 1;
-            }
-        }
-        Ok((added, removed, changed))
-    }
-
-    /// The delta of a run (a `.kx` file: sorted keys, versions, `deleted`
-    /// for removes) against this snapshot: as a patch, or with `replace` as
-    /// the whole new content, live keys it omits deleted. Written into `w`;
-    /// returns added, removed, changed. A patch reads only the blocks of its
-    /// keys while that is less than every block; anything else merges.
+    /// The delta of `run` against this snapshot: as a patch, or with
+    /// `replace` as the whole new content, live keys it omits deleted. A
+    /// patch looks up each of its keys while that reads less than every
+    /// block; anything else is the streaming job, fed local blocks.
     pub fn resolve(
         &mut self,
-        run: &[u8],
+        run: &Arc<SortedRun>,
         replace: bool,
         generation: u64,
-        w: &mut Writer,
-    ) -> Result<(u64, u64, u64)> {
-        self.memo.clear();
-        let (codec, metas) = file_blocks(run)?;
-        let mut blocks = Vec::with_capacity(metas.len());
-        for m in &metas {
-            let Some(raw) = run.get(m.offset as usize..(m.offset + m.size) as usize) else {
-                return fmt_err("block out of bounds");
-            };
-            if crc32fast::hash(raw) != m.crc {
-                return fmt_err("block checksum mismatch");
-            }
-            blocks.push(Block::decode(raw, codec)?);
-        }
-        let mut keys: Vec<&[u8]> = Vec::new();
-        let mut versions: Vec<&[u8]> = Vec::new();
-        let mut deleted: Vec<bool> = Vec::new();
-        for b in &blocks {
-            for i in 0..b.len() {
-                keys.push(b.key(i));
-                versions.push(b.version(i));
-                deleted.push(b.deleted(i));
-            }
-        }
-        if replace && deleted.iter().any(|&d| d) {
-            return Err(Error::Value("a replacement has no removes".into()));
-        }
+        o: Options,
+        max_file_bytes: usize,
+    ) -> Result<Delta> {
         // A point lookup reads and checks one small block (~2.5 µs); a merge decodes every entry
         // (~120 ns each, bench/keys/warm.py): points win until about one lookup per 20 entries.
-        let out = if !replace && 16 * keys.len() * self.runs.len() < self.entries() as usize {
-            self.patch(&keys, &versions, &deleted, generation, w)?
-        } else {
-            self.join(&keys, &versions, &deleted, replace, generation, w)?
-        };
-        w.finish(false)?;
-        Ok(out)
-    }
-
-    fn join(
-        &self,
-        keys: &[&[u8]],
-        versions: &[&[u8]],
-        deleted: &[bool],
-        replace: bool,
-        generation: u64,
-        w: &mut Writer,
-    ) -> Result<(u64, u64, u64)> {
-        let (mut added, mut removed, mut changed) = (0, 0, 0);
-        let mut m = self.merge();
-        let mut more = m.advance()?;
-        let mut i = 0;
+        if !replace && 16 * run.len() * self.runs.len() < self.entries() as usize {
+            let mut d = Delta::new(o, max_file_bytes, 0, generation);
+            for i in 0..run.len() {
+                let hit = self.get(run.key(i))?;
+                let was = match &hit {
+                    Some(h) if !h.deleted => Old::Live(&h.version, h.locator),
+                    _ => Old::Absent,
+                };
+                d.apply(run.key(i), run.write(i), was)?;
+            }
+            d.finish()?;
+            return Ok(d);
+        }
+        let mut job = Patch::new(
+            run.clone(),
+            replace,
+            self.runs.len(),
+            o,
+            max_file_bytes,
+            0,
+            generation,
+        )?;
+        let mut feed = Feed::new(self.runs.len());
+        let mut files = VecDeque::new();
         loop {
-            // The merged view's current entry, if live.
-            while more && m.merge.deleted() {
-                more = m.advance()?;
-            }
-            let ord = match (i < keys.len(), more) {
-                (false, false) => break,
-                (false, true) if !replace => break,
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                (true, true) => keys[i].cmp(m.merge.key()),
-            };
-            match ord {
-                std::cmp::Ordering::Less => {
-                    if !deleted[i] {
-                        w.push(keys[i], versions[i], false, generation, None)?;
-                        added += 1;
-                    }
-                    i += 1;
-                }
-                std::cmp::Ordering::Greater => {
-                    if replace {
-                        let pred = (m.merge.version(), m.merge.locator());
-                        w.push(m.merge.key(), b"", true, generation, Some(pred))?;
-                        removed += 1;
-                    }
-                    more = m.advance()?;
-                }
-                std::cmp::Ordering::Equal => {
-                    let pred = (m.merge.version(), m.merge.locator());
-                    if deleted[i] {
-                        w.push(keys[i], b"", true, generation, Some(pred))?;
-                        removed += 1;
-                    } else if versions[i] != pred.0 {
-                        w.push(keys[i], versions[i], false, generation, Some(pred))?;
-                        changed += 1;
-                    }
-                    i += 1;
-                    more = m.advance()?;
+            match job.step()? {
+                Step::Run(r) => feed.feed(self, &mut job.merge, r)?,
+                Step::File => files.extend(job.delta.writer.files.pop_front()),
+                Step::Done => break,
+                Step::Rows | Step::Garbage => {
+                    unreachable!("a patch reads no rows, writes no garbage")
                 }
             }
         }
-        Ok((added, removed, changed))
+        let mut d = job.delta;
+        d.writer.files = files;
+        Ok(d)
     }
 
-    /// The live entries of the merged snapshot, in key order, for a merge-join.
+    /// The entries of the merged snapshot, in key order.
     pub fn merge(&self) -> LocalMerge<'_> {
-        let mut m = Merge::new(self.runs.len());
-        for (r, run) in self.runs.iter().enumerate() {
-            if run.iter().all(|f| f.blocks() == 0) {
-                m.runs[r].end();
-            }
-        }
         LocalMerge {
             snap: self,
-            merge: m,
-            next: vec![(0, 0); self.runs.len()],
+            merge: Merge::new(self.runs.len()),
+            feed: Feed::new(self.runs.len()),
         }
     }
 }
 
 /// Feeds a `Merge` the decoded blocks of a snapshot's runs, one at a time.
+struct Feed {
+    next: Vec<(usize, usize)>, // per run: file, block
+}
+
+impl Feed {
+    fn new(runs: usize) -> Feed {
+        Feed {
+            next: vec![(0, 0); runs],
+        }
+    }
+
+    /// Run `r`'s next block into `m`, or its end.
+    fn feed(&mut self, snap: &Snapshot, m: &mut Merge, r: usize) -> Result<()> {
+        let run = &snap.runs[r];
+        let skip = |mut at: (usize, usize)| {
+            while at.0 < run.len() && at.1 >= run[at.0].blocks() {
+                at = (at.0 + 1, 0);
+            }
+            at
+        };
+        let (fi, bi) = skip(self.next[r]);
+        if fi >= run.len() {
+            m.runs[r].end();
+            return Ok(());
+        }
+        let block = run[fi].decoded(bi)?;
+        self.next[r] = skip((fi, bi + 1));
+        m.runs[r].push_block(block, self.next[r].0 >= run.len());
+        Ok(())
+    }
+}
+
+/// The merged view of a snapshot, a key at a time.
 pub struct LocalMerge<'a> {
     snap: &'a Snapshot,
     pub merge: Merge,
-    next: Vec<(usize, usize)>, // per run: file, block
+    feed: Feed,
 }
 
 impl LocalMerge<'_> {
@@ -614,27 +561,7 @@ impl LocalMerge<'_> {
             match self.merge.next_key()? {
                 Next::Entry => return Ok(true),
                 Next::End => return Ok(false),
-                Next::Need(r) => {
-                    let run = &self.snap.runs[r];
-                    let (mut fi, bi) = self.next[r];
-                    while fi < run.len() && run[fi].blocks() == 0 {
-                        fi += 1;
-                    }
-                    if fi >= run.len() {
-                        return fmt_err("a local run ended early");
-                    }
-                    let block = run[fi].decoded(bi)?;
-                    let mut next = if bi + 1 < run[fi].blocks() {
-                        (fi, bi + 1)
-                    } else {
-                        (fi + 1, 0)
-                    };
-                    while next.0 < run.len() && run[next.0].blocks() == 0 {
-                        next = (next.0 + 1, 0);
-                    }
-                    self.next[r] = next;
-                    self.merge.runs[r].push_block(block, next.0 >= run.len());
-                }
+                Next::Need(r) => self.feed.feed(self.snap, &mut self.merge, r)?,
             }
         }
     }

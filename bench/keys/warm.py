@@ -37,7 +37,7 @@ import uuid
 from dataclasses import replace
 
 sys.path.insert(0, os.path.dirname(__file__))
-from solera import _native  # noqa: E402
+from solera.keys import SortedRun  # noqa: E402
 from solera.keys.cache import EngineCache  # noqa: E402
 from solera.keys.index import KeyIndex, Options  # noqa: E402
 from solera.keys.io import DiskCache, ObjectIO  # noqa: E402
@@ -82,7 +82,10 @@ async def run_size(n: int, args) -> list[dict]:
             items = sorted(rng.sample(list(current.items()), 1000))
             vers = [rng.randbytes(16) for _ in items]
             files, _ = await KeyIndex(setup, None, state, opts).resolve(
-                [bench.key_of(i) for i, _ in items], vers, batch=b + 1, attempt="setup", generation=b + 1
+                SortedRun.of([bench.key_of(i) for i, _ in items], vers),
+                batch=b + 1,
+                attempt="setup",
+                generation=b + 1,
             )
             state = state.committed(b + 1, files, keep_log=False)
             current.update((i, v) for (i, _), v in zip(items, vers, strict=True))
@@ -122,14 +125,14 @@ async def run_size(n: int, args) -> list[dict]:
             io = cold()
             (files, _), wall, cpu = await timed(
                 lambda io=io, keys=keys, vers=vers, k=k: KeyIndex(io, None, state, opts).resolve(
-                    keys, vers, batch=99, attempt=f"c{k}"
+                    SortedRun.of(keys, vers), batch=99, attempt=f"c{k}"
                 )
             )
             row["cold"] = (wall, cpu, io.metrics.gets, io.metrics.bytes_in / 1e6)
             wio.metrics.reset()
             _, wall, cpu = await timed(
                 lambda keys=keys, vers=vers, k=k: KeyIndex(wio, None, state, opts).resolve(
-                    keys, vers, batch=99, attempt=f"w{k}"
+                    SortedRun.of(keys, vers), batch=99, attempt=f"w{k}"
                 )
             )
             row["warm_worker"] = (wall, cpu, wio.metrics.gets, wio.metrics.bytes_in / 1e6)
@@ -140,8 +143,8 @@ async def run_size(n: int, args) -> list[dict]:
                 io, spent = cold(), {}
 
                 async def engine_path(io=io, keys=keys, vers=vers, p=p, k=k, label=label, spent=spent):
-                    run = _native.encode_file(keys, vers, bytes(len(keys)))
-                    body = request("inv", [Ask("out", "", "patch", 100, 1, state.prefix, 99, run, len(keys))])
+                    run = SortedRun.of(keys, vers)
+                    body = request("inv", [Ask("out", "", "patch", 100, 1, state.prefix, 99, run)])
                     t = time.perf_counter()
                     out = await resolver.resolve(f"e{k}{label}", body, lambda name: p, lambda: True)
                     spent["resolve"] = time.perf_counter() - t

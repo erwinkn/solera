@@ -9,7 +9,11 @@ recomputed, or shares a computation still in flight.
 
 Framing, both ways: `u8` protocol version · `u32` header length (little
 endian) · JSON header · payloads, each output's at `offset` (from the end
-of the header), `size` bytes long — a `.kx` file.
+of the header), `size` bytes long — a `.kx` file. Payloads lie back to back
+in output order, so no byte is two outputs'.
+
+Nothing in a request is taken on its word: a run is decoded once, every
+fact checked (`SortedRun.decode`), and the limits apply to what it holds.
 """
 
 from __future__ import annotations
@@ -24,7 +28,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from .. import _native
-from . import FOOTER_SIZE, parse_footer
+from .._native import LimitError, SortedRun
 from .cache import EngineCache
 from .index import IndexState, Options
 from .io import ObjectIO
@@ -68,23 +72,27 @@ def unframe(body: bytes) -> tuple[dict, memoryview]:
     return header, memoryview(body)[5 + n :]
 
 
-def _outputs(header: dict, payloads: memoryview) -> list[tuple[dict, bytes]]:
-    """Each output's header and payload, every bound checked."""
+def _outputs(header: dict, payloads: memoryview) -> list[tuple[dict, memoryview]]:
+    """Each output's header and payload, every bound checked: the payloads
+    lie back to back, in output order, and fill the body."""
 
     outputs, names = header.get("outputs"), set()
     if not isinstance(outputs, list):
         raise Malformed("outputs is not a list")
-    out = []
+    out, at = [], 0
     for o in outputs:
         if not isinstance(o, dict) or not isinstance(o.get("name"), str) or o["name"] in names:
             raise Malformed("an output without a name of its own")
         names.add(o["name"])
         offset, size = o.get("offset"), o.get("size")
-        if not (isinstance(offset, int) and isinstance(size, int) and 0 <= offset and 0 <= size):
+        if not (isinstance(offset, int) and isinstance(size, int) and 0 <= size):
             raise Malformed(f"{o['name']}: bad offset or size")
-        if offset + size > len(payloads):
-            raise Malformed(f"{o['name']}: payload past the end of the body")
-        out.append((o, bytes(payloads[offset : offset + size])))
+        if offset != at or offset + size > len(payloads):
+            raise Malformed(f"{o['name']}: a payload not right after the one before")
+        out.append((o, payloads[offset : offset + size]))
+        at += size
+    if at != len(payloads):
+        raise Malformed("bytes past the last payload")
     return out
 
 
@@ -104,9 +112,10 @@ class Prepared:
 
 @dataclass
 class Limits:
-    max_keys: int = 100_000
-    max_bytes: int = 16 * 2**20
-    max_entries: int = 2_000_000
+    max_keys: int = 100_000  # a patch's entries
+    max_bytes: int = 16 * 2**20  # a run's bytes, and a delta's
+    max_decoded: int = 64 * 2**20  # a run's bytes decoded: decompressed, and its keys and versions
+    max_entries: int = 2_000_000  # a replacement's entries plus the index's
     queue_bytes: int = 64 * 2**20
     concurrency: int = 2
 
@@ -158,12 +167,12 @@ class Resolver:
             out_header.append({"name": o["name"], **answer})
         return frame({"outputs": out_header}, out_payloads)
 
-    async def _one(self, attempt, invocation, o, data, prepared, live):
+    async def _one(self, attempt, invocation, o, view: memoryview, prepared, live):
         declined = {"result": "declined"}
         p = prepared(o["name"])
         if p is None or not live():
             return {**declined, "reason": "not_live"}, None
-        kind = o.get("kind")
+        kind, keys = o.get("kind"), o.get("keys")
         if (
             o.get("scope") != p.scope
             or o.get("batch") != p.batch
@@ -171,23 +180,17 @@ class Resolver:
             or (o.get("base") or {}).get("prefix") != p.index.prefix
             or kind not in ("patch", "replace")
             or (kind == "replace" and not p.replace)
+            or not isinstance(keys, int)
         ):
             return {**declined, "reason": "invalid"}, None
         if (o.get("base") or {}).get("head_batch") != p.head_batch:
             return {**declined, "reason": "stale"}, None
-        # What the payload is, from its bytes, not from what the header says.
+        if len(view) > self.limits.max_bytes:
+            return {**declined, "reason": "too_big"}, None
+        data = bytes(view)  # an output the attempt holds: its payload, copied once
         actual = _native.content_digest(data)
-        try:
-            entries = parse_footer(data[-FOOTER_SIZE:])["entries"] if data else -1
-        except ValueError:
-            entries = -1
-        if o.get("digest") != actual or o.get("keys") != entries:
+        if o.get("digest") != actual:
             return {**declined, "reason": "invalid"}, None
-        lim = self.limits
-        if len(data) > lim.max_bytes or (kind == "patch" and entries > lim.max_keys):
-            return {**declined, "reason": "too_big"}, None
-        if kind == "replace" and sum(f.entries for f in p.index.files) + entries > lim.max_entries:
-            return {**declined, "reason": "too_big"}, None
         key = (
             attempt,
             invocation,
@@ -199,6 +202,7 @@ class Resolver:
             p.index.prefix,
             p.head_batch,
             actual,
+            keys,
         )
         fut = self._inflight.get(key)
         if fut is None:
@@ -206,7 +210,7 @@ class Resolver:
                 return {**declined, "reason": "busy"}, None
             # The worker uploads the delta under its own name: kept as a candidate under it.
             path = p.index.path(f"{p.batch:012d}-{attempt}.0000")
-            fut = self._inflight[key] = asyncio.ensure_future(self._compute(p, kind, data, live, path))
+            fut = self._inflight[key] = asyncio.ensure_future(self._compute(p, kind, data, live, path, keys))
 
             size = len(data)
 
@@ -217,19 +221,25 @@ class Resolver:
             fut.add_done_callback(done)
         return await asyncio.shield(fut)
 
-    async def compute(self, p: Prepared, kind: str, data: bytes, path: str):
+    async def compute(self, p: Prepared, kind: str, run: SortedRun, path: str):
         """One resolve with no request around it — a source commit, in the engine:
         `(answer, delta)` as for an output of a request, under the same limits."""
 
-        if not self._reserve(len(data)):
+        if not self._reserve(run.nbytes):
             return {"result": "declined", "reason": "busy"}, None
         try:
-            return await self._compute(p, kind, data, lambda: True, path)
+            return await self._compute(p, kind, run, lambda: True, path)
         finally:
-            self._release(len(data))
+            self._release(run.nbytes)
 
-    async def _compute(self, p: Prepared, kind: str, data: bytes, live, path: str):
+    async def _compute(self, p: Prepared, kind: str, run, live, path: str, keys: int | None = None):
+        """The answer for `run` — a `SortedRun`, or a request's `.kx` payload
+        claiming `keys` entries, decoded here — against `p`'s index."""
+
         declined = {"result": "declined"}
+        lim = self.limits
+        indexed = sum(f.entries for f in p.index.files)
+        most = lim.max_keys if kind == "patch" else lim.max_entries - indexed
         pin = self.cache.pin(p.index)
         if pin is None:
             self._background_fill(p.index, p.position)
@@ -238,14 +248,29 @@ class Resolver:
             async with self._sem:
                 if not live():
                     return {**declined, "reason": "not_live"}, None
+                if isinstance(run, bytes):
+                    try:
+                        run = await asyncio.to_thread(
+                            SortedRun.decode, run, max_entries=max(most, 0), max_bytes=lim.max_decoded
+                        )
+                    except LimitError:
+                        return {**declined, "reason": "too_big"}, None
+                    except ValueError:  # malformed, or a checksum fails
+                        return {**declined, "reason": "invalid"}, None
+                    if len(run) != keys:
+                        return {**declined, "reason": "invalid"}, None
+                if len(run) > most:
+                    return {**declined, "reason": "too_big"}, None
+                if kind == "replace" and run.removes:
+                    return {**declined, "reason": "invalid"}, None
                 snap = _native.Snapshot(pin.runs)
                 try:
                     files, added, removed, changed = await asyncio.to_thread(
                         snap.resolve,
-                        data,
+                        run,
                         replace=kind == "replace",
                         generation=p.generation,
-                        **_writer(self.o, self.limits.max_bytes),
+                        **_writer(self.o, lim.max_bytes),
                     )
                 except ValueError as e:
                     bad = re.match(r"local file (\S+): ", str(e))
@@ -256,7 +281,7 @@ class Resolver:
                     return {**declined, "reason": "cold"}, None
         if not files:
             return {"result": "empty"}, None
-        if len(files) > 1 or len(files[0]) > self.limits.max_bytes:
+        if len(files) > 1 or len(files[0]) > lim.max_bytes:
             return {**declined, "reason": "too_big"}, None
         delta = files[0]
         return {
@@ -303,7 +328,7 @@ def _writer(o: Options, max_file_bytes: int) -> dict:
 
 @dataclass
 class Ask:
-    """One output to resolve: its run is a `.kx` file of the sorted entries."""
+    """One output to resolve: its sorted entries, sent as a `.kx` file."""
 
     name: str
     scope: str
@@ -312,13 +337,14 @@ class Ask:
     generation: int
     prefix: str
     head_batch: int
-    run: bytes
-    keys: int
+    run: SortedRun
 
 
 def request(invocation: str, asks: list[Ask]) -> bytes:
-    outputs, offset = [], 0
+    outputs, offset, payloads = [], 0, []
     for a in asks:
+        payload = a.run.encode()
+        payloads.append(payload)
         outputs.append(
             {
                 "name": a.name,
@@ -327,14 +353,14 @@ def request(invocation: str, asks: list[Ask]) -> bytes:
                 "batch": a.batch,
                 "generation": a.generation,
                 "base": {"prefix": a.prefix, "head_batch": a.head_batch},
-                "keys": a.keys,
+                "keys": len(a.run),
                 "offset": offset,
-                "size": len(a.run),
-                "digest": _native.content_digest(a.run),
+                "size": len(payload),
+                "digest": _native.content_digest(payload),
             }
         )
-        offset += len(a.run)
-    return frame({"invocation": invocation, "outputs": outputs}, [a.run for a in asks])
+        offset += len(payload)
+    return frame({"invocation": invocation, "outputs": outputs}, payloads)
 
 
 def answers(body: bytes) -> dict[str, tuple[dict, bytes | None]]:

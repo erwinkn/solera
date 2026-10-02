@@ -90,7 +90,7 @@ def test_replace_objects(presorted):
     assert job.removed == sum(1 for k in live if k not in written)
     assert job.changed == sum(1 for k in written if k in live and live[k] != written[k])
     upserts, removes = job.collected()
-    assert upserts == [k for k, _, d in want if not d] and removes == [k for k, _, d in want if d]
+    assert upserts == {k: v for k, v, d in want if not d} and removes == [k for k, _, d in want if d]
 
 
 def test_replace_initial_load_and_nothing_changed():

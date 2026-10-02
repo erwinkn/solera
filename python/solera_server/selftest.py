@@ -52,7 +52,7 @@ async def key_index_probe(objects):
         index = KeyIndex(io, None, state)
         keys, versions, _, _ = await index.page(None, 10)
         check(keys == [b"a", b"b"] and versions == [b"1", b"1"], "Key index page read back wrong")
-        check(len(await index.changes([b"b"], [b"2"])) == 1, "Key index delta read back wrong")
+        check(await index.lookup([b"b"]) == {b"b": (b"1", 0)}, "Key index lookup read back wrong")
         changes = await index.pending(0, 0, None, 10)
         check(changes[0] == [b"a", b"b"], "Key index delta log read back wrong")
     finally:

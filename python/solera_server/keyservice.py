@@ -25,7 +25,7 @@ import math
 import threading
 from collections import OrderedDict
 
-from solera.keys import decode_block, parse_index
+from solera.keys import SortedRun, decode_block, parse_index
 from solera.keys.cache import Corrupt, EngineCache, verify
 from solera.keys.index import FileInfo, Options
 from solera.keys.io import ObjectIO
@@ -153,9 +153,9 @@ class KeyService:
             self.release(token)
 
     async def direct(
-        self, index, kind: str, run: bytes, generation: int, batch: int, path: str, position: float
+        self, index, kind: str, run: SortedRun, generation: int, batch: int, path: str, position: float
     ):
-        """A resolve of a run against `index` as the engine holds it at
+        """A resolve of a sorted run against `index` as the engine holds it at
         `position` — a source commit's, in process (docs/resolved-commits.md
         §4): `(answer, delta)`, under the resolver's limits."""
 

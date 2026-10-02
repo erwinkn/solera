@@ -170,8 +170,10 @@ resolves itself (big writes, `Sql`, unkeyed, failure deltas, §8) are
 absent.
 
 **Framing.** `u8` protocol version · `u32` header length · JSON header ·
-payloads. A version the engine does not speak gets `415`, and the worker
-resolves locally.
+payloads, back to back in output order: each output's `offset` is where
+the one before ended, and together they fill the body, so no byte is two
+outputs'. A version the engine does not speak gets `415`, and the worker
+resolves locally; a frame whose bounds do not hold gets `400`.
 
 **Request.**
 
@@ -208,7 +210,14 @@ live attempt (and rebuilds from `.spec` on adoption):
   prepared for that output, the run's locators are that generation, and
   `base.head_batch` is the head's batch now;
 - `kind` is allowed for the output (a `replace` of an output whose write
-  can only be a patch is refused).
+  can only be a patch is refused);
+- the payload is what the header says, from its own bytes: its digest is
+  `digest`, and decoded once — footer, index and block CRCs, each block's
+  entries against its index entry and the file's against its footer, keys
+  strictly increasing, every length checked before it is used — it holds
+  `keys` entries. The limits below apply to what it holds, decoding stops
+  at them (`too_big`), and the resolve reads the decoded run, never the
+  payload again.
 
 A mismatch is a per-output decline (`stale`, `not_live`, `invalid`), never
 a guess.
@@ -290,6 +299,7 @@ are §6's:
 |---|---|---|
 | `resolve_max_keys` | 100K run entries | patches |
 | `resolve_max_bytes` | 16 MB | request and response bodies |
+| `resolve_max_decoded` | 64 MB | a run decoded: decompressed blocks, and its keys and versions |
 | `resolve_max_entries` | 2M physical entries in the snapshot | replacements: the engine merges the run with every entry |
 | `resolve_queue_bytes` | 64 MB of queued payloads | admission; beyond it, `busy` at once |
 | `resolve_concurrency` | 2 | resolves in flight, on their own threads, apart from compaction's |
@@ -534,6 +544,11 @@ sorted run, and emits the delta as it goes. Measured for a recount of a
 fresh 100M index (one level): 2.4 GB in 371 GETs, 14.1 s. A steady-state
 snapshot (~3.4 GB over three levels) and a patch merge are not measured
 yet; the patch merge adds a lookup per run key to the recount's work.
+
+The sparse reader, this join and the engine's cache (§5) decide each key
+by one rule (`native/src/delta.rs`): what the index holds — absent, live
+at a known version and locator, or live at another version as the filters
+said — against an upsert or a remove.
 
 **The crossover.** A patch goes to the sparse reader, and switches at
 most once, by two thresholds expressed in the quantities that decide it —

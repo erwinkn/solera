@@ -26,6 +26,8 @@ pub enum Error {
     Value(String),
     /// Raised by a caller's callback (a version function), passed through.
     Callback(Box<dyn std::error::Error + Send + Sync>),
+    /// Well-formed input over a caller's limit: more entries or bytes than it takes.
+    Limit(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -95,17 +97,35 @@ pub(crate) fn compress(data: &[u8], codec: u8, level: u32) -> Vec<u8> {
 }
 
 pub(crate) fn decompress(data: &[u8], codec: u8) -> Result<Vec<u8>> {
-    match codec {
+    decompress_at_most(data, codec, u64::MAX)
+}
+
+/// `data` decompressed, unless that is more than `limit` bytes: an
+/// `Error::Limit` then, after reading no more than `limit + 1`.
+pub(crate) fn decompress_at_most(data: &[u8], codec: u8, limit: u64) -> Result<Vec<u8>> {
+    let out = match codec {
         CODEC_ZLIB => {
-            let mut out = Vec::with_capacity(data.len() * 3);
+            let mut out = Vec::with_capacity(data.len().saturating_mul(3).min(limit as usize));
             ZlibDecoder::new(data)
+                .take(limit.saturating_add(1))
                 .read_to_end(&mut out)
                 .map_err(|e| Error::Format(format!("bad zlib data: {e}")))?;
-            Ok(out)
+            out
         }
-        CODEC_NONE => Ok(data.to_vec()),
-        other => fmt_err(format!("unknown codec {other}")),
+        CODEC_NONE => data.to_vec(),
+        other => return fmt_err(format!("unknown codec {other}")),
+    };
+    if out.len() as u64 > limit {
+        return Err(Error::Limit(format!("more than {limit} bytes decoded")));
     }
+    Ok(out)
+}
+
+/// `buf[at..at + len]`, or None when that is not inside `buf`.
+pub(crate) fn slice_at(buf: &[u8], at: u64, len: u64) -> Option<&[u8]> {
+    let start = usize::try_from(at).ok()?;
+    let end = start.checked_add(usize::try_from(len).ok()?)?;
+    buf.get(start..end)
 }
 
 // -- Bloom filters ------------------------------------------------------------------
@@ -345,12 +365,14 @@ pub fn parse_index(part: &[u8], file_size: u64) -> Result<Index> {
         return fmt_err("index part too short");
     }
     let footer = parse_footer(&part[part.len() - FOOTER_SIZE..])?;
-    let start = file_size - part.len() as u64;
+    let Some(start) = file_size.checked_sub(part.len() as u64) else {
+        return fmt_err("index part longer than the file");
+    };
     if footer.index_offset < start {
         return fmt_err("index part too short");
     }
-    let rel = (footer.index_offset - start) as usize;
-    let Some(raw) = part.get(rel..rel + footer.index_length as usize) else {
+    let rel = footer.index_offset - start;
+    let Some(raw) = slice_at(part, rel, footer.index_length as u64) else {
         return fmt_err("index out of bounds");
     };
     if crc32fast::hash(raw) != footer.index_crc {
@@ -367,10 +389,10 @@ pub fn parse_index(part: &[u8], file_size: u64) -> Result<Index> {
         let offset = get_varint(&idx, &mut pos)?;
         let size = get_varint(&idx, &mut pos)?;
         let entries = get_varint(&idx, &mut pos)?;
-        if pos + 4 > idx.len() {
+        let Some(crc) = slice_at(&idx, pos as u64, 4) else {
             return fmt_err("truncated index");
-        }
-        let crc = u32_at(&idx, pos);
+        };
+        let crc = u32_at(crc, 0);
         pos += 4;
         blocks.push((first, offset, size, entries, crc));
     }
@@ -388,12 +410,14 @@ pub fn parse_filters(tail: &[u8], file_size: u64) -> Result<[(u64, u8, &[u8]); 3
         return fmt_err("tail too short");
     }
     let footer = parse_footer(&tail[tail.len() - FOOTER_SIZE..])?;
-    let start = file_size - tail.len() as u64;
+    let Some(start) = file_size.checked_sub(tail.len() as u64) else {
+        return fmt_err("tail longer than the file");
+    };
     if footer.filters_offset < start {
         return fmt_err("tail too short");
     }
-    let rel = (footer.filters_offset - start) as usize;
-    let Some(filters) = tail.get(rel..rel + footer.filters_length as usize) else {
+    let rel = footer.filters_offset - start;
+    let Some(filters) = slice_at(tail, rel, footer.filters_length as u64) else {
         return fmt_err("filters out of bounds");
     };
     if filters.len() < 4
@@ -408,11 +432,10 @@ pub fn parse_filters(tail: &[u8], file_size: u64) -> Result<[(u64, u8, &[u8]); 3
             return fmt_err("truncated filters");
         };
         pos += 1;
-        let n = (nbits / 8) as usize;
-        let Some(bits) = filters.get(pos..pos + n) else {
+        let Some(bits) = slice_at(filters, pos as u64, nbits / 8) else {
             return fmt_err("truncated filters");
         };
-        pos += n;
+        pos += bits.len();
         Ok((nbits, k, bits))
     };
     Ok([one()?, one()?, one()?])
@@ -479,16 +502,19 @@ pub fn lookup(blocks: &[&[u8]], codec: u8, keys: &[&[u8]]) -> Result<Found> {
 pub type Merged = (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<u8>, Vec<u64>);
 
 /// The newest-wins merged view of `runs` (newest first, each a file's
-/// consecutive blocks) over keys in `(after, upto]`.
+/// consecutive blocks, in that file's codec) over keys in `(after, upto]`.
 pub fn merge_range(
     runs: &[Vec<&[u8]>],
-    codec: u8,
+    codecs: &[u8],
     after: Option<&[u8]>,
     upto: Option<&[u8]>,
     drop_deleted: bool,
 ) -> Result<Merged> {
+    if codecs.len() != runs.len() {
+        return Err(Error::Value("a codec per run".into()));
+    }
     let mut m = Merge::new(runs.len());
-    for (r, blocks) in runs.iter().enumerate() {
+    for ((r, blocks), &codec) in runs.iter().enumerate().zip(codecs) {
         let mut data = Vec::new();
         let mut metas = Vec::new();
         for b in blocks {

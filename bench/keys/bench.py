@@ -262,7 +262,7 @@ async def grid(prefix, state, sample, opts, cold, label, sizes=GRID) -> list[dic
                     f"{k} keys, {route}",
                     io,
                     lambda idx=idx, keys=keys, vers=vers, n=n, route=route: idx.resolve(
-                        keys, vers, batch=10**9, attempt=f"grid-{label}-{n}-{route}"
+                        K.SortedRun.of(keys, vers), batch=10**9, attempt=f"grid-{label}-{n}-{route}"
                     ),
                 )
                 r.pop("out")
@@ -366,7 +366,7 @@ async def steady(n, prefix, state, sample, opts, cold, with_grid=False) -> tuple
         items = pick(1000)
         vers = [rng.randbytes(16) for _ in items]
         idx = KeyIndex(io, prefix, st, opts)
-        delta = await idx.changes([key_of(i) for i, _ in items], vers)
+        delta = await idx.changes(K.SortedRun.of([key_of(i) for i, _ in items], vers))
         st = st.committed(batch, await idx.write(batch, f"steady{batch}", delta), keep_log=False)
         current.update((i, v) for (i, _), v in zip(items, vers, strict=True))
         batch += 1
@@ -379,7 +379,9 @@ async def steady(n, prefix, state, sample, opts, cold, with_grid=False) -> tuple
     async def changes(io, k, same_share=0.0):
         items = pick(k)
         vers = [v if rng.random() < same_share else rng.randbytes(16) for _, v in items]
-        return await KeyIndex(io, prefix, st, opts).changes([key_of(i) for i, _ in items], vers)
+        return await KeyIndex(io, prefix, st, opts).changes(
+            K.SortedRun.of([key_of(i) for i, _ in items], vers)
+        )
 
     async def compact(io, plan=None):
         nonlocal st
@@ -446,7 +448,7 @@ async def steady(n, prefix, state, sample, opts, cold, with_grid=False) -> tuple
     # The compactions kept each key's newest version: rewriting current versions changes nothing.
     items = pick(1000)
     delta = await KeyIndex(setup, prefix, st, opts).changes(
-        [key_of(i) for i, _ in items], [v for _, v in items]
+        K.SortedRun.of([key_of(i) for i, _ in items], [v for _, v in items])
     )
     if len(delta):
         raise AssertionError(f"steady: {len(delta)} of 1,000 unchanged keys changed after the compactions")
@@ -504,7 +506,7 @@ async def _run_size(n: int, prefix: str, args) -> dict:
         keys = [key_of(i) for i, _ in items]
         vers = [v if rng.random() < same_share else rng.randbytes(16) for _, v in items]
         idx = KeyIndex(io, prefix, state, opts)
-        return await idx.changes(keys, vers)
+        return await idx.changes(K.SortedRun.of(keys, vers))
 
     if "base" in args.suites:
         for label, k, share in (
@@ -529,7 +531,7 @@ async def _run_size(n: int, prefix: str, args) -> dict:
 
         async def clustered(io=io):
             idx = KeyIndex(io, prefix, state, opts)
-            return await idx.changes(ck, [rng.randbytes(16) for _ in ck])
+            return await idx.changes(K.SortedRun.of(ck, [rng.randbytes(16) for _ in ck]))
 
         rows.append(await measure("1K clustered keys changed", io, clustered))
 
@@ -539,7 +541,7 @@ async def _run_size(n: int, prefix: str, args) -> dict:
         async def inserts(io=io):
             idx = KeyIndex(io, prefix, state, opts)
             ks = sorted(key_of(i) + b"-new" for i, _ in pick(1000))
-            return await idx.changes(ks, [rng.randbytes(16) for _ in ks])
+            return await idx.changes(K.SortedRun.of(ks, [rng.randbytes(16) for _ in ks]))
 
         rows.append(await measure("1K new keys inserted", io, inserts))
 
@@ -585,7 +587,9 @@ async def _run_size(n: int, prefix: str, args) -> dict:
             nonlocal s2, batch
             idx = KeyIndex(io, prefix, s2, opts)
             items = sorted(pick(1000))
-            delta = await idx.changes([key_of(i) for i, _ in items], [rng.randbytes(16) for _ in items])
+            delta = await idx.changes(
+                K.SortedRun.of([key_of(i) for i, _ in items], [rng.randbytes(16) for _ in items])
+            )
             files = await idx.write(batch, f"bench{batch}", delta)
             s2 = s2.committed(batch, files, keep_log=True)
             batch += 1
