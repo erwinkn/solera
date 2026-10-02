@@ -66,10 +66,10 @@ def on_disk(state, index) -> set[str]:
 class CountingStore(FileStore):
     def __init__(self):
         super().__init__()
-        self.writes = 0
+        self.stored = 0
 
     async def store(self, write, prior, scope):
-        self.writes += 1
+        self.stored += 1
         return await super().store(write, prior, scope)
 
 
@@ -89,16 +89,16 @@ async def test_unchanged_writes_skip_the_store(state):
     await engine.initialize()
     await run(engine, ["items"])
     first = dict(state.model.heads[("items", "")])
-    assert store.writes == 1 and first["batch"] == 0 and first["count"] == 2
+    assert store.stored == 1 and first["batch"] == 0 and first["count"] == 2
     await run(engine, ["items"])
     await run(engine, ["items"], mode="full")  # a full run of identical content too
-    assert store.writes == 1
+    assert store.stored == 1
     assert state.model.heads[("items", "")]["ref"] == first["ref"]
     assert state.model.heads[("items", "")]["batch"] == 0
     rows["v"] = [{"id": "a", "v": 2}]
     await run(engine, ["items"])
     head = state.model.heads[("items", "")]
-    assert store.writes == 2 and head["batch"] == 1 and head["count"] == 1
+    assert store.stored == 2 and head["batch"] == 1 and head["count"] == 1
 
 
 async def test_a_keyed_write_reaches_the_store_as_its_delta(state, data):

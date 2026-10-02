@@ -1383,7 +1383,7 @@
     }
   },
   "retention": null,
-  "revision": "d11c9b008517ec6264de613ac3f31404a73e7f6b5df1f43fa424c7b8abc3ac1c",
+  "revision": "67f28cd1fa84a603c593cdbcaf5137d2b9f4fa030a06cf362c6d5fff63a83280",
   "sources": {
     "leach_crosswalk": {
       "handle": {
@@ -1612,7 +1612,7 @@
       "ref": "table",
       "strict": false,
       "version": "1",
-      "writes": "overwrite"
+      "writes": "fenced"
     }
   }
 }

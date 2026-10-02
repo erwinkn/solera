@@ -1,6 +1,11 @@
 """PostgresStore: shared mutable tables (§3, §4). Reads are not pinned: a
-ref names a table slice, and a load reads what it holds now; the engine's
-write fence (§8) keeps a dead attempt from writing over a live one.
+ref names a table slice, and a load reads what it holds now.
+
+A `fenced` store (docs/lifecycle.md §9.7): each attempt takes its generation
+for the slice it writes — keyed by the table's OID, which survives renames,
+and the partition — before it reads anything, and every write transaction
+checks it under the row's lock. A newer attempt's acquisition waits for an
+older writer's open transaction, after which that writer can change nothing.
 
 `psycopg` is imported lazily so project files can declare the store without a
 driver installed; only `store`/`load` need it (in the harness).
@@ -25,6 +30,7 @@ from solera.stores import (
 )
 
 LEDGER_TABLE = "public.solera_migrations"
+FENCE_TABLE = "public.solera_generations"
 BATCH_COLUMN = "_batch"
 SEQ_COLUMN = "_seq"
 KEY_CHUNK = 100_000  # rows per chunk a keyed Sql write reports
@@ -55,6 +61,7 @@ class PostgresStore:
     version = "1"
     ref_type = TableRef
     shared_table = True
+    writes = "fenced"
 
     def __init__(self, dsn: str, grants: list[str] | tuple = ()):
         self.dsn, self.grants = dsn, tuple(grants)
@@ -118,7 +125,7 @@ class PostgresStore:
                     pk = [*pk, c]
         return columns, pk
 
-    def _ensure(self, cur, output: Output, rows: list[dict] | None = None):
+    def _ensure(self, cur, output: Output, rows: list[dict] | None = None, scope: Scope | None = None):
         table, schema, table_name = self._table(output)
         indexes = self._indexes(output)
         names = [table_name + "_" + "_".join(index) for index in indexes]
@@ -155,7 +162,70 @@ class PostgresStore:
                 cur.execute(f"GRANT SELECT ON {table} TO {_ident(role)}")
             except Exception:
                 pass  # grants are deployment sugar; a missing role is not fatal
+        self._fence(cur, table, scope)  # before this transaction changes any row
         return table
+
+    # -- generations (docs/lifecycle.md §9.7) -------------------------------------
+
+    def _fence_table(self, cur) -> None:
+        if cur.execute("SELECT to_regclass(%s) IS NOT NULL AS ok", (FENCE_TABLE,)).fetchone()["ok"]:
+            return
+        cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (FENCE_TABLE,))
+        cur.execute(
+            f"CREATE TABLE IF NOT EXISTS {FENCE_TABLE} (relid oid NOT NULL, part text NOT NULL, "
+            "generation bigint NOT NULL, invocation text NOT NULL, PRIMARY KEY (relid, part))"
+        )
+
+    def _take(self, cur, relid: int, scope: Scope) -> None:
+        """Take `scope`'s generation for (relid, partition), holding the row's
+        lock until the transaction ends. Postgres locks the conflicting row
+        even when the `WHERE` refuses the update, so a newer acquisition waits
+        for an older writer's open transaction."""
+
+        taken = cur.execute(
+            f"INSERT INTO {FENCE_TABLE} VALUES (%s, %s, %s, %s) ON CONFLICT (relid, part) "
+            f"DO UPDATE SET generation = EXCLUDED.generation, invocation = EXCLUDED.invocation "
+            f"WHERE {FENCE_TABLE}.generation < EXCLUDED.generation "
+            f"OR ({FENCE_TABLE}.generation = EXCLUDED.generation AND {FENCE_TABLE}.invocation = EXCLUDED.invocation) "
+            "RETURNING invocation",
+            (relid, scope.partition, scope.generation, scope.invocation),
+        ).fetchone()
+        if taken is None:
+            raise StoreError(
+                f"{scope.output.name}: a newer attempt holds this slice (generation {scope.generation} "
+                f"of {scope.invocation} refused)"
+            )
+
+    def _relid(self, cur, table: str) -> int | None:
+        return cur.execute("SELECT to_regclass(%s)::oid AS relid", (table,)).fetchone()["relid"]
+
+    def _fence(self, cur, table: str, scope: Scope | None) -> None:
+        """In a write transaction, before it changes anything: the slice must
+        still be this attempt's (`_take` is a no-op for its own generation
+        and invocation). A slice it never acquired — a table this
+        transaction created, a new partition — is acquired here."""
+
+        if scope is None or scope.generation is None:
+            return
+        self._fence_table(cur)
+        self._take(cur, self._relid(cur, table), scope)
+
+    async def acquire(self, scope: Scope) -> None:
+        """Take the attempt's generation for the slice it writes, in a
+        transaction of its own, before any read of the store: from here on
+        no older attempt can change it. A table that does not exist yet is
+        acquired when the first write creates it."""
+
+        if scope.generation is None:
+            return
+        table, _, _ = self._table(scope.output)
+        with self._connect() as conn, conn.cursor() as cur:
+            self._rename(cur, scope.output, scope)
+            relid = self._relid(cur, table)
+            if relid is None:
+                return
+            self._fence_table(cur)
+            self._take(cur, relid, scope)
 
     def _indexes(self, output: Output) -> list[list[str]]:
         """The table's indexes: the declared ones, and one on the key column."""
@@ -282,7 +352,7 @@ class PostgresStore:
                 row[partition_col] = scope.partition
         if output.key is not None:
             _keys(output, rows)
-        self._ensure(cur, output, rows)
+        self._ensure(cur, output, rows, scope)
         self._delete_slice(cur, table, slice_where)
         self._insert(cur, table, rows)
         return digest(rows)
@@ -294,7 +364,7 @@ class PostgresStore:
         rows = _coerce_rows(write.rows)
         if not rows and not remove and prior is not None:
             return None
-        self._ensure(cur, output, rows)
+        self._ensure(cur, output, rows, scope)
         partition_col = output.config.get("partition_column")
         if output.key is None:
             # Batch mode: stamp the batch columns, replace this batch's rows.
@@ -356,7 +426,7 @@ class PostgresStore:
             for c in columns:
                 declared.setdefault(c, "text")
             output.config["columns"] = declared
-            self._ensure(cur, output)
+            self._ensure(cur, output, scope=scope)
             self._delete_slice(cur, table, slice_where)
             select_cols = ", ".join(_ident(c) for c in columns if c != partition_col)
             if partition_col:
@@ -370,7 +440,7 @@ class PostgresStore:
                     f"INSERT INTO {table} ({select_cols}) SELECT {select_cols} FROM ({write.stmt}) _src"
                 )
         else:
-            self._ensure(cur, output)
+            self._ensure(cur, output, scope=scope)
             cur.execute(write.stmt)
             _, schema, table_name = self._table(output)
             exists = cur.execute(
@@ -426,9 +496,12 @@ class PostgresStore:
         with self._connect() as conn, conn.cursor() as cur:
             self._ensure_ledger(cur)
         applied = []
+        table, _, _ = self._table(output)
         for migration in migrations:
             with self._connect() as conn, conn.cursor() as cur:
                 cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (output.name,))
+                cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (table,))
+                before = self._relid(cur, table)
                 done = cur.execute(
                     f"SELECT 1 FROM {LEDGER_TABLE} WHERE output = %s AND name = %s",
                     (output.name, migration.name),
@@ -445,6 +518,11 @@ class PostgresStore:
                         f"{output.name}: migration {migration.name!r} payload must be "
                         "a SQL string or a callable taking a cursor"
                     )
+                after = self._relid(cur, table)
+                if before is not None and after is not None and after != before:
+                    # The migration replaced the relation: its slices keep their generations.
+                    self._fence_table(cur)
+                    cur.execute(f"UPDATE {FENCE_TABLE} SET relid = %s WHERE relid = %s", (after, before))
                 cur.execute(
                     f"INSERT INTO {LEDGER_TABLE} (output, name) VALUES (%s, %s)",
                     (output.name, migration.name),

@@ -8,6 +8,7 @@ import json
 from solera import lifecycle
 from solera.lifecycle import Ended
 from solera.sdk import Output, Project, Retry, asset
+from solera.stores import Patch
 from solera_server.state import State
 from solera_worker.channel import LocalChannel
 from solera_worker.worker import run_attempt
@@ -275,5 +276,45 @@ async def test_a_strict_scope_is_released_by_the_writers_late_result(tmp_path):
     assert detail["request"]["status"] == "succeeded"
     events = await engine.history.events(run["id"])
     assert [e["reason"] for e in events if e["type"] == "released"] == ["result"]
+    await engine.stop()
+    await state.close()
+
+
+async def test_a_fenced_stores_scope_is_released_at_once(tmp_path):
+    """A fenced store needs no grace (§9.6): the retry's acquisition fences
+    the dead writer. Its scope is not held, and each attempt acquires a
+    higher generation than the last, before it reads anything."""
+
+    from .test_fence import LiveStore
+
+    class Fenced(LiveStore):
+        writes = "fenced"
+
+        def __init__(self):
+            super().__init__()
+            self.acquired = []
+
+        async def acquire(self, scope):
+            self.acquired.append((scope.generation, scope.invocation))
+
+    live = Fenced()
+    writes = [Patch([{"id": "a", "v": 1}, {"id": "b", "v": 1}]), Patch([{"id": "a", "v": 2}])]
+
+    @asset(outputs=Output("items", key="id", revision="v", store="live"), retries=Retry(1, delay=0))
+    def items():
+        return writes[0] if len(writes) == 1 else writes.pop(0)
+
+    project = Project(assets=[items], stores={"live": live})
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = engine_for(state, project, placement="inline")
+    await engine.initialize()
+    live.die = 1
+    detail = await engine.run_until((await engine.submit(["items"]))["id"], 15)
+    assert detail["request"]["status"] == "succeeded"
+    assert [a["status"] for a in detail["attempts"][detail["tasks"][0]["id"]]] == ["failed", "succeeded"]
+    events = await engine.history.events(detail["request"]["id"])
+    assert not [e for e in events if e["type"] == "released"]  # never held
+    (first, one), (second, other) = live.acquired
+    assert second > first and one != other
     await engine.stop()
     await state.close()

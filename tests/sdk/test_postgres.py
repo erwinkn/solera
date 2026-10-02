@@ -299,3 +299,88 @@ async def test_migration_can_reconcile_drift(store):
     assert await store.migrate(out, out.migrations) == ["fix_pk"]
     written = await store.store([{"id": "a", "v": "1"}], None, scope(out))
     assert written.ref.version
+
+
+def fenced(out, generation, invocation="i"):
+    return scope(out, generation=generation, invocation=invocation)
+
+
+async def test_a_newer_generation_fences_older_writers(store):
+    """docs/lifecycle.md §9.7: once a newer attempt acquired a slice, an older
+    one can change nothing; another invocation of the same generation can't
+    either, while the same invocation acquiring again is its own retry."""
+
+    out = output(key="id", revision="v")
+    first = await store.store([{"id": "a", "v": "1"}], None, fenced(out, 5))
+    await store.acquire(fenced(out, 7))
+    with pytest.raises(StoreError, match="newer attempt"):
+        await store.store([{"id": "a", "v": "0"}], first.ref, fenced(out, 5))
+    with pytest.raises(StoreError, match="newer attempt"):
+        await store.acquire(fenced(out, 7, "a duplicate"))
+    await store.acquire(fenced(out, 7))
+    written = await store.store([{"id": "a", "v": "2"}], first.ref, fenced(out, 7))
+    assert await store.load(written.ref, list[dict], None) == [{"id": "a", "v": "2"}]
+
+
+async def test_a_takeover_waits_for_an_older_writers_transaction(store):
+    """The older writer's transaction is open, holding the slice: the newer
+    acquisition waits for it to end, and from then on the older writer's
+    next transaction is refused."""
+
+    import asyncio
+    import threading
+
+    out = output(key="id", revision="v")
+    first = await store.store([{"id": "a", "v": "1"}], None, fenced(out, 5))
+    table, _, _ = store._table(out)
+    conn = store._connect()
+    cur = conn.cursor()
+    store._fence(cur, table, fenced(out, 5))  # the older writer's open transaction
+    acquired = threading.Event()
+
+    def take():
+        asyncio.run(store.acquire(fenced(out, 9)))
+        acquired.set()
+
+    thread = threading.Thread(target=take)
+    thread.start()
+    assert not acquired.wait(0.5)  # waiting behind it
+    cur.execute(f"UPDATE {table} SET v = 'old' WHERE id = 'a'")
+    conn.commit()  # its write lands before the takeover
+    assert acquired.wait(5)
+    thread.join()
+    conn.close()
+    with pytest.raises(StoreError, match="newer attempt"):
+        await store.store([{"id": "a", "v": "late"}], first.ref, fenced(out, 5))
+    assert await store.load(first.ref, list[dict], None) == [{"id": "a", "v": "old"}]
+
+
+async def test_the_first_write_creates_and_acquires(store):
+    """A table that does not exist yet is acquired by the write that creates
+    it, in the same transaction; a stale writer arriving later is refused."""
+
+    out = output(key="id", revision="v")
+    await store.acquire(fenced(out, 3))  # no table yet: nothing to take
+    first = await store.store([{"id": "a", "v": "1"}], None, fenced(out, 3))
+    with pytest.raises(StoreError, match="newer attempt"):
+        await store.store([{"id": "a", "v": "0"}], first.ref, fenced(out, 2))
+    await store.store([{"id": "a", "v": "2"}], first.ref, fenced(out, 3))
+
+
+async def test_a_migration_that_replaces_the_table_keeps_its_fence(store):
+    """A migration that recreates the relation gives it a new OID; the fence
+    row moves with it, so a stale writer is still refused."""
+
+    from solera.sdk import Migration
+
+    name = f"t_{uuid.uuid4().hex[:12]}"
+    out = output(name, key="id", revision="v")
+    first = await store.store([{"id": "a", "v": "1"}], None, fenced(out, 4))
+    swap = (
+        f'CREATE TABLE public."{name}_new" AS SELECT * FROM public."{name}"; '
+        f'DROP TABLE public."{name}"; ALTER TABLE public."{name}_new" RENAME TO "{name}"'
+    )
+    await store.migrate(out, [Migration("swap", swap)])
+    with pytest.raises(StoreError, match="newer attempt"):
+        await store.store([{"id": "a", "v": "0"}], first.ref, fenced(out, 3))
+    await store.store([{"id": "a", "v": "2"}], first.ref, fenced(out, 4))

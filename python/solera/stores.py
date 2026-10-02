@@ -77,6 +77,10 @@ class Scope:
     aliases: tuple = ()
     upserts: frozenset[str] | None = None
     removes: frozenset[str] | None = None
+    # The attempt's generation and invocation, for a `fenced` store to check
+    # (docs/lifecycle.md §9.7); `None` outside an attempt.
+    generation: int | None = None
+    invocation: str | None = None
 
 
 @dataclass(frozen=True)

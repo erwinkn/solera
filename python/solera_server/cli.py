@@ -112,7 +112,9 @@ def main():
     runs_prune.add_argument("--asset", help="Only runs of this asset")
     runs_prune.add_argument("--keep", type=int, help="Keep the N newest matching runs")
     runs_prune.add_argument("--dry-run", action="store_true")
-    scopes = commands.add_parser("scopes", help="Scopes held for an uncertain writer (docs/lifecycle.md §9.9)")
+    scopes = commands.add_parser(
+        "scopes", help="Scopes held for an uncertain writer (docs/lifecycle.md §9.9)"
+    )
     scopes_sub = scopes.add_subparsers(dest="scopes_command", required=True)
     release = scopes_sub.add_parser("release", help="Release a scope held for an uncertain writer")
     release.add_argument("asset")

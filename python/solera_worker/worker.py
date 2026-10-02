@@ -350,7 +350,9 @@ def _dict_inner(t):
     return None
 
 
-async def _store_outputs(spec, project, asset, objects, keys_io, result_value, fence, writes, timeline):
+async def _store_outputs(
+    spec, project, asset, objects, keys_io, result_value, fence, writes, timeline, invocation=None
+):
     """Store each returned output (§4, §6, §8, §9), in two phases.
 
     Planning compares each keyed output's write with its key index as pinned
@@ -379,16 +381,39 @@ async def _store_outputs(spec, project, asset, objects, keys_io, result_value, f
     else:
         raise StoreError(f"{asset.name}: multi-output assets must return Result(outputs={{...}})")
 
-    # Plan: what each keyed write changes, as delta files.
+    def scope_of(name: str, plan: dict) -> Scope:
+        info = plan["info"]
+        return Scope(
+            output=plan["output"],
+            partition=spec["partition"],
+            batch=info.get("batch"),
+            attempt=spec["attempt"],
+            aliases=tuple(info.get("aliases") or ()),
+            upserts=plan.get("upserts"),
+            removes=plan.get("removes"),
+            generation=spec.get("generation"),
+            invocation=invocation,
+        )
+
+    # Acquire: a fenced store's generation, before anything reads the store —
+    # repair included (docs/lifecycle.md §9.7).
     plans, intents, entries = {}, {}, {}
-    for name, value in values.items():
+    for name in values:
         if name not in decls:
             raise StoreError(f"{asset.name}: returned undeclared output {name!r}")
-        output = decls[name]
-        store = project.stores[declared[name]["store"]]
-        info = pinned.get(name) or {}
-        prior = priors.get(name)
-        plan = plans[name] = {"output": output, "store": store, "info": info, "prior": prior}
+        plan = plans[name] = {
+            "output": decls[name],
+            "store": project.stores[declared[name]["store"]],
+            "info": pinned.get(name) or {},
+            "prior": priors.get(name),
+        }
+        if getattr(plan["store"], "writes", "overwrite") == "fenced":
+            await plan["store"].acquire(scope_of(name, plan))
+
+    # Plan: what each keyed write changes, as delta files.
+    for name, value in values.items():
+        plan = plans[name]
+        output, store, info, prior = plan["output"], plan["store"], plan["info"], plan["prior"]
         if info.get("index") is None:
             if isinstance(value, Sql) and output.incremental:
                 raise WriteError(f"{output.name}: Sql writes need a keyed output")
@@ -399,7 +424,9 @@ async def _store_outputs(spec, project, asset, objects, keys_io, result_value, f
                 raise WriteError(f"{output.name}: Sql writes need a table output")
             # Rows the harness never sees: the store reports the whole new key
             # map once it wrote, so its delta comes after — and needs no repair.
-            intents[name] = DeltaFiles([], 0, 0, True).to_json()
+            # Unknown writes: if this attempt dies after its gate, no key list says what landed
+            # (docs/lifecycle.md §9.6): the next attempt reconciles the whole slice.
+            intents[name] = {**DeltaFiles([], 0, 0, True).to_json(), "unknown": True}
             continue
         patch = isinstance(value, Patch)
         # With no prior (a first write, or a full run) a Patch is the whole content.
@@ -493,16 +520,7 @@ async def _store_outputs(spec, project, asset, objects, keys_io, result_value, f
             except Exception as error:
                 raise StoreError(f"{output.name}: migration failed: {error}") from error
             schema = applied[-1] if applied else output.migrations[-1].name
-        scope = Scope(
-            output=output,
-            partition=spec["partition"],
-            batch=info.get("batch"),
-            attempt=spec["attempt"],
-            aliases=tuple(info.get("aliases") or ()),
-            upserts=plan.get("upserts"),
-            removes=plan.get("removes"),
-        )
-        written = await writes.call(store.store(value, prior, scope))
+        written = await writes.call(store.store(value, prior, scope_of(name, plan)))
         entry = {}
         if "index" in plan and isinstance(value, Sql):
             if written.keys is None:
@@ -828,7 +846,7 @@ async def _execute(
         timeline.add("computed")
         metadata = ctx._recorded(value)
         outputs, cursor = await _store_outputs(
-            spec, project, asset, objects, keys_io, value, fence, writes, timeline
+            spec, project, asset, objects, keys_io, value, fence, writes, timeline, invocation
         )
         for name, values in metadata.items():
             if values and "ref" in outputs.get(name, {}):
