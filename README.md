@@ -24,8 +24,9 @@ One distribution, `solera`, built with maturin: four Python packages under
   subprocesses and pool workers.
 - `native` — the Rust crate built into `solera._native`: the key index's
   per-key work (encoding, decoding, sorting, merging).
-- `apps/console` — the pnpm/Vite/TanStack console source. The built bundle is
-  committed, so running the server needs no Node.
+- `apps/console` — the web console: React, TanStack Router and Query, Base UI,
+  and two themes over one set of design tokens (`apps/console/DESIGN.md`).
+  The built bundle is committed, so running the server needs no Node.
 - `python/solera_server/demo.py` — the self-contained demo project
   (`uv run solera serve --insecure` loads it by default).
 - `example/brimstone.py` — a second reference project.

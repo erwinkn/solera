@@ -1,220 +1,353 @@
 import { useState } from "react";
-import { createFileRoute, useLocation } from "@tanstack/react-router";
-import { GitCommitVertical, Inbox } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Textarea } from "@/components/ui/textarea";
-import { Empty, ErrorNotice, PageHeader } from "@/components/common";
-import { request, useAction, useQuery } from "@/lib/api";
-import { useWorkspace } from "@/lib/workspace";
-import { cn } from "cn";
-import type { Manifest, SourceDecl } from "@/lib/types";
+import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
+import { getRouteApi, Link } from "@tanstack/react-router";
+import { GitCommitHorizontal } from "lucide-react";
+import { q, useManifest, useProject } from "@/api/queries";
+import { useCommitSource } from "@/api/mutations";
+import type { Manifest, SourceDecl } from "@/api/types";
+import { RunsTable } from "@/features/runs";
+import { count, plural } from "@/lib/format";
+import { Button } from "@/ui/button";
+import { Empty, Hash, Skeleton, Time } from "@/ui/data";
+import { Field, Input, Segmented, Textarea } from "@/ui/form";
+import { Card, CardHeader, Crumb, Fact, Facts, Page, PageHeader } from "@/ui/layout";
+import { Table, TableScroll, Td, Th, Tr } from "@/ui/table";
 
-export const Route = createFileRoute("/sources")({
-  component: SourcesPage,
-});
+/**
+ * Sources (architecture.md §5): outputs with no producer, advanced from
+ * outside through the commit API or by a sensor. A keyed source and a
+ * partition set are consumed exactly like keyed outputs.
+ */
 
-function sourceKind(source: SourceDecl) {
-  if (source.key === "<elements>") return "partition set";
-  return source.key ? `keyed by ${source.key}` : "unkeyed value";
+type Kind = "partition set" | "keyed" | "unkeyed";
+const kindOf = (s: SourceDecl, manifest: Manifest): Kind =>
+  manifest.outputs[s.name]?.partition_set ? "partition set" : s.key ? "keyed" : "unkeyed";
+
+function consumers(manifest: Manifest, source: string): string[] {
+  return Object.entries(manifest.assets)
+    .filter(
+      ([, a]) =>
+        Object.values(a.inputs).some((e) => e.output === source) ||
+        a.deps.includes(source) ||
+        Object.values(a.partitions?.dims ?? {}).some((d) => d.kind === "set" && d.output === source),
+    )
+    .map(([name]) => name);
 }
 
-function KeyPreview({ base, name }: { base: string; name: string }) {
-  const { data } = useQuery<{ total: number; keys: Record<string, string> }>(
-    `${base}/outputs/${name}/keys`,
-    4000,
-  );
-  if (!data) return null;
-  const entries = Object.entries(data.keys).slice(0, 6);
+export function Sources() {
+  const manifest = useManifest();
+  const project = useProject();
+  const sensors = useQuery(q.sensors(project)).data?.sensors ?? [];
+  const sources = Object.values(manifest.sources);
   return (
-    <div className="flex flex-col gap-1 rounded-lg border bg-muted/30 p-2.5 font-mono text-xs">
-      {entries.map(([key, revision]) => (
-        <div key={key} className="flex justify-between gap-4">
-          <span className="truncate">{key}</span>
-          <span className="text-muted-foreground">{revision.slice(0, 12)}</span>
-        </div>
-      ))}
-      {data.total > entries.length && (
-        <div className="text-muted-foreground tabular-nums">
-          … {data.total} keys total
-        </div>
-      )}
-      {!entries.length && <div className="text-muted-foreground">empty</div>}
-    </div>
-  );
-}
-
-function CommitForm({
-  base,
-  name,
-  keyed,
-  partitionSet,
-}: {
-  base: string;
-  name: string;
-  keyed: boolean;
-  partitionSet: boolean;
-}) {
-  const action = useAction();
-  const { refresh } = useWorkspace();
-  const [version, setVersion] = useState("");
-  const [keys, setKeys] = useState("");
-  const [upsert, setUpsert] = useState("");
-  const [remove, setRemove] = useState("");
-  const [formError, setFormError] = useState<string | null>(null);
-  async function commit() {
-    setFormError(null);
-    const body: Record<string, unknown> = {};
-    try {
-      if (version.trim()) body.version = version.trim();
-      if (keys.trim()) body.keys = JSON.parse(keys);
-      if (upsert.trim()) body.upsert = JSON.parse(upsert);
-      if (remove.trim())
-        body.remove = remove
-          .split(",")
-          .map((k) => k.trim())
-          .filter(Boolean);
-    } catch {
-      setFormError("keys/upsert must be valid JSON");
-      return;
-    }
-    const result = await action.run(() =>
-      request(`${base}/sources/${name}/commit`, { body }),
-    );
-    if (result) {
-      setVersion("");
-      setKeys("");
-      setUpsert("");
-      setRemove("");
-      refresh();
-    }
-  }
-  return (
-    <div className="flex flex-col gap-2.5">
-      {keyed ? (
-        <>
-          <div className="flex flex-col gap-1.5">
-            <Label className="text-xs">
-              {partitionSet ? "Full key set" : "Full key map"} (JSON)
-            </Label>
-            <Textarea
-              rows={2}
-              className="font-mono text-xs"
-              placeholder={partitionSet ? '["u-1", "u-2"]' : '{"f1": "v1"}'}
-              aria-label={`${name} keys`}
-              value={keys}
-              onChange={(e) => setKeys(e.target.value)}
-            />
-          </div>
-          <div className="grid grid-cols-2 gap-2.5">
-            <div className="flex flex-col gap-1.5">
-              <Label className="text-xs">Patch — upsert (JSON)</Label>
-              <Textarea
-                rows={2}
-                className="font-mono text-xs"
-                placeholder={partitionSet ? '["u-3"]' : '{"f2": "v4"}'}
-                aria-label={`${name} upsert`}
-                value={upsert}
-                onChange={(e) => setUpsert(e.target.value)}
-              />
-            </div>
-            <div className="flex flex-col gap-1.5">
-              <Label className="text-xs">Remove keys (comma-sep)</Label>
-              <Input
-                className="font-mono text-xs"
-                placeholder="u-0"
-                aria-label={`${name} remove`}
-                value={remove}
-                onChange={(e) => setRemove(e.target.value)}
-              />
-            </div>
-          </div>
-        </>
-      ) : (
-        <div className="flex flex-col gap-1.5">
-          <Label className="text-xs">New version</Label>
-          <Input
-            className="font-mono text-xs"
-            placeholder="2026-09-20T00:00Z"
-            aria-label={`${name} version`}
-            value={version}
-            onChange={(e) => setVersion(e.target.value)}
-          />
-        </div>
-      )}
-      {(formError || action.error) && (
-        <ErrorNotice message={formError ?? action.error!} />
-      )}
-      <Button
-        size="sm"
-        className="self-start"
-        onClick={commit}
-        disabled={action.pending}
-      >
-        <GitCommitVertical /> Commit
-      </Button>
-    </div>
-  );
-}
-
-function SourcesPage() {
-  const { base, diagnostics } = useWorkspace();
-  const manifest = useQuery<Manifest>(base ? `${base}/manifest` : null, 30000);
-  // Lineage-graph source nodes link here with a `#source-<name>` hash; the
-  // router scrolls the matching card into view, so highlight it as well.
-  const hash = useLocation({ select: (location) => location.hash });
-  if (!diagnostics) return null;
-  const sources = Object.values(manifest.data?.sources ?? {});
-  return (
-    <section className="flex flex-col gap-4">
+    <Page>
       <PageHeader
-        eyebrow="Ingress"
         title="Sources"
-        description="Externally advanced outputs — pushed through the commit API."
+        description="Outputs with no producer: advanced from outside by the commit API, or polled by a sensor."
       />
-      {!sources.length ? (
-        <Empty title="No sources declared" />
-      ) : (
-        <div className="grid gap-4 md:grid-cols-2">
-          {sources.map((source) => (
-            <div
-              key={source.name}
-              id={`source-${source.name}`}
-              data-source={source.name}
-              className={cn(
-                "flex flex-col gap-3 rounded-xl border bg-card p-4",
-                hash === `source-${source.name}` &&
-                  "border-primary ring-1 ring-primary",
+      <Card>
+        {sources.length === 0 ? (
+          <Empty title="No sources">Declare `sources=` on the project to feed the graph from outside.</Empty>
+        ) : (
+          <TableScroll>
+            <Table>
+              <thead>
+                <tr>
+                  <Th>Source</Th>
+                  <Th>Kind</Th>
+                  <Th>Head</Th>
+                  <Th className="text-right">Keys</Th>
+                  <Th>Fed by</Th>
+                  <Th>Read by</Th>
+                </tr>
+              </thead>
+              <tbody>
+                {sources.map((s) => (
+                  <SourceRow
+                    key={s.name}
+                    source={s}
+                    manifest={manifest}
+                    feeders={sensors.filter((x) => x.commits.includes(s.name)).map((x) => x.name)}
+                  />
+                ))}
+              </tbody>
+            </Table>
+          </TableScroll>
+        )}
+      </Card>
+    </Page>
+  );
+}
+
+function SourceRow({
+  source,
+  manifest,
+  feeders,
+}: {
+  source: SourceDecl;
+  manifest: Manifest;
+  feeders: string[];
+}) {
+  const project = useProject();
+  const head = useQuery(q.heads(project, source.name)).data?.[0];
+  const kind = kindOf(source, manifest);
+  return (
+    <Tr className="relative">
+      <Td className="py-2">
+        <Link
+          to="/sources/$source"
+          params={{ source: source.name }}
+          className="font-medium after:absolute after:inset-0 after:content-['']"
+        >
+          {source.name}
+        </Link>
+      </Td>
+      <Td className="text-fg-muted">{kind}</Td>
+      <Td>
+        <span className="flex items-center gap-2">
+          <Hash value={head?.ref.version ?? source.head.version} />
+          {head && (
+            <span className="text-xs text-fg-subtle">
+              <Time at={head.at} />
+            </span>
+          )}
+        </span>
+      </Td>
+      <Td className="text-right">
+        {kind === "unkeyed" ? "—" : head?.key_count != null ? count(head.key_count) : "—"}
+      </Td>
+      <Td className="text-xs text-fg-muted">
+        {feeders.length ? feeders.map((f) => `sensor ${f}`).join(", ") : "commit API"}
+      </Td>
+      <Td className="max-w-64 truncate text-xs text-fg-muted">
+        {consumers(manifest, source.name).join(", ") || "—"}
+      </Td>
+    </Tr>
+  );
+}
+
+const route = getRouteApi("/sources/$source");
+
+export function Source() {
+  const { source: name } = route.useParams();
+  const manifest = useManifest();
+  const project = useProject();
+  const source = manifest.sources[name];
+  const head = useQuery(q.heads(project, name)).data?.[0];
+  const sensors = useQuery(q.sensors(project)).data?.sensors.filter((s) => s.commits.includes(name)) ?? [];
+  const commits = useInfiniteQuery(q.runs(project, { source: [name] }, 20)).data;
+  if (!source)
+    return (
+      <Page>
+        <Empty title={`No source named ${name}`} />
+      </Page>
+    );
+  const kind = kindOf(source, manifest);
+  const readers = consumers(manifest, name);
+  return (
+    <Page>
+      <PageHeader
+        eyebrow={
+          <>
+            <Crumb>
+              <Link to="/sources" className="hover:text-fg">
+                Sources
+              </Link>
+            </Crumb>
+            <Crumb last>{name}</Crumb>
+          </>
+        }
+        title={name}
+        description={`A ${kind} source${source.store ? ` on the ${source.store} store` : ", a lineage pointer only"}.`}
+      />
+      <div className="grid gap-4 lg:grid-cols-[minmax(0,2fr)_minmax(18rem,1fr)]">
+        <div className="flex min-w-0 flex-col gap-4">
+          <Card>
+            <CardHeader title="Head" />
+            <Facts className="px-4 pb-4">
+              <Fact label="Version">
+                <Hash value={head?.ref.version ?? source.head.version} />
+              </Fact>
+              {kind !== "unkeyed" && (
+                <Fact label="Keys">{head?.key_count != null ? count(head.key_count) : "—"}</Fact>
               )}
-            >
-              <div className="flex items-center gap-2">
-                <Inbox className="size-4 text-primary" />
-                <span className="font-mono text-sm font-semibold">
-                  {source.name}
-                </span>
-                <span className="ml-auto flex items-center gap-1 text-xs text-muted-foreground">
-                  {source.store} · {sourceKind(source)} · v
-                  <span className="font-mono">
-                    {source.head.version.slice(0, 8)}
-                  </span>
-                </span>
-              </div>
-              {source.key && base && (
-                <KeyPreview base={base} name={source.name} />
-              )}
-              {base && (
-                <CommitForm
-                  base={base}
-                  name={source.name}
-                  keyed={!!source.key}
-                  partitionSet={source.key === "<elements>"}
-                />
-              )}
-            </div>
-          ))}
+              <Fact label="Committed">{head ? <Time at={head.at} /> : "at registration"}</Fact>
+              <Fact label="Fed by">
+                {sensors.length
+                  ? sensors.map((s) => (
+                      <Link
+                        key={s.name}
+                        to="/sensors/$sensor"
+                        params={{ sensor: s.name }}
+                        className="mr-2 text-link hover:underline"
+                      >
+                        {s.name}
+                      </Link>
+                    ))
+                  : "the commit API"}
+              </Fact>
+              <Fact label="Read by">
+                {readers.length
+                  ? readers.map((r) => (
+                      <Link
+                        key={r}
+                        to="/assets/$asset"
+                        params={{ asset: r }}
+                        className="mr-2 text-link hover:underline"
+                      >
+                        {r}
+                      </Link>
+                    ))
+                  : "—"}
+              </Fact>
+            </Facts>
+          </Card>
+          {kind !== "unkeyed" && <SourceKeys name={name} />}
+          <Card>
+            <CardHeader
+              title="Commits"
+              description="Each commit that changed something is a run with no tasks"
+            />
+            {!commits ? (
+              <Skeleton className="mx-4 mb-4 h-24" />
+            ) : (
+              <RunsTable
+                compact
+                runs={commits.pages.flatMap((p) => p.runs)}
+                empty={
+                  <Empty compact title="No commits yet">
+                    Its head is the one synthesized at registration.
+                  </Empty>
+                }
+              />
+            )}
+          </Card>
         </div>
+        <CommitForm name={name} kind={kind} />
+      </div>
+    </Page>
+  );
+}
+
+function SourceKeys({ name }: { name: string }) {
+  const project = useProject();
+  const keys = useInfiniteQuery(q.keys(project, name, ""));
+  const entries = keys.data?.pages.flatMap((p) => Object.entries(p.keys)) ?? [];
+  return (
+    <Card>
+      <CardHeader
+        title="Keys"
+        description={keys.data ? plural(keys.data.pages[0]?.total ?? 0, "key") : undefined}
+      />
+      {!keys.data ? (
+        keys.isError ? (
+          <Empty compact title="No keys yet" />
+        ) : (
+          <Skeleton className="mx-4 mb-4 h-20" />
+        )
+      ) : entries.length === 0 ? (
+        <Empty compact title="No keys yet" />
+      ) : (
+        <TableScroll className="max-h-80 overflow-y-auto border-t border-line">
+          <Table>
+            <thead className="sticky top-0 bg-surface">
+              <tr>
+                <Th>Key</Th>
+                <Th>Revision</Th>
+              </tr>
+            </thead>
+            <tbody>
+              {entries.map(([k, v]) => (
+                <Tr key={k}>
+                  <Td className="font-mono text-xs">{k}</Td>
+                  <Td className="font-mono text-xs text-fg-muted">{v}</Td>
+                </Tr>
+              ))}
+            </tbody>
+          </Table>
+        </TableScroll>
       )}
-    </section>
+    </Card>
+  );
+}
+
+/** The commit API by hand. Identical content is no change: committing it wakes nothing. */
+function CommitForm({ name, kind }: { name: string; kind: Kind }) {
+  const commit = useCommitSource();
+  const [action, setAction] = useState<"upsert" | "remove">("upsert");
+  const [text, setText] = useState("");
+  const items = text
+    .split(/[\n,]/)
+    .map((t) => t.trim())
+    .filter(Boolean);
+  const pairs =
+    kind === "keyed" ? items.map((i) => i.split("=").map((x) => x.trim()) as [string, string?]) : [];
+  const invalid =
+    items.length === 0 || (kind === "keyed" && action === "upsert" && pairs.some(([, v]) => !v));
+  return (
+    <Card className="self-start">
+      <CardHeader title="Commit" description="Advance this source through the commit API" />
+      <form
+        className="flex flex-col gap-3 px-4 pb-4"
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (invalid) return;
+          const body =
+            kind === "unkeyed"
+              ? { source: name, version: items[0] }
+              : action === "remove"
+                ? { source: name, remove: items }
+                : {
+                    source: name,
+                    upsert: kind === "keyed" ? Object.fromEntries(pairs as [string, string][]) : items,
+                  };
+          commit.mutate(body, { onSuccess: () => setText("") });
+        }}
+      >
+        {kind === "unkeyed" ? (
+          <Field label="New version" hint="Any string; an identical version is no change">
+            <Input value={text} onChange={(e) => setText(e.target.value)} placeholder="2026-10-02T09:00Z" />
+          </Field>
+        ) : (
+          <>
+            <Segmented
+              label="Commit action"
+              value={action}
+              onChange={setAction}
+              options={[
+                {
+                  value: "upsert",
+                  label: kind === "partition set" ? "Add keys" : "Upsert",
+                },
+                { value: "remove", label: "Remove" },
+              ]}
+            />
+            <Field
+              label={
+                kind === "keyed" && action === "upsert" ? "key=revision, one per line" : "Keys, one per line"
+              }
+            >
+              <Textarea
+                value={text}
+                onChange={(e) => setText(e.target.value)}
+                placeholder={kind === "keyed" && action === "upsert" ? "f1=v3\nf2=v1" : "u-1\nu-2"}
+              />
+            </Field>
+          </>
+        )}
+        <Button
+          type="submit"
+          variant="primary"
+          icon={<GitCommitHorizontal />}
+          disabled={invalid || commit.isPending}
+        >
+          {commit.isPending
+            ? "Committing…"
+            : action === "remove" && kind !== "unkeyed"
+              ? `Remove ${plural(items.length, "key")}`
+              : "Commit"}
+        </Button>
+      </form>
+    </Card>
   );
 }

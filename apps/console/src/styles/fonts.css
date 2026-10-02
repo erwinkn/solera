@@ -1,0 +1,37 @@
+/*
+ * Latin subsets only, declared here rather than through the packages' CSS,
+ * which would ship every script's files into the wheel. A browser downloads a
+ * face only when the active theme uses it.
+ */
+@font-face {
+  font-family: "Geist Variable";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url("../../node_modules/@fontsource-variable/geist/files/geist-latin-wght-normal.woff2")
+    format("woff2-variations");
+}
+@font-face {
+  font-family: "Geist Mono Variable";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url("../../node_modules/@fontsource-variable/geist-mono/files/geist-mono-latin-wght-normal.woff2")
+    format("woff2-variations");
+}
+@font-face {
+  font-family: "Bricolage Grotesque Variable";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 200 800;
+  src: url("../../node_modules/@fontsource-variable/bricolage-grotesque/files/bricolage-grotesque-latin-wght-normal.woff2")
+    format("woff2-variations");
+}
+@font-face {
+  font-family: "Fraunces Variable";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url("../../node_modules/@fontsource-variable/fraunces/files/fraunces-latin-full-normal.woff2")
+    format("woff2-variations");
+}

@@ -1,185 +1,179 @@
-import { createFileRoute } from "@tanstack/react-router";
-import {
-  ArrowRight,
-  Clock,
-  Code2,
-  Play,
-  RefreshCw,
-  RocketIcon,
-  Zap,
-} from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { Switch } from "@/components/ui/switch";
-import { Empty, ErrorNotice, PageHeader } from "@/components/common";
-import { request, useAction, useQuery } from "@/lib/api";
-import { describeInterval, time } from "@/lib/format";
-import type { AutomationRecord } from "@/lib/types";
-import { useWorkspace } from "@/lib/workspace";
-import { cn } from "cn";
+import { useSuspenseQuery } from "@tanstack/react-query";
+import { getRouteApi, Link } from "@tanstack/react-router";
+import { Zap } from "lucide-react";
+import { q, useProject } from "@/api/queries";
+import { useAutomationToggle, useRunAutomation } from "@/api/mutations";
+import type { Automation } from "@/api/types";
+import { describeTrigger } from "@/features/triggers";
+import { useNow } from "@/lib/clock";
+import { cn } from "@/lib/cn";
+import { plural, shortId, until } from "@/lib/format";
+import { Button } from "@/ui/button";
+import { Empty, Time } from "@/ui/data";
+import { SearchInput, Switch } from "@/ui/form";
+import { Card, Page, PageHeader } from "@/ui/layout";
+import { Tooltip } from "@/ui/overlay";
+import { Table, TableScroll, Td, Th, Tr } from "@/ui/table";
 
-export const Route = createFileRoute("/automations")({
-  component: AutomationsPage,
-});
+const route = getRouteApi("/automations");
 
-function triggerIcon(kind: string) {
-  if (kind === "onchange") return Zap;
-  if (kind === "ondeploy") return RocketIcon;
-  return Clock;
-}
+const KIND_ORDER = { every: 0, cron: 1, onchange: 2, ondeploy: 3 } as const;
 
-function triggerLabel(automation: AutomationRecord) {
-  const trigger = automation.trigger;
-  if (trigger.kind === "cron")
-    return `Cron ${trigger.expression} · ${trigger.timezone}`;
-  if (trigger.kind === "onchange")
-    return trigger.outputs?.length
-      ? `On change of ${trigger.outputs.join(", ")}`
-      : "On change of inputs";
-  if (trigger.kind === "ondeploy") return "On deploy";
-  return `Every ${describeInterval(trigger.seconds ?? 0)}`;
-}
-
-function runFields(automation: AutomationRecord) {
-  const parts: string[] = [];
-  const p = automation.partitions;
-  if (p) parts.push(Array.isArray(p) ? `${p.length} scopes` : p);
-  if (automation.mode !== "incremental") parts.push(automation.mode);
-  if (automation.upstream) parts.push("+upstream");
-  return parts.join(" · ");
-}
-
-function AutomationsPage() {
-  const { base, refresh, select, diagnostics } = useWorkspace();
-  const query = useQuery<{ automations: AutomationRecord[] }>(
-    base ? `${base}/automations` : null,
-    2000,
-  );
-  const action = useAction();
-  if (!diagnostics) return null;
-  const automations = query.data?.automations ?? [];
+export function Automations() {
+  const { q: text = "" } = route.useSearch();
+  const navigate = route.useNavigate();
+  const project = useProject();
+  const { data } = useSuspenseQuery(q.automations(project));
+  const rows = data
+    .filter((a) => !text || `${a.name} ${a.targets.join(" ")}`.toLowerCase().includes(text.toLowerCase()))
+    .sort((a, b) => KIND_ORDER[a.trigger.kind] - KIND_ORDER[b.trigger.kind] || a.name.localeCompare(b.name));
+  const disabled = data.filter((a) => !a.enabled).length;
   return (
-    <section className="flex flex-col gap-4">
+    <Page>
       <PageHeader
-        eyebrow="Scheduling"
         title="Automations"
-        description="Time and change triggers, one materialization engine."
-        aside={
-          <span className="flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs text-muted-foreground">
-            <Code2 className="size-3.5" />
-            Defined in code
-          </span>
+        description="A trigger says when; the automation says what run to submit. Schedules skip scopes still running."
+        meta={
+          <>
+            <span>{plural(data.length, "automation")}</span>
+            {disabled > 0 && <span className="text-warn-fg">{disabled} disabled</span>}
+          </>
+        }
+        actions={
+          <SearchInput
+            aria-label="Filter automations"
+            placeholder="Filter by name or target"
+            className="w-64"
+            value={text}
+            onChange={(e) =>
+              navigate({
+                search: { q: e.target.value || undefined },
+                replace: true,
+              })
+            }
+          />
         }
       />
-      {action.error && <ErrorNotice message={action.error} />}
-      {!automations.length ? (
-        <Empty title="No automations defined">
-          Add an Automation to your project definitions and restart the writer
-          to register the updated manifest.
-        </Empty>
-      ) : (
-        <div className="flex flex-col gap-2.5">
-          {automations.map((automation) => {
-            const Icon = triggerIcon(automation.trigger.kind);
-            const fields = runFields(automation);
-            return (
-              <article
-                className="flex flex-wrap items-center gap-3 rounded-xl border bg-card p-4"
-                key={automation.name}
-                data-automation={automation.name}
+      <Card>
+        {rows.length === 0 ? (
+          <Empty title={data.length ? "No automation matches" : "No automations"}>
+            {data.length ? undefined : "Attach `automations=` to an asset, or declare one on the project."}
+          </Empty>
+        ) : (
+          <TableScroll>
+            <Table>
+              <thead>
+                <tr>
+                  <Th>Automation</Th>
+                  <Th>Trigger</Th>
+                  <Th>Submits</Th>
+                  <Th>Last fired</Th>
+                  <Th>Next</Th>
+                  <Th className="text-right">Enabled</Th>
+                  <Th />
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((a) => (
+                  <Row key={a.name} a={a} />
+                ))}
+              </tbody>
+            </Table>
+          </TableScroll>
+        )}
+      </Card>
+    </Page>
+  );
+}
+
+function Row({ a }: { a: Automation }) {
+  const toggle = useAutomationToggle();
+  const fire = useRunAutomation();
+  const now = useNow();
+  return (
+    <Tr className={cn(!a.enabled && "text-fg-subtle")}>
+      <Td className="py-2">
+        <span className="font-mono text-xs text-fg">{a.name}</span>
+        <span className="mt-0.5 flex flex-wrap gap-1">
+          {a.targets.map((t) => (
+            <Link
+              key={t}
+              to="/assets/$asset"
+              params={{ asset: t }}
+              className="text-xs text-link hover:underline"
+            >
+              {t}
+            </Link>
+          ))}
+        </span>
+      </Td>
+      <Td className="text-fg-muted">{describeTrigger(a.trigger, a.watched)}</Td>
+      <Td className="text-xs text-fg-muted">
+        {typeof a.partitions === "string"
+          ? a.partitions
+          : Array.isArray(a.partitions)
+            ? plural(a.partitions.length, "partition")
+            : a.trigger.kind === "onchange"
+              ? "changed scopes"
+              : "latest"}
+        {a.mode === "full" && " · full"}
+        {a.upstream && " · upstream"}
+        {a.skip_missing_inputs && " · skips missing inputs"}
+        {Object.entries(a.tags).map(([k, v]) => ` · ${k}=${v}`)}
+      </Td>
+      <Td className="text-fg-muted">
+        {a.last_at ? (
+          <span className="flex items-center gap-2">
+            <Time at={a.last_at} />
+            {a.last_run && (
+              <Link
+                to="/runs/$run"
+                params={{ run: a.last_run }}
+                className="font-mono text-xs text-link hover:underline"
               >
-                <span
-                  className={cn(
-                    "flex size-9 shrink-0 items-center justify-center rounded-lg",
-                    automation.enabled
-                      ? "bg-primary/10 text-primary"
-                      : "bg-muted text-muted-foreground",
-                  )}
-                >
-                  <Icon className="size-4.5" />
-                </span>
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2">
-                    <span className="truncate font-mono text-sm font-medium">
-                      {automation.name}
-                    </span>
-                    {automation.trigger.kind === "onchange" &&
-                      !!automation.pending.length && (
-                        <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[0.7rem] font-semibold text-primary tabular-nums">
-                          {automation.pending.length} pending
-                        </span>
-                      )}
-                  </div>
-                  <div className="text-xs text-muted-foreground">
-                    {triggerLabel(automation)}
-                    <ArrowRight className="mx-1 inline size-3 align-[-1px]" />
-                    <span className="font-mono">
-                      {automation.targets.join(", ")}
-                    </span>
-                    {fields && ` · ${fields}`}
-                  </div>
-                </div>
-                <div className="flex flex-col items-end gap-0.5 text-xs text-muted-foreground">
-                  <span>
-                    {automation.last_at
-                      ? `fired ${time(automation.last_at)}`
-                      : "never fired"}
-                  </span>
-                  {automation.trigger.kind === "ondeploy" &&
-                    automation.last_revision && (
-                      <span className="font-mono">
-                        rev {automation.last_revision.slice(0, 8)}
-                      </span>
-                    )}
-                </div>
-                <div className="flex items-center gap-2 border-l pl-3">
-                  <Switch
-                    aria-label={`Enable ${automation.name}`}
-                    checked={automation.enabled}
-                    onCheckedChange={(enabled) =>
-                      action.run(async () => {
-                        await request(
-                          `${base}/automations/${automation.name}/${enabled ? "enable" : "disable"}`,
-                          { body: {} },
-                        );
-                        query.refresh();
-                      })
-                    }
-                  />
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() =>
-                      action.run(async () => {
-                        await request(
-                          `${base}/automations/${automation.name}/run-now`,
-                          { body: {} },
-                        );
-                        query.refresh();
-                        refresh();
-                      })
-                    }
-                  >
-                    <Play /> Run now
-                  </Button>
-                  {automation.last_run && (
-                    <Button
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label="Open last run"
-                      title="Open last run"
-                      onClick={() =>
-                        select({ kind: "run", id: automation.last_run! })
-                      }
-                    >
-                      <RefreshCw />
-                    </Button>
-                  )}
-                </div>
-              </article>
-            );
-          })}
-        </div>
-      )}
-    </section>
+                {shortId(a.last_run)}
+              </Link>
+            )}
+          </span>
+        ) : (
+          "never"
+        )}
+      </Td>
+      <Td className="text-fg-muted tabular">
+        {!a.enabled ? (
+          "—"
+        ) : a.next_at != null ? (
+          <Tooltip content={new Date(a.next_at * 1000).toLocaleString()}>
+            <span>{until(a.next_at, now)}</span>
+          </Tooltip>
+        ) : a.trigger.kind === "onchange" ? (
+          a.pending.length ? (
+            <span className="text-wait-fg">{plural(a.pending.length, "change")} pending</span>
+          ) : (
+            "on the next change"
+          )
+        ) : (
+          "on the next deploy"
+        )}
+      </Td>
+      <Td className="text-right">
+        <Switch
+          checked={a.enabled}
+          label={`${a.enabled ? "Disable" : "Enable"} ${a.name}`}
+          onCheckedChange={(enabled) => toggle.mutate({ name: a.name, enabled })}
+        />
+      </Td>
+      <Td className="text-right">
+        <Button
+          size="sm"
+          variant="ghost"
+          icon={<Zap />}
+          onClick={() => fire.mutate(a.name)}
+          disabled={fire.isPending && fire.variables === a.name}
+        >
+          Run now
+        </Button>
+      </Td>
+    </Tr>
   );
 }

@@ -1,296 +1,155 @@
-import { expect, test } from "@playwright/test";
-import type { Page } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 
-// §12 console flows against the demo project (`solera serve`): assets, runs,
-// automations, sources, executors — desktop and mobile layouts.
+// The console's main flows against the demo project (python/solera_server/demo.py),
+// on desktop and mobile: connect, navigate, theme, materialize and inspect a
+// run, cancel, keys and explain, automations, sources, health.
 
-async function login(page: Page) {
-  await page.goto("/");
-  await page
-    .getByLabel("API token", { exact: true })
-    .fill("test-browser-token");
+const TOKEN = "test-browser-token";
+
+async function connect(page: Page, path = "/") {
+  await page.goto(path);
+  await page.getByLabel("API token", { exact: true }).fill(TOKEN);
   await page.getByRole("button", { name: "Connect", exact: true }).click();
-  await expect(
-    page.getByRole("heading", { name: "Assets", exact: true }),
-  ).toBeVisible();
-  await expect(page.getByLabel("Filter assets")).toBeVisible();
 }
 
-async function materialize(
-  page: Page,
-  asset: string,
-  { upstream = false }: { upstream?: boolean } = {},
-) {
-  await page
-    .locator("header")
-    .getByRole("button", { name: /Materialize/ })
-    .click();
-  const dialog = page.getByRole("dialog", { name: "Materialize" });
-  await dialog.locator(`[role="checkbox"][aria-label="${asset}"]`).click();
-  if (upstream)
-    await dialog
-      .getByRole("switch", { name: "Materialize upstream first" })
-      .click();
-  await dialog
-    .getByRole("button", { name: "Start materialization", exact: true })
-    .click();
-  const sheet = page.getByRole("dialog").last();
-  // Wait for the run detail to load before interacting with its controls.
-  await expect(sheet.getByText(/\d+ tasks?/).first()).toBeVisible();
-  return sheet;
+const mobile = (page: Page) => (page.viewportSize()?.width ?? 1440) < 1024;
+
+/** Follow a main-navigation link; on a phone it lives behind the menu button. */
+async function nav(page: Page, name: string) {
+  if (mobile(page)) await page.getByRole("button", { name: "Open navigation" }).click();
+  await page.getByRole("navigation", { name: "Main" }).getByRole("link", { name, exact: false }).first().click();
 }
 
-test("every page loads", async ({ page }) => {
-  await login(page);
+test("asks for a token, then shows the overview", async ({ page }) => {
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Connect to Solera" })).toBeVisible();
+  await page.getByLabel("API token", { exact: true }).fill("wrong");
+  await page.getByRole("button", { name: "Connect", exact: true }).click();
+  await expect(page.getByText("That token was refused")).toBeVisible();
+  await page.getByLabel("API token", { exact: true }).fill(TOKEN);
+  await page.getByRole("button", { name: "Connect", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Overview", level: 1 })).toBeVisible();
+  await expect(page.getByText("Running now").first()).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Up next" })).toBeVisible();
+});
+
+test("every page loads from the navigation", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(e.message));
+  await connect(page);
   for (const [link, heading] of [
+    ["Assets", "Assets"],
     ["Runs", "Runs"],
     ["Automations", "Automations"],
+    ["Sensors", "Sensors"],
     ["Sources", "Sources"],
     ["Executors", "Executors"],
-    ["Storage", "Storage"],
-    ["Assets", "Assets"],
+    ["Health", "Health"],
+    ["Overview", "Overview"],
   ] as const) {
-    await page
-      .getByRole("navigation", { name: "Main navigation" })
-      .getByRole("link", { name: link })
-      .click();
-    await expect(
-      page.getByRole("heading", { name: heading, exact: true }),
-    ).toBeVisible();
-    expect(
-      await page.evaluate(
-        () => document.documentElement.scrollWidth <= window.innerWidth,
-      ),
-    ).toBeTruthy();
+    await nav(page, link);
+    await expect(page.getByRole("heading", { name: heading, level: 1 })).toBeVisible();
   }
+  expect(errors).toEqual([]);
 });
 
-test("theme toggle switches light and dark", async ({ page }) => {
-  await login(page);
-  // Two theme toggles exist (sidebar on desktop, header on mobile); the visible
-  // one depends on the viewport.
-  const dark = page
-    .getByRole("radio", { name: "Dark" })
-    .filter({ visible: true });
-  const light = page
-    .getByRole("radio", { name: "Light" })
-    .filter({ visible: true });
-  await dark.click();
-  await expect(page.locator("html")).toHaveClass(/dark/);
-  await light.click();
-  await expect(page.locator("html")).not.toHaveClass(/dark/);
+test("the theme switches by tokens alone and persists", async ({ page }) => {
+  await connect(page);
+  await expect(page.getByRole("heading", { name: "Overview", level: 1 })).toBeVisible();
+  const bg = () => page.evaluate(() => getComputedStyle(document.body).backgroundColor);
+  const normal = await bg();
+  if (mobile(page)) await page.getByRole("button", { name: "Open navigation" }).click();
+  await page.getByRole("radio", { name: "Fun" }).click();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "fun");
+  expect(await bg()).not.toBe(normal);
+  await page.reload();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "fun");
+  if (mobile(page)) await page.getByRole("button", { name: "Open navigation" }).click();
+  await page.getByRole("radio", { name: "Normal" }).click();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "normal");
 });
 
-test("lineage graph shows sources and edge kinds", async ({ page }) => {
-  await login(page);
-  await page.getByRole("radio", { name: "Graph" }).click();
-  const graph = page.getByLabel("Asset lineage graph");
-  await expect(graph).toBeVisible();
-  // Sources render as nodes alongside assets.
-  await expect(
-    graph.getByRole("button", { name: "Inspect uploads" }),
-  ).toBeVisible();
-  await expect(
-    graph.getByRole("button", { name: "Inspect site_feed" }),
-  ).toBeVisible();
-  // The edge-kind legend names every consumption kind.
-  for (const kind of ["whole", "Incremental", "AllPartitions", "dep"])
-    await expect(page.getByText(kind, { exact: true })).toBeVisible();
-  // Clicking a source node opens its card on the Sources page.
-  await graph.getByRole("button", { name: "Inspect uploads" }).click();
-  await expect(page).toHaveURL(/\/sources#source-uploads$/);
-  await expect(page.locator('[data-source="uploads"]')).toBeInViewport();
-});
-
-test("materialize latest from the dialog and watch the run", async ({
-  page,
-}) => {
-  await login(page);
-  const sheet = await materialize(page, "sites");
-  await expect(sheet.locator('[data-status="succeeded"]').first()).toBeVisible({
-    timeout: 60000,
-  });
-});
-
-test("pick individual cells from the partition grid", async ({ page }) => {
-  await login(page);
-  // Open a partitioned asset and materialize one scope straight off the grid.
-  await page.getByRole("button", { name: "site_feed", exact: true }).click();
-  const asset = page.getByRole("dialog", { name: "site_feed" });
-  await expect(asset.locator("[data-scope]").first()).toBeVisible({
-    timeout: 30000,
-  });
-  await asset.locator("[data-scope]").first().click();
+test("materialize an asset and follow its run to the logs", async ({ page }) => {
+  await connect(page, "/assets/site_feed");
+  await expect(page.getByRole("heading", { name: "site_feed", level: 1 })).toBeVisible();
+  await page.getByRole("button", { name: "Materialize", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Materialize" });
-  await expect(dialog.getByRole("radio", { name: "pick" })).toHaveAttribute(
-    "aria-checked",
-    "true",
-  );
-  await expect(dialog.getByText(/Pick cells — \d+ selected/)).toBeVisible();
+  await expect(dialog.getByRole("checkbox", { name: "site_feed" })).toBeChecked();
+  await dialog.getByRole("radio", { name: "All" }).click();
+  await dialog.getByRole("button", { name: "Start materialization" }).click();
+  await expect(page).toHaveURL(/\/runs\/[0-9A-Z]{26}/);
+  await expect(page.getByRole("heading", { name: "site_feed", level: 1 })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Timeline" })).toBeVisible();
+  await expect(page.getByText("succeeded").first()).toBeVisible({ timeout: 45_000 });
+  await expect(page.getByRole("log")).toContainText("polled");
+  await page.getByRole("tab", { name: "Spec" }).click();
+  await expect(page.getByRole("tab", { name: "Spec" })).toHaveAttribute("aria-selected", "true");
+  await expect(page).toHaveURL(/tab=spec/);
+  await page.getByRole("tab", { name: "Events" }).click();
+  await expect(page.getByText("committed").first()).toBeVisible();
 });
 
-test("partition grid, attempt logs, upstream run", async ({ page }) => {
-  await login(page);
-  // site_feed is partitioned on the `sites` set; --upstream plans `sites`
-  // first so the set exists before the per-site scopes run.
-  const sheet = await materialize(page, "site_feed", { upstream: true });
-  await expect(sheet.locator('[data-status="succeeded"]').first()).toBeVisible({
-    timeout: 60000,
-  });
-  // Attempt logs live-tail: site_feed logs "polled" via ctx.log.
-  const feedTask = sheet.locator("section", { hasText: "site_feed" }).first();
-  await feedTask.locator("summary").first().click();
-  await expect(sheet.getByLabel("Attempt logs").first()).toContainText(
-    "polled",
-    { timeout: 15000 },
-  );
-  // Where its time went, and the run's timeline, from submitted to succeeded.
-  await expect(feedTask.locator("[data-phases]").first()).toContainText(
-    "computing",
-  );
-  await sheet.getByRole("tab", { name: "Timeline" }).click();
-  const timeline = sheet.getByLabel("Run timeline");
-  await expect(timeline.locator('[data-event="submitted"]')).toBeVisible();
-  await expect(timeline.locator('[data-event="booted"]').first()).toBeVisible();
-  await expect(timeline.locator("li").last()).toHaveAttribute(
-    "data-event",
-    "succeeded",
-  );
-  await sheet.getByRole("button", { name: "Close", exact: true }).click();
-  // The partition grid colors committed scopes complete.
-  await page.getByRole("button", { name: "site_feed", exact: true }).click();
-  const asset = page.getByRole("dialog", { name: "site_feed" });
-  await expect(asset.locator('[data-status="complete"]').first()).toBeVisible({
-    timeout: 30000,
-  });
+test("commit to a source, then cancel the run waiting for a pool worker", async ({ page }, info) => {
+  const upload = `e2e-${info.project.name}`; // the projects share one server
+  await connect(page, "/sources/uploads");
+  await expect(page.getByRole("heading", { name: "uploads", level: 1 })).toBeVisible();
+  await page.getByPlaceholder(/u-1/).fill(upload);
+  await page.getByRole("button", { name: "Commit", exact: true }).click();
+  await expect(page.getByRole("cell", { name: upload })).toBeVisible();
+
+  // manual_ingest runs on Pool("ingest"): with no worker, its attempt waits.
+  await page.goto("/assets/manual_ingest");
+  await page.getByRole("button", { name: "Materialize", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Materialize" });
+  await dialog.getByRole("radio", { name: "Pick…" }).click();
+  await dialog.getByLabel("Partition keys").fill(upload);
+  await dialog.getByRole("button", { name: "Start materialization" }).click();
+  await expect(page).toHaveURL(/\/runs\//);
+  await page.getByRole("button", { name: "Cancel run" }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Cancel run" }).click();
+  await expect(page.getByText("canceled").first()).toBeVisible({ timeout: 45_000 });
+  await expect(page.getByRole("button", { name: "Retry failed" })).toBeVisible();
 });
 
-test("run history: facets, asset versions, lineage, workload", async ({
-  page,
-}) => {
-  await login(page);
-  // Earlier tests ran `sites` and `site_feed` by hand, so the history has
-  // manual runs; filtering on them lands in the URL and shows a chip.
-  await page
-    .getByRole("navigation", { name: "Main navigation" })
-    .getByRole("link", { name: "Runs" })
-    .click();
-  await expect(page.getByRole("img", { name: "Runs over time" })).toBeVisible();
-  await page
-    .locator('[data-facet="trigger"]')
-    .getByRole("button", { name: /manual/ })
-    .click();
-  await expect(page).toHaveURL(/trigger=/);
-  await expect(
-    page.getByRole("button", { name: "Remove trigger: manual" }),
-  ).toBeVisible();
-  await expect(page.getByRole("button", { name: "Clear all" })).toBeVisible();
-  await expect(page.getByRole("navigation", { name: "Pages" })).toContainText(
-    /1–\d+ of \d+/,
-  );
-
-  // Zooming into a bar selects its window in the time range control; a
-  // preset zooms back out.
-  await page.locator("[data-bar]:has(span)").last().click();
-  await expect(page).toHaveURL(/window=/);
-  const range = page.getByRole("radiogroup", { name: "Time range" });
-  await expect(range.getByRole("radio", { checked: true })).toContainText("–");
-  await range.getByRole("radio", { name: "7d" }).click();
-  await expect(page).not.toHaveURL(/window=/);
-
-  // Every materialization of `sites` is a version; lineage shows what read it.
-  await page
-    .getByRole("navigation", { name: "Main navigation" })
-    .getByRole("link", { name: "Assets" })
-    .click();
-  await page.getByRole("button", { name: "sites", exact: true }).click();
-  const asset = page.getByRole("dialog", { name: "sites" });
-  const version = asset.locator("[data-version]").first();
-  await expect(version).toBeVisible({ timeout: 30000 });
-  await version.getByRole("button", { name: /Lineage of/ }).click();
-  const lineage = page.getByRole("dialog", { name: "Lineage" });
-  await expect(lineage.getByText("This version")).toBeVisible();
-  await expect(lineage.locator('[data-lineage="sites"]')).toBeVisible();
-  await page.keyboard.press("Escape");
-
-  await page.goto("/executors");
-  await expect(page.locator('[data-executor="ingest"]')).toContainText("Pool");
-  await expect(
-    page.getByRole("table", { name: "Workload per executor" }),
-  ).toContainText("local");
+test("runs filter through the address bar", async ({ page }) => {
+  await connect(page, "/runs");
+  await expect(page.getByRole("heading", { name: "Runs", level: 1 })).toBeVisible();
+  await page.getByRole("group", { name: "Status" }).getByRole("button", { name: /succeeded/ }).click();
+  await expect(page).toHaveURL(/status=succeeded/);
+  await expect(page.locator("tbody tr").first()).toContainText("succeeded");
+  await page.getByRole("radio", { name: "1h" }).click();
+  await expect(page).toHaveURL(/range=1h/);
+  await page.reload();
+  await expect(page.getByRole("button", { name: /succeeded/ })).toHaveAttribute("aria-pressed", "true");
 });
 
-test("automation toggle and run-now", async ({ page }) => {
-  await login(page);
-  await page
-    .getByRole("navigation", { name: "Main navigation" })
-    .getByRole("link", { name: "Automations" })
-    .click();
-  const automation = page.locator('[data-automation="refresh-index"]');
-  await expect(automation).toBeVisible();
-  const toggle = automation.getByRole("switch");
-  const before = await toggle.getAttribute("aria-checked");
+test("assets graph, keys and explain", async ({ page }) => {
+  await connect(page, "/assets");
+  await page.getByRole("link", { name: /file_checks/ }).first().click();
+  await expect(page.getByRole("heading", { name: "file_checks", level: 1 })).toBeVisible();
+  await page.getByRole("navigation", { name: "Asset sections" }).getByRole("link", { name: /Keys/ }).click();
+  await expect(page.getByRole("heading", { name: "Failing keys" })).toBeVisible();
+  // alpha-file-2 is excluded by the edge's "drafts" pattern: explain says so.
+  await page.getByLabel("Key to explain").fill("alpha-file-2");
+  await page.getByRole("button", { name: "Explain" }).click();
+  await expect(page.getByText(/Excluded by the edge's pattern/)).toBeVisible({ timeout: 45_000 });
+  await page.getByRole("navigation", { name: "Asset sections" }).getByRole("link", { name: "Edges" }).click();
+  await expect(page.getByText("Each(")).toBeVisible();
+  await page.goto("/assets?view=list");
+  await expect(page.getByRole("link", { name: /file_index/ })).toBeVisible();
+});
+
+test("automations toggle and health", async ({ page }) => {
+  await connect(page, "/automations");
+  const toggle = page.getByRole("switch", { name: /refresh-index/ });
+  await expect(toggle).toBeChecked();
   await toggle.click();
-  await expect(toggle).toHaveAttribute(
-    "aria-checked",
-    before === "true" ? "false" : "true",
-  );
-  await toggle.click();
-  await expect(toggle).toHaveAttribute("aria-checked", before ?? "true");
-  await automation
-    .getByRole("button", { name: "Run now", exact: true })
-    .click();
-  await page
-    .getByRole("navigation", { name: "Main navigation" })
-    .getByRole("link", { name: "Runs" })
-    .click();
-  await expect(
-    page.locator("tbody tr", { hasText: "refresh-index" }).first(),
-  ).toBeVisible({ timeout: 30000 });
-});
+  await expect(page.getByRole("switch", { name: /Enable refresh-index/ })).not.toBeChecked();
+  await page.reload();
+  await page.getByRole("switch", { name: /Enable refresh-index/ }).click();
+  await expect(page.getByRole("switch", { name: /Disable refresh-index/ })).toBeChecked();
 
-test("source commit wakes downstream work", async ({ page }) => {
-  await login(page);
-  await page
-    .getByRole("navigation", { name: "Main navigation" })
-    .getByRole("link", { name: "Sources" })
-    .click();
-  const uploads = page.locator('[data-source="uploads"]');
-  await expect(uploads).toBeVisible();
-  const key = `up-${Date.now()}`;
-  await uploads.getByLabel("uploads upsert").fill(`["${key}"]`);
-  await uploads.getByRole("button", { name: "Commit", exact: true }).click();
-  // The Every(30) automation with partitions="missing" plans the new key on
-  // a pool placement; with no worker it stays queued — but the run exists.
-  await page
-    .getByRole("navigation", { name: "Main navigation" })
-    .getByRole("link", { name: "Runs" })
-    .click();
-  await expect(
-    page.locator("tbody tr", { hasText: "manual_ingest" }).first(),
-  ).toBeVisible({ timeout: 45000 });
-});
-
-test("run cancellation", async ({ page }) => {
-  await login(page);
-  // Commit an upload so manual_ingest has a scope to plan.
-  await page
-    .getByRole("navigation", { name: "Main navigation" })
-    .getByRole("link", { name: "Sources" })
-    .click();
-  const uploads = page.locator('[data-source="uploads"]');
-  await uploads
-    .getByLabel("uploads upsert")
-    .fill(`["up-cancel-${Date.now()}"]`);
-  await uploads.getByRole("button", { name: "Commit", exact: true }).click();
-  // manual_ingest is pool-placed: without a worker it stays queued, which is
-  // exactly the cancellable state.
-  const sheet = await materialize(page, "manual_ingest");
-  await sheet.getByRole("button", { name: "Cancel", exact: true }).click();
-  await sheet
-    .getByRole("button", { name: "Confirm cancel", exact: true })
-    .click();
-  await expect(sheet.locator('[data-status="canceled"]').first()).toBeVisible({
-    timeout: 15000,
-  });
+  await page.goto("/health");
+  await expect(page.getByRole("heading", { name: "Held scopes" })).toBeVisible();
+  await expect(page.getByText("browser", { exact: true })).toBeVisible();
 });

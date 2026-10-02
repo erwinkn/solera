@@ -132,11 +132,11 @@ def create_app(
                 response = JSONResponse({"detail": str(error)}, status_code=503)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
-        # The prerendered console shell relies on framework-injected inline
-        # hydration scripts, so inline script/style execution stays allowed.
+        # The console runs no inline script (its theme is applied by a file, not a
+        # snippet); inline styles stay allowed for the style attributes it sets.
         # Everything remains same-origin: no external scripts, styles, or frames.
         response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
             "connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'"
         )
         response.headers["Cache-Control"] = "no-store" if request.url.path.startswith("/api/") else "no-cache"
@@ -720,8 +720,10 @@ def create_app(
         return {"workers": sorted(runtime.pollers.values(), key=lambda w: w["id"])}
 
     # -- console -----------------------------------------------------------------------
-    # The SPA builds with base=/static/, so client routes like /static/assets
-    # collide with the bundle path: serve real files, fall back to index.html.
+    # The console builds with base=/static/: its bundle is web/… served under
+    # /static/…, and every other path is a client route (/runs/…, and names
+    # with dots, like /sensors/landing.observe). A missing bundle file is a
+    # 404, never the shell, so a page from an older build fails loudly.
 
     @app.get("/")
     async def index():
@@ -731,15 +733,12 @@ def create_app(
     async def console(path: str):
         if path.startswith("api/"):
             raise KeyError(path)
-        # The SPA builds with base=/static/: bundle files live under
-        # web/assets/…, while client routes (/static/assets, /static/runs) are
-        # pathnames that happen to share the prefix — files win, then the SPA.
-        bundle = path[7:] if path.startswith("static/") else path
+        bundle = path.removeprefix("static/")
         target = (web / bundle).resolve()
         if target.is_file() and web.resolve() in target.parents:
             return FileResponse(target)
-        if "." in Path(path).name:
-            raise KeyError(path)
+        if path.startswith("static/") or ("/" not in path and "." in path):
+            raise KeyError(path)  # a file asked for by name (/favicon.ico), not a route
         return FileResponse(web / "index.html")
 
     return app

@@ -386,6 +386,14 @@ async def test_console_shell_served(client):
     assert index.status_code == 200 and "text/html" in index.headers["content-type"]
     route = await client.get("/runs/abc")
     assert route.status_code == 200
+    # Names may hold dots (a source's sensor is `NAME.observe`): still a route.
+    dotted = await client.get("/sensors/landing.observe")
+    assert dotted.status_code == 200 and "text/html" in dotted.headers["content-type"]
+    # Bundle files are files: a missing one is a 404, never the shell.
+    assert (await client.get("/static/assets/gone-1234.js")).status_code == 404
+    assert (await client.get("/favicon.ico")).status_code == 404
+    shell = await client.get("/runs/abc")
+    assert "script-src 'self';" in shell.headers["content-security-policy"]
 
 
 async def test_partitions_read_scope_records_not_task_history(client, base, engine, monkeypatch):

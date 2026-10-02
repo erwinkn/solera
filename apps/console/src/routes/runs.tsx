@@ -1,764 +1,242 @@
-import { useEffect, useMemo, useState } from "react";
-import { Link, createFileRoute, useNavigate } from "@tanstack/react-router";
-import {
-  ArrowRight,
-  ChevronLeft,
-  ChevronRight,
-  ChevronsLeft,
-  ChevronsRight,
-  RefreshCw,
-  Search,
-  X,
-  ZoomIn,
-} from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
-import {
-  Empty,
-  ErrorNotice,
-  Eyebrow,
-  PageHeader,
-  Segmented,
-  StatusBadge,
-  statusFill,
-  statusOrder,
-} from "@/components/common";
-import { useQuery } from "@/lib/api";
-import { bucketLabel, count, seconds, time, windowLabel } from "@/lib/format";
-import { useWorkspace } from "@/lib/workspace";
-import { cn } from "cn";
-import type { Facets, Histogram, RunPage, RunRow } from "@/lib/types";
+import { keepPreviousData, useInfiniteQuery, useQuery } from "@tanstack/react-query";
+import { getRouteApi } from "@tanstack/react-router";
+import { FilterX, Play } from "lucide-react";
+import { q, useProject, type RunFilter } from "@/api/queries";
+import type { Facet } from "@/api/types";
+import { RunHistogram, RunsTable } from "@/features/runs";
+import { MaterializeButton } from "@/features/materialize";
+import { count, plural } from "@/lib/format";
+import { label } from "@/lib/status";
+import { join, list, RANGES, type RunSearch } from "@/router";
+import { Button } from "@/ui/button";
+import { Empty, ErrorNote, Skeleton } from "@/ui/data";
+import { Chip, SearchInput, Segmented, Select } from "@/ui/form";
+import { Card, Page, PageHeader } from "@/ui/layout";
+import { StatusIcon } from "@/ui/status";
 
-// The fields a run listing filters on; each takes several values (any matches).
-const FIELDS = [
-  "status",
-  "trigger",
-  "asset",
-  "tag",
-  "automation",
-  "by",
-  "source",
-] as const;
-type Field = (typeof FIELDS)[number];
+const route = getRouteApi("/runs");
 
-const RANGES = {
-  "1h": 3600,
-  "24h": 86400,
-  "7d": 7 * 86400,
-  "30d": 30 * 86400,
-  all: null,
-} as const;
-type Range = keyof typeof RANGES;
-/** The time range control's value: a preset, or the histogram window. */
-type RangeChoice = Range | "window";
-
-const SIZES = [25, 50, 100, 200] as const;
-
-type RunSearch = Partial<Record<Field, string[]>> & {
-  q?: string;
-  range?: Range;
-  /** A window picked on the histogram; overrides `range`. */
-  window?: [number, number];
-  /** 1-based; past the first page, `anchor` pins the newest run so arriving
-      runs don't shift the pages. */
-  page?: number;
-  anchor?: string;
-  size?: number;
-};
-
-export const Route = createFileRoute("/runs")({
-  component: RunsPage,
-  validateSearch: (raw: Record<string, unknown>): RunSearch => {
-    const out: RunSearch = {};
-    for (const field of FIELDS) {
-      const value = raw[field];
-      const list = (Array.isArray(value) ? value : value ? [value] : []).map(
-        String,
-      );
-      if (list.length) out[field] = list;
-    }
-    if (typeof raw.q === "string" && raw.q) out.q = raw.q;
-    if (typeof raw.range === "string" && raw.range in RANGES)
-      out.range = raw.range as Range;
-    if (
-      Array.isArray(raw.window) &&
-      raw.window.length === 2 &&
-      raw.window.every((n) => typeof n === "number")
-    )
-      out.window = raw.window as [number, number];
-    const page = Number(raw.page);
-    if (Number.isInteger(page) && page > 1) out.page = page;
-    if (typeof raw.anchor === "string" && raw.anchor) out.anchor = raw.anchor;
-    const size = Number(raw.size);
-    if ((SIZES as readonly number[]).includes(size)) out.size = size;
-    return out;
-  },
-});
-
-/** The API query string for a filter. `since` is rounded to the minute so the
-    polled paths stay stable between renders. */
-function filterQuery(search: RunSearch) {
-  const params = new URLSearchParams();
-  for (const field of FIELDS)
-    for (const value of search[field] ?? []) params.append(field, value);
-  if (search.q) params.set("q", search.q);
-  if (search.window) {
-    params.set("since", String(search.window[0]));
-    params.set("until", String(search.window[1]));
-  } else {
-    const span = RANGES[search.range ?? "7d"];
-    if (span !== null) {
-      const minute = Math.floor(Date.now() / 60000) * 60;
-      params.set("since", String(minute - span));
-    }
-  }
-  return params;
+/** The URL's run search as an API filter. Lists stay lists; a range stays a range. */
+export function filterOf(search: RunSearch): RunFilter {
+  return {
+    status: list(search.status),
+    trigger: list(search.trigger),
+    automation: list(search.automation),
+    asset: list(search.asset),
+    tag: list(search.tag),
+    q: search.q,
+    range: search.since ? undefined : search.range,
+    since: search.since,
+    until: search.until,
+  };
 }
 
-function withParams(path: string, params: URLSearchParams) {
-  const text = params.toString();
-  return text ? `${path}?${text}` : path;
-}
+const STATUSES = ["running", "queued", "failed", "succeeded", "canceled", "skipped"];
 
-function RunsPage() {
-  const { base, diagnostics, select, refresh } = useWorkspace();
-  const search = Route.useSearch();
-  const navigate = useNavigate({ from: Route.fullPath });
-  const params = filterQuery(search);
-  const size = search.size ?? 50;
-  const pageNo = search.page ?? 1;
+export function Runs() {
+  const search = route.useSearch();
+  const navigate = route.useNavigate();
+  const project = useProject();
+  const filter = filterOf(search);
+  const set = (patch: Partial<RunSearch>) => navigate({ search: (s) => ({ ...s, ...patch }), replace: true });
 
-  const listParams = new URLSearchParams(params);
-  listParams.set("limit", String(size));
-  if (pageNo > 1) {
-    listParams.set("offset", String((pageNo - 1) * size));
-    if (search.anchor) listParams.set("anchor", search.anchor);
-  }
-  const page = useQuery<RunPage>(
-    base ? withParams(`${base}/runs`, listParams) : null,
-    3000,
-  );
-  const facets = useQuery<Facets>(
-    base ? withParams(`${base}/runs:facets`, params) : null,
-    5000,
-  );
-  const histogram = useQuery<Histogram>(
-    base ? withParams(`${base}/runs:histogram`, params) : null,
-    5000,
-  );
+  const runs = useInfiniteQuery({
+    ...q.runs(project, filter),
+    placeholderData: keepPreviousData,
+  });
+  const facets = useQuery({
+    ...q.runFacets(project, filter),
+    placeholderData: keepPreviousData,
+  }).data;
+  const histogram = useQuery({
+    ...q.runHistogram(project, filter, 72),
+    placeholderData: keepPreviousData,
+  }).data;
 
-  /** Changes the search; any change but paging goes back to the first page. */
-  function update(next: Partial<RunSearch>) {
-    void navigate({
-      search: (current: RunSearch) => {
-        const merged: RunSearch = {
-          ...current,
-          page: undefined,
-          anchor: undefined,
-          ...next,
-        };
-        for (const [k, v] of Object.entries(merged))
-          if (v === undefined || (Array.isArray(v) && !v.length))
-            delete merged[k as keyof RunSearch];
-        return merged;
-      },
-      replace: true,
-    });
-  }
-
-  function toggle(field: Field, value: string) {
-    const current = search[field] ?? [];
-    update({
-      [field]: current.includes(value)
-        ? current.filter((v) => v !== value)
-        : [...current, value],
-    });
-  }
-
-  if (!diagnostics) return null;
-  const runs = page.data?.runs ?? [];
-  const chips = FIELDS.flatMap((field) =>
-    (search[field] ?? []).map((value) => ({ field, value })),
-  );
-  const filtered = chips.length > 0 || !!search.q || !!search.window;
+  const rows = runs.data?.pages.flatMap((page) => page.runs) ?? [];
+  const total = runs.data?.pages[0]?.total;
+  const filtered = Object.entries(search).some(([k, v]) => k !== "range" && v !== undefined);
+  const statuses = list(search.status);
+  const facetCount = (facet: Facet[] | undefined, value: string) =>
+    facet?.find((f) => f.value === value)?.count ?? 0;
 
   return (
-    <section className="flex flex-col gap-4">
+    <Page>
       <PageHeader
-        eyebrow="Execution"
         title="Runs"
-        description="Every run and source commit, from the run history."
-        aside={
-          <div className="flex items-center gap-4">
-            {!!diagnostics.active_runs && (
-              <div className="flex flex-col items-end">
-                <span className="text-xl font-semibold text-sky-600 tabular-nums dark:text-sky-400">
-                  {diagnostics.active_runs}
-                </span>
-                <span className="text-xs text-muted-foreground">active</span>
-              </div>
-            )}
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => {
-                refresh();
-                page.refresh();
-                facets.refresh();
-                histogram.refresh();
-              }}
-            >
-              <RefreshCw />
-              Refresh
-            </Button>
-          </div>
-        }
+        description="Every run, live and finished. Filters live in the address bar, so any view here is a link."
+        actions={<MaterializeButton icon={<Play />} />}
       />
 
-      <div className="flex flex-wrap items-center gap-3">
-        <SearchBox value={search.q ?? ""} onChange={(q) => update({ q })} />
-        <Segmented<RangeChoice>
-          ariaLabel="Time range"
-          value={search.window ? "window" : (search.range ?? "7d")}
-          onChange={(range) => {
-            if (range !== "window") update({ range, window: undefined });
-          }}
-          options={[
-            ...(Object.keys(RANGES) as Range[]).map((r) => ({
-              value: r,
-              label: r === "all" ? "All" : r,
-            })),
-            ...(search.window
-              ? [
-                  {
-                    value: "window" as const,
-                    label: windowLabel(...search.window),
-                    icon: <ZoomIn className="size-3.5" />,
-                  },
-                ]
-              : []),
-          ]}
-        />
-      </div>
-
-      {chips.length > 0 && (
-        <div
-          className="flex flex-wrap items-center gap-1.5"
-          aria-label="Filters"
-        >
-          {chips.map(({ field, value }) => (
-            <Chip
-              key={`${field}:${value}`}
-              label={`${field}: ${field === "status" && value === "skipped" ? "unchanged" : value}`}
-              onRemove={() => toggle(field, value)}
-            />
-          ))}
-          <button
-            className="px-1 text-xs text-muted-foreground hover:text-foreground"
-            onClick={() =>
-              update({
-                ...Object.fromEntries(FIELDS.map((f) => [f, undefined])),
-                q: undefined,
-                window: undefined,
+      <div className="flex flex-col gap-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <SearchInput
+            aria-label="Search runs"
+            placeholder="Search targets, errors, ids…"
+            className="w-full sm:w-72"
+            value={search.q ?? ""}
+            onChange={(e) => set({ q: e.target.value || undefined })}
+          />
+          <Segmented
+            label="Time range"
+            value={search.since ? "custom" : (search.range ?? "all")}
+            onChange={(value) =>
+              set({
+                range: RANGES.find((r) => r === value),
+                since: undefined,
+                until: undefined,
               })
             }
-          >
-            Clear all
-          </button>
-        </div>
-      )}
-
-      {histogram.data && (
-        <RunHistogram
-          data={histogram.data}
-          onPick={(t) => update({ window: [t, t + histogram.data!.bucket] })}
-        />
-      )}
-
-      <div className="grid items-start gap-4 lg:grid-cols-[15rem_minmax(0,1fr)]">
-        <FacetPanel facets={facets.data} search={search} onToggle={toggle} />
-        <div className="flex min-w-0 flex-col gap-3">
-          {page.error && <ErrorNotice message={page.error.message} />}
-          {page.data && !runs.length ? (
-            <Empty
-              title={filtered ? "No matching runs" : "No runs yet"}
-              action={
-                !filtered && (
-                  <Button variant="outline" render={<Link to="/assets" />}>
-                    Browse assets
-                  </Button>
-                )
-              }
-            >
-              {filtered
-                ? "Loosen a filter or widen the time range."
-                : "Materialize an asset to create the first run."}
-            </Empty>
-          ) : (
-            <RunTable
-              runs={runs}
-              onOpen={(id) => select({ kind: "run", id })}
-              onTag={(tag) => toggle("tag", tag)}
-              tagged={search.tag ?? []}
+            options={[
+              ...RANGES.map((r) => ({ value: r as string, label: r })),
+              { value: "all", label: "All" },
+              ...(search.since ? [{ value: "custom", label: "Custom" }] : []),
+            ]}
+          />
+          <FacetSelect
+            label="Trigger"
+            field="trigger"
+            facet={facets?.trigger}
+            value={search.trigger}
+            onChange={(v) => set({ trigger: v })}
+          />
+          <FacetSelect
+            label="Automation"
+            field="automation"
+            facet={facets?.automation}
+            value={search.automation}
+            onChange={(v) => set({ automation: v })}
+          />
+          <FacetSelect
+            label="Asset"
+            field="asset"
+            facet={facets?.asset}
+            value={search.asset}
+            onChange={(v) => set({ asset: v })}
+          />
+          {facets && facets.tag.length > 0 && (
+            <FacetSelect
+              label="Tag"
+              field="tag"
+              facet={facets.tag}
+              value={search.tag}
+              onChange={(v) => set({ tag: v })}
             />
           )}
-          {page.data && page.data.total > 0 && (
-            <Pager
-              page={pageNo}
-              size={size}
-              total={page.data.total}
-              onPage={(n) =>
-                update({
-                  page: n > 1 ? n : undefined,
-                  anchor:
-                    n > 1
-                      ? (search.anchor ??
-                        (pageNo === 1 ? runs[0]?.id : undefined))
-                      : undefined,
-                })
-              }
-              onSize={(n) => update({ size: n === 50 ? undefined : n })}
-            />
-          )}
-        </div>
-      </div>
-    </section>
-  );
-}
-
-/** "51–100 of 1,234", the page size, and first / previous / next / last. */
-function Pager({
-  page,
-  size,
-  total,
-  onPage,
-  onSize,
-}: {
-  page: number;
-  size: number;
-  total: number;
-  onPage: (page: number) => void;
-  onSize: (size: number) => void;
-}) {
-  const last = Math.max(1, Math.ceil(total / size));
-  const first = (page - 1) * size + 1;
-  const steps = [
-    { label: "First page", icon: <ChevronsLeft />, to: 1, off: page <= 1 },
-    {
-      label: "Previous page",
-      icon: <ChevronLeft />,
-      to: page - 1,
-      off: page <= 1,
-    },
-    {
-      label: "Next page",
-      icon: <ChevronRight />,
-      to: page + 1,
-      off: page >= last,
-    },
-    {
-      label: "Last page",
-      icon: <ChevronsRight />,
-      to: last,
-      off: page >= last,
-    },
-  ];
-  return (
-    <nav
-      className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground"
-      aria-label="Pages"
-    >
-      <span className="tabular-nums">
-        {first > total
-          ? `Past the last of ${count(total)}`
-          : `${count(first)}–${count(Math.min(total, page * size))} of ${count(total)}`}
-      </span>
-      <div className="flex items-center gap-2">
-        <Select
-          value={String(size)}
-          onValueChange={(value) => onSize(Number(value))}
-          items={SIZES.map((n) => ({ value: String(n), label: `${n} / page` }))}
-        >
-          <SelectTrigger size="sm" aria-label="Runs per page">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {SIZES.map((n) => (
-              <SelectItem key={n} value={String(n)}>
-                {n} / page
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        <span className="tabular-nums">
-          Page {count(page)} of {count(last)}
-        </span>
-        <div className="flex items-center">
-          {steps.map((step) => (
+          {filtered && (
             <Button
-              key={step.label}
               variant="ghost"
-              size="icon-sm"
-              aria-label={step.label}
-              disabled={step.off}
-              onClick={() => onPage(Math.min(last, Math.max(1, step.to)))}
+              icon={<FilterX />}
+              onClick={() => navigate({ search: { range: search.range }, replace: true })}
             >
-              {step.icon}
+              Clear
             </Button>
-          ))}
+          )}
+        </div>
+        <div role="group" aria-label="Status" className="flex flex-wrap items-center gap-1.5">
+          {STATUSES.map((status) => {
+            const active = statuses.includes(status);
+            const n = facetCount(facets?.status, status);
+            if (!active && n === 0) return null;
+            return (
+              <Chip
+                key={status}
+                active={active}
+                count={n}
+                onClick={() =>
+                  set({
+                    status: join(active ? statuses.filter((s) => s !== status) : [...statuses, status]),
+                  })
+                }
+              >
+                <StatusIcon status={status} className={active ? "text-current" : undefined} />
+                {label(status)}
+              </Chip>
+            );
+          })}
         </div>
       </div>
-    </nav>
+
+      <Card>
+        <div className="border-b border-line px-4 pt-4 pb-3">
+          {histogram ? (
+            <RunHistogram
+              data={histogram}
+              onSelect={(since, until) => set({ since, until, range: undefined })}
+            />
+          ) : (
+            <Skeleton className="h-[96px]" />
+          )}
+        </div>
+        {runs.isError ? (
+          <div className="p-4">
+            <ErrorNote error={runs.error} />
+          </div>
+        ) : !runs.data ? (
+          <div className="flex flex-col gap-2 p-4">
+            {Array.from({ length: 8 }, (_, i) => (
+              <Skeleton key={i} className="h-7" />
+            ))}
+          </div>
+        ) : (
+          <>
+            <RunsTable
+              runs={rows}
+              empty={
+                <Empty title={filtered ? "No runs match" : "No runs yet"}>
+                  {filtered
+                    ? "Nothing in the history matches these filters. Skipped runs only show when you ask for them."
+                    : "Materialize an asset, or wait for an automation to fire."}
+                </Empty>
+              }
+            />
+            <div className="flex items-center justify-between border-t border-line px-4 py-2.5 text-xs text-fg-subtle">
+              <span className="tabular">
+                {total !== undefined && `${count(rows.length)} of ${plural(total, "run")}`}
+              </span>
+              {runs.hasNextPage && (
+                <Button size="sm" onClick={() => runs.fetchNextPage()} disabled={runs.isFetchingNextPage}>
+                  {runs.isFetchingNextPage ? "Loading…" : "Load more"}
+                </Button>
+              )}
+            </div>
+          </>
+        )}
+      </Card>
+    </Page>
   );
 }
 
-function SearchBox({
+function FacetSelect({
+  label: name,
+  field,
+  facet,
   value,
   onChange,
 }: {
-  value: string;
+  label: string;
+  field: string;
+  facet: Facet[] | undefined;
+  value: string | undefined;
   onChange: (value: string | undefined) => void;
 }) {
-  const [text, setText] = useState(value);
-  useEffect(() => setText(value), [value]);
-  useEffect(() => {
-    if (text === value) return;
-    const timer = window.setTimeout(() => onChange(text || undefined), 300);
-    return () => window.clearTimeout(timer);
-  }, [text]);
+  const options = facet ?? [];
+  if (options.length === 0 && !value) return null;
   return (
-    <div className="relative min-w-52 flex-1">
-      <Search className="pointer-events-none absolute top-2.5 left-2.5 size-4 text-muted-foreground" />
-      <Input
-        type="search"
-        className="pl-8"
-        placeholder="Search errors or run ids…"
-        aria-label="Search runs"
-        value={text}
-        onChange={(event) => setText(event.target.value)}
-      />
-    </div>
-  );
-}
-
-function Chip({ label, onRemove }: { label: string; onRemove: () => void }) {
-  return (
-    <span className="flex items-center gap-1 rounded-full border bg-muted/40 py-0.5 pr-1 pl-2 text-xs">
-      <span className="font-mono">{label}</span>
-      <button
-        aria-label={`Remove ${label}`}
-        className="rounded-full p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground"
-        onClick={onRemove}
-      >
-        <X className="size-3" />
-      </button>
-    </span>
-  );
-}
-
-/** Runs per time bucket, stacked by status. Click a bar to zoom into it. */
-function RunHistogram({
-  data,
-  onPick,
-}: {
-  data: Histogram;
-  onPick: (t: number) => void;
-}) {
-  const bars = useMemo(() => {
-    if (data.since === null) return [];
-    const byT = new Map(data.bars.map((b) => [b.t, b.counts]));
-    const out = [];
-    for (let t = data.since; t <= data.until; t += data.bucket)
-      out.push({ t, counts: byT.get(t) ?? {} });
-    return out;
-  }, [data]);
-  const total = (counts: Record<string, number>) =>
-    Object.values(counts).reduce((a, b) => a + b, 0);
-  const peak = Math.max(1, ...bars.map((b) => total(b.counts)));
-  const runs = bars.reduce((n, b) => n + total(b.counts), 0);
-  if (!bars.length) return null;
-  return (
-    <div className="flex flex-col gap-1.5 rounded-xl border bg-card p-3">
-      <div className="flex items-baseline justify-between gap-2">
-        <Eyebrow>Runs over time</Eyebrow>
-        <span className="text-xs text-muted-foreground tabular-nums">
-          {count(runs)} runs · {seconds(data.bucket)} buckets
-        </span>
-      </div>
-      <div
-        className="flex h-20 items-end gap-px"
-        role="img"
-        aria-label="Runs over time"
-      >
-        {bars.map(({ t, counts }) => {
-          const n = total(counts);
-          return (
-            <button
-              key={t}
-              data-bar={t}
-              title={`${bucketLabel(t, data.bucket)}\n${
-                statusOrder
-                  .filter((s) => counts[s])
-                  .map((s) => `${counts[s]} ${s}`)
-                  .join("\n") || "no runs"
-              }`}
-              onClick={() => n && onPick(t)}
-              className={cn(
-                "flex h-full min-w-0 flex-1 flex-col-reverse rounded-[2px]",
-                n ? "cursor-zoom-in hover:opacity-80" : "cursor-default",
-              )}
-            >
-              {statusOrder
-                .filter((s) => counts[s])
-                .map((s) => (
-                  <span
-                    key={s}
-                    className={cn(
-                      "w-full first:rounded-b-[2px] last:rounded-t-[2px]",
-                      statusFill[s],
-                    )}
-                    style={{ height: `${(counts[s] / peak) * 100}%` }}
-                  />
-                ))}
-              {!n && <span className="h-px w-full bg-border" />}
-            </button>
-          );
-        })}
-      </div>
-      <div className="flex justify-between text-[0.65rem] text-muted-foreground tabular-nums">
-        <span>{bucketLabel(bars[0].t, data.bucket)}</span>
-        <span>{bucketLabel(bars[bars.length - 1].t, data.bucket)}</span>
-      </div>
-    </div>
-  );
-}
-
-const FACET_LABELS: Record<Field, string> = {
-  status: "Status",
-  trigger: "Trigger",
-  asset: "Asset",
-  tag: "Tag",
-  automation: "Automation",
-  by: "Requested by",
-  source: "Source",
-};
-
-/** Value counts per field, each counted with every other filter applied. */
-function FacetPanel({
-  facets,
-  search,
-  onToggle,
-}: {
-  facets: Facets | null;
-  search: RunSearch;
-  onToggle: (field: Field, value: string) => void;
-}) {
-  const [open, setOpen] = useState<Partial<Record<Field, boolean>>>({});
-  if (!facets) return <div className="hidden lg:block" />;
-  const groups = FIELDS.filter(
-    (f) => facets[f]?.length || (search[f] ?? []).length,
-  );
-  return (
-    <aside
-      aria-label="Facets"
-      className="flex flex-col gap-4 rounded-xl border bg-card p-3 lg:sticky lg:top-4"
+    <Select
+      aria-label={name}
+      name={field}
+      className="w-auto max-w-52"
+      value={value ?? ""}
+      onChange={(e) => onChange(e.target.value || undefined)}
     >
-      {groups.map((field) => {
-        const selected = search[field] ?? [];
-        const values = [...(facets[field] ?? [])];
-        for (const value of selected)
-          if (!values.some((v) => v.value === value))
-            values.push({ value, count: 0 });
-        const peak = Math.max(1, ...values.map((v) => v.count));
-        const shown = open[field] ? values : values.slice(0, 6);
-        return (
-          <div key={field} className="flex flex-col gap-1" data-facet={field}>
-            <Eyebrow>{FACET_LABELS[field]}</Eyebrow>
-            {shown.map(({ value, count: n }) => {
-              const active = selected.includes(value);
-              return (
-                <button
-                  key={value}
-                  aria-pressed={active}
-                  onClick={() => onToggle(field, value)}
-                  className={cn(
-                    "relative flex items-center gap-2 overflow-hidden rounded-md px-2 py-1 text-left text-xs transition-colors",
-                    active
-                      ? "bg-primary/10 text-foreground ring-1 ring-primary/30"
-                      : "text-muted-foreground hover:bg-muted hover:text-foreground",
-                  )}
-                >
-                  <span
-                    className="absolute inset-y-0 left-0 bg-muted/70"
-                    style={{ width: `${(n / peak) * 100}%` }}
-                    aria-hidden
-                  />
-                  {field === "status" && (
-                    <span
-                      className={cn(
-                        "relative size-1.5 shrink-0 rounded-full",
-                        statusFill[value] ?? "bg-muted-foreground/50",
-                      )}
-                    />
-                  )}
-                  <span className="relative min-w-0 flex-1 truncate font-mono">
-                    {field === "status" && value === "skipped"
-                      ? "unchanged"
-                      : value}
-                  </span>
-                  <span className="relative tabular-nums">{count(n)}</span>
-                </button>
-              );
-            })}
-            {values.length > 6 && (
-              <button
-                className="self-start px-2 text-[0.7rem] text-muted-foreground hover:text-foreground"
-                onClick={() => setOpen((o) => ({ ...o, [field]: !o[field] }))}
-              >
-                {open[field] ? "Show fewer" : `Show all ${values.length}`}
-              </button>
-            )}
-          </div>
-        );
-      })}
-      {!groups.length && (
-        <p className="text-xs text-muted-foreground">Nothing to filter yet.</p>
-      )}
-    </aside>
-  );
-}
-
-function selectionLabel(run: RunRow) {
-  if (run.trigger === "commit") return "source commit";
-  const scopes = Array.isArray(run.partitions)
-    ? `${run.partitions.length} scope${run.partitions.length === 1 ? "" : "s"}`
-    : run.partitions;
-  return [scopes, run.mode].filter(Boolean).join(" · ");
-}
-
-function origin(run: RunRow) {
-  if (run.trigger === "automation") return run.automation;
-  if (run.trigger === "commit") return `${run.source} · ${run.by ?? "api"}`;
-  return run.by ? `manual · ${run.by}` : "manual";
-}
-
-function RunTable({
-  runs,
-  onOpen,
-  onTag,
-  tagged,
-}: {
-  runs: RunRow[];
-  onOpen: (id: string) => void;
-  onTag: (tag: string) => void;
-  tagged: string[];
-}) {
-  const now = Date.now() / 1000;
-  return (
-    <div className="overflow-x-auto rounded-xl border bg-card">
-      <Table>
-        <TableHeader>
-          <TableRow className="hover:bg-transparent">
-            <TableHead>Run</TableHead>
-            <TableHead>Status</TableHead>
-            <TableHead>Targets</TableHead>
-            <TableHead>Requested</TableHead>
-            <TableHead className="text-right">Duration</TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {runs.map((run) => (
-            <TableRow key={run.id} data-run={run.id}>
-              <TableCell className="align-top">
-                <button
-                  className="flex items-center gap-1 font-mono text-xs font-medium text-primary hover:underline"
-                  onClick={() => onOpen(run.id)}
-                >
-                  {run.id.slice(0, 8)}
-                  <ArrowRight className="size-3" />
-                </button>
-                <span className="block max-w-44 truncate text-xs text-muted-foreground">
-                  {origin(run)}
-                </span>
-              </TableCell>
-              <TableCell className="max-w-72 align-top">
-                <StatusBadge status={run.status} />
-                {run.error && (
-                  <span
-                    className="mt-1 block truncate text-xs text-red-600 dark:text-red-400"
-                    title={run.error}
-                  >
-                    {run.failed_count > 1 && `${run.failed_count} failed · `}
-                    {run.error}
-                  </span>
-                )}
-              </TableCell>
-              <TableCell className="align-top">
-                <span
-                  className="block max-w-56 truncate font-mono text-xs"
-                  title={run.targets.join(", ")}
-                >
-                  {run.targets.length === 1
-                    ? run.targets[0]
-                    : `${run.targets.length} assets`}
-                </span>
-                <span className="block text-xs text-muted-foreground tabular-nums">
-                  {run.trigger === "commit"
-                    ? selectionLabel(run)
-                    : `${run.task_count} task${run.task_count === 1 ? "" : "s"} · ${selectionLabel(run)}`}
-                  {run.upstream && (
-                    <span className="ml-1 rounded bg-muted px-1 text-[0.65rem]">
-                      +upstream
-                    </span>
-                  )}
-                </span>
-                {Object.keys(run.tags).length > 0 && (
-                  <span className="mt-1 flex flex-wrap gap-1">
-                    {Object.entries(run.tags).map(([k, v]) => {
-                      const tag = `${k}=${v}`;
-                      return (
-                        <button
-                          key={k}
-                          onClick={() => onTag(tag)}
-                          title={`Filter by ${tag}`}
-                          className={cn(
-                            "rounded border px-1 font-mono text-[0.65rem] text-muted-foreground hover:text-foreground",
-                            tagged.includes(tag) &&
-                              "border-primary/40 bg-primary/10 text-foreground",
-                          )}
-                        >
-                          {tag}
-                        </button>
-                      );
-                    })}
-                  </span>
-                )}
-              </TableCell>
-              <TableCell className="align-top text-sm text-muted-foreground">
-                {time(run.created_at)}
-              </TableCell>
-              <TableCell className="text-right align-top font-mono text-xs text-muted-foreground tabular-nums">
-                {seconds((run.finished_at ?? now) - run.created_at)}
-              </TableCell>
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </div>
+      <option value="">{name}: any</option>
+      {value && !options.some((o) => o.value === value) && <option value={value}>{value}</option>}
+      {options.map((o) => (
+        <option key={o.value} value={o.value}>
+          {o.value} ({o.count})
+        </option>
+      ))}
+    </Select>
   );
 }

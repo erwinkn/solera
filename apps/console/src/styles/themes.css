@@ -1,0 +1,218 @@
+/*
+ * The two themes. Each is a complete set of semantic token values; components
+ * only ever read these (through the Tailwind names in app.css), never a theme
+ * name. Adding a theme means adding a block here — and its pairs to
+ * scripts/contrast.mjs.
+ */
+
+:root,
+[data-theme="normal"] {
+  /* surfaces */
+  --bg: #f6f6f7;
+  --surface: #ffffff;
+  --surface-2: #fafafa;
+  --sunken: #f2f2f4;
+  --overlay: rgb(9 9 11 / 0.36);
+
+  /* ink */
+  --fg: #18181b;
+  --fg-muted: #52525b;
+  --fg-subtle: #686871;
+  --fg-inverse: #ffffff;
+
+  /* lines */
+  --line: #e7e7ea;
+  --line-strong: #d6d6db;
+  --border-w: 1px;
+
+  /* accent: in the normal theme the chrome is monochrome and color means state */
+  --accent: #18181b;
+  --accent-hover: #3f3f46;
+  --accent-fg: #ffffff;
+  --accent-soft: #efeff1;
+  --select: #eef2ff;
+  --select-line: #a5b4fc;
+  --focus: #3b63f5;
+  --link: #2f54d6;
+
+  /* status: solid (marks), soft (fills), fg (text on soft or surface) */
+  --ok: #1f9d55;
+  --ok-soft: #e8f6ee;
+  --ok-fg: #166b3b;
+  --run: #2f6bec;
+  --run-soft: #e9f0fe;
+  --run-fg: #1e4fc2;
+  --wait: #8762e8;
+  --wait-soft: #f2edfd;
+  --wait-fg: #6236c9;
+  --warn: #d98a06;
+  --warn-soft: #fcf3df;
+  --warn-fg: #8f4e02;
+  --fail: #dc3a32;
+  --fail-soft: #fdeceb;
+  --fail-fg: #b4231c;
+  --idle: #a1a1aa;
+  --idle-soft: #f1f1f3;
+  --idle-fg: #52525b;
+
+  /* attempt phases, in order: preparing … settling. A categorical set validated for
+     color-vision deficiency in this adjacency order on both surfaces; same in both themes. */
+  --ph-1: #4a3aa7;
+  --ph-2: #e87ba4;
+  --ph-3: #eda100;
+  --ph-4: #008300;
+  --ph-5: #2a78d6;
+  --ph-6: #eb6834;
+  --ph-7: #1baf7a;
+
+  /* type */
+  --font-ui: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-head: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-code: "Geist Mono Variable", ui-monospace, "SF Mono", monospace;
+  --head-weight: 600;
+  --head-tracking: -0.015em;
+  --head-variation: normal;
+  --t-2xs: 0.6875rem;
+  --t-xs: 0.75rem;
+  --t-sm: 0.8125rem;
+  --t-base: 0.875rem;
+  --t-lg: 1rem;
+  --t-xl: 1.25rem;
+  --t-2xl: 1.625rem;
+  --t-3xl: 2.25rem;
+
+  /* shape */
+  --spacing: 0.25rem;
+  --r-xs: 3px;
+  --r-sm: 5px;
+  --r-md: 7px;
+  --r-lg: 10px;
+  --shadow-1: 0 1px 2px rgb(24 24 27 / 0.05);
+  --shadow-2: 0 1px 2px rgb(24 24 27 / 0.04), 0 4px 12px rgb(24 24 27 / 0.06);
+  --shadow-3: 0 2px 6px rgb(24 24 27 / 0.06), 0 16px 40px rgb(24 24 27 / 0.14);
+  --shadow-button: 0 1px 1px rgb(24 24 27 / 0.06);
+  --press-x: 0px;
+  --press-y: 0.5px;
+
+  /* motion */
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+  --ease-bounce: cubic-bezier(0.2, 0, 0, 1);
+  --dur-1: 90ms;
+  --dur-2: 160ms;
+  --dur-3: 260ms;
+
+  /* illustration accents */
+  --texture: none;
+  --canvas-dots: rgb(24 24 27 / 0.09);
+  --title-mark: none;
+  --art-opacity: 0.7;
+  --art-saturate: 0;
+  --art-1: var(--fg-subtle);
+  --art-2: var(--line-strong);
+  --art-3: var(--idle-soft);
+}
+
+[data-theme="fun"] {
+  --bg: #f4ead6;
+  --surface: #fffaf0;
+  --surface-2: #fbf2e1;
+  --sunken: #f0e3c9;
+  --overlay: rgb(42 29 21 / 0.42);
+
+  --fg: #2a1d15;
+  --fg-muted: #5c4738;
+  --fg-subtle: #6f5a48;
+  --fg-inverse: #fffaf0;
+
+  --line: #e6d6b8;
+  --line-strong: #2a1d15;
+  --border-w: 1.5px;
+
+  --accent: #136f63;
+  --accent-hover: #0d5a50;
+  --accent-fg: #fffaf0;
+  --accent-soft: #d9eee8;
+  --select: #fbe6b3;
+  --select-line: #e09b1a;
+  --focus: #2b59c3;
+  --link: #0f6458;
+
+  --ok: #3e8e5a;
+  --ok-soft: #e0efda;
+  --ok-fg: #276a3e;
+  --run: #2b6cb0;
+  --run-soft: #dde9f6;
+  --run-fg: #1f4f86;
+  --wait: #9161b8;
+  --wait-soft: #eee2f5;
+  --wait-fg: #6b3d8f;
+  --warn: #e09b1a;
+  --warn-soft: #fbedc8;
+  --warn-fg: #7f4c00;
+  --fail: #d9482b;
+  --fail-soft: #f9dccf;
+  --fail-fg: #a3301a;
+  --idle: #b3a28c;
+  --idle-soft: #eee3cf;
+  --idle-fg: #5f4d3d;
+
+  --ph-1: #4a3aa7;
+  --ph-2: #e87ba4;
+  --ph-3: #eda100;
+  --ph-4: #008300;
+  --ph-5: #2a78d6;
+  --ph-6: #eb6834;
+  --ph-7: #1baf7a;
+
+  --font-ui: "Bricolage Grotesque Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-head: "Fraunces Variable", ui-serif, Georgia, serif;
+  --font-code: "Geist Mono Variable", ui-monospace, "SF Mono", monospace;
+  --head-weight: 620;
+  --head-tracking: -0.01em;
+  --head-variation: "SOFT" 100, "WONK" 1;
+  --t-2xs: 0.71875rem;
+  --t-xs: 0.78125rem;
+  --t-sm: 0.84375rem;
+  --t-base: 0.90625rem;
+  --t-lg: 1.0625rem;
+  --t-xl: 1.375rem;
+  --t-2xl: 1.875rem;
+  --t-3xl: 2.625rem;
+
+  --spacing: 0.27rem;
+  --r-xs: 5px;
+  --r-sm: 8px;
+  --r-md: 12px;
+  --r-lg: 18px;
+  --shadow-1: 2px 2px 0 0 rgb(42 29 21 / 0.9);
+  --shadow-2: 3px 3px 0 0 rgb(42 29 21 / 0.9);
+  --shadow-3: 5px 6px 0 0 rgb(42 29 21 / 0.9);
+  --shadow-button: 2px 2px 0 0 rgb(42 29 21 / 0.9);
+  --press-x: 2px;
+  --press-y: 2px;
+
+  --ease: cubic-bezier(0.3, 0.7, 0.4, 1);
+  --ease-bounce: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --dur-1: 120ms;
+  --dur-2: 220ms;
+  --dur-3: 380ms;
+
+  /* paper grain, colored canvas dots, a squiggle under page titles */
+  --texture: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 .16 0 0 0 0 .11 0 0 0 0 .08 0 0 0 .07 0'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)'/%3E%3C/svg%3E");
+  --canvas-dots: rgb(19 111 99 / 0.28);
+  --title-mark: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='8' viewBox='0 0 24 8'%3E%3Cpath d='M0 4 Q 6 0 12 4 T 24 4' fill='none' stroke='%23e2643f' stroke-width='2.2' stroke-linecap='round'/%3E%3C/svg%3E");
+  --art-opacity: 1;
+  --art-saturate: 1;
+  --art-1: #2a1d15;
+  --art-2: #e09b1a;
+  --art-3: #f2c76d;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root,
+  [data-theme] {
+    --dur-1: 0ms;
+    --dur-2: 0ms;
+    --dur-3: 0ms;
+  }
+}

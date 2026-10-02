@@ -1,31 +1,16 @@
 import { defineConfig } from "vite";
-import { tanstackStart } from "@tanstack/react-start/plugin/vite";
-import viteReact from "@vitejs/plugin-react";
+import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 
+const api = process.env.SOLERA_SERVER_URL ?? "http://127.0.0.1:8000";
+
 export default defineConfig(({ command }) => ({
-  // Built assets are served by the Python app under /static/; dev stays at /.
+  // The Python app serves the bundle under /static/; client routes live at /.
   base: command === "build" ? "/static/" : "/",
+  resolve: { tsconfigPaths: true },
   server: {
-    host: "127.0.0.1",
-    port: 5173,
-    proxy: {
-      "/api": "http://127.0.0.1:8000",
-      "/healthz": "http://127.0.0.1:8000",
-    },
+    proxy: { "/api": api, "/healthz": api },
   },
-  resolve: {
-    tsconfigPaths: true,
-  },
-  plugins: [
-    tailwindcss(),
-    tanstackStart({
-      spa: {
-        enabled: true,
-        prerender: { outputPath: "/index.html", crawlLinks: false },
-      },
-      prerender: { failOnError: false },
-    }),
-    viteReact(),
-  ],
+  build: { outDir: "dist", emptyOutDir: true, chunkSizeWarningLimit: 400 },
+  plugins: [tailwindcss(), react()],
 }));

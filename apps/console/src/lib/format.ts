@@ -1,108 +1,121 @@
-export function time(value: number | null | undefined) {
-  return value
-    ? new Intl.DateTimeFormat(undefined, {
-        month: "short",
-        day: "numeric",
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit",
-      }).format(new Date(value * 1000))
-    : "—";
+/** Formatting for times, sizes and identifiers. Times are epoch seconds. */
+
+const numberFormat = new Intl.NumberFormat("en-US");
+const compactFormat = new Intl.NumberFormat("en-US", {
+  notation: "compact",
+  maximumFractionDigits: 1,
+});
+
+export const count = (n: number) => numberFormat.format(n);
+export const compact = (n: number) =>
+  Math.abs(n) < 10_000 ? numberFormat.format(n) : compactFormat.format(n);
+
+export function plural(n: number, one: string, many = `${one}s`) {
+  return `${count(n)} ${n === 1 ? one : many}`;
 }
 
-export function duration(
-  start: number | null | undefined,
-  end?: number | null,
-) {
-  if (!start) return "—";
-  const ms = Math.max(0, (end ?? Date.now() / 1000) * 1000 - start * 1000);
-  return ms < 1000
-    ? `${Math.round(ms)} ms`
-    : ms < 60000
-      ? `${(ms / 1000).toFixed(1)} s`
-      : `${Math.floor(ms / 60000)}m ${Math.floor((ms % 60000) / 1000)}s`;
+/** 0.3s · 4.2s · 1m 05s · 2h 03m · 3d 4h */
+export function duration(seconds: number | null | undefined): string {
+  if (seconds == null || !Number.isFinite(seconds)) return "—";
+  const s = Math.max(0, seconds);
+  if (s < 0.01) return "0s";
+  if (s < 10) return `${s.toFixed(s < 1 ? 2 : 1).replace(/\.?0+$/, "")}s`;
+  if (s < 60) return `${Math.round(s)}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${String(Math.round(s % 60)).padStart(2, "0")}s`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ${String(m % 60).padStart(2, "0")}m`;
+  const d = Math.floor(h / 24);
+  return `${d}d ${h % 24}h`;
 }
 
-export function describeInterval(seconds: number) {
-  if (seconds >= 3600 && seconds % 3600 === 0)
-    return `${seconds / 3600} hour${seconds === 3600 ? "" : "s"}`;
-  if (seconds >= 60 && seconds % 60 === 0)
-    return `${seconds / 60} minute${seconds === 60 ? "" : "s"}`;
-  return `${seconds} second${seconds === 1 ? "" : "s"}`;
+/** A coarse duration for "4m ago" / "in 4m". */
+function span(seconds: number): string {
+  const s = Math.abs(seconds);
+  if (s < 60) return `${Math.max(1, Math.round(s))}s`;
+  if (s < 3600) return `${Math.round(s / 60)}m`;
+  if (s < 86400 * 2) return `${Math.round(s / 3600)}h`;
+  return `${Math.round(s / 86400)}d`;
 }
 
-/** A length of time in seconds, at the precision that matters for it. */
-export function seconds(value: number | null | undefined) {
-  if (value == null) return "—";
-  if (value > 0 && value < 0.0005) return "<1 ms";
-  if (value < 1) return `${Math.round(value * 1000)} ms`;
-  if (value < 60) return `${value.toFixed(value < 10 ? 1 : 0)} s`;
-  if (value < 3600)
-    return `${Math.floor(value / 60)}m ${Math.round(value % 60)}s`;
-  return `${Math.floor(value / 3600)}h ${Math.round((value % 3600) / 60)}m`;
+export function ago(at: number | null | undefined, now: number): string {
+  if (at == null) return "never";
+  const delta = now - at;
+  if (delta < 3) return "just now";
+  if (delta < 0) return `in ${span(delta)}`;
+  if (delta > 86400 * 30) return date(at);
+  return `${span(delta)} ago`;
 }
 
-export function count(value: number | null | undefined) {
-  if (value == null) return "—";
-  return new Intl.NumberFormat(undefined, {
-    notation: value >= 10000 ? "compact" : "standard",
-    maximumFractionDigits: 1,
-  }).format(value);
+export function until(at: number | null | undefined, now: number): string {
+  if (at == null) return "—";
+  const delta = at - now;
+  if (delta <= 1) return "due now";
+  return `in ${span(delta)}`;
 }
 
-/** A bucket start as a label: the time of day for buckets under a day, the
-    date otherwise. */
-export function bucketLabel(t: number, bucket: number) {
-  return new Intl.DateTimeFormat(
-    undefined,
-    bucket < 86400
-      ? { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }
-      : { month: "short", day: "numeric" },
-  ).format(new Date(t * 1000));
+const timeFormat = new Intl.DateTimeFormat(undefined, {
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hour12: false,
+});
+const dateFormat = new Intl.DateTimeFormat(undefined, {
+  month: "short",
+  day: "numeric",
+});
+const fullFormat = new Intl.DateTimeFormat(undefined, {
+  year: "numeric",
+  month: "short",
+  day: "numeric",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hour12: false,
+  timeZoneName: "short",
+});
+
+export const clock = (at: number) => timeFormat.format(at * 1000);
+export const date = (at: number) => dateFormat.format(at * 1000);
+export const stamp = (at: number) => fullFormat.format(at * 1000);
+export function dateTime(at: number, now: number) {
+  return now - at < 86400 * 0.75 ? clock(at) : `${date(at)}, ${clock(at)}`;
 }
 
-/** A time window, sharing what its ends share: `Sep 29, 3:00 – 6:00 PM`, or
-    by day `Sep 22 – 28` (the last day included, not the midnight after it). */
-export function windowLabel(since: number, until: number) {
-  const days = until - since >= 86400;
-  return new Intl.DateTimeFormat(
-    undefined,
-    days
-      ? { month: "short", day: "numeric" }
-      : { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" },
-  ).formatRange(
-    new Date(since * 1000),
-    new Date((until - (days ? 1 : 0)) * 1000),
-  );
+/** ULIDs share their time prefix with every neighbour: show the random tail. */
+export const shortId = (id: string) => (id.length > 12 ? id.slice(-7) : id);
+export const shortHash = (hex: string | null | undefined) => (hex ? hex.slice(0, 8) : "—");
+
+export function bytes(n: number | null | undefined): string {
+  if (n == null) return "—";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let v = n;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return `${v < 10 && i > 0 ? v.toFixed(1) : Math.round(v)} ${units[i]}`;
 }
 
-/** Failures out of a total: `0`, or `3 · 12%` — never a misleading `0%`. */
-export function failures(failed: number, total: number) {
-  if (!failed) return "0";
-  const pct = (failed / total) * 100;
-  return `${count(failed)} · ${pct < 1 ? "<1" : Math.round(pct)}%`;
+export function percent(part: number, whole: number) {
+  return whole > 0 ? `${Math.round((100 * part) / whole)}%` : "—";
 }
 
-// Bytes in decimal units, as the SDK reads "30GB".
-export function bytes(value: number | null | undefined) {
-  if (value == null) return null;
-  const gb = value / 1e9;
-  return gb >= 1
-    ? `${gb.toFixed(gb < 10 ? 1 : 0)} GB`
-    : `${Math.round(value / 1e6)} MB`;
+/** Seconds as a compact interval: "every 10s", "every 5m". */
+export function interval(seconds: number): string {
+  if (seconds % 86400 === 0) return `${seconds / 86400}d`;
+  if (seconds % 3600 === 0) return `${seconds / 3600}h`;
+  if (seconds % 60 === 0) return `${seconds / 60}m`;
+  return `${seconds}s`;
 }
 
-// "4 cpu · 30 GB · 1 gpu", or "" when nothing was asked for.
-export function resources(r: {
-  cpu?: number | null;
-  memory?: number | null;
-  gpu?: number | null;
-}) {
-  return [
-    r.cpu != null ? `${r.cpu} cpu` : null,
-    bytes(r.memory),
-    r.gpu != null ? `${r.gpu} gpu` : null,
-  ]
-    .filter(Boolean)
-    .join(" · ");
+export function firstLine(text: string | null | undefined): string {
+  if (!text) return "";
+  const line =
+    text
+      .trim()
+      .split("\n")
+      .find((l) => l.trim()) ?? "";
+  return line.length > 240 ? `${line.slice(0, 239)}…` : line;
 }
