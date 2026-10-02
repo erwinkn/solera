@@ -338,8 +338,8 @@ more than 16 per streamed segment, it streams instead. An `exact` read
 **Full replacement.** A bare return of every row must compare every live
 key, so it reads the whole index — as a stream, never whole. The written
 content stays where the worker holds it: an Arrow key column is read in
-place (anything with `__arrow_c_stream__`; a pandas DataFrame goes through
-DuckDB to get there), Python keys are packed once into one buffer (~28 B
+place (anything with `__arrow_c_stream__`), Python keys — of rows, or of a
+pandas DataFrame's key column — are packed once into one buffer (~28 B
 per key). One O(n) pass finds whether they arrive sorted; if not, a
 permutation sorts them — bucketed by the two key bytes after the prefix
 they all share, each bucket sorted as 12-byte (prefix, row) pairs on every
@@ -760,10 +760,10 @@ class Store(Protocol):
 
 - `Scope` carries the engine-assigned `batch`, the `attempt` id, its
   `generation` and `invocation` (`lifecycle.md` §9.7–9.8) and the
-  output's `aliases`. For a keyed output it also carries the write, read
-  once (`prepared`), and says which keys it changes against the key index:
-  `upserts` to write, each to the version the index will hold, `removes` to
-  delete. Both are `None` when there is no prior (a first write or a
+  output's `aliases`. A keyed output's write reaches the store as a
+  `KeyedWrite`: read once (`prepared`), and what it changes against the
+  key index — `upserts` to write, each to the version the index will hold,
+  `removes` to delete — or `whole`, with no prior (a first write or a
   `full` run): the store then writes everything and deletes whatever else
   it holds. A patch that changes 3 keys of 100,000 reaches the store as 3
   upserts, and the store reads only their groups.

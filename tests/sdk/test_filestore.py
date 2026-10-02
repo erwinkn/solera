@@ -13,7 +13,17 @@ from urllib.parse import urlsplit
 import pandas as pd
 import pytest
 from solera.sdk import KEYS, Output, PartitionSet, Ref, RegistrationError
-from solera.stores import Batches, FileStore, Keys, Patch, S3Store, StoreError, WriteError, prepare
+from solera.stores import (
+    Batches,
+    FileStore,
+    KeyedWrite,
+    Keys,
+    Patch,
+    S3Store,
+    StoreError,
+    WriteError,
+    prepare,
+)
 
 from tests.conftest import scope
 
@@ -114,15 +124,18 @@ async def test_a_keyed_output_is_one_object_per_key_and_version(store):
 async def test_a_keyed_write_touches_only_what_the_harness_says(store):
     out = Output("uploads", keyed=True)
     content = {"a": 1, "b": 20, "c": 3}
-    versions = dict(prepare(content, out).entries())
-    only = scope(out, upserts={"b": versions["b"]}, removes=frozenset({"a"}), generation=3)
-    await store.store(content, None, only)
+    prepared = prepare(content, out)
+    versions = dict(prepared.entries())
+    only = KeyedWrite(prepared, {"b": versions["b"]}, frozenset({"a"}))
+    await store.store(only, None, scope(out, generation=3))
     # `c` is in the write but not in upserts: the harness knows it is there already.
     assert [p.split("/")[1] for p in await paths(store)] == ["b"]
     assert [p.split("/")[2] for p in await paths(store)] == [f"{versions['b'].hex()}.3.json"]
     # A requested key the write does not hold is an error, never a silent skip.
     with pytest.raises(StoreError, match="zzz"):
-        await store.store(content, None, scope(out, upserts={"b": versions["b"], "zzz": b"1"}, generation=4))
+        await store.store(
+            KeyedWrite(prepared, {"b": versions["b"], "zzz": b"1"}), None, scope(out, generation=4)
+        )
 
 
 async def test_a_keyed_output_takes_a_dict_of_str(store):
@@ -280,6 +293,8 @@ async def test_a_prepared_write_is_read_once_and_only_its_selection_taken(store,
     reads no more of it than the groups of the keys it is asked to write —
     a DataFrame of many keys with one changed is one group, not every row."""
 
+    import dataclasses
+
     import solera.stores as stores
 
     out = Output("frame", key="id")
@@ -287,15 +302,63 @@ async def test_a_prepared_write_is_read_once_and_only_its_selection_taken(store,
     prepared = prepare(frame, out)
     versions = dict(prepared.entries())
     taken = []
-    real = stores._take
 
-    def counting(payload, rows):
-        taken.append(len(payload) if rows is None else len(rows))
-        return real(payload, rows)
+    def counting(rows):
+        taken.append(None if rows is None else len(rows))
+        return prepared.take(rows)
 
-    monkeypatch.setattr(stores, "_take", counting)
-    monkeypatch.setattr(stores, "prepare", lambda *a, **k: pytest.fail("the store read the write again"))
-    selected = scope(out, upserts={"k7": versions["k7"]}, generation=2, prepared=prepared)
-    written = await store.store(frame, None, selected)
+    monkeypatch.setattr(stores, "prepare_for", lambda *a, **k: pytest.fail("the store read the write again"))
+    write = KeyedWrite(dataclasses.replace(prepared, take=counting), {"k7": versions["k7"]})
+    written = await store.store(write, None, scope(out, generation=2))
     assert taken == [1]
     assert await store.load(written.ref, None, Keys({"k7": (versions["k7"], 2)})) == [{"id": "k7", "n": 7}]
+
+
+async def test_a_missing_object_a_commit_names_fails_the_read(store, data):
+    """An immutable store's objects are named by the key index or the ref: a
+    missing one is an error, never a silently shorter read."""
+
+    import obstore
+
+    out = Output("uploads", keyed=True)
+    written = await store.store({"a": 1, "b": 2}, None, scope(out, generation=1))
+    keys = at(out, {"a": 1, "b": 2}, 1)
+    gone = FileStore.key_name(written.ref.handle["path"], "a", keys.revisions["a"][0], 1)
+    await obstore.delete_async(store._objects(), f"{gone}.json")
+    with pytest.raises(StoreError, match="'a'.* is gone"):
+        await store.load(written.ref, None, keys)
+    events = Output("events", incremental=True)
+    batch = await store.store(Patch([{"e": 1}]), None, scope(events, batch=0, generation=1))
+    names = await store._batches(batch.ref.handle["path"], 0, 0)
+    await obstore.delete_async(store._objects(), f"{names[0]}.json")
+    with pytest.raises(StoreError, match="is gone"):
+        await store.load(batch.ref, None, None)
+
+
+async def test_a_store_reads_its_own_types(store):
+    """A store reads writes of a type of its own (`Store.prepare`): the key
+    index and its writes see that type's rows, nothing else does."""
+
+    import dataclasses
+
+    from solera.keys import Rows
+    from solera.stores import Prepared
+
+    @dataclasses.dataclass
+    class Sheet:  # a type of the store's own: rows as (key, amount) pairs
+        lines: list
+
+    def prepare(write, output):
+        rows = [{"id": k, "amount": a} for k, a in write.lines]
+        return Prepared(
+            output, Rows.records(rows, "id"), lambda at: rows if at is None else [rows[r] for r in at]
+        )
+
+    store.prepare = prepare
+    out = Output("sheet", key="id")
+    written = await store.store(Sheet([("a", 1), ("b", 2)]), None, scope(out, generation=1))
+    keys = {k: (v, 1) for k, v in prepare(Sheet([("a", 1), ("b", 2)]), out).entries()}
+    assert await store.load(written.ref, None, Keys(keys)) == [
+        {"id": "a", "amount": 1},
+        {"id": "b", "amount": 2},
+    ]

@@ -321,3 +321,72 @@ async def test_a_pool_attempt_runs_in_a_child_of_the_warm_worker(state, tmp_path
     assert asyncio.get_running_loop().time() - started < 30  # not the lingering minute
     detail = await engine.run_until(run["id"], 30)
     assert detail["request"]["status"] == "succeeded"
+
+
+def test_a_worker_of_plain_rows_imports_no_dataframe_library(tmp_path):
+    """A project whose outputs are lists of dicts — keyed, batched, a value —
+    runs in workers that never import pandas, pyarrow or duckdb: a library
+    is imported only for a value of its own type."""
+
+    import subprocess
+    import sys
+    import textwrap
+
+    project = tmp_path / "plain.py"
+    project.write_text(
+        textwrap.dedent(
+            """
+            import atexit, os, sys
+            from solera import Output, Patch, Project, asset
+
+            @asset(outputs=Output("items", key="id"))
+            def items():
+                return [{"id": "a", "n": 1}, {"id": "b", "n": 2}]
+
+            @asset(outputs=Output("events", incremental=True))
+            def events(items: list[dict]):
+                return Patch([{"e": len(items)}])
+
+            @asset
+            def total(items: list[dict], events: list[dict]) -> int:
+                return sum(r["n"] for r in items) + len(events)
+
+            def record():
+                seen = [m for m in ("pandas", "pyarrow", "duckdb", "numpy") if m in sys.modules]
+                name = os.path.join(os.path.dirname(__file__), f"modules-{os.getpid()}.txt")
+                with open(name, "w") as f:
+                    f.write(",".join(seen))
+
+            # An attempt's process ends at once (`_exit`), skipping `atexit`: record first.
+            import solera_worker.worker as worker
+
+            end = worker._exit
+            worker._exit = lambda code: (record(), end(code))
+            atexit.register(record)
+            project = Project(name="plain", assets=[items, events, total])
+            """
+        )
+    )
+    done = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from solera_server.cli import main; main()",
+            "--state-url",
+            (tmp_path / "state").as_uri(),
+            "run",
+            "--project",
+            f"{project}:project",
+            "total",
+            "--upstream",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env={k: v for k, v in os.environ.items() if k != "SOLERA_SERVER_URL"},
+    )
+    assert done.returncode == 0, done.stderr[-3000:]
+    assert '"succeeded"' in done.stdout, done.stdout[-3000:]
+    records = sorted(tmp_path.glob("modules-*.txt"))
+    assert len(records) >= 4  # the manifest, and an attempt of each asset
+    assert {r.name: r.read_text() for r in records if r.read_text()} == {}

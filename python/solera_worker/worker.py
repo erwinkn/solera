@@ -65,6 +65,7 @@ from solera.sdk import (
 )
 from solera.stores import (
     Batches,
+    KeyedWrite,
     Keys,
     Patch,
     Prepared,
@@ -72,7 +73,6 @@ from solera.stores import (
     Sql,
     StoreError,
     WriteError,
-    key_text,
     prepare_for,
     resolve_env,
 )
@@ -514,7 +514,7 @@ async def _store_outputs(
             del outs[name]
             continue
         intents[name] = o.files.to_json()
-        _select(o, keys_io)
+        o.write = dataclasses.replace(_keyed_write(o, keys_io), value=o.value)
 
     gated = {n for n, o in outs.items() if o.kind != "immutable"}
     try:
@@ -547,7 +547,7 @@ async def _store_outputs(
             except Exception as error:
                 raise StoreError(f"{output.name}: migration failed: {error}") from error
             schema = applied[-1] if applied else output.migrations[-1].name
-        written = await writes.call(store.store(o.value, o.prior, scope))
+        written = await writes.call(store.store(o.write or o.value, o.prior, scope))
         entry = {}
         if o.index is not None and o.sql:
             if written.keys is None:
@@ -589,10 +589,9 @@ RESOLVE_TIMEOUT = 5.0  # seconds the worker waits for the engine before resolvin
 @dataclasses.dataclass
 class _Out:
     """One output's write in an attempt, as the phases leave it: read once
-    (`prepared`), its patch's keys checked against what dead attempts left
-    (`new`, `removes`), resolved against its key index (`files`, and up to
-    `LISTED` keys what `changed`), and what its store is asked to write
-    (`upserts`, `selected`)."""
+    (`prepared`); for a patch, its `run` of upserts and removes, repair's
+    overlaid; resolved against its key index (`files`, and up to `LISTED`
+    keys what `changed`); and what its store is given (`write`)."""
 
     name: str
     output: Output
@@ -602,14 +601,11 @@ class _Out:
     value: Any
     index: KeyIndex | None = None
     prepared: Prepared | None = None
-    own: tuple[set, set] = (set(), set())  # a patch's own keys and removes
-    new: dict[str, bytes] = dataclasses.field(default_factory=dict)  # ...with repair's, to their versions
-    removes: list[str] = dataclasses.field(default_factory=list)
-    intended: set[str] = dataclasses.field(default_factory=set)  # keys dead attempts meant to change
+    run: SortedRun | None = None
+    intended: frozenset[str] = frozenset()  # keys dead attempts meant to change
     files: DeltaFiles | None = None
     changed: tuple | None = None  # ({key: version}, [removed key]), or None past LISTED
-    upserts: Any = None  # the store's selection (`Scope.upserts`, `Scope.removes`)
-    selected: frozenset[str] | None = None
+    write: KeyedWrite | None = None
     elements: list[str] | None = None
 
     @property
@@ -638,18 +634,8 @@ class _Out:
             batch=self.info.get("batch"),
             attempt=spec["attempt"],
             aliases=tuple(self.info.get("aliases") or ()),
-            upserts=self.upserts,
-            removes=self.selected,
             generation=spec.get("generation"),
             invocation=invocation,
-            prepared=self.prepared,
-        )
-
-    def run(self) -> SortedRun:
-        """What a patch writes and removes, for a resolve."""
-
-        return SortedRun.of(
-            [key_bytes(k) for k in self.new], list(self.new.values()), [key_bytes(k) for k in self.removes]
         )
 
     def asks(self) -> bool:
@@ -662,14 +648,14 @@ class _Out:
             return (
                 len(self.prepared.rows) + live <= RESOLVE_ENTRIES and len(self.prepared.rows) <= RESOLVE_KEYS
             )
-        return len(self.new) + len(self.removes) <= RESOLVE_KEYS
+        return len(self.run) <= RESOLVE_KEYS
 
 
 async def _prepare(o: _Out, spec, keys_io) -> None:
-    """Read a keyed write once (`solera.stores.Prepared`); for a patch, its
-    keys and versions, and what dead attempts left in the store: repaired
-    key by key (`_repair`), or — after an unknown `Sql` write — reconciled
-    whole (`_reconcile`), which resolves the write too."""
+    """Read a keyed write once, by its store (`Store.prepare`); for a patch,
+    its run, and what dead attempts left in the store: repaired key by key
+    (`_repair`), or — after an unknown `Sql` write — reconciled whole
+    (`_reconcile`), which resolves the write too."""
 
     if o.info.get("index") is None:
         if o.sql and o.output.incremental:
@@ -683,26 +669,22 @@ async def _prepare(o: _Out, spec, keys_io) -> None:
     o.prepared = await asyncio.to_thread(prepare_for, o.store, o.value, o.output)
     if o.replace:
         return
-    o.new = dict(await _entries(o.output, o.prepared))
-    o.removes = list(o.prepared.removes)
-    o.own = (set(o.new), set(o.removes))
+    removes = [key_bytes(k) for k in o.prepared.removes]
+    try:
+        o.run = await asyncio.to_thread(SortedRun.from_rows, o.prepared.rows, removes)
+    except ValueError as e:  # a value with no digest
+        raise WriteError(f"{o.output.name}: {e}") from e
     if any(intent.get("unknown") for intent in o.unsettled):
         # A dead Sql writer's keys are unknown (docs/resolved-commits.md §3): the index
         # takes the whole store as it is, with this patch on top, and the store
         # writes this patch's keys, every one.
         o.files, _ = await _reconcile(o, spec)
-        o.intended = o.own[0] | o.own[1]
         return
     if o.unsettled:
-        o.intended = set(await _intended(o.info, keys_io, o.unsettled))
-        await _repair(o, o.intended - o.own[0] - o.own[1])
-
-
-async def _entries(output, prepared: Prepared) -> list[tuple[str, bytes]]:
-    try:
-        return await asyncio.to_thread(prepared.entries)
-    except ValueError as e:  # a value with no digest
-        raise WriteError(f"{output.name}: {e}") from e
+        o.intended = frozenset(await _intended(o.info, keys_io, o.unsettled))
+        left = [k for k in o.intended if k not in o.prepared.rows and k not in o.prepared.removes]
+        if left:
+            o.run = await _repair(o, sorted(left))
 
 
 async def _resolve(o: _Out, spec, answer) -> None:
@@ -722,50 +704,51 @@ async def _resolve(o: _Out, spec, answer) -> None:
             raise WriteError(f"{o.output.name}: {e}") from e
     else:
         o.files, o.changed = await o.index.resolve(
-            o.run(), batch=batch, attempt=attempt, generation=generation, collect=LISTED
+            o.run, batch=batch, attempt=attempt, generation=generation, collect=LISTED
         )
 
 
-def _select(o: _Out, keys_io) -> None:
-    """What the store is asked to write: each key to its version, and the
-    keys to delete — `None`, everything in the write."""
+def _keyed_write(o: _Out, keys_io) -> KeyedWrite:
+    """What the store is given: each key it writes to its version, and the
+    keys it deletes — or the write whole."""
 
-    changed = o.changed
+    p, changed = o.prepared, o.changed
+    if o.output.is_partition_set:
+        own = set(p.take(None))
+        if o.replace:
+            o.elements = sorted(own)
+        else:
+            o.elements = sorted((set(o.info.get("elements") or ()) - set(p.removes)) | own)
+    if changed is not None:
+        upserted = {key_str(k): v for k, v in changed[0].items()}
+        deleted = frozenset(map(key_str, changed[1]))
     if o.kind == "immutable":
         # Every object it writes must be named by an index entry, or nothing ever
         # collects it: exactly the keys the delta writes, paged from its files
         # when there are too many to list (docs/lifecycle.md §9.8).
         if changed is None:
-            o.upserts = DeltaKeys(keys_io, o.index.prefix, tuple(o.files.files))
-        else:
-            o.upserts = {key_str(k): v for k, v in changed[0].items()}
-            o.selected = frozenset(map(key_str, changed[1]))
-    elif o.prior is not None and not (o.replace and (changed is None or o.unsettled)):
-        # The store writes only what changes: the delta, and for a patch whatever a
-        # dead attempt may have left half-done among its keys. A replacement with
-        # more changes than it lists, or with dead attempts', rewrites the scope;
-        # a patch with more than it lists writes all of its own keys.
-        own, intended = o.own, o.intended
-        if changed is None:
-            o.upserts, o.selected = {k: o.new[k] for k in own[0]}, frozenset(own[1])
-        else:
-            upserted = {key_str(k): v for k, v in changed[0].items()}
-            deleted = {key_str(k) for k in changed[1]}
-            if o.replace:
-                o.upserts, o.selected = upserted, frozenset(deleted)
-            else:
-                keys = (set(upserted) & own[0]) | (own[0] & intended)
-                o.upserts = {k: o.new[k] for k in keys}
-                o.selected = frozenset(deleted | (own[1] & intended))
-    if o.output.is_partition_set:
-        if o.replace:
-            o.elements = sorted(set(o.prepared.payload))
-        else:
-            o.elements = sorted((set(o.info.get("elements") or ()) - set(o.removes)) | set(o.new))
+            return KeyedWrite(p, DeltaKeys(keys_io, o.index.prefix, tuple(o.files.files)), whole=o.replace)
+        return KeyedWrite(p, upserted, deleted, whole=o.replace)
+    if o.prior is None or (o.replace and (changed is None or o.unsettled)):
+        # A first write, or a replacement with more changes than it lists, or with
+        # dead attempts': the scope rewritten.
+        return KeyedWrite(p, whole=True)
+    if o.replace:
+        return KeyedWrite(p, upserted, deleted)
+    # A patch: its own keys that changed, and whatever a dead attempt may have
+    # left half-done among them; past what it lists, all of its own keys.
+    removes = frozenset(p.removes)
+    if changed is None:
+        return KeyedWrite(p, None, removes)
+    mine = {k: v for k, v in upserted.items() if k in p.rows}
+    redo = sorted(k for k in o.intended if k in p.rows and k not in mine)
+    if redo:
+        mine.update(zip(redo, p.rows.versions(redo), strict=True))
+    return KeyedWrite(p, mine, deleted | (removes & o.intended))
 
 
 def _ask_for(o: _Out, spec: dict) -> Ask:
-    run = SortedRun.from_rows(o.prepared.rows) if o.replace else o.run()
+    run = SortedRun.from_rows(o.prepared.rows) if o.replace else o.run
     batch = int(o.info["batch"])
     return Ask(
         o.name,
@@ -824,100 +807,57 @@ async def _intended(info, keys_io, unsettled) -> list[str]:
             return found
 
 
-async def _repair(o: _Out, left) -> None:
+async def _repair(o: _Out, left: list[str]) -> SortedRun:
     """Take in what dead attempts left in the store (§8). Keys this patch
     writes or removes end as it says either way; the others (`left`) are
     read back, and the index learns what landed as part of this commit's
-    delta."""
+    delta: the patch's run with theirs overlaid."""
 
-    left = sorted(left)
+    found: dict[str, bytes] = {}
+    gone: list[str] = []
     for i in range(0, len(left), REPAIR_PAGE):
         page = left[i : i + REPAIR_PAGE]
         loaded = await o.store.load(o.prior, None, Keys(dict.fromkeys(page, (b"", 0))))
-        found = dict(
-            await _entries(o.output, await asyncio.to_thread(prepare_for, o.store, loaded, o.output))
-        )
-        o.new.update(found)
-        o.removes.extend(k for k in page if k not in found)
+        read = await asyncio.to_thread(prepare_for, o.store, loaded, o.output)
+        got = dict(await asyncio.to_thread(read.entries))
+        found.update(got)
+        gone.extend(k for k in page if k not in got)
+    keys, versions = o.prepared.rows.entries()
+    keys += [key_bytes(k) for k in found]
+    versions += list(found.values())
+    removes = [key_bytes(k) for k in (*o.prepared.removes, *gone)]
+    return SortedRun.of(keys, versions, removes)
 
 
 async def _reconcile(o: _Out, spec):
     """The delta of a patch over a store a dead `Sql` writer changed in ways no
     key list records: the store's rows as they are — streamed back sorted a
-    chunk at a time by its `scan`, versioned as a `Sql` write's rows are —
-    with this patch's keys in place of theirs (an empty group included) and
-    its removes gone, against the pinned index: a streamed replacement.
-    Memory is a chunk and the patch."""
+    chunk at a time by its `scan`, versioned as a `Sql` write's rows are,
+    folded natively — with the patch's run laid over them (its keys' groups
+    in place of the store's, an empty group included, its removes gone),
+    against the pinned index: a streamed replacement. Memory is a chunk and
+    the patch."""
 
     output, store = o.output, o.store
-    skip = sorted(set(o.new) | set(o.removes))
     scan = getattr(store, "scan", None)
     if scan is not None:
-        chunks = scan(o.prior, output, skip)
-    else:  # a store that cannot stream its rows back: read them whole
-        chunks = [await store.load(o.prior, None, None)]
-    patch = sorted(((key_bytes(k), v) for k, v in o.new.items()), key=lambda e: e[0])
+        chunks = scan(o.prior, output)
+        stamped = getattr(store, "stamped", None)
+        rows = {"key": output.key, "revision": output.revision}
+        rows["exclude"] = tuple(stamped(output)) if stamped is not None else ()
+    else:  # a store that cannot stream its rows back: read whole, and sorted as entries
+        loaded = await store.load(o.prior, None, None)
+        chunks = [await asyncio.to_thread(lambda: prepare_for(store, loaded, output).entries())]
+        rows = {}
     return await o.index.replace(
-        _merged(_scanned(chunks, o, set(skip)), patch),
+        chunks,
         int(o.info["batch"]),
         spec["attempt"],
         collect=LISTED,
         generation=int(spec.get("generation") or 0),
+        overlay=o.run,
+        **rows,
     )
-
-
-def _scanned(chunks, o: _Out, skip: set[str]):
-    """The `(key bytes, version)` of a store's rows, sorted, a chunk at a time
-    but those of keys in `skip`. A key's rows may go on in the next chunk, so
-    each chunk's last key waits for it."""
-
-    key, carry = o.output.key, []
-    for chunk in chunks:
-        rows = carry + [r for r in _rows_list(o.output, chunk) if key_text(r[key]) not in skip]
-        if not rows:
-            carry = []
-            continue
-        last, cut = key_text(rows[-1][key]), len(rows)
-        while cut and key_text(rows[cut - 1][key]) == last:
-            cut -= 1
-        done, carry = rows[:cut], rows[cut:]
-        if done:
-            yield [(key_bytes(k), v) for k, v in prepare_for(o.store, done, o.output).entries()]
-    if carry:
-        yield [(key_bytes(k), v) for k, v in prepare_for(o.store, carry, o.output).entries()]
-
-
-def _rows_list(output, value) -> list:
-    """Rows as mappings, from lists of mappings, DataFrames or Arrow data."""
-
-    if value is None:
-        return []
-    if isinstance(value, list):
-        return value
-    if type(value).__name__ == "DataFrame":
-        return value.to_dict(orient="records")
-    if hasattr(value, "__arrow_c_stream__"):
-        import pyarrow as pa
-
-        return pa.table(value).to_pylist()
-    raise WriteError(f"{output.name}: expected rows (list[dict] or DataFrame), got {type(value).__name__}")
-
-
-def _merged(scanned, patch: list):
-    """Sorted `(key, version)` chunks with `patch` — sorted, of keys they do
-    not hold — merged in."""
-
-    i = 0
-    for chunk in scanned:
-        out = []
-        for entry in chunk:
-            while i < len(patch) and patch[i][0] < entry[0]:
-                out.append(patch[i])
-                i += 1
-            out.append(entry)
-        yield out
-    if i < len(patch):
-        yield patch[i:]
 
 
 class Writes:

@@ -10,7 +10,7 @@ from obstore.exceptions import AlreadyExistsError
 from solera import lifecycle
 from solera.executors import Environment
 from solera.sdk import Output, Project, Ref, Result, Retry, asset
-from solera.stores import FileStore, Keys, Patch, Written
+from solera.stores import FileStore, KeyedWrite, Keys, Patch, Written
 from solera_server.engine import Engine
 from solera_server.placements.inline import InlinePlacement
 from solera_server.state import State
@@ -411,6 +411,8 @@ class LiveStore(FileStore):
         return True
 
     async def store(self, write, prior, scope):
+        if isinstance(write, KeyedWrite):  # written as the producer returned it
+            write = write.value
         patch = isinstance(write, Patch)
         rows = write.rows if patch else write
         if hasattr(rows, "to_pylist"):  # Arrow

@@ -20,15 +20,17 @@ from solera.sdk import KEYS, Output, Ref, TableRef, digest
 from solera.stores import (
     MISSING,
     Batches,
+    KeyedWrite,
     Keys,
     Patch,
+    Prepared,
     Scope,
     Sql,
     StoreError,
     WriteError,
     Written,
     by_key_type,
-    prepare_for,
+    prepare,
     resolve_env,
 )
 
@@ -131,7 +133,14 @@ class PostgresStore:
                     pk = [*pk, c]
         return columns, pk
 
-    def _ensure(self, cur, output: Output, rows: list[dict] | None = None, scope: Scope | None = None):
+    def _ensure(
+        self,
+        cur,
+        output: Output,
+        rows: list[dict] | None = None,
+        scope: Scope | None = None,
+        inferred: dict | None = None,
+    ):
         table, schema, table_name = self._table(output)
         indexes = self._indexes(output)
         names = [table_name + "_" + "_".join(index) for index in indexes]
@@ -146,6 +155,7 @@ class PostgresStore:
             cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (table,))
         cur.execute(f"CREATE SCHEMA IF NOT EXISTS {_ident(schema)}")
         declared, pk = self._declared_shape(output)
+        declared = {**(inferred or {}), **declared}
         columns = dict(declared)
         if rows:
             for row in rows:
@@ -322,8 +332,8 @@ class PostgresStore:
             elif output.key is not None:
                 if isinstance(write, Patch) and not output.incremental:
                     raise WriteError(f"{output.name}: Patch requires an incremental output")
-                prepared = scope.prepared or prepare_for(self, write, output)
-                version = self._apply_keyed(cur, output, prepared, scope, table, slice_where, prior)
+                write = KeyedWrite.of(self, write, output, prior)
+                version = self._apply_keyed(cur, output, write, scope, table, slice_where, prior)
                 if version is None:
                     return Written(prior)
             elif isinstance(write, Patch):
@@ -415,28 +425,26 @@ class PostgresStore:
         self._insert(cur, table, rows)
         return version
 
-    def _apply_keyed(self, cur, output, prepared, scope, table, slice_where, prior):
-        """Every key is the group of rows that carry it. With no selection —
-        a first write, a full run, or more changes than the harness lists —
-        a replacement is the slice's whole content; otherwise only the
-        selected keys change: their rows replaced by their groups, removed
-        keys' rows gone, every other row untouched. A patch with no selection
-        changes its own keys and removes."""
+    def _apply_keyed(self, cur, output, write: KeyedWrite, scope, table, slice_where, prior):
+        """Every key is the group of rows that carry it. A whole write is the
+        slice's content; otherwise only the keys it writes change — their
+        rows replaced by their groups — and its removes go, every other row
+        untouched."""
 
-        nothing = not len(prepared.rows) and not prepared.removes and not prepared.entries()
-        if prepared.patch and prior is not None and nothing:
-            return None  # the prior stands
-        if prior is None or (scope.upserts is None and not prepared.patch):
-            rows = self._stamp(output, [dict(r) for r in prepared.all_rows()], scope)
+        prepared = write.prepared
+        if not write.whole and write.upserts is None and not write.removes:
+            if not len(prepared.rows) and not prepared.entries():
+                return None  # a patch of nothing: the prior stands
+        if write.whole:
+            rows = self._stamp(output, [dict(r) for r in prepared.take(None)], scope)
             self._ensure(cur, output, rows, scope)
             self._delete_slice(cur, table, slice_where)
         else:
-            keys = sorted(scope.upserts) if scope.upserts is not None else [k for k, _ in prepared.entries()]
+            keys = sorted(write.upserts) if write.upserts is not None else [k for k, _ in prepared.entries()]
             groups = prepared.groups(keys)
             rows = self._stamp(output, [dict(row) for group in groups for row in group], scope)
             self._ensure(cur, output, rows, scope)
-            removes = scope.removes if scope.removes is not None else prepared.removes
-            gone = sorted(set(keys) | set(removes))
+            gone = sorted(set(keys) | set(write.removes))
             if gone:
                 cur.execute(
                     f"DELETE FROM {table} WHERE {self._where_sql(slice_where)} "
@@ -444,7 +452,7 @@ class PostgresStore:
                     ([slice_where[k] for k in sorted(slice_where)] + [gone]),
                 )
         self._insert(cur, table, rows)
-        return prepared.version(prior)
+        return write.version(prior)
 
     def _apply_sql(self, cur, output, write: Sql, scope, table, slice_where, prior):
         """Materialize a SELECT into the slice, or run a statement verbatim. The
@@ -453,15 +461,21 @@ class PostgresStore:
 
         if _is_select(write.stmt):
             probe = cur.execute(f"SELECT * FROM ({write.stmt}) _probe LIMIT 0")
-            columns = [d.name for d in probe.description]
+            described = [(d.name, d.type_code) for d in probe.description]
+            columns = [name for name, _ in described]
             partition_col = output.config.get("partition_column")
             if partition_col and partition_col not in columns:
                 columns.append(partition_col)
-            declared = dict(output.config.get("columns") or {})
-            for c in columns:
-                declared.setdefault(c, "text")
-            output.config["columns"] = declared
-            self._ensure(cur, output, scope=scope)
+            # The SELECT's own column types, for a table it creates; declared ones win.
+            types = {
+                r["oid"]: r["t"]
+                for r in cur.execute(
+                    "SELECT oid, format_type(oid, NULL) AS t FROM pg_type WHERE oid = ANY(%s)",
+                    ([oid for _, oid in described],),
+                )
+            }
+            inferred = {name: _inferred(types.get(oid)) for name, oid in described}
+            self._ensure(cur, output, scope=scope, inferred=inferred)
             self._delete_slice(cur, table, slice_where)
             select_cols = ", ".join(_ident(c) for c in columns if c != partition_col)
             if partition_col:
@@ -484,6 +498,12 @@ class PostgresStore:
                 )
         keys = self._sorted_rows(table, output, slice_where) if output.key else None
         return digest([prior.version if prior else "", digest(write.stmt)]), keys
+
+    def prepare(self, write, output: Output) -> Prepared:
+        """A keyed write, read as the default reads it, without the columns the
+        store stamps (`stamped`)."""
+
+        return prepare(write, output, self.stamped(output))
 
     def stamped(self, output: Output) -> tuple[str, ...]:
         """Columns the store adds to every row — the partition column — which
@@ -643,15 +663,14 @@ class PostgresStore:
         cur.execute(f"DELETE FROM {table} WHERE {self._where_sql(where)}", params)
 
     def _insert(self, cur, table, rows: list[dict]):
+        """Rows, by `COPY`: every column any row has, missing ones null."""
+
         if not rows:
             return
         columns = sorted({c for r in rows for c in r})
-        for row in rows:
-            cur.execute(
-                f"INSERT INTO {table} ({', '.join(_ident(c) for c in columns)}) "
-                f"VALUES ({', '.join('%s' for _ in columns)})",
-                [row.get(c) for c in columns],
-            )
+        with cur.copy(f"COPY {table} ({', '.join(_ident(c) for c in columns)}) FROM STDIN") as copy:
+            for row in rows:
+                copy.write_row([row.get(c) for c in columns])
 
 
 def _coerce_rows(write: Any) -> list[dict]:
@@ -681,13 +700,38 @@ def _rows_version(rows: list[dict], before: list) -> str:
 
 
 def _column_type(value: Any) -> str:
+    """The column a value's type makes, for a table its first write creates:
+    one that reads it back as the same value (docs/row-digest.md)."""
+
+    import datetime as dt
+    from decimal import Decimal
+
     if isinstance(value, bool):
         return "boolean"
     if isinstance(value, int):
         return "bigint"
     if isinstance(value, float):
         return "double precision"
+    if isinstance(value, Decimal):
+        return "numeric"
+    if isinstance(value, dt.datetime):
+        return "timestamp" if value.tzinfo is None else "timestamptz"
+    if isinstance(value, dt.date):
+        return "date"
+    if isinstance(value, dt.time):
+        return "time"
+    if isinstance(value, dt.timedelta):
+        return "interval"
+    if isinstance(value, bytes | bytearray | memoryview):
+        return "bytea"
     return "text"
+
+
+def _inferred(sql_type: str | None) -> str:
+    """A column a SELECT produced, as a table declares it: its own type; a
+    literal Postgres never typed (`unknown`), text."""
+
+    return "text" if sql_type in (None, "unknown") else sql_type
 
 
 def _sql_type(decl: str) -> str:

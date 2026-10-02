@@ -204,11 +204,11 @@ it is what each kind can promise.
   gate (`lifecycle.md` §9.5–§9.9).
 
 **Keyed outputs.** Stores keep no key maps: the engine's key index does
-(§6). The harness reads a keyed write once (`Scope.prepared`) and tells
-the store which keys it changes, each to the version the index will hold
-(`Scope.upserts`, `Scope.removes`), so a store reads and touches only
-those; with no prior (a first write or a `full` run) the write replaces
-the slice. An
+(§6). The harness has a keyed write read once — by its store's `prepare`,
+or the default — and hands the store a `KeyedWrite`: the keys it changes,
+each to the version the index will hold, and the keys it removes, so a
+store reads and touches only those; with no prior (a first write or a
+`full` run) the write is the slice's whole content. An
 unkeyed incremental output is a sequence of engine-numbered batches —
 `scope.batch` gives the next one, and a `full` run (`prior=None`) starts
 the partition over. A sink that cannot delete makes writes idempotent on
@@ -225,8 +225,10 @@ class Store(Protocol):
     async def migrate(self, output: Output, migrations: Sequence[Migration]) -> list[str]: ...  # optional
 
 Scope   = (output: Output, partition: str, batch: int | None, attempt: str | None, aliases: tuple,
-           upserts: Mapping[str, bytes] | DeltaKeys | None, removes: frozenset[str] | None,
-           prepared: Prepared | None)   # a keyed write, read once (per-key-processing.md §7)
+           generation: int | None, invocation: str | None)
+Prepared   = (output, rows: Rows, take: Callable, patch: bool, removes)  # a keyed write, read once
+KeyedWrite = (prepared: Prepared, upserts: Mapping[str, bytes] | DeltaKeys | None,
+              removes: frozenset[str], whole: bool, value: Any)  # what a keyed output's store gets
 Written = (ref: Ref, keys: Iterable | None)   # keys: only for Sql writes the harness never sees as rows
 Keys    = (revisions: Mapping[str, bytes])  # revisions as the key index holds them
 Batches = (lo: int, hi: int)  # load rows of batches in [lo, hi]
@@ -236,15 +238,19 @@ Batches = (lo: int, hi: int)  # load rows of batches in [lo, hi]
 |---|---|
 | `can_load(t, selection)` | Registration. Can you produce `t`, filtered by `Keys` when `selection` is given? `can_load(R, None)` for a `Ref` subclass `R` means "are your refs `R`". |
 | `can_store(t, output)` | Registration. Can you take values of type `t` for this `Output` declaration, and extract its declared key from them? `t` is `None` when the producer is unannotated. |
-| `store(write, prior, scope)` | Apply the write; return the new ref (version per §3). `scope.batch` is the engine-assigned batch number; for a keyed output `scope.upserts` / `scope.removes` are the keys the write changes (`None`: all of them — write everything, delete the rest). `prior` is withheld on a `full` run. Duplicate keys are a write error. For `partition_column` outputs, stamp the column with `scope.partition` and reject rows that disagree. |
+| `store(write, prior, scope)` | Apply the write; return the new ref (version per §3). `scope.batch` is the engine-assigned batch number. A keyed output's `write` is a `KeyedWrite`: write its `upserts` (each key's group from `prepared.groups`, at the version given; `None`: every key of the write) and delete its `removes`, or with `whole` make the write the scope's whole content; `value` is what the producer returned. `prior` is withheld on a `full` run. Duplicate keys are a write error. For `partition_column` outputs, stamp the column with `scope.partition` and reject rows that disagree. |
 | `load(ref, t, selection)` | Materialize `t` from what the store holds now; under `Keys`, only the selected keys; under `Batches`, only batches in the range. |
 | `migrate(output, migrations)` | Optional. Apply, in declared order, every migration not yet in the store's own ledger for this output; return the applied names. Must be safe under concurrent attempts of one output (partitions share tables): take a store-level lock and re-read the ledger inside it. Where the backend is transactional, a migration and its ledger row commit together. A store without `migrate` rejects `migrations=` at registration. |
 
 Optional attributes and methods, with defaults: `writes`, `strict`,
 `late_write_grace`, `acquire(scope)` and `discard(scope, prior, items)` —
 how the store writes and what the engine may do once a writer is gone
-(lifecycle.md §9.6–§9.9); `stamped(output)` and `scan(ref, output, skip)`
-— the columns the store adds to every row, left out of their digests, and
+(lifecycle.md §9.6–§9.9); `prepare(write, output) -> Prepared` — how a
+keyed write of any type is read: its rows, natively, and how to take the
+rows it persists (the default, `solera.stores.prepare`, reads lists of
+mappings, pandas DataFrames and Arrow data, importing only the library of
+the value's own type); `stamped(output)` and `scan(ref, output, skip)` —
+the columns the store adds to every row, left out of their digests, and
 how a `Sql` write's rows are read back (row-digest.md); `shared_table`
 — one table for every partition, so a partitioned output needs a
 `partition_column` (§3).

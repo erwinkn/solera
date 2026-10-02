@@ -587,6 +587,7 @@ class KeyIndex:
         revision: str | None = None,
         exclude: tuple[str, ...] = (),
         generation: int = 0,
+        overlay: SortedRun | None = None,
     ) -> tuple[DeltaFiles, tuple[list[bytes], list[bytes]] | None]:
         """A full replacement: `rows` is the whole new content — a `Rows`, or
         chunks sorted by key, pulled as needed: `(key, version)` pairs, or
@@ -597,7 +598,10 @@ class KeyIndex:
         located at `generation` and carrying the key's predecessor `(version,
         locator)`. The delta goes out as the batch's files as they fill.
         Returns them and, up to `collect` keys, the written keys, `{key:
-        version}`, and the deleted keys (None past it)."""
+        version}`, and the deleted keys (None past it). Streamed chunks may
+        have a run laid over them (`overlay`): its upserts in place of their
+        entries of its keys, its removes gone — a patch over what a store
+        holds, read back."""
 
         runs = self.state.newest_first()
         job = Job.replace(
@@ -609,6 +613,7 @@ class KeyIndex:
             revision=revision,
             exclude=list(exclude),
             generation=generation,
+            overlay=overlay,
         )
         files = await self._run(job, runs, lambda n: f"{batch:012d}-{attempt}.{n:04d}", 0, rows)
         return DeltaFiles(files, job.added, job.removed, True), job.collected()

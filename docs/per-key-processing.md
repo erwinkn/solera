@@ -323,33 +323,42 @@ every existing version once, together with the grammar's own version.
 ## 7. A write is read once, and stays columnar
 
 A keyed write feeds the key index its `(key, version)` entries, and its
-store the groups of the keys that changed. The harness reads it once,
-`solera.stores.prepare` → `Prepared`, and carries that through resolution,
-repair and storage:
+store the groups of the keys that changed. Its store reads it once —
+`Store.prepare(write, output) -> Prepared`, for any type the store takes;
+by default `solera.stores.prepare` — after the producer returns and before
+anything resolves or writes, and that one reading is carried through
+resolution, repair and storage:
 
 - `rows`, native `Rows`: keys read in place from Arrow or packed once,
   sorted, each the group of the rows that carry it, versions computed
   natively — never a per-key Python object, which keeps 100M keys under
   1 GB (`key-index-costs.md`). Rows are read, not used up: the
-  resolution's join, the engine's request and the store's version (the
-  digest of every key and version, `Rows.digest`) all read the same ones.
-- `payload`: the write as returned, flattened, in its own types. The
-  store, asked to write some keys (`Scope.upserts`, each to the version
-  the index will hold), reads only their groups (`Prepared.groups`, from
-  `Rows.find`'s row indices) and converts them to its own serialization
-  then: a 100K-row DataFrame with one changed key reads one group.
+  resolution's join, the engine's request, a patch's `SortedRun` and the
+  store's version (`Rows.digest`, every key and version) read the same ones.
+- `take(indices)`: the write's rows as the store persists them, from the
+  same reading that was hashed, so what is stored digests as it was
+  hashed. Asked to write some keys, a store takes only their groups
+  (`Prepared.groups`, from `Rows.find`'s row indices): a 100K-row
+  DataFrame with one changed key reads one group.
+
+The store gets a `KeyedWrite`: the prepared write, the keys to write each
+at the version the index will hold, the keys to delete, whether it is the
+scope's whole content, and the producer's `value` for a store that writes
+it as it is.
 
 | Write | Read as |
 |---|---|
-| `list[dict]` | `Rows.records` |
-| DataFrame | through DuckDB, `Rows.arrow`; groups by `iloc` |
-| Arrow data | `Rows.arrow`, in place (a stream is read once, into a table) |
+| `list[dict]` | `Rows.records`; taken as the dicts |
+| pandas DataFrame | column by column through pandas alone (`Rows.columns`), every missing value — NaN, NaT, None, NA — None; timestamps without nanoseconds as `datetime`s; taken as dicts of those values |
+| Arrow data | `Rows.arrow`, in place (a pyarrow stream is read once, into a table); taken through pyarrow, a map as a dict |
 | `{key: rows}` | flattened, each row stamped with its key; a key given no rows is the empty group (`Rows.records(…, empty=)`) |
 | `keyed=True` dict | `Rows.values` |
 | partition set | `Rows.keys` |
 
-A store adapts the reading with `stamped(output)`: the columns it adds to
-every row itself, which a row's digest leaves out (PostgresStore's
+The default imports a library only for a value of its own type: a worker
+whose outputs are lists of dicts imports neither pandas, pyarrow nor
+DuckDB. A store adds the columns it stamps on every row with
+`stamped(output)`, which a row's digest leaves out (PostgresStore's
 partition column).
 
 **`Sql` writes have two paths**, because the rows never pass through the

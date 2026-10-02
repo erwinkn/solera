@@ -358,3 +358,96 @@ def test_a_row_changed_while_it_is_read_is_no_crash():
     rows += [{"a": at, "b": "x" * 50, "c": [1, 2], "id": i} for i in range(3)]
     expected = _native.row_digest({"a": dt.datetime(2026, 1, 1, tzinfo=dt.UTC), "b": "x" * 50, "c": [1, 2]})
     assert _native.row_digests(rows[:1], "id") == expected
+
+
+# -- what is hashed is what is stored ----------------------------------------------------------
+
+
+def _stored_again(value, out):
+    """Each key's version as prepared, and as its groups — what a store
+    persists — prepare again."""
+
+    from solera.stores import prepare
+
+    prepared = prepare(value, out)
+    versions = dict(prepared.entries())
+    groups = prepared.groups(sorted(versions))
+    again = dict(prepare([row for group in groups for row in group], out).entries())
+    return versions, again
+
+
+def test_a_dataframe_is_stored_as_it_is_hashed():
+    """A DataFrame's missing values — NaN, NaT, None, NA — are null where it
+    is hashed and where it is stored; read through pandas alone, it digests
+    as the same rows given as mappings would."""
+
+    from solera.sdk import Output
+    from solera.stores import prepare
+
+    out = Output("t", key="id")
+    frame = pd.DataFrame(
+        {
+            "id": ["a", "b", "c"],
+            "x": [1.5, math.nan, 2.0],
+            "at": pd.to_datetime(
+                ["2026-01-01 00:00:00.000000001", None, "2026-01-03 00:00:00.000000000"], utc=True
+            ),
+            "s": ["p", None, math.nan],
+            "n": pd.array([1, None, 3], dtype="Int64"),
+            "d": [D("1.20"), None, D("3")],
+        }
+    )
+    versions, again = _stored_again(frame, out)
+    assert versions == again
+    rows = [
+        {"id": "a", "x": 1.5, "at": frame["at"][0], "s": "p", "n": 1, "d": D("1.20")},
+        {"id": "b"},
+        {"id": "c", "x": 2.0, "at": frame["at"][2], "n": 3, "d": D("3")},
+    ]
+    assert dict(prepare(rows, out).entries()) == versions
+    # Timestamps with no nanoseconds are read as `datetime`s: the same instants.
+    local = pd.DataFrame(
+        {"id": ["a", "b"], "t": pd.to_datetime(["2026-01-01 10:00", None]).tz_localize("Europe/Paris")}
+    )
+    versions, again = _stored_again(local, out)
+    assert versions == again == dict(prepare([{"id": "a", "t": local["t"][0]}, {"id": "b"}], out).entries())
+
+
+def test_arrow_is_stored_as_it_is_hashed():
+    """Arrow values become Python values that digest alike: a map a dict, an
+    interval, nanoseconds, decimals, structs and lists as they were."""
+
+    from solera.sdk import Output
+
+    out = Output("t", key="id")
+    table = pa.table(
+        {
+            "id": ["a", "b"],
+            "m": pa.array([[("x", 1)], None], pa.map_(pa.string(), pa.int64())),
+            "iv": pa.array([pa.MonthDayNano([1, 2, 3]), None], pa.month_day_nano_interval()),
+            "at": pa.array([1_000_000_001, None], pa.timestamp("ns", tz="UTC")),
+            "d": pa.array([D("1.20"), D("-3")], pa.decimal128(5, 2)),
+            "st": pa.array([{"p": 1, "q": None}, None], pa.struct([("p", pa.int64()), ("q", pa.string())])),
+            "l": pa.array([[1, None], []], pa.list_(pa.int64())),
+        }
+    )
+    versions, again = _stored_again(table, out)
+    assert versions == again
+
+
+async def test_a_dataframe_read_back_from_a_store_digests_as_written(tmp_path):
+    """The round trip through FileStore: written, read back, prepared again."""
+
+    from solera.keys.index import key_str
+    from solera.sdk import Output
+    from solera.stores import FileStore, Keys, prepare
+
+    from tests.conftest import scope
+
+    out = Output("t", key="id")
+    frame = pd.DataFrame({"id": ["a", "a", "b"], "x": [1.0, math.nan, 2.5]})
+    store = FileStore(tmp_path)
+    written = await store.store(frame, None, scope(out, generation=1))
+    versions = dict(prepare(frame, out).entries())
+    read = await store.load(written.ref, None, Keys({k: (v, 1) for k, v in versions.items()}))
+    assert {key_str(k.encode()): v for k, v in prepare(read, out).entries()} == versions

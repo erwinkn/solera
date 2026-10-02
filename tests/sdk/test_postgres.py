@@ -3,11 +3,12 @@ Sql writes. Skips unless SOLERA_TEST_DATABASE_URL points at a scratch database."
 
 import os
 import uuid
+from decimal import Decimal as D
 
 import pytest
-from solera.keys import Rows
+from solera.keys import Rows, SortedRun
 from solera.sdk import Output
-from solera.stores import Keys, Patch, Sql, StoreError, WriteError
+from solera.stores import KeyedWrite, Keys, Patch, Sql, StoreError, WriteError, prepare_for
 
 from tests.conftest import scope
 
@@ -393,9 +394,8 @@ async def test_a_patch_refuses_requested_keys_it_does_not_hold(store):
     out = output(key="id", revision="v")
     first = await store.store([{"id": "a", "v": "1"}], None, scope(out))
     with pytest.raises(StoreError, match="does not hold"):
-        await store.store(
-            Patch([{"id": "a", "v": "2"}]), first.ref, scope(out, upserts=frozenset({"a", "zzz"}))
-        )
+        patch = prepare_for(store, Patch([{"id": "a", "v": "2"}]), out)
+        await store.store(KeyedWrite(patch, dict.fromkeys(["a", "zzz"], b"")), first.ref, scope(out))
 
 
 async def test_reconciliation_streams_the_slice_and_digests_rows_as_written(store, monkeypatch):
@@ -409,7 +409,6 @@ async def test_reconciliation_streams_the_slice_and_digests_rows_as_written(stor
     from solera.keys import _python
     from solera.keys.index import IndexState, KeyIndex
     from solera.keys.io import ObjectIO
-    from solera.stores import prepare_for
     from solera_worker import worker
 
     out = output(key="id", partition_column="site")
@@ -435,18 +434,19 @@ async def test_reconciliation_streams_the_slice_and_digests_rows_as_written(stor
         o = worker._Out("t", out, store, {"batch": 1, "unsettled": [{"unknown": True}]}, written.ref, patch)
         o.index = KeyIndex(io, None, state)
         o.prepared = prepare_for(store, patch, out)
-        o.new, o.removes = dict(o.prepared.entries()), list(o.prepared.removes)
+        o.run = SortedRun.from_rows(o.prepared.rows, [k.encode() for k in o.prepared.removes])
+        new = dict(o.prepared.entries())
         delta, _ = await worker._reconcile(o, {"attempt": f"w{attempt + 2}", "generation": attempt + 2})
         got = [
             e[:3]
             for f in delta.files
             for e in _python.iter_file(await io.read_whole(state.path(f.name), f.size))
         ]
-        expected = [(b"b", o.new["b"], 0), (b"c", b"", 1)]  # `a` and `e` are unchanged
-        if "d" in o.new:
-            expected.insert(2, (b"d", o.new["d"], 0))
+        expected = [(b"b", new["b"], 0), (b"c", b"", 1)]  # `a` and `e` are unchanged
+        if "d" in new:
+            expected.insert(2, (b"d", new["d"], 0))
         assert got == expected
-        assert o.new["b"] == dict(prepare_for(store, [{"id": "b", "x": 2}], out).entries())["b"]
+        assert new["b"] == dict(prepare_for(store, [{"id": "b", "x": 2}], out).entries())["b"]
 
 
 def in_thread(coroutine) -> tuple:
@@ -583,10 +583,10 @@ async def test_by_key_patch_stamps_keys_and_keeps_empty_groups(store):
     first = await store.store(
         Patch({"a.csv": pd.DataFrame({"n": [1, 2]}), "b.csv": pd.DataFrame({"n": [3]})}), None, scope(out)
     )
+    patch = Patch({"b.csv": pd.DataFrame({"n": []}), "c.csv": [{"n": 4}]}, remove=["a.csv"])
+    selected = dict.fromkeys(["b.csv", "c.csv"], b"")
     second = await store.store(
-        Patch({"b.csv": pd.DataFrame({"n": []}), "c.csv": [{"n": 4}]}, remove=["a.csv"]),
-        first.ref,
-        scope(out, upserts=frozenset({"b.csv", "c.csv"}), removes=frozenset({"a.csv"})),
+        KeyedWrite(prepare_for(store, patch, out), selected, frozenset({"a.csv"})), first.ref, scope(out)
     )
     rows = await store.load(second.ref, list[dict], None)
     assert sorted((r["path"], r["n"]) for r in rows) == [("c.csv", 4)]
@@ -704,7 +704,8 @@ async def test_a_replacement_writes_only_the_keys_it_is_asked_to(store):
         scope(out),
     )
     later = [{"id": "a", "r": "1", "v": 999}, {"id": "b", "r": "2", "v": 21}]
-    written = await store.store(later, first.ref, scope(out, upserts={"b": b"2"}, removes=frozenset({"c"})))
+    selected = KeyedWrite(prepare_for(store, later, out), {"b": b"2"}, frozenset({"c"}))
+    written = await store.store(selected, first.ref, scope(out))
     got = sorted((r["id"], r["v"]) for r in await store.load(written.ref, list[dict], None))
     assert got == [("a", 10), ("b", 21)]  # `a` was not selected: its row stays
     whole = await store.store(later, written.ref, scope(out))
@@ -712,3 +713,39 @@ async def test_a_replacement_writes_only_the_keys_it_is_asked_to(store):
         ("a", 999),
         ("b", 21),
     ]
+
+
+async def test_a_sql_table_keeps_the_select_s_column_types(store):
+    """§4: a table a Sql SELECT creates takes the SELECT's column types, so
+    its rows read back — and digest — as the values they were: 42, not
+    "42". The declaration is not changed by it."""
+
+    out = output(key="id")
+    written = await store.store(
+        Sql("SELECT 'a'::text AS id, 42::bigint AS n, 1.5::numeric AS x, 'w' AS w"), None, scope(out)
+    )
+    rows = [row for chunk in written.keys for row in chunk]
+    assert rows == [{"id": "a", "n": 42, "x": D("1.5"), "w": "w"}]
+    assert "columns" not in out.config
+    assert dict(prepare_for(store, rows, out).entries()) == dict(
+        prepare_for(store, [{"id": "a", "n": 42, "x": D("1.5"), "w": "w"}], out).entries()
+    )
+
+
+async def test_rows_first_written_keep_their_types(store):
+    """A table a Python write creates takes column types that read its
+    values back as they were: decimals, timestamps, dates, bytes."""
+
+    import datetime as dt
+
+    out = output(key="id")
+    row = {
+        "id": "a",
+        "d": D("1.25"),
+        "at": dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+        "on": dt.date(2026, 1, 2),
+        "b": b"\x00\x01",
+    }
+    written = await store.store([row], None, scope(out))
+    [back] = await store.load(written.ref, list[dict], None)
+    assert {k: back[k] for k in row} == {**row, "b": back["b"]} and bytes(back["b"]) == row["b"]

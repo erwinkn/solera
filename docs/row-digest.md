@@ -81,8 +81,9 @@ Rules where representations could disagree:
 - **Missing is null.** A record field that is null and one that is absent
   are the same, so a `list[dict]` whose rows omit a field and an Arrow table
   that pads it with nulls digest alike. Nulls inside a list are kept. NaN is
-  a float, not a null — but pandas marks missing floats with NaN, and a
-  DataFrame becomes Arrow through DuckDB, which reads them as nulls.
+  a float, not a null — but pandas marks missing values with NaN (and NaT,
+  None, NA), and a DataFrame is read column by column through pandas with
+  every missing value null: where it is hashed and where it is stored.
 - **Timezones.** An aware timestamp is an instant: `12:00+02:00` equals
   `10:00Z`, and the zone's name is not part of it. A naive timestamp is a
   wall-clock reading and never equals an aware one. A `datetime.time` with a
@@ -126,9 +127,13 @@ one key with different revisions.
 
 The harness reads a keyed write once as native `Rows`
 (`solera.stores.prepare`, `per-key-processing.md` §7): `Rows.records` for
-Python rows, `Rows.arrow` for Arrow data (a pandas DataFrame through
-DuckDB), `Rows.values` for `keyed=True`, `Rows.keys` for partition sets;
-a store leaves out the columns it adds (`Store.stamped`). Keys are sorted
+Python rows, `Rows.columns` for a pandas DataFrame (column by column,
+through pandas alone), `Rows.arrow` for Arrow data, `Rows.values` for
+`keyed=True`, `Rows.keys` for partition sets; a store reading types of its
+own reads them itself (`Store.prepare`), and one adding columns leaves
+them out (`Store.stamped`). What a store persists is taken from the same
+reading — a DataFrame's missing values None, an Arrow map a dict — so it
+digests as it was hashed. Keys are sorted
 natively, each run of equal keys is folded into one version, and no
 per-key Python object is made. A patch's keys, versions and removes
 become one `SortedRun`, native through every resolver — the sparse
@@ -174,6 +179,6 @@ integers, floats with `-0.0` and NaN, decimals with trailing zeros and
 256-bit decimals, nanosecond, microsecond and second timestamps, instants
 across zones, naive against aware, dates against timestamps, times and
 durations, lists, structs and string-keyed maps as records, typed maps,
-missing against null fields (and a DataFrame's NaN through DuckDB), groups
+missing against null fields (and a DataFrame's missing values), groups
 in two orders and with a duplicate, revisions rendered from both sides,
 and no fallback for sets, objects or infinite decimals.

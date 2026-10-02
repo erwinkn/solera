@@ -9,7 +9,7 @@ import json
 import os
 import pickle
 import typing
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 from urllib.parse import quote, unquote
@@ -67,30 +67,18 @@ class Batches:
 class Scope:
     """A write scope (§9): `batch` is the engine-assigned batch number for
     incremental outputs, `attempt` the writing attempt's id, `aliases` the
-    output's former names.
-
-    For a keyed output the harness reads the write once (`prepared`) and
-    says which keys it changes against the key index: `upserts` are the keys
-    to write, each to the version the index will hold, `removes` the keys to
-    delete. A store may write only those; `None` means unknown — everything
-    in the write, and for a replacement, every key not in it goes. Past
-    what fits in a list, an immutable store's `upserts` is a
-    `solera.keys.index.DeltaKeys`, whose `pages()` read them from the
-    commit's delta files. Asked to write a key the write does not hold, a
-    store raises: a requested write never silently disappears."""
+    output's former names. What a keyed write changes is the write's own
+    (`KeyedWrite`)."""
 
     output: Output
     partition: str
     batch: int | None = None
     attempt: str | None = None
     aliases: tuple = ()
-    upserts: Any = None  # Mapping[str, bytes], a `DeltaKeys`, or None
-    removes: frozenset[str] | None = None
     # The attempt's generation and invocation, for a `fenced` store to check
     # (docs/lifecycle.md §9.7); `None` outside an attempt.
     generation: int | None = None
     invocation: str | None = None
-    prepared: Prepared | None = None
 
 
 @dataclass(frozen=True)
@@ -109,7 +97,11 @@ class Written:
 
 @runtime_checkable
 class Store(Protocol):
-    """A store may also define `stamped(output)`: columns it adds to every
+    """A keyed output's write reaches `store` as a `KeyedWrite`: read once,
+    resolved against the key index. A store may define how it is read,
+    `prepare(write, output) -> Prepared` — for types of its own; without
+    it, `solera.stores.prepare` reads lists of mappings, pandas DataFrames
+    and Arrow data — and `stamped(output)`, the columns it adds to every
     row itself, which a row's digest leaves out (docs/row-digest.md).
 
     `writes` says how it writes, which decides what the engine may do once
@@ -244,26 +236,28 @@ def by_key(write: Any, output: Output) -> tuple[Any, list[str]] | None:
 
 @dataclass(frozen=True)
 class Prepared:
-    """A keyed write, read once for the key index and for its store (§4, §6).
+    """A keyed write's content, read once (§4, §6). The key index resolves
+    it, the store's version is computed from it, and the store writes its
+    groups from it: what is hashed is what is stored.
 
-    `rows` holds its keys, sorted, each the group of rows that carry it,
-    with versions computed natively (`solera.keys.Rows`, docs/row-digest.md):
-    the key index reads it to work out what changed, and the store, asked to
-    write some keys, reads their groups from `payload` (`groups`) — what the
-    producer returned, flattened, kept in its own types until the store
-    serializes it: rows (a list of mappings, a DataFrame or an Arrow table),
-    a `keyed=True` output's `(key, value)` items, or a partition set's
-    elements. A `Patch` also names the keys it `removes`, none it writes."""
+    `rows` are its keys, sorted, each the group of the rows that carry it,
+    with versions computed natively (`solera.keys.Rows`,
+    docs/row-digest.md). `take(indices)` gives the write's rows at those
+    indices — every row for None — as the store persists them: mappings for
+    a rows output (a DataFrame's missing values None, an Arrow map a dict),
+    `(key, value)` items for `keyed=True`, a partition set's elements; a
+    store reading types of its own gives its own. A `Patch` also names the
+    keys it `removes`, none of them written."""
 
     output: Output
-    payload: Any
     rows: Any
+    take: Callable[[Sequence[int] | None], list]
     patch: bool = False
     removes: tuple[str, ...] = ()
 
     def groups(self, keys: Sequence[str]) -> list:
-        """Each key's group, as its store writes it: the list of its rows as
-        mappings, a `keyed=True` output's value, or a partition set's element."""
+        """Each key's group, as its store writes it: the list of its rows, a
+        `keyed=True` output's value, or a partition set's element."""
 
         try:
             rows, ends = self.rows.find(list(keys))
@@ -271,17 +265,12 @@ class Prepared:
             raise StoreError(
                 f"{self.output.name}: asked to write key {e.args[0]!r}, which the write does not hold"
             ) from None
+        picked = self.take(rows)
         if self.output.is_partition_set:
-            return list(keys)
+            return picked
         if self.output.key == KEYS:
-            return [self.payload[r][1] for r in rows]
-        picked = _take(self.payload, rows)
+            return [value for _, value in picked]
         return [picked[a:b] for a, b in zip([0, *ends], ends, strict=False)]
-
-    def all_rows(self) -> list[dict]:
-        """Every row of a rows output, as mappings."""
-
-        return _take(self.payload, None)
 
     def entries(self) -> list[tuple[str, bytes]]:
         """Every key and its version, in key order."""
@@ -302,23 +291,60 @@ class Prepared:
         return _digest(["rows", content])
 
 
-def _take(payload: Any, rows: list[int] | None) -> list:
-    """Rows of `payload` as mappings — those at `rows`, in that order, or all."""
+@dataclass(frozen=True)
+class KeyedWrite:
+    """A keyed output's write as its store takes it: read once
+    (`prepared`), resolved against the key index (§4, §6).
 
-    if isinstance(payload, list):
-        return payload if rows is None else [payload[r] for r in rows]
-    if _is_dataframe(payload):
-        return (payload if rows is None else payload.iloc[rows]).to_dict(orient="records")
-    return (payload if rows is None else payload.take(rows)).to_pylist()  # an Arrow table
+    `upserts` are the keys to write, each at the version the index will
+    hold: a mapping; a `solera.keys.index.DeltaKeys` reading them from the
+    commit's delta files when there are too many to list; or None, every key
+    of the write. `removes` are deleted, and every other key stays as it is
+    — unless the write is `whole`, the scope's whole content: then every key
+    not in it goes, and `upserts`, if given, are only those that changed,
+    all a store that keeps unchanged keys as they are needs to write.
+    `value` is what the producer returned, for a store that writes it as
+    it is."""
+
+    prepared: Prepared
+    upserts: Any = None
+    removes: frozenset[str] = frozenset()
+    whole: bool = False
+    value: Any = None
+
+    @classmethod
+    def of(cls, store: Any, write: Any, output: Output, prior: Ref | None) -> KeyedWrite:
+        """A write as a store takes it with no key index to resolve it
+        against: a replacement, or a patch's every key and remove."""
+
+        if isinstance(write, KeyedWrite):
+            return write
+        prepared = prepare_for(store, write, output)
+        if not prepared.patch or prior is None:
+            return cls(prepared, whole=True, value=write)
+        return cls(prepared, removes=frozenset(prepared.removes), value=write)
+
+    async def pages(self, size: int = 100_000):
+        """The keys to write, sorted, a page at a time: `(key, version, group)` each."""
+
+        async for page in _selected(self.upserts, self.prepared, size):
+            groups = await asyncio.to_thread(self.prepared.groups, [k for k, _ in page])
+            yield [(k, v, g) for (k, v), g in zip(page, groups, strict=True)]
+
+    def version(self, prior: Ref | None) -> str:
+        return self.prepared.version(prior)
 
 
 def prepare(write: Any, output: Output, exclude: tuple[str, ...] = ()) -> Prepared:
     """A keyed write — the whole content, or a `Patch` — read once
-    (`Prepared`): lists of mappings, by-key mappings (`{key: rows}`), pandas
-    DataFrames (made Arrow through DuckDB), Arrow data, a `keyed=True`
-    output's dict, a partition set's elements. A row's digest leaves out
-    its key column and the `exclude`d ones — columns its store adds, so a
-    row digests the same as written and as read back."""
+    (`Prepared`): a list of mappings, a by-key mapping (`{key: rows}`), a
+    pandas DataFrame (read a column at a time, through pandas alone: a
+    missing value — NaN, NaT, None, NA — is None), Arrow data (anything with
+    `__arrow_c_stream__`, read in place), a `keyed=True` output's dict, a
+    partition set's elements. Only the library of the value's own type is
+    imported. A row's digest leaves out its key column and the `exclude`d
+    ones — columns its store adds, so a row digests the same as written and
+    as read back."""
 
     from .keys import Rows
 
@@ -327,32 +353,31 @@ def prepare(write: Any, output: Output, exclude: tuple[str, ...] = ()) -> Prepar
     content = write.rows if patch else write
     try:
         if output.is_partition_set:
-            payload = [str(e) for e in content or ()]
-            rows = Rows.keys(payload, b"1")
+            elements = [str(e) for e in content or ()]
+            rows, take = Rows.keys(elements, b"1"), _taker(elements)
         elif output.key == KEYS:
             if content is None:
                 content = {}
             if not isinstance(content, Mapping) or not all(isinstance(k, str) for k in content):
                 raise WriteError(f"{name}: a keyed output takes dict[str, Any], got {type(content).__name__}")
-            payload = list(content.items())
-            rows = Rows.values(payload)
+            items = list(content.items())
+            rows, take = Rows.values(items), _taker(items)
         else:
             payload, empty = content, []
             flat = by_key(content, output)
             if flat is not None:
                 payload, empty = flat
+            args = (output.key, output.revision, list(exclude), empty)
             if _is_dataframe(payload):
-                import duckdb
-
-                rows = Rows.arrow(
-                    duckdb.connect().from_df(payload), output.key, output.revision, list(exclude), empty
-                )
+                names, columns = _frame(payload, name)
+                rows = Rows.columns(names, columns, *args)
+                take = _column_taker(names, columns)
             elif hasattr(payload, "__arrow_c_stream__"):
-                import pyarrow as pa
+                if type(payload).__module__.startswith("pyarrow") and type(payload).__name__ != "Table":
+                    import pyarrow as pa  # a stream reads once: hold it
 
-                if not isinstance(payload, pa.Table):  # a stream reads once: hold it
                     payload = pa.table(payload)
-                rows = Rows.arrow(payload, output.key, output.revision, list(exclude), empty)
+                rows, take = Rows.arrow(payload, *args), _arrow_taker(payload)
             else:
                 if payload is None:
                     payload = []
@@ -360,7 +385,7 @@ def prepare(write: Any, output: Output, exclude: tuple[str, ...] = ()) -> Prepar
                     raise WriteError(
                         f"{name}: expected rows (list[dict] or DataFrame), got {type(payload).__name__}"
                     )
-                rows = Rows.records(payload, output.key, output.revision, list(exclude), empty)
+                rows, take = Rows.records(payload, *args), _taker(payload)
         removes = ()
         if patch:
             removes = tuple(k for k in sorted(set(map(key_text, write.remove))) if k not in rows)
@@ -368,12 +393,83 @@ def prepare(write: Any, output: Output, exclude: tuple[str, ...] = ()) -> Prepar
         raise WriteError(f"{name}: row lacks the declared key column {output.key!r}") from e
     except ValueError as e:  # a key that is not one, Arrow data without the columns, a value with no digest
         raise WriteError(f"{name}: {e}") from e
-    return Prepared(output, payload, rows, patch, removes)
+    return Prepared(output, rows, take, patch, removes)
+
+
+def _taker(items: list) -> Callable:
+    return lambda rows: items if rows is None else [items[r] for r in rows]
+
+
+def _frame(frame: Any, name: str) -> tuple[list[str], list[list]]:
+    """A DataFrame's columns as Python values, each missing one None."""
+
+    if not frame.columns.is_unique:
+        raise WriteError(f"{name}: a DataFrame's column names must be unique")
+    names, columns = [], []
+    for column, series in frame.items():
+        if not isinstance(column, str):
+            raise WriteError(f"{name}: column names must be strings, got {column!r}")
+        missing = series.isna().to_numpy()
+        values = _column_values(series, missing)
+        if missing.any():
+            for i in missing.nonzero()[0].tolist():
+                values[i] = None
+        names.append(column)
+        columns.append(values)
+    return names, columns
+
+
+def _column_values(series: Any, missing: Any) -> list:
+    """A column's values as Python objects. Timestamps with no nanoseconds
+    become `datetime`s, the same instants (and digests) as pandas'
+    `Timestamp`s, made and read faster."""
+
+    if series.dtype.kind == "M" and not (series.dt.nanosecond.to_numpy()[~missing] != 0).any():
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)  # an array now, a Series in pandas 3
+            return list(series.dt.to_pydatetime())
+    return series.tolist()
+
+
+def _column_taker(names: list[str], columns: list[list]) -> Callable:
+    n = len(columns[0]) if columns else 0
+
+    def take(rows):
+        return [
+            {name: column[r] for name, column in zip(names, columns, strict=True)}
+            for r in (range(n) if rows is None else rows)
+        ]
+
+    return take
+
+
+def _arrow_taker(data: Any) -> Callable:
+    """Rows of Arrow data as Python values that digest as the Arrow values
+    do: maps as dicts. pyarrow is imported only here, for its own data, or
+    when another library's has rows to give."""
+
+    table = None
+
+    def take(rows):
+        nonlocal table
+        if table is None:
+            import pyarrow as pa
+
+            table = data if isinstance(data, pa.Table) else pa.table(data)
+        return (table if rows is None else table.take(rows)).to_pylist(maps_as_pydicts="strict")
+
+    return take
 
 
 def prepare_for(store: Any, write: Any, output: Output) -> Prepared:
-    """`prepare`, leaving out the columns `store` adds itself (`stamped`)."""
+    """`store.prepare`, or the default `prepare`, leaving out the columns
+    the store adds itself (`stamped`)."""
 
+    own = getattr(store, "prepare", None)
+    if own is not None:
+        return own(write, output)
     stamped = getattr(store, "stamped", None)
     return prepare(write, output, tuple(stamped(output)) if stamped is not None else ())
 
@@ -486,11 +582,12 @@ class FileStore:
             raise WriteError(f"{output.name}: Patch requires an incremental output")
         base = self._base(output, scope, prior)
         generation = int(scope.generation or 0)
-        if output.is_partition_set:
-            return await self._store_set(write, prior, scope, base, generation)
         if output.key is not None:
-            prepared = scope.prepared or await asyncio.to_thread(prepare_for, self, write, output)
-            return await self._store_keyed(prepared, prior, scope, base, generation)
+            if not isinstance(write, KeyedWrite):
+                write = await asyncio.to_thread(KeyedWrite.of, self, write, output, prior)
+            if output.is_partition_set:
+                return await self._store_set(write, prior, scope, base, generation)
+            return await self._store_keyed(write, prior, scope, base, generation)
         if output.incremental:
             if not patch:
                 raise WriteError(f"{output.name}: an unkeyed incremental output only accepts Patch writes")
@@ -499,35 +596,32 @@ class FileStore:
         version = await self._put(name, write)
         return Written(self._ref(scope, {"mode": "value", "path": name, "base": base}, version))
 
-    async def _store_set(self, write, prior, scope, base, generation) -> Written:
+    async def _store_set(self, write: KeyedWrite, prior, scope, base, generation) -> Written:
         """A partition set: its element list, as one value."""
 
-        elements = (scope.prepared or prepare(write, scope.output)).payload
-        if isinstance(write, Patch) and prior is not None:
-            drop = {key_text(k) for k in write.remove} | set(elements)
+        elements = write.prepared.take(None)
+        if not write.whole and prior is not None:
+            drop = set(write.removes) | set(write.prepared.removes) | set(elements)
             elements = [e for e in await self._elements(prior) if e not in drop] + elements
         name = f"{base}@{generation}"
         version = await self._put(name, elements)
         return Written(self._ref(scope, {"mode": "set", "path": name, "base": base}, version))
 
-    async def _store_keyed(self, prepared: Prepared, prior, scope, base, generation) -> Written:
-        """One object per key and version. The harness says which keys
-        changed, each to its version (`Scope.upserts`) — listed, or paged
-        from the commit's delta files when there are too many to list; only
-        their groups are read from the write and written, named by the
-        versions the key index will hold, so no object goes unnamed. Removed
-        keys need no write: the index stops naming them, and `discard`
-        deletes what nothing reads."""
+    async def _store_keyed(self, write: KeyedWrite, prior, scope, base, generation) -> Written:
+        """One object per key and version: the keys the write changes, each
+        named by the version the key index will hold, so no object goes
+        unnamed — only their groups are read from the write. Removed keys
+        need no write: the index stops naming them, and `discard` deletes
+        what nothing reads."""
 
         async def put(entry) -> None:
-            (key, version), group = entry
+            key, version, group = entry
             await self._put(self.key_name(base, key, version, generation), group)
 
-        async for page in _selected(scope.upserts, prepared):
-            groups = await asyncio.to_thread(prepared.groups, [k for k, _ in page])
-            await self._many(put, zip(page, groups, strict=True))
+        async for page in write.pages():
+            await self._many(put, page)
         handle = {"mode": "keyed", "path": base, "key": scope.output.key}
-        return Written(self._ref(scope, handle, prepared.version(prior)))
+        return Written(self._ref(scope, handle, write.version(prior)))
 
     async def _store_batch(self, write: Patch, prior, scope, base, generation) -> Written:
         """An unkeyed incremental write: its items, as one object per batch.
@@ -616,8 +710,11 @@ class FileStore:
             first, last = (int(b) for b in handle["batches"])
             lo, hi = (max(first, selection.lo), selection.hi) if selection is not None else (first, last)
             names = await self._batches(base, lo, hi)
-            batches = await self._many(self._get, [names[b] for b in sorted(names)])
-            return _materialize([item for b in batches if b is not MISSING for item in b], t)
+            # The ref's batches run first..last without a gap: every one a commit wrote.
+            if missing := [b for b in range(lo, min(hi, last) + 1) if b not in names]:
+                raise StoreError(f"{ref.output}: batch {missing[0]} of {base} is gone")
+            batches = await self._many(self._found, [names[b] for b in sorted(names)])
+            return _materialize([item for b in batches for item in b], t)
         if mode == "keyed":
             if not isinstance(selection, Keys):
                 raise StoreError(
@@ -625,9 +722,9 @@ class FileStore:
                 )
             keys = list(selection.revisions)
             found = await self._many(
-                lambda k: self._get(self.key_name(base, k, *selection.revisions[k])), keys
+                lambda k: self._found(self.key_name(base, k, *selection.revisions[k]), k), keys
             )
-            content = {k: v for k, v in zip(keys, found, strict=True) if v is not MISSING}
+            content = dict(zip(keys, found, strict=True))
             if handle.get("key") == KEYS:
                 return content
             inner = by_key_type(t)
@@ -646,8 +743,17 @@ class FileStore:
         return value
 
     async def _elements(self, ref: Ref) -> list[str]:
-        value = await self._get((ref.handle or {}).get("path", ""))
-        return [] if value is MISSING else list(value)
+        return list(await self._found((ref.handle or {}).get("path", "")))
+
+    async def _found(self, base: str, key: str | None = None):
+        """The object at `base`, which a commit names: gone, it is an error,
+        never an empty read."""
+
+        value = await self._get(base)
+        if value is MISSING:
+            what = f"key {key!r}: " if key is not None else ""
+            raise StoreError(f"{what}{base} is gone")
+        return value
 
     async def _batches(self, base: str, lo: int, hi: int) -> dict[int, str]:
         """Batch `n` -> its committed object, in `[lo, hi]`: of the objects
