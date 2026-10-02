@@ -3,6 +3,7 @@ cancel) and the remote kinds against stubbed SDK clients."""
 
 import asyncio
 import json
+import os
 import re
 import sys
 import types
@@ -394,6 +395,10 @@ async def test_modal_reports_only_what_modal_says_of_the_call(state, monkeypatch
     assert (await placement.wait(handle, 1))["reason"] == "lost"
 
 
+@pytest.mark.skipif(
+    not os.path.exists("/proc/self/stat"),
+    reason="no /proc: a Local handle cannot be told from a reused pid, and is followed by heartbeats only",
+)
 async def test_a_local_handle_is_only_ever_its_own_process(state, monkeypatch):
     """A handle names one launch. A handle adopted from another host, or
     naming a pid since reused here, never reaches the process now holding

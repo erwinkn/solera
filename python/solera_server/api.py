@@ -612,10 +612,11 @@ def create_app(
         revision: str,
         slots: int = Query(4, ge=0, le=64),
         wait: float = Query(30, ge=0, le=30),
+        build: str | None = None,
     ):
         runtime = await project_engine(request, p)
         host = request.query_params.get("host") or (request.client.host if request.client else "host")
-        return await runtime.sensor_next(executor, revision, host, slots, wait)
+        return await runtime.sensor_next(executor, revision, host, slots, wait, build)
 
     @app.post("/api/projects/{p}/sensors/{sensor}/ticks/{tick}")
     async def sensor_tick(p: str, sensor: str, tick: str, request: Request):

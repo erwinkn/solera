@@ -86,3 +86,26 @@ def _file_digest(path: str) -> bytes:
             return hashlib.file_digest(f, "sha256").digest()
     except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
         return b"absent"
+
+
+METHODS = {
+    "explicit": "an explicit build id",
+    "git": "the git work tree",
+    "files": "a hash of the Python files",
+}
+
+
+def method_note(served: dict | None, reported: dict | None) -> str | None:
+    """Why two revisions differ when it is the method, not the code: the
+    engine serves a revision computed one way and a worker or sensor host
+    computed its own another way — a build with `.git` against an image
+    without it — so they never agree. `None` when the methods match."""
+
+    a, b = (served or {}).get("source"), (reported or {}).get("source")
+    if not a or not b or a == b:
+        return None
+    return (
+        f"the engine's revision comes from {METHODS.get(a, a)}, this host's from {METHODS.get(b, b)}: "
+        "they will never match — set SOLERA_BUILD (e.g. the git commit) wherever the project is "
+        "registered and wherever workers and sensor hosts import it"
+    )

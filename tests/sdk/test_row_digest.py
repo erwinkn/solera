@@ -260,7 +260,10 @@ def test_numpy_scalars_convert_or_fail_without_crashing():
     )
     done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
     assert done.returncode == 0, (done.returncode, done.stderr[-500:])
-    assert done.stdout.startswith("refused")
+    if np.finfo(np.longdouble).bits > 64:  # extended precision: no exact float64 to take
+        assert done.stdout.startswith("refused")
+    else:  # longdouble is float64 here (Apple Silicon, MSVC): it encodes as one
+        assert done.stdout == "" and _native.encode(np.longdouble("1.25")) == _native.encode(1.25)
 
 
 def test_memoryview_is_bytes():

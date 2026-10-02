@@ -38,8 +38,12 @@ class HttpSensorChannel:
         self.base = f"/api/projects/{project}/sensors"
         self.client = httpx.AsyncClient(base_url=server, headers=headers, timeout=60)
 
-    async def next(self, executor: str, revision: str, host: str, slots: int) -> dict:
+    async def next(
+        self, executor: str, revision: str, host: str, slots: int, build: str | None = None
+    ) -> dict:
         params = {"executor": executor, "revision": revision, "host": host, "slots": slots, "wait": 30}
+        if build:
+            params["build"] = build  # how this host computed its revision, for the engine's warning
         response = await self.client.get(f"{self.base}/next", params=params)
         response.raise_for_status()
         return response.json()
@@ -61,8 +65,10 @@ class LocalSensorChannel:
     def __init__(self, engine):
         self.engine = engine
 
-    async def next(self, executor: str, revision: str, host: str, slots: int) -> dict:
-        return await self.engine.sensor_next(executor, revision, host, slots, 30)
+    async def next(
+        self, executor: str, revision: str, host: str, slots: int, build: str | None = None
+    ) -> dict:
+        return await self.engine.sensor_next(executor, revision, host, slots, 30, build)
 
     async def post(self, sensor: str, tick: str, outcome: dict) -> dict:
         try:
@@ -92,6 +98,7 @@ async def run_sensor_host(
     and the sensors tick again on the next host."""
 
     revision = project.manifest["revision"]
+    build = (project.manifest.get("build") or {}).get("source")
     host = host or f"{socket.gethostname()}:{os.getpid()}"
     running: set[asyncio.Task] = set()
     ran, overran = 0, asyncio.Event()
@@ -123,7 +130,7 @@ async def run_sensor_host(
             await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
             continue
         poll, gave_up = (
-            asyncio.create_task(channel.next(executor, revision, host, slots)),
+            asyncio.create_task(channel.next(executor, revision, host, slots, build)),
             asyncio.create_task(overran.wait()),
         )
         await asyncio.wait({poll, gave_up}, return_when=asyncio.FIRST_COMPLETED)

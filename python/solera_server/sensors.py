@@ -17,6 +17,7 @@ import signal
 import sys
 
 from solera import lifecycle
+from solera.build import method_note
 from solera.ids import ulid
 
 from .placements.local import _env
@@ -93,17 +94,26 @@ class Sensors:
     def _due(self, name: str, now: float) -> bool:
         return name not in self.m.ticks and self.sensor_due.get(name, -math.inf) <= now
 
-    async def sensor_next(self, executor: str, revision: str, host: str, slots: int, wait: float) -> dict:
+    async def sensor_next(
+        self, executor: str, revision: str, host: str, slots: int, wait: float, build: str | None = None
+    ) -> dict:
         """Due ticks for a host of `executor` on `revision`, up to `slots`;
         waits up to `wait` seconds for one. A host on another revision gets
-        none: it is told the current one."""
+        none: it is told the current one — and warned, once, when `build`
+        says it computed its revision another way than the engine did."""
 
         loop = asyncio.get_running_loop()
+        known = self.sensor_hosts.get(host) or {}
+        if revision != self.manifest["revision"] and not known.get("warned"):
+            if note := method_note(self.manifest.get("build"), {"source": build}):
+                log.warning("sensor host %s: %s", host, note)
+                known = {**known, "warned": True}
         self.sensor_hosts[host] = {
             "id": host,
             "executor": executor,
             "revision": revision,
             "seen_at": self.clock(),
+            **({"warned": True} if known.get("warned") else {}),
         }
         current = self.manifest["revision"]
         deadline = loop.time() + max(0.0, min(wait, 30.0))

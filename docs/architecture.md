@@ -783,7 +783,10 @@ included and ignored ones not; else the content of the Python files under
 the project's directory. A commit and a dirty flag are recorded for
 display only. Where the manifest is built and where workers import the
 project must agree on it — an image without `.git` should set
-`SOLERA_BUILD`. The engine counts the revisions it serves: the **revision
+`SOLERA_BUILD` (the `Dockerfile` takes it as a build arg, or from Railway's
+`RAILWAY_GIT_COMMIT_SHA`). A worker or sensor host whose revision differs
+because it was computed by another method (git against a file hash) makes
+the engine log a warning that says so. The engine counts the revisions it serves: the **revision
 epoch**.
 
 Registration errors:

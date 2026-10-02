@@ -12,7 +12,10 @@ services:
       timeout: 3s
       retries: 20
   solera:
-    build: .
+    build:
+      context: .
+      args:
+        SOLERA_BUILD: ${SOLERA_BUILD:-}  # e.g. SOLERA_BUILD=$(git rev-parse HEAD) docker compose build
     ports: ['127.0.0.1:8000:8000']
     environment:
       SOLERA_STATE_URL: file:///home/app/state

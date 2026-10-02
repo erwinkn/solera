@@ -1095,7 +1095,9 @@ async def _execute(
         mismatch = (
             f"revision mismatch: spec {spec['revision'][:12]} != project {project.manifest['revision'][:12]}"
         )
-        return _failed(StoreError(mismatch), False)
+        failed = _failed(StoreError(mismatch), False)
+        failed["error"]["build"] = project.manifest.get("build")  # how this host computed its revision
+        return failed
     asset = project.assets[spec["asset"]]
     try:
         keys_io = _key_io(objects, objects_url, project)

@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 
 from obstore.exceptions import AlreadyExistsError
 from solera import errors, lifecycle
+from solera.build import method_note
 from solera.lifecycle import Cancel, Ended
 
 from .state import LostOwnership
@@ -527,10 +528,14 @@ class Attempts:
         if status == "failed":
             error = result.get("error") or {}
             transient = error.get("class") == errors.TRANSIENT
+            told = f"{error.get('type', 'Error')}: {error.get('message', '')}"
+            if note := method_note(self.manifest.get("build"), error.get("build")):
+                log.warning("attempt %s: %s", attempt, note)
+                told = f"{told} ({note})"
             await self._fail(
                 task_id,
                 attempt,
-                f"{error.get('type', 'Error')}: {error.get('message', '')}",
+                told,
                 retryable=bool(error.get("retryable")),
                 delay=self._transient_delay(task, error) if transient else self._retry_delay(task),
                 result=result,

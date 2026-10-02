@@ -102,3 +102,64 @@ def test_epoch_counts_served_revisions():
     restored = Model()
     restored.restore(m.snapshot())
     assert restored.epoch == 3
+
+
+def test_a_method_mismatch_is_named():
+    from solera.build import method_note
+
+    assert method_note({"source": "git"}, {"source": "git"}) is None
+    assert method_note({"source": "git"}, None) is None
+    note = method_note({"source": "git"}, {"source": "files"})
+    assert "git work tree" in note and "Python files" in note and "SOLERA_BUILD" in note
+
+
+async def test_the_engine_warns_when_a_worker_computed_its_revision_another_way(tmp_path, caplog):
+    """A worker whose revision differs because it hashed files while the engine
+    used git fails its attempt as before, and the engine says why."""
+
+    import logging
+
+    from solera.sdk import Project, asset
+    from solera_server.state import State
+
+    from tests.server.test_engine import make_engine
+
+    @asset
+    def numbers():
+        return [1]
+
+    project = Project(assets=[numbers], build="served")
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = make_engine(state, project)
+    engine.manifest = {**engine.manifest, "build": {"id": "x", "source": "git"}, "revision": "elsewhere"}
+    await engine.initialize()
+    with caplog.at_level(logging.WARNING):
+        detail = await engine.run_until((await engine.submit(["numbers"]))["id"], 10)
+    assert detail["request"]["status"] == "failed"
+    assert any("never match" in r.getMessage() for r in caplog.records)
+    assert "SOLERA_BUILD" in detail["attempts"][detail["tasks"][0]["id"]][0]["error"]
+    await state.close()
+
+
+async def test_the_engine_warns_a_sensor_host_once(tmp_path, caplog):
+    import logging
+
+    from solera.sdk import Project, asset
+    from solera_server.state import State
+
+    from tests.server.test_engine import make_engine
+
+    @asset
+    def numbers():
+        return [1]
+
+    project = Project(assets=[numbers], build="served")
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = make_engine(state, project)
+    engine.manifest = {**engine.manifest, "build": {"id": "x", "source": "git"}}
+    await engine.initialize()
+    with caplog.at_level(logging.WARNING):
+        for _ in range(2):
+            await engine.sensor_next("local", "other", "h1", 1, 0, "files")
+    assert sum("never match" in r.getMessage() for r in caplog.records) == 1
+    await state.close()
