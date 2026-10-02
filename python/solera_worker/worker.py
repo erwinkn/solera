@@ -1185,7 +1185,7 @@ async def _discard_due(spec, project, asset, objects, writes) -> dict:
                     await read(f"{prefix}{f}.{'kx' if kind == 'delta' else 'kg'}") for f in entry["files"]
                 ]
                 if any(data is None for data in found):  # the names are not known: it stays pending
-                    unresolved.setdefault(name, []).append(entry["n"])
+                    unresolved.setdefault(name, []).append(entry["id"])
                     continue
                 for data in found:
                     if kind == "delta":
@@ -1218,7 +1218,7 @@ async def _discard_due(spec, project, asset, objects, writes) -> dict:
                     items.append(("value", generation))
             else:
                 items += [tuple(i) for i in entry["items"]]
-            done.append(entry["n"])
+            done.append(entry["id"])
         if not done:
             continue
         scope = Scope(output=decls[name], partition=spec["partition"], attempt=spec["attempt"])

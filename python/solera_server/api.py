@@ -200,7 +200,7 @@ def create_app(
             "last_error": runtime.failing,
             # data garbage whose names could not be read: see and clear with `solera scopes discards`
             "stuck_discards": [
-                {"output": output, "scope": scope, "n": e["n"]}
+                {"output": output, "scope": scope, "id": e["id"]}
                 for (output, scope), entries in runtime.m.discards.items()
                 for e in entries
                 if e.get("stuck")

@@ -636,7 +636,7 @@ class Attempts:
 
         entries = self.m.discards.get((output, scope)) or []
         stuck = [
-            {k: e[k] for k in ("n", "kind", "misses", "attempt", "files") if k in e}
+            {k: e[k] for k in ("id", "kind", "misses", "attempt", "files") if k in e}
             for e in entries
             if e.get("stuck")
         ]
@@ -646,9 +646,9 @@ class Attempts:
         """An operator's `solera scopes discards --clear`: forget the stuck
         entries. Their objects stay where they are."""
 
-        stuck = [e["n"] for e in self.m.discards.get((output, scope)) or [] if e.get("stuck")]
+        stuck = [e["id"] for e in self.m.discards.get((output, scope)) or [] if e.get("stuck")]
         if stuck:
-            event = {"output": output, "scope": scope, "n": stuck, "by": by, "at": self.clock()}
+            event = {"output": output, "scope": scope, "ids": stuck, "by": by, "at": self.clock()}
             self.state.record({"type": "DiscardsCleared", **event})
         return {"output": output, "scope": scope, "cleared": stuck}
 

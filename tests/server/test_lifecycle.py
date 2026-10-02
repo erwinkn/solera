@@ -395,7 +395,7 @@ async def test_a_renamed_asset_keeps_its_strict_hold(tmp_path):
     await engine.stop()
     m = state.model
     assert ("items", "") in m.unsettled
-    m.discards[("items", "")] = [{"n": 1, "kind": "items", "items": [["path", "x"]]}]
+    m.discards[("items", "")] = [{"n": 1, "id": "1.0", "kind": "items", "items": [["path", "x"]]}]
 
     @asset(outputs=Output(key="id", revision="v", store="live"), aliases=["items"])
     def catalog():

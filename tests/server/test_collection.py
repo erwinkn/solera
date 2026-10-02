@@ -166,7 +166,7 @@ async def test_a_reader_pin_holds_collection_back(tmp_path):
     engine = engine_for(state, project)
     await engine.initialize()
     m = state.model
-    m.discards[("scores", "")] = [{"n": 10, "kind": "items", "items": [["path", "x"]]}]
+    m.discards[("scores", "")] = [{"n": 10, "id": "10.0", "kind": "items", "items": [["path", "x"]]}]
     m.claims["reader"] = {"attempt": "r", "pin": 9, "started_at": 0, "status": "running"}
     assert engine._due_discards("scores", "", "me") == []
     m.claims["reader"]["pin"] = 10
@@ -196,7 +196,7 @@ async def test_a_delta_a_pending_discard_reads_outlives_its_index(tmp_path, data
     prefix = m.indexes[("scores", "")].prefix
     path = f"{prefix}held.kx"
     await state.create_object(path, b"delta")
-    m.discards[("scores", "")] = [{"n": 1, "kind": "delta", "prefix": prefix, "files": ["held"]}]
+    m.discards[("scores", "")] = [{"n": 1, "id": "1.0", "kind": "delta", "prefix": prefix, "files": ["held"]}]
     m.garbage.append([path, 1])  # the index let go of it
     await engine.upkeep.collect()
     assert await state.get_object(path) == b"delta" and [path, 1] in m.garbage
@@ -229,7 +229,7 @@ async def test_an_entry_whose_names_cannot_be_read_gets_stuck_and_is_shown(tmp_p
     await run(engine, ["scores"])
     m = state.model
     prefix = m.indexes[("scores", "")].prefix
-    m.discards[("scores", "")] = [{"n": 1, "kind": "delta", "prefix": prefix, "files": ["gone"]}]
+    m.discards[("scores", "")] = [{"n": 1, "id": "1.0", "kind": "delta", "prefix": prefix, "files": ["gone"]}]
     for misses in (1, 2, 3):
         await run(engine, ["scores"])
         [entry] = m.discards[("scores", "")]
@@ -239,13 +239,52 @@ async def test_an_entry_whose_names_cannot_be_read_gets_stuck_and_is_shown(tmp_p
     app.state.engine = engine
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         assert (await client.get("/api/diagnostics")).json()["stuck_discards"] == [
-            {"output": "scores", "scope": "", "n": 1}
+            {"output": "scores", "scope": "", "id": "1.0"}
         ]
         base = f"/api/projects/{project.manifest['name']}"
         [head] = (await client.get(f"{base}/outputs/scores/heads")).json()["heads"]
-        assert head["discards"]["pending"] == 0 and [e["n"] for e in head["discards"]["stuck"]] == [1]
+        assert head["discards"]["pending"] == 0 and [e["id"] for e in head["discards"]["stuck"]] == ["1.0"]
         cleared = await client.post(f"{base}/scopes:clear-discards", json={"output": "scores", "by": "ops"})
-        assert cleared.json()["cleared"] == [1]
+        assert cleared.json()["cleared"] == ["1.0"]
     assert ("scores", "") not in m.discards
+    await engine.stop()
+    await state.close()
+
+
+async def test_entries_of_one_event_are_acknowledged_one_by_one(tmp_path):
+    """Astra review 2, P2-5: one commit lets go of several entries at one
+    event position, and the delivery limit can split them. Acknowledging
+    the delivered ones leaves the others queued; and a resolved sibling's
+    acknowledgment does not erase an unresolved one's miss."""
+
+    from solera_server import engine as engine_module
+
+    @asset(outputs=Output("scores", keyed=True))
+    def scores():
+        return {"a": 1}
+
+    project = Project(assets=[scores])
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = engine_for(state, project)
+    await engine.initialize()
+    await run(engine, ["scores"])
+    m = state.model
+    prefix = m.indexes[("scores", "")].prefix
+    m.discards.pop(("scores", ""), None)  # the first commit's own
+    m.applied += 1
+    m._collect("scores", "", {"kind": "items", "items": [["path", "x"]]})
+    m._collect("scores", "", {"kind": "delta", "prefix": prefix, "files": ["gone"]})
+    m._collect("scores", "", {"kind": "items", "items": [["path", "y"]]})
+    entries = m.discards[("scores", "")]
+    assert len({d["n"] for d in entries}) == 1 and len({d["id"] for d in entries}) == 3
+    engine_module.DISCARDS, limit = 1, engine_module.DISCARDS
+    try:
+        await run(engine, ["scores"])  # delivers the first alone
+    finally:
+        engine_module.DISCARDS = limit
+    assert [d["kind"] for d in m.discards[("scores", "")]] == ["delta", "items"]
+    await run(engine, ["scores"])  # the unresolved delta and its resolved sibling
+    [left] = m.discards[("scores", "")]
+    assert left["kind"] == "delta" and left["misses"] == 1
     await engine.stop()
     await state.close()

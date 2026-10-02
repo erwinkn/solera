@@ -74,6 +74,16 @@ def _flatten(nested: dict, depth: int) -> dict:
     return out
 
 
+def _renumbered(entries: list[dict]) -> list[dict]:
+    """Two names' discard entries as one scope's: in order, ids unique again."""
+
+    out, seen = [], {}
+    for d in sorted(entries, key=lambda d: d["n"]):
+        ordinal = seen[d["n"]] = seen.get(d["n"], -1) + 1
+        out.append({**d, "id": f"{d['n']}.{ordinal}"})
+    return out
+
+
 class Model:
     def __init__(self):
         self.restore(None)
@@ -440,7 +450,7 @@ class Model:
         move(self.watermarks, asset_map, 0)
         move(self.holds, asset_map, 0)
         move(self.unsettled, output_map, 0, merge=list)
-        move(self.discards, output_map, 0, merge=lambda entries: sorted(entries, key=lambda d: d["n"]))
+        move(self.discards, output_map, 0, merge=_renumbered)
         for head in self.heads.values():
             if head.get("asset") in asset_map:
                 head["asset"] = asset_map[head["asset"]]
@@ -945,7 +955,13 @@ class Model:
         }
 
     def _collect(self, output: str, scope: str, entry: dict) -> None:
-        self.discards.setdefault((output, scope), []).append({"n": self.applied, **entry})
+        """Queue data garbage let go of now: `n`, the event position, is
+        when it may be collected; `id`, unique in its scope, is what an
+        attempt acknowledges — one event can let go of several entries."""
+
+        entries = self.discards.setdefault((output, scope), [])
+        ordinal = sum(1 for d in entries if d["n"] == self.applied)
+        entries.append({"n": self.applied, "id": f"{self.applied}.{ordinal}", **entry})
 
     def _superseded(
         self, output: str, scope: str, before: dict | None, head: dict, keys: dict | None
@@ -1004,14 +1020,14 @@ class Model:
             self._drop_discards(output, scope, done)
         for output, missed in (e.get("discard_unresolved") or {}).items():
             for d in self.discards.get((output, scope), []):
-                if d["n"] in missed:
+                if d["id"] in missed:
                     d["misses"] = d.get("misses", 0) + 1
                     if d["misses"] >= STUCK_AFTER:
                         d["stuck"] = True
         self.garbage.extend([path, self.applied] for path in e.get("discarded_files") or ())
 
-    def _drop_discards(self, output: str, scope: str, ns) -> None:
-        left = [d for d in self.discards.get((output, scope), []) if d["n"] not in set(ns)]
+    def _drop_discards(self, output: str, scope: str, ids) -> None:
+        left = [d for d in self.discards.get((output, scope), []) if d["id"] not in set(ids)]
         if left:
             self.discards[(output, scope)] = left
         else:
@@ -1020,7 +1036,7 @@ class Model:
     def _on_DiscardsCleared(self, e):
         """An operator gave up on stuck entries: their objects stay."""
 
-        self._drop_discards(e["output"], e["scope"], e["n"])
+        self._drop_discards(e["output"], e["scope"], e["ids"])
 
     def _replace_index(self, key: tuple, index: IndexState) -> None:
         """Swap in a new index state; files it no longer references await deletion."""
