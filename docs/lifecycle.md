@@ -1,6 +1,13 @@
 # The attempt lifecycle — target design
 
-Status: **target design**, not built, revised after the follow-up review.
+Status: **target design, partly built.** Built (milestone 1): the records
+of §2 (`solera/lifecycle.py`), the attempt objects and claims of §2–§4, the
+channel of §5 (`solera_server/attempts.py`, `solera_worker/channel.py`),
+heartbeats as evidence (§6), the two-phase cancel (§7), the clocks of §8,
+retained gates (§2.4) and Pool (§10). Not yet: store kinds and their
+release rules (§9.5–§9.9: every store is released at once for now), the
+FileStore names of §9.8, sensors (§11). Where the build departs from the
+text, it says so in place.
 It replaces the attempt files, heartbeat, pool protocol and write-safety
 rules of `object-store-state.md` §8 and `architecture.md` §10. It settles
 D2–D4, and D1 as Erwin decided it after the review: heartbeats are evidence
@@ -246,7 +253,10 @@ succeeds. So:
   bound invocation's last report: one within three beat intervals means
   the exit was another invocation's, so the engine keeps waiting on the
   owner's reports (and drops the handle, which named a duplicate). With no
-  invocation bound yet, it reads `.worker` first.
+  invocation bound yet, it reads `.worker` first. (Built: only reports
+  received over the channel count here — a `.worker` read now may have been
+  written before the exit — so a worker reporting only through `.worker`
+  has its duplicate's exit taken for its own; its gate then stops it.)
 
 Delayed duplicates, long after the attempt ended, are §9.5.
 
@@ -294,7 +304,8 @@ Gone: `POST /api/workers/register`, `/api/tasks/claim`,
   it, so tokens in specs written before a restart stay valid.
 - **Pool token.** `pools/{pool}/work` takes a per-pool secret configured
   on the server and on that pool's workers. It reveals which attempts
-  wait; claiming still takes the object store.
+  wait; claiming still takes the object store. (Built: one
+  `SOLERA_POOL_TOKEN` for every pool, or the admin token.)
 - The admin API keeps its own token; a worker's token reaches nothing else.
 - The engine's URL is a stable HTTPS name (load balancer or DNS), so an
   engine restarted on another host is the same URL.
@@ -351,7 +362,8 @@ Proposal for Erwin's question, decided: **HTTP heartbeats every 10 s; the
 
 - The worker beats over HTTP every 10 s. After two failed beats it also
   overwrites `.worker` with its `seq` and timeline every 20 s until a beat
-  succeeds again.
+  succeeds again, and reads its gate each time: an `aborted` or `closed`
+  gate is the one cancel that reaches a worker the engine cannot answer.
 - The engine reads `.worker` only for attempts whose HTTP beats stopped,
   so a steady-state heartbeat costs no object-store request.
 - A worker is **silent** when the engine has seen neither a beat nor a

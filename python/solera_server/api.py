@@ -1,22 +1,29 @@
 """The solera API (§5, §8-§10): project-scoped reads and run control under
-`/api/projects/{p}`, the worker pull path under `/api`, token auth."""
+`/api/projects/{p}`, and the worker channel (docs/lifecycle.md §5): attempt
+routes authenticated by the attempt's own token, pool discovery by a pool
+token. Everything else takes the admin token."""
 
 from __future__ import annotations
 
 import hmac
 import os
-import uuid
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Header, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
+from solera import lifecycle
+from solera.lifecycle import Ended
 
 from .engine import Conflict, Engine
 from .history import TERMINAL_RUN, RunFilter
 from .placements.local import load_manifest
 from .state import LostOwnership, State, Unavailable
+
+ATTEMPT_ROUTE = re.compile(r"^/api/projects/[^/]+/attempts/([^/]+)/(start|beat|logs|finished)$")
+POOL_ROUTE = re.compile(r"^/api/projects/[^/]+/pools/[^/]+/work$")
 
 
 class RunInput(BaseModel):
@@ -45,11 +52,15 @@ class SourceCommitInput(BaseModel):
     remove: list[str] = Field(default_factory=list, max_length=100000)
 
 
-def create_app(*, state_url=None, namespace=None, project=None, token=None, insecure=False, engine=None):
+def create_app(
+    *, state_url=None, namespace=None, project=None, token=None, insecure=False, engine=None, engine_url=None
+):
     state_url = state_url or os.getenv("SOLERA_STATE_URL", Path(".solera").resolve().as_uri())
     namespace = namespace or os.getenv("SOLERA_NAMESPACE", "default")
     project = project or os.getenv("SOLERA_PROJECT", "solera_server.demo:project")
     token = token or os.getenv("SOLERA_API_TOKEN")
+    pool_token = os.getenv("SOLERA_POOL_TOKEN")
+    engine_url = engine_url or os.getenv("SOLERA_ENGINE_URL")
 
     @asynccontextmanager
     async def lifespan(app):
@@ -65,6 +76,7 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
                 manifest,
                 project=project,
                 concurrency=int(os.getenv("SOLERA_CONCURRENCY", "4")),
+                engine_url=engine_url,
             )
             try:
                 await runtime.initialize()
@@ -86,12 +98,22 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
 
     web = Path(__file__).parent / "web"
 
+    def allowed(request: Request) -> bool:
+        presented = request.headers.get("Authorization", "").removeprefix("Bearer ")
+        if hmac.compare_digest(presented.encode(), token.encode()):
+            return True
+        path = request.url.path
+        if (match := ATTEMPT_ROUTE.match(path)) is not None:
+            secret = request.app.state.engine.secret
+            return secret is not None and lifecycle.valid(secret, match.group(1), presented)
+        if POOL_ROUTE.match(path) and pool_token:
+            return hmac.compare_digest(presented.encode(), pool_token.encode())
+        return False
+
     @app.middleware("http")
     async def authenticate(request: Request, call_next):
-        if request.url.path.startswith("/api/") and token:
-            authorization = request.headers.get("Authorization", "")
-            if not hmac.compare_digest(authorization.encode(), f"Bearer {token}".encode()):
-                return JSONResponse({"detail": "Authentication required"}, status_code=401)
+        if request.url.path.startswith("/api/") and token and not allowed(request):
+            return JSONResponse({"detail": "Authentication required"}, status_code=401)
         state = request.app.state.engine.state
         recorded = state.recorded
         response = await call_next(request)
@@ -132,6 +154,10 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
     @app.exception_handler(LostOwnership)
     async def fenced(request, error):
         return JSONResponse({"detail": str(error)}, status_code=409)
+
+    @app.exception_handler(Ended)
+    async def ended(request, error):
+        return JSONResponse({"detail": error.reason}, status_code=409)
 
     def engine_of(request: Request) -> Engine:
         return request.app.state.engine
@@ -449,32 +475,64 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
 
     # -- attempts (§8) --------------------------------------------------------------
 
-    async def _attempt(runtime, run_id: str, attempt: str) -> dict:
-        record = await runtime.state.attempt_record(run_id, attempt)
-        if record is None:
-            raise KeyError(f"{run_id}/{attempt}")
-        return record
-
     @app.get("/api/projects/{p}/runs/{run_id}/attempts/{attempt}/logs")
     async def attempt_logs(
         p: str, run_id: str, attempt: str, request: Request, tail: int | None = Query(None, ge=1)
     ):
         runtime = await project_engine(request, p)
+        live = runtime.attempt_lines(attempt)
+        if live is not None:  # still running: the lines it sent live
+            lines = live[-tail:] if tail else live
+            return Response("".join(lines).encode(), media_type="application/x-ndjson")
         data = await runtime.state.attempt_log(run_id, attempt, tail)
         return Response(data, media_type="application/x-ndjson")
 
     @app.get("/api/projects/{p}/runs/{run_id}/attempts/{attempt}/spec")
     async def attempt_spec(p: str, run_id: str, attempt: str, request: Request):
         runtime = await project_engine(request, p)
-        return (await _attempt(runtime, run_id, attempt))["spec"]
+        spec = await runtime.state.attempt_spec(run_id, attempt)
+        if spec is None:
+            raise KeyError(f"{run_id}/{attempt}")
+        return {k: v for k, v in spec.items() if k != "token"}
 
     @app.get("/api/projects/{p}/runs/{run_id}/attempts/{attempt}/result")
     async def attempt_result(p: str, run_id: str, attempt: str, request: Request):
         runtime = await project_engine(request, p)
-        record = await _attempt(runtime, run_id, attempt)
-        if "result" not in record:
+        result = await runtime.state.attempt_result(run_id, attempt)
+        if result is None:
             raise KeyError(f"{run_id}/{attempt}: no result yet")
-        return {**record["result"], "log": record.get("log")}
+        return result
+
+    # -- the worker channel (docs/lifecycle.md §5) ----------------------------------------
+
+    @app.post("/api/projects/{p}/attempts/{attempt}/start")
+    async def attempt_start(p: str, attempt: str, request: Request):
+        runtime = await project_engine(request, p)
+        return await runtime.attempt_start(attempt, await request.json())
+
+    @app.post("/api/projects/{p}/attempts/{attempt}/beat")
+    async def attempt_beat(p: str, attempt: str, request: Request):
+        runtime = await project_engine(request, p)
+        return await runtime.attempt_beat(attempt, await request.json())
+
+    @app.post("/api/projects/{p}/attempts/{attempt}/logs")
+    async def attempt_live_logs(p: str, attempt: str, request: Request):
+        runtime = await project_engine(request, p)
+        return await runtime.attempt_logs(attempt, await request.json())
+
+    @app.post("/api/projects/{p}/attempts/{attempt}/finished", status_code=204)
+    async def attempt_finished(p: str, attempt: str, request: Request):
+        runtime = await project_engine(request, p)
+        await runtime.attempt_finished(attempt, await request.json())
+        return Response(status_code=204)
+
+    @app.get("/api/projects/{p}/pools/{pool}/work")
+    async def pool_work(p: str, pool: str, request: Request, wait: float = Query(30, ge=0, le=30)):
+        runtime = await project_engine(request, p)
+        query = request.query_params
+        capacity = {k: float(query[k]) for k in ("cpu", "memory", "gpu") if k in query}
+        host = query.get("host") or (request.client.host if request.client else "worker")
+        return {"work": await runtime.pool_work(pool, capacity, host, wait)}
 
     # -- automations -------------------------------------------------------------
 
@@ -537,58 +595,7 @@ def create_app(*, state_url=None, namespace=None, project=None, token=None, inse
     @app.get("/api/projects/{p}/workers")
     async def workers(p: str, request: Request):
         runtime = await project_engine(request, p)
-        claimed = {
-            record["claimed_by"]: record["attempt"]
-            for record in runtime.m.pool.values()
-            if record["status"] == "claimed" and record["claimed_by"]
-        }
-        return {"workers": [{**w, "task": claimed.get(w["id"])} for w in runtime.m.workers.values()]}
-
-    # -- worker pull path (§10) -------------------------------------------------------
-
-    @app.post("/api/workers/register", status_code=201)
-    async def register_worker(request: Request):
-        body = await request.json()
-        worker_id = uuid.uuid4().hex
-        engine_of(request).register_worker(worker_id, body.get("pools") or [], body.get("capacity") or {})
-        return {"worker": worker_id}
-
-    @app.post("/api/tasks/claim")
-    async def claim_task(request: Request):
-        body = await request.json()
-        runtime = engine_of(request)
-        worker = runtime.m.workers.get(body["worker"])
-        if worker is None:
-            raise KeyError(body["worker"])
-        task = runtime.claim_pool_task(
-            body["worker"],
-            worker["pools"],
-            body.get("capacity") or {},
-            lease_seconds=float(body.get("lease_seconds") or 30),
-        )
-        if task is None:
-            return Response(status_code=204)
-        return {
-            "task": task["attempt"],
-            "stage": {"attempt": task["attempt"], "run": task["run"], "objects": runtime.state.objects_url},
-            "lease_seconds": 30,
-        }
-
-    @app.post("/api/tasks/{task_id:path}/renew")
-    async def renew_task(task_id: str, request: Request):
-        body = await request.json()
-        engine_of(request).heartbeat_pool_task(body["worker"], task_id, lease_seconds=30)
-        return {"ok": True}
-
-    @app.post("/api/tasks/{task_id:path}/complete")
-    async def complete_task(task_id: str, request: Request):
-        body = await request.json()
-        runtime = engine_of(request)
-        task = runtime.m.pool.get(task_id)
-        if task is None or task["claimed_by"] != body["worker"]:
-            raise Conflict(f"pool task {task_id} is not claimed by {body['worker']}")
-        runtime.release_pool_task(body["worker"], task_id)
-        return {"ok": True}
+        return {"workers": sorted(runtime.pollers.values(), key=lambda w: w["id"])}
 
     # -- console -----------------------------------------------------------------------
     # The SPA builds with base=/static/, so client routes like /static/assets

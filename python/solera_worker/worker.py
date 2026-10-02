@@ -15,24 +15,25 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
-import gzip
 import importlib
 import importlib.util
 import inspect
 import json
 import os
 import resource
+import secrets
 import socket
 import sys
-import threading
 import time
 import traceback
 import typing
 from pathlib import Path
 
 from obstore.exceptions import AlreadyExistsError
+from solera import lifecycle
 from solera.keys.index import DeltaFiles, FileInfo, IndexState, KeyIndex, key_bytes, key_str
 from solera.keys.io import ObjectIO, key_cache
+from solera.lifecycle import Cancel, Ended
 from solera.objects import create
 from solera.sdk import (
     UNSET,
@@ -56,6 +57,8 @@ from solera.stores import (
     resolve_env,
     store_key_rows,
 )
+
+from .reporting import LogShipper, Reporter
 
 
 def _load_module(path: Path):
@@ -113,16 +116,13 @@ async def _get(objects, key: str) -> bytes | None:
 
     try:
         result = await obstore.get_async(objects, key)
-    except NotFoundError:
+    except (NotFoundError, FileNotFoundError):  # the local store raises the latter
         return None
     return bytes(await result.bytes_async())
 
 
 class Aborted(Exception):
-    """The engine took the attempt's write fence first: it may write nothing."""
-
-
-ABORTED = 3  # the exit code of an aborted attempt
+    """The engine took the attempt's gate first: it may write nothing."""
 
 
 MAX_EVENTS = 1_000  # per attempt: past this, marks and lazy loads are not recorded
@@ -173,57 +173,6 @@ class Timeline:
             peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
             usage["peak_memory"] = peak if sys.platform == "darwin" else peak * 1024
         return {"events": list(self.events), "usage": usage}
-
-
-class Heartbeat:
-    """Proof of life for an engine with no handle on this worker (§8).
-
-    A thread rewrites `{attempt}.beat` every `interval` seconds — from a
-    thread, so a producer that blocks the event loop still beats — with the
-    timeline so far, and reads the write fence each time: once the engine
-    has aborted the attempt, `on_abort` runs. A worker that stops marks the
-    beat done, so the engine settles it without waiting for three missed
-    beats."""
-
-    def __init__(self, objects, base: str, interval: float, on_abort, timeline: Timeline):
-        self.objects, self.base, self.interval, self.on_abort = objects, base, interval, on_abort
-        self.timeline = timeline
-        self.aborted = False
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, name=f"beat {base}", daemon=True)
-
-    def start(self):
-        self._thread.start()
-
-    def _run(self):
-        import obstore
-        from obstore.exceptions import NotFoundError
-
-        n = 0
-        while True:
-            try:
-                beat = json.dumps({"at": time.time(), "n": n, **self.timeline.report()}).encode()
-                obstore.put(self.objects, f"{self.base}.beat", beat, use_multipart=False)
-                try:
-                    fence = json.loads(bytes(obstore.get(self.objects, f"{self.base}.writing").bytes()))
-                except NotFoundError:
-                    fence = None
-                if fence is not None and fence["state"] == "aborted":
-                    self.aborted = True
-                    self.on_abort()
-                    return
-            except Exception:
-                pass  # a missed beat: only three in a row make the worker dead
-            n += 1
-            if self._stop.wait(self.interval):
-                return
-
-    async def stop(self):
-        self._stop.set()
-        await asyncio.to_thread(self._thread.join)
-        with contextlib.suppress(Exception):
-            beat = {"done": True, **self.timeline.report()}
-            await _put(self.objects, f"{self.base}.beat", json.dumps(beat).encode())
 
 
 class Ctx:
@@ -314,90 +263,6 @@ class Ctx:
         return out
 
 
-LOG_FLUSH_SECONDS = 2.0
-LOG_FLUSH_BYTES = 256 * 1024
-LOG_CAP = 100 * 2**20  # compressed bytes per attempt
-
-
-class LogShipper:
-    """`ctx.log` lines as gzip-compressed JSON lines (docs/object-store-state.md §8).
-
-    While the attempt runs, each flush — every 2 s or 256 KB — writes one
-    gzip member as `{attempt}.log.{n}`, so the console can tail it. At the
-    end the members are joined into `{attempt}.log` (concatenated gzip
-    members are one valid gzip file) and the chunks deleted; `index()` lists
-    `[byte offset, lines, first timestamp]` per member for range reads. Past
-    `LOG_CAP` a truncation marker is written and shipping stops."""
-
-    def __init__(self, objects, base: str):
-        self.objects, self.base = objects, base
-        self.pending: list[tuple[float, str]] = []
-        self.pending_bytes = 0
-        self.members: list[bytes] = []
-        self.blocks: list[list] = []
-        self.size = self.lines = 0
-        self.truncated = False
-        self._lock = asyncio.Lock()
-
-    def append(self, entry):
-        if self.truncated:
-            return
-        line = json.dumps(entry, allow_nan=False) + "\n"
-        self.pending.append((entry["at"], line))
-        self.pending_bytes += len(line)
-        if self.pending_bytes >= LOG_FLUSH_BYTES:
-            try:
-                asyncio.get_running_loop().create_task(self.flush())
-            except RuntimeError:
-                pass  # logging from a thread: the next periodic flush ships it
-
-    async def flush(self):
-        async with self._lock:
-            if not self.pending or self.truncated:
-                return
-            lines, self.pending, self.pending_bytes = self.pending, [], 0
-            member = gzip.compress("".join(line for _, line in lines).encode(), compresslevel=6, mtime=0)
-            if self.size + len(member) > LOG_CAP:
-                self.truncated = True
-                marker = {
-                    "at": lines[0][0],
-                    "level": "warning",
-                    "message": f"log truncated: the attempt's log reached {LOG_CAP} bytes",
-                    "fields": {},
-                }
-                lines = [(marker["at"], json.dumps(marker) + "\n")]
-                member = gzip.compress(lines[0][1].encode(), mtime=0)
-            await _put(self.objects, f"{self.base}.log.{len(self.members):06d}", member)
-            self.blocks.append([self.size, len(lines), lines[0][0]])
-            self.members.append(member)
-            self.size += len(member)
-            self.lines += len(lines)
-
-    async def periodically(self):
-        while True:
-            await asyncio.sleep(LOG_FLUSH_SECONDS)
-            await self.flush()
-
-    async def finish(self) -> dict | None:
-        """Join the chunks into the attempt's log; returns its index — or
-        `None` if the log could not be joined: then its chunks stay, and are
-        what the console reads. The log never changes an attempt's outcome."""
-
-        import obstore
-
-        try:
-            await self.flush()
-            if self.members:
-                await _put(self.objects, f"{self.base}.log", b"".join(self.members))
-        except Exception:
-            return None
-        with contextlib.suppress(Exception):
-            await obstore.delete_async(
-                self.objects, [f"{self.base}.log.{n:06d}" for n in range(len(self.members))]
-            )
-        return {"blocks": self.blocks, "lines": self.lines, "bytes": self.size, "truncated": self.truncated}
-
-
 async def _resolve_inputs(spec, project, asset, keys_io, timeline):
     """Load each pin by annotation; build call args + ctx.changes (§5, §10).
 
@@ -485,7 +350,7 @@ def _dict_inner(t):
     return None
 
 
-async def _store_outputs(spec, project, asset, objects, keys_io, result_value, fence, timeline):
+async def _store_outputs(spec, project, asset, objects, keys_io, result_value, fence, writes, timeline):
     """Store each returned output (§4, §6, §8, §9), in two phases.
 
     Planning compares each keyed output's write with its key index as pinned
@@ -593,7 +458,8 @@ async def _store_outputs(spec, project, asset, objects, keys_io, result_value, f
             plan["elements"] = sorted(elements)
 
     try:
-        await fence(intents)
+        if plans:  # the gate is taken only by a worker about to write (docs/lifecycle.md §2.4)
+            await fence(intents)
     except Aborted:
         # The engine has discarded this attempt's delta files; these came after.
         import obstore
@@ -621,7 +487,7 @@ async def _store_outputs(spec, project, asset, objects, keys_io, result_value, f
                     f"{output.name}: store {store_name!r} has no migrate for declared migrations"
                 )
             try:
-                applied = await migrate(output, output.migrations)
+                applied = await writes.call(migrate(output, output.migrations))
             except StoreError:
                 raise
             except Exception as error:
@@ -636,7 +502,7 @@ async def _store_outputs(spec, project, asset, objects, keys_io, result_value, f
             upserts=plan.get("upserts"),
             removes=plan.get("removes"),
         )
-        written = await store.store(value, prior, scope)
+        written = await writes.call(store.store(value, prior, scope))
         entry = {}
         if "index" in plan and isinstance(value, Sql):
             if written.keys is None:
@@ -722,52 +588,150 @@ def _key_io(objects, objects_url: str, project: Project) -> ObjectIO:
     return ObjectIO(objects, cache=key_cache(project.manifest.get("key_cache"), objects_url))
 
 
+class Writes:
+    """Write-completion evidence (docs/lifecycle.md §2.3): `none` until a
+    store call starts; `uncertain` while one runs, or if one raised or was
+    abandoned; `complete` once every call made has returned."""
+
+    def __init__(self):
+        self.state = lifecycle.NONE
+
+    async def call(self, work):
+        self.state = lifecycle.UNCERTAIN
+        result = await work
+        self.state = lifecycle.COMPLETE
+        return result
+
+
+class _Stop(Exception):
+    """A cancel was requested before the gate: stop, writing nothing."""
+
+
+ENDED = ABORTED = 3  # the exit code of an attempt the engine ended: no result was published
+LOSER_POLL = 30.0  # how often an invocation that lost the claim looks for the owner's result
+
+
 async def run_attempt(
     objects_url: str,
     attempt: str,
     entrypoint: str | Project,
     *,
     run: str,
-    on_abort=None,
-    own_process=False,
-):
-    """Run one attempt. The engine created `runs/{run}/{attempt}.json` holding
-    the spec; the harness rewrites it once, at the end, with the spec, the
-    result and the log index (docs/object-store-state.md §8).
+    channel=None,
+    engine_url: str | None = None,
+    pool: bool = False,
+    own_process: bool = False,
+    loser_poll: float = LOSER_POLL,
+) -> int:
+    """Run one attempt (docs/lifecycle.md §3): read its spec, claim it, run
+    it, seal its result.
 
-    Returns 0 on success, 1 on failure, and 3 if the engine aborted the
-    attempt: then nothing was written. Raises if the result could not be
-    published. Once aborted, `on_abort` runs — from
-    the heartbeat thread; by default the attempt's work is canceled.
+    The claim is the first write: an invocation that loses it touches
+    nothing and, unless it is a pool worker (`pool`), waits for the owner's
+    result before exiting, so its exit never reads as the attempt's. The
+    engine is reached through `channel`, or over HTTPS at `engine_url` (else
+    the spec's); without one, the worker reports through `.worker` alone.
+
+    Returns 0 once a result is published (succeeded or canceled), 1 for a
+    failed result, and 3 when the engine ended the attempt first: then no
+    result is published. Raises if the result could not be published.
     `own_process` says the process runs this attempt alone: its peak memory
-    is the attempt's."""
+    is the attempt's, and a forced cancel exits it at once."""
 
     timeline = Timeline(own_process)
     timeline.add("booted", socket.gethostname())
     objects = _objects(objects_url)
-    base = f"runs/{run}/{attempt}"
-    record = await _get(objects, f"{base}.json")
-    if record is None:
-        raise StoreError(f"No attempt file at {base}.json")
-    spec = json.loads(record)["spec"]
-    loop = asyncio.get_running_loop()
-    work = asyncio.create_task(_attempt(objects, objects_url, base, spec, entrypoint, timeline))
-    beat = Heartbeat(
-        objects,
-        base,
-        spec.get("heartbeat", 30),
-        on_abort or (lambda: loop.call_soon_threadsafe(work.cancel)),
-        timeline,
-    )
-    beat.start()
+    base = lifecycle.base(run, attempt)
+    data = await _get(objects, f"{base}{lifecycle.SPEC}")
+    if data is None:
+        raise StoreError(f"No spec at {base}{lifecycle.SPEC}")
+    spec = json.loads(data)
+    invocation = secrets.token_hex(8)
+    claim = {"invocation": invocation, "host": socket.gethostname(), "pid": os.getpid(), "at": time.time()}
     try:
-        return await work
+        await create(objects, f"{base}{lifecycle.WORKER}", json.dumps(claim).encode())
+    except AlreadyExistsError:
+        if not pool:
+            await _await_owner(objects, base, loser_poll)
+        return 0
+    if channel is None and (engine_url or spec.get("engine")):
+        from .channel import HttpChannel
+
+        channel = HttpChannel(engine_url or spec["engine"], spec["project"], attempt, spec["token"])
+    loop = asyncio.get_running_loop()
+    control = {"cancel": None, "writing": False, "stopped": False, "forced": False}
+
+    def on_cancel(record: Cancel):
+        control["cancel"] = record
+        if record.phase == "forced":
+            on_ended()
+        elif not control["writing"] and not control["stopped"]:
+            control["stopped"] = True  # requested: stop computing; a writer drains instead
+            loop.call_soon_threadsafe(execution.cancel)
+
+    def on_ended():
+        control["forced"] = True
+        if own_process:
+            os._exit(ENDED)  # an engine that ended this attempt takes no result from it
+        loop.call_soon_threadsafe(execution.cancel)
+
+    if channel is not None:
+        try:
+            answer = await channel.start({**claim})
+            started = Cancel.from_json(answer.get("cancel"))
+        except Ended:
+            return ENDED
+        except Exception:
+            started = None  # unreachable for now: the reporter falls back to `.worker`
+    else:
+        started = None
+    shipper = LogShipper(objects, base, channel, invocation)
+    writes = Writes()
+    execution = asyncio.create_task(
+        _execute(objects, objects_url, base, spec, entrypoint, timeline, shipper, writes, invocation, control)
+    )
+    reporter = Reporter(
+        objects, base, invocation, channel, spec.get("heartbeat", 10), timeline, on_cancel, on_ended
+    )
+    if started is not None:
+        reporter.cancel = started
+        on_cancel(started)
+    reporter.start()
+    flusher = asyncio.create_task(shipper.periodically())
+    try:
+        try:
+            result = await execution
+        except (asyncio.CancelledError, _Stop):
+            if control["forced"] or not control["stopped"]:
+                raise
+            result = {"status": "canceled"}  # requested before the gate: nothing written
+        if result is None or control["forced"]:
+            return ENDED
+        await _publish(objects, base, spec, result, invocation, writes, control["cancel"], timeline, shipper)
+        flusher.cancel()
+        if channel is not None:
+            with contextlib.suppress(Exception):
+                await channel.finished({"invocation": invocation})
+        return 1 if result["status"] == "failed" else 0
     except asyncio.CancelledError:
-        if not beat.aborted:
-            raise
-        return ABORTED
+        if control["forced"] and not asyncio.current_task().cancelling():
+            return ENDED
+        raise
     finally:
-        await beat.stop()
+        flusher.cancel()
+        await reporter.stop()
+        if channel is not None:
+            channel.close()
+
+
+async def _await_owner(objects, base: str, poll: float) -> None:
+    """A losing invocation: wait until the owner's result exists, or the
+    attempt's objects are gone, before exiting."""
+
+    while await _get(objects, f"{base}{lifecycle.SPEC}") is not None:
+        if await _get(objects, f"{base}{lifecycle.RESULT}") is not None:
+            return
+        await asyncio.sleep(poll)
 
 
 def _failed(error: BaseException, retryable: bool) -> dict:
@@ -785,56 +749,55 @@ def _failed(error: BaseException, retryable: bool) -> dict:
 PUBLISH_TRIES = 6
 
 
-async def _attempt(objects, objects_url: str, base: str, spec: dict, entrypoint, timeline: Timeline) -> int:
-    """Execute, then publish. The outcome is settled before anything is
-    published, and sealed into bytes once: publishing retries exactly those
-    bytes, and a failure to publish never changes what is published. A
-    worker that cannot publish exits without a result, which the engine
-    treats as a worker that died."""
+async def _publish(objects, base, spec, result, invocation, writes, cancel, timeline, shipper) -> None:
+    """Seal the result once and create `.result` with exactly those bytes,
+    retried as they are: a failure to publish never changes what is
+    published. A worker that cannot publish raises, and the engine treats
+    it as a worker that died."""
 
-    shipper = LogShipper(objects, base)
-    flusher = asyncio.create_task(shipper.periodically())
-    try:
-        result = await _execute(objects, objects_url, base, spec, entrypoint, timeline, shipper)
-    finally:
-        flusher.cancel()
-    if result is None:
-        return ABORTED  # the engine has finished this attempt: write nothing, not even a result
     log = await shipper.finish()
     timeline.add("finished")
 
     def seal(result: dict) -> bytes:
-        body = {"spec": spec, "result": {**result, **timeline.report()}, "log": log}
+        body = {"invocation": invocation, **result, "writes": writes.state, **timeline.report(), "log": log}
+        if cancel is not None:
+            body["cancel"] = cancel.to_json()
         return json.dumps(body, allow_nan=False).encode()
 
     try:
         data = seal(result)
     except (TypeError, ValueError) as error:  # the result cannot be told as it is
-        result = _failed(error, True)
-        data = seal(result)
+        data = seal(_failed(error, True))
     for attempt in range(PUBLISH_TRIES):
         try:
-            await _put(objects, f"{base}.json", data)
-            break
+            await create(objects, f"{base}{lifecycle.RESULT}", data)
+            return
+        except AlreadyExistsError:
+            raise  # only the claim's owner writes it: someone else's bytes are a bug
         except Exception:
             if attempt == PUBLISH_TRIES - 1:
                 raise
             await asyncio.sleep(0.2 * 2**attempt)
-    return 0 if result["status"] == "succeeded" else 1
 
 
-async def _execute(objects, objects_url, base, spec, entrypoint, timeline, shipper) -> dict | None:
-    """Run the attempt: its result, or `None` once the engine aborted it."""
+async def _execute(
+    objects, objects_url, base, spec, entrypoint, timeline, shipper, writes, invocation, control
+) -> dict | None:
+    """Run the attempt: its result, or `None` once the engine ended it."""
 
     async def fence(intents: dict):
-        """Take the write fence (§8), or learn that the engine aborted us. A
-        fence holding our own bytes is ours: a try that landed unheard."""
+        """Take the gate (docs/lifecycle.md §2.4) before the first store
+        write — unless a cancel was requested: then stop, writing nothing.
+        A gate already there means the engine ended this attempt."""
 
-        body = json.dumps({"state": "writing", "intents": intents}).encode()
+        if control["stopped"]:
+            raise _Stop()
+        body = lifecycle.gate(lifecycle.WRITING, invocation, intents)
         try:
-            await create(objects, f"{base}.writing", body)
+            await create(objects, f"{base}{lifecycle.GATE}", body)
         except AlreadyExistsError:
             raise Aborted(spec["attempt"]) from None
+        control["writing"] = True
         timeline.add("writing")
 
     try:
@@ -864,7 +827,9 @@ async def _execute(objects, objects_url, base, spec, entrypoint, timeline, shipp
             value = await value
         timeline.add("computed")
         metadata = ctx._recorded(value)
-        outputs, cursor = await _store_outputs(spec, project, asset, objects, keys_io, value, fence, timeline)
+        outputs, cursor = await _store_outputs(
+            spec, project, asset, objects, keys_io, value, fence, writes, timeline
+        )
         for name, values in metadata.items():
             if values and "ref" in outputs.get(name, {}):
                 outputs[name]["metadata"] = values
@@ -874,67 +839,60 @@ async def _execute(objects, objects_url, base, spec, entrypoint, timeline, shipp
         return result
     except Aborted:
         return None
+    except _Stop:
+        raise
     except StoreError as error:
         return _failed(error, getattr(error, "retryable", False))
     except Exception as error:
         return _failed(error, True)
 
 
-async def run_pool(pool: str, server: str, token: str | None = None):
-    """Pull path: register, claim, run the stage, complete (§10)."""
+async def run_pool(pool: str, server: str, token: str | None = None, *, project: str | None = None):
+    """Pull path (docs/lifecycle.md §10): ask the engine which attempts wait
+    on this pool, claim one by creating its `.worker`, run it, repeat. The
+    claim decides between workers; discovery is only a hint."""
 
     import httpx
 
     headers = {"Authorization": f"Bearer {token}"} if token else {}
-    async with httpx.AsyncClient(base_url=server, headers=headers, timeout=30) as client:
-        capacity = {"cpu": os.cpu_count(), "memory": None, "gpu": None}
-        registered = (
-            await client.post(
-                "/api/workers/register",
-                json={"pools": [pool], "capacity": capacity},
-            )
-        ).json()
-        worker_id = registered["worker"]
-        print(f"[pool] worker {worker_id} registered in pool {pool!r}", flush=True)
+    capacity = {"cpu": os.cpu_count(), "memory": None, "gpu": None}
+    host = f"{socket.gethostname()}:{os.getpid()}"
+    async with httpx.AsyncClient(base_url=server, headers=headers, timeout=60) as client:
+        while project is None:
+            try:
+                response = await client.get("/api/diagnostics")
+                response.raise_for_status()
+                project = response.json()["project"]
+            except httpx.HTTPError:
+                await asyncio.sleep(1.0)
+        print(f"[pool] {host} polls pool {pool!r}", flush=True)
         while True:
             try:
-                response = await client.post(
-                    "/api/tasks/claim", json={"worker": worker_id, "capacity": capacity}
+                response = await client.get(
+                    f"/api/projects/{project}/pools/{pool}/work",
+                    params={"wait": 30, "host": host, **{k: v for k, v in capacity.items() if v is not None}},
                 )
+                response.raise_for_status()
+                stages = response.json()["work"]
             except httpx.HTTPError:
-                # The server may be briefly unreachable (engine tick pressure,
-                # restart) — a pool worker polls forever rather than dying.
+                # The server may be briefly unreachable (a restart): a pool worker polls on.
                 await asyncio.sleep(1.0)
                 continue
-            if response.status_code == 204:
-                await asyncio.sleep(1.0)
-                continue
-            response.raise_for_status()
-            claim = response.json()
-            task_id, stage = claim["task"], claim["stage"]
-            print(f"[pool] claimed {task_id}", flush=True)
-            lease = float(claim.get("lease_seconds", 30))
-
-            async def renew(lease=lease, task_id=task_id):
-                while True:
-                    await asyncio.sleep(max(lease / 3, 1.0))
-                    try:
-                        await client.post(f"/api/tasks/{task_id}/renew", json={"worker": worker_id})
-                    except Exception:
-                        return
-
-            renewal = asyncio.create_task(renew())
-            try:
+            for stage in stages:
                 try:
-                    await run_attempt(
-                        stage["objects"], stage["attempt"], os.environ["SOLERA_PROJECT"], run=stage["run"]
+                    code = await run_attempt(
+                        stage["objects"],
+                        stage["attempt"],
+                        os.environ["SOLERA_PROJECT"],
+                        run=stage["run"],
+                        engine_url=server,
+                        pool=True,
                     )
                 except Exception:  # it could not publish: the engine treats it as dead
                     traceback.print_exc()
-                await client.post(f"/api/tasks/{task_id}/complete", json={"worker": worker_id})
-                print(f"[pool] completed {task_id}", flush=True)
-            finally:
-                renewal.cancel()
+                    continue
+                print(f"[pool] {stage['attempt']} exited {code}", flush=True)
+                break  # ask again: what waits has changed
 
 
 async def main():
@@ -956,7 +914,6 @@ async def main():
             options["--attempt"],
             os.environ["SOLERA_PROJECT"],
             run=options["--run"],
-            on_abort=lambda: os._exit(ABORTED),  # an aborted process stops at once
             own_process=True,
         )
         raise SystemExit(code)

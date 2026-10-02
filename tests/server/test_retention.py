@@ -52,7 +52,10 @@ async def history_ids(engine) -> list[str]:
 
 
 async def run_dirs(state) -> set[str]:
-    return {p.split("/")[1] for p in await state.list_objects("runs/")}
+    """Runs whose objects are there; a deleted run leaves only its gates
+    (docs/lifecycle.md §2.4)."""
+
+    return {p.split("/")[1] for p in await state.list_objects("runs/") if not p.endswith(".writing")}
 
 
 async def run(engine, targets, **kw):
@@ -234,3 +237,29 @@ async def test_a_run_reopened_while_chosen_for_deletion_is_kept(state, clock):
     assert second in state.model.runs and second in await run_dirs(state)
     assert state.model.retired == []
     await engine.stop()
+
+
+async def test_a_deleted_runs_gates_outlive_it(state, clock):
+    """docs/lifecycle.md §2.4: deleting a run keeps its gates, so a worker
+    that resumes after its run is gone cannot take its gate and write.
+    They go `gate_days` after the run."""
+
+    from obstore.exceptions import AlreadyExistsError
+    from solera import lifecycle
+
+    engine = engine_for(state, PLAIN, clock)
+    await engine.initialize()
+    gone = await run(engine, ["plain"])
+    await engine.history.lake.flush(force=True)
+    await engine.delete_run(gone)
+    left = await state.list_objects(f"runs/{gone}/")
+    assert left and all(p.endswith(".writing") for p in left)
+    with pytest.raises(AlreadyExistsError):  # what a resumed worker's gate create meets
+        await state.create_object(left[0], lifecycle.gate("writing", "late", {}))
+    clock.now += 29 * 86400
+    await engine.upkeep.sweep()
+    assert await state.list_objects(f"runs/{gone}/") == left
+    clock.now += 2 * 86400
+    await engine.upkeep.sweep()
+    assert await state.list_objects(f"runs/{gone}/") == []
+    assert await state.list_objects("control/gates/") == []

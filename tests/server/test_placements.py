@@ -1,5 +1,5 @@
-"""§10 placements: the pool pull path (claim fit, renew, complete, a lost
-worker, cancel) and the remote kinds against stubbed SDK clients."""
+"""§10 placements: the pool pull path (discovery, claims, a dead claim,
+cancel) and the remote kinds against stubbed SDK clients."""
 
 import asyncio
 import json
@@ -13,8 +13,7 @@ from solera.executors import Pool
 from solera.sdk import Project, Retry, asset
 from solera_server.engine import Engine
 from solera_server.placements import PlacementContext
-from solera_server.placements.pool import PoolPlacement
-from solera_server.state import LostOwnership, State
+from solera_server.state import State
 from solera_worker.worker import run_attempt
 
 
@@ -30,107 +29,133 @@ def make_engine(state, project, placements=None, **kw):
     return Engine(state, project.manifest, placements=placements or {}, clock=state.clock, **kw)
 
 
-async def test_pool_task_lifecycle(state):
-    """§10: a Pool-placed task is claimable; a fitting worker claims, renews,
-    runs the harness, completes; the engine commits the result."""
+async def pool_attempt(engine, state, count=1):
+    """Wait for `count` pool attempts to be launched and discoverable."""
+
+    for _ in range(200):
+        await engine.tick()
+        if len(state.model.pool) >= count:
+            return sorted(state.model.pool, key=lambda a: state.model.pool[a]["created_at"])
+        await asyncio.sleep(0.02)
+    raise AssertionError("no pool attempt")
+
+
+async def test_pool_workers_race_for_a_claim(state):
+    """docs/lifecycle.md §10: discovery offers a launched pool attempt to the
+    workers it fits; they race for its claim. The winner runs it and the
+    engine commits it; the loser writes nothing and goes back to polling."""
+
+    from solera_worker.channel import LocalChannel
 
     @asset(executor=Pool("ingest")(cpu=2))
     def job():
         return [{"ok": True}]
 
     project = Project(assets=[job])
-    engine = make_engine(state, project, heartbeat_seconds=30)
+    engine = make_engine(state, project, heartbeat_seconds=0.3)
     await engine.initialize()
     run = await engine.submit(["job"])
-    await engine.tick()  # dispatch: stage the pool task, wait for a claim
-    await asyncio.sleep(0.1)
+    [attempt] = await pool_attempt(engine, state)
+    assert state.model.pool[attempt]["needs"] == {"cpu": 2}
+    assert await engine.pool_work("ingest", {"cpu": 1}, "w-small", 0) == []  # does not fit
+    [stage] = await engine.pool_work("ingest", {"cpu": 4}, "w1", 0)
+    assert [s["attempt"] for s in await engine.pool_work("ingest", {"cpu": 4}, "w2", 0)] == [attempt]
 
-    [attempt] = state.model.pool
-    record = state.model.pool[attempt]
-    assert record["status"] == "queued" and record["needs"] == {"cpu": 2}
-    assert record["task"] == f"{run['id']}/job:"
+    async def worker():
+        channel = LocalChannel(engine, attempt)
+        return await run_attempt(
+            stage["objects"], attempt, project, run=stage["run"], channel=channel, pool=True
+        )
 
-    # a worker that doesn't fit never sees the task
-    assert engine.claim_pool_task("w-small", ["ingest"], {"cpu": 1}, lease_seconds=30) is None
-    claimed = engine.claim_pool_task("w1", ["ingest"], {"cpu": 4}, lease_seconds=30)
-    assert claimed["attempt"] == attempt and claimed["status"] == "claimed"
-    # the claim is durable: a restarted engine never offers the task again
-    assert state.model.task(record["task"])["launched"]["worker"] == "w1"
-
-    # renew extends the claim; a second worker can't steal it
-    engine.heartbeat_pool_task("w1", attempt, lease_seconds=30)
-    assert engine.claim_pool_task("w2", ["ingest"], {"cpu": 4}, lease_seconds=30) is None
-
-    # the worker runs the stage and completes; the engine's wait sees the result
-    code = await run_attempt(state.objects_url, attempt, project, run=record["run"])
-    assert code == 0
-    engine.release_pool_task("w1", attempt)
+    codes = await asyncio.gather(worker(), worker())
+    assert sorted(codes) == [0, 0]
     detail = await engine.run_until(run["id"], 10)
     assert detail["request"]["status"] == "succeeded"
-    assert detail["tasks"][0]["status"] == "succeeded"
+    assert await engine.pool_work("ingest", {"cpu": 4}, "w1", 0) == []  # ended: no longer offered
 
 
-async def test_a_lost_pool_worker_fails_its_attempt_and_the_retry_goes_to_another(state):
-    """§10: a worker whose lease expires is lost. Its attempt is aborted and
-    fails retryably; the retry is a new attempt, which another worker claims,
-    and the lost worker's renew and complete are rejected."""
+async def test_a_dead_pool_claim_expires_into_a_new_attempt(state):
+    """A worker claims, then dies before it says anything. The engine finds
+    the claim, waits for a report, and ends the attempt lost; its writes are
+    classified from its gate, never from progress (§2.3): the engine's
+    `aborted` create wins, so `none`. The retry is a new attempt id, which
+    another worker can claim — never the old claim with a new owner."""
 
     @asset(executor=Pool("ingest")(), retries=Retry(1, delay=0))
     def job():
         return [{"ok": True}]
 
     project = Project(assets=[job])
-    engine = make_engine(state, project, heartbeat_seconds=30)
+    engine = make_engine(state, project, heartbeat_seconds=0.1, pool_offered_grace=0.1)
     await engine.initialize()
     run = await engine.submit(["job"])
-    await engine.tick()
-    await asyncio.sleep(0.1)
-    [first] = state.model.pool
-    assert (engine.claim_pool_task("w1", ["ingest"], {}, lease_seconds=0.2))["claimed_by"] == "w1"
-    for _ in range(40):
+    [first] = await pool_attempt(engine, state)
+    await engine.pool_work("ingest", {}, "w1", 0)
+    base = state.attempt_path(run["id"], first)
+    await state.create_object(f"{base}.worker", json.dumps({"invocation": "dead"}).encode())
+    for _ in range(200):
         await engine.tick()
-        await asyncio.sleep(0.05)
-        if state.model.pool and first not in state.model.pool:
+        await asyncio.sleep(0.02)
+        if first not in state.model.pool and state.model.pool:
             break
     [second] = state.model.pool
+    assert second != first
     task = state.model.task(state.model.pool[second]["task"])
-    assert task["attempts"][0]["id"] == first and task["attempts"][0]["outcome"] == "failed"
-    assert (
-        json.loads(await state.get_object(f"{state.attempt_path(run['id'], first)}.writing"))["state"]
-        == "aborted"
-    )
-    assert (engine.claim_pool_task("w2", ["ingest"], {}, lease_seconds=30))["attempt"] == second
-    with pytest.raises(LostOwnership):
-        engine.heartbeat_pool_task("w1", first, lease_seconds=30)
-    engine.release_pool_task("w1", second)  # no-op: w1 doesn't own it
-    assert state.model.pool[second]["claimed_by"] == "w2"
+    ended = task["attempts"][0]
+    assert ended["id"] == first and ended["outcome"] == "failed"
+    assert json.loads(await state.get_object(f"{base}.writing")) == {"state": "aborted"}
+    assert [s["attempt"] for s in await engine.pool_work("ingest", {}, "w2", 0)] == [second]
 
 
-async def test_pool_cancel_stops_renewal(state):
-    """§10: cancel withdraws the claimable task; a claimed worker's next renew
-    fails with LostOwnership and it stops."""
-    placement = PoolPlacement(PlacementContext(state, state.objects_url, "", state.clock), "ingest")
-    record = {
-        "attempt": "t/1",
-        "task": "t",
-        "run": "r",
-        "asset": "a",
-        "scope": "",
-        "pool": "ingest",
-        "needs": {},
-        "spec": {},
-        "prepared": {},
-        "status": "claimed",
-        "claimed_by": "w1",
-        "lease_until": state.clock() + 60,
-        "created_at": 0,
-    }
-    engine = make_engine(state, Project(assets=[]))
-    state.model.pool["t/1"] = record
-    await placement.cancel({"task": "t/1"})
-    assert "t/1" not in state.model.pool
-    with pytest.raises(LostOwnership):
-        engine.heartbeat_pool_task("w1", "t/1", lease_seconds=30)
+async def test_a_dead_pool_claim_that_took_its_gate_is_uncertain(state):
+    """The claimant took its gate and entered a store call before it could
+    report again: the engine finds `writing`, so the writes are uncertain
+    and the intents stay unsettled — whatever `.worker` showed."""
+
+    from solera import lifecycle
+
+    @asset(executor=Pool("ingest")(), retries=Retry(0))
+    def job():
+        return [{"ok": True}]
+
+    project = Project(assets=[job])
+    engine = make_engine(state, project, heartbeat_seconds=0.1, pool_offered_grace=0.1)
+    await engine.initialize()
+    run = await engine.submit(["job"])
+    [first] = await pool_attempt(engine, state)
+    await engine.pool_work("ingest", {}, "w1", 0)
+    base = state.attempt_path(run["id"], first)
+    await state.create_object(f"{base}.worker", json.dumps({"invocation": "dead"}).encode())
+    intents = {"job": {"files": [], "added": 0, "removed": 0, "exact": True}}
+    await state.create_object(f"{base}.writing", lifecycle.gate("writing", "dead", intents))
+    detail = await engine.run_until(run["id"], 10)
+    assert detail["request"]["status"] == "failed"
+    assert state.model.unsettled[("job", "")][0]["attempt"] == first
+
+
+async def test_a_pool_attempt_canceled_before_its_claim_is_withdrawn(state):
+    """A cancel before any worker claimed the attempt ends it at once: no
+    worker can hear a request, so it is forced, and discovery stops
+    offering it."""
+
+    @asset(executor=Pool("ingest")())
+    def job():
+        return [{"ok": True}]
+
+    project = Project(assets=[job])
+    engine = make_engine(state, project, heartbeat_seconds=0.3)
+    await engine.initialize()
+    run = await engine.submit(["job"])
+    [attempt] = await pool_attempt(engine, state)
+    await engine.cancel(run["id"])
+    for _ in range(100):
+        await engine.tick()
+        await asyncio.sleep(0.02)
+        if not state.model.pool:
+            break
+    assert await engine.pool_work("ingest", {}, "w1", 0) == []
+    gate = json.loads(await state.get_object(f"{state.attempt_path(run['id'], attempt)}.writing"))
+    assert gate == {"state": "aborted"}
 
 
 # -- remote placements against stubbed SDKs ---------------------------------------

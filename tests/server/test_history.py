@@ -164,10 +164,11 @@ async def test_a_run_reads_the_same_once_archived(state, clock):
     details = {}
     record = state.record
 
-    def spy(e):  # the run's detail just before it moves into the history
-        if e["type"] == "RunArchived":
-            details[e["run"]] = engine._detail(state.model.runs[e["run"]], live=True)
-        record(e)
+    def spy(*events, **kw):  # the run's detail just before it moves into the history
+        for e in events:
+            if e["type"] == "RunArchived":
+                details[e["run"]] = engine._detail(state.model.runs[e["run"]], live=True)
+        record(*events, **kw)
 
     state.record = spy
     failed = await run(engine, clock, ["revenue"], upstream=True, config={"fail": True}, tags={"env": "prod"})

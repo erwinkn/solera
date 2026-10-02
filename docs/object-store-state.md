@@ -42,11 +42,12 @@ Everything lives under `{root}/{namespace}/`.
 | Checkpoint | `control/checkpoints/{seq:020d}.json` | engine | create-only | two newer checkpoints exist |
 | Key index file | `keys/{output}/{scope}/{name}.kx` | harness (delta files), compaction | create-only | no longer in the index and no consumer needs it (§6) |
 | History file | `history/{table}/{ulid}.parquet` | engine | create-only | merged into a bigger file, or rewritten without deleted runs (§7) |
-| Attempt file | `runs/{run}/{attempt}.json` | engine creates it with the spec; the harness overwrites it with spec + result + log index | two writes, one writer each | with its run |
-| Write fence | `runs/{run}/{attempt}.writing` | the harness before it writes, or the engine before it ends the attempt — whichever is first | create-only | with its run |
-| Heartbeat | `runs/{run}/{attempt}.beat` | harness, every 30 s | overwritten | with its run |
+| Spec | `runs/{run}/{attempt}.spec` | engine, before `AttemptLaunched` | create-only, immutable | with its run |
+| Claim | `runs/{run}/{attempt}.worker` | the invocation that claims the attempt; then its reports while its channel fails | created once, then overwritten by its owner only | with its run |
+| Result | `runs/{run}/{attempt}.result` | the claim's owner, once | create-only, immutable, sealed bytes | with its run |
+| Gate | `runs/{run}/{attempt}.writing` | the worker about to write, or the engine ending the attempt — whichever is first | create-only | `gate_days` (30) after its run (§8) |
 | Engine heartbeat | `engine/alive.json` | engine, every 30 s while runs are live | overwritten | never (one object) |
-| Attempt log | `runs/{run}/{attempt}.log` (chunks `{attempt}.log.{n:06d}` while running) | harness | chunks write-once; joined at the end | with its run |
+| Attempt log | chunks `runs/{run}/{attempt}.log.{n:06d}`, every 30 s or 1 MB; the end inside the result | worker | create-only, never joined | with its run |
 | Output data | store-defined (FileStore: `{output}/{partition}/{key}.json` under `.solera/data`, §9) | the store, inside the harness | overwritten in place | when the output no longer holds it (§9); never expired |
 
 **Growth.** `control/` is bounded: at most two checkpoints plus the
@@ -75,10 +76,11 @@ current content.
     runs/01J9C7….parquet                     ← one flush
     tasks/…  attempts/…  materializations/…  lineage/…
   runs/
-    01J8ZB3K…/01J8ZB3M….json                 ← attempt: spec, then spec + result
-    01J8ZB3K…/01J8ZB3M….log                  ← gzip blocks
-    01J8ZB3K…/01J8ZB3M….writing              ← write fence
-    01J8ZB3K…/01J8ZB3M….beat                 ← heartbeat
+    01J8ZB3K…/01J8ZB3M….spec                 ← what to run, immutable
+    01J8ZB3K…/01J8ZB3M….worker               ← the claim
+    01J8ZB3K…/01J8ZB3M….writing              ← the gate
+    01J8ZB3K…/01J8ZB3M….log.000000           ← log chunks
+    01J8ZB3K…/01J8ZB3M….result               ← the outcome, immutable
 ```
 
 Output data lives wherever its store puts it: FileStore under
@@ -166,8 +168,7 @@ status are derived inside `apply`; they are not events.
 | `RunControlled` | `run`, `action` (`cancel` \| `pause` \| `resume`) | |
 | `AttemptLaunched` | `run`, `task`, `attempt`, `started_at`, `pin`, `at`, `execution`, `prepared`, `pool?` | the attempt file exists and a placement is about to start it: its claim and scope lock become durable (§8) |
 | `AttemptPlaced` | `attempt`, `handle` | the placement started it: where it runs, for whichever engine follows it (§8) |
-| `AttemptClaimed` | `attempt`, `worker`, `at` | a pool worker took a launched attempt; no other worker is offered it |
-| `AttemptFinished` | `run`, `task`, `attempt`, `outcome` (`succeeded` \| `failed` \| `skipped` \| `canceled`), `started_at`, `finished_at`, `error?`, `retryable?`, `commit?`, `unsettled?` | records the attempt; on commit, installs heads, cursor, watermarks, and each keyed output's new delta file; `unsettled` keeps the intents of a writer that died (§8) |
+| `AttemptFinished` | `run`, `task`, `attempt`, `outcome` (`succeeded` \| `failed` \| `skipped` \| `canceled`), `started_at`, `finished_at`, `error?`, `retryable?`, `commit?`, `unsettled?`, `writes?` | records the attempt; on commit, installs heads, cursor, watermarks, and each keyed output's new delta file; `unsettled` keeps the intents of a writer that died (§8) |
 | `SourceCommitted` | `source`, `head`, `keys?`, `at`, `run?` | installs a source head and its delta file; a commit that changed something records `run` in the history (§7) |
 | `IndexCompacted` | `output`, `scope`, `added` [file], `removed` [name], `at` | swaps compacted files into a key index |
 | `IndexRecounted` | `output`, `scope`, `live`, `pinned_count`, `pinned_inexact` | a recount found `live` keys where the state it scanned said `pinned_count`: the count becomes `live` plus what commits since added, and `inexact` drops by `pinned_inexact` (§6) |
@@ -227,9 +228,9 @@ attempts (from `Task.launched`), the pool queue, the ready queue and the
 dependents index.
 
 **Memory only:** the claim of an attempt still preparing (a restart
-dispatches its task again), pool leases, registered workers (they
-re-register on their next heartbeat), a cache of key index blocks, and a
-local copy of the history files (§7).
+dispatches its task again), what each launched attempt's worker reported
+(rebuilt from `.worker` after a restart), a cache of key index blocks, and
+a local copy of the history files (§7).
 
 Example (abridged):
 
@@ -618,138 +619,121 @@ failed is selected. Histogram buckets are the smallest of 1 min, 5 min,
 15 min, 1 h, 3 h, 6 h, 12 h, 1 d, 7 d, 30 d that fit the span in the
 requested number of bars. `next` is a cursor: the last run id of the page.
 
-## 8. Attempt files — `runs/{run}/{attempt}.json` and `.log`
+## 8. Attempt objects — `runs/{run}/{attempt}.*`
 
-**The attempt file** is written twice, by one writer each time: the
-engine creates it with `spec` before launching; the harness reads it and,
-when it finishes, overwrites it with `spec` + `result` + `log`. Attempt
-ids are unique, so no two harnesses ever write the same file. The engine
-reads it after the harness exits; a file without `result` means the
-harness died.
+The protocol is `lifecycle.md`'s, which this section summarizes as built;
+the records the engine and the worker share are `solera/lifecycle.py`.
 
-The harness settles its outcome before it publishes anything, and seals
-the file's bytes once: a failed or unconfirmed PUT is retried with those
-very bytes, so publishing can fail but never turns a success into a
-failure. A harness that cannot publish at all exits without a result, as
-if it had died.
+**Spec, claim, result.** The engine writes `{attempt}.spec` — immutable,
+before `AttemptLaunched`. A worker reads it and claims the attempt by
+creating `{attempt}.worker` with a random invocation token; the first
+create wins. An invocation that loses writes nothing and, unless it is a
+pool worker, waits for the owner's result before exiting, so its exit is
+never taken for the attempt's. The owner seals its outcome once into
+`{attempt}.result`, create-only, retried with the same bytes: its existence
+means the worker is done. A worker that cannot publish exits without a
+result, as if it had died.
 
-`spec` is everything the harness needs and the lineage record of what the
-attempt read, including the key indexes as pinned (the `KeyIndex` records
-of the outputs it writes and the incremental inputs it reads).
+`spec` is everything the worker needs and the lineage record of what the
+attempt read, including the key indexes as pinned, plus the engine's URL,
+the attempt's token and its generation (the claim's event position).
 
 ```json
 {
-  "spec": {
-    "attempt": "01J8ZB3M…", "run": "01J8ZB3K…", "revision": "c0ffee…",
-    "asset": "file_index", "scope": "alpha", "config": {}, "execution": {"kind": "Local"},
-    "inputs": {"site_files": {"ref": {"…": "…"}, "index": {"…": "KeyIndex: levels + log[56..57]"},
-               "changes": {"from": 56, "to": 57, "after": null, "full": false, "limit": 2}}},
-    "prior": {"file_index": {"…": "ref"}},
-    "outputs": {"file_index": {"exists": true, "batch": 12, "index": {"…": "KeyIndex: levels only"}}},
-    "cursor": null
-  },
-  "result": {
-    "status": "succeeded",
-    "outputs": {"file_index": {"ref": {"…": "…"},
-                "keys": {"added": 0, "removed": 0, "exact": true, "files": [{"name": "000000000012-01J8ZB3M…", "…": "…"}]}}},
-    "delivered": {"site_files": {"after": null, "upserted": ["alpha-file-2"], "deleted": []}},
-    "cursor": null,
-    "error": null
-  },
-  "log": {"blocks": [[0, 412, 1790074791.2], [3911, 388, 1790074793.2]], "lines": 800, "bytes": 7702, "truncated": false}
+  "attempt": "01J8ZB3M…", "run": {"id": "01J8ZB3K…", "config": {}}, "revision": "c0ffee…",
+  "project": "brimstone", "asset": "file_index", "partition": "alpha", "execution": {"kind": "Local"},
+  "inputs": {"site_files": {"ref": {"…": "…"}, "index": {"…": "KeyIndex: levels + log[56..57]"},
+             "changes": {"from": 56, "to": 57, "after": null, "full": false, "limit": 2}}},
+  "prior": {"file_index": {"…": "ref"}},
+  "outputs": {"file_index": {"exists": true, "batch": 12, "index": {"…": "KeyIndex: levels only"}}},
+  "heartbeat": 10, "engine": "https://solera.example.com", "token": "…", "generation": 184467
 }
 ```
 
-**Launch and adoption.** The engine writes the attempt file, then
-`AttemptLaunched`, then starts the placement. From that event on, the
-attempt's claim and its scope lock are durable: an engine that restarts
-does not launch the task again, it adopts the attempt — waits for it and
-settles it (commits its result, or fails it) as the first engine would
-have.
+```json
+{
+  "invocation": "k3v9q2", "status": "succeeded", "writes": "complete",
+  "outputs": {"file_index": {"ref": {"…": "…"},
+              "keys": {"added": 0, "removed": 0, "exact": true, "files": [{"name": "000000000012-01J8ZB3M…", "…": "…"}]}}},
+  "delivered": {"site_files": {"after": null, "upserted": ["alpha-file-2"], "deleted": []}},
+  "events": [{"type": "booted", "at": 1790074791.2}, "…"], "usage": {"cpu_seconds": 0.4},
+  "log": {"chunks": [[0, 412, 1790074791.2]], "tail": "H4sI…", "lines": 800, "bytes": 3911, "truncated": false}
+}
+```
 
-**Placement handles.** The engine follows an attempt through its
-placement handle (a process, an ECS task, a Kubernetes job), recorded as
-`AttemptPlaced` once the placement answers, so a restarted engine follows
-it the same way. A handle is never given up: a provider that errs, or does
-not show the run (ECS right after a launch), cannot tell for now — it is
-asked again at the next look, and the worker's own reports stand in
-meanwhile. Only the provider saying the run ended is an exit.
+**Launch and adoption.** The engine writes the spec, then
+`AttemptLaunched`, durable, then starts the placement and records its
+handle as `AttemptPlaced` — lazily, riding the next journal segment. From
+`AttemptLaunched` on, the attempt's claim and its scope lock are durable:
+an engine that restarts adopts it — follows its handle, or finds it again
+by name (ECS `clientToken`, the Kubernetes job `solera-{attempt}`), or
+follows its worker's reports — and settles it as the first engine would
+have. A handle is never given up: a provider that errs, or does not show
+the run, cannot tell for now.
 
-A restart can come between `AttemptLaunched` and `AttemptPlaced` — even
-before the placement was called. Placements that name runs after their
-attempt (ECS `clientToken`, the Kubernetes job `solera-{attempt}`) start an
-attempt once however often it is launched, so the next engine simply
-launches it again (`resume`) and records the handle it gets. Others
-(Local, Modal) are followed through the worker's reports.
+**Reports: evidence, never permission.** The worker reaches the engine
+over its channel (HTTPS, `lifecycle.md` §5): `start` once, a beat every 10
+s, live log lines with their offsets, `finished`. Each answer carries the
+cancel record, if any. After two failed beats — or with no engine to
+reach, as under the CLI — it reports by overwriting `.worker` every two
+beats instead, and reads its gate each time: an `aborted` or `closed` gate
+stops it. The engine reads `.worker` only while the channel is quiet. A
+worker is silent after three beats without a report over the channel, or
+six through `.worker`; a provider's exit ends an attempt unless its owner
+still reports over the channel (then it was a duplicate's). None of this
+decides whether the attempt's writes may still land: that is the gate's.
 
-**Heartbeat.** The harness rewrites `{attempt}.beat` every
-`heartbeat_seconds` (30 s), from a thread so a producer that blocks its
-event loop still beats, and marks it done when its result is written. Each
-beat carries the attempt's timeline so far (§7). Where the engine has no
-handle, or the placement cannot tell, three missed beats and the worker is
-dead: the engine fails the attempt, and the task is retried.
+**Provisioning and deadlines.** Until its first report — `start`, a beat,
+or its claim seen — a worker is provisioning, under a deadline of its own
+(`provision_seconds`, 10 min; none for a pool). Its `timeout` runs from the
+first report. The engine times attempts on its own monotonic clock; an
+adopted attempt still provisioning keeps what the launching engine's clock
+says is left of its allowance, between three heartbeats and all of it,
+and one already running gets its whole timeout again.
 
-**Provisioning.** Until its first beat a worker is provisioning — an image
-pulling, a task waiting for capacity — and missed beats mean nothing yet.
-Provisioning has its own deadline (`provision_seconds`, 10 min; none for a
-pool, whose attempts wait for a worker as long as it takes): a worker that
-has not reported by then never started, and is aborted like a timeout.
-The asset's `timeout` counts from the first report, not from the launch: a
-20-minute image pull does not eat a 30-second timeout.
+**Cancel, in two phases.** A user cancel, a timeout or the provisioning
+deadline latches a cancel record `{phase, reason, since}` (user over
+timeout over provisioning). A worker that has reported gets `requested`:
+it stops starting work and drains within `cancel_grace` (60 s), publishing
+what finished — a plain asset, `canceled` with nothing written, unless it
+had already taken its gate, in which case it completes its writes and the
+commit stands. Its result carries the record it acted on. After the grace,
+or at once for a worker that never reported, the record becomes `forced`:
+the engine takes the gate and ends the attempt; a late result is refused.
 
-**Deadlines.** The engine times attempts on its own monotonic clock. An
-adopted attempt was launched by another engine, whose clock may disagree.
-Still provisioning, it keeps what that clock says is left of its
-allowance, but never less than three heartbeats, nor more than all of it.
-Already running, it gets its whole timeout again from when the new engine
-first hears from it, since when it started running was never recorded: a
-restart can stretch an attempt by one timeout, never cut it short.
+**The gate — `{attempt}.writing`.** A worker about to write creates it,
+`{"state": "writing", "invocation", "intents"}`, listing the delta files
+of the keys it will change; finding one already there — `aborted` or
+`closed` — it writes nothing. The engine ending an attempt without a
+result creates it `aborted`, and what it finds is the attempt's
+write-completion evidence: winning means `none`; finding `writing` means
+`uncertain`. A result says its own: `none` (no store call), `complete`
+(every store call returned) or `uncertain` (one raised, or was
+abandoned). An attempt that ends with nothing written and no gate gets one
+`closed`.
 
-**Write fence — `{attempt}.writing`.** Stores overwrite in place (§9), so
-a dead attempt must never write over a live one. One create-only object
-decides it:
+**Gates outlive their runs.** A worker that read its spec, paused, and
+resumes after its run was deleted must still find its gate: retention
+deletes a run's objects except its gates, notes them under
+`control/gates/{day}/`, and deletes them `gate_days` (30) later.
 
-- The harness creates it — `{"state": "writing", "intents": {…}}`, listing
-  the delta files of the keys it is about to change — before its first
-  store write. If it already exists with other contents, the engine got
-  there first: the harness writes nothing and exits. Its own contents mean
-  its own earlier try landed: the fence is its.
-- The engine creates it — `{"state": "aborted"}` — before it cancels, times
-  out or fails a launched attempt. If it already exists, the harness is
-  writing: the engine waits for it and commits its result, even on a
-  canceled run, since its data has landed.
-
-For example, a run is canceled while `file_index:alpha` computes. The
-engine takes the fence first; the harness, done computing, finds it taken
-and exits without touching the store. Had the harness taken it first, the
-engine would have waited, and the commit would stand.
-
-**Unsettled outputs.** A harness that dies after taking the fence may have
-written part of its keyed outputs. The engine fails the attempt with the
-fence's intents (`AttemptFinished.unsettled`) and keeps their delta files.
+**Unsettled outputs.** An attempt that ends with its gate `writing` may
+have written part of its keyed outputs. The engine fails it with the
+gate's intents (`AttemptFinished.unsettled`) and keeps their delta files.
 The next attempt on that scope reads the intended keys back from the store
-and folds what landed into its own delta — keys it writes itself end as it
-says either way — and its commit settles the output, releasing the intent
-files. Unkeyed outputs need no repair: the next attempt writes the same
-value or batch again. The console shows unsettled outputs.
+and folds what landed into its own delta, and its commit settles the
+output. Unkeyed outputs need no repair: the next attempt writes the same
+value or batch again.
 
-**The attempt log** is gzip-compressed JSON lines, one line per
-`ctx.log(message, level="info", **fields)` call: `{"at", "level", "message", "fields"}`.
-
-- While running, the harness flushes every 2 s or 256 KB, whichever comes
-  first. Each flush writes one gzip block as `{attempt}.log.{n}`; the
-  console tails a running attempt by reading new chunks.
-- When the attempt ends, the harness joins the chunks into
-  `{attempt}.log` and deletes them. Concatenated gzip blocks are a valid
-  gzip file, so nothing is recompressed and standard tools read it. If
-  the join fails, the result carries no `log` and the chunks stay: the
-  console reads them instead.
-- `log.blocks` lists `[byte offset, lines, first timestamp]` per block, so
-  the console fetches "the last 200 lines" or a given page with a range
-  read of just those blocks.
-- Each attempt's log is capped (default 100 MB compressed). Past the cap
-  the harness writes a truncation marker, stops shipping, and sets
-  `log.truncated`.
+**The attempt log** is gzip-compressed JSON lines, one per `ctx.log(…)`:
+`{"at", "level", "message", "fields"}`. Lines go live to the engine within
+a second (the console tails a running attempt from there), and durably as
+create-only chunks `{attempt}.log.{n:06d}` every 30 s or 1 MB, never
+joined. At the end, lines not yet in a chunk travel inside the result
+(`log.tail`, gzipped, under 64 KB), else as one last chunk: a short
+attempt writes no log object at all. `log.chunks` lists `[n, lines, first
+timestamp]`, so the last 200 lines are the tail and the last few chunks.
+Past 100 MB compressed a truncation marker is written and shipping stops.
 
 ## 9. Store contract
 
@@ -839,10 +823,11 @@ unreadable can be recovered from.
 `RunsDeleted`, durable → `DELETE runs/{run}/` → `RunsPurged`.
 
 **Attempt lifecycle.** claim (memory) → pin and write the spec →
-`AttemptLaunched` → launch → `AttemptPlaced` → [pool: `AttemptClaimed`] → the harness takes the
-fence, writes, and writes its result → the engine commits it
-(`AttemptFinished`). A cancel or timeout takes the fence first and ends the
-attempt with `AttemptFinished` (`canceled`, or `failed` and retryable).
+`AttemptLaunched` → launch → `AttemptPlaced` → the worker claims
+(`.worker`), starts, takes the gate, writes, and seals its result → the
+engine commits it (`AttemptFinished`). A cancel or timeout is requested,
+drained, then forced: the engine takes the gate and ends the attempt with
+`AttemptFinished` (`canceled`, or `failed` and retryable) (§8).
 
 ## 11. Retention
 

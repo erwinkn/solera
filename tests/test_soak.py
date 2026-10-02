@@ -185,11 +185,11 @@ async def test_soak(tmp_path, monkeypatch):
     planned = 0
     for task in detail["tasks"]:
         for attempt in detail["attempts"].get(task["id"], []):
-            record = await state.attempt_record(detail["request"]["id"], attempt["id"])
-            if record is None:
+            spec = await state.attempt_spec(detail["request"]["id"], attempt["id"])
+            if spec is None:
                 continue
             planned += 1
-            assert record["spec"]["inputs"]["site_files"]["changes"]["full"] is False
+            assert spec["inputs"]["site_files"]["changes"]["full"] is False
     assert planned, "file_index planned no incremental attempts"
 
     # Every head loads through its store, including after a restart.

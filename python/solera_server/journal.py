@@ -221,8 +221,10 @@ class Journal:
 
     # -- appending ----------------------------------------------------------------------
 
-    def append(self, *events: dict) -> None:
-        """Queue events for the next flush."""
+    def append(self, *events: dict, lazy: bool = False) -> None:
+        """Queue events for the next flush. A `lazy` event does not start
+        the flush clock: it is written with whatever comes next, or by
+        `durable()` (docs/lifecycle.md §13)."""
 
         if self.fenced:
             raise Fenced("this writer was replaced")
@@ -230,6 +232,8 @@ class Journal:
             self._buffer.append(event)
             self._buffer_bytes += len(_dumps(event))
         self.appended += len(events)
+        if lazy:
+            return
         if self._first_buffered is None:
             # Flush timing is monotonic loop time; `clock` only stamps records.
             self._first_buffered = asyncio.get_running_loop().time()

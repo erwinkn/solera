@@ -89,7 +89,7 @@ async def spec_of(state, output, scope=""):
     """The spec of the attempt behind a head: what it read (lineage)."""
 
     h = head(state, output, scope)
-    return (await state.attempt_record(h["run"], h["attempt"]))["spec"]
+    return await state.attempt_spec(h["run"], h["attempt"])
 
 
 def make_engine(state, project, placements=None, **kw):
@@ -855,9 +855,9 @@ async def test_timeout_fails_retryably(state):
     attempt fails retryably."""
 
     class Running(FakePlacement):
-        async def launch(self, stage):  # the worker starts, and reports once
-            path = f"{self.ctx.state.attempt_path(stage['run'], stage['attempt'])}.beat"
-            await self.ctx.state.put_object(path, json.dumps({"n": 0}).encode())
+        async def launch(self, stage):  # the worker starts: its claim is its first report
+            path = f"{self.ctx.state.attempt_path(stage['run'], stage['attempt'])}.worker"
+            await self.ctx.state.put_object(path, json.dumps({"invocation": "w"}).encode())
             return await super().launch(stage)
 
     @asset(executor=Fake("fake")(), timeout=1, retries=Retry(0))
@@ -865,7 +865,9 @@ async def test_timeout_fails_retryably(state):
         return []
 
     project = Project(assets=[never], executors=[Fake("fake")])
-    engine = make_engine(state, project, placements={"Fake": lambda s, c: Running(c)}, heartbeat_seconds=1)
+    engine = make_engine(
+        state, project, placements={"Fake": lambda s, c: Running(c)}, heartbeat_seconds=1, cancel_grace=0.3
+    )
     FakePlacement.script.clear()
     await engine.initialize()
     run = await engine.submit(["never"])
@@ -891,11 +893,11 @@ async def test_harness_exit_without_result_fails_retryably(state):
         async def launch(self, stage):
             # What the worker said before it went silent, by a clock far off.
             beat = {
-                "at": 0,
-                "n": 1,
+                "invocation": "w",
+                "seq": 1,
                 "events": [{"type": "booted", "at": 0}, {"type": "computing", "at": 1e12}],
             }
-            path = f"{self.ctx.state.attempt_path(stage['run'], stage['attempt'])}.beat"
+            path = f"{self.ctx.state.attempt_path(stage['run'], stage['attempt'])}.worker"
             await self.ctx.state.put_object(path, json.dumps(beat).encode())
             return await super().launch(stage)
 
@@ -1003,7 +1005,7 @@ async def test_job_commits_lineage_only(state):
     task = next(t for t in detail["tasks"] if t["asset"] == "vacuum")
     [attempt] = detail["attempts"][task["id"]]
     assert attempt["status"] == "succeeded" and not attempt.get("outputs")  # no outputs, no heads
-    spec = (await state.attempt_record(detail["request"]["id"], attempt["id"]))["spec"]
+    spec = await state.attempt_spec(detail["request"]["id"], attempt["id"])
     assert spec["inputs"]["feed"]["ref"]["output"] == "feed"  # lineage is the spec
 
 

@@ -1,8 +1,6 @@
 """Phase 5 — the API (§5, §8-§10). httpx over ASGI against a real engine
 backed by file:// objects; auth, validation, and every endpoint."""
 
-import asyncio
-
 import httpx
 import pytest
 from solera.executors import Pool
@@ -285,45 +283,73 @@ async def test_source_commit_endpoints(client, base, engine):
 async def test_executors_and_workers(client, base):
     executors = (await client.get(f"{base}/executors")).json()["executors"]
     assert {e["name"]: e["kind"] for e in executors} == {"gpu": "Pool", "local": "Local"}
-    assert (await client.get(f"{base}/workers")).json() == {"workers": []}
+    assert (await client.get(f"{base}/workers")).json() == {"workers": []}  # no pool worker asked yet
 
 
-async def test_worker_pull_path(client, base, engine):
-    """§10: register → claim → renew → complete; claim-fit respects capacity."""
+async def test_worker_pull_path_and_channel(engine):
+    """docs/lifecycle.md §5, §10: a pool worker discovers work that fits it
+    (pool token), claims it by creating `.worker`, and reports on the
+    attempt's routes with the attempt's own token; another invocation, or
+    another attempt's token, gets nothing."""
 
-    registered = await client.post(
-        "/api/workers/register",
-        json={"pools": ["gpu"], "capacity": {"cpu": 8, "memory": None, "gpu": 1}},
-    )
-    assert registered.status_code == 201
-    worker = registered.json()["worker"]
+    import json
 
-    empty = await client.post("/api/tasks/claim", json={"worker": worker, "capacity": {"cpu": 8, "gpu": 1}})
-    assert empty.status_code == 204
+    from solera import lifecycle
 
-    await engine.submit(["trained"])
-    await engine.tick()
-    for _ in range(200):  # staging happens inside the dispatched attempt task
-        if engine.m.pool:
-            break
-        await asyncio.sleep(0.02)
-    assert engine.m.pool
+    app = create_app(engine=engine, token="admin")
+    app.state.engine = engine
+    p = engine.manifest["name"]
+    admin = {"Authorization": "Bearer admin"}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        work = f"/api/projects/{p}/pools/gpu/work"
+        empty = await client.get(work, params={"wait": 0, "cpu": 8, "host": "w1"}, headers=admin)
+        assert empty.status_code == 200 and empty.json() == {"work": []}
 
-    claimed = await client.post("/api/tasks/claim", json={"worker": worker, "capacity": {"cpu": 8, "gpu": 1}})
-    assert claimed.status_code == 200
-    body = claimed.json()
-    task_id = body["task"]
-    assert body["stage"]["attempt"] == task_id and body["stage"]["objects"]
+        await engine.submit(["trained"])
+        await engine.tick()
+        found = (await client.get(work, params={"wait": 5, "cpu": 8, "host": "w1"}, headers=admin)).json()[
+            "work"
+        ]
+        [stage] = found
+        assert stage["objects"] == engine.state.objects_url
+        small = await client.get(work, params={"wait": 0, "cpu": 0, "host": "w2"}, headers=admin)
+        assert small.json() == {"work": []}  # needs cpu 1
+        workers = (await client.get(f"/api/projects/{p}/workers", headers=admin)).json()["workers"]
+        assert {w["id"] for w in workers} == {"w1", "w2"}
 
-    renewed = await client.post(f"/api/tasks/{task_id}/renew", json={"worker": worker})
-    assert renewed.status_code == 200
+        spec = await engine.state.attempt_spec(stage["run"], stage["attempt"])
+        base = lifecycle.base(stage["run"], stage["attempt"])
+        await engine.state.create_object(f"{base}.worker", json.dumps({"invocation": "mine"}).encode())
+        routes = f"/api/projects/{p}/attempts/{stage['attempt']}"
+        token = {"Authorization": f"Bearer {spec['token']}"}
+        assert (await client.post(f"{routes}/start", json={"invocation": "mine"})).status_code == 401
+        started = await client.post(f"{routes}/start", json={"invocation": "mine"}, headers=token)
+        assert started.status_code == 200 and started.json() == {"cancel": None}
+        stranger = await client.post(f"{routes}/beat", json={"invocation": "theirs", "seq": 1}, headers=token)
+        assert stranger.status_code == 409 and stranger.json()["detail"] == "not_owner"
+        beat = await client.post(f"{routes}/beat", json={"invocation": "mine", "seq": 1}, headers=token)
+        assert beat.json() == {"cancel": None}
 
-    stranger = await client.post(f"/api/tasks/{task_id}/complete", json={"worker": "other"})
-    assert stranger.status_code == 409
-    done = await client.post(f"/api/tasks/{task_id}/complete", json={"worker": worker})
-    assert done.status_code == 200
+        lines = ['{"message": "a"}\n', '{"message": "b"}\n']
+        sent = await client.post(
+            f"{routes}/logs", json={"invocation": "mine", "offset": 0, "lines": lines}, headers=token
+        )
+        again = await client.post(
+            f"{routes}/logs", json={"invocation": "mine", "offset": 0, "lines": lines}, headers=token
+        )
+        assert sent.json() == again.json() == {"offset": 2}  # a retried batch is not shown twice
+        assert engine.attempt_lines(stage["attempt"]) == lines
 
-    assert (await client.post("/api/tasks/claim", json={"worker": "ghost"})).status_code == 404
+        other = lifecycle.token(engine.secret, "another-attempt")
+        forged = await client.post(
+            f"{routes}/beat",
+            json={"invocation": "mine", "seq": 2},
+            headers={"Authorization": f"Bearer {other}"},
+        )
+        assert forged.status_code == 401
+        assert (
+            await client.post(f"{routes}/finished", json={"invocation": "mine"}, headers=token)
+        ).status_code == 204
 
 
 async def test_console_shell_served(client):

@@ -14,8 +14,7 @@ journal reproduces it exactly. It has three layers:
   roll-ups, and the claims, scope locks and pool work of launched attempts.
   Rebuilt by `restore()`, maintained by `apply()`.
 - **Memory only**: the claim an attempt holds while it prepares, before it
-  is launched (a restart simply dispatches its task again), pool leases, and
-  workers.
+  is launched (a restart simply dispatches its task again).
 
 Events carry every timestamp they need; `apply` never reads a clock.
 `applied` counts the events applied: the model's own clock, the same in
@@ -134,8 +133,6 @@ class Model:
         self.attempts: dict[str, str] = {}  # attempt id -> task id, while claimed
         self.locks: dict[tuple, str] = {}  # (asset, scope) -> attempt id
         self.pool: dict[str, dict] = {}  # attempt id -> pool work
-        # memory only
-        self.workers: dict[str, dict] = {}
         self._reindex()
 
     def _reindex(self) -> None:
@@ -275,7 +272,7 @@ class Model:
         launched = task["launched"]
         attempt = launched["attempt"]
         pool = launched.get("pool")
-        status = "running" if pool is None or launched.get("worker") else "claimable"
+        status = "running" if pool is None else "claimable"
         self.claims[task["id"]] = {
             "attempt": attempt,
             "started_at": launched["started_at"],
@@ -287,10 +284,8 @@ class Model:
         self.attempts[attempt] = task["id"]
         self.locks[(task["asset"], task["scope"])] = attempt
         self.queue.pop(task["id"], None)
-        if pool is not None:
-            record = self.pool.get(attempt) or {"lease_until": None}
+        if pool is not None:  # discoverable until it ends; its claim is the worker's (§10)
             self.pool[attempt] = {
-                **record,
                 "attempt": attempt,
                 "task": task["id"],
                 "run": self.task_run[task["id"]],
@@ -298,9 +293,6 @@ class Model:
                 "scope": task["scope"],
                 "pool": pool["name"],
                 "needs": pool.get("needs") or {},
-                "status": "claimed" if launched.get("worker") else "queued",
-                "claimed_by": launched.get("worker"),
-                "claimed_at": launched.get("claimed_at"),
                 "created_at": launched["at"],
             }
 
@@ -552,17 +544,6 @@ class Model:
         self._claimed(run, task, e["attempt"], e["started_at"])
         self._event(run, "launched", e["at"], task["id"], e["attempt"], name=e["execution"]["executor"])
 
-    def _on_AttemptClaimed(self, e):
-        """A pool worker took a launched attempt (§10)."""
-
-        task = self.task(self.attempts.get(e["attempt"], ""))
-        launched = (task or {}).get("launched")
-        if launched is None or launched["attempt"] != e["attempt"]:
-            return
-        launched["worker"], launched["claimed_at"] = e["worker"], e["at"]
-        self._hold(task)
-        self._event(self.runs[task["run"]], "taken", e["at"], task["id"], e["attempt"], name=e["worker"])
-
     def _on_AttemptPlaced(self, e):
         """Where a launched attempt runs: its placement handle (§10)."""
 
@@ -651,7 +632,7 @@ class Model:
         times = {"claimed": e["started_at"]}
         if launched is not None:
             times["launched"] = launched["at"]
-            at = launched.get("claimed_at") or launched["at"]
+            at = launched["at"]
             for event in (e.get("worker") or {}).get("events") or ():
                 at = min(max(at, float(event["at"])), end)
                 times.setdefault(event["type"], at)

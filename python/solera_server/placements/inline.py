@@ -16,10 +16,13 @@ class InlinePlacement:
         self.ctx, self.project = ctx, project
 
     async def launch(self, stage: dict) -> dict:
+        from solera_worker.channel import LocalChannel
         from solera_worker.worker import run_attempt
 
+        engine = self.ctx.engine
+        channel = LocalChannel(engine, stage["attempt"]) if engine is not None else None
         task = asyncio.create_task(
-            run_attempt(stage["objects"], stage["attempt"], self.project, run=stage["run"])
+            run_attempt(stage["objects"], stage["attempt"], self.project, run=stage["run"], channel=channel)
         )
         self._tasks[stage["attempt"]] = task
         return {"id": stage["attempt"]}

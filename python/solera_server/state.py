@@ -30,6 +30,7 @@ from urllib.parse import quote, unquote, urlsplit
 import obstore
 from obstore.exceptions import NotFoundError
 from obstore.store import LocalStore, MemoryStore
+from solera import lifecycle
 from solera.objects import create
 
 from .journal import Fenced, Journal
@@ -136,15 +137,16 @@ class State:
     def poisoned(self) -> bool:
         return self.journal.fenced
 
-    def record(self, *events: dict) -> None:
+    def record(self, *events: dict, lazy: bool = False) -> None:
         """Apply events to the model now, and make them durable in the
-        background: the one way state changes."""
+        background: the one way state changes. A `lazy` event waits for the
+        next one to be written with it."""
 
         if self.journal.fenced:
             raise Unavailable("This writer was replaced; restart required")
         for event in events:
             self.model.apply(event)
-        self.journal.append(*events)
+        self.journal.append(*events, lazy=lazy)
         self.changed.set()
 
     @property
@@ -168,54 +170,56 @@ class State:
     def attempt_path(self, run_id: str, attempt: str) -> str:
         return f"runs/{esc(run_id)}/{esc(attempt)}"
 
-    async def delete_run(self, run_id: str) -> None:
-        """Delete a run's attempt files and logs."""
+    async def delete_run(self, run_id: str) -> list[str]:
+        """Delete a run's attempt objects and logs, except its gates, which
+        outlive it as tombstones (docs/lifecycle.md §2.4). Returns them."""
 
         from solera.stores import remove_empty_dirs
 
-        await self.delete_objects(await self.list_objects(f"runs/{esc(run_id)}/"))
-        remove_empty_dirs(self.objects, [f"runs/{esc(run_id)}"])
+        paths = await self.list_objects(f"runs/{esc(run_id)}/")
+        gates = [p for p in paths if p.endswith(lifecycle.GATE)]
+        await self.delete_objects([p for p in paths if not p.endswith(lifecycle.GATE)])
+        if not gates:
+            remove_empty_dirs(self.objects, [f"runs/{esc(run_id)}"])
+        return gates
 
-    async def attempt_record(self, run_id: str, attempt: str) -> dict | None:
-        data = await self.get_object(f"{self.attempt_path(run_id, attempt)}.json")
+    async def attempt_spec(self, run_id: str, attempt: str) -> dict | None:
+        data = await self.get_object(f"{lifecycle.base(run_id, attempt)}{lifecycle.SPEC}")
+        return json.loads(data) if data is not None else None
+
+    async def attempt_result(self, run_id: str, attempt: str) -> dict | None:
+        data = await self.get_object(f"{lifecycle.base(run_id, attempt)}{lifecycle.RESULT}")
         return json.loads(data) if data is not None else None
 
     async def attempt_finished(self, run_id: str, attempt: str) -> bool:
-        record = await self.attempt_record(run_id, attempt)
-        return record is not None and "result" in record
+        return await self.attempt_result(run_id, attempt) is not None
 
     async def attempt_log(self, run_id: str, attempt: str, tail: int | None = None) -> bytes:
-        """An attempt's log as JSON lines: the joined log, reading only the
-        blocks the last `tail` lines are in, or the chunks shipped so far
-        while it runs (§8)."""
+        """An attempt's log as JSON lines: from the chunks its result lists
+        and its tail, reading only the chunks the last `tail` lines are in;
+        while it runs, the chunks shipped so far (docs/lifecycle.md §2.1)."""
 
-        import gzip
-
-        base = self.attempt_path(run_id, attempt)
-        record = await self.attempt_record(run_id, attempt)
-        index = (record or {}).get("log")
+        base = lifecycle.base(run_id, attempt)
+        result = await self.attempt_result(run_id, attempt)
+        index = (result or {}).get("log")
         if index is not None:
-            if not index["blocks"]:
-                return b""
-            start = 0
+            chunks, lines = list(index["chunks"]), 0
             if tail is not None:
-                lines = 0
-                for offset, count, _ in reversed(index["blocks"]):
-                    start, lines = offset, lines + count
+                if index.get("tail"):
+                    lines = len(lifecycle.log_text([], index["tail"]).splitlines())
+                kept = []
+                for entry in reversed(chunks):
                     if lines >= tail:
                         break
-            data = bytes(
-                await obstore.get_range_async(self.objects, f"{base}.log", start=start, end=index["bytes"])
-            )
-            text = gzip.decompress(data)
+                    kept.insert(0, entry)
+                    lines += entry[1]
+                chunks = kept
+            data = [await self.get_object(f"{base}{lifecycle.chunk(n)}") or b"" for n, _, _ in chunks]
+            text = lifecycle.log_text(data, index.get("tail"))
         else:
-            name = f"{esc(attempt)}.log."
-            chunks = [
-                p
-                for p in await self.list_objects(f"runs/{esc(run_id)}/")
-                if p.rsplit("/", 1)[-1].startswith(name)
-            ]
-            text = b"".join([gzip.decompress(await self.get_object(p) or b"") for p in sorted(chunks)])
+            prefix = f"{base}.log."
+            paths = [p for p in await self.list_objects(f"runs/{esc(run_id)}/") if p.startswith(prefix)]
+            text = lifecycle.log_text([await self.get_object(p) or b"" for p in sorted(paths)], None)
         if tail is not None:
             text = b"".join(text.splitlines(keepends=True)[-tail:])
         return text

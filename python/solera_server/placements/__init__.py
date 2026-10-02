@@ -30,6 +30,7 @@ class PlacementContext:
     objects_url: str
     project: str
     clock: Any
+    engine: Any = None  # for placements that run workers in process
 
 
 class ServerPlacement(Protocol):

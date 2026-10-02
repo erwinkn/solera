@@ -23,7 +23,7 @@ import contextlib
 import datetime as dt
 import json
 import logging
-import math
+import secrets
 from itertools import product
 from zoneinfo import ZoneInfo
 
@@ -36,9 +36,10 @@ from solera.keys.io import ObjectIO, key_cache
 from solera.sdk import TimePartitions, canonical_partition, digest, split_partition
 
 from . import history
+from .attempts import POOL_OFFERED_GRACE, Attempts, Live
 from .history import MAX_METADATA, History, RunFilter
 from .model import TERMINAL_RUN, delta_reads
-from .placements import PlacementContext, Registry, pool
+from .placements import PlacementContext, Registry
 from .state import Conflict, LostOwnership, State
 from .upkeep import ALIVE, Upkeep
 
@@ -46,8 +47,9 @@ log = logging.getLogger(__name__)
 
 SUCCESS = {"succeeded", "skipped"}
 TERMINAL = SUCCESS | {"failed", "blocked", "canceled"}
-HEARTBEAT_SECONDS = 30.0  # a worker beats this often; three missed beats and it is dead
+HEARTBEAT_SECONDS = 10.0  # a worker beats this often (docs/lifecycle.md §6)
 PROVISION_SECONDS = 600.0  # a launched worker reports within this, or it never started
+CANCEL_GRACE = 60.0  # a requested cancel's time to drain before it is forced (§7)
 SOURCE_KEYS_RECORDED = 1000  # a source commit's run lists changed keys up to this many, else counts
 GRACE_SECONDS = 5.0
 
@@ -58,20 +60,6 @@ class Retryable(RuntimeError):
 
 class NonRetryable(RuntimeError):
     """A dispatch-time failure no retry will fix (§8: full run required, …)."""
-
-
-async def _unless(stirred: asyncio.Event, work):
-    """Await `work`, but give up on it, returning `None`, once `stirred` is set."""
-
-    job, woken = asyncio.ensure_future(work), asyncio.ensure_future(stirred.wait())
-    try:
-        await asyncio.wait((job, woken), return_when=asyncio.FIRST_COMPLETED)
-    finally:
-        for pending in (job, woken):
-            pending.cancel()
-        await asyncio.gather(job, woken, return_exceptions=True)
-        stirred.clear()
-    return job.result() if not job.cancelled() else None
 
 
 def check_tags(tags) -> dict[str, str]:
@@ -88,7 +76,10 @@ def check_tags(tags) -> dict[str, str]:
     return dict(sorted(tags.items()))
 
 
-class Engine:
+class Engine(Attempts):
+    Conflict = Conflict
+    GRACE_SECONDS = GRACE_SECONDS
+
     def __init__(
         self,
         state: State,
@@ -99,6 +90,9 @@ class Engine:
         project: str = "",
         heartbeat_seconds: float = HEARTBEAT_SECONDS,
         provision_seconds: float = PROVISION_SECONDS,
+        cancel_grace: float = CANCEL_GRACE,
+        engine_url: str | None = None,
+        pool_offered_grace: float = POOL_OFFERED_GRACE,
         concurrency: int = 4,
         clock=None,
         eval_interval: float = 0.5,
@@ -116,9 +110,17 @@ class Engine:
         self.project = project
         self.clock = clock or time.time
         self.heartbeat_seconds, self.concurrency = heartbeat_seconds, concurrency
-        self.provision_seconds = provision_seconds
+        self.provision_seconds, self.cancel_grace = provision_seconds, cancel_grace
+        # Where workers reach this engine (docs/lifecycle.md §5); without one,
+        # they report through `.worker` alone.
+        self.engine_url = engine_url
+        self.pool_offered_grace = pool_offered_grace
+        self.secret: bytes | None = None  # signs attempt tokens; stable across restarts
+        self.live: dict[str, Live] = {}  # attempt id -> what its worker reported
+        self.pollers: dict[str, dict] = {}  # pool workers that asked for work lately
+        self._pool_changed = asyncio.Event()
         self.eval_interval = eval_interval
-        ctx = PlacementContext(state, state.objects_url, project, self.clock)
+        ctx = PlacementContext(state, state.objects_url, project, self.clock, self)
         self.registry = registry or Registry(ctx, extra=placements)
         # attempt id -> (run id, asyncio task): attempts this process is driving.
         self.inflight: dict[str, tuple[str, asyncio.Task]] = {}
@@ -164,6 +166,7 @@ class Engine:
         that the engine was down, since it last said it was alive."""
 
         m = self.m
+        await self._load_secret()
         alive = await self.state.get_object(ALIVE)
         if alive is not None and any(run["status"] not in TERMINAL_RUN for run in m.runs.values()):
             now = self.clock()
@@ -183,6 +186,17 @@ class Engine:
                     "at": self.clock(),
                 }
             )
+
+    async def _load_secret(self) -> bytes:
+        """The secret attempt tokens are signed with: created once, kept in
+        the namespace, so tokens in specs survive a restart (§5.2)."""
+
+        if self.secret is None:
+            path = "control/engine-secret"
+            with contextlib.suppress(AlreadyExistsError):
+                await self.state.create_object(path, secrets.token_hex(32).encode())
+            self.secret = await self.state.get_object(path)
+        return self.secret
 
     async def start(self):
         """Start the eval loop, and storage upkeep beside it. Its first tick
@@ -607,11 +621,13 @@ class Engine:
         worker=None,
         end=None,
         reason=None,
+        writes=None,
     ):
         """End an attempt. `worker` is what its worker reported — its result,
         or its last heartbeat: the events it recorded and what it used. `end`
         names how it ended if its outcome does not say (`aborted`, `lost`),
-        and `reason` why."""
+        `reason` why, and `writes` what is known of its writes
+        (docs/lifecycle.md §2.3)."""
 
         event = {
             "type": "AttemptFinished",
@@ -639,6 +655,8 @@ class Engine:
             event["end"] = end
         if reason is not None:
             event["reason"] = str(reason)[:200]
+        if writes is not None:
+            event["writes"] = writes
         self.state.record(event)
 
     # -- dispatch ---------------------------------------------------------------
@@ -696,6 +714,7 @@ class Engine:
             finally:  # before anyone awaiting the attempt resumes
                 self.inflight.pop(attempt, None)
                 self._stirred.pop(attempt, None)
+                self.live.pop(attempt, None)
                 self.engine_inflight.discard(attempt)
                 self.executor_inflight[executor] = max(0, self.executor_inflight.get(executor, 1) - 1)
 
@@ -1096,304 +1115,6 @@ class Engine:
 
     # -- the placement loop (§10) ---------------------------------------------------
 
-    async def _launch(self, task, run, attempt, prepared) -> dict:
-        """Write the attempt file and make the launch durable (§8): from here
-        on, the attempt outlives this engine. Returns the placement's stage."""
-
-        spec = {
-            "attempt": attempt,
-            "revision": self.manifest["revision"],
-            "asset": task["asset"],
-            "partition": task["scope"],
-            "run": {"id": task["run"], "config": run.get("config") or {}},
-            "prior": prepared["prior"],
-            "outputs": prepared["outputs"],
-            "inputs": prepared["inputs"],
-            "execution": self.manifest["assets"][task["asset"]]["placement"],
-            "heartbeat": self.heartbeat_seconds,
-        }
-        if prepared["cursor"] is not None:
-            spec["cursor"] = prepared["cursor"]
-        # The attempt file (§8): created here with the spec; the harness
-        # rewrites it once, with the spec, its result and its log index.
-        path = f"{self.state.attempt_path(task['run'], attempt)}.json"
-        await self.state.create_object(path, json.dumps({"spec": spec}).encode())
-        claim = self.m.claimed(attempt)
-        if claim is None:
-            raise LostOwnership(attempt)  # canceled while the spec was written
-        execution = spec["execution"]
-        event = {
-            "type": "AttemptLaunched",
-            "run": task["run"],
-            "task": task["id"],
-            "attempt": attempt,
-            "started_at": claim["started_at"],
-            "pin": claim["pin"],
-            "at": self.clock(),
-            "execution": execution,
-            "prepared": self._durable(prepared),
-        }
-        if execution["kind"] == "Pool":
-            needs = {
-                k: v for k in ("cpu", "memory", "gpu") if (v := execution["placement"].get(k)) is not None
-            }
-            event["pool"] = {"name": execution["executor"], "needs": needs}
-        self.state.record(event)
-        # Launch only what a restarted engine would adopt, never an orphan.
-        await self.state.durable()
-        return {"attempt": attempt, "run": task["run"], "objects": self.state.objects_url}
-
-    def _placed(self, attempt: str, handle: dict) -> None:
-        """Record where a launched attempt runs, so a restarted engine follows
-        it there (§8). Not waited on: a handle lost to a crash is found again
-        through `resume`, or the attempt through its worker's reports."""
-
-        if self.m.claimed(attempt) is not None:
-            self.state.record({"type": "AttemptPlaced", "attempt": attempt, "handle": handle})
-
-    def _left(self, launched: dict, seconds: float) -> float:
-        """What an adopted attempt has left of its provisioning allowance,
-        `seconds` from its launch. The launch time is the launching engine's
-        clock, which may disagree with this one: it is trusted, but it never
-        leaves less than three heartbeats, nor more than all of `seconds`."""
-
-        return min(seconds, max(seconds - (self.clock() - launched["at"]), 3 * self.heartbeat_seconds))
-
-    async def _watch(self, task_id: str, attempt: str, placement, handle, adopted=False):
-        """Wait for a launched attempt to end, then settle it (§8).
-
-        The placement handle says when the worker exits. Where there is none,
-        or the placement cannot tell for now, the worker's own reports do: it
-        rewrites `{attempt}.beat` every `heartbeat_seconds`, marks it done
-        once its result is written, and is dead after three missed beats.
-        Until its first report it is provisioning, under a deadline of its
-        own (`provision_seconds`); its `timeout` runs from then on. A cancel,
-        a timeout or a provisioning deadline aborts the attempt as it
-        happens; one already writing is waited for instead.
-
-        Deadlines run on this process's monotonic clock. An adopted attempt
-        still provisioning keeps what the launching engine's clock says is
-        left of its allowance (`_left`). When it started running was never
-        recorded, so an adopted attempt that is running gets its whole
-        `timeout` again, from when this engine first hears from it: a
-        restart can stretch an attempt by one timeout, never cut it short."""
-
-        task = self.m.task(task_id)
-        run_id, launched = task["run"], self._launched(task, attempt)
-        beat_path = f"{self.state.attempt_path(run_id, attempt)}.beat"
-        loop = asyncio.get_running_loop()
-        limit = (self.manifest["assets"].get(task["asset"]) or {}).get("timeout") or 3600
-        provision = getattr(placement, "provision_seconds", self.provision_seconds)
-        started = loop.time()
-        deadline = math.inf  # set once it runs
-        provisioned_by = math.inf
-        if provision is not None:
-            provisioned_by = started + (self._left(launched, provision) if adopted else provision)
-        poll = self.heartbeat_seconds / 3
-        beat, beat_at = None, started
-        reported = False  # the worker has said something: it is no longer provisioning
-        writing = False  # an abort found the worker writing: wait for it
-        stirred = self._stirred.setdefault(attempt, asyncio.Event())
-
-        async def look(timeout):
-            if handle is None:
-                await asyncio.sleep(timeout)
-                return None
-            return await placement.wait(handle, timeout)
-
-        while True:
-            polled = loop.time()
-            wake = deadline if reported else provisioned_by
-            timeout = poll if writing else max(0.0, min(poll, wake - polled))
-            observed = handle is not None
-            try:
-                exit_ = await _unless(stirred, look(timeout))
-            except Exception as error:
-                # It cannot tell for now: keep the handle, and hear from the worker.
-                log.warning("attempt %s: placement cannot tell, following reports: %s", attempt, error)
-                observed, exit_ = False, None
-                await _unless(stirred, asyncio.sleep(max(0.0, timeout - (loop.time() - polled))))
-            if exit_ is not None:
-                break
-            # A placement that returns before its timeout must not spin the loop.
-            await asyncio.sleep(max(0.0, 0.05 - (loop.time() - polled)))
-            now = loop.time()
-            if observed:
-                beat_at = now  # the placement vouches for it
-            if not observed or not reported:
-                current = await self.state.get_object(beat_path)
-                if current is not None:
-                    if json.loads(current).get("done"):
-                        exit_ = {"code": None, "reason": "done", "meta": {}}
-                        break
-                    if not reported:
-                        reported, deadline = True, now + limit  # it runs: its timeout starts
-                if current != beat:
-                    beat, beat_at = current, now
-                elif reported and now - beat_at > 3 * self.heartbeat_seconds:
-                    exit_ = {"code": None, "reason": "no heartbeat", "meta": {}}
-                    break
-            task = self.m.task(task_id)
-            canceled = task is None or task["status"] == "canceled"
-            unstarted = not reported and now > provisioned_by
-            if writing or not (canceled or now > deadline or unstarted):
-                continue
-            if await self._abort(run_id, attempt) is not None:
-                writing = True
-                continue
-            if handle is not None:
-                await self._cancel(placement, handle)
-            if canceled:
-                await self._fail(
-                    task_id, attempt, "canceled", outcome="canceled", end="aborted", reason="canceled"
-                )
-            elif now > deadline:
-                await self._fail(task_id, attempt, "timeout", retryable=True, end="aborted", reason="timeout")
-            else:
-                error = f"the worker did not report within {provision:g}s of its launch"
-                await self._fail(
-                    task_id, attempt, error, retryable=True, end="aborted", reason="provisioning"
-                )
-            return
-        await self._settle(task_id, attempt, exit_)
-
-    async def _settle(self, task_id: str, attempt: str, exit_: dict):
-        """Commit an ended attempt's result, or fail it."""
-
-        task = self.m.task(task_id)
-        prepared = self._launched(task, attempt)["prepared"]
-        record = await self.state.attempt_record(task["run"], attempt)
-        result = (record or {}).get("result")
-        if result is None:
-            await self._fail(
-                task_id,
-                attempt,
-                f"harness exited without a result: {exit_}",
-                retryable=True,
-                end="lost",
-                reason=exit_["reason"] or f"exit code {exit_['code']}",
-            )
-            return
-        if result.get("status") == "failed":
-            error = result.get("error") or {}
-            await self._fail(
-                task_id,
-                attempt,
-                f"{error.get('type', 'Error')}: {error.get('message', '')}",
-                retryable=bool(error.get("retryable")),
-                delay=self._retry_delay(task),
-                worker=result,
-            )
-            return
-        try:
-            await self.commit_attempt(attempt, prepared, result)
-        except LostOwnership:
-            return
-        except Conflict as error:
-            await self._fail(
-                task_id,
-                attempt,
-                str(error),
-                retryable=getattr(error, "retryable", True),
-                worker=result,
-                reason="conflict",
-            )
-
-    @staticmethod
-    def _launched(task: dict | None, attempt: str) -> dict:
-        launched = (task or {}).get("launched")
-        if launched is None or launched["attempt"] != attempt:
-            raise LostOwnership(attempt)  # it finished meanwhile
-        return launched
-
-    async def _abort(self, run_id: str, attempt: str) -> dict | None:
-        """Take the attempt's write fence (§8). Returns None once the attempt
-        is aborted — it can never write; else the fence its worker took first:
-        it is writing, and the fence lists its intents."""
-
-        path = f"{self.state.attempt_path(run_id, attempt)}.writing"
-        try:
-            await self.state.create_object(path, json.dumps({"state": "aborted"}).encode())
-            return None
-        except AlreadyExistsError:
-            fence = json.loads(await self.state.get_object(path))
-            return None if fence["state"] == "aborted" else fence
-
-    async def _fail(
-        self,
-        task_id: str,
-        attempt: str,
-        error: str,
-        *,
-        retryable=False,
-        delay=0.0,
-        outcome="failed",
-        worker=None,
-        end=None,
-        reason=None,
-    ):
-        """End a launched attempt without a commit (§8). It is aborted first,
-        so it can never write after this. If it had begun writing, the keyed
-        outputs it meant to change stay unsettled until a later commit takes
-        in what landed; their intent files are kept for that. Without a
-        result (`worker`), what the worker last reported is in its heartbeat."""
-
-        task = self.m.task(task_id)
-        prepared = self._launched(task, attempt)["prepared"]
-        fence = await self._abort(task["run"], attempt)
-        unsettled = (fence or {}).get("intents") or {}
-        if worker is None:
-            worker = await self._last_beat(task["run"], attempt)
-        claim = self.m.claimed(attempt)
-        if claim is None:
-            return
-        self._finish(
-            task,
-            claim,
-            outcome,
-            error=error,
-            retryable=retryable,
-            delay=delay,
-            unsettled=unsettled,
-            worker=worker,
-            end=end,
-            reason=reason,
-        )
-        await self._discard(attempt, prepared, keep=set(unsettled))
-
-    async def _last_beat(self, run_id: str, attempt: str) -> dict:
-        try:
-            beat = await self.state.get_object(f"{self.state.attempt_path(run_id, attempt)}.beat")
-            return json.loads(beat) if beat else {}
-        except Exception:
-            return {}
-
-    async def _discard(self, attempt: str, prepared: dict, keep=()):
-        """Delete the delta files an attempt wrote but never committed, except
-        the intents of outputs it left unsettled. They are named after the
-        attempt, so nothing else can hold them (§6)."""
-
-        for name, info in (prepared.get("outputs") or {}).items():
-            if info.get("prefix") is None or name in keep:
-                continue
-            prefix = f"{info['prefix']}{int(info['batch']):012d}-{attempt}"
-            with contextlib.suppress(Exception):
-                await self.state.delete_objects(await self.state.list_objects(prefix))
-
-    def _retry_delay(self, task) -> float:
-        retry = task.get("retry") or {}
-        delay = float(retry.get("delay", 1.0))
-        if retry.get("backoff") == "exponential":
-            failures = sum(1 for a in task["attempts"] if a["outcome"] == "failed")
-            delay *= 2**failures
-        return delay
-
-    async def _cancel(self, placement, handle):
-        with contextlib.suppress(Exception):
-            await placement.cancel(handle)
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(placement.wait(handle, GRACE_SECONDS), GRACE_SECONDS + 1)
-
     # -- the commit (§8) ---------------------------------------------------------------
 
     async def commit_attempt(self, attempt: str, prepared: dict, result: dict) -> dict:
@@ -1501,57 +1222,10 @@ class Engine:
             commit["cursor"] = result["cursor"]
         elif prepared.get("full"):
             commit["cursor"] = None  # a full run clears the committed cursor (§8)
-        self._finish(task, claim, "succeeded", commit=commit, more=more, worker=result)
+        self._finish(
+            task, claim, "succeeded", commit=commit, more=more, worker=result, writes=result.get("writes")
+        )
         return {"run": task["run"], "attempt": attempt, "outputs": outputs}
-
-    # -- pool work (§10) ---------------------------------------------------------------
-
-    def register_worker(self, worker_id: str, pools: list[str], meta: dict) -> dict:
-        record = {"id": worker_id, "pools": pools, "meta": meta, "seen_at": self.clock()}
-        self.m.workers[worker_id] = record
-        return record
-
-    def claim_pool_task(self, worker_id: str, pools: list[str], capacity: dict, lease_seconds: float):
-        """Oldest unclaimed pool task in the worker's pools that fits the
-        worker's cpu/memory/gpu capacity (§10). The claim is durable, so a
-        restarted engine never offers it to a second worker."""
-
-        now = self.clock()
-        for record in sorted(self.m.pool.values(), key=lambda r: r["created_at"]):
-            if record["status"] != "queued" or record["pool"] not in pools:
-                continue
-            if (self.m.task(record["task"]) or {}).get("status") == "canceled":
-                continue  # being aborted
-            needs = record.get("needs") or {}
-            if any(capacity.get(dim) is None or capacity[dim] < want for dim, want in needs.items()):
-                continue
-            record["lease_until"] = now + lease_seconds
-            self.state.record(
-                {"type": "AttemptClaimed", "attempt": record["attempt"], "worker": worker_id, "at": now}
-            )
-            pool.wake(record["attempt"])
-            claimed = self.m.pool.get(record["attempt"])
-            if claimed is not None and claimed["claimed_by"] == worker_id:
-                return claimed
-        return None
-
-    def heartbeat_pool_task(self, worker_id: str, attempt: str, lease_seconds: float) -> float:
-        record = self.m.pool.get(attempt)
-        if (
-            record is None
-            or record["status"] != "claimed"
-            or record["claimed_by"] != worker_id
-            or (record["lease_until"] is not None and record["lease_until"] <= self.clock())
-        ):
-            raise LostOwnership(attempt)
-        record["lease_until"] = self.clock() + lease_seconds
-        return record["lease_until"]
-
-    def release_pool_task(self, worker_id: str, attempt: str) -> None:
-        record = self.m.pool.get(attempt)
-        if record and record["claimed_by"] == worker_id:
-            del self.m.pool[attempt]
-            pool.wake(attempt)
 
     # -- sources commit API (§5) ------------------------------------------------------
 

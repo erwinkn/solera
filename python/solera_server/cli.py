@@ -168,6 +168,10 @@ def main():
                 namespace=args.namespace,
                 project=project,
                 insecure=args.insecure,
+                # Where workers reach this engine: set SOLERA_ENGINE_URL to a
+                # public HTTPS name for remote workers (docs/lifecycle.md §5.2).
+                engine_url=os.getenv("SOLERA_ENGINE_URL")
+                or f"http://{'127.0.0.1' if args.host in ('0.0.0.0', '::') else args.host}:{args.port}",
             ),
             host=args.host,
             port=args.port,

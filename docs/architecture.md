@@ -587,46 +587,45 @@ class Placement(Protocol):
 
 | Method | Contract |
 |---|---|
-| `launch` | Start the harness, handing it the three `stage` strings — `attempt`, `run`, `objects` — (container override, argv, function argument); the harness reaches `objects` with the environment's own auth. The spec is already in the attempt file. Where the provider allows it, the run is named after the attempt, so launching twice starts it once. Raising = attempt failed, retryable. The handle is recorded (`AttemptPlaced`). |
+| `launch` | Start the harness, handing it the three `stage` strings — `attempt`, `run`, `objects` — (container override, argv, function argument); the harness reaches `objects` with the environment's own auth. The spec is already in `.spec`. Where the provider allows it, the run is named after the attempt, so launching twice starts it once. Raising = attempt failed, retryable. The handle is recorded (`AttemptPlaced`). |
 | `resume` | Optional, for an attempt adopted without a handle: find its run, or start it if the launch never happened — `launch` itself, when that is idempotent. |
 | `wait` | Block at most `timeout`; `None` while running, else `Exit`. Idempotent, safe after termination; a run the provider says is gone is `Exit(None, "lost")`. Raises when it cannot tell — an API error, a run not shown yet: the engine keeps the handle and asks again. |
 | `cancel` | Best-effort, idempotent, never raises for a finished run. |
 
-Object keys are conventional under `objects`: the attempt file
-`runs/{run}/{attempt}.json` — the spec, then spec + result + log index —,
-its gzip log `runs/{run}/{attempt}.log` (`.log.{n}` chunks while it runs),
-its write fence `.writing` and its heartbeat `.beat`; see
-object-store-state.md §8.
+Object keys are conventional under `objects`: `runs/{run}/{attempt}.spec`,
+the claim `.worker`, the gate `.writing`, log chunks `.log.{n:06d}` and the
+result `.result`; see object-store-state.md §8 and `lifecycle.md`.
 
 **Engine loop**, per attempt:
 
 ```python
-await objects.create(f"runs/{run_id}/{attempt}.json", {"spec": spec})
+await objects.create(f"runs/{run_id}/{attempt}.spec", spec)
 record(AttemptLaunched(...))                  # from here on, a restart adopts it
 await durable()                               # never launch what a restart wouldn't adopt
 run = await placement.launch(Stage(attempt, run_id, objects_url))
-record(AttemptPlaced(attempt, run))           # a restart follows it through this handle
-while (exit := await placement.wait(run, poll)) is None:   # can't tell: follow {attempt}.beat
-    # a cancel wakes this wait at once; a timeout ends it on time; so does
-    # provisioning that never ends in a first report
-    if canceled or now() > deadline or not reported and now() > provisioned_by:
-        if await take_fence(attempt, "aborted"):          # the harness has not begun writing
+record(AttemptPlaced(attempt, run), lazy=True)   # a restart follows it through this handle
+while not finished:                           # the worker's `finished`, the provider's exit,
+    ...                                       # or the worker silent: settle
+    # reports (channel, else `.worker`) are evidence, never permission
+    if canceled or past_timeout or not reported and past_provisioning:
+        cancel = latch(requested, reason)     # answered to the worker's next beat
+        if not reported or past(cancel_grace):
+            writes = await take_gate(attempt, "aborted")   # none, or uncertain if `writing`
             await placement.cancel(run)
-            return fail("canceled" or "timeout")
-        # else it is writing: wait, and commit what it wrote
-result = (await objects.get(f"runs/{run_id}/{attempt}.json")).get("result")
+            return fail(reason, writes)
+result = await objects.get(f"runs/{run_id}/{attempt}.result")
 if result is None:
-    return fail(f"harness exited without a result: {exit}", retryable=True)
+    return fail(f"the worker exited without a result: {exit}", retryable=True)
 commit_or_fail(result)
 ```
 
 A launched attempt survives an engine restart: the new engine adopts it,
 following its recorded placement handle, else the one `resume` finds,
-else its heartbeat (three missed beats: dead) — object-store-state.md §8. A harness that dies after taking the
-fence leaves its keyed outputs **unsettled**: the next attempt reads the
-keys it meant to change back from the store and folds what landed into its
-own commit. The engine counts in-flight attempts per executor against
-`max_concurrent`.
+else its worker's reports — object-store-state.md §8. An attempt that ends
+with its gate `writing` leaves its keyed outputs **unsettled**: the next
+attempt reads the keys it meant to change back from the store and folds
+what landed into its own commit. The engine counts in-flight attempts per
+executor against `max_concurrent`.
 
 ### Worker protocol
 
@@ -689,16 +688,18 @@ they were pinned do not void the commit: the attempt delivered the window
 it was given.
 
 **Harness** (`python -m solera_worker run --objects URL --attempt ID`; the
-project entrypoint comes from the environment): fetch spec → refuse on
-revision mismatch (a failed result, not a crash) → resolve `env:` → load
-inputs per annotation (keyed Incremental edges through the upstream key
-index) → build `ctx` → run the producer → compare each keyed output with
-its key index and write the delta file (an output where nothing changed is
-not stored) → take the write fence (exit if the engine holds it) →
-`store()` each output → seal the result's bytes and write them last, in one
-PUT, retried as they are: a failed upload never changes the outcome.
-Logs stream to chunked objects throughout. `manifest` mode runs through
-`Local` only, at server start.
+project entrypoint comes from the environment): fetch `.spec` → claim
+`.worker` (a loser writes nothing and waits for the owner's result) →
+`start` on the channel → refuse on revision mismatch (a failed result, not
+a crash) → resolve `env:` → load inputs per annotation (keyed Incremental
+edges through the upstream key index) → build `ctx` → run the producer →
+compare each keyed output with its key index and write the delta file (an
+output where nothing changed is not stored) → take the gate, if anything
+is to be written (write nothing if the engine holds it) → `store()` each
+output → seal the result once into `.result`, retried as it is: a failed
+upload never changes the outcome. Throughout, a thread beats every 10 s,
+logs go live and as chunks, and a requested cancel stops the work before
+the gate. `manifest` mode runs through `Local` only, at server start.
 
 ### Built-ins
 
@@ -708,15 +709,16 @@ Logs stream to chunked objects throughout. `manifest` mode runs through
 | `AWSECS(name, cluster, region)(cpu, memory, gpu, image)` | `run_task` with container overrides carrying the stage, `clientToken` = attempt | `{task_arn}` | describes until `STOPPED`; `Exit.meta.log_url`; a task not shown: can't tell | `stop_task` |
 | `Modal(name, app)(gpu)` | spawns the harness function | `{call_id}` | polls the call: its return, raise or timeout is an exit; Modal's client and service errors: can't tell | cancels it |
 | `K8sJob(name, cluster, namespace)(cpu, memory, image)` | creates the job `solera-{attempt}` (lowercased); an existing one is its own | `{job}` | watches conditions; deleted: lost | deletes the job |
-| `Pool(name)(cpu, memory, gpu)` | publishes the stage as a claimable task | `{task}` | result appeared, `complete` called, or claim lease expired | marks the task canceled |
+| `Pool(name)(cpu, memory, gpu)` | nothing: the launched attempt is discoverable | none | — (the worker's reports) | — (a cancel before the claim ends it) |
 
-`Pool` is the pull path. Workers are external processes:
-`POST /api/workers/register` `{pool, cpu, memory, gpu}`;
-`POST /api/tasks/claim` returns `{task, stage, lease_seconds}` for a task
-whose placement fits; `POST /api/tasks/{id}/renew`; `POST
-/api/tasks/{id}/complete`. Claims are journaled (`AttemptClaimed`), so a
-restarted engine never offers a task twice; a worker whose lease expires is
-lost, and its attempt is failed and retried.
+`Pool` is the pull path (`lifecycle.md` §10). Workers are external
+processes (`solera worker pool NAME`): they long-poll `GET
+/api/projects/{p}/pools/{pool}/work` with their capacity and get launched
+attempts that fit and have not started, oldest first; they race for each
+attempt's claim by creating its `.worker`, and the winner runs it like any
+attempt. No registration, no leases: a pool worker's liveness is its
+attempt's heartbeat. A claim whose worker never reports is ended, classified
+from its gate, and retried under a new attempt id.
 
 ## 11. Registration
 
