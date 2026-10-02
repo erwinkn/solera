@@ -521,7 +521,8 @@ async def test_a_migration_waits_for_every_slices_open_writer(store):
     table, _, _ = store._table(out)
     conn = store._connect()
     cur = conn.cursor()
-    store._fence(cur, table, scope(out, partition="p2", generation=3, invocation="i"))  # p2's writer, open
+    store._domain(cur, table)  # p2's writer, open: as every write transaction begins
+    store._fence(cur, table, scope(out, partition="p2", generation=3, invocation="i"))
     p1 = scope(out, partition="p1", generation=4, invocation="i")
     migrating, migrated, errors = in_thread(
         store.migrate(out, [Migration("all", f"UPDATE {table} SET v = 'm'")], p1)
@@ -583,3 +584,45 @@ async def test_by_key_patch_stamps_keys_and_keeps_empty_groups(store):
     with pytest.raises(WriteError, match="carries"):
         await store.store(Patch({"d.csv": [{"path": "other", "n": 1}]}), second.ref, scope(out))
     assert store.can_load(dict[str, pd.DataFrame], Keys) and not store.can_load(dict[str, pd.DataFrame], None)
+
+
+async def test_a_partitions_first_write_waits_for_a_migration(store):
+    """Astra review 2, P1-1: a migration has copied the table and is about
+    to swap it in when a partition no attempt has written yet acquires and
+    writes. The write waits for the migration, then lands in the new table:
+    the swap cannot drop it."""
+
+    import threading
+
+    from solera.sdk import Migration
+
+    name = f"t_{uuid.uuid4().hex[:12]}"
+    out = output(name, key="id", revision="v", partition_column="site")
+    await store.store([{"id": "a", "v": "1"}], None, scope(out, partition="p1", generation=4, invocation="i"))
+    copied, go = threading.Event(), threading.Event()
+
+    def swap(cur):
+        cur.execute(f'CREATE TABLE public."{name}_new" AS SELECT * FROM public."{name}"')
+        copied.set()
+        assert go.wait(10)
+        cur.execute(f'DROP TABLE public."{name}"; ALTER TABLE public."{name}_new" RENAME TO "{name}"')
+
+    p1 = scope(out, partition="p1", generation=4, invocation="i")
+    migrating, migrated, errors = in_thread(store.migrate(out, [Migration("swap", swap)], p1))
+    assert copied.wait(10)
+    p2 = scope(out, partition="p2", generation=5, invocation="i")
+
+    async def first_write():
+        await store.acquire(p2)
+        return await store.store([{"id": "b", "v": "1"}], None, p2)
+
+    writing, written, write_errors = in_thread(first_write())
+    assert not written.wait(0.5)  # waits for the migration
+    go.set()
+    assert migrated.wait(10) and written.wait(10) and not errors and not write_errors
+    migrating.join()
+    writing.join()
+    table, _, _ = store._table(out)
+    with store._connect() as conn, conn.cursor() as cur:
+        rows = cur.execute(f"SELECT id, site FROM {table} ORDER BY id").fetchall()
+    assert [(r["id"], r["site"]) for r in rows] == [("a", "p1"), ("b", "p2")]

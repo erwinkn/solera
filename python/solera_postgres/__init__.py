@@ -204,6 +204,16 @@ class PostgresStore:
                 f"of {scope.invocation} refused)"
             )
 
+    def _domain(self, cur, table: str, exclusive: bool = False) -> None:
+        """The table's write domain, until the transaction ends: shared by
+        every writer's transaction — acquisitions, a partition's first write,
+        writes — and exclusive for a migration, which so runs between
+        writers of every partition, never under one. Always the first lock a
+        transaction takes, so the order is the same everywhere."""
+
+        lock = "pg_advisory_xact_lock" if exclusive else "pg_advisory_xact_lock_shared"
+        cur.execute(f"SELECT {lock}(hashtext(%s))", (f"solera-domain:{table}",))
+
     def _relid(self, cur, table: str) -> int | None:
         return cur.execute("SELECT to_regclass(%s)::oid AS relid", (table,)).fetchone()["relid"]
 
@@ -228,6 +238,7 @@ class PostgresStore:
             return
         table, _, _ = self._table(scope.output)
         with self._connect() as conn, conn.cursor() as cur:
+            self._domain(cur, table)
             self._rename(cur, scope.output, scope)
             relid = self._relid(cur, table)
             if relid is None:
@@ -295,9 +306,10 @@ class PostgresStore:
 
     def _store(self, write, prior: Ref | None, scope: Scope) -> Written:
         output = scope.output
+        table, _, _ = self._table(output)
         with self._connect() as conn, conn.cursor() as cur:
+            self._domain(cur, table)
             self._rename(cur, output, scope)
-            table, _, _ = self._table(output)
             partition_col = output.config.get("partition_column")
             slice_where = {partition_col: scope.partition} if partition_col else {}
 
@@ -532,11 +544,11 @@ class PostgresStore:
         ledger row commit in one transaction under an advisory lock keyed on
         the output, so concurrent attempts apply each exactly once (§4).
 
-        A migration changes the whole table, so before it changes anything
-        its transaction takes the attempt's own slice — an older attempt's
-        migration is refused, a newer attempt's acquisition waits for it to
-        commit — and locks every other slice's fence row, in partition
-        order: it runs between writers, never under one
+        A migration changes the whole table, so it holds the table's write
+        domain exclusively (`_domain`): it waits for every partition's open
+        write transaction, a partition's first included, and holds off new
+        ones until it commits. Before it changes anything it takes the
+        attempt's own slice, so an older attempt's migration is refused
         (docs/lifecycle.md §9.7). An operator's migration (no scope) only
         takes its turn."""
 
@@ -547,6 +559,7 @@ class PostgresStore:
         for migration in migrations:
             with self._connect() as conn, conn.cursor() as cur:
                 cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (output.name,))
+                self._domain(cur, table, exclusive=True)
                 cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (table,))
                 before = self._relid(cur, table)
                 done = cur.execute(
@@ -556,13 +569,9 @@ class PostgresStore:
                 if done:
                     applied.append(migration.name)
                     continue
-                if before is not None:
+                if before is not None and scope is not None and scope.generation is not None:
                     self._fence_table(cur)
-                    if scope is not None and scope.generation is not None:
-                        self._take(cur, before, scope)
-                    cur.execute(
-                        f"SELECT 1 FROM {FENCE_TABLE} WHERE relid = %s ORDER BY part FOR UPDATE", (before,)
-                    )
+                    self._take(cur, before, scope)
                 if isinstance(migration.payload, str):
                     cur.execute(migration.payload)
                 elif callable(migration.payload):

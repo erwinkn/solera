@@ -664,11 +664,13 @@ Internal to the store; the engine supplies one number.
   arriving meanwhile waits on the lock, finds the table, and acquires as
   usual.
 - **Migrations** change the whole table, so each runs between writers,
-  never under one. Before it changes anything, its transaction takes the
-  attempt's own slice (an older attempt's migration is refused; a newer
-  attempt's acquisition waits for it to commit) and locks every other
-  slice's fence row in partition order, waiting for their open write
-  transactions. One that **replaces the relation** (create, copy, drop,
+  never under one. Every writer's transaction — an acquisition, a
+  partition's first write, any write — first takes the table's write
+  domain shared (a transaction-level advisory lock); a migration takes it
+  exclusively, so it waits for every open write transaction and holds off
+  new ones, of partitions with a fence row or not. Before it changes
+  anything, it takes the attempt's own slice: an older attempt's migration
+  is refused. One that **replaces the relation** (create, copy, drop,
   rename) gives the table a new OID; it moves the fence rows to the new OID
   in the same transaction, so the write domain keeps its generations. An
   operator's `solera migrate` has no generation: it only takes its turn.
