@@ -35,7 +35,7 @@ async def test_every_boundary_once(tmp_path):
     def items():
         return Patch(pending["rows"], remove=pending["remove"])
 
-    @asset(inputs={"items": Incremental(batch_size=5)})  # a full read spans pages: wipe on its first
+    @asset(inputs={"items": Incremental(page_size=5)})  # a full read spans pages: wipe on its first
     def mirror(ctx, items: list):
         changes = ctx.changes["items"]
         if changes.full and changes.first:

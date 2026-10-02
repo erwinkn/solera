@@ -62,53 +62,86 @@ class Window:
     unmatched: bool = False
 
 
+async def _fill(chunk, start: bytes | None, limit: int, kind) -> tuple[list, str | None, int]:
+    """A page of `limit` entries that `kind` takes, read ahead past the ones
+    it does not: `chunk(after)` returns `(entries, next)` — entries as
+    `(key, version, deleted, locator)` in key order past `after`, and where
+    to go on (None: exhausted). Past a full page it looks on for one more
+    entry it takes, so that a page is `final` exactly when nothing follows
+    and no delivery ends on an empty page (§5). Returns the page's entries,
+    where the next page starts (None: this one is final), and how many
+    entries were read."""
+
+    page, cursor, read, last = [], start, 0, None
+    while True:
+        entries, nxt = await chunk(cursor)
+        read += len(entries)
+        for entry in entries:
+            if kind(entry) is None:
+                continue
+            if len(page) == limit:  # one more is taken: the page is full, not final
+                return page, key_str(last), read
+            page.append((kind(entry), entry))
+            last = entry[0]
+        if nxt is None:
+            return page, None, read
+        cursor = nxt
+
+
 async def read_window(pin: dict, keys_io) -> Window:
     """An Incremental page of a keyed upstream, as the spec pins it: the
     keys= override, a full delivery's page, a window of pending deltas — all
-    filtered by the edge's patterns (per-key §11) — or a rescope's diff of
-    the index as of its cutover: the keys whose membership changed."""
+    filtered by the edge's patterns (per-key §11), read ahead past keys they
+    leave out until the page holds `page_size` keys or the delivery runs
+    out — or a rescope's diff of the index as of its cutover: the keys whose
+    membership changed. A pure function of the pin: it reads the index
+    through `KeyIndex.page`, `pending` and `lookup` only, so the engine can
+    run it on its own copies to serve the same page."""
 
     ch = pin["changes"]
     index = KeyIndex(keys_io, None, IndexState.from_json(pin["index"]))
+    limit = int(ch.get("limit") or 1)
+    start = key_bytes(ch["after"]) if ch.get("after") is not None else None
+
+    async def whole(after):
+        keys, versions, locators, nxt = await index.page(after, limit)
+        return list(zip(keys, versions, bytes(len(keys)), locators, strict=True)), nxt
+
+    async def window(after):
+        keys, versions, flags, locators, nxt = await index.pending(
+            int(ch["from"]), int(ch["to"]), after, limit
+        )
+        return list(zip(keys, versions, flags, locators, strict=True)), nxt
+
     if "rescope" in ch:
         old, new = Matcher(ch["rescope"]["from"]), Matcher(ch["rescope"]["to"])
-        start = key_bytes(ch["after"]) if ch.get("after") is not None else None
-        keys, versions, locators, nxt = await index.page(start, int(ch["limit"]))
-        upserted, deleted = {}, []
-        for k, v, loc in zip(keys, versions, locators, strict=True):
-            key = key_str(k)
+
+        def changed(entry):
+            key = key_str(entry[0])
             before, now = old(key), new(key)
-            if now and not before:
-                upserted[key] = (v, loc)
-            elif before and not now:
-                deleted.append(key)
-        after = key_str(nxt) if nxt is not None else None
-        return Window(upserted, tuple(deleted), after, len(keys), unmatched=True)
+            return "upsert" if now and not before else "delete" if before and not now else None
+
+        page, after, read = await _fill(whole, start, limit, changed)
+        upserted = {key_str(e[0]): (e[1], e[3]) for kind, e in page if kind == "upsert"}
+        deleted = tuple(key_str(e[0]) for kind, e in page if kind == "delete")
+        return Window(upserted, deleted, after, read, unmatched=True)
     taken = Matcher(pin.get("patterns"))
     if "keys" in ch:  # a run's keys= override: a one-off selection, of the keys that exist
         found = await index.lookup([key_bytes(str(k)) for k in ch["keys"]])
         upserted = {key_str(k): entry for k, entry in found.items()}
         return Window({k: e for k, e in upserted.items() if taken(k)}, (), None, len(upserted))
-    if "inline" in ch:  # the engine merged this page from its cache (resolved-commits.md §7)
+    if "inline" in ch and pin.get("patterns") is None:  # the engine merged this page from its cache
         page = ch["inline"]
-        upserted = {k: (bytes.fromhex(v), int(loc)) for k, (v, loc) in page["upserted"].items() if taken(k)}
-        deleted = tuple(k for k in page["deleted"] if taken(k))
-        return Window(upserted, deleted, page["next"], len(page["upserted"]) + len(page["deleted"]))
-    start = key_bytes(ch["after"]) if ch.get("after") is not None else None
-    if ch.get("full"):
-        keys, versions, locators, nxt = await index.page(start, int(ch["limit"]))
-        flags = bytes(len(keys))
-    else:
-        keys, versions, flags, locators, nxt = await index.pending(
-            int(ch["from"]), int(ch["to"]), start, int(ch["limit"])
-        )
-    upserted = {
-        key_str(k): (v, loc)
-        for k, v, d, loc in zip(keys, versions, flags, locators, strict=True)
-        if not d and taken(key_str(k))
-    }
-    deleted = tuple(key_str(k) for k, d in zip(keys, flags, strict=True) if d and taken(key_str(k)))
-    return Window(upserted, deleted, key_str(nxt) if nxt is not None else None, len(keys))
+        upserted = {k: (bytes.fromhex(v), int(loc)) for k, (v, loc) in page["upserted"].items()}
+        return Window(upserted, tuple(page["deleted"]), page["next"], len(upserted) + len(page["deleted"]))
+
+    def kind(entry):
+        return ("delete" if entry[2] else "upsert") if taken(key_str(entry[0])) else None
+
+    page, after, read = await _fill(whole if ch.get("full") else window, start, limit, kind)
+    upserted = {key_str(e[0]): (e[1], e[3]) for k, e in page if k == "upsert"}
+    deleted = tuple(key_str(e[0]) for k, e in page if k == "delete")
+    return Window(upserted, deleted, after, read)
 
 
 async def read_page(spec: dict, pin: dict, keys_io) -> Page:

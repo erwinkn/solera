@@ -104,7 +104,7 @@ function EdgeCard({ edge, scope }: { edge: Edge; scope?: string }) {
         description={kind.means}
         actions={
           <div className="flex flex-wrap items-center gap-2 text-xs text-fg-muted">
-            {edge.batch_size != null && <span>{edge.batch_size} keys a page</span>}
+            {edge.page_size != null && <span>{edge.page_size} keys a page</span>}
             {edge.concurrency != null && <span>· {edge.concurrency} at a time</span>}
             {edge.scopes.length > 0 && <span>· {behind ? `${behind} behind` : "all caught up"}</span>}
           </div>

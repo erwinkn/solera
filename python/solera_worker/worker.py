@@ -58,6 +58,7 @@ from solera.sdk import (
     Ref,
     Result,
     TimePartitions,
+    Upstream,
     is_ref_type,
     split_partition,
 )
@@ -350,11 +351,11 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline):
                 args[param] = await store.load(ref, t, Batches(lo, hi))
                 changes[param] = Changes(
                     rows=args[param],
-                    window=range(lo, hi + 1),
                     full=full,
-                    batch=int(ch.get("batch") or 0),
-                    batches=int(ch.get("batches_planned") or 1),
+                    page=int(ch.get("page") or 0),
+                    pages=int(ch.get("pages") or 1),
                     final=not ch.get("more"),
+                    upstream=Upstream(ref.output, range(lo, hi + 1)),
                 )
                 timeline.add("loaded", param, _rows(args[param]))
                 continue
@@ -369,9 +370,10 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline):
                 deleted=deleted,
                 full=full,
                 upserted=tuple(sorted(upserted)),
-                batch=int(ch.get("batch") or 0),
-                batches=int(ch.get("batches_planned") or 1),
-                final=after is None,  # the delivery ran out: never inferred from `batches`
+                page=int(ch.get("page") or 0),
+                pages=int(ch.get("pages") or 1),
+                final=after is None,  # the delivery ran out: never inferred from `pages`
+                upstream=Upstream(ref.output),
             )
             delivered[param] = {"after": after, "upserted": sorted(upserted), "deleted": list(deleted)}
             timeline.add("loaded", param, _rows(args[param]))
@@ -384,10 +386,7 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline):
     # Every keyed page held keys, and the edges' patterns took none of them: nothing
     # to call the producer with.
     filtered = bool(windows) and all(not w.upserted and not w.deleted for w in windows)
-    # ...unless the page ends a delivery that already had pages: its consumer is owed
-    # `final`, even with nothing in it (§5).
-    ending = any(c.final and c.batch > 0 for c in changes.values() if c.window is None)
-    delivered["*filtered"] = filtered and any(w.read for w in windows) and not ending
+    delivered["*filtered"] = filtered and any(w.read for w in windows)
     return args, changes, delivered
 
 

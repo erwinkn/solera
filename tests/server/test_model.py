@@ -384,7 +384,7 @@ async def test_a_paged_task_keeps_no_list_of_its_pages(state, clock):
     def uploads():
         return Patch(batch)
 
-    @asset(inputs={"uploads": Incremental(batch_size=1)})
+    @asset(inputs={"uploads": Incremental(page_size=1)})
     def each_page(uploads: dict):
         return [{"n": len(uploads)}]
 

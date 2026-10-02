@@ -348,7 +348,7 @@ async def test_version_bump_fails_then_full_recovers(state):
 
 
 async def test_incremental_batching_and_more(state):
-    """§6: work is batched by batch_size; `more` re-queues the task;
+    """§6: work is batched by page_size; `more` re-queues the task;
     scope_complete lands on the head only with the last batch."""
     batches = []
 
@@ -356,7 +356,7 @@ async def test_incremental_batching_and_more(state):
     def files():
         return [{"id": f"k{i}", "v": 1} for i in range(5)]
 
-    @asset(inputs={"files": Incremental(batch_size=2)})
+    @asset(inputs={"files": Incremental(page_size=2)})
     def consumer(ctx, files: list):
         batches.append([r["id"] for r in files])
         return []
@@ -1159,8 +1159,8 @@ async def test_ondeploy_two_registrations_fire_latest_once(state):
 
 
 async def test_a_delivery_says_where_each_page_sits(state):
-    """A delivery spans pages of `batch_size`: `batch` is the page's index,
-    `batches` the plan, `first` is batch 0, `final` the delivery running out —
+    """A delivery spans pages of `page_size`: `page` is the page's index,
+    `pages` the plan, `first` is page 0, `final` the delivery running out —
     for full deliveries, delta windows and batch-mode upstreams (§5)."""
 
     from solera.stores import Patch
@@ -1172,10 +1172,10 @@ async def test_a_delivery_says_where_each_page_sits(state):
     def files():
         return [{"id": k, "v": v} for k, v in content.items()]
 
-    @asset(inputs={"files": Incremental(batch_size=3)})
+    @asset(inputs={"files": Incremental(page_size=3)})
     def consumer(ctx, files: list):
         ch = ctx.changes["files"]
-        pages.append((ch.batch, ch.batches, ch.first, ch.final))
+        pages.append((ch.page, ch.pages, ch.first, ch.final))
         if ch.full and ch.first:
             rebuilt["keys"] = []
         rebuilt["keys"] += [r["id"] for r in files]
@@ -1187,10 +1187,10 @@ async def test_a_delivery_says_where_each_page_sits(state):
 
     batch_pages = []
 
-    @asset(inputs={"log": Incremental(batch_size=1)})
+    @asset(inputs={"log": Incremental(page_size=1)})
     def tail(ctx, log: list):
         ch = ctx.changes["log"]
-        batch_pages.append((ch.batch, ch.batches, ch.first, ch.final, list(ch.window)))
+        batch_pages.append((ch.page, ch.pages, ch.first, ch.final, list(ch.upstream.batches)))
         return [{"n": len(log)}]
 
     project = Project(assets=[files, consumer, log, tail])
@@ -1212,9 +1212,9 @@ async def test_a_delivery_says_where_each_page_sits(state):
 
 
 async def test_the_page_plan_is_an_estimate_but_final_is_not(state):
-    """Patterns filter keys after the plan is made: the delivery takes the
-    pages it takes, and its last one still says `final` — delivered empty if
-    the patterns left nothing in it."""
+    """Patterns filter keys after the plan is made: pages are formed from the
+    keys they take, read ahead past the rest, so the delivery takes the pages
+    it takes, none is empty, and `final` is on the last real one (§5)."""
 
     pages = []
 
@@ -1222,10 +1222,10 @@ async def test_the_page_plan_is_an_estimate_but_final_is_not(state):
     def files():
         return [{"id": f"k{i}", "v": 1} for i in range(7)]
 
-    @asset(inputs={"files": Incremental(batch_size=3, include=["k0", "k1", "k2", "k3"])})
+    @asset(inputs={"files": Incremental(page_size=3, include=["k0", "k1", "k2", "k3"])})
     def consumer(ctx, files: list):
         ch = ctx.changes["files"]
-        pages.append((ch.batch, ch.batches, ch.final, sorted(r["id"] for r in files)))
+        pages.append((ch.page, ch.pages, ch.final, sorted(r["id"] for r in files)))
         return [{"n": len(files)}]
 
     project = Project(assets=[files, consumer])
@@ -1234,6 +1234,34 @@ async def test_the_page_plan_is_an_estimate_but_final_is_not(state):
     await drive(engine, await engine.submit(["consumer"], upstream=True))
     assert pages == [
         (0, 3, False, ["k0", "k1", "k2"]),
-        (1, 3, False, ["k3"]),
-        (2, 3, True, []),  # nothing matched, but the consumer is told the delivery ended
+        (1, 3, True, ["k3"]),  # k4..k6 read past: nothing follows, so this page is final
     ]
+
+
+async def test_pages_read_ahead_past_keys_the_patterns_leave_out(state):
+    """Every page holds `page_size` taken keys, however sparse they are in the
+    upstream; a delivery that takes none never calls the producer."""
+
+    calls = []
+
+    @asset(outputs=Output("files", key="id"))
+    def files():
+        return [{"id": f"k{i:02d}", "v": 1} for i in range(30)]
+
+    @asset(inputs={"files": Incremental(page_size=2, include=["k03", "k04", "k17", "k18", "k29"])})
+    def sparse(ctx, files: list):
+        calls.append((ctx.changes["files"].page, sorted(r["id"] for r in files), ctx.changes["files"].final))
+        return [{"n": len(files)}]
+
+    @asset(inputs={"files": Incremental(page_size=2, include="nothing/**")})
+    def none(files: list):
+        calls.append("none")
+        return []
+
+    project = Project(assets=[files, sparse, none])
+    engine = make_engine(state, project)
+    await engine.initialize()
+    await drive(engine, await engine.submit(["sparse"], upstream=True))
+    assert calls == [(0, ["k03", "k04"], False), (1, ["k17", "k18"], False), (2, ["k29"], True)]
+    detail = await drive(engine, await engine.submit(["none"]))
+    assert "none" not in calls and task_statuses(detail)["none"] == "skipped"

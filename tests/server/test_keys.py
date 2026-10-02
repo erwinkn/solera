@@ -206,7 +206,7 @@ async def test_compaction_truncation_and_garbage(state):
     def items():
         return Patch(pending["rows"], remove=pending["remove"])
 
-    @asset(inputs={"items": Incremental(batch_size=7)})
+    @asset(inputs={"items": Incremental(page_size=7)})
     def mirror(ctx, items: list):
         changes = ctx.changes["items"]
         if changes.full and changes.first:
@@ -480,7 +480,7 @@ async def test_small_writes_resolve_in_the_engine_and_pages_come_inline(state, m
     def items():
         return Patch(pending["rows"])
 
-    @asset(inputs={"items": Incremental(batch_size=100)})
+    @asset(inputs={"items": Incremental(page_size=100)})
     def mirror(ctx, items: list):
         for row in items:
             seen[row["id"]] = row["v"]

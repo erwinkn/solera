@@ -120,7 +120,7 @@ async def test_compaction_garbage_is_collected(tmp_path, data):
     def items():
         return Patch(pending["rows"])
 
-    @asset(inputs={"items": Incremental(batch_size=5)})
+    @asset(inputs={"items": Incremental(page_size=5)})
     def mirror(items: list):
         return []
 

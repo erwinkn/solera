@@ -30,7 +30,7 @@ export interface EdgeDecl {
   kind: "in" | "incremental" | "all_partitions";
   output: string;
   meta: Json;
-  batch_size?: number;
+  page_size?: number;
   each?: { concurrency: number } | null;
   patterns?: Patterns | null;
 }
@@ -349,7 +349,7 @@ export interface Edge {
   output: string;
   upstream_asset: string | null;
   source: boolean;
-  batch_size: number | null;
+  page_size: number | null;
   concurrency: number | null;
   patterns: Patterns | null;
   scopes: EdgeScope[];

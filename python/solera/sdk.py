@@ -374,7 +374,7 @@ class Incremental(In):
     def __init__(
         self,
         output: str | None = None,
-        batch_size: int = 100,
+        page_size: int = 100,
         meta: dict | None = None,
         *,
         include=None,
@@ -383,16 +383,16 @@ class Incremental(In):
         from . import patterns
 
         super().__init__(output, meta=meta)
-        if batch_size < 1:
-            raise RegistrationError("Incremental batch_size must be positive")
-        self.batch_size = batch_size
+        if page_size < 1:
+            raise RegistrationError("Incremental page_size must be positive")
+        self.page_size = page_size
         try:
             self.patterns = patterns.spec(include, exclude)
         except (ValueError, TypeError) as error:
             raise RegistrationError(str(error)) from None
 
     def spec(self, param: str) -> dict:
-        spec = {**super().spec(param), "batch_size": self.batch_size}
+        spec = {**super().spec(param), "page_size": self.page_size}
         if self.patterns is not None:
             spec["patterns"] = self.patterns
         return spec
@@ -402,7 +402,7 @@ class Each(Incremental):
     """An asset written for one key, run over every changed key of a keyed
     upstream (docs/per-key-processing.md §5): the parameter receives one
     key's value, `ctx.key` names it, and every output is keyed by it.
-    `batch_size` keys make one attempt and one commit; `concurrency` of them
+    `page_size` keys make one attempt and one commit; `concurrency` of them
     run at once. A key whose call raises is recorded in the asset's failure
     index and retried by its class (§8, §9); it never blocks the others."""
 
@@ -410,13 +410,13 @@ class Each(Incremental):
         self,
         output: str | None = None,
         *,
-        batch_size: int = 100,
+        page_size: int = 100,
         concurrency: int = 16,
         meta: dict | None = None,
         include=None,
         exclude=None,
     ):
-        super().__init__(output, batch_size=batch_size, meta=meta, include=include, exclude=exclude)
+        super().__init__(output, page_size=page_size, meta=meta, include=include, exclude=exclude)
         if concurrency < 1:
             raise RegistrationError("Each concurrency must be positive")
         self.concurrency = concurrency
@@ -432,38 +432,54 @@ class AllPartitions(In):
 
 
 @dataclass(frozen=True)
+class Upstream:
+    """Facts about the upstream a page came from (§5.1): its `output`, and —
+    for a batch-mode upstream — the range of its `batches`, the upstream
+    commits the page covers."""
+
+    output: str | None = None
+    batches: range | None = None
+
+
+@dataclass(frozen=True)
 class Changes:
-    """What an `Incremental` edge delivered to a parameter (§5.1): the delivered
-    `rows` (same object the parameter received), the removed `deleted` keys and
-    the delivered `upserted` keys (keyed upstreams), the upstream batches it
-    covers as a `window` range (batch-mode upstreams), whether it is part of a
-    `full` delivery (the whole head after a reset, not a delta), and where the
-    page sits in its delivery, which may span many pages of `batch_size`:
+    """What an `Incremental` edge delivered to a parameter (§5.1). The rows
+    arrive as the parameter; `ctx.changes[name]` says what they are and
+    where they sit in their delivery:
 
-    - `batch`: this page's 0-based index within its delivery — exact;
-    - `batches`: how many pages the delivery was planned to take when it
-      started (its keys, or batches, by `batch_size`). A plan, not a promise:
-      when the edge's patterns filter keys, or the upstream's key count is
-      approximate, the delivery may end earlier or later;
-    - `first`: `batch == 0` — on a full delivery, the moment to start over;
-    - `final`: no page of this delivery follows — known from the delivery
-      itself running out, never from `batches`.
+    - `rows`: the delivered rows (the object the parameter received);
+      `upserted` and `deleted`: the keys delivered and removed (keyed
+      upstreams);
+    - `full`: the page is part of a full delivery — the whole head after a
+      reset, not a delta;
+    - `page`: this page's 0-based index in its delivery, exact;
+    - `pages`: how many pages the delivery was planned to take when it
+      started, by `page_size`. Exact when the edge has no patterns and the
+      upstream's key count is exact; otherwise an estimate, and the
+      delivery may take fewer pages, or more;
+    - `first`: `page == 0` — on a full delivery, the moment to start over;
+    - `final`: no page of this delivery follows, known from the delivery
+      itself running out, never from `pages`. Pages are formed from the
+      keys the edge's patterns take, so every page holds some: `final` is
+      always on a real page, and a delivery that takes no key at all does
+      not call the producer;
+    - `upstream`: facts about the upstream (`Upstream`).
 
-    A consumer that rebuilds wipes when `full and first`, appends every page,
-    and swaps or finalizes on `final`."""
+    A consumer that rebuilds starts over when `full and first`, appends every
+    page, and swaps or finalizes on `final`."""
 
     rows: Any = ()
     deleted: tuple = ()
-    window: range | None = None
-    full: bool = False
     upserted: tuple = ()
-    batch: int = 0
-    batches: int = 1
+    full: bool = False
+    page: int = 0
+    pages: int = 1
     final: bool = True
+    upstream: Upstream = field(default_factory=Upstream)
 
     @property
     def first(self) -> bool:
-        return self.batch == 0
+        return self.page == 0
 
 
 # ---------------------------------------------------------------------------

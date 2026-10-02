@@ -50,7 +50,7 @@ Three things in Solera force that shape:
 ## 2. The design in one paragraph
 
 An asset declares how to process **one key**; `Each` runs it over every
-changed key of a keyed upstream, `concurrency` at a time, `batch_size` keys
+changed key of a keyed upstream, `concurrency` at a time, `page_size` keys
 per attempt, and hands each output's store one `Patch({key: value})`.
 Every key is a group: it holds all the rows that carry it, one or many,
 and its version is a digest of the multiset of those rows. Errors raised for one key are classified by the
@@ -123,7 +123,7 @@ def sharepoint_files(ctx, events: pd.DataFrame):
     inputs={"file": Each("sharepoint_files",
                          include="ICP/Results/**/*.csv",
                          exclude={"archive": "**/archive/**", "templates": "**/*template*"},
-                         batch_size=100, concurrency=16)},
+                         page_size=100, concurrency=16)},
     automations=AutoRefresh(),
 )
 async def icp(ctx, file: dict, sharepoint: SharePointClient) -> Result:
@@ -156,7 +156,7 @@ its path. `item_id` stays a column.
 ## 5. `Each`
 
 ```python
-Each(output=None, *, include=None, exclude=None, batch_size=100, concurrency=16, meta=None)
+Each(output=None, *, include=None, exclude=None, page_size=100, concurrency=16, meta=None)
 ```
 
 - **The upstream must be keyed** — a keyed output or keyed source; keys
@@ -165,14 +165,14 @@ Each(output=None, *, include=None, exclude=None, batch_size=100, concurrency=16,
   as part of a page: the worker asks `store.load(ref, dict[str, T],
   Keys(page))` and the store splits the page by key. `ctx.key` and
   `ctx.revision` name the key and its upstream version.
-- **`batch_size`** is keys per attempt, which is keys per commit: it bounds
+- **`page_size`** is keys per attempt, which is keys per commit: it bounds
   how much work a crash throws away. **`concurrency`** is keys in flight
   within an attempt: a semaphore for an `async` function, a pool of
   threads for a plain one.
 - **Neither bounds row memory.** Both count keys: a page of 100 keys holds
   whatever rows those keys produce, and one 2 GB workbook is still one
   key. A per-key function that can produce huge groups needs a smaller
-  `batch_size` and `concurrency`, chosen by its author; Solera does not
+  `page_size` and `concurrency`, chosen by its author; Solera does not
   measure rows.
 - **Every output of the asset is keyed by the input's key** — `key=`
   (the rows the call returns, any number) or `keyed=True` (one value).
@@ -376,7 +376,7 @@ transfer; declaring a revision column avoids it.
   sorted run of `(key, version, deleted)` — so one path serves
   replacement, patch, resolve and merge-join.
 - **The only per-key Python objects are an `Each` page's**: a
-  `dict[key, value]` of at most `batch_size` entries.
+  `dict[key, value]` of at most `page_size` entries.
 
 ## 8. Errors
 
@@ -488,7 +488,7 @@ history (§10) never orphans a failing key's explanation; a systemic
 failure repeats one message, which block compression absorbs.
 
 **Who writes it: the worker, resolved locally.** Failure deltas never go
-to the HTTP resolver. A page touches at most `batch_size` keys of the
+to the HTTP resolver. A page touches at most `page_size` keys of the
 failure index, and the worker needs their *prior records*, not just
 whether they changed: tries, `since` and `until` carry over. So it does
 exact point lookups of the touched keys in the pinned failure index (a
@@ -590,7 +590,7 @@ assets are started by the clock; an asset run by hand picks up due keys
 on its next run.
 
 **Every eligible key is retried**; the only question is pacing. Retries
-form **pages of their own**, up to `batch_size` keys, in a **retry pass**:
+form **pages of their own**, up to `page_size` keys, in a **retry pass**:
 a walk over the failure index in key order, with its position in the
 watermark:
 
@@ -606,7 +606,7 @@ retry: {pass: 7, epoch: 12, forced_pos: 4031, after: "ICP/Results/run-17.csv",
 | `due_acc`, `epoch_acc` | minima over the **resulting records** of every key at or before `after`: `next_at` over retrying and timed-out records, `epoch` over failed ones |
 
 - **Each retry page** walks the index from `after` until it has
-  `batch_size` eligible keys or reaches the end. Its commit — atomic with
+  `page_size` eligible keys or reaches the end. Its commit — atomic with
   the outputs, failure delta and watermark — advances `after` and folds
   into the accumulators every record in the walked range *as it is after
   the page's transitions*, eligible or not. The worker computes that from
@@ -642,7 +642,7 @@ is processed once, at its new revision.
 
 **Bounds.** State is constant per scope. A systemic failure of 1M keys is a
 1M-entry index on the object store, compacted like any other. Each page
-does O(`batch_size`) lookups and O(`batch_size`) bound updates; nothing
+does O(`page_size`) lookups and O(`page_size`) bound updates; nothing
 rescans the index per commit. Its recovery — a deploy that fixes the bug,
 or `solera retry --failed` — is a paged pass on workers, off the engine's
 scheduling path.
@@ -662,7 +662,7 @@ processed:
 | `duration` | seconds in the call |
 | `at` | |
 
-The rows travel in the attempt's `.result` (at most `batch_size` of them) and
+The rows travel in the attempt's `.result` (at most `page_size` of them) and
 the engine appends them at settlement. They are filed by `run`, so
 retention drops them with their run; the failure index is state and never
 expires. The table counts no rows: how many rows a key produced is the
@@ -928,7 +928,7 @@ is below the current one.
 
 **Simpler.**
 
-- `Each` pages are small writes — `batch_size` keys — so their output
+- `Each` pages are small writes — `page_size` keys — so their output
   deltas take the HTTP resolver whenever the engine has the output's index
   admitted to its cache (exact counts, no index reads on the worker), and
   the cold path otherwise. Failure deltas are always resolved by the
@@ -1087,7 +1087,7 @@ Where the implementation (`solera/errors.py`, `solera/build.py`,
   `retry_after=0` costs one retry per run, not a loop.
 - **A full delivery** (a reset, or a `full` run) defers retries until it is
   drained: it reprocesses every key anyway.
-- **A retry page walks at most 100 × `batch_size` records** before it ends,
+- **A retry page walks at most 100 × `page_size` records** before it ends,
   so a long stretch of keys that are not due spans several pages.
 - **Retry pages are not inlined**, though change pages are
   (`resolved-commits.md` §7–§8): the worker pages through the failure index. Transitions read priors with an
@@ -1116,13 +1116,15 @@ Where the implementation (`solera/errors.py`, `solera/build.py`,
 - **Patterns** (`solera/patterns.py`) are evaluated by Python's `re`, by
   the worker only — on every page it reads: windows, inlined pages
   (`resolved-commits.md` §7), full deliveries, `keys=` overrides and
-  retry pages (a due key the edge no longer takes is `unmatched`). A page
-  they take nothing from does not call the producer and ends `skipped`
-  once its window is done.
+  retry pages (a due key the edge no longer takes is `unmatched`). Pages
+  are formed from the keys they take, read ahead past the others until a
+  page holds `page_size` keys or the delivery runs out, so no page is
+  empty; a delivery they take nothing from does not call the producer
+  and ends `skipped`.
 - **The rescope cutover** lives on the watermark: `patterns` (what it
   delivers under) and, during a transition, `rescope` {`from`, `to`,
   `cutover`, `snapshot` (the upstream index as of the cutover), `pin`,
-  `after`}. The diff pages through the whole snapshot (`batch_size` keys
+  `after`}. The diff pages through the whole snapshot (`page_size` keys
   read per page), not only the key ranges the patterns' prefixes cover.
   A newer pattern change waits for the transition to end, then cuts over
   again. Retries wait for a transition, as for a full delivery. A window

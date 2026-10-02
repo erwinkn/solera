@@ -429,7 +429,7 @@ function Declaration({ asset, manifest }: { asset: AssetDecl; manifest: Manifest
                   {edge.output}
                   <span className="text-fg-subtle">)</span>
                 </span>
-                {edge.batch_size != null && <Tag>{edge.batch_size} keys a page</Tag>}
+                {edge.page_size != null && <Tag>{edge.page_size} keys a page</Tag>}
                 {edge.each && <Tag>{edge.each.concurrency} at a time</Tag>}
                 {edge.patterns && <PatternList patterns={edge.patterns} />}
               </Row>

@@ -253,7 +253,7 @@ async def test_concurrency_and_batches(state):  # noqa: F811
         pages.append(ctx.attempt if hasattr(ctx, "attempt") else ctx.run_id)
         return [{"value": file["n"]}]
 
-    project = files_project({f"k{i}": {"n": i} for i in range(7)}, parse, batch_size=3, concurrency=2)
+    project = files_project({f"k{i}": {"n": i} for i in range(7)}, parse, page_size=3, concurrency=2)
     engine = make_engine(state, project)
     await engine.initialize()
     detail = await drive(engine, await engine.submit(["parse"], upstream=True))
@@ -364,7 +364,7 @@ async def test_a_user_cancel_commits_finished_keys_and_leaves_the_rest_dormant(t
 
 
 async def test_a_retry_pass_spans_pages_and_accumulates_its_bounds(state):  # noqa: F811
-    """Retry pages walk the failure index `batch_size` keys at a time,
+    """Retry pages walk the failure index `page_size` keys at a time,
     alternating with change pages; the pass's accumulators become the exact
     bounds when it completes (§9)."""
 
@@ -376,7 +376,7 @@ async def test_a_retry_pass_spans_pages_and_accumulates_its_bounds(state):  # no
             raise ValueError("bug")
         return [{"n": file["n"]}]
 
-    project = files_project(content, parse, batch_size=2)
+    project = files_project(content, parse, page_size=2)
     engine = make_engine(state, project)
     await engine.initialize()
     await drive(engine, await engine.submit(["parse"], upstream=True))
@@ -524,7 +524,7 @@ async def test_a_pattern_change_cuts_over(state):  # noqa: F811
         seen.append(ctx.key)
         return [{"n": file["n"]}]
 
-    old = files_project(content, parse, include=["a/**", "archive/**"], batch_size=1)
+    old = files_project(content, parse, include=["a/**", "archive/**"], page_size=1)
     engine = make_engine(state, old)
     await engine.initialize()
     await drive(engine, await engine.submit(["parse"], upstream=True))
@@ -535,7 +535,7 @@ async def test_a_pattern_change_cuts_over(state):  # noqa: F811
     await drive(engine, await engine.submit(["files"]))
     # A deploy: archive excluded, b included.
     new = files_project(
-        content, parse, include=["a/**", "b/**"], exclude={"archive": "archive/**"}, batch_size=1
+        content, parse, include=["a/**", "b/**"], exclude={"archive": "archive/**"}, page_size=1
     )
     engine = make_engine(state, new)
     await engine.initialize()

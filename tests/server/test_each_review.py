@@ -281,9 +281,9 @@ async def test_a_full_run_pages_through_every_key_once(state):  # noqa: F811
         seen.append(ctx.key)
         return [{"n": file["n"]}]
 
-    project = files_project({"a": {"n": 1}, "b": {"n": 2}, "c": {"n": 3}}, parse, batch_size=1)
+    project = files_project({"a": {"n": 1}, "b": {"n": 2}, "c": {"n": 3}}, parse, page_size=1)
 
-    @asset(inputs={"f": Incremental("files", batch_size=1)})
+    @asset(inputs={"f": Incremental("files", page_size=1)})
     def consumer(f: dict):
         plain.extend(f)
         return [{"n": len(f)}]

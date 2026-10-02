@@ -313,7 +313,7 @@ class Views:
                     "output": output,
                     "upstream_asset": self.manifest["outputs"][output].get("asset"),
                     "source": output in self.manifest["sources"],
-                    "batch_size": edge.get("batch_size"),
+                    "page_size": edge.get("page_size"),
                     "concurrency": (edge.get("each") or {}).get("concurrency"),
                     "patterns": edge.get("patterns"),
                     "scopes": scopes,

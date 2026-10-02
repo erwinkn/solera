@@ -1154,17 +1154,17 @@ class Engine(Attempts, Sensors, Views):
         fingerprint change, a `full` run, a keys='full' override, or a log that
         no longer holds the window — the whole index, restarting from the
         head's next batch so changes made while draining arrive afterwards as
-        deltas. Either is delivered `batch_size` keys at a time; the harness
+        deltas. Either is delivered `page_size` keys at a time; the harness
         reports where it stopped (`after`), and a task with more to deliver is
         queued again. A batch-mode upstream is planned here: the next
-        `batch_size` batches after the watermark, all since the last reset
+        `page_size` batches after the watermark, all since the last reset
         (`base`) when starting over.
 
         Watermark: {"batch", "until"?, "after", "full", "fingerprint", "output", "up"}."""
 
         output = edge["output"]
         keyed = self.manifest["outputs"][output].get("key") is not None
-        limit = int(edge.get("batch_size") or 100)
+        limit = int(edge.get("page_size") or 100)
         head = self.m.heads.get((output, up_scope)) or {}
         head_batch = int(head.get("batch", -1))
         override = (run.get("keys") or {}).get(output)
@@ -1213,8 +1213,8 @@ class Engine(Attempts, Sensors, Views):
                 "batches": [lo, hi],
                 "full": reset,
                 "more": more,
-                "batch": page,
-                "batches_planned": pages,
+                "page": page,
+                "pages": pages,
             }
             update = {**base, "batch": max(lo, hi + 1), "after": None, "full": False}
             if more:
@@ -1251,8 +1251,8 @@ class Engine(Attempts, Sensors, Views):
                         "rescope": {"from": rescope["from"], "to": rescope["to"]},
                         "after": rescope["after"],
                         "limit": limit,
-                        "batch": page,
-                        "batches_planned": pages,
+                        "page": page,
+                        "pages": pages,
                     },
                 }
                 plan = {**base, "diff": True, "batch": int(wm["batch"]), "page": page, "pages": pages}
@@ -1284,7 +1284,7 @@ class Engine(Attempts, Sensors, Views):
             empty = False  # the transition has its diff still to do
         pinned = index.pinned() if window["full"] else index.pinned(window["from"], window["to"])
         # Where this page sits in its delivery (§5): planned when the delivery starts —
-        # the keys in the whole index or in the window's delta files, by `batch_size`,
+        # the keys in the whole index or in the window's delta files, by `page_size`,
         # an estimate when patterns filter or a count is inexact — and kept on the
         # watermark while the delivery continues.
         if window["after"] is not None and wm is not None and wm.get("page") is not None:
@@ -1294,7 +1294,7 @@ class Engine(Attempts, Sensors, Views):
                 pinned.count if window["full"] else sum(f.entries for _, files in pinned.log for f in files)
             )
             page, pages = 0, _pages(keys, limit)
-        changes = {**window, "limit": limit, "batch": page, "batches_planned": pages}
+        changes = {**window, "limit": limit, "page": page, "pages": pages}
         pin = {"ref": ref, "index": pinned.to_json(), "changes": changes}
         if not window["full"] and not empty and self.keys is not None:
             # The first page of the pinned window, from summaries in memory (§7 of
@@ -1373,7 +1373,7 @@ class Engine(Attempts, Sensors, Views):
             "batch": int(record.get("batch", -1)) + 1,
             "pass_after": (retry or {}).get("after"),
         }
-        limit = int(edge.get("batch_size") or 100)
+        limit = int(edge.get("page_size") or 100)
         if kind == "reconcile":
             pin = {
                 "ref": ref,

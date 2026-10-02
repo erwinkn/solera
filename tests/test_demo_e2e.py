@@ -198,7 +198,7 @@ def test_demo_end_to_end(demo, pool_worker):
     # -- the changed-keys pass (§6, Incremental) -----------------------------
     # Once the tick advances every file's revision bumps; the consumer must
     # process exactly the changed keys (and any deletions), in batches of
-    # batch_size=2 — four files per site means `more` continuation.
+    # page_size=2 — four files per site means `more` continuation.
     def site_file_keys():
         out = {}
         for h in heads("site_files"):
@@ -219,7 +219,7 @@ def test_demo_end_to_end(demo, pool_worker):
     for task in detail["tasks"]:
         if task["asset"] != "file_index":
             continue
-        assert task["attempt_count"] >= 2, "batch_size=2 over 4 files must continue with more"
+        assert task["attempt_count"] >= 2, "page_size=2 over 4 files must continue with more"
         for attempt in detail["attempts"][task["id"]]:
             if attempt["status"] != "succeeded":
                 continue

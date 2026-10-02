@@ -231,7 +231,7 @@ index; that is inherent, and cheap in requests.
 ### Full delivery to a consumer
 
 A consumer re-reads everything (new consumer, version bump, `full` run),
-one attempt per page of `batch_size` keys. Only the key index side is
+one attempt per page of `page_size` keys. Only the key index side is
 counted here; loading the rows is the store's cost.
 
 Pages of 10K keys:

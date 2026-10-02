@@ -62,7 +62,7 @@ def build_project(content, parts):
     def parted(ctx):
         return dict(parts[ctx.partition])
 
-    @asset(inputs={"parts": Incremental(batch_size=1)}, partitions={"day": days}, deps=["files"])
+    @asset(inputs={"parts": Incremental(page_size=1)}, partitions={"day": days}, deps=["files"])
     def consume(parts: dict):
         return {"n": len(parts)}
 
@@ -283,7 +283,7 @@ async def test_edges_report_every_scope_and_its_lag(world):
     assert found["asset"] == "consume"
     edges = {e["param"]: e for e in found["edges"]}
     assert (edges["parts"]["kind"], edges["files"]["kind"]) == ("incremental", "dep")
-    assert edges["parts"]["upstream_asset"] == "parted" and edges["parts"]["batch_size"] == 1
+    assert edges["parts"]["upstream_asset"] == "parted" and edges["parts"]["page_size"] == 1
     assert edges["files"]["scopes"] == [] and edges["files"]["source"] is False
     scopes = {s["scope"]: s for s in edges["parts"]["scopes"]}
     assert scopes["x"]["state"] == "caught_up" and scopes["x"]["lag"] == 0

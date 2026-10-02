@@ -226,7 +226,7 @@ def site_feed(ctx, feed: FeedClient):
         migrations=postgres_migrations("file_index"),
     ),
     partitions={"site": sites},
-    inputs={"site_files": Incremental(batch_size=2)},
+    inputs={"site_files": Incremental(page_size=2)},
     version="2",
     automations=AutoRefresh(),
 )
@@ -262,7 +262,7 @@ class Unreadable(Rejected):
         migrations=postgres_migrations("file_checks"),
     ),
     partitions={"site": sites},
-    inputs={"file": Each("site_files", batch_size=4, concurrency=4, exclude={"drafts": "*-file-2"})},
+    inputs={"file": Each("site_files", page_size=4, concurrency=4, exclude={"drafts": "*-file-2"})},
     automations=AutoRefresh(),
 )
 async def file_checks(ctx, file: list[dict]):
