@@ -628,7 +628,14 @@ class History:
     def __init__(self, state, *, clock=None, **lake):
         self.state = state
         self.lake = Lake(
-            state, TABLES, lambda: state.model.history, name="History", clock=clock, volatile=VOLATILE, **lake
+            state,
+            TABLES,
+            lambda: state.model.history,
+            name="History",
+            clock=clock,
+            volatile=VOLATILE,
+            pin=lambda: state.model.reading(),
+            **lake,
         )
         self.clock = self.lake.clock
 

@@ -96,3 +96,30 @@ async def test_a_query_sees_the_buffer_as_it_was(tmp_path):
     assert await lake.query(rows, ("events",)) == [("b", 2)]  # mirrored anew meanwhile
     go.set()
     assert await pending == [("a", 1)]
+
+
+async def test_a_flush_during_the_download_neither_hides_nor_repeats_a_row(tmp_path, monkeypatch):
+    """System review #2: `a` is in a file, `b` in the buffer. A query
+    starts; while it downloads `a`'s file, `b` is flushed. The query saw one
+    moment: both rows, once."""
+
+    store = Store(tmp_path)
+    lake = Lake(store, SCHEMA, lambda: store.lake, name="Log", cache=str(tmp_path / "cache"))
+    store.lake.append("events", {"run": "a", "at": 1.0, "n": 1})
+    await lake.flush(force=True)
+    lake._evict(store.lake.files["events"][0]["path"])  # it must be downloaded
+    store.lake.append("events", {"run": "b", "at": 2.0, "n": 2})
+    fetch, fetching, go = lake._fetch, asyncio.Event(), asyncio.Event()
+
+    async def slow(paths):
+        fetching.set()
+        await go.wait()
+        await fetch(paths)
+
+    monkeypatch.setattr(lake, "_fetch", slow)
+    pending = asyncio.create_task(lake.query(rows, ("events",)))
+    await fetching.wait()
+    await lake.flush(force=True)  # `b` leaves the buffer for a file
+    go.set()
+    assert await pending == [("a", 1), ("b", 2)]
+    assert await lake.query(rows, ("events",)) == [("a", 1), ("b", 2)]

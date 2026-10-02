@@ -136,6 +136,7 @@ class Lake:
         base_rows: int = 1_000,
         final_rows: int = 1_000_000,
         volatile: tuple[str, ...] = (),
+        pin=contextlib.nullcontext,
     ):
         self.state, self.schema, self.held = state, schema, held
         # files go under `{prefix}/{table}/`; events are `{name}Flushed` and so on
@@ -162,6 +163,7 @@ class Lake:
         self._mirrored: dict[str, tuple] = {}  # table -> (state, generation, first seq, last seq)
         # rows of `volatile` tables: memory only, never journaled, until a flush writes them
         self.volatile: dict[str, list[list]] = {table: [] for table in volatile}
+        self.pin = pin  # a context in which the files a query chose are not collected
 
     # -- write path ----------------------------------------------------------------------
 
@@ -508,51 +510,58 @@ class Lake:
     ):
         """Run `work(con)` on a worker thread against a DuckDB connection with
         a view per table: its files, its buffer, and `extra` rows (objects).
-        Files outside `since`/`until`, or unable to hold `key`, are left out."""
+        Files outside `since`/`until`, or unable to hold `key`, are left out.
 
-        lake = self.held()
-        files = {}
-        for table in tables:
-            chosen = []
-            for f in lake.files.get(table, ()):
-                lo, hi = f["at"]
-                if since is not None and hi is not None and hi < since:
-                    continue
-                if until is not None and lo is not None and lo >= until:
-                    continue
-                if key is not None and not (f["keys"][0] <= key <= f["keys"][1]):
-                    continue
-                chosen.append(f)
-            await self._fetch([f["path"] for f in chosen])
-            files[table] = [(self._local(f["path"]), list(f.get("hidden") or ())) for f in chosen]
-        # With no await from here on, the files chosen and the buffers agree;
-        # the transaction keeps the buffers as they are now for the query.
-        for table in tables:
-            self._mirror(table)
-        con = self._database().cursor()
-        con.execute("BEGIN TRANSACTION")
-        for table in tables:
-            con.execute(f'SELECT 1 FROM "{table}__buffer" LIMIT 0').fetchall()
-        extra = {t: rows for t, rows in (extra or {}).items() if rows and t in tables}
+        One snapshot, taken before the first await: the files chosen, their
+        hidden keys and the buffers (kept by the transaction) agree, so a
+        flush during the download can neither hide a row nor show it twice.
+        The files chosen are pinned until the query ends."""
 
-        def go():
-            with tempfile.TemporaryDirectory() as tmp:
-                try:
-                    for table in tables:
-                        parts = [f'SELECT * EXCLUDE (_seq) FROM "{table}__buffer"']
-                        if table in extra:
-                            path = os.path.join(tmp, f"{table}.json")
-                            names = list(self.schema[table].columns)
-                            self._ndjson(path, table, [[r.get(c) for c in names] for r in extra[table]])
-                            parts.append(self._json_sql(table, [path]))
-                        con.execute(
-                            f"CREATE TEMP VIEW {table} AS {self._files_sql(table, files[table], parts)}"
-                        )
-                    return work(con)
-                finally:
-                    con.close()
+        with self.pin():
+            lake = self.held()
+            files, chosen = {}, []
+            for table in tables:
+                picked = []
+                for f in lake.files.get(table, ()):
+                    lo, hi = f["at"]
+                    if since is not None and hi is not None and hi < since:
+                        continue
+                    if until is not None and lo is not None and lo >= until:
+                        continue
+                    if key is not None and not (f["keys"][0] <= key <= f["keys"][1]):
+                        continue
+                    picked.append(f)
+                files[table] = [(self._local(f["path"]), list(f.get("hidden") or ())) for f in picked]
+                chosen += [f["path"] for f in picked]
+            for table in tables:
+                self._mirror(table)
+            con = self._database().cursor()
+            try:
+                con.execute("BEGIN TRANSACTION")
+                for table in tables:
+                    con.execute(f'SELECT 1 FROM "{table}__buffer" LIMIT 0').fetchall()
+                extra = {t: rows for t, rows in (extra or {}).items() if rows and t in tables}
+                await self._fetch(chosen)
+            except BaseException:
+                con.close()
+                raise
+            return await asyncio.to_thread(self._answer, con, work, tables, files, extra)
 
-        return await asyncio.to_thread(go)
+    def _answer(self, con, work, tables, files, extra):
+
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                for table in tables:
+                    parts = [f'SELECT * EXCLUDE (_seq) FROM "{table}__buffer"']
+                    if table in extra:
+                        path = os.path.join(tmp, f"{table}.json")
+                        names = list(self.schema[table].columns)
+                        self._ndjson(path, table, [[r.get(c) for c in names] for r in extra[table]])
+                        parts.append(self._json_sql(table, [path]))
+                    con.execute(f"CREATE TEMP VIEW {table} AS {self._files_sql(table, files[table], parts)}")
+                return work(con)
+            finally:
+                con.close()
 
 
 def _sql_str(value: str) -> str:
