@@ -28,7 +28,13 @@ from .stores import Database
 from .world import POINTS, Fate, World
 
 log = logging.getLogger("sim")
-STATS = {"examples": 0, "steps": 0, "virtual": 0.0, "seconds": 0.0, "known": {}}  # across runs of this process
+STATS = {
+    "examples": 0,
+    "steps": 0,
+    "virtual": 0.0,
+    "seconds": 0.0,
+    "known": {},
+}  # across runs of this process
 
 KEYS = ["k0", "k1", "k2", "k3", "k10", "k11"]
 SITES = ["east", "west", "north"]
@@ -37,10 +43,7 @@ TERMINAL = {"succeeded", "failed", "canceled", "skipped"}
 # Re-registrations the rules make. Those that trip an open finding on most
 # runs are left out until it is fixed (tests/server/test_sim_found.py);
 # SOLERA_SIM_KNOWN=1 puts them back.
-KNOWN = {
-    "table": "moving a keyed output to another store keeps its index (F2)",
-    "rename": "an attempt launched before a rename never settles (F5)",
-}
+KNOWN: dict[str, str] = {}  # change -> the finding it trips, while open
 CHANGES = sorted(set(VARIANTS) - (set() if os.environ.get("SOLERA_SIM_KNOWN") else set(KNOWN)))
 
 fates = st.one_of(
@@ -329,8 +332,6 @@ class Simulation(RuleBasedStateMachine):
         if self.world is None:
             return
         if self.journal.problems:
-            if all("landed twice" in p for p in self.journal.problems):
-                self._known("F7", "; ".join(self.journal.problems))
             raise Violation("; ".join(self.journal.problems))
         for attempt, ends in self.journal.finished.items():
             if len(ends) > 1:
@@ -428,18 +429,7 @@ class Simulation(RuleBasedStateMachine):
                 for t, x in run["tasks"].items()
                 if x["status"] not in TERMINAL
             }
-            stuck = [
-                t
-                for r in busy
-                for t in engine.m.runs[r]["tasks"].values()
-                if t["status"] == "queued" and (t.get("held") or [None])[0] == "invalid"
-            ]
-            if stuck and stuck[0]["asset"] not in engine.manifest["assets"]:
-                self._known("F4", f"{stuck[0]['id']} queued under a removed asset")
             return f"run {busy[0]} {run['status']}: {tasks}"
-        gone = [t for t in engine.m.claims if t.split("/")[1].split(":")[0] not in engine.manifest["assets"]]
-        if gone:
-            self._known("F5", f"claim {gone[0]} of an asset the manifest no longer names")
         if engine.m.claims:
             return f"claims {list(engine.m.claims)}"
         if world.live_workers():

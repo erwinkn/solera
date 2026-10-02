@@ -4,10 +4,9 @@ object-store faults, checked after every step and at convergence. CI runs
 a short budget; `--slow` (or SOLERA_SIM_EXAMPLES) a long one."""
 
 import os
+import time
 
 from hypothesis import HealthCheck, Phase, Verbosity, settings
-
-import time
 
 from .machine import STATS, Simulation
 

@@ -165,10 +165,10 @@ possibly another interleaving of equal-time events.
 | # | Finding | Severity | Status |
 |---|---|---|---|
 | F1 | `Incremental(exclude="k1*")` with a string is split into characters: `*` excludes every key (`include=` wraps a string) | P3 | open |
-| F2 | A keyed output moved to another store keeps its key index: the next write stores only the changed keys there, and the others become unreadable | P1 | open — `test_a_keyed_output_moved_to_another_store_stays_readable` |
+| F2 | A keyed output moved to another store keeps its key index: the next write stores only the changed keys there, and the others become unreadable | P1 | fixed in 59812c4 — `test_a_keyed_output_moved_to_another_store_stays_readable` |
 | F3 | `Each` loads its upstream as `dict[str, T]`; the store contract, the conformance kit and `examples/json_table_store.py` do not say or do so, and `Each` over such a store fails every key | P2 | open |
-| F4 | A removed asset's launched attempt that asks for more pages, or fails retryably, re-queues a task no manifest can place: its run never ends | P1 | open — `test_a_removed_assets_last_attempt_ends_its_run` |
-| F5 | An attempt launched before a rename settles into a head that moved and an output the manifest no longer names: its claim is never released, its run never ends | P1 | open — `test_an_attempt_launched_before_a_rename_settles` |
+| F4 | A removed asset's launched attempt that asks for more pages, or fails retryably, re-queues a task no manifest can place: its run never ends | P1 | fixed in 59812c4 — `test_a_removed_assets_last_attempt_ends_its_run` |
+| F5 | An attempt launched before a rename settles into a head that moved and an output the manifest no longer names: its claim is never released, its run never ends | P1 | fixed in 59812c4 — `test_an_attempt_launched_before_a_rename_settles` |
 | F6 | A run that finishes an interrupted full delivery ends there though the upstream moved: the `OnChange` firing it ran for delivers nothing of its change | P1 | open — `test_a_change_made_during_a_full_delivery_reaches_downstream` |
-| F7 | Journal cleanup deletes segments a writer still opening has not read; its fence lands in the hole and it serves a state without acknowledged events | P1 | open — `test_a_slow_new_writer_never_fences_into_a_deleted_segment` |
+| F7 | Journal cleanup deletes segments a writer still opening has not read; its fence lands in the hole and it serves a state without acknowledged events | P1 | fixed in 3c23397 — `test_a_slow_new_writer_never_fences_into_a_deleted_segment` |
 | F8 | A `full` run resets an unkeyed incremental output at a new `base`; a consumer whose next batch is exactly that base gets the reset as a delta and keeps the rows the upstream let go (`next < base`, not `<=`) | P1 | open — `test_a_batch_upstream_reset_right_after_a_delivery_is_delivered_in_full` |
