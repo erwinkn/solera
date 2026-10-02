@@ -1215,6 +1215,11 @@ impl LocalFile {
     }
 
     #[getter]
+    fn source_size(&self) -> u64 {
+        self.inner.source_size
+    }
+
+    #[getter]
     fn entries(&self) -> u64 {
         self.inner.entries
     }

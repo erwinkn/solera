@@ -157,11 +157,17 @@ class Attempts:
         §4), or None when the engine keeps no cache. Every output is checked
         against what the engine prepared for the attempt, never trusted."""
 
-        from solera.keys.resolver import Prepared, unframe
+        from solera.keys.resolver import MAX_BODY, Malformed, Prepared, _outputs, unframe
 
         live = self._live(attempt)
-        header, _ = unframe(body)
-        await self._bind(attempt, live, header.get("invocation"))
+        if len(body) > MAX_BODY:
+            raise Malformed(f"a body over {MAX_BODY} bytes")
+        header, payloads = unframe(body)
+        outputs_asked = _outputs(header, payloads)
+        invocation = header.get("invocation")
+        if not isinstance(invocation, str) or not invocation:
+            raise Ended("not_owner")  # no identity is never the owner's
+        await self._bind(attempt, live, invocation)
         if self.keys is None:
             return None
         task = self.m.task(self.m.attempts[attempt])
@@ -179,7 +185,13 @@ class Attempts:
             if index is None or index.prefix != info["prefix"]:
                 return None
             return Prepared(
-                scope, int(info["batch"]), int(launched["pin"]), index, int(head.get("batch", -1)), True
+                scope,
+                int(info["batch"]),
+                int(launched["pin"]),
+                index,
+                int(head.get("batch", -1)),
+                True,
+                self.m.applied,  # the index as of now: what a fill of it reads
             )
 
         def still_live():
@@ -187,8 +199,8 @@ class Attempts:
                 return False
             return live.cancel is None or live.cancel.phase != "forced"
 
-        resolved = {o.get("name"): prepared(o.get("name")) for o in header.get("outputs") or []}
-        return await self.keys.resolve(attempt, body, resolved.get, still_live)
+        resolved = {o["name"]: prepared(o["name"]) for o, _ in outputs_asked}
+        return await self.keys.resolve(attempt, body, resolved.get, still_live, self.m.applied)
 
     def attempt_lines(self, attempt: str) -> list[str] | None:
         live = self.live.get(attempt)

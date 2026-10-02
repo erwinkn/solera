@@ -152,7 +152,8 @@ async def test_row_digests_are_16_bytes_end_to_end(state):
     assert listed["keys"] == {"a": digests[0].hex(), "b": digests[1].hex()}
 
 
-async def test_a_patch_reconciles_what_a_dead_sql_writer_left(state):
+@pytest.mark.parametrize("arrow", [False, True], ids=["rows", "arrow"])
+async def test_a_patch_reconciles_what_a_dead_sql_writer_left(state, arrow):
     """docs/resolved-commits.md §3: a dead `Sql` writer's intent names no keys.
     It deleted `a` and inserted `b` and died before reporting; the next patch,
     of `c`, cannot read back "the intended keys" — it reconciles the whole
@@ -166,6 +167,10 @@ async def test_a_patch_reconciles_what_a_dead_sql_writer_left(state):
 
     @asset(outputs=Output("items", key="id", revision="v", store="live"))
     def items():
+        if arrow:  # the same patch as an Arrow table: repair takes what `key_rows` takes
+            import pyarrow as pa
+
+            return Patch(pa.Table.from_pylist(pending["rows"]))
         return Patch(pending["rows"])
 
     engine = engine_for(state, Project(assets=[items], stores={"live": live}))
@@ -481,8 +486,8 @@ async def test_small_writes_resolve_in_the_engine_and_pages_come_inline(state, m
     answers, reads = [], []
     real_resolve = KeyService.resolve
 
-    async def resolve(self, attempt, body, prepared, live):
-        out = await real_resolve(self, attempt, body, prepared, live)
+    async def resolve(self, attempt, body, prepared, live, position):
+        out = await real_resolve(self, attempt, body, prepared, live, position)
         answers.append(resolver.answers(out)["items"][0]["result"] if out else None)
         return out
 
@@ -576,3 +581,54 @@ async def test_a_byte_valued_key_fails_the_write_instead_of_vanishing(state):
     assert detail["request"]["status"] == "failed"
     assert "a key must be a str or an int" in detail["tasks"][0]["error"]
     assert sorted((await engine.list_keys("items"))["keys"]) == ["a"]
+
+
+@pytest.mark.parametrize("cache", [True, False], ids=["engine", "no-cache"])
+async def test_a_key_removed_twice_is_removed_once(state, cache):
+    """A patch naming a removal twice is normalized once, before either the
+    engine's request or the worker's own resolve is built."""
+
+    pending = {"value": [{"id": "a", "v": 1}, {"id": "b", "v": 1}]}
+
+    @asset(outputs=Output("items", key="id", revision="v"))
+    def items():
+        return pending["value"]
+
+    engine = engine_for(state, Project(assets=[items]), resolve_cache=cache)
+    await engine.initialize()
+    await run(engine, ["items"])
+    pending["value"] = Patch([], remove=["a", "a"])
+    await run(engine, ["items"])
+    assert sorted((await engine.list_keys("items"))["keys"]) == ["b"]
+    assert state.model.indexes[("items", "")].count == 1
+    if engine.keys is not None:
+        await engine.keys.stop()
+
+
+async def test_collection_waits_for_the_engines_own_readers(state):
+    """Review 8: a fill of the engine's cache is a reader pin like an
+    attempt's — collection deletes nothing it may still read."""
+
+    @asset(outputs=Output("items", key="id"))
+    def items():
+        return [{"id": "a"}]
+
+    engine = engine_for(state, Project(assets=[items]))
+    await engine.initialize()
+    await run(engine, ["items"])
+    path = "keys/items/_/gone.kx"
+    await state.put_object(path, b"x")
+    state.model.garbage.append([path, state.model.applied])
+
+    class Reading:
+        def floor(self):
+            return state.model.applied - 1  # a fill that read the index before the file was let go of
+
+    engine.upkeep.keys, keys = Reading(), engine.upkeep.keys
+    await engine.upkeep.collect()
+    assert await state.get_object(path) == b"x"
+    engine.upkeep.keys = keys
+    await engine.upkeep.collect()
+    assert await state.get_object(path) is None
+    if engine.keys is not None:
+        await engine.keys.stop()

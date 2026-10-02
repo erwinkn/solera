@@ -226,6 +226,9 @@ class Upkeep:
         if dropped:
             event["garbage"] = [g.to_json() for g in dropped]
         self.state.record(event)
+        if self.keys is not None:  # published: no new snapshot reads its inputs
+            moved = {f.name for f in added}
+            self.keys.retired([index.path(n) for n in removed if n not in moved])
 
     # -- garbage ---------------------------------------------------------------------
 
@@ -239,6 +242,8 @@ class Upkeep:
         if not self.m.garbage:
             return
         oldest, read = self.m.pin_floor(), self.m.discard_reads()  # pending discards still read them
+        if self.keys is not None:  # and the engine's own fills and fetches of index files
+            oldest = min(oldest, self.keys.floor())
         due = [path for path, n in self.m.garbage if n <= oldest and path not in read]
         if not due:
             return

@@ -565,13 +565,20 @@ def create_app(
         """A small write's delta from the engine's cache (docs/resolved-commits.md §4):
         binary, versioned framing both ways."""
 
-        from solera.keys.resolver import CONTENT_TYPE, UnsupportedVersion
+        from solera.keys.resolver import CONTENT_TYPE, MAX_BODY, Malformed, UnsupportedVersion
 
         runtime = await project_engine(request, p)
+        received = bytearray()
+        async for chunk in request.stream():  # never more than a request may be
+            received += chunk
+            if len(received) > MAX_BODY:
+                return JSONResponse({"detail": f"a body over {MAX_BODY} bytes"}, status_code=413)
         try:
-            body = await runtime.attempt_resolve(attempt, await request.body())
+            body = await runtime.attempt_resolve(attempt, bytes(received))
         except UnsupportedVersion as e:
             return JSONResponse({"detail": str(e)}, status_code=415)
+        except Malformed as e:
+            return JSONResponse({"detail": str(e)}, status_code=400)
         if body is None:
             return Response(status_code=503)
         return Response(content=body, media_type=CONTENT_TYPE)

@@ -9,9 +9,14 @@ shape (upper levels filled, seven deltas in level 0). For patches of 1K,
 
 - cold worker: `KeyIndex.resolve` with nothing cached;
 - warm worker: the same through a disk cache holding every file (`key_cache`);
-- engine: the resolver's whole request — framing, validation, the lookup
-  over the cache's local files, the delta — with the files in the page
-  cache, and again after dropping it (local SSD only; needs `sudo`).
+- engine: the worker's run and request built, the resolver's whole answer
+  — framing, validation, the lookup over the cache's local files, the
+  delta — and the delta uploaded by the worker, with the files in the page
+  cache, and again after dropping it (local SSD only; needs `sudo`); the
+  resolve alone is reported too. HTTP is not in it (`results.md` measures
+  it apart).
+
+Every path ends at the same line: the delta file uploaded.
 
 Also the engine's fill of the snapshot: requests, bytes, time, disk.
 Requests are injected with latency and bandwidth as in `bench.py`.
@@ -128,19 +133,27 @@ async def run_size(n: int, args) -> list[dict]:
                 )
             )
             row["warm_worker"] = (wall, cpu, wio.metrics.gets, wio.metrics.bytes_in / 1e6)
-            run = _native.encode_file(keys, vers, bytes(len(keys)))
-            body = request("inv", [Ask("out", "", "patch", 100, 1, state.prefix, 99, run, len(keys))])
             p = Prepared("", 100, 1, state, 99, True)
             for label in ("engine", "engine_ssd"):
                 if label == "engine_ssd" and not drop_page_cache():
                     continue
-                out, wall, cpu = await timed(
-                    lambda body=body, p=p, k=k: resolver.resolve(f"e{k}", body, lambda name: p, lambda: True)
-                )
-                answer = answers(out)["out"][0]
-                assert answer["result"] == "delta", answer
+                io, spent = cold(), {}
+
+                async def engine_path(io=io, keys=keys, vers=vers, p=p, k=k, label=label, spent=spent):
+                    run = _native.encode_file(keys, vers, bytes(len(keys)))
+                    body = request("inv", [Ask("out", "", "patch", 100, 1, state.prefix, 99, run, len(keys))])
+                    t = time.perf_counter()
+                    out = await resolver.resolve(f"e{k}{label}", body, lambda name: p, lambda: True)
+                    spent["resolve"] = time.perf_counter() - t
+                    answer, delta = answers(out)["out"]
+                    assert answer["result"] == "delta", answer
+                    await io.write(f"{state.prefix}{99:012d}-e{k}{label}.0000.kx", delta)
+                    return answer, len(body)
+
+                (answer, size), wall, cpu = await timed(engine_path)
                 assert (answer["added"], answer["removed"]) == (files.added, files.removed)
-                row[label] = (wall, cpu, 0, len(body) / 1e6)
+                row[label] = (wall, cpu, io.metrics.gets, size / 1e6)
+                row[label + "_resolve"] = spent["resolve"]
             rows.append(row)
             print(row, flush=True)
     finally:
@@ -169,14 +182,16 @@ async def main():
     rows = []
     for n in (int(float(x)) for x in args.sizes.split(",")):
         rows += await run_size(n, args)
-    print("\n| Keys | Patch | Cold worker | Warm worker | Engine, page cache | Engine, SSD only |")
+    print("\nEvery path to the delta uploaded; in brackets, the engine's resolve alone.\n")
+    print("| Keys | Patch | Cold worker | Warm worker | Engine, page cache | Engine, SSD only |")
     print("|---|---|---|---|---|---|")
     for r in rows:
         if r["op"] == "engine fill":
             continue
         print(
             f"| {r['n']:,} | {r['op']} | {cell(r.get('cold'))} | {cell(r.get('warm_worker'))} | "
-            f"{cell(r.get('engine'))} | {cell(r.get('engine_ssd'))} |"
+            f"{cell(r.get('engine'))} ({bench.fmt_s(r.get('engine_resolve', 0))}) | "
+            f"{cell(r.get('engine_ssd'))} ({bench.fmt_s(r.get('engine_ssd_resolve', 0))}) |"
         )
     print("\n| Keys | Engine fill: time · GETs · MB read · CPU | Local files on disk |")
     print("|---|---|---|")

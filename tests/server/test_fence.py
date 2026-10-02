@@ -412,6 +412,8 @@ class LiveStore(FileStore):
     async def store(self, write, prior, scope):
         patch = isinstance(write, Patch)
         rows = write.rows if patch else write
+        if hasattr(rows, "to_pylist"):  # Arrow
+            rows = rows.to_pylist()
         if not patch:
             self.rows.clear()
         for n, row in enumerate(rows):

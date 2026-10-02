@@ -352,6 +352,17 @@ async def test_worker_pull_path_and_channel(engine):
             f"{routes}/resolve", content=resolver.request("theirs", [ask]), headers=token
         )
         assert stranger.status_code == 409
+        for nobody in ("", None):  # no identity is never the owner's, bound or not
+            anonymous = resolver.frame({"invocation": nobody, "outputs": []}, [])
+            assert (
+                await client.post(f"{routes}/resolve", content=anonymous, headers=token)
+            ).status_code == 409
+        torn = resolver.frame({"invocation": "mine", "outputs": [{"name": "x", "offset": 0, "size": 9}]}, [])
+        assert (await client.post(f"{routes}/resolve", content=torn, headers=token)).status_code == 400
+        huge = await client.post(
+            f"{routes}/resolve", content=b"\x01" + bytes(resolver.MAX_BODY), headers=token
+        )
+        assert huge.status_code == 413
         answered = await client.post(f"{routes}/resolve", content=body, headers=token)
         assert answered.headers["content-type"] == resolver.CONTENT_TYPE
         assert resolver.answers(answered.content)["nope"][0]["reason"] == "not_live"  # no such keyed output

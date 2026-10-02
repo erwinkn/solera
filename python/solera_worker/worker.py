@@ -517,7 +517,8 @@ async def _store_outputs(
             continue
         new = await _versions(output, rows)
         try:
-            removes = [k for k in map(key_text, value.remove) if k not in new]
+            # Once, for every reader below: each key once, in order.
+            removes = sorted({k for k in map(key_text, value.remove) if k not in new})
         except WriteError as e:
             raise WriteError(f"{output.name}: {e}") from None
         own = p["own"] = (set(new), set(removes))
@@ -792,10 +793,17 @@ async def _reconcile(output, store, prior, index, content, new, removes, batch, 
 
 
 def _rows_of(output, value) -> list:
+    """Rows as dicts, from whatever `key_rows` takes: lists of dicts, pandas
+    DataFrames, and Arrow (anything with `__arrow_c_stream__`)."""
+
     if value is None:
         return []
-    if type(value).__name__ == "DataFrame":
+    if type(value).__name__ == "DataFrame" and type(value).__module__.startswith("pandas"):
         return value.to_dict(orient="records")
+    if hasattr(value, "__arrow_c_stream__"):
+        import pyarrow as pa
+
+        return pa.table(value).to_pylist()
     if not isinstance(value, list):
         raise WriteError(
             f"{output.name}: expected rows (list[dict] or DataFrame), got {type(value).__name__}"

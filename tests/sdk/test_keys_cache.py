@@ -10,10 +10,10 @@ import pytest
 from obstore.store import MemoryStore
 from solera import _native
 from solera.keys import _python
-from solera.keys.cache import EngineCache
-from solera.keys.index import IndexState, KeyIndex, Options
+from solera.keys.cache import Corrupt, EngineCache
+from solera.keys.index import FileInfo, IndexState, KeyIndex, Options
 from solera.keys.io import ObjectIO
-from solera.keys.resolver import Ask, Limits, Prepared, Resolver, answers, request
+from solera.keys.resolver import Ask, Limits, Malformed, Prepared, Resolver, answers, frame, request
 
 OPTS = Options(
     block_size=512,
@@ -58,9 +58,8 @@ def prepared(state, batch=99, generation=100, replace=True):
 
 
 def ask(state, keys, versions, removes=(), kind="patch", batch=99, generation=100):
-    return Ask(
-        "out", "", kind, batch, generation, state.prefix, 98, run_file(keys, versions, removes), len(keys)
-    )
+    run = run_file(keys, versions, removes)
+    return Ask("out", "", kind, batch, generation, state.prefix, 98, run, len(keys) + len(removes))
 
 
 async def engine_answer(resolver, state, a, invocation="inv", p=None, live=True):
@@ -257,3 +256,238 @@ async def test_a_restart_keeps_what_checks_out(io, tmp_path):
     gets = io.metrics.gets
     assert await again.fill(io, state)  # only the bad one is fetched again
     assert io.metrics.gets == gets + 1
+
+
+# -- the milestone 4 review's findings ---------------------------------------------------------
+
+
+async def test_only_the_named_object_is_installed(io, tmp_path):
+    """Review 1: bytes are installed or summarized only if they are the file
+    their `FileInfo` names — size and digest — and a copy kept across a
+    restart counts only for the object it was built from."""
+
+    good = _native.encode_file([b"a"], [b"good"], b"\x00")
+    evil = _native.encode_file([b"a"], [b"evil"], b"\x00")
+    f = FileInfo.describe("000000000001-x.0000", 0, good)
+    state = IndexState(prefix="keys/out/_/", files=(f,))
+    cache = EngineCache(str(tmp_path))
+    assert cache.admit(state)
+    with pytest.raises(Corrupt):
+        await cache.install(state.prefix, f, state.path(f.name), evil)
+    assert not cache.files
+    await io.write(state.path(f.name), evil)  # what the store holds is not what the commit names
+    with pytest.raises(Corrupt):
+        await cache.fill(io, state)
+    assert not cache.warm(state)
+    assert await cache.install(state.prefix, f, state.path(f.name), good) and cache.warm(state)
+    other = FileInfo.describe(f.name, 0, evil)  # the same name, another object
+    again = EngineCache(str(tmp_path))
+    assert again.warm(state) and not again.warm(IndexState(prefix=state.prefix, files=(other,)))
+    assert not again.files  # and the copy that is not it goes
+
+
+async def test_committed_deltas_are_verified_before_summaries(io, tmp_path):
+    from solera_server.keyservice import KeyService
+
+    good = _native.encode_file([b"a"], [b"good"], b"\x00")
+    evil = _native.encode_file([b"a"], [b"evil"], b"\x00")
+    f = FileInfo.describe("000000000001-x.0000", 0, good)
+    service = KeyService(io.store, str(tmp_path))
+    service.start()
+    try:
+        path = f"keys/out/_/{f.name}.kx"
+        await io.write(path, evil)
+        service.committed("keys/out/_/", lambda n: f"keys/out/_/{n}.kx", 1, [f], True, 0)
+        await asyncio.sleep(0.2)
+        assert service.inline("keys/out/_/", 1, 1, None, 10) is None  # no summary of the wrong bytes
+        assert service.floor() == float("inf")  # its reader pin went with it
+    finally:
+        await service.stop()
+
+
+async def test_the_disk_budget_holds_against_the_real_size(io, tmp_path):
+    """Review 2: 10,000 keys with one long repeated revision compress to almost
+    nothing; their local form is many times the estimate. The build is not
+    written if the room for its real size cannot be had."""
+
+    keys = [key(i) for i in range(10_000)]
+    data = _native.encode_file(keys, [b"r" * 256] * len(keys), bytes(len(keys)))
+    f = FileInfo.describe("c1-0000", 1, data)
+    state = IndexState(prefix="keys/out/_/", files=(f,))
+    await io.write(state.path(f.name), data)
+    cache = EngineCache(str(tmp_path), candidates=0)
+    cache.disk = cache.need(state)
+    assert cache.admit(state)
+    assert not await cache.fill(io, state)
+    assert cache.used <= cache.disk and cache.reserved == 0 and not os.listdir(str(tmp_path))
+    roomy = EngineCache(str(tmp_path / "roomy"), candidates=0)
+    assert await roomy.fill(io, state) and roomy.used <= roomy.disk
+
+
+async def test_requests_are_checked_against_their_bytes(io, tmp_path):
+    """Review 3: the digest that deduplicates and the count that limits are
+    the payload's own, and a frame whose bounds do not hold is refused."""
+
+    state = await built_index(io, commits=2)
+    cache = EngineCache(str(tmp_path))
+    await cache.fill(io, state)
+    resolver = Resolver(cache, io, OPTS, Limits(max_keys=1))
+    first, second = ask(state, [key(1)], [b"first"]), ask(state, [key(1)], [b"second"])
+    second.run, second.keys = second.run, 1
+    lying = request("inv", [first])
+    forged = request("inv", [second]).replace(
+        _native.content_digest(second.run).encode(), _native.content_digest(first.run).encode()
+    )
+    got = await asyncio.gather(
+        *(resolver.resolve("att", b, lambda n: prepared(state), lambda: True) for b in (lying, forged))
+    )
+    assert answers(got[0])["out"][0]["result"] == "delta"
+    assert answers(got[1])["out"][0]["reason"] == "invalid"  # its digest is not its bytes'
+    two = ask(state, [key(1), key(2)], [b"x", b"y"])
+    two.keys = 0  # claims nothing, carries two
+    assert (await engine_answer(resolver, state, two))[0]["reason"] == "invalid"
+    for bad in (
+        b"\x01\xff\xff\x00\x00{}",  # a header past the end
+        frame({"outputs": [{"name": "out", "offset": 0, "size": 10**6}]}, [b"x"]),  # a payload too
+        frame(
+            {"outputs": [{"name": "out", "offset": 0, "size": 1}, {"name": "out", "offset": 0, "size": 1}]},
+            [b"x"],
+        ),
+    ):
+        with pytest.raises(Malformed):
+            await resolver.resolve("att", bad, lambda n: prepared(state), lambda: True)
+
+
+async def test_the_queue_is_taken_before_scheduling(io, tmp_path, monkeypatch):
+    """Review 5: a burst of distinct requests holds no more than the queue's
+    bytes at once, and a source commit's resolve is held to the same limit."""
+
+    state = await built_index(io, commits=2)
+    cache = EngineCache(str(tmp_path))
+    await cache.fill(io, state)
+    asks = [ask(state, [key(i)], [b"v%d" % i]) for i in range(10)]
+    one = max(len(a.run) for a in asks)
+    resolver = Resolver(cache, io, OPTS, Limits(queue_bytes=2 * one))
+    real, peak = resolver._compute, []
+
+    async def slow(*args):
+        peak.append(resolver._queued)
+        await asyncio.sleep(0.05)
+        return await real(*args)
+
+    monkeypatch.setattr(resolver, "_compute", slow)
+    got = await asyncio.gather(*(engine_answer(resolver, state, a) for a in asks))
+    reasons = [g[0].get("reason") for g in got]
+    assert reasons.count("busy") == 8 and max(peak) <= 2 * one and resolver._queued == 0
+    resolver._queued = 2 * one  # full: a source commit's resolve waits its turn too
+    answer, _ = await resolver.compute(prepared(state), "patch", asks[0].run, "keys/out/_/x.kx")
+    assert answer["reason"] == "busy"
+
+
+async def test_a_canceled_fill_keeps_its_room_until_the_build_ends(io, tmp_path, monkeypatch):
+    """Review 6: the build runs on its thread whatever happens to the fill;
+    its reservation and its temporary file are its own until it ends, and
+    nothing is published for a fill that was canceled."""
+
+    import threading
+
+    from solera.keys import cache as cache_module
+
+    state = await built_index(io, commits=1)
+    cache = EngineCache(str(tmp_path))
+    started, go = threading.Event(), threading.Event()
+    real = cache_module._native.build_local
+
+    def paused(*args):
+        started.set()
+        go.wait(5)
+        return real(*args)
+
+    monkeypatch.setattr(cache_module._native, "build_local", paused)
+    fill = asyncio.ensure_future(cache.fill(io, state))
+    await asyncio.to_thread(started.wait, 5)
+    files = list(cache._fills.values())  # one per file: the builds behind the fill
+    fill.cancel()
+    await asyncio.sleep(0.05)
+    assert cache.reserved > 0  # still the builder's
+    go.set()
+    with pytest.raises(asyncio.CancelledError):
+        await fill
+    await asyncio.gather(*files, return_exceptions=True)
+    assert cache.reserved == 0
+    assert sorted(os.listdir(str(tmp_path))) == sorted(
+        os.path.basename(f.local) for f in cache.files.values()
+    )
+
+
+async def test_a_reader_does_not_evict_what_compaction_wrote(io, tmp_path):
+    """Review 7: a compaction's output, installed before the compaction is
+    published, stays while readers still pin the snapshot it replaces; the
+    inputs go once the compaction is published and no reader holds them."""
+
+    state = await built_index(io, commits=3)
+    cache = EngineCache(str(tmp_path))
+    await cache.fill(io, state)
+    idx = KeyIndex(io, None, state, OPTS)
+    plan = (state.level(0) + state.level(1), 1) if state.level(0) else (state.level(1), 2)
+    written = []
+    idx.on_write = lambda path, f, data: written.append((path, f, data))
+    added, removed, _ = await idx.compact(plan)
+    for path, f, data in written:
+        assert await cache.install(state.prefix, f, path, data)
+    with cache.pin(state):
+        assert all(path in cache.files for path, _, _ in written)
+        cache.retire([state.path(n) for n in removed])
+        assert all(state.path(n) in cache.files for n in removed)  # still read
+    assert not any(state.path(n) in cache.files for n in removed)  # gone with the last reader
+    assert cache.warm(state.compacted(added, removed))
+
+
+async def test_a_background_fill_is_a_reader_pin(io, tmp_path, monkeypatch):
+    """Review 8: a fill started by a cold decline holds the position it read
+    the index at until its fetches are done."""
+
+    from solera_server.keyservice import KeyService
+
+    state = await built_index(io, commits=1)
+    service = KeyService(io.store, str(tmp_path))
+    service.start()
+    try:
+        gate = asyncio.Event()
+        real = EngineCache.fill
+
+        async def held(self, io_, st):
+            await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(gate.wait(), asyncio_loop))
+            return await real(self, io_, st)
+
+        asyncio_loop = asyncio.get_running_loop()
+        monkeypatch.setattr(EngineCache, "fill", held)
+        p = Prepared("", 99, 100, state, 98, True, position=7)
+        body = request("inv", [ask(state, [key(1)], [b"x"])])
+        out = await service.resolve("att", body, lambda n: p, lambda: True, 7)
+        assert answers(out)["out"][0]["reason"] == "cold"
+        assert service.floor() == 7  # the fill still reads
+        gate.set()
+        for _ in range(100):
+            if service.floor() == float("inf"):
+                break
+            await asyncio.sleep(0.02)
+        assert service.floor() == float("inf")
+    finally:
+        await service.stop()
+
+
+def test_inline_pages_are_capped_as_serialized(tmp_path):
+    """Review 11: the cap counts the page as the spec serializes it — JSON
+    escapes included — and the cursor."""
+
+    import json
+
+    from solera_server import keyservice
+
+    service = keyservice.KeyService(None, str(tmp_path))
+    keys = sorted((f"ключ-{i:05d}-" + "€" * 40).encode() for i in range(5000))
+    service._summarize("p/", 1, [_native.encode_file(keys, [b"v" * 16] * len(keys), bytes(len(keys)))])
+    page = service.inline("p/", 1, 1, None, 5000)
+    assert page is not None and page["next"] is not None
+    assert len(json.dumps(page)) <= keyservice.INLINE_BYTES

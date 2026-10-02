@@ -16,15 +16,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import math
 import re
 import struct
 from collections.abc import Callable
 from dataclasses import dataclass
 
 from .. import _native
-from .cache import Corrupt, EngineCache
+from . import FOOTER_SIZE, parse_footer
+from .cache import EngineCache
 from .index import IndexState, Options
 from .io import ObjectIO
+
+log = logging.getLogger(__name__)
 
 VERSION = 1
 CONTENT_TYPE = f"application/vnd.solera.resolve; version={VERSION}"
@@ -32,6 +37,13 @@ CONTENT_TYPE = f"application/vnd.solera.resolve; version={VERSION}"
 
 class UnsupportedVersion(ValueError):
     pass
+
+
+class Malformed(ValueError):
+    """A body whose framing or payloads do not hold together."""
+
+
+MAX_BODY = 64 * 2**20  # a request's bytes, all its outputs' runs together
 
 
 def frame(header: dict, payloads: list[bytes]) -> bytes:
@@ -42,8 +54,38 @@ def frame(header: dict, payloads: list[bytes]) -> bytes:
 def unframe(body: bytes) -> tuple[dict, memoryview]:
     if not body or body[0] != VERSION:
         raise UnsupportedVersion(f"resolve protocol version {body[0] if body else None}")
+    if len(body) < 5:
+        raise Malformed("truncated frame")
     (n,) = struct.unpack_from("<I", body, 1)
-    return json.loads(body[5 : 5 + n]), memoryview(body)[5 + n :]
+    if 5 + n > len(body):
+        raise Malformed("header past the end of the body")
+    try:
+        header = json.loads(body[5 : 5 + n])
+    except ValueError as e:
+        raise Malformed(f"header: {e}") from e
+    if not isinstance(header, dict):
+        raise Malformed("header is not an object")
+    return header, memoryview(body)[5 + n :]
+
+
+def _outputs(header: dict, payloads: memoryview) -> list[tuple[dict, bytes]]:
+    """Each output's header and payload, every bound checked."""
+
+    outputs, names = header.get("outputs"), set()
+    if not isinstance(outputs, list):
+        raise Malformed("outputs is not a list")
+    out = []
+    for o in outputs:
+        if not isinstance(o, dict) or not isinstance(o.get("name"), str) or o["name"] in names:
+            raise Malformed("an output without a name of its own")
+        names.add(o["name"])
+        offset, size = o.get("offset"), o.get("size")
+        if not (isinstance(offset, int) and isinstance(size, int) and 0 <= offset and 0 <= size):
+            raise Malformed(f"{o['name']}: bad offset or size")
+        if offset + size > len(payloads):
+            raise Malformed(f"{o['name']}: payload past the end of the body")
+        out.append((o, bytes(payloads[offset : offset + size])))
+    return out
 
 
 @dataclass(frozen=True)
@@ -57,6 +99,7 @@ class Prepared:
     index: IndexState  # the index the engine holds for the scope now
     head_batch: int
     replace: bool  # whether a replacement is allowed
+    position: float = math.inf  # the event position the index was read at: a fill's reader pin
 
 
 @dataclass
@@ -70,10 +113,14 @@ class Limits:
 
 class Resolver:
     """`resolve(attempt, body, prepared)`: `prepared(name)` returns the
-    output's `Prepared`, or None when the attempt does not hold it."""
+    output's `Prepared`, or None when the attempt does not hold it. `holds`,
+    when given, keeps fills in collection's reader pins: `hold(position)`
+    returns a token for `release`."""
 
-    def __init__(self, cache: EngineCache, io: ObjectIO, options: Options | None = None, limits=None):
-        self.cache, self.io = cache, io
+    def __init__(
+        self, cache: EngineCache, io: ObjectIO, options: Options | None = None, limits=None, holds=None
+    ):
+        self.cache, self.io, self.holds = cache, io, holds
         self.o = options or Options()
         self.limits = limits or Limits()
         self._sem = asyncio.Semaphore(self.limits.concurrency)
@@ -81,24 +128,39 @@ class Resolver:
         self._inflight: dict[tuple, asyncio.Future] = {}
         self._fills: set[asyncio.Task] = set()
 
+    def _reserve(self, n: int) -> bool:
+        """Room in the queue for `n` bytes, taken now: released by `_release`."""
+
+        if self._queued + n > self.limits.queue_bytes:
+            return False
+        self._queued += n
+        return True
+
+    def _release(self, n: int) -> None:
+        self._queued -= n
+
     async def resolve(
         self, attempt: str, body: bytes, prepared: Callable[[str], Prepared | None], live: Callable[[], bool]
     ) -> bytes:
+        """The answer to a request. Raises `UnsupportedVersion` or `Malformed`."""
+
+        if len(body) > MAX_BODY:
+            raise Malformed(f"a body over {MAX_BODY} bytes")
         header, payloads = unframe(body)
+        outputs = _outputs(header, payloads)
         out_header, out_payloads, offset = [], [], 0
-        for o in header.get("outputs") or []:
-            data = bytes(payloads[o["offset"] : o["offset"] + o["size"]])
+        for o, data in outputs:
             answer, delta = await self._one(attempt, header.get("invocation"), o, data, prepared, live)
             if delta is not None:
                 answer.update(offset=offset, size=len(delta))
                 out_payloads.append(delta)
                 offset += len(delta)
-            out_header.append({"name": o.get("name"), **answer})
+            out_header.append({"name": o["name"], **answer})
         return frame({"outputs": out_header}, out_payloads)
 
     async def _one(self, attempt, invocation, o, data, prepared, live):
         declined = {"result": "declined"}
-        p = prepared(o.get("name"))
+        p = prepared(o["name"])
         if p is None or not live():
             return {**declined, "reason": "not_live"}, None
         kind = o.get("kind")
@@ -113,69 +175,85 @@ class Resolver:
             return {**declined, "reason": "invalid"}, None
         if (o.get("base") or {}).get("head_batch") != p.head_batch:
             return {**declined, "reason": "stale"}, None
+        # What the payload is, from its bytes, not from what the header says.
+        actual = _native.content_digest(data)
+        try:
+            entries = parse_footer(data[-FOOTER_SIZE:])["entries"] if data else -1
+        except ValueError:
+            entries = -1
+        if o.get("digest") != actual or o.get("keys") != entries:
+            return {**declined, "reason": "invalid"}, None
         lim = self.limits
-        if len(data) > lim.max_bytes or (kind == "patch" and o.get("keys", 0) > lim.max_keys):
+        if len(data) > lim.max_bytes or (kind == "patch" and entries > lim.max_keys):
             return {**declined, "reason": "too_big"}, None
-        if kind == "replace" and sum(f.entries for f in p.index.files) + o.get("keys", 0) > lim.max_entries:
+        if kind == "replace" and sum(f.entries for f in p.index.files) + entries > lim.max_entries:
             return {**declined, "reason": "too_big"}, None
         key = (
             attempt,
             invocation,
-            o.get("name"),
+            o["name"],
             p.scope,
             kind,
             p.batch,
             p.generation,
             p.index.prefix,
             p.head_batch,
-            o.get("digest"),
+            actual,
         )
         fut = self._inflight.get(key)
         if fut is None:
-            if self._queued + len(data) > lim.queue_bytes:
+            if not self._reserve(len(data)):
                 return {**declined, "reason": "busy"}, None
             # The worker uploads the delta under its own name: kept as a candidate under it.
             path = p.index.path(f"{p.batch:012d}-{attempt}.0000")
             fut = self._inflight[key] = asyncio.ensure_future(self._compute(p, kind, data, live, path))
-            fut.add_done_callback(lambda _f: self._inflight.pop(key, None))
+
+            size = len(data)
+
+            def done(_f, key=key, size=size):
+                self._inflight.pop(key, None)
+                self._release(size)
+
+            fut.add_done_callback(done)
         return await asyncio.shield(fut)
 
     async def compute(self, p: Prepared, kind: str, data: bytes, path: str):
         """One resolve with no request around it — a source commit, in the engine:
-        `(answer, delta)` as for an output of a request."""
+        `(answer, delta)` as for an output of a request, under the same limits."""
 
-        return await self._compute(p, kind, data, lambda: True, path)
+        if not self._reserve(len(data)):
+            return {"result": "declined", "reason": "busy"}, None
+        try:
+            return await self._compute(p, kind, data, lambda: True, path)
+        finally:
+            self._release(len(data))
 
     async def _compute(self, p: Prepared, kind: str, data: bytes, live, path: str):
         declined = {"result": "declined"}
         pin = self.cache.pin(p.index)
         if pin is None:
-            self._background_fill(p.index)
+            self._background_fill(p.index, p.position)
             return {**declined, "reason": "cold"}, None
-        self._queued += len(data)
-        try:
-            with pin:
-                async with self._sem:
-                    if not live():
-                        return {**declined, "reason": "not_live"}, None
-                    snap = _native.Snapshot(pin.runs)
-                    try:
-                        files, added, removed, changed = await asyncio.to_thread(
-                            snap.resolve,
-                            data,
-                            replace=kind == "replace",
-                            generation=p.generation,
-                            **_writer(self.o, self.limits.max_bytes),
-                        )
-                    except ValueError as e:
-                        bad = re.match(r"local file (\S+): ", str(e))
-                        if bad is None:
-                            return {**declined, "reason": "invalid"}, None
-                        self.cache.corrupt(bad.group(1))  # refetched by the fill
-                        self._background_fill(p.index)
-                        return {**declined, "reason": "cold"}, None
-        finally:
-            self._queued -= len(data)
+        with pin:
+            async with self._sem:
+                if not live():
+                    return {**declined, "reason": "not_live"}, None
+                snap = _native.Snapshot(pin.runs)
+                try:
+                    files, added, removed, changed = await asyncio.to_thread(
+                        snap.resolve,
+                        data,
+                        replace=kind == "replace",
+                        generation=p.generation,
+                        **_writer(self.o, self.limits.max_bytes),
+                    )
+                except ValueError as e:
+                    bad = re.match(r"local file (\S+): ", str(e))
+                    if bad is None:
+                        return {**declined, "reason": "invalid"}, None
+                    self.cache.corrupt(bad.group(1))  # refetched by the fill
+                    self._background_fill(p.index, p.position)
+                    return {**declined, "reason": "cold"}, None
         if not files:
             return {"result": "empty"}, None
         if len(files) > 1 or len(files[0]) > self.limits.max_bytes:
@@ -189,12 +267,21 @@ class Resolver:
             "file": {"size": len(delta), "digest": self.cache.offer(path, delta)},
         }, delta
 
-    def _background_fill(self, index: IndexState) -> None:
+    def _background_fill(self, index: IndexState, position: float) -> None:
+        """Fill a cold index, a reader of its files until every fetch is done:
+        collection keeps what it reads (taken now, while the request that
+        found it cold still holds its own)."""
+
+        token = self.holds.hold(position) if self.holds is not None else None
+
         async def fill():
             try:
                 await self.cache.fill(self.io, index)
-            except Corrupt:
-                pass
+            except Exception as e:  # the next resolve declines and asks again
+                log.warning("key cache fill of %s: %s", index.prefix, e)
+            finally:
+                if token is not None:
+                    self.holds.release(token)
 
         t = asyncio.ensure_future(fill())
         self._fills.add(t)

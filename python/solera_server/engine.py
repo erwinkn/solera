@@ -763,7 +763,7 @@ class Engine(Attempts, Sensors):
             files = [FileInfo.from_json(f) for f in keys["files"]]
             batch = int(keys["batch"])
             logged = bool(index.log) and index.log[-1][0] == batch  # a consumer will read it
-            self.keys.committed(index.prefix, index.path, batch, files, logged)
+            self.keys.committed(index.prefix, index.path, batch, files, logged, self.m.applied)
 
     # -- dispatch ---------------------------------------------------------------
 
@@ -1772,7 +1772,7 @@ class Engine(Attempts, Sensors):
         data = encode_file([e[0] for e in run], [e[1] for e in run], bytes(e[2] for e in run))
         name = f"{batch:012d}-{attempt}.0000"
         answer, delta = await self.keys.direct(
-            pinned, "replace" if replace else "patch", data, 0, batch, index.path(name)
+            pinned, "replace" if replace else "patch", data, 0, batch, index.path(name), self.m.applied
         )
         if answer["result"] == "empty":
             return DeltaFiles([], 0, 0, True), ([], [])

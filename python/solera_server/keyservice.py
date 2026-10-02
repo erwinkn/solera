@@ -8,18 +8,25 @@ thread of their own: nothing here runs on the engine's event loop.
 - `installed` takes a file the engine wrote (a compaction output).
 - `inline` merges summaries into the first page of a pending window, for
   prepare: memory only, never waiting.
+
+Whatever here reads index files from the object store holds a reader pin
+(`hold`) at the event position it read the index at, until its reads are
+done: collection (`floor`) deletes nothing a pinned reader may still read.
 """
 
 from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import itertools
+import json
 import logging
+import math
 import threading
 from collections import OrderedDict
 
 from solera.keys import decode_block, parse_index
-from solera.keys.cache import EngineCache
+from solera.keys.cache import Corrupt, EngineCache, verify
 from solera.keys.index import FileInfo, Options
 from solera.keys.io import ObjectIO
 from solera.keys.resolver import Limits, Prepared, Resolver
@@ -55,6 +62,27 @@ class KeyService:
         self.loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._stopped = False
+        self._holds: dict[int, float] = {}  # token -> event position: readers of index files
+        self._hold_lock = threading.Lock()
+        self._tokens = itertools.count()
+
+    # -- reader pins ----------------------------------------------------------------------
+
+    def hold(self, position: float) -> int:
+        with self._hold_lock:
+            token = next(self._tokens)
+            self._holds[token] = position
+            return token
+
+    def release(self, token: int) -> None:
+        with self._hold_lock:
+            self._holds.pop(token, None)
+
+    def floor(self) -> float:
+        """The oldest position a reader here holds: for collection's `pin_floor`."""
+
+        with self._hold_lock:
+            return min(self._holds.values(), default=math.inf)
 
     # -- the thread -----------------------------------------------------------------------
 
@@ -71,7 +99,7 @@ class KeyService:
             self.cache = EngineCache(
                 self.root, disk=self.disk, candidates=self.candidates, window=self.window
             )
-            self.resolver = Resolver(self.cache, self.io, self.options, self.limits)
+            self.resolver = Resolver(self.cache, self.io, self.options, self.limits, holds=self)
             ready.set()
             self.loop.run_forever()
 
@@ -111,27 +139,57 @@ class KeyService:
 
     # -- requests ---------------------------------------------------------------------------
 
-    async def resolve(self, attempt: str, body: bytes, prepared, live) -> bytes | None:
+    async def resolve(self, attempt: str, body: bytes, prepared, live, position: float) -> bytes | None:
+        """A worker's request, its indexes read at `position` (held meanwhile)."""
+
         if not self._running():
             return None
-        return await asyncio.wrap_future(self._submit(self.resolver.resolve(attempt, body, prepared, live)))
+        token = self.hold(position)
+        try:
+            return await asyncio.wrap_future(
+                self._submit(self.resolver.resolve(attempt, body, prepared, live))
+            )
+        finally:
+            self.release(token)
 
-    async def direct(self, index, kind: str, run: bytes, generation: int, batch: int, path: str):
-        """A resolve of a run against `index` as the engine holds it — a source
-        commit's, in process (docs/resolved-commits.md §4): `(answer, delta)`."""
+    async def direct(
+        self, index, kind: str, run: bytes, generation: int, batch: int, path: str, position: float
+    ):
+        """A resolve of a run against `index` as the engine holds it at
+        `position` — a source commit's, in process (docs/resolved-commits.md
+        §4): `(answer, delta)`, under the resolver's limits."""
 
         if not self._running():
             return {"result": "declined", "reason": "busy"}, None
-        p = Prepared("", batch, generation, index, batch - 1, True)
-        return await asyncio.wrap_future(self._submit(self.resolver.compute(p, kind, run, path)))
+        p = Prepared("", batch, generation, index, batch - 1, True, position)
+        token = self.hold(position)
+        try:
+            return await asyncio.wrap_future(self._submit(self.resolver.compute(p, kind, run, path)))
+        finally:
+            self.release(token)
 
-    def committed(self, prefix: str, path, batch: int, files: list[FileInfo], keep_summary: bool) -> None:
-        """A commit installed `files` (a batch's delta) into the index at `prefix`."""
+    def committed(
+        self, prefix: str, path, batch: int, files: list[FileInfo], keep_summary: bool, position: float
+    ) -> None:
+        """A commit at `position` installed `files` (a batch's delta) into the index at `prefix`."""
 
-        self._fire(lambda: self._committed(prefix, path, batch, files, keep_summary))
+        if not self._running():
+            return
+        token = self.hold(position)
+        fut = self._submit(self._committed(prefix, path, batch, files, keep_summary))
+        fut.add_done_callback(_logged)
+        fut.add_done_callback(lambda _f: self.release(token))
 
     def installed(self, prefix: str, f: FileInfo, path: str, data: bytes) -> None:
         self._fire(lambda: self.cache.install(prefix, f, path, data))
+
+    def retired(self, paths: list[str]) -> None:
+        """A published compaction let go of these files."""
+
+        self._fire(lambda: self._retire(paths))
+
+    async def _retire(self, paths: list[str]) -> None:
+        self.cache.retire(paths)
 
     def ended(self, attempt: str) -> None:
         """An attempt ended: candidates it did not commit go."""
@@ -146,16 +204,22 @@ class KeyService:
         small = keep_summary and sum(f.entries for f in files) <= INLINE_MAX
         admitted = prefix in self.cache.indexes and self.cache.indexes[prefix].admitted
         parts = []
-        for f in files:
-            p = path(f.name)
-            cand = self.cache.candidates.get((p, f.size, f.digest))
-            data = cand.data if cand is not None else None
-            if not await self.cache.committed(prefix, f, p) and admitted:
-                # A delta the resolver did not produce: fetched once, while it is small.
-                data = data or await self.io.read_whole(p, f.size)
-                await self.cache.install(prefix, f, p, data)
-            if small:
-                parts.append(data or await self.io.read_whole(p, f.size))
+        try:
+            for f in files:
+                p = path(f.name)
+                cand = self.cache.candidates.get((p, f.size, f.digest))
+                data = cand.data if cand is not None else None
+                if not await self.cache.committed(prefix, f, p) and admitted:
+                    # A delta the resolver did not produce: fetched once, while it is small.
+                    data = data or await self.io.read_whole(p, f.size)
+                    await self.cache.install(prefix, f, p, data)  # verified there
+                if small:
+                    data = data or await self.io.read_whole(p, f.size)
+                    verify(f, p, data)  # a summary says what the committed file holds, or nothing
+                    parts.append(data)
+        except Corrupt as e:
+            log.warning("key cache: %s", e)
+            return
         if small:
             self._summarize(prefix, batch, parts)
 
@@ -195,22 +259,28 @@ class KeyService:
                 if (start is None or k > start) and k not in seen:
                     seen[k] = (v, d, loc)
         order = sorted(seen)
-        upserted, removed, size, last = {}, [], 0, None
+        # The page's size as the spec serializes it (`json.dumps`, its default separators):
+        # with `next` null; a cursor replaces that with a key.
+        upserted, removed, size, last = {}, [], len(json.dumps(inline_page({}, [], None))), None
         for k in order[:limit]:
             v, d, loc = seen[k]
             key = k.decode("utf-8", "surrogateescape")
-            size += len(key) + 2 * len(v) + 24
-            if size > INLINE_BYTES:
+            entry = len(json.dumps(key) if d else json.dumps({key: [v.hex(), loc]})[1:-1]) + 2
+            if size + entry + len(json.dumps(key)) > INLINE_BYTES:  # this key may be the cursor
                 if last is None:
                     return None  # the first entry alone is too big: no page that advances
-                return {"upserted": upserted, "deleted": removed, "next": last}
+                return inline_page(upserted, removed, last)
+            size += entry
             if d:
                 removed.append(key)
             else:
                 upserted[key] = [v.hex(), loc]
             last = key
-        more = len(order) > limit
-        return {"upserted": upserted, "deleted": removed, "next": last if more else None}
+        return inline_page(upserted, removed, last if len(order) > limit else None)
+
+
+def inline_page(upserted: dict, deleted: list, nxt) -> dict:
+    return {"upserted": upserted, "deleted": deleted, "next": nxt}
 
 
 def _logged(fut: concurrent.futures.Future) -> None:
