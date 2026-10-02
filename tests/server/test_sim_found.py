@@ -19,7 +19,7 @@ async def test_a_keyed_output_moved_to_another_store_stays_readable(state, tmp_p
     content = {"rows": [{"id": "a", "v": "1"}, {"id": "b", "v": "1"}]}
 
     def project(store):
-        @asset(outputs=Output("items", key="id", revision="v", store=store))
+        @asset(outputs=Output("items", key="id", store=store))
         def items():
             return content["rows"]
 
@@ -45,7 +45,7 @@ async def test_a_keyed_output_moved_to_another_store_stays_readable(state, tmp_p
 def _ref(head):
     from solera.sdk import Ref
 
-    return Ref(**{k: head["ref"][k] for k in ("output", "store", "handle", "version", "partition", "meta")})
+    return Ref.from_json(head["ref"])
 
 
 async def test_a_removed_assets_last_attempt_ends_its_run(state, monkeypatch):  # noqa: F811
@@ -150,13 +150,13 @@ async def test_a_change_made_during_a_full_delivery_reaches_downstream(state):  
 
     content = {"a": "1", "b": "1"}
 
-    @asset(outputs=Output("items", key="id", revision="v"))
+    @asset(outputs=Output("items", key="id"))
     def items():
         return [{"id": k, "v": v} for k, v in content.items()]
 
     @asset(
         inputs={"items": Incremental(page_size=1)},
-        outputs=Output("out", key="id", revision="v"),
+        outputs=Output("out", key="id"),
         automations=AutoRefresh(),
     )
     def out(ctx, items: list):

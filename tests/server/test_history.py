@@ -96,14 +96,14 @@ async def test_versions_carry_metadata_and_lineage(state, clock):
             break
     assert paged == made
 
-    head = state.model.heads[("revenue", "")]["ref"]["version"]
+    head = state.model.heads[("revenue", "")]["ref"]["generation"]
     up = await engine.history.lineage("revenue", "", head)
-    assert [(e["from"]["output"], e["to"]["output"], e["param"]) for e in up["edges"]] == [
-        ("orders", "revenue", "orders")
-    ]
+    orders = state.model.heads[("orders", "")]["ref"]["generation"]
+    assert [
+        (e["from"]["output"], e["from"]["generation"], e["to"]["output"], e["param"]) for e in up["edges"]
+    ] == [("orders", orders, "revenue", "orders")]
     assert all(n["current"] for n in up["nodes"])
-    orders_version = state.model.heads[("orders", "")]["ref"]["version"]
-    down = await engine.history.lineage("orders", "", orders_version, downstream=True)
+    down = await engine.history.lineage("orders", "", orders, downstream=True)
     assert {n["output"] for n in down["nodes"]} == {"orders", "revenue"}
 
 

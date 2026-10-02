@@ -119,8 +119,8 @@ def scope(output: Output, partition: str = "", batch=None, **kw) -> Scope:
 
 async def whole(state, output: str, scope: str = ""):
     """A whole keyed read's selection, as the harness builds it for an
-    immutable store: every live entry of the output's key index, with its
-    version and locator (docs/lifecycle.md §9.8)."""
+    immutable store: every live entry of the output's key index, with the
+    generation that wrote it (docs/lifecycle.md §9.8)."""
 
     from solera.keys.index import KeyIndex, key_str
     from solera.keys.io import ObjectIO
@@ -129,7 +129,7 @@ async def whole(state, output: str, scope: str = ""):
     index = KeyIndex(ObjectIO(state.objects), None, state.model.index(output, scope).pinned())
     entries, after = {}, None
     while True:
-        keys, versions, locators, after = await index.page(after, 100_000)
-        entries.update({key_str(k): (v, loc) for k, v, loc in zip(keys, versions, locators, strict=True)})
+        keys, generations, _, after = await index.page(after, 100_000)
+        entries.update(zip(map(key_str, keys), generations, strict=True))
         if after is None:
             return Keys(entries)

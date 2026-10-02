@@ -146,7 +146,6 @@ class Views:
         """A failing key's record, its times null where unset; `eligible`:
         whether a retry pass would take it now."""
 
-        output = self._each_edge(asset)[1]["output"]
         return {
             "scope": scope,
             "key": key,
@@ -156,7 +155,7 @@ class Views:
             "last": record.last,
             "next_at": record.next_at or None,
             "until": record.until or None,
-            "revision": self._rendered(output, record.revision),
+            "generation": record.upstream,  # the upstream key's that failed
             "message": record.message,
             "eligible": eligible(record, self.clock(), self.m.epoch, forced),
         }
@@ -175,9 +174,9 @@ class Views:
             with self.m.reading(state.prefix):  # its files outlive compaction until the walk ends (aclose)
                 index = KeyIndex(self._key_io(), None, state.pinned(), self.key_options)
                 while True:
-                    keys, versions, _, cursor = await index.page(cursor, PAGE)
-                    for k, v in zip(keys, versions, strict=True):
-                        yield scope, key_str(k), Record.decode(v)
+                    keys, _, payloads, cursor = await index.page(cursor, PAGE)
+                    for k, p in zip(keys, payloads, strict=True):
+                        yield scope, key_str(k), Record.decode(p)
                     if cursor is None:
                         break
 
@@ -338,8 +337,9 @@ class Views:
 
     # -- explain (per-key-processing.md §10) -------------------------------------------------
 
-    async def _lookup(self, output: str, scope: str, key: str) -> bytes | None:
-        """A key's live version in an index, exactly; `None` if it holds none."""
+    async def _lookup(self, output: str, scope: str, key: str) -> tuple[int, bytes | None] | None:
+        """A key's live entry in an index, exactly — `(generation, payload)`;
+        `None` if it holds none."""
 
         state = self.m.indexes.get((output, scope))
         if state is None:
@@ -348,8 +348,7 @@ class Views:
             found = await KeyIndex(self._key_io(), None, state.pinned(), self.key_options).lookup(
                 [key_bytes(key)]
             )
-        hit = found.get(key_bytes(key))
-        return hit[0] if hit else None
+        return found.get(key_bytes(key))
 
     async def _newest_outcome(self, asset: str, scope: str, key: str, outcomes=None) -> dict | None:
         found = await self.history.key_outcomes(asset, scope=scope, key=key, outcomes=outcomes, limit=1)
@@ -366,11 +365,11 @@ class Views:
         - `removed`: the upstream no longer holds it, and it was processed
           once or an output still does (its removal may be undelivered);
         - `absent`: the upstream does not hold it, and nothing shows it did;
-        - `ok`: processed at the upstream's current revision — its newest
-          `ok`, `removed` or `unmatched` row is an `ok` at that revision, or
-          the edge is caught up (a row expires with its run, and a plain
+        - `ok`: processed at the upstream key's current generation — its
+          newest `ok`, `removed` or `unmatched` row is an `ok` at it, or the
+          edge is caught up (a row expires with its run, and a plain
           Incremental edge records none);
-        - `pending`: the upstream holds a revision the edge has not
+        - `pending`: the upstream holds a write of it the edge has not
           delivered yet.
 
         The patterns are those the edge delivers under — its watermark's,
@@ -425,11 +424,11 @@ class Views:
         served = wm.get("patterns") if wm is not None else spec.get("patterns")
         matcher = Matcher(served)
         included, excluded_by = matcher.included(key), matcher.excluded_by(key)
-        revision = self._rendered(output, upstream) if upstream is not None else None
+        generation = upstream[0] if upstream is not None else None
         failure = None
         if failing is not None:
             forced = (self.m.scope(asset, scope).get("failures") or {}).get("forced") or {}
-            failure = self._failure_view(asset, scope, key, Record.decode(failing), forced)
+            failure = self._failure_view(asset, scope, key, Record.decode(failing[1]), forced)
         present = {name: v is not None for name, v in zip(outputs, held, strict=True)}
         if not included:
             verdict = "not_matched"
@@ -439,7 +438,7 @@ class Views:
             verdict = "failing"
         elif upstream is None:
             verdict = "removed" if last is not None or any(present.values()) else "absent"
-        elif (kept is not None and kept["revision"] == revision) or where["state"] == "caught_up":
+        elif (kept is not None and kept["generation"] == generation) or where["state"] == "caught_up":
             verdict = "ok"
         else:
             verdict = "pending"
@@ -451,10 +450,10 @@ class Views:
             "upstream": output,
             "upstream_asset": self.manifest["outputs"][output].get("asset"),
             "up_scope": where["up_scope"],
-            "upstream_revision": revision,
+            "upstream_generation": generation,
             "edge_state": where["state"],
             "outputs": {
-                name: {"present": v is not None, "revision": None if v is None else self._rendered(name, v)}
+                name: {"present": v is not None, "generation": None if v is None else v[0]}
                 for name, v in zip(outputs, held, strict=True)
             },
             "patterns": {

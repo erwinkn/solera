@@ -110,7 +110,7 @@ def test_local_run_and_reads(project_file, state_url, capsys, monkeypatch):
         "--keys",
         '{"u-1": "v1"}',
     )
-    assert committed["ref"]["version"]
+    assert committed["ref"]["generation"]
 
 
 def test_local_full_and_partitions(project_file, state_url, capsys, monkeypatch):
@@ -185,7 +185,7 @@ def test_remote_run_and_reads(server, project_file, capsys, monkeypatch):
     assert shown["request"]["id"] == run_id
 
     committed = cli(monkeypatch, capsys, "commit", "uploads", "--keys", '{"u-1": "v1"}')
-    assert committed["ref"]["version"]
+    assert committed["ref"]["generation"]
 
     autos = cli(monkeypatch, capsys, "automations")
     assert isinstance(autos, list)

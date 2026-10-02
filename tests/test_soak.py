@@ -186,7 +186,7 @@ async def test_soak(tmp_path, monkeypatch):
         rows = await project.stores[ref.store].load(ref, None, await whole(state, "site_files", site))
         listed = await engine.list_keys("site_files", site)
         assert listed["total"] == len(rows) == state.model.heads[("site_files", site)]["count"]
-        assert listed["keys"] == {r["file_id"]: str(r["version"]) for r in rows}
+        assert sorted(listed["keys"]) == sorted(r["file_id"] for r in rows)
 
     # A live consumer still plans incrementally, not as a full re-read.
     run = await engine.submit(["file_index"], partitions="all")

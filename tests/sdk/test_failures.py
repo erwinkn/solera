@@ -15,10 +15,10 @@ from solera.failures import (
 )
 
 
-def step(prior, kind, now=1000, epoch=3, forced=0, retries=2, revision=b"r1", **kw):
+def step(prior, kind, now=1000, epoch=3, forced=0, retries=2, upstream=11, **kw):
     return transition(
         prior,
-        Outcome(kind, revision, kw.pop("message", ""), **kw),
+        Outcome(kind, upstream, kw.pop("message", ""), **kw),
         now=now,
         epoch=epoch,
         forced=forced,
@@ -27,9 +27,9 @@ def step(prior, kind, now=1000, epoch=3, forced=0, retries=2, revision=b"r1", **
 
 
 def test_record_round_trips_and_clips_its_message():
-    r = Record(FAILED, 300, 7, 4031, 10, 20, 0, 0, b"\x00\xffrev", "é" * 300)
+    r = Record(FAILED, 300, 7, 4031, 10, 20, 0, 0, 1 << 40, "é" * 300)
     back = Record.decode(r.encode())
-    assert back.tries == 300 and back.forced == 4031 and back.revision == b"\x00\xffrev"
+    assert back.tries == 300 and back.forced == 4031 and back.upstream == 1 << 40
     assert len(back.message.encode()) <= 200 and back.message == "é" * 100
 
 
@@ -40,8 +40,8 @@ def test_transition_table():
     again = step(fresh, "failed", now=2000, epoch=4)
     assert (again.tries, again.since, again.last, again.epoch) == (2, 1000, 2000, 4)
     assert step(again, "ok") is None and step(again, "removed") is None  # tombstones
-    # Another revision is a fresh record.
-    assert step(again, "failed", revision=b"r2").tries == 1
+    # Another upstream generation — the key written since — is a fresh record.
+    assert step(again, "failed", upstream=12).tries == 1
     # Another class keeps `since`, counts the try.
     rejected = step(again, "rejected", now=3000)
     assert (rejected.outcome, rejected.tries, rejected.since) == (REJECTED, 3, 1000)
@@ -91,13 +91,11 @@ def test_minima_and_bounds():
 def test_deadlines_are_never_shortened_by_rounding():
     """Review 11: a budget or a wait is computed from the exact time, then rounded up."""
 
-    half = transition(
-        None, Outcome("transient", b"r", retry_for=0.5), now=1000.5, epoch=0, forced=0, retries=0
-    )
+    half = transition(None, Outcome("transient", 11, retry_for=0.5), now=1000.5, epoch=0, forced=0, retries=0)
     assert half.outcome == RETRYING and half.until == 1001
     soon = transition(
         None,
-        Outcome("transient", b"r", retry_after=1, retry_for=60),
+        Outcome("transient", 11, retry_after=1, retry_for=60),
         now=1000.9,
         epoch=0,
         forced=0,

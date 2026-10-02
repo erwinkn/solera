@@ -2,6 +2,7 @@
 writes, the failure index, retry passes, forced retries, key outcomes."""
 
 import asyncio
+import copy
 
 import pytest
 from solera import Abort, Rejected, Transient
@@ -9,6 +10,7 @@ from solera.failures import FAILED, REJECTED, RETRYING, Record
 from solera.keys.index import KeyIndex, key_str
 from solera.keys.io import ObjectIO
 from solera.sdk import Each, Output, Project, Ref, RegistrationError, Result, Retry, asset
+from solera.stores import Patch
 
 from ..conftest import whole
 from .test_engine import drive, make_engine, state, status_of, task_statuses  # noqa: F401
@@ -28,14 +30,25 @@ async def rows_of(engine, project, output, scope=""):
 
 async def records(engine, asset_name, scope=""):
     index = KeyIndex(ObjectIO(engine.state.objects), None, engine.m.index(f"@{asset_name}", scope).pinned())
-    keys, versions, _, _ = await index.page(None, 10_000)
-    return {key_str(k): Record.decode(v) for k, v in zip(keys, versions, strict=True)}
+    keys, _, payloads, _ = await index.page(None, 10_000)
+    return {key_str(k): Record.decode(p) for k, p in zip(keys, payloads, strict=True)}
 
 
-def files_project(content, fn, **edge):
+def files_project(content, fn, *, written=None, **edge):
+    """`files`, a producer that writes what changed in `content` since it
+    last ran — a `Patch`, as one does to make its consumers reprocess no
+    more (docs/versions.md §1) — and `parse`, `fn` over each of its keys.
+    Projects of one `content` pass one `written`: what was written so far."""
+
+    written = {} if written is None else written
+
     @asset(outputs=Output("files", keyed=True))
     def files():
-        return dict(content)
+        changed = {k: v for k, v in content.items() if written.get(k) != v}
+        gone = [k for k in written if k not in content]
+        written.clear()
+        written.update(copy.deepcopy(content))
+        return Patch(changed, remove=gone)
 
     parse = asset(fn, inputs={"file": Each("files", **edge)}, outputs=Output("samples", key="path"))
     return Project(assets=[files, parse])
@@ -494,7 +507,9 @@ async def test_patterns_select_keys_and_a_page_of_none_is_skipped(state):  # noq
     # The same on a plain Incremental edge.
     @asset(outputs=Output("files2", keyed=True))
     def files2():
-        return dict(content)
+        return Patch({k: content[k] for k in written2.pop("keys", content)})
+
+    written2 = {}
 
     calls = []
 
@@ -508,6 +523,7 @@ async def test_patterns_select_keys_and_a_page_of_none_is_skipped(state):  # noq
     await engine.initialize()
     await drive(engine, await engine.submit(["plain"], upstream=True))
     content["ICP/a.csv"] = {"n": 9}
+    written2["keys"] = ["ICP/a.csv"]  # only the key that changed
     detail = await drive(engine, await engine.submit(["plain"], upstream=True))
     assert calls == [["XRF/c.csv"]] and task_statuses(detail)["plain"] == "skipped"
 
@@ -525,7 +541,8 @@ async def test_a_pattern_change_cuts_over(state):  # noqa: F811
         seen.append(ctx.key)
         return [{"n": file["n"]}]
 
-    old = files_project(content, parse, include=["a/**", "archive/**"], page_size=1)
+    written = {}
+    old = files_project(content, parse, include=["a/**", "archive/**"], page_size=1, written=written)
     engine = make_engine(state, old)
     await engine.initialize()
     await drive(engine, await engine.submit(["parse"], upstream=True))
@@ -536,7 +553,12 @@ async def test_a_pattern_change_cuts_over(state):  # noqa: F811
     await drive(engine, await engine.submit(["files"]))
     # A deploy: archive excluded, b included.
     new = files_project(
-        content, parse, include=["a/**", "b/**"], exclude={"archive": "archive/**"}, page_size=1
+        content,
+        parse,
+        include=["a/**", "b/**"],
+        exclude={"archive": "archive/**"},
+        page_size=1,
+        written=written,
     )
     engine = make_engine(state, new)
     await engine.initialize()

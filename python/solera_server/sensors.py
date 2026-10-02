@@ -51,7 +51,7 @@ class Sensors:
 
     def _head_id(self, source: str) -> str:
         """A source head's identity (§11.3): the event position that
-        installed it, whatever its version says."""
+        installed it."""
 
         return f"h:{(self.m.heads.get((source, '')) or {}).get('n', 0)}"
 

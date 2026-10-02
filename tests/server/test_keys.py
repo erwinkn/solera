@@ -9,10 +9,8 @@ import random
 import threading
 
 import pytest
-from solera._native import group_digest
 from solera.keys import resolver
 from solera.keys.index import DeltaFiles, IndexState, KeyIndex, Options
-from solera.keys.io import ObjectIO
 from solera.sdk import Incremental, Output, PartitionSet, Project, Ref, Source, asset
 from solera.stores import FileStore, Patch
 from solera_server.engine import Engine
@@ -77,14 +75,15 @@ class CountingStore(FileStore):
         return await super().store(write, prior, scope)
 
 
-async def test_unchanged_writes_skip_the_store(state):
-    """§6: a write the index shows changes nothing is never stored; the head,
-    its batch and its count stay as they are."""
+async def test_every_write_is_a_change_and_an_empty_patch_none(state):
+    """docs/versions.md §1: writing a key changes it — the same rows written
+    again are a new version, at the attempt's generation — while a patch
+    of nothing is never stored, and the head, its batch and its count stay."""
 
     store = CountingStore()
     rows = {"v": [{"id": "a", "v": 1}, {"id": "b", "v": 1}]}
 
-    @asset(outputs=Output("items", key="id", revision="v", store="counting"))
+    @asset(outputs=Output("items", key="id", store="counting"))
     def items():
         return rows["v"]
 
@@ -94,20 +93,19 @@ async def test_unchanged_writes_skip_the_store(state):
     await run(engine, ["items"])
     first = dict(state.model.heads[("items", "")])
     assert store.stored == 1 and first["batch"] == 0 and first["count"] == 2
+    await run(engine, ["items"])  # identical rows: written again
+    second = state.model.heads[("items", "")]
+    assert store.stored == 2 and second["batch"] == 1 and second["count"] == 2
+    assert second["ref"]["generation"] > first["ref"]["generation"]
+    rows["v"] = Patch([])
     await run(engine, ["items"])
-    await run(engine, ["items"], mode="full")  # a full run of identical content too
-    assert store.stored == 1
-    assert state.model.heads[("items", "")]["ref"] == first["ref"]
-    assert state.model.heads[("items", "")]["batch"] == 0
-    rows["v"] = [{"id": "a", "v": 2}]
-    await run(engine, ["items"])
-    head = state.model.heads[("items", "")]
-    assert store.stored == 2 and head["batch"] == 1 and head["count"] == 1
+    assert store.stored == 2 and state.model.heads[("items", "")]["batch"] == 1
 
 
 async def test_a_keyed_write_reaches_the_store_as_its_delta(state, data):
-    """§6: the store is told which keys changed, and writes only those: a
-    dict output whose `b` changed and `a` went touches two objects."""
+    """§6: the store is told which keys the delta writes, and writes only
+    those: a dict output that drops `a` writes `b` and `c` again — every
+    written key is a change — and `a` goes with the index."""
 
     values = {"v": {"a": 1, "b": 1, "c": 1}}
 
@@ -123,49 +121,50 @@ async def test_a_keyed_write_reaches_the_store_as_its_delta(state, data):
     values["v"] = {"b": 2, "c": 1}
     await run(engine, ["scores"])
     after = {str(p.relative_to(data)) for p in (data / "scores").rglob("*.json")}
-    [new] = after - before  # one object written: `b`'s new version; `c` untouched, `a` dropped by the index
-    assert new.startswith("scores/b/") and (data / new).read_text() == "2"
+    new = sorted(after - before)  # `b` and `c` written again; `a` dropped by the index
+    assert [n.split("/")[1] for n in new] == ["b", "c"] and (data / new[0]).read_text() == "2"
     ref = Ref.from_json(state.model.heads[("scores", "")]["ref"])
     assert await project.stores["default"].load(ref, None, await whole(state, "scores")) == {"b": 2, "c": 1}
 
 
-async def test_row_digests_are_16_bytes_end_to_end(state):
-    """§6: without a declared revision, a key's version is the 16-byte group
-    digest of its rows (docs/row-digest.md): what the index stores, and what
-    key listings show in hex."""
+async def test_a_keys_version_is_the_generation_that_wrote_it(state):
+    """docs/versions.md §1: a key's version is the generation of the write
+    that last wrote it: what the index holds, what the head's ref carries,
+    and what key listings show."""
 
-    rows = [{"id": "a", "n": 1}, {"id": "b", "n": 2}]
+    rows = {"v": [{"id": "a", "n": 1}, {"id": "b", "n": 2}]}
 
     @asset(outputs=Output("items", key="id"))
     def items():
-        return rows
+        return Patch(rows["v"])
 
     engine = engine_for(state, Project(assets=[items]))
     await engine.initialize()
     await run(engine, ["items"])
-    index = KeyIndex(ObjectIO(state.objects), None, state.model.indexes[("items", "")])
-    keys, versions, _, _ = await index.page(None, 10)
-    digests = [group_digest([r], "id") for r in rows]
-    assert keys == [b"a", b"b"] and versions == digests
-    assert all(len(v) == 16 for v in versions)
-    listed = await engine.list_keys("items")
-    assert listed["keys"] == {"a": digests[0].hex(), "b": digests[1].hex()}
+    first = state.model.heads[("items", "")]["ref"]["generation"]
+    assert first > 0
+    assert (await engine.list_keys("items"))["keys"] == {"a": first, "b": first}
+    rows["v"] = [{"id": "b", "n": 3}]
+    await run(engine, ["items"])
+    second = state.model.heads[("items", "")]["ref"]["generation"]
+    assert second > first
+    assert (await engine.list_keys("items"))["keys"] == {"a": first, "b": second}
 
 
 @pytest.mark.parametrize("arrow", [False, True], ids=["rows", "arrow"])
 async def test_a_patch_reconciles_what_a_dead_sql_writer_left(state, arrow):
-    """docs/resolved-commits.md §3: a dead `Sql` writer's intent names no keys.
-    It deleted `a` and inserted `b` and died before reporting; the next patch,
-    of `c`, cannot read back "the intended keys" — it reconciles the whole
-    store against the index, and the commit settles the intent. (An
-    overwrite store: an immutable one never has such an intent.)"""
+    """docs/versions.md §5: a dead `Sql` writer's intent names no keys. It
+    deleted `a` and inserted `b` and died before reporting; the next patch,
+    of `c`, cannot know "the intended keys" — it takes every key the store
+    holds, and the commit settles the intent. (A fenced store: an immutable
+    one never has such an intent.)"""
 
     from tests.server.test_fence import LiveStore
 
     live = LiveStore()
     pending = {"rows": [{"id": "a", "v": 1}]}
 
-    @asset(outputs=Output("items", key="id", revision="v", store="live"))
+    @asset(outputs=Output("items", key="id", store="live"))
     def items():
         if arrow:  # the same patch as an Arrow table: repair takes what `key_rows` takes
             import pyarrow as pa
@@ -202,7 +201,7 @@ async def test_compaction_truncation_and_garbage(state):
     pending = {"rows": [], "remove": []}
     seen: dict[str, int] = {}
 
-    @asset(outputs=Output("items", key="id", revision="v"))
+    @asset(outputs=Output("items", key="id"))
     def items():
         return Patch(pending["rows"], remove=pending["remove"])
 
@@ -251,8 +250,8 @@ async def test_compaction_truncation_and_garbage(state):
     read = state.model.discard_reads()  # kept for the discards still pending (docs/lifecycle.md §9.8)
     assert {path for path, _ in state.model.garbage} <= read
     assert on_disk(state, index) == {index.path(n) for n in index.referenced()} | read
-    listed = await engine.list_keys("items")
-    assert listed["keys"] == {k: str(v) for k, v in sorted(truth.items())}
+    assert sorted((await engine.list_keys("items"))["keys"]) == sorted(truth)
+    assert await _stored(engine, state) == truth
 
 
 async def test_recount_makes_an_approximate_count_exact(state):
@@ -352,7 +351,8 @@ async def test_a_consumer_without_a_log_starts_over(state):
 
 async def test_keyed_source_commits_go_through_the_index(state):
     """§6: a source commit becomes a delta file; a full map replaces the
-    content, deleting what it omits; identical content is not a change."""
+    content, deleting what it omits; a key at the version it holds is not
+    a change (docs/versions.md §2)."""
 
     got = []
 
@@ -365,7 +365,7 @@ async def test_keyed_source_commits_go_through_the_index(state):
         """The source's data lives elsewhere; loads answer from the selection."""
 
         async def load(self, ref, t, selection):
-            return [{"id": k} for k in selection.revisions]
+            return [{"id": k} for k in selection.generations]
 
     project = Project(
         assets=[ingest], sources=[Source("uploads", key="id", store="ext")], stores={"ext": External()}
@@ -435,7 +435,7 @@ async def test_renamed_asset_keeps_its_state(state):
 
     before_project = Project(
         assets=[
-            asset(outputs=Output(key="id", revision="v"))(feed),
+            asset(outputs=Output(key="id"))(feed),
             asset(inputs={"feed": Incremental()})(mirror),
         ]
     )
@@ -446,7 +446,7 @@ async def test_renamed_asset_keeps_its_state(state):
 
     project = Project(
         assets=[
-            asset(outputs=Output(key="id", revision="v"), aliases=["feed"])(source_feed),
+            asset(outputs=Output(key="id"), aliases=["feed"])(source_feed),
             asset(inputs={"feed": Incremental("source_feed")})(mirror),
         ]
     )
@@ -457,7 +457,7 @@ async def test_renamed_asset_keeps_its_state(state):
     assert m.heads[("source_feed", "")]["asset"] == "source_feed"
     assert m.indexes[("source_feed", "")].prefix == "keys/feed/_/"  # files stay where they are
     assert m.watermark("mirror", "feed", "")["output"] == "source_feed"
-    rows["v"] = [{"id": "a", "v": 1}, {"id": "b", "v": 2}]
+    rows["v"] = Patch([{"id": "b", "v": 2}])
     await run(engine, ["mirror"], upstream=True)
     assert m.heads[("source_feed", "")]["batch"] == 1
     assert delivered == [(True, ["a", "b"]), (False, ["b"])]  # only the change, not everything
@@ -476,7 +476,7 @@ async def test_small_writes_resolve_in_the_engine_and_pages_come_with_start(stat
     pending = {"rows": [{"id": f"k{i}", "v": 1} for i in range(50)]}
     seen: dict[str, int] = {}
 
-    @asset(outputs=Output("items", key="id", revision="v"))
+    @asset(outputs=Output("items", key="id"))
     def items():
         return Patch(pending["rows"])
 
@@ -524,8 +524,7 @@ async def test_small_writes_resolve_in_the_engine_and_pages_come_with_start(stat
         await _warm(engine, ("items", ""))  # its delta installed: what the next start reads
         await run(engine, ["mirror"])
         monkeypatch.setattr(IO, "read", real_read)
-        truth = {k: v for k, (v, _) in (await _listed(engine)).items()}
-        assert seen == truth
+        assert seen == await _stored(engine, state)
     assert set(answers[-3:]) == {"delta"}  # warm: the engine answers
     assert served[-3:] == [True] * 3  # and the consumer's pages come with its start
     assert not [p for p in reads if p.endswith(".kx")]  # so nothing reads an index file
@@ -543,7 +542,7 @@ async def test_input_reads_come_from_the_engine_once_warm(state, monkeypatch):
     rows = {"v": [{"id": f"k{i:03d}", "v": 1} for i in range(300)]}
     seen: dict[str, dict[str, int]] = {"mirror": {}, "copy": {}}
 
-    @asset(outputs=Output("items", key="id", revision="v"))
+    @asset(outputs=Output("items", key="id"))
     def items():
         return Patch(rows["v"])
 
@@ -588,7 +587,7 @@ async def test_input_reads_come_from_the_engine_once_warm(state, monkeypatch):
         await run(engine, ["mirror"] if n < 2 else ["mirror", "copy"])  # copy: a full delivery
         monkeypatch.setattr(IO, "read", real_read)
         assert served and all(served)
-        truth = {k: v for k, (v, _) in (await _listed(engine)).items()}
+        truth = await _stored(engine, state)
         assert seen["mirror"] == truth
     assert seen["copy"] == truth
     assert not [p for p in index_reads if p.endswith(".kx")]  # every page came with its start
@@ -609,9 +608,12 @@ async def _warm(engine, key):
     raise AssertionError("the index never warmed")
 
 
-async def _listed(engine):
-    listed = await engine.list_keys("items")
-    return {k: (int(v), 0) for k, v in listed["keys"].items()}
+async def _stored(engine, state):
+    """`items` as its store holds it: each key's `v`."""
+
+    ref = Ref.from_json(state.model.heads[("items", "")]["ref"])
+    loaded = await FileStore().load(ref, None, await whole(state, "items"))
+    return {r["id"]: r["v"] for r in loaded}
 
 
 @pytest.mark.parametrize("patch", [False, True], ids=["replace", "patch"])
@@ -620,15 +622,16 @@ async def test_too_many_changes_to_list_still_write_only_what_the_delta_names(
 ):
     """docs/lifecycle.md §9.8: an immutable store's every object must be named
     by an index entry, or nothing collects it. Past what the worker lists
-    (`LISTED`, here 0), the store pages the changed keys from the delta files:
-    an unchanged key gets no new object under a generation no entry names."""
+    (`LISTED`, here 0), the store pages the written keys from the delta
+    files: a key the delta does not write — one a patch leaves alone —
+    gets no new object under a generation no entry names."""
 
     from solera_worker import worker
 
     monkeypatch.setattr(worker, "LISTED", 0)
     rows = {"a": 1, "b": 1}
 
-    @asset(outputs=Output("items", key="id", revision="v"))
+    @asset(outputs=Output("items", key="id"))
     def items():
         content = [{"id": k, "v": v} for k, v in rows.items()]
         return Patch(content) if patch else content
@@ -637,13 +640,17 @@ async def test_too_many_changes_to_list_still_write_only_what_the_delta_names(
     await engine.initialize()
     await run(engine, ["items"])
     rows["b"] = 2
+    if patch:
+        del rows["a"]  # the patch leaves `a` alone
     await run(engine, ["items"])
+    if patch:
+        rows["a"] = 1
     objects = {p.parent.name: [] for p in data.rglob("*.json") if "items" in p.parts}
     for p in data.rglob("*.json"):
         if "items" in p.parts:
             objects[p.parent.name].append(p.name)
-    assert len(objects["a"]) == 1, objects  # unchanged: its first object only
-    assert len(objects["b"]) == 1, objects  # changed: a new one; the old one went after the commit (D8)
+    assert len(objects["a"]) == 1, objects  # its newest object only: written again, or left alone
+    assert len(objects["b"]) == 1, objects  # written again; the old one went after the commit (D8)
 
 
 async def test_a_byte_valued_key_fails_the_write_instead_of_vanishing(state):
@@ -674,7 +681,7 @@ async def test_a_key_removed_twice_is_removed_once(state, cache):
 
     pending = {"value": [{"id": "a", "v": 1}, {"id": "b", "v": 1}]}
 
-    @asset(outputs=Output("items", key="id", revision="v"))
+    @asset(outputs=Output("items", key="id"))
     def items():
         return pending["value"]
 

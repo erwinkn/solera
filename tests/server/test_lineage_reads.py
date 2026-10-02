@@ -1,16 +1,17 @@
 """Lineage of a store that reads the current rows (docs/stores.md, "What a
-read sees"): an attempt's reads of PostgresStore see one moment, and say
-which generation's write they saw. Lineage records the pin's generation and
-the one read: exact when they agree; when a newer write landed, the
-generation read and, for a page of keys, the versions read. Skips unless
-SOLERA_TEST_DATABASE_URL points at a scratch database."""
+read sees"; docs/versions.md §6): an attempt's reads of PostgresStore see
+one moment, and say which generation's write they saw. Lineage records the
+pin's generation and the one read: exact when they agree; when a newer
+write landed, the generation read, flagged `uncommitted` until a commit
+installs it. Skips unless SOLERA_TEST_DATABASE_URL points at a scratch
+database."""
 
 import os
 import uuid
 
 import pytest
-from solera.sdk import In, Incremental, Output, Project, Ref, asset
-from solera.stores import Scope, prepare_for
+from solera.sdk import In, Incremental, Output, Project, Ref, Source, asset
+from solera.stores import Scope
 from solera_server.engine import Engine
 from solera_server.placements.inline import InlinePlacement
 from solera_server.state import State
@@ -43,8 +44,8 @@ async def run(engine, targets, **kw):
 
 
 async def edges(engine, state, output):
-    version = state.model.heads[(output, "")]["ref"]["version"]
-    return {e["param"]: e for e in (await engine.history.lineage(output, "", version))["edges"]}
+    generation = state.model.heads[(output, "")]["ref"]["generation"]
+    return {e["param"]: e for e in (await engine.history.lineage(output, "", generation))["edges"]}
 
 
 async def test_lineage_says_what_a_current_read_saw(state):
@@ -86,23 +87,19 @@ async def test_lineage_says_what_a_current_read_saw(state):
     assert edge["from"] == {
         "output": name,
         "scope": "",
-        "version": head["ref"]["version"],
-        "generation": head["generation"],
+        "generation": head["ref"]["generation"],
         "run": head["run"],
         "attempt": head["attempt"],
         "at": head["at"],
     }
-    assert "uncommitted" not in edge and "mixed" not in edge
-    assert edge["detail"] == {
-        "pinned_version": head["ref"]["version"],
-        "pinned_generation": head["generation"],
-    }
+    assert "uncommitted" not in edge
+    assert edge["detail"] == {"pinned_generation": head["ref"]["generation"]}
 
     # sites commits b=2; then a newer writer's b=3 lands before the readers read,
     # uncommitted (a retry under way, or one that died after its write).
     content["rows"] = [{"id": "a", "v": "1"}, {"id": "b", "v": "2"}]
     await run(engine, ["sites"])
-    pinned = state.model.heads[(name, "")]["generation"]
+    pinned = state.model.heads[(name, "")]["ref"]["generation"]
     newer = pinned + 1_000
     head = state.model.heads[(name, "")]["ref"]
     landed = [{"id": "a", "v": "1"}, {"id": "b", "v": "3"}]
@@ -113,40 +110,80 @@ async def test_lineage_says_what_a_current_read_saw(state):
     )
     await run(engine, ["report", "changes"])
 
-    # A whole read of a write no attempt committed: flagged, no version; the pin in `detail`.
+    # A read of a write no commit installed: flagged; the pin in `detail`.
+    for param in ("report", "changes"):  # a whole read, and a page of keys
+        edge = (await edges(engine, state, param))["sites"]
+        assert edge["from"]["generation"] == newer
+        assert edge["uncommitted"] == {"attempt": None, "run": None}  # written outside the engine
+        assert edge["detail"]["pinned_generation"] == pinned
+
+    # Its attempt is known: the edge names it, still uncommitted.
+    from solera_server.history import attempt_row, materialization
+
+    summary = {"id": "late", "outcome": "failed", "started_at": 1.0, "finished_at": 2.0, "generation": newer}
+    state.model._record(
+        "attempts", attempt_row("r-late", {"id": "t", "asset": "sites", "scope": ""}, summary, 1)
+    )
     edge = (await edges(engine, state, "report"))["sites"]
-    assert edge["from"]["generation"] == newer and edge["from"]["version"] is None
-    assert edge["uncommitted"] == {"attempt": None, "run": None}  # written outside the engine
-    assert edge["detail"]["pinned_generation"] == pinned
-    # A page of keys (b changed): the versions it read, as the store versions rows.
-    edge = (await edges(engine, state, "changes"))["sites"]
-    assert edge["from"]["generation"] == newer and "uncommitted" in edge
-    versions = dict(prepare_for(store, [{"id": "b", "v": "3"}], out).entries())
-    assert edge["from"]["keys"] == {"b": versions["b"].hex()}
+    assert edge["uncommitted"] == {"attempt": "late", "run": "r-late"}
 
-    # The writer commits after all: the edge then names the version it committed, and who.
-    from solera_server.history import attempt_row
-
-    summary = {"id": "late", "outcome": "succeeded", "started_at": 1.0, "finished_at": 2.0}
-    summary |= {"outputs": {name: "v-late"}, "generation": newer}
-    task = {"id": "t-late", "asset": "sites", "scope": ""}
-    state.model._record("attempts", attempt_row("r-late", task, summary, 1))
+    # A commit installs that generation (a repair's, say): the edge then names who made it.
+    late = {"ref": {**head, "generation": newer}, "run": "r-repair", "attempt": "repair", "at": 3.0}
+    state.model._record("materializations", materialization(name, "sites", "", late))
     edge = (await edges(engine, state, "report"))["sites"]
     assert "uncommitted" not in edge
-    assert {k: edge["from"][k] for k in ("version", "generation", "run", "attempt", "at")} == {
-        "version": "v-late",
+    assert {k: edge["from"][k] for k in ("generation", "run", "attempt", "at")} == {
         "generation": newer,
-        "run": "r-late",
-        "attempt": "late",
-        "at": 2.0,
+        "run": "r-repair",
+        "attempt": "repair",
+        "at": 3.0,
     }
 
 
+async def test_an_external_tables_lineage_is_its_observation(state):
+    """docs/versions.md §6, review finding 4: a source's table is written
+    outside Solera — no fence says which write a read saw. Lineage records
+    the generation of the observation the read came from, and flags
+    nothing: an external source is read as it is now, so what a reader
+    loads may be newer than the observation."""
+
+    if not DSN:
+        pytest.skip("SOLERA_TEST_DATABASE_URL is not set")
+    from solera_postgres import PostgresStore
+
+    store = PostgresStore(DSN)
+    table = f"ext_{uuid.uuid4().hex[:8]}"
+    with store._connect() as conn:
+        conn.execute(f'CREATE TABLE "{table}" (id text, v text)')
+        conn.execute(f"INSERT INTO \"{table}\" VALUES ('a', '1')")
+
+    @asset(inputs={"ext": In("ext")})
+    def report(ext: list[dict]):
+        return {"seen": sorted(r["v"] for r in ext)}
+
+    source = Source("ext", store="postgres", table=f'"public"."{table}"', where={})
+    project = Project(assets=[report], sources=[source], stores={"postgres": store})
+    engine = Engine(
+        state,
+        project.manifest,
+        placements={"Local": lambda s, c: InlinePlacement(c, project)},
+        clock=state.clock,
+        eval_interval=0.01,
+    )
+    await engine.initialize()
+    await engine.commit_source("ext", version="t1")
+    observed = state.model.heads[("ext", "")]["ref"]["generation"]
+    with store._connect() as conn:  # the external writer moves on before the reader reads
+        conn.execute(f"UPDATE \"{table}\" SET v = '2'")
+    await run(engine, ["report"])
+    edge = (await edges(engine, state, "report"))["ext"]
+    assert edge["from"]["generation"] == observed and "uncommitted" not in edge
+
+
 async def test_a_renamed_postgres_output_stays_readable(state):
-    """Review round 5 #1: an asset renamed with `aliases=` that writes the
-    same rows commits nothing new, and its head — the old table — must
-    still load; a changed write lands in that table too. The engine pins
-    the head; the store keeps the table the head names."""
+    """Review round 5 #1: an asset renamed with `aliases=` writes into the
+    table its head names — the old one — and its head still loads. The
+    engine pins the head; the store keeps the table the head names."""
 
     if not DSN:
         pytest.skip("SOLERA_TEST_DATABASE_URL is not set")
@@ -178,7 +215,7 @@ async def test_a_renamed_postgres_output_stays_readable(state):
     await run(engine, ["old"])
     _, engine = make([asset(outputs=Output(**decl), aliases=["old"])(new)])
     await engine.initialize()
-    await run(engine, ["new"])  # the same rows: the head stays
+    await run(engine, ["new"])  # the same rows, written again: into the old table
     head = Ref.from_json(state.model.heads[("new", "")]["ref"])
     assert await store.load(head, list[dict], None) == [{"id": "a", "v": "1"}]
     rows["v"] = [{"id": "a", "v": "2"}]

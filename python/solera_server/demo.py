@@ -86,8 +86,8 @@ class FeedClient:
     """A pretend delta feed: one new batch per site every five seconds.
 
     `delta(site, since)` returns (events, token); the token is the cursor.
-    Polling inside the same five-second tick returns identical events, so a
-    re-run commits the same version and wakes nothing downstream. Run config
+    Polling again inside the same five-second tick returns nothing new, so a
+    re-run writes nothing and wakes nothing downstream. Run config
     `feed_tick_seconds` stretches the tick — handy for slowing the feed down
     while exploring the console.
     """
@@ -184,7 +184,6 @@ def upload_drop(ctx) -> Tick | None:
             "site_files",
             store=RELATIONAL,
             key="file_id",
-            revision="version",
             partition_column="site",
             migrations=postgres_migrations("site_files"),
         ),
@@ -231,7 +230,7 @@ def site_feed(ctx, feed: FeedClient):
     automations=AutoRefresh(),
 )
 def file_index(ctx, site_files: list[dict]):
-    """Index the files whose revision changed since the last commit (§6)."""
+    """Index the files written since the last commit (§6)."""
     changes = ctx.changes["site_files"]
     ctx.log("indexing", upserted=len(changes.upserted), deleted=len(changes.deleted))
     rows = [

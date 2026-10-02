@@ -26,7 +26,7 @@ from solera.sdk import (
     asset,
     job,
 )
-from solera.stores import FileStore
+from solera.stores import FileStore, Patch
 from solera_server.engine import Engine
 from solera_server.placements.inline import InlinePlacement
 from solera_server.state import State
@@ -131,7 +131,7 @@ async def test_bare_return_and_commit(state):
     detail = await drive(engine, run)
     assert status_of(detail) == "succeeded"
     installed = head(state, "numbers")
-    assert installed["ref"]["output"] == "numbers" and installed["ref"]["version"]
+    assert installed["ref"]["output"] == "numbers" and installed["ref"]["generation"]
     assert state.model.scope("numbers", "")["drained"] is True
     assert installed["run"] == run["id"] and installed["attempt"]
 
@@ -155,7 +155,7 @@ async def test_result_cursor_and_omitted_output(state):
     await engine.initialize()
     await drive(engine, await engine.submit(["pair"]))
     await drive(engine, await engine.submit(["pair"]))
-    assert head(state, "a")["ref"]["version"] != ""
+    assert head(state, "a")["ref"]["generation"] > head(state, "b")["ref"]["generation"]
     assert head(state, "b") is not None  # kept from the first commit
     assert state.model.scope("pair", "").get("cursor") == "c2"
     await drive(engine, await engine.submit(["pair"], mode="full"))
@@ -227,21 +227,21 @@ async def test_incremental_filters_input_and_changes(state):
     assert seen["upserted"] == ["a", "b", "c"]  # §6: first delivery upserts everything
     assert {r["id"] for r in seen["rows"]} == {"a", "b", "c"}
 
-    # Second run, no changes → skipped, nothing loaded.
+    # Second run, nothing written since → skipped, nothing loaded.
     seen.clear()
-    detail = await drive(engine, await engine.submit(["consumer"], upstream=True))
+    detail = await drive(engine, await engine.submit(["consumer"]))
     assert task_statuses(detail)["consumer"] == "skipped"
     assert seen == {}
 
-    # One changed revision reprocesses only that key (§6).
-    content["rows"] = [{"id": "a", "v": 1}, {"id": "b", "v": 2}, {"id": "c", "v": 1}]
+    # One key written again reprocesses only that key (§6).
+    content["rows"] = Patch([{"id": "b", "v": 2}])
     await drive(engine, await engine.submit(["consumer"], upstream=True))
     assert seen["upserted"] == ["b"]
     assert [r["id"] for r in seen["rows"]] == ["b"]
 
     # A deletion arrives via ctx.changes (§5: what a selection cannot carry).
     seen.clear()
-    content["rows"] = [{"id": "a", "v": 1}, {"id": "c", "v": 1}]
+    content["rows"] = Patch([], remove=["b"])
     await drive(engine, await engine.submit(["consumer"], upstream=True))
     assert seen["deleted"] == ["b"] and seen["upserted"] == []
 
@@ -499,7 +499,7 @@ async def test_ref_annotated_input_receives_ref(state):
     @asset(inputs={"upstream": "upstream"})
     def by_ref(upstream: ObjectRef):
         seen["ref"] = upstream
-        return [{"v": upstream.version[:8]}]
+        return [{"v": upstream.generation}]
 
     project = Project(assets=[upstream, by_ref])
     engine = make_engine(state, project)
@@ -583,8 +583,8 @@ async def test_external_partition_set_via_commit(state):
     await engine.commit_source("uploads", upsert=["u-3"])
     detail = await drive(engine, await engine.submit(["per_upload"], partitions="missing"))
     assert ran == ["u-3"]
-    # An identical map is not a change (§5).
-    result = await engine.commit_source("uploads", keys={"u-1": "1", "u-2": "1", "u-3": "1"})
+    # The same elements listed again are not a change (§5, docs/versions.md §2).
+    result = await engine.commit_source("uploads", keys=["u-1", "u-2", "u-3"])
     assert result["changed"] is False
 
 
@@ -1028,14 +1028,16 @@ async def test_max_concurrent(state):
     assert held and {(e["reason"], e["name"]) for e in held} == {("executor", "fake")}
 
 
-async def test_identical_poll_wakes_nothing(state):
-    """§1 corollary: a poll producing identical content yields no `changed`
-    and pends no automation."""
-    fired = []
+async def test_a_poll_that_writes_nothing_wakes_nothing(state):
+    """§1 corollary: a poll that finds nothing new writes nothing — an empty
+    `Patch` — which yields no `changed` and pends no automation. (Writing
+    the same rows again would be a change: docs/versions.md §1.)"""
+    fired, polls = [], []
 
     @asset(outputs=Output("feed", key="id"))
     def feed():
-        return [{"id": "a", "v": 1}]
+        polls.append(True)
+        return [{"id": "a", "v": 1}] if len(polls) == 1 else Patch([])
 
     @asset(inputs={"feed": Incremental()}, automations=OnChange())
     def consumer(feed: list):
@@ -1048,11 +1050,12 @@ async def test_identical_poll_wakes_nothing(state):
     await drive(engine, await engine.submit(["consumer"], upstream=True))
     assert fired == [True]
     await engine.tick()  # drain the first pending event
-    await drive(engine, await engine.submit(["feed"]))  # identical content
+    await drive(engine, await engine.submit(["feed"]))  # nothing new
+    assert polls == [True, True]
     assert state.model.automations["consumer.onchange.0"]["pending"] == []
     fired.clear()
     await engine.tick()
-    assert fired == []  # nothing woke: identical content is not a change
+    assert fired == []  # nothing woke: nothing was written
 
 
 async def test_job_commits_lineage_only(state):
@@ -1122,7 +1125,7 @@ async def test_migration_changes_fingerprint_and_marks_handle(state):
     assert seen == [["a", "b"]]
     assert store.calls == []  # no migrations declared yet
 
-    detail = await drive(engine, await engine.submit(["consumer"], upstream=True))
+    detail = await drive(engine, await engine.submit(["consumer"]))
     assert task_statuses(detail)["consumer"] == "skipped"
 
     @asset(outputs=Output("files", key="id"))
@@ -1140,7 +1143,7 @@ async def test_migration_changes_fingerprint_and_marks_handle(state):
     project2 = Project(assets=[files, consumer], stores={"mig": store})
     engine2 = make_engine(state, project2)
     await engine2.initialize()
-    await drive(engine2, await engine2.submit(["consumer"], upstream=True))
+    await drive(engine2, await engine2.submit(["consumer"]))
     assert seen == [["a", "b"], ["a", "b"]]  # fingerprint changed: all keys again
     assert store.calls == ["rolled"]  # migrate ran before the write
 
@@ -1237,10 +1240,11 @@ async def test_a_delivery_says_where_each_page_sits(state):
 
     pages, rebuilt = [], {"keys": []}
     content = {f"k{i}": 1 for i in range(7)}
+    written = {"keys": list(content)}
 
     @asset(outputs=Output("files", key="id"))
     def files():
-        return [{"id": k, "v": v} for k, v in content.items()]
+        return Patch([{"id": k, "v": content[k]} for k in written["keys"]])
 
     @asset(inputs={"files": Incremental(page_size=3)})
     def consumer(ctx, files: list):
@@ -1273,6 +1277,7 @@ async def test_a_delivery_says_where_each_page_sits(state):
     pages.clear()
     for key in ("k0", "k2", "k4", "k6"):
         content[key] = 2
+    written["keys"] = ["k0", "k2", "k4", "k6"]
     await drive(engine, await engine.submit(["consumer"], upstream=True))
     assert pages == [(0, 2, True, False, False), (1, 2, False, True, False)]
     for _ in range(3):
@@ -1391,16 +1396,18 @@ async def test_a_page_looks_ahead_a_bounded_way(state, monkeypatch):
 
 
 async def test_an_unchanged_keyed_write_still_applies_its_migrations(state):
-    """§4: schema is not data. A migration added to a keyed output whose rows
-    did not change is applied all the same, and the head's handle says so."""
+    """§4: schema is not data. A migration added to a keyed output a run
+    writes nothing to is applied all the same, and the head's handle says
+    so: the content, its version, stays."""
     from solera.sdk import Migration
 
     store = MigratingStore()
+    rows = {"v": [{"id": "a", "v": 1}]}
 
     def project_with(migrations):
         @asset(outputs=Output("files", key="id", store="mig", migrations=migrations))
         def files():
-            return [{"id": "a", "v": 1}]
+            return rows["v"]
 
         return Project(assets=[files], stores={"mig": store})
 
@@ -1408,6 +1415,7 @@ async def test_an_unchanged_keyed_write_still_applies_its_migrations(state):
     await engine.initialize()
     await drive(engine, await engine.submit(["files"]))
     before = head(state, "files")
+    rows["v"] = Patch([])  # nothing written
     engine2 = make_engine(state, project_with([Migration("m1", lambda o, p: None)]))
     await engine2.initialize()
     detail = await drive(engine2, await engine2.submit(["files"]))
@@ -1415,6 +1423,6 @@ async def test_an_unchanged_keyed_write_still_applies_its_migrations(state):
     assert store.calls == ["files"]
     after = head(state, "files")
     assert after["ref"]["handle"]["schema"] == "m1"
-    assert after["ref"]["version"] == before["ref"]["version"] and after["batch"] == before["batch"]
+    assert after["ref"]["generation"] == before["ref"]["generation"] and after["batch"] == before["batch"]
     await drive(engine2, await engine2.submit(["files"]))
     assert store.calls == ["files"]  # applied, and known to be: not asked again

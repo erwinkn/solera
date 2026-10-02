@@ -764,16 +764,6 @@ class Engine(Attempts, Sensors, Views):
             inputs[param] = pin
             plans[param] = plan
             all_empty = all_empty and empty
-        # The generation that wrote each pinned head: a read of a store that reads
-        # the current rows says whether it saw that one (docs/stores.md, "What a read sees").
-        for pin in inputs.values():
-            if pin.get("ref") and (generation := self._generation_of(pin["ref"])) is not None:
-                pin["generation"] = generation
-            generations = {
-                k: g for k, r in (pin.get("refs") or {}).items() if (g := self._generation_of(r)) is not None
-            }
-            if generations:
-                pin["generations"] = generations
         if full and delivery.selects(plans):
             raise NonRetryable(f"{task['asset']}: a keys= selection cannot run while a full run is due")
         claim = self.m.claimed(attempt) if attempt is not None else None
@@ -824,21 +814,14 @@ class Engine(Attempts, Sensors, Views):
             if due := self._due_discards(name, scope, attempt):
                 info["discard"] = due
             outputs[name] = info
-        # The input versions its outputs will be built from, for the history (§7).
+        # The input versions its outputs will be built from, for the history (§7):
+        # each pinned ref's generation (docs/versions.md §6).
         lineage = []
         for edge in edges:
             pin = inputs.get(edge.param) or {}
             refs = [pin["ref"]] if pin.get("ref") else list((pin.get("refs") or {}).values())
             for ref in refs:
-                lineage.append(
-                    [
-                        edge.output,
-                        ref.get("partition") or "",
-                        ref.get("version"),
-                        edge.param,
-                        self._generation_of(ref),
-                    ]
-                )
+                lineage.append([edge.output, ref.get("partition") or "", ref.get("generation"), edge.param])
         return {
             "version": asset["version"],
             "domains": self._domains(inputs, outputs, task),
@@ -873,7 +856,7 @@ class Engine(Attempts, Sensors, Views):
             if isinstance(value, dict):
                 if isinstance(value.get("prefix"), str):
                     found.add(value["prefix"])
-                if isinstance(value.get("output"), str) and "version" in value:  # a ref
+                if isinstance(value.get("output"), str) and "handle" in value:  # a ref
                     found.add(self.m.index(value["output"], value.get("partition") or "").prefix)
                 for item in value.values():
                     walk(item)
@@ -923,12 +906,6 @@ class Engine(Attempts, Sensors, Views):
             raise Retryable(f"input {output!r} has no head for scope {up_scope!r}")
         return head["ref"]
 
-    def _generation_of(self, ref: dict) -> int | None:
-        """The generation whose commit installed `ref`, while it is its head."""
-
-        head = self.m.heads.get((ref.get("output"), ref.get("partition") or ""))
-        return head.get("generation") if head is not None and head["ref"] == ref else None
-
     def _whole_index(self, output: str, ref: dict) -> dict | None:
         """The pinned key index a whole read of a keyed output on an immutable
         store needs to name its objects (docs/lifecycle.md §9.8)."""
@@ -974,6 +951,11 @@ class Engine(Attempts, Sensors, Views):
         output = edge["output"]
         keyed = self.manifest["outputs"][output].get("key") is not None
         limit = int(edge.get("page_size") or 100)
+        # The generation of the head a page is planned against. A delivery that
+        # reads a fixed snapshot over its pages — a delta window, a rescope's
+        # diff, a range of batches — keeps the one it started at: what its
+        # pages read, and what lineage says they read (docs/versions.md §6).
+        latest_generation = int(ref.get("generation") or 0)
         head = self.m.heads.get((output, up_scope)) or {}
         head_batch = latest = int(head.get("batch", -1))  # `latest`: the head this page is planned against
         override = (run.get("keys") or {}).get(output)
@@ -1014,6 +996,7 @@ class Engine(Attempts, Sensors, Views):
                 mode = "full" if reset else "delta"
                 current = {"mode": mode, "from": lo, "to": head_batch, "at": lo, "page": 0}
                 current["pages"] = _pages(head_batch - lo + 1, limit)
+                current["generation"] = latest_generation
             lo = int(current["at"])
             hi = min(current["to"], lo + limit - 1)
             changes = {
@@ -1025,7 +1008,7 @@ class Engine(Attempts, Sensors, Views):
             }
             carried["next"] = current["from"] if reset else int(wm["next"])
             plan = {"kind": "batches", "watermark": carried, "delivery": current, "hi": hi, "head": latest}
-            return {"ref": ref, "changes": changes}, plan, hi < lo
+            return {"ref": {**ref, "generation": current["generation"]}, "changes": changes}, plan, hi < lo
 
         index = self.m.index(output, up_scope)
         patterns = edge.get("patterns")
@@ -1040,6 +1023,7 @@ class Engine(Attempts, Sensors, Views):
                 "old": wm.get("patterns"),
                 "new": patterns,
                 "cutover": head_batch,
+                "generation": latest_generation,
                 "snapshot": index.pinned().to_json(),
                 "pin": claim_pin if claim_pin is not None else self.m.applied,
             }
@@ -1050,7 +1034,7 @@ class Engine(Attempts, Sensors, Views):
                     count = IndexState.from_json(rescope["snapshot"]).count
                     current = {"mode": "diff", "at": None, "page": 0, "pages": _pages(count, limit)}
                 pin = {
-                    "ref": ref,
+                    "ref": {**ref, "generation": rescope["generation"]},
                     "index": rescope["snapshot"],
                     "changes": {
                         "rescope": {"from": rescope["old"], "to": rescope["new"]},
@@ -1063,7 +1047,8 @@ class Engine(Attempts, Sensors, Views):
                 if carried["patterns"] is None:
                     carried.pop("patterns")
                 return pin, {"kind": "keys", "watermark": carried, "delivery": current, "head": latest}, False
-            head_batch = min(head_batch, rescope["cutover"])  # finish: under the old patterns
+            if head_batch > rescope["cutover"]:  # finish: under the old patterns, up to the cutover
+                head_batch, latest_generation = rescope["cutover"], rescope["generation"]
         each = edge.get("each") is not None
         held = [o["name"] for o in self.manifest["assets"][task["asset"]]["outputs"]] + [f"@{task['asset']}"]
         empty = False
@@ -1075,7 +1060,13 @@ class Engine(Attempts, Sensors, Views):
                 current["cleanup"] = any(self.m.index(name, task["scope"]).count for name in held)
             empty = index.count == 0 and not index.files
         elif current is None:
-            current = {"mode": "delta", "from": carried["next"], "to": head_batch, "at": None}
+            current = {
+                "mode": "delta",
+                "from": carried["next"],
+                "to": head_batch,
+                "at": None,
+                "generation": latest_generation,
+            }
             empty = carried["next"] > head_batch
         if current["mode"] == "delta" and not index.covers(current["from"], current["to"]):
             # The log no longer holds this window: deliver everything again. What it held
@@ -1108,7 +1099,8 @@ class Engine(Attempts, Sensors, Views):
         if not whole:
             window["to"] = current["to"]
         changes = {**window, "limit": limit, "page": current["page"], "pages": current["pages"]}
-        pin = {"ref": ref, "index": pinned.to_json(), "changes": changes}
+        read = current["generation"] if not whole else latest_generation  # a full delivery reads the head
+        pin = {"ref": {**ref, "generation": read}, "index": pinned.to_json(), "changes": changes}
         if carried["patterns"] is not None:
             pin["patterns"] = carried["patterns"]  # the worker filters the page
         else:
@@ -1313,10 +1305,10 @@ class Engine(Attempts, Sensors, Views):
     @staticmethod
     def _logical(output: str, ref: dict) -> list:
         """A pinned input as interpretation sees it: which output, which
-        scope, which content version — never where its objects are. A value
-        written again unchanged, under a name of its own, is the same input."""
+        scope, which version — the generation that wrote it — never where
+        its objects are."""
 
-        return [output, ref.get("partition") or "", ref.get("version")]
+        return [output, ref.get("partition") or "", ref.get("generation")]
 
     def _fingerprint(self, asset, run, pinned):
         """H(version, store versions of input+output stores, run config,
@@ -1428,7 +1420,7 @@ class Engine(Attempts, Sensors, Views):
             elif decl.get("incremental"):
                 if info["reset"]:  # starts over at its batch, whatever its content
                     head["batch"] = head["base"] = int(info["batch"])
-                elif before["ref"]["version"] == ref["version"]:  # appended nothing
+                elif before["ref"].get("generation") == ref.get("generation"):  # appended nothing
                     head["batch"], head["base"] = before.get("batch", -1), before.get("base", 0)
                 else:
                     head["batch"], head["base"] = int(info["batch"]), before.get("base", 0)
@@ -1504,11 +1496,14 @@ class Engine(Attempts, Sensors, Views):
     async def commit_source(
         self, name: str, *, version=None, keys=None, upsert=None, remove=None, by: str | None = None
     ):
-        """Advance a source without moving data (§2.3, §6). A keyed source
-        commit is checked against the source's key index like any write: a
-        full map (`keys=`) replaces its content, `upsert`/`remove` patch it,
-        and the changes become the commit's delta file. A commit that changes
-        nothing is not a change. An unkeyed source takes a `version=`.
+        """Advance a source without moving data (§2.3, §6; docs/versions.md
+        §2). A keyed source commit is checked against the source's key index
+        like any write: a full map (`keys=`) replaces its content,
+        `upsert`/`remove` patch it, and the changes become the commit's delta
+        file. A map gives each key its version, and a key at the version
+        its entry holds is unchanged; a list names keys with none, each a
+        change. An unkeyed source takes a `version=`: the head's, no change.
+        A commit that changes nothing is not a change.
 
         Every change is recorded as a run with no tasks (§7):
         `{"id", "source", "by", "batch", "upserted", "deleted"}` — or `version`
@@ -1529,7 +1524,9 @@ class Engine(Attempts, Sensors, Views):
     async def _prepare_commit(self, name, version, keys, upsert, remove, by, tags=None):
         """A source commit's `SourceCommitted`, its delta file written but
         nothing recorded, and the ref it installs; no event if it changes
-        nothing. Whoever does not record it drops it (`_drop_prepared`)."""
+        nothing. Whoever does not record it drops it (`_drop_prepared`).
+        Its generation is the event position it is prepared at, as an
+        attempt's is its claim's: larger than any commit before it."""
 
         source = self.manifest["sources"].get(name)
         if source is None:
@@ -1540,7 +1537,8 @@ class Engine(Attempts, Sensors, Views):
         keyed = source.get("key") is not None
         if not keyed and (keys is not None or upsert is not None or remove is not None):
             raise ValueError(f"Source {name!r} is unkeyed; pass version=")
-        ref = dict(head["ref"] if head is not None else source["head"])
+        generation = self.m.applied
+        ref = {**(head["ref"] if head is not None else source["head"]), "generation": generation}
         run_id = ulid(self.clock())
         record = {
             "ref": ref,
@@ -1550,50 +1548,60 @@ class Engine(Attempts, Sensors, Views):
             "version": None,
         }
         event = {"type": "SourceCommitted", "source": name, "head": record}
-        batch = None
         run = {"id": run_id, "source": name, "by": by, **({"tags": tags} if tags else {})}
         if not keyed:
             if version is None:
                 raise ValueError(f"Source {name!r} requires version=")
-            if head is not None and head["ref"]["version"] == str(version):
+            if head is not None and head.get("version") == str(version):
                 return None, head["ref"]
-            ref["version"] = str(version)
-            run["version"] = ref["version"]
+            record["version"] = run["version"] = str(version)
         else:
+            # A partition set's elements carry an empty version: listed again, unchanged.
+            listed = b"" if source.get("key") == "<elements>" or name in self._set_dims else None
+
+            def versions(given):
+                if isinstance(given, dict):
+                    return {str(k): (key_bytes(str(v)) if v is not None else None) for k, v in given.items()}
+                return {str(k): listed for k in given or []}
+
             if keys is not None:
-                items = keys.items() if isinstance(keys, dict) else ((k, "1") for k in keys)
-                new, removes, replace = {str(k): str(v) for k, v in items}, [], True
+                new, removes, replace = versions(keys), [], True
             else:
-                items = upsert.items() if isinstance(upsert, dict) else ((k, "1") for k in upsert or [])
-                new = {str(k): str(v) for k, v in items}
+                new = versions(upsert)
                 removes, replace = [str(k) for k in remove or [] if str(k) not in new], False
             batch = int((head or {}).get("batch", -1)) + 1
             attempt = ulid(self.clock())
             sorted_run = SortedRun.of(
-                [key_bytes(k) for k in new],
-                [key_bytes(v) for v in new.values()],
-                [key_bytes(k) for k in removes],
+                [key_bytes(k) for k in new], list(new.values()), [key_bytes(k) for k in removes]
             )
             with self.m.reading(self.m.index(name, "").prefix):  # outlives compaction meanwhile
                 pinned = self.m.index(name, "").pinned()
                 index = KeyIndex(self._key_io(), None, pinned, self.key_options)
-                files = await self._resolve_source(index, pinned, sorted_run, replace, batch, attempt)
+                files = await self._resolve_source(
+                    index, pinned, sorted_run, replace, batch, attempt, generation
+                )
                 if files is not None:
                     files, changed = files
                 elif replace:
-                    rows = Rows.pairs(list(new.items()))
                     files, changed = await index.replace(
-                        rows, batch, attempt, collect=2 * SOURCE_KEYS_RECORDED
+                        Rows.pairs([(key_bytes(k), r) for k, r in new.items()]),
+                        batch,
+                        attempt,
+                        collect=2 * SOURCE_KEYS_RECORDED,
+                        generation=generation,
                     )
                 else:
                     files, changed = await index.resolve(
-                        sorted_run, batch=batch, attempt=attempt, collect=2 * SOURCE_KEYS_RECORDED
+                        sorted_run,
+                        batch=batch,
+                        attempt=attempt,
+                        generation=generation,
+                        collect=2 * SOURCE_KEYS_RECORDED,
                     )
             if not files.files:
-                return None, ref
-            ref["version"] = digest([ref["version"], batch, [f.name for f in files.files]])
+                return None, head["ref"] if head is not None else source["head"]
             record["batch"] = batch
-            if source.get("key") == "<elements>" or name in self._set_dims:
+            if listed is not None:
                 before = set((head or {}).get("elements") or ())
                 record["elements"] = sorted(set(new) if replace else (before - set(removes)) | set(new))
             event["keys"] = {**files.to_json(), "batch": batch}
@@ -1602,8 +1610,8 @@ class Engine(Attempts, Sensors, Views):
             for field, keys, count in zip(
                 ("upserted", "deleted"), changed or (None, None), counts, strict=True
             ):
-                listed = keys is not None and len(keys) <= SOURCE_KEYS_RECORDED
-                run[field] = [key_str(k) for k in keys] if listed else count
+                shown = keys is not None and len(keys) <= SOURCE_KEYS_RECORDED
+                run[field] = [key_str(k) for k in keys] if shown else count
         meta = dict(ref.get("meta") or {})
         meta["external"] = True
         ref["meta"] = meta
@@ -1631,7 +1639,7 @@ class Engine(Attempts, Sensors, Views):
         if paths:
             await self.state.delete_objects(paths)
 
-    async def _resolve_source(self, index, pinned, run, replace, batch, attempt):
+    async def _resolve_source(self, index, pinned, run, replace, batch, attempt, generation):
         """A small source commit through the warm resolver, in process
         (docs/resolved-commits.md §4): its files and changed keys, or None when
         the cache cannot answer and the commit resolves cold."""
@@ -1644,10 +1652,16 @@ class Engine(Attempts, Sensors, Views):
             return None
         name = f"{batch:012d}-{attempt}.0000"
         answer, delta = await self.keys.direct(
-            pinned, "replace" if replace else "patch", run, 0, batch, index.path(name), self.m.applied
+            pinned,
+            "replace" if replace else "patch",
+            run,
+            generation,
+            batch,
+            index.path(name),
+            self.m.applied,
         )
         if answer["result"] == "empty":
-            return DeltaFiles([], 0, 0, True), ({}, [])
+            return DeltaFiles([], 0, 0, True), ([], [])
         if answer["result"] != "delta":
             return None
         await index.io.write(index.path(name), delta)
@@ -1672,26 +1686,14 @@ class Engine(Attempts, Sensors, Views):
         start = key_bytes(after) if after is not None else None
         with self.m.reading(state.prefix):  # its files outlive compaction until the page is read
             index = KeyIndex(self._key_io(), None, state.pinned(), self.key_options)
-            keys, versions, _, nxt = await index.page(start, offset + limit)
+            keys, generations, _, nxt = await index.page(start, offset + limit)
         return {
             "total": state.count,
             "exact": state.count_exact,
-            "keys": {
-                key_str(k): self._rendered(output, v)
-                for k, v in list(zip(keys, versions, strict=True))[offset:]
-            },
+            # Each key's version: the generation that last wrote it (docs/versions.md).
+            "keys": {key_str(k): g for k, g in list(zip(keys, generations, strict=True))[offset:]},
             "next": key_str(nxt) if nxt is not None else None,
         }
-
-    def _rendered(self, output: str, version: bytes) -> str:
-        """A key's version in `output`, as `key_outcomes` shows it: a declared
-        revision's text, a source's version, a set's element — else a row
-        digest, in hex."""
-
-        record = self.manifest["outputs"].get(output) or {}
-        if record.get("source") or record.get("partition_set") or record.get("revision"):
-            return version.decode(errors="replace")
-        return version.hex()
 
     # -- automations (§9) ------------------------------------------------------------
 

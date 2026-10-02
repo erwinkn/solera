@@ -457,18 +457,18 @@ def create_app(
         name: str,
         request: Request,
         scope: str = "",
-        version: str | None = None,
+        generation: int | None = None,
         direction: str = Query(default="upstream", pattern="^(upstream|downstream)$"),
         depth: int = Query(default=5, ge=1, le=50),
     ):
         runtime = await project_engine(request, p)
-        if version is None:
+        if generation is None:
             head = runtime.m.heads.get((name, scope))
             if head is None:
                 raise KeyError(name)
-            version = head["ref"].get("version")
+            generation = head["ref"].get("generation")
         return await runtime.history.lineage(
-            name, scope, version, downstream=direction == "downstream", depth=depth
+            name, scope, generation, downstream=direction == "downstream", depth=depth
         )
 
     @app.get("/api/projects/{p}/runs/{run_id}")

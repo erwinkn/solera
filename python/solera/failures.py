@@ -3,7 +3,7 @@
 and the worker both call these; nothing else decides them.
 
 An `Each` asset keeps, per scope, a key index of the keys that did not
-succeed: `key → record`, the record packed into the entry's version. A key
+succeed: `key → record`, the record packed into the entry's payload. A key
 that succeeds, is removed upstream or stops matching gets a tombstone.
 """
 
@@ -52,7 +52,7 @@ class Record:
     last: int
     next_at: int  # a retrying or timed-out key's due time; 0 otherwise
     until: int  # when a retrying key turns failed; 0 otherwise
-    revision: bytes  # the upstream version that failed
+    upstream: int  # the generation of the upstream key that failed: its version
     message: str = ""
 
     @property
@@ -61,36 +61,41 @@ class Record:
 
     def encode(self) -> bytes:
         out = bytearray([self.outcome])
-        for n in (self.tries, self.epoch, self.forced, self.since, self.last, self.next_at, self.until):
+        for n in (
+            self.tries,
+            self.epoch,
+            self.forced,
+            self.since,
+            self.last,
+            self.next_at,
+            self.until,
+            self.upstream,
+        ):
             _varint(out, n)
         message = _clip(self.message)
-        for blob in (self.revision, message):
-            _varint(out, len(blob))
-            out += blob
+        _varint(out, len(message))
+        out += message
         return bytes(out)
 
     @classmethod
     def decode(cls, data: bytes) -> Record:
         outcome, pos, ints = data[0], 1, []
-        for _ in range(7):
+        for _ in range(8):
             n, pos = _read_varint(data, pos)
             ints.append(n)
-        blobs = []
-        for _ in range(2):
-            n, pos = _read_varint(data, pos)
-            blobs.append(bytes(data[pos : pos + n]))
-            pos += n
-        return cls(outcome, *ints, blobs[0], blobs[1].decode(errors="replace"))
+        n, pos = _read_varint(data, pos)
+        return cls(outcome, *ints, bytes(data[pos : pos + n]).decode(errors="replace"))
 
 
 @dataclass(frozen=True)
 class Outcome:
     """What one key came to: `kind` is `ok`, `removed`, `unmatched`, or an
     error's class (`rejected`, `failed`, `transient`) or interruption
-    (`canceled`, `timed_out`); `revision` the upstream version it ran at."""
+    (`canceled`, `timed_out`); `upstream` the generation of the upstream
+    key it ran at."""
 
     kind: str
-    revision: bytes = b""
+    upstream: int = 0
     message: str = ""
     retry_after: float | None = None
     retry_for: float | None = None
@@ -107,11 +112,11 @@ def transition(
     if outcome.kind in GONE:
         return None
     code, t = KINDS[outcome.kind], int(now)  # `since` and `last`: whole seconds, for display
-    fresh = prior is None or prior.revision != outcome.revision
+    fresh = prior is None or prior.upstream != outcome.upstream
     counted = 0 if code == CANCELED else 1  # a cancel interrupted the try: it does not count
     tries = counted if fresh else prior.tries + counted
     since = t if fresh else prior.since
-    record = Record(code, tries, epoch, forced, since, t, 0, 0, outcome.revision, outcome.message)
+    record = Record(code, tries, epoch, forced, since, t, 0, 0, outcome.upstream, outcome.message)
     # Deadlines are computed from the exact time, then rounded up: a budget or a wait
     # is never shortened by the rounding.
     if code == RETRYING:

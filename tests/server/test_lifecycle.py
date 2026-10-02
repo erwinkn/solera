@@ -295,7 +295,7 @@ async def test_a_fenced_store_runs_its_retry_at_once(tmp_path):
     live = Fenced()
     writes = [Patch([{"id": "a", "v": 1}, {"id": "b", "v": 1}]), Patch([{"id": "a", "v": 2}])]
 
-    @asset(outputs=Output("items", key="id", revision="v", store="live"), retries=Retry(1, delay=0))
+    @asset(outputs=Output("items", key="id", store="live"), retries=Retry(1, delay=0))
     def items():
         return writes[0] if len(writes) == 1 else writes.pop(0)
 
@@ -318,7 +318,7 @@ async def test_a_renamed_asset_keeps_what_its_scope_owes(tmp_path):
     intents and its pending discards with it: a new name never lets a dead
     writer's keys go unrepaired, nor its garbage go uncollected."""
 
-    @asset(outputs=Output("items", key="id", revision="v"))
+    @asset(outputs=Output("items", key="id"))
     def items():
         return [{"id": "a", "v": 1}]
 
@@ -329,7 +329,7 @@ async def test_a_renamed_asset_keeps_what_its_scope_owes(tmp_path):
     m.unsettled[("items", "")] = [{"files": [], "run": "r", "attempt": "dead"}]
     m.discards[("items", "")] = [{"n": 1, "id": "1.0", "kind": "items", "items": [["path", "x"]]}]
 
-    @asset(outputs=Output(key="id", revision="v"), aliases=["items"])
+    @asset(outputs=Output(key="id"), aliases=["items"])
     def catalog():
         return [{"id": "a", "v": 3}]
 

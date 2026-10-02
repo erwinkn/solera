@@ -213,7 +213,7 @@ class Ctx:
     ):
         self._objects, self._shipper, self._timeline = objects, shipper, timeline
         self._keys_io = keys_io
-        self._observed = observed if observed is not None else Observed(spec, project)
+        self._observed = observed if observed is not None else Observed()
         # The pinned key indexes of keyed inputs, for whole reads of immutable stores.
         self._indexes: dict[tuple, dict] = {}
         for pin in spec["inputs"].values():
@@ -241,16 +241,17 @@ class Ctx:
         self._stores = project.stores
         self._outputs = [o.name or asset.name for o in asset.outputs]
         self._metadata: dict[str, dict] = {}
-        # An Each call's key and its upstream version (docs/per-key-processing.md §5).
+        # An Each call's key, and the generation of its upstream entry: the
+        # version it runs at (docs/per-key-processing.md §5, docs/versions.md).
         self.key: str | None = None
-        self.revision: str | None = None
+        self.generation: int | None = None
 
-    def _for_key(self, key: str, revision: str) -> Ctx:
+    def _for_key(self, key: str, generation: int) -> Ctx:
         """The `ctx` of one Each call: the same attempt, its key named, its log
         lines tagged with it."""
 
         one = copy.copy(self)
-        one.key, one.revision = key, revision
+        one.key, one.generation = key, generation
         return one
 
     def _window(self, project, asset):
@@ -281,9 +282,12 @@ class Ctx:
         self._shipper.append(entry)
 
     async def load(self, ref: Ref, t):
+        """Read a ref the producer holds — one an input gave as a ref. Not an
+        input read of the attempt's: lineage does not record it."""
+
         store = self._stores[ref.store]
         index = self._indexes.get((ref.output, ref.partition))
-        value = await _load_whole(self._observed, store, ref, t, self._keys_io, index)
+        value = await _load_whole(_unobserved, store, ref, t, self._keys_io, index)
         self._timeline.add("loaded", ref.output, _rows(value), optional=True)
         return value
 
@@ -350,7 +354,7 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
                     out[key] = ref
                     continue
                 store = project.stores[ref.store]
-                out[key] = await _load_whole(observed, store, ref, inner, keys_io, indexes.get(key))
+                out[key] = await _load_whole(observed.load, store, ref, inner, keys_io, indexes.get(key))
             args[param] = out
             timeline.add("loaded", param)
             continue
@@ -394,7 +398,7 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
         if pin.get("load", "data") == "ref":  # decided at registration, as the engine read for it
             args[param] = ref
         else:
-            args[param] = await _load_whole(observed, store, ref, t, keys_io, pin.get("index"))
+            args[param] = await _load_whole(observed.load, store, ref, t, keys_io, pin.get("index"))
             timeline.add("loaded", param, _rows(args[param]))
     # Every keyed page held keys, and the edges' patterns took none of them: nothing
     # to call the producer with.
@@ -403,20 +407,24 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
     return args, changes, delivered
 
 
-async def _load_whole(observed: Observed, store, ref, t, keys_io, index_json):
+async def _unobserved(store, ref, t, selection):
+    return await store.load(ref, t, selection)
+
+
+async def _load_whole(load, store, ref, t, keys_io, index_json):
     """A whole read. From an immutable store, a keyed one names its objects
     from the live entries of its pinned index (`Keys`), since a listing would
     also show superseded and abandoned ones (docs/lifecycle.md §9.8): it is
     loaded a page of the index at a time, and the pages put together."""
 
     if index_json is None or store.writes != "immutable":
-        return await observed.load(store, ref, t, None)
+        return await load(store, ref, t, None)
     index = KeyIndex(keys_io, None, IndexState.from_json(index_json))
     paged = _plain(t)  # a type of the store's own (a DataFrame): one read, which the store makes
     parts, entries, after = [], {}, None
     while True:
-        keys, versions, locators, after = await index.page(after, REPAIR_PAGE)
-        entries.update({key_str(k): (v, loc) for k, v, loc in zip(keys, versions, locators, strict=True)})
+        keys, generations, _, after = await index.page(after, REPAIR_PAGE)
+        entries.update(zip(map(key_str, keys), generations, strict=True))
         if paged:
             parts.append(await store.load(ref, t, Keys(entries)))
             entries = {}
@@ -454,8 +462,10 @@ async def _store_outputs(
     """Store each returned output (§4, §6, §8, §9), in two phases.
 
     Planning compares each keyed output's write with its key index as pinned
-    in the spec, and writes the changes as the batch's delta file: a write
-    that changes nothing is not stored at all and keeps the head. Then
+    in the spec, and writes the changes as the batch's delta file: every key
+    written is one, at the attempt's generation (docs/versions.md), and a
+    write that changes nothing — an empty patch, a set listed again — is
+    not stored at all and keeps the head. Then
     `fence(intents, gated)` begins writing: on stores that take a gate
     (all but `immutable` ones), it takes the attempt's gate first, listing
     their delta files — the keys this attempt is about to change — and only
@@ -569,8 +579,6 @@ async def _store_outputs(
                 written.keys,
                 int(o.info["batch"]),
                 spec["attempt"],
-                key=output.key,
-                revision=output.revision,
                 generation=int(spec.get("generation") or 0),
             )
             entry["keys"] = files.to_json()
@@ -581,6 +589,8 @@ async def _store_outputs(
         if written.ref is None:
             continue
         ref = dataclasses.replace(written.ref, store=store_name)
+        if ref != o.prior:  # a store that wrote nothing gives back its prior: the head stands
+            ref = dataclasses.replace(ref, generation=int(spec.get("generation") or 0))
         if schema is not None:
             ref = dataclasses.replace(ref, handle={**(ref.handle or {}), "schema": schema})
         entry["ref"] = ref.to_json()
@@ -603,7 +613,7 @@ RESOLVE_TIMEOUT = 5.0  # seconds the worker waits for the engine before resolvin
 class _Out:
     """One output's write in an attempt, as the phases leave it: read once
     (`prepared`); for a patch, its `run` of upserts and removes, repair's
-    overlaid; resolved against its key index (`files`, and up to `LISTED`
+    with it; resolved against its key index (`files`, and up to `LISTED`
     keys what `changed`); and what its store is given (`write`)."""
 
     name: str
@@ -616,7 +626,7 @@ class _Out:
     run: SortedRun | None = None
     intended: frozenset[str] = frozenset()  # keys dead attempts meant to change
     files: DeltaFiles | None = None
-    changed: tuple | None = None  # ({key: version}, [removed key]), or None past LISTED
+    changed: tuple | None = None  # ([written key], [removed key]), or None past LISTED
     write: KeyedWrite | None = None
     elements: list[str] | None = None
     schema_only: bool = False  # unchanged content, migrations to apply
@@ -691,7 +701,7 @@ async def _prepare(o: _Out, spec, keys_io) -> None:
     """Read a keyed write once, by its store (`Store.prepare`); for a patch,
     its run, and what dead attempts left in the store: repaired key by key
     (`_repair`), or — after an unknown `Sql` write — reconciled whole
-    (`_reconcile`), which resolves the write too."""
+    (`_reconcile`), which resolves the write too (docs/versions.md §5)."""
 
     if o.info.get("index") is None:
         if o.sql and o.output.incremental:
@@ -708,12 +718,12 @@ async def _prepare(o: _Out, spec, keys_io) -> None:
     removes = [key_bytes(k) for k in o.prepared.removes]
     try:
         o.run = await asyncio.to_thread(SortedRun.from_rows, o.prepared.rows, removes)
-    except ValueError as e:  # a value with no digest
+    except ValueError as e:  # a key both written and removed
         raise WriteError(f"{o.output.name}: {e}") from e
     if any(intent.get("unknown") for intent in o.unsettled):
-        # A dead Sql writer's keys are unknown (docs/resolved-commits.md §3): the index
-        # takes the whole store as it is, with this patch on top, and the store
-        # writes this patch's keys, every one.
+        # A dead Sql writer's keys are unknown (docs/versions.md §5): the index takes
+        # every key the store holds, with this patch on top, and the store writes
+        # this patch's keys, every one.
         o.files, _ = await _reconcile(o, spec)
         return
     if o.unsettled:
@@ -728,16 +738,13 @@ async def _resolve(o: _Out, spec, answer) -> None:
     own; or a replacement streamed against the whole index; or a patch."""
 
     batch, attempt = int(o.info["batch"]), spec["attempt"]
-    generation = int(spec.get("generation") or 0)  # each entry's locator (lifecycle.md §9.8)
+    generation = int(spec.get("generation") or 0)  # each key's version (docs/versions.md)
     if answer is not None:
         o.files, o.changed = await _upload(o.index, batch, attempt, answer)
     elif o.replace:
-        try:
-            o.files, o.changed = await o.index.replace(
-                o.prepared.rows, batch, attempt, collect=LISTED, generation=generation
-            )
-        except ValueError as e:  # a value with no digest, found as the join reaches it
-            raise WriteError(f"{o.output.name}: {e}") from e
+        o.files, o.changed = await o.index.replace(
+            o.prepared.rows, batch, attempt, collect=LISTED, generation=generation
+        )
     else:
         o.files, o.changed = await o.index.resolve(
             o.run, batch=batch, attempt=attempt, generation=generation, collect=LISTED
@@ -745,8 +752,8 @@ async def _resolve(o: _Out, spec, answer) -> None:
 
 
 def _keyed_write(o: _Out, keys_io) -> KeyedWrite:
-    """What the store is given: each key it writes to its version, and the
-    keys it deletes — or the write whole."""
+    """What the store is given: the keys it writes, and the keys it
+    deletes — or the write whole."""
 
     p, changed = o.prepared, o.changed
     if o.output.is_partition_set:
@@ -756,7 +763,7 @@ def _keyed_write(o: _Out, keys_io) -> KeyedWrite:
         else:
             o.elements = sorted((set(o.info.get("elements") or ()) - set(p.removes)) | own)
     if changed is not None:
-        upserted = {key_str(k): v for k, v in changed[0].items()}
+        upserted = frozenset(map(key_str, changed[0]))
         deleted = frozenset(map(key_str, changed[1]))
     if o.kind == "immutable":
         # Every object it writes must be named by an index entry, or nothing ever
@@ -771,16 +778,13 @@ def _keyed_write(o: _Out, keys_io) -> KeyedWrite:
         return KeyedWrite(p, whole=True)
     if o.replace:
         return KeyedWrite(p, upserted, deleted)
-    # A patch: its own keys that changed, and whatever a dead attempt may have
-    # left half-done among them; past what it lists, all of its own keys.
+    # A patch: its own keys — not those a repair found in the store, which are
+    # there already — and its removes, of keys the index holds or a dead attempt
+    # may have written; past what it lists, all of its own keys.
     removes = frozenset(p.removes)
     if changed is None:
         return KeyedWrite(p, None, removes)
-    mine = {k: v for k, v in upserted.items() if k in p.rows}
-    redo = sorted(k for k in o.intended if k in p.rows and k not in mine)
-    if redo:
-        mine.update(zip(redo, p.rows.versions(redo), strict=True))
-    return KeyedWrite(p, mine, deleted | (removes & o.intended))
+    return KeyedWrite(p, frozenset(k for k in upserted if k in p.rows), deleted | (removes & o.intended))
 
 
 def _ask_for(o: _Out, spec: dict) -> Ask:
@@ -817,7 +821,7 @@ async def _upload(index: KeyIndex, batch: int, attempt: str, answer) -> tuple[De
 
     a, data = answer
     if data is None:
-        return DeltaFiles([], 0, 0, True), ({}, [])
+        return DeltaFiles([], 0, 0, True), ([], [])
     name = f"{batch:012d}-{attempt}.0000"
     await index.io.write(index.path(name), data)
     return DeltaFiles([FileInfo.describe(name, 0, data)], a["added"], a["removed"], True), delta_keys(data)
@@ -844,55 +848,42 @@ async def _intended(info, keys_io, unsettled) -> list[str]:
 
 
 async def _repair(o: _Out, left: list[str]) -> SortedRun:
-    """Take in what dead attempts left in the store (§8). Keys this patch
-    writes or removes end as it says either way; the others (`left`) are
-    read back, and the index learns what landed as part of this commit's
-    delta: the patch's run with theirs overlaid."""
+    """Take in what dead attempts left in the store (docs/versions.md §5),
+    whose fence this attempt holds: they can write nothing more. Keys this
+    patch writes or removes end as it says either way; of the others
+    (`left`), the store says which it holds (`keys`), never their values. A
+    key it holds takes this attempt's generation — whether or not the dead
+    write landed, it changed — and one it lacks is removed: a tombstone if
+    the index holds it, nothing if not."""
 
-    found: dict[str, bytes] = {}
-    gone: list[str] = []
+    held: set[str] = set()
     for i in range(0, len(left), REPAIR_PAGE):
         page = left[i : i + REPAIR_PAGE]
-        loaded = await o.store.load(o.prior, None, Keys(dict.fromkeys(page, (b"", 0))))
-        read = await asyncio.to_thread(prepare_for, o.store, loaded, o.output)
-        got = dict(await asyncio.to_thread(read.entries))
-        found.update(got)
-        gone.extend(k for k in page if k not in got)
-    keys, versions = o.prepared.rows.entries()
-    keys += [key_bytes(k) for k in found]
-    versions += list(found.values())
-    removes = [key_bytes(k) for k in (*o.prepared.removes, *gone)]
-    return SortedRun.of(keys, versions, removes)
+        chunks = await asyncio.to_thread(lambda page=page: list(o.store.keys(o.prior, page)))
+        held.update(k for chunk in chunks for k in chunk)
+    keys, payloads = o.prepared.rows.entries()
+    keys += [key_bytes(k) for k in sorted(held)]
+    payloads += [None] * len(held)
+    removes = [key_bytes(k) for k in (*o.prepared.removes, *(k for k in left if k not in held))]
+    return SortedRun.of(keys, payloads, removes)
 
 
 async def _reconcile(o: _Out, spec):
     """The delta of a patch over a store a dead `Sql` writer changed in ways no
-    key list records: the store's rows as they are — streamed back sorted a
-    chunk at a time by its `scan`, versioned as a `Sql` write's rows are,
-    folded natively — with the patch's run laid over them (its keys' groups
-    in place of the store's, its removes gone),
-    against the pinned index: a streamed replacement. Memory is a chunk and
-    the patch."""
+    key list records (docs/versions.md §5): every key the store holds —
+    streamed back sorted a chunk at a time by its `keys` — at this attempt's
+    generation, with the patch's run laid over them (its keys in place of
+    the store's, its removes gone), against the pinned index: a streamed
+    replacement, so a live key the store lacks is removed. Memory is a chunk
+    and the patch."""
 
-    output, store = o.output, o.store
-    scan = getattr(store, "scan", None)
-    if scan is not None:
-        chunks = scan(o.prior, output)
-        stamped = getattr(store, "stamped", None)
-        rows = {"key": output.key, "revision": output.revision}
-        rows["exclude"] = tuple(stamped(output)) if stamped is not None else ()
-    else:  # a store that cannot stream its rows back: read whole, and sorted as entries
-        loaded = await store.load(o.prior, None, None)
-        chunks = [await asyncio.to_thread(lambda: prepare_for(store, loaded, output).entries())]
-        rows = {}
     return await o.index.replace(
-        chunks,
+        o.store.keys(o.prior, None),
         int(o.info["batch"]),
         spec["attempt"],
         collect=LISTED,
         generation=int(spec.get("generation") or 0),
         overlay=o.run,
-        **rows,
     )
 
 
@@ -1155,7 +1146,7 @@ async def _execute(
         failed["error"]["build"] = project.manifest.get("build")  # how this host computed its revision
         return failed
     asset = project.assets[spec["asset"]]
-    observed = Observed(spec, project)
+    observed = Observed()
     try:
         # Index files straight from the store, but for the reads the engine answered at
         # `start` (docs/resolved-commits.md §7); small writes are the engine's too.
@@ -1252,8 +1243,8 @@ async def _discard_after(answer, spec, project, objects, channel, invocation) ->
 
 
 def _file_entries(data: bytes):
-    """A `.kx` file's entries, every block checked: `(key, version, deleted,
-    locator, predecessor)` each, in key order."""
+    """A `.kx` file's entries, every block checked: `(key, generation,
+    deleted, payload, predecessor)` each, in key order."""
 
     from solera.keys import check_block, decode_block, parse_index
 
@@ -1299,13 +1290,10 @@ async def _discard_due(spec, project, asset, objects, writes) -> dict:
                     if kind == "delta":
                         for key, _, _, _, before in _file_entries(data):
                             if before is not None:
-                                items.append(("key", key_str(key), before[0].hex(), before[1]))
+                                items.append(("key", key_str(key), before))
                     else:
-                        keys, versions, _, locators = decode_garbage(data)
-                        items += [
-                            ("key", key_str(k), v.hex(), loc)
-                            for k, v, loc in zip(keys, versions, locators, strict=True)
-                        ]
+                        keys, generations = decode_garbage(data)
+                        items += [("key", key_str(k), g) for k, g in zip(keys, generations, strict=True)]
                 if kind == "sidecar":
                     files += [f"{prefix}{f}.kg" for f in entry["files"]]
             elif kind == "abandoned":  # all an uncommitted attempt wrote carries its generation
@@ -1316,9 +1304,9 @@ async def _discard_due(spec, project, asset, objects, writes) -> dict:
                         for meta in batch:
                             if meta["path"][len(prefix) :].startswith(stem):
                                 data = await read(meta["path"])
-                                for key, version, deleted, _, _ in _file_entries(data) if data else ():
+                                for key, _, deleted, _, _ in _file_entries(data) if data else ():
                                     if not deleted:
-                                        items.append(("key", key_str(key), version.hex(), generation))
+                                        items.append(("key", key_str(key), generation))
                                 files.append(meta["path"])
                 elif entry.get("batch") is not None:
                     items.append(("batch", entry["batch"], generation))

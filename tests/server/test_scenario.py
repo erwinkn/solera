@@ -31,7 +31,7 @@ async def test_every_boundary_once(tmp_path):
     seen: dict[str, int] = {}
     pending = {"rows": [], "remove": []}
 
-    @asset(outputs=Output("items", key="id", revision="v"))
+    @asset(outputs=Output("items", key="id"))
     def items():
         return Patch(pending["rows"], remove=pending["remove"])
 

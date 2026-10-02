@@ -154,9 +154,9 @@ async def test_failures_list_page_and_filter(world, monkeypatch):
     bad = by_key["bad.csv"]
     assert (bad["outcome"], bad["tries"], bad["message"]) == ("rejected", 1, "Unprocessable: empty file")
     assert bad["next_at"] is None and bad["until"] is None and bad["eligible"] is False
-    # A row digest, in hex: as key_outcomes shows it.
+    # The upstream key's generation: as key_outcomes shows it.
     rows = (await client.get(f"{base}/assets/parse/key-outcomes", params={"key": "bad.csv"})).json()
-    assert bad["revision"] == rows["outcomes"][0]["revision"]
+    assert bad["generation"] == rows["outcomes"][0]["generation"]
     assert by_key["bug.csv"]["message"] == "ValueError: unexpected header"
 
     first = (await client.get(f"{base}/assets/parse/failures", params={"limit": 1})).json()
@@ -212,7 +212,7 @@ async def test_key_outcomes_page_newest_first(world):
 
     exact = (await client.get(f"{base}/assets/parse/key-outcomes", params={"key": "a.csv"})).json()
     assert [r["outcome"] for r in exact["outcomes"]] == ["ok", "ok"]
-    assert exact["outcomes"][0]["revision"] != exact["outcomes"][1]["revision"]
+    assert exact["outcomes"][0]["generation"] != exact["outcomes"][1]["generation"]
     searched = (await client.get(f"{base}/assets/parse/key-outcomes", params={"q": "BAD"})).json()
     assert {r["key"] for r in searched["outcomes"]} == {"bad.csv"}
     failing = (
@@ -237,9 +237,11 @@ async def test_explain_says_why_a_key_is_or_is_not_there(world):
 
     ok = await explain("a.csv")
     assert (ok["verdict"], ok["edge"], ok["upstream"], ok["up_scope"]) == ("ok", "file", "files", "")
-    assert ok["outputs"] == {"samples": {"present": True, "revision": ok["outputs"]["samples"]["revision"]}}
+    assert ok["outputs"] == {
+        "samples": {"present": True, "generation": ok["outputs"]["samples"]["generation"]}
+    }
     assert ok["last"]["outcome"] == "ok" and ok["last_ok"] == ok["last"]
-    assert ok["last_ok"]["revision"] == ok["upstream_revision"] and ok["edge_state"] == "caught_up"
+    assert ok["last_ok"]["generation"] == ok["upstream_generation"] and ok["edge_state"] == "caught_up"
     assert ok["patterns"]["included"] and ok["patterns"]["excluded_by"] is None
     assert ok["patterns"]["pending"] is None and ok["failure"] is None
 
@@ -258,7 +260,7 @@ async def test_explain_says_why_a_key_is_or_is_not_there(world):
     await run(engine, ["files"])
     pending = await explain("a.csv")
     assert pending["verdict"] == "pending" and pending["edge_state"] == "behind"
-    assert pending["last_ok"]["revision"] != pending["upstream_revision"]
+    assert pending["last_ok"]["generation"] != pending["upstream_generation"]
     assert (await explain("new.csv"))["verdict"] == "pending"
     assert (await explain("bug.csv"))["verdict"] == "failing"  # its record outlives the key until delivered
     await run(engine, ["parse"])
@@ -279,7 +281,7 @@ async def test_explain_a_key_restored_after_its_removal_is_pending(world):
     await run(engine, ["parse"], upstream=True)
     original = content.pop("a.csv")
     await run(engine, ["parse"], upstream=True)  # the removal is delivered: no row holds it
-    content["a.csv"] = original  # back as it was: the revision of its last `ok`
+    content["a.csv"] = original  # back as it was: written again, at a generation of its own
     await run(engine, ["files"])
 
     async def explain(key):
@@ -289,7 +291,7 @@ async def test_explain_a_key_restored_after_its_removal_is_pending(world):
 
     restored = await explain("a.csv")
     assert restored["last"]["outcome"] == "removed"
-    assert restored["last_ok"]["revision"] == restored["upstream_revision"]  # matches, but is history
+    assert restored["last_ok"]["generation"] != restored["upstream_generation"]  # a new write of it
     assert restored["outputs"]["samples"]["present"] is False and restored["edge_state"] == "behind"
     assert restored["verdict"] == "pending"
     await run(engine, ["parse"])

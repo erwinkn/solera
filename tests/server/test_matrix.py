@@ -305,14 +305,15 @@ async def test_a_removed_consumer_lets_go_of_its_upstreams_log(state):  # noqa: 
     assert state.model.indexes[("feed", "")].log == ()
 
 
-# -- an unchanged rewrite × interpretation ----------------------------------------------
+# -- a rewrite × interpretation ----------------------------------------------------------
 
 
-async def test_an_unchanged_value_rewritten_keeps_its_readers_deliveries(state):  # noqa: F811
-    """Review round 5, system #4: `settings` is written again with the same
-    content, at a new object (FileStore names a value by its generation).
-    Its version is the same, so a reader of `feed` that also reads it keeps
-    its watermark: nothing changed in `feed`, nothing is delivered again."""
+async def test_a_value_written_again_is_a_new_version_its_readers_reread(state):  # noqa: F811
+    """docs/versions.md §7, identical rewrites: `settings` is written again
+    with the same content — a new version, at a new generation. A reader of
+    `feed` that also reads it reads under another interpretation, so its
+    `feed` edge starts over: accepted, and avoided by a producer that writes
+    nothing when nothing changed."""
 
     calls = []
 
@@ -335,9 +336,9 @@ async def test_an_unchanged_value_rewritten_keeps_its_readers_deliveries(state):
     for _ in range(3):
         assert status_of(await drive(engine, await engine.submit(["reader"], upstream=True))) == "succeeded"
         ref = state.model.heads[("settings", "")]["ref"]
-        refs.append((ref["handle"]["path"], ref["version"]))
-    assert len({path for path, _ in refs}) == 3 and len({version for _, version in refs}) == 1
-    assert calls == [1]
+        refs.append((ref["handle"]["path"], ref["generation"]))
+    assert len({path for path, _ in refs}) == 3 and len({g for _, g in refs}) == 3
+    assert calls == [1, 1, 1]
 
 
 # -- OnChange × an interrupted delivery, for Each -----------------------------------------
@@ -351,7 +352,7 @@ async def test_an_each_delivery_resumed_by_a_firing_takes_its_change(state):  # 
 
     content, calls = {"a": "1", "b": "1"}, []
 
-    @asset(outputs=Output("items", key="id", revision="v"))
+    @asset(outputs=Output("items", key="id"))
     def items():
         return [{"id": k, "v": v} for k, v in content.items()]
 

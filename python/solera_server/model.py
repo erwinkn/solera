@@ -125,7 +125,7 @@ def commit_of(head: dict | None) -> tuple | None:
     return (
         head.get("run"),
         head.get("attempt"),
-        head["ref"].get("version"),
+        head["ref"].get("generation"),
         head.get("batch"),
         head.get("n"),
     )
@@ -531,7 +531,7 @@ class Model:
                     "attempt": None,
                     "at": e["at"],
                     "asset": None,
-                    "version": None,
+                    "version": None,  # a source has no code version
                     "n": self.applied,
                 }
 
@@ -784,7 +784,7 @@ class Model:
         prepared, execution = {}, {}
         launched = task.get("launched")
         # The generation its writes carried (§9.7), as its launch recorded it: the
-        # heads it installs record it. An attempt never launched wrote nothing.
+        # refs it installs carry it. An attempt never launched wrote nothing.
         generation = launched["pin"] if (launched or {}).get("attempt") == e["attempt"] else None
         if (launched or {}).get("attempt") == e["attempt"]:
             del task["launched"]
@@ -818,30 +818,28 @@ class Model:
             summary["generation"] = int(generation)
         commit = e.get("commit")
         if commit:
-            summary["outputs"] = {
-                name: h["ref"].get("version") for name, h in commit.get("heads", {}).items()
-            }
+            summary["outputs"] = sorted(commit.get("heads", {}))
         if e.get("keys"):
             summary["keys"] = e["keys"]
         self._tried(run, task, summary)
         if commit and outcome in ("canceled", "failed"):
             # A drained Each page: what finished commits (docs/lifecycle.md §7).
-            self._install(task, commit, e, prepared, generation)
+            self._install(task, commit, e, prepared)
         if task["status"] in TERMINAL_TASK:
             # Its run was canceled while it ran. An attempt that was already
             # writing still commits: its data landed (§8).
             if outcome == "succeeded" and commit:
-                self._install(task, commit, e, prepared, generation)
+                self._install(task, commit, e, prepared)
             return
         if outcome == "succeeded":
-            self._install(task, commit or {}, e, prepared, generation)
+            self._install(task, commit or {}, e, prepared)
             if e.get("more"):
                 self._ready(run, task, at)
             else:
                 task["status"] = "succeeded"
                 self._finished(run, task, "succeeded", e["attempt"], at)
         elif outcome == "skipped":
-            self._install(task, commit or {}, e, prepared, generation)
+            self._install(task, commit or {}, e, prepared)
             task["status"] = "skipped"
             self._finished(run, task, "skipped", e["attempt"], at)
         elif outcome == "failed":
@@ -912,15 +910,12 @@ class Model:
         self._event(run, closing, end, tid, attempt, reason=e.get("reason"))
         return times
 
-    def _install(
-        self, task: dict, commit: dict, e: dict, prepared: dict, generation: int | None = None
-    ) -> None:
+    def _install(self, task: dict, commit: dict, e: dict, prepared: dict) -> None:
         """Install a commit: heads, key indexes, the scope's record — under the
-        contract its attempt was launched with (`prepared`). Each output
-        version it makes enters the history, with what it was built from
-        (its `lineage`, with what its reads saw: `history.read_lineage`). A
-        head records the generation that wrote it (`generation`), which a
-        read of a store that reads the current rows compares with its own."""
+        contract its attempt was launched with (`prepared`). An output whose
+        ref's generation moved changed (docs/versions.md); each such version
+        enters the history, with what it was built from (its `lineage`, with
+        what its reads saw: `history.read_lineage`)."""
 
         asset, scope, at = task["asset"], task["scope"], e["finished_at"]
         reads = history.read_lineage(prepared.get("lineage"), e.get("read"))
@@ -929,13 +924,11 @@ class Model:
         for name, head in commit.get("heads", {}).items():
             before, keys = self.heads.get((name, scope)), (commit.get("keys") or {}).get(name)
             prefix = contracts[name].get("prefix")  # where its delta files are
-            if before is None or before["ref"].get("version") != head["ref"].get("version"):
+            if before is None or before["ref"].get("generation") != head["ref"].get("generation"):
                 changed.append(name)
             if contracts[name]["contract"]["writes"] == "immutable":
                 self._superseded(name, scope, before, head, keys, prefix)
             self.heads[(name, scope)] = {**head, "run": e["run"], "attempt": e["attempt"], "at": at}
-            if generation is not None:
-                self.heads[(name, scope)]["generation"] = int(generation)
             self._commit_keys(name, scope, keys, prefix)
             if name in commit.get("settled", ()):
                 # The commit's delta took in what the dead attempts left (§8):
@@ -1302,11 +1295,14 @@ class Model:
                 },
             )
             installed = {**self.heads[(e["source"], "")], "run": run["id"], "attempt": None}
+            version = {"version": head["version"]} if head.get("version") is not None else None
             self._record(
                 "materializations",
-                history.materialization(e["source"], None, "", installed, keys=e.get("keys"), listed=run),
+                history.materialization(
+                    e["source"], None, "", installed, keys=e.get("keys"), listed=run, metadata=version
+                ),
             )
-        if before is None or before["ref"].get("version") != head["ref"].get("version"):
+        if before is None or before["ref"].get("generation") != head["ref"].get("generation"):
             self._pend_onchange(None, "", [e["source"]])
 
     def _on_SensorAdvanced(self, e):

@@ -6,9 +6,12 @@ Eight tables, each row about one:
     run_events        thing that happened to a run, one of its tasks or attempts
     runs              finished run or source commit: how it was asked for, how it ended
     tasks             task of a finished run: timings, retries, executor
-    attempts          attempt of a finished run: its phases, and the versions it committed
+    attempts          attempt of a finished run: its phases, and the outputs it committed
     materializations  output version a commit installed, with its metadata
     lineage           input version an output version was built from, and what its read saw
+
+A version is the generation of the write that made it (docs/versions.md):
+an output version is `(output, scope, generation)`.
     key_outcomes      key an Each attempt processed: what it came to (per-key-processing.md §10)
     ticks             sensor tick (lifecycle.md §11): buffered, never journaled
 
@@ -134,7 +137,7 @@ TABLES = {
             "memory": "BIGINT",  # bytes, requested
             "gpu": "INTEGER",  # requested; a named GPU type counts one
             "options": "MAP(VARCHAR, VARCHAR)",  # its other placement options: image, GPU type
-            "outputs": "MAP(VARCHAR, VARCHAR)",  # output -> the version it committed
+            "outputs": "VARCHAR[]",  # the outputs it committed, at its generation
             "generation": "BIGINT",  # the one its writes carried (lifecycle.md §9.7)
             "keys": "MAP(VARCHAR, BIGINT)",  # an Each attempt's keys by outcome: ok, failed…
         },
@@ -146,7 +149,6 @@ TABLES = {
             "output": "VARCHAR",
             "asset": "VARCHAR",
             "scope": "VARCHAR",
-            "version": "VARCHAR",
             "store": "VARCHAR",
             "run": "VARCHAR",
             "attempt": "VARCHAR",
@@ -158,8 +160,8 @@ TABLES = {
             "removed_keys": "VARCHAR[]",
             "rows": "BIGINT",
             "complete": "BOOLEAN",
-            "metadata": "VARCHAR",  # JSON object
-            "generation": "BIGINT",  # the writing attempt's (lifecycle.md §9.7)
+            "metadata": "VARCHAR",  # JSON object; an unkeyed source commit's version is in it
+            "generation": "BIGINT",  # its version: the write's (an attempt's, a source commit's)
         },
     ),
     "lineage": Table(
@@ -168,19 +170,19 @@ TABLES = {
         {
             "output": "VARCHAR",
             "scope": "VARCHAR",
-            "version": "VARCHAR",
+            "generation": "BIGINT",  # the output version's
             "run": "VARCHAR",
             "attempt": "VARCHAR",
             "at": "DOUBLE",
             "input": "VARCHAR",
             "input_scope": "VARCHAR",
-            "input_version": "VARCHAR",
+            "input_generation": "BIGINT",  # what was pinned: the head, or the delivery's snapshot
             "param": "VARCHAR",
-            # A store that reads the current rows (docs/stores.md, "What a read sees"):
-            # the pinned head's generation, and what the read saw — JSON
-            # {generation, keys?, mixed?}. Null for a snapshot store: the pin, exactly.
-            "input_generation": "BIGINT",
-            "read": "VARCHAR",
+            # What a read of a store that reads the current rows saw (docs/stores.md,
+            # "What a read sees"): the generation whose write it found. Null for a
+            # snapshot store's read — the pin, exactly — and for one no fenced write
+            # says, as an external table's (docs/versions.md §6).
+            "read_generation": "BIGINT",
         },
     ),
     # Sensor ticks (docs/lifecycle.md §11.5): buffered in memory, never
@@ -211,7 +213,7 @@ TABLES["key_outcomes"] = Table(
         "asset": "VARCHAR",
         "scope": "VARCHAR",
         "key": "VARCHAR",
-        "revision": "VARCHAR",  # the upstream version it processed: its text, or a digest's hex
+        "generation": "BIGINT",  # the upstream key's it processed: its version
         "outcome": "VARCHAR",  # ok, removed, unmatched, rejected, failed, retrying, canceled, timed_out
         "error": "VARCHAR",  # class and message
         "duration": "DOUBLE",  # seconds in the call
@@ -293,7 +295,7 @@ def attempt_row(run_id: str, task: dict, summary: dict, n: int) -> dict:
         "error": summary.get("error"),
         **{k: summary.get(k) for k in EXECUTION},
         "options": summary.get("options") or {},
-        "outputs": summary.get("outputs") or {},
+        "outputs": summary.get("outputs") or [],
         "generation": summary.get("generation"),
         "keys": summary.get("keys") or {},
     }
@@ -308,7 +310,7 @@ def attempt_summary(row: dict) -> dict:
     if row["error"]:
         attempt["error"] = row["error"]
     if row["outputs"]:
-        attempt["outputs"] = dict(row["outputs"])
+        attempt["outputs"] = list(row["outputs"])
     if row.get("keys"):
         attempt["keys"] = dict(row["keys"])
     return attempt
@@ -406,7 +408,7 @@ def run_record(rows: dict[str, list[dict]], events: int = 0) -> dict:
         record = {"id": row["id"], "source": row["source"], "by": row["by"]}
         for m in rows.get("materializations") or ():
             if m["batch"] is None:
-                record["version"] = m["version"]
+                record["version"] = json.loads(m["metadata"] or "{}").get("version")
             else:
                 record["batch"] = m["batch"]
                 record["upserted"] = m["added_keys"] if m["added_keys"] is not None else m["added"]
@@ -493,7 +495,6 @@ def materialization(
         "output": output,
         "asset": asset,
         "scope": scope,
-        "version": head["ref"].get("version"),
         "store": head["ref"].get("store"),
         "run": head.get("run"),
         "attempt": head.get("attempt"),
@@ -507,61 +508,39 @@ def materialization(
         "rows": count if count is not None else rows,
         "complete": bool(complete),
         "metadata": metadata or None,
-        "generation": head.get("generation"),
+        "generation": head["ref"].get("generation"),
     }
+
+
+def _node_order(key: tuple) -> tuple:
+    return key[0], key[1], key[2] if key[2] is not None else -1
 
 
 def _edge(row, nodes) -> dict:
     """A lineage edge, as `History.lineage` gives it: what was read first."""
 
-    (
-        i,
-        i_s,
-        read_version,
-        o,
-        s,
-        v,
-        param,
-        run,
-        pinned,
-        pinned_generation,
-        read,
-        writer,
-        writer_run,
-        writer_at,
-    ) = row
-    seen = json.loads(read) if read else {}
-    generation = seen.get("generation", pinned_generation) if read else pinned_generation
-    source = {"output": i, "scope": i_s, "version": read_version, "generation": generation}
-    if read_version == pinned or writer is None:  # the pinned version: its materialization says who made it
-        made = nodes.get((i, i_s, read_version)) or {}
+    i, i_s, read, o, s, g, param, run, pinned, read_generation, committed, writer, writer_run, writer_at = row
+    source = {"output": i, "scope": i_s, "generation": read}
+    if committed or writer is None:  # its materialization says who made it
+        made = nodes.get((i, i_s, read)) or {}
         source |= {"run": made.get("run"), "attempt": made.get("attempt"), "at": made.get("at")}
     else:
         source |= {"run": writer_run, "attempt": writer, "at": writer_at}
-    if "keys" in seen:
-        source["keys"] = seen["keys"]
-    edge = {"from": source, "to": {"output": o, "scope": s, "version": v}, "param": param, "run": run}
-    if seen.get("mixed"):
-        edge["mixed"] = True
-    elif read and generation != pinned_generation and read_version is None:
+    edge = {"from": source, "to": {"output": o, "scope": s, "generation": g}, "param": param, "run": run}
+    if read_generation is not None and not committed:
+        # The read saw a write no commit installed (docs/versions.md §6).
         edge["uncommitted"] = {"attempt": writer, "run": writer_run}
-    edge["detail"] = {"pinned_version": pinned, "pinned_generation": pinned_generation}
-    if "key_count" in seen:
-        edge["detail"]["key_count"] = seen["key_count"]
+    edge["detail"] = {"pinned_generation": pinned}
     return edge
 
 
 def read_lineage(pinned, read) -> list[list]:
     """What an attempt was built from: its spec's pins, `[output, scope,
-    version, param, generation]` (§8), each with what the worker's read of
+    generation, param]` (§8), each with the generation the worker's read of
     it saw (`read`, from a store that reads the current rows) — or None."""
 
-    seen = {(r["output"], r["scope"]): r for r in read or ()}
-    out = []
-    for output, scope, version, param, *generation in pinned or ():
-        observed = seen.get((output, scope))
-        out.append([output, scope, version, param, (generation or [None])[0], observed])
-    return out
+    seen = {(r["output"], r["scope"]): r.get("generation") for r in read or ()}
+    return [[output, scope, g, param, seen.get((output, scope))] for output, scope, g, param in pinned or ()]
 
 
 def lineage(output, scope, head, reads) -> list[dict]:
@@ -571,22 +550,15 @@ def lineage(output, scope, head, reads) -> list[dict]:
     base = {
         "output": output,
         "scope": scope,
-        "version": head["ref"].get("version"),
+        "generation": head["ref"].get("generation"),
         "run": head.get("run"),
         "attempt": head.get("attempt"),
         "at": head["at"],
     }
-    rows = []
-    for i, s, v, p, *more in reads or ():
-        generation, observed = (*more, None, None)[:2]
-        row = {**base, "input": i, "input_scope": s, "input_version": v, "param": p}
-        row["input_generation"] = generation
-        if observed is not None:
-            row["read"] = json.dumps(
-                {k: observed[k] for k in ("generation", "keys", "key_count", "mixed") if k in observed}
-            )
-        rows.append(row)
-    return rows
+    return [
+        {**base, "input": i, "input_scope": s, "input_generation": g, "param": p, "read_generation": r}
+        for i, s, g, p, r in reads or ()
+    ]
 
 
 # -- filters ------------------------------------------------------------------------------
@@ -1137,85 +1109,82 @@ class History:
         return {"outcomes": found, "next": cursor}
 
     async def lineage(
-        self, output: str, scope: str, version: str, *, downstream: bool = False, depth: int = 5
+        self, output: str, scope: str, generation: int, *, downstream: bool = False, depth: int = 5
     ) -> dict:
-        """The versions `output@scope:version` was built from (or, with
-        `downstream`, those built from it), `depth` steps out: `edges` go from
-        input to output, and `nodes` say when and by which run each version
-        was made.
+        """The versions `output@scope`, generation `generation`, was built from
+        (or, with `downstream`, those built from it), `depth` steps out:
+        `edges` go from input to output, and `nodes` say when and by which
+        run each version was made (docs/versions.md §6).
 
-        An edge's `from` is what the attempt read: the version, the
-        generation that wrote it, and that writer's run, attempt and time —
-        the pinned version, unless a store that reads the current rows saw
-        a newer write (docs/stores.md, "What a read sees"). Two cases are
-        flagged: `uncommitted`, a read of a write whose attempt never
-        committed (`from.version` None, the writer named), and `mixed`, an
-        attempt that read the input at two moments that saw two versions.
-        `detail` keeps the pin, for debugging."""
+        An edge's `from` is what the attempt read: the generation, and the
+        run, attempt and time of its write — the pinned generation, unless a
+        store that reads the current rows saw another write (docs/stores.md,
+        "What a read sees"). One case is flagged: `uncommitted`, a read of a
+        write no commit installed (the writer named, if it ran). `detail`
+        keeps the pin, for debugging."""
 
-        # The version each lineage row's read saw: the pin's, unless the read saw
-        # another generation — then what that generation's attempt committed, if it did.
+        # The generation each lineage row's read saw: the pin's, unless a current
+        # read saw another; and whether a commit installed it, else which attempt wrote it.
         edges_sql = """
-            SELECT l.*, a.id AS writer, a.run AS writer_run, a.finished_at AS writer_at,
-                CASE WHEN l.read_generation IS NULL AND l.read IS NULL THEN l.input_version
-                     WHEN l.read_generation = l.input_generation THEN l.input_version
-                     ELSE a.outputs[l.input] END AS read_version
-            FROM (
-                SELECT *, TRY_CAST(json_extract_string(read, '$.generation') AS BIGINT) AS read_generation
-                FROM lineage
-            ) l
+            SELECT l.*, coalesce(l.read_generation, l.input_generation) AS read,
+                m.generation IS NOT NULL AS committed,
+                a.id AS writer, a.run AS writer_run, a.finished_at AS writer_at
+            FROM lineage l
+            LEFT JOIN (SELECT DISTINCT output, scope, generation FROM materializations) m
+                ON m.output = l.input AND m.scope = l.input_scope
+                AND m.generation = coalesce(l.read_generation, l.input_generation)
             LEFT JOIN attempts a
-                ON l.read_generation IS NOT NULL AND l.read_generation IS DISTINCT FROM l.input_generation
+                ON l.read_generation IS NOT NULL AND m.generation IS NULL
                 AND a.generation = l.read_generation AND a.scope = l.input_scope
         """
-        made, read = ("output", "scope", "version"), ("input", "input_scope", "read_version")
+        made, read = ("output", "scope", "generation"), ("input", "input_scope", "read")
         near, far = (read, made) if downstream else (made, read)
         join = " AND ".join(f"e.{c} = w.{w}" for c, w in zip(near, made, strict=True))
         sql = f"""
             WITH RECURSIVE edges AS ({edges_sql}),
-            walk(output, scope, version, depth) AS (
-                SELECT ?::VARCHAR, ?::VARCHAR, ?::VARCHAR, 0
+            walk(output, scope, generation, depth) AS (
+                SELECT ?::VARCHAR, ?::VARCHAR, ?::BIGINT, 0
                 UNION
                 SELECT e.{far[0]}, e.{far[1]}, e.{far[2]}, w.depth + 1
                 FROM edges e JOIN walk w ON {join}
                 WHERE w.depth < ? AND e.{far[2]} IS NOT NULL
             )
-            SELECT DISTINCT e.input, e.input_scope, e.read_version, e.output, e.scope, e.version, e.param, e.run,
-                e.input_version, e.input_generation, e.read, e.writer, e.writer_run, e.writer_at
+            SELECT DISTINCT e.input, e.input_scope, e.read, e.output, e.scope, e.generation, e.param, e.run,
+                e.input_generation, e.read_generation, e.committed, e.writer, e.writer_run, e.writer_at
             FROM edges e JOIN walk w ON {join}
             WHERE w.depth < ?
         """
 
         def work(con):
-            edges = con.execute(sql, [output, scope, version, depth, depth]).fetchall()
-            keys = {(output, scope, version)}
-            for i, i_s, i_v, o, s, v, *_ in edges:
-                keys.add((o, s, v))
-                if i_v is not None:
-                    keys.add((i, i_s, i_v))
+            edges = con.execute(sql, [output, scope, generation, depth, depth]).fetchall()
+            keys = {(output, scope, generation)}
+            for i, i_s, i_g, o, s, g, *_ in edges:
+                keys.add((o, s, g))
+                if i_g is not None:
+                    keys.add((i, i_s, i_g))
             nodes = {}
             if keys:
-                con.execute("CREATE TEMP TABLE wanted (output VARCHAR, scope VARCHAR, version VARCHAR)")
-                con.executemany("INSERT INTO wanted VALUES (?, ?, ?)", sorted(keys))
+                con.execute("CREATE TEMP TABLE wanted (output VARCHAR, scope VARCHAR, generation BIGINT)")
+                con.executemany("INSERT INTO wanted VALUES (?, ?, ?)", sorted(keys, key=_node_order))
                 for row in _dicts(
                     con.execute(
-                        "SELECT m.output, m.scope, m.version, m.asset, m.run, m.attempt, m.at, m.rows, "
-                        "m.generation FROM materializations m JOIN wanted USING (output, scope, version)"
+                        "SELECT m.output, m.scope, m.generation, m.asset, m.run, m.attempt, m.at, m.rows "
+                        "FROM materializations m JOIN wanted USING (output, scope, generation)"
                     )
                 ):
-                    nodes[(row["output"], row["scope"], row["version"])] = row
+                    nodes[(row["output"], row["scope"], row["generation"])] = row
             return edges, keys, nodes
 
         edges, keys, nodes = await self.query(work, ("lineage", "materializations", "attempts"), live=False)
         m = self.m
         out_nodes = []
-        for key in sorted(keys, key=lambda k: (k[0], k[1], k[2] or "")):
-            node = dict(nodes.get(key) or {"output": key[0], "scope": key[1], "version": key[2]})
+        for key in sorted(keys, key=_node_order):
+            node = dict(nodes.get(key) or {"output": key[0], "scope": key[1], "generation": key[2]})
             head = m.heads.get((key[0], key[1]))
-            node["current"] = head is not None and head["ref"].get("version") == key[2]
+            node["current"] = head is not None and head["ref"].get("generation") == key[2]
             out_nodes.append(node)
         return {
-            "root": {"output": output, "scope": scope, "version": version},
+            "root": {"output": output, "scope": scope, "generation": generation},
             "direction": "downstream" if downstream else "upstream",
             "nodes": out_nodes,
             "edges": [_edge(e, nodes) for e in edges],

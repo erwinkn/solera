@@ -7,6 +7,7 @@ import json
 
 import pytest
 from solera.sdk import Automation, Every, Incremental, OnChange, Output, Project, asset
+from solera.stores import Patch
 from solera_server.engine import Engine
 from solera_server.model import Model
 from solera_server.placements.inline import InlinePlacement
@@ -120,13 +121,22 @@ async def test_commit_installs_heads_cursor_watermarks_and_pends_onchange(state,
     assert auto["last_at"] is not None and auto["pending"] == []
 
 
-async def test_identical_content_is_not_a_change(state, clock):
+async def test_content_written_again_is_a_change(state, clock):
+    """docs/versions.md §1: writing a key changes it, identical or not — the
+    second run's head and keys are its own generation, and its delta lists
+    them for the consumer."""
+
     engine = engine_on(state, clock)
-    await engine.initialize()
+    await quiet(engine)
     await settle(engine, (await engine.submit(["files"]))["id"])
-    state.model.automations["consumer.onchange.0"]["pending"] = []
+    first = state.model.heads[("files", "")]["ref"]["generation"]
     await settle(engine, (await engine.submit(["files"]))["id"])
-    assert state.model.automations["consumer.onchange.0"]["pending"] == []
+    second = state.model.heads[("files", "")]
+    assert second["ref"]["generation"] > first
+    assert (await engine.list_keys("files", ""))["keys"] == {
+        "a": second["ref"]["generation"],
+        "b": second["ref"]["generation"],
+    }
 
 
 async def test_failed_precondition_changes_nothing(state, clock):
@@ -140,7 +150,7 @@ async def test_failed_precondition_changes_nothing(state, clock):
         "inputs": {},
         "outputs": {"files": {"head": None, "reset": True, "contract": contract}},
     }  # stale
-    ref = {"output": "files", "store": "default", "handle": {}, "version": "v2", "partition": "", "meta": {}}
+    ref = {"output": "files", "store": "default", "handle": {}, "partition": "", "generation": 2, "meta": {}}
     with pytest.raises(Conflict):
         engine.commit_attempt(attempt, prepared, {"outputs": {"files": ref}})
     assert durable(state.model) == before
@@ -178,7 +188,7 @@ async def test_a_moved_input_still_commits(state, clock):
         delivered.append(sorted(r["id"] for r in items))
         if len(delivered) == 1:
             # The upstream moves (and commits) while this attempt is still running.
-            rows["v"] = [{"id": "a"}, {"id": "b"}, {"id": "c"}]
+            rows["v"] = Patch([{"id": "c"}])
             await settle(engine2, (await engine2.submit(["items"]))["id"])
             assert state.model.heads[("items", "")]["batch"] == 1
         return []
@@ -323,6 +333,7 @@ async def test_replay_reproduces_the_live_model(tmp_path, clock):
         clock.now += 61
         await engine.tick()
     await engine.tick()  # archive what finished
+    await engine.stop()  # an OnChange run it fired may still be going: nothing may record past here
     live = durable(state.model)
     await state.close()
     again = await State.open(tmp_path.as_uri(), "test", clock=clock, writer=False)
@@ -460,9 +471,9 @@ def test_one_outputs_heads_are_found_without_looking_at_the_others():
 
     m = Model()
     for i in range(1000):
-        m.heads[("other", f"p{i}")] = {"ref": {"version": str(i)}}
-    m.heads[("mine", "b")] = {"ref": {"version": "b"}}
-    m.heads[("mine", "a")] = {"ref": {"version": "a"}}
+        m.heads[("other", f"p{i}")] = {"ref": {"generation": i}}
+    m.heads[("mine", "b")] = {"ref": {"generation": 2}}
+    m.heads[("mine", "a")] = {"ref": {"generation": 1}}
 
     def scanned():
         raise AssertionError("heads_of looked at every head")

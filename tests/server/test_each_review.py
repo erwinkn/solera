@@ -133,7 +133,8 @@ async def test_4_a_rescope_without_its_log_still_removes_left_out_and_deleted_ke
     def parse(file: dict):
         return [{"n": file["n"]}]
 
-    old = files_project(content, parse)
+    written = {}
+    old = files_project(content, parse, written=written)
     engine = make_engine(state, old)
     await engine.initialize()
     await drive(engine, await engine.submit(["parse"], upstream=True))
@@ -141,7 +142,7 @@ async def test_4_a_rescope_without_its_log_still_removes_left_out_and_deleted_ke
     await drive(engine, await engine.submit(["files"]))
     index = engine.m.indexes[("files", "")]
     engine.m.indexes[("files", "")] = index.truncated(index.log[-1][0] + 1)  # the log is lost
-    new = files_project(content, parse, include="a/**")
+    new = files_project(content, parse, include="a/**", written=written)
     engine = make_engine(state, new)
     await engine.initialize()
     detail = await drive(engine, await engine.submit(["parse"]))

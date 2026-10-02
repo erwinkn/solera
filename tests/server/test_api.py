@@ -267,7 +267,7 @@ async def test_source_commit_endpoints(client, base, engine):
 
     committed = await client.post(f"{base}/sources/uploads/commit", json={"keys": {"u-1": "v1"}})
     assert committed.status_code == 200
-    assert committed.json()["ref"]["version"]
+    assert committed.json()["ref"]["generation"]
 
     patched = await client.post(
         f"{base}/sources/uploads/commit",

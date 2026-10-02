@@ -35,7 +35,7 @@ LOOKAHEAD = 100_000  # index entries a page examines at most, to fill itself and
 @dataclass
 class Page:
     kind: str  # "changes" or "retry"
-    upserted: dict[str, tuple[bytes, int]]  # key -> upstream (version, locator)
+    upserted: dict[str, int]  # key -> the generation of its upstream entry: its version
     deleted: list[str]
     after: str | None  # where the window's page, or the retry walk, ended (None: done)
     unmatched: list[str] = field(default_factory=list)  # keys that stopped matching the edge's patterns
@@ -55,7 +55,7 @@ class Window:
     `unmatched` that its deletions are keys that stopped matching (a
     rescope's diff) rather than keys gone upstream."""
 
-    upserted: dict[str, tuple[bytes, int]]
+    upserted: dict[str, int]  # key -> generation
     deleted: tuple
     after: str | None
     read: int
@@ -65,7 +65,7 @@ class Window:
 async def _fill(chunk, start: bytes | None, limit: int, kind) -> tuple[list, str | None, int]:
     """A page of `limit` entries that `kind` takes, read ahead past the ones
     it does not: `chunk(after, n)` returns `(entries, next)` — at most `n`
-    entries as `(key, version, deleted, locator)` in key order past `after`,
+    entries as `(key, generation, deleted)` in key order past `after`,
     and where to go on (None: exhausted). Past a full page it looks on for
     one more entry it takes, so that a page is `final` exactly when nothing
     follows and no delivery ends on an empty page (§5).
@@ -112,12 +112,12 @@ async def read_window(pin: dict, keys_io) -> Window:
     start = key_bytes(ch["after"]) if ch.get("after") is not None else None
 
     async def whole(after, n):
-        keys, versions, locators, nxt = await index.page(after, n)
-        return list(zip(keys, versions, bytes(len(keys)), locators, strict=True)), nxt
+        keys, generations, _, nxt = await index.page(after, n)
+        return list(zip(keys, generations, bytes(len(keys)), strict=True)), nxt
 
     async def window(after, n):
-        keys, versions, flags, locators, nxt = await index.pending(int(ch["from"]), int(ch["to"]), after, n)
-        return list(zip(keys, versions, flags, locators, strict=True)), nxt
+        keys, generations, flags, _, nxt = await index.pending(int(ch["from"]), int(ch["to"]), after, n)
+        return list(zip(keys, generations, flags, strict=True)), nxt
 
     if "rescope" in ch:
         old, new = Matcher(ch["rescope"]["from"]), Matcher(ch["rescope"]["to"])
@@ -128,20 +128,20 @@ async def read_window(pin: dict, keys_io) -> Window:
             return "upsert" if now and not before else "delete" if before and not now else None
 
         page, after, read = await _fill(whole, start, limit, changed)
-        upserted = {key_str(e[0]): (e[1], e[3]) for kind, e in page if kind == "upsert"}
+        upserted = {key_str(e[0]): e[1] for kind, e in page if kind == "upsert"}
         deleted = tuple(key_str(e[0]) for kind, e in page if kind == "delete")
         return Window(upserted, deleted, after, read, unmatched=True)
     taken = Matcher(pin.get("patterns"))
     if "keys" in ch:  # a run's keys= override: a one-off selection, of the keys that exist
         found = await index.lookup([key_bytes(str(k)) for k in ch["keys"]])
-        upserted = {key_str(k): entry for k, entry in found.items()}
+        upserted = {key_str(k): generation for k, (generation, _) in found.items()}
         return Window({k: e for k, e in upserted.items() if taken(k)}, (), None, len(upserted))
 
     def kind(entry):
         return ("delete" if entry[2] else "upsert") if taken(key_str(entry[0])) else None
 
     page, after, read = await _fill(whole if ch.get("full") else window, start, limit, kind)
-    upserted = {key_str(e[0]): (e[1], e[3]) for k, e in page if k == "upsert"}
+    upserted = {key_str(e[0]): e[1] for k, e in page if k == "upsert"}
     deleted = tuple(key_str(e[0]) for k, e in page if k == "delete")
     return Window(upserted, deleted, after, read)
 
@@ -161,7 +161,7 @@ async def read_page(spec: dict, pin: dict, keys_io) -> Page:
             [] if window.unmatched else list(window.deleted),
             window.after,
             unmatched=list(window.deleted) if window.unmatched else [],
-            priors={key_str(k): Record.decode(v) for k, (v, _) in priors.items()},
+            priors={key_str(k): Record.decode(p) for k, (_, p) in priors.items()},
         )
     # A retry page: walk the failure index from the pass's position, taking the
     # keys that are due, `limit` at most (§9).
@@ -172,10 +172,10 @@ async def read_page(spec: dict, pin: dict, keys_io) -> Page:
     due: list[str] = []
     end = None
     while len(due) < limit and len(walked) < WALK * limit:
-        keys, versions, _, nxt = await failures.page(cursor, limit)
-        for k, v in zip(keys, versions, strict=True):
+        keys, _, payloads, nxt = await failures.page(cursor, limit)
+        for k, p in zip(keys, payloads, strict=True):
             key = key_str(k)
-            record = walked[key] = Record.decode(v)
+            record = walked[key] = Record.decode(p)
             if eligible(record, each["now"], int(each["epoch"]), each.get("forced") or {}):
                 due.append(key)
             end = key
@@ -198,9 +198,9 @@ async def read_page(spec: dict, pin: dict, keys_io) -> Page:
             unmatched.append(key)  # no longer one of the edge's keys: its outputs and record go
         elif entry is None:
             deleted.append(key)  # gone upstream: its outputs and its record go
-        elif entry[0] == walked[key].revision:
-            upserted[key] = entry
-        # else: its upstream moved on — the change window brings it, at its new version
+        elif entry[0] == walked[key].upstream:
+            upserted[key] = entry[0]
+        # else: its upstream was written since — the change window brings it, at its new generation
     return Page(
         "retry",
         upserted,
@@ -253,7 +253,7 @@ async def _reconcile_page(spec: dict, pin: dict, keys_io, failures: KeyIndex) ->
         deleted,
         end,
         unmatched=unmatched,
-        priors={key_str(k): Record.decode(v) for k, (v, _) in priors.items()},
+        priors={key_str(k): Record.decode(p) for k, (_, p) in priors.items()},
     )
 
 
@@ -278,12 +278,6 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
     t = project.hints[asset.name].get(param)
     loaded = await ctx._observed.load(store, ref, dict[str, t], Keys(page.upserted)) if page.upserted else {}
     await ctx._observed.close()  # the inputs' moment ends before the calls
-    up = project.manifest["outputs"][ref.output]
-    textual = bool(up.get("revision") or up.get("source") or up.get("partition_set"))
-
-    def rendered(version: bytes) -> str:
-        return version.decode(errors="replace") if textual else version.hex()
-
     decls = {o.name or asset.name: o for o in asset.outputs}
     is_async = inspect.iscoroutinefunction(asset.fn)
     signature = inspect.signature(asset.fn)
@@ -320,22 +314,22 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
         return values
 
     async def one(key: str):
-        version = page.upserted[key][0]
+        generation = page.upserted[key]
         try:
             async with gate:  # a cancel may reach a key still waiting here: it is interrupted too
                 if drain.is_set() or abort:
-                    outcomes[key] = Outcome(INTERRUPTED, version)
+                    outcomes[key] = Outcome(INTERRUPTED, generation)
                     return
-                await call(key, version)
+                await call(key, generation)
         except asyncio.CancelledError:
             if not (drain.is_set() or abort):
                 raise
-            outcomes[key] = Outcome(INTERRUPTED, version)
+            outcomes[key] = Outcome(INTERRUPTED, generation)
 
-    async def call(key: str, version: bytes):
+    async def call(key: str, generation: int):
         kwargs = dict(args)
         if "ctx" in signature.parameters:
-            kwargs["ctx"] = ctx._for_key(key, rendered(version))
+            kwargs["ctx"] = ctx._for_key(key, generation)
         kwargs[param] = loaded.get(key)
         start = time.monotonic()
         try:
@@ -348,7 +342,7 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
                 if inspect.isawaitable(value):
                     value = await value
             outputs[key] = split(key, value)
-            outcomes[key] = Outcome("ok", version)
+            outcomes[key] = Outcome("ok", generation)
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -358,9 +352,9 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
                 raise _Abort(error) from error
             message = f"{type(error).__name__}: {error}"
             outcomes[key] = Outcome(
-                kind, version, message, timing.get("retry_after"), timing.get("retry_for")
+                kind, generation, message, timing.get("retry_after"), timing.get("retry_for")
             )
-            ctx._for_key(key, rendered(version)).log(message, "error")
+            ctx._for_key(key, generation).log(message, "error")
         finally:
             durations[key] = time.monotonic() - start
 
@@ -389,9 +383,9 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
     timeline.add("computed")
     if abort:
         return {"abort": abort[0]}
-    for key, (version, _) in page.upserted.items():
+    for key, generation in page.upserted.items():
         # Every key of the page has an outcome before its watermark moves past it.
-        outcomes.setdefault(key, Outcome(INTERRUPTED, version))
+        outcomes.setdefault(key, Outcome(INTERRUPTED, generation))
     for key in page.deleted:
         outcomes[key] = Outcome(REMOVED)
     for key in page.unmatched:
@@ -420,7 +414,7 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
         timed out for a timeout, canceled otherwise (lifecycle.md §2.2)."""
 
         made = "timed_out" if cancel is not None and cancel.reason == "timeout" else "canceled"
-        final = {k: Outcome(made, o.revision) if o.kind == INTERRUPTED else o for k, o in outcomes.items()}
+        final = {k: Outcome(made, o.upstream) if o.kind == INTERRUPTED else o for k, o in outcomes.items()}
         failures = await _failures(spec, each, page, final, keys_io)
         rows, counts = [], Counter()
         for key, outcome in sorted(final.items()):
@@ -430,7 +424,7 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
             rows.append(
                 {
                     "key": key,
-                    "revision": rendered(outcome.revision) if outcome.revision else None,
+                    "generation": outcome.upstream or None,
                     "outcome": name,
                     "error": outcome.message or None,
                     "duration": round(durations.get(key, 0.0), 6),
@@ -462,7 +456,7 @@ async def _failures(spec, each: dict, page: Page, outcomes: dict, keys_io) -> di
     epoch, forced = int(each["epoch"]), int(each.get("forced_pos") or 0)
     retries = int(each.get("retries") or 0)
     records, transitions = {}, Counter()
-    upsert_keys, upsert_versions, removes = [], [], []
+    upsert_keys, upsert_records, removes = [], [], []
     for key, outcome in sorted(outcomes.items()):
         prior = page.priors.get(key)
         record = transition(prior, outcome, now=time.time(), epoch=epoch, forced=forced, retries=retries)
@@ -473,12 +467,12 @@ async def _failures(spec, each: dict, page: Page, outcomes: dict, keys_io) -> di
             transitions[record.name] += 1
             if record != prior:
                 upsert_keys.append(key_bytes(key))
-                upsert_versions.append(record.encode())
+                upsert_records.append(record.encode())
         elif prior is not None:
             removes.append(key_bytes(key))
     index = KeyIndex(keys_io, None, IndexState.from_json(each["failures"]))
     files, _ = await index.resolve(
-        SortedRun.of(upsert_keys, upsert_versions, removes),
+        SortedRun.of(upsert_keys, upsert_records, removes),
         batch=int(each["batch"]),
         attempt=spec["attempt"],
         generation=int(spec.get("generation") or 0),

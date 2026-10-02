@@ -112,7 +112,7 @@ def test_demo_end_to_end(demo, pool_worker):
     # The external `uploads` partition set is fed from outside (§5) — this
     # commit is what the README does with `solera commit uploads`.
     committed = client.post(f"{base}/sources/uploads/commit", json={"keys": {"u-1": "v1", "u-2": "v1"}})
-    assert committed.status_code == 200 and committed.json()["ref"]["version"]
+    assert committed.status_code == 200 and committed.json()["ref"]["generation"]
 
     # `manual_ingest` is placed on Pool("ingest"): only an external worker
     # can complete it — `pool_worker`, `solera worker pool ingest` in the README.
@@ -159,17 +159,17 @@ def test_demo_end_to_end(demo, pool_worker):
     # -- the no-change corollary (§6) --------------------------------------
     # FeedClient emits one batch per site per five-second tick; a poll whose
     # run config stretches the tick far past the stored cursor ticks is a
-    # guaranteed no-change pass — the delta is empty, the recommit is
-    # byte-identical, `changed` comes back empty. (`ref.version` is the
-    # committed data version; `version` on the head record is the declared
-    # asset version and never changes.)
+    # guaranteed no-change pass — the producer writes nothing, and the head
+    # keeps its generation. (`ref.generation` is the version of the
+    # committed data; `version` on the head record is the declared asset
+    # version and never changes.)
     #
     # The concurrent runs above commit site_files deltas that can land after
     # a sibling run's last file_index drain — real work the watermark must
     # not skip. Drain the log first so every watermark sits at head.
     drain = submit(["file_index"], partitions="all", upstream=False)
     assert wait(lambda: run_done(drain)) and run_status(drain) == "succeeded"
-    site_files = {h["scope"]: h["ref"]["version"] for h in heads("site_files")}
+    site_files = {h["scope"]: h["ref"]["generation"] for h in heads("site_files")}
     file_index_heads = {h["scope"]: h["commit"] for h in heads("file_index")}
     poll_run = submit(
         ["site_feed"],
@@ -178,7 +178,7 @@ def test_demo_end_to_end(demo, pool_worker):
         config={"feed_tick_seconds": 3600},
     )
     assert wait(lambda: run_done(poll_run)) and run_status(poll_run) == "succeeded"
-    assert {h["scope"]: h["ref"]["version"] for h in heads("site_files")} == site_files
+    assert {h["scope"]: h["ref"]["generation"] for h in heads("site_files")} == site_files
 
     # The Incremental consumer over unchanged upstream state skips every
     # scope — the delta log holds nothing past its watermark.

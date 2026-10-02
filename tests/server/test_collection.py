@@ -37,7 +37,7 @@ async def named(state, output) -> set[str]:
     """The objects the key index names: exactly what a keyed output should hold."""
 
     keys = await whole(state, output)
-    return {FileStore.key_name(output, k, v, loc) for k, (v, loc) in keys.revisions.items()}
+    return {FileStore.key_name(output, k, g) for k, g in keys.generations.items()}
 
 
 async def no_discards_after_commit(*args):
@@ -230,9 +230,11 @@ async def test_an_entry_whose_names_cannot_be_read_gets_stuck_and_is_shown(tmp_p
     import httpx
     from solera_server.api import create_app
 
+    writes = iter([{"a": 1}])
+
     @asset(outputs=Output("scores", keyed=True))
     def scores():
-        return {"a": 1}
+        return next(writes, Patch({}))  # then nothing: no commit lets go of anything more
 
     project = Project(assets=[scores])
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
@@ -272,9 +274,11 @@ async def test_entries_of_one_event_are_acknowledged_one_by_one(tmp_path):
 
     from solera_server import engine as engine_module
 
+    writes = iter([{"a": 1}])
+
     @asset(outputs=Output("scores", keyed=True))
     def scores():
-        return {"a": 1}
+        return next(writes, Patch({}))  # then nothing: no commit lets go of anything more
 
     project = Project(assets=[scores])
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)

@@ -115,7 +115,7 @@ async def test_a_tick_commits_and_requests_runs_in_one_record(tmp_path):
     ]
     m = state.model
     assert m.sensors["watch"]["cursor"] == "page-2"
-    assert m.heads[("feed", "")]["ref"]["version"] == "v7"
+    assert m.heads[("feed", "")]["version"] == "v7"
     for source, head in answer["commits"].items():
         assert engine._head_id(source) == head
     run = m.runs[answer["runs"][0]]
@@ -174,13 +174,13 @@ async def test_a_tick_that_saw_a_source_since_moved_is_refused_whole(tmp_path):
     with pytest.raises(Conflict, match="moved"):
         await engine.sensor_post("watch", tick["tick"], outcome)
     assert state.recorded == before and set(await state.list_objects("keys/")) == files
-    assert state.model.heads[("feed", "")]["ref"]["version"] == "v2"
+    assert state.model.heads[("feed", "")]["version"] == "v2"
     assert rows(engine)[-1]["outcome"] == "refused"
     with pytest.raises(Conflict, match="not current"):  # decided: its claim is consumed
         await engine.sensor_post("watch", tick["tick"], outcome)
     tick = await dispatch(engine, "watch")  # the next tick observes again
     await engine.sensor_post("watch", tick["tick"], Tick(commits=[Commit("feed", version="v3")]).to_json())
-    assert state.model.heads[("feed", "")]["ref"]["version"] == "v3"
+    assert state.model.heads[("feed", "")]["version"] == "v3"
     await state.close()
 
 
@@ -206,7 +206,7 @@ async def test_a_source_moving_while_the_tick_is_prepared_refuses_it(tmp_path, m
         await engine.sensor_post(
             "watch", tick["tick"], Tick(commits=[Commit("uploads", keys={"a": "1"})]).to_json()
         )
-    assert (await engine.list_keys("uploads"))["keys"] == {"z": "1"}  # the API's commit, not the tick's
+    assert list((await engine.list_keys("uploads"))["keys"]) == ["z"]  # the API's commit, not the tick's
     assert len(set(await state.list_objects("keys/")) - files) == 1  # the API commit's delta alone
     await state.close()
 
@@ -267,7 +267,7 @@ async def test_what_a_sensor_may_not_do_is_refused_whole(tmp_path):
         with pytest.raises(ValueError):
             await engine.sensor_post("watch", tick["tick"], outcome.to_json())
         assert state.recorded == before and rows(engine)[-1]["outcome"] == "failed"
-    assert state.model.heads[("feed", "")]["ref"]["version"] == "v1"
+    assert state.model.heads[("feed", "")]["version"] == "v1"
     await state.close()
 
 
@@ -330,9 +330,9 @@ async def test_observable_sources_commit_on_their_schedule(tmp_path):
     await engine.start()
     m = state.model
     await until(lambda: (m.sensors.get("events.observe") or {}).get("cursor") == "p3")
-    await until(lambda: m.heads[("table", "")]["ref"]["version"] == "2026-10-02")
+    await until(lambda: m.heads[("table", "")].get("version") == "2026-10-02")
     await until(lambda: m.heads[("landing", "")].get("batch") is not None)
-    assert (await engine.list_keys("landing"))["keys"] == {"a": "e1", "b": "e2"}
+    assert list((await engine.list_keys("landing"))["keys"]) == ["a", "b"]
     assert (await engine.list_keys("events"))["keys"] == {}  # x came, then went
     assert {r["outcome"] for r in rows(engine, "events.observe")} >= {"committed", "advanced"}
     await engine.stop()
@@ -657,7 +657,7 @@ async def test_an_async_observe_is_awaited(tmp_path):
     project = Project(sources=[Feed("feed", observe=Every(1))])
     state, engine = await open_engine(tmp_path, project, host=True)
     await engine.start()
-    await until(lambda: state.model.heads[("feed", "")]["ref"]["version"] == "v1")
+    await until(lambda: state.model.heads[("feed", "")].get("version") == "v1")
     await engine.stop()
     await state.close()
 

@@ -155,31 +155,19 @@ def worker_report(worker: dict | None) -> dict:
     return out
 
 
-READ_KEYS = 1000  # a read's key versions a lineage row keeps; past that, the generation alone
-
-
 def _read(entry) -> dict | None:
     """One slice a worker's read saw (`solera_worker.observed`): its output
-    and scope, the generation it saw, and — when not the pinned one — the
-    versions of the keys it read, hex, or None for a key it did not find."""
+    and scope, and the generation whose write it saw (None: no fenced write
+    says, as for an external table)."""
 
     if not isinstance(entry, dict) or not isinstance(entry.get("output"), str):
         return None
     generation = entry.get("generation")
-    out = {
+    return {
         "output": entry["output"],
         "scope": str(entry.get("scope") or ""),
         "generation": int(generation) if _number(generation) is not None else None,
     }
-    if entry.get("mixed"):
-        out["mixed"] = True
-    keys = entry.get("keys")
-    if isinstance(keys, dict):
-        if len(keys) <= READ_KEYS:
-            out["keys"] = {str(k): (str(v) if v is not None else None) for k, v in keys.items()}
-        else:
-            out["key_count"] = len(keys)
-    return out
 
 
 @dataclass

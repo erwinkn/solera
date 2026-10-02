@@ -414,7 +414,7 @@ async def test_unkeyed_source_commits_over_http(state):  # noqa: F811
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post("/api/projects/p/sources/matrix/commit", json={"version": "v2"})
     assert response.status_code == 200, response.text
-    assert state.model.heads[("matrix", "")]["ref"]["version"] == "v2"
+    assert state.model.heads[("matrix", "")]["version"] == "v2"
 
 
 def test_the_cli_says_no_removals_as_none():

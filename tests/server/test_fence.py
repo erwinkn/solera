@@ -31,6 +31,9 @@ class Gated(FileStore):
     async def acquire(self, scope, prior=None):
         pass
 
+    def keys(self, ref, among=None):
+        raise AssertionError("no test of Gated repairs a slice")
+
 
 class Remote:
     """A placement whose worker the test plays by writing its objects."""
@@ -431,11 +434,16 @@ class LiveStore(FileStore):
             self.rows[row["id"]] = dict(row)
         for key in write.remove if patch else ():
             self.rows.pop(key, None)
-        return Written(Ref(scope.output.name, "live", {}, scope.attempt, scope.partition))
+        return Written(Ref(scope.output.name, "live", {}, scope.partition))
+
+    def keys(self, ref, among=None):
+        """The keys it holds, sorted by their bytes: what a repair asks."""
+
+        yield sorted((k for k in self.rows if among is None or k in among), key=str.encode)
 
     async def load(self, ref, t, selection):
         if isinstance(selection, Keys):
-            return [dict(r) for k, r in self.rows.items() if k in selection.revisions]
+            return [dict(r) for k, r in self.rows.items() if k in selection.generations]
         return [dict(r) for r in self.rows.values()]
 
 
@@ -451,7 +459,7 @@ async def test_a_worker_that_dies_writing_leaves_its_output_unsettled_and_the_re
         Patch([{"id": "a", "v": 2}]),  # the retry
     ]
 
-    @asset(outputs=Output("items", key="id", revision="v", store="live"), retries=Retry(1, delay=0))
+    @asset(outputs=Output("items", key="id", store="live"), retries=Retry(1, delay=0))
     def items():
         return writes.pop(0)
 
@@ -718,16 +726,17 @@ async def test_the_timeout_runs_from_the_first_report(tmp_path):
 
 
 async def test_an_attempt_that_wrote_nothing_still_leaves_a_gate(tmp_path):
-    """An attempt that commits without a store call (its output unchanged)
-    took no gate; the engine closes it, so no delayed worker can take it
-    later (§2.4). One that wrote keeps the worker's `writing` gate."""
+    """An attempt that commits without a store call (its output unchanged:
+    an empty patch) took no gate; the engine closes it, so no delayed
+    worker can take it later (§2.4). One that wrote keeps the worker's
+    `writing` gate."""
 
     calls = []
 
     @asset(outputs=Output("same", keyed=True))
     def same():
         calls.append(1)
-        return {"a": 1}
+        return {"a": 1} if len(calls) == 1 else Patch({})
 
     project = Project(assets=[same], default_store=Gated())
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
