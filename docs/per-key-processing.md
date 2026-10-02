@@ -321,8 +321,8 @@ every existing version once, together with the grammar's own version.
 
 A keyed write feeds the key index its `(key, version)` entries, and its
 store the groups of the keys that changed. Its store reads it once —
-`Store.prepare(write, output) -> Prepared`, for any type the store takes;
-by default `solera.stores.prepare` — after the producer returns and before
+`Store.prepare(write, output) -> Prepared`, for the types the store takes;
+by default `solera.stores.prepare`, plain Python — after the producer returns and before
 anything resolves or writes, and that one reading is carried through
 resolution, repair and storage:
 
@@ -346,15 +346,17 @@ it as it is.
 | Write | Read as |
 |---|---|
 | `list[dict]` | `Rows.records`; taken as the dicts |
-| pandas DataFrame | column by column through pandas alone (`Rows.columns`), every missing value — NaN, NaT, None, NA — None; timestamps without nanoseconds as `datetime`s; taken as dicts of those values |
-| Arrow data | `Rows.arrow`, in place (a pyarrow stream is read once, into a table); taken through pyarrow, a map as a dict |
+| pandas DataFrame (a store's, through `solera.stores.frames`) | column by column through pandas alone (`Rows.columns`), every missing value — NaN, NaT, None, NA — None; timestamps without nanoseconds as `datetime`s; taken as dicts of those values |
+| Arrow data (likewise) | `Rows.arrow`, in place (a pyarrow stream is read once, into a table); taken through pyarrow, a map as a dict |
 | `{key: rows}` | flattened, each row stamped with its key; a key given no rows is removed by a patch, absent from a replacement |
 | `keyed=True` dict | `Rows.values` |
 | partition set | `Rows.keys` |
 
-The default imports a library only for a value of its own type: a worker
-whose outputs are lists of dicts imports neither pandas, pyarrow nor
-DuckDB. A store adds the columns it stamps on every row with
+The framework knows no DataFrame or Arrow type: the default reads plain
+Python, and a store taking more reads it itself — FileStore, S3Store and
+PostgresStore through `solera.stores.frames`, which imports a library only
+for a value of its own type. A worker whose outputs are lists of dicts
+imports neither pandas, pyarrow nor DuckDB. A store adds the columns it stamps on every row with
 `stamped(output)`, which a row's digest leaves out (PostgresStore's
 partition column).
 

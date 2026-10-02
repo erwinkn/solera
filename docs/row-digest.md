@@ -126,13 +126,13 @@ one key with different revisions.
 
 ## Where versions come from
 
-The harness reads a keyed write once as native `Rows`
-(`solera.stores.prepare`, `per-key-processing.md` §7): `Rows.records` for
-Python rows, `Rows.columns` for a pandas DataFrame (column by column,
-through pandas alone), `Rows.arrow` for Arrow data, `Rows.values` for
-`keyed=True`, `Rows.keys` for partition sets; a store reading types of its
-own reads them itself (`Store.prepare`), and one adding columns leaves
-them out (`Store.stamped`). What a store persists is taken from the same
+A keyed write is read once as native `Rows` by its store (`Store.prepare`,
+`per-key-processing.md` §7): by default (`solera.stores.prepare`, plain
+Python) `Rows.records` for rows, `Rows.values` for `keyed=True`,
+`Rows.keys` for partition sets; a store taking DataFrames or Arrow reads
+them with `solera.stores.frames` — `Rows.columns` for a DataFrame (column
+by column, through pandas alone), `Rows.arrow` for Arrow data; and a store
+adding columns leaves them out (`Store.stamped`). What a store persists is taken from the same
 reading — a DataFrame's missing values None, an Arrow map a dict — so it
 digests as it was hashed. Keys are sorted
 natively, each run of equal keys is folded into one version, and no

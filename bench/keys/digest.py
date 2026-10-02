@@ -3,7 +3,8 @@
     uv run python bench/keys/digest.py --sizes 1e6,1e7
 
 Each case runs in a process of its own: it builds its rows, then — measured —
-turns them into a key index's content (`key_rows`) and writes it as an
+turns them into a key index's content (`solera.stores.frames.prepare`, as
+a store taking DataFrames and Arrow reads them) and writes it as an
 initial load into an empty index on local disk, so every row's version is
 computed exactly once. Peak memory is what the operation adds on top of the
 rows (the kernel's peak counter reset first). Rows have six columns: a key,
@@ -29,7 +30,7 @@ from obstore.store import LocalStore  # noqa: E402
 from solera.keys.index import IndexState, KeyIndex  # noqa: E402
 from solera.keys.io import ObjectIO  # noqa: E402
 from solera.sdk import Output  # noqa: E402
-from solera.stores import key_rows  # noqa: E402
+from solera.stores.frames import prepare  # noqa: E402
 
 CASES = ("dicts", "flat", "arrow")
 EPOCH = dt.datetime(2026, 1, 1)
@@ -78,7 +79,7 @@ async def one(case: str, n: int) -> dict:
         base, _ = memory()
         reset_peak()
         t = time.perf_counter()
-        rows = await asyncio.to_thread(key_rows, value, out)
+        rows = (await asyncio.to_thread(prepare, value, out)).rows
         files, _ = await idx.replace(rows, 0, "bench")
         wall = time.perf_counter() - t
         _, peak = memory()

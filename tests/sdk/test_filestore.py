@@ -299,7 +299,7 @@ async def test_a_prepared_write_is_read_once_and_only_its_selection_taken(store,
 
     out = Output("frame", key="id")
     frame = pd.DataFrame({"id": [f"k{i}" for i in range(1000)], "n": range(1000)})
-    prepared = prepare(frame, out)
+    prepared = store.prepare(frame, out)  # FileStore takes DataFrames (`solera.stores.frames`)
     versions = dict(prepared.entries())
     taken = []
 

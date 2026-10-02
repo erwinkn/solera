@@ -45,6 +45,7 @@ class Store(Protocol):
     async def discard(self, scope, prior, items) -> None: ...   # immutable
     async def acquire(self, scope) -> None: ...                 # fenced
     async def migrate(self, output, migrations) -> list[str]: ...  # optional
+    def prepare(self, write, output) -> Prepared: ...          # optional: types of its own
 ```
 
 **`Scope`** — what a write belongs to:
@@ -78,6 +79,10 @@ write is the scope's whole content (a first write, or a `full` run).
   them into one. A store reading values of its own type defines
   `prepare(write, output)`.
 
+**`prepare(write, output)`** (optional) reads a keyed write of the types
+the store takes — see **Values a store takes** below. Without it, the
+store takes plain Python.
+
 **`load(ref, t, selection)`** materializes `t` (`list[dict]`, a DataFrame,
 …). `selection` is `None` (everything), `Keys` (key → `(version,
 locator)`: only those keys) or `Batches(lo, hi)`. An immutable store needs
@@ -101,6 +106,55 @@ wrong shape), `StoreError` for anything else the store refuses. A store
 call that raises after the attempt began writing leaves its writes
 *uncertain*: the next attempt repairs them (fenced stores keep the
 attempt's intents for that).
+
+## Values a store takes
+
+The framework knows plain Python only: a keyed write is a list of
+mappings, a by-key `{key: rows}`, a `keyed=True` dict or a partition
+set's elements, and `solera.stores.prepare` reads it. DataFrames, Arrow
+tables or a type of your own are a store's business: a store that takes
+them reads them in `prepare` — once, for the key index and for its own
+write — and says so in `can_store`, which registration checks against the
+producer's return annotation.
+
+- **Plain Python only:** define no `prepare`; `can_store` returns
+  `solera.stores.takes_plain(t)`.
+- **DataFrames and Arrow:** `solera.stores.frames` reads them, importing
+  pandas or pyarrow only for a value of their type. FileStore, S3Store
+  and PostgresStore use it:
+
+  ```python
+  from solera.stores import frames, takes_plain
+
+  class MyStore:
+      def prepare(self, write, output):
+          return frames.prepare(write, output)
+
+      def can_store(self, t, output):
+          return takes_plain(t) or frames.can_store(t)
+  ```
+
+- **A type of your own:** build the `Prepared` yourself — native `Rows`
+  of its keys and versions, and `take(indices)`, the rows it stores:
+
+  ```python
+  from solera.keys import Rows
+  from solera.stores import Prepared, prepare
+
+  def prepare(self, write, output):
+      if not isinstance(write, Sheet):
+          return prepare(write, output)            # plain Python, as the default
+      rows = [{"id": k, "amount": a} for k, a in write.lines]
+      return Prepared(output, Rows.records(rows, output.key), lambda at: rows if at is None else [rows[i] for i in at])
+  ```
+
+  Rows built from a columnar form keep it: `Rows.columns(names, columns,
+  key)` takes column lists, `Rows.arrow(data, key)` anything with
+  `__arrow_c_stream__`, without making a dict per row.
+
+What a store stores must digest as what `prepare` hashed
+(docs/row-digest.md): take the stored rows from the same reading, and
+refuse a value your backend would read back as another type.
 
 ## The invariants
 
@@ -187,8 +241,15 @@ PostgreSQL's; `param=` adapts placeholders for another driver, and any
 database with `INSERT … ON CONFLICT … DO UPDATE … WHERE … RETURNING` and
 row locks works the same way.
 
-Write keyed outputs as delete-then-insert of the keys in `upserts` and
-`removes` (or the whole slice for `whole`), or as a `MERGE`. A complete
+Declare the table's columns (`Output(..., columns={"n": "bigint"})`, and
+migrations to change them): a table a write creates from inferred types
+holds what that first write happened to show. PostgresStore infers them
+when undeclared — from a DataFrame's schema, else from every value not
+null — refuses a column it cannot type, and logs what it inferred.
+
+Write a keyed output page by page: for `whole`, clear the slice first;
+then for each of `write.pages()`, delete its keys and insert their rows
+(or `MERGE`); then delete `removes`. A complete
 example, which passes the conformance kit, is
 [`examples/json_table_store.py`](../examples/json_table_store.py).
 

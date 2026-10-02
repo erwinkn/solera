@@ -13,7 +13,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 from solera.fencing import fence, fence_table
 from solera.sdk import Ref, digest
-from solera.stores import Batches, KeyedWrite, Keys, Written
+from solera.stores import Batches, KeyedWrite, Keys, Written, takes_plain
 
 
 class JsonTableStore:
@@ -26,7 +26,7 @@ class JsonTableStore:
         return True
 
     def can_store(self, t, output) -> bool:
-        return True
+        return takes_plain(t)  # rows as Python: it defines no `prepare` of its own
 
     def _table(self, output) -> str:
         return f'"rows_{output.name}"'

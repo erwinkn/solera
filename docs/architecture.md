@@ -250,10 +250,10 @@ prior, items)`, or `"fenced"`, implementing `acquire(scope)` — how a writer
 the engine gave up on is kept from writing over a newer one. `stores.md`
 is the contract, with its invariants, recipes per backend and the
 scenarios `solera.testing.stores` checks. Optional: `prepare(write, output) -> Prepared` — how a
-keyed write of any type is read: its rows, natively, and how to take the
-rows it persists (the default, `solera.stores.prepare`, reads lists of
-mappings, pandas DataFrames and Arrow data, importing only the library of
-the value's own type); `stamped(output)` and `scan(ref, output, skip)` —
+keyed write of the types the store takes is read: its rows, natively, and
+how to take the rows it persists. The framework knows plain Python only
+(the default, `solera.stores.prepare`); DataFrames and Arrow are a store's
+to read (`solera.stores.frames`), and its `can_store` says what it takes; `stamped(output)` and `scan(ref, output, skip)` —
 the columns the store adds to every row, left out of their digests, and
 how a `Sql` write's rows are read back (row-digest.md); `shared_table`
 — one table for every partition, so a partitioned output needs a
@@ -288,15 +288,18 @@ the store, works out what changed, against the key index (§6):
 
 | Store | Accepts | Ref |
 |---|---|---|
-| `FileStore(path=None)` (default, built in) | anything: JSON when it round-trips, pickle otherwise. One file per value, partition, key or batch under `.solera/data` next to the project file (or `$SOLERA_DATA`) | `ObjectRef` |
+| `FileStore(path=None)` (default, built in) | anything: JSON when it round-trips, pickle otherwise; keyed rows as plain Python, DataFrames or Arrow. One file per value, partition, key or batch under `.solera/data` next to the project file (or `$SOLERA_DATA`) | `ObjectRef` |
 | `S3Store(url, **options)` | the same, in a bucket | `ObjectRef` |
-| `PostgresStore` | `DataFrame`, `GeoDataFrame`, `list[dict]`; `Sql` | `TableRef` |
+| `PostgresStore` | `list[dict]`, `DataFrame`, `GeoDataFrame`, Arrow; `Sql` | `TableRef` |
 
-PostgresStore stores what was hashed: a table a write creates types each
-undeclared column by the kind of every value not null in it (two kinds,
-or only nulls, want `columns=`), one a `Sql` SELECT creates by the SELECT's
-own types, and a value its column would read back as another type — `42`
-into a text column — is a write error. Its transactions run on a thread,
+Declare PostgresStore's columns (`Output(..., columns={...})`, changed by
+migrations). Undeclared, a table a write creates is typed from that
+write — a DataFrame's or Arrow table's schema (pyarrow's inference when it
+is installed, else pandas' dtypes), else the kind of every value not null
+in a column; two kinds, or only nulls, want `columns=`; what it inferred
+is logged once — and one a `Sql` SELECT creates by the SELECT's own
+types. It stores what was hashed: a value its column would read back as
+another type — `42` into a text column — is a write error. Its transactions run on a thread,
 off the worker's event loop.
 
 Secrets travel via `env:` indirection in store and resource config, resolved

@@ -14,8 +14,9 @@ driver installed; only `store`/`load` need it (in the harness).
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 from solera.sdk import KEYS, Output, Ref, TableRef, digest
@@ -32,9 +33,11 @@ from solera.stores import (
     WriteError,
     Written,
     by_key_type,
-    prepare,
+    frames,
     resolve_env,
 )
+
+log = logging.getLogger("solera.postgres")
 
 LEDGER_TABLE = "public.solera_migrations"
 FENCE_TABLE = "public.solera_generations"
@@ -142,11 +145,14 @@ class PostgresStore:
         rows: Callable[[], Iterable[dict]] | None = None,
         scope: Scope | None = None,
         inferred: dict | None = None,
+        kinds: Mapping[str, str | None] | None = None,
     ) -> dict[str, str]:
         """The table, created if missing, under the transaction's fence; its
         columns' types. A table the write creates takes the declared columns,
-        then those of a `Sql` SELECT (`inferred`), then those of the write's
-        rows (`rows()`, read only then), from every value not null."""
+        then those of a `Sql` SELECT (`inferred`), then the write's: each
+        column's kind as its reader knows it (`kinds`: a DataFrame's dtypes,
+        an Arrow schema), else the kind of every value not null in it
+        (`rows()`, read only then). Inferred columns are logged, once."""
 
         table, schema, table_name = self._table(output)
         indexes = self._indexes(output)
@@ -166,7 +172,18 @@ class PostgresStore:
         columns = dict(declared)
         existed = cur.execute(exists, (schema, table_name)).fetchone()
         if not existed and rows is not None:
-            columns = {**_column_types(output.name, rows(), declared), **declared}
+            known = {c: _COLUMNS[k] for c, k in (kinds or {}).items() if k is not None and c not in declared}
+            untyped = kinds is None or any(k is None for c, k in kinds.items() if c not in declared)
+            found = _column_types(output.name, rows(), {**declared, **known}) if untyped else {}
+            columns = {**known, **found, **declared}
+            if guessed := {c: t for c, t in columns.items() if c not in declared}:
+                log.warning(
+                    "%s: creating %s with inferred columns %s; declare them to keep them: "
+                    "Output(..., columns={...})",
+                    output.name,
+                    table,
+                    guessed,
+                )
         defs = [f"{_ident(c)} {_sql_type(t)}" for c, t in (columns or {"value": "jsonb"}).items()]
         if pk:
             defs.append(f"PRIMARY KEY ({', '.join(_ident(c) for c in pk)})")
@@ -402,9 +419,10 @@ class PostgresStore:
         """An unkeyed output's whole content: its version is the multiset of
         its rows (docs/row-digest.md), before the store stamps them."""
 
-        rows = _coerce_rows(write)
+        rows = frames.rows_of(write, output.name)
         version = _rows_version(rows, [])
-        types = self._ensure(cur, output, lambda: rows, scope)
+        kinds = frames.frame_kinds(write) if frames.is_frame(write) else None
+        types = self._ensure(cur, output, lambda: rows, scope, kinds=kinds)
         self._delete_slice(cur, table, slice_where)
         self._insert(cur, output, table, rows, types, self._stamps(output, scope))
         return version
@@ -418,7 +436,7 @@ class PostgresStore:
             raise WriteError(f"{output.name}: Patch requires an incremental output")
         if write.remove:
             raise WriteError(f"{output.name}: remove is not allowed on an unkeyed incremental output")
-        rows = _coerce_rows(write.rows)
+        rows = frames.rows_of(write.rows, output.name)
         if not rows and prior is not None:
             return None
         version = _rows_version(rows, [prior.version if prior else ""])
@@ -436,7 +454,9 @@ class PostgresStore:
 
         if not write.whole and write.upserts is None and not write.removes and not len(write.prepared.rows):
             return None  # a patch of nothing: the prior stands
-        types = self._ensure(cur, output, lambda: write.prepared.take(None), scope)
+        types = self._ensure(
+            cur, output, lambda: write.prepared.take(None), scope, kinds=write.prepared.kinds
+        )
         stamps = self._stamps(output, scope)
         if write.whole:
             self._delete_slice(cur, table, slice_where)
@@ -509,7 +529,7 @@ class PostgresStore:
         """A keyed write, read as the default reads it, without the columns the
         store stamps (`stamped`)."""
 
-        return prepare(write, output, self.stamped(output))
+        return frames.prepare(write, output, self.stamped(output))
 
     def stamped(self, output: Output) -> tuple[str, ...]:
         """Columns the store adds to every row — the partition column — which
@@ -694,19 +714,6 @@ class PostgresStore:
                 copy.write_row([row.get(c) for c in columns] + constant)
 
 
-def _coerce_rows(write: Any) -> list[dict]:
-    if write is None:
-        return []
-    if type(write).__name__ in ("DataFrame", "GeoDataFrame") and type(write).__module__.split(".")[0] in (
-        "pandas",
-        "geopandas",
-    ):
-        return write.to_dict(orient="records")
-    if isinstance(write, list) and all(isinstance(r, dict) for r in write):
-        return [dict(r) for r in write]
-    raise WriteError(f"Expected rows (list[dict] or DataFrame), got {type(write).__name__}")
-
-
 def _rows_version(rows: list[dict], before: list) -> str:
     """A version from rows as a multiset (`group`, docs/row-digest.md) and
     what comes before them (a prior version)."""
@@ -756,37 +763,6 @@ _COLUMNS = {
 }
 
 
-def _kind(value: Any) -> str | None:
-    """A Python value's kind; None for one the store cannot type."""
-
-    import datetime as dt
-    from decimal import Decimal
-
-    if isinstance(value, bool):
-        return "boolean"
-    if isinstance(value, int):
-        return "integer"
-    if isinstance(value, float):
-        return "float"
-    if isinstance(value, Decimal):
-        return "decimal"
-    if isinstance(value, str):
-        return "text"
-    if isinstance(value, dt.datetime):
-        return "timestamp" if value.utcoffset() is None else "instant"
-    if isinstance(value, dt.date):
-        return "date"
-    if isinstance(value, dt.time):
-        return "time"
-    if isinstance(value, dt.timedelta):
-        return "interval"
-    if isinstance(value, bytes | bytearray | memoryview):
-        return "bytes"
-    if type(value).__module__ == "numpy" and hasattr(value, "dtype"):
-        return {"b": "boolean", "i": "integer", "u": "integer", "f": "float"}.get(value.dtype.kind)
-    return None
-
-
 def _column_types(name: str, rows: Iterable[dict], declared: dict) -> dict[str, str]:
     """The columns a table the write creates gets for the undeclared ones:
     each from the kind of every value not null it holds. Two kinds in one
@@ -799,7 +775,7 @@ def _column_types(name: str, rows: Iterable[dict], declared: dict) -> dict[str, 
                 continue
             found = kinds.setdefault(column, set())
             if value is not None:
-                found.add(_kind(value))
+                found.add(frames.kind_of(value))
     columns = {}
     for column, found in kinds.items():
         if len(found) != 1 or None in found:
@@ -822,7 +798,7 @@ def _check_types(name: str, rows: list[dict], columns: list[str], types: dict) -
             continue  # a column the store does not type (json, arrays, …): taken as it is
         for row in rows:
             value = row.get(column)
-            if value is not None and (got := _kind(value)) != want:
+            if value is not None and (got := frames.kind_of(value)) != want:
                 raise WriteError(
                     f"{name}: column {column!r} is {types[column]}, but a row holds {got or type(value).__name__}"
                     f" {value!r}: it would read back as another value"

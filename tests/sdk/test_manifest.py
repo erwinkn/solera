@@ -212,6 +212,32 @@ def test_patch_and_result_annotations_say_nothing_of_the_payload():
     Project(assets=[patch, result, either])
 
 
+def test_a_dataframe_needs_a_store_that_reads_dataframes():
+    """§4: the core knows no DataFrame; a store takes one only if it reads it
+    (`Store.prepare`), and says so in `can_store`. A producer annotated to
+    return a DataFrame into a store of plain rows fails at registration."""
+
+    import pandas as pd
+    from solera.stores import takes_plain
+
+    class PlainStore(FileStore):
+        def can_store(self, t, output):
+            return takes_plain(t)
+
+    @asset(outputs=Output("rows", key="id", store="plain"))
+    def rows() -> pd.DataFrame:
+        return pd.DataFrame({"id": ["a"]})
+
+    with pytest.raises(RegistrationError, match="cannot store output rows .*Store.prepare"):
+        Project(assets=[rows], stores={"plain": PlainStore()})
+
+    @asset(outputs=Output("rows", key="id", store="plain"))
+    def listed() -> list[dict]:
+        return [{"id": "a"}]
+
+    Project(assets=[listed], stores={"plain": PlainStore()})
+
+
 def test_unannotated_store_bound_input():
     """§11: a store-bound input must be annotated."""
 

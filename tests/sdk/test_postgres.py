@@ -844,3 +844,25 @@ async def test_a_repair_read_back_waits_off_the_event_loop(store, monkeypatch):
     await worker._reconcile(o, {"attempt": "w2", "generation": 2})
     await ticking
     assert late[0] < 0.2, late
+
+
+async def test_a_dataframe_s_table_is_typed_by_its_dtypes_and_logged(store, caplog):
+    """A table a DataFrame creates takes its columns' types from its schema
+    (pyarrow's, when installed, else pandas' dtypes): a float column of NaN
+    alone is still a float column. The inferred columns are logged once,
+    with the hint to declare them."""
+
+    import logging
+    import math
+
+    import pandas as pd
+
+    out = output(key="id")
+    frame = pd.DataFrame({"id": ["a", "b"], "x": [math.nan, math.nan], "n": [1, 2]})
+    with caplog.at_level(logging.WARNING, logger="solera.postgres"):
+        written = await store.store(frame, None, scope(out))
+    [warning] = [r for r in caplog.records if r.name == "solera.postgres"]
+    assert "inferred columns" in warning.getMessage() and "columns=" in warning.getMessage()
+    later = pd.DataFrame({"id": ["c"], "x": [1.5], "n": [3]})
+    written = await store.store(later, written.ref, scope(out))
+    assert await store.load(written.ref, list[dict], None) == [{"id": "c", "x": 1.5, "n": 3}]

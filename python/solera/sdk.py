@@ -1453,7 +1453,8 @@ class Project:
                 if not store.can_store(t, output):
                     raise RegistrationError(
                         f"{name}: store {record['store']} cannot store output {output.name} "
-                        f"(type {t}, config {output.config})"
+                        f"(type {t}, config {output.config}): a store takes what its `can_store` "
+                        "says, plain Python unless it reads more itself (`Store.prepare`, docs/stores.md)"
                     )
                 if output.migrations:
                     names = []

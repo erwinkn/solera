@@ -259,7 +259,10 @@ def test_key_rows_shapes():
 
     import pandas as pd
     from solera.sdk import KEYS, Output
-    from solera.stores import WriteError, key_rows
+    from solera.stores import WriteError, frames
+
+    def key_rows(value, output):  # as a store taking DataFrames and Arrow reads them
+        return frames.prepare(value, output).rows
 
     rows = [{"id": 2, "v": "b"}, {"id": 1, "v": "a"}]
     declared = Output("t", key="id", revision="v")

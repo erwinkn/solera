@@ -46,7 +46,8 @@ uv run solera serve --insecure
 Installed as a package, `pip install solera` is the SDK and the worker —
 obstore, httpx, croniter and the native extension; `solera[server]` adds the
 engine, its API and run history (fastapi, uvicorn, duckdb), and
-`solera[postgres]` PostgresStore's driver. pandas and pyarrow are used when
+`solera[postgres]` PostgresStore's driver. The framework itself knows no
+DataFrame: the shipped stores take pandas and Arrow data, used when
 a value is of their type, never required: a worker of plain `list[dict]`
 outputs imports neither.
 

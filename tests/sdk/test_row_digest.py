@@ -171,10 +171,10 @@ def test_missing_is_null():
     assert python([{"id": "a", "x": math.nan}]) != python([{"id": "a"}])  # NaN is a value
     # pandas marks missing floats with NaN; a DataFrame reaches Arrow through DuckDB, which reads them as nulls.
     from solera.sdk import Output
-    from solera.stores import key_rows
+    from solera.stores import frames
 
     frame = pd.DataFrame([{"id": "a", "x": math.nan, "y": 1.0}, {"id": "b", "x": 2.0, "y": None}])
-    keys, versions = key_rows(frame, Output("t", key="id")).entries()
+    keys, versions = frames.prepare(frame, Output("t", key="id")).rows.entries()
     assert dict(zip(keys, versions, strict=True)) == python([{"id": "a", "y": 1.0}, {"id": "b", "x": 2.0}])
 
 
@@ -367,7 +367,7 @@ def _stored_again(value, out):
     """Each key's version as prepared, and as its groups — what a store
     persists — prepare again."""
 
-    from solera.stores import prepare
+    from solera.stores.frames import prepare
 
     prepared = prepare(value, out)
     versions = dict(prepared.entries())
@@ -382,7 +382,7 @@ def test_a_dataframe_is_stored_as_it_is_hashed():
     as the same rows given as mappings would."""
 
     from solera.sdk import Output
-    from solera.stores import prepare
+    from solera.stores.frames import prepare
 
     out = Output("t", key="id")
     frame = pd.DataFrame(
@@ -440,7 +440,8 @@ async def test_a_dataframe_read_back_from_a_store_digests_as_written(tmp_path):
 
     from solera.keys.index import key_str
     from solera.sdk import Output
-    from solera.stores import FileStore, Keys, prepare
+    from solera.stores import FileStore, Keys
+    from solera.stores.frames import prepare
 
     from tests.conftest import scope
 
@@ -451,3 +452,17 @@ async def test_a_dataframe_read_back_from_a_store_digests_as_written(tmp_path):
     versions = dict(prepare(frame, out).entries())
     read = await store.load(written.ref, None, Keys({k: (v, 1) for k, v in versions.items()}))
     assert {key_str(k.encode()): v for k, v in prepare(read, out).entries()} == versions
+
+
+def test_the_core_reads_plain_python_only():
+    """The default `prepare` knows no DataFrame or Arrow table: a store that
+    takes them reads them itself (`solera.stores.frames`)."""
+
+    from solera.sdk import Output
+    from solera.stores import WriteError, frames, prepare
+
+    out = Output("t", key="id")
+    for value in (pd.DataFrame({"id": ["a"]}), pa.table({"id": ["a"]})):
+        with pytest.raises(WriteError, match="reads plain rows"):
+            prepare(value, out)
+        assert dict(frames.prepare(value, out).entries()) == dict(prepare([{"id": "a"}], out).entries())

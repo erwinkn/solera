@@ -400,29 +400,30 @@ async def _load_whole(store, ref, t, keys_io, index_json):
     if index_json is None or store.writes != "immutable":
         return await store.load(ref, t, None)
     index = KeyIndex(keys_io, None, IndexState.from_json(index_json))
-    parts, after = [], None
+    paged = _plain(t)  # a type of the store's own (a DataFrame): one read, which the store makes
+    parts, entries, after = [], {}, None
     while True:
         keys, versions, locators, after = await index.page(after, REPAIR_PAGE)
-        entries = {key_str(k): (v, loc) for k, v, loc in zip(keys, versions, locators, strict=True)}
-        parts.append(await store.load(ref, t, Keys(entries)))
+        entries.update({key_str(k): (v, loc) for k, v, loc in zip(keys, versions, locators, strict=True)})
+        if paged:
+            parts.append(await store.load(ref, t, Keys(entries)))
+            entries = {}
         if after is None:
-            return _together(parts)
-
-
-def _together(parts: list):
-    """Pages of one read as one value: dicts merged, lists joined, frames concatenated."""
-
+            break
+    if not paged:
+        return await store.load(ref, t, Keys(entries))
     if len(parts) == 1:
         return parts[0]
     if all(isinstance(p, Mapping) for p in parts):
         return {k: v for p in parts for k, v in p.items()}
-    if all(isinstance(p, list) for p in parts):
-        return [item for p in parts for item in p]
-    if type(parts[0]).__name__ == "DataFrame":
-        import pandas as pd
+    return [item for p in parts for item in p]
 
-        return pd.concat(parts, ignore_index=True)
-    raise StoreError(f"cannot put pages of {type(parts[0]).__name__} together")
+
+def _plain(t) -> bool:
+    """Whether a read as `t` is plain Python — untyped, a list or a dict —
+    so its pages are put together here."""
+
+    return t is None or t in (list, dict) or typing.get_origin(t) in (list, dict, Mapping)
 
 
 def _dict_inner(t):
