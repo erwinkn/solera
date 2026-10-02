@@ -19,7 +19,6 @@ from .._native import (
     Rows,
     SortedRun,
     bloom_check_keys,
-    bloom_check_pairs,
     bloom_check_tombstones,
     check_block,
     decode_block,
@@ -32,7 +31,6 @@ from .._native import (
     parse_footer,
     parse_index,
     parse_tail,
-    sort_entries,
     write_files,
 )
 
@@ -47,7 +45,6 @@ __all__ = [
     "Rows",
     "SortedRun",
     "bloom_check_keys",
-    "bloom_check_pairs",
     "bloom_check_tombstones",
     "check_block",
     "decode_block",
@@ -60,6 +57,5 @@ __all__ = [
     "parse_footer",
     "parse_index",
     "parse_tail",
-    "sort_entries",
     "write_files",
 ]

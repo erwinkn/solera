@@ -12,13 +12,13 @@
 //! the file, and stops at a ceiling before writing past it.
 //!
 //! ```text
-//! file       := "KXL2" · blocks · tail · footer
+//! file       := "KXL3" · blocks · tail · footer
 //! block      := entries (as in `.kx` blocks, uncompressed) · restart offsets (u32 each)
 //! tail       := source size u64 · source digest (16 bytes) · source path (u32 len + bytes)
 //!               · blocks u32 · entries u64 · directory
 //! directory  := per block: first key, last key (varint len + bytes) · offset u64 (from the
 //!               file's start) · entries length u32 · restarts u32 · entries u32 · crc u32
-//! footer     := tail offset u64 · tail length u32 · tail crc u32 · "KXL2"
+//! footer     := tail offset u64 · tail length u32 · tail crc u32 · "KXL3"
 //! ```
 
 use std::collections::VecDeque;
@@ -39,7 +39,7 @@ use crate::rows::Source;
 use crate::run::SortedRun;
 use crate::stream::{read_entry, write_entry, Block, Merge, Next};
 
-pub const MAGIC: &[u8; 4] = b"KXL2";
+pub const MAGIC: &[u8; 4] = b"KXL3";
 pub const RESTART: usize = 16;
 const FOOTER: usize = 20;
 
@@ -77,10 +77,10 @@ impl LocalBlock {
     fn push(
         &mut self,
         key: &[u8],
-        version: &[u8],
+        generation: u64,
         deleted: bool,
-        locator: u64,
-        predecessor: Option<(&[u8], u64)>,
+        payload: Option<&[u8]>,
+        predecessor: Option<u64>,
     ) {
         if self.entries == 0 {
             self.first = key.to_vec();
@@ -95,9 +95,9 @@ impl LocalBlock {
             &mut self.buf,
             shared,
             &key[shared..],
-            version,
+            generation,
             deleted,
-            locator,
+            payload,
             predecessor,
         );
         self.prev.clear();
@@ -193,10 +193,10 @@ pub fn build(kx: &[u8], source: &str, digest: &[u8], out: &Path, max_bytes: u64)
             }
             local.push(
                 &key,
-                &data[f.version.0..f.version.1],
-                f.flags & 1 != 0,
-                f.locator,
-                f.predecessor.map(|((a, b), l)| (&data[a..b], l)),
+                f.generation,
+                f.deleted(),
+                f.payload(&data),
+                f.predecessor,
             );
             if local.buf.len() >= LOCAL_BLOCK {
                 let (bytes, d) = local.close(w.written);
@@ -242,9 +242,9 @@ pub fn build(kx: &[u8], source: &str, digest: &[u8], out: &Path, max_bytes: u64)
 /// An entry found by a lookup.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hit {
-    pub version: Vec<u8>,
+    pub generation: u64,
     pub deleted: bool,
-    pub locator: u64,
+    pub payload: Option<Vec<u8>>,
 }
 
 /// A local file, open: its directory in memory, its blocks read on demand.
@@ -454,9 +454,9 @@ impl Local {
                 std::cmp::Ordering::Less => continue,
                 std::cmp::Ordering::Equal => {
                     return Ok(Some(Hit {
-                        version: entries[f.version.0..f.version.1].to_vec(),
-                        deleted: f.flags & 1 != 0,
-                        locator: f.locator,
+                        generation: f.generation,
+                        deleted: f.deleted(),
+                        payload: f.payload(entries).map(<[u8]>::to_vec),
                     }))
                 }
                 std::cmp::Ordering::Greater => return Ok(None),
@@ -531,7 +531,7 @@ impl Snapshot {
             for i in 0..run.len() {
                 let hit = self.get(run.key(i))?;
                 let was = match &hit {
-                    Some(h) if !h.deleted => Old::Live(&h.version, h.locator),
+                    Some(h) if !h.deleted => Old::Live(h.generation, h.payload.as_deref()),
                     _ => Old::Absent,
                 };
                 d.apply(run.key(i), run.write(i), was)?;
@@ -578,7 +578,7 @@ impl Snapshot {
     /// deletions dropped with `drop_deleted` — as a sorted run, and the
     /// cursor to continue from: the last one's key, or None when nothing
     /// lies past it. Each run is read from the block holding `after`; past
-    /// `max_bytes` of keys and versions, an `Error::Limit`.
+    /// `max_bytes` of keys and payloads, an `Error::Limit`.
     pub fn scan(
         &self,
         after: Option<&[u8]>,
@@ -600,13 +600,11 @@ impl Snapshot {
                 let last = page.key(page.len() - 1).to_vec();
                 return Ok((page.shrink(), Some(last)));
             }
-            if (page.keys.data.len() + page.versions.data.len() + e.key().len() + e.version().len())
-                as u64
-                > max_bytes
-            {
+            let held = page.keys.data.len() + page.payloads.data.len();
+            if (held + e.key().len() + e.payload().map_or(0, <[u8]>::len)) as u64 > max_bytes {
                 return Err(Error::Limit(format!("a page over {max_bytes} bytes")));
             }
-            page.push(e.key(), e.version(), e.deleted(), e.locator())?;
+            page.push(e.key(), e.generation(), e.deleted(), e.payload())?;
         }
         Ok((page.shrink(), None))
     }
@@ -691,14 +689,14 @@ mod tests {
         codec: CODEC_ZLIB,
     };
 
-    fn kx(n: usize, tag: &str, step: usize, loc: u64) -> Vec<u8> {
+    fn kx(n: usize, tag: &str, step: usize, gen: u64) -> Vec<u8> {
         let keys: Vec<Vec<u8>> = (0..n)
             .map(|i| format!("k{:06}", i * step).into_bytes())
             .collect();
-        let vers: Vec<Vec<u8>> = (0..n).map(|i| format!("{tag}{i}").into_bytes()).collect();
+        let pays: Vec<Vec<u8>> = (0..n).map(|i| format!("{tag}{i}").into_bytes()).collect();
         let k: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
-        let v: Vec<&[u8]> = vers.iter().map(|v| v.as_slice()).collect();
-        encode_file(&k, &v, &vec![0; n], &vec![loc; n], &vec![None; n], O).unwrap()
+        let p: Vec<Option<&[u8]>> = pays.iter().map(|p| Some(p.as_slice())).collect();
+        encode_file(&k, &vec![gen; n], &vec![0; n], &p, &vec![None; n], O).unwrap()
     }
 
     fn local(dir: &Path, name: &str, data: &[u8]) -> Arc<Local> {
@@ -720,13 +718,13 @@ mod tests {
             let hit = s.get(format!("k{i:06}").as_bytes()).unwrap().unwrap();
             if i % 3 == 0 && i / 3 < 300 {
                 assert_eq!(
-                    (hit.version, hit.locator),
-                    (format!("n{}", i / 3).into_bytes(), 2)
+                    (hit.payload, hit.generation),
+                    (Some(format!("n{}", i / 3).into_bytes()), 2)
                 );
             } else {
                 assert_eq!(
-                    (hit.version, hit.locator),
-                    (format!("o{i}").into_bytes(), 1)
+                    (hit.payload, hit.generation),
+                    (Some(format!("o{i}").into_bytes()), 1)
                 );
             }
         }

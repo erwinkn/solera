@@ -11,8 +11,7 @@ use xxhash_rust::xxh3::xxh3_128;
 
 use crate::format::{
     compress, decompress_at_most, filter_nbits, fmt_err, get_varint, hash_positions, key_item,
-    pair_item, put_bytes, put_varint, shared_prefix, tomb_item, Error, Options, Result,
-    FORMAT_VERSION, MAGIC,
+    put_bytes, put_varint, shared_prefix, tomb_item, Error, Options, Result, FORMAT_VERSION, MAGIC,
 };
 
 /// Bytes owned elsewhere — a Python `bytes`, or a `Vec` in tests.
@@ -23,15 +22,26 @@ pub type Bytes = Arc<dyn AsRef<[u8]> + Send + Sync>;
 /// Entry flags (docs/key-index-format.md § Blocks).
 const DELETED: u8 = 1;
 const PREDECESSOR: u8 = 2;
+const PAYLOAD: u8 = 4;
 
 /// One encoded entry, its byte strings as ranges of the block.
 pub(crate) struct Fields {
     pub shared: usize,
     pub suffix: (usize, usize),
-    pub version: (usize, usize),
     pub flags: u8,
-    pub locator: u64,
-    pub predecessor: Option<((usize, usize), u64)>,
+    pub generation: u64,
+    pub payload: Option<(usize, usize)>,
+    pub predecessor: Option<u64>,
+}
+
+impl Fields {
+    pub fn deleted(&self) -> bool {
+        self.flags & DELETED != 0
+    }
+
+    pub fn payload<'a>(&self, raw: &'a [u8]) -> Option<&'a [u8]> {
+        self.payload.map(|(a, b)| &raw[a..b])
+    }
 }
 
 fn range(buf: &[u8], pos: &mut usize) -> Result<(usize, usize)> {
@@ -50,26 +60,30 @@ fn range(buf: &[u8], pos: &mut usize) -> Result<(usize, usize)> {
 pub(crate) fn read_entry(raw: &[u8], pos: &mut usize) -> Result<Fields> {
     let shared = get_varint(raw, pos)? as usize;
     let suffix = range(raw, pos)?;
-    let version = range(raw, pos)?;
     let Some(&flags) = raw.get(*pos) else {
         return fmt_err("truncated entry");
     };
     *pos += 1;
-    if flags & !(DELETED | PREDECESSOR) != 0 {
+    if flags & !(DELETED | PREDECESSOR | PAYLOAD) != 0 {
         return fmt_err("unknown entry flags");
     }
-    let locator = get_varint(raw, pos)?;
+    let generation = get_varint(raw, pos)?;
+    let payload = if flags & PAYLOAD != 0 {
+        Some(range(raw, pos)?)
+    } else {
+        None
+    };
     let predecessor = if flags & PREDECESSOR != 0 {
-        Some((range(raw, pos)?, get_varint(raw, pos)?))
+        Some(get_varint(raw, pos)?)
     } else {
         None
     };
     Ok(Fields {
         shared,
         suffix,
-        version,
         flags,
-        locator,
+        generation,
+        payload,
         predecessor,
     })
 }
@@ -79,26 +93,28 @@ pub(crate) fn write_entry(
     out: &mut Vec<u8>,
     shared: usize,
     suffix: &[u8],
-    version: &[u8],
+    generation: u64,
     deleted: bool,
-    locator: u64,
-    predecessor: Option<(&[u8], u64)>,
+    payload: Option<&[u8]>,
+    predecessor: Option<u64>,
 ) {
     put_varint(out, shared as u64);
     put_bytes(out, suffix);
-    put_bytes(out, version);
     out.push(
         if deleted { DELETED } else { 0 }
             | if predecessor.is_some() {
                 PREDECESSOR
             } else {
                 0
-            },
+            }
+            | if payload.is_some() { PAYLOAD } else { 0 },
     );
-    put_varint(out, locator);
-    if let Some((v, l)) = predecessor {
-        put_bytes(out, v);
-        put_varint(out, l);
+    put_varint(out, generation);
+    if let Some(p) = payload {
+        put_bytes(out, p);
+    }
+    if let Some(g) = predecessor {
+        put_varint(out, g);
     }
 }
 
@@ -106,13 +122,13 @@ pub(crate) fn write_entry(
 struct Ent {
     key: u32,
     key_len: u32,
-    ver: (u32, u32),
+    generation: u64,
     deleted: bool,
-    locator: u64,
-    predecessor: Option<((u32, u32), u64)>,
+    payload: Option<(u32, u32)>,
+    predecessor: Option<u64>,
 }
 
-/// A decoded block: whole keys in one arena, versions in place in the raw bytes.
+/// A decoded block: whole keys in one arena, payloads in place in the raw bytes.
 pub struct Block {
     raw: Vec<u8>,
     keys: Vec<u8>,
@@ -148,10 +164,10 @@ impl Block {
             ents.push(Ent {
                 key: key as u32,
                 key_len: prev_len as u32,
-                ver: r(f.version),
-                deleted: f.flags & DELETED != 0,
-                locator: f.locator,
-                predecessor: f.predecessor.map(|(v, l)| (r(v), l)),
+                generation: f.generation,
+                deleted: f.deleted(),
+                payload: f.payload.map(r),
+                predecessor: f.predecessor,
             });
         }
         Ok(Block { raw, keys, ents })
@@ -172,9 +188,8 @@ impl Block {
     }
 
     #[inline]
-    pub fn version(&self, i: usize) -> &[u8] {
-        let (a, b) = self.ents[i].ver;
-        &self.raw[a as usize..b as usize]
+    pub fn generation(&self, i: usize) -> u64 {
+        self.ents[i].generation
     }
 
     #[inline]
@@ -183,15 +198,15 @@ impl Block {
     }
 
     #[inline]
-    pub fn locator(&self, i: usize) -> u64 {
-        self.ents[i].locator
+    pub fn payload(&self, i: usize) -> Option<&[u8]> {
+        self.ents[i]
+            .payload
+            .map(|(a, b)| &self.raw[a as usize..b as usize])
     }
 
-    /// The version and locator the key had before this entry (delta files only).
-    pub fn predecessor(&self, i: usize) -> Option<(&[u8], u64)> {
-        self.ents[i]
-            .predecessor
-            .map(|((a, b), l)| (&self.raw[a as usize..b as usize], l))
+    /// The generation the key had before this entry (delta files only).
+    pub fn predecessor(&self, i: usize) -> Option<u64> {
+        self.ents[i].predecessor
     }
 }
 
@@ -412,8 +427,8 @@ impl Merge {
     }
 
     #[inline]
-    pub fn version(&self) -> &[u8] {
-        self.runs[self.cur.0].block().version(self.cur.1)
+    pub fn generation(&self) -> u64 {
+        self.runs[self.cur.0].block().generation(self.cur.1)
     }
 
     #[inline]
@@ -422,16 +437,16 @@ impl Merge {
     }
 
     #[inline]
-    pub fn locator(&self) -> u64 {
-        self.runs[self.cur.0].block().locator(self.cur.1)
+    pub fn payload(&self) -> Option<&[u8]> {
+        self.runs[self.cur.0].block().payload(self.cur.1)
     }
 
     /// The older entries of the current key the merge passed over, newest
-    /// first: `(version, deleted, locator)`. Readable until the next call.
-    pub fn shadowed(&self) -> impl Iterator<Item = (&[u8], bool, u64)> {
+    /// first: `(deleted, generation)`. Readable until the next call.
+    pub fn shadowed(&self) -> impl Iterator<Item = (bool, u64)> + '_ {
         self.shadowed.iter().map(|&(r, i)| {
             let b = self.runs[r].block();
-            (b.version(i), b.deleted(i), b.locator(i))
+            (b.deleted(i), b.generation(i))
         })
     }
 }
@@ -455,13 +470,12 @@ struct Packed {
     last: Vec<u8>,
     count: u64,
     keys: Vec<u128>,
-    pairs: Vec<u128>,
     tombs: Vec<u128>,
 }
 
 /// Compresses a raw block and hashes its filter items.
 fn pack(b: RawBlock, o: &Options) -> Result<Packed> {
-    let (mut keys, mut pairs, mut tombs) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut keys, mut tombs) = (Vec::new(), Vec::new());
     let (mut pos, raw) = (0usize, &b.data);
     let mut key: Vec<u8> = Vec::new();
     let mut item = Vec::new();
@@ -469,16 +483,11 @@ fn pack(b: RawBlock, o: &Options) -> Result<Packed> {
         let f = read_entry(raw, &mut pos)?;
         key.truncate(f.shared);
         key.extend_from_slice(&raw[f.suffix.0..f.suffix.1]);
-        let version = &raw[f.version.0..f.version.1];
-        let deleted = f.flags & DELETED != 0;
         key_item(&mut item, &key);
         keys.push(xxh3_128(&item));
-        if deleted {
+        if f.deleted() {
             tomb_item(&mut item, &key);
             tombs.push(xxh3_128(&item));
-        } else {
-            pair_item(&mut item, &key, version);
-            pairs.push(xxh3_128(&item));
         }
     }
     let data = compress(&b.data, o.codec, o.level);
@@ -489,7 +498,6 @@ fn pack(b: RawBlock, o: &Options) -> Result<Packed> {
         last: b.last,
         count: b.count,
         keys,
-        pairs,
         tombs,
     })
 }
@@ -512,7 +520,6 @@ struct FileBuf {
     out: Vec<u8>,
     index: Vec<(Vec<u8>, u64, u64, u64, u32)>,
     keys: Vec<u128>,
-    pairs: Vec<u128>,
     tombs: Vec<u128>,
     min: Vec<u8>,
     max: Vec<u8>,
@@ -533,7 +540,6 @@ impl FileBuf {
         ));
         self.out.extend_from_slice(&p.data);
         self.keys.extend_from_slice(&p.keys);
-        self.pairs.extend_from_slice(&p.pairs);
         self.tombs.extend_from_slice(&p.tombs);
         self.max = p.last;
         self.entries += p.count;
@@ -544,15 +550,13 @@ impl FileBuf {
             mut out,
             index,
             keys,
-            pairs,
             tombs,
             min,
             max,
             entries,
         } = self;
-        let mut filters = Vec::with_capacity((keys.len() + pairs.len() + tombs.len()) * 2 + 256);
+        let mut filters = Vec::with_capacity((keys.len() + tombs.len()) * 2 + 256);
         filter(&keys, o, &mut filters);
-        filter(&pairs, o, &mut filters);
         filter(&tombs, o, &mut filters);
         let crc = crc32fast::hash(&filters);
         filters.extend_from_slice(&crc.to_le_bytes());
@@ -626,10 +630,10 @@ impl Writer {
     pub fn push(
         &mut self,
         key: &[u8],
-        version: &[u8],
+        generation: u64,
         deleted: bool,
-        locator: u64,
-        predecessor: Option<(&[u8], u64)>,
+        payload: Option<&[u8]>,
+        predecessor: Option<u64>,
     ) -> Result<()> {
         if self.started && key <= self.prev.as_slice() {
             return Err(Error::Value(format!(
@@ -649,9 +653,9 @@ impl Writer {
             &mut self.block,
             shared,
             &key[shared..],
-            version,
+            generation,
             deleted,
-            locator,
+            payload,
             predecessor,
         );
         self.prev.clear();
@@ -692,7 +696,7 @@ impl Writer {
         for p in packed {
             self.file.add(p);
             // The file so far: its blocks, and the filters they will need.
-            let items = self.file.keys.len() + self.file.pairs.len() + self.file.tombs.len();
+            let items = self.file.keys.len() + self.file.tombs.len();
             if self.file.out.len() + items * self.o.bits_per_item as usize / 8
                 >= self.max_file_bytes
             {
@@ -731,11 +735,11 @@ mod tests {
         codec: CODEC_ZLIB,
     };
 
-    fn entries(n: usize, tag: &str, step: usize) -> Vec<(Vec<u8>, Vec<u8>, bool)> {
+    fn entries(n: usize, tag: u64, step: usize) -> Vec<(Vec<u8>, u64, bool)> {
         (0..n)
             .map(|i| {
                 let k = format!("key-{:06}", i * step).into_bytes();
-                (k, format!("{tag}{i}").into_bytes(), i % 7 == 3)
+                (k, tag * 100_000 + i as u64, i % 7 == 3)
             })
             .collect()
     }
@@ -756,10 +760,11 @@ mod tests {
             .collect()
     }
 
-    fn write(es: &[(Vec<u8>, Vec<u8>, bool)], max: usize) -> Vec<Vec<u8>> {
+    fn write(es: &[(Vec<u8>, u64, bool)], max: usize) -> Vec<Vec<u8>> {
         let mut w = Writer::new(O, max);
-        for (k, v, d) in es {
-            w.push(k, v, *d, 7, None).unwrap();
+        for (k, g, d) in es {
+            w.push(k, *g, *d, (*g % 2 == 0).then_some(b"p".as_slice()), None)
+                .unwrap();
         }
         w.finish(true).unwrap();
         w.files.into_iter().collect()
@@ -767,15 +772,18 @@ mod tests {
 
     #[test]
     fn writer_matches_encode_file() {
-        let es = entries(3000, "v", 1);
+        let es = entries(3000, 1, 1);
         let files = write(&es, usize::MAX);
         assert_eq!(files.len(), 1);
         let ks: Vec<&[u8]> = es.iter().map(|e| e.0.as_slice()).collect();
-        let vs: Vec<&[u8]> = es.iter().map(|e| e.1.as_slice()).collect();
+        let gs: Vec<u64> = es.iter().map(|e| e.1).collect();
         let ds: Vec<u8> = es.iter().map(|e| e.2 as u8).collect();
-        let ls = vec![7u64; ks.len()];
-        let ps = vec![None; ks.len()];
-        assert_eq!(files[0], encode_file(&ks, &vs, &ds, &ls, &ps, O).unwrap());
+        let ps: Vec<Option<&[u8]>> = gs
+            .iter()
+            .map(|g| (g % 2 == 0).then_some(b"p".as_slice()))
+            .collect();
+        let pre = vec![None; ks.len()];
+        assert_eq!(files[0], encode_file(&ks, &gs, &ds, &ps, &pre, O).unwrap());
         assert_eq!(
             write(&[], usize::MAX),
             vec![encode_file(&[], &[], &[], &[], &[], O).unwrap()]
@@ -784,8 +792,8 @@ mod tests {
 
     #[test]
     fn merge_newest_wins_across_split_files() {
-        let old = entries(4000, "old", 1);
-        let new = entries(1500, "new", 2);
+        let old = entries(4000, 1, 1);
+        let new = entries(1500, 2, 2);
         let old_files = write(&old, 4096);
         assert!(old_files.len() > 3);
         let new_files = write(&new, usize::MAX);
@@ -797,7 +805,7 @@ mod tests {
         let mut got = Vec::new();
         loop {
             match m.next_key().unwrap() {
-                Next::Entry => got.push((m.key().to_vec(), m.version().to_vec(), m.deleted())),
+                Next::Entry => got.push((m.key().to_vec(), m.generation(), m.deleted())),
                 Next::Need(r) => match feeds[r].pop_front() {
                     Some(s) => m.runs[r].feed(s),
                     None => m.runs[r].end(),
@@ -805,23 +813,28 @@ mod tests {
                 Next::End => break,
             }
         }
-        let mut want: std::collections::BTreeMap<Vec<u8>, (Vec<u8>, bool)> =
-            old.into_iter().map(|(k, v, d)| (k, (v, d))).collect();
-        for (k, v, d) in new {
-            want.insert(k, (v, d));
+        let mut want: std::collections::BTreeMap<Vec<u8>, (u64, bool)> =
+            old.into_iter().map(|(k, g, d)| (k, (g, d))).collect();
+        for (k, g, d) in new {
+            want.insert(k, (g, d));
         }
-        let want: Vec<_> = want.into_iter().map(|(k, (v, d))| (k, v, d)).collect();
+        let want: Vec<_> = want.into_iter().map(|(k, (g, d))| (k, g, d)).collect();
         assert_eq!(got, want);
         // Blocks decode the same as the reference decoder.
         let (codec, blocks) = file_blocks(&old_files[0]).unwrap();
         let b = &blocks[0];
         let raw = &old_files[0][b.offset as usize..(b.offset + b.size) as usize];
-        let (ks, vs, fs, _, _) = decode_block(raw, codec).unwrap();
+        let ((ks, gs, fs, ps), _) = decode_block(raw, codec).unwrap();
         let blk = Block::decode(raw, codec).unwrap();
         for i in 0..ks.len() {
             assert_eq!(
-                (blk.key(i), blk.version(i), blk.deleted(i)),
-                (&ks[i][..], &vs[i][..], fs[i] != 0)
+                (
+                    blk.key(i),
+                    blk.generation(i),
+                    blk.deleted(i),
+                    blk.payload(i)
+                ),
+                (&ks[i][..], gs[i], fs[i] != 0, ps[i].as_deref())
             );
         }
     }

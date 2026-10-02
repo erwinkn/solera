@@ -5,17 +5,16 @@
 //! `solera/keys/_python.py`, the format's reference. Jobs stream over a whole
 //! index — a full replacement, a compaction, a recount: a `Job` asks for the
 //! file segments it needs and hands back the files it writes, and Python does
-//! the I/O in between. Keys, versions and file contents cross the boundary
-//! as `bytes`; flags as a `bytes` with one byte per entry.
+//! the I/O in between. Keys, payloads and file contents cross the boundary
+//! as `bytes` (a payload `None` where an entry carries none), generations
+//! as `int`, flags as a `bytes` with one byte per entry.
 
 pub mod arrow;
 pub mod delta;
-pub mod digest;
 pub mod format;
 pub mod garbage;
 pub mod jobs;
 pub mod local;
-mod pyvalue;
 pub mod rows;
 pub mod run;
 pub mod sort;
@@ -35,7 +34,7 @@ use pyo3::types::{PyBool, PyBytes, PyCapsule, PyDict, PyInt, PyList, PyString};
 use format::{Error, Options};
 use jobs::{Compact, Count, Join, Step};
 use rayon::prelude::*;
-use rows::{Arena, Constant, Cursor, Overlay, Source, Stream, Table, Versions};
+use rows::{Arena, Constant, Cursor, Overlay, Payloads, Source, Stream, Table};
 use stream::Segment;
 
 create_exception!(
@@ -88,6 +87,21 @@ fn arena_list<'py>(py: Python<'py>, a: &Arena) -> PyResult<Bound<'py, PyList>> {
     PyList::new(py, (0..a.len()).map(|i| PyBytes::new(py, a.get(i))))
 }
 
+/// Payloads as a list: `bytes`, or None where an entry carries none.
+fn payload_list<'py, 'a>(
+    py: Python<'py>,
+    items: impl IntoIterator<Item = Option<&'a [u8]>>,
+) -> PyResult<Bound<'py, PyList>> {
+    let out = PyList::empty(py);
+    for p in items {
+        match p {
+            Some(b) => out.append(PyBytes::new(py, b))?,
+            None => out.append(py.None())?,
+        }
+    }
+    Ok(out)
+}
+
 fn options(block_size: usize, level: u32, bits_per_item: u64, k: u8, codec: u8) -> Options {
     Options {
         block_size,
@@ -100,39 +114,39 @@ fn options(block_size: usize, level: u32, bits_per_item: u64, k: u8, codec: u8) 
 
 // -- kernels ----------------------------------------------------------------------------
 
-/// Optional per-entry columns: locators (0 when absent), and the predecessor
-/// `(version, locator)` of a delta entry's key, or None.
-type Extra = (Vec<u64>, Vec<Option<(PyBackedBytes, u64)>>);
+/// Optional per-entry columns: payloads and, a delta entry's, the
+/// generation of the key before it, each None where an entry has none.
+type Extra = (Vec<Option<PyBackedBytes>>, Vec<Option<u64>>);
 
 fn extra(
     n: usize,
-    locators: Option<Vec<u64>>,
-    predecessors: Option<Vec<Option<(PyBackedBytes, u64)>>>,
+    payloads: Option<Vec<Option<PyBackedBytes>>>,
+    predecessors: Option<Vec<Option<u64>>>,
 ) -> PyResult<Extra> {
-    let locators = locators.unwrap_or_else(|| vec![0; n]);
-    let predecessors = predecessors.unwrap_or_else(|| (0..n).map(|_| None).collect());
-    if locators.len() != n || predecessors.len() != n {
+    let payloads = payloads.unwrap_or_else(|| (0..n).map(|_| None).collect());
+    let predecessors = predecessors.unwrap_or_else(|| vec![None; n]);
+    if payloads.len() != n || predecessors.len() != n {
         return Err(PyValueError::new_err(
-            "locators and predecessors must have one item per key",
+            "payloads and predecessors must have one item per key",
         ));
     }
-    Ok((locators, predecessors))
+    Ok((payloads, predecessors))
 }
 
-fn prev(p: &Option<(PyBackedBytes, u64)>) -> format::Predecessor<'_> {
-    p.as_ref().map(|(v, l)| (v.as_ref(), *l))
+fn opt(p: &Option<PyBackedBytes>) -> Option<&[u8]> {
+    p.as_ref().map(|b| b.as_ref())
 }
 
 #[pyfunction]
-#[pyo3(signature = (keys, versions, deleted, *, locators=None, predecessors=None, block_size=65536, level=1, bits_per_item=14, k=10, codec=1))]
+#[pyo3(signature = (keys, generations, deleted, *, payloads=None, predecessors=None, block_size=65536, level=1, bits_per_item=14, k=10, codec=1))]
 #[allow(clippy::too_many_arguments)]
 fn encode_file<'py>(
     py: Python<'py>,
     keys: Vec<PyBackedBytes>,
-    versions: Vec<PyBackedBytes>,
+    generations: Vec<u64>,
     deleted: PyBackedBytes,
-    locators: Option<Vec<u64>>,
-    predecessors: Option<Vec<Option<(PyBackedBytes, u64)>>>,
+    payloads: Option<Vec<Option<PyBackedBytes>>>,
+    predecessors: Option<Vec<Option<u64>>>,
     block_size: usize,
     level: u32,
     bits_per_item: u64,
@@ -140,15 +154,15 @@ fn encode_file<'py>(
     codec: u8,
 ) -> PyResult<Bound<'py, PyBytes>> {
     let o = options(block_size, level, bits_per_item, k, codec);
-    let (locators, predecessors) = extra(keys.len(), locators, predecessors)?;
+    let (payloads, predecessors) = extra(keys.len(), payloads, predecessors)?;
     let out = py
         .detach(|| {
-            let predecessors: Vec<format::Predecessor> = predecessors.iter().map(prev).collect();
+            let payloads: Vec<Option<&[u8]>> = payloads.iter().map(opt).collect();
             format::encode_file(
                 &slices(&keys),
-                &slices(&versions),
+                &generations,
                 &deleted,
-                &locators,
+                &payloads,
                 &predecessors,
                 o,
             )
@@ -159,15 +173,15 @@ fn encode_file<'py>(
 
 /// Entries (sorted, unique keys) as files of about `max_file_bytes` each.
 #[pyfunction]
-#[pyo3(signature = (keys, versions, deleted, *, locators=None, predecessors=None, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864))]
+#[pyo3(signature = (keys, generations, deleted, *, payloads=None, predecessors=None, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864))]
 #[allow(clippy::too_many_arguments)]
 fn write_files<'py>(
     py: Python<'py>,
     keys: Vec<PyBackedBytes>,
-    versions: Vec<PyBackedBytes>,
+    generations: Vec<u64>,
     deleted: PyBackedBytes,
-    locators: Option<Vec<u64>>,
-    predecessors: Option<Vec<Option<(PyBackedBytes, u64)>>>,
+    payloads: Option<Vec<Option<PyBackedBytes>>>,
+    predecessors: Option<Vec<Option<u64>>>,
     block_size: usize,
     level: u32,
     bits_per_item: u64,
@@ -175,12 +189,12 @@ fn write_files<'py>(
     codec: u8,
     max_file_bytes: usize,
 ) -> PyResult<Bound<'py, PyList>> {
-    if versions.len() != keys.len() || deleted.len() != keys.len() {
+    if generations.len() != keys.len() || deleted.len() != keys.len() {
         return Err(PyValueError::new_err(
-            "keys, versions and deleted must have the same length",
+            "keys, generations and deleted must have the same length",
         ));
     }
-    let (locators, predecessors) = extra(keys.len(), locators, predecessors)?;
+    let (payloads, predecessors) = extra(keys.len(), payloads, predecessors)?;
     let o = options(block_size, level, bits_per_item, k, codec);
     let files = py
         .detach(|| {
@@ -188,10 +202,10 @@ fn write_files<'py>(
             for i in 0..keys.len() {
                 w.push(
                     &keys[i],
-                    &versions[i],
+                    generations[i],
                     deleted[i] != 0,
-                    locators[i],
-                    prev(&predecessors[i]),
+                    opt(&payloads[i]),
+                    predecessors[i],
                 )?;
             }
             w.finish(false)?;
@@ -203,29 +217,23 @@ fn write_files<'py>(
 
 type Block5<'py> = (
     Bound<'py, PyList>,
-    Bound<'py, PyList>,
-    Bound<'py, PyBytes>,
     Vec<u64>,
+    Bound<'py, PyBytes>,
     Bound<'py, PyList>,
+    Vec<Option<u64>>,
 );
 
-/// A block's keys, versions, deleted flags, locators, and each entry's predecessor `(version, locator)` or None.
+/// A block's keys, generations, deleted flags, payloads, and each entry's
+/// predecessor generation or None.
 #[pyfunction]
 fn decode_block<'py>(py: Python<'py>, data: PyBackedBytes, codec: u8) -> PyResult<Block5<'py>> {
-    let (keys, versions, flags, locators, prev) =
+    let ((keys, generations, flags, payloads), predecessors) =
         format::decode_block(&data, codec).map_err(to_py)?;
-    let predecessors = PyList::empty(py);
-    for p in prev {
-        match p {
-            Some((v, l)) => predecessors.append((PyBytes::new(py, &v), l))?,
-            None => predecessors.append(py.None())?,
-        }
-    }
     Ok((
         list_of_bytes(py, &keys)?,
-        list_of_bytes(py, &versions)?,
+        generations,
         PyBytes::new(py, &flags),
-        locators,
+        payload_list(py, payloads.iter().map(Option::as_deref))?,
         predecessors,
     ))
 }
@@ -258,56 +266,14 @@ fn bloom_check_tombstones<'py>(
     )
 }
 
-#[pyfunction]
-fn bloom_check_pairs<'py>(
-    py: Python<'py>,
-    bits: PyBackedBytes,
-    nbits: u64,
-    k: u8,
-    keys: Vec<PyBackedBytes>,
-    versions: Vec<PyBackedBytes>,
-) -> PyResult<Bound<'py, PyBytes>> {
-    if keys.len() != versions.len() {
-        return Err(PyValueError::new_err(
-            "keys and versions must have the same length",
-        ));
-    }
-    Ok(PyBytes::new(
-        py,
-        &format::bloom_check_pairs(&bits, nbits, k, &slices(&keys), &slices(&versions)),
-    ))
-}
-
-#[pyfunction]
-fn sort_entries<'py>(
-    py: Python<'py>,
-    keys: Vec<Bound<'py, PyBytes>>,
-    versions: Vec<Bound<'py, PyBytes>>,
-    deleted: PyBackedBytes,
-) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyList>, Bound<'py, PyBytes>)> {
-    let n = keys.len();
-    if versions.len() != n || deleted.len() != n {
-        return Err(PyValueError::new_err(
-            "keys, versions and deleted must have the same length",
-        ));
-    }
-    let key_slices: Vec<&[u8]> = keys.iter().map(|b| b.as_bytes()).collect();
-    let order = format::sort_order(&key_slices).map_err(to_py)?;
-    // Hand back the original bytes objects, reordered: no copies.
-    let sk = PyList::new(py, order.iter().map(|&i| keys[i].clone()))?;
-    let sv = PyList::new(py, order.iter().map(|&i| versions[i].clone()))?;
-    let sd: Vec<u8> = order.iter().map(|&i| deleted[i]).collect();
-    Ok((sk, sv, PyBytes::new(py, &sd)))
-}
-
 type Found<'py> = (
     Bound<'py, PyBytes>,
-    Bound<'py, PyList>,
-    Bound<'py, PyBytes>,
     Vec<u64>,
+    Bound<'py, PyBytes>,
+    Bound<'py, PyList>,
 );
 
-/// Per sorted key: found, version, deleted, locator.
+/// Per sorted key: found, generation, deleted, payload.
 #[pyfunction]
 fn lookup<'py>(
     py: Python<'py>,
@@ -315,25 +281,35 @@ fn lookup<'py>(
     codec: u8,
     keys: Vec<PyBackedBytes>,
 ) -> PyResult<Found<'py>> {
-    let (found, versions, deleted, locators) =
+    let (found, generations, deleted, payloads) =
         format::lookup(&slices(&blocks), codec, &slices(&keys)).map_err(to_py)?;
     Ok((
         PyBytes::new(py, &found),
-        list_of_bytes(py, &versions)?,
+        generations,
         PyBytes::new(py, &deleted),
-        locators,
+        payload_list(py, payloads.iter().map(Option::as_deref))?,
     ))
 }
 
 type Merged<'py> = (
     Bound<'py, PyList>,
-    Bound<'py, PyList>,
-    Bound<'py, PyBytes>,
     Vec<u64>,
+    Bound<'py, PyBytes>,
+    Bound<'py, PyList>,
 );
 
-/// The merged view's keys, versions, deleted flags and locators: `runs` are
-/// each a file's consecutive blocks, `codecs` each run's file's codec.
+fn merged<'py>(py: Python<'py>, m: format::Merged) -> PyResult<Merged<'py>> {
+    let (k, g, f, p) = m;
+    Ok((
+        list_of_bytes(py, &k)?,
+        g,
+        PyBytes::new(py, &f),
+        payload_list(py, p.iter().map(Option::as_deref))?,
+    ))
+}
+
+/// The merged view's keys, generations, deleted flags and payloads: `runs`
+/// are each a file's consecutive blocks, `codecs` each run's file's codec.
 #[pyfunction]
 fn merge_range<'py>(
     py: Python<'py>,
@@ -344,7 +320,7 @@ fn merge_range<'py>(
     drop_deleted: bool,
 ) -> PyResult<Merged<'py>> {
     let runs: Vec<Vec<&[u8]>> = runs.iter().map(|r| slices(r)).collect();
-    let (k, v, f, l) = format::merge_range(
+    let m = format::merge_range(
         &runs,
         &codecs,
         after.as_ref().map(|a| a.as_ref()),
@@ -352,16 +328,12 @@ fn merge_range<'py>(
         drop_deleted,
     )
     .map_err(to_py)?;
-    Ok((
-        list_of_bytes(py, &k)?,
-        list_of_bytes(py, &v)?,
-        PyBytes::new(py, &f),
-        l,
-    ))
+    merged(py, m)
 }
 
-/// A bounded page of the merged view (`format::merge_page`): keys, versions,
-/// deleted flags, locators, the last key examined, and whether more follow.
+/// A bounded page of the merged view (`format::merge_page`): keys,
+/// generations, deleted flags, payloads, the last key examined, and whether
+/// more follow.
 #[pyfunction]
 #[pyo3(signature = (runs, codecs, after, bound, limit, drop_deleted))]
 #[allow(clippy::type_complexity)]
@@ -375,9 +347,9 @@ fn merge_page<'py>(
     drop_deleted: bool,
 ) -> PyResult<(
     Bound<'py, PyList>,
-    Bound<'py, PyList>,
-    Bound<'py, PyBytes>,
     Vec<u64>,
+    Bound<'py, PyBytes>,
+    Bound<'py, PyList>,
     Option<Bound<'py, PyBytes>>,
     bool,
 )> {
@@ -394,28 +366,23 @@ fn merge_page<'py>(
             )
         })
         .map_err(to_py)?;
-    let (k, v, f, l) = page.entries;
+    let (k, g, f, p) = merged(py, page.entries)?;
     Ok((
-        list_of_bytes(py, &k)?,
-        list_of_bytes(py, &v)?,
-        PyBytes::new(py, &f),
-        l,
+        k,
+        g,
+        f,
+        p,
         page.last.map(|k| PyBytes::new(py, &k)),
         page.more,
     ))
 }
 
 /// Every entry of a garbage file (docs/key-index-format.md § Garbage files):
-/// keys, versions, locators.
+/// keys, generations.
 #[pyfunction]
-fn decode_garbage<'py>(py: Python<'py>, data: &[u8]) -> PyResult<Merged<'py>> {
-    let (k, v, l) = garbage::decode(data).map_err(to_py)?;
-    Ok((
-        list_of_bytes(py, &k)?,
-        list_of_bytes(py, &v)?,
-        PyBytes::new(py, &vec![0u8; l.len()]),
-        l,
-    ))
+fn decode_garbage<'py>(py: Python<'py>, data: &[u8]) -> PyResult<(Bound<'py, PyList>, Vec<u64>)> {
+    let (k, g) = garbage::decode(data).map_err(to_py)?;
+    Ok((list_of_bytes(py, &k)?, g))
 }
 
 // -- tails ----------------------------------------------------------------------------
@@ -463,10 +430,7 @@ fn parse_index<'py>(py: Python<'py>, part: &[u8], file_size: u64) -> PyResult<Bo
 fn parse_tail<'py>(py: Python<'py>, tail: &[u8], file_size: u64) -> PyResult<Bound<'py, PyDict>> {
     let d = parse_index(py, tail, file_size)?;
     let filters = format::parse_filters(tail, file_size).map_err(to_py)?;
-    for (name, (nbits, k, bits)) in ["key_filter", "pair_filter", "tomb_filter"]
-        .into_iter()
-        .zip(filters)
-    {
+    for (name, (nbits, k, bits)) in ["key_filter", "tomb_filter"].into_iter().zip(filters) {
         d.set_item(name, (nbits, k, PyBytes::new(py, bits)))?;
     }
     Ok(d)
@@ -540,125 +504,6 @@ fn row_key(obj: &Bound<'_, PyAny>, out: &mut Vec<u8>) -> PyResult<()> {
     )))
 }
 
-/// How rows are read: their key column, their revision column if declared,
-/// and the columns their digest leaves out — the key, and any the store adds
-/// itself (a partition column), so a row digests the same wherever it is read.
-struct Records {
-    key: String,
-    revision: Option<String>,
-    skip: Vec<String>,
-}
-
-impl Records {
-    fn new(key: &str, revision: Option<&str>, exclude: Vec<String>) -> Records {
-        let mut skip = vec![key.to_string()];
-        skip.extend(exclude);
-        Records {
-            key: key.into(),
-            revision: revision.map(Into::into),
-            skip,
-        }
-    }
-
-    /// The key and revision columns' names, as Python strings made once.
-    fn names<'py>(&self, py: Python<'py>) -> Names<'py> {
-        (
-            PyString::new(py, &self.key),
-            self.revision.as_deref().map(|r| PyString::new(py, r)),
-        )
-    }
-
-    /// Appends a mapping row's key, and its version: its digest, or its revision's text.
-    fn read<'py>(
-        &self,
-        w: &mut pyvalue::Walker<'py>,
-        names: &Names<'py>,
-        row: &Bound<'py, PyAny>,
-        keys: Option<&mut Vec<u8>>,
-        version: &mut Vec<u8>,
-    ) -> PyResult<()> {
-        if let Some(keys) = keys {
-            let k = field(row, &names.0)?.ok_or_else(|| PyKeyError::new_err(self.key.clone()))?;
-            row_key(&k, keys)?;
-        }
-        match (&self.revision, &names.1) {
-            (Some(rev), Some(name)) => {
-                let v = field(row, name)?.ok_or_else(|| {
-                    PyValueError::new_err(format!(
-                        "a row lacks the declared revision field {rev:?}"
-                    ))
-                })?;
-                w.render(&v, version)?;
-            }
-            _ => version.extend_from_slice(&w.row(row, &self.skip)?),
-        }
-        Ok(())
-    }
-}
-
-type Names<'py> = (Bound<'py, PyString>, Option<Bound<'py, PyString>>);
-
-/// Versions read with the keys, in the rows' own order — the order they lie
-/// in memory, where reading them in key order would miss the cache at every
-/// row — and handed out in key order.
-struct Read {
-    versions: Arena,
-    rows: bool,
-}
-
-impl Versions for Read {
-    fn fill(&self, rows: &[u32], out: &mut Arena) -> format::Result<()> {
-        for &r in rows {
-            out.push(self.versions.get(r as usize));
-        }
-        Ok(())
-    }
-
-    fn rows(&self) -> bool {
-        self.rows
-    }
-}
-
-/// `(key, …)` pairs' versions, a window of rows at a time under the GIL.
-enum PyVersions {
-    /// `(key, value)` pairs: `value(v)`.
-    Values(Py<PyList>),
-    /// `(key, version)` pairs: the version as given.
-    Pairs(Py<PyList>),
-}
-
-impl PyVersions {
-    fn fill_py(&self, py: Python<'_>, rows: &[u32], out: &mut Arena) -> PyResult<()> {
-        let mut w = pyvalue::Walker::new(py)?;
-        let mut buf = Vec::new();
-        match self {
-            PyVersions::Values(list) => {
-                let list = list.bind(py);
-                for &r in rows {
-                    buf.clear();
-                    w.value(&list.get_item(r as usize)?.get_item(1)?, &mut buf, 0)?;
-                    out.push(&digest::value(&buf));
-                }
-            }
-            PyVersions::Pairs(list) => {
-                let list = list.bind(py);
-                for &r in rows {
-                    buf.clear();
-                    key_of(&list.get_item(r as usize)?.get_item(1)?, &mut buf)?;
-                    out.push(&buf);
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-impl Versions for PyVersions {
-    fn fill(&self, rows: &[u32], out: &mut Arena) -> format::Result<()> {
-        Python::attach(|py| self.fill_py(py, rows, out)).map_err(|e| Error::Callback(Box::new(e)))
-    }
-}
-
 /// `row[name]` of a mapping row, None when it has no such field.
 fn field<'py>(
     row: &Bound<'py, PyAny>,
@@ -671,6 +516,55 @@ fn field<'py>(
             Err(e) if e.is_instance_of::<PyKeyError>(row.py()) => Ok(None),
             Err(e) => Err(e),
         },
+    }
+}
+
+/// Mapping rows' keys, `row[key]`, packed once.
+fn record_keys<'py>(py: Python<'py>, rows: &Bound<'py, PyAny>, key: &str) -> PyResult<Arena> {
+    let name = PyString::new(py, key);
+    let mut keys = Arena::default();
+    for (i, row) in rows.try_iter()?.enumerate() {
+        let row = row?;
+        let k = field(&row, &name)?.ok_or_else(|| PyKeyError::new_err(key.to_string()))?;
+        row_key(&k, &mut keys.data)?;
+        keys.ends.push(keys.data.len());
+        if i % 65536 == 65535 {
+            py.detach(|| ()); // let other threads run: this loop holds the GIL
+        }
+    }
+    keys.data.shrink_to_fit();
+    Ok(keys)
+}
+
+/// `(key, version)` pairs' versions, a window of rows at a time under the
+/// GIL: `str` or `bytes`, or None for none.
+struct Versions(Py<PyList>);
+
+impl Versions {
+    fn fill_py(
+        &self,
+        py: Python<'_>,
+        rows: &[u32],
+        out: &mut Vec<Option<Vec<u8>>>,
+    ) -> PyResult<()> {
+        let list = self.0.bind(py);
+        for &r in rows {
+            let v = list.get_item(r as usize)?.get_item(1)?;
+            if v.is_none() {
+                out.push(None);
+            } else {
+                let mut buf = Vec::new();
+                key_of(&v, &mut buf)?;
+                out.push(Some(buf));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Payloads for Versions {
+    fn fill(&self, rows: &[u32], out: &mut Vec<Option<Vec<u8>>>) -> format::Result<()> {
+        Python::attach(|py| self.fill_py(py, rows, out)).map_err(|e| Error::Callback(Box::new(e)))
     }
 }
 
@@ -693,7 +587,10 @@ fn pack<'py>(
     Ok(keys)
 }
 
-/// A pass over `Rows`, a page of keys and versions at a time (`Rows.pages`).
+/// Keys, and their payloads where they carry them, as lists.
+type Entries<'py> = (Bound<'py, PyList>, Bound<'py, PyList>);
+
+/// A pass over `Rows`, a page of keys and payloads at a time (`Rows.pages`).
 #[pyclass(module = "solera._native")]
 struct Pages {
     cursor: Cursor,
@@ -706,24 +603,20 @@ impl Pages {
         slf
     }
 
-    #[allow(clippy::type_complexity)]
-    fn __next__<'py>(
-        &mut self,
-        py: Python<'py>,
-    ) -> PyResult<Option<(Bound<'py, PyList>, Bound<'py, PyList>)>> {
-        let (keys, versions) = (PyList::empty(py), PyList::empty(py));
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Entries<'py>>> {
+        let (keys, payloads) = (PyList::empty(py), PyList::empty(py));
         while keys.len() < self.size && self.cursor.read().map_err(to_py)? {
-            let (k, v) = self.cursor.entry();
+            let (k, p) = self.cursor.entry();
             keys.append(PyBytes::new(py, k))?;
-            versions.append(PyBytes::new(py, v))?;
+            payloads.append(p.map(|p| PyBytes::new(py, p)))?;
         }
-        Ok((!keys.is_empty()).then_some((keys, versions)))
+        Ok((!keys.is_empty()).then_some((keys, payloads)))
     }
 }
 
-/// A keyed write's content, sorted by key (unless it arrived sorted) and
-/// read a key at a time: every key is the group of rows that carry it, and
-/// its version is computed as the reader reaches it (docs/row-digest.md).
+/// A keyed write's keys, sorted (unless they arrived sorted) and read a key
+/// at a time: every key is the group of rows that carry it. Only the key
+/// of a row is read; a source's keys may carry a version each.
 #[pyclass(module = "solera._native", frozen)]
 struct Rows {
     table: Arc<Table>,
@@ -733,12 +626,11 @@ impl Rows {
     fn new(
         py: Python<'_>,
         keys: Box<dyn sort::Keys + Send>,
-        versions: Box<dyn Versions>,
-    ) -> PyResult<Rows> {
-        let table = py.detach(|| Table::new(keys, versions)).map_err(to_py)?;
-        Ok(Rows {
-            table: Arc::new(table),
-        })
+        payloads: Option<Box<dyn Payloads>>,
+    ) -> Rows {
+        Rows {
+            table: Arc::new(py.detach(|| Table::new(keys, payloads))),
+        }
     }
 }
 
@@ -754,61 +646,21 @@ fn packed_keys(keys: &[Bound<'_, PyAny>]) -> PyResult<Arena> {
 
 #[pymethods]
 impl Rows {
-    /// Rows as mappings: the key is `row[key]`, a `str` or an `int`; the
-    /// version is the group of the key's row digests, without the key column
-    /// and the `exclude`d ones, or with `revision` that column's text, which
-    /// the key's rows must share.
+    /// Rows as mappings: the key is `row[key]`, a `str` or an `int`.
     #[staticmethod]
-    #[pyo3(signature = (rows, key, revision=None, exclude=vec![]))]
-    fn records(
-        py: Python<'_>,
-        rows: Bound<'_, PyList>,
-        key: &str,
-        revision: Option<&str>,
-        exclude: Vec<String>,
-    ) -> PyResult<Rows> {
-        let records = Records::new(key, revision, exclude);
-        let (mut w, names) = (pyvalue::Walker::new(py)?, records.names(py));
-        let (mut keys, mut versions) = (Arena::default(), Arena::default());
-        keys.ends.reserve(rows.len());
-        versions.ends.reserve(rows.len());
-        for (i, row) in rows.iter().enumerate() {
-            records.read(
-                &mut w,
-                &names,
-                &row,
-                Some(&mut keys.data),
-                &mut versions.data,
-            )?;
-            keys.ends.push(keys.data.len());
-            versions.ends.push(versions.data.len());
-            if i % 65536 == 65535 {
-                py.detach(|| ()); // let other threads run: this loop holds the GIL
-            }
-        }
-        keys.data.shrink_to_fit();
-        versions.data.shrink_to_fit();
-        let versions = Read {
-            versions,
-            rows: revision.is_none(),
-        };
-        Rows::new(py, Box::new(keys), Box::new(versions))
+    fn records(py: Python<'_>, rows: Bound<'_, PyList>, key: &str) -> PyResult<Rows> {
+        let keys = record_keys(py, rows.as_any(), key)?;
+        Ok(Rows::new(py, Box::new(keys), None))
     }
 
     /// Rows read a column at a time — a DataFrame through pandas alone, no
-    /// Arrow: `columns[i]` holds column `names[i]`'s value of every row, None
-    /// where it is missing. A row digests as the mapping of its values not
-    /// null would (`records`).
+    /// Arrow: `columns[i]` holds column `names[i]`'s value of every row.
     #[staticmethod]
-    #[pyo3(signature = (names, columns, key, revision=None, exclude=vec![]))]
-    #[allow(clippy::too_many_arguments)]
     fn columns(
         py: Python<'_>,
         names: Vec<String>,
         columns: Vec<Bound<'_, PyList>>,
         key: &str,
-        revision: Option<&str>,
-        exclude: Vec<String>,
     ) -> PyResult<Rows> {
         if names.len() != columns.len() {
             return Err(PyValueError::new_err("a name for every column"));
@@ -825,109 +677,54 @@ impl Rows {
         if columns.iter().any(|c| c.len() != n) {
             return Err(PyValueError::new_err("columns of different lengths"));
         }
-        let at = |name: &str| names.iter().position(|c| c == name);
-        let k = at(key).ok_or_else(|| PyKeyError::new_err(key.to_string()))?;
-        let (mut keys, mut versions) = (Arena::default(), Arena::default());
-        keys.ends.reserve(n);
-        versions.ends.reserve(n);
-        let mut w = pyvalue::Walker::new(py)?;
-        let records = Records::new(key, revision, exclude);
-        let mut order: Vec<usize> = (0..names.len())
-            .filter(|&c| !records.skip.contains(&names[c]))
-            .collect();
-        order.sort_by(|&a, &b| names[a].as_bytes().cmp(names[b].as_bytes()));
-        let cells: Vec<(Vec<u8>, Bound<'_, PyList>)> = order
+        let k = names
             .iter()
-            .map(|&c| {
-                let mut head = Vec::new();
-                digest::put_len(&mut head, names[c].as_bytes());
-                (head, columns[c].clone())
-            })
-            .collect();
-        let rev = match revision {
-            Some(r) => Some(at(r).ok_or_else(|| {
-                PyValueError::new_err(format!("a row lacks the declared revision field {r:?}"))
-            })?),
-            None => None,
-        };
+            .position(|c| c == key)
+            .ok_or_else(|| PyKeyError::new_err(key.to_string()))?;
+        let mut keys = Arena::default();
+        keys.ends.reserve(n);
         for i in 0..n {
             row_key(&columns[k].get_item(i)?, &mut keys.data)?;
             keys.ends.push(keys.data.len());
-            match rev {
-                Some(r) => {
-                    let v = columns[r].get_item(i)?;
-                    if v.is_none() {
-                        return Err(PyValueError::new_err(format!(
-                            "a row lacks the declared revision field {:?}",
-                            names[r]
-                        )));
-                    }
-                    w.render(&v, &mut versions.data)?;
-                }
-                None => versions.data.extend_from_slice(&w.column_row(&cells, i)?),
-            }
-            versions.ends.push(versions.data.len());
             if i % 65536 == 65535 {
                 py.detach(|| ()); // let other threads run: this loop holds the GIL
             }
         }
-        let versions = Read {
-            versions,
-            rows: revision.is_none(),
-        };
-        Rows::new(py, Box::new(keys), Box::new(versions))
+        Ok(Rows::new(py, Box::new(keys), None))
     }
 
-    /// `(key, value)` pairs (a `keyed=True` output): the version is `value(v)`.
+    /// `(key, value)` pairs (a `keyed=True` output).
     #[staticmethod]
     fn values(py: Python<'_>, items: Bound<'_, PyList>) -> PyResult<Rows> {
         let keys = pack(py, &items, |item| item.get_item(0))?;
-        Rows::new(
-            py,
-            Box::new(keys),
-            Box::new(PyVersions::Values(items.unbind())),
-        )
+        Ok(Rows::new(py, Box::new(keys), None))
     }
 
-    /// `(key, version)` pairs, versions as given (`str` or `bytes`).
+    /// A source's `(key, version)` pairs: the version `str` or `bytes`, or
+    /// None for none.
     #[staticmethod]
     fn pairs(py: Python<'_>, items: Bound<'_, PyList>) -> PyResult<Rows> {
         let keys = pack(py, &items, |item| item.get_item(0))?;
-        Rows::new(
-            py,
-            Box::new(keys),
-            Box::new(PyVersions::Pairs(items.unbind())),
-        )
+        let versions: Box<dyn Payloads> = Box::new(Versions(items.unbind()));
+        Ok(Rows::new(py, Box::new(keys), Some(versions)))
     }
 
-    /// Keys, every one at `version` (a partition set's elements).
+    /// Keys, each with `payload` if given (a partition set's elements: empty).
     #[staticmethod]
-    fn keys(py: Python<'_>, keys: Bound<'_, PyList>, version: &[u8]) -> PyResult<Rows> {
+    #[pyo3(signature = (keys, payload=None))]
+    fn keys(py: Python<'_>, keys: Bound<'_, PyList>, payload: Option<&[u8]>) -> PyResult<Rows> {
         let packed = pack(py, &keys, |k| Ok(k.clone()))?;
-        Rows::new(py, Box::new(packed), Box::new(Constant(version.to_vec())))
+        let payloads = payload.map(|p| Box::new(Constant(p.to_vec())) as Box<dyn Payloads>);
+        Ok(Rows::new(py, Box::new(packed), payloads))
     }
 
-    /// Arrow data (any object with `__arrow_c_stream__`), read in place: keys
-    /// from the `key` column, versions from the `revision` column's text, or
-    /// else each key's group of row digests without the `exclude`d columns
-    /// (`arrow.rs`).
+    /// Arrow data (any object with `__arrow_c_stream__`), its `key` column
+    /// read in place.
     #[staticmethod]
-    #[pyo3(signature = (data, key, revision=None, exclude=vec![]))]
-    fn arrow(
-        py: Python<'_>,
-        data: Bound<'_, PyAny>,
-        key: &str,
-        revision: Option<&str>,
-        exclude: Vec<String>,
-    ) -> PyResult<Rows> {
+    fn arrow(py: Python<'_>, data: Bound<'_, PyAny>, key: &str) -> PyResult<Rows> {
         let batches = arrow_batches(py, &data)?;
         let keys = arrow::keys(&batches, key, false).map_err(to_py)?;
-        let records = Records::new(key, revision, exclude);
-        let versions: Box<dyn Versions> = match revision {
-            Some(r) => Box::new(arrow::Revision::new(&batches, r).map_err(to_py)?),
-            None => Box::new(arrow::RowDigest::new(batches, &records.skip).map_err(to_py)?),
-        };
-        Rows::new(py, keys, versions)
+        Ok(Rows::new(py, keys, None))
     }
 
     /// Rows, not keys.
@@ -941,21 +738,19 @@ impl Rows {
         self.table.presorted()
     }
 
-    /// Every key and its version, in key order. Rows are read, never used
-    /// up: every pass computes the versions it reaches.
-    fn entries<'py>(&self, py: Python<'py>) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyList>)> {
+    /// Every key and its payload (None for none), in key order.
+    fn entries<'py>(&self, py: Python<'py>) -> PyResult<Entries<'py>> {
         let mut c = Cursor::new(self.table.clone());
-        let (keys, versions) = (PyList::empty(py), PyList::empty(py));
+        let (keys, payloads) = (PyList::empty(py), PyList::empty(py));
         while c.read().map_err(to_py)? {
-            let (k, v) = c.entry();
+            let (k, p) = c.entry();
             keys.append(PyBytes::new(py, k))?;
-            versions.append(PyBytes::new(py, v))?;
+            payloads.append(p.map(|p| PyBytes::new(py, p)))?;
         }
-        Ok((keys, versions))
+        Ok((keys, payloads))
     }
 
-    /// Every key and its version, in key order, `size` at a time: `(keys,
-    /// versions)` per page, computed as the pass reaches them.
+    /// Every key and its payload, in key order, `size` at a time.
     fn pages(&self, size: usize) -> PyResult<Pages> {
         if size == 0 {
             return Err(PyValueError::new_err("a page holds at least one key"));
@@ -964,14 +759,6 @@ impl Rows {
             cursor: Cursor::new(self.table.clone()),
             size,
         })
-    }
-
-    /// The digest of every `(key, version)`, in key order: the content's
-    /// identity. Free once a pass has read every key, as a replacement does.
-    fn digest<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let table = self.table.clone();
-        let d = py.detach(|| table.content()).map_err(to_py)?;
-        Ok(PyBytes::new(py, &d))
     }
 
     /// The rows of each of `keys`, as indices into what the rows were made
@@ -1006,31 +793,6 @@ impl Rows {
         Ok((rows, ends))
     }
 
-    /// The version of each of `keys`, from its rows alone; a key the write
-    /// does not hold is a `KeyError`.
-    fn versions<'py>(
-        &self,
-        py: Python<'py>,
-        keys: Vec<Bound<'py, PyAny>>,
-    ) -> PyResult<Bound<'py, PyList>> {
-        let packed = packed_keys(&keys)?;
-        let table = self.table.clone();
-        let found: Vec<format::Result<Option<Vec<u8>>>> = py.detach(|| {
-            (0..packed.len())
-                .into_par_iter()
-                .map(|i| table.version(packed.get(i)))
-                .collect()
-        });
-        let out = PyList::empty(py);
-        for (i, f) in found.into_iter().enumerate() {
-            match f.map_err(to_py)? {
-                Some(v) => out.append(PyBytes::new(py, &v))?,
-                None => return Err(PyKeyError::new_err(keys[i].clone().unbind())),
-            }
-        }
-        Ok(out)
-    }
-
     /// Whether the write holds `key`.
     fn __contains__(&self, key: Bound<'_, PyAny>) -> PyResult<bool> {
         let mut k = Vec::new();
@@ -1039,159 +801,43 @@ impl Rows {
     }
 }
 
-// -- digests ------------------------------------------------------------------------------
-
-/// `enc(v)` of a Python value: the canonical bytes (docs/row-digest.md).
-#[pyfunction]
-fn encode<'py>(py: Python<'py>, value: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyBytes>> {
-    let mut out = Vec::new();
-    pyvalue::Walker::new(py)?.value(&value, &mut out, 0)?;
-    Ok(PyBytes::new(py, &out))
-}
-
-/// `row(r)` of a row, without its `key` column.
-#[pyfunction]
-#[pyo3(signature = (row, key=None))]
-fn row_digest<'py>(
-    py: Python<'py>,
-    row: Bound<'py, PyAny>,
-    key: Option<&str>,
-) -> PyResult<Bound<'py, PyBytes>> {
-    let skip: Vec<&str> = key.into_iter().collect();
-    Ok(PyBytes::new(
-        py,
-        &pyvalue::Walker::new(py)?.row(&row, &skip)?,
-    ))
-}
-
-/// `row(r)` of every row, without its `key` column: 16 bytes each, concatenated.
-#[pyfunction]
-#[pyo3(signature = (rows, key=None))]
-fn row_digests<'py>(
-    py: Python<'py>,
-    rows: Bound<'py, PyList>,
-    key: Option<&str>,
-) -> PyResult<Bound<'py, PyBytes>> {
-    let mut w = pyvalue::Walker::new(py)?;
-    let skip: Vec<&str> = key.into_iter().collect();
-    let mut out = Vec::with_capacity(rows.len() * 16);
-    for r in rows.iter() {
-        out.extend_from_slice(&w.row(&r, &skip)?);
-    }
-    Ok(PyBytes::new(py, &out))
-}
-
-/// `group(rows)`: the version of a key whose rows these are.
-#[pyfunction]
-#[pyo3(signature = (rows, key=None))]
-fn group_digest<'py>(
-    py: Python<'py>,
-    rows: Bound<'py, PyAny>,
-    key: Option<&str>,
-) -> PyResult<Bound<'py, PyBytes>> {
-    let mut w = pyvalue::Walker::new(py)?;
-    let skip: Vec<&str> = key.into_iter().collect();
-    let mut digests: Vec<digest::Digest> = rows
-        .try_iter()?
-        .map(|r| w.row(&r?, &skip))
-        .collect::<PyResult<_>>()?;
-    Ok(PyBytes::new(py, &digest::group(&mut digests)))
-}
-
-/// `value(v)`: a `keyed=True` output's version.
-#[pyfunction]
-fn value_digest<'py>(py: Python<'py>, value: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyBytes>> {
-    let mut out = Vec::new();
-    pyvalue::Walker::new(py)?.value(&value, &mut out, 0)?;
-    Ok(PyBytes::new(py, &digest::value(&out)))
-}
-
-/// A declared revision's text.
-#[pyfunction]
-fn revision_text<'py>(py: Python<'py>, value: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyBytes>> {
-    let mut out = Vec::new();
-    pyvalue::Walker::new(py)?.render(&value, &mut out)?;
-    Ok(PyBytes::new(py, &out))
-}
-
-/// A chunk of a sorted stream: `(key, version)` pairs — a list, or Arrow
-/// data whose first two columns they are — or with `records`, rows (a list
-/// of mappings, or Arrow data) whose versions are computed here: each row's
-/// digest without its key column, or the text of its revision column.
-fn chunk(
-    py: Python<'_>,
-    obj: &Bound<'_, PyAny>,
-    records: Option<&Records>,
-) -> PyResult<(Arena, Arena)> {
-    let (mut keys, mut versions) = (Arena::default(), Arena::default());
+/// A chunk of a sorted stream of keys: a list of keys (`str`, `int` or
+/// `bytes`) or Arrow data whose first column holds them — or with `key`,
+/// rows (a list of mappings, or Arrow data) keyed by that column.
+fn chunk(py: Python<'_>, obj: &Bound<'_, PyAny>, key: Option<&str>) -> PyResult<Arena> {
     if obj.hasattr("__arrow_c_stream__")? {
         let batches = arrow_batches(py, obj)?;
         let Some(first) = batches.first() else {
-            return Ok((keys, versions));
+            return Ok(Arena::default());
         };
-        let schema = first.schema();
-        let (kn, v): (String, Box<dyn Versions>) = match records {
-            Some(Records {
-                key,
-                revision: None,
-                skip,
-            }) => (
-                key.clone(),
-                Box::new(arrow::RowDigest::new(batches.clone(), skip).map_err(to_py)?),
-            ),
-            Some(Records {
-                key,
-                revision: Some(rev),
-                ..
-            }) => (
-                key.clone(),
-                Box::new(arrow::Revision::new(&batches, rev).map_err(to_py)?),
-            ),
-            None if schema.fields().len() >= 2 => (
-                schema.field(0).name().clone(),
-                Box::new(arrow::Revision::new(&batches, schema.field(1).name()).map_err(to_py)?),
-            ),
-            None => {
-                return Err(PyValueError::new_err(
-                    "a sorted chunk has key and version columns",
-                ))
-            }
+        let name = match key {
+            Some(k) => k.to_string(),
+            None => first.schema().field(0).name().clone(),
         };
-        let k = arrow::keys(&batches, &kn, records.is_none()).map_err(to_py)?;
+        let k = arrow::keys(&batches, &name, key.is_none()).map_err(to_py)?;
+        let mut keys = Arena::default();
         for i in 0..k.len() {
             keys.push(k.key(i));
         }
-        let rows: Vec<u32> = (0..k.len() as u32).collect();
-        v.fill(&rows, &mut versions).map_err(to_py)?;
-        return Ok((keys, versions));
+        return Ok(keys);
     }
-    let mut w = pyvalue::Walker::new(py)?;
-    let names = records.map(|r| r.names(py));
-    for item in obj.try_iter()? {
-        let item = item?;
-        match records {
-            None => {
-                key_of(&item.get_item(0)?, &mut keys.data)?;
-                key_of(&item.get_item(1)?, &mut versions.data)?;
+    match key {
+        Some(k) => record_keys(py, obj, k),
+        None => {
+            let mut keys = Arena::default();
+            for item in obj.try_iter()? {
+                key_of(&item?, &mut keys.data)?;
+                keys.ends.push(keys.data.len());
             }
-            Some(records) => records.read(
-                &mut w,
-                names.as_ref().unwrap(),
-                &item,
-                Some(&mut keys.data),
-                &mut versions.data,
-            )?,
+            Ok(keys)
         }
-        keys.ends.push(keys.data.len());
-        versions.ends.push(versions.data.len());
     }
-    Ok((keys, versions))
 }
 
 // -- sorted runs ------------------------------------------------------------------------
 
-/// A write's entries in key order (`run.rs`): upserts at their versions, and
-/// removes. Immutable once built, so readers share it.
+/// A write's entries in key order (`run.rs`): upserts, each with its payload
+/// if it carries one, and removes. Immutable once built, so readers share it.
 #[pyclass(module = "solera._native", frozen)]
 struct SortedRun {
     inner: Arc<run::SortedRun>,
@@ -1205,23 +851,26 @@ fn sorted_run(r: format::Result<run::SortedRun>) -> PyResult<SortedRun> {
 
 #[pymethods]
 impl SortedRun {
-    /// Upserts of `keys` at `versions` (any order, each key once), and the
-    /// removes of `removes`; a key both written and removed is an error.
+    /// Upserts of `keys` (any order, each key once), each with its payload
+    /// if `payloads` gives one (None for none), and the removes of
+    /// `removes`; a key both written and removed is an error.
     #[staticmethod]
-    #[pyo3(signature = (keys, versions, removes=vec![]))]
+    #[pyo3(signature = (keys, payloads=None, removes=vec![]))]
     fn of(
         py: Python<'_>,
         keys: Vec<PyBackedBytes>,
-        versions: Vec<PyBackedBytes>,
+        payloads: Option<Vec<Option<PyBackedBytes>>>,
         removes: Vec<PyBackedBytes>,
     ) -> PyResult<SortedRun> {
-        sorted_run(
-            py.detach(|| run::SortedRun::of(&slices(&keys), &slices(&versions), &slices(&removes))),
-        )
+        sorted_run(py.detach(|| {
+            let payloads: Option<Vec<Option<&[u8]>>> =
+                payloads.as_ref().map(|p| p.iter().map(opt).collect());
+            run::SortedRun::of(&slices(&keys), payloads.as_deref(), &slices(&removes))
+        }))
     }
 
-    /// Every key of `rows` at its version, in key order, and the removes of
-    /// `removes`. Reads the rows, which stay usable.
+    /// Every key of `rows`, with its payload, in key order, and the removes
+    /// of `removes`. Reads the rows, which stay usable.
     #[staticmethod]
     #[pyo3(signature = (rows, removes=vec![]))]
     fn from_rows(
@@ -1287,15 +936,15 @@ impl SortedRun {
         arena_list(py, &self.inner.keys)
     }
 
-    /// Keys, versions (empty for a remove), deleted flags, locators.
+    /// Keys, generations, deleted flags, payloads (None for none).
     fn entries<'py>(&self, py: Python<'py>) -> PyResult<Merged<'py>> {
         let r = &self.inner;
         let flags: Vec<u8> = r.deleted.iter().map(|&d| d as u8).collect();
         Ok((
             arena_list(py, &r.keys)?,
-            arena_list(py, &r.versions)?,
+            r.generations.clone(),
             PyBytes::new(py, &flags),
-            r.locators.clone(),
+            payload_list(py, (0..r.len()).map(|i| r.payload(i)))?,
         ))
     }
 }
@@ -1388,16 +1037,9 @@ impl Sparse {
         hi: usize,
         keys: (u64, u8, PyBackedBytes),
         tombs: (u64, u8, PyBackedBytes),
-        pairs: (u64, u8, PyBackedBytes),
     ) {
-        self.inner.filter(
-            file,
-            lo,
-            hi,
-            filter_of(&keys),
-            filter_of(&tombs),
-            filter_of(&pairs),
-        );
+        self.inner
+            .filter(file, lo, hi, filter_of(&keys), filter_of(&tombs));
     }
 
     /// Decides what the filters can (`exact`: no change from filters alone).
@@ -1405,13 +1047,14 @@ impl Sparse {
         self.inner.classify(exact);
     }
 
-    /// Each live entry read: `{key: (version, locator)}`.
+    /// Each live entry read: `{key: (generation, payload)}`, the payload
+    /// None for none.
     fn live<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let out = PyDict::new(py);
-        for (p, v, l) in self.inner.live() {
+        for (p, g, payload) in self.inner.live() {
             out.set_item(
                 PyBytes::new(py, self.inner.run.key(p)),
-                (PyBytes::new(py, v), l),
+                (g, payload.map(|b| PyBytes::new(py, b))),
             )?;
         }
         Ok(out)
@@ -1458,7 +1101,8 @@ enum Kind {
 #[pyclass(module = "solera._native")]
 struct Job {
     kind: Kind,
-    records: Option<Records>,
+    /// The column a streamed replacement's chunks of rows are keyed by.
+    key: Option<String>,
     /// The index's runs as local files (`local`): fed from them, not by the caller.
     local: Option<(local::Snapshot, local::Feed)>,
 }
@@ -1495,17 +1139,14 @@ impl Job {
 #[pymethods]
 impl Job {
     /// The merge-join of the written content (`rows`, or with None a stream
-    /// fed sorted chunks, `feed_rows`) against `runs` existing runs, newest
-    /// first. A streamed chunk holds `(key, version)` pairs, or with `key`
-    /// rows keyed by that column: their versions are their digests without
-    /// the key and `exclude`d columns, folded into each key's group, or the
-    /// `revision` a key's rows share. At most
+    /// fed sorted chunks of keys, `feed_rows` — with `key`, rows keyed by
+    /// that column) against `runs` existing runs, newest first. At most
     /// `collect` changed keys are kept for `collected`. Written entries carry
-    /// `generation` as their locator. A streamed replacement may take an
-    /// `overlay`: a run whose upserts stand in for the stream's entries of
-    /// their keys, and whose removes drop them.
+    /// `generation`. A streamed replacement may take an `overlay`: a run
+    /// whose upserts stand in for the stream's entries of their keys, and
+    /// whose removes drop them.
     #[staticmethod]
-    #[pyo3(signature = (rows, runs, *, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864, collect=0, key=None, revision=None, exclude=vec![], generation=0, overlay=None))]
+    #[pyo3(signature = (rows, runs, *, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864, collect=0, key=None, generation=0, overlay=None))]
     #[allow(clippy::too_many_arguments)]
     fn replace(
         rows: Option<PyRef<'_, Rows>>,
@@ -1518,18 +1159,15 @@ impl Job {
         max_file_bytes: usize,
         collect: usize,
         key: Option<String>,
-        revision: Option<String>,
-        exclude: Vec<String>,
         generation: u64,
         overlay: Option<PyRef<'_, SortedRun>>,
     ) -> PyResult<Job> {
         let src = match (rows, overlay) {
             (Some(r), None) => Source::Table(Box::new(Cursor::new(r.table.clone()))),
-            (None, None) => Source::Stream(Stream::new(key.is_some() && revision.is_none())),
-            (None, Some(run)) => Source::Overlay(Box::new(Overlay::new(
-                Stream::new(key.is_some() && revision.is_none()),
-                run.inner.clone(),
-            ))),
+            (None, None) => Source::Stream(Stream::default()),
+            (None, Some(run)) => {
+                Source::Overlay(Box::new(Overlay::new(Stream::default(), run.inner.clone())))
+            }
             (Some(_), Some(_)) => {
                 return Err(PyValueError::new_err(
                     "an overlay goes over a streamed replacement",
@@ -1542,7 +1180,7 @@ impl Job {
                 Join::new(src, true, runs, o, max_file_bytes, collect, generation)
                     .map_err(to_py)?,
             )),
-            records: key.map(|k| Records::new(&k, revision.as_deref(), exclude)),
+            key,
             local: None,
         })
     }
@@ -1550,7 +1188,7 @@ impl Job {
     /// The merge-join of a sorted run against `runs` existing runs, newest
     /// first: a patch, or with `replace` the whole new content. At most
     /// `collect` changed keys are kept for `collected`. Written entries carry
-    /// `generation` as their locator.
+    /// `generation`.
     #[staticmethod]
     #[pyo3(signature = (run, runs, *, replace=false, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864, collect=0, generation=0))]
     #[allow(clippy::too_many_arguments)]
@@ -1572,7 +1210,7 @@ impl Job {
         let job =
             Join::new(src, replace, runs, o, max_file_bytes, collect, generation).map_err(to_py)?;
         Ok(Job {
-            records: None,
+            key: None,
             local: None,
             kind: Kind::Join(Box::new(job)),
         })
@@ -1597,7 +1235,7 @@ impl Job {
     ) -> Job {
         let o = options(block_size, level, bits_per_item, k, codec);
         Job {
-            records: None,
+            key: None,
             local: None,
             kind: Kind::Compact(Box::new(Compact::new(
                 runs,
@@ -1613,7 +1251,7 @@ impl Job {
     #[staticmethod]
     fn count(runs: usize) -> Job {
         Job {
-            records: None,
+            key: None,
             local: None,
             kind: Kind::Count(Count::new(runs)),
         }
@@ -1650,9 +1288,9 @@ impl Job {
     }
 
     fn feed_rows(&mut self, py: Python<'_>, rows: Bound<'_, PyAny>) -> PyResult<()> {
-        let (k, v) = chunk(py, &rows, self.records.as_ref())?;
+        let keys = chunk(py, &rows, self.key.as_deref())?;
         match self.join()?.src.stream() {
-            Some(s) => s.feed(k, v).map_err(to_py),
+            Some(s) => s.feed(keys).map_err(to_py),
             None => Err(PyTypeError::new_err("not a streamed replacement")),
         }
     }
@@ -1703,7 +1341,7 @@ impl Job {
     }
 
     /// A replacement's or a patch's counts: new live keys, deleted keys,
-    /// changed versions.
+    /// keys written again.
     #[getter]
     fn added(&self) -> PyResult<u64> {
         Ok(self.delta()?.added)
@@ -1737,14 +1375,14 @@ impl Job {
         }
     }
 
-    /// A replacement's or a patch's written keys, `{key: version}`, and its
-    /// deleted keys, or None past `collect`.
+    /// A replacement's or a patch's written keys and its deleted keys, or
+    /// None past `collect`.
     fn collected<'py>(&self, py: Python<'py>) -> PyResult<Option<Changed<'py>>> {
         changed(py, &self.delta()?.collected)
     }
 }
 
-// -- the engine cache's local files (docs/resolved-commits.md §5), and content digests ---------
+// -- the engine cache's local files (docs/resolved-commits.md §5), and file digests ---------
 
 /// A file's content digest: XXH3-128, as hex.
 #[pyfunction]
@@ -1828,18 +1466,12 @@ impl LocalFile {
 
 type Resolved<'py> = (Vec<Bound<'py, PyBytes>>, u64, u64, u64);
 
-/// Written keys with their versions, and deleted keys.
-type Changed<'py> = (Bound<'py, PyDict>, Bound<'py, PyList>);
+/// Written keys, and deleted keys.
+type Changed<'py> = (Bound<'py, PyList>, Bound<'py, PyList>);
 
 fn changed<'py>(py: Python<'py>, c: &delta::Collected) -> PyResult<Option<Changed<'py>>> {
     match (&c.upserts, &c.removes) {
-        (Some((k, v)), Some(r)) => {
-            let written = PyDict::new(py);
-            for i in 0..k.len() {
-                written.set_item(PyBytes::new(py, k.get(i)), PyBytes::new(py, v.get(i)))?;
-            }
-            Ok(Some((written, arena_list(py, r)?)))
-        }
+        (Some(w), Some(r)) => Ok(Some((arena_list(py, w)?, arena_list(py, r)?))),
         _ => Ok(None),
     }
 }
@@ -1904,7 +1536,7 @@ impl Snapshot {
 
     /// Up to `limit` entries of the merged snapshot past `after` — deletions
     /// dropped with `drop_deleted` — as a `SortedRun`, and the cursor (None at
-    /// the end); past `max_bytes` of keys and versions, `LimitError`.
+    /// the end); past `max_bytes` of keys and payloads, `LimitError`.
     #[pyo3(signature = (after, limit, *, drop_deleted, max_bytes=u64::MAX))]
     #[allow(clippy::type_complexity)]
     fn scan<'py>(
@@ -1927,13 +1559,13 @@ impl Snapshot {
         ))
     }
 
-    /// The newest entry of each key — `(version, deleted, locator)` — or None.
+    /// The newest entry of each key — `(generation, deleted, payload)` — or None.
     #[allow(clippy::type_complexity)]
     fn get<'py>(
         &mut self,
         py: Python<'py>,
         keys: Vec<PyBackedBytes>,
-    ) -> PyResult<Vec<Option<(Bound<'py, PyBytes>, bool, u64)>>> {
+    ) -> PyResult<Vec<Option<(u64, bool, Option<Bound<'py, PyBytes>>)>>> {
         let inner = &mut self.inner;
         let hits = py
             .detach(|| {
@@ -1944,7 +1576,12 @@ impl Snapshot {
             .map_err(to_py)?;
         Ok(hits
             .into_iter()
-            .map(|h| h.map(|h| (PyBytes::new(py, &h.version), h.deleted, h.locator)))
+            .map(|h| {
+                h.map(|h| {
+                    let payload = h.payload.as_deref().map(|p| PyBytes::new(py, p));
+                    (h.generation, h.deleted, payload)
+                })
+            })
             .collect())
     }
 }
@@ -1964,9 +1601,7 @@ fn solera_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(write_files, m)?)?;
     m.add_function(wrap_pyfunction!(decode_block, m)?)?;
     m.add_function(wrap_pyfunction!(bloom_check_keys, m)?)?;
-    m.add_function(wrap_pyfunction!(bloom_check_pairs, m)?)?;
     m.add_function(wrap_pyfunction!(bloom_check_tombstones, m)?)?;
-    m.add_function(wrap_pyfunction!(sort_entries, m)?)?;
     m.add_function(wrap_pyfunction!(lookup, m)?)?;
     m.add_function(wrap_pyfunction!(merge_range, m)?)?;
     m.add_function(wrap_pyfunction!(merge_page, m)?)?;
@@ -1980,13 +1615,6 @@ fn solera_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(content_digest, m)?)?;
     m.add_class::<LocalFile>()?;
     m.add_class::<Snapshot>()?;
-    m.add_function(wrap_pyfunction!(encode, m)?)?;
-    m.add_function(wrap_pyfunction!(row_digest, m)?)?;
-    m.add_function(wrap_pyfunction!(row_digests, m)?)?;
-    m.add_function(wrap_pyfunction!(group_digest, m)?)?;
-    m.add_function(wrap_pyfunction!(value_digest, m)?)?;
-    m.add_function(wrap_pyfunction!(revision_text, m)?)?;
-    m.add("DIGEST_VERSION", digest::VERSION)?;
     m.add_class::<Rows>()?;
     m.add_class::<Pages>()?;
     m.add_class::<Job>()?;

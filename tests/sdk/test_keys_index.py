@@ -19,24 +19,24 @@ class Written:
     """A delta's entries as its files hold them."""
 
     keys: list
-    versions: list
+    generations: list
     deleted: bytes
+    payloads: list
+    predecessors: list
     added: int
     removed: int
     exact: bool
-    locators: list
-    predecessors: list
 
     def __len__(self):
         return len(self.keys)
 
 
-def run(keys, versions, removes=()):
-    return SortedRun.of(list(keys), list(versions), list(removes))
+def run(keys, payloads=None, removes=()):
+    return SortedRun.of(list(keys), None if payloads is None else list(payloads), list(removes))
 
 
 def entries_of(delta):
-    """Every entry of an unwritten delta: key, version, deleted, locator, predecessor."""
+    """Every entry of an unwritten delta: key, generation, deleted, payload, predecessor."""
 
     return [e for d in delta.files for e in _python.iter_file(d)]
 
@@ -72,16 +72,17 @@ def switching_options(**kw):
 
 class Harness:
     """Commits against a dict, and keeps every object a write created —
-    `(key, version, locator)`, the generation being the batch — to check that
-    each one superseded is named for collection exactly once it is: by the
-    delta that superseded it, or by a compaction's garbage."""
+    `(key, generation)` — to check that each one superseded is named for
+    collection exactly once it is: by the delta that superseded it, or by a
+    compaction's garbage. A key written with a payload (a source's version)
+    equal to its entry's is unchanged; any other write changes it."""
 
     def __init__(self, options, *, exact=False):
         self.io = ObjectIO(MemoryStore())
         self.options = options
         self.exact = exact
         self.state = IndexState()
-        self.model: dict[bytes, tuple[bytes, int]] = {}  # key -> (version, locator)
+        self.model: dict[bytes, tuple[int, bytes | None]] = {}  # key -> (generation, payload)
         self.batch = 0
         self.created: set[tuple] = set()
         self.named: set[tuple] = set()  # superseded objects a delta or a garbage file named
@@ -95,19 +96,20 @@ class Harness:
             e for f in files for e in _python.iter_file(await self.io.read_whole(idx.path(f.name), f.size))
         ]
 
-    async def commit(self, keys, versions, removes=(), replace=False):
+    async def commit(self, keys, payloads=None, removes=(), replace=False):
+        payloads = list(payloads) if payloads is not None else [None] * len(keys)
         before = dict(self.model)
         idx = self.index()
         gen = self.batch + 1
         if replace:
-            items = list(zip(keys, versions, strict=True))
+            items = list(zip(keys, payloads, strict=True))
             random.Random(len(items)).shuffle(items)
             files, changed = await idx.replace(
                 Rows.pairs(items), self.batch, f"a{self.batch}", collect=10**6, generation=gen
             )
         else:
             files, changed = await idx.resolve(
-                run(keys, versions, removes),
+                run(keys, payloads, removes),
                 batch=self.batch,
                 attempt=f"a{self.batch}",
                 generation=gen,
@@ -118,46 +120,47 @@ class Harness:
                 self.routes.append(idx.route)
         written = await self._read(idx, files.files)
         delta = Written(
-            [e[0] for e in written],
-            [e[1] for e in written],
-            bytes(e[2] for e in written),
+            *map(list, zip(*written, strict=True)) if written else ([],) * 5,
             files.added,
             files.removed,
             files.exact,
-            [e[3] for e in written],
-            [e[4] for e in written],
         )
-        assert changed == ({e[0]: e[1] for e in written if not e[2]}, [e[0] for e in written if e[2]])
+        delta.deleted = bytes(delta.deleted)
+        assert changed == ([e[0] for e in written if not e[2]], [e[0] for e in written if e[2]])
         # What the dict says changed.
         if replace:
-            after = {k: (v, gen) for k, v in zip(keys, versions, strict=True)}
+            after = {k: (gen, p) for k, p in zip(keys, payloads, strict=True)}
         else:
             after = dict(before)
-            after.update((k, (v, gen)) for k, v in zip(keys, versions, strict=True))
+            after.update((k, (gen, p)) for k, p in zip(keys, payloads, strict=True))
             for k in removes:
                 after.pop(k, None)
         for k in after:
-            if k in before and before[k][0] == after[k][0]:
-                after[k] = before[k]  # rewritten unchanged: the object stays
-        expect = {k: v for k, (v, _) in after.items() if k not in before or before[k][0] != v}
+            if k in before and before[k][1] is not None and before[k][1] == after[k][1]:
+                after[k] = before[k]  # at its version: unchanged, the object stays
+        expect = {k: e for k, e in after.items() if before.get(k) != e}
         expect_rm = {k for k in before if k not in after}
-        got = {k: v for k, v, d in zip(delta.keys, delta.versions, delta.deleted, strict=True) if not d}
+        got = {
+            k: (g, p)
+            for k, g, d, p in zip(delta.keys, delta.generations, delta.deleted, delta.payloads, strict=True)
+            if not d
+        }
         got_rm = {k for k, d in zip(delta.keys, delta.deleted, strict=True) if d}
         assert got == expect, "upserts"
         assert got_rm == expect_rm, "removals"
         assert delta.keys == sorted(delta.keys)
-        assert all(loc == gen for loc in delta.locators)
+        assert all(g == gen for g in delta.generations)
         for k, p in zip(delta.keys, delta.predecessors, strict=True):
             if p is not None:
-                assert k in before and p == before[k], "a predecessor names what the key held"
-                self.named.add((k, *p))
+                assert k in before and p == before[k][0], "a predecessor names what the key held"
+                self.named.add((k, p))
             elif k in before and (self.exact or replace or idx.route == "stream"):
                 raise AssertionError(f"{k!r}: its old entry was read, so its predecessor is named")
         if delta.exact:
             assert delta.added - delta.removed == len(after) - len(before)
         if self.exact:
             assert delta.exact
-        self.created |= {(k, v, loc) for k, (v, loc) in after.items()}
+        self.created |= {(k, g) for k, (g, _) in after.items()}
         self.state = self.state.committed(self.batch, files, keep_log=True)
         self.batch += 1
         self.model = after
@@ -169,13 +172,11 @@ class Harness:
         if out is None:
             return False
         added, removed, garbage = out
-        live = {(k, v, loc) for k, (v, loc) in self.model.items()}
-        for g in garbage:
-            ks, vs, _, locs = _python.decode_garbage(
-                await self.io.read_whole(idx.garbage_path(g.name), g.size)
-            )
-            assert len(ks) == g.entries
-            dropped = set(zip(ks, vs, locs, strict=True))
+        live = {(k, g) for k, (g, _) in self.model.items()}
+        for gf in garbage:
+            ks, gs = _python.decode_garbage(await self.io.read_whole(idx.garbage_path(gf.name), gf.size))
+            assert len(ks) == gf.entries
+            dropped = set(zip(ks, gs, strict=True))
             assert not dropped & live, "garbage never names a live object"
             assert dropped <= self.created
             self.named |= dropped
@@ -194,7 +195,7 @@ class Harness:
             await self._compact((files, self.state.depth))
 
     def check_collection(self):
-        live = {(k, v, loc) for k, (v, loc) in self.model.items()}
+        live = {(k, g) for k, (g, _) in self.model.items()}
         assert self.created - live <= self.named, "every superseded object is named once dropped"
         assert not self.named & live
 
@@ -202,10 +203,10 @@ class Harness:
         idx = self.index()
         seen, after = {}, None
         while True:
-            keys, versions, locators, after = await idx.page(after, 97)
-            for k, v, loc in zip(keys, versions, locators, strict=True):
+            keys, generations, payloads, after = await idx.page(after, 97)
+            for k, g, p in zip(keys, generations, payloads, strict=True):
                 assert k not in seen
-                seen[k] = (v, loc)
+                seen[k] = (g, p)
             if after is None:
                 break
         assert seen == self.model
@@ -223,8 +224,11 @@ def key(i):
     return f"k{i:07d}".encode()
 
 
-def ver(rng):
-    return f"v{rng.randrange(4)}".encode()  # few versions: many unchanged rewrites
+def rev(rng):
+    """No version (an attempt's write), or one of a few: many unchanged rewrites."""
+
+    n = rng.randrange(5)
+    return f"r{n}".encode() if n else None
 
 
 @pytest.mark.parametrize(
@@ -247,12 +251,12 @@ async def test_random_workload_matches_a_dict(options, exact):
         if op < 0.08 and step > 5:
             # A full replacement: a random subset, at random versions.
             ks = sorted({key(rng.randrange(universe)) for _ in range(rng.randrange(1, 1500))})
-            await h.commit(ks, [ver(rng) for _ in ks], replace=True)
+            await h.commit(ks, [rev(rng) for _ in ks], replace=True)
         else:
             n = rng.choice([1, 5, 50, 400])
             ks = sorted({key(rng.randrange(universe)) for _ in range(n)})
             rm = sorted({key(rng.randrange(universe)) for _ in range(n // 5)} - set(ks))
-            await h.commit(ks, [ver(rng) for _ in ks], rm)
+            await h.commit(ks, [rev(rng) for _ in ks], rm)
         if step % 7 == 6:
             await h.compact_all()
         if step % 10 == 9:
@@ -269,27 +273,35 @@ async def test_random_workload_matches_a_dict(options, exact):
         assert {"sparse", "stream"} <= set(h.routes)  # filters cleared some patches, others streamed
 
 
-async def test_unchanged_rewrite_is_an_empty_delta():
+async def test_a_rewrite_is_a_change_unless_at_its_version():
+    """docs/versions.md §1–§2: writing a key changes it; only a source's key
+    observed again at its stored version is unchanged."""
+
     h = Harness(small_options())
     ks = [key(i) for i in range(500)]
-    await h.commit(ks, [b"v1"] * 500)
-    delta = await h.commit(ks, [b"v1"] * 500)
+    await h.commit(ks, [b"r1"] * 500)
+    delta = await h.commit(ks, [b"r1"] * 500)
     assert len(delta) == 0 and delta.added == delta.removed == 0
+    delta = await h.commit(ks)  # written with no version: every key changed
+    assert len(delta) == 500 and delta.added == delta.removed == 0
+    delta = await h.commit(ks)
+    assert len(delta) == 500
 
 
-async def test_filters_skip_block_reads_for_real_changes():
-    """Changed versions of existing keys are cleared by the pair filters alone."""
+async def test_filters_skip_block_reads_for_writes():
+    """A write of existing keys is decided by the key and tombstone filters
+    alone: it changes them whatever their entries hold."""
 
     h = Harness(filtered_options())
     ks = [key(i) for i in range(4000)]
-    await h.commit(ks, [b"v1"] * len(ks))
+    await h.commit(ks)
     for _ in range(3):
         await h.compact_all()
     probe = ks[::40]
     h.io.metrics.reset()
     idx = h.index()
-    delta = await idx.changes(run(probe, [b"v2"] * len(probe)))
-    assert len(delta) == len(probe) and not delta.exact  # "changed" came from filters
+    delta = await idx.changes(run(probe))
+    assert len(delta) == len(probe) and not delta.exact  # "live" came from filters
     tails = sum(1 for level in h.state.newest_first() for _ in level)
     # Only file tails were read (plus a block or two for rare false positives).
     assert h.io.metrics.gets <= tails + 3
@@ -297,16 +309,16 @@ async def test_filters_skip_block_reads_for_real_changes():
 
 async def test_pending_deltas_newest_wins_and_survive_compaction():
     h = Harness(small_options())
-    await h.commit([key(1), key(2), key(3)], [b"a", b"a", b"a"])  # batch 0
-    await h.commit([key(2)], [b"b"], [key(3)])  # batch 1
-    await h.commit([key(4)], [b"c"])  # batch 2
+    await h.commit([key(1), key(2), key(3)])  # batch 0
+    await h.commit([key(2)], None, [key(3)])  # batch 1
+    await h.commit([key(4)])  # batch 2
     await h.compact_all()
     idx = h.index()
-    keys, versions, deleted, _, nxt = await idx.pending(1, 2, None, 10)
-    assert list(zip(keys, versions, deleted, strict=True)) == [
-        (key(2), b"b", 0),
-        (key(3), b"", 1),
-        (key(4), b"c", 0),
+    keys, generations, deleted, _, nxt = await idx.pending(1, 2, None, 10)
+    assert list(zip(keys, generations, deleted, strict=True)) == [
+        (key(2), 2, 0),
+        (key(3), 2, 1),
+        (key(4), 3, 0),
     ]
     assert nxt is None
     # Paged, two at a time.
@@ -325,8 +337,8 @@ async def test_pending_deltas_newest_wins_and_survive_compaction():
 
 async def test_large_first_commit_goes_straight_to_level_one_and_splits():
     h = Harness(small_options())
-    ks = [key(i) for i in range(5000)]
-    await h.commit(ks, [b"v"] * len(ks))
+    ks = [key(i) for i in range(20000)]  # a few bytes an entry: enough for several 16 KiB files
+    await h.commit(ks)
     assert {f.level for f in h.state.files} == {1}
     assert len(h.state.files) > 1  # split at max_file_bytes
     await h.check()
@@ -339,7 +351,7 @@ async def test_pages_read_only_the_block_indexes_they_need():
     h = Harness(small_options())
     ks = [key(i) for i in range(20000)]
     rng = random.Random(0)
-    await h.commit(ks, [rng.randbytes(16) for _ in ks])  # row digests: blocks outweigh filters
+    await h.commit(ks, [rng.randbytes(16) for _ in ks])  # versions: blocks outweigh filters
     assert len(h.state.files) >= 6
     size = sum(f.size for f in h.state.files)
     h.io.metrics.reset()
@@ -369,43 +381,43 @@ async def test_level_0_files_are_read_at_once():
     h = Harness(small_options(l0_max_files=100))
     h.io = Tracking(h.io.store)
     rng = random.Random(3)
-    await h.commit([key(i) for i in range(2000)], [b"v1"] * 2000)
+    await h.commit([key(i) for i in range(2000)])
     for _ in range(6):
         ks = sorted({key(rng.randrange(2000)) for _ in range(20)})
-        await h.commit(ks, [b"v2"] * len(ks))
+        await h.commit(ks)
     assert len(h.state.level(0)) == 6
     h.io.peak = 0
-    await h.index().changes(run([key(i) for i in range(0, 2000, 50)], [b"v3"] * 40))
+    await h.index().changes(run([key(i) for i in range(0, 2000, 50)]))
     assert h.io.peak >= 7  # six deltas and level 1, not one after another
 
 
 async def test_a_patch_reads_blocks_or_streams():
     """docs/resolved-commits.md §6: the sparse reader reads tails, then only
-    the blocks of keys the filters cannot clear; a patch dense enough, or one
+    the blocks of keys the filters cannot decide; a patch dense enough, or one
     whose exact reads would touch more blocks than streaming the index costs,
     streams instead."""
 
     h = Harness(filtered_options(l0_max_files=100, stream_reads=2.0))
     rng = random.Random(4)
     ks = [key(i) for i in range(4000)]
-    vs = [rng.randbytes(16) for _ in ks]  # incompressible: data outweighs filters
+    vs = [rng.randbytes(16) for _ in ks]  # incompressible versions: data outweighs filters
     await h.commit(ks, vs)
     files = h.state.level(1)
     assert len(files) >= 3 and all(f.size > 2 * f.tail for f in files)
     probe, same = ks[::60], vs[::60]  # every few blocks: no two consecutive
 
-    # All changed: the filters clear nearly every key — tails and a false positive's block.
+    # Written with no version: the filters decide nearly every key — tails and a false positive's block.
     idx = h.index()
     h.io.metrics.reset()
-    delta = await idx.changes(run(probe, [b"v2"] * len(probe)))
+    delta = await idx.changes(run(probe))
     assert len(delta) == len(probe) and not delta.exact
     assert h.io.metrics.gets <= len(files) + 2
 
     # Exact: every key's entry is read, so the count is exact and predecessors are named.
-    delta = await h.index().changes(run(probe, [b"v2"] * len(probe)), exact=True)
+    delta = await h.index().changes(run(probe), exact=True)
     assert delta.exact and all(e[4] is not None for e in entries_of(delta))
 
-    # All rewritten unchanged: every key needs its block, more than streaming costs.
+    # Observed again at their versions: every key needs its block, more than streaming costs.
     idx = h.index()
     files_out, _ = await idx.resolve(run(probe, same), batch=9, attempt="x")
     assert idx.route == "stream" and not files_out.files
@@ -413,17 +425,17 @@ async def test_a_patch_reads_blocks_or_streams():
     # Dense: more of the index than `stream_density` streams at once.
     idx = KeyIndex(h.io, "keys/out/p", h.state, filtered_options(stream_density=0.01))
     h.io.metrics.reset()
-    await idx.resolve(run(ks[::50], [b"v3"] * 80), batch=9, attempt="y")
+    await idx.resolve(run(ks[::50]), batch=9, attempt="y")
     assert idx.route == "stream" and h.io.metrics.gets == len(h.state.files)  # each file once, no tail first
 
 
 async def test_lookup_reads_prior_records_exactly():
     h = Harness(filtered_options())
     ks = [key(i) for i in range(2000)]
-    await h.commit(ks, [b"v1"] * len(ks))
-    await h.commit(ks[:10], [b"v2"] * 10, ks[10:20])
+    await h.commit(ks, [b"r1"] * len(ks))
+    await h.commit(ks[:10], None, ks[10:20])
     got = await h.index().lookup(ks[:30] + [b"zz-absent"])
-    assert got == {**{k: (b"v2", 2) for k in ks[:10]}, **{k: (b"v1", 1) for k in ks[20:30]}}
+    assert got == {**{k: (2, None) for k in ks[:10]}, **{k: (1, b"r1") for k in ks[20:30]}}
 
 
 async def test_a_full_scan_reads_each_block_once():
@@ -455,12 +467,12 @@ async def test_a_full_scan_reads_each_block_once():
 async def test_level_0_merges_in_itself_until_it_is_a_tenth_of_level_1():
     h = Harness(small_options(l0_max_files=3, level_base=1 << 30, fanout=10))
     rng = random.Random(9)
-    await h.commit([key(i) for i in range(3000)], [b"v1"] * 3000)
+    await h.commit([key(i) for i in range(3000)])
     l1 = sum(f.size for f in h.state.level(1))
     pushed = False
     for step in range(200):
         some = sorted({key(rng.randrange(3000)) for _ in range(10)})
-        await h.commit(some, [ver(rng) for _ in some])
+        await h.commit(some, [rev(rng) for _ in some])
         plan = h.index().plan_compaction()
         if plan is None:
             continue
@@ -479,19 +491,20 @@ async def test_level_0_merges_in_itself_until_it_is_a_tenth_of_level_1():
             break
     assert pushed
     # A merged level-0 file stays older than the deltas after it.
-    await h.commit([key(1)], [b"old"])
-    await h.commit([key(2)], [b"x"])
-    await h.commit([key(3)], [b"x"])
+    await h.commit([key(1)])
+    await h.commit([key(2)])
+    await h.commit([key(3)])
     assert h.index().plan_compaction()[1] == 0
     await h.compact_all()
-    await h.commit([key(1)], [b"new"])
+    await h.commit([key(1)])
     await h.check()
 
 
-async def test_locators_and_predecessors():
+async def test_generations_and_predecessors():
     """Entries carry the generation that wrote them; delta entries carry the
-    key's predecessor `(version, locator)`, for the store to discard the object
-    they superseded (lifecycle.md §9.8). Compaction keeps locators only."""
+    generation the key had before, for an immutable store to discard the
+    object it superseded (lifecycle.md §9.8). Compaction keeps generations
+    and payloads only."""
 
     io = ObjectIO(MemoryStore())
     state = IndexState(prefix="keys/out/")
@@ -500,30 +513,31 @@ async def test_locators_and_predecessors():
         return [e for f in files for e in _python.iter_file(await io.read_whole(state.path(f.name), f.size))]
 
     first, _ = await KeyIndex(io, None, state).replace(
-        Rows.pairs([(b"a", b"1"), (b"b", b"1"), (b"c", b"1")]), 0, "w1", generation=10
+        Rows.pairs([(b"a", b"1"), (b"b", b"1"), (b"c", None)]), 0, "w1", generation=10
     )
-    assert await entries(first.files) == [(k, b"1", 0, 10, None) for k in (b"a", b"b", b"c")]
+    assert await entries(first.files) == [
+        (b"a", 10, 0, b"1", None),
+        (b"b", 10, 0, b"1", None),
+        (b"c", 10, 0, None, None),
+    ]
     state = state.committed(0, first, keep_log=True)
     second, _ = await KeyIndex(io, None, state).replace(
-        Rows.pairs([(b"a", b"1"), (b"b", b"2"), (b"d", b"1")]), 1, "w2", generation=20
+        Rows.pairs([(b"a", b"1"), (b"b", b"2"), (b"d", None)]), 1, "w2", generation=20
     )
     assert await entries(second.files) == [
-        (b"b", b"2", 0, 20, (b"1", 10)),  # changed: the object of generation 10 is superseded
-        (b"c", b"", 1, 20, (b"1", 10)),  # deleted
-        (b"d", b"1", 0, 20, None),  # new: nothing superseded
+        (b"b", 20, 0, b"2", 10),  # changed: the object of generation 10 is superseded
+        (b"c", 20, 1, None, 10),  # deleted
+        (b"d", 20, 0, None, None),  # new: nothing superseded
     ]
     state = state.committed(1, second, keep_log=True)
     idx = KeyIndex(io, None, state)
-    delta = await idx.changes(run([b"a", b"d"], [b"2", b"1"], [b"b"]), generation=30)
-    assert [(e[0], e[3], e[4]) for e in entries_of(delta)] == [
-        (b"a", 30, (b"1", 10)),
-        (b"b", 30, (b"2", 20)),
-    ]
+    delta = await idx.changes(run([b"a", b"d"], None, [b"b"]), generation=30)
+    assert [(e[0], e[1], e[4]) for e in entries_of(delta)] == [(b"a", 30, 10), (b"b", 30, 20), (b"d", 30, 20)]
     state = state.committed(2, await idx.write(2, "w3", delta), keep_log=True)
-    keys, versions, locators, _ = await KeyIndex(io, None, state).page(None, 10)
-    assert list(zip(keys, versions, locators, strict=True)) == [(b"a", b"2", 30), (b"d", b"1", 20)]
+    keys, generations, payloads, _ = await KeyIndex(io, None, state).page(None, 10)
+    assert list(zip(keys, generations, payloads, strict=True)) == [(b"a", 30, None), (b"d", 30, None)]
     added, removed, _ = await KeyIndex(io, None, state).compact((state.level(0) + state.level(1), 1))
-    assert [e[3:] for e in await entries(added)] == [(30, None), (20, None)]
+    assert [e[1:] for e in await entries(added)] == [(30, 0, None, None), (30, 0, None, None)]
 
 
 async def test_pages_read_each_file_in_its_own_codec():
@@ -535,10 +549,10 @@ async def test_pages_read_each_file_in_its_own_codec():
     io = ObjectIO(MemoryStore())
     state = IndexState(prefix="keys/out/p/")
     for n, (k, codec) in enumerate([(b"a", 0), (b"b", 1)]):
-        data = _python.encode_file([k], [b"v"], b"\x00", codec=codec)
+        data = _python.encode_file([k], [5], b"\x00", codec=codec)
         name = f"{n:012d}-x.0000"
         await io.write(state.path(name), data)
         state = IndexState(files=(*state.files, FileInfo.describe(name, 0, data)), prefix=state.prefix)
     idx = KeyIndex(io, None, state)
     assert (await idx.page(None, 10))[0] == [b"a", b"b"]
-    assert await idx.lookup([b"a", b"b"]) == {b"a": (b"v", 0), b"b": (b"v", 0)}
+    assert await idx.lookup([b"a", b"b"]) == {b"a": (5, None), b"b": (5, None)}

@@ -3,18 +3,17 @@
 //!
 //! A `Table` holds every key in place (an Arrow column, or keys packed once)
 //! plus the permutation that sorts them — none when they arrive sorted — and
-//! is shared: each pass over it is a `Cursor`, computing versions as it
-//! reaches them, and `find` gives the rows of chosen keys. A `Stream` is fed
-//! sorted chunks and holds one at a time.
+//! is shared: each pass over it is a `Cursor`, and `find` gives the rows of
+//! chosen keys. Only keys are read: a row's other values never reach native
+//! code (docs/versions.md). A source's keys may carry a payload each, its
+//! version. A `Stream` is fed sorted chunks of keys and holds one at a time.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, OnceLock};
-
-use xxhash_rust::xxh3::Xxh3Default;
+use std::sync::Arc;
 
 use rayon::prelude::*;
 
-use crate::digest::{self, Digest};
+use crate::delta::Write;
 use crate::format::{Error, Result};
 use crate::run::SortedRun;
 use crate::sort::{self, Keys};
@@ -68,100 +67,72 @@ impl Keys for Arena {
     }
 }
 
-/// Where versions come from: `fill` appends the versions of `rows` to `out`.
-/// Either they are row digests (`rows`), folded into each key's `group`, or
-/// they are final, and every row of a key must have the same one.
-pub trait Versions: Send + Sync {
-    fn fill(&self, rows: &[u32], out: &mut Arena) -> Result<()>;
-
-    fn rows(&self) -> bool {
-        false
-    }
+/// Where a source's payloads come from: `fill` appends the payload of each
+/// of `rows` to `out`, None where a row carries none.
+pub trait Payloads: Send + Sync {
+    fn fill(&self, rows: &[u32], out: &mut Vec<Option<Vec<u8>>>) -> Result<()>;
 }
 
-/// Every row has the same version (a partition set's elements).
+/// Every row carries the same payload (a partition set's elements: empty).
 pub struct Constant(pub Vec<u8>);
 
-impl Versions for Constant {
-    fn fill(&self, rows: &[u32], out: &mut Arena) -> Result<()> {
-        for _ in rows {
-            out.push(&self.0);
-        }
+impl Payloads for Constant {
+    fn fill(&self, rows: &[u32], out: &mut Vec<Option<Vec<u8>>>) -> Result<()> {
+        out.extend(rows.iter().map(|_| Some(self.0.clone())));
         Ok(())
     }
 }
 
-/// The rows of one key, read one at a time: their version is the group of
-/// their row digests (`fold`), else the version they all share. A key has
-/// rows: one written with none does not exist.
+/// The rows of one key, read one at a time: a key has rows, and one written
+/// with none does not exist. Rows that carry payloads must agree on it.
 #[derive(Default)]
 pub struct Group {
     pub key: Vec<u8>,
-    pub version: Vec<u8>,
-    digests: Vec<Digest>,
-    fold: bool,
+    pub payload: Option<Vec<u8>>,
     rows: usize,
 }
 
 impl Group {
-    fn start(&mut self, key: &[u8], fold: bool) {
+    fn start(&mut self, key: &[u8]) {
         self.key.clear();
         self.key.extend_from_slice(key);
-        self.version.clear();
-        self.digests.clear();
-        self.fold = fold;
+        self.payload = None;
         self.rows = 0;
     }
 
-    fn add(&mut self, version: &[u8]) -> Result<()> {
-        if self.fold {
-            let d = version
-                .try_into()
-                .map_err(|_| Error::Value("a row digest is 16 bytes".into()))?;
-            self.digests.push(d);
-        } else if self.rows == 0 {
-            self.version.extend_from_slice(version);
-        } else if version != self.version.as_slice() {
+    fn add(&mut self, payload: Option<&[u8]>) -> Result<()> {
+        if self.rows == 0 {
+            self.payload = payload.map(<[u8]>::to_vec);
+        } else if payload != self.payload.as_deref() {
             return Err(Error::Value(format!(
-                "the rows of key {:?} have different revisions",
+                "key {:?} is given two versions",
                 String::from_utf8_lossy(&self.key)
             )));
         }
         self.rows += 1;
         Ok(())
     }
-
-    fn finish(&mut self) {
-        if self.fold {
-            self.version.clear();
-            self.version
-                .extend_from_slice(&digest::group(&mut self.digests));
-        }
-    }
 }
 
-/// Versions computed a window of rows at a time, in key order.
+/// Keys gathered a window of rows at a time, in key order.
 const WINDOW: usize = 1 << 14;
 
 /// A write's rows, sorted once and shared by every pass over them.
 pub struct Table {
     keys: Box<dyn Keys + Send>,
     order: Option<Vec<u32>>,
-    versions: Box<dyn Versions>,
-    /// The digest of every `(key, version)`, once a pass has read them all.
-    content: OnceLock<Digest>,
+    payloads: Option<Box<dyn Payloads>>,
 }
 
 impl Table {
     /// Sorts the keys unless they arrive sorted.
-    pub fn new(keys: Box<dyn Keys + Send>, versions: Box<dyn Versions>) -> Result<Table> {
+    pub fn new(keys: Box<dyn Keys + Send>, payloads: Option<Box<dyn Payloads>>) -> Table {
         let order = (!sort::is_sorted(&*keys)).then(|| sort::order(&*keys));
-        Ok(Table {
+        Table {
             keys,
             order,
-            versions,
-            content: OnceLock::new(),
-        })
+            payloads,
+        }
     }
 
     /// Rows, not keys.
@@ -210,52 +181,20 @@ impl Table {
         rows.sort_unstable();
         (!rows.is_empty()).then_some(rows)
     }
-
-    /// The version of `key`, from its rows alone; None when the write does
-    /// not hold it.
-    pub fn version(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let Some(rows) = self.find(key) else {
-            return Ok(None);
-        };
-        let mut versions = Arena::default();
-        self.versions.fill(&rows, &mut versions)?;
-        let mut g = Group::default();
-        g.start(key, self.versions.rows());
-        for i in 0..versions.len() {
-            g.add(versions.get(i))?;
-        }
-        g.finish();
-        Ok(Some(g.version))
-    }
-
-    /// The digest of every `(key, version)` in key order, reading them all
-    /// unless a pass already has.
-    pub fn content(self: &Arc<Table>) -> Result<Digest> {
-        if let Some(d) = self.content.get() {
-            return Ok(*d);
-        }
-        let mut c = Cursor::new(self.clone());
-        while c.read()? {}
-        Ok(*self
-            .content
-            .get()
-            .expect("a whole pass records the content"))
-    }
 }
 
 /// One pass over a `Table`, a key at a time.
 pub struct Cursor {
     table: Arc<Table>,
-    // The next rows in key order, keys and versions side by side: rows sit in
-    // any order in memory, so they are gathered a window at a time, on every core.
+    // The next rows in key order: rows sit in any order in memory, so their
+    // keys are gathered a window at a time, on every core.
     wrows: Vec<u32>,
     wkeys: Arena,
-    wvers: Arena,
+    wpays: Vec<Option<Vec<u8>>>,
     start: usize,
     pos: usize,
     group: Group,
     ready: bool,
-    hash: Xxh3Default,
 }
 
 impl Cursor {
@@ -264,17 +203,12 @@ impl Cursor {
             table,
             wrows: Vec::new(),
             wkeys: Arena::default(),
-            wvers: Arena::default(),
+            wpays: Vec::new(),
             start: 0,
             pos: 0,
             group: Group::default(),
             ready: false,
-            hash: Xxh3Default::new(),
         }
-    }
-
-    pub fn table(&self) -> &Arc<Table> {
-        &self.table
     }
 
     /// Makes the window hold row `pos`.
@@ -288,8 +222,10 @@ impl Cursor {
         self.wrows.extend((self.pos..end).map(|p| t.row(p)));
         self.wkeys.clear();
         gather(&*t.keys, &self.wrows, &mut self.wkeys);
-        self.wvers.clear();
-        t.versions.fill(&self.wrows, &mut self.wvers)?;
+        self.wpays.clear();
+        if let Some(p) = &t.payloads {
+            p.fill(&self.wrows, &mut self.wpays)?;
+        }
         self.start = self.pos;
         Ok(())
     }
@@ -298,20 +234,14 @@ impl Cursor {
     pub fn read(&mut self) -> Result<bool> {
         let n = self.table.keys.len();
         if self.pos >= n {
-            if self.pos == n && self.table.content.get().is_none() {
-                let d = self.hash.digest128().to_le_bytes();
-                let _ = self.table.content.set(d);
-            }
-            self.pos = n + 1; // recorded once
             return Ok(false);
         }
         self.fill()?;
-        let fold = self.table.versions.rows();
-        self.group
-            .start(self.wkeys.get(self.pos - self.start), fold);
+        self.group.start(self.wkeys.get(self.pos - self.start));
         loop {
             let i = self.pos - self.start;
-            self.group.add(self.wvers.get(i))?;
+            self.group
+                .add(self.wpays.get(i).and_then(Option::as_deref))?;
             self.pos += 1;
             if self.pos >= n {
                 break;
@@ -321,17 +251,12 @@ impl Cursor {
                 break;
             }
         }
-        self.group.finish();
-        for part in [&self.group.key, &self.group.version] {
-            self.hash.update(&(part.len() as u64).to_le_bytes());
-            self.hash.update(part);
-        }
         Ok(true)
     }
 
-    /// The current key and its version, after `read` returned true.
-    pub fn entry(&self) -> (&[u8], &[u8]) {
-        (&self.group.key, &self.group.version)
+    /// The current key and its payload, after `read` returned true.
+    pub fn entry(&self) -> (&[u8], Option<&[u8]>) {
+        (&self.group.key, self.group.payload.as_deref())
     }
 }
 
@@ -352,29 +277,21 @@ fn gather<K: Keys + ?Sized>(keys: &K, rows: &[u32], out: &mut Arena) {
     }
 }
 
-/// Sorted chunks of `(key, version)`, fed as they are read. A key may
-/// repeat: its versions are row digests to `fold`, or must agree.
+/// Sorted chunks of keys, fed as they are read. A key may repeat: it is
+/// one key, as rows are.
 #[derive(Default)]
 pub struct Stream {
-    chunks: VecDeque<(Arena, Arena)>,
+    chunks: VecDeque<Arena>,
     pos: usize,
     last: Option<Vec<u8>>,
     ended: bool,
-    fold: bool,
     group: Group,
     open: bool,
     ready: bool,
 }
 
 impl Stream {
-    pub fn new(fold: bool) -> Stream {
-        Stream {
-            fold,
-            ..Stream::default()
-        }
-    }
-
-    pub fn feed(&mut self, keys: Arena, versions: Arena) -> Result<()> {
+    pub fn feed(&mut self, keys: Arena) -> Result<()> {
         for i in 0..keys.len() {
             let k = keys.get(i);
             let prev = if i > 0 {
@@ -392,7 +309,7 @@ impl Stream {
         }
         if !keys.is_empty() {
             self.last = Some(keys.get(keys.len() - 1).to_vec());
-            self.chunks.push_back((keys, versions));
+            self.chunks.push_back(keys);
         }
         Ok(())
     }
@@ -401,18 +318,17 @@ impl Stream {
         self.ended = true;
     }
 
-    /// Reads the next key's rows into `group`, across chunks.
+    /// Reads the next key into `group`, across chunks.
     fn state(&mut self) -> Result<State> {
         if self.ready {
             return Ok(State::Ready);
         }
         loop {
-            let Some((k, v)) = self.chunks.front() else {
+            let Some(k) = self.chunks.front() else {
                 if !self.ended {
-                    return Ok(State::Starved); // the group may go on in the next chunk
+                    return Ok(State::Starved); // the key may go on in the next chunk
                 }
                 if self.open {
-                    self.group.finish();
                     (self.open, self.ready) = (false, true);
                     return Ok(State::Ready);
                 }
@@ -425,15 +341,13 @@ impl Stream {
             }
             let key = k.get(self.pos);
             if self.open && key != self.group.key.as_slice() {
-                self.group.finish();
                 (self.open, self.ready) = (false, true);
                 return Ok(State::Ready);
             }
             if !self.open {
-                self.group.start(key, self.fold);
+                self.group.start(key);
                 self.open = true;
             }
-            self.group.add(v.get(self.pos))?;
             self.pos += 1;
         }
     }
@@ -441,7 +355,7 @@ impl Stream {
 
 /// A stream with a sorted run laid over it: the run's upserts in place of
 /// the stream's entries of their keys, and its removes gone — a patch over
-/// what a store holds, read back a chunk at a time.
+/// the keys a store holds, read back a chunk at a time.
 pub struct Overlay {
     pub base: Stream,
     run: Arc<SortedRun>,
@@ -485,7 +399,7 @@ impl Overlay {
                 self.base.ready = false; // the run's entry stands for it
                 continue;
             }
-            if self.run.write(self.i).is_none() {
+            if matches!(self.run.write(self.i), Write::Remove) {
                 self.i += 1; // a remove: nothing of the key stays
                 continue;
             }
@@ -493,13 +407,10 @@ impl Overlay {
         }
     }
 
-    fn entry(&self) -> (&[u8], &[u8]) {
+    fn entry(&self) -> (&[u8], Option<&[u8]>) {
         match self.current {
-            Some(true) => (
-                self.run.key(self.i),
-                self.run.write(self.i).expect("an upsert"),
-            ),
-            _ => (&self.base.group.key, &self.base.group.version),
+            Some(true) => (self.run.key(self.i), self.run.payload(self.i)),
+            _ => (&self.base.group.key, None),
         }
     }
 
@@ -550,21 +461,21 @@ impl Source {
         self.entry().0
     }
 
-    /// The current write: its version, or None for a remove.
+    /// The current write: an upsert with its payload, or a remove.
     #[inline]
-    pub fn write(&self) -> Option<&[u8]> {
+    pub fn write(&self) -> Write<'_> {
         match self {
             Source::Run(run, i) => run.write(*i),
-            _ => Some(self.entry().1),
+            _ => Write::Upsert(self.entry().1),
         }
     }
 
-    /// The current key and its version; only when `state` is `Ready`.
-    pub fn entry(&self) -> (&[u8], &[u8]) {
+    /// The current key and its payload; only when `state` is `Ready`.
+    pub fn entry(&self) -> (&[u8], Option<&[u8]>) {
         match self {
-            Source::Table(t) => (&t.group.key, &t.group.version),
-            Source::Stream(s) => (&s.group.key, &s.group.version),
-            Source::Run(run, i) => (run.key(*i), run.versions.get(*i)),
+            Source::Table(t) => t.entry(),
+            Source::Stream(s) => (&s.group.key, None),
+            Source::Run(run, i) => (run.key(*i), run.payload(*i)),
             Source::Overlay(o) => o.entry(),
         }
     }

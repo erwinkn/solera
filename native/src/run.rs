@@ -1,9 +1,9 @@
-//! A sorted run: a write's entries in key order — upserts at their versions,
-//! and removes — as the key index takes them end to end. Built once (from
-//! lists, from rows, or from the `.kx` transport form, every fact checked),
-//! read by every resolver, and encoded only to cross the wire. A delta
-//! file's entries held in memory (the engine's summaries) are one too, with
-//! their locators.
+//! A sorted run: a write's entries in key order — upserts, each with its
+//! payload if it carries one, and removes — as the key index takes them end
+//! to end. Built once (from lists, from rows, or from the `.kx` transport
+//! form, every fact checked), read by every resolver, and encoded only to
+//! cross the wire. A delta file's entries held in memory (the engine's
+//! summaries) are one too, with their generations.
 
 use crate::format::{
     decompress_at_most, fmt_err, parse_index_at_most, slice_at, sort_order, Error, Index, Options,
@@ -15,15 +15,18 @@ fn index_bytes(idx: &Index) -> u64 {
     let blocks: usize = idx.blocks.iter().map(|b| b.0.len() + 32).sum();
     (idx.min_key.len() + idx.max_key.len() + blocks) as u64
 }
+use crate::delta::Write;
 use crate::rows::{Arena, Source};
 use crate::stream::{read_entry, State, Writer};
 
 #[derive(Default)]
 pub struct SortedRun {
     pub keys: Arena,
-    pub versions: Arena,
+    /// Payloads, one per entry (empty where there is none: `has_payload`).
+    pub payloads: Arena,
+    pub has_payload: Vec<bool>,
     pub deleted: Vec<bool>,
-    pub locators: Vec<u64>,
+    pub generations: Vec<u64>,
     removes: usize,
 }
 
@@ -49,38 +52,49 @@ impl SortedRun {
         self.keys.get(i)
     }
 
-    /// Entry `i`'s write: its version, or None for a remove.
+    /// Entry `i`'s payload, if it carries one.
     #[inline]
-    pub fn write(&self, i: usize) -> Option<&[u8]> {
-        (!self.deleted[i]).then(|| self.versions.get(i))
+    pub fn payload(&self, i: usize) -> Option<&[u8]> {
+        self.has_payload[i].then(|| self.payloads.get(i))
+    }
+
+    /// Entry `i`'s write: an upsert with its payload, or a remove.
+    #[inline]
+    pub fn write(&self, i: usize) -> Write<'_> {
+        if self.deleted[i] {
+            Write::Remove
+        } else {
+            Write::Upsert(self.payload(i))
+        }
     }
 
     /// Bytes held.
     pub fn nbytes(&self) -> usize {
         self.keys.data.capacity()
-            + self.versions.data.capacity()
-            + 8 * (self.keys.ends.capacity() + self.versions.ends.capacity())
-            + self.deleted.capacity()
-            + 8 * self.locators.capacity()
+            + self.payloads.data.capacity()
+            + 8 * (self.keys.ends.capacity() + self.payloads.ends.capacity())
+            + 2 * self.deleted.capacity()
+            + 8 * self.generations.capacity()
     }
 
     /// Gives back what building over-allocated: a run is held as long as it is read.
     pub(crate) fn shrink(mut self) -> SortedRun {
         self.keys.data.shrink_to_fit();
         self.keys.ends.shrink_to_fit();
-        self.versions.data.shrink_to_fit();
-        self.versions.ends.shrink_to_fit();
+        self.payloads.data.shrink_to_fit();
+        self.payloads.ends.shrink_to_fit();
+        self.has_payload.shrink_to_fit();
         self.deleted.shrink_to_fit();
-        self.locators.shrink_to_fit();
+        self.generations.shrink_to_fit();
         self
     }
 
     pub(crate) fn push(
         &mut self,
         key: &[u8],
-        version: &[u8],
+        generation: u64,
         deleted: bool,
-        locator: u64,
+        payload: Option<&[u8]>,
     ) -> Result<()> {
         if let Some(last) = self.keys.len().checked_sub(1) {
             if key <= self.keys.get(last) {
@@ -96,36 +110,41 @@ impl SortedRun {
             }
         }
         self.keys.push(key);
-        self.versions.push(version);
+        self.payloads.push(payload.unwrap_or_default());
+        self.has_payload.push(payload.is_some());
         self.deleted.push(deleted);
-        self.locators.push(locator);
+        self.generations.push(generation);
         self.removes += deleted as usize;
         Ok(())
     }
 
-    /// Upserts of `keys` at `versions` (any order, each key once) and the
-    /// removes of `removes` (any order, repeats ignored); a key both
-    /// written and removed is an error.
-    pub fn of(keys: &[&[u8]], versions: &[&[u8]], removes: &[&[u8]]) -> Result<SortedRun> {
-        if keys.len() != versions.len() {
+    /// Upserts of `keys` (any order, each key once), each with its payload
+    /// if `payloads` gives one, and the removes of `removes` (any order,
+    /// repeats ignored); a key both written and removed is an error.
+    pub fn of(
+        keys: &[&[u8]],
+        payloads: Option<&[Option<&[u8]>]>,
+        removes: &[&[u8]],
+    ) -> Result<SortedRun> {
+        if payloads.is_some_and(|p| p.len() != keys.len()) {
             return Err(Error::Value(
-                "keys and versions must have the same length".into(),
+                "keys and payloads must have the same length".into(),
             ));
         }
         let order = sort_order(keys)?;
         let mut b = Builder::new(removes, keys.len());
         for i in order {
-            b.upsert(keys[i], versions[i])?;
+            b.upsert(keys[i], payloads.and_then(|p| p[i]))?;
         }
         b.finish()
     }
 
-    /// The keys and versions of `rows`, in key order, and `removes`.
+    /// The keys of `rows`, in key order, with their payloads, and `removes`.
     pub fn from_source(src: &mut Source, removes: &[&[u8]]) -> Result<SortedRun> {
         let mut b = Builder::new(removes, 0);
         while src.state()? == State::Ready {
-            let (k, v) = src.entry();
-            b.upsert(k, v)?;
+            let (k, p) = src.entry();
+            b.upsert(k, p)?;
             src.advance();
         }
         b.finish()
@@ -136,7 +155,7 @@ impl SortedRun {
     /// checksum, each block's entries against its index entry and the
     /// file's against the footer, keys strictly increasing. Decodes at most
     /// `max_entries` entries and `max_bytes` bytes (decompressed, and keys
-    /// and versions decoded): past either, an `Error::Limit`, whatever the
+    /// and payloads decoded): past either, an `Error::Limit`, whatever the
     /// file claims.
     pub fn decode(kx: &[u8], max_entries: u64, max_bytes: u64) -> Result<SortedRun> {
         let idx = parse_index_at_most(kx, kx.len() as u64, max_bytes)?;
@@ -152,7 +171,7 @@ impl SortedRun {
             return fmt_err("the index's entries do not match the footer");
         }
         let mut run = SortedRun::default();
-        // One budget: the index decoded, then the blocks, then their keys and versions.
+        // One budget: the index decoded, then the blocks, then their keys and payloads.
         let mut budget = max_bytes.saturating_sub(index_bytes(&idx));
         let take = |budget: &mut u64, n: usize| -> Result<()> {
             match budget.checked_sub(n as u64) {
@@ -184,11 +203,14 @@ impl SortedRun {
                     return fmt_err("bad shared prefix length");
                 }
                 let suffix = &data[f.suffix.0..f.suffix.1];
-                let version = &data[f.version.0..f.version.1];
-                take(&mut budget, f.shared + suffix.len() + version.len())?;
+                let payload = f.payload(&data);
+                take(
+                    &mut budget,
+                    f.shared + suffix.len() + payload.map_or(0, <[u8]>::len),
+                )?;
                 key.truncate(f.shared);
                 key.extend_from_slice(suffix);
-                run.push(&key, version, f.flags & 1 != 0, f.locator)
+                run.push(&key, f.generation, f.deleted(), payload)
                     .map_err(|_| Error::Format("keys out of order".into()))?;
             }
             if (run.len() - start) as u64 != *entries {
@@ -216,9 +238,9 @@ impl SortedRun {
         for i in 0..self.len() {
             w.push(
                 self.key(i),
-                self.versions.get(i),
+                self.generations[i],
                 self.deleted[i],
-                self.locators[i],
+                self.payload(i),
                 None,
             )?;
         }
@@ -241,7 +263,7 @@ impl<'a> Builder<'a> {
         removes.dedup();
         let mut run = SortedRun::default();
         run.keys.ends.reserve(upserts + removes.len());
-        run.versions.ends.reserve(upserts + removes.len());
+        run.payloads.ends.reserve(upserts + removes.len());
         Builder {
             run,
             removes,
@@ -249,17 +271,17 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn upsert(&mut self, key: &[u8], version: &[u8]) -> Result<()> {
+    fn upsert(&mut self, key: &[u8], payload: Option<&[u8]>) -> Result<()> {
         while self.next < self.removes.len() && self.removes[self.next] <= key {
-            self.run.push(self.removes[self.next], b"", true, 0)?;
+            self.run.push(self.removes[self.next], 0, true, None)?;
             self.next += 1;
         }
-        self.run.push(key, version, false, 0)
+        self.run.push(key, 0, false, payload)
     }
 
     fn finish(mut self) -> Result<SortedRun> {
         for k in &self.removes[self.next..] {
-            self.run.push(k, b"", true, 0)?;
+            self.run.push(k, 0, true, None)?;
         }
         Ok(self.run.shrink())
     }
@@ -282,18 +304,22 @@ mod tests {
     fn of_encode_decode_round_trip() {
         let run = SortedRun::of(
             &[b"c", b"a", b"e"],
-            &[b"3", b"1", b"5"],
+            Some(&[Some(b"3"), None, Some(b"")]),
             &[b"d", b"b", b"d"],
         )
         .unwrap();
         let keys: Vec<&[u8]> = (0..run.len()).map(|i| run.key(i)).collect();
         assert_eq!(keys, [b"a", b"b", b"c", b"d", b"e"]);
         assert_eq!(run.removes(), 2);
-        assert_eq!(run.write(1), None);
-        assert_eq!(run.write(2), Some(&b"3"[..]));
+        assert!(matches!(run.write(1), Write::Remove));
+        assert!(matches!(run.write(0), Write::Upsert(None)));
+        assert!(matches!(run.write(2), Write::Upsert(Some(b"3"))));
+        assert!(matches!(run.write(4), Write::Upsert(Some(b""))));
         let back = SortedRun::decode(&run.encode(O).unwrap(), 5, 1 << 20).unwrap();
         assert_eq!(back.keys.data, run.keys.data);
         assert_eq!(back.deleted, run.deleted);
+        assert_eq!(back.has_payload, run.has_payload);
+        assert_eq!(back.payloads.data, run.payloads.data);
         assert!(matches!(
             SortedRun::decode(&run.encode(O).unwrap(), 4, 1 << 20),
             Err(Error::Limit(_))
@@ -302,7 +328,7 @@ mod tests {
             SortedRun::decode(&run.encode(O).unwrap(), 5, 8),
             Err(Error::Limit(_))
         ));
-        assert!(SortedRun::of(&[b"a"], &[b"1"], &[b"a"]).is_err());
-        assert!(SortedRun::of(&[b"a", b"a"], &[b"1", b"2"], &[]).is_err());
+        assert!(SortedRun::of(&[b"a"], None, &[b"a"]).is_err());
+        assert!(SortedRun::of(&[b"a", b"a"], None, &[]).is_err());
     }
 }

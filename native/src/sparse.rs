@@ -2,14 +2,15 @@
 //! native from start to delta. Python chooses files and fetches their tails
 //! and blocks; this decides, for each entry of a sorted run — by its
 //! position, never a Python object — what the index holds: read from a
-//! block, absent by the key filters, or live at another version by the pair
-//! and tombstone filters; then writes the delta by the one rule (`delta.rs`).
+//! block, absent by the key filters, or — for an upsert carrying no payload,
+//! which changes the key whatever its entry — live by the key and tombstone
+//! filters; then writes the delta by the one rule (`delta.rs`).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::delta::{Delta, Old};
-use crate::format::{key_item, may_hold, pair_item, tomb_item, Options, Result};
+use crate::delta::{Delta, Old, Write};
+use crate::format::{key_item, may_hold, tomb_item, Options, Result};
 use crate::run::SortedRun;
 use crate::stream::Block;
 
@@ -19,9 +20,9 @@ enum Known {
     Unknown,
     /// No live entry: read deleted, or no file's key filter holds it.
     Absent,
-    /// Read live, at this version and locator.
-    Live(Vec<u8>, u64),
-    /// Live at another version, as the filters said.
+    /// Read live, at this generation, with this payload.
+    Live(u64, Option<Vec<u8>>),
+    /// Live, as the filters said.
     Other,
     /// The filters cannot decide: an exact read in the files holding it.
     Maybe,
@@ -33,7 +34,6 @@ pub type Filter<'a> = (u64, u8, &'a [u8]);
 pub struct Sparse {
     pub run: Arc<SortedRun>,
     known: Vec<Known>,
-    pair: Vec<bool>,
     tomb: Vec<bool>,
     key: Vec<bool>,
     /// Per file the filters ran on (an id the caller gives): positions its key filter holds.
@@ -47,7 +47,6 @@ impl Sparse {
         Sparse {
             run,
             known: vec![Known::Unknown; n],
-            pair: vec![false; n],
             tomb: vec![false; n],
             key: vec![false; n],
             holders: BTreeMap::new(),
@@ -178,7 +177,7 @@ impl Sparse {
                         self.known[p as usize] = if blk.deleted(mid) {
                             Known::Absent
                         } else {
-                            Known::Live(blk.version(mid).to_vec(), blk.locator(mid))
+                            Known::Live(blk.generation(mid), blk.payload(mid).map(<[u8]>::to_vec))
                         };
                         break;
                     }
@@ -190,15 +189,7 @@ impl Sparse {
 
     /// Runs one file's filters over the undecided positions in `[lo, hi)`;
     /// `file` names it for the exact reads that follow.
-    pub fn filter(
-        &mut self,
-        file: usize,
-        lo: usize,
-        hi: usize,
-        keys: Filter,
-        tombs: Filter,
-        pairs: Filter,
-    ) {
+    pub fn filter(&mut self, file: usize, lo: usize, hi: usize, keys: Filter, tombs: Filter) {
         let mut item = Vec::new();
         let mut held = Vec::new();
         for p in lo..hi {
@@ -214,10 +205,6 @@ impl Sparse {
             self.key[p] = true;
             tomb_item(&mut item, key);
             self.tomb[p] |= may_hold(tombs.2, &item, tombs.0, tombs.1);
-            if let Some(v) = self.run.write(p) {
-                pair_item(&mut item, key, v);
-                self.pair[p] |= may_hold(pairs.2, &item, pairs.0, pairs.1);
-            }
         }
         if !held.is_empty() {
             self.holders.insert(file, held);
@@ -225,16 +212,17 @@ impl Sparse {
     }
 
     /// Decides what the filters can: no key filter holds a key — absent; an
-    /// upsert no pair or tombstone filter holds — live at another version,
-    /// unless `exact`; the rest need an exact read.
+    /// upsert with no payload, which no tombstone filter holds — live, unless
+    /// `exact`; the rest need an exact read.
     pub fn classify(&mut self, exact: bool) {
         for p in 0..self.known.len() {
             if !matches!(self.known[p], Known::Unknown) {
                 continue;
             }
+            let bare = matches!(self.run.write(p), Write::Upsert(None));
             self.known[p] = if !self.key[p] {
                 Known::Absent
-            } else if self.run.write(p).is_some() && !self.pair[p] && !self.tomb[p] && !exact {
+            } else if bare && !self.tomb[p] && !exact {
                 self.inferred = true;
                 Known::Other
             } else {
@@ -246,16 +234,16 @@ impl Sparse {
     /// What the index holds for entry `p`.
     fn old(&self, p: usize) -> Old<'_> {
         match &self.known[p] {
-            Known::Live(v, l) => Old::Live(v, *l),
+            Known::Live(g, payload) => Old::Live(*g, payload.as_deref()),
             Known::Other => Old::Other,
             _ => Old::Absent,
         }
     }
 
-    /// Each live entry read: position, version, locator.
-    pub fn live(&self) -> impl Iterator<Item = (usize, &[u8], u64)> {
+    /// Each live entry read: position, generation, payload.
+    pub fn live(&self) -> impl Iterator<Item = (usize, u64, Option<&[u8]>)> {
         self.known.iter().enumerate().filter_map(|(p, k)| match k {
-            Known::Live(v, l) => Some((p, v.as_slice(), *l)),
+            Known::Live(g, payload) => Some((p, *g, payload.as_deref())),
             _ => None,
         })
     }

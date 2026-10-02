@@ -83,7 +83,8 @@ async def test_engine_and_cold_resolves_agree(io, tmp_path):
     assert first[0] == {"name": "out", "result": "declined", "reason": "cold"}
     await asyncio.gather(*resolver._fills)
     assert cache.warm(state)
-    current = dict(zip(*(await KeyIndex(io, None, state, OPTS).page(None, 10**6))[:2], strict=False))
+    page = await KeyIndex(io, None, state, OPTS).page(None, 10**6)
+    current = dict(zip(page[0], page[2], strict=True))  # each key's version
     for step in range(30):
         kind = "replace" if step % 5 == 4 else "patch"
         ks = sorted({key(rng.randrange(3500)) for _ in range(rng.choice([1, 20, 400]))})
@@ -104,7 +105,7 @@ async def test_engine_and_cold_resolves_agree(io, tmp_path):
             assert cold == [] and files.added == files.removed == 0
         else:
             assert answer["result"] == "delta"
-            assert decoded([delta]) == cold  # entries, locators and predecessors
+            assert decoded([delta]) == cold  # entries, generations, payloads and predecessors
             assert (answer["added"], answer["removed"]) == (files.added, files.removed)
 
 
@@ -269,8 +270,8 @@ async def test_only_the_named_object_is_installed(io, tmp_path):
     their `FileInfo` names — size and digest — and a copy kept across a
     restart counts only for the object it was built from."""
 
-    good = _native.encode_file([b"a"], [b"good"], b"\x00")
-    evil = _native.encode_file([b"a"], [b"evil"], b"\x00")
+    good = _native.encode_file([b"a"], [1], b"\x00", payloads=[b"good"])
+    evil = _native.encode_file([b"a"], [1], b"\x00", payloads=[b"evil"])
     f = FileInfo.describe("000000000001-x.0000", 0, good)
     state = IndexState(prefix="keys/out/_/", files=(f,))
     cache = EngineCache(str(tmp_path))
@@ -292,8 +293,8 @@ async def test_only_the_named_object_is_installed(io, tmp_path):
 async def test_committed_deltas_are_verified_before_install(io, tmp_path):
     from solera_server.keyservice import KeyService
 
-    good = _native.encode_file([b"a"], [b"good"], b"\x00")
-    evil = _native.encode_file([b"a"], [b"evil"], b"\x00")
+    good = _native.encode_file([b"a"], [1], b"\x00", payloads=[b"good"])
+    evil = _native.encode_file([b"a"], [1], b"\x00", payloads=[b"evil"])
     f = FileInfo.describe("000000000001-x.0000", 0, good)
     service = KeyService(io.store, str(tmp_path))
     service.start()
@@ -317,7 +318,7 @@ async def test_the_disk_budget_holds_against_the_real_size(io, tmp_path):
     written if the room for its real size cannot be had."""
 
     keys = [key(i) for i in range(10_000)]
-    data = _native.encode_file(keys, [b"r" * 256] * len(keys), bytes(len(keys)))
+    data = _native.encode_file(keys, [0] * len(keys), bytes(len(keys)), payloads=[b"r" * 256] * len(keys))
     f = FileInfo.describe("c1-0000", 1, data)
     state = IndexState(prefix="keys/out/_/", files=(f,))
     await io.write(state.path(f.name), data)
@@ -569,7 +570,7 @@ async def test_admission_remembers_what_a_file_built_to(io, tmp_path):
     is."""
 
     keys = [key(i) for i in range(10_000)]
-    data = _native.encode_file(keys, [b"r" * 256] * len(keys), bytes(len(keys)))
+    data = _native.encode_file(keys, [0] * len(keys), bytes(len(keys)), payloads=[b"r" * 256] * len(keys))
     f = FileInfo.describe("c1-0000", 1, data)
     state = IndexState(prefix="keys/out/_/", files=(f,))
     await io.write(state.path(f.name), data)
@@ -682,7 +683,9 @@ async def test_local_reads_are_the_stores(io, tmp_path):
         probe = [key(rng.randrange(2100)) for _ in range(50)]
         assert await warm.lookup(probe) == await cold.lookup(probe)
     # Recording reads only local copies: one it does not hold is `Cold`.
-    partial = ObjectIO(None, local=dict(list(pin.handles.items())[1:]), served=Reads(recording=True))
+    gone = state.path(state.files[0].name)  # a file a page reads, not one only the log holds
+    held = {p: h for p, h in pin.handles.items() if p != gone}
+    partial = ObjectIO(None, local=held, served=Reads(recording=True))
     with pytest.raises(Cold):
         await KeyIndex(partial, None, state, OPTS).page(None, 10)
     pin.__exit__(None, None, None)
@@ -737,7 +740,7 @@ async def test_a_build_stops_at_the_room_it_holds(io, tmp_path):
     least what it reached, is what the next admission counts: no refetch."""
 
     keys = [key(i) for i in range(10_000)]
-    data = _native.encode_file(keys, [b"r" * 4096] * len(keys), bytes(len(keys)))
+    data = _native.encode_file(keys, [0] * len(keys), bytes(len(keys)), payloads=[b"r" * 4096] * len(keys))
     f = FileInfo.describe("c1-0000", 1, data)
     state = IndexState(prefix="keys/out/_/", files=(f,))
     await io.write(state.path(f.name), data)
@@ -826,7 +829,9 @@ async def test_installs_waiting_are_bounded_in_bytes(io, tmp_path, monkeypatch):
         rng = random.Random(2)
         for i in range(30):
             ks = [key(j) for j in range(2000)]
-            data = _native.encode_file(ks, [rng.randbytes(500) for _ in ks], bytes(len(ks)), codec=0)
+            data = _native.encode_file(
+                ks, [0] * len(ks), bytes(len(ks)), payloads=[rng.randbytes(500) for _ in ks], codec=0
+            )
             f = FileInfo.describe(f"c{i:04d}-0000", 1, data)
             service.installed(state.prefix, f, state.path(f.name), data)
             assert service._installing <= keyservice.INSTALL_QUEUE
@@ -931,7 +936,7 @@ def test_a_record_refuses_entries_before_encoding(monkeypatch):
     reads = reads_module.Reads(recording=True, max_entries=10, max_bytes=2**20)
     keys = [key(i) for i in range(11)]
     with pytest.raises(reads_module.Full):
-        reads.record("i", "page", (None, 11), (keys, [b"v"] * 11, [0] * 11, None))
+        reads.record("i", "page", (None, 11), (keys, [0] * 11, [None] * 11, None))
     assert not encoded
 
 
@@ -999,7 +1004,9 @@ def test_a_build_never_expands_a_blocks_keys_at_once(tmp_path):
     import sys
 
     keys = [b"p" * 32768 + b"%06d" % i for i in range(4000)]
-    (tmp_path / "source.kx").write_bytes(_native.encode_file(keys, [b"v"] * len(keys), bytes(len(keys))))
+    (tmp_path / "source.kx").write_bytes(
+        _native.encode_file(keys, [0] * len(keys), bytes(len(keys)), payloads=[b"v"] * len(keys))
+    )
     del keys
     # The peak of this address space (VmHWM): a child's ru_maxrss carries its parent's.
     script = f"""

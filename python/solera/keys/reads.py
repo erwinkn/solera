@@ -10,8 +10,8 @@ other reads the store.
 
 A call names its index by the digest of its pinned state, so an answer
 is only ever used for the snapshot it was read from. Results travel as
-`.kx` files (keys, versions, deletions, locators) — the format resolves
-use, checked as it is decoded.
+`.kx` files (keys, generations, deletions, payloads) — the format
+resolves use, checked as it is decoded.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ import json
 from .. import _native
 from .._native import SortedRun, encode_file
 
-VERSION = 1
+VERSION = 2
 
 
 class Cold(Exception):
@@ -59,7 +59,7 @@ class Reads:
     ):
         self.recording = recording
         self.max_entries, self.max_bytes = max_entries, max_bytes
-        self.max_decoded = max_decoded or 4 * max_bytes  # keys and versions read, before encoding
+        self.max_decoded = max_decoded or 4 * max_bytes  # keys and payloads read, before encoding
         self.entries = self.bytes = self.decoded = 0
         self.calls: dict[str, dict] = {}
 
@@ -77,7 +77,7 @@ class Reads:
             raise Full(call)
 
     def decoded_left(self) -> int:
-        """Bytes of keys and versions a read may still decode for this record."""
+        """Bytes of keys and payloads a read may still decode for this record."""
 
         return max(0, self.max_decoded - self.decoded)
 
@@ -100,15 +100,15 @@ class Reads:
                 keys,
                 [result[k][0] for k in keys],
                 bytes(len(keys)),
-                locators=[result[k][1] for k in keys],
+                payloads=[result[k][1] for k in keys],
             )
             nxt = None
         elif call == "page":
-            keys, versions, locators, nxt = result
-            run = encode_file(keys, versions, bytes(len(keys)), locators=locators)
+            keys, generations, payloads, nxt = result
+            run = encode_file(keys, generations, bytes(len(keys)), payloads=payloads)
         else:
-            keys, versions, deleted, locators, nxt = result
-            run = encode_file(keys, versions, deleted, locators=locators)
+            keys, generations, deleted, payloads, nxt = result
+            run = encode_file(keys, generations, deleted, payloads=payloads)
         if self.entries + len(keys) > self.max_entries or self.bytes + len(run) > self.max_bytes:
             raise Full(call)
         self.entries += len(keys)
@@ -145,11 +145,11 @@ class Reads:
         if c is None:
             return None
         try:
-            keys, versions, deleted, locators = SortedRun.decode(c["run"]).entries()
+            keys, generations, deleted, payloads = SortedRun.decode(c["run"]).entries()
         except ValueError:
             return None  # read from the store instead
         if call == "lookup":
-            return {k: (v, loc) for k, v, loc in zip(keys, versions, locators, strict=True)}
+            return {k: (g, p) for k, g, p in zip(keys, generations, payloads, strict=True)}
         if call == "page":
-            return keys, versions, locators, c["next"]
-        return keys, versions, deleted, locators, c["next"]
+            return keys, generations, payloads, c["next"]
+        return keys, generations, deleted, payloads, c["next"]

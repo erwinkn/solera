@@ -64,12 +64,13 @@ def digest(data: bytes) -> str:
     return _native.content_digest(data)
 
 
-def delta_keys(data: bytes) -> tuple[dict[bytes, bytes], list[bytes]]:
-    """A delta file's written keys, `{key: version}`, and its deleted keys."""
+def delta_keys(data: bytes) -> tuple[list[bytes], list[bytes]]:
+    """A delta file's written keys, and its deleted keys."""
 
-    keys, versions, deleted, _ = SortedRun.decode(data).entries()
-    written = {k: v for k, v, d in zip(keys, versions, deleted, strict=True) if not d}
-    return written, [k for k, d in zip(keys, deleted, strict=True) if d]
+    keys, _, deleted, _ = SortedRun.decode(data).entries()
+    return [k for k, d in zip(keys, deleted, strict=True) if not d], [
+        k for k, d in zip(keys, deleted, strict=True) if d
+    ]
 
 
 def index_prefix(output: str, scope: str) -> str:
@@ -261,13 +262,13 @@ class Delta:
     """A patch's delta, encoded but not yet written: its `.kx` files, and how
     the live key count changes. `exact` is false when a count change was
     inferred from a filter rather than read. `listed`: up to the `collect`
-    asked for, the written keys, `{key: version}`, and the deleted keys."""
+    asked for, the written keys and the deleted keys."""
 
     files: list[bytes]
     added: int
     removed: int
     exact: bool
-    listed: tuple[dict[bytes, bytes], list[bytes]] | None = None
+    listed: tuple[list[bytes], list[bytes]] | None = None
 
     def __len__(self) -> int:
         return sum(parse_footer(d[-FOOTER_SIZE:])["entries"] for d in self.files)
@@ -284,13 +285,13 @@ class DeltaKeys:
     files: tuple[FileInfo, ...]
 
     async def pages(self, size: int = 100_000):
-        """Pages of the written keys, as `str`, with their versions: `[(key, version)]`."""
+        """Pages of the written keys, as `str`."""
 
         index = KeyIndex(self.io, self.prefix, IndexState(log=((0, self.files),), prefix=self.prefix))
         after = None
         while self.files:
-            keys, versions, deleted, _, after = await index.pending(0, 0, after, size)
-            page = [(key_str(k), v) for k, v, d in zip(keys, versions, deleted, strict=True) if not d]
+            keys, _, deleted, _, after = await index.pending(0, 0, after, size)
+            page = [key_str(k) for k, d in zip(keys, deleted, strict=True) if not d]
             if page:
                 yield page
             if after is None:
@@ -392,7 +393,7 @@ class _Parsed:
 
 async def _scan_local(snap, after, limit: int, keep_deleted: bool, ceiling: int):
     """A page of local copies as a native run, and its cursor; past `ceiling`
-    bytes of keys and versions, `Full` — the page could not be kept."""
+    bytes of keys and payloads, `Full` — the page could not be kept."""
 
     try:
         return await in_thread(snap.scan, after, limit, drop_deleted=not keep_deleted, max_bytes=ceiling)
@@ -489,16 +490,16 @@ class KeyIndex:
         generation: int = 0,
         exact: bool = False,
         collect: int = 0,
-    ) -> tuple[DeltaFiles, tuple[dict[bytes, bytes], list[bytes]] | None]:
-        """A patch's delta — `run`'s upserts and removes, by `generation` —
+    ) -> tuple[DeltaFiles, tuple[list[bytes], list[bytes]] | None]:
+        """A patch's delta — `run`'s upserts and removes, at `generation` —
         written as the batch's files (docs/resolved-commits.md §6). A small
         patch reads only what it must — the sparse reader; a dense one, or
         one whose exact reads would touch too many blocks, streams the whole
         index instead; an empty index reads nothing. With `exact`, every live
-        key's entry is read — no filter decides a change — so the counts are
-        exact and every changed key names its predecessor. Returns the files
-        and, up to `collect` keys, the written keys, `{key: version}`, and
-        the deleted keys (None past it). A full replacement is `replace`."""
+        key's entry is read — no filter counts a key live — so the counts are
+        exact and every written key names its predecessor. Returns the files
+        and, up to `collect` keys, the written keys and the deleted keys
+        (None past it). A full replacement is `replace`."""
 
         entries = sum(f.entries for f in self.state.files)
         if entries and len(run) > self.o.stream_density * entries:
@@ -525,17 +526,18 @@ class KeyIndex:
         )
         return Delta(files, added, removed, not sparse.inferred, listed)
 
-    async def lookup(self, keys: list[bytes]) -> dict[bytes, tuple[bytes, int]]:
-        """Exactly, the live `(version, locator)` of each of `keys` the index
-        holds — the newest entry wins, and a deleted key is absent: for
-        selections named outright (a run's `keys=`), immutable stores' reads
-        (docs/lifecycle.md §9.8) and failure indexes' prior records. Every
-        level at once; the filters only skip files that cannot hold a key."""
+    async def lookup(self, keys: list[bytes]) -> dict[bytes, tuple[int, bytes | None]]:
+        """Exactly, the live `(generation, payload)` of each of `keys` the
+        index holds — the newest entry wins, and a deleted key is absent:
+        for selections named outright (a run's `keys=`), immutable stores'
+        reads (docs/lifecycle.md §9.8) and failure indexes' prior records.
+        Every level at once; the filters only skip files that cannot hold a
+        key."""
 
         keys = sorted(set(keys))
 
         async def store():
-            run = SortedRun.of(keys, [b""] * len(keys))
+            run = SortedRun.of(keys)
             return (await self._find(run, exact=True, switch=False)).live()
 
         async def local(snap, _ceiling):
@@ -604,24 +606,19 @@ class KeyIndex:
         *,
         collect: int = 0,
         key: str | None = None,
-        revision: str | None = None,
-        exclude: tuple[str, ...] = (),
         generation: int = 0,
         overlay: SortedRun | None = None,
     ) -> tuple[DeltaFiles, tuple[list[bytes], list[bytes]] | None]:
         """A full replacement: `rows` is the whole new content — a `Rows`, or
-        chunks sorted by key, pulled as needed: `(key, version)` pairs, or
-        with `key` rows keyed by that column, whose versions are computed
-        natively without the `exclude`d columns (docs/row-digest.md). Every
-        live key is compared as the join reaches it; new keys and changed
-        versions are written, live keys not in `rows` deleted, each entry
-        located at `generation` and carrying the key's predecessor `(version,
-        locator)`. The delta goes out as the batch's files as they fill.
-        Returns them and, up to `collect` keys, the written keys, `{key:
-        version}`, and the deleted keys (None past it). Streamed chunks may
-        have a run laid over them (`overlay`): its upserts in place of their
-        entries of its keys, its removes gone — a patch over what a store
-        holds, read back."""
+        chunks of keys sorted, pulled as needed (with `key`, rows keyed by
+        that column). Every key is written at `generation` — unless it
+        carries a payload equal to its live entry's — carrying the key's
+        predecessor, and live keys not in `rows` are deleted. The delta goes
+        out as the batch's files as they fill. Returns them and, up to
+        `collect` keys, the written keys and the deleted keys (None past
+        it). Streamed chunks may have a run laid over them (`overlay`): its
+        upserts in place of their entries of its keys, its removes gone — a
+        patch over the keys a store holds, read back."""
 
         runs = self.state.newest_first()
         job = Job.replace(
@@ -630,8 +627,6 @@ class KeyIndex:
             **self._writer(),
             collect=collect,
             key=key,
-            revision=revision,
-            exclude=list(exclude),
             generation=generation,
             overlay=overlay,
         )
@@ -676,13 +671,13 @@ class KeyIndex:
 
     async def _find(self, run: SortedRun, *, exact: bool, switch: bool):
         """What the index holds for each entry of `run`, as a native `Sparse`
-        state — read live or deleted, absent by the key filters, or live at
-        another version by the pair and tombstone filters. Newest first, levels
-        small enough are read whole, all at once; from the first larger one
-        on, every level goes through its filters, since "definitely changed"
-        must hold across every level that could hold the key. Only entries
-        the filters cannot clear get block reads, in the files whose key
-        filter matched, all levels at once. With `switch`, None once those
+        state — read live or deleted, absent by the key filters, or, for an
+        upsert carrying no payload, live by the key and tombstone filters.
+        Newest first, levels small enough are read whole, all at once; from
+        the first larger one on, every level goes through its filters, since
+        "absent" must hold across every level that could hold the key. Only
+        entries the filters cannot decide get block reads, in the files whose
+        key filter matched, all levels at once. With `switch`, None once those
         reads would touch more blocks than streaming the index costs segments
         × `stream_reads`. Python chooses files and fetches; no key becomes a
         Python object."""
@@ -718,9 +713,7 @@ class KeyIndex:
         parsed = await asyncio.gather(*(self._open(f) for f in files))
         for i, p in enumerate(parsed):
             tail = p.tail
-            sparse.filter(
-                i, *spans[p.info.name], tail["key_filter"], tail["tomb_filter"], tail["pair_filter"]
-            )
+            sparse.filter(i, *spans[p.info.name], tail["key_filter"], tail["tomb_filter"])
         sparse.classify(exact)
         if not sparse.maybe:
             return sparse
@@ -806,34 +799,34 @@ class KeyIndex:
                 p.window = got  # the next page starts in it: a file never pays for the same block twice
         codecs = [p.tail["codec"] for p in parsed]  # each file's own
         # Natively, off the loop: the merge stops at the page, never building the rest.
-        keys, versions, deleted, locators, last, more = await in_thread(
+        keys, generations, deleted, payloads, last, more = await in_thread(
             merge_page, runs, codecs, after, bound, limit, drop_deleted
         )
         cursor = last if last is not None else after
         if len(keys) == limit:  # full: more past it, or past the fetched blocks
-            return keys, versions, deleted, locators, cursor if more or bound is not None else None
-        return keys, versions, deleted, locators, cursor if bound is not None else None
+            return keys, generations, deleted, payloads, cursor if more or bound is not None else None
+        return keys, generations, deleted, payloads, cursor if bound is not None else None
 
     async def page(self, after: bytes | None, limit: int):
-        """One page of the full delivery: live keys > `after`, their versions and
-        locators, and the next cursor (`None` when done)."""
+        """One page of the full delivery: live keys > `after`, their
+        generations and payloads, and the next cursor (`None` when done)."""
 
         levels = self.state.newest_first()
 
         async def store():
-            keys, versions, _, locators, nxt = await self._scan(levels, after, limit, drop_deleted=True)
-            return keys, versions, locators, nxt
+            keys, generations, _, payloads, nxt = await self._scan(levels, after, limit, drop_deleted=True)
+            return keys, generations, payloads, nxt
 
         async def local(snap, ceiling):
             page, nxt = await _scan_local(snap, after, limit, False, ceiling)
-            keys, versions, _, locators = page.entries()
-            return (keys, versions, locators, nxt), page
+            keys, generations, _, payloads = page.entries()
+            return (keys, generations, payloads, nxt), page
 
         return await self._read("page", (after, limit), levels, local, store)
 
     async def pending(self, first_batch: int, last_batch: int, after: bytes | None, limit: int):
         """Changes in batches `[first_batch, last_batch]`, newest winning, keys > `after`:
-        keys, versions, deleted flags, locators, and the next cursor (`None` when done)."""
+        keys, generations, deleted flags, payloads, and the next cursor (`None` when done)."""
 
         logged = dict(self.state.log)
         missing = [b for b in range(first_batch, last_batch + 1) if b not in logged]

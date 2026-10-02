@@ -1,33 +1,43 @@
 //! What a write does to one key — the one rule every resolver applies: the
 //! sparse reader, the streaming patch and replacement, and the engine
-//! cache's lookups and merges (docs/resolved-commits.md §6).
+//! cache's lookups and merges (docs/resolved-commits.md §6, docs/versions.md).
 //!
-//! A write of a key is an upsert at a version or a removal; what the index
-//! held is absent, live at a known version and locator, or — from the
-//! filters alone — live at some other version. A new key is added, a removed
-//! live key deleted, a changed version written, an unchanged one dropped.
-//! Written entries carry the writer's generation as their locator, and a key
-//! read live its predecessor.
+//! A write of a key is an upsert, which may carry a payload (a source's
+//! version, a failure record), or a removal; what the index held is
+//! absent, live at a known generation and payload, or — from the filters
+//! alone — live, its entry unread. Writing a key changes it: a new key is
+//! added, a removed live key deleted, any other upsert written — unless it
+//! carries a payload equal to the live entry's, which says the key is as it
+//! was. Written entries carry the writer's generation, and a key read live
+//! its predecessor's.
 
 use crate::format::{Options, Result};
 use crate::rows::Arena;
 use crate::stream::Writer;
+
+/// A write of one key.
+#[derive(Clone, Copy)]
+pub enum Write<'a> {
+    /// An upsert, with its payload if it carries one.
+    Upsert(Option<&'a [u8]>),
+    Remove,
+}
 
 /// What the index holds for a key.
 #[derive(Clone, Copy)]
 pub enum Old<'a> {
     /// No live entry: never written, or deleted.
     Absent,
-    /// Live, at this version and locator.
-    Live(&'a [u8], u64),
-    /// Live at a version other than the one written, as the filters said:
-    /// neither is known (or, behind a false positive, not there at all).
+    /// Live, at this generation, with this payload.
+    Live(u64, Option<&'a [u8]>),
+    /// Live, as the filters said: its entry unread (or, behind a false
+    /// positive, not there at all).
     Other,
 }
 
-/// Keys a delta changed, with their versions, up to a limit: beyond it, `None`.
+/// Keys a delta changed, up to a limit: beyond it, `None`.
 pub struct Collected {
-    pub upserts: Option<(Arena, Arena)>,
+    pub upserts: Option<Arena>,
     pub removes: Option<Arena>,
     limit: usize,
 }
@@ -35,31 +45,26 @@ pub struct Collected {
 impl Collected {
     fn new(limit: usize) -> Collected {
         Collected {
-            upserts: Some((Arena::default(), Arena::default())),
+            upserts: Some(Arena::default()),
             removes: Some(Arena::default()),
             limit,
         }
     }
 
-    fn add(&mut self, key: &[u8], version: Option<&[u8]>) {
-        let total = self.upserts.as_ref().map_or(0, |a| a.0.len())
+    fn add(&mut self, key: &[u8], removed: bool) {
+        let total = self.upserts.as_ref().map_or(0, |a| a.len())
             + self.removes.as_ref().map_or(0, |a| a.len());
         if total >= self.limit {
             self.upserts = None;
             self.removes = None;
         }
-        match version {
-            Some(v) => {
-                if let Some((k, vs)) = &mut self.upserts {
-                    k.push(key);
-                    vs.push(v);
-                }
-            }
-            None => {
-                if let Some(a) = &mut self.removes {
-                    a.push(key);
-                }
-            }
+        let into = if removed {
+            &mut self.removes
+        } else {
+            &mut self.upserts
+        };
+        if let Some(a) = into {
+            a.push(key);
         }
     }
 }
@@ -86,31 +91,30 @@ impl Delta {
         }
     }
 
-    /// A write of `key` — an upsert at `new`, or with None a removal — over
-    /// `old`. Keys come strictly increasing.
-    pub fn apply(&mut self, key: &[u8], new: Option<&[u8]>, old: Old) -> Result<()> {
+    /// A write of `key` over `old`. Keys come strictly increasing.
+    pub fn apply(&mut self, key: &[u8], new: Write, old: Old) -> Result<()> {
         let g = self.generation;
         let before = match old {
-            Old::Live(v, l) => Some((v, l)),
+            Old::Live(was, _) => Some(was),
             _ => None,
         };
         match (new, old) {
-            (None, Old::Absent) => return Ok(()),
-            (None, _) => {
-                self.writer.push(key, b"", true, g, before)?;
+            (Write::Remove, Old::Absent) => return Ok(()),
+            (Write::Remove, _) => {
+                self.writer.push(key, g, true, None, before)?;
                 self.removed += 1;
             }
-            (Some(v), Old::Absent) => {
-                self.writer.push(key, v, false, g, None)?;
+            (Write::Upsert(p), Old::Absent) => {
+                self.writer.push(key, g, false, p, None)?;
                 self.added += 1;
             }
-            (Some(v), Old::Live(was, _)) if was == v => return Ok(()),
-            (Some(v), _) => {
-                self.writer.push(key, v, false, g, before)?;
+            (Write::Upsert(Some(p)), Old::Live(_, Some(was))) if was == p => return Ok(()),
+            (Write::Upsert(p), _) => {
+                self.writer.push(key, g, false, p, before)?;
                 self.changed += 1;
             }
         }
-        self.collected.add(key, new);
+        self.collected.add(key, matches!(new, Write::Remove));
         Ok(())
     }
 

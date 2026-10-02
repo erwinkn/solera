@@ -1,7 +1,7 @@
 //! Garbage files (`.kg`, docs/key-index-format.md § Garbage files): the
 //! entries a compaction dropped, for an immutable store to discard the
 //! objects they name. Unlike a `.kx` file, one key may appear at several
-//! versions — a merge can drop a key's entries from more than one level.
+//! generations — a merge can drop a key's entries from more than one level.
 
 use std::collections::VecDeque;
 
@@ -10,7 +10,7 @@ use crate::format::{
 };
 
 pub const MAGIC: &[u8; 4] = b"CKG1";
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 pub const FOOTER_SIZE: usize = 24;
 const BLOCK: usize = 64 * 1024;
 
@@ -43,10 +43,9 @@ impl GarbageWriter {
         }
     }
 
-    pub fn push(&mut self, key: &[u8], version: &[u8], locator: u64) {
+    pub fn push(&mut self, key: &[u8], generation: u64) {
         put_bytes(&mut self.block, key);
-        put_bytes(&mut self.block, version);
-        put_varint(&mut self.block, locator);
+        put_varint(&mut self.block, generation);
         self.entries += 1;
         self.total += 1;
         if self.block.len() >= BLOCK {
@@ -94,9 +93,8 @@ impl GarbageWriter {
     }
 }
 
-/// Every entry of a garbage file: keys, versions, locators.
-#[allow(clippy::type_complexity)]
-pub fn decode(data: &[u8]) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<u64>)> {
+/// Every entry of a garbage file: keys, generations.
+pub fn decode(data: &[u8]) -> Result<(Vec<Vec<u8>>, Vec<u64>)> {
     if data.len() < FOOTER_SIZE {
         return fmt_err("garbage file too short");
     }
@@ -112,7 +110,7 @@ pub fn decode(data: &[u8]) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<u64>)> {
     let entries = u64::from_le_bytes(foot[8..16].try_into().unwrap());
     let blocks = u32::from_le_bytes(foot[16..20].try_into().unwrap());
     let body = &data[..data.len() - FOOTER_SIZE];
-    let (mut keys, mut versions, mut locators) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut keys, mut generations) = (Vec::new(), Vec::new());
     let (mut pos, mut seen) = (0usize, 0u32);
     while pos < body.len() {
         if pos + 8 > body.len() {
@@ -133,14 +131,13 @@ pub fn decode(data: &[u8]) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<u64>)> {
         let mut p = 0;
         while p < raw.len() {
             keys.push(get_bytes(&raw, &mut p)?.to_vec());
-            versions.push(get_bytes(&raw, &mut p)?.to_vec());
-            locators.push(get_varint(&raw, &mut p)?);
+            generations.push(get_varint(&raw, &mut p)?);
         }
     }
     if seen != blocks || keys.len() as u64 != entries {
         return fmt_err("garbage file counts do not match its footer");
     }
-    Ok((keys, versions, locators))
+    Ok((keys, generations))
 }
 
 #[cfg(test)]
@@ -152,19 +149,18 @@ mod tests {
     fn round_trip_splits_and_repeats_keys() {
         let mut w = GarbageWriter::new(CODEC_ZLIB, 1, 100_000);
         for i in 0..50_000u64 {
-            let key = format!("k{:06}", i / 2); // each key twice: two dropped versions
-            w.push(key.as_bytes(), format!("v{i}").as_bytes(), i);
+            let key = format!("k{:06}", i / 2); // each key twice: two dropped generations
+            w.push(key.as_bytes(), i);
         }
         w.finish();
         assert!(w.files.len() > 1);
         let mut n = 0u64;
         for f in &w.files {
-            let (k, v, l) = decode(f).unwrap();
+            let (k, g) = decode(f).unwrap();
             for i in 0..k.len() {
                 let j = n + i as u64;
                 assert_eq!(k[i], format!("k{:06}", j / 2).into_bytes());
-                assert_eq!(v[i], format!("v{j}").into_bytes());
-                assert_eq!(l[i], j);
+                assert_eq!(g[i], j);
             }
             n += k.len() as u64;
         }

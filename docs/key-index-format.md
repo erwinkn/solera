@@ -1,4 +1,4 @@
-# Key index file format (`.kx`, version 2)
+# Key index file format (`.kx`, version 3)
 
 Byte-level format of a key index file (`object-store-state.md` §6). The
 `solera._native` Rust extension reads and writes it; `solera/keys/_python.py`
@@ -15,15 +15,17 @@ file   := block* filters index footer
 tail   := filters index footer          ← everything after the last block
 ```
 
-A file holds **entries** `(key, version, deleted, locator)`: `key` and
-`version` are byte strings, `deleted` a flag, and `locator` the generation
-of the attempt that wrote the key at that version — what a store names the
-key's object by (`lifecycle.md` §9.8). An entry of a delta file may also
-hold its key's **predecessor** `(version, locator)`: what the commit
-superseded, for the store to discard. Compaction drops predecessors;
-comparing versions ("is this a change?") ignores locators. Entries are
-strictly increasing by `key` (byte-wise comparison); a file never holds the
-same key twice.
+A file holds **entries** `(key, generation, deleted, payload?)`: `key` is
+a byte string, `generation` the generation of the write that last wrote
+the key — its version, and what an immutable store names the key's object
+by (`versions.md`, `lifecycle.md` §9.8) — `deleted` a flag, and `payload`
+optional bytes the index's kind interprets: a source key's version
+(`versions.md` §2; empty for a partition set's element), or a failure
+index's failure record (`per-key-processing.md` §9). An entry of a delta
+file may also hold its key's **predecessor** generation: what the commit
+superseded, for the store to discard. Compaction drops predecessors.
+Entries are strictly increasing by `key` (byte-wise comparison); a file
+never holds the same key twice.
 
 ## Blocks
 
@@ -35,17 +37,18 @@ last entry.
 Encoded entry:
 
 ```
-shared    varint     bytes shared with the previous key in this block (0 for the first)
-suffix    varint len + bytes
-version   varint len + bytes
-flags     u8         bit 0: deleted; bit 1: predecessor follows; other bits 0
-locator   varint
-predecessor varint len + bytes, then varint    only with flag bit 1: the key's version and locator before
+shared      varint     bytes shared with the previous key in this block (0 for the first)
+suffix      varint len + bytes
+flags       u8         bit 0: deleted; bit 1: predecessor follows; bit 2: payload follows; other bits 0
+generation  varint
+payload     varint len + bytes    only with flag bit 2
+predecessor varint                only with flag bit 1: the key's generation before
 ```
 
 Readers reject an entry with other flag bits set. Neighbouring entries
-usually share a locator (one attempt wrote them), which the block's
-compression absorbs.
+usually share a generation (one attempt wrote them), which the block's
+compression absorbs. A payload is present or not, never implied: an
+empty payload (a set's element) is flag bit 2 and a zero length.
 
 The block's bytes are the concatenated encoded entries, compressed with
 the file's codec (footer).
@@ -53,17 +56,16 @@ the file's codec (footer).
 ## Filters
 
 ```
-filters := filter(keys) filter(pairs) filter(tombstones) crc32
+filters := filter(keys) filter(tombstones) crc32
 filter  := nbits varint, k u8, bits (ceil(nbits / 8) bytes)
-crc32   := u32, CRC-32 of the three filters' bytes
+crc32   := u32, CRC-32 of the two filters' bytes
 ```
 
-Three Bloom filters: one over every key in the file, one over every
-`(key, version)` pair of a non-deleted entry, and one over every deleted
-key. Each is sized to its own item count.
+Two Bloom filters: one over every key in the file, one over every deleted
+key. Each is sized to its own item count. Readers reject bytes after the
+second filter.
 
-- Items: a key is `b"k" + key`; a pair is `b"p" + varint(len(key)) + key +
-  version`; a deleted key is `b"t" + key`.
+- Items: a key is `b"k" + key`; a deleted key is `b"t" + key`.
 - Filters are **blocked**: `nbits` is a whole number of 512-bit (64-byte)
   blocks, and all `k` bits of an item fall in one block — one cache line
   per item.
@@ -99,7 +101,7 @@ Fixed 48 bytes at the very end of the file:
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 4 | magic `CKX1` |
-| 4 | 2 | format version, `2` |
+| 4 | 2 | format version, `3` |
 | 6 | 1 | codec: `0` none, `1` zlib |
 | 7 | 1 | reserved, `0` |
 | 8 | 8 | entries |
@@ -113,8 +115,8 @@ Fixed 48 bytes at the very end of the file:
 `tail length = file size − filters offset`; `index part = file size −
 index offset`. A reader that needs only the block index (a scan) fetches
 the index part alone; one that needs the filters fetches the whole tail.
-Readers verify both magics, the version (2: version 1 had no locators
-and is not read), the index CRC, the filters CRC
+Readers verify both magics, the version (3: earlier versions carried a
+content version per entry and are not read), the index CRC, the filters CRC
 when they read the filters, and each block's CRC before decoding it.
 
 ## Empty files
@@ -123,22 +125,21 @@ A file with no entries has no blocks; each of its filters has `nbits = 512`, and
 its index has empty `min_key` and `max_key` and `blocks = 0`. Writers only
 produce one for an empty delta.
 
-## Garbage files (`.kg`, version 1)
+## Garbage files (`.kg`, version 2)
 
 A compaction of an index whose output is on an immutable store
 (`lifecycle.md` §9.8) also writes, beside its `.kx` outputs, the entries
 its merge dropped that name an object: every live entry passed over for a
-newer entry of the same key, at another version or locator. A key may
-appear several times — a merge can drop its entries from more than one
-input — which a `.kx` file cannot hold, so these are a format of their
-own. Tombstones name no object and are never listed; an entry whose
-version and locator equal the surviving entry's is the same object and is
-not listed either.
+newer entry of the same key at another generation. A key may appear
+several times — a merge can drop its entries from more than one input —
+which a `.kx` file cannot hold, so these are a format of their own.
+Tombstones name no object and are never listed; an entry at the
+surviving entry's generation is the same object and is not listed either.
 
 ```
 file   := block* footer
 block  := length u32 · crc32 u32 · bytes      length and CRC-32 of the compressed bytes
-entry  := key (varint len + bytes) · version (varint len + bytes) · locator varint
+entry  := key (varint len + bytes) · generation varint
 ```
 
 A block's bytes decompress (the footer's codec) to consecutive entries,
@@ -149,7 +150,7 @@ compaction may write several. Footer, fixed 24 bytes at the end:
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 4 | magic `CKG1` |
-| 4 | 2 | format version, `1` |
+| 4 | 2 | format version, `2` |
 | 6 | 1 | codec: `0` none, `1` zlib |
 | 7 | 1 | reserved, `0` |
 | 8 | 8 | entries |

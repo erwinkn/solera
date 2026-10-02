@@ -5,7 +5,7 @@
 
 use std::cmp::Ordering;
 
-use crate::delta::{Delta, Old};
+use crate::delta::{Delta, Old, Write};
 use crate::format::{Error, Options, Result};
 use crate::garbage::GarbageWriter;
 use crate::rows::Source;
@@ -108,13 +108,13 @@ impl Join {
                 Ordering::Greater => {
                     // An index key the content does not mention: gone, in a replacement.
                     if self.replace {
-                        let was = Old::Live(m.version(), m.locator());
-                        self.delta.apply(m.key(), None, was)?;
+                        let was = Old::Live(m.generation(), m.payload());
+                        self.delta.apply(m.key(), Write::Remove, was)?;
                     }
                     self.old = None;
                 }
                 Ordering::Equal => {
-                    let was = Old::Live(m.version(), m.locator());
+                    let was = Old::Live(m.generation(), m.payload());
                     self.delta.apply(self.src.key(), self.src.write(), was)?;
                     self.src.advance();
                     self.old = None;
@@ -127,7 +127,7 @@ impl Join {
 /// Merges runs into new files, newest entry winning; with `drop_deleted`
 /// (nothing older below), deletions go. With `garbage`, every entry the
 /// merge drops that names an object — a live entry shadowed by a newer one
-/// of its key, at another version or locator — is written to garbage files.
+/// of its key, at another generation — is written to garbage files.
 pub struct Compact {
     pub merge: Merge,
     pub writer: Writer,
@@ -166,19 +166,18 @@ impl Compact {
             }
             match self.merge.next_key()? {
                 Next::Entry => {
-                    let deleted = self.merge.deleted();
-                    let (k, v, loc) =
-                        (self.merge.key(), self.merge.version(), self.merge.locator());
+                    let m = &self.merge;
+                    let (k, gen, deleted) = (m.key(), m.generation(), m.deleted());
                     if let Some(g) = &mut self.garbage {
-                        for (ov, odel, oloc) in self.merge.shadowed() {
-                            if !odel && (ov != v || oloc != loc) {
-                                g.push(k, ov, oloc);
+                        for (odel, ogen) in m.shadowed() {
+                            if !odel && ogen != gen {
+                                g.push(k, ogen);
                             }
                         }
                     }
                     if !(deleted && self.drop_deleted) {
-                        // A merge keeps locators; predecessors belong to delta files only.
-                        self.writer.push(k, v, deleted, loc, None)?;
+                        // Predecessors belong to delta files only.
+                        self.writer.push(k, gen, deleted, m.payload(), None)?;
                     }
                 }
                 Next::Need(r) => return Ok(Step::Run(r)),

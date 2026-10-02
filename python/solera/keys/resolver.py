@@ -114,7 +114,7 @@ class Prepared:
 class Limits:
     max_keys: int = 100_000  # a patch's entries
     max_bytes: int = 16 * 2**20  # a run's bytes, and a delta's
-    max_decoded: int = 64 * 2**20  # a run's bytes decoded: decompressed, and its keys and versions
+    max_decoded: int = 64 * 2**20  # a run's bytes decoded: decompressed, and its keys and payloads
     max_entries: int = 2_000_000  # a replacement's entries plus the index's
     queue_bytes: int = 64 * 2**20
     concurrency: int = 2
