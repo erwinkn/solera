@@ -791,3 +791,104 @@ to end: the worker reads no index file and makes one PUT (its delta), the
 engine installs that delta from the bytes it returned (no GET), and a
 consumer's page comes inline in its spec (no GET): scenario E's projected
 15.5 GET-equivalents a commit, compaction included.
+
+## Python rows: the native walk against tuned pure Python (2026-10-02)
+
+Is the native digest of `list[dict]` held back by FFI? The 2.1–3.6 µs a row
+above compared the old path (JSON or pickle, a Python hash callback) with the
+new encoder, never with Python written for speed.
+
+    uv run python bench/keys/pyrows.py --sizes 1e4,1e6,1e7
+    uv run python bench/keys/pyrows.py --sizes 1e4,1e6,1e7 --native <old build>/_native.abi3.so --cases native,arrow
+
+Rows shaped like an operational table: twelve columns — a string key, four
+strings (two from small vocabularies), three integers, three floats, a
+UTC-aware `datetime` — about 10% of fields None, keys shuffled. Each case
+runs in its own process with its rows built first. Peak memory is what the
+step adds on top of the rows, which take ~0.9 GB per million.
+**Digest** is every row's `row(r)` in list order: `row_digests`, or the
+baseline. **Versions** is each key's version, sorted by key, as a patch
+reads them: `Rows.records(...).entries()`, or the baseline sorting and
+grouping.
+
+- **Pure Python, tuned**: `docs/row-digest.md` for these value types. It is
+  one flat loop with locals bound, each key set's sorted field plan made
+  once, values dispatched on their exact type, one `join` and one
+  `xxhash.xxh3_128_intdigest` a row. It is byte-identical to the
+  extension, checked on every run.
+- **Native, before** and **after**: the extension at `3ef5c4d`, and with
+  this section's changes.
+- **Arrow**: `pyarrow.Table.from_pylist`, then `Rows.arrow`, conversion
+  timed.
+
+| µs a row · peak MB | 10K | 1M | 10M |
+|---|---|---|---|
+| Digest: pure Python | 3.48 · 2 | 3.60 · 169 | 3.55 · 1,682 |
+| Digest: native, before | 2.42 · 1 | 2.58 · 33 | 2.42 · 321 |
+| Digest: native, after | **0.47** · 1 | **0.54** · 32 | **0.50** · 320 |
+| Versions: pure Python | 4.43 · 5 | 5.90 · 287 | 6.33 · 2,730 |
+| Versions: native, before | 2.86 · 7 | 4.36 · 159 | 4.56 · 1,553 |
+| Versions: native, after | **0.78** · 6 | **0.83** · 181 | **0.83** · 1,796 |
+| Versions: Arrow, before | 1.61 · 104 | 3.25 · 399 | 2.87 · 2,940 |
+| Versions: Arrow, after | 1.54 · 97 | 3.26 · 392 | 2.57 · 2,937 |
+
+Before, the native walk was only 1.5× faster than pure Python. It is now
+~7× faster on digests and ~7.5× on versions, and digesting the dicts beats
+converting them to Arrow by 3–4×.
+
+**Where the time went** (`perf`, 1M rows, the old build's digest step):
+71% reading Python objects (attribute lookups, dict lookups, refcounting
+calls, decoding UTF-8), 24% the walker's own glue (pair vectors, copies,
+dispatch), 3% encoding, 1% hashing. By column, from a row holding only its
+key:
+
+| Added to a row | Before | After | After, without abi3 |
+|---|---|---|---|
+| the key alone (dict, framing, hash) | 0.17 µs | 0.05 µs | 0.05 µs |
+| four strings | 0.25 µs | 0.09 µs | — |
+| three integers | 0.34 µs | 0.08 µs | — |
+| three floats | 0.23 µs | 0.05 µs | — |
+| one aware `datetime` | 1.07 µs | 0.16 µs | 0.05 µs |
+| the whole row | 2.36 µs | 0.48 µs | 0.34 µs |
+
+So the boundary itself was not the problem. These were:
+
+- **Reading a `datetime`** cost 45% of the row: about fourteen attribute
+  reads (`year` … `microsecond`, `tzinfo`, `utcoffset()`, then the
+  offset's `days`/`seconds`/`microseconds`). Each one built its attribute
+  name as a new Python string (decode, hash, lookup) and a new int. Now an
+  exact `datetime` is one subtraction from the epoch (aware or naive), then
+  three reads of the `timedelta`, with interned names, and the
+  `timezone.utc` singleton needs no `utcoffset()` call.
+- **The generic walk.** Each dict was collected into a vector of owned
+  pairs (two refcount *calls* per field under the stable ABI). Its field
+  names were sorted per row, the skip list allocated per row, integers
+  read through pyo3's 128-bit slow path and formatted into a `String`, and
+  the record copied into a fresh buffer to hash. Now a dict row is read with
+  `PyDict_Next` (borrowed references), and its fields are written in an
+  order sorted once per key set. The key set is recognized by the very
+  `str` objects, then by name. Exact `str`, `int`, `float`, `bool` and
+  `None` are encoded without running Python code. Anything else is held
+  and encoded once the dict is done with, so a value's own code (a
+  `tzinfo`) cannot pull the row out from under the walk.
+- **Key order.** `Rows.records` used to digest rows lazily, a window at a
+  time in *key* order. With shuffled keys that order is random in memory,
+  and reading a row missed the cache at nearly every object. The versions
+  step cost 2.4 µs a row on top of its digests. Now the rows are digested
+  in list order in the same pass that reads their keys, and the 16-byte
+  digests are handed out in key order. The cost is the digests held for the
+  whole write (+0.24 GB at 10M rows, against ~9 GB of rows).
+- **Hashing.** XXH3-128 of a ~200-byte record takes 19 ns. A streaming
+  state fed the record's ~24 pieces took 79 ns, against 89 ns to copy the
+  pieces into one buffer and hash it. So the record is now written after
+  the 2-byte `row` prefix and hashed where it lies: no copy, no streaming.
+
+Arrow rows now skip the per-row sort too: their columns are already in
+name order, so each field is written directly. `from_pylist` alone takes
+~2.5 µs a row. For Python rows, Arrow pays off only when the data
+already is Arrow.
+
+**What is left** is the stable ABI (`abi3-py312`: one wheel for every
+CPython from 3.12). Built per version instead, the `datetime` is read from
+its struct (0.16 → 0.05 µs) and the row costs 0.34 µs, not 0.48. That
+would mean a wheel per Python version, so it is left as a choice.
