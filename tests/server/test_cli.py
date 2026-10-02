@@ -256,3 +256,34 @@ def test_migrate_command_applies_and_is_idempotent(
     out = cli(monkeypatch, capsys, "--state-url", state_url, "migrate", "--project", str(path))
     assert "docs: applied seed" in out  # ledger names; nothing re-applied
     assert jsonlib.loads((data / "ledger.json").read_text()) == ["seed"]
+
+
+async def test_local_reads_leave_the_running_writer_alone(project_file, state_url, capsys, monkeypatch):
+    """System review #1: a coordinator owns the namespace; local read
+    commands open it as readers, so it goes on recording."""
+
+    import asyncio
+
+    from solera_server.state import State
+
+    monkeypatch.delenv("SOLERA_SERVER_URL", raising=False)
+
+    def run(*argv):
+        return cli(monkeypatch, capsys, "--state-url", state_url, *argv)
+
+    detail = await asyncio.to_thread(run, "run", "--project", project_file, "feed")
+    run_id = detail["request"]["id"]
+    attempt = detail["attempts"][detail["tasks"][0]["id"]][-1]["id"]
+    coordinator = await State.open(state_url, "default", flush_interval=0.001)
+    for argv in (
+        ("runs",),
+        ("run-show", run_id),
+        ("logs", run_id, attempt),
+        ("automations",),
+        ("runs", "prune", "--dry-run"),
+        ("scopes", "discards", "feed"),
+    ):
+        await asyncio.to_thread(run, *argv)
+    coordinator.record({"type": "AutomationChanged", "name": "none", "enabled": True})
+    await coordinator.durable()  # still the writer: nothing fenced it
+    await coordinator.close()

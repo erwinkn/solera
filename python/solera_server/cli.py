@@ -32,6 +32,34 @@ async def _remote_project(client):
     return response.json()["project"]
 
 
+def _reads(args) -> bool:
+    """Commands that only read: they open the namespace as a reader, and
+    leave a running engine its writer."""
+
+    command, action = args.command, getattr(args, "runs_command", None)
+    if command == "runs":
+        return action is None or (action == "prune" and args.dry_run)
+    if command == "scopes":
+        return args.scopes_command == "discards" and not args.clear
+    if command == "automations":
+        return not args.action
+    return command in ("run-show", "logs")
+
+
+async def _local_reader(args):
+    """The engine's queries over a reader: the persisted manifest, nothing
+    initialized, nothing fenced — `record` fails if anything tried."""
+
+    from .engine import Engine
+    from .state import State
+
+    state = await State.open(args.state_url, args.namespace, writer=False)
+    if state.model.manifest is None:
+        await state.close()
+        raise SystemExit("no project registered in this namespace")
+    return Engine(state, state.model.manifest, project=state.model.project or "", resolve_cache=False)
+
+
 async def _local_engine(args):
     """An in-process engine: re-registers --project when given, else serves the
     manifest persisted by the last registration."""
@@ -432,7 +460,7 @@ async def _remote(args, parser):
 
 
 async def _local(args, parser):
-    runtime = await _local_engine(args)
+    runtime = await (_local_reader(args) if _reads(args) else _local_engine(args))
     try:
         if args.command == "run":
             config = json.loads(args.config)
