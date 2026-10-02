@@ -616,10 +616,9 @@ cost of resolving. Same machine and setup as above: 8 cores, local MinIO,
 "Index": fresh is one bottom level; steady has its upper levels filled as
 steady-state writes leave them (§ the steady suite above). CPU is the
 process's, all threads; peak RSS is what the operation added. `resolve`
-picks with the chosen thresholds (`stream_density` 2%, `stream_reads` 16)
-except where noted: the 10M and 100M runs used 5% and 4, so their picks
-show the earlier values; the columns forced each way are what set them.
-
+picks with the final thresholds (`stream_density` 2%, `stream_reads` 16).
+The 10M and 100M rows are a second run, made with those defaults; the
+first run, which set them from the forced columns, picked with 5% and 4.
 
 | Keys | Index | Patch | Unchanged | Sparse | Stream | `resolve` picks |
 |---|---|---|---|---|---|---|
@@ -641,64 +640,64 @@ show the earlier values; the columns forced each way are what set them.
 | 1,000,000 | steady | 100,000 | 0% | 1.0 s · 9 GET · 31.1 MB · 684 ms · 0.03 GB | 535 ms · 12 GET · 27.6 MB · 431 ms · 0.02 GB | stream: 611 ms |
 | 1,000,000 | steady | 100,000 | 50% | 1.0 s · 9 GET · 31.1 MB · 729 ms · 0.01 GB | 558 ms · 12 GET · 27.6 MB · 570 ms · 0.00 GB | stream: 622 ms |
 | 1,000,000 | steady | 100,000 | 100% | 859 ms · 9 GET · 31.1 MB · 604 ms · 0.00 GB | 496 ms · 12 GET · 27.6 MB · 586 ms · 0.00 GB | stream: 469 ms |
-| 10,000,000 | fresh | 1,000 | 0% | 303 ms · 8 GET · 35.4 MB · 62 ms · 0.04 GB | 1.6 s · 34 GET · 248.8 MB · 1.7 s · 0.07 GB | sparse: 300 ms |
-| 10,000,000 | fresh | 1,000 | 50% | 779 ms · 429 GET · 64.1 MB · 263 ms · 0.00 GB | 1.9 s · 34 GET · 248.8 MB · 1.7 s · 0.04 GB | stream: 1.8 s |
-| 10,000,000 | fresh | 1,000 | 100% | 957 ms · 694 GET · 89.2 MB · 481 ms · 0.00 GB | 1.3 s · 34 GET · 248.8 MB · 1.7 s · 0.01 GB | stream: 1.5 s |
-| 10,000,000 | fresh | 10,000 | 0% | 354 ms · 33 GET · 36.9 MB · 81 ms · 0.02 GB | 1.5 s · 34 GET · 248.8 MB · 1.8 s · 0.02 GB | sparse: 376 ms |
-| 10,000,000 | fresh | 10,000 | 50% | 1.7 s · 831 GET · 211.3 MB · 1.2 s · 0.04 GB | 1.4 s · 34 GET · 248.8 MB · 1.7 s · 0.00 GB | stream: 1.7 s |
-| 10,000,000 | fresh | 10,000 | 100% | 1.7 s · 353 GET · 260.5 MB · 1.4 s · 0.05 GB | 1.6 s · 34 GET · 248.8 MB · 1.7 s · 0.00 GB | stream: 1.8 s |
-| 10,000,000 | fresh | 100,000 | 0% | 1.2 s · 269 GET · 52.5 MB · 556 ms · 0.01 GB | 1.7 s · 34 GET · 248.8 MB · 1.9 s · 0.02 GB | stream: 2.1 s |
-| 10,000,000 | fresh | 100,000 | 50% | 2.2 s · 20 GET · 283.8 MB · 1.9 s · 0.29 GB | 1.6 s · 34 GET · 248.8 MB · 2.4 s · 0.00 GB | stream: 2.2 s |
-| 10,000,000 | fresh | 100,000 | 100% | 2.3 s · 20 GET · 283.8 MB · 2.0 s · 0.28 GB | 1.4 s · 34 GET · 248.8 MB · 2.4 s · 0.00 GB | stream: 2.0 s |
-| 10,000,000 | fresh | 1,000,000 | 0% | 8.4 s · 999 GET · 178.1 MB · 7.4 s · 0.23 GB | 2.9 s · 34 GET · 248.8 MB · 3.0 s · 0.20 GB | stream: 2.9 s |
-| 10,000,000 | fresh | 1,000,000 | 50% | 9.0 s · 20 GET · 283.8 MB · 8.4 s · 0.40 GB | 2.9 s · 34 GET · 248.8 MB · 3.3 s · 0.03 GB | stream: 2.8 s |
-| 10,000,000 | fresh | 1,000,000 | 100% | 10.7 s · 20 GET · 283.8 MB · 9.4 s · 0.37 GB | 2.7 s · 34 GET · 248.8 MB · 2.6 s · 0.01 GB | stream: 2.3 s |
-| 10,000,000 | steady | 1,000 | 0% | 421 ms · 15 GET · 46.9 MB · 76 ms · 0.02 GB | 2.5 s · 49 GET · 309.5 MB · 3.6 s · 0.06 GB | sparse: 428 ms |
-| 10,000,000 | steady | 1,000 | 50% | 660 ms · 253 GET · 62.0 MB · 220 ms · 0.00 GB | 2.5 s · 49 GET · 309.5 MB · 3.4 s · 0.01 GB | stream: 2.9 s |
-| 10,000,000 | steady | 1,000 | 100% | 835 ms · 458 GET · 77.5 MB · 356 ms · 0.00 GB | 2.4 s · 49 GET · 309.5 MB · 3.7 s · 0.05 GB | stream: 2.8 s |
-| 10,000,000 | steady | 10,000 | 0% | 486 ms · 33 GET · 48.0 MB · 144 ms · 0.02 GB | 2.6 s · 49 GET · 309.5 MB · 4.6 s · 0.04 GB | sparse: 538 ms |
-| 10,000,000 | steady | 10,000 | 50% | 1.8 s · 1201 GET · 170.3 MB · 1.1 s · 0.02 GB | 2.5 s · 49 GET · 309.5 MB · 4.3 s · 0.03 GB | stream: 3.1 s |
-| 10,000,000 | steady | 10,000 | 100% | 2.1 s · 1188 GET · 244.3 MB · 1.5 s · 0.02 GB | 2.6 s · 49 GET · 309.5 MB · 4.3 s · 0.00 GB | stream: 2.8 s |
-| 10,000,000 | steady | 100,000 | 0% | 1.3 s · 202 GET · 58.7 MB · 864 ms · 0.00 GB | 2.6 s · 49 GET · 309.5 MB · 3.6 s · 0.04 GB | stream: 3.7 s |
-| 10,000,000 | steady | 100,000 | 50% | 3.0 s · 49 GET · 350.7 MB · 2.5 s · 0.29 GB | 3.0 s · 49 GET · 309.5 MB · 3.9 s · 0.04 GB | stream: 3.6 s |
-| 10,000,000 | steady | 100,000 | 100% | 3.0 s · 32 GET · 352.4 MB · 2.4 s · 0.37 GB | 3.2 s · 49 GET · 309.5 MB · 3.6 s · 0.00 GB | stream: 3.7 s |
-| 100,000,000 | fresh | 1,000 | 0% | 515 ms · 30 GET · 350.9 MB · 419 ms · 0.40 GB | 13.9 s · 341 GET · 2394.0 MB · 18.2 s · 0.03 GB | sparse: 523 ms |
-| 100,000,000 | fresh | 1,000 | 50% | 978 ms · 534 GET · 381.8 MB · 652 ms · 0.30 GB | 15.7 s · 341 GET · 2394.0 MB · 17.1 s · 0.00 GB | sparse: 1.1 s |
-| 100,000,000 | fresh | 1,000 | 100% | 1.4 s · 1001 GET · 411.0 MB · 934 ms · 0.36 GB | 13.6 s · 341 GET · 2394.0 MB · 18.5 s · 0.04 GB | sparse: 1.3 s |
-| 100,000,000 | fresh | 10,000 | 0% | 580 ms · 77 GET · 353.8 MB · 468 ms · 0.34 GB | 13.4 s · 341 GET · 2394.0 MB · 22.4 s · 0.00 GB | sparse: 564 ms |
-| 100,000,000 | fresh | 10,000 | 50% | 4.4 s · 4145 GET · 635.0 MB · 3.0 s · 0.28 GB | 12.9 s · 341 GET · 2394.0 MB · 17.6 s · 0.00 GB | stream: 14.1 s |
-| 100,000,000 | fresh | 10,000 | 100% | 8.4 s · 6811 GET · 886.9 MB · 5.0 s · 0.35 GB | 13.8 s · 341 GET · 2394.0 MB · 18.9 s · 0.00 GB | stream: 13.4 s |
-| 100,000,000 | fresh | 100,000 | 0% | 1.2 s · 372 GET · 371.9 MB · 921 ms · 0.39 GB | 13.1 s · 341 GET · 2394.0 MB · 19.4 s · 0.00 GB | sparse: 1.2 s |
-| 100,000,000 | fresh | 100,000 | 50% | 15.1 s · 7918 GET · 2089.9 MB · 12.1 s · 0.33 GB | 12.9 s · 341 GET · 2394.0 MB · 22.3 s · 0.00 GB | stream: 13.4 s |
-| 100,000,000 | fresh | 100,000 | 100% | 13.3 s · 2734 GET · 2568.1 MB · 13.1 s · 0.44 GB | 12.6 s · 341 GET · 2394.0 MB · 21.4 s · 0.00 GB | stream: 17.7 s |
-| 100,000,000 | fresh | 1,000,000 | 0% | 11.1 s · 3093 GET · 555.1 MB · 9.1 s · 0.21 GB | 14.7 s · 341 GET · 2394.0 MB · 19.6 s · 0.05 GB | stream: 23.0 s |
-| 100,000,000 | fresh | 1,000,000 | 50% | 26.2 s · 199 GET · 2744.0 MB · 22.5 s · 1.53 GB | 18.2 s · 341 GET · 2394.0 MB · 18.7 s · 0.00 GB | stream: 28.2 s |
-| 100,000,000 | fresh | 1,000,000 | 100% | 27.1 s · 199 GET · 2744.0 MB · 23.3 s · 1.69 GB | 15.6 s · 341 GET · 2394.0 MB · 20.4 s · 0.00 GB | stream: 24.6 s |
-| 100,000,000 | steady | 1,000 | 0% | 680 ms · 46 GET · 444.6 MB · 532 ms · 0.34 GB | 22.6 s · 436 GET · 3025.2 MB · 39.9 s · 0.06 GB | sparse: 730 ms |
-| 100,000,000 | steady | 1,000 | 50% | 793 ms · 281 GET · 458.9 MB · 639 ms · 0.38 GB | 22.1 s · 436 GET · 3025.2 MB · 35.9 s · 0.01 GB | sparse: 869 ms |
-| 100,000,000 | steady | 1,000 | 100% | 962 ms · 532 GET · 474.1 MB · 792 ms · 0.35 GB | 21.1 s · 436 GET · 3025.2 MB · 37.1 s · 0.04 GB | sparse: 962 ms |
-| 100,000,000 | steady | 10,000 | 0% | 772 ms · 83 GET · 446.9 MB · 631 ms · 0.36 GB | 22.7 s · 436 GET · 3025.2 MB · 43.6 s · 0.06 GB | sparse: 724 ms |
-| 100,000,000 | steady | 10,000 | 50% | 2.8 s · 2305 GET · 588.6 MB · 2.1 s · 0.35 GB | 22.2 s · 436 GET · 3025.2 MB · 43.5 s · 0.09 GB | stream: 22.3 s |
-| 100,000,000 | steady | 10,000 | 100% | 4.4 s · 4197 GET · 721.6 MB · 3.5 s · 0.06 GB | 22.7 s · 436 GET · 3025.2 MB · 44.1 s · 0.00 GB | stream: 22.3 s |
-| 100,000,000 | steady | 100,000 | 0% | 1.5 s · 274 GET · 458.5 MB · 1.2 s · 0.01 GB | 22.8 s · 436 GET · 3025.2 MB · 44.4 s · 0.00 GB | sparse: 1.4 s |
-| 100,000,000 | steady | 100,000 | 50% | 13.7 s · 11878 GET · 1630.8 MB · 11.0 s · 0.05 GB | 22.4 s · 436 GET · 3025.2 MB · 37.3 s · 0.00 GB | stream: 24.0 s |
-| 100,000,000 | steady | 100,000 | 100% | 16.8 s · 11381 GET · 2401.5 MB · 14.5 s · 0.03 GB | 22.1 s · 436 GET · 3025.2 MB · 41.0 s · 0.00 GB | stream: 22.7 s |
+| 10,000,000 | fresh | 1,000 | 0% | 311 ms · 8 GET · 35.4 MB · 72 ms · 0.04 GB | 1.5 s · 34 GET · 248.8 MB · 3.4 s · 0.08 GB | sparse: 296 ms |
+| 10,000,000 | fresh | 1,000 | 50% | 716 ms · 429 GET · 64.1 MB · 365 ms · 0.01 GB | 1.4 s · 34 GET · 248.8 MB · 3.4 s · 0.02 GB | sparse: 674 ms |
+| 10,000,000 | fresh | 1,000 | 100% | 963 ms · 694 GET · 89.2 MB · 606 ms · 0.01 GB | 1.4 s · 34 GET · 248.8 MB · 3.0 s · 0.01 GB | stream: 1.6 s |
+| 10,000,000 | fresh | 10,000 | 0% | 379 ms · 33 GET · 36.9 MB · 120 ms · 0.03 GB | 1.5 s · 34 GET · 248.8 MB · 2.6 s · 0.00 GB | sparse: 375 ms |
+| 10,000,000 | fresh | 10,000 | 50% | 2.0 s · 831 GET · 211.3 MB · 1.2 s · 0.04 GB | 1.4 s · 34 GET · 248.8 MB · 2.5 s · 0.02 GB | stream: 1.7 s |
+| 10,000,000 | fresh | 10,000 | 100% | 1.5 s · 353 GET · 260.5 MB · 1.4 s · 0.05 GB | 1.5 s · 34 GET · 248.8 MB · 2.6 s · 0.01 GB | stream: 1.7 s |
+| 10,000,000 | fresh | 100,000 | 0% | 947 ms · 269 GET · 52.5 MB · 634 ms · 0.00 GB | 1.5 s · 34 GET · 248.8 MB · 2.6 s · 0.02 GB | sparse: 912 ms |
+| 10,000,000 | fresh | 100,000 | 50% | 2.2 s · 20 GET · 283.8 MB · 1.9 s · 0.37 GB | 1.5 s · 34 GET · 248.8 MB · 2.6 s · 0.00 GB | stream: 2.0 s |
+| 10,000,000 | fresh | 100,000 | 100% | 2.3 s · 20 GET · 283.8 MB · 1.9 s · 0.24 GB | 1.5 s · 34 GET · 248.8 MB · 3.0 s · 0.00 GB | stream: 2.0 s |
+| 10,000,000 | fresh | 1,000,000 | 0% | 7.7 s · 999 GET · 178.1 MB · 7.1 s · 0.22 GB | 2.8 s · 34 GET · 248.8 MB · 3.5 s · 0.18 GB | stream: 2.9 s |
+| 10,000,000 | fresh | 1,000,000 | 50% | 8.5 s · 20 GET · 283.8 MB · 8.0 s · 0.38 GB | 2.8 s · 34 GET · 248.8 MB · 4.1 s · 0.09 GB | stream: 2.8 s |
+| 10,000,000 | fresh | 1,000,000 | 100% | 8.8 s · 20 GET · 283.8 MB · 8.4 s · 0.44 GB | 2.2 s · 34 GET · 248.8 MB · 3.8 s · 0.00 GB | stream: 2.3 s |
+| 10,000,000 | steady | 1,000 | 0% | 399 ms · 15 GET · 46.9 MB · 73 ms · 0.00 GB | 2.3 s · 49 GET · 309.5 MB · 4.1 s · 0.01 GB | sparse: 414 ms |
+| 10,000,000 | steady | 1,000 | 50% | 673 ms · 253 GET · 62.0 MB · 283 ms · 0.00 GB | 2.5 s · 49 GET · 309.5 MB · 4.3 s · 0.02 GB | sparse: 684 ms |
+| 10,000,000 | steady | 1,000 | 100% | 831 ms · 458 GET · 77.5 MB · 366 ms · 0.00 GB | 2.3 s · 49 GET · 309.5 MB · 3.8 s · 0.01 GB | sparse: 861 ms |
+| 10,000,000 | steady | 10,000 | 0% | 468 ms · 33 GET · 48.0 MB · 118 ms · 0.00 GB | 2.4 s · 49 GET · 309.5 MB · 3.9 s · 0.00 GB | sparse: 506 ms |
+| 10,000,000 | steady | 10,000 | 50% | 1.7 s · 1201 GET · 170.3 MB · 1.1 s · 0.00 GB | 2.3 s · 49 GET · 309.5 MB · 4.7 s · 0.00 GB | stream: 3.1 s |
+| 10,000,000 | steady | 10,000 | 100% | 2.0 s · 1188 GET · 244.3 MB · 1.5 s · 0.03 GB | 2.4 s · 49 GET · 309.5 MB · 4.4 s · 0.00 GB | stream: 3.0 s |
+| 10,000,000 | steady | 100,000 | 0% | 1.3 s · 202 GET · 58.7 MB · 843 ms · 0.00 GB | 2.8 s · 49 GET · 309.5 MB · 4.2 s · 0.02 GB | sparse: 1.3 s |
+| 10,000,000 | steady | 100,000 | 50% | 2.9 s · 49 GET · 350.7 MB · 2.4 s · 0.25 GB | 2.6 s · 49 GET · 309.5 MB · 4.3 s · 0.04 GB | stream: 3.3 s |
+| 10,000,000 | steady | 100,000 | 100% | 2.8 s · 32 GET · 352.4 MB · 2.4 s · 0.29 GB | 2.6 s · 49 GET · 309.5 MB · 4.4 s · 0.00 GB | stream: 3.3 s |
+| 100,000,000 | fresh | 1,000 | 0% | 461 ms · 30 GET · 350.9 MB · 332 ms · 0.26 GB | 12.5 s · 341 GET · 2394.0 MB · 17.6 s · 0.02 GB | sparse: 489 ms |
+| 100,000,000 | fresh | 1,000 | 50% | 896 ms · 534 GET · 381.8 MB · 619 ms · 0.32 GB | 12.5 s · 341 GET · 2394.0 MB · 18.7 s · 0.02 GB | sparse: 911 ms |
+| 100,000,000 | fresh | 1,000 | 100% | 1.3 s · 1001 GET · 411.0 MB · 984 ms · 0.45 GB | 12.6 s · 341 GET · 2394.0 MB · 18.1 s · 0.02 GB | sparse: 1.6 s |
+| 100,000,000 | fresh | 10,000 | 0% | 657 ms · 77 GET · 353.8 MB · 350 ms · 0.31 GB | 15.4 s · 341 GET · 2394.0 MB · 23.3 s · 0.00 GB | sparse: 550 ms |
+| 100,000,000 | fresh | 10,000 | 50% | 4.1 s · 4145 GET · 635.0 MB · 3.1 s · 0.28 GB | 12.5 s · 341 GET · 2394.0 MB · 23.1 s · 0.00 GB | sparse: 4.1 s |
+| 100,000,000 | fresh | 10,000 | 100% | 6.8 s · 6811 GET · 886.9 MB · 5.1 s · 0.01 GB | 12.5 s · 341 GET · 2394.0 MB · 22.5 s · 0.01 GB | stream: 12.9 s |
+| 100,000,000 | fresh | 100,000 | 0% | 1.2 s · 372 GET · 371.9 MB · 948 ms · 0.20 GB | 12.5 s · 341 GET · 2394.0 MB · 23.7 s · 0.00 GB | sparse: 1.1 s |
+| 100,000,000 | fresh | 100,000 | 50% | 13.5 s · 7918 GET · 2089.9 MB · 12.1 s · 0.04 GB | 12.7 s · 341 GET · 2394.0 MB · 23.8 s · 0.00 GB | stream: 13.1 s |
+| 100,000,000 | fresh | 100,000 | 100% | 13.1 s · 2734 GET · 2568.1 MB · 12.9 s · 0.20 GB | 12.8 s · 341 GET · 2394.0 MB · 21.9 s · 0.00 GB | stream: 13.1 s |
+| 100,000,000 | fresh | 1,000,000 | 0% | 10.0 s · 3093 GET · 555.1 MB · 9.3 s · 0.18 GB | 14.4 s · 341 GET · 2394.0 MB · 31.1 s · 0.09 GB | sparse: 9.7 s |
+| 100,000,000 | fresh | 1,000,000 | 50% | 19.1 s · 199 GET · 2744.0 MB · 19.7 s · 1.75 GB | 13.8 s · 341 GET · 2394.0 MB · 24.7 s · 0.00 GB | stream: 18.6 s |
+| 100,000,000 | fresh | 1,000,000 | 100% | 19.6 s · 199 GET · 2744.0 MB · 20.0 s · 1.67 GB | 13.7 s · 341 GET · 2394.0 MB · 22.8 s · 0.00 GB | stream: 18.7 s |
+| 100,000,000 | steady | 1,000 | 0% | 618 ms · 46 GET · 444.6 MB · 475 ms · 0.32 GB | 23.3 s · 436 GET · 3025.2 MB · 46.7 s · 0.04 GB | sparse: 588 ms |
+| 100,000,000 | steady | 1,000 | 50% | 782 ms · 281 GET · 458.9 MB · 594 ms · 0.32 GB | 22.8 s · 436 GET · 3025.2 MB · 44.3 s · 0.00 GB | sparse: 842 ms |
+| 100,000,000 | steady | 1,000 | 100% | 1.1 s · 532 GET · 474.1 MB · 827 ms · 0.28 GB | 22.7 s · 436 GET · 3025.2 MB · 44.6 s · 0.00 GB | sparse: 955 ms |
+| 100,000,000 | steady | 10,000 | 0% | 732 ms · 83 GET · 446.9 MB · 594 ms · 0.30 GB | 21.5 s · 436 GET · 3025.2 MB · 39.3 s · 0.01 GB | sparse: 718 ms |
+| 100,000,000 | steady | 10,000 | 50% | 2.9 s · 2305 GET · 588.6 MB · 1.9 s · 0.30 GB | 21.2 s · 436 GET · 3025.2 MB · 39.2 s · 0.04 GB | sparse: 2.7 s |
+| 100,000,000 | steady | 10,000 | 100% | 4.2 s · 4197 GET · 721.6 MB · 3.1 s · 0.36 GB | 21.3 s · 436 GET · 3025.2 MB · 39.4 s · 0.02 GB | sparse: 4.4 s |
+| 100,000,000 | steady | 100,000 | 0% | 1.4 s · 274 GET · 458.5 MB · 1.2 s · 0.36 GB | 21.3 s · 436 GET · 3025.2 MB · 38.2 s · 0.05 GB | sparse: 1.5 s |
+| 100,000,000 | steady | 100,000 | 50% | 13.8 s · 11878 GET · 1630.8 MB · 11.0 s · 0.42 GB | 22.6 s · 436 GET · 3025.2 MB · 39.3 s · 0.06 GB | stream: 22.6 s |
+| 100,000,000 | steady | 100,000 | 100% | 16.5 s · 11381 GET · 2401.5 MB · 15.2 s · 0.00 GB | 23.6 s · 436 GET · 3025.2 MB · 47.0 s · 0.00 GB | stream: 25.1 s |
 
 How the thresholds follow:
 
 - **Density.** The sparse reader's cost grows with the written keys —
   ~9 µs of CPU each in Python, past the filters — and the stream's with the
   index's entries, about 7M a second at 10M–100M. They meet near 2% of the
-  entries: 1M keys into 100M (1%) take 11.1 s sparse and 14.7 s streamed,
-  1M into 10M (10%) 8.4 s sparse and 2.9 s streamed.
+  entries: 1M keys into 100M (1%) take 10.0 s sparse and 14.4 s streamed,
+  1M into 10M (10%) 7.7 s sparse and 2.8 s streamed.
 - **Exact reads after the filters.** Wall times meet where the reads
   number about 24 per streamed segment: 100M steady, 100K keys half
-  unchanged, 11,878 reads in 13.7 s against 436 segments in 22.4 s; 10M
-  fresh, 10K half unchanged, 831 reads in 1.7 s against 34 segments in
+  unchanged, 11,878 reads in 13.8 s against 436 segments in 22.6 s; 10M
+  fresh, 10K half unchanged, 831 reads in 2.0 s against 34 segments in
   1.4 s. At 16 per segment the stream takes the close calls: it issues
   1/16 of the requests or fewer, and its memory does not grow with the
-  patch (the sparse reader added 1.5 GB for 1M keys at 100M, the stream
-  0.05 GB).
+  patch (the sparse reader added 1.75 GB for 1M keys half unchanged at
+  100M, the stream nothing measurable).
 - **Small indexes.** At 1M keys the sparse reader reads the one level
   whole in two 16 MB requests, and streaming's 8 MB segments are faster
   by 100–150 ms at every size; the thresholds keep small patches on the
@@ -707,8 +706,17 @@ How the thresholds follow:
 Against the design's figures: a 1K-key patch at 100M in steady state, cold,
 was projected at ~50 GETs and measured 46 GETs, 445 MB, 0.68 s (the delta
 PUT included). A streamed patch of the steady 100M index was projected at
-~430 GETs and ~3.4 GB; it reads 436 GETs and 3.0 GB in 21–23 s, the fresh
-one 341 GETs and 2.4 GB in 13–16 s, on all eight cores (18–44 CPU-seconds).
+~430 GETs and ~3.4 GB; it reads 436 GETs and 3.0 GB in 21–25 s, the fresh
+one 341 GETs and 2.4 GB in 12–15 s, on all eight cores (19–47 CPU-seconds).
+
+How the final picks fare, over the 60 rows: `resolve` took 198.5 s in
+all, against 157.6 s had every row taken its faster route, and 22,124
+GETs against 6,895 had every row taken its cheaper one — the thresholds
+trade some of each. Six picks are over 1.5× (and 0.3 s) slower than the
+faster route, all of them streams the request rule chose, and their time
+includes the tails and filter checks read before switching (0.3–0.8 s at
+10M): 10M steady, 10K keys half unchanged, streams in 3.1 s where the
+sparse reader takes 1.7 s with 1,201 GETs instead of 60.
 
 **Compaction garbage** (`key-index-format.md` § Garbage files): with
 `garbage=True` a compaction also writes the entries it dropped. In the

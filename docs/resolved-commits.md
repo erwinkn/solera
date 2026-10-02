@@ -556,14 +556,14 @@ with requests tipping close calls toward streaming, which issues an order
 of magnitude fewer:
 
 - **`stream_density` = 2%.** Under it the sparse reader wins: 1M keys
-  into 100M (1%) take 11 s against 15 s streamed. Over it streaming does:
-  1M keys into 10M (10%) take 2.9 s streamed, 8.4 s sparse — the sparse
+  into 100M (1%) take 10 s against 14 s streamed. Over it streaming does:
+  1M keys into 10M (10%) take 2.8 s streamed, 7.7 s sparse — the sparse
   reader's cost per written key is mostly CPU (~9 µs in Python), the
   stream's per index entry.
 - **`stream_reads` = 16.** The two routes take the same time where the
   exact reads number about 24 per streamed segment (100M steady, 100K
-  keys half unchanged: 11,878 reads in 13.7 s, against 436 segments in
-  22.4 s; 10M fresh, 10K: 831 reads in 1.7 s, 34 segments in 1.4 s);
+  keys half unchanged: 11,878 reads in 13.8 s, against 436 segments in
+  22.6 s; 10M fresh, 10K: 831 reads in 2.0 s, 34 segments in 1.4 s);
   16 gives streaming the close calls, saving the requests.
 
 ## 7. Inlined downstream changes
