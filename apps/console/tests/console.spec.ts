@@ -17,7 +17,11 @@ const mobile = (page: Page) => (page.viewportSize()?.width ?? 1440) < 1024;
 /** Follow a main-navigation link; on a phone it lives behind the menu button. */
 async function nav(page: Page, name: string) {
   if (mobile(page)) await page.getByRole("button", { name: "Open navigation" }).click();
-  await page.getByRole("navigation", { name: "Main" }).getByRole("link", { name, exact: false }).first().click();
+  await page
+    .getByRole("navigation", { name: "Main" })
+    .getByRole("link", { name, exact: false })
+    .first()
+    .click();
 }
 
 test("asks for a token, then shows the overview", async ({ page }) => {
@@ -108,13 +112,20 @@ test("commit to a source, then cancel the run waiting for a pool worker", async 
   await page.getByRole("button", { name: "Cancel run" }).click();
   await page.getByRole("alertdialog").getByRole("button", { name: "Cancel run" }).click();
   await expect(page.getByText("canceled").first()).toBeVisible({ timeout: 45_000 });
-  await expect(page.getByRole("button", { name: "Retry failed" })).toBeVisible();
+  // A finished run never changes: retrying it is a new run that names it.
+  const canceled = page.url();
+  await page.getByRole("button", { name: "Retry", exact: true }).click();
+  await expect(page).not.toHaveURL(canceled);
+  await expect(page.getByText("Retries", { exact: true })).toBeVisible();
 });
 
 test("runs filter through the address bar", async ({ page }) => {
   await connect(page, "/runs");
   await expect(page.getByRole("heading", { name: "Runs", level: 1 })).toBeVisible();
-  await page.getByRole("group", { name: "Status" }).getByRole("button", { name: /succeeded/ }).click();
+  await page
+    .getByRole("group", { name: "Status" })
+    .getByRole("button", { name: /succeeded/ })
+    .click();
   await expect(page).toHaveURL(/status=succeeded/);
   await expect(page.locator("tbody tr").first()).toContainText("succeeded");
   await page.getByRole("radio", { name: "1h" }).click();
@@ -125,7 +136,10 @@ test("runs filter through the address bar", async ({ page }) => {
 
 test("assets graph, keys and explain", async ({ page }) => {
   await connect(page, "/assets");
-  await page.getByRole("link", { name: /file_checks/ }).first().click();
+  await page
+    .getByRole("link", { name: /file_checks/ })
+    .first()
+    .click();
   await expect(page.getByRole("heading", { name: "file_checks", level: 1 })).toBeVisible();
   await page.getByRole("navigation", { name: "Asset sections" }).getByRole("link", { name: /Keys/ }).click();
   await expect(page.getByRole("heading", { name: "Failing keys" })).toBeVisible();

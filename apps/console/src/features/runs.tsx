@@ -3,7 +3,7 @@ import { Link } from "@tanstack/react-router";
 import { CalendarClock, GitCommitHorizontal, Hand, Radar, RotateCcw } from "lucide-react";
 import type { Histogram, RunRow } from "@/api/types";
 import { cn } from "@/lib/cn";
-import { clock, count, dateTime, firstLine, plural } from "@/lib/format";
+import { clock, count, dateTime, firstLine, plural, shortId } from "@/lib/format";
 import { label, toneSolid, type Tone } from "@/lib/status";
 import { useNow } from "@/lib/clock";
 import { Elapsed, Id, Time } from "@/ui/data";
@@ -15,7 +15,7 @@ import { Table, TableScroll, Td, Th, Tr } from "@/ui/table";
 export function TriggerLabel({
   run,
 }: {
-  run: Pick<RunRow, "trigger" | "automation" | "by" | "source" | "tags">;
+  run: Pick<RunRow, "trigger" | "automation" | "by" | "source" | "tags" | "retry_of">;
 }) {
   const sensor = run.tags?.sensor;
   let icon: ReactNode;
@@ -30,6 +30,13 @@ export function TriggerLabel({
   } else if (sensor || run.trigger === "sensor") {
     icon = <Radar />;
     text = <span className="text-fg">{sensor ?? run.by}</span>;
+  } else if (run.retry_of) {
+    icon = <RotateCcw />;
+    text = (
+      <>
+        retry of <span className="font-mono text-fg">{shortId(run.retry_of)}</span>
+      </>
+    );
   } else if (run.automation) {
     icon = <CalendarClock />;
     text = <span className="text-fg">{run.automation}</span>;

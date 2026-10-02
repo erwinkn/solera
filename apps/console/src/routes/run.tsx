@@ -3,7 +3,7 @@ import { useQuery, useSuspenseQuery } from "@tanstack/react-query";
 import { getRouteApi, Link } from "@tanstack/react-router";
 import { Ban, CirclePause, CirclePlay, Ellipsis, RotateCcw, Trash2 } from "lucide-react";
 import { ACTIVE_ATTEMPT, ACTIVE_RUN, q, useProject } from "@/api/queries";
-import { useDeleteRun, useRunAction } from "@/api/mutations";
+import { useDeleteRun, useRetryRun, useRunAction } from "@/api/mutations";
 import type { Attempt, AttemptError, Json, RunDetail, RunEvent, Task } from "@/api/types";
 import { PartitionsLabel, TriggerLabel } from "@/features/runs";
 import { Logs, type LogLevel } from "@/features/logs";
@@ -80,6 +80,17 @@ export function Run() {
                 }}
               />
             </Meta>
+            {request.retry_of && (
+              <Meta label="Retries">
+                <Link
+                  to="/runs/$run"
+                  params={{ run: request.retry_of }}
+                  className="font-mono text-link hover:underline"
+                >
+                  {shortId(request.retry_of)}
+                </Link>
+              </Meta>
+            )}
             <Meta label="Partitions">
               <PartitionsLabel partitions={request.partitions} />
             </Meta>
@@ -154,6 +165,7 @@ export function Run() {
 function RunActions({ detail }: { detail: RunDetail }) {
   const { request } = detail;
   const act = useRunAction(request.id);
+  const retry = useRetryRun(request.id);
   const remove = useDeleteRun();
   const live = ACTIVE_RUN.has(request.status);
   const retryable = request.status === "failed" || request.status === "canceled";
@@ -185,12 +197,13 @@ function RunActions({ detail }: { detail: RunDetail }) {
       )}
       {retryable && (
         <Button
+          title="Runs this run's failed, canceled and blocked work again, as a new run"
           variant="primary"
           icon={<RotateCcw />}
-          onClick={() => act.mutate("retry")}
-          disabled={act.isPending}
+          onClick={() => retry.mutate()}
+          disabled={retry.isPending}
         >
-          Retry failed
+          Retry
         </Button>
       )}
       {!live && (
@@ -459,7 +472,15 @@ function AttemptSummary({ run, attempt }: { run: string; attempt: Attempt }) {
 }
 
 /** The error as the engine summarised it, completed from the sealed result: type, class, traceback. */
-function ErrorBlock({ error: summary, run, attempt }: { error: AttemptError; run: string; attempt: Attempt }) {
+function ErrorBlock({
+  error: summary,
+  run,
+  attempt,
+}: {
+  error: AttemptError;
+  run: string;
+  attempt: Attempt;
+}) {
   const project = useProject();
   const sealed = useQuery({
     ...q.attemptResult(project, run, attempt.id),

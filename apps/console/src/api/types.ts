@@ -412,6 +412,7 @@ export interface RunRow {
   automation: string | null;
   by: string | null;
   source: string | null;
+  retry_of?: string | null;
   targets: string[];
   assets: string[];
   committed: string[] | null;
@@ -455,6 +456,7 @@ export interface RunRequest {
   automation?: string | null;
   by?: string | null;
   source?: string;
+  retry_of?: string | null;
   tags: Record<string, string>;
   status: RunStatus;
   paused: boolean;

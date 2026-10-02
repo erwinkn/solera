@@ -213,7 +213,10 @@ export function Waterfall({
                       aria-hidden
                       title={`retried after ${duration(attempt.started_at - before.finished_at)}`}
                       className="absolute top-1/2 h-px border-t border-dotted border-fail"
-                      style={{ left: x(before.finished_at), width: `calc(${x(attempt.started_at)} - ${x(before.finished_at)})` }}
+                      style={{
+                        left: x(before.finished_at),
+                        width: `calc(${x(attempt.started_at)} - ${x(before.finished_at)})`,
+                      }}
                     />
                   );
                 })}

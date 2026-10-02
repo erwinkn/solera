@@ -45,10 +45,9 @@ export function useSubmitRun() {
   });
 }
 
-type RunAction = "cancel" | "retry" | "pause" | "resume";
+type RunAction = "cancel" | "pause" | "resume";
 const PAST: Record<RunAction, string> = {
   cancel: "Cancel requested",
-  retry: "Retry submitted",
   pause: "Run paused",
   resume: "Run resumed",
 };
@@ -66,6 +65,22 @@ export function useRunAction(run: string) {
       client.invalidateQueries({ queryKey: ["runs"] });
     },
     onError: (error, action) => complain(`Couldn't ${action} the run`, error),
+  });
+}
+
+/** A finished run never changes: retrying it submits its failed, canceled and blocked work as a new run. */
+export function useRetryRun(run: string) {
+  const project = useProject();
+  const client = useQueryClient();
+  const navigate = useNavigate();
+  return useMutation({
+    mutationFn: () => api<RunRequest>(`/projects/${enc(project)}/runs/${enc(run)}/retry`, { method: "POST" }),
+    onSuccess: (retry) => {
+      notify("Retry submitted", `run ${shortId(retry.id)} retries ${shortId(run)}`);
+      client.invalidateQueries({ queryKey: ["runs"] });
+      navigate({ to: "/runs/$run", params: { run: retry.id } });
+    },
+    onError: (error) => complain("Couldn't retry the run", error),
   });
 }
 
