@@ -1088,39 +1088,47 @@
  * type, and the page beside it is white and monochrome, so the one hue reads
  * as the source the console draws from. The figures go very tall and very
  * narrow. A thing running now wears a flat blue halo.
+ *
+ * The geometry is softened after PostHog: 4px on controls and chips, 6px on
+ * panels, a 1px outline and a 2px bottom lip on buttons instead of shadows,
+ * a calmer focus ring. The blue is a cobalt ink, a step less saturated than
+ * Voltage's ultramarine. Two siblings try other slabs: Signal · Ink (a darker
+ * slab) and Signal · Tint (a pale wash with dark type); the page is the same.
  */
-[data-theme="signal"] {
-  --bg: #fcfcfd;
+[data-theme="signal"],
+[data-theme="signal-ink"],
+[data-theme="signal-tint"] {
+  --bg: #fafafc;
   --surface: #ffffff;
-  --surface-2: #f5f5f8;
-  --sunken: #ececf0;
+  --surface-2: #f4f4f8;
+  --sunken: #ebebf0;
   --overlay: rgb(0 0 24 / 0.5);
 
-  --fg: #050510;
-  --fg-muted: #40404c;
-  --fg-subtle: #5c5c68;
+  --fg: #0a0a1a;
+  --fg-muted: #42424f;
+  --fg-subtle: #5e5e6b;
   --fg-inverse: #ffffff;
 
-  --line: #e2e2e7;
-  --line-strong: #c4c4cc;
+  --line: #dcdce3;
+  --line-strong: #b9b9c4;
   --border-w: 1px;
 
-  --accent: #0000f2;
-  --accent-hover: #1a1aff;
+  --accent: #1b2bd4;
+  --accent-hover: #2838e0;
   --accent-fg: #ffffff;
-  --accent-soft: #e6e6ff;
-  --select: #dcdcff;
-  --select-line: #0000f2;
-  --focus: #0000f2;
-  --link: #0000d6;
+  --accent-soft: #e8eaff;
+  --select: #dbdfff;
+  --select-line: #1b2bd4;
+  --focus: #4d5cff;
+  --link: #1726bd;
 
   --ok: #7a7a85;
   --ok-soft: #e8eeea;
   --ok-fg: #2d5a40;
   --viz-ok: #9a9aa3;
-  --run: #0000f2;
-  --run-soft: #e4e4ff;
-  --run-fg: #0000c8;
+  --run: #1b2bd4;
+  --run-soft: #e4e7ff;
+  --run-fg: #1424b3;
   --wait: #5b5bb8;
   --wait-soft: #e9e9f8;
   --wait-fg: #3c3c99;
@@ -1138,7 +1146,7 @@
   --ph-2: #a3a3ad;
   --ph-3: #82828d;
   --ph-4: #61616c;
-  --ph-5: #0000f2;
+  --ph-5: #1b2bd4;
   --ph-6: #c77800;
   --ph-7: #c4c4cc;
 
@@ -1153,35 +1161,36 @@
   --t-2xl: 2.5rem;
   --t-3xl: 3.5rem;
 
-  --r-xs: 0px;
-  --r-sm: 0px;
-  --r-md: 0px;
-  --r-lg: 0px;
-  --r-pill: 0px;
-  --r-mark: 0px;
+  --r-xs: 3px;
+  --r-sm: 4px;
+  --r-md: 6px;
+  --r-lg: 6px;
+  --r-pill: 4px;
+  --r-mark: 2px;
   --shadow-1: none;
   --shadow-2: none;
-  --shadow-3: 0 12px 32px rgb(0 0 40 / 0.18);
-  --shadow-button: none;
+  --shadow-3: 0 12px 32px rgb(0 0 40 / 0.16);
+  --shadow-button: 0 2px 0 0 color-mix(in srgb, var(--fg) 22%, transparent);
+  --shadow-button-hover: 0 2px 0 0 color-mix(in srgb, var(--fg) 22%, transparent);
   --press-x: 0px;
-  --press-y: 1px;
+  --press-y: 2px;
 
-  --ease: cubic-bezier(0.1, 0, 0, 1);
-  --ease-bounce: cubic-bezier(0.1, 0, 0, 1);
-  --dur-1: 60ms;
-  --dur-2: 110ms;
-  --dur-3: 160ms;
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+  --ease-bounce: cubic-bezier(0.2, 0, 0, 1);
+  --dur-1: 80ms;
+  --dur-2: 140ms;
+  --dur-3: 200ms;
 
-  --canvas-dots: rgb(0 0 242 / 0.08);
+  --canvas-dots: rgb(27 43 212 / 0.08);
   --canvas-pattern:
     linear-gradient(var(--canvas-dots) 1px, transparent 1px),
     linear-gradient(90deg, var(--canvas-dots) 1px, transparent 1px);
   --canvas-size: 24px 24px;
   --art-opacity: 1;
   --art-saturate: 1;
-  --art-1: #050510;
-  --art-2: #0000f2;
-  --art-3: #dcdcff;
+  --art-1: #0a0a1a;
+  --art-2: #1b2bd4;
+  --art-3: #dbdfff;
 
   --masthead-rule: 1px solid var(--fg);
   --masthead-pad: 1rem;
@@ -1199,21 +1208,21 @@
   --label-tracking: 0.08em;
   --nav-bar: var(--accent);
   --nav-active-fg: var(--accent);
-  --chrome-bg: #0000f2;
+  --chrome-bg: #1b2bd4;
   --live-glow: 0 0 0 3px var(--run-soft);
 }
 
-/* Signal's navigation: white type on the blue slab, badges as opaque chips. */
+/* Signal's slab: cobalt ink, white type, badges as opaque chips. */
 [data-theme="signal"] [data-chrome] {
-  --surface: #1212ff;
-  --surface-2: #2a2aff;
-  --sunken: #0000c8;
+  --surface: #2737dc;
+  --surface-2: #3444e4;
+  --sunken: #1322b0;
   --fg: #ffffff;
-  --fg-muted: #e0e0ff;
-  --fg-subtle: #c4c4ff;
-  --line: #4040ff;
-  --line-strong: #8080ff;
-  --accent-soft: #0000b8;
+  --fg-muted: #dfe2ff;
+  --fg-subtle: #c3c8ff;
+  --line: #4653e0;
+  --line-strong: #8a95f0;
+  --accent-soft: #0f1c9e;
   --nav-bar: #ffffff;
   --nav-active-fg: #ffffff;
   --focus: #ffffff;
@@ -1221,14 +1230,71 @@
   --ok-soft: #d9f5e6;
   --ok-fg: #0f4d2e;
   --run-soft: #ffffff;
-  --run-fg: #0000c8;
+  --run-fg: #1424b3;
   --warn-soft: #ffe6b3;
   --warn-fg: #5c3a00;
   --fail-soft: #ffd6d9;
   --fail-fg: #8a0f1a;
-  --idle-soft: #3333ff;
+  --idle-soft: #3f4ee6;
   --idle-fg: #ffffff;
+  --shadow-button: none;
   --live-glow: 0 0 0 3px rgb(255 255 255 / 0.25);
+  color: var(--fg);
+}
+
+/* Signal · Ink: the slab a step darker and inkier, the page unchanged. */
+[data-theme="signal-ink"] [data-chrome] {
+  --chrome-bg: #0e18a8;
+  --surface: #1a24b8;
+  --surface-2: #2630c4;
+  --sunken: #0a1288;
+  --fg: #ffffff;
+  --fg-muted: #d6daff;
+  --fg-subtle: #b4bbff;
+  --line: #2f3ac2;
+  --line-strong: #6b76e0;
+  --accent-soft: #060e72;
+  --nav-bar: #ffffff;
+  --nav-active-fg: #ffffff;
+  --focus: #ffffff;
+  --ok: #d9f5e6;
+  --ok-soft: #d9f5e6;
+  --ok-fg: #0f4d2e;
+  --run-soft: #ffffff;
+  --run-fg: #1424b3;
+  --warn-soft: #ffe6b3;
+  --warn-fg: #5c3a00;
+  --fail-soft: #ffd6d9;
+  --fail-fg: #8a0f1a;
+  --idle-soft: #2f3ac2;
+  --idle-fg: #ffffff;
+  --shadow-button: none;
+  --live-glow: 0 0 0 3px rgb(255 255 255 / 0.25);
+  color: var(--fg);
+}
+
+/* Signal · Tint: the slab a pale blue wash with dark type; the active item is
+   a deeper wash with blue type and a blue bar, the page unchanged. */
+[data-theme="signal-tint"] [data-chrome] {
+  --chrome-bg: #e3e7ff;
+  --surface: #f4f5ff;
+  --surface-2: #eceeff;
+  --sunken: #d6dbff;
+  --fg: #0b0b30;
+  --fg-muted: #2f2f6e;
+  --fg-subtle: #4b4b8c;
+  --line: #bcc3ff;
+  --line-strong: #8f9bff;
+  --accent-soft: #c6ccff;
+  --nav-bar: #1b2bd4;
+  --nav-active-fg: #1424b3;
+  --focus: #1b2bd4;
+  --run-soft: #ffffff;
+  --run-fg: #1424b3;
+  --idle-soft: #c6ccff;
+  --idle-fg: #0b0b30;
+  --shadow-button: none;
+  --live-glow: 0 0 0 3px rgb(27 43 212 / 0.2);
   color: var(--fg);
 }
 
@@ -1358,7 +1424,9 @@
  * Voltage · Arc: the arc in the dark. Deep navy paper, pale blue-white ink,
  * white for the action (as Reactor), and one phosphor cyan that means live,
  * with a real glow. Card titles drop to a tracked mono, the Reactor way, so
- * the condensed capitals are reserved for titles and figures.
+ * the condensed capitals are reserved for titles and figures. Softened after
+ * PostHog like Signal: 4px controls, 6px panels, outlines a step heavier, a
+ * dark lip under buttons, a calmer focus ring.
  */
 [data-theme="arc"] {
   --scheme: dark;
@@ -1373,8 +1441,8 @@
   --fg-subtle: #8a93bd;
   --fg-inverse: #05070f;
 
-  --line: #1b2140;
-  --line-strong: #2c3457;
+  --line: #1e2546;
+  --line-strong: #3a4470;
   --border-w: 1px;
 
   --accent: #ffffff;
@@ -1383,7 +1451,7 @@
   --accent-soft: #1a2250;
   --select: #1c2a6a;
   --select-line: #3fd8ff;
-  --focus: #3fd8ff;
+  --focus: #38bfe6;
   --link: #a9b6ff;
 
   --ok: #5f6a8f;
@@ -1425,24 +1493,25 @@
   --t-2xl: 2.25rem;
   --t-3xl: 3rem;
 
-  --r-xs: 0px;
-  --r-sm: 0px;
-  --r-md: 0px;
-  --r-lg: 0px;
-  --r-pill: 0px;
-  --r-mark: 0px;
+  --r-xs: 3px;
+  --r-sm: 4px;
+  --r-md: 6px;
+  --r-lg: 6px;
+  --r-pill: 4px;
+  --r-mark: 2px;
   --shadow-1: none;
   --shadow-2: none;
   --shadow-3: 0 24px 60px rgb(0 0 0 / 0.8);
-  --shadow-button: none;
+  --shadow-button: 0 2px 0 0 color-mix(in srgb, #000000 60%, transparent);
+  --shadow-button-hover: 0 2px 0 0 color-mix(in srgb, #000000 60%, transparent);
   --press-x: 0px;
-  --press-y: 1px;
+  --press-y: 2px;
 
-  --ease: cubic-bezier(0.1, 0, 0, 1);
-  --ease-bounce: cubic-bezier(0.1, 0, 0, 1);
-  --dur-1: 60ms;
-  --dur-2: 110ms;
-  --dur-3: 160ms;
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+  --ease-bounce: cubic-bezier(0.2, 0, 0, 1);
+  --dur-1: 80ms;
+  --dur-2: 140ms;
+  --dur-3: 200ms;
 
   --canvas-dots: rgb(63 216 255 / 0.1);
   --canvas-pattern:
