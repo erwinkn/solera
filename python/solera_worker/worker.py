@@ -1331,11 +1331,13 @@ async def run_pool(pool: str, server: str, token: str | None = None, *, project:
     the project's name, by default its manifest's: a pool token reaches the
     pool's routes and nothing else.
 
-    The project is imported once, in a forkserver; each attempt runs in a
-    child forked from that warm, threadless process, as a process of its
-    own: a forced cancel ends the child, and with it any thread the
-    attempt left running. (This process has threads — an HTTP client's
-    name lookups — and fork copies only the forking one: unsafe on macOS.)"""
+    Each attempt runs in a child forked from a forkserver — a process that
+    has imported the framework and nothing else, and started no thread —
+    and imports the project itself: no project code's threads or locks are
+    ever forked half-held. The child is the attempt's own process: a forced
+    cancel ends it, and with it any thread the attempt left running. (This
+    process has threads — an HTTP client's name lookups — and fork copies
+    only the forking one: unsafe on macOS.)"""
 
     import httpx
 
@@ -1369,18 +1371,20 @@ LOST = 4  # the exit code of an attempt that could not publish: the engine treat
 
 
 def _attempts():
-    """Where pool attempts start: a forkserver with the project imported."""
+    """Where pool attempts start: a forkserver with the framework imported,
+    never the project — project code may start threads or hold locks a
+    fork would copy without them."""
 
     import multiprocessing
 
     context = multiprocessing.get_context("forkserver")
-    context.set_forkserver_preload(["solera_worker._warm"])
+    context.set_forkserver_preload(["solera_worker.worker"])
     return context
 
 
 async def _forked(stage: dict, server: str | None, context=None) -> int:
-    """Run one pool attempt in a process of its own, forked from the warm
-    forkserver (`_warm`); its exit code."""
+    """Run one pool attempt in a process of its own, forked from the
+    forkserver; its exit code."""
 
     child = (context or _attempts()).Process(
         target=_child, args=(stage, server), name=f"attempt {stage['attempt']}"
@@ -1392,9 +1396,7 @@ async def _forked(stage: dict, server: str | None, context=None) -> int:
 
 
 def _child(stage: dict, server: str | None) -> None:
-    from . import _warm
-
-    project = _warm.project or os.environ["SOLERA_PROJECT"]  # imported again: its error goes in the result
+    project = os.environ["SOLERA_PROJECT"]  # imported here, by the attempt: a failure goes in its result
 
     async def attempt():
         code = LOST

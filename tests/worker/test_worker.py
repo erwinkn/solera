@@ -300,10 +300,34 @@ project = Project(assets=[lingering])
 """
 
 
+LOCKED_AT_IMPORT = """
+import threading, time
+from solera.executors import Pool
+from solera.sdk import Project, asset
+
+lock = threading.Lock()
+
+def busy():  # a client's background thread, holding its lock for a while after import
+    with lock:
+        time.sleep(2)
+
+threading.Thread(target=busy, daemon=True).start()
+
+@asset(executor=Pool("ingest")())
+def lingering() -> int:
+    if not lock.acquire(timeout=10):  # forked mid-hold from a process that imported this: never released
+        raise RuntimeError("the project's lock was inherited held")
+    lock.release()
+    return 1
+
+project = Project(assets=[lingering])
+"""
+
+
 @pytest.mark.parametrize(
     "source",
-    [LINGERING.format(executor='(executor=Pool("ingest")())'), ABANDONED_CALL],
-    ids=["thread", "executor-call"],
+    [LINGERING.format(executor='(executor=Pool("ingest")())'), ABANDONED_CALL, LOCKED_AT_IMPORT],
+    ids=["thread", "executor-call", "locked-at-import"],
 )
 async def test_a_pool_attempt_runs_in_a_child_of_the_warm_worker(state, tmp_path, monkeypatch, source):
     """D5: the pool worker forks a child per attempt from its imported
@@ -344,8 +368,8 @@ async def test_a_pool_attempt_runs_in_a_child_of_the_warm_worker(state, tmp_path
     )
     assert done.stdout.strip().splitlines()[-1] == "0", done.stderr
     assert asyncio.get_running_loop().time() - started < 30  # not the lingering minute
-    # Once, in the forkserver: the attempt's child started from it, warm.
-    assert imports.read_text().count("imported") == 2  # and once more here, by this test's engine
+    # By this test's engine, and by the attempt's child: never in the forkserver it was forked from.
+    assert imports.read_text().count("imported") == 2
     detail = await engine.run_until(run["id"], 30)
     assert detail["request"]["status"] == "succeeded"
 
