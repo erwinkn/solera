@@ -14,8 +14,6 @@ import {
   Menu as MenuIcon,
   Radar,
   Search,
-  Sparkles,
-  Briefcase,
   X,
 } from "lucide-react";
 import { q } from "@/api/queries";
@@ -46,7 +44,7 @@ export function Shell() {
         <Connect />
       ) : (
         <div className="min-h-dvh lg:grid lg:grid-cols-[232px_minmax(0,1fr)]">
-          <div className="hidden border-r border-line bg-surface/60 lg:block">
+          <div data-chrome className="hidden border-r border-line bg-[var(--chrome-bg)] lg:block">
             <aside className="sticky top-0 flex h-dvh flex-col">
               <Sidebar />
             </aside>
@@ -187,7 +185,8 @@ function Nav({ onNavigate }: { onNavigate?: () => void }) {
           className={cn(
             "group flex h-8 items-center gap-2.5 rounded-sm px-2.5 text-sm text-fg-muted motion-1 transition-colors",
             "hover:bg-accent-soft hover:text-fg [&_svg]:size-4 [&_svg]:shrink-0",
-            "data-[status=active]:bg-accent-soft data-[status=active]:font-medium data-[status=active]:text-fg",
+            "data-[status=active]:bg-accent-soft data-[status=active]:font-medium data-[status=active]:text-[var(--nav-active-fg)]",
+            "border-b border-[var(--nav-divider)]",
           )}
         >
           {item.icon}
@@ -248,29 +247,26 @@ function EngineStatus() {
 function ThemeSwitch() {
   const theme = useTheme();
   return (
-    <div className="flex items-center justify-between gap-2 px-2.5">
+    <div className="flex flex-col gap-1.5 px-2.5">
       <span className="text-xs text-fg-subtle">Theme</span>
       <Segmented
         label="Theme"
         size="sm"
+        stretch
         value={theme}
         onChange={setTheme}
         options={[
           {
             value: "normal",
-            label: (
-              <>
-                <Briefcase aria-hidden /> Normal
-              </>
-            ),
+            label: "Normal",
           },
           {
             value: "fun",
-            label: (
-              <>
-                <Sparkles aria-hidden /> Fun
-              </>
-            ),
+            label: "Fun",
+          },
+          {
+            value: "brutal",
+            label: "Brutal",
           },
         ]}
       />
@@ -299,7 +295,10 @@ function SessionControl() {
 function MobileBar() {
   const [open, setOpen] = useState(false);
   return (
-    <div className="sticky top-0 z-30 flex h-12 items-center justify-between border-b border-line bg-surface/90 px-3 backdrop-blur lg:hidden">
+    <div
+      data-chrome
+      className="sticky top-0 z-30 flex h-12 items-center justify-between border-b border-line bg-[var(--chrome-bg)] px-3 backdrop-blur lg:hidden"
+    >
       <Brand />
       <BaseDialog.Root open={open} onOpenChange={setOpen}>
         <BaseDialog.Trigger render={<IconButton label="Open navigation" />}>
@@ -308,6 +307,7 @@ function MobileBar() {
         <BaseDialog.Portal>
           <BaseDialog.Backdrop className="fixed inset-0 z-40 bg-overlay transition-opacity motion-2 data-[ending-style]:opacity-0 data-[starting-style]:opacity-0" />
           <BaseDialog.Popup
+            data-chrome
             aria-label="Navigation"
             className="fixed inset-y-0 left-0 z-50 w-[min(280px,85vw)] border-r border-line-strong bg-surface shadow-3 transition-transform motion-2 data-[ending-style]:-translate-x-full data-[starting-style]:-translate-x-full"
           >

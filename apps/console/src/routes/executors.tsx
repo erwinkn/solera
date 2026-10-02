@@ -36,6 +36,7 @@ export function Executors() {
           return (
             <Card key={e.name}>
               <CardHeader
+                ident
                 title={e.name}
                 description={`${e.kind}${e.kind === "Pool" ? " · workers pull its attempts" : ""}`}
                 actions={<Load executor={e} />}

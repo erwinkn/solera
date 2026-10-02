@@ -75,6 +75,7 @@ function EdgeCard({ edge, scope }: { edge: Edge; scope?: string }) {
   return (
     <Card>
       <CardHeader
+        ident
         title={
           <span className="flex flex-wrap items-baseline gap-x-2">
             <span className="font-mono text-sm">{edge.param}</span>

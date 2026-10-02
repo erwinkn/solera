@@ -130,19 +130,25 @@ export function Segmented<T extends string>({
   onChange,
   label,
   size = "md",
+  stretch,
 }: {
   value: T;
   options: { value: T; label: ReactNode; title?: string }[];
   onChange: (value: T) => void;
   label: string;
   size?: "sm" | "md";
+  /** Fill the container, options sharing it equally. */
+  stretch?: boolean;
 }) {
   return (
     <div
       role="radiogroup"
       aria-label={label}
       onKeyDown={(e) => rove(e, "radio")}
-      className="inline-flex shrink-0 rounded-sm border-theme border-line-strong bg-sunken p-0.5"
+      className={cn(
+        "shrink-0 rounded-sm border-theme border-line-strong bg-sunken p-0.5",
+        stretch ? "flex w-full" : "inline-flex",
+      )}
     >
       {options.map((option) => (
         <button
@@ -156,7 +162,8 @@ export function Segmented<T extends string>({
           className={cn(
             "inline-flex items-center gap-1.5 rounded-xs font-medium whitespace-nowrap text-fg-muted motion-1 transition-colors [&_svg]:size-3.5",
             size === "sm" ? "h-6 px-2 text-xs" : "h-7 px-2.5 text-xs",
-            option.value === value ? "bg-surface text-fg shadow-1" : "hover:text-fg",
+            stretch && "flex-1 justify-center px-1",
+            option.value === value ? "bg-surface text-fg shadow-1 ring-1 ring-line-strong" : "hover:text-fg",
           )}
         >
           {option.label}

@@ -52,7 +52,7 @@ function PhaseTip({ attempt, end }: { attempt: Attempt; end: number }) {
       {phases.map(({ phase, seconds }) => (
         <span key={phase} className="flex items-center justify-between gap-4 tabular">
           <span className="flex items-center gap-1.5">
-            <span className="size-2 rounded-[2px]" style={phaseColor(phase)} />
+            <span className="size-2 rounded-mark" style={phaseColor(phase)} />
             {PHASE_LABEL[phase]}
           </span>
           {duration(seconds)}
@@ -69,7 +69,7 @@ export function PhaseBar({ attempt, end, className }: { attempt: Attempt; end: n
   const live = ACTIVE.has(attempt.status);
   const span = Math.max(total, end - (attempt.started_at ?? end));
   return (
-    <div className={cn("flex h-full w-full gap-[2px] overflow-hidden rounded-[4px]", className)}>
+    <div className={cn("flex h-full w-full gap-[2px] overflow-hidden rounded-mark", className)}>
       {phases.map(({ phase, seconds }) => (
         <span
           key={phase}
@@ -104,7 +104,7 @@ export function PhaseLegend({ className }: { className?: string }) {
     <div className={cn("flex flex-wrap items-center gap-x-3 gap-y-1 text-2xs text-fg-subtle", className)}>
       {PHASES.map((phase) => (
         <span key={phase} className="inline-flex items-center gap-1">
-          <span className="size-2 rounded-[2px]" style={phaseColor(phase)} />
+          <span className="size-2 rounded-mark" style={phaseColor(phase)} />
           {PHASE_LABEL[phase]}
         </span>
       ))}
@@ -260,7 +260,7 @@ export function Waterfall({
                   <span
                     key={b.pos}
                     aria-hidden
-                    className="absolute inset-y-0 bg-[repeating-linear-gradient(120deg,var(--line)_0_1px,transparent_1px_5px)]"
+                    className="absolute inset-y-0 bg-[repeating-linear-gradient(120deg,color-mix(in_srgb,var(--fg)_14%,transparent)_0_1px,transparent_1px_5px)]"
                     style={{ left: `${b.pos}%`, width: `${b.width}%` }}
                   />
                 ))}
@@ -311,7 +311,7 @@ export function Waterfall({
                         replace
                         aria-label={`${task.asset} ${task.scope} attempt ${attempt.generation}: ${label(attempt.status)}, ${duration(stop - attempt.started_at)}`}
                         className={cn(
-                          "absolute top-1/2 h-3.5 -translate-y-1/2 rounded-[5px] p-[1.5px]",
+                          "absolute top-1/2 h-3.5 -translate-y-1/2 rounded-mark p-[1.5px]",
                           active ? "ring-2 ring-fg" : "hover:ring-2 hover:ring-line-strong",
                         )}
                         style={{

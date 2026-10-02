@@ -74,6 +74,7 @@
   --head-weight: 600;
   --head-tracking: -0.015em;
   --head-variation: normal;
+  --head-case: none;
   --t-2xs: 0.6875rem;
   --t-xs: 0.75rem;
   --t-sm: 0.8125rem;
@@ -95,6 +96,11 @@
   --shadow-button: 0 1px 1px rgb(24 24 27 / 0.06);
   --press-x: 0px;
   --press-y: 0.5px;
+  --r-pill: 9999px;
+  --r-mark: 3px;
+  --lift-x: 0px;
+  --lift-y: 0px;
+  --shadow-button-hover: var(--shadow-button);
 
   /* motion */
   --ease: cubic-bezier(0.2, 0, 0, 1);
@@ -106,7 +112,15 @@
   /* illustration accents */
   --texture: none;
   --canvas-dots: rgb(24 24 27 / 0.09);
+  --canvas-pattern: radial-gradient(var(--canvas-dots) 1px, transparent 1.2px);
+  --canvas-size: 18px 18px;
   --title-mark: none;
+  --title-mark-size: 24px 8px;
+  --title-mark-repeat: repeat-x;
+  --title-mark-pad: 8px;
+  --nav-divider: transparent;
+  --nav-active-fg: var(--fg);
+  --chrome-bg: color-mix(in srgb, var(--surface) 60%, transparent);
   --art-opacity: 0.7;
   --art-saturate: 0;
   --art-1: var(--fg-subtle);
@@ -172,6 +186,7 @@
   --head-weight: 620;
   --head-tracking: -0.01em;
   --head-variation: "SOFT" 100, "WONK" 1;
+  --head-case: none;
   --t-2xs: 0.71875rem;
   --t-xs: 0.78125rem;
   --t-sm: 0.84375rem;
@@ -192,6 +207,11 @@
   --shadow-button: 2px 2px 0 0 rgb(42 29 21 / 0.9);
   --press-x: 2px;
   --press-y: 2px;
+  --r-pill: 9999px;
+  --r-mark: 3px;
+  --lift-x: 0px;
+  --lift-y: 0px;
+  --shadow-button-hover: var(--shadow-button);
 
   --ease: cubic-bezier(0.3, 0.7, 0.4, 1);
   --ease-bounce: cubic-bezier(0.34, 1.56, 0.64, 1);
@@ -202,12 +222,166 @@
   /* paper grain, colored canvas dots, a squiggle under page titles */
   --texture: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 .16 0 0 0 0 .11 0 0 0 0 .08 0 0 0 .07 0'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)'/%3E%3C/svg%3E");
   --canvas-dots: rgb(19 111 99 / 0.28);
+  --canvas-pattern: radial-gradient(var(--canvas-dots) 1px, transparent 1.2px);
+  --canvas-size: 18px 18px;
   --title-mark: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='8' viewBox='0 0 24 8'%3E%3Cpath d='M0 4 Q 6 0 12 4 T 24 4' fill='none' stroke='%23e2643f' stroke-width='2.2' stroke-linecap='round'/%3E%3C/svg%3E");
+  --title-mark-size: 24px 8px;
+  --title-mark-repeat: repeat-x;
+  --title-mark-pad: 8px;
+  --nav-divider: transparent;
+  --nav-active-fg: var(--fg);
+  --chrome-bg: color-mix(in srgb, var(--surface) 60%, transparent);
   --art-opacity: 1;
   --art-saturate: 1;
   --art-1: #2a1d15;
   --art-2: #e09b1a;
   --art-3: #f2c76d;
+}
+
+/*
+ * Brutal: neubrutalism for an operator's tool. Black 2px outlines, hard
+ * zero-blur offset shadows, square corners, flat saturated fills, a visible
+ * grid, heavy display type over a plain grotesk, controls that lift on hover
+ * and press flat. The navigation is a black slab with ruled rows (Gumroad).
+ * Dense views stay legible: text is black on white, rules stay 1px.
+ */
+[data-theme="brutal"] {
+  --bg: #f4f3ec;
+  --surface: #ffffff;
+  --surface-2: #fff8d6;
+  --sunken: #efeee6;
+  --overlay: rgb(0 0 0 / 0.5);
+
+  --fg: #000000;
+  --fg-muted: #2e2e2e;
+  --fg-subtle: #575757;
+  --fg-inverse: #ffffff;
+
+  --line: #000000;
+  --line-strong: #000000;
+  --border-w: 2px;
+
+  --accent: #ff90e8;
+  --accent-hover: #ff6fe0;
+  --accent-fg: #000000;
+  --accent-soft: #ffd8f6;
+  --select: #ffe66d;
+  --select-line: #000000;
+  --focus: #1f5fe0;
+  --link: #1a47c9;
+
+  --ok: #19b36b;
+  --ok-soft: #b9f2cf;
+  --ok-fg: #00663a;
+  --run: #2f6bff;
+  --run-soft: #cddbff;
+  --run-fg: #1235a8;
+  --wait: #9b6bff;
+  --wait-soft: #e4d7ff;
+  --wait-fg: #4f1fbf;
+  --warn: #ffb800;
+  --warn-soft: #ffe58a;
+  --warn-fg: #6e4300;
+  --fail: #ff4545;
+  --fail-soft: #ffc9c9;
+  --fail-fg: #a3000f;
+  --idle: #8f8f8f;
+  --idle-soft: #e4e4e4;
+  --idle-fg: #333333;
+
+  /* phases: a grey ramp for the overhead, the run blue for computing, orange for writing */
+  --ph-1: #ababab;
+  --ph-2: #8a8a8a;
+  --ph-3: #6b6b6b;
+  --ph-4: #4a4a4a;
+  --ph-5: #2f6bff;
+  --ph-6: #ff7a1a;
+  --ph-7: #ababab;
+
+  --font-ui: "Space Grotesk Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-head: "Archivo Black", "Space Grotesk Variable", ui-sans-serif, sans-serif;
+  --font-code: "Geist Mono Variable", ui-monospace, "SF Mono", monospace;
+  --head-weight: 400;
+  --head-tracking: -0.01em;
+  --head-variation: normal;
+  --head-case: uppercase;
+  --t-2xs: 0.6875rem;
+  --t-xs: 0.75rem;
+  --t-sm: 0.8125rem;
+  --t-base: 0.875rem;
+  --t-lg: 1rem;
+  --t-xl: 1.25rem;
+  --t-2xl: 1.75rem;
+  --t-3xl: 2.375rem;
+
+  --spacing: 0.25rem;
+  --r-xs: 0px;
+  --r-sm: 0px;
+  --r-md: 0px;
+  --r-lg: 0px;
+  --r-pill: 0px;
+  --r-mark: 0px;
+  --shadow-1: 2px 2px 0 0 #000;
+  --shadow-2: 4px 4px 0 0 #000;
+  --shadow-3: 7px 7px 0 0 #000;
+  --shadow-button: 3px 3px 0 0 #000;
+  --shadow-button-hover: 5px 5px 0 0 #000;
+  --press-x: 3px;
+  --press-y: 3px;
+  --lift-x: -2px;
+  --lift-y: -2px;
+
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+  --ease-bounce: cubic-bezier(0.2, 0, 0, 1);
+  --dur-1: 80ms;
+  --dur-2: 120ms;
+  --dur-3: 160ms;
+
+  --texture: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='32' height='32'%3E%3Cpath d='M32 0V32M0 32H32' fill='none' stroke='%23000' stroke-opacity='.07'/%3E%3C/svg%3E");
+  --canvas-dots: rgb(0 0 0 / 0.12);
+  --canvas-pattern:
+    linear-gradient(var(--canvas-dots) 1px, transparent 1px),
+    linear-gradient(90deg, var(--canvas-dots) 1px, transparent 1px);
+  --canvas-size: 24px 24px;
+  --title-mark: linear-gradient(#ffe66d, #ffe66d);
+  --title-mark-size: 100% 0.42em;
+  --title-mark-repeat: no-repeat;
+  --title-mark-pad: 0px;
+  --nav-divider: #ffffff;
+  --nav-active-fg: #000000;
+  --chrome-bg: #000000;
+  --art-opacity: 1;
+  --art-saturate: 1;
+  --art-1: #000000;
+  --art-2: #ff90e8;
+  --art-3: #ffe66d;
+}
+
+/* The navigation's own scope: a black slab in Brutal, the page's tokens elsewhere. */
+[data-theme="brutal"] [data-chrome] {
+  --surface: #000000;
+  --surface-2: #1c1c1c;
+  --sunken: #333333;
+  --fg: #ffffff;
+  --fg-muted: #e6e6e6;
+  --fg-subtle: #bdbdbd;
+  --line: #ffffff;
+  --line-strong: #ffffff;
+  --accent-soft: #ff90e8;
+  --ok-soft: #19b36b;
+  --ok-fg: #000000;
+  --run-soft: #2a5ff0;
+  --run-fg: #ffffff;
+  --warn-soft: #ffb800;
+  --warn-fg: #000000;
+  --fail-soft: #ff4545;
+  --fail-fg: #000000;
+  --idle-soft: #3a3a3a;
+  --idle-fg: #ffffff;
+  --shadow-button: 3px 3px 0 0 #ff90e8;
+  --shadow-button-hover: 5px 5px 0 0 #ff90e8;
+  --shadow-1: none;
+  color: var(--fg);
 }
 
 @media (prefers-reduced-motion: reduce) {

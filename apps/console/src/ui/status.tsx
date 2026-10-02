@@ -49,7 +49,7 @@ export function StatusBadge({
   return (
     <span
       className={cn(
-        "inline-flex h-5 items-center gap-1 rounded-full pr-2 pl-1.5 text-xs font-medium whitespace-nowrap",
+        "inline-flex h-5 items-center gap-1 rounded-full pr-2 pl-1.5 font-sans text-xs font-medium whitespace-nowrap normal-case",
         toneSoft[t],
         className,
       )}

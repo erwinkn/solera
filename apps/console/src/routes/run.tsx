@@ -52,6 +52,7 @@ export function Run() {
   return (
     <Page>
       <PageHeader
+        ident
         eyebrow={
           <>
             <Crumb>
@@ -258,6 +259,7 @@ function TaskPanel({
   return (
     <Card>
       <CardHeader
+        ident
         title={
           <span className="flex flex-wrap items-center gap-2">
             <Link
@@ -437,7 +439,7 @@ function AttemptSummary({ run, attempt, live }: { run: string; attempt: Attempt;
           <dl className="flex flex-wrap gap-x-5 gap-y-1 text-xs">
             {phases.map(({ phase, seconds }) => (
               <div key={phase} className="flex items-center gap-1.5">
-                <span className="size-2 rounded-[2px]" style={phaseColor(phase)} />
+                <span className="size-2 rounded-mark" style={phaseColor(phase)} />
                 <dt className="text-fg-muted">{PHASE_LABEL[phase]}</dt>
                 <dd className="text-fg tabular">{duration(seconds)}</dd>
               </div>

@@ -205,6 +205,7 @@ function ScopePanel({ name, row, detail }: { name: string; row?: PartitionRow; d
   return (
     <Card className="self-start">
       <CardHeader
+        ident
         title={<span className="font-mono text-sm">{row.scope}</span>}
         actions={<StatusBadge status={row.status} />}
       />

@@ -8,9 +8,11 @@ import { fileURLToPath } from "node:url";
 const css = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "src", "styles", "themes.css"), "utf8");
 
 function theme(selector) {
-  const start = css.indexOf(selector);
+  const start = css.indexOf(selector + " {") >= 0 ? css.indexOf(selector + " {") : css.indexOf(selector);
   const block = css.slice(css.indexOf("{", start) + 1, css.indexOf("\n}", start));
-  return Object.fromEntries([...block.matchAll(/--([\w-]+):\s*(#[0-9a-f]{6});/gi)].map((m) => [m[1], m[2]]));
+  return Object.fromEntries(
+    [...block.matchAll(/--([\w-]+):\s*(#[0-9a-f]{6}|var\(--[\w-]+\));/gi)].map((m) => [m[1], m[2]]),
+  );
 }
 
 const luminance = (hex) => {
@@ -42,13 +44,26 @@ const pairs = [
   ["line-strong", "surface", 1.2],
 ];
 
+// What the navigation draws: its text, its badges, the active item.
+const navPairs = [
+  ...["fg", "fg-muted", "fg-subtle"].map((fg) => [fg, "surface", TEXT]),
+  ...["ok", "run", "warn", "fail", "idle"].map((s) => [`${s}-fg`, `${s}-soft`, TEXT]),
+  ["nav-active-fg", "accent-soft", TEXT],
+  ["focus", "surface", MARK],
+];
+
 let failed = 0;
-for (const [name, selector] of [
+for (const [name, ...selectors] of [
   ["normal", '[data-theme="normal"]'],
   ["fun", '[data-theme="fun"]'],
+  ["brutal", '[data-theme="brutal"]'],
+  // The navigation's own scope: a black slab in Brutal.
+  ["brutal navigation", '[data-theme="brutal"]', '[data-theme="brutal"] [data-chrome]'],
 ]) {
-  const t = { ...theme(":root,"), ...theme(selector) };
-  const rows = pairs.map(([fg, bg, min]) => {
+  const t = Object.assign({}, theme(":root,"), ...selectors.map(theme));
+  const resolve = (v) => (v?.startsWith("var(--") ? t[v.slice(6, -1)] : v);
+  for (const k of Object.keys(t)) t[k] = resolve(t[k]);
+  const rows = (name.endsWith("navigation") ? navPairs : [...pairs, ["nav-active-fg", "accent-soft", TEXT]]).map(([fg, bg, min]) => {
     const value = ratio(t[fg], t[bg]);
     if (value < min) failed++;
     return { pair: `${fg} on ${bg}`, ratio: value.toFixed(2), min, ok: value >= min ? "pass" : "FAIL" };

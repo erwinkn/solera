@@ -78,7 +78,8 @@
   --radius-sm: var(--r-sm);
   --radius-md: var(--r-md);
   --radius-lg: var(--r-lg);
-  --radius-full: 9999px;
+  --radius-full: var(--r-pill);
+  --radius-mark: var(--r-mark);
 
   --shadow-*: initial;
   --shadow-1: var(--shadow-1);
@@ -114,6 +115,10 @@
   transition-property: transform, box-shadow, background-color, color, border-color;
   transition-duration: var(--dur-1);
   transition-timing-function: var(--ease);
+  &:hover:not(:disabled) {
+    transform: translate(var(--lift-x), var(--lift-y));
+    box-shadow: var(--shadow-button-hover);
+  }
   &:active:not(:disabled) {
     transform: translate(var(--press-x), var(--press-y));
     box-shadow: none;
@@ -124,20 +129,21 @@
   font-weight: var(--head-weight);
   letter-spacing: var(--head-tracking);
   font-variation-settings: var(--head-variation);
+  text-transform: var(--head-case);
 }
 @utility tabular {
   font-variant-numeric: tabular-nums;
 }
 @utility canvas-dots {
-  background-image: radial-gradient(var(--canvas-dots) 1px, transparent 1.2px);
-  background-size: 18px 18px;
+  background-image: var(--canvas-pattern);
+  background-size: var(--canvas-size);
 }
 @utility title-mark {
   background-image: var(--title-mark);
-  background-repeat: repeat-x;
+  background-repeat: var(--title-mark-repeat);
   background-position: 0 100%;
-  background-size: 24px 8px;
-  padding-bottom: 8px;
+  background-size: var(--title-mark-size);
+  padding-bottom: var(--title-mark-pad);
 }
 @utility art {
   opacity: var(--art-opacity);

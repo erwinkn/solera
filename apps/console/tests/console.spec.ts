@@ -60,16 +60,32 @@ test("every page loads from the navigation", async ({ page }) => {
 test("the theme switches by tokens alone and persists", async ({ page }) => {
   await connect(page);
   await expect(page.getByRole("heading", { name: "Overview", level: 1 })).toBeVisible();
-  const bg = () => page.evaluate(() => getComputedStyle(document.body).backgroundColor);
-  const normal = await bg();
-  if (mobile(page)) await page.getByRole("button", { name: "Open navigation" }).click();
-  await page.getByRole("radio", { name: "Fun" }).click();
-  await expect(page.locator("html")).toHaveAttribute("data-theme", "fun");
-  expect(await bg()).not.toBe(normal);
+  const look = () =>
+    page.evaluate(() => {
+      const card = document.querySelector("main section") as HTMLElement;
+      const style = getComputedStyle(card);
+      return [getComputedStyle(document.body).backgroundColor, style.borderRadius, style.boxShadow].join(
+        " | ",
+      );
+    });
+  const open = async () => {
+    if (mobile(page)) await page.getByRole("button", { name: "Open navigation" }).click();
+  };
+  const seen = new Set([await look()]);
+  for (const theme of ["Fun", "Brutal"]) {
+    await open();
+    await page.getByRole("radio", { name: theme }).click();
+    await expect(page.locator("html")).toHaveAttribute("data-theme", theme.toLowerCase());
+    if (mobile(page)) await page.keyboard.press("Escape");
+    seen.add(await look());
+  }
+  expect(seen.size).toBe(3); // three looks, one component tree
   await page.reload();
-  await expect(page.locator("html")).toHaveAttribute("data-theme", "fun");
-  if (mobile(page)) await page.getByRole("button", { name: "Open navigation" }).click();
-  await page.getByRole("radio", { name: "Normal" }).click();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "brutal");
+  await open();
+  // Arrow keys move through the options, selecting as they go.
+  await page.getByRole("radio", { name: "Brutal" }).focus();
+  await page.keyboard.press("Home");
   await expect(page.locator("html")).toHaveAttribute("data-theme", "normal");
 });
 

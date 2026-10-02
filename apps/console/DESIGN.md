@@ -46,12 +46,19 @@ Navigation state lives in the URL: filters, the selected scope, task,
 attempt and tab are search params validated per route, so every view is a
 link. The browser's back button is the undo.
 
-## Theming: one component tree, two token sets
+## Theming: one component tree, three token sets
 
 Components reference **semantic tokens only** — no hex values, no
 Tailwind palette (`--color-*: initial` removes it). A theme is a block of
 CSS custom properties under `[data-theme=…]`; switching sets one attribute
-on `<html>`. No component reads the theme name.
+on `<html>`. No component reads the theme name. Three themes: **Normal**
+(a calm, professional tool), **Fun** (warm paper, a serif with character,
+sticker shadows) and **Brutal** (neubrutalism: black outlines, hard offset
+shadows, square corners, flat saturated fills, a visible grid).
+
+A region can carry its own scope: the navigation is marked `data-chrome`,
+and a theme may redefine tokens inside it. Brutal makes it a black slab
+with white rules (after Gumroad); Normal and Fun leave it as the page.
 
 | Group | Tokens | Normal | Fun |
 |---|---|---|---|
@@ -65,14 +72,25 @@ on `<html>`. No component reads the theme name.
 | Shape | `radius-sm…lg`, `shadow-1…3`, `shadow-press` | 6px, soft shadows | 14px, hard offset "sticker" shadows; buttons press in |
 | Space | `--spacing` (Tailwind's base unit) | 0.25rem | 0.27rem: a touch roomier |
 | Motion | `ease`, `ease-bounce`, `dur-1…3` | quick, no overshoot | springy overshoot |
-| Accents | `texture`, `canvas-dots`, `title-mark`, `art-opacity`, `art-saturate` | none, grey dots, no underline, quiet art | paper grain, colored dots, squiggle underline, full-color art |
+| Accents | `texture`, `canvas-pattern`, `title-mark` (+ size, repeat, pad), `art-*` | none, grey dots, no underline, quiet art | paper grain, colored dots, squiggle underline, full-color art |
+
+Brutal sets every row too: an off-white page with a faint 32px grid,
+black ink, Gumroad pink for primary actions and the active item, yellow
+highlighter under titles, saturated status fills with dark text, Space
+Grotesk under Archivo Black titles (uppercase, `head-case`), radius 0
+everywhere (`r-pill` and `r-mark` included, so pills and chart marks go
+square too), 2px borders, shadows of 2/4/7px at zero blur, and buttons
+that lift on hover (`lift-*`, `shadow-button-hover`) and press flat.
+
+Names are never case-transformed: headings that are an asset, a run's
+targets or a sensor (`ident`) keep their case in every theme.
 
 The illustrations (empty states: a stack of solera barrels, the
 fractional-blending system the product is named after) are one SVG
 component drawn with `currentColor` and status tokens; the theme decides how
 loud they are. `prefers-reduced-motion` zeroes the motion tokens in both
-themes. `pnpm contrast` checks every text/background pair of both themes
-against WCAG AA.
+themes. `pnpm contrast` checks every text/background pair of every theme, and
+of Brutal's navigation scope, against WCAG AA.
 
 The theme is persisted in `localStorage` and applied before first paint by
 `public/theme.js`, a blocking external script (no inline script, so the

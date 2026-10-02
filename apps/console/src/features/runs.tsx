@@ -281,7 +281,7 @@ export function RunHistogram({
                 type="button"
                 aria-label={`${clock(t)}: ${total} runs`}
                 onClick={() => onSelect?.(t, t + data.bucket)}
-                className="group flex h-full max-w-6 min-w-0 flex-1 flex-col-reverse gap-[2px] rounded-t-[4px] hover:bg-accent-soft"
+                className="group flex h-full max-w-6 min-w-0 flex-1 flex-col-reverse gap-[2px] rounded-t-mark hover:bg-accent-soft"
               >
                 {parts.map((part, i) => (
                   <span
@@ -289,7 +289,7 @@ export function RunHistogram({
                     className={cn(
                       "w-full shrink-0",
                       toneSolid[part.tone],
-                      i === parts.length - 1 && "rounded-t-[4px]",
+                      i === parts.length - 1 && "rounded-t-mark",
                     )}
                     style={{
                       height: `${(100 * (counts[part.status] ?? 0)) / max}%`,

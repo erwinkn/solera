@@ -5,12 +5,13 @@ import { createStore, useStore } from "./store";
  * spacing unit and easing reads from it (styles/themes.css). public/theme.js
  * applies the stored choice before first paint.
  */
-export const THEMES = ["normal", "fun"] as const;
+export const THEMES = ["normal", "fun", "brutal"] as const;
 export type Theme = (typeof THEMES)[number];
 
 const KEY = "solera.theme";
 
-const initial: Theme = document.documentElement.dataset.theme === "fun" ? "fun" : "normal";
+const stamped = document.documentElement.dataset.theme;
+const initial: Theme = THEMES.find((t) => t === stamped) ?? "normal";
 const theme = createStore<Theme>(initial);
 
 export function setTheme(next: Theme) {

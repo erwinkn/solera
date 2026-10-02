@@ -64,6 +64,7 @@ export function AssetLayout() {
   return (
     <Page>
       <PageHeader
+        ident
         eyebrow={
           <>
             <Crumb>

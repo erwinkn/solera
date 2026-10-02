@@ -56,6 +56,7 @@ function SensorCard({ sensor }: { sensor: SensorView }) {
   return (
     <Card>
       <CardHeader
+        ident
         title={
           <Link to="/sensors/$sensor" params={{ sensor: sensor.name }} className="hover:underline">
             {sensor.name}
@@ -110,7 +111,7 @@ function TickStrip({ ticks }: { ticks: Tick[] }) {
             <span
               role="listitem"
               aria-label={`${clock(t.started_at)} ${t.outcome}`}
-              className={cn("w-1.5 rounded-[2px]", toneSolid[tn], loud ? "h-6" : "h-2.5 opacity-60")}
+              className={cn("w-1.5 rounded-mark", toneSolid[tn], loud ? "h-6" : "h-2.5 opacity-60")}
             />
           </Tooltip>
         );
@@ -190,6 +191,7 @@ export function Sensor() {
   return (
     <Page>
       <PageHeader
+        ident
         eyebrow={
           <>
             <Crumb>

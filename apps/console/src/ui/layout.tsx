@@ -14,6 +14,7 @@ export function Page({ className, ...props }: ComponentProps<"div">) {
 
 export function PageHeader({
   title,
+  ident,
   badge,
   eyebrow,
   description,
@@ -21,6 +22,8 @@ export function PageHeader({
   meta,
 }: {
   title: ReactNode;
+  /** The title is a name (an asset, a run's targets): never case-transformed by a theme. */
+  ident?: boolean;
   /** Shown beside the title, outside its decoration: a status, a kind. */
   badge?: ReactNode;
   eyebrow?: ReactNode;
@@ -38,7 +41,14 @@ export function PageHeader({
       <div className="flex flex-wrap items-end justify-between gap-x-6 gap-y-3">
         <div className="flex min-w-0 flex-col gap-1.5">
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-            <h1 className="title-mark w-fit font-display text-2xl break-all text-fg">{title}</h1>
+            <h1
+              className={cn(
+                "title-mark w-fit font-display text-2xl break-all text-fg",
+                ident && "normal-case",
+              )}
+            >
+              {title}
+            </h1>
             {badge}
           </div>
           {description && <p className="max-w-3xl text-sm text-fg-muted">{description}</p>}
@@ -82,12 +92,15 @@ export function Card({ className, ...props }: ComponentProps<"section">) {
 
 export function CardHeader({
   title,
+  ident,
   description,
   actions,
   className,
   id,
 }: {
   title: ReactNode;
+  /** The title is a name: never case-transformed by a theme. */
+  ident?: boolean;
   description?: ReactNode;
   actions?: ReactNode;
   className?: string;
@@ -101,7 +114,7 @@ export function CardHeader({
       )}
     >
       <div className="flex min-w-0 flex-col gap-0.5">
-        <h2 id={id} className="font-display text-base text-fg">
+        <h2 id={id} className={cn("font-display text-base text-fg", ident && "normal-case")}>
           {title}
         </h2>
         {description && <p className="text-xs text-fg-subtle">{description}</p>}
