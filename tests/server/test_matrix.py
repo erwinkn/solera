@@ -6,7 +6,6 @@ firing and work already queued — through the real engine and stores."""
 import asyncio
 import time
 
-import pytest
 from solera.sdk import (
     AllPartitions,
     Automation,
@@ -28,7 +27,6 @@ from .test_engine import drive, make_engine, state, status_of, task_statuses  # 
 # -- full rewrite × equal payload -------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="system review round 4 #1: the lifecycle thread's per-output reset")
 async def test_an_identical_full_rewrite_stays_readable(state):  # noqa: F811
     seen = []
 
@@ -48,6 +46,38 @@ async def test_an_identical_full_rewrite_stays_readable(state):  # noqa: F811
     await drive(engine, await engine.submit(["log"], mode="full"))  # the same payload, written again
     await drive(engine, await engine.submit(["reader"]))
     assert seen == [[{"n": 1}]]
+
+
+async def test_a_full_run_after_a_rename_stays_readable(state):  # noqa: F811
+    """Worker/stores review round 4 #1: `old` wrote {a, b}; renamed `new`,
+    a full run writes {a: 2, b: 1}. Only `a` is written again: `b` stays
+    where `old` put it, so the new head must still say its content is
+    there, and a reader sees both."""
+    seen = []
+
+    @asset(outputs=Output(key="k"))
+    def old():
+        return [{"k": "a", "v": 1}, {"k": "b", "v": 1}]
+
+    engine = make_engine(state, Project(assets=[old]))
+    await engine.initialize()
+    await drive(engine, await engine.submit(["old"]))
+    await engine.stop()
+
+    @asset(outputs=Output(key="k"), aliases=["old"])
+    def new():
+        return [{"k": "a", "v": 2}, {"k": "b", "v": 1}]
+
+    @asset(inputs={"new": "new"})
+    def reader(new: list):
+        seen.append(sorted((r["k"], r["v"]) for r in new))
+        return []
+
+    engine = make_engine(state, Project(assets=[new, reader]))
+    await engine.initialize()
+    await drive(engine, await engine.submit(["new"], mode="full"))
+    assert status_of(await drive(engine, await engine.submit(["reader"]))) == "succeeded"
+    assert seen == [[("a", 2), ("b", 1)]]
 
 
 # -- AllPartitions × zero free dimensions -----------------------------------------------

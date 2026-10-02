@@ -210,10 +210,10 @@ it is what each kind can promise.
 (§6). The harness has a keyed write read once — by its store's `prepare`,
 or the default — and hands the store a `KeyedWrite`: the keys it changes,
 each to the version the index will hold, and the keys it removes, so a
-store reads and touches only those; with no prior (a first write or a
-`full` run) the write is the slice's whole content. An
+store reads and touches only those; a first write's or a `full` run's
+(`scope.reset`) is the slice's whole content. An
 unkeyed incremental output is a sequence of engine-numbered batches —
-`scope.batch` gives the next one, and a `full` run (`prior=None`) starts
+`scope.batch` gives the next one, and a `full` run (`scope.reset`) starts
 the partition over. A sink that cannot delete makes writes idempotent on
 `(scope, batch)` instead.
 
@@ -241,7 +241,7 @@ Batches = (lo: int, hi: int)  # load rows of batches in [lo, hi]
 |---|---|
 | `can_load(t, selection)` | Registration. Can you produce `t`, filtered by `Keys` when `selection` is given? `can_load(R, None)` for a `Ref` subclass `R` means "are your refs `R`". |
 | `can_store(t, output)` | Registration. Can you take values of type `t` for this `Output` declaration, and extract its declared key from them? `t` is `None` when the producer is unannotated. |
-| `store(write, prior, scope)` | Apply the write; return the new ref (version per §3). `scope.batch` is the engine-assigned batch number. A keyed output's `write` is a `KeyedWrite`, which a store reads four ways: `whole` (clear the scope first), `removes`, `pages()` — the keys to write a page at a time, each with its version and group, only that page taken from the write (`iter_pages()` for a store writing on a thread of its own) — and `version(prior)`; `value` is what the producer returned. `prior` is withheld on a `full` run. Duplicate keys are a write error. For `partition_column` outputs, stamp the column with `scope.partition` and reject rows that disagree. |
+| `store(write, prior, scope)` | Apply the write; return the new ref (version per §3). `scope.batch` is the engine-assigned batch number. A keyed output's `write` is a `KeyedWrite`, which a store reads four ways: `whole` (clear the scope first), `removes`, `pages()` — the keys to write a page at a time, each with its version and group, only that page taken from the write (`iter_pages()` for a store writing on a thread of its own) — and `version(prior)`; `value` is what the producer returned. `prior` is the committed head, where the content is; on a `full` run `scope.reset` says nothing of it is kept. Duplicate keys are a write error. For `partition_column` outputs, stamp the column with `scope.partition` and reject rows that disagree. |
 | `load(ref, t, selection)` | Materialize `t` from what the store holds now; under `Keys`, only the selected keys; under `Batches`, only batches in the range. |
 | `migrate(output, migrations)` | Optional. Apply, in declared order, every migration not yet in the store's own ledger for this output; return the applied names. Must be safe under concurrent attempts of one output (partitions share tables): take a store-level lock and re-read the ledger inside it. Where the backend is transactional, a migration and its ledger row commit together. A store without `migrate` rejects `migrations=` at registration. |
 
@@ -548,8 +548,8 @@ A run is `{targets, partitions, mode, upstream, config, keys}`:
 | `config` | JSON passed as `ctx.config` |
 | `keys` | per-edge override `{"qaqc_files": {"keys": [...]} \| "full"}`: explicit keys are delivered as that edge's selection; `full` resets the edge — the whole head as a reset delivery |
 
-**Modes.** `incremental`: the store gets `prior` = head, the cursor is
-kept, `Incremental` edges get the watermark diff. `full`: no prior, no
+**Modes.** `incremental`: the store builds on `prior` = head, the cursor is
+kept, `Incremental` edges get the watermark diff. `full`: a reset write, no
 cursor, every incremental edge resets to the whole head and its watermark
 lands past the head batch; the store makes the output equal to
 exactly this write. `keys=full` resets one edge only: `prior` is kept.
@@ -775,8 +775,8 @@ code.
   "partition": "Richmond",
   "run":       {"id": "r7", "config": {}},
   "cursor":    "token-41",
-  "prior":     {"qaqc_samples": Ref},
-  "outputs":   {"qaqc_samples": {"exists": true, "head": Ref, "batch": 7, "index": KeyIndex}},
+  "outputs":   {"qaqc_samples": {"before": Ref, "reset": false, "contract": {"store": "…", "writes": "fenced", "key": "id", "incremental": true},
+                                 "batch": 7, "index": KeyIndex}},
   "inputs": {
     "qaqc_files":      {"ref": Ref, "index": KeyIndex,
                         "changes": {"from": 12, "to": 14, "after": null, "full": false, "limit": 100}},
@@ -794,10 +794,13 @@ code.
   the whole index when `full`), read `limit` keys at a time from `after`; for
   an unkeyed one the `[lo, hi]` `Batches` range; a run's `keys=` override
   names its keys outright. `full` marks a reset delivery.
-- `prior` is the committed head per output; `outputs` pins each output's
-  committed head, its engine-assigned batch number and, when keyed, its key
-  index. A `full` run is expressed by withholding `prior` and `cursor`
-  (`outputs` stays); there is no `mode` field. An output left unsettled
+- `outputs` is each output's one launch record: its committed head
+  (`before`, where its content is), whether the write starts it over
+  (`reset`: a first write, or a `full` run, which also withholds the
+  `cursor`), the contract it was launched under (`contract`: store, write
+  kind, key — what settles, fails and cleans up the attempt, whatever the
+  manifest says by then), its engine-assigned batch number and, when
+  keyed, its key index. There is no `mode` field. An output left unsettled
   by a dead attempt carries its `unsettled` intents in `outputs`.
 - Store names, output config, annotations, placement and time windows are
   derived from the manifest and the key.

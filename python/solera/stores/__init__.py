@@ -68,14 +68,17 @@ class Batches:
 class Scope:
     """A write scope (§9): `batch` is the engine-assigned batch number for
     incremental outputs, `attempt` the writing attempt's id, `aliases` the
-    output's former names. What a keyed write changes is the write's own
-    (`KeyedWrite`)."""
+    output's former names. `reset` says the write starts the content over
+    (a full run): `prior` still says where the content is, but nothing of
+    it is kept — a store's batches start over at `batch`. What a keyed write
+    changes is the write's own (`KeyedWrite`)."""
 
     output: Output
     partition: str
     batch: int | None = None
     attempt: str | None = None
     aliases: tuple = ()
+    reset: bool = False
     # The attempt's generation and invocation, for a `fenced` store to check
     # (docs/lifecycle.md §9.7); `None` outside an attempt.
     generation: int | None = None
@@ -369,7 +372,7 @@ class KeyedWrite:
         return [(k, v, g) for (k, v), g in zip(page, groups, strict=True)]
 
     def version(self, prior: Ref | None) -> str:
-        return self.prepared.version(prior)
+        return self.prepared.version(None if self.whole else prior)  # a whole write builds on nothing
 
 
 def prepare(

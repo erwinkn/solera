@@ -771,19 +771,27 @@ class Engine(Attempts, Sensors, Views):
         # An Each asset whose keys all failed so far has no head yet: nothing to wait for.
         if skip and each_page is None and not planner.complete(task["asset"], scope):
             skip = False
-        prior = {name: head["ref"] for name, head in baseline.items() if head is not None}
-        cursor = self.m.cursors.get((task["asset"], scope))
-        if full and each_page is None:
-            # Withheld: the write is the whole content. An Each page keeps its prior:
-            # it patches by key, and a key that fails keeps its last good output (§5).
-            prior, cursor = {}, None
+        # A full run's write is the whole content. An Each page's is not: it
+        # patches by key, and a key that fails keeps its last good output (§5).
+        reset = full and each_page is None
+        cursor = None if reset else self.m.cursors.get((task["asset"], scope))
         outputs = {}
         for output in asset["outputs"]:
             name, head = output["name"], baseline[output["name"]]
-            # The contract it is launched under: settled by it, whatever is served by then.
-            info = {"exists": head is not None, "decl": {k: output.get(k) for k in ("key", "incremental")}}
-            if head is not None:
-                info["head"] = head["ref"]
+            info = {
+                # Where its content is (`before`, the committed ref), and whether the
+                # write starts it over: a first write, or a full run.
+                "before": head["ref"] if head is not None else None,
+                "reset": reset or head is None,
+                # The contract it is launched under: settled, failed and cleaned up
+                # by it, whatever is served by then.
+                "contract": {
+                    "store": output["store"],
+                    "writes": self.manifest["stores"][output["store"]]["writes"],
+                    "key": output.get("key"),
+                    "incremental": output.get("incremental"),
+                },
+            }
             if name == task["asset"] and asset.get("aliases"):
                 info["aliases"] = list(asset["aliases"])
             if output.get("incremental"):
@@ -814,7 +822,6 @@ class Engine(Attempts, Sensors, Views):
             "more": more,
             "full": full,
             "skip": skip,
-            "prior": prior,
             "cursor": cursor,
             "fingerprint": fingerprint,
             "outputs": outputs,
@@ -874,7 +881,6 @@ class Engine(Attempts, Sensors, Views):
                 "plans",
                 "more",
                 "full",
-                "prior",
                 "lineage",
                 "failures",
             )
@@ -1333,7 +1339,7 @@ class Engine(Attempts, Sensors, Views):
                 raise Conflict(f"output {output} head changed since this attempt was claimed")
         outputs = result.get("outputs") or {}
         # Settled under the contract it was launched with, not today's manifest.
-        declared = {name: info["decl"] for name, info in (prepared.get("outputs") or {}).items()}
+        declared = {name: info["contract"] for name, info in (prepared.get("outputs") or {}).items()}
         # Where each keyed Incremental page ended decides the next watermark.
         delivered = result.get("delivered") or {}
         watermarks, more = {}, bool(prepared.get("more"))
@@ -1382,12 +1388,12 @@ class Engine(Attempts, Sensors, Views):
                 if "elements" in info:
                     head["elements"] = entry.get("elements", info["elements"])
             elif decl.get("incremental"):
-                if before is not None and before["ref"]["version"] == ref["version"]:
+                if info["reset"]:  # starts over at its batch, whatever its content
+                    head["batch"] = head["base"] = int(info["batch"])
+                elif before["ref"]["version"] == ref["version"]:  # appended nothing
                     head["batch"], head["base"] = before.get("batch", -1), before.get("base", 0)
                 else:
-                    # A write with no prior (a first write, or a full run) starts over.
-                    head["batch"] = int(info["batch"])
-                    head["base"] = head["batch"] if name not in prepared["prior"] else before.get("base", 0)
+                    head["batch"], head["base"] = int(info["batch"]), before.get("base", 0)
             heads[name] = head
         for name in set(declared) - set(outputs):
             # An Each page whose keys all failed writes nothing, and makes no head yet;

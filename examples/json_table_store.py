@@ -54,13 +54,15 @@ class JsonTableStore:
 
     def _store(self, write, prior, scope) -> Written:
         out, table = scope.output, self._table(scope.output)
+        if scope.reset:
+            prior = None  # a full run keeps nothing of the content
         conn, cur = self._transaction(out)
         with conn:
             fence(cur, scope, table)  # before this transaction changes anything
             if out.key is None:  # an unkeyed incremental output: a batch of rows
                 rows = list(write.rows)
                 # The batch replaces itself (a retried call writes it again); with no
-                # prior (a full run) the batches start over.
+                # prior (a first write, or a reset) the batches start over.
                 if prior is None:
                     cur.execute(f"DELETE FROM {table} WHERE part = %s", (scope.partition,))
                 else:

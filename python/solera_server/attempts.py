@@ -261,7 +261,7 @@ class Attempts:
             if self.m.immutable(name) and head is not None:
                 entries = self._due_discards(name, task["scope"], None)
                 if entries:
-                    due[name] = {"discard": entries, "head": head["ref"]}
+                    due[name] = {"discard": entries, "before": head["ref"]}
         return {"discard": due, "scope": task["scope"]} if due else {}
 
     async def attempt_discarded(self, attempt: str, body: dict) -> None:
@@ -389,7 +389,6 @@ class Attempts:
             "asset": task["asset"],
             "partition": task["scope"],
             "run": {"id": task["run"], "config": run.get("config") or {}},
-            "prior": prepared["prior"],
             "outputs": prepared["outputs"],
             "inputs": prepared["inputs"],
             "execution": self.manifest["assets"][task["asset"]]["placement"],
@@ -693,14 +692,14 @@ class Attempts:
             raise LostOwnership(attempt)  # it finished meanwhile
         return launched
 
-    def _store_of(self, output: str) -> dict:
-        return self.manifest["stores"].get(self.manifest["outputs"][output]["store"]) or {}
-
-    def _gated(self, prepared: dict) -> bool:
+    @staticmethod
+    def _gated(prepared: dict) -> bool:
         """Whether the attempt writes outputs on fenced stores, which take a
         gate and its intents for the next attempt's repair (§9.6)."""
 
-        return any(self._store_of(n)["writes"] == "fenced" for n in prepared.get("outputs") or {})
+        return any(
+            info["contract"]["writes"] == "fenced" for info in (prepared.get("outputs") or {}).values()
+        )
 
     def scope_discards(self, output: str, scope: str) -> dict:
         """An output scope's data garbage awaiting its next attempt (§9.8):
@@ -809,7 +808,7 @@ class Attempts:
         attempt, so nothing else can hold them (§6)."""
 
         for name, info in (prepared.get("outputs") or {}).items():
-            if info.get("prefix") is None or name in keep or self.m.immutable(name):
+            if info.get("prefix") is None or name in keep or info["contract"]["writes"] == "immutable":
                 continue  # an immutable output's are collected with what they name (§9.8)
             prefix = f"{info['prefix']}{int(info['batch']):012d}-{attempt}"
             self._authority()

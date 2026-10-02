@@ -400,7 +400,7 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
                 removes[name].add(key)
             elif value is not None:  # None, or not returned: no change for this key
                 groups[name][key] = value
-    exists = {name for name, info in (spec.get("outputs") or {}).items() if info.get("exists")}
+    exists = {name for name, info in (spec.get("outputs") or {}).items() if info.get("before")}
     values = {
         name: Patch(groups[name], remove=sorted(removes[name] - set(groups[name])))
         for name in decls

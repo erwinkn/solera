@@ -363,6 +363,8 @@ class PostgresStore:
 
     def _store(self, write, prior: Ref | None, scope: Scope) -> Written:
         output = scope.output
+        if scope.reset:
+            prior = None  # a full run keeps nothing of the content
         table, _, _ = self._table(output)
         with self._connect() as conn, conn.cursor() as cur:
             self._domain(cur, table)
@@ -439,7 +441,7 @@ class PostgresStore:
     def _apply_batch(self, cur, output, write: Patch, scope, table, slice_where, prior, batch):
         """An unkeyed incremental output's batch: its rows stamped with the
         batch columns, in place of this batch's (a retry's) — or, with no
-        prior (a full run), of every batch."""
+        prior (a first write, or a reset), of every batch."""
 
         if not output.incremental:
             raise WriteError(f"{output.name}: Patch requires an incremental output")

@@ -56,11 +56,14 @@ class Ledger:
         return Keys(dict(self.entries))
 
 
-def scope(out: Output, generation: int, invocation: str = "i", batch: int | None = None) -> Scope:
+def scope(
+    out: Output, generation: int, invocation: str = "i", batch: int | None = None, reset: bool = False
+) -> Scope:
     return Scope(
         output=out,
         partition="",
         batch=batch,
+        reset=reset,
         attempt=f"kit-{generation}",
         generation=generation,
         invocation=invocation,
@@ -206,11 +209,11 @@ async def a_batch_written_again_lands_once(h: Harness) -> None:
 
 
 async def a_full_run_starts_the_batches_over(h: Harness) -> None:
-    """Batch 3, then batch 4 with no prior (a full run): only batch 4."""
+    """Batch 3, then batch 4 reset (a full run): only batch 4."""
 
     out = h.output(incremental=True)
-    await h.store.store(Patch([{"id": "a", "v": "1"}]), None, scope(out, 1, batch=3))
-    reset = await h.store.store(Patch([{"id": "b", "v": "1"}]), None, scope(out, 2, batch=4))
+    first = await h.store.store(Patch([{"id": "a", "v": "1"}]), None, scope(out, 1, batch=3))
+    reset = await h.store.store(Patch([{"id": "b", "v": "1"}]), first.ref, scope(out, 2, batch=4, reset=True))
     assert await rows(h, reset.ref, None) == [("b", "1")]
 
 

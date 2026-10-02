@@ -431,7 +431,13 @@ async def test_reconciliation_streams_the_slice_and_digests_rows_as_written(stor
             Patch({"b": [{"x": 2}], "d": []}, remove=["c"]),
         )
     ):
-        o = worker._Out("t", out, store, {"batch": 1, "unsettled": [{"unknown": True}]}, written.ref, patch)
+        o = worker._Out(
+            "t",
+            out,
+            store,
+            {"batch": 1, "unsettled": [{"unknown": True}], "before": written.ref.to_json()},
+            patch,
+        )
         o.index = KeyIndex(io, None, state)
         o.prepared = prepare_for(store, patch, out)
         o.run = SortedRun.from_rows(o.prepared.rows, [k.encode() for k in o.prepared.removes])
@@ -874,7 +880,13 @@ async def test_a_repair_read_back_waits_off_the_event_loop(store, monkeypatch):
 
     monkeypatch.setattr(store, "scan", slow)
     patch = Patch([{"id": "b", "x": 2}])
-    o = worker._Out("t", out, store, {"batch": 1, "unsettled": [{"unknown": True}]}, written.ref, patch)
+    o = worker._Out(
+        "t",
+        out,
+        store,
+        {"batch": 1, "unsettled": [{"unknown": True}], "before": written.ref.to_json()},
+        patch,
+    )
     o.index = KeyIndex(io, None, state)
     o.prepared = prepare_for(store, patch, out)
     o.run = SortedRun.from_rows(o.prepared.rows)

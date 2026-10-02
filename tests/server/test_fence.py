@@ -886,3 +886,46 @@ async def test_a_replaced_engine_stops_acting(tmp_path):
     assert successor.model.claimed(attempt) is not None  # B still owns it, and adopts it
     await engine.stop()
     await successor.close()
+
+
+async def failed_writing(state, run_id, attempt, intents):
+    """A worker that took the gate listing `intents`, then failed."""
+
+    base = state.attempt_path(run_id, attempt)
+    await state.create_object(f"{base}.worker", json.dumps({"invocation": "w"}).encode())
+    await state.create_object(f"{base}.writing", lifecycle.gate("writing", "w", intents))
+    error = {"type": "ValueError", "message": "boom", "retryable": False}
+    result = {"invocation": "w", "status": "failed", "writes": "uncertain", "error": error}
+    await state.create_object(f"{base}.result", json.dumps(result).encode())
+
+
+@pytest.mark.parametrize("change", ["removed", "immutable"])
+async def test_an_adopted_attempt_fails_under_the_contract_it_was_launched_with(tmp_path, change):
+    """Review round 4, engine #3: launched writing `remote` on a fenced
+    store, failed after a restart that serves `remote` removed, or on an
+    immutable store. Its failure is still a fenced one: the scope is
+    released, and the intents its gate lists stay unsettled for repair."""
+
+    url = tmp_path.as_uri()
+    state = await State.open(url, "test", flush_interval=0.001)
+    engine = engine_for(state, REMOTE)
+    await engine.initialize()
+    run, attempt = await launched(engine, ["remote"])
+
+    @asset(executor=Fake("fake")())
+    def other():
+        return [{"ok": True}]
+
+    if change == "removed":
+        served = Project(assets=[other], executors=[Fake("fake")], default_store=Gated())
+    else:
+        served = Project(assets=[asset(executor=Fake("fake")())(remote.fn)], executors=[Fake("fake")])
+    state, engine = await restart(state, engine, url, served)
+    await engine.initialize()
+    intents = {"remote": {"files": [], "added": 0, "removed": 0, "exact": True}}
+    await failed_writing(state, run["id"], attempt, intents)
+    await until(engine, lambda: state.model.claimed(attempt) is None)
+    assert state.model.runs[run["id"]]["status"] == "failed"
+    assert [i["attempt"] for i in state.model.unsettled[("remote", "")]] == [attempt]
+    await engine.stop()
+    await state.close()

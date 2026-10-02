@@ -105,6 +105,8 @@ class FileStore:
         if patch and not output.incremental:
             raise WriteError(f"{output.name}: Patch requires an incremental output")
         base = self._base(output, scope, prior)
+        if scope.reset:
+            prior = None  # where the content is, but nothing of it is kept
         generation = int(scope.generation or 0)
         if output.key is not None:
             if not isinstance(write, KeyedWrite):
@@ -149,7 +151,7 @@ class FileStore:
 
     async def _store_batch(self, write: Patch, prior, scope, base, generation) -> Written:
         """An unkeyed incremental write: its items, as one object per batch.
-        With no prior (a first write or a full run) the output starts over at
+        With no prior (a first write, or a reset) the output starts over at
         this batch; earlier ones are no longer read, and go with `discard`."""
 
         output = scope.output

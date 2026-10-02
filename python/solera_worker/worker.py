@@ -464,7 +464,6 @@ async def _store_outputs(
     manifest_asset = project.manifest["assets"][asset.name]
     declared = {o["name"]: o for o in manifest_asset["outputs"]}
     decls = {o.name or asset.name: o for o in asset.outputs}
-    priors = {name: Ref.from_json(r) for name, r in (spec.get("prior") or {}).items()}
     pinned = spec.get("outputs") or {}
 
     if isinstance(result_value, Result):
@@ -485,7 +484,7 @@ async def _store_outputs(
         if name not in decls:
             raise StoreError(f"{asset.name}: returned undeclared output {name!r}")
         store = project.stores[declared[name]["store"]]
-        o = outs[name] = _Out(name, decls[name], store, pinned.get(name) or {}, priors.get(name), value)
+        o = outs[name] = _Out(name, decls[name], store, pinned.get(name) or {}, value)
         if o.kind == "fenced":
             await store.acquire(o.scope(spec, invocation))
 
@@ -510,7 +509,7 @@ async def _store_outputs(
             continue
         if o.files is None:
             await _resolve(o, spec, engine.get(name))
-        if not o.files.files and o.info.get("exists") and not o.unsettled:
+        if not o.files.files and o.prior is not None and not o.unsettled:
             if not _schema_due(o):
                 entries[name] = {"unchanged": True}
                 del outs[name]
@@ -555,7 +554,7 @@ async def _store_outputs(
                 raise StoreError(f"{output.name}: migration failed: {error}") from error
             schema = applied[-1] if applied else output.migrations[-1].name
         if o.schema_only:
-            ref = o.head()
+            ref = o.prior
             handle = {**(ref.handle or {}), "schema": schema}
             entries[name] = {"ref": dataclasses.replace(ref, handle=handle).to_json(), "keys": intents[name]}
             continue
@@ -609,7 +608,6 @@ class _Out:
     output: Output
     store: Any
     info: dict  # the spec's pin of the output
-    prior: Ref | None
     value: Any
     index: KeyIndex | None = None
     prepared: Prepared | None = None
@@ -625,10 +623,19 @@ class _Out:
     def kind(self) -> str:
         return self.store.writes
 
-    def head(self) -> Ref:
-        """The committed ref: the prior, or — a full run withholds it — the head."""
+    @property
+    def prior(self) -> Ref | None:
+        """The committed ref: where the content is, and — unless the write
+        starts it over (`reset`) — what it builds on."""
 
-        return self.prior if self.prior is not None else Ref.from_json(self.info["head"])
+        before = self.info.get("before")
+        return Ref.from_json(before) if before is not None else None
+
+    @property
+    def reset(self) -> bool:
+        """Whether the write starts the content over: a first write, or a full run."""
+
+        return bool(self.info.get("reset"))
 
     @property
     def sql(self) -> bool:
@@ -636,10 +643,10 @@ class _Out:
 
     @property
     def replace(self) -> bool:
-        """A full replacement: a bare write, or with no prior (a first write or
-        a full run) a Patch, which is then the whole content."""
+        """A full replacement: a bare write, or a Patch that starts the content
+        over, which is then the whole content."""
 
-        return not isinstance(self.value, Patch) or self.prior is None
+        return not isinstance(self.value, Patch) or self.reset
 
     @property
     def unsettled(self) -> list:
@@ -652,6 +659,7 @@ class _Out:
             batch=self.info.get("batch"),
             attempt=spec["attempt"],
             aliases=tuple(self.info.get("aliases") or ()),
+            reset=self.reset,
             generation=spec.get("generation"),
             invocation=invocation,
         )
@@ -675,7 +683,7 @@ def _schema_due(o: _Out) -> bool:
 
     if not o.output.migrations:
         return False
-    return (o.head().handle or {}).get("schema") != o.output.migrations[-1].name
+    return (o.prior.handle or {}).get("schema") != o.output.migrations[-1].name
 
 
 async def _prepare(o: _Out, spec, keys_io) -> None:
@@ -756,7 +764,7 @@ def _keyed_write(o: _Out, keys_io) -> KeyedWrite:
         if changed is None:
             return KeyedWrite(p, DeltaKeys(keys_io, o.index.prefix, tuple(o.files.files)), whole=o.replace)
         return KeyedWrite(p, upserted, deleted, whole=o.replace)
-    if o.prior is None or (o.replace and (changed is None or o.unsettled)):
+    if o.reset or (o.replace and (changed is None or o.unsettled)):
         # A first write, or a replacement with more changes than it lists, or with
         # dead attempts': the scope rewritten.
         return KeyedWrite(p, whole=True)
@@ -1313,8 +1321,8 @@ async def _discard_due(spec, project, asset, objects, writes) -> dict:
         if not done:
             continue
         scope = Scope(output=decls[name], partition=spec["partition"], attempt=spec["attempt"])
-        head = Ref.from_json(info["head"]) if info.get("head") else None  # where its objects live
-        await writes.call(store.discard(scope, head, items))
+        before = Ref.from_json(info["before"]) if info.get("before") else None  # where its objects live
+        await writes.call(store.discard(scope, before, items))
         discarded[name] = done
     out = {"discarded": discarded} if discarded else {}
     if unresolved:

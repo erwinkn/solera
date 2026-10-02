@@ -657,8 +657,8 @@ the attempt's token and its generation (the claim's event position).
   "project": "brimstone", "asset": "file_index", "partition": "alpha", "execution": {"kind": "Local"},
   "inputs": {"site_files": {"ref": {"…": "…"}, "index": {"…": "KeyIndex: levels + log[56..57]"},
              "changes": {"from": 56, "to": 57, "after": null, "full": false, "limit": 2}}},
-  "prior": {"file_index": {"…": "ref"}},
-  "outputs": {"file_index": {"exists": true, "batch": 12, "index": {"…": "KeyIndex: levels only"}}},
+  "outputs": {"file_index": {"before": {"…": "ref"}, "reset": false, "contract": {"…": "store, writes, key"},
+                             "batch": 12, "index": {"…": "KeyIndex: levels only"}}},
   "heartbeat": 10, "engine": "https://solera.example.com", "token": "…", "generation": 184467
 }
 ```
@@ -759,13 +759,14 @@ class Store(Protocol):
     writes: str                                             # "immutable" or "fenced" (stores.md)
 ```
 
-- `Scope` carries the engine-assigned `batch`, the `attempt` id, its
+- `Scope` carries the engine-assigned `batch`, whether the write is a
+  `reset`, the `attempt` id, its
   `generation` and `invocation` (`lifecycle.md` §9.7–9.8) and the
   output's `aliases`. A keyed output's write reaches the store as a
   `KeyedWrite`: read once (`prepared`), and what it changes against the
   key index — `upserts` to write, each to the version the index will hold,
-  `removes` to delete — or `whole`, with no prior (a first write or a
-  `full` run): the store then writes everything and deletes whatever else
+  `removes` to delete — or `whole`, a first write or a reset (a `full`
+  run): the store then writes everything and deletes whatever else
   it holds. A patch that changes 3 keys of 100,000 reaches the store as 3
   upserts, and the store reads only their groups.
 - `Written.keys` is only for writes the harness never sees as rows

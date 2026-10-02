@@ -662,11 +662,11 @@ class Model:
             return
         self._release_claim(task["id"], e["attempt"])
         outcome, at = e["outcome"], e["finished_at"]
-        reads, execution = [], {}
+        prepared, execution = {}, {}
         launched = task.get("launched")
         if (launched or {}).get("attempt") == e["attempt"]:
             del task["launched"]
-            reads = launched["prepared"].get("lineage") or []
+            prepared = launched["prepared"]
             execution = history.execution(launched["execution"])
             if task["status"] == "running":
                 task["status"] = "queued"  # until the outcome below says otherwise
@@ -702,22 +702,22 @@ class Model:
         self._tried(run, task, summary)
         if commit and outcome in ("canceled", "failed"):
             # A drained Each page: what finished commits (docs/lifecycle.md §7).
-            self._install(task, commit, e, reads)
+            self._install(task, commit, e, prepared)
         if task["status"] in TERMINAL_TASK:
             # Its run was canceled while it ran. An attempt that was already
             # writing still commits: its data landed (§8).
             if outcome == "succeeded" and commit:
-                self._install(task, commit, e, reads)
+                self._install(task, commit, e, prepared)
             return
         if outcome == "succeeded":
-            self._install(task, commit or {}, e, reads)
+            self._install(task, commit or {}, e, prepared)
             if e.get("more"):
                 self._ready(run, task, at)
             else:
                 task["status"] = "succeeded"
                 self._finished(run, task, "succeeded", e["attempt"], at)
         elif outcome == "skipped":
-            self._install(task, commit or {}, e, reads)
+            self._install(task, commit or {}, e, prepared)
             task["status"] = "skipped"
             self._finished(run, task, "skipped", e["attempt"], at)
         elif outcome == "failed":
@@ -788,18 +788,21 @@ class Model:
         self._event(run, closing, end, tid, attempt, reason=e.get("reason"))
         return times
 
-    def _install(self, task: dict, commit: dict, e: dict, reads=()) -> None:
-        """Install a commit: heads, key indexes, cursor, watermarks. Each
-        output version it makes enters the history, with what it was built
-        from (`reads`: `[output, scope, version, param]`)."""
+    def _install(self, task: dict, commit: dict, e: dict, prepared: dict) -> None:
+        """Install a commit: heads, key indexes, cursor, watermarks — under the
+        contract its attempt was launched with (`prepared`). Each output
+        version it makes enters the history, with what it was built from
+        (its `lineage`: `[output, scope, version, param]`)."""
 
         asset, scope, at = task["asset"], task["scope"], e["finished_at"]
+        reads, contracts = prepared.get("lineage") or [], prepared.get("outputs") or {}
         changed = []
         for name, head in commit.get("heads", {}).items():
             before = self.heads.get((name, scope))
             if before is None or before["ref"].get("version") != head["ref"].get("version"):
                 changed.append(name)
-            self._superseded(name, scope, before, head, (commit.get("keys") or {}).get(name))
+            if contracts[name]["contract"]["writes"] == "immutable":
+                self._superseded(name, scope, before, head, (commit.get("keys") or {}).get(name))
             self.heads[(name, scope)] = {**head, "run": e["run"], "attempt": e["attempt"], "at": at}
             self._commit_keys(name, scope, (commit.get("keys") or {}).get(name))
             if name in commit.get("settled", ()):
@@ -1013,12 +1016,10 @@ class Model:
     def _superseded(
         self, output: str, scope: str, before: dict | None, head: dict, keys: dict | None
     ) -> None:
-        """What a commit let go of: each changed key's predecessor (named in
+        """What a commit on an immutable store let go of: each changed key's predecessor (named in
         its delta files), a value's previous object, or — when an append
         output starts over — its earlier batches."""
 
-        if not self.immutable(output):
-            return
         if keys and keys.get("files"):
             prefix = self.index(output, scope).prefix
             self._collect(
@@ -1046,7 +1047,7 @@ class Model:
         immutable store carries its generation, which no other attempt uses."""
 
         for name, info in (launched["prepared"].get("outputs") or {}).items():
-            if self.immutable(name):
+            if info["contract"]["writes"] == "immutable":
                 entry = {
                     "kind": "abandoned",
                     "attempt": attempt,

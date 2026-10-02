@@ -56,18 +56,21 @@ class Store(Protocol):
 | `output` | the `Output` declaration: `name`, `key`, `revision`, `incremental`, `config` |
 | `partition` | the partition key, `""` for an unpartitioned output |
 | `batch` | for an incremental output, the batch number the engine assigned |
+| `reset` | the write starts the content over (a `full` run): keep nothing of `prior` |
 | `attempt` | the writing attempt's id |
 | `generation` | a number the engine assigns each attempt on a scope, larger for every later attempt; `None` outside an attempt |
 | `invocation` | which process runs the attempt: an attempt started twice has one generation and two invocations, and only the first to claim it may write |
 
 **`store(write, prior, scope) -> Written(ref)`** applies a write and
 returns a ref to the new content, with a `version` that changes when the
-content does. `prior` is the head the write builds on; `None` means the
-write is the scope's whole content (a first write, or a `full` run).
+content does. `prior` is the committed head: where the content is (a
+renamed output's objects stay where they were), and what the write builds
+on — unless `scope.reset`, when nothing of it is kept. `None` is a first
+write.
 
 - An unkeyed, non-incremental output's write is a value: replace it.
 - An unkeyed incremental output's write is a `Patch` of rows: append it as
-  batch `scope.batch`.
+  batch `scope.batch` — or, reset, start the batches over at it.
 - A keyed output's write arrives as a `KeyedWrite`, already resolved
   against the engine's key index. A store reads it four ways: `whole` —
   the write is the scope's entire content, so clear the scope first;
