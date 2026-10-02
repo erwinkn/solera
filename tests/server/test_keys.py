@@ -682,3 +682,43 @@ async def test_a_whole_keyed_read_is_loaded_a_page_at_a_time(state, monkeypatch)
     await run(engine, ["items", "by_value", "reader"])
     assert sorted(r["n"] for r in seen["items"]) == list(range(5))
     assert seen["by_value"] == {f"v{i}": i for i in range(5)}
+
+
+async def test_a_listing_holds_its_index_files_through_collection(tmp_path, monkeypatch):
+    """Engine review #3: a key listing captured the index, then compaction
+    and collection run before it reads: its files must still be there."""
+
+    import asyncio
+
+    from solera.keys.index import KeyIndex
+    from solera.sdk import Source
+    from solera_server.engine import Engine
+
+    project = Project(sources=[Source("uploads", key="id")], key_cache=None)  # every read reaches the store
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = Engine(
+        state, project.manifest, clock=state.clock, key_options=Options(l0_max_files=2), resolve_cache=False
+    )
+    await engine.initialize()
+    for n in range(3):
+        await engine.commit_source("uploads", upsert={f"k{n}": "1"})
+    page, paused, go = KeyIndex.page, asyncio.Event(), asyncio.Event()
+
+    async def held(self, *args, **kw):
+        paused.set()
+        await go.wait()
+        return await page(self, *args, **kw)
+
+    monkeypatch.setattr(KeyIndex, "page", held)
+    listing = asyncio.create_task(engine.list_keys("uploads"))
+    await paused.wait()
+    engine.upkeep.maintain()
+    for job in list(engine.upkeep.jobs.values()):
+        await job
+    assert state.model.garbage  # compaction let the listed files go
+    await engine.upkeep.collect()
+    go.set()
+    assert set((await listing)["keys"]) == {"k0", "k1", "k2"}
+    await engine.upkeep.collect()  # done reading: now they go
+    assert not state.model.garbage
+    await state.close()

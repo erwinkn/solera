@@ -1738,27 +1738,30 @@ class Engine(Attempts, Sensors):
                 items = upsert.items() if isinstance(upsert, dict) else ((k, "1") for k in upsert or [])
                 new = {str(k): str(v) for k, v in items}
                 removes, replace = [str(k) for k in remove or [] if str(k) not in new], False
-            pinned = self.m.index(name, "").pinned()
-            index = KeyIndex(self._key_io(), None, pinned, self.key_options)
             batch = int((head or {}).get("batch", -1)) + 1
             attempt = ulid(self.clock())
-            files = await self._resolve_source(index, pinned, new, removes, replace, batch, attempt)
-            if files is not None:
-                files, changed = files
-            elif replace:
-                rows = Rows.pairs(list(new.items()))
-                files, changed = await index.replace(rows, batch, attempt, collect=2 * SOURCE_KEYS_RECORDED)
-            else:
-                delta = await index.changes(
-                    [key_bytes(k) for k in new],
-                    [key_bytes(v) for v in new.values()],
-                    [key_bytes(k) for k in removes],
-                )
-                files = await index.write(batch, attempt, delta)
-                changed = (
-                    [k for k, d in zip(delta.keys, delta.deleted, strict=True) if not d],
-                    [k for k, d in zip(delta.keys, delta.deleted, strict=True) if d],
-                )
+            with self.m.reading():  # the index it resolves against outlives compaction meanwhile
+                pinned = self.m.index(name, "").pinned()
+                index = KeyIndex(self._key_io(), None, pinned, self.key_options)
+                files = await self._resolve_source(index, pinned, new, removes, replace, batch, attempt)
+                if files is not None:
+                    files, changed = files
+                elif replace:
+                    rows = Rows.pairs(list(new.items()))
+                    files, changed = await index.replace(
+                        rows, batch, attempt, collect=2 * SOURCE_KEYS_RECORDED
+                    )
+                else:
+                    delta = await index.changes(
+                        [key_bytes(k) for k in new],
+                        [key_bytes(v) for v in new.values()],
+                        [key_bytes(k) for k in removes],
+                    )
+                    files = await index.write(batch, attempt, delta)
+                    changed = (
+                        [k for k, d in zip(delta.keys, delta.deleted, strict=True) if not d],
+                        [k for k, d in zip(delta.keys, delta.deleted, strict=True) if d],
+                    )
             if not files.files:
                 return None, ref
             ref["version"] = digest([ref["version"], batch, [f.name for f in files.files]])
@@ -1846,9 +1849,10 @@ class Engine(Attempts, Sensors):
         state = self.m.indexes.get((output, scope))
         if state is None:
             return {"total": 0, "exact": True, "keys": {}, "next": None}
-        index = KeyIndex(self._key_io(), None, state.pinned(), self.key_options)
         start = key_bytes(after) if after is not None else None
-        keys, versions, _, nxt = await index.page(start, offset + limit)
+        with self.m.reading():  # its files outlive compaction until the page is read
+            index = KeyIndex(self._key_io(), None, state.pinned(), self.key_options)
+            keys, versions, _, nxt = await index.page(start, offset + limit)
         # Versions are a declared revision's text, a source's version, or else a row digest.
         record = self.manifest["outputs"].get(output) or {}
         digests = not (record.get("source") or record.get("partition_set") or record.get("revision"))

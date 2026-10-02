@@ -25,6 +25,7 @@ at its claim's position, and a file let go of at a later one waits for it.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import math
 
@@ -167,6 +168,7 @@ class Model:
         self.pool: dict[str, dict] = {}  # attempt id -> pool work
         # sensor -> the tick dispatched and not yet decided: {tick, cursor, snapshot, pin, ...}
         self.ticks: dict[str, dict] = {}
+        self.readers: dict[object, int] = {}  # the engine's own index readers: their pins
         self._reindex()
 
     def _reindex(self) -> None:
@@ -304,7 +306,21 @@ class Model:
         pins += [wm["pin"] for wm in self.watermarks.values() if wm.get("pin") is not None]
         pins += [wm["rescope"]["pin"] for wm in self.watermarks.values() if wm.get("rescope")]
         pins += [t["pin"] for t in self.ticks.values()]
+        pins += self.readers.values()
         return min(pins, default=math.inf)
+
+    @contextlib.contextmanager
+    def reading(self):
+        """Pin what the index state holds now for as long as the block reads
+        it — an engine listing, a source commit's resolution: files let go of
+        from here on wait for it. Memory only, like the reads."""
+
+        token = object()
+        self.readers[token] = self.applied
+        try:
+            yield
+        finally:
+            del self.readers[token]
 
     def release(self, task_id: str, attempt: str) -> None:
         """Drop the memory-only claim of an attempt that was never launched."""
