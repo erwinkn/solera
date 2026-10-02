@@ -637,9 +637,10 @@ request per step: `start` for reads, `resolve` before writing.
   refused before anything is read, and a scan stops at a ceiling of
   decoded bytes (4× the encoded budget); the record stops at the first
   such call, and the worker's later calls read the store. Start reads are
-  admitted two at a time, eight at most waiting; one past that is answered
-  without a record, and one that timed out keeps its place until its
-  native work ends. A page stays a native run from the scan to the reply. Entries travel as a sorted run's `.kx` form
+  admitted as resolves are (§4: `resolve_concurrency` computing, their
+  reply's bound counted in `resolve_queue_bytes`), one rule for all the
+  cache's work: past it a start is answered without a record, and one that
+  timed out keeps its place until its native work ends. A page stays a native run from the scan to the reply. Entries travel as a sorted run's `.kx` form
   (keys, versions, locators, deletions), so one format and one checked
   parser serve resolves and reads.
 - **Local or nothing.** The engine reads only its local copies, never the

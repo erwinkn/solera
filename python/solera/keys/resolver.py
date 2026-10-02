@@ -148,6 +148,20 @@ class Resolver:
     def _release(self, n: int) -> None:
         self._queued -= n
 
+    async def admitted(self, n: int, work):
+        """`work()` under the one admission rule of the engine's cache —
+        resolves and start reads alike: `n` bytes of the queue, then one of
+        `concurrency` turns, both held until it ends — or None when the queue
+        is full (busy: the worker reads the store)."""
+
+        if not self._reserve(n):
+            return None
+        try:
+            async with self._sem:
+                return await work()
+        finally:
+            self._release(n)
+
     async def resolve(
         self, attempt: str, body: bytes, prepared: Callable[[str], Prepared | None], live: Callable[[], bool]
     ) -> bytes:

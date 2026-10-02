@@ -40,8 +40,6 @@ INSTALL_QUEUE = 128 * 2**20  # bytes of written files waiting to be installed: t
 READS_MAX_ENTRIES = 1_000_000  # entries one start reply's reads may carry
 READS_MAX_BYTES = 16 * 2**20  # ...and bytes, encoded
 READS_TIMEOUT = 2.0  # seconds the engine spends on them before answering without
-READS_CONCURRENCY = 2  # start reads computing at once
-READS_QUEUE = 8  # start reads computing or waiting: past them, a start is answered without
 
 
 def cache_root(objects_url: str) -> str:
@@ -80,7 +78,6 @@ class KeyService:
         self._tokens = itertools.count()
         self._owners: set[asyncio.Task] = set()  # operations running on the loop
         self._installing = 0  # bytes of `installed` files waiting
-        self._reading = 0  # start reads computing or waiting (on the service's loop)
 
     # -- reader pins ----------------------------------------------------------------------
 
@@ -120,7 +117,6 @@ class KeyService:
                     self.root, disk=self.disk, candidates=self.candidates, window=self.window
                 )
                 self.resolver = Resolver(self.cache, self.io, self.options, self.limits, holds=self)
-                self._read_gate = asyncio.Semaphore(READS_CONCURRENCY)
             except BaseException as e:
                 loop.close()
                 started.set_exception(e)
@@ -282,18 +278,11 @@ class KeyService:
             self.release(token)
 
     async def _admitted(self, spec: dict, position: float) -> dict | None:
-        """`_reads`, admitted: at most `READS_QUEUE` computing or waiting and
-        `READS_CONCURRENCY` computing — each counted until its work, native
-        threads included, has ended, whenever its start stopped waiting."""
+        """`_reads` under the resolver's admission (`Resolver.admitted`), holding
+        the reply's bound of its queue until its work — native threads too —
+        has ended, whenever its start stopped waiting."""
 
-        if self._reading >= READS_QUEUE:
-            return None  # busy: the worker reads the store
-        self._reading += 1
-        try:
-            async with self._read_gate:
-                return await self._reads(spec, position)
-        finally:
-            self._reading -= 1
+        return await self.resolver.admitted(READS_MAX_BYTES, lambda: self._reads(spec, position))
 
     async def _reads(self, spec: dict, position: float) -> dict | None:
         from solera_worker import each

@@ -1169,8 +1169,9 @@ async def test_a_page_the_record_cannot_keep_is_never_read(io, tmp_path, monkeyp
 
 
 async def test_start_reads_are_admitted_and_hold_their_room(io, tmp_path, monkeypatch):
-    """Round 5: start reads compute two at a time and queue at most eight;
-    one that timed out keeps its place until its native work ends."""
+    """Round 5: start reads are admitted as resolves are — the resolver's
+    concurrency and queue — and one that timed out keeps its place until
+    its native work ends."""
 
     import threading
 
@@ -1205,14 +1206,15 @@ async def test_start_reads_are_admitted_and_hold_their_room(io, tmp_path, monkey
         }
         outs = await asyncio.gather(*(service.reads(spec, 0) for _ in range(16)))
         assert outs == [None] * 16  # timed out, or turned away
-        assert peak[0] <= keyservice.READS_CONCURRENCY
-        assert 0 < service._reading <= keyservice.READS_QUEUE  # still theirs: the threads run
+        resolver = service.resolver
+        assert peak[0] <= resolver.limits.concurrency  # the resolver's gate: one rule for the cache
+        assert 0 < resolver._queued <= resolver.limits.queue_bytes  # still theirs: the threads run
         go.set()
         for _ in range(250):
-            if not service._reading:
+            if not resolver._queued:
                 break
             await asyncio.sleep(0.02)
-        assert service._reading == 0
+        assert resolver._queued == 0
     finally:
         go.set()
         await service.stop()
