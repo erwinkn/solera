@@ -1,4 +1,4 @@
-import { StrictMode } from "react";
+import { lazy, StrictMode, Suspense } from "react";
 import { createRoot } from "react-dom/client";
 import { MutationCache, QueryCache, QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { RouterProvider } from "@tanstack/react-router";
@@ -27,6 +27,12 @@ const queryClient = new QueryClient({
 });
 
 const router = makeRouter(queryClient);
+
+// Agentation (UI feedback for agents) in development only: `import.meta.env.DEV`
+// is false in a build, so the import and the component are dropped from the bundle.
+const Agentation = import.meta.env.DEV
+  ? lazy(() => import("agentation").then((m) => ({ default: m.Agentation })))
+  : null;
 listenForPalette();
 
 createRoot(document.getElementById("root")!).render(
@@ -34,5 +40,10 @@ createRoot(document.getElementById("root")!).render(
     <QueryClientProvider client={queryClient}>
       <RouterProvider router={router} />
     </QueryClientProvider>
+    {Agentation && (
+      <Suspense fallback={null}>
+        <Agentation appName="Solera console" />
+      </Suspense>
+    )}
   </StrictMode>,
 );
