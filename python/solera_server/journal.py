@@ -71,6 +71,14 @@ def _dumps(value) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
 
 
+def encode(event: dict) -> bytes:
+    """An event as the journal keeps it. Raises `ValueError` for what JSON
+    cannot hold exactly (`inf`, `nan`) and `TypeError` for what it cannot
+    hold at all — before anything was applied."""
+
+    return _dumps(event)
+
+
 @dataclass
 class OpenResult:
     seq: int  # the writer's fence segment — its writer id
@@ -102,7 +110,7 @@ class Journal:
         # would otherwise seal the same bytes, each taking the other's for its own.
         self.nonce = secrets.token_hex(8)
         self.fenced = False
-        self._buffer: list[dict] = []
+        self._buffer: list[bytes] = []  # encoded events: what was recorded, never what the model became
         self._buffer_bytes = 0
         self._first_buffered: float | None = None
         self.appended = self.written = 0  # events this writer appended, and wrote
@@ -221,16 +229,16 @@ class Journal:
 
     # -- appending ----------------------------------------------------------------------
 
-    def append(self, *events: dict, lazy: bool = False) -> None:
-        """Queue events for the next flush. A `lazy` event does not start
-        the flush clock: it is written with whatever comes next, or by
-        `durable()` (docs/lifecycle.md §13)."""
+    def append(self, *events: bytes, lazy: bool = False) -> None:
+        """Queue encoded events (`encode`) for the next flush. A `lazy` event
+        does not start the flush clock: it is written with whatever comes
+        next, or by `durable()` (docs/lifecycle.md §13)."""
 
         if self.fenced:
             raise Fenced("this writer was replaced")
         for event in events:
             self._buffer.append(event)
-            self._buffer_bytes += len(_dumps(event))
+            self._buffer_bytes += len(event)
         self.appended += len(events)
         if lazy:
             return
@@ -297,7 +305,8 @@ class Journal:
         events = self._buffer
         self._buffer, self._buffer_bytes, self._first_buffered, self._urgent = [], 0, None, False
         seq = self.seq + 1
-        data = _dumps({"seq": seq, "writer": self.writer, "at": self.clock(), "events": events})
+        head = {"at": self.clock(), "seq": seq, "writer": self.writer}
+        data = b'{"events":[' + b",".join(events) + b"]," + _dumps(head)[1:]
         # Sealed: memory now reflects exactly segments 1..seq, so a snapshot
         # taken here matches `seq` — before any later event is applied.
         due = self._snapshot is not None and self._since_checkpoint + len(data) >= max(

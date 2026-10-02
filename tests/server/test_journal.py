@@ -11,7 +11,7 @@ import uuid
 import obstore
 import pytest
 from obstore.store import LocalStore, MemoryStore
-from solera_server.journal import Fenced, Journal, JournalCorrupt
+from solera_server.journal import Fenced, Journal, JournalCorrupt, encode
 
 
 class Counter:
@@ -73,7 +73,7 @@ async def open_journal(store, state=None, **kw):
 async def add(j, state, key, n=1):
     event = {"type": "Add", "key": key, "n": n}
     state.apply(event)
-    j.append(event)
+    j.append(encode(event))
     await j.durable()
 
 
@@ -100,7 +100,7 @@ async def test_events_group_into_segments(store):
     events = [{"type": "Add", "key": "a", "n": 1} for _ in range(50)]
     for e in events:
         state.apply(e)
-    j.append(*events)
+    j.append(*map(encode, events))
     await asyncio.sleep(0.3)  # the flush interval passes
     await j.close(checkpoint=False)
     # The fence, then one segment holding all 50 events.
@@ -134,7 +134,7 @@ async def test_a_new_writer_fences_the_old_one(store):
         await add(a, sa, "x", 1)  # a's next segment collides with b's fence
     assert a.fenced
     with pytest.raises(Fenced):
-        a.append({"type": "Add", "key": "x", "n": 1})
+        a.append(encode({"type": "Add", "key": "x", "n": 1}))
     await add(b, sb, "y", 2)
     await b.close()
     _, sc, _ = await open_journal(store)

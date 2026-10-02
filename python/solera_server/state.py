@@ -33,7 +33,7 @@ from obstore.store import LocalStore, MemoryStore
 from solera import lifecycle
 from solera.objects import create
 
-from .journal import Fenced, Journal
+from .journal import Fenced, Journal, encode
 from .model import Model
 
 
@@ -136,13 +136,19 @@ class State:
     def record(self, *events: dict, lazy: bool = False) -> None:
         """Apply events to the model now, and make them durable in the
         background: the one way state changes. A `lazy` event waits for the
-        next one to be written with it."""
+        next one to be written with it.
+
+        The whole batch is encoded first, so one the journal cannot hold
+        (`ValueError`) changes nothing; then the model applies decoded
+        copies. Neither the caller's events nor the model's objects are
+        ever the journal's: what is replayed is what was recorded."""
 
         if self.journal.fenced:
             raise Unavailable("This writer was replaced; restart required")
-        for event in events:
-            self.model.apply(event)
-        self.journal.append(*events, lazy=lazy)
+        encoded = [encode(event) for event in events]
+        for data in encoded:
+            self.model.apply(json.loads(data))
+        self.journal.append(*encoded, lazy=lazy)
         self.changed.set()
 
     @property

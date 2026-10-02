@@ -329,3 +329,43 @@ async def test_replay_reproduces_the_live_model(tmp_path, clock):
     replayed = durable(again.model)
     live.pop("writer"), replayed.pop("writer")
     assert replayed == live
+
+
+async def test_the_journal_alone_reproduces_the_live_model(tmp_path, clock):
+    """Engine review #1: no final checkpoint — the namespace is read while
+    its writer still runs, from the journal its flushes wrote. Later
+    transitions (a pause, an attempt, archiving) must not have rewritten
+    what earlier events recorded."""
+
+    state = await State.open(
+        tmp_path.as_uri(), "test", clock=clock, flush_interval=0.001, min_checkpoint=1 << 30
+    )
+    engine = engine_on(state, clock)
+    await quiet(engine)
+    for _ in range(3):
+        await settle(engine, (await engine.submit(["consumer"], upstream=True))["id"])
+        clock.now += 61
+    await engine.tick()  # archive what finished
+    run = await engine.submit(["polled"])
+    await state.durable()
+    await engine.pause(run["id"])  # after RunSubmitted was flushed: it must not change it
+    await state.durable()
+    again = await State.open(tmp_path.as_uri(), "test", clock=clock, writer=False)
+    live, replayed = durable(state.model), durable(again.model)
+    live.pop("writer"), replayed.pop("writer")
+    assert replayed == live
+    await state.close()
+
+
+async def test_a_value_the_journal_cannot_hold_changes_nothing(state, clock):
+    """Engine review #1: `config={"x": 1e400}` is refused before the run
+    reaches the model; the journal and its checkpoints go on."""
+
+    engine = engine_on(state, clock)
+    await engine.initialize()
+    runs = dict(state.model.runs)
+    with pytest.raises(ValueError):
+        await engine.submit(["polled"], config={"x": float("inf")})
+    assert state.model.runs == runs
+    await state.durable()
+    json.dumps(state.model.snapshot(), allow_nan=False)
