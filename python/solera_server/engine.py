@@ -49,7 +49,7 @@ from solera.keys.io import ObjectIO
 from solera.sdk import digest
 
 from . import delivery, history, planning
-from .attempts import POOL_OFFERED_GRACE, Attempts, Live, current_names, worker_report
+from .attempts import POOL_OFFERED_GRACE, Attempts, Live, current_names, moved, worker_report
 from .history import MAX_METADATA, History, RunFilter
 from .keyservice import KeyService, cache_root
 from .model import TERMINAL_RUN, commit_of
@@ -792,14 +792,9 @@ class Engine(Attempts, Sensors, Views):
         outputs = {}
         for output in asset["outputs"]:
             name, head = output["name"], heads[output["name"]]
-            # An output moved to another store since its head was written: nothing
-            # of that store's is the new one's, so the write is a first one there.
-            moved = head is not None and head["ref"].get("store") != output["store"]
             info = {
-                # The committed head it writes over — its ref says where the content
-                # is — and whether the write starts it over: a first write, or a full run.
+                # The committed head it writes over: its ref says where the content is.
                 "head": head,
-                "reset": reset or head is None or moved,
                 # The contract it is launched under: settled, failed and cleaned up
                 # by it, whatever is served by then.
                 "contract": {
@@ -809,11 +804,13 @@ class Engine(Attempts, Sensors, Views):
                     "incremental": output.get("incremental"),
                 },
             }
+            # Whether the write starts the content over: a first write, a full run,
+            # or one in a store the head is not in (`moved`), which holds none of it.
+            elsewhere = moved(info)
+            info["reset"] = reset or head is None or elsewhere
             if output.get("incremental"):
                 info["batch"] = int((head or {}).get("batch", -1)) + 1
-            if moved:
-                info["moved"] = True
-            if output.get("key") is not None and moved:
+            if output.get("key") is not None and elsewhere:
                 # Its key index names the old store's objects: it starts over too, at
                 # a prefix of its own, and the commit replaces it (`Model._commit_keys`).
                 current = self.m.index(name, scope)
@@ -1423,11 +1420,9 @@ class Engine(Attempts, Sensors, Views):
                     raise Conflict(f"keyed output {name}: the result carries no key delta", retryable=False)
                 head["batch"] = int((before or {}).get("batch", -1))
                 if delta is not None:
-                    if delta["files"] or info.get("moved"):
+                    if delta["files"] or moved(info):
                         head["batch"] = int(info["batch"])
                     keys[name] = {**delta, "batch": head["batch"]}
-                    if info.get("moved"):
-                        keys[name]["prefix"] = info["prefix"]  # a key index of its own
                 if "elements" in info:
                     head["elements"] = entry.get("elements", info["elements"])
             elif decl.get("incremental"):

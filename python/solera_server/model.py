@@ -927,15 +927,16 @@ class Model:
         contracts = prepared.get("outputs") or {}
         changed = []
         for name, head in commit.get("heads", {}).items():
-            before = self.heads.get((name, scope))
+            before, keys = self.heads.get((name, scope)), (commit.get("keys") or {}).get(name)
+            prefix = contracts[name].get("prefix")  # where its delta files are
             if before is None or before["ref"].get("version") != head["ref"].get("version"):
                 changed.append(name)
             if contracts[name]["contract"]["writes"] == "immutable":
-                self._superseded(name, scope, before, head, (commit.get("keys") or {}).get(name))
+                self._superseded(name, scope, before, head, keys, prefix)
             self.heads[(name, scope)] = {**head, "run": e["run"], "attempt": e["attempt"], "at": at}
             if generation is not None:
                 self.heads[(name, scope)]["generation"] = int(generation)
-            self._commit_keys(name, scope, (commit.get("keys") or {}).get(name))
+            self._commit_keys(name, scope, keys, prefix)
             if name in commit.get("settled", ()):
                 # The commit's delta took in what the dead attempts left (§8):
                 # their intent files are no longer needed.
@@ -1100,7 +1101,7 @@ class Model:
         else:
             run["status"] = "running"
 
-    def _commit_keys(self, output: str, scope: str, keys: dict | None) -> None:
+    def _commit_keys(self, output: str, scope: str, keys: dict | None, prefix: str | None = None) -> None:
         """Add a commit's delta files to the output's key index (§6): into the
         levels, and into the delta log if anything reads it incrementally.
         The head carries the index's live key count."""
@@ -1108,12 +1109,12 @@ class Model:
         if keys is not None:
             index, delta = self.index(output, scope), DeltaFiles.from_json(keys)
             keep_log = output in self._consumed
-            if keys.get("prefix", index.prefix) != index.prefix:
-                # The output moved to another store: its index starts over at a prefix
-                # of its own, and every file of the old one — and the intents of what
-                # dead attempts meant to write in the old store — goes once no reader
-                # pins it.
-                fresh = IndexState(prefix=keys["prefix"]).committed(keys["batch"], delta, keep_log=keep_log)
+            if prefix is not None and prefix != index.prefix:
+                # Delta files under a prefix of their own: the output moved to another
+                # store, and its index starts over there. Every file of the old one —
+                # and the intents of what dead attempts meant to write in the old
+                # store — goes once no reader pins it.
+                fresh = IndexState(prefix=prefix).committed(keys["batch"], delta, keep_log=keep_log)
                 if (output, scope) in self.indexes:
                     self._replace_index((output, scope), fresh)
                 for intent in self.unsettled.pop((output, scope), ()):
@@ -1156,14 +1157,15 @@ class Model:
         entries.append({"n": self.applied, "id": f"{self.applied}.{ordinal}", **entry})
 
     def _superseded(
-        self, output: str, scope: str, before: dict | None, head: dict, keys: dict | None
+        self, output: str, scope: str, before: dict | None, head: dict, keys: dict | None, prefix=None
     ) -> None:
-        """What a commit on an immutable store let go of: each changed key's predecessor (named in
-        its delta files), a value's previous object, or — when an append
-        output starts over — its earlier batches."""
+        """What a commit on an immutable store let go of: each changed key's
+        predecessor (named in its delta files, under `prefix`), a value's
+        previous object, or — when an append output starts over — its
+        earlier batches."""
 
         if keys and keys.get("files"):
-            prefix = keys.get("prefix") or self.index(output, scope).prefix  # a moved output's own
+            prefix = prefix or self.index(output, scope).prefix
             self._collect(
                 output,
                 scope,
