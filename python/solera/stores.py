@@ -99,10 +99,21 @@ class Store(Protocol):
     a keyed write's content — the whole write, or a `Patch`'s rows — for the
     key index, read from the store's own types (§6, docs/row-digest.md).
     Without it, `key_rows` below reads lists of dicts, dicts, DataFrames and
-    Arrow data."""
+    Arrow data.
+
+    `writes` says how it writes, which decides what the engine may do once
+    it gave up on a writer (docs/lifecycle.md §9.6): `"immutable"` (it only
+    ever writes names nothing committed references; it implements
+    `discard`), `"fenced"` (it implements `acquire`, and every write checks
+    the generation atomically), or `"overwrite"`, the default (a scope whose
+    writer may still write is held `late_write_grace` seconds, or — with
+    `strict` — until the writer's completion is established)."""
 
     version: str = "1"
     ref_type: type[Ref] = Ref
+    writes: str = "overwrite"
+    strict: bool = False
+    late_write_grace: float = 120.0
 
     def can_load(self, t: type | None, selection: type | None) -> bool: ...
     def can_store(self, t: type | None, output: Output) -> bool: ...

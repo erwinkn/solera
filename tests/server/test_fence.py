@@ -388,6 +388,8 @@ class LiveStore(FileStore):
     wrote is visible. `die` makes the next write land its first n rows, then
     kills the worker."""
 
+    late_write_grace = 0.2  # a dead writer's scope is released this soon (docs/lifecycle.md §9.9)
+
     def __init__(self):
         super().__init__()
         self.rows: dict[str, dict] = {}
@@ -452,6 +454,8 @@ async def test_a_worker_that_dies_writing_leaves_its_output_unsettled_and_the_re
     watcher.cancel()
     assert detail["request"]["status"] == "succeeded", detail
     assert seen == [{("items", ""): 1}]  # the dead attempt left `items` unsettled
+    events = await engine.history.events(detail["request"]["id"])
+    assert [e["reason"] for e in events if e["type"] == "released"] == ["grace"]  # held, then released
     assert state.model.unsettled == {}  # the retry's commit settled it
     assert live.rows == {"a": {"id": "a", "v": 2}, "b": {"id": "b", "v": 1}, "c": {"id": "c", "v": 1}}
     assert state.model.heads[("items", "")]["count"] == 3
@@ -507,6 +511,7 @@ async def test_a_retry_puts_back_what_a_dead_keyed_write_half_did(tmp_path, data
     project = Project(assets=[scores])
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = engine_for(state, project, placement="inline")
+    engine.late_write_grace["scores"] = 0  # a dead writer's scope is held, briefly (§9.9)
     await engine.initialize()
     assert (await engine.run_until((await engine.submit(["scores"]))["id"], 10))["request"][
         "status"
@@ -604,6 +609,7 @@ async def test_a_result_that_fails_to_publish_stays_what_it_was(tmp_path, monkey
     project = Project(assets=[scores])
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = engine_for(state, project, placement="inline")
+    engine.late_write_grace["scores"] = 0  # a dead writer's scope is held, briefly (§9.9)
     await engine.initialize()
     detail = await engine.run_until((await engine.submit(["scores"]))["id"], 10)
     [attempt] = detail["attempts"][detail["tasks"][0]["id"]]

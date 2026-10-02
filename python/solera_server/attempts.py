@@ -477,11 +477,84 @@ class Attempts:
             raise LostOwnership(attempt)  # it finished meanwhile
         return launched
 
-    @staticmethod
-    def _gated(prepared: dict) -> bool:
+    KINDS = ("immutable", "fenced", "overwrite")
+
+    def _store_of(self, output: str) -> dict:
+        return self.manifest["stores"].get(self.manifest["outputs"][output]["store"]) or {}
+
+    def _kind(self, outputs) -> tuple[str, bool]:
+        """The strictest write kind among the stores of `outputs`, and
+        whether one of its overwrite stores is strict (§9.6)."""
+
+        kind, strict = "immutable", False
+        for name in outputs:
+            store = self._store_of(name)
+            writes = store.get("writes", "overwrite")
+            if self.KINDS.index(writes) > self.KINDS.index(kind):
+                kind = writes
+            strict = strict or (writes == "overwrite" and bool(store.get("strict")))
+        return kind, strict
+
+    def _gated(self, prepared: dict) -> bool:
         """Whether the attempt writes outputs on stores that take a gate."""
 
-        return bool(prepared.get("outputs"))
+        return any(
+            self._store_of(n).get("writes", "overwrite") != "immutable" for n in prepared.get("outputs") or {}
+        )
+
+    def _hold(self, prepared: dict, writes: str) -> str | None:
+        """How an attempt that ended with `writes` holds its scope: never for
+        `immutable` and `fenced` stores, nor once writes are known; for an
+        `overwrite` store, a grace, or — `strict` — until completion is
+        established (§9.9)."""
+
+        if writes != lifecycle.UNCERTAIN:
+            return None
+        kind, strict = self._kind(prepared.get("outputs") or {})
+        if kind != "overwrite":
+            return None
+        return "strict" if strict else "grace"
+
+    def _grace(self, asset: str) -> float:
+        if asset in self.late_write_grace:
+            return self.late_write_grace[asset]
+        outputs = [o["name"] for o in self.manifest["assets"][asset]["outputs"]]
+        return max([float(self._store_of(n).get("late_write_grace", 120.0)) for n in outputs] or [0.0])
+
+    async def _release_holds(self) -> None:
+        """Release scopes held for an uncertain writer: after the grace, on
+        this engine's monotonic clock (a restart starts it again), or — for a
+        strict store — once the writer's own result says its store calls
+        returned (§9.9). An operator releases with `release_scope`."""
+
+        now = asyncio.get_running_loop().time()
+        for (asset, scope), hold in list(self.m.holds.items()):
+            key = (asset, scope, hold["attempt"])
+            since = self._held_since.setdefault(key, now)
+            if hold["mode"] == "grace":
+                if now - since >= self._grace(asset):
+                    self._release(asset, scope, hold, "grace")
+                continue
+            if now - self._held_looked.get(key, -math.inf) < 3 * self.heartbeat_seconds:
+                continue
+            self._held_looked[key] = now
+            result = await self.state.attempt_result(hold["run"], hold["attempt"])
+            if result is not None and result.get("writes") in (lifecycle.NONE, lifecycle.COMPLETE):
+                self._release(asset, scope, hold, "result")
+
+    def _release(self, asset: str, scope: str, hold: dict, by: str) -> None:
+        if self.m.holds.get((asset, scope)) is hold:
+            event = {"type": "ScopeReleased", "asset": asset, "scope": scope, "attempt": hold["attempt"]}
+            self.state.record({**event, "by": by, "at": self.clock()})
+
+    def release_scope(self, asset: str, scope: str, by: str) -> dict:
+        """An operator's release of a held scope (`solera scopes release`)."""
+
+        hold = self.m.holds.get((asset, scope))
+        if hold is None:
+            raise KeyError(f"{asset}/{scope}")
+        self._release(asset, scope, hold, f"operator:{by}")
+        return {"asset": asset, "scope": scope, "released": hold["attempt"]}
 
     async def _gate(self, run_id: str, attempt: str, state: str) -> tuple[str, dict | None]:
         """Create the attempt's gate as `state` (`aborted` or `closed`), or
@@ -535,6 +608,7 @@ class Attempts:
         unsettled = (
             (gate or {}).get("intents") or {} if (gate or {}).get("state") == lifecycle.WRITING else {}
         )
+        hold = self._hold(prepared, writes)
         worker = result if result is not None else self._last_report(attempt)
         claim = self.m.claimed(attempt)
         if claim is None:
@@ -551,6 +625,7 @@ class Attempts:
             end=end,
             reason=reason,
             writes=writes,
+            hold=hold,
         )
         await self._discard(attempt, prepared, keep=set(unsettled))
 

@@ -208,3 +208,72 @@ async def test_a_long_log_is_chunks_and_a_tail(tmp_path, monkeypatch):
     assert [json.loads(line)["message"] for line in last.splitlines()] == ["line 4", "line 5"]
     await engine.stop()
     await state.close()
+
+
+async def strict_hold(tmp_path):
+    """A strict overwrite store whose writer dies mid-write: the attempt ends
+    `uncertain` and its scope is held, the retry with it."""
+
+    from .test_fence import LiveStore
+
+    class Strict(LiveStore):
+        strict = True
+
+    live = Strict()
+    writes = [[{"id": "a", "v": 1}], [{"id": "a", "v": 2}, {"id": "b", "v": 2}], [{"id": "a", "v": 2}]]
+
+    @asset(outputs=Output("items", key="id", revision="v", store="live"), retries=Retry(1, delay=0))
+    def items():
+        return writes.pop(0)
+
+    project = Project(assets=[items], stores={"live": live})
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = engine_for(state, project, placement="inline", heartbeat_seconds=0.1)
+    await engine.initialize()
+    await engine.run_until((await engine.submit(["items"]))["id"], 10)
+    live.die = 1
+    run = await engine.submit(["items"])
+    await until(engine, lambda: ("items", "") in state.model.holds)
+    hold = state.model.holds[("items", "")]
+    assert hold["mode"] == "strict"
+    task = state.model.task(next(iter(state.model.runs[run["id"]]["tasks"])))
+    await until(engine, lambda: task.get("held") == ["uncertain", hold["attempt"]])
+    return engine, state, run, hold, live
+
+
+async def test_a_strict_scope_waits_for_an_operator(tmp_path):
+    """Strict: no grace. The scope stays held however long; an operator's
+    release lets the retry run, and its write settles what the dead writer
+    left."""
+
+    engine, state, run, hold, live = await strict_hold(tmp_path)
+    for _ in range(20):
+        await engine.tick()
+        await asyncio.sleep(0.05)
+    assert ("items", "") in state.model.holds
+    engine.release_scope("items", "", "ops@example.com")
+    detail = await engine.run_until(run["id"], 15)
+    assert detail["request"]["status"] == "succeeded"
+    events = await engine.history.events(run["id"])
+    assert [e["reason"] for e in events if e["type"] == "released"] == ["operator:ops@example.com"]
+    assert live.rows == {"a": {"id": "a", "v": 2}}  # the retry's replacement, whatever the dead one left
+    await engine.stop()
+    await state.close()
+
+
+async def test_a_strict_scope_is_released_by_the_writers_late_result(tmp_path):
+    """The writer was not dead after all: its result arrives, sealed after
+    its store calls returned (`complete`). That establishes completion, and
+    the scope is released."""
+
+    engine, state, run, hold, live = await strict_hold(tmp_path)
+    late = {"invocation": "late", "status": "succeeded", "writes": "complete", "outputs": {}}
+    await state.create_object(
+        f"{lifecycle.base(hold['run'], hold['attempt'])}.result", json.dumps(late).encode()
+    )
+    detail = await engine.run_until(run["id"], 15)
+    assert detail["request"]["status"] == "succeeded"
+    events = await engine.history.events(run["id"])
+    assert [e["reason"] for e in events if e["type"] == "released"] == ["result"]
+    await engine.stop()
+    await state.close()

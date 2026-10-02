@@ -94,6 +94,7 @@ class Model:
                 "watermarks": _nest(self.watermarks, 3),
                 "outcomes": _nest(self.outcomes, 2),
                 "unsettled": _nest(self.unsettled, 2),
+                "holds": _nest(self.holds, 2),
                 "automations": self.automations,
                 "runs": self.runs,
                 "receipts": list(self.receipts.items()),
@@ -122,6 +123,9 @@ class Model:
         self.outcomes: dict[tuple, dict] = _flatten(snap.get("outcomes"), 2)
         # (output, scope) -> intents of attempts that died while writing it (§8)
         self.unsettled: dict[tuple, list] = _flatten(snap.get("unsettled"), 2)
+        # (asset, scope) -> the ended attempt whose writes may still land on an
+        # overwrite store: no attempt runs there until it is released (docs/lifecycle.md §9.9)
+        self.holds: dict[tuple, dict] = _flatten(snap.get("holds"), 2)
         self.automations: dict[str, dict] = snap.get("automations") or {}
         self.runs: dict[str, dict] = snap.get("runs") or {}
         self.receipts: dict[str, str] = dict(snap.get("receipts") or [])
@@ -544,6 +548,19 @@ class Model:
         self._claimed(run, task, e["attempt"], e["started_at"])
         self._event(run, "launched", e["at"], task["id"], e["attempt"], name=e["execution"]["executor"])
 
+    def _on_ScopeReleased(self, e):
+        """A held scope runs again: the grace passed, the writer's result
+        established its completion, or an operator released it."""
+
+        hold = self.holds.get((e["asset"], e["scope"]))
+        if hold is None or hold["attempt"] != e["attempt"]:
+            return
+        del self.holds[(e["asset"], e["scope"])]
+        run = self.runs.get(hold["run"])
+        if run is not None:
+            task = run["tasks"].get(f"{hold['run']}/{e['asset']}:{e['scope']}")
+            self._event(run, "released", e["at"], task and task["id"], e["attempt"], reason=e["by"])
+
     def _on_AttemptPlaced(self, e):
         """Where a launched attempt runs: its placement handle (§10)."""
 
@@ -574,6 +591,13 @@ class Model:
         for output, intent in (e.get("unsettled") or {}).items():
             intents = self.unsettled.setdefault((output, task["scope"]), [])
             intents.append({**intent, "run": e["run"], "attempt": e["attempt"]})
+        if e.get("hold"):
+            self.holds[(task["asset"], task["scope"])] = {
+                "attempt": e["attempt"],
+                "run": e["run"],
+                "mode": e["hold"],
+                "at": at,
+            }
         usage = (e.get("worker") or {}).get("usage") or {}
         summary = {
             "id": e["attempt"],

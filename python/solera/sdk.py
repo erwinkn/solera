@@ -1250,10 +1250,18 @@ class Project:
             }
             for name, s in self.sources.items()
         }
+        for name, store in self.stores.items():
+            if getattr(store, "writes", "overwrite") not in ("immutable", "fenced", "overwrite"):
+                raise RegistrationError(
+                    f"store {name!r}: writes must be 'immutable', 'fenced' or 'overwrite' (docs/lifecycle.md §9.6)"
+                )
         store_records = {
             name: {
                 "version": getattr(store, "version", "1"),
                 "ref": getattr(getattr(store, "ref_type", None), "kind", None) or "ref",
+                "writes": getattr(store, "writes", "overwrite"),
+                "strict": bool(getattr(store, "strict", False)),
+                "late_write_grace": float(getattr(store, "late_write_grace", 120.0)),
             }
             for name, store in self.stores.items()
         }

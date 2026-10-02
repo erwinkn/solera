@@ -1383,7 +1383,7 @@
     }
   },
   "retention": null,
-  "revision": "8dfa3abe03c3aa12d246c9a0fdf15aafdb77f0e017a248e7b8590454b358935d",
+  "revision": "d11c9b008517ec6264de613ac3f31404a73e7f6b5df1f43fa424c7b8abc3ac1c",
   "sources": {
     "leach_crosswalk": {
       "handle": {
@@ -1594,16 +1594,25 @@
   },
   "stores": {
     "blob": {
+      "late_write_grace": 120.0,
       "ref": "object",
-      "version": "1"
+      "strict": false,
+      "version": "1",
+      "writes": "overwrite"
     },
     "default": {
+      "late_write_grace": 120.0,
       "ref": "object",
-      "version": "1"
+      "strict": false,
+      "version": "1",
+      "writes": "overwrite"
     },
     "postgres": {
+      "late_write_grace": 120.0,
       "ref": "table",
-      "version": "1"
+      "strict": false,
+      "version": "1",
+      "writes": "overwrite"
     }
   }
 }

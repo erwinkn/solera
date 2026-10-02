@@ -503,6 +503,12 @@ def create_app(
             raise KeyError(f"{run_id}/{attempt}: no result yet")
         return result
 
+    @app.post("/api/projects/{p}/scopes:release")
+    async def release_scope(p: str, request: Request):
+        runtime = await project_engine(request, p)
+        body = await request.json()
+        return runtime.release_scope(body["asset"], body.get("scope", ""), body.get("by") or "api")
+
     # -- the worker channel (docs/lifecycle.md §5) ----------------------------------------
 
     @app.post("/api/projects/{p}/attempts/{attempt}/start")
