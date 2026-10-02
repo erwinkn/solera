@@ -14,10 +14,12 @@ the machine plays the engine for it:
 - **attempts.** `begin` starts the next attempt, its generation larger than
   every one before (a fenced store's `acquire` comes first, as the engine
   guarantees). An attempt writes a replacement, a patch or a replacement
-  resolved against the index (only what changed), and the write commits or
-  is abandoned (its worker died, its answer was lost). Its call may be
-  retried. An earlier attempt may write again (a stale writer) and a second
-  invocation of the current one may try (a duplicate).
+  resolved against the index (its keys, and removes of the rest), and the
+  write commits or is abandoned (its worker died, its answer was lost). An
+  attempt makes one write, which may be retried: a name carries its
+  generation, so it never writes a key twice with other content. An earlier
+  attempt may write late (a stale writer) and a second invocation of the
+  current one may try (a duplicate).
 - **readers.** A reader pins the committed content and reads it later;
   a by-key reader loads `dict[str, T]` under `Keys`, as `Each` does.
 - **collection** (immutable stores). The names no committed index and no
@@ -51,14 +53,15 @@ KEYS = ["a", "b", "c", "d"]
 class Attempt:
     generation: int
     invocation: str
-    last: tuple | None = None  # its last write call, to retry: (keyed write, prior)
+    last: tuple | None = None  # its write call, to retry: (keyed write, prior, written ref)
     fenced: bool = False  # it holds the slice: acquired once the slice existed, or wrote
 
 
 @dataclass
 class Pin:
     ref: Ref
-    entries: dict[str, tuple[bytes, int]]
+    entries: dict[str, int]  # key -> generation, as the index held them
+    content: dict[str, str]  # key -> its `v`, as committed
 
 
 @dataclass
@@ -83,8 +86,9 @@ def stateful(make_harness: Callable[[], Harness]):
             self.h = make_harness()
             self.store = self.h.store
             self.kind = self.store.writes
-            self.out = self.h.output(key="id", revision="v")
+            self.out = self.h.output(key="id")
             self.ledger = Ledger()  # what the index holds
+            self.content: dict[str, str] = {}  # each committed key's `v`
             self.head: Ref | None = None
             self.generation = 0
             self.current: Attempt | None = None
@@ -92,7 +96,7 @@ def stateful(make_harness: Callable[[], Harness]):
             self.dirty: set[str] = set()  # keys a dead writer may have changed in place (fenced)
             self.exists = False  # the slice exists in the store: something wrote it
             self.fence = 0  # the newest generation holding the slice (fenced)
-            self.written: set[tuple[str, str, int]] = set()  # (key, version hex, locator) names ever written
+            self.written: set[tuple[str, int]] = set()  # (key, generation) names ever written
             self.pins: list[Pin] = []
             self.batches_out = None
             self.batches = BatchModel()
@@ -118,7 +122,7 @@ def stateful(make_harness: Callable[[], Harness]):
                 if self.exists:  # a slice not written yet is acquired by its first write
                     self.current.fenced, self.fence = True, self.generation
 
-        @precondition(lambda self: self.current is not None)
+        @precondition(lambda self: self.current is not None and self.current.last is None)
         @rule(
             kind=st.sampled_from(["replace", "patch", "changed"]),
             keys=st.sets(st.sampled_from(KEYS), max_size=3),
@@ -140,10 +144,9 @@ def stateful(make_harness: Callable[[], Harness]):
             prior = self.head
             written = self.run(self.store.store(keyed, prior, self._scope(attempt)))
             self.exists, attempt.fenced, self.fence = True, True, max(self.fence, attempt.generation)
-            attempt.last = (keyed, prior)
+            attempt.last = (keyed, prior, written.ref)
             touched = set(upserts) | set(gone) | (set(self.ledger.entries) if whole else set())
-            for key, ver in upserts.items():
-                self.written.add((key, ver.hex(), attempt.generation))
+            self.written |= {(key, attempt.generation) for key in upserts}
             if not commits:
                 self.current = None  # its worker died: the next attempt follows
                 if self.kind == "fenced":
@@ -151,9 +154,12 @@ def stateful(make_harness: Callable[[], Harness]):
                 return
             if whole:
                 self.ledger.entries.clear()
+                self.content.clear()
             for key in gone:
                 self.ledger.entries.pop(key, None)
-            self.ledger.entries.update({k: (v, attempt.generation) for k, v in upserts.items()})
+                self.content.pop(key, None)
+            self.ledger.entries.update(dict.fromkeys(upserts, attempt.generation))
+            self.content.update(upserts)
             self.head = written.ref
             self.dirty -= touched
 
@@ -161,29 +167,31 @@ def stateful(make_harness: Callable[[], Harness]):
         @rule()
         def retry(self):
             """The current attempt's last call, sent again: the same content,
-            the same version."""
+            the same ref."""
 
-            keyed, prior = self.current.last
-            before = self.head
+            keyed, prior, first = self.current.last
             again = self.run(self.store.store(keyed, prior, self._scope(self.current)))
-            if before is not None and prior is not None and again.ref.version != before.version:
-                if self.head is before:
-                    raise AssertionError(
-                        f"a retried write gave version {again.ref.version}, the first {before.version}"
-                    )
+            if again.ref != first:
+                raise AssertionError(f"a retried write gave {again.ref}, the first {first}")
 
         @precondition(lambda self: self.stale)
         @rule(which=st.integers(0, 10), version=st.sampled_from(["0", "9"]), patch=st.booleans())
         def stale_write(self, which, version, patch):
-            """An attempt the engine gave up on writes again: a fenced store
-            refuses it once a newer attempt holds the slice, an immutable one
-            lets it write names nobody reads. (Before the slice exists nothing
-            may hold it: the stale write may land, uncommitted, and the next
-            commit, a first write, replaces it whole.)"""
+            """An attempt the engine gave up on writes late — its one write, or
+            that write once more: a fenced store refuses it once a newer
+            attempt holds the slice, an immutable one lets it write names
+            nobody reads. (Before the slice exists nothing may hold it: the
+            stale write may land, uncommitted, and the next commit, a first
+            write, replaces it whole.)"""
 
             attempt = self.stale[which % len(self.stale)]
+            if attempt.last is not None and self.kind == "immutable":
+                keyed, prior, _ = attempt.last  # it wrote already: the same call, late
+                self.run(self.store.store(keyed, prior, self._scope(attempt)))
+                return
             rows = [{"id": k, "v": version} for k in KEYS[:2]]
             keyed, upserts, _, _ = self._resolve("patch" if patch else "replace", rows, [])
+            attempt.last = (keyed, self.head, None)
             if self.kind == "fenced":
                 if attempt.generation < self.fence:
                     with _refused("a stale writer"):
@@ -197,8 +205,7 @@ def stateful(make_harness: Callable[[], Harness]):
                 self.dirty |= set(upserts)
                 return
             self.run(self.store.store(keyed, self.head, self._scope(attempt)))
-            for key, ver in upserts.items():
-                self.written.add((key, ver.hex(), attempt.generation))
+            self.written |= {(key, attempt.generation) for key in upserts}
 
         @precondition(lambda self: self.kind == "fenced" and self.current is not None and self.current.fenced)
         @rule()
@@ -221,7 +228,7 @@ def stateful(make_harness: Callable[[], Harness]):
         def pin(self):
             """A reader pins the committed content, to read it later."""
 
-            self.pins.append(Pin(self.head, dict(self.ledger.entries)))
+            self.pins.append(Pin(self.head, dict(self.ledger.entries), dict(self.content)))
 
         @precondition(lambda self: self.pins)
         @rule(which=st.integers(0, 10))
@@ -234,12 +241,12 @@ def stateful(make_harness: Callable[[], Harness]):
             """Collection: names no index and no pinned reader references —
             superseded, abandoned or never written — are discarded."""
 
-            live = {(k, v.hex(), loc) for k, (v, loc) in self.ledger.entries.items()}
+            live = set(self.ledger.entries.items())
             for pin in self.pins:
-                live |= {(k, v.hex(), loc) for k, (v, loc) in pin.entries.items()}
+                live |= set(pin.entries.items())
             unused = sorted(self.written - live)
             chosen = [n for i, n in enumerate(unused) if take >> (i % 16) & 1]
-            items = [("key", k, v, loc) for k, v, loc in chosen] + [("key", "zz", b"never".hex(), 99_999)]
+            items = [("key", k, g) for k, g in chosen] + [("key", "zz", 99_999)]
             for _ in range(2 if twice else 1):
                 self.run(
                     self.store.discard(self._scope(Attempt(self.generation + 1, "gc")), self.head, items)
@@ -251,13 +258,13 @@ def stateful(make_harness: Callable[[], Harness]):
             """`Each`'s read: `dict[str, T]` under `Keys`, each key's group."""
 
             selection = Keys(
-                {k: v for k, v in self.ledger.entries.items() if k in keys and k not in self.dirty}
+                {k: g for k, g in self.ledger.entries.items() if k in keys and k not in self.dirty}
             )
-            if not selection.revisions:
+            if not selection.generations:
                 return
             found = self.run(self.store.load(self.head, dict[str, list[dict]], selection))
             got = {k: sorted(str(r["v"]) for r in group) for k, group in found.items()}
-            want = {k: [v.decode()] for k, (v, _) in selection.revisions.items()}
+            want = {k: [self.content[k]] for k in selection.generations}
             if got != want:
                 raise AssertionError(f"a by-key load gave {got}; the index holds {want}")
 
@@ -308,7 +315,7 @@ def stateful(make_harness: Callable[[], Harness]):
         def committed_content_reads_back(self):
             if self.head is None:
                 return
-            want = sorted((k, v.decode()) for k, (v, _) in self.ledger.entries.items())
+            want = sorted(self.content.items())
             if self.kind == "immutable":
                 got = self._rows(self.head, self.ledger.keys())
             else:
@@ -321,7 +328,7 @@ def stateful(make_harness: Callable[[], Harness]):
         def pinned_readers_read_what_they_pinned(self):
             for pin in self.pins:
                 got = self._rows(pin.ref, Keys(dict(pin.entries)))
-                want = sorted((k, v.decode()) for k, (v, _) in pin.entries.items())
+                want = sorted(pin.content.items())
                 if got != want:
                     raise AssertionError(f"a pinned reader reads {got}; it pinned {want}")
 
@@ -347,24 +354,22 @@ def stateful(make_harness: Callable[[], Harness]):
 
         def _resolve(self, kind: str, rows: list[dict], removes: list[str]):
             """A write as the worker hands it to the store, resolved against
-            the index: `(KeyedWrite, upserts, removed keys, whole)`."""
+            the index — every key it writes is a change (docs/versions.md):
+            `(KeyedWrite, upserts {key: v}, removed keys, whole)`."""
 
             entries = self.ledger.entries
+            upserts = {r["id"]: r["v"] for r in rows}
             if kind == "replace" or self.head is None:
                 prepared = prepare_for(self.store, rows, self.out)
-                upserts = dict(prepared.entries())
                 return KeyedWrite(prepared, whole=True, value=rows), upserts, set(), True
             if kind == "patch":
                 prepared = prepare_for(self.store, Patch(rows, remove=removes), self.out)
-                upserts = dict(prepared.entries())
                 gone = {k for k in removes if k in entries}
-                keyed = KeyedWrite(prepared, upserts=upserts, removes=frozenset(gone), value=rows)
+                keyed = KeyedWrite(prepared, upserts=frozenset(upserts), removes=frozenset(gone), value=rows)
                 return keyed, upserts, gone, False
             prepared = prepare_for(self.store, rows, self.out)
-            current = dict(prepared.entries())
-            upserts = {k: v for k, v in current.items() if entries.get(k, (None,))[0] != v}
-            gone = set(entries) - set(current)
-            keyed = KeyedWrite(prepared, upserts=upserts, removes=frozenset(gone), value=rows)
+            gone = set(entries) - set(upserts)
+            keyed = KeyedWrite(prepared, upserts=frozenset(upserts), removes=frozenset(gone), value=rows)
             return keyed, upserts, gone, False
 
         def _rows(self, ref: Ref, selection) -> list[tuple[str, str]]:

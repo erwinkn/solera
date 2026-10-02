@@ -67,13 +67,16 @@ _REF_KINDS: dict[str, type[Ref]] = {}
 
 @dataclass(frozen=True)
 class Ref:
-    """A self-contained pointer into a store, with a version (§3)."""
+    """A self-contained pointer into a store (§3), and its version: the
+    `generation` of the write that made it (docs/versions.md) — the attempt's
+    generation, or a source commit's event position. A store builds a ref
+    without it; the harness sets it."""
 
     output: str
     store: str
     handle: Any
-    version: str
     partition: str = ""
+    generation: int = 0
     meta: dict = field(default_factory=dict)
 
     kind: ClassVar[str | None] = None
@@ -90,8 +93,8 @@ class Ref:
             "output": self.output,
             "store": self.store,
             "handle": self.handle,
-            "version": self.version,
             "partition": self.partition,
+            "generation": self.generation,
             "meta": meta,
         }
 
@@ -103,8 +106,8 @@ class Ref:
             output=data["output"],
             store=data["store"],
             handle=data["handle"],
-            version=data["version"],
             partition=data.get("partition", ""),
+            generation=int(data.get("generation") or 0),
             meta=meta,
         )
 
@@ -218,7 +221,6 @@ class Output:
         name: str | None = None,
         store: str | None = None,
         key: str | None = None,
-        revision: str | None = None,
         incremental: bool | None = None,
         migrations: tuple | list = (),
         keyed: bool = False,
@@ -229,9 +231,9 @@ class Output:
                 f"Output {name or '?'}: mode= was removed; declare incremental= instead (§2.1)"
             )
         if keyed:
-            if key is not None or revision is not None:
+            if key is not None:
                 raise RegistrationError(
-                    f"Output {name or '?'}: keyed=True takes a dict[str, Any]; key= and revision= are for rows"
+                    f"Output {name or '?'}: keyed=True takes a dict[str, Any]; key= is for rows"
                 )
             key = KEYS
         if incremental is None:
@@ -239,7 +241,7 @@ class Output:
         elif not incremental and key is not None:
             raise RegistrationError(f"Output {name or '?'}: key= implies incremental=True (§2.1)")
         self.name, self.store = name, store
-        self.key, self.revision, self.incremental = key, revision, bool(incremental)
+        self.key, self.incremental = key, bool(incremental)
         self.config = config
         self.migrations = tuple(migrations)
 
@@ -249,7 +251,6 @@ class Output:
             "name": name,
             "store": self.store or DEFAULT_STORE,
             "key": self.key,
-            "revision": self.revision,
             "incremental": self.incremental,
             "migrations": [m.name for m in self.migrations],
             "config": self.config,
@@ -290,7 +291,8 @@ class Source:
             raise RegistrationError(f"Source {name!r}: observe= needs a subclass that defines observe()")
 
     def observe(self, ctx) -> Any:
-        """`str`: a version; a map: the full key map; `Observed`: a patch and a
+        """`str`: an unkeyed source's version; a map: the full key map, each
+        key to its version (docs/versions.md §2); `Observed`: a patch and a
         cursor; `None`: nothing changed."""
 
         raise NotImplementedError
@@ -331,7 +333,6 @@ class Source:
             output=self.name,
             store=self.store or DEFAULT_STORE,
             handle={"name": self.name, **self.handle},
-            version=digest(self.handle),
             partition="",
             meta={"external": True},
         )
@@ -804,8 +805,10 @@ def AutoRefresh(**kwargs) -> Automation:
 
 @dataclass(frozen=True)
 class Commit:
-    """A source commit a tick asks for, as the commit API takes it: a
-    `version`, a full `keys` map, or `upsert`/`remove`."""
+    """A source commit a tick asks for, as the commit API takes it: an
+    unkeyed source's `version`, a full `keys` map, or `upsert`/`remove`.
+    A map gives each key its version; a list names keys with none
+    (docs/versions.md §2)."""
 
     source: str
     version: str | None = None
@@ -1255,7 +1258,6 @@ class Project:
                 "source": True,
                 "store": source.store or DEFAULT_STORE,
                 "key": source.key,
-                "revision": None,
                 "incremental": source.key is not None,
                 "migrations": [],
                 "config": source.handle,
@@ -1284,7 +1286,6 @@ class Project:
                     "source": False,
                     "store": output.store or DEFAULT_STORE,
                     "key": output.key,
-                    "revision": output.revision,
                     "incremental": output.incremental,
                     "migrations": [m.name for m in output.migrations],
                     "config": output.config,
@@ -1652,17 +1653,19 @@ class Project:
         for name, store in self.stores.items():
             # How a store keeps a writer the engine gave up on from writing over a
             # newer one (docs/stores.md): it writes only names no one else uses, or
-            # every write checks the attempt's generation.
+            # every write checks the attempt's generation — and says which keys a
+            # slice holds, for a repair (docs/versions.md §5).
             writes = getattr(store, "writes", None)
-            needs = {"immutable": "discard", "fenced": "acquire"}.get(writes)
+            needs = {"immutable": ("discard",), "fenced": ("acquire", "keys")}.get(writes)
             if needs is None:
                 raise RegistrationError(
                     f"store {name!r}: writes must be 'immutable' or 'fenced' (docs/stores.md)"
                 )
-            if not callable(getattr(store, needs, None)):
-                raise RegistrationError(
-                    f"store {name!r}: a {writes} store implements {needs}() (docs/stores.md)"
-                )
+            for method in needs:
+                if not callable(getattr(store, method, None)):
+                    raise RegistrationError(
+                        f"store {name!r}: a {writes} store implements {method}() (docs/stores.md)"
+                    )
         store_records = {
             name: {
                 "version": getattr(store, "version", "1"),

@@ -443,7 +443,7 @@ def test_source_synthesized_head():
     head = project.manifest["sources"]["ext"]["head"]
     assert head["meta"]["external"] is True
     assert head["handle"]["region"] == "us"
-    assert head["version"]
+    assert head["generation"] == 0  # no commit wrote it yet
 
 
 def test_migrations_in_manifest():

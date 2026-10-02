@@ -26,7 +26,6 @@
           "migrations": [],
           "name": "fleet_dashboard",
           "partition_set": false,
-          "revision": null,
           "store": "postgres"
         }
       ],
@@ -85,7 +84,6 @@
           "migrations": [],
           "name": "change_events",
           "partition_set": false,
-          "revision": null,
           "store": "postgres"
         },
         {
@@ -95,7 +93,6 @@
           "migrations": [],
           "name": "qaqc_files",
           "partition_set": false,
-          "revision": "version",
           "store": "default"
         }
       ],
@@ -150,7 +147,6 @@
           "migrations": [],
           "name": "hillshade",
           "partition_set": false,
-          "revision": null,
           "store": "blob"
         }
       ],
@@ -251,7 +247,6 @@
           "migrations": [],
           "name": "leach_kinetics",
           "partition_set": false,
-          "revision": null,
           "store": "postgres"
         },
         {
@@ -263,7 +258,6 @@
           "migrations": [],
           "name": "leach_invalid_sample_id_log",
           "partition_set": false,
-          "revision": null,
           "store": "postgres"
         }
       ],
@@ -333,7 +327,6 @@
           "migrations": [],
           "name": "manual_upload",
           "partition_set": false,
-          "revision": null,
           "store": "postgres"
         }
       ],
@@ -418,7 +411,6 @@
           "migrations": [],
           "name": "psa_mean_data",
           "partition_set": false,
-          "revision": null,
           "store": "postgres"
         }
       ],
@@ -458,7 +450,7 @@
         "qaqc_samples.onchange.0"
       ],
       "deps": [],
-      "doc": "One changed workbook of this site: its samples. Solera runs it for every\nfile_id whose version changed, eight at a time, writes all of them in one\nstore write, and removes the samples of deleted workbooks; the store\nstamps `file_id` and `site`. A workbook that raises is recorded as a\nfailing key, and the others still commit.",
+      "doc": "One changed workbook of this site: its samples. Solera runs it for every\nfile_id written since, eight at a time, writes all of them in one\nstore write, and removes the samples of deleted workbooks; the store\nstamps `file_id` and `site`. A workbook that raises is recorded as a\nfailing key, and the others still commit.",
       "inputs": {
         "workbook": {
           "each": {
@@ -490,7 +482,6 @@
           ],
           "name": "qaqc_samples",
           "partition_set": false,
-          "revision": null,
           "store": "postgres"
         }
       ],
@@ -563,7 +554,6 @@
           "migrations": [],
           "name": "region_rollup",
           "partition_set": false,
-          "revision": null,
           "store": "postgres"
         }
       ],
@@ -639,7 +629,6 @@
           "migrations": [],
           "name": "site_health",
           "partition_set": false,
-          "revision": null,
           "store": "postgres"
         }
       ],
@@ -695,7 +684,6 @@
           "migrations": [],
           "name": "sites",
           "partition_set": true,
-          "revision": null,
           "store": "default"
         }
       ],
@@ -1058,7 +1046,6 @@
       "migrations": [],
       "name": "change_events",
       "partition_set": false,
-      "revision": null,
       "source": false,
       "store": "postgres"
     },
@@ -1072,7 +1059,6 @@
       "migrations": [],
       "name": "fleet_dashboard",
       "partition_set": false,
-      "revision": null,
       "source": false,
       "store": "postgres"
     },
@@ -1084,7 +1070,6 @@
       "migrations": [],
       "name": "hillshade",
       "partition_set": false,
-      "revision": null,
       "source": false,
       "store": "blob"
     },
@@ -1099,7 +1084,6 @@
       "migrations": [],
       "name": "leach_crosswalk",
       "partition_set": false,
-      "revision": null,
       "source": true,
       "store": "postgres"
     },
@@ -1113,7 +1097,6 @@
       "migrations": [],
       "name": "leach_invalid_sample_id_log",
       "partition_set": false,
-      "revision": null,
       "source": false,
       "store": "postgres"
     },
@@ -1127,7 +1110,6 @@
       "migrations": [],
       "name": "leach_kinetics",
       "partition_set": false,
-      "revision": null,
       "source": false,
       "store": "postgres"
     },
@@ -1142,7 +1124,6 @@
       "migrations": [],
       "name": "manual_upload",
       "partition_set": false,
-      "revision": null,
       "source": false,
       "store": "postgres"
     },
@@ -1157,7 +1138,6 @@
       "migrations": [],
       "name": "pmpt_project_matrix",
       "partition_set": false,
-      "revision": null,
       "source": true,
       "store": "postgres"
     },
@@ -1172,7 +1152,6 @@
       "migrations": [],
       "name": "project_team_map",
       "partition_set": false,
-      "revision": null,
       "source": true,
       "store": "postgres"
     },
@@ -1187,7 +1166,6 @@
       "migrations": [],
       "name": "psa_data",
       "partition_set": false,
-      "revision": null,
       "source": true,
       "store": "postgres"
     },
@@ -1213,7 +1191,6 @@
       "migrations": [],
       "name": "psa_mean_data",
       "partition_set": false,
-      "revision": null,
       "source": false,
       "store": "postgres"
     },
@@ -1228,7 +1205,6 @@
       "migrations": [],
       "name": "psa_samples",
       "partition_set": false,
-      "revision": null,
       "source": true,
       "store": "postgres"
     },
@@ -1240,7 +1216,6 @@
       "migrations": [],
       "name": "qaqc_files",
       "partition_set": false,
-      "revision": "version",
       "source": false,
       "store": "default"
     },
@@ -1262,7 +1237,6 @@
       ],
       "name": "qaqc_samples",
       "partition_set": false,
-      "revision": null,
       "source": false,
       "store": "postgres"
     },
@@ -1277,7 +1251,6 @@
       "migrations": [],
       "name": "region_rollup",
       "partition_set": false,
-      "revision": null,
       "source": false,
       "store": "postgres"
     },
@@ -1292,7 +1265,6 @@
       "migrations": [],
       "name": "sample_id_crosswalk",
       "partition_set": false,
-      "revision": null,
       "source": true,
       "store": "postgres"
     },
@@ -1307,7 +1279,6 @@
       "migrations": [],
       "name": "site_health",
       "partition_set": false,
-      "revision": null,
       "source": false,
       "store": "postgres"
     },
@@ -1319,7 +1290,6 @@
       "migrations": [],
       "name": "sites",
       "partition_set": true,
-      "revision": null,
       "source": false,
       "store": "default"
     },
@@ -1334,7 +1304,6 @@
       "migrations": [],
       "name": "uploads",
       "partition_set": true,
-      "revision": null,
       "source": true,
       "store": "default"
     },
@@ -1347,7 +1316,6 @@
       "migrations": [],
       "name": "usgs_3dep_tiles",
       "partition_set": false,
-      "revision": null,
       "source": true,
       "store": "default"
     },
@@ -1362,7 +1330,6 @@
       "migrations": [],
       "name": "xrd_profex",
       "partition_set": false,
-      "revision": null,
       "source": true,
       "store": "postgres"
     },
@@ -1377,13 +1344,12 @@
       "migrations": [],
       "name": "xrf",
       "partition_set": false,
-      "revision": null,
       "source": true,
       "store": "postgres"
     }
   },
   "retention": null,
-  "revision": "f83c507d86e32b1b44031a1db1d25a529a829f8ab95faceb37a68a1bcbfeb068",
+  "revision": "5b511e7b31082c25eb095b11a99cb1f157ffa7504b80c3c552bb4249e3fa7387",
   "sensors": {},
   "sources": {
     "leach_crosswalk": {
@@ -1391,6 +1357,7 @@
         "schema": "datasmart"
       },
       "head": {
+        "generation": 0,
         "handle": {
           "name": "leach_crosswalk",
           "schema": "datasmart"
@@ -1400,8 +1367,7 @@
         },
         "output": "leach_crosswalk",
         "partition": "",
-        "store": "postgres",
-        "version": "0dda741882dc3a6cf751a5d04df95f53bba49e722c47321efa8fb08c23e348ab"
+        "store": "postgres"
       },
       "key": null,
       "name": "leach_crosswalk",
@@ -1412,6 +1378,7 @@
         "schema": "datasmart"
       },
       "head": {
+        "generation": 0,
         "handle": {
           "name": "pmpt_project_matrix",
           "schema": "datasmart"
@@ -1421,8 +1388,7 @@
         },
         "output": "pmpt_project_matrix",
         "partition": "",
-        "store": "postgres",
-        "version": "0dda741882dc3a6cf751a5d04df95f53bba49e722c47321efa8fb08c23e348ab"
+        "store": "postgres"
       },
       "key": null,
       "name": "pmpt_project_matrix",
@@ -1433,6 +1399,7 @@
         "schema": "datasmart"
       },
       "head": {
+        "generation": 0,
         "handle": {
           "name": "project_team_map",
           "schema": "datasmart"
@@ -1442,8 +1409,7 @@
         },
         "output": "project_team_map",
         "partition": "",
-        "store": "postgres",
-        "version": "0dda741882dc3a6cf751a5d04df95f53bba49e722c47321efa8fb08c23e348ab"
+        "store": "postgres"
       },
       "key": null,
       "name": "project_team_map",
@@ -1454,6 +1420,7 @@
         "schema": "datasmart"
       },
       "head": {
+        "generation": 0,
         "handle": {
           "name": "psa_data",
           "schema": "datasmart"
@@ -1463,8 +1430,7 @@
         },
         "output": "psa_data",
         "partition": "",
-        "store": "postgres",
-        "version": "0dda741882dc3a6cf751a5d04df95f53bba49e722c47321efa8fb08c23e348ab"
+        "store": "postgres"
       },
       "key": null,
       "name": "psa_data",
@@ -1475,6 +1441,7 @@
         "schema": "datasmart"
       },
       "head": {
+        "generation": 0,
         "handle": {
           "name": "psa_samples",
           "schema": "datasmart"
@@ -1484,8 +1451,7 @@
         },
         "output": "psa_samples",
         "partition": "",
-        "store": "postgres",
-        "version": "0dda741882dc3a6cf751a5d04df95f53bba49e722c47321efa8fb08c23e348ab"
+        "store": "postgres"
       },
       "key": null,
       "name": "psa_samples",
@@ -1496,6 +1462,7 @@
         "schema": "datasmart"
       },
       "head": {
+        "generation": 0,
         "handle": {
           "name": "sample_id_crosswalk",
           "schema": "datasmart"
@@ -1505,8 +1472,7 @@
         },
         "output": "sample_id_crosswalk",
         "partition": "",
-        "store": "postgres",
-        "version": "0dda741882dc3a6cf751a5d04df95f53bba49e722c47321efa8fb08c23e348ab"
+        "store": "postgres"
       },
       "key": null,
       "name": "sample_id_crosswalk",
@@ -1517,6 +1483,7 @@
         "name": "uploads"
       },
       "head": {
+        "generation": 0,
         "handle": {
           "name": "uploads"
         },
@@ -1525,8 +1492,7 @@
         },
         "output": "uploads",
         "partition": "",
-        "store": "default",
-        "version": "2b4f69fbd4e1417a60a9620682862564271d76afde65cd42ea69a5313ead1fcb"
+        "store": "default"
       },
       "key": "<elements>",
       "name": "uploads",
@@ -1535,6 +1501,7 @@
     "usgs_3dep_tiles": {
       "handle": {},
       "head": {
+        "generation": 0,
         "handle": {
           "name": "usgs_3dep_tiles"
         },
@@ -1543,8 +1510,7 @@
         },
         "output": "usgs_3dep_tiles",
         "partition": "",
-        "store": "default",
-        "version": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+        "store": "default"
       },
       "key": null,
       "name": "usgs_3dep_tiles",
@@ -1555,6 +1521,7 @@
         "schema": "datasmart"
       },
       "head": {
+        "generation": 0,
         "handle": {
           "name": "xrd_profex",
           "schema": "datasmart"
@@ -1564,8 +1531,7 @@
         },
         "output": "xrd_profex",
         "partition": "",
-        "store": "postgres",
-        "version": "0dda741882dc3a6cf751a5d04df95f53bba49e722c47321efa8fb08c23e348ab"
+        "store": "postgres"
       },
       "key": null,
       "name": "xrd_profex",
@@ -1576,6 +1542,7 @@
         "schema": "datasmart"
       },
       "head": {
+        "generation": 0,
         "handle": {
           "name": "xrf",
           "schema": "datasmart"
@@ -1585,8 +1552,7 @@
         },
         "output": "xrf",
         "partition": "",
-        "store": "postgres",
-        "version": "0dda741882dc3a6cf751a5d04df95f53bba49e722c47321efa8fb08c23e348ab"
+        "store": "postgres"
       },
       "key": null,
       "name": "xrf",
@@ -1596,12 +1562,12 @@
   "stores": {
     "blob": {
       "ref": "object",
-      "version": "3",
+      "version": "4",
       "writes": "immutable"
     },
     "default": {
       "ref": "object",
-      "version": "3",
+      "version": "4",
       "writes": "immutable"
     },
     "postgres": {

@@ -122,7 +122,7 @@ uploads = PartitionSet("uploads")
             incremental=True,
             partition_column="site",
         ),
-        Output("qaqc_files", key="file_id", revision="version"),
+        Output("qaqc_files", key="file_id"),
     ),
     partitions=sites,
     automations=Automation(trigger=Every(30)),
@@ -181,7 +181,7 @@ class Unprocessable(Rejected):
 )
 async def qaqc_samples(ctx, workbook: list[dict], sharepoint: SharePointClient) -> pd.DataFrame:
     """One changed workbook of this site: its samples. Solera runs it for every
-    file_id whose version changed, eight at a time, writes all of them in one
+    file_id written since, eight at a time, writes all of them in one
     store write, and removes the samples of deleted workbooks; the store
     stamps `file_id` and `site`. A workbook that raises is recorded as a
     failing key, and the others still commit."""

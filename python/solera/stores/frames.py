@@ -5,14 +5,14 @@ pandas DataFrames or Arrow data (anything with `__arrow_c_stream__`)
 reads them here: `prepare` for its `Store.prepare`, `can_store` in its
 `can_store`, `rows` and `materialize` where it writes or loads them. A
 DataFrame is read a column at a time through pandas alone, every missing
-value — NaN, NaT, None, NA — None, where it is hashed and where it is
-stored; Arrow is read in place and stored with maps as dicts. pandas and
-pyarrow are imported only for a value of their own type.
+value — NaN, NaT, None, NA — None, where it is stored; Arrow is read in place and stored with maps as dicts. pandas and
+pyarrow are imported only for a value of their own type. Of a keyed
+write, only the key column is read for the key index (docs/versions.md).
 
-`KINDS` are the value kinds a store types columns by — what a column reads
-a value back as, so what its digest is (docs/row-digest.md): `kind_of` a
-Python value, `frame_kinds` and `arrow_kinds` of whole columns, from
-pyarrow's inferred schema when it is installed, else pandas' dtypes.
+`KINDS` are the value kinds a store types the columns of a table it
+creates by: `kind_of` a Python value, `frame_kinds` and `arrow_kinds` of
+whole columns, from pyarrow's inferred schema when it is installed, else
+pandas' dtypes.
 """
 
 from __future__ import annotations
@@ -63,13 +63,13 @@ def can_store(t: Any) -> bool:
     return is_frame_type(t) or (isinstance(t, type) and t.__module__.split(".")[0] == "pyarrow")
 
 
-def prepare(write: Any, output: Output, exclude: tuple[str, ...] = ()):
+def prepare(write: Any, output: Output):
     """`solera.stores.prepare`, reading DataFrames and Arrow data too."""
 
-    return _prepare(write, output, exclude, read)
+    return _prepare(write, output, read)
 
 
-def read(content: Any, output: Output, exclude: tuple[str, ...]):
+def read(content: Any, output: Output):
     """`(rows, take, empty, kinds)` of a rows output's DataFrame, Arrow data,
     or by-key mapping holding DataFrames; None for plain Python."""
 
@@ -81,18 +81,22 @@ def read(content: Any, output: Output, exclude: tuple[str, ...]):
     by_key = isinstance(content, Mapping) and any(is_frame(g) for g in content.values())
     if by_key:
         content, empty = _by_key(content, output)
-    args = (output.key, output.revision, list(exclude))
     if is_frame(content):
         names, columns = _frame(content, output.name)
-        return Rows.columns(names, columns, *args), _column_taker(names, columns), empty, frame_kinds(content)
+        return (
+            Rows.columns(names, columns, output.key),
+            _column_taker(names, columns),
+            empty,
+            frame_kinds(content),
+        )
     if hasattr(content, "__arrow_c_stream__"):
         if type(content).__module__.startswith("pyarrow") and type(content).__name__ != "Table":
             import pyarrow as pa  # a stream reads once: hold it
 
             content = pa.table(content)
-        return Rows.arrow(content, *args), _arrow_taker(content), empty, arrow_kinds(content)
+        return Rows.arrow(content, output.key), _arrow_taker(content), empty, arrow_kinds(content)
     if by_key:  # DataFrames among lists of rows: rows, every one
-        return Rows.records(content, *args), _list_taker(content), empty, None
+        return Rows.records(content, output.key), _list_taker(content), empty, None
     return None
 
 
@@ -179,8 +183,8 @@ def _frame(frame: Any, name: str) -> tuple[list[str], list[list]]:
 
 def _column_values(series: Any, missing: Any) -> list:
     """A column's values as Python objects. Timestamps with no nanoseconds
-    become `datetime`s, the same instants (and digests) as pandas'
-    `Timestamp`s, made and read faster."""
+    become `datetime`s, the same instants as pandas' `Timestamp`s, made
+    and read faster."""
 
     if series.dtype.kind == "M" and not (series.dt.nanosecond.to_numpy()[~missing] != 0).any():
         import warnings
@@ -204,8 +208,7 @@ def _column_taker(names: list[str], columns: list[list]) -> Callable:
 
 
 def _arrow_taker(data: Any) -> Callable:
-    """Rows of Arrow data as Python values that digest as the Arrow values
-    do: maps as dicts. pyarrow is imported only here, for its own data, or
+    """Rows of Arrow data as Python values: maps as dicts. pyarrow is imported only here, for its own data, or
     when another library's has rows to give."""
 
     table = None

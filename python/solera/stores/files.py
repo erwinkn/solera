@@ -1,11 +1,10 @@
-"""FileStore and S3Store (§4): one object per value, key version or batch,
-each written once under a name no other attempt writes. They take plain
+"""FileStore and S3Store (§4): one object per value, key or batch, each
+written once under a name no other attempt writes. They take plain
 Python, pandas DataFrames and Arrow data (`frames`)."""
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import os
 import pickle
@@ -24,7 +23,6 @@ from . import (
     StoreError,
     WriteError,
     Written,
-    _digest,
     _segment,
     by_key_type,
     encode,
@@ -41,17 +39,16 @@ class FileStore:
 
         {root}/rollup@184467.json               a value, by generation 184467
         {root}/site_status/alpha@184467.json    a value, partition alpha
-        {root}/uploads/u-7/9c41e0….184467.pkl   a keyed output: one object per key and version
-        {root}/site_files/alpha/f-1/5d2a….184467.json
-                                                keyed and partitioned: the key's rows
+        {root}/uploads/u-7/184467.pkl           a keyed output: one object per key and generation
+        {root}/site_files/alpha/f-1/184467.json keyed and partitioned: the key's rows
         {root}/site_events/alpha/000000000042/184467.json
                                                 an unkeyed incremental output: one per batch
 
-    A name carries the logical version and the writing attempt's generation
-    (`Scope.generation`), and a write is create-only: a dead writer only
-    ever leaves objects nothing references, and a reader gets exactly the
-    version it was pinned to. A keyed read names its objects from the key
-    index's `(version, locator)` (`Keys`); a range of batches keeps, per
+    A name carries the writing attempt's generation (`Scope.generation`) —
+    a key's version (docs/versions.md) — and a write is create-only: a dead
+    writer only ever leaves objects nothing references, and a reader gets
+    exactly what it was pinned to. A keyed read names its objects from the
+    generations the key index holds (`Keys`); a range of batches keeps, per
     batch, the highest generation, which committed it — listed batch by
     batch, so reading one never lists the others. Superseded objects
     are deleted by `discard`, once nothing can read them.
@@ -60,7 +57,7 @@ class FileStore:
     defaults to `$SOLERA_DATA`, else `.solera/data` next to the project
     file."""
 
-    version = "3"
+    version = "4"
     writes = "immutable"
     ref_type = ObjectRef
     shared_table = False
@@ -119,8 +116,8 @@ class FileStore:
                 raise WriteError(f"{output.name}: an unkeyed incremental output only accepts Patch writes")
             return await self._store_batch(write, prior, scope, base, generation)
         name = f"{base}@{generation}"
-        version = await self._put(name, write)
-        return Written(self._ref(scope, {"mode": "value", "path": name, "base": base}, version))
+        await self._put(name, write)
+        return Written(self._ref(scope, {"mode": "value", "path": name, "base": base}))
 
     async def _store_set(self, write: KeyedWrite, prior, scope, base, generation) -> Written:
         """A partition set: its element list, as one value."""
@@ -130,24 +127,23 @@ class FileStore:
             drop = set(write.removes) | set(write.prepared.removes) | set(elements)
             elements = [e for e in await self._elements(prior) if e not in drop] + elements
         name = f"{base}@{generation}"
-        version = await self._put(name, elements)
-        return Written(self._ref(scope, {"mode": "set", "path": name, "base": base}, version))
+        await self._put(name, elements)
+        return Written(self._ref(scope, {"mode": "set", "path": name, "base": base}))
 
     async def _store_keyed(self, write: KeyedWrite, prior, scope, base, generation) -> Written:
-        """One object per key and version: the keys the write changes, each
-        named by the version the key index will hold, so no object goes
-        unnamed — only their groups are read from the write. Removed keys
-        need no write: the index stops naming them, and `discard` deletes
-        what nothing reads."""
+        """One object per key and generation: the keys the write's delta
+        writes, each named by the generation the key index will hold, so no
+        object goes unnamed — only their groups are read from the write.
+        Removed keys need no write: the index stops naming them, and
+        `discard` deletes what nothing reads."""
 
         async def put(entry) -> None:
-            key, version, group = entry
-            await self._put(self.key_name(base, key, version, generation), group)
+            key, group = entry
+            await self._put(self.key_name(base, key, generation), group)
 
         async for page in write.pages():
             await self._many(put, page)
-        handle = {"mode": "keyed", "path": base, "key": scope.output.key}
-        return Written(self._ref(scope, handle, write.version(prior)))
+        return Written(self._ref(scope, {"mode": "keyed", "path": base, "key": scope.output.key}))
 
     async def _store_batch(self, write: Patch, prior, scope, base, generation) -> Written:
         """An unkeyed incremental write: its items, as one object per batch.
@@ -168,32 +164,19 @@ class FileStore:
             batch = scope.batch
         else:
             batch = int(prior.handle["batches"][1]) + 1 if prior is not None else 0
-        version = await self._put(f"{base}/{batch:012d}/{generation}", items)
-        if prior is None:
-            first = batch
-        else:
-            first = int(prior.handle["batches"][0])
-            version = _digest([prior.version, version])
+        await self._put(f"{base}/{batch:012d}/{generation}", items)
+        first = batch if prior is None else int(prior.handle["batches"][0])
         handle = {"mode": "batches", "path": base, "batches": [first, batch]}
-        return Written(self._ref(scope, handle, version))
+        return Written(self._ref(scope, handle))
 
     @staticmethod
-    def version_name(version: bytes) -> str:
-        """A key's version as a file name: its hex, or — past 32 bytes, a long
-        declared revision — the hex of the first 16 bytes of its SHA-256."""
-
-        if len(version) > 32:
-            version = hashlib.sha256(version).digest()[:16]
-        return version.hex()
-
-    @classmethod
-    def key_name(cls, base: str, key: str, version: bytes, locator: int) -> str:
-        return f"{base}/{_segment(key)}/{cls.version_name(version)}.{int(locator)}"
+    def key_name(base: str, key: str, generation: int) -> str:
+        return f"{base}/{_segment(key)}/{int(generation)}"
 
     async def discard(self, scope: Scope, prior: Ref | None, items: list) -> None:
         """Delete objects nothing reads any more (docs/lifecycle.md §9.8):
-        superseded versions, and what attempts that never committed wrote.
-        `items` name them: `("key", key, version_hex, locator)`,
+        superseded ones, and what attempts that never committed wrote.
+        `items` name them: `("key", key, generation)`,
         `("path", path)`, `("value", generation)`, `("batch", n, generation)`,
         or `("batches", lo, hi)` — every object of batches lo..hi. Names are
         never reused, so deleting one twice is no harm."""
@@ -203,7 +186,7 @@ class FileStore:
         for item in items:
             kind = item[0]
             if kind == "key":
-                names.append(self.key_name(base, item[1], bytes.fromhex(item[2]), item[3]))
+                names.append(self.key_name(base, item[1], item[2]))
             elif kind == "path":
                 names.append(item[1])
             elif kind == "value":
@@ -253,9 +236,9 @@ class FileStore:
                 raise StoreError(
                     f"{ref.output}: a keyed read names its objects from the key index: it takes Keys"
                 )
-            keys = list(selection.revisions)
+            keys = list(selection.generations)
             found = await self._many(
-                lambda k: self._found(self.key_name(base, k, *selection.revisions[k]), k), keys
+                lambda k: self._found(self.key_name(base, k, selection.generations[k]), k), keys
             )
             content = dict(zip(keys, found, strict=True))
             if handle.get("key") == KEYS:
@@ -269,7 +252,7 @@ class FileStore:
             raise StoreError(f"{ref.output}: {base} is gone")
         if mode == "set":
             if selection is not None:
-                value = [e for e in value if e in selection.revisions]
+                value = [e for e in value if e in selection.generations]
             return frames.materialize(value, t)
         if selection is not None:
             raise StoreError(f"{ref.output}: an unkeyed output cannot serve a selection")
@@ -331,15 +314,14 @@ class FileStore:
         name = _segment(output.name)
         return f"{name}/{_segment(scope.partition)}" if scope.partition else name
 
-    async def _put(self, base: str, value) -> str:
-        """Create `value` at `base`, once; returns its revision. The same name
-        written again is the same attempt's, with the same bytes."""
+    async def _put(self, base: str, value) -> None:
+        """Create `value` at `base`, once. The same name written again is the
+        same attempt's, with the same bytes."""
 
         from ..objects import create
 
         data, fmt = encode(value)
         await create(self._objects(), f"{base}.{fmt}", data)
-        return hashlib.sha256(data).hexdigest()
 
     async def _get(self, base: str):
         import obstore
@@ -382,10 +364,8 @@ class FileStore:
         return results
 
     @staticmethod
-    def _ref(scope, handle, version) -> ObjectRef:
-        return ObjectRef(
-            output=scope.output.name, store="", handle=handle, version=version, partition=scope.partition
-        )
+    def _ref(scope, handle) -> ObjectRef:
+        return ObjectRef(output=scope.output.name, store="", handle=handle, partition=scope.partition)
 
 
 def _batch_of(base: str, path: str) -> tuple[int, int] | None:

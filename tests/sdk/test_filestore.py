@@ -1,9 +1,10 @@
-"""§4: FileStore and S3Store — one object per value, key and version, or
-batch, each written once under a name that carries the writing attempt's
-generation (docs/lifecycle.md §9.8); JSON when it round-trips, pickle
-otherwise. The store never works out what changed; the harness does,
-against the key index (tests/worker), and says so in the write's scope. A
-keyed read names its objects from the index's `(version, locator)`."""
+"""§4: FileStore and S3Store — one object per value, key or batch, each
+written once under a name that carries the writing attempt's generation
+(docs/lifecycle.md §9.8, docs/versions.md); JSON when it round-trips,
+pickle otherwise. The store never works out what changed; the harness
+does, against the key index (tests/worker), and says so in the write's
+scope. A keyed read names its objects from the generations the index
+holds."""
 
 import os
 import uuid
@@ -12,6 +13,7 @@ from urllib.parse import unquote, urlsplit
 
 import pandas as pd
 import pytest
+from solera.keys.index import key_str
 from solera.sdk import KEYS, Output, PartitionSet, Ref, RegistrationError
 from solera.stores import (
     Batches,
@@ -60,8 +62,8 @@ async def paths(store) -> list[str]:
 def at(out, content, generation, keys=None) -> Keys:
     """The `Keys` a key index would hold after writing `content` at `generation`."""
 
-    entries = {k: (v, generation) for k, v in prepare(content, out).entries()}
-    return Keys({k: e for k, e in entries.items() if keys is None or k in keys})
+    written = [key_str(k) for k in prepare(content, out).rows.entries()[0]]
+    return Keys({k: generation for k in written if keys is None or k in keys})
 
 
 async def test_a_value_is_one_object_per_generation(store):
@@ -70,7 +72,7 @@ async def test_a_value_is_one_object_per_generation(store):
     assert first.ref.handle == {"mode": "value", "path": "rollup@7", "base": "rollup"}
     assert await store.load(first.ref, None, None) == {"sites": 3}
     second = await store.store({"sites": 4}, first.ref, scope(out, generation=9))
-    assert second.ref.version != first.ref.version
+    assert second.ref.handle["path"] != first.ref.handle["path"]
     assert await paths(store) == ["rollup@7.json", "rollup@9.json"]
     assert await store.load(first.ref, None, None) == {"sites": 3}  # a pinned reader reads its version
     assert await store.load(second.ref, None, None) == {"sites": 4}
@@ -97,22 +99,22 @@ async def test_partitions_and_keys_are_escaped_path_segments(store):
     assert all(p.startswith("status/site%7Cx/") for p in await paths(store))
 
 
-async def test_a_keyed_output_is_one_object_per_key_and_version(store):
+async def test_a_keyed_output_is_one_object_per_key_and_generation(store):
     out = Output("uploads", keyed=True)
     first = {"u-1": {"bytes": 3}, "u-2": {"bytes": 5}}
     written = await store.store(first, None, scope(out, generation=5))
     names = await paths(store)
-    assert len(names) == 2 and all(n.endswith(".5.json") for n in names)
+    assert names == ["uploads/u-1/5.json", "uploads/u-2/5.json"]
     assert {n.split("/")[1] for n in names} == {"u-1", "u-2"}
     with pytest.raises(StoreError, match="takes Keys"):
         await store.load(written.ref, None, None)  # a whole read goes through the index
     patch = {"u-2": {"bytes": 6}}
     patched = await store.store(Patch(patch, remove=["u-1"]), written.ref, scope(out, generation=8))
     assert len(await paths(store)) == 3  # nothing overwritten, nothing deleted
-    current = Keys({**at(out, patch, 8).revisions})
+    current = at(out, patch, 8)
     assert await store.load(patched.ref, None, current) == {"u-2": {"bytes": 6}}
     assert await store.load(written.ref, None, at(out, first, 5)) == first  # the old version, intact
-    old = [("key", k, v.hex(), loc) for k, (v, loc) in at(out, first, 5).revisions.items()]
+    old = [("key", k, g) for k, g in at(out, first, 5).generations.items()]
     await store.discard(scope(out, generation=9), patched.ref, old)
     await store.discard(
         scope(out, generation=9), patched.ref, old
@@ -125,17 +127,13 @@ async def test_a_keyed_write_touches_only_what_the_harness_says(store):
     out = Output("uploads", keyed=True)
     content = {"a": 1, "b": 20, "c": 3}
     prepared = prepare(content, out)
-    versions = dict(prepared.entries())
-    only = KeyedWrite(prepared, {"b": versions["b"]}, frozenset({"a"}))
+    only = KeyedWrite(prepared, frozenset({"b"}), frozenset({"a"}))
     await store.store(only, None, scope(out, generation=3))
     # `c` is in the write but not in upserts: the harness knows it is there already.
-    assert [p.split("/")[1] for p in await paths(store)] == ["b"]
-    assert [p.split("/")[2] for p in await paths(store)] == [f"{versions['b'].hex()}.3.json"]
+    assert await paths(store) == ["uploads/b/3.json"]
     # A requested key the write does not hold is an error, never a silent skip.
     with pytest.raises(StoreError, match="zzz"):
-        await store.store(
-            KeyedWrite(prepared, {"b": versions["b"], "zzz": b"1"}), None, scope(out, generation=4)
-        )
+        await store.store(KeyedWrite(prepared, frozenset({"b", "zzz"})), None, scope(out, generation=4))
 
 
 async def test_a_keyed_output_takes_a_dict_of_str(store):
@@ -157,14 +155,13 @@ def test_keyed_registration():
 
 
 async def test_rows_by_key_column(store):
-    out = Output("files", key="id", revision="v")
+    out = Output("files", key="id")
     rows = [{"id": 1, "v": "1"}, {"id": 2, "v": "1"}]
     first = await store.store(rows, None, scope(out, generation=1))
-    assert sorted(p.split("/")[1] for p in await paths(store)) == ["1", "2"]
-    assert all(p.endswith(f"/{b'1'.hex()}.1.json") for p in await paths(store))  # the revision names it
+    assert await paths(store) == ["files/1/1.json", "files/2/1.json"]
     patch = [{"id": 3, "v": "1"}]
     patched = await store.store(Patch(patch, remove=[1]), first.ref, scope(out, generation=2))
-    current = Keys({**at(out, rows, 1, keys={"2"}).revisions, **at(out, patch, 2).revisions})
+    current = Keys({**at(out, rows, 1, keys={"2"}).generations, **at(out, patch, 2).generations})
     assert await store.load(patched.ref, list[dict], current) == [{"id": 2, "v": "1"}, {"id": 3, "v": "1"}]
     frame = await store.load(patched.ref, pd.DataFrame, at(out, patch, 2))
     assert list(frame["id"]) == [3]
@@ -206,7 +203,7 @@ async def test_a_partition_set_is_its_element_list(store):
     out = PartitionSet("sites")
     written = await store.store(["Richmond", "Perth"], None, scope(out, generation=1))
     assert await store.load(written.ref, list, None) == ["Richmond", "Perth"]
-    assert await store.load(written.ref, list, Keys({"Perth": (b"1", 0)})) == ["Perth"]
+    assert await store.load(written.ref, list, Keys({"Perth": 1})) == ["Perth"]
     patched = await store.store(Patch(["Hobart"], remove=["Perth"]), written.ref, scope(out, generation=2))
     assert await store.load(patched.ref, list, None) == ["Richmond", "Hobart"]
 
@@ -216,7 +213,7 @@ async def test_a_renamed_output_keeps_its_objects(store):
     written = await store.store({"a": 1}, None, scope(old, generation=1))
     renamed = await store.store(Patch({"b": 2}), written.ref, scope(Output("new", keyed=True), generation=2))
     assert renamed.ref.handle["path"] == "old"
-    both = Keys({**at(old, {"a": 1}, 1).revisions, **at(old, {"b": 2}, 2).revisions})
+    both = Keys({**at(old, {"a": 1}, 1).generations, **at(old, {"b": 2}, 2).generations})
     assert await store.load(renamed.ref, None, both) == {"a": 1, "b": 2}
     value = await store.store(1, None, scope(Output("v1"), generation=3))
     moved = await store.store(2, value.ref, scope(Output("v2"), generation=4))
@@ -305,7 +302,6 @@ async def test_a_prepared_write_is_read_once_and_only_its_selection_taken(store,
     out = Output("frame", key="id")
     frame = pd.DataFrame({"id": [f"k{i}" for i in range(1000)], "n": range(1000)})
     prepared = store.prepare(frame, out)  # FileStore takes DataFrames (`solera.stores.frames`)
-    versions = dict(prepared.entries())
     taken = []
 
     def counting(rows):
@@ -313,10 +309,10 @@ async def test_a_prepared_write_is_read_once_and_only_its_selection_taken(store,
         return prepared.take(rows)
 
     monkeypatch.setattr(stores, "prepare_for", lambda *a, **k: pytest.fail("the store read the write again"))
-    write = KeyedWrite(dataclasses.replace(prepared, take=counting), {"k7": versions["k7"]})
+    write = KeyedWrite(dataclasses.replace(prepared, take=counting), frozenset({"k7"}))
     written = await store.store(write, None, scope(out, generation=2))
     assert taken == [1]
-    assert await store.load(written.ref, None, Keys({"k7": (versions["k7"], 2)})) == [{"id": "k7", "n": 7}]
+    assert await store.load(written.ref, None, Keys({"k7": 2})) == [{"id": "k7", "n": 7}]
 
 
 async def test_a_missing_object_a_commit_names_fails_the_read(store, data):
@@ -328,7 +324,7 @@ async def test_a_missing_object_a_commit_names_fails_the_read(store, data):
     out = Output("uploads", keyed=True)
     written = await store.store({"a": 1, "b": 2}, None, scope(out, generation=1))
     keys = at(out, {"a": 1, "b": 2}, 1)
-    gone = FileStore.key_name(written.ref.handle["path"], "a", keys.revisions["a"][0], 1)
+    gone = FileStore.key_name(written.ref.handle["path"], "a", keys.generations["a"])
     await obstore.delete_async(store._objects(), f"{gone}.json")
     with pytest.raises(StoreError, match="'a'.* is gone"):
         await store.load(written.ref, None, keys)
@@ -362,8 +358,7 @@ async def test_a_store_reads_its_own_types(store):
     store.prepare = prepare
     out = Output("sheet", key="id")
     written = await store.store(Sheet([("a", 1), ("b", 2)]), None, scope(out, generation=1))
-    keys = {k: (v, 1) for k, v in prepare(Sheet([("a", 1), ("b", 2)]), out).entries()}
-    assert await store.load(written.ref, None, Keys(keys)) == [
+    assert await store.load(written.ref, None, Keys({"a": 1, "b": 1})) == [
         {"id": "a", "amount": 1},
         {"id": "b", "amount": 2},
     ]
@@ -371,12 +366,11 @@ async def test_a_store_reads_its_own_types(store):
 
 def test_a_write_with_no_selection_is_paged_natively():
     """`KeyedWrite.iter_pages`: every key of the write, a page at a time, with
-    its version and group — never every entry at once."""
+    its group — never every entry at once."""
 
     out = Output("t", key="id")
     rows = [{"id": f"k{i}", "n": i} for i in range(5)]
     write = KeyedWrite(prepare(rows, out), whole=True)
     pages = list(write.iter_pages(2))
     assert [len(p) for p in pages] == [2, 2, 1]
-    versions = dict(prepare(rows, out).entries())
-    assert [(k, v, g) for p in pages for k, v, g in p] == [(r["id"], versions[r["id"]], [r]) for r in rows]
+    assert [(k, g) for p in pages for k, g in p] == [(r["id"], [r]) for r in rows]

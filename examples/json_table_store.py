@@ -6,7 +6,8 @@ as `Each` reads a page. The committed head names the table, so a renamed
 output keeps it. `fence()` at the top of every write transaction, and as
 `acquire`, is all the fencing it needs; `reads`
 reads an attempt's inputs at one moment, each with the generation that
-wrote what it read (`written()`). Each call's transaction runs on a
+wrote what it read (`written()`); `keys` says which keys a scope holds,
+for the repair after a writer died. Each call's transaction runs on a
 thread, off the worker's event loop. The conformance kit
 (`solera.testing.stores`) checks it like any store."""
 
@@ -18,7 +19,7 @@ import contextlib
 import psycopg
 from psycopg.types.json import Jsonb
 from solera.fencing import fence, fence_table, written
-from solera.sdk import Ref, digest
+from solera.sdk import Ref
 from solera.stores import MISSING, Batches, KeyedWrite, Keys, Patch, Written, by_key_type, takes
 
 ROWS = (None, list, list[dict])  # what a load gives: rows, as a list
@@ -79,7 +80,7 @@ class JsonTableStore:
                     f"INSERT INTO {table} VALUES (%s, NULL, NULL, %s)",
                     [(scope.partition, Jsonb(r)) for r in rows],
                 )
-                return Written(Ref(out.name, "", handle, digest(rows), scope.partition))
+                return Written(Ref(out.name, "", handle, scope.partition))
             if out.key is None:  # an unkeyed incremental output: a batch of rows
                 rows = list(write.rows if isinstance(write, Patch) else write)
                 # The batch replaces itself (a retried call writes it again); with no
@@ -94,27 +95,40 @@ class JsonTableStore:
                     f"INSERT INTO {table} VALUES (%s, NULL, %s, %s)",
                     [(scope.partition, scope.batch, Jsonb(r)) for r in rows],
                 )
-                version = digest([prior.version if prior else "", scope.batch, rows])
-                return Written(Ref(out.name, "", {**handle, "batch": scope.batch}, version, scope.partition))
+                return Written(Ref(out.name, "", {**handle, "batch": scope.batch}, scope.partition))
             write = KeyedWrite.of(self, write, out, prior)
             if write.whole:  # the scope's whole content: clear it first
                 cur.execute(f"DELETE FROM {table} WHERE part = %s", (scope.partition,))
-            for page in write.iter_pages():  # the keys to write: (key, version, rows)
-                keys = [k for k, _, _ in page]
+            for page in write.iter_pages():  # the keys to write: (key, rows)
+                keys = [k for k, _ in page]
                 if not write.whole:
                     cur.execute(
                         f"DELETE FROM {table} WHERE part = %s AND k = ANY(%s)", (scope.partition, keys)
                     )
                 cur.executemany(
                     f"INSERT INTO {table} VALUES (%s, %s, NULL, %s)",
-                    [(scope.partition, k, Jsonb(dict(r))) for k, _, group in page for r in group],
+                    [(scope.partition, k, Jsonb(dict(r))) for k, group in page for r in group],
                 )
             if write.removes:
                 cur.execute(
                     f"DELETE FROM {table} WHERE part = %s AND k = ANY(%s)",
                     (scope.partition, sorted(write.removes)),
                 )
-            return Written(Ref(out.name, "", handle, write.version(prior), scope.partition))
+            return Written(Ref(out.name, "", handle, scope.partition))
+
+    def keys(self, ref, among=None):
+        """The keys `ref`'s scope holds — among `among`, or all — sorted by
+        their bytes, in chunks: never a value."""
+
+        sql, params = (
+            f"SELECT DISTINCT k FROM {ref.handle['table']} WHERE part = %s AND k IS NOT NULL",
+            [ref.partition],
+        )
+        if among is not None:
+            sql, params = sql + " AND k = ANY(%s)", [*params, sorted(among)]
+        with psycopg.connect(self.dsn) as conn:
+            found = [k for (k,) in conn.execute(sql, params)]
+        yield sorted(found, key=str.encode)
 
     async def load(self, ref, t, selection):
         def work():
@@ -149,7 +163,7 @@ class JsonTableStore:
     def _load(self, conn, ref, t, selection):
         sql, params = f"SELECT k, row FROM {ref.handle['table']} WHERE part = %s", [ref.partition]
         if isinstance(selection, Keys):
-            sql, params = sql + " AND k = ANY(%s)", [*params, sorted(selection.revisions)]
+            sql, params = sql + " AND k = ANY(%s)", [*params, sorted(selection.generations)]
         elif isinstance(selection, Batches):
             sql, params = sql + " AND batch BETWEEN %s AND %s", [*params, selection.lo, selection.hi]
         elif (ref.handle or {}).get("batch") is not None:

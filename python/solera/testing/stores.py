@@ -35,8 +35,8 @@ from ..stores import Batches, KeyedWrite, Keys, Patch, Scope, StoreError, prepar
 class Harness:
     """What a scenario needs of the store under test. `output(**decl)` makes
     a fresh `Output` on it — a new name each call, so scenarios never share
-    data — with the declaration given (`key="id", revision="v"`,
-    `incremental=True`, or none). `hold(scope)`, which a fenced store's
+    data — with the declaration given (`key="id"`, `incremental=True`, or
+    none). `hold(scope)`, which a fenced store's
     harness must give, is an async context manager that opens a write
     transaction of `scope` holding its fence until the block ends, then
     commits it: a newer writer waits for it."""
@@ -53,9 +53,9 @@ class Harness:
 @dataclass
 class Ledger:
     """What the engine's key index would hold for one output scope: each
-    live key's version and the generation that wrote it (its locator)."""
+    live key's version — the generation that wrote it."""
 
-    entries: dict[str, tuple[bytes, int]] = field(default_factory=dict)
+    entries: dict[str, int] = field(default_factory=dict)
 
     def keys(self) -> Keys:
         return Keys(dict(self.entries))
@@ -96,37 +96,36 @@ async def write(
 ) -> Ref:
     """Write `rows` to a keyed output as the harness would — the scope's whole
     content, or (`patch`) its keys and `remove` — and record in `ledger`
-    what the index then holds. With `changed`, a replacement is resolved
-    against the ledger as the worker resolves it against the index: only
-    the keys whose version changed are written, the ones gone removed, and
-    an unchanged key stays where it is, at its old locator."""
+    what the index then holds: every key written, at `generation`. With
+    `changed`, a replacement is resolved against the ledger as the worker
+    resolves it against the index: its keys are written, the keys it leaves
+    out removed, and nothing else cleared."""
 
     store = h.store
+    written_keys = sorted({str(r["id"]) for r in rows})
     if changed:
         prepared = prepare_for(store, rows, out)
-        current = dict(prepared.entries())
-        upserts = {k: v for k, v in current.items() if ledger.entries.get(k, (None,))[0] != v}
-        gone = frozenset(set(ledger.entries) - set(current))
-        keyed = KeyedWrite(prepared, upserts=upserts, removes=gone, value=rows)
+        gone = frozenset(set(ledger.entries) - set(written_keys))
+        keyed = KeyedWrite(prepared, upserts=frozenset(written_keys), removes=gone, value=rows)
         written = await store.store(keyed, prior, scope(out, generation, invocation, partition=partition))
         for key in gone:
             del ledger.entries[key]
-        ledger.entries.update({k: (v, generation) for k, v in upserts.items()})
+        ledger.entries.update(dict.fromkeys(written_keys, generation))
         return written.ref
     if patch:
         prepared = prepare_for(store, Patch(rows, remove=list(remove)), out)
-        upserts = dict(prepared.entries())
-        keyed = KeyedWrite(prepared, upserts=upserts, removes=frozenset(map(str, remove)), value=rows)
+        keyed = KeyedWrite(
+            prepared, upserts=frozenset(written_keys), removes=frozenset(map(str, remove)), value=rows
+        )
     else:
         prepared = prepare_for(store, rows, out)
-        upserts = dict(prepared.entries())
         keyed = KeyedWrite(prepared, whole=True, value=rows)
     written = await store.store(keyed, prior, scope(out, generation, invocation, partition=partition))
     if not patch:
         ledger.entries.clear()
     for key in remove:
         ledger.entries.pop(str(key), None)
-    ledger.entries.update({k: (v, generation) for k, v in upserts.items()})
+    ledger.entries.update(dict.fromkeys(written_keys, generation))
     return written.ref
 
 
@@ -145,7 +144,7 @@ async def now(h: Harness, ref: Ref, ledger: Ledger) -> list[tuple[str, str]]:
 
 
 def keyed(h: Harness) -> Output:
-    return h.output(key="id", revision="v")
+    return h.output(key="id")
 
 
 # -- every store ---------------------------------------------------------------------------
@@ -186,13 +185,13 @@ async def an_empty_replacement_holds_no_key(h: Harness) -> None:
 
 async def a_write_repeated_by_its_attempt_lands_once(h: Harness) -> None:
     """The same attempt — one generation, one invocation — writes the same
-    content twice (a retried call): one version, the same content."""
+    content twice (a retried call): the same ref, the same content."""
 
     out, ledger = keyed(h), Ledger()
     content = [{"id": "a", "v": "1"}, {"id": "b", "v": "1"}]
     first = await write(h, out, content, 4, ledger)
     again = await write(h, out, content, 4, ledger)
-    assert again.version == first.version
+    assert again == first
     assert await now(h, again, ledger) == [("a", "1"), ("b", "1")]
 
 
@@ -228,17 +227,17 @@ async def a_full_run_starts_the_batches_over(h: Harness) -> None:
     assert await rows(h, reset.ref, None) == [("b", "1")]
 
 
-async def a_replacement_writes_only_what_changed(h: Harness) -> None:
-    """{a, b, c}, then the replacement {a, b at 2} as the worker resolves it:
-    b written, c removed, a untouched — and still read, at its first
-    locator."""
+async def a_replacement_resolved_writes_its_keys_and_removes_the_rest(h: Harness) -> None:
+    """{a, b, c}, then the replacement {a, b at 2} as the worker resolves it
+    — not a whole write: its keys, and the keys it removes. a and b written
+    at generation 2, c removed."""
 
     out, ledger = keyed(h), Ledger()
     first = await write(h, out, [{"id": k, "v": "1"} for k in "abc"], 1, ledger)
     second = await write(
         h, out, [{"id": "a", "v": "1"}, {"id": "b", "v": "2"}], 2, ledger, first, changed=True
     )
-    assert ledger.entries["a"][1] == 1  # a was not written again
+    assert ledger.entries == {"a": 2, "b": 2}
     assert await now(h, second, ledger) == [("a", "1"), ("b", "2")]
 
 
@@ -264,7 +263,7 @@ async def partitions_never_touch_each_other(h: Harness) -> None:
     `shared_table`; its outputs get a `partition_column`.)"""
 
     shared = getattr(h.store, "shared_table", False)
-    out = h.output(key="id", revision="v", **({"partition_column": "part"} if shared else {}))
+    out = h.output(key="id", **({"partition_column": "part"} if shared else {}))
     one, two = Ledger(), Ledger()
     first = await write(h, out, [{"id": "a", "v": "1"}], 1, one, partition="p1")
     other = await write(h, out, [{"id": "b", "v": "1"}], 2, two, partition="p2")
@@ -292,12 +291,10 @@ async def discarding_never_takes_what_is_read(h: Harness) -> None:
 
     out, ledger = keyed(h), Ledger()
     first = await write(h, out, [{"id": "a", "v": "1"}], 5, ledger)
-    old = ledger.entries["a"]
     abandoned = Ledger()
     await write(h, out, [{"id": "b", "v": "1"}], 7, abandoned, first, patch=True)  # never committed
     second = await write(h, out, [{"id": "a", "v": "2"}], 9, ledger, first)
-    items = [("key", "a", old[0].hex(), old[1]), ("key", "b", abandoned.entries["b"][0].hex(), 7)]
-    items.append(("key", "z", b"never".hex(), 8))
+    items = [("key", "a", 5), ("key", "b", 7), ("key", "z", 8)]
     for _ in range(2):
         await h.store.discard(scope(out, 10), second, items)
     assert await now(h, second, ledger) == [("a", "2")]
@@ -361,6 +358,23 @@ async def the_next_attempt_replaces_what_a_dead_writer_left(h: Harness) -> None:
     assert await now(h, second, ledger) == [("a", "2"), ("b", "1")]
     with _refused():
         await write(h, out, [{"id": "c", "v": "2"}], 5, Ledger(), first, patch=True)
+
+
+async def a_scope_says_which_keys_it_holds(h: Harness) -> None:
+    """`keys(ref, among)`: the keys the scope holds, sorted by their bytes —
+    among those given, or all of them — never a value (docs/versions.md
+    §5). Writer 5's patch of c landed and it died: the scope holds c."""
+
+    out, ledger = keyed(h), Ledger()
+    first = await write(h, out, [{"id": k, "v": "1"} for k in ("b", "a", "é", "B")], 1, ledger)
+    await write(h, out, [{"id": "c", "v": "1"}], 5, Ledger(), first, patch=True)  # landed, never committed
+
+    def held(among):
+        return [k for chunk in h.store.keys(first, among) for k in chunk]
+
+    assert held(None) == sorted(["a", "b", "c", "é", "B"], key=str.encode)
+    assert held(["c", "d", "a"]) == ["a", "c"]
+    assert held([]) == []
 
 
 async def a_newer_writer_waits_for_an_open_older_one(h: Harness) -> None:
@@ -427,7 +441,7 @@ EVERY = [
     batches_append_and_load_by_range,
     a_batch_written_again_lands_once,
     a_full_run_starts_the_batches_over,
-    a_replacement_writes_only_what_changed,
+    a_replacement_resolved_writes_its_keys_and_removes_the_rest,
     an_unkeyed_output_is_its_plain_rows,
     partitions_never_touch_each_other,
 ]
@@ -437,6 +451,7 @@ FENCED = [
     one_generation_admits_one_invocation,
     a_first_write_acquires,
     the_next_attempt_replaces_what_a_dead_writer_left,
+    a_scope_says_which_keys_it_holds,
     a_newer_writer_waits_for_an_open_older_one,
 ]
 READS = [a_read_reports_the_generation_it_saw]

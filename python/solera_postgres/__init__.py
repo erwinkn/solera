@@ -20,7 +20,7 @@ import re
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
-from solera.sdk import KEYS, Output, Ref, TableRef, digest
+from solera.sdk import KEYS, Output, Ref, TableRef
 from solera.stores import (
     MISSING,
     Batches,
@@ -45,7 +45,7 @@ LEDGER_TABLE = "public.solera_migrations"
 FENCE_TABLE = "public.solera_generations"
 BATCH_COLUMN = "_batch"
 SEQ_COLUMN = "_seq"
-KEY_CHUNK = 100_000  # rows per chunk a keyed Sql write reports
+KEY_CHUNK = 100_000  # keys per chunk `keys` reads
 
 
 def _assigned_batch(scope: Scope, prior: Ref | None) -> int:
@@ -167,13 +167,15 @@ class PostgresStore:
         scope: Scope | None = None,
         inferred: dict | None = None,
         kinds: Mapping[str, str | None] | None = None,
-    ) -> dict[str, dict]:
-        """The table, created if missing, under the transaction's fence; its
-        columns' types, exactly (`information_schema.columns`). A table the write creates takes the declared columns,
-        then those of a `Sql` SELECT (`inferred`), then the write's: each
-        column's kind as its reader knows it (`kinds`: a DataFrame's dtypes,
-        an Arrow schema), else the kind of every value not null in it
-        (`rows()`, read only then). Inferred columns are logged, once."""
+    ) -> None:
+        """The table, created if missing, under the transaction's fence. A
+        table the write creates takes the declared columns, then those of a
+        `Sql` SELECT (`inferred`), then the write's: each column's kind as
+        its reader knows it (`kinds`: a DataFrame's dtypes, an Arrow schema),
+        else the kind of every value not null in it (`rows()`, read only
+        then). Inferred columns are logged, once. What a column does to a
+        value is the database's: the declared columns are the user's
+        contract (docs/versions.md §4)."""
 
         schema, table_name = _split(table)
         indexes = self._indexes(output)
@@ -233,15 +235,6 @@ class PostgresStore:
             if role in present:
                 cur.execute(f"GRANT SELECT ON {table} TO {_ident(role)}")
         self._fence(cur, table, scope)  # before this transaction changes any row
-        return {
-            r["column_name"]: r
-            for r in cur.execute(
-                "SELECT column_name, data_type, numeric_precision, numeric_scale, datetime_precision, "
-                "character_maximum_length FROM information_schema.columns "
-                "WHERE table_schema = %s AND table_name = %s",
-                (schema, table_name),
-            )
-        }
 
     # -- generations (docs/lifecycle.md §9.7) -------------------------------------
 
@@ -421,24 +414,27 @@ class PostgresStore:
             batch = _assigned_batch(scope, prior) if output.incremental else None
             keys = None
             if isinstance(write, Sql):
-                version, keys = self._apply_sql(cur, output, write, scope, table, slice_where, prior)
+                self._apply_sql(cur, output, write, scope, table, slice_where)
+                if output.key:  # read once the write has committed
+                    keys = self._keys(table, output.key, slice_where, None)
             elif output.key is not None:
                 if isinstance(write, Patch) and not output.incremental:
                     raise WriteError(f"{output.name}: Patch requires an incremental output")
                 write = KeyedWrite.of(self, write, output, prior)
-                version = self._apply_keyed(cur, output, write, scope, table, slice_where, prior)
-                if version is None:
-                    return Written(prior)
+                if prior is None and not (
+                    write.whole or write.upserts or write.removes or len(write.prepared.rows)
+                ):
+                    return Written(None)  # a first write of nothing: no table to make
+                self._apply_keyed(cur, output, write, scope, table, slice_where)
             elif isinstance(write, Patch):
-                version = self._apply_batch(cur, output, write, scope, table, slice_where, prior, batch)
-                if version is None:
+                if not self._apply_batch(cur, output, write, scope, table, slice_where, prior, batch):
                     return Written(prior)
             else:
                 if output.incremental:
                     raise WriteError(
                         f"{output.name}: an unkeyed incremental output only accepts Patch writes"
                     )
-                version = self._apply_replace(cur, output, write, scope, table, slice_where)
+                self._apply_replace(cur, output, write, scope, table, slice_where)
         batch_mode = output.key is None and output.incremental
         return Written(
             TableRef(
@@ -448,26 +444,21 @@ class PostgresStore:
                     "table": table,
                     "where": slice_where,
                     "key": BATCH_COLUMN if batch_mode else output.key,
-                    "revision": output.revision,
                     "batch": batch if batch_mode else None,
                 },
-                version=version,
                 partition=scope.partition,
             ),
             keys,
         )
 
-    def _apply_replace(self, cur, output, write, scope, table, slice_where):
-        """An unkeyed output's whole content: its version is the multiset of
-        its rows (docs/row-digest.md), before the store stamps them."""
+    def _apply_replace(self, cur, output, write, scope, table, slice_where) -> None:
+        """An unkeyed output's whole content."""
 
         rows = frames.rows_of(write, output.name)
-        version = _rows_version(rows, [])
         kinds = frames.frame_kinds(write) if frames.is_frame(write) else None
-        types = self._ensure(cur, output, table, lambda: rows, scope, kinds=kinds)
+        self._ensure(cur, output, table, lambda: rows, scope, kinds=kinds)
         self._delete_slice(cur, table, slice_where)
-        self._insert(cur, output, table, rows, types, self._stamps(output, scope))
-        return version
+        self._insert(cur, output, table, rows, self._stamps(output, scope))
 
     def _apply_batch(self, cur, output, write: Patch, scope, table, slice_where, prior, batch):
         """An unkeyed incremental output's batch: its rows stamped with the
@@ -480,35 +471,63 @@ class PostgresStore:
             raise WriteError(f"{output.name}: remove is not allowed on an unkeyed incremental output")
         rows = frames.rows_of(write.rows, output.name)
         if not rows and prior is not None:
-            return None
-        version = _rows_version(rows, [prior.version if prior else ""])
+            return False
         rows = [{**row, SEQ_COLUMN: i} for i, row in enumerate(rows)]
-        types = self._ensure(cur, output, table, lambda: rows, scope)
+        self._ensure(cur, output, table, lambda: rows, scope)
         self._delete_slice(cur, table, slice_where if prior is None else {**slice_where, BATCH_COLUMN: batch})
-        self._insert(cur, output, table, rows, types, {**self._stamps(output, scope), BATCH_COLUMN: batch})
-        return version
+        self._insert(cur, output, table, rows, {**self._stamps(output, scope), BATCH_COLUMN: batch})
+        return True
 
-    def _apply_keyed(self, cur, output, write: KeyedWrite, scope, table, slice_where, prior):
+    def _apply_keyed(self, cur, output, write: KeyedWrite, scope, table, slice_where) -> None:
         """Every key is the group of rows that carry it. A whole write is the
         slice's content: cleared, then written; otherwise only the keys it
         writes change — their rows replaced by their groups, a page at a
-        time — and its removes go, every other row untouched."""
+        time — and its removes go, every other row untouched. A write of
+        nothing still runs, fencing the slice: the harness gives one only
+        to a repair, whose generation the slice must then read as written
+        (docs/versions.md §5)."""
 
-        if not write.whole and write.upserts is None and not write.removes and not len(write.prepared.rows):
-            return None  # a patch of nothing: the prior stands
-        types = self._ensure(
-            cur, output, table, lambda: write.prepared.take(None), scope, kinds=write.prepared.kinds
-        )
+        self._ensure(cur, output, table, lambda: write.prepared.take(None), scope, kinds=write.prepared.kinds)
         stamps = self._stamps(output, scope)
         if write.whole:
             self._delete_slice(cur, table, slice_where)
         for page in write.iter_pages():
+            keys = [key for key, _ in page]
             if not write.whole:
-                self._delete_keys(cur, output, table, slice_where, [key for key, _, _ in page])
-            self._insert(cur, output, table, [row for _, _, group in page for row in group], types, stamps)
+                self._delete_keys(cur, output, table, slice_where, keys)
+            self._insert(cur, output, table, [row for _, group in page for row in group], stamps)
+            self._check_keys(cur, output, table, slice_where, keys)
         if write.removes and not write.whole:
             self._delete_keys(cur, output, table, slice_where, sorted(write.removes))
-        return write.version(prior)
+
+    def _check_keys(self, cur, output, table, slice_where, keys: list[str]) -> None:
+        """Every key written is stored as itself: the key column's text of its
+        rows is the key the index holds. A column may change any other value
+        — round it, pad it — but a key it changed (`"01"` in a bigint
+        column, stored as `1`) would leave the index naming rows no read or
+        delete finds (docs/versions.md §4)."""
+
+        if not keys:
+            return
+        key = _ident(output.key)
+        found = cur.execute(
+            f"SELECT count(DISTINCT {key}::text) AS n FROM {table} "
+            f"WHERE {self._where_sql(slice_where)} AND {key}::text = ANY(%s)",
+            [slice_where[k] for k in sorted(slice_where)] + [keys],
+        ).fetchone()["n"]
+        if found != len(keys):
+            stored = {
+                r["k"]
+                for r in cur.execute(
+                    f"SELECT DISTINCT {key}::text AS k FROM {table} "
+                    f"WHERE {self._where_sql(slice_where)} AND {key}::text = ANY(%s)",
+                    [slice_where[k] for k in sorted(slice_where)] + [keys],
+                )
+            }
+            lost = next(k for k in keys if k not in stored)
+            raise WriteError(
+                f"{output.name}: key {lost!r} would be stored as another key in column {output.key!r}"
+            )
 
     def _stamps(self, output, scope) -> dict:
         """The columns the store sets on every row: the partition's."""
@@ -522,15 +541,14 @@ class PostgresStore:
             [slice_where[k] for k in sorted(slice_where)] + [keys],
         )
 
-    def _apply_sql(self, cur, output, write: Sql, scope, table, slice_where, prior):
+    def _apply_sql(self, cur, output, write: Sql, scope, table, slice_where) -> None:
         """Materialize a query into the slice. The query is never a statement
         of its own: the store embeds it in one, `INSERT INTO t SELECT … FROM
         (<query>) _src`, prepared (the extended protocol), so UPDATE, DELETE,
         DDL and data-modifying CTEs do not parse, and a second statement is
         refused. What remains is a function the query calls, which must not
-        write; `sql_read_only` makes sure. The harness never sees these rows,
-        so a keyed output reports the slice's rows, sorted, for the harness to
-        version (§6, §9)."""
+        write; `sql_read_only` makes sure. The harness never sees these rows:
+        a keyed output reports the slice's keys (§6, §9)."""
 
         import psycopg
         from psycopg import sql
@@ -585,56 +603,40 @@ class PostgresStore:
                         f"{output.name}: a Sql query must not write, nor any function it calls "
                         f"({str(e).splitlines()[0]})"
                     ) from e
-        keys = self._sorted_rows(table, output, slice_where) if output.key else None
-        return digest([prior.version if prior else "", digest(write.stmt)]), keys
 
     def prepare(self, write, output: Output) -> Prepared:
-        """A keyed write, read as the default reads it, without the columns the
-        store stamps (`stamped`)."""
+        """A keyed write of plain Python, DataFrames or Arrow (`frames`)."""
 
-        return frames.prepare(write, output, self.stamped(output))
+        return frames.prepare(write, output)
 
-    def stamped(self, output: Output) -> tuple[str, ...]:
-        """Columns the store adds to every row — the partition column — which
-        a row's digest leaves out, however it is read (docs/row-digest.md)."""
-
-        column = output.config.get("partition_column")
-        return (column,) if column and column != output.key else ()
-
-    def scan(self, ref: Ref, output: Output, skip=()):
-        """A slice's rows as they are, sorted by key, a chunk at a time — as a
-        `Sql` write reports them — but those of the keys in `skip`."""
+    def keys(self, ref: Ref, among: list[str] | None = None):
+        """The keys `ref`'s slice holds — among `among`, or all of them —
+        sorted by their bytes, a chunk at a time: never a value
+        (docs/versions.md §5)."""
 
         handle = ref.handle or {}
-        return self._sorted_rows(handle["table"], output, dict(handle.get("where") or {}), skip)
+        return self._keys(handle["table"], handle["key"], dict(handle.get("where") or {}), among)
 
-    def _sorted_rows(self, table, output: Output, where: dict, skip=()):
-        """The slice's rows sorted by the key's bytes, a chunk at a time from a
-        server-side cursor once the write has committed, for the harness to
-        version as it versions any rows: the key (as text) and the declared
-        revision, or every column but the partition column, typed. Keys in
-        `skip` are left out."""
+    def _keys(self, table, key_column: str, where: dict, among: list[str] | None):
+        """The slice's keys (as text) sorted by their bytes, a chunk at a time
+        from a server-side cursor, read once the iteration starts — after a
+        write has committed."""
 
         import psycopg
-        from psycopg.rows import dict_row
 
-        key = _ident(output.key)
+        key = _ident(key_column)
         params = [where[k] for k in sorted(where)]
-        with psycopg.connect(resolve_env(self.dsn), row_factory=dict_row) as conn:
-            if output.revision:
-                columns = [output.revision]
-            else:
-                probe = conn.execute(f"SELECT * FROM {table} LIMIT 0")
-                columns = [d.name for d in probe.description if d.name != output.key and d.name not in where]
-            select = ", ".join([f"{key}::text AS {key}", *(_ident(c) for c in columns)])
-            with conn.cursor(name="solera_keys") as cur:
-                cur.execute(
-                    f"SELECT {select} FROM {table} WHERE {self._where_sql(where)} "
-                    f"AND NOT ({key}::text = ANY(%s)) ORDER BY convert_to({key}::text, 'UTF8')",
-                    [*params, sorted(skip)],
-                )
-                while chunk := cur.fetchmany(KEY_CHUNK):
-                    yield chunk
+        only = ""
+        if among is not None:
+            only, params = f" AND {key}::text = ANY(%s)", [*params, sorted(among)]
+        with psycopg.connect(resolve_env(self.dsn)) as conn, conn.cursor(name="solera_keys") as cur:
+            cur.execute(
+                f"SELECT DISTINCT {key}::text, convert_to({key}::text, 'UTF8') FROM {table} "
+                f"WHERE {self._where_sql(where)}{only} ORDER BY 2",
+                params,
+            )
+            while chunk := cur.fetchmany(KEY_CHUNK):
+                yield [k for k, _ in chunk]
 
     # -- migrations (§4) --------------------------------------------------------
 
@@ -760,7 +762,7 @@ class PostgresStore:
                 if not key_col:
                     raise StoreError(f"{ref.output}: no key column for a Keys selection")
                 clauses.append(f"{_ident(key_col)}::text = ANY(%s)")
-                params.append(sorted(selection.revisions))
+                params.append(sorted(selection.generations))
             if clauses:
                 sql += " WHERE " + " AND ".join(clauses)
             found = cur.execute(sql, params)
@@ -789,12 +791,9 @@ class PostgresStore:
         params = [where[k] for k in sorted(where)]
         cur.execute(f"DELETE FROM {table} WHERE {self._where_sql(where)}", params)
 
-    def _insert(self, cur, output, table, rows: list[dict], types: dict, stamps: dict):
+    def _insert(self, cur, output, table, rows: list[dict], stamps: dict):
         """Rows, by `COPY`: every column any row has, missing ones null, and
-        the `stamps` the store sets on every row. A value its column would read
-        back as another type is a write error; so, in a column the output's
-        versions digest, is one it would read back otherwise at all —
-        rounded, narrowed, truncated, padded."""
+        the `stamps` the store sets on every row."""
 
         if not rows:
             return
@@ -802,7 +801,6 @@ class PostgresStore:
             if any(column in row and str(row[column]) != str(value) for row in rows):
                 raise WriteError(f"{output.name}: a row's {column} disagrees with {value!r}")
         columns = sorted({c for r in rows for c in r} - set(stamps))
-        _check_types(output.name, rows, columns, types, _digested(output, columns))
         constant = list(stamps.values())
         names = ", ".join(_ident(c) for c in [*columns, *stamps])
         with cur.copy(f"COPY {table} ({names}) FROM STDIN") as copy:
@@ -810,39 +808,6 @@ class PostgresStore:
                 copy.write_row([row.get(c) for c in columns] + constant)
 
 
-def _rows_version(rows: list[dict], before: list) -> str:
-    """A version from rows as a multiset (`group`, docs/row-digest.md) and
-    what comes before them (a prior version)."""
-
-    from solera._native import group_digest
-
-    try:
-        content = group_digest(rows).hex()
-    except ValueError as e:
-        raise WriteError(str(e)) from e
-    return digest([*before, content])
-
-
-# A value's kind: what a column reads it back as, so what its digest is
-# (docs/row-digest.md). A column of one kind holds values of that kind only.
-_KINDS = {
-    "boolean": "boolean",
-    "bigint": "integer",
-    "integer": "integer",
-    "smallint": "integer",
-    "double precision": "float",
-    "real": "float",
-    "numeric": "decimal",
-    "text": "text",
-    "character varying": "text",
-    "character": "text",
-    "timestamp with time zone": "instant",
-    "timestamp without time zone": "timestamp",
-    "date": "date",
-    "time without time zone": "time",
-    "interval": "interval",
-    "bytea": "bytes",
-}
 # The column a table the write creates gives each kind.
 _COLUMNS = {
     "boolean": "boolean",
@@ -882,75 +847,6 @@ def _column_types(name: str, rows: Iterable[dict], declared: dict) -> dict[str, 
             )
         columns[column] = _COLUMNS[found.pop()]
     return columns
-
-
-def _digested(output: Output, columns: list[str]) -> set[str]:
-    """The columns the output's versions digest: a keyed output with a
-    revision, its key and revision; any other, every row's column (the
-    stamped ones are no row's)."""
-
-    if output.key is not None and output.revision:
-        return {output.key, output.revision}
-    return set(columns)
-
-
-def _check_types(name: str, rows: list[dict], columns: list[str], types: dict, exact: set[str]) -> None:
-    """Every value is of its column's kind: a column reading it back as
-    another — 42 as "42" — would store another digest than the one hashed.
-    In the columns versions digest (`exact`), a value must read back as it
-    is (`_kept`): not rounded to a numeric's scale, a real's 32 bits or a
-    timestamp's microseconds."""
-
-    for column in columns:
-        meta = types.get(column) or {}
-        want = _KINDS.get(meta.get("data_type", ""))
-        if want is None:
-            continue  # a column the store does not type (json, arrays, …): taken as it is
-        for row in rows:
-            value = row.get(column)
-            if value is None:
-                continue
-            if (got := frames.kind_of(value)) != want:
-                raise WriteError(
-                    f"{name}: column {column!r} is {meta['data_type']}, but a row holds "
-                    f"{got or type(value).__name__} {value!r}: it would read back as another value"
-                )
-            if column in exact and (lost := _kept(value, meta)) is not None:
-                raise WriteError(f"{name}: column {column!r} would store {value!r} {lost}")
-
-
-def _kept(value: Any, meta: dict) -> str | None:
-    """How a column would alter `value` — None when it keeps it exactly."""
-
-    import struct
-
-    kind = meta["data_type"]
-    if kind == "numeric" and meta.get("numeric_scale") is not None and value.is_finite():
-        if value.normalize().as_tuple().exponent < -meta["numeric_scale"]:
-            return f"rounded to {meta['numeric_scale']} places"
-    if kind == "real":
-        try:
-            if struct.unpack("<f", struct.pack("<f", value))[0] != value and value == value:
-                return "narrowed to 32 bits"
-        except OverflowError:
-            return "out of a 32-bit float's range"
-    if kind in (
-        "timestamp with time zone",
-        "timestamp without time zone",
-        "time without time zone",
-        "interval",
-    ):
-        if getattr(value, "nanosecond", 0) or getattr(value, "nanoseconds", 0):
-            return "without its nanoseconds"
-        places = meta.get("datetime_precision")
-        micros = value.microseconds if kind == "interval" else value.microsecond
-        if places is not None and places < 6 and micros % 10 ** (6 - places):
-            return f"rounded to {places} fractional digits"
-    if kind == "character" and meta.get("character_maximum_length") not in (None, len(value)):
-        return f"padded to {meta['character_maximum_length']} characters"
-    if kind == "character varying" and (n := meta.get("character_maximum_length")) and len(value) > n:
-        return f"cut to {n} characters"
-    return None
 
 
 def _inferred(sql_type: str | None) -> str:
