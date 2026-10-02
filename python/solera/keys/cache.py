@@ -111,6 +111,7 @@ class Pin:
 
     def __init__(self, cache: EngineCache, files: list[_File], runs: list[list[object]]):
         self.cache, self.files, self.runs = cache, files, runs
+        self.handles = {f.path: f.handle for f in files}  # path -> LocalFile
 
     def __enter__(self):
         return self

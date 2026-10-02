@@ -19,6 +19,7 @@ import contextlib
 import json
 import logging
 import math
+import re
 import time
 
 from solera.ids import ulid
@@ -171,13 +172,29 @@ class Upkeep:
         garbage = self.m.immutable(key[0])
 
         def work():
-            async def go():
+            async def go(local):
                 keys = KeyIndex(ObjectIO(objects), None, index, options)
                 if service is not None:
                     keys.on_write = lambda path, f, data: service.installed(index.prefix, f, path, data)
-                return await (keys.recount() if recount else keys.compact(garbage=garbage))
+                if recount:
+                    return await keys.recount(local)
+                return await keys.compact(garbage=garbage, local=local)
 
-            return asyncio.run(go())
+            # One warm copy serves every engine reader: an index the engine's cache
+            # holds is read from its local files, the store otherwise.
+            pin = service.pinned(index) if service is not None else None
+            if pin is None:
+                return asyncio.run(go(None))
+            try:
+                return asyncio.run(go(pin.handles))
+            except ValueError as e:
+                bad = re.match(r"local file (\S+): ", str(e))
+                if bad is None:
+                    raise
+                service.corrupt(bad.group(1))  # dropped, fetched again by a fill; this run reads the store
+            finally:
+                service.unpin(pin)
+            return asyncio.run(go(None))
 
         try:
             result = await asyncio.to_thread(work)

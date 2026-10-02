@@ -45,8 +45,6 @@ from solera.keys.resolver import Ask, Prepared, Resolver, answers, request  # no
 
 import bench  # noqa: E402
 
-SIZES = (1_000, 10_000, 100_000)
-
 
 def drop_page_cache() -> bool:
     try:
@@ -110,9 +108,24 @@ async def run_size(n: int, args) -> list[dict]:
                 "disk_gb": disk / 1e9,
             }
         )
+        if args.recount:
+            # The engine's recount: from the store, then over the cache's local copies.
+            row = {"n": n, "op": "recount"}
+            io = cold()
+            live, wall, cpu = await timed(lambda io=io: KeyIndex(io, None, state, opts).recount())
+            row["store"] = (wall, cpu, io.metrics.gets, io.metrics.bytes_in / 1e6)
+            io = cold()
+            with cache.pin(state) as pin:
+                again, wall, cpu = await timed(
+                    lambda io=io, pin=pin: KeyIndex(io, None, state, opts).recount(pin.handles)
+                )
+            assert again == live, (again, live)
+            row["local"] = (wall, cpu, io.metrics.gets, io.metrics.bytes_in / 1e6)
+            rows.append(row)
+            print(row, flush=True)
         resolver = Resolver(cache, cold(), opts)
 
-        for k in SIZES:
+        for k in (int(float(x)) for x in args.patches.split(",") if x):
             items = sorted(rng.sample(list(current.items()), min(k, len(current))))
             keys = [bench.key_of(i) for i, _ in items]
             vers = [v if rng.random() < 0.5 else rng.randbytes(16) for _, v in items]
@@ -167,6 +180,8 @@ async def main():
     ap.add_argument("--bandwidth", type=float, default=80e6)
     ap.add_argument("--s3", default=os.environ.get("SOLERA_TEST_S3", ""))
     ap.add_argument("--prefix", default=None)
+    ap.add_argument("--recount", action="store_true", help="also the engine's recount, store against local")
+    ap.add_argument("--patches", default="1e3,1e4,1e5", help="patch sizes; empty for none")
     args = ap.parse_args()
     base = bench.configure(args.s3) if args.s3 else ""
     args.prefix = base + (args.prefix or f"bench-warm-{uuid.uuid4().hex[:8]}/")
@@ -177,7 +192,7 @@ async def main():
     print("| Keys | Patch | Cold worker | Engine, page cache | Engine, SSD only |")
     print("|---|---|---|---|---|")
     for r in rows:
-        if r["op"] == "engine fill":
+        if r["op"] in ("engine fill", "recount"):
             continue
         print(
             f"| {r['n']:,} | {r['op']} | {cell(r.get('cold'))} | "
@@ -192,6 +207,12 @@ async def main():
                 f"| {r['n']:,} | {bench.fmt_s(r['wall'])} · {r['gets']} GET · {r['mb']:.0f} MB · "
                 f"CPU {bench.fmt_s(r['cpu'])} | {r['disk_gb']:.2f} GB |"
             )
+    if args.recount:
+        print("\n| Keys | Recount from the store | Recount over the cache's local copies |")
+        print("|---|---|---|")
+        for r in rows:
+            if r["op"] == "recount":
+                print(f"| {r['n']:,} | {cell(r['store'])} | {cell(r['local'])} |")
 
 
 if __name__ == "__main__":

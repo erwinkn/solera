@@ -4,7 +4,8 @@ The job does the per-key work; this module does its I/O. Each run — a
 level-0 file, or a level's files in key order — is read a segment of
 consecutive blocks at a time, a few segments ahead; each file the job
 writes is handed to `on_file` as soon as it is full, a few uploads at a
-time. Memory is those buffers, whatever the size of the index.
+time. Memory is those buffers, whatever the size of the index. Given the
+runs as the engine cache's local files, the job reads those itself.
 """
 
 from __future__ import annotations
@@ -80,14 +81,18 @@ async def run(
     on_file: Callable[[int, bytes], Awaitable[None]] | None = None,
     rows: Iterable | None = None,
     on_garbage: Callable[[int, bytes], Awaitable[None]] | None = None,
+    local: list[list] | None = None,
 ) -> None:
     """Drive `job` to the end over `runs` (each a list of `FileInfo`, in key
     order; newest run first). Written files go to `on_file(n, data)`, `n`
     counting from 0 in key order, and a compaction's garbage files to
     `on_garbage(n, data)`. `rows` feeds a streamed replacement its sorted
-    chunks; they are pulled off the event loop."""
+    chunks; they are pulled off the event loop. `local`: the runs as
+    `LocalFile`s, read in place of the store."""
 
-    readers = [_Run(io, path, files) for files in runs]
+    if local is not None:
+        job.local(local)
+    readers = [] if local is not None else [_Run(io, path, files) for files in runs]
     chunks = iter(rows) if rows is not None else None
     uploads: set[asyncio.Future] = set()
     n = g = 0

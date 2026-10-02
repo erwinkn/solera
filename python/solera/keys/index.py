@@ -407,6 +407,7 @@ class KeyIndex:
         self.o = options or Options()
         self._parsed: dict[str, _Parsed] = {}
         self.route = ""  # how the last resolve read the index: "sparse" or "stream"
+        self.local_reads = False  # whether the last streaming job read local copies
         self.on_write = None  # called with (path, FileInfo, bytes) for every file written
 
     def path(self, name: str) -> str:
@@ -587,9 +588,11 @@ class KeyIndex:
         }
 
     async def _run(
-        self, job: Job, runs, name=None, level: int = 0, rows=None, on_garbage=None
+        self, job: Job, runs, name=None, level: int = 0, rows=None, on_garbage=None, local=None
     ) -> list[FileInfo]:
-        """Drive a streaming job over `runs`; its files are written as `name(n)`, at `level`."""
+        """Drive a streaming job over `runs`; its files are written as `name(n)`, at
+        `level`. With `local` — the engine cache's files by path — and every
+        file of `runs` in it, the job reads those, not the store."""
 
         files: dict[int, FileInfo] = {}
 
@@ -599,8 +602,12 @@ class KeyIndex:
             if self.on_write is not None:
                 self.on_write(self.path(name(n)), files[n], data)
 
+        held = None
+        if local is not None and all(self.path(f.name) in local for run in runs for f in run):
+            held = [[local[self.path(f.name)] for f in run] for run in runs]
+        self.local_reads = held is not None
         await jobs.run(
-            job, self.io, self.path, runs, put, None if isinstance(rows, Rows) else rows, on_garbage
+            job, self.io, self.path, runs, put, None if isinstance(rows, Rows) else rows, on_garbage, held
         )
         return [files[n] for n in sorted(files)]
 
@@ -871,11 +878,12 @@ class KeyIndex:
         levels = [list(logged[b]) for b in range(last_batch, first_batch - 1, -1)]
         return await self._scan(levels, after, limit, drop_deleted=False)
 
-    async def recount(self) -> int:
-        """Count live keys exactly: one streaming pass over the whole index."""
+    async def recount(self, local: dict | None = None) -> int:
+        """Count live keys exactly: one streaming pass over the whole index,
+        over `local` copies when they hold it (`_run`)."""
 
         job = Job.count(len(runs := self.state.newest_first()))
-        await self._run(job, runs)
+        await self._run(job, runs, local=local)
         return job.live
 
     # -- compaction ------------------------------------------------------------------------
@@ -917,12 +925,13 @@ class KeyIndex:
         return None
 
     async def compact(
-        self, plan=None, *, garbage: bool = False
+        self, plan=None, *, garbage: bool = False, local: dict | None = None
     ) -> tuple[list[FileInfo], list[str], list[GarbageFile]] | None:
         """Run one compaction; returns the added files and removed names for
         `IndexState.compacted`, and with `garbage` the garbage files listing
         every entry the merge dropped that names an object — what an
-        immutable store discards (docs/key-index-format.md § Garbage files)."""
+        immutable store discards (docs/key-index-format.md § Garbage files).
+        Its inputs are read from `local` copies when they hold them (`_run`)."""
 
         plan = plan or self.plan_compaction()
         if plan is None:
@@ -955,6 +964,7 @@ class KeyIndex:
             lambda n: f"c{stamp}-{n:04d}" if out_level else f"{stamp}.{n:04d}",
             out_level,
             on_garbage=put_garbage,
+            local=local,
         )
         return added, [f.name for f in inputs], [dropped[n] for n in sorted(dropped)]
 

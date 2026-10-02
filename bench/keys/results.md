@@ -832,12 +832,20 @@ processes), so only part of the local files stayed in the page cache.
   way; the cache saved requests, not the CPU, which dominates.
 - **Other cold readers**, from the follow-up's tables above: a
   full-delivery page of 10K keys, 80–110 ms and 2–14 GETs; `Each`'s and
-  failure indexes' lookups, a sparse read like the 1K-key rows. The
-  engine's own recount reads the store too: 241.7 s and 3,029 GETs for a
-  steady 100M index, where the disk cache made a repeat 42.6 s of CPU.
-  Recounts follow inexact commits and are rare, and the engine's cache
-  holds the same files in local form: a recount over its `Snapshot`
-  instead of the store is the follow-up if they become frequent.
+  failure indexes' lookups, a sparse read like the 1K-key rows.
+- **The engine's recount and compaction** read the cache's local copies
+  when it holds the index warm (one warm copy serves every engine
+  reader), the store otherwise. `warm.py --recount --patches ""` at 100M,
+  the same steady index, the counts equal:
+
+  | Keys | Recount from the store | Recount over the cache's local copies |
+  |---|---|---|
+  | 1,000,000 | 493 ms · 12 GET · 26.1 MB · CPU 244 ms | 235 ms · 0 GET · 0.0 MB · CPU 107 ms |
+  | 100,000,000 | 26.0 s · 436 GET · 3021.5 MB · CPU 32.0 s | 15.9 s · 0 GET · 0.0 MB · CPU 14.8 s |
+
+  No requests, and half the CPU: local blocks are stored decompressed.
+  (The follow-up's 241.7 s and 3,029 GETs above were a differently shaped
+  steady index, before the streaming recount's later changes.)
 
 ## Python rows: the native walk against tuned pure Python (2026-10-02)
 

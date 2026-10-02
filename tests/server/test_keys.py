@@ -294,10 +294,10 @@ async def test_a_commit_during_the_recount_keeps_it(state, monkeypatch):
     started, release = threading.Event(), threading.Event()
     recount, counted = KeyIndex.recount, []
 
-    async def slow_recount(self):
+    async def slow_recount(self, local=None):
         started.set()
         await asyncio.to_thread(release.wait, 10)
-        counted.append(await recount(self))
+        counted.append(await recount(self, local))
         return counted[-1]
 
     monkeypatch.setattr(KeyIndex, "recount", slow_recount)

@@ -622,3 +622,39 @@ async def test_admission_remembers_what_a_file_built_to(io, tmp_path):
     assert gets == [1, 1, 1, 1]  # built once, then known not to fit
     cache.disk = 2 * cache.need(state)  # its real size: room now
     assert await cache.fill(io, state) and io.metrics.gets == 2
+
+
+async def test_maintenance_reads_the_engine_caches_copies(io, tmp_path):
+    """One warm copy serves every engine reader: a recount and a
+    compaction over the cache's local files read nothing from the store and
+    agree with the store's; a copy short of one file reads the store."""
+
+    from solera_server.keyservice import KeyService
+
+    state = await built_index(io, commits=6)
+    service = KeyService(io.store, str(tmp_path))
+    service.start()
+    try:
+        assert await asyncio.wrap_future(service._submit(service.cache.fill(service.io, state)))
+        pin = await asyncio.to_thread(service.pinned, state)
+        assert pin is not None
+        cold = await KeyIndex(io, None, state, OPTS).recount()
+        gets = io.metrics.gets
+        idx = KeyIndex(io, None, state, OPTS)
+        assert await idx.recount(pin.handles) == cold and idx.local_reads and io.metrics.gets == gets
+        plan = (state.level(0) + state.level(1), 1) if state.level(0) else (state.level(1), 2)
+        local, gets = KeyIndex(io, None, state, OPTS), io.metrics.gets
+        added, _, _ = await local.compact(plan, garbage=True, local=pin.handles)
+        assert local.local_reads and io.metrics.gets == gets
+        stored, _, _ = await KeyIndex(io, None, state, OPTS).compact(plan, garbage=True)
+
+        async def read(files):
+            return decoded([await io.read_whole(state.path(f.name), f.size) for f in files])
+
+        assert await read(added) == await read(stored)
+        partial = dict(list(pin.handles.items())[1:])
+        idx = KeyIndex(io, None, state, OPTS)
+        assert await idx.recount(partial) == cold and not idx.local_reads
+        service.unpin(pin)
+    finally:
+        await service.stop()

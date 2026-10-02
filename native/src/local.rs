@@ -515,19 +515,19 @@ impl Snapshot {
 }
 
 /// Feeds a `Merge` the decoded blocks of a snapshot's runs, one at a time.
-struct Feed {
+pub struct Feed {
     next: Vec<(usize, usize)>, // per run: file, block
 }
 
 impl Feed {
-    fn new(runs: usize) -> Feed {
+    pub fn new(runs: usize) -> Feed {
         Feed {
             next: vec![(0, 0); runs],
         }
     }
 
     /// Run `r`'s next block into `m`, or its end.
-    fn feed(&mut self, snap: &Snapshot, m: &mut Merge, r: usize) -> Result<()> {
+    pub fn feed(&mut self, snap: &Snapshot, m: &mut Merge, r: usize) -> Result<()> {
         let run = &snap.runs[r];
         let skip = |mut at: (usize, usize)| {
             while at.0 < run.len() && at.1 >= run[at.0].blocks() {

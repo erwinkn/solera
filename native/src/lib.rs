@@ -1219,16 +1219,22 @@ enum Kind {
 struct Job {
     kind: Kind,
     records: Option<Records>,
+    /// The index's runs as local files (`local`): fed from them, not by the caller.
+    local: Option<(local::Snapshot, local::Feed)>,
+}
+
+fn merge_of(kind: &mut Kind) -> &mut stream::Merge {
+    match kind {
+        Kind::Replace(j) => &mut j.merge,
+        Kind::Patch(j) => &mut j.merge,
+        Kind::Compact(j) => &mut j.merge,
+        Kind::Count(j) => &mut j.merge,
+    }
 }
 
 impl Job {
     fn merge(&mut self) -> &mut stream::Merge {
-        match &mut self.kind {
-            Kind::Replace(j) => &mut j.merge,
-            Kind::Patch(j) => &mut j.merge,
-            Kind::Compact(j) => &mut j.merge,
-            Kind::Count(j) => &mut j.merge,
-        }
+        merge_of(&mut self.kind)
     }
 
     fn replacement(&mut self) -> PyResult<&mut Replace> {
@@ -1291,6 +1297,7 @@ impl Job {
                 generation,
             ))),
             records: key.map(|k| Records::new(&k, revision.as_deref(), exclude)),
+            local: None,
         })
     }
 
@@ -1327,6 +1334,7 @@ impl Job {
         .map_err(to_py)?;
         Ok(Job {
             records: None,
+            local: None,
             kind: Kind::Patch(Box::new(job)),
         })
     }
@@ -1351,6 +1359,7 @@ impl Job {
         let o = options(block_size, level, bits_per_item, k, codec);
         Job {
             records: None,
+            local: None,
             kind: Kind::Compact(Box::new(Compact::new(
                 runs,
                 drop_deleted,
@@ -1366,6 +1375,7 @@ impl Job {
     fn count(runs: usize) -> Job {
         Job {
             records: None,
+            local: None,
             kind: Kind::Count(Count::new(runs)),
         }
     }
@@ -1382,6 +1392,22 @@ impl Job {
 
     fn end(&mut self, r: usize) {
         self.merge().runs[r].end();
+    }
+
+    /// Reads the existing runs from local files (`LocalFile`s, newest run
+    /// first, each in key order) instead of asking for segments: `step`
+    /// then never returns `("run", r)`.
+    fn local(&mut self, runs: Vec<Vec<PyRef<'_, LocalFile>>>) -> PyResult<()> {
+        if runs.len() != self.merge().runs.len() {
+            return Err(PyValueError::new_err("a local run per run"));
+        }
+        let snap = local::Snapshot::new(
+            runs.iter()
+                .map(|r| r.iter().map(|f| f.inner.clone()).collect())
+                .collect(),
+        );
+        self.local = Some((snap, local::Feed::new(runs.len())));
+        Ok(())
     }
 
     fn feed_rows(&mut self, py: Python<'_>, rows: Bound<'_, PyAny>) -> PyResult<()> {
@@ -1403,14 +1429,20 @@ impl Job {
         &mut self,
         py: Python<'py>,
     ) -> PyResult<Option<(&'static str, Bound<'py, PyAny>)>> {
-        let kind = &mut self.kind;
+        let (kind, local) = (&mut self.kind, &mut self.local);
         let (step, file) = py
             .detach(|| {
-                let step = match kind {
-                    Kind::Replace(j) => j.step()?,
-                    Kind::Patch(j) => j.step()?,
-                    Kind::Compact(j) => j.step()?,
-                    Kind::Count(j) => j.step()?,
+                let step = loop {
+                    let step = match kind {
+                        Kind::Replace(j) => j.step()?,
+                        Kind::Patch(j) => j.step()?,
+                        Kind::Compact(j) => j.step()?,
+                        Kind::Count(j) => j.step()?,
+                    };
+                    match (step, local.as_mut()) {
+                        (Step::Run(r), Some((snap, feed))) => feed.feed(snap, merge_of(kind), r)?,
+                        (step, _) => break step,
+                    }
                 };
                 let file = match (&step, kind) {
                     (Step::File, Kind::Replace(j)) => j.delta.writer.files.pop_front(),

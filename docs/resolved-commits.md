@@ -341,7 +341,10 @@ the engine checks again.
 One cache serves every reader on the engine: resolves, inlined windows,
 compaction (which reads what it just wrote), recounts, and the per-key
 readers (§8). It runs on maintenance threads, never on the engine's event
-loop.
+loop. A compaction or a recount of an index the cache holds warm pins its
+local copies and streams them (`Job.local`), reading nothing from the
+store; otherwise, or if a copy fails its check mid-way, it reads the
+store.
 
 **Unit: an immutable file.** Entries are keyed by object path; a path is
 never reused, so an entry is never stale, only evicted. An index is

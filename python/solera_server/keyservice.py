@@ -33,7 +33,7 @@ from urllib.parse import unquote, urlsplit
 
 from solera.keys import SortedRun
 from solera.keys.cache import Corrupt, EngineCache, verify
-from solera.keys.index import FileInfo, Options
+from solera.keys.index import FileInfo, IndexState, Options
 from solera.keys.io import ObjectIO
 from solera.keys.resolver import Limits, Prepared, Resolver
 
@@ -213,6 +213,32 @@ class KeyService:
         fut = self._submit(self._committed(prefix, path, batch, files, keep_summary))
         fut.add_done_callback(_logged)
         fut.add_done_callback(lambda _f: self.release(token))
+
+    def pinned(self, state: IndexState):
+        """The engine cache's copies of `state`'s files, pinned — a `Pin`,
+        its `handles` by path — when it holds them all, else None. From any
+        thread but this service's; `unpin` when done."""
+
+        if not self._running():
+            return None
+        return self._submit(self._pin(state)).result()
+
+    async def _pin(self, state: IndexState):
+        return self.cache.pin(state)
+
+    def corrupt(self, path: str) -> None:
+        """A local file failed a check while read: it goes."""
+
+        self._fire(lambda: self._corrupt(path))
+
+    async def _corrupt(self, path: str) -> None:
+        self.cache.corrupt(path)
+
+    def unpin(self, pin) -> None:
+        self._fire(lambda: self._unpin(pin))
+
+    async def _unpin(self, pin) -> None:
+        pin.__exit__(None, None, None)
 
     def installed(self, prefix: str, f: FileInfo, path: str, data: bytes) -> None:
         self._fire(lambda: self.cache.install(prefix, f, path, data))

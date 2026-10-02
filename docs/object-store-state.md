@@ -387,7 +387,9 @@ reference to it.
 
 **Engine work.** Compaction is the one heavy computation the engine
 itself starts. It runs locally on the engine's machine, on a worker thread
-with its own event loop, at most `maintenance_concurrency` at a time. A
+with its own event loop, at most `maintenance_concurrency` at a time. It
+and recounts read the engine's cache's local copies when the cache holds
+the index warm, the store otherwise. A
 project-level setting to offload it to an executor is planned, not built:
 
 ```python
