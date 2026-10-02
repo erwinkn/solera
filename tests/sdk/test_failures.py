@@ -86,3 +86,27 @@ def test_minima_and_bounds():
     assert minima(records) == (160, 2)
     assert minima([]) == (None, None)
     assert lower(None, 5) == 5 and lower(3, None) == 3 and lower(3, 5) == 3
+
+
+def test_deadlines_are_never_shortened_by_rounding():
+    """Review 11: a budget or a wait is computed from the exact time, then rounded up."""
+
+    half = transition(
+        None, Outcome("transient", b"r", retry_for=0.5), now=1000.5, epoch=0, forced=0, retries=0
+    )
+    assert half.outcome == RETRYING and half.until == 1001
+    soon = transition(
+        None,
+        Outcome("transient", b"r", retry_after=1, retry_for=60),
+        now=1000.9,
+        epoch=0,
+        forced=0,
+        retries=0,
+    )
+    assert soon.next_at == 1002  # not 1001, a tenth of a second later
+
+
+def test_backoff_saturates():
+    from solera.errors import BACKOFF_MAX, backoff
+
+    assert backoff(1025) == BACKOFF_MAX and backoff(10**9) == BACKOFF_MAX

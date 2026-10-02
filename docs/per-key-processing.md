@@ -1116,3 +1116,31 @@ Where the implementation (`solera/errors.py`, `solera/build.py`,
   rescope pin as for a live claim. A retry pass needs none: each retry page
   reads the failure index and the upstream as they are at its own prepare,
   and the accumulators absorb what changes between pages.
+- **After the v1 review** (thr_9ezn6cyar5):
+  - Every key of a page gets an outcome before its watermark moves past
+    it — a key a cancel reaches while it waits for a concurrency slot is
+    interrupted like one in flight. Interrupted keys become canceled or
+    timed out by the cancel record the result is sealed with, decided
+    after the store writes; the result carries that record.
+  - A full delivery of an `Each` edge keeps patch semantics: a key that
+    fails keeps its last good output. If the asset held keys when the
+    delivery began (or the delta log was lost mid-rescope), the delivery
+    ends with a **cleanup** (`reconcile` on the watermark): the outputs'
+    and failure index's keys, a page at a time, against the current
+    upstream and patterns; those it no longer has are removed. Retries
+    wait for it.
+  - A reset begins a **pass** (`pass` on the watermark: the run that began
+    it); a `full` run's later attempts resume it instead of starting over.
+  - A scope's failure record keeps the configuration it last ran under;
+    the retry clock, `solera keys retry` and the API submit retries under
+    it (`Engine.submit_retries`).
+  - A forced request newer than the pass in progress, or than the last
+    one done, makes the run that sees it continue with a pass.
+  - `keys=` overrides are filtered by the edge's patterns.
+  - Renaming an asset (`aliases=`) moves its failure record and its
+    `@asset` index.
+  - The manifest records the error policy (`errors`: raised, class,
+    `retry_for`), so changing it changes the revision; the build identity
+    hashes submodules and nested work trees that differ from `HEAD`.
+  - Deadlines are computed from the exact time, then rounded up; the
+    backoff's exponent saturates.

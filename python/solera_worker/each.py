@@ -28,6 +28,7 @@ from solera.sdk import UNSET, Ref, Result
 from solera.stores import Keys, Patch
 
 WALK = 100  # failure records walked per retry page, at most, for each key it may take
+INTERRUPTED = "interrupted"  # a key a drain stopped: canceled or timed out once the result is sealed
 
 
 @dataclass
@@ -109,9 +110,11 @@ async def read_window(pin: dict, keys_io) -> Window:
     return Window(upserted, deleted, key_str(nxt) if nxt is not None else None, len(keys))
 
 
-async def read_page(pin: dict, keys_io) -> Page:
+async def read_page(spec: dict, pin: dict, keys_io) -> Page:
     each = pin["each"]
     failures = KeyIndex(keys_io, None, IndexState.from_json(each["failures"]))
+    if each["kind"] == "reconcile":
+        return await _reconcile_page(spec, pin, keys_io, failures)
     if each["kind"] != "retry":
         window = await read_window(pin, keys_io)
         touched = [key_bytes(k) for k in [*window.upserted, *window.deleted]]
@@ -173,6 +176,51 @@ async def read_page(pin: dict, keys_io) -> Page:
     )
 
 
+async def _reconcile_page(spec: dict, pin: dict, keys_io, failures: KeyIndex) -> Page:
+    """After a full delivery: the next `limit` keys the asset's outputs or its
+    failure index hold, and which of them the edge no longer has — gone
+    upstream, or left out by its patterns. Those go (§11); the rest stay."""
+
+    limit = int(pin["changes"]["limit"])
+    after = pin["changes"]["reconcile"].get("after")
+    start = key_bytes(after) if after is not None else None
+    indexes = [
+        KeyIndex(keys_io, None, IndexState.from_json(info["index"]))
+        for info in (spec.get("outputs") or {}).values()
+        if info.get("index") is not None
+    ] + [failures]
+    found, bound = set(), None
+    for index in indexes:
+        keys, _, _, nxt = await index.page(start, limit)
+        found.update(keys)
+        if nxt is not None:  # this index holds more, past `nxt`: nothing beyond it is known yet
+            bound = nxt if bound is None else min(bound, nxt)
+    candidates = sorted(k for k in found if bound is None or k <= bound)
+    take = candidates[:limit]
+    more = bound is not None or len(candidates) > limit
+    end = (key_str(take[-1]) if take else key_str(bound)) if more else None
+    upstream = KeyIndex(keys_io, None, IndexState.from_json(pin["index"]))
+    current = await upstream.lookup(take) if take else {}
+    taken = Matcher(pin.get("patterns"))
+    deleted, unmatched = [], []
+    for k in take:
+        key = key_str(k)
+        if not taken(key):
+            unmatched.append(key)
+        elif k not in current:
+            deleted.append(key)
+    touched = [key_bytes(k) for k in [*deleted, *unmatched]]
+    priors = await failures.lookup(touched) if touched else {}
+    return Page(
+        "reconcile",
+        {},
+        deleted,
+        end,
+        unmatched=unmatched,
+        priors={key_str(k): Record.decode(v) for k, (v, _) in priors.items()},
+    )
+
+
 async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys_io, timeline, control):
     """Run one page: returns what to store (`values`), the result's parts,
     and — when a key raised `Abort` — the error that fails the attempt.
@@ -180,11 +228,14 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
     `control["drain"]` is set when a cancel is requested (docs/lifecycle.md
     §7): no key starts after it, the calls in flight are cancelled, and the
     keys they leave are interrupted — canceled or timed out, by the cancel
-    record's reason (§2.2) — while the keys that finished are stored."""
+    record's reason (§2.2) — while the keys that finished are stored.
+    Which of the two is decided by `finish(cancel)`, after the store writes,
+    with the record the result is sealed with: a user cancel that arrives
+    while a timeout drain stores still makes its keys canceled."""
 
     drain = control["drain"]
     each = pin["each"]
-    page = await read_page(pin, keys_io)
+    page = await read_page(spec, pin, keys_io)
     timeline.add("loaded", param, len(page.upserted))
     ref = Ref.from_json(pin["ref"])
     store = project.stores[ref.store]
@@ -207,13 +258,6 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
     durations: dict[str, float] = {}
     abort: list[BaseException] = []
 
-    def interrupted() -> str:
-        """What a key the drain stops becomes: by the cancel record's reason
-        (docs/lifecycle.md §2.2), timed out or canceled."""
-
-        cancel = control.get("cancel")
-        return "timed_out" if cancel is not None and cancel.reason == "timeout" else "canceled"
-
     def split(value) -> dict:
         """One call's value per output: a bare value for a single output, or
         `Result(outputs=…)`; an output it does not return holds nothing."""
@@ -231,42 +275,48 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
 
     async def one(key: str):
         version = page.upserted[key][0]
-        async with gate:
-            if drain.is_set() or abort:
-                outcomes[key] = Outcome(interrupted(), version)
-                return
-            call = dict(args)
-            if "ctx" in signature.parameters:
-                call["ctx"] = ctx._for_key(key, rendered(version))
-            call[param] = loaded.get(key)
-            start = time.monotonic()
-            try:
-                if key not in loaded:
-                    raise errors.Failed("the upstream store returned no value for this key")
-                if is_async:
-                    value = await asset.fn(**call)
-                else:
-                    value = await loop.run_in_executor(pool, functools.partial(asset.fn, **call))
-                    if inspect.isawaitable(value):
-                        value = await value
-                outputs[key] = split(value)
-                outcomes[key] = Outcome("ok", version)
-            except asyncio.CancelledError:
-                if not (drain.is_set() or abort):
-                    raise
-                outcomes[key] = Outcome(interrupted(), version)
-            except Exception as error:
-                kind, timing = errors.classify(error, project.errors)
-                if kind == errors.ABORT:
-                    abort.append(error)
-                    raise _Abort(error) from error
-                message = f"{type(error).__name__}: {error}"
-                outcomes[key] = Outcome(
-                    kind, version, message, timing.get("retry_after"), timing.get("retry_for")
-                )
-                ctx._for_key(key, rendered(version)).log(message, "error")
-            finally:
-                durations[key] = time.monotonic() - start
+        try:
+            async with gate:  # a cancel may reach a key still waiting here: it is interrupted too
+                if drain.is_set() or abort:
+                    outcomes[key] = Outcome(INTERRUPTED, version)
+                    return
+                await call(key, version)
+        except asyncio.CancelledError:
+            if not (drain.is_set() or abort):
+                raise
+            outcomes[key] = Outcome(INTERRUPTED, version)
+
+    async def call(key: str, version: bytes):
+        kwargs = dict(args)
+        if "ctx" in signature.parameters:
+            kwargs["ctx"] = ctx._for_key(key, rendered(version))
+        kwargs[param] = loaded.get(key)
+        start = time.monotonic()
+        try:
+            if key not in loaded:
+                raise errors.Failed("the upstream store returned no value for this key")
+            if is_async:
+                value = await asset.fn(**kwargs)
+            else:
+                value = await loop.run_in_executor(pool, functools.partial(asset.fn, **kwargs))
+                if inspect.isawaitable(value):
+                    value = await value
+            outputs[key] = split(value)
+            outcomes[key] = Outcome("ok", version)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            kind, timing = errors.classify(error, project.errors)
+            if kind == errors.ABORT:
+                abort.append(error)
+                raise _Abort(error) from error
+            message = f"{type(error).__name__}: {error}"
+            outcomes[key] = Outcome(
+                kind, version, message, timing.get("retry_after"), timing.get("retry_for")
+            )
+            ctx._for_key(key, rendered(version)).log(message, "error")
+        finally:
+            durations[key] = time.monotonic() - start
 
     timeline.add("computing")
     tasks = {key: asyncio.create_task(one(key)) for key in page.upserted}
@@ -293,6 +343,9 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
     timeline.add("computed")
     if abort:
         return {"abort": abort[0]}
+    for key, (version, _) in page.upserted.items():
+        # Every key of the page has an outcome before its watermark moves past it.
+        outcomes.setdefault(key, Outcome(INTERRUPTED, version))
     for key in page.deleted:
         outcomes[key] = Outcome(REMOVED)
     for key in page.unmatched:
@@ -314,36 +367,43 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
         if groups[name] or (removes[name] and name in exists)
     }
 
-    failures = await _failures(spec, each, page, outcomes, keys_io)
-    rows, counts = [], Counter()
-    for key, outcome in sorted(outcomes.items()):
-        record = failures["records"].get(key)
-        name = outcome.kind if outcome.kind in ("ok", "removed", "unmatched") else record.name
-        counts[name] += 1
-        rows.append(
-            {
-                "key": key,
-                "revision": rendered(outcome.revision) if outcome.revision else None,
-                "outcome": name,
-                "error": outcome.message or None,
-                "duration": round(durations.get(key, 0.0), 6),
-            }
-        )
+    async def finish(cancel) -> dict:
+        """The page's failure delta, key outcomes and counts, with interrupted
+        keys made what `cancel` — the record the result is sealed with — says:
+        timed out for a timeout, canceled otherwise (lifecycle.md §2.2)."""
+
+        made = "timed_out" if cancel is not None and cancel.reason == "timeout" else "canceled"
+        final = {k: Outcome(made, o.revision) if o.kind == INTERRUPTED else o for k, o in outcomes.items()}
+        failures = await _failures(spec, each, page, final, keys_io)
+        rows, counts = [], Counter()
+        for key, outcome in sorted(final.items()):
+            record = failures["records"].get(key)
+            name = outcome.kind if outcome.kind in ("ok", "removed", "unmatched") else record.name
+            counts[name] += 1
+            rows.append(
+                {
+                    "key": key,
+                    "revision": rendered(outcome.revision) if outcome.revision else None,
+                    "outcome": name,
+                    "error": outcome.message or None,
+                    "duration": round(durations.get(key, 0.0), 6),
+                }
+            )
+        report = {k: v for k, v in failures.items() if k != "records"}
+        return {"failures": report, "key_outcomes": rows, "keys": dict(counts)}
+
     delivered = {
         "kind": page.kind,
         "after": page.after,
         "upserted": sorted(page.upserted),
         "deleted": [*page.deleted, *page.unmatched],
     }
-    report = {k: v for k, v in failures.items() if k != "records"}
     return {
         "values": values,
         "delivered": delivered,
-        "failures": report,
-        "key_outcomes": rows,
-        "keys": dict(counts),
+        "finish": finish,
         "drained": drain.is_set(),
-        "skipped": not outcomes,  # nothing on the page was the edge's
+        "skipped": not outcomes and page.kind != "reconcile",  # nothing on the page was the edge's
     }
 
 

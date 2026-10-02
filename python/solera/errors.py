@@ -79,6 +79,20 @@ def seconds(value: float | int | str) -> float:
     return result
 
 
+def describe(errors: Mapping[type, type]) -> list[list]:
+    """The error policy as the manifest records it, so that changing it changes
+    the project revision: `[raised, class, retry_for]` per mapping entry, by
+    qualified name, with the transient budget a mapped class carries."""
+
+    def name(t: type) -> str:
+        return f"{t.__module__}.{t.__qualname__}"
+
+    return sorted(
+        [name(raised), name(kind), seconds(kind.retry_for) if issubclass(kind, Transient) else None]
+        for raised, kind in errors.items()
+    )
+
+
 def check_mapping(errors: Mapping | None) -> dict[type, type]:
     """`Project(errors=)`: exception types to one of the four classes."""
 
@@ -122,4 +136,5 @@ def backoff(tries: int) -> float:
     """Seconds before the next try after `tries` transient failures: one
     minute, doubling, at most six hours."""
 
-    return min(BACKOFF_FIRST * 2 ** max(tries - 1, 0), BACKOFF_MAX)
+    doublings = min(max(tries - 1, 0), 32)  # past the cap long before: never overflows
+    return min(BACKOFF_FIRST * 2**doublings, BACKOFF_MAX)

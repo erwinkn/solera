@@ -296,11 +296,12 @@ async def test_full_run_resets_watermark(state):
         "fingerprint": first["fingerprint"],
         "output": "files",
         "up": "",
+        "pass": first["pass"],  # the run whose reset began the delivery
     }
     detail = await drive(engine, await engine.submit(["consumer"], mode="full"))
     assert task_statuses(detail)["consumer"] == "succeeded"  # never skipped on full
     second = state.model.watermarks[("consumer", "files", "")]
-    assert second == first  # back at head+1, nothing left mid-way
+    assert second == {**first, "pass": detail["request"]["id"]}  # back at head+1, nothing left mid-way
     # Both deliveries were full-head reads.
     assert seen == [(["a", "b"], True), (["a", "b"], True)]
 

@@ -61,7 +61,14 @@ def _git(directory: str) -> dict | None:
     changed = sorted({entry[3:] for entry in status.decode(errors="surrogateescape").split("\0") if entry})
     for path in changed:
         h.update(path.encode(errors="surrogateescape") + b"\0")
-        h.update(_file_digest(os.path.join(top, path)))
+        full = os.path.join(top, path.rstrip("/"))
+        if os.path.isdir(full):
+            # A submodule (or a nested work tree) that differs from what HEAD records:
+            # its own identity — its HEAD and its changed contents — recursively.
+            nested = _git(full)
+            h.update(nested["id"].encode() if nested and nested["source"] == "git" else _tree_digest(full))
+        else:
+            h.update(_file_digest(full))
     return {"id": h.hexdigest(), "source": "git", "commit": head, "dirty": bool(changed)}
 
 
@@ -75,6 +82,19 @@ def _python_files(directory: str) -> str:
         h.update(os.path.relpath(path, directory).encode(errors="surrogateescape") + b"\0")
         h.update(_file_digest(path))
     return h.hexdigest()
+
+
+def _tree_digest(directory: str) -> bytes:
+    """Every file under a directory git reports as one path, by content."""
+
+    h = hashlib.sha256(b"tree\0")
+    for root, dirs, files in os.walk(directory):
+        dirs[:] = sorted(d for d in dirs if d != ".git")
+        for f in sorted(files):
+            path = os.path.join(root, f)
+            h.update(os.path.relpath(path, directory).encode(errors="surrogateescape") + b"\0")
+            h.update(_file_digest(path))
+    return h.digest()
 
 
 def _file_digest(path: str) -> bytes:

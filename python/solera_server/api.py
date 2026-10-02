@@ -538,9 +538,7 @@ def create_app(
             name, body.get("classes") or ["failed"], body.get("scope"), body.get("by") or "api"
         )
         if found["scopes"]:
-            await runtime.submit(
-                [name], partitions=found["scopes"], skip_active=True, by=body.get("by") or "api"
-            )
+            await runtime.submit_retries(name, found["scopes"], body.get("by") or "api")
         return found
 
     # -- the worker channel (docs/lifecycle.md §5) ----------------------------------------

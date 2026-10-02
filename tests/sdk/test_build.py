@@ -163,3 +163,62 @@ async def test_the_engine_warns_a_sensor_host_once(tmp_path, caplog):
             await engine.sensor_next("local", "other", "h1", 1, 0, "files")
     assert sum("never match" in r.getMessage() for r in caplog.records) == 1
     await state.close()
+
+
+def test_the_error_policy_changes_the_revision(monkeypatch):
+    """Review 9: classifying an error differently is a different project."""
+
+    from solera import Failed, Rejected, Transient
+    from solera.sdk import Project, asset
+
+    monkeypatch.setenv("SOLERA_BUILD", "same")
+
+    @asset
+    def a():
+        return 1
+
+    class Slow(Transient):
+        retry_for = "2h"
+
+    class Slower(Transient):
+        retry_for = "3h"
+
+    revisions = {
+        Project(assets=[a], errors=mapping).manifest["revision"]
+        for mapping in (
+            {ValueError: Failed},
+            {ValueError: Rejected},
+            {ValueError: Slow},
+            {ValueError: Slower},
+            {},
+        )
+    }
+    assert len(revisions) == 5
+
+
+def test_submodule_contents_are_part_of_the_build(tmp_path, monkeypatch):
+    """Review 10: two different edits inside a submodule are two builds."""
+
+    monkeypatch.delenv("SOLERA_BUILD", raising=False)
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    git(sub, "init", "-q")
+    git(sub, "config", "user.email", "t@example.com")
+    git(sub, "config", "user.name", "t")
+    (sub / "lib.py").write_text("x = 1\n")
+    git(sub, "add", "-A")
+    git(sub, "commit", "-qm", "sub")
+    top = tmp_path / "top"
+    top.mkdir()
+    git(top, "init", "-q")
+    git(top, "config", "user.email", "t@example.com")
+    git(top, "config", "user.name", "t")
+    (top / "project.py").write_text("y = 1\n")
+    git(top, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub), "vendored")
+    git(top, "commit", "-qam", "top")
+    clean = identity(str(top))
+    (top / "vendored" / "lib.py").write_text("x = 2\n")
+    first = identity(str(top))
+    (top / "vendored" / "lib.py").write_text("x = 3\n")
+    second = identity(str(top))
+    assert len({clean["id"], first["id"], second["id"]}) == 3

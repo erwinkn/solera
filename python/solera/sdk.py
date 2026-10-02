@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from croniter import croniter
 
 from .build import identity as build_identity
+from .errors import describe as describe_errors
 
 NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,127}$")
 DEFAULT_STORE = "default"
@@ -1576,6 +1577,8 @@ class Project:
             "retention": self.retention.spec() if self.retention else None,
             "key_cache": self.key_cache.spec() if self.key_cache else None,
             "build": build_identity(self.home, self.build),
+            # How user errors are classified changes what failures become (per-key §8).
+            "errors": describe_errors(self.errors),
         }
         return {**body, "revision": digest(body)}
 

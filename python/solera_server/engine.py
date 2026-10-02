@@ -1005,6 +1005,14 @@ class Engine(Attempts, Sensors):
                 inputs[param]["index"] = index
             pinned[param] = inputs[param]["ref"]
         fingerprint = self._fingerprint(asset, run, pinned)
+        if full and run["mode"] == "full" and incremental:
+            # This run's reset began the pass every edge is on: resume it, page by page.
+            started = [
+                (self.m.watermarks.get((task["asset"], p, scope)) or {}).get("pass")
+                for p, _, _ in incremental
+            ]
+            if all(s == run["id"] for s in started):
+                full = False
         # Pass 2: Incremental plans against the fingerprinted interpretation (§2.2).
         plans, all_empty, each_page = {}, True, None
         for param, edge, up_dims in incremental:
@@ -1035,7 +1043,9 @@ class Engine(Attempts, Sensors):
                     break
         prior = {name: head["ref"] for name, head in baseline.items() if head is not None}
         cursor = self.m.cursors.get((task["asset"], scope))
-        if full:
+        if full and each_page is None:
+            # Withheld: the write is the whole content. An Each page keeps its prior:
+            # it patches by key, and a key that fails keeps its last good output (§5).
             prior, cursor = {}, None
         outputs = {}
         for output in asset["outputs"]:
@@ -1181,14 +1191,31 @@ class Engine(Attempts, Sensors):
         override = (run.get("keys") or {}).get(output)
         wm = self.m.watermarks.get((task["asset"], param, task["scope"]))
         reset = full or wm is None or wm.get("fingerprint") != fingerprint or override == "full"
+        # A reset starts a pass, which the run's later attempts resume (`pass` on the
+        # watermark) instead of starting over at every page.
         base = {"output": output, "up": up_scope, "fingerprint": fingerprint}
+        base["pass"] = run["id"] if reset else (wm or {}).get("pass")
+        if edge.get("each") is not None:
+            # A full delivery of an Each edge ends with a cleanup of the keys it no longer
+            # names — needed only if the asset held keys when the delivery began (§11).
+            held = [o["name"] for o in self.manifest["assets"][task["asset"]]["outputs"]] + [
+                f"@{task['asset']}"
+            ]
+            base["cleanup"] = (
+                any(self.m.index(name, task["scope"]).count for name in held)
+                if reset
+                else bool((wm or {}).get("cleanup"))
+            )
 
-        # A keys= override is a one-off selection — it never moves the watermark.
+        # A keys= override is a one-off selection — it never moves the watermark. The
+        # edge's patterns still decide which of the keys it takes (per-key §11).
         if isinstance(override, dict) and "keys" in override and not reset:
             keys = sorted({str(k) for k in override["keys"]})
             pin = {"ref": ref, "changes": {"keys": keys, "full": False}}
             if keyed:  # the keys' versions and locators, for the store to find them
                 pin["index"] = self.m.index(output, up_scope).pinned().to_json()
+            if edge.get("patterns") is not None:
+                pin["patterns"] = edge["patterns"]
             return pin, None, not keys
 
         if not keyed:
@@ -1248,6 +1275,10 @@ class Engine(Attempts, Sensors):
             if rescope is not None:  # a full delivery is under the new patterns: no diff left
                 base.pop("rescope")
                 base["patterns"] = patterns
+            if edge.get("each") is not None:
+                # What the lost log held — deletions, keys the patterns now leave out —
+                # is found by the cleanup after the delivery (§11).
+                base["cleanup"] = True
         if base.get("rescope") is not None:
             empty = False  # the transition has its diff still to do
         pinned = index.pinned() if window["full"] else index.pinned(window["from"], window["to"])
@@ -1297,11 +1328,18 @@ class Engine(Attempts, Sensors):
         record = self.m.failures.get(key) or {}
         failures = self.m.index(f"@{task['asset']}", task["scope"])
         changes = not empty
-        # A full delivery reprocesses every key, and a pattern transition decides which
-        # keys are the edge's: retries wait for either to end.
-        transition = (plan or {}).get("full") or (plan or {}).get("rescope") is not None
+        wm = self.m.watermarks.get((task["asset"], param, task["scope"]))
+        # After a full delivery, the output's keys it no longer names go first (§11).
+        reconcile = None if (plan or {}).get("full") else (wm or {}).get("reconcile")
+        # A full delivery reprocesses every key, a pattern transition and its cleanup
+        # decide which keys are the edge's: retries wait for them to end.
+        transition = (
+            (plan or {}).get("full") or (plan or {}).get("rescope") is not None or reconcile is not None
+        )
         retries = not transition and self._has_retries(record)
-        if changes and retries:
+        if reconcile is not None:
+            kind = "reconcile"
+        elif changes and retries:
             kind = "retry" if record.get("last") == "changes" else "changes"
         else:
             kind = "retry" if retries else "changes"
@@ -1323,6 +1361,16 @@ class Engine(Attempts, Sensors):
             "pass_after": (retry or {}).get("after"),
         }
         limit = int(edge.get("batch_size") or 100)
+        if kind == "reconcile":
+            pin = {
+                "ref": ref,
+                "index": self.m.index(edge["output"], up_scope).pinned().to_json(),
+                "changes": {"reconcile": {"after": reconcile["after"]}, "limit": limit},
+                "each": each,
+            }
+            if wm.get("patterns") is not None:
+                pin["patterns"] = wm["patterns"]
+            return pin, {"update": wm, "each": {"kind": "reconcile", "changes": changes}}, False
         if kind == "retry":
             if retry is None:
                 retry = {
@@ -1334,7 +1382,6 @@ class Engine(Attempts, Sensors):
                     "epoch_acc": None,
                 }
             each["pass_after"] = retry["after"]
-            wm = self.m.watermarks.get((task["asset"], param, task["scope"]))
             pin = {
                 "ref": ref,
                 "index": self.m.index(edge["output"], up_scope).pinned().to_json(),
@@ -1350,15 +1397,18 @@ class Engine(Attempts, Sensors):
         plan = {"update": None, "each": page} if plan is None else {**plan, "each": page}
         return pin, plan, empty
 
-    def _each_commit(self, task, plan: dict, result: dict) -> tuple[dict, bool]:
+    def _each_commit(self, task, plan: dict, result: dict) -> tuple[dict, bool, dict | None]:
         """What an Each page commits to its failure record, and whether the
         task has more to do (§9): the outcome counts move by the page's
         transitions; the bounds are lowered by the records it wrote; a retry
         page advances its pass and folds the range it walked into the pass's
         accumulators, which become the exact bounds when the pass completes;
-        a change page folds what it wrote behind the pass's position."""
+        a change page folds what it wrote behind the pass's position; a
+        reconcile page moves the cleanup on. Returns the record's commit, the
+        `more`, and the watermark a reconcile page leaves (else None)."""
 
         record = self.m.failures.get((task["asset"], task["scope"])) or {}
+        run = self.m.runs.get(task["run"]) or {}
         report = result.get("failures") or {}
         counts = dict(record.get("counts") or {})
         for name, delta in (report.get("counts") or {}).items():
@@ -1372,10 +1422,26 @@ class Engine(Attempts, Sensors):
             "batch": int(record.get("batch", -1)) + 1,
             "counts": counts,
             "last": page["kind"],
+            # The configuration the scope runs under, for the runs retries start (§9).
+            "config": run.get("config") or {},
         }
-        retry, more = page.get("pass"), False
+        retry, more, watermark = page.get("pass"), False, None
         delivered = (result.get("delivered") or {}).get(plan.get("param") or "", {})
-        if page["kind"] == "retry":
+        # A forced request newer than the pass in progress, or than the last one done,
+        # is owed a pass: this run takes it rather than waiting for unrelated activity.
+        forced_after = self._forced_pos(record) > int(
+            (retry or {}).get("forced_pos", record.get("done_forced") or 0)
+        )
+        if page["kind"] == "reconcile":
+            after = delivered.get("after")
+            wm = dict(plan["update"])
+            if after is None:
+                wm.pop("reconcile", None)
+            else:
+                wm["reconcile"] = {"after": after}
+            watermark = wm
+            more = after is not None or bool(page.get("changes")) or forced_after
+        elif page["kind"] == "retry":
             walked = report.get("range") or {}
             retry = {
                 **retry,
@@ -1386,7 +1452,7 @@ class Engine(Attempts, Sensors):
             if after is None:  # the pass is complete: its accumulators are the exact bounds
                 due, epoch_min = retry["due_acc"], retry["epoch_acc"]
                 commit.update({"passes": retry["pass"], "done_forced": retry["forced_pos"], "retry": None})
-                more = bool(page.get("changes"))
+                more = bool(page.get("changes")) or forced_after
             else:
                 commit["retry"] = {**retry, "after": after}
                 more = True
@@ -1399,11 +1465,13 @@ class Engine(Attempts, Sensors):
                     "epoch_acc": lower(retry.get("epoch_acc"), fold.get("epoch_min")),
                 }
             # Keys this page left due at once are retried in the same run.
-            more = bool(page.get("retries")) or (
-                report.get("due") is not None and report["due"] <= self.clock()
+            more = (
+                bool(page.get("retries"))
+                or (report.get("due") is not None and report["due"] <= self.clock())
+                or forced_after
             )
         commit.update({"due": due, "epoch_min": epoch_min})
-        return commit, more
+        return commit, more, watermark
 
     @staticmethod
     def _watermark(plan: dict, after: str | None) -> dict:
@@ -1413,6 +1481,10 @@ class Engine(Attempts, Sensors):
         its later pages still read versions as of then (docs/lifecycle.md §9.8)."""
 
         base = {k: plan[k] for k in ("output", "up", "fingerprint")}
+        if plan.get("pass") is not None:  # the run whose reset began this pass
+            base["pass"] = plan["pass"]
+        if plan.get("cleanup") and plan["full"]:  # a full Each delivery owes a cleanup (§11)
+            base["cleanup"] = True
         if plan.get("patterns") is not None:  # what the edge delivers under (per-key §11)
             base["patterns"] = plan["patterns"]
         rescope = plan.get("rescope")
@@ -1432,7 +1504,13 @@ class Engine(Attempts, Sensors):
             base["rescope"] = rescope
         if plan["full"]:
             if after is None:
-                return {**base, "batch": plan["from"], "after": None, "full": False}
+                done = {**base, "batch": plan["from"], "after": None, "full": False}
+                done.pop("cleanup", None)
+                if plan.get("each") is not None and plan.get("cleanup"):
+                    # An Each output may hold keys the delivery no longer names — gone
+                    # upstream, or left out by the patterns: reconcile them next (§11).
+                    done["reconcile"] = {"after": None}
+                return done
             return {**base, "batch": plan["from"], "after": after, "full": True}
         if after is None:
             return {**base, "batch": max(plan["from"], plan["to"] + 1), "after": None, "full": False}
@@ -1521,8 +1599,11 @@ class Engine(Attempts, Sensors):
             if plan is None:
                 continue
             if "each" in plan:
-                failures, each_more = self._each_commit(task, {**plan, "param": param}, result)
+                failures, each_more, reconciled = self._each_commit(task, {**plan, "param": param}, result)
                 more = more or each_more
+                if reconciled is not None:
+                    watermarks[param] = reconciled
+                    continue
             if "update" in plan:
                 if plan["update"] is not None:
                     watermarks[param] = plan["update"]
@@ -1531,8 +1612,14 @@ class Engine(Attempts, Sensors):
                 raise Conflict(f"input {param}: the result reports no delivery", retryable=False)
             after = delivered[param].get("after")
             watermarks[param] = self._watermark(plan, after)
-            # A pattern transition that finished its old-pattern changes has its diff to do.
-            more = more or after is not None or (plan.get("rescope") is not None and not plan.get("diff"))
+            # A pattern transition that finished its old-pattern changes has its diff to do;
+            # a full Each delivery that finished has its cleanup to do.
+            more = (
+                more
+                or after is not None
+                or (plan.get("rescope") is not None and not plan.get("diff"))
+                or "reconcile" in watermarks[param]
+            )
         heads, keys = {}, {}
         for name, entry in outputs.items():
             if name not in declared:
@@ -1606,7 +1693,8 @@ class Engine(Attempts, Sensors):
             commit["cursor"] = result["cursor"]
         elif prepared.get("full"):
             commit["cursor"] = None  # a full run clears the committed cursor (§8)
-        if outcome == "succeeded" and result.get("skipped") and not more:
+        worked = any(a["outcome"] == "succeeded" for a in task["attempts"])
+        if outcome == "succeeded" and result.get("skipped") and not more and not worked:
             outcome = "skipped"  # the patterns took none of its keys: it did nothing (per-key §11)
         self._finish(
             task,
@@ -1860,7 +1948,27 @@ class Engine(Attempts, Sensors):
             if self._scope_active(asset, scope) or self.m.is_pending(asset, scope):
                 continue
             if self._has_retries(record):
-                await self.submit([asset], partitions=[scope], skip_active=True, by="retry clock")
+                await self.submit_retries(asset, [scope], "retry clock")
+
+    async def submit_retries(self, asset: str, scopes, by: str | None) -> list[dict]:
+        """Runs for an Each asset's scopes that have keys to retry, each under
+        the configuration its scope last ran with (kept on its failure record):
+        a retry under another configuration would read other inputs, and its
+        new fingerprint would redeliver every key (§9). Scopes already active
+        are left to the run they are in."""
+
+        by_config: dict[str, list[str]] = {}
+        for scope in scopes:
+            config = (self.m.failures.get((asset, scope)) or {}).get("config") or {}
+            by_config.setdefault(json.dumps(config, sort_keys=True), []).append(scope)
+        runs = []
+        for config, group in sorted(by_config.items()):
+            run = await self.submit(
+                [asset], partitions=sorted(group), config=json.loads(config), skip_active=True, by=by
+            )
+            if run is not None:
+                runs.append(run)
+        return runs
 
     def retry_keys(self, asset: str, classes, scope: str | None = None, by: str | None = None) -> dict:
         """`solera keys retry`: a forced request for an Each asset's failing

@@ -416,7 +416,8 @@ class Model:
     def _apply_aliases(self, manifest) -> dict[str, list[str]]:
         """Move everything held under an asset's former names to its current
         one (§2): cursors, watermarks, outcomes, pending automation entries,
-        holds on its scopes, and — for outputs named after the asset — heads,
+        holds on its scopes, an Each asset's failure records and failure
+        index, and — for outputs named after the asset — heads,
         key indexes, unsettled intents and pending discards. A new name never
         releases a write domain. An index keeps its files where they are (its
         `prefix`). Returns `{asset: [aliases]}` for the automations to follow."""
@@ -449,6 +450,10 @@ class Model:
         move(self.outcomes, asset_map, 0)
         move(self.watermarks, asset_map, 0)
         move(self.holds, asset_map, 0)
+        # An Each asset's failure record and its index (`@asset`), whose files stay
+        # under their prefix; retry-pass state and forced positions go with them.
+        move(self.failures, asset_map, 0)
+        move(self.indexes, {f"@{old}": f"@{new}" for old, new in asset_map.items()}, 0)
         move(self.unsettled, output_map, 0, merge=list)
         move(self.discards, output_map, 0, merge=_renumbered)
         for head in self.heads.values():
@@ -808,7 +813,7 @@ class Model:
             index = self.index(name, scope).committed(f["batch"], DeltaFiles.from_json(keys), keep_log=False)
             self.indexes[(name, scope)] = index
             record["batch"] = f["batch"]
-        for field in ("counts", "due", "epoch_min", "retry", "passes", "done_forced", "last"):
+        for field in ("counts", "due", "epoch_min", "retry", "passes", "done_forced", "last", "config"):
             if field in f:
                 record[field] = f[field]
 

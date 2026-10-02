@@ -149,7 +149,10 @@ async def test_transient_key_retried_when_due(state):  # noqa: F811
     engine = make_engine(state, project)
     await engine.initialize()
     await drive(engine, await engine.submit(["parse"], upstream=True))
-    # The page left `a` due at once: the same run took it in a retry page.
+    # Due within a second — deadlines round up, never early (§9): the next run takes it.
+    assert tries["n"] == 1
+    await asyncio.sleep(1.05)
+    await drive(engine, await engine.submit(["parse"]))
     assert tries["n"] == 2 and set(await rows_of(engine, project, "samples")) == {"a"}
     record = engine.m.failures[("parse", "")]
     assert record["counts"] == {} and record["due"] is None and record["retry"] is None

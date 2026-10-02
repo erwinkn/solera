@@ -466,12 +466,8 @@ async def _local(args, parser):
             print(json.dumps(view, indent=2))
         elif args.command == "keys":
             found = runtime.retry_keys(args.asset, _key_classes(args), args.partition, "cli")
-            if found["scopes"]:
-                run = await runtime.submit(
-                    [args.asset], partitions=found["scopes"], skip_active=True, by="cli"
-                )
-                if run is not None:
-                    found["run"] = (await runtime.run_until(run["id"]))["request"]["status"]
+            runs = await runtime.submit_retries(args.asset, found["scopes"], "cli") if found["scopes"] else []
+            found["runs"] = [(await runtime.run_until(r["id"]))["request"]["status"] for r in runs]
             print(json.dumps(found, indent=2))
         elif args.command == "scopes":
             print(json.dumps(runtime.release_scope(args.asset, args.scope, "cli"), indent=2))

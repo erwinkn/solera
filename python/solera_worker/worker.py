@@ -1043,7 +1043,7 @@ async def _publish(objects, base, spec, result, invocation, writes, cancel, time
 
     def seal(result: dict) -> bytes:
         body = {"invocation": invocation, **result, "writes": writes.state, **timeline.report(), "log": log}
-        if cancel is not None:
+        if cancel is not None and "cancel" not in body:  # an Each page sealed its own record
             body["cancel"] = cancel.to_json()
         return json.dumps(body, allow_nan=False).encode()
 
@@ -1147,9 +1147,14 @@ async def _execute(
                 outputs[name]["metadata"] = values
         result = {"status": "succeeded", "outputs": outputs, "delivered": delivered}
         if page is not None:
-            # A drained page commits what finished (docs/lifecycle.md §7).
+            # A drained page commits what finished (docs/lifecycle.md §7). Its interrupted
+            # keys follow the cancel record it is sealed with, as latched now — after its
+            # store writes — and the result carries that record, not a later one (§2.2).
+            cancel = control.get("cancel")
+            result.update(await ran["finish"](cancel))
             result["status"] = "canceled" if ran["drained"] else "succeeded"
-            result.update({k: ran[k] for k in ("failures", "key_outcomes", "keys")})
+            if cancel is not None:
+                result["cancel"] = cancel.to_json()
             if ran["skipped"]:
                 result["skipped"] = True
         result.update(await _discard_due(spec, project, asset, objects, writes))

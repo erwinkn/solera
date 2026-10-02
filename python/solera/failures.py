@@ -107,22 +107,27 @@ def transition(
 
     if outcome.kind in GONE:
         return None
-    code, t = KINDS[outcome.kind], int(now)
+    code, t = KINDS[outcome.kind], int(now)  # `since` and `last`: whole seconds, for display
     fresh = prior is None or prior.revision != outcome.revision
     counted = 0 if code == CANCELED else 1  # a cancel interrupted the try: it does not count
     tries = counted if fresh else prior.tries + counted
     since = t if fresh else prior.since
     record = Record(code, tries, epoch, forced, since, t, 0, 0, outcome.revision, outcome.message)
+    # Deadlines are computed from the exact time, then rounded up: a budget or a wait
+    # is never shortened by the rounding.
     if code == RETRYING:
-        until = prior.until if not fresh and prior.outcome == RETRYING else t + int(outcome.retry_for or 0)
-        if t >= until:
+        if not fresh and prior.outcome == RETRYING:
+            until = prior.until
+        else:
+            until = math.ceil(now + float(outcome.retry_for or 0))
+        if now >= until:
             return replace(record, outcome=FAILED)  # its retry_for ran out
         wait = outcome.retry_after if outcome.retry_after is not None else backoff(tries)
-        return replace(record, next_at=t + math.ceil(wait), until=until)
+        return replace(record, next_at=math.ceil(now + wait), until=until)
     if code == TIMED_OUT:
         if tries > retries:
             return replace(record, outcome=FAILED)  # always outlives the timeout: stop cycling
-        return replace(record, next_at=t + math.ceil(backoff(tries)))
+        return replace(record, next_at=math.ceil(now + backoff(tries)))
     return record
 
 
