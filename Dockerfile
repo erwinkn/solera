@@ -9,7 +9,7 @@ WORKDIR /home/app
 COPY pyproject.toml uv.lock README.md ./
 COPY native native
 COPY python python
-RUN uv sync --locked --no-dev --no-editable --extra postgres
+RUN uv sync --locked --no-dev --no-editable --extra server --extra postgres
 
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 

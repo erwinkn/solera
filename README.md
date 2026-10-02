@@ -43,6 +43,13 @@ uv run solera serve --insecure
 # console + API at http://127.0.0.1:8000
 ```
 
+Installed as a package, `pip install solera` is the SDK and the worker —
+obstore, httpx, croniter and the native extension; `solera[server]` adds the
+engine, its API and run history (fastapi, uvicorn, duckdb), and
+`solera[postgres]` PostgresStore's driver. pandas and pyarrow are used when
+a value is of their type, never required: a worker of plain `list[dict]`
+outputs imports neither.
+
 State lands in `./.solera` — a `file://` object store using the same client
 interfaces as S3. Asset data lands in `.solera/data` next to the project
 file (`$SOLERA_DATA` overrides it). `--insecure` disables token auth and is restricted to

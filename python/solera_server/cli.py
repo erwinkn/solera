@@ -96,7 +96,24 @@ async def _wait_remote(client, p, run_id, poll=0.5):
         await asyncio.sleep(poll)
 
 
+SERVER_MODULES = {"fastapi", "uvicorn", "duckdb", "starlette"}
+
+
 def main():
+    """`solera …`. The engine's commands need `solera[server]`; `worker` and
+    `manifest` run on the base install, as a worker's host has it."""
+
+    try:
+        _main()
+    except ModuleNotFoundError as e:
+        if (e.name or "").split(".")[0] not in SERVER_MODULES:
+            raise
+        raise SystemExit(
+            f"this command runs the engine, which needs {e.name}: pip install 'solera[server]'"
+        ) from None
+
+
+def _main():
     parser = argparse.ArgumentParser(description="Asset orchestration on object storage")
     parser.add_argument(
         "--state-url", default=os.getenv("SOLERA_STATE_URL", Path(".solera").resolve().as_uri())

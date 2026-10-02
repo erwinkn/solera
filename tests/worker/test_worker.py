@@ -325,8 +325,9 @@ async def test_a_pool_attempt_runs_in_a_child_of_the_warm_worker(state, tmp_path
 
 def test_a_worker_of_plain_rows_imports_no_dataframe_library(tmp_path):
     """A project whose outputs are lists of dicts — keyed, batched, a value —
-    runs in workers that never import pandas, pyarrow or duckdb: a library
-    is imported only for a value of its own type."""
+    runs in workers that never import pandas, pyarrow or duckdb, nor the
+    engine's libraries: a library is imported only for a value of its own
+    type, and `pip install solera` (no `[server]`) is a worker's install."""
 
     import subprocess
     import sys
@@ -352,7 +353,8 @@ def test_a_worker_of_plain_rows_imports_no_dataframe_library(tmp_path):
                 return sum(r["n"] for r in items) + len(events)
 
             def record():
-                seen = [m for m in ("pandas", "pyarrow", "duckdb", "numpy") if m in sys.modules]
+                libraries = ("pandas", "pyarrow", "duckdb", "numpy", "fastapi", "starlette", "uvicorn")
+                seen = [m for m in libraries if m in sys.modules]
                 name = os.path.join(os.path.dirname(__file__), f"modules-{os.getpid()}.txt")
                 with open(name, "w") as f:
                     f.write(",".join(seen))
@@ -436,3 +438,22 @@ project = Project(assets=[leak])
         assert json.loads(written.read_text()) == {"gh": None}
     finally:
         await state.close()
+
+
+def test_the_sdk_and_worker_import_graph_holds_no_server_or_dataframe_library():
+    """`solera` (the SDK), `solera_worker` and the stores import only the
+    base install's libraries: the engine's — fastapi, uvicorn, duckdb — and
+    pandas or pyarrow never come in through them."""
+
+    import subprocess
+    import sys
+
+    code = (
+        "import sys, solera, solera.stores, solera.keys, solera_worker.worker, solera_worker.channel, "
+        "solera_worker.sensors, solera_worker.each, solera_postgres\n"
+        "banned = ('pandas', 'pyarrow', 'duckdb', 'numpy', 'fastapi', 'starlette', 'uvicorn', 'psycopg')\n"
+        "print(','.join(m for m in banned if m in sys.modules))"
+    )
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == ""

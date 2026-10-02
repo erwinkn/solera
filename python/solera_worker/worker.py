@@ -1207,6 +1207,19 @@ async def _discard_after(answer, spec, project, objects, channel, invocation) ->
         await channel.discarded({"invocation": invocation, "scope": answer["scope"], **done})
 
 
+def _file_entries(data: bytes):
+    """A `.kx` file's entries, every block checked: `(key, version, deleted,
+    locator, predecessor)` each, in key order."""
+
+    from solera.keys import check_block, decode_block, parse_index
+
+    index = parse_index(data, len(data))
+    for _, offset, size, _, crc in index["blocks"]:
+        block = data[offset : offset + size]
+        check_block(block, crc)
+        yield from zip(*decode_block(block, index["codec"]), strict=True)
+
+
 async def _discard_due(spec, project, asset, objects, writes) -> dict:
     """Discard the data garbage the engine handed this attempt (docs/
     lifecycle.md §9.8): the objects a commit or a compaction let go of, and
@@ -1215,7 +1228,7 @@ async def _discard_due(spec, project, asset, objects, writes) -> dict:
     store, deletes for it. Returns what was done, for the result."""
 
     import obstore
-    from solera.keys._python import decode_garbage, iter_file
+    from solera.keys import decode_garbage
 
     declared = {o["name"]: o for o in project.manifest["assets"][asset.name]["outputs"]}
     decls = {o.name or asset.name: o for o in asset.outputs}
@@ -1240,7 +1253,7 @@ async def _discard_due(spec, project, asset, objects, writes) -> dict:
                     continue
                 for data in found:
                     if kind == "delta":
-                        for key, _, _, _, before in iter_file(data):
+                        for key, _, _, _, before in _file_entries(data):
                             if before is not None:
                                 items.append(("key", key_str(key), before[0].hex(), before[1]))
                     else:
@@ -1259,7 +1272,7 @@ async def _discard_due(spec, project, asset, objects, writes) -> dict:
                         for meta in batch:
                             if meta["path"][len(prefix) :].startswith(stem):
                                 data = await read(meta["path"])
-                                for key, version, deleted, _, _ in iter_file(data) if data else ():
+                                for key, version, deleted, _, _ in _file_entries(data) if data else ():
                                     if not deleted:
                                         items.append(("key", key_str(key), version.hex(), generation))
                                 files.append(meta["path"])

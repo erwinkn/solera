@@ -1746,17 +1746,18 @@ version = "0.0.1"
 source = { editable = "." }
 dependencies = [
     { name = "croniter" },
-    { name = "duckdb" },
-    { name = "fastapi" },
     { name = "httpx" },
     { name = "obstore" },
-    { name = "uvicorn" },
 ]
 
 [package.optional-dependencies]
 postgres = [
-    { name = "pandas" },
     { name = "psycopg", extra = ["binary"] },
+]
+server = [
+    { name = "duckdb" },
+    { name = "fastapi" },
+    { name = "uvicorn" },
 ]
 
 [package.dev-dependencies]
@@ -1770,21 +1771,21 @@ dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
+    { name = "solera", extra = ["server"] },
     { name = "xxhash" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "croniter", specifier = ">=6,<7" },
-    { name = "duckdb", specifier = ">=1.3,<2" },
-    { name = "fastapi", specifier = ">=0.115,<1" },
+    { name = "duckdb", marker = "extra == 'server'", specifier = ">=1.3,<2" },
+    { name = "fastapi", marker = "extra == 'server'", specifier = ">=0.115,<1" },
     { name = "httpx", specifier = ">=0.28,<1" },
     { name = "obstore", specifier = "==0.11.1" },
-    { name = "pandas", marker = "extra == 'postgres'", specifier = ">=2.2,<3" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.2,<4" },
-    { name = "uvicorn", specifier = ">=0.34,<1" },
+    { name = "uvicorn", marker = "extra == 'server'", specifier = ">=0.34,<1" },
 ]
-provides-extras = ["postgres"]
+provides-extras = ["server", "postgres"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -1797,6 +1798,7 @@ dev = [
     { name = "pytest", specifier = ">=8,<10" },
     { name = "pytest-asyncio", specifier = ">=1,<2" },
     { name = "ruff", specifier = ">=0.12,<1" },
+    { name = "solera", extras = ["server"] },
     { name = "xxhash", specifier = ">=3,<4" },
 ]
 

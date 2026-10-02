@@ -9,18 +9,22 @@ description = "Asset-first orchestration on object storage: SDK, worker, and con
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
+# `pip install solera` is the SDK and the worker; `solera[server]` adds the
+# engine, its API and run history. pandas and pyarrow are used when a value
+# is of their type, never required.
 dependencies = [
     "croniter>=6,<7",
     "httpx>=0.28,<1",
     "obstore==0.11.1",
+]
+
+[project.optional-dependencies]
+server = [
     "fastapi>=0.115,<1",
     "uvicorn>=0.34,<1",
     "duckdb>=1.3,<2",
 ]
-
-[project.optional-dependencies]
 postgres = [
-    "pandas>=2.2,<3",
     "psycopg[binary]>=3.2,<4",
 ]
 
@@ -64,6 +68,7 @@ dev = [
     "psycopg[binary]>=3.2,<4",
     "pyarrow>=25,<26",
     "xxhash>=3,<4",
+    "solera[server]",
 ]
 
 [tool.pytest.ini_options]

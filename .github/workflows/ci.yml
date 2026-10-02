@@ -50,6 +50,34 @@ jobs:
               assert any(n.startswith('solera_server/web/assets/') and n.endswith('.css') for n in names), 'no bundled CSS in wheel'
           PY
           uv run solera --state-url file:///tmp/ci-native-probe selftest
+      - name: The base install is the SDK and the worker, without the server's libraries
+        run: |
+          uv venv /tmp/base --python 3.12
+          uv pip install --python /tmp/base/bin/python dist/solera-*.whl
+          cat > /tmp/plain.py <<'PY'
+          from solera import Output, Project, asset
+
+          @asset(outputs=Output("items", key="id"))
+          def items():
+              return [{"id": "a", "n": 1}]
+
+          project = Project(name="plain", assets=[items])
+          PY
+          /tmp/base/bin/python - <<'PY'
+          import sys
+          import solera, solera.stores, solera_worker.worker, solera_postgres  # noqa: F401
+          banned = ("fastapi", "uvicorn", "starlette", "duckdb", "pandas", "pyarrow", "numpy")
+          for name in banned:
+              assert name not in sys.modules, name
+              try:
+                  __import__(name)
+              except ImportError:
+                  continue
+              raise AssertionError(f"{name} is installed with the base package")
+          PY
+          /tmp/base/bin/solera manifest --project /tmp/plain.py:project > /dev/null
+          ! /tmp/base/bin/solera --state-url file:///tmp/base-state run --project /tmp/plain.py:project items 2> /tmp/err
+          grep -q "solera\[server\]" /tmp/err
       - uses: actions/upload-artifact@v4
         if: always()
         with:

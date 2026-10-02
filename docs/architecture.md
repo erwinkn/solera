@@ -61,6 +61,11 @@ Three processes:
 | **harness** | user code: producers, stores, resources. Launched per attempt by a placement. | store/resource secrets via `env:`, object store access via the environment's auth |
 | **console** | UI over the API. | nothing |
 
+One distribution, split by extras: `solera` is the SDK and the harness
+(the worker), `solera[server]` adds the engine, API and run history. The
+harness's import graph holds none of the server's libraries, nor pandas or
+pyarrow unless a value is of their type.
+
 ## 2. Assets
 
 ```python
