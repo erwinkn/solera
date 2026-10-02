@@ -805,9 +805,11 @@ abandoned attempt's keyed names come from listing its own delta files
 (`{batch:012d}-{attempt}*` under the index prefix, complete because
 deltas are uploaded before data), not from a sweep; those delta files and
 consumed compaction sidecars then go through the ordinary index garbage.
-Not built: the sweep, so a worker that writes after its attempt ended
-leaves orphans; and the rescope-drain and retry-pass pins, whose reads
-do not exist yet.
+A rescope drain's snapshot pin (`watermark.rescope.pin`) holds both
+index-file garbage and data discards, as a live claim does; a retry pass
+needs none, since each of its pages reads the state of its own prepare
+(`per-key-processing.md` §20). Not built: the sweep, so a worker that
+writes after its attempt ended leaves orphans.
 
 Reusing a version (`v1 → v2 → v1`) writes a new name (`f-1/v1.{g3}`):
 deleting the old `f-1/v1.{g1}` cannot touch it. That is what removes the

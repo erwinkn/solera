@@ -347,18 +347,37 @@ class In:
 
 
 class Incremental(In):
-    """Delta edge: the watermark-planned changes since last delivery (§5, §6)."""
+    """Delta edge: the watermark-planned changes since last delivery (§5, §6).
+    On a keyed upstream, `include` and `exclude` select the keys it takes
+    by name (`solera.patterns`, docs/per-key-processing.md §11)."""
 
     kind = "incremental"
 
-    def __init__(self, output: str | None = None, batch_size: int = 100, meta: dict | None = None):
+    def __init__(
+        self,
+        output: str | None = None,
+        batch_size: int = 100,
+        meta: dict | None = None,
+        *,
+        include=None,
+        exclude=None,
+    ):
+        from . import patterns
+
         super().__init__(output, meta=meta)
         if batch_size < 1:
             raise RegistrationError("Incremental batch_size must be positive")
         self.batch_size = batch_size
+        try:
+            self.patterns = patterns.spec(include, exclude)
+        except (ValueError, TypeError) as error:
+            raise RegistrationError(str(error)) from None
 
     def spec(self, param: str) -> dict:
-        return {**super().spec(param), "batch_size": self.batch_size}
+        spec = {**super().spec(param), "batch_size": self.batch_size}
+        if self.patterns is not None:
+            spec["patterns"] = self.patterns
+        return spec
 
 
 class Each(Incremental):
@@ -376,8 +395,10 @@ class Each(Incremental):
         batch_size: int = 100,
         concurrency: int = 16,
         meta: dict | None = None,
+        include=None,
+        exclude=None,
     ):
-        super().__init__(output, batch_size=batch_size, meta=meta)
+        super().__init__(output, batch_size=batch_size, meta=meta, include=include, exclude=exclude)
         if concurrency < 1:
             raise RegistrationError("Each concurrency must be positive")
         self.concurrency = concurrency
@@ -1280,6 +1301,10 @@ class Project:
                         raise RegistrationError(
                             f"{name}: Incremental edge {param!r} upstream {output_name} "
                             "is not incremental (declare incremental=True) (§2.1)"
+                        )
+                    if edge.patterns is not None and upstream["key"] is None:
+                        raise RegistrationError(
+                            f"{name}: include=/exclude= on {param!r} select keys; {output_name} has none"
                         )
                     if is_ref_type(annotation):
                         raise RegistrationError(

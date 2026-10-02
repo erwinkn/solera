@@ -1,9 +1,11 @@
 # Per-key processing
 
-Status: **§5–§10 and §13 built** (error classes, build identity, `Each`,
+Status: **§5–§11 and §13 built** (error classes, build identity, `Each`,
 groups by key, the failure index, retry passes, forced retries, the drain on
-cancel, `key_outcomes`); §11 (patterns) in progress; §12 follows
-`lifecycle.md` §11 (sensors). §20 records where the build departs from this
+cancel, `key_outcomes`, key patterns and the rescope cutover); the engine's
+match-count hints (§11) and summary recomputation (§9) are deferred, and
+`solera explain` (§10) is not built; §12 follows `lifecycle.md` §11
+(sensors). §20 records where the build departs from this
 text. It adds an `Each` edge (an asset written
 for one key, run over every changed key), keys that hold many rows,
 per-key outcomes with user-classified errors, key patterns on edges, and
@@ -1094,3 +1096,23 @@ Where the implementation (`solera/errors.py`, `solera/build.py`,
   files only (data written next to a project would otherwise change it).
 - **PostgresStore** loads an empty group as an empty DataFrame with the
   table's columns; `can_load(dict[str, T], Keys)` holds when `can_load(T, Keys)` does.
+- **Patterns** (`solera/patterns.py`) are evaluated by Python's `re`, by
+  the worker only — on every page it reads: windows, inlined pages
+  (`resolved-commits.md` §7), full deliveries, `keys=` overrides and
+  retry pages (a due key the edge no longer takes is `unmatched`). A page
+  they take nothing from does not call the producer and ends `skipped`
+  once its window is done.
+- **The rescope cutover** lives on the watermark: `patterns` (what it
+  delivers under) and, during a transition, `rescope` {`from`, `to`,
+  `cutover`, `snapshot` (the upstream index as of the cutover), `pin`,
+  `after`}. The diff pages through the whole snapshot (`batch_size` keys
+  read per page), not only the key ranges the patterns' prefixes cover.
+  A newer pattern change waits for the transition to end, then cuts over
+  again. Retries wait for a transition, as for a full delivery. A window
+  the log no longer covers falls back to a full delivery under the new
+  patterns, which ends the transition.
+- **The snapshot pin** joins collection's pins: index-file garbage
+  (`Upkeep.collect`) and immutable data discards both wait for the oldest
+  rescope pin as for a live claim. A retry pass needs none: each retry page
+  reads the failure index and the upstream as they are at its own prepare,
+  and the accumulators absorb what changes between pages.

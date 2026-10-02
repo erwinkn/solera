@@ -315,6 +315,7 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline):
     edges = manifest_asset["inputs"]
     hints = typing.get_type_hints(asset.fn)
     args, changes, delivered = {}, {}, {}
+    windows = []
     for name, pin in spec["inputs"].items():
         edge = edges.get(name)
         if edge is None or "each" in pin:  # a dep pin: recorded, never bound; an Each page: per key
@@ -346,31 +347,11 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline):
                 changes[param] = Changes(rows=args[param], batches=range(lo, hi + 1), full=full)
                 timeline.add("loaded", param, _rows(args[param]))
                 continue
-            if "keys" in ch:  # a run's keys= override: a one-off selection, of the keys that exist
-                index = KeyIndex(keys_io, None, IndexState.from_json(pin["index"]))
-                found = await index.lookup([key_bytes(str(k)) for k in ch["keys"]])
-                upserted, deleted, after = {key_str(k): entry for k, entry in found.items()}, (), None
-            elif "inline" in ch:  # the engine merged this page from its cache
-                page = ch["inline"]
-                upserted = {k: (bytes.fromhex(v), int(loc)) for k, (v, loc) in page["upserted"].items()}
-                deleted, after = tuple(page["deleted"]), page["next"]
-            else:
-                index = KeyIndex(keys_io, None, IndexState.from_json(pin["index"]))
-                start = key_bytes(ch["after"]) if ch.get("after") is not None else None
-                if full:
-                    keys, versions, locators, nxt = await index.page(start, int(ch["limit"]))
-                    flags = bytes(len(keys))
-                else:
-                    keys, versions, flags, locators, nxt = await index.pending(
-                        int(ch["from"]), int(ch["to"]), start, int(ch["limit"])
-                    )
-                upserted = {
-                    key_str(k): (v, loc)
-                    for k, v, d, loc in zip(keys, versions, flags, locators, strict=True)
-                    if not d
-                }
-                deleted = tuple(key_str(k) for k, d in zip(keys, flags, strict=True) if d)
-                after = key_str(nxt) if nxt is not None else None
+            # The page — a keys= override, inlined by the engine, or read from the
+            # pinned index — filtered by the edge's patterns (per-key §11).
+            window = await each.read_window(pin, keys_io)
+            windows.append(window)
+            upserted, deleted, after = window.upserted, window.deleted, window.after
             args[param] = await store.load(ref, t, Keys(upserted))
             changes[param] = Changes(
                 rows=args[param], deleted=deleted, full=full, upserted=tuple(sorted(upserted))
@@ -383,6 +364,10 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline):
         else:
             args[param] = await store.load(ref, t, await _whole(store, keys_io, pin.get("index")))
             timeline.add("loaded", param, _rows(args[param]))
+    # Every keyed page held keys, and the edges' patterns took none of them: nothing
+    # to call the producer with.
+    filtered = bool(windows) and all(not w.upserted and not w.deleted for w in windows)
+    delivered["*filtered"] = filtered and any(w.read for w in windows)
     return args, changes, delivered
 
 
@@ -1107,6 +1092,7 @@ async def _execute(
     try:
         keys_io = _key_io(objects, objects_url, project)
         args, changes, delivered = await _resolve_inputs(spec, project, asset, keys_io, timeline)
+        filtered = delivered.pop("*filtered", False)
         ctx = Ctx(spec, asset, project, objects, changes, shipper, timeline, keys_io)
         signature = inspect.signature(asset.fn)
         if "ctx" in signature.parameters:
@@ -1122,6 +1108,10 @@ async def _execute(
                 return _user_failed(ran["abort"], project)
             value = Result(outputs=ran["values"])
             delivered[page[0]] = ran["delivered"]
+        elif filtered:
+            # The edges' patterns took none of the page's keys: the producer has
+            # nothing to see, and the page commits only its watermark (per-key §11).
+            return {"status": "succeeded", "skipped": True, "outputs": {}, "delivered": delivered}
         else:
             timeline.add("computing")
             value = asset.fn(**args)
@@ -1150,6 +1140,8 @@ async def _execute(
             # A drained page commits what finished (docs/lifecycle.md §7).
             result["status"] = "canceled" if ran["drained"] else "succeeded"
             result.update({k: ran[k] for k in ("failures", "key_outcomes", "keys")})
+            if ran["skipped"]:
+                result["skipped"] = True
         result.update(await _discard_due(spec, project, asset, objects, writes))
         if cursor is not UNSET:
             result["cursor"] = cursor

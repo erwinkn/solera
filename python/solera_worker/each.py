@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from solera import errors
 from solera.failures import REMOVED, UNMATCHED, Outcome, Record, eligible, minima, transition
 from solera.keys.index import IndexState, KeyIndex, key_bytes, key_str
+from solera.patterns import Matcher
 from solera.sdk import UNSET, Ref, Result
 from solera.stores import Keys, Patch
 
@@ -35,6 +36,7 @@ class Page:
     upserted: dict[str, tuple[bytes, int]]  # key -> upstream (version, locator)
     deleted: list[str]
     after: str | None  # where the window's page, or the retry walk, ended (None: done)
+    unmatched: list[str] = field(default_factory=list)  # keys that stopped matching the edge's patterns
     walked: dict[str, Record] = field(default_factory=dict)  # retry: every record walked
     priors: dict[str, Record] = field(default_factory=dict)
 
@@ -44,16 +46,52 @@ class _Abort(Exception):
         self.error = error
 
 
-async def read_window(pin: dict, keys_io) -> tuple[dict, tuple, str | None]:
+@dataclass
+class Window:
+    """An Incremental page of a keyed upstream, its keys filtered by the
+    edge's patterns: `read` says how many keys the page held before, and
+    `unmatched` that its deletions are keys that stopped matching (a
+    rescope's diff) rather than keys gone upstream."""
+
+    upserted: dict[str, tuple[bytes, int]]
+    deleted: tuple
+    after: str | None
+    read: int
+    unmatched: bool = False
+
+
+async def read_window(pin: dict, keys_io) -> Window:
     """An Incremental page of a keyed upstream, as the spec pins it: the
-    keys= override, a full delivery's page, or a window of pending deltas.
-    Returns `(upserted, deleted, after)`."""
+    keys= override, a full delivery's page, a window of pending deltas — all
+    filtered by the edge's patterns (per-key §11) — or a rescope's diff of
+    the index as of its cutover: the keys whose membership changed."""
 
     ch = pin["changes"]
     index = KeyIndex(keys_io, None, IndexState.from_json(pin["index"]))
+    if "rescope" in ch:
+        old, new = Matcher(ch["rescope"]["from"]), Matcher(ch["rescope"]["to"])
+        start = key_bytes(ch["after"]) if ch.get("after") is not None else None
+        keys, versions, locators, nxt = await index.page(start, int(ch["limit"]))
+        upserted, deleted = {}, []
+        for k, v, loc in zip(keys, versions, locators, strict=True):
+            key = key_str(k)
+            before, now = old(key), new(key)
+            if now and not before:
+                upserted[key] = (v, loc)
+            elif before and not now:
+                deleted.append(key)
+        after = key_str(nxt) if nxt is not None else None
+        return Window(upserted, tuple(deleted), after, len(keys), unmatched=True)
+    taken = Matcher(pin.get("patterns"))
     if "keys" in ch:  # a run's keys= override: a one-off selection, of the keys that exist
         found = await index.lookup([key_bytes(str(k)) for k in ch["keys"]])
-        return {key_str(k): entry for k, entry in found.items()}, (), None
+        upserted = {key_str(k): entry for k, entry in found.items()}
+        return Window({k: e for k, e in upserted.items() if taken(k)}, (), None, len(upserted))
+    if "inline" in ch:  # the engine merged this page from its cache (resolved-commits.md §7)
+        page = ch["inline"]
+        upserted = {k: (bytes.fromhex(v), int(loc)) for k, (v, loc) in page["upserted"].items() if taken(k)}
+        deleted = tuple(k for k in page["deleted"] if taken(k))
+        return Window(upserted, deleted, page["next"], len(page["upserted"]) + len(page["deleted"]))
     start = key_bytes(ch["after"]) if ch.get("after") is not None else None
     if ch.get("full"):
         keys, versions, locators, nxt = await index.page(start, int(ch["limit"]))
@@ -63,24 +101,27 @@ async def read_window(pin: dict, keys_io) -> tuple[dict, tuple, str | None]:
             int(ch["from"]), int(ch["to"]), start, int(ch["limit"])
         )
     upserted = {
-        key_str(k): (v, loc) for k, v, d, loc in zip(keys, versions, flags, locators, strict=True) if not d
+        key_str(k): (v, loc)
+        for k, v, d, loc in zip(keys, versions, flags, locators, strict=True)
+        if not d and taken(key_str(k))
     }
-    deleted = tuple(key_str(k) for k, d in zip(keys, flags, strict=True) if d)
-    return upserted, deleted, key_str(nxt) if nxt is not None else None
+    deleted = tuple(key_str(k) for k, d in zip(keys, flags, strict=True) if d and taken(key_str(k)))
+    return Window(upserted, deleted, key_str(nxt) if nxt is not None else None, len(keys))
 
 
 async def read_page(pin: dict, keys_io) -> Page:
     each = pin["each"]
     failures = KeyIndex(keys_io, None, IndexState.from_json(each["failures"]))
     if each["kind"] != "retry":
-        upserted, deleted, after = await read_window(pin, keys_io)
-        touched = [key_bytes(k) for k in [*upserted, *deleted]]
+        window = await read_window(pin, keys_io)
+        touched = [key_bytes(k) for k in [*window.upserted, *window.deleted]]
         priors = await failures.lookup(touched) if touched else {}
         return Page(
             "changes",
-            upserted,
-            list(deleted),
-            after,
+            window.upserted,
+            [] if window.unmatched else list(window.deleted),
+            window.after,
+            unmatched=list(window.deleted) if window.unmatched else [],
             priors={key_str(k): Record.decode(v) for k, (v, _) in priors.items()},
         )
     # A retry page: walk the failure index from the pass's position, taking the
@@ -110,15 +151,26 @@ async def read_page(pin: dict, keys_io) -> Page:
         break
     upstream = KeyIndex(keys_io, None, IndexState.from_json(pin["index"]))
     current = await upstream.lookup([key_bytes(k) for k in due]) if due else {}
-    upserted, deleted = {}, []
+    taken = Matcher(pin.get("patterns"))
+    upserted, deleted, unmatched = {}, [], []
     for key in due:
         entry = current.get(key_bytes(key))
-        if entry is None:
+        if not taken(key):
+            unmatched.append(key)  # no longer one of the edge's keys: its outputs and record go
+        elif entry is None:
             deleted.append(key)  # gone upstream: its outputs and its record go
         elif entry[0] == walked[key].revision:
             upserted[key] = entry
         # else: its upstream moved on — the change window brings it, at its new version
-    return Page("retry", upserted, deleted, end, walked=walked, priors={k: walked[k] for k in due})
+    return Page(
+        "retry",
+        upserted,
+        deleted,
+        end,
+        unmatched=unmatched,
+        walked=walked,
+        priors={k: walked[k] for k in due},
+    )
 
 
 async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys_io, timeline, control):
@@ -243,12 +295,12 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
         return {"abort": abort[0]}
     for key in page.deleted:
         outcomes[key] = Outcome(REMOVED)
-    for key in each.get("unmatched") or ():
-        outcomes.setdefault(key, Outcome(UNMATCHED))
+    for key in page.unmatched:
+        outcomes[key] = Outcome(UNMATCHED)
 
     # What to store: the keys that succeeded, by output; removed keys go.
     groups = {name: {} for name in decls}
-    removes = {name: set(page.deleted) for name in decls}
+    removes = {name: {*page.deleted, *page.unmatched} for name in decls}
     for key, values in outputs.items():
         for name in decls:
             if values.get(name) is None:
@@ -281,7 +333,7 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
         "kind": page.kind,
         "after": page.after,
         "upserted": sorted(page.upserted),
-        "deleted": page.deleted,
+        "deleted": [*page.deleted, *page.unmatched],
     }
     report = {k: v for k, v in failures.items() if k != "records"}
     return {
@@ -291,6 +343,7 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
         "key_outcomes": rows,
         "keys": dict(counts),
         "drained": drain.is_set(),
+        "skipped": not outcomes,  # nothing on the page was the edge's
     }
 
 

@@ -459,3 +459,115 @@ async def test_a_timeout_drain_counts_a_try_and_comes_due(tmp_path):
     assert record.outcome == TIMED_OUT and record.tries == 1 and record.next_at >= record.last + 60
     await engine.stop()
     await opened.close()
+
+
+async def test_patterns_select_keys_and_a_page_of_none_is_skipped(state):  # noqa: F811
+    from solera import Incremental
+
+    content = {"ICP/a.csv": {"n": 1}, "ICP/archive/b.csv": {"n": 2}, "XRF/c.csv": {"n": 3}}
+    seen = []
+
+    def parse(ctx, file: dict):
+        seen.append(ctx.key)
+        return [{"n": file["n"]}]
+
+    project = files_project(content, parse, include="ICP/**", exclude={"archive": "**/archive/**"})
+    engine = make_engine(state, project)
+    await engine.initialize()
+    await drive(engine, await engine.submit(["parse"], upstream=True))
+    assert seen == ["ICP/a.csv"] and set(await rows_of(engine, project, "samples")) == {"ICP/a.csv"}
+    # A change the patterns leave out: the page is read, nothing is called, the task skips.
+    content["XRF/c.csv"] = {"n": 4}
+    detail = await drive(engine, await engine.submit(["parse"], upstream=True))
+    assert seen == ["ICP/a.csv"] and task_statuses(detail)["parse"] == "skipped"
+
+    # The same on a plain Incremental edge.
+    @asset(outputs=Output("files2", keyed=True))
+    def files2():
+        return dict(content)
+
+    calls = []
+
+    @asset(inputs={"f": Incremental("files2", include="XRF/**")})
+    def plain(f: dict):
+        calls.append(sorted(f))
+        return [{"n": len(f)}]
+
+    project = Project(assets=[files2, plain])
+    engine = make_engine(state, project)
+    await engine.initialize()
+    await drive(engine, await engine.submit(["plain"], upstream=True))
+    content["ICP/a.csv"] = {"n": 9}
+    detail = await drive(engine, await engine.submit(["plain"], upstream=True))
+    assert calls == [["XRF/c.csv"]] and task_statuses(detail)["plain"] == "skipped"
+
+
+async def test_a_pattern_change_cuts_over(state):  # noqa: F811
+    """§11: changes up to the cutover finish under the old patterns — so a
+    pending deletion of a newly excluded key still removes its rows — then
+    membership is diffed against the snapshot at the cutover, then deltas
+    continue under the new patterns."""
+
+    content = {"a/1.csv": {"n": 1}, "archive/2.csv": {"n": 2}, "b/3.csv": {"n": 3}}
+    seen = []
+
+    def parse(ctx, file: dict):
+        seen.append(ctx.key)
+        return [{"n": file["n"]}]
+
+    old = files_project(content, parse, include=["a/**", "archive/**"], batch_size=1)
+    engine = make_engine(state, old)
+    await engine.initialize()
+    await drive(engine, await engine.submit(["parse"], upstream=True))
+    assert set(await rows_of(engine, old, "samples")) == {"a/1.csv", "archive/2.csv"}
+    # Upstream deletes archive/2.csv (not consumed yet), and b/4.csv appears.
+    del content["archive/2.csv"]
+    content["b/4.csv"] = {"n": 4}
+    await drive(engine, await engine.submit(["files"]))
+    # A deploy: archive excluded, b included.
+    new = files_project(
+        content, parse, include=["a/**", "b/**"], exclude={"archive": "archive/**"}, batch_size=1
+    )
+    engine = make_engine(state, new)
+    await engine.initialize()
+    seen.clear()
+    detail = await drive(engine, await engine.submit(["parse"]))
+    assert status_of(detail) == "succeeded"
+    assert set(await rows_of(engine, new, "samples")) == {"a/1.csv", "b/3.csv", "b/4.csv"}
+    assert sorted(seen) == ["b/3.csv", "b/4.csv"]  # a/1.csv matched both times: not reprocessed
+    wm = engine.m.watermarks[("parse", "file", "")]
+    assert (
+        "rescope" not in wm
+        and wm["patterns"] == new.manifest["assets"]["parse"]["inputs"]["file"]["patterns"]
+    )
+    # From here on, deltas under the new patterns.
+    content["b/5.csv"] = {"n": 5}
+    content["archive/6.csv"] = {"n": 6}
+    seen.clear()
+    await drive(engine, await engine.submit(["parse"], upstream=True))
+    assert seen == ["b/5.csv"]
+
+
+async def test_a_rescope_pins_its_snapshot_between_attempts(state):  # noqa: F811
+    """The snapshot a rescope diffs is read across attempts: index files it
+    names stay until the transition ends, even with no attempt running."""
+
+    def parse(file: dict):
+        return []
+
+    engine = make_engine(state, files_project({}, parse))
+    await engine.initialize()
+    path = "keys/files/_/old.kx"
+    await state.put_object(path, b"x")
+    engine.m.garbage.append([path, engine.m.applied + 5])  # let go of after the pin below
+    engine.m.watermarks[("parse", "file", "")] = {
+        "output": "files",
+        "up": "",
+        "batch": 3,
+        "rescope": {"pin": engine.m.applied, "cutover": 2, "after": "k"},
+    }
+    await engine.upkeep.collect()
+    assert await state.get_object(path) is not None
+    del engine.m.watermarks[("parse", "file", "")]
+    await engine.upkeep.collect()
+    assert await state.get_object(path) is None

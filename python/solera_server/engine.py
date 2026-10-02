@@ -1192,6 +1192,35 @@ class Engine(Attempts, Sensors):
             return pin, {"update": update, "more": hi < head_batch}, hi < lo
 
         index = self.m.index(output, up_scope)
+        patterns = edge.get("patterns")
+        base["patterns"] = patterns
+        rescope = None if reset else wm.get("rescope")
+        if not reset and rescope is None and wm.get("patterns") != patterns:
+            # The edge's patterns changed: cut over at the upstream's head (per-key §11).
+            # Changes up to it finish under the old patterns, then membership is
+            # diffed against the index as of the cutover, pinned until the diff ends.
+            rescope = {
+                "from": wm.get("patterns"),
+                "to": patterns,
+                "cutover": head_batch,
+                "snapshot": index.pinned().to_json(),
+                "pin": claim_pin if claim_pin is not None else self.m.applied,
+                "after": None,
+            }
+        if rescope is not None:
+            base["patterns"], base["rescope"] = rescope["from"], rescope
+            if not wm.get("full") and int(wm["batch"]) > rescope["cutover"]:
+                pin = {
+                    "ref": ref,
+                    "index": rescope["snapshot"],
+                    "changes": {
+                        "rescope": {"from": rescope["from"], "to": rescope["to"]},
+                        "after": rescope["after"],
+                        "limit": limit,
+                    },
+                }
+                return pin, {**base, "diff": True, "batch": int(wm["batch"])}, False
+            head_batch = min(head_batch, rescope["cutover"])  # finish: under the old patterns
         empty = False
         if reset:
             window = {"full": True, "from": head_batch + 1, "after": None}
@@ -1207,6 +1236,11 @@ class Engine(Attempts, Sensors):
             # The log no longer holds this window: deliver everything again.
             window = {"full": True, "from": head_batch + 1, "after": None}
             empty = False
+            if rescope is not None:  # a full delivery is under the new patterns: no diff left
+                base.pop("rescope")
+                base["patterns"] = patterns
+        if base.get("rescope") is not None:
+            empty = False  # the transition has its diff still to do
         pinned = index.pinned() if window["full"] else index.pinned(window["from"], window["to"])
         pin = {"ref": ref, "index": pinned.to_json(), "changes": {**window, "limit": limit}}
         if not window["full"] and not empty and self.keys is not None:
@@ -1215,6 +1249,8 @@ class Engine(Attempts, Sensors):
             inline = self.keys.inline(index.prefix, window["from"], window["to"], window["after"], limit)
             if inline is not None:
                 pin["changes"]["inline"] = inline
+        if base["patterns"] is not None:
+            pin["patterns"] = base["patterns"]  # the worker filters the page, inlined or read
         plan = {**base, **window}
         if not window["full"]:  # a window paged over attempts holds its first page's reader pin
             plan["pin"] = wm.get("pin") if window["after"] is not None and wm else claim_pin
@@ -1252,7 +1288,10 @@ class Engine(Attempts, Sensors):
         record = self.m.failures.get(key) or {}
         failures = self.m.index(f"@{task['asset']}", task["scope"])
         changes = not empty
-        retries = not (plan or {}).get("full") and self._has_retries(record)
+        # A full delivery reprocesses every key, and a pattern transition decides which
+        # keys are the edge's: retries wait for either to end.
+        transition = (plan or {}).get("full") or (plan or {}).get("rescope") is not None
+        retries = not transition and self._has_retries(record)
         if changes and retries:
             kind = "retry" if record.get("last") == "changes" else "changes"
         else:
@@ -1293,6 +1332,8 @@ class Engine(Attempts, Sensors):
                 "changes": {"retry": {"after": retry["after"]}, "limit": limit},
                 "each": each,
             }
+            if (wm or {}).get("patterns") is not None:
+                pin["patterns"] = wm["patterns"]  # a due key the edge no longer takes goes
             return pin, {"update": wm, "each": {"kind": "retry", "pass": retry, "changes": changes}}, False
         pin = {**pin, "each": each}
         page = {"kind": "changes", "retries": retries, "pass": retry}
@@ -1363,6 +1404,23 @@ class Engine(Attempts, Sensors):
         its later pages still read versions as of then (docs/lifecycle.md §9.8)."""
 
         base = {k: plan[k] for k in ("output", "up", "fingerprint")}
+        if plan.get("patterns") is not None:  # what the edge delivers under (per-key §11)
+            base["patterns"] = plan["patterns"]
+        rescope = plan.get("rescope")
+        if plan.get("diff"):  # a rescope's membership diff (per-key §11)
+            if after is None:  # done: the new patterns from the cutover on
+                done = {**base, "batch": plan["batch"], "after": None, "full": False}
+                done.pop("patterns", None)
+                return {**done, "patterns": rescope["to"]} if rescope["to"] is not None else done
+            return {
+                **base,
+                "batch": plan["batch"],
+                "after": None,
+                "full": False,
+                "rescope": {**rescope, "after": after},
+            }
+        if rescope is not None:
+            base["rescope"] = rescope
         if plan["full"]:
             if after is None:
                 return {**base, "batch": plan["from"], "after": None, "full": False}
@@ -1464,7 +1522,8 @@ class Engine(Attempts, Sensors):
                 raise Conflict(f"input {param}: the result reports no delivery", retryable=False)
             after = delivered[param].get("after")
             watermarks[param] = self._watermark(plan, after)
-            more = more or after is not None
+            # A pattern transition that finished its old-pattern changes has its diff to do.
+            more = more or after is not None or (plan.get("rescope") is not None and not plan.get("diff"))
         heads, keys = {}, {}
         for name, entry in outputs.items():
             if name not in declared:
@@ -1500,8 +1559,9 @@ class Engine(Attempts, Sensors):
                     head["base"] = head["batch"] if name not in prepared["prior"] else before.get("base", 0)
             heads[name] = head
         for name in set(declared) - set(outputs):
-            # An Each page whose keys all failed writes nothing, and makes no head yet.
-            if prepared["baseline"].get(name) is None and failures is None:
+            # An Each page whose keys all failed writes nothing, and makes no head yet;
+            # nor does a page whose keys the edge's patterns all left out.
+            if prepared["baseline"].get(name) is None and failures is None and not result.get("skipped"):
                 raise Conflict(f"omitted output {name} has no head to keep (§2)", retryable=False)
         commit = {"heads": heads, "watermarks": watermarks}
         if failures is not None:
@@ -1537,6 +1597,8 @@ class Engine(Attempts, Sensors):
             commit["cursor"] = result["cursor"]
         elif prepared.get("full"):
             commit["cursor"] = None  # a full run clears the committed cursor (§8)
+        if outcome == "succeeded" and result.get("skipped") and not more:
+            outcome = "skipped"  # the patterns took none of its keys: it did nothing (per-key §11)
         self._finish(
             task,
             claim,

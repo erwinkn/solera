@@ -286,11 +286,13 @@ class Model:
     def pin_floor(self, but: str | None = None) -> float:
         """The oldest reader pin (docs/lifecycle.md §9.8): of the attempts
         claimed (but attempt `but`), the delta windows delivered over several
-        attempts, and the sensor ticks in flight. What was let go of at or
-        before it is read by no one."""
+        attempts, the rescope drains reading one snapshot over several
+        attempts (per-key-processing.md §11), and the sensor ticks in flight.
+        What was let go of at or before it is read by no one."""
 
         pins = [c["pin"] for c in self.claims.values() if c["attempt"] != but and "pin" in c]
         pins += [wm["pin"] for wm in self.watermarks.values() if wm.get("pin") is not None]
+        pins += [wm["rescope"]["pin"] for wm in self.watermarks.values() if wm.get("rescope")]
         pins += [t["pin"] for t in self.ticks.values()]
         return min(pins, default=math.inf)
 

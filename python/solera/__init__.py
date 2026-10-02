@@ -1,5 +1,6 @@
 from .errors import Abort, Failed, Rejected, Transient
 from .executors import AWSECS, K8sJob, Local, Modal, Placement, Pool
+from .patterns import Regex
 from .sdk import (
     KEYS,
     UNSET,
@@ -91,6 +92,7 @@ __all__ = [
     "Pool",
     "Project",
     "Ref",
+    "Regex",
     "Rejected",
     "RegistrationError",
     "Result",
