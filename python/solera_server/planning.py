@@ -224,8 +224,8 @@ class Edge:
 class Planner:
     """Planning over one view: `manifest`; `head(output, scope)` and
     `heads_of(output)` — the committed heads, with `projected` heads (what a
-    sensor's commits will install) over them; `progress(asset, scope)`, a
-    scope's delivery progress; and `now` (epoch seconds). The view is read as
+    sensor's commits will install) over them; `drained(asset, scope)`,
+    whether a scope's last commit finished its delivery; and `now` (epoch seconds). The view is read as
     of each call; what a call derives from it (heads by output, set members)
     is kept for the planner's life — one operation's."""
 
@@ -236,11 +236,11 @@ class Planner:
         heads_of: Callable[[str], Iterable[tuple[str, dict]]],
         now: float,
         projected: Mapping[tuple[str, str], dict] | None = None,
-        progress: Callable[[str, str], dict | None] = lambda asset, scope: None,
+        drained: Callable[[str, str], bool] = lambda asset, scope: False,
     ):
         self.manifest, self.now = manifest, now
         self.projected = dict(projected or {})
-        self._head, self._heads_of, self._progress = head, heads_of, progress
+        self._head, self._heads_of, self._drained = head, heads_of, drained
         self.time = dt.datetime.fromtimestamp(now, dt.UTC)
         self._groups: dict[tuple, dict] = {}
 
@@ -260,8 +260,7 @@ class Planner:
     def drained(self, asset: str, scope: str) -> bool:
         """Whether the scope's last commit finished its delivery."""
 
-        record = self._progress(asset, scope)
-        return record is not None and record["drained"]
+        return self._drained(asset, scope)
 
     def complete(self, asset: str, scope: str) -> bool:
         """Whether a scope is complete (§7): each of its outputs has a head,

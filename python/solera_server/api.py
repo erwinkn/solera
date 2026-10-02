@@ -300,7 +300,7 @@ def create_app(
         planner = runtime.planner()
         for scope, head in runtime.m.heads_of(name):
             owner = head.get("asset")
-            cursor = owner is not None and runtime.m.cursors.get((owner, scope)) is not None
+            cursor = owner is not None and runtime.m.scope(owner, scope).get("cursor") is not None
             out.append(
                 {
                     "scope": scope,

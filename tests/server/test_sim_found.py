@@ -89,7 +89,7 @@ async def test_a_removed_assets_last_attempt_ends_its_run(state, monkeypatch):  
         tasks = state.model.runs[run["id"]]["tasks"].values()
         raise AssertionError(f"the run never ends: {[(t['status'], t.get('held')) for t in tasks]}") from None
     assert status_of(detail) in {"succeeded", "failed", "canceled"}
-    assert [k for k in state.model.watermarks if k[0] == "pages"] == []  # its delivery ends with it
+    assert not state.model.scope("pages", "").get("watermarks")  # its delivery ends with it
 
 
 async def test_an_attempt_launched_before_a_rename_settles(state, monkeypatch):  # noqa: F811
@@ -168,7 +168,7 @@ async def test_a_change_made_during_a_full_delivery_reaches_downstream(state):  
     await engine.set_automation("out.onchange.0", False)
     await drive(engine, await engine.submit(["items"]))
     run = await engine.submit(["out"])
-    while (state.model.watermarks.get(("out", "items", "")) or {}).get("delivery", {}).get("page") != 1:
+    while (state.model.watermark("out", "items", "") or {}).get("delivery", {}).get("page") != 1:
         await engine.tick()
         await asyncio.sleep(0.01)
     await engine.cancel(run["id"])  # after its first page: `a` delivered at 1
@@ -260,4 +260,4 @@ async def test_a_batch_upstream_reset_right_after_a_delivery_is_delivered_in_ful
     await drive(engine, await engine.submit(["tally"]))
     assert state.model.heads[("log", "")]["base"] == 1
     assert seen[-1][0], f"the reset was delivered as a delta: {seen}"
-    assert state.model.cursors[("tally", "")] == 1
+    assert state.model.scope("tally", "")["cursor"] == 1

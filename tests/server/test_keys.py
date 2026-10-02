@@ -245,7 +245,7 @@ async def test_compaction_truncation_and_garbage(state):
     assert index.count == len(truth) and index.count_exact
     assert len(index.level(0)) < 3 and index.depth >= 1  # compacted
     head_batch = state.model.heads[("items", "")]["batch"]
-    watermark = state.model.watermarks[("mirror", "items", "")]
+    watermark = state.model.watermark("mirror", "items", "")
     assert watermark["next"] == head_batch + 1
     assert all(batch >= watermark["next"] for batch, _ in index.log)  # truncated behind it
     read = state.model.discard_reads()  # kept for the discards still pending (docs/lifecycle.md §9.8)
@@ -344,8 +344,8 @@ async def test_a_consumer_without_a_log_starts_over(state):
     await engine.initialize()
     await run(engine, ["mirror"], upstream=True)
     engine.upkeep.truncate()
-    wm = state.model.watermarks[("mirror", "items", "")]
-    state.model.watermarks[("mirror", "items", "")] = {**wm, "next": 0}  # behind the (empty) log
+    wm = state.model.watermark("mirror", "items", "")
+    state.model.scope("mirror", "")["watermarks"]["items"] = {**wm, "next": 0}  # behind the (empty) log
     await run(engine, ["mirror"])
     assert deliveries == [(True, ["a", "b"]), (True, ["a", "b"])]
 
@@ -456,7 +456,7 @@ async def test_renamed_asset_keeps_its_state(state):
     assert ("feed", "") not in m.heads and m.heads[("source_feed", "")]["ref"] == before["ref"]
     assert m.heads[("source_feed", "")]["asset"] == "source_feed"
     assert m.indexes[("source_feed", "")].prefix == "keys/feed/_/"  # files stay where they are
-    assert m.watermarks[("mirror", "feed", "")]["output"] == "source_feed"
+    assert m.watermark("mirror", "feed", "")["output"] == "source_feed"
     rows["v"] = [{"id": "a", "v": 1}, {"id": "b", "v": 2}]
     await run(engine, ["mirror"], upstream=True)
     assert m.heads[("source_feed", "")]["batch"] == 1

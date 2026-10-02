@@ -92,7 +92,7 @@ async def test_failures_are_recorded_and_never_block(state):  # noqa: F811
     detail = await drive(engine, await engine.submit(["parse"], upstream=True))
     assert status_of(detail) == "succeeded"
     assert set(await rows_of(engine, project, "samples")) == {"good.csv"}
-    record = engine.m.failures[("parse", "")]
+    record = engine.m.scope("parse", "")["failures"]
     assert record["counts"] == {"rejected": 1, "failed": 1, "retrying": 1}
     found = await records(engine, "parse")
     assert {k: r.outcome for k, r in found.items()} == {
@@ -119,7 +119,7 @@ async def test_failures_are_recorded_and_never_block(state):  # noqa: F811
     detail = await drive(engine, await engine.submit(["parse"], upstream=True))
     assert set(await rows_of(engine, project, "samples")) == {"good.csv", "empty.csv"}
     assert set(await records(engine, "parse")) == {"slow.csv"}
-    assert engine.m.failures[("parse", "")]["counts"] == {"retrying": 1}
+    assert engine.m.scope("parse", "")["failures"]["counts"] == {"retrying": 1}
 
 
 async def test_removed_keys_lose_their_rows(state):  # noqa: F811
@@ -161,7 +161,7 @@ async def test_transient_key_retried_when_due(state):  # noqa: F811
     skew["seconds"] = 7200.0  # two hours on
     await drive(engine, await engine.submit(["parse"]))
     assert tries["n"] == 2 and set(await rows_of(engine, project, "samples")) == {"a"}
-    record = engine.m.failures[("parse", "")]
+    record = engine.m.scope("parse", "")["failures"]
     assert record["counts"] == {} and record["due"] is None and record["retry"] is None
     assert record["passes"] == 1
 
@@ -218,7 +218,7 @@ async def test_forced_retry_takes_each_key_once(state):  # noqa: F811
     assert tries["n"] == 2
     engine.retry_keys("parse", ["all"])
     await drive(engine, await engine.submit(["parse"]))
-    assert tries["n"] == 3 and engine.m.failures[("parse", "")]["counts"] == {}
+    assert tries["n"] == 3 and engine.m.scope("parse", "")["failures"]["counts"] == {}
 
 
 async def test_abort_fails_the_attempt_and_commits_nothing(state):  # noqa: F811
@@ -239,7 +239,7 @@ async def test_abort_fails_the_attempt_and_commits_nothing(state):  # noqa: F811
     await engine.initialize()
     detail = await drive(engine, await engine.submit(["parse"], upstream=True))
     assert task_statuses(detail)["parse"] == "failed"
-    assert ("samples", "") not in engine.m.heads and ("parse", "") not in engine.m.failures
+    assert ("samples", "") not in engine.m.heads and "failures" not in engine.m.scope("parse", "")
 
 
 async def test_concurrency_and_batches(state):  # noqa: F811
@@ -349,7 +349,7 @@ async def test_a_user_cancel_commits_finished_keys_and_leaves_the_rest_dormant(t
     assert set(await rows_of(engine, project, "rows")) == {"a"}
     found = await records(engine, "parse")
     assert {k: r.outcome for k, r in found.items()} == {"b": CANCELED, "c": CANCELED}
-    assert "delivery" not in engine.m.watermarks[("parse", "file", "")]  # past the whole page
+    assert "delivery" not in engine.m.watermark("parse", "file", "")  # past the whole page
     # Dormant: a later run finds nothing to do.
     release.set()
     detail = await engine.run_until((await engine.submit(["parse"]))["id"], 10)
@@ -381,7 +381,7 @@ async def test_a_retry_pass_spans_pages_and_accumulates_its_bounds(state):  # no
     engine = make_engine(state, project)
     await engine.initialize()
     await drive(engine, await engine.submit(["parse"], upstream=True))
-    record = engine.m.failures[("parse", "")]
+    record = engine.m.scope("parse", "")["failures"]
     assert record["counts"] == {"failed": 5} and record["epoch_min"] == engine.m.epoch
 
     # A deploy fixes the bug; a new file arrives at the same time.
@@ -394,7 +394,7 @@ async def test_a_retry_pass_spans_pages_and_accumulates_its_bounds(state):  # no
     task = next(t for t in detail["tasks"] if t["asset"] == "parse")
     kinds = [a["keys"] for a in detail["attempts"][task["id"]]]
     assert sum(k.get("ok", 0) for k in kinds) == 6
-    record = engine.m.failures[("parse", "")]
+    record = engine.m.scope("parse", "")["failures"]
     assert record["counts"] == {} and record["retry"] is None
     assert record["due"] is None and record["epoch_min"] is None  # exact once the pass completed
     assert len(await rows_of(engine, project, "samples")) == 6
@@ -427,10 +427,10 @@ async def test_the_retry_clock_runs_automated_assets(state):  # noqa: F811
     assert tries["n"] == 1
     for _ in range(100):  # nothing upstream changes: the clock alone brings it back
         await engine.tick()
-        if tries["n"] == 2 and not engine.m.failures[("parse", "")].get("counts"):
+        if tries["n"] == 2 and not engine.m.scope("parse", "")["failures"].get("counts"):
             break
         await asyncio.sleep(0.05)
-    assert tries["n"] == 2 and engine.m.failures[("parse", "")]["counts"] == {}
+    assert tries["n"] == 2 and engine.m.scope("parse", "")["failures"]["counts"] == {}
 
 
 async def test_a_timeout_drain_counts_a_try_and_comes_due(tmp_path):
@@ -545,7 +545,7 @@ async def test_a_pattern_change_cuts_over(state):  # noqa: F811
     assert status_of(detail) == "succeeded"
     assert set(await rows_of(engine, new, "samples")) == {"a/1.csv", "b/3.csv", "b/4.csv"}
     assert sorted(seen) == ["b/3.csv", "b/4.csv"]  # a/1.csv matched both times: not reprocessed
-    wm = engine.m.watermarks[("parse", "file", "")]
+    wm = engine.m.watermark("parse", "file", "")
     assert (
         "rescope" not in wm
         and wm["patterns"] == new.manifest["assets"]["parse"]["inputs"]["file"]["patterns"]
@@ -570,17 +570,19 @@ async def test_a_rescope_pins_its_snapshot_between_attempts(state):  # noqa: F81
     path = "keys/files/_/old.kx"
     await state.put_object(path, b"x")
     engine.m.garbage.append([path, engine.m.applied + 5])  # let go of after the pin below
-    engine.m.watermarks[("parse", "file", "")] = {
-        "kind": "keys",
-        "output": "files",
-        "up": "",
-        "next": 3,
-        "rescope": {"pin": engine.m.applied, "cutover": 2},
-        "delivery": {"mode": "diff", "at": "k", "page": 1, "pages": 2},
+    engine.m._scope("parse", "")["watermarks"] = {
+        "file": {
+            "kind": "keys",
+            "output": "files",
+            "up": "",
+            "next": 3,
+            "rescope": {"pin": engine.m.applied, "cutover": 2},
+            "delivery": {"mode": "diff", "at": "k", "page": 1, "pages": 2},
+        }
     }
     await engine.upkeep.collect()
     assert await state.get_object(path) is not None
-    del engine.m.watermarks[("parse", "file", "")]
+    del engine.m.scopes[("parse", "")]["watermarks"]
     await engine.upkeep.collect()
     assert await state.get_object(path) is None
 
@@ -637,7 +639,7 @@ async def test_a_last_page_that_writes_nothing_still_completes_the_scope(state):
     written = engine.m.heads[("samples", "")]
     task = next(t for t in detail["tasks"] if t["asset"] == "parse")
     assert written["attempt"] == detail["attempts"][task["id"]][0]["id"]  # a's page wrote it
-    assert engine.m.progress[("parse", "")] == {"drained": True}
+    assert engine.m.scope("parse", "")["drained"] is True
     planner = engine.planner()
     assert planner.complete("parse", "") and planner.scopes("parse", "missing") == []
     assert engine.head_view(written)["complete"] is True

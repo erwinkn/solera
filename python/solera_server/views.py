@@ -37,9 +37,6 @@ class Views:
         heads: dict[str, dict] = {}
         for (output, scope), head in self.m.heads.items():
             heads.setdefault(output, {})[scope] = head
-        outcomes: dict[str, dict] = {}
-        for (asset, scope), record in self.m.outcomes.items():
-            outcomes.setdefault(asset, {})[scope] = record
         running: dict[str, set] = {}
         for (asset, scope), ids in self.m.pending.items():
             if ids:
@@ -50,7 +47,8 @@ class Views:
             scoped: dict[str, dict] = {}
             for output in outputs:  # a scope's head: its last declared output's, among those it has
                 scoped.update(heads.get(output["name"]) or {})
-            recorded, pending = outcomes.get(asset) or {}, running.get(asset) or set()
+            recorded = {s: r["last"] for s, r in self.m.scopes.of(asset).items() if "last" in r}
+            pending = running.get(asset) or set()
             scopes = set(scoped) | set(recorded) | pending
             if every:
                 listed = set(planner.scopes(asset, "all"))
@@ -117,9 +115,11 @@ class Views:
         for (output, _), head in self.m.heads.items():
             if (entry := out.get(owner.get(output))) is not None:
                 entry["updated_at"] = max(entry["updated_at"] or head["at"], head["at"])
-        for (asset, scope), record in self.m.outcomes.items():
-            entry = out.get(asset)
-            if entry is not None and (entry["last"] is None or record["at"] > entry["last"]["at"]):
+        for (asset, scope), state in self.m.scopes.items():
+            entry, record = out.get(asset), state.get("last")
+            if entry is None or record is None:
+                continue
+            if entry["last"] is None or record["at"] > entry["last"]["at"]:
                 view = self.outcome_view(record)
                 entry["last"] = {
                     "scope": scope,
@@ -127,9 +127,9 @@ class Views:
                     "at": view["at"],
                     "attempt": view["last_attempt"],
                 }
-        for (asset, _), record in self.m.failures.items():
+        for (asset, _), state in self.m.scopes.items():
             if (failures := (out.get(asset) or {}).get("failures")) is not None:
-                for name, n in (record.get("counts") or {}).items():
+                for name, n in ((state.get("failures") or {}).get("counts") or {}).items():
                     failures[name] = failures.get(name, 0) + n
         for output, _ in self.m.unsettled:
             if (entry := out.get(owner.get(output))) is not None:
@@ -196,7 +196,11 @@ class Views:
         unknown = set(outcomes) - set(NAMES.values())
         if unknown:
             raise ValueError(f"unknown key classes: {sorted(unknown)}")
-        records = {s: r for (a, s), r in self.m.failures.items() if a == asset and scope in (None, s)}
+        records = {
+            s: r["failures"]
+            for s, r in self.m.scopes.of(asset).items()
+            if "failures" in r and scope in (None, s)
+        }
         start = json.loads(after) if after else None
         if start is not None and not (isinstance(start, list) and [type(s) for s in start] == [str, str]):
             raise ValueError("after= takes a page's `next`")
@@ -258,7 +262,7 @@ class Views:
         cleanup after a full Each delivery), `paging` (a delta delivered over
         several attempts), `behind` (lag), else `caught_up`."""
 
-        wm = self.m.watermarks.get((asset, param, scope))
+        wm = self.m.watermark(asset, param, scope)
         up_scope = (wm or {}).get("up")
         if up_scope is None:
             try:
@@ -307,8 +311,8 @@ class Views:
         edges = [*info["inputs"].items(), *((d, {"kind": "dep", "output": d}) for d in info["deps"])]
         current = set(self.planner().scopes(asset, "all"))
         marked: dict[str, set] = {}
-        for a, param, scope in self.m.watermarks:
-            if a == asset:
+        for scope, record in self.m.scopes.of(asset).items():
+            for param in record.get("watermarks") or ():
                 marked.setdefault(param, set()).add(scope)
         out = []
         for param, edge in edges:
@@ -391,7 +395,7 @@ class Views:
         spec, is_each = keyed[edge], keyed[edge].get("each") is not None
         if (
             scope not in self.planner().scopes(asset, [scope])
-            and (asset, edge, scope) not in self.m.watermarks
+            and self.m.watermark(asset, edge, scope) is None
         ):
             raise KeyError(f"{asset}/{scope}")
         output = spec["output"]
@@ -417,14 +421,14 @@ class Views:
                 kept = last_ok = settled
             elif settled is not None:
                 last_ok = await self._newest_outcome(asset, scope, key, [OK])
-        wm = self.m.watermarks.get((asset, edge, scope))
+        wm = self.m.watermark(asset, edge, scope)
         served = wm.get("patterns") if wm is not None else spec.get("patterns")
         matcher = Matcher(served)
         included, excluded_by = matcher.included(key), matcher.excluded_by(key)
         revision = self._rendered(output, upstream) if upstream is not None else None
         failure = None
         if failing is not None:
-            forced = (self.m.failures.get((asset, scope)) or {}).get("forced") or {}
+            forced = (self.m.scope(asset, scope).get("failures") or {}).get("forced") or {}
             failure = self._failure_view(asset, scope, key, Record.decode(failing), forced)
         present = {name: v is not None for name, v in zip(outputs, held, strict=True)}
         if not included:

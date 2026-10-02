@@ -562,7 +562,7 @@ class Simulation(RuleBasedStateMachine):
         still behind its upstream's head, with no delivery under way."""
 
         m = self.world.engine.m
-        wm = m.watermarks.get((asset, edge, "")) or {}
+        wm = m.watermark(asset, edge, "") or {}
         head = (m.heads.get(("items", "")) or {}).get("batch", -1)
         if automated and wm and wm.get("next", 0) <= head and not wm.get("delivery"):
             self._known("F6", f"{asset}'s watermark is at {wm.get('next')}, items at batch {head}")

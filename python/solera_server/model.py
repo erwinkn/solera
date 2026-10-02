@@ -4,8 +4,9 @@ events that change it, and `apply`.
 The model is plain data changed only by `apply(event)`, so replaying the
 journal reproduces it exactly. It has three layers:
 
-- **Durable**: the project, heads, key indexes, cursors, watermarks,
-  per-scope outcomes and delivery progress, automation state, active runs
+- **Durable**: the project, heads, key indexes, each asset scope's record
+  (cursor, last outcome, completeness, watermarks, failing keys),
+  automation state, active runs
   (tasks nested inside, each launched attempt on its task), unsettled outputs, idempotency
   receipts, files awaiting deletion, and the run history's files and the
   rows not yet flushed to them (§7). `snapshot()` serializes exactly this,
@@ -149,13 +150,9 @@ class Model:
                 "indexes": _nest({k: v.to_json() for k, v in self.indexes.items()}, 2),
                 "garbage": self.garbage,
                 "retired": self.retired,
-                "cursors": _nest(self.cursors, 2),
-                "watermarks": _nest(self.watermarks, 3),
-                "outcomes": _nest(self.outcomes, 2),
-                "progress": _nest(self.progress, 2),
+                "scopes": _nest(self.scopes, 2),
                 "unsettled": _nest(self.unsettled, 2),
                 "discards": _nest(self.discards, 2),
-                "failures": _nest(self.failures, 2),
                 "automations": self.automations,
                 "sensors": self.sensors,
                 "runs": self.runs,
@@ -183,21 +180,19 @@ class Model:
         self.garbage: list[list] = snap.get("garbage") or []
         # deleted runs whose directories are still to be deleted (§11)
         self.retired: list[str] = snap.get("retired") or []
-        self.cursors: dict[tuple, object] = _flatten(snap.get("cursors"), 2)
-        self.watermarks: dict[tuple, dict] = _flatten(snap.get("watermarks"), 3)
-        self.outcomes: dict[tuple, dict] = _flatten(snap.get("outcomes"), 2)
-        # (asset, scope) -> {"drained": bool}: whether its last commit finished the
-        # delivery it was on — the scope's completeness, whatever its outputs wrote
-        self.progress: dict[tuple, dict] = _flatten(snap.get("progress"), 2)
+        # (asset, scope) -> the scope's record (§5): its `cursor`; `last`, its last
+        # terminal outcome; `drained`, whether its last commit finished the delivery
+        # it was on — its completeness, whatever its outputs wrote; `watermarks`
+        # {edge: Watermark}; and an Each asset's `failures` record
+        # (docs/per-key-processing.md §9), whose index lives in `indexes` under
+        # ("@asset", scope). A rename moves it, retirement trims it: one record.
+        self.scopes = Grouped(_flatten(snap.get("scopes"), 2))
         # (output, scope) -> intents of attempts that died while writing it (§8)
         self.unsettled: dict[tuple, list] = _flatten(snap.get("unsettled"), 2)
         # (output, scope) -> data garbage of an immutable store, each entry at the
         # event position that let go of it: for the scope's next attempt to discard
         # once no reader pins it (docs/lifecycle.md §9.8)
         self.discards: dict[tuple, list] = _flatten(snap.get("discards"), 2)
-        # (asset, scope) -> an Each asset's failure record (docs/per-key-processing.md §9):
-        # its index lives in `indexes` under ("@asset", scope)
-        self.failures: dict[tuple, dict] = _flatten(snap.get("failures"), 2)
         self.automations: dict[str, dict] = snap.get("automations") or {}
         # sensor -> {cursor, accepted}: the last tick that changed something (docs/lifecycle.md §11.4)
         self.sensors: dict[str, dict] = snap.get("sensors") or {}
@@ -309,8 +304,35 @@ class Model:
     def heads_of(self, output: str) -> list[tuple[str, dict]]:
         return sorted(self.heads.of(output).items())
 
-    def outcomes_of(self, asset: str) -> dict[str, dict]:
-        return {scope: rec for (a, scope), rec in self.outcomes.items() if a == asset}
+    def scope(self, asset: str, scope: str) -> dict:
+        """An asset scope's record, empty where it has none: to read."""
+
+        return self.scopes.get((asset, scope)) or {}
+
+    def watermark(self, asset: str, edge: str, scope: str) -> dict | None:
+        return (self.scope(asset, scope).get("watermarks") or {}).get(edge)
+
+    def watermarks(self):
+        """Every Incremental edge's watermark, of every scope."""
+
+        for record in self.scopes.values():
+            yield from (record.get("watermarks") or {}).values()
+
+    def _scope(self, asset: str, scope: str) -> dict:
+        """An asset scope's record, to change: made if it has none."""
+
+        key = (asset, scope)
+        if key not in self.scopes:
+            self.scopes[key] = {}
+        return self.scopes[key]
+
+    def _ended(self, task: dict, outcome: str, run: str, attempt: str | None, at: float) -> None:
+        self._scope(task["asset"], task["scope"])["last"] = {
+            "outcome": outcome,
+            "run": run,
+            "attempt": attempt,
+            "at": at,
+        }
 
     def pending_scopes(self, asset: str) -> set[str]:
         return {scope for (a, scope), ids in self.pending.items() if a == asset and ids}
@@ -352,7 +374,7 @@ class Model:
         out = [
             (c["pin"], c.get("domains")) for c in self.claims.values() if c["attempt"] != but and "pin" in c
         ]
-        for wm in self.watermarks.values():
+        for wm in self.watermarks():
             upstream = (self.index(wm["output"], wm["up"]).prefix,)
             out += [(pin, upstream) for pin in delivery.pins(wm)]
         for tick in self.ticks.values():
@@ -584,18 +606,20 @@ class Model:
         `asset` and `scope`, only that scope's — one whose attempt ended."""
 
         live = {(t["asset"], t["scope"]) for tid in self.claims if (t := self.task(tid)) is not None}
-        for key in list(self.watermarks):
-            owner, edge, at = key
-            if asset is not None and (owner, at) != (asset, scope):
+        keys = list(self.scopes) if asset is None else [(asset, scope)]
+        for key in keys:
+            marks = self.scopes.get(key, {}).get("watermarks")
+            if not marks or key in live:
                 continue
-            if (owner, at) not in live and not self._subscribed(owner, edge, self.watermarks[key]):
-                del self.watermarks[key]
+            for edge in [edge for edge, wm in marks.items() if not self._subscribed(key[0], edge, wm)]:
+                del marks[edge]
+            if not marks:
+                del self.scopes[key]["watermarks"]
 
     def _apply_aliases(self, manifest) -> tuple[dict[str, list[str]], dict[str, str]]:
         """Move everything held under an asset's former names to its current
-        one (§2): cursors, watermarks, outcomes, pending automation entries,
-        an Each asset's failure records and failure
-        index, and — for outputs named after the asset — heads,
+        one (§2): its scope records, pending automation entries, an Each
+        asset's failure index, and — for outputs named after the asset — heads,
         key indexes, unsettled intents and pending discards. A new name never
         releases a write domain. An index keeps its files where they are (its
         `prefix`). Returns `{asset: [aliases]}`, for the automations and tasks
@@ -625,20 +649,16 @@ class Model:
 
         move(self.heads, output_map, 0)
         move(self.indexes, output_map, 0)
-        move(self.cursors, asset_map, 0)
-        move(self.outcomes, asset_map, 0)
-        move(self.progress, asset_map, 0)
-        move(self.watermarks, asset_map, 0)
-        # An Each asset's failure record and its index (`@asset`), whose files stay
-        # under their prefix; retry-pass state and forced positions go with them.
-        move(self.failures, asset_map, 0)
+        # A scope's record goes whole: a name that already has one keeps its own.
+        move(self.scopes, asset_map, 0)
+        # An Each asset's failure index (`@asset`), whose files stay under their prefix.
         move(self.indexes, {f"@{old}": f"@{new}" for old, new in asset_map.items()}, 0)
         move(self.unsettled, output_map, 0, merge=list)
         move(self.discards, output_map, 0, merge=_renumbered)
         for head in self.heads.values():
             if head.get("asset") in asset_map:
                 head["asset"] = asset_map[head["asset"]]
-        for wm in self.watermarks.values():
+        for wm in self.watermarks():
             if wm.get("output") in output_map:
                 wm["output"] = output_map[wm["output"]]
         for auto in self.automations.values():
@@ -690,12 +710,7 @@ class Model:
                 task.pop("held", None)
                 self._stop_clock(task, at)
                 self._event(run, "canceled", at, tid)
-                self.outcomes[(task["asset"], task["scope"])] = {
-                    "outcome": "canceled",
-                    "run": run["id"],
-                    "attempt": attempt,
-                    "at": at,
-                }
+                self._ended(task, "canceled", run["id"], attempt, at)
             # Claims go with their tasks, except those of launched attempts:
             # each is aborted, or — if it is already writing — waited for and
             # committed (§8).
@@ -900,7 +915,7 @@ class Model:
     def _install(
         self, task: dict, commit: dict, e: dict, prepared: dict, generation: int | None = None
     ) -> None:
-        """Install a commit: heads, key indexes, cursor, watermarks — under the
+        """Install a commit: heads, key indexes, the scope's record — under the
         contract its attempt was launched with (`prepared`). Each output
         version it makes enters the history, with what it was built from
         (its `lineage`, with what its reads saw: `history.read_lineage`). A
@@ -927,16 +942,17 @@ class Model:
                 index = self.index(name, scope)
                 for intent in self.unsettled.pop((name, scope), ()):
                     self.garbage.extend([index.path(f["name"]), self.applied] for f in intent["files"])
+        record = self._scope(asset, scope)
         if "drained" in commit:
-            self.progress[(asset, scope)] = {"drained": bool(commit["drained"])}
+            record["drained"] = bool(commit["drained"])
         if "cursor" in commit:
             if commit["cursor"] is None:
-                self.cursors.pop((asset, scope), None)
+                record.pop("cursor", None)
             else:
-                self.cursors[(asset, scope)] = commit["cursor"]
+                record["cursor"] = commit["cursor"]
         for edge, wm in commit.get("watermarks", {}).items():
             if self._subscribed(asset, edge, wm):  # an edge removed while it ran keeps no delivery
-                self.watermarks[(asset, edge, scope)] = wm
+                record.setdefault("watermarks", {})[edge] = wm
         if "failures" in commit:
             self._failures(asset, scope, commit["failures"])
         for row in commit.get("key_outcomes") or ():
@@ -968,7 +984,7 @@ class Model:
         delta, and the counts, bounds and retry-pass state the engine worked
         out from it (docs/per-key-processing.md §9)."""
 
-        record = self.failures.setdefault((asset, scope), {"batch": -1, "forced": {}})
+        record = self._scope(asset, scope).setdefault("failures", {"batch": -1, "forced": {}})
         keys = f.get("keys") or {}
         if keys.get("files"):
             name = f"@{asset}"
@@ -984,10 +1000,10 @@ class Model:
         position in the event order, for each class it names
         (docs/per-key-processing.md §9)."""
 
-        for (asset, scope), record in self.failures.items():
-            if asset == e["asset"] and (e.get("scope") is None or e["scope"] == scope):
+        for scope, record in self.scopes.of(e["asset"]).items():
+            if "failures" in record and e.get("scope") in (None, scope):
                 for name in e["classes"]:
-                    record.setdefault("forced", {})[name] = self.applied
+                    record["failures"].setdefault("forced", {})[name] = self.applied
 
     def _pend_onchange(self, asset: str | None, scope: str, changed: list[str]) -> None:
         if not changed:
@@ -1045,12 +1061,7 @@ class Model:
             bucket.discard(tid)
             if not bucket:
                 del self.pending[(task["asset"], task["scope"])]
-        self.outcomes[(task["asset"], task["scope"])] = {
-            "outcome": outcome,
-            "run": run["id"],
-            "attempt": attempt,
-            "at": at,
-        }
+        self._ended(task, outcome, run["id"], attempt, at)
         self._event(run, outcome, at, tid)
         stats = self.run_left.setdefault(run["id"], [0, 0])
         if roll_up:

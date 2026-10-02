@@ -174,15 +174,17 @@ async def test_a_reader_pin_holds_collection_back(tmp_path):
     m.claims["reader"] = {"attempt": "r", "pin": 9, "started_at": 0, "status": "running"}
     assert engine._due_discards("scores", "", "me") == []
     m.claims["reader"]["pin"] = 10
-    m.watermarks[("c", "e", "")] = {
-        "kind": "keys",
-        "output": "scores",
-        "up": "",
-        "next": 0,
-        "delivery": {"mode": "delta", "from": 0, "to": 1, "at": "k", "page": 1, "pages": 2, "pin": 8},
+    m._scope("c", "")["watermarks"] = {
+        "e": {
+            "kind": "keys",
+            "output": "scores",
+            "up": "",
+            "next": 0,
+            "delivery": {"mode": "delta", "from": 0, "to": 1, "at": "k", "page": 1, "pages": 2, "pin": 8},
+        }
     }
     assert engine._due_discards("scores", "", "me") == []
-    del m.watermarks[("c", "e", "")]
+    del m.scopes[("c", "")]
     assert [d["n"] for d in engine._due_discards("scores", "", "me")] == [10]
     assert [d["n"] for d in engine._due_discards("scores", "", "r")] == [10]  # its own claim reads none of it
     await state.close()

@@ -2,6 +2,7 @@
 use of it: commits, fencing, durable launches, restarts, and replay."""
 
 import asyncio
+import copy
 import json
 
 import pytest
@@ -110,8 +111,8 @@ async def test_commit_installs_heads_cursor_watermarks_and_pends_onchange(state,
     assert detail["request"]["status"] == "succeeded"
     m = state.model
     assert m.heads[("files", "")]["run"] == detail["request"]["id"]
-    assert m.progress[("consumer", "")] == {"drained": True}
-    assert m.watermarks[("consumer", "files", "")]["next"] == 1
+    assert m.scope("consumer", "")["drained"] is True
+    assert m.watermark("consumer", "files", "")["next"] == 1
     # files changed and consumer watches it: the change pended, and the next tick
     # (run_until ticks) fired the OnChange automation and consumed it — without a
     # new run, since this run's consumer task was still pending (§9).
@@ -474,3 +475,34 @@ def test_one_outputs_heads_are_found_without_looking_at_the_others():
     again = Model()
     again.restore(m.snapshot())
     assert len(again.heads_of("other")) == 1000 and again.heads_of("nothing") == []
+
+
+def test_a_rename_moves_a_scopes_record_whole():
+    """§2, §5: a scope's cursor, outcome, completeness, watermarks and
+    failing keys are one record, and `aliases=` moves it as one. A name
+    that already has a record keeps its own: two assets' states never mix.
+    A watermark of an edge the project no longer declares goes."""
+
+    wm = {"kind": "keys", "output": "feed", "up": "", "next": 3}
+    whole = {
+        "cursor": "c1",
+        "last": {"outcome": "failed", "run": "r", "attempt": "a", "at": 1.0},
+        "drained": True,
+        "watermarks": {"feed": wm, "gone": {**wm, "output": "elsewhere"}},
+        "failures": {"batch": 0, "forced": {}, "counts": {"failed": 1}},
+    }
+    m = Model()
+    m.scopes[("old", "x")] = copy.deepcopy(whole)
+    m.scopes[("old", "y")] = {"cursor": "old's"}
+    m.scopes[("new", "y")] = {"last": {"outcome": "succeeded", "run": "r", "attempt": "b", "at": 2.0}}
+    edge = {"kind": "incremental", "output": "feed"}
+    manifest = {
+        "assets": {"new": {"aliases": ["old"], "inputs": {"feed": edge}, "outputs": []}},
+        "outputs": {},
+        "sources": {},
+        "automations": {},
+    }
+    m.apply({"type": "ProjectRegistered", "revision": "r2", "manifest": manifest, "at": 3.0})
+    assert m.scope("new", "x") == {**whole, "watermarks": {"feed": wm}}
+    assert m.scope("new", "y") == {"last": {"outcome": "succeeded", "run": "r", "attempt": "b", "at": 2.0}}
+    assert m.scope("old", "x") == {} and sorted(m.scopes.of("new")) == ["x", "y"]

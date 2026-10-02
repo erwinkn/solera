@@ -132,7 +132,7 @@ async def test_bare_return_and_commit(state):
     assert status_of(detail) == "succeeded"
     installed = head(state, "numbers")
     assert installed["ref"]["output"] == "numbers" and installed["ref"]["version"]
-    assert state.model.progress[("numbers", "")] == {"drained": True}
+    assert state.model.scope("numbers", "")["drained"] is True
     assert installed["run"] == run["id"] and installed["attempt"]
 
 
@@ -157,9 +157,9 @@ async def test_result_cursor_and_omitted_output(state):
     await drive(engine, await engine.submit(["pair"]))
     assert head(state, "a")["ref"]["version"] != ""
     assert head(state, "b") is not None  # kept from the first commit
-    assert state.model.cursors.get(("pair", "")) == "c2"
+    assert state.model.scope("pair", "").get("cursor") == "c2"
     await drive(engine, await engine.submit(["pair"], mode="full"))
-    assert state.model.cursors.get(("pair", "")) is None  # full clears the cursor
+    assert state.model.scope("pair", "").get("cursor") is None  # full clears the cursor
 
 
 async def test_omitted_output_without_head_fails(state):
@@ -288,7 +288,7 @@ async def test_full_run_resets_watermark(state):
     engine = make_engine(state, project)
     await engine.initialize()
     await drive(engine, await engine.submit(["consumer"], upstream=True))
-    first = state.model.watermarks[("consumer", "files", "")]
+    first = state.model.watermark("consumer", "files", "")
     assert first == {
         "kind": "keys",
         "next": 1,  # the head's next batch: nothing under way
@@ -299,7 +299,7 @@ async def test_full_run_resets_watermark(state):
     }
     detail = await drive(engine, await engine.submit(["consumer"], mode="full"))
     assert task_statuses(detail)["consumer"] == "succeeded"  # never skipped on full
-    second = state.model.watermarks[("consumer", "files", "")]
+    second = state.model.watermark("consumer", "files", "")
     assert second == {**first, "pass": detail["request"]["id"]}  # back at head+1, nothing left mid-way
     # Both deliveries were full-head reads.
     assert seen == [(["a", "b"], True), (["a", "b"], True)]
@@ -366,7 +366,7 @@ async def test_incremental_batching_and_more(state):
     detail = await drive(engine, await engine.submit(["consumer"], upstream=True))
     assert status_of(detail) == "succeeded"
     assert batches == [["k0", "k1"], ["k2", "k3"], ["k4"]]
-    assert state.model.progress[("consumer", "")] == {"drained": True}
+    assert state.model.scope("consumer", "")["drained"] is True
     task = [t for t in detail["tasks"] if t["asset"] == "consumer"][0]
     assert len(detail["attempts"][task["id"]]) == 3  # three batches, three attempts
 
@@ -420,21 +420,21 @@ async def test_a_selection_reads_its_keys_and_moves_nothing(state):
     await drive(engine, await engine.submit(["files"]))
     detail = await drive(engine, await engine.submit(["consumer"], keys={"files": {"keys": ["b"]}}))
     assert status_of(detail) == "succeeded" and calls == [["b"]]  # the selection, and nothing else
-    assert ("consumer", "files", "") not in state.model.watermarks
-    assert ("consumer", "") not in state.model.progress
+    assert state.model.watermark("consumer", "files", "") is None
+    assert "drained" not in state.model.scope("consumer", "")
     calls.clear()
     await drive(engine, await engine.submit(["consumer"]))  # a full delivery, stopped after `a`
-    stopped = state.model.watermarks[("consumer", "files", "")]
+    stopped = state.model.watermark("consumer", "files", "")
     assert calls == [["a"]] and stopped["delivery"]["at"] == "a"
-    assert state.model.progress[("consumer", "")] == {"drained": False}
+    assert state.model.scope("consumer", "")["drained"] is False
     calls.clear()
     await drive(engine, await engine.submit(["consumer"], keys={"files": {"keys": ["c"]}}))
-    assert calls == [["c"]] and state.model.watermarks[("consumer", "files", "")] == stopped
-    assert state.model.progress[("consumer", "")] == {"drained": False}  # `b` is still owed
+    assert calls == [["c"]] and state.model.watermark("consumer", "files", "") == stopped
+    assert state.model.scope("consumer", "")["drained"] is False  # `b` is still owed
     broken["page"] = None
     calls.clear()
     await drive(engine, await engine.submit(["consumer"]))
-    assert calls == [["b"], ["c"]] and state.model.progress[("consumer", "")] == {"drained": True}
+    assert calls == [["b"], ["c"]] and state.model.scope("consumer", "")["drained"] is True
     with pytest.raises(ValueError, match="cannot be a full run"):
         await engine.submit(["consumer"], mode="full", keys={"files": {"keys": ["a"]}})
 
@@ -1387,7 +1387,7 @@ async def test_a_page_looks_ahead_a_bounded_way(state, monkeypatch):
     detail = await drive(engine, await engine.submit(["sparse"], upstream=True))
     assert status_of(detail) == "succeeded"
     assert calls == [([f"k0{i}" for i in range(5)], False), ([f"k0{i}" for i in range(5, 10)], False)]
-    assert state.model.progress[("sparse", "")] == {"drained": True}  # the empty rest, skipped
+    assert state.model.scope("sparse", "")["drained"] is True  # the empty rest, skipped
 
 
 async def test_an_unchanged_keyed_write_still_applies_its_migrations(state):

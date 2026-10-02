@@ -376,7 +376,7 @@ class Engine(Attempts, Sensors, Views):
             self.m.heads_of,
             self.clock(),
             projected,
-            lambda a, s: self.m.progress.get((a, s)),
+            lambda a, s: self.m.scope(a, s).get("drained", False),
         )
 
     def _plan_run(
@@ -743,8 +743,7 @@ class Engine(Attempts, Sensors, Views):
         if full and run["mode"] == "full" and incremental:
             # This run's reset began the pass every edge is on: resume it, page by page.
             started = [
-                (self.m.watermarks.get((task["asset"], e.param, scope)) or {}).get("pass")
-                for e in incremental
+                (self.m.watermark(task["asset"], e.param, scope) or {}).get("pass") for e in incremental
             ]
             if all(s == run["id"] for s in started):
                 full = False
@@ -789,7 +788,7 @@ class Engine(Attempts, Sensors, Views):
         # A full run's write is the whole content. An Each page's is not: it
         # patches by key, and a key that fails keeps its last good output (§5).
         reset = full and each_page is None
-        cursor = None if reset else self.m.cursors.get((task["asset"], scope))
+        cursor = None if reset else self.m.scope(task["asset"], scope).get("cursor")
         outputs = {}
         for output in asset["outputs"]:
             name, head = output["name"], heads[output["name"]]
@@ -981,7 +980,7 @@ class Engine(Attempts, Sensors, Views):
         head = self.m.heads.get((output, up_scope)) or {}
         head_batch = latest = int(head.get("batch", -1))  # `latest`: the head this page is planned against
         override = (run.get("keys") or {}).get(output)
-        wm = self.m.watermarks.get((task["asset"], param, task["scope"]))
+        wm = self.m.watermark(task["asset"], param, task["scope"])
         if isinstance(override, dict) and "keys" in override:
             # A keys= selection reads the keys it names, whatever the watermark — none
             # yet, a delivery under way, a reset due — and moves neither it nor the
@@ -1147,11 +1146,10 @@ class Engine(Attempts, Sensors, Views):
         neither starves, and there is no fraction to tune (§9). A full
         delivery reprocesses every key anyway, so retries wait for it."""
 
-        key = (task["asset"], task["scope"])
-        record = self.m.failures.get(key) or {}
+        record = self.m.scope(task["asset"], task["scope"]).get("failures") or {}
         failures = self.m.index(f"@{task['asset']}", task["scope"])
         changes = not empty
-        wm = self.m.watermarks.get((task["asset"], param, task["scope"]))
+        wm = self.m.watermark(task["asset"], param, task["scope"])
         whole = plan["kind"] == "keys" and plan["delivery"]["mode"] == "full"
         # After a full delivery, the output's keys it no longer names go first (§11).
         reconcile = None if whole else (wm or {}).get("reconcile")
@@ -1237,7 +1235,7 @@ class Engine(Attempts, Sensors, Views):
         reconcile page moves the cleanup on. Returns the record's commit, the
         `more`, and the watermark a reconcile page leaves (else None)."""
 
-        record = self.m.failures.get((task["asset"], task["scope"])) or {}
+        record = self.m.scope(task["asset"], task["scope"]).get("failures") or {}
         run = self.m.runs.get(task["run"]) or {}
         report = result.get("failures") or {}
         counts = dict(record.get("counts") or {})
@@ -1451,7 +1449,7 @@ class Engine(Attempts, Sensors, Views):
             # may write none of them (§7) — and every edge's: one still delivering, its
             # watermark untouched by this attempt, keeps the scope from draining.
             after = [
-                watermarks.get(p) or self.m.watermarks.get((task["asset"], p, task["scope"]))
+                watermarks.get(p) or self.m.watermark(task["asset"], p, task["scope"])
                 for p in prepared.get("plans") or {}
             ]
             commit["drained"] = not more and not any(delivery.outstanding(wm) for wm in after if wm)
@@ -1758,12 +1756,12 @@ class Engine(Attempts, Sensors, Views):
         its next run."""
 
         automated = {t for auto in self.m.automations.values() if auto["enabled"] for t in auto["targets"]}
-        for (asset, scope), record in list(self.m.failures.items()):
-            if asset not in automated or asset not in self.manifest["assets"]:
+        for (asset, scope), state in list(self.m.scopes.items()):
+            if asset not in automated or asset not in self.manifest["assets"] or "failures" not in state:
                 continue
             if self._scope_active(asset, scope) or self.m.is_pending(asset, scope):
                 continue
-            if self._has_retries(record):
+            if self._has_retries(state["failures"]):
                 await self.submit_retries(asset, [scope], "retry clock")
 
     async def submit_retries(self, asset: str, scopes, by: str | None) -> list[dict]:
@@ -1775,7 +1773,7 @@ class Engine(Attempts, Sensors, Views):
 
         by_config: dict[str, list[str]] = {}
         for scope in scopes:
-            config = (self.m.failures.get((asset, scope)) or {}).get("config") or {}
+            config = (self.m.scope(asset, scope).get("failures") or {}).get("config") or {}
             by_config.setdefault(json.dumps(config, sort_keys=True), []).append(scope)
         runs = []
         for config, group in sorted(by_config.items()):
@@ -1805,7 +1803,9 @@ class Engine(Attempts, Sensors, Views):
         self.state.record(
             {"type": "KeysRetryRequested", "asset": asset, "scope": scope, "classes": classes, "by": by}
         )
-        scopes = sorted(s for (a, s) in self.m.failures if a == asset and (scope is None or s == scope))
+        scopes = sorted(
+            s for s, r in self.m.scopes.of(asset).items() if "failures" in r and scope in (None, s)
+        )
         return {"asset": asset, "classes": classes, "scopes": scopes}
 
     def _automation_run(self, auto, partitions, targets=None) -> dict | None:
@@ -2128,7 +2128,7 @@ class Engine(Attempts, Sensors, Views):
             for o in info["outputs"]
         }
         watermarks = {
-            param: self.m.watermarks.get((asset, param, scope))
+            param: self.m.watermark(asset, param, scope)
             for param, edge in info["inputs"].items()
             if edge["kind"] == "incremental"
         }
@@ -2136,13 +2136,15 @@ class Engine(Attempts, Sensors, Views):
         return {
             "asset": info,
             "heads": heads,
-            "cursor": self.m.cursors.get((asset, scope)),
+            "cursor": self.m.scope(asset, scope).get("cursor"),
             "watermarks": watermarks,
             "current_keys": self.planner().dim_keys(dims) if dims else [],
             "unsettled": {
                 o["name"]: sorted(s for (n, s) in self.m.unsettled if n == o["name"]) for o in info["outputs"]
             },
-            "scopes": {s: self.outcome_view(r) for s, r in self.m.outcomes_of(asset).items()},
+            "scopes": {
+                s: self.outcome_view(r["last"]) for s, r in self.m.scopes.of(asset).items() if "last" in r
+            },
         }
 
     async def catalog(self):

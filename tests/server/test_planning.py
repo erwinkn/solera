@@ -186,7 +186,7 @@ def test_an_empty_fan_in_is_missing():
         return []
 
     manifest = Project(assets=[readings, report, rollup]).manifest
-    heads, progress = {}, {}
+    heads, drained = {}, {}
     now = dt.datetime(2026, 10, 2, tzinfo=UTC).timestamp()
 
     def planned(target, **kw):
@@ -195,7 +195,7 @@ def test_an_empty_fan_in_is_missing():
             lambda o, s: heads.get((o, s)),
             lambda o: [(s, h) for (out, s), h in heads.items() if out == o],
             now,
-            progress=lambda a, s: progress.get((a, s)),
+            drained=lambda a, s: drained.get((a, s), False),
         )
         run = planner.plan_run([target], partitions="all", **kw)
         return (
@@ -207,10 +207,10 @@ def test_an_empty_fan_in_is_missing():
         assert planned(target) == ["d1", "d2"]  # unchanged without the flag
         assert planned(target, skip_missing_inputs=True, upstream=True) == ["d1", "d2"]  # the run builds them
     heads[("readings", "day=d1,site=west")] = {"asset": "readings"}
-    progress[("readings", "day=d1,site=west")] = {"drained": False}  # a delivery under way
+    drained[("readings", "day=d1,site=west")] = False  # a delivery under way
     assert planned("report", skip_missing_inputs=True) == ["d1"]  # one head of its day is enough
     assert planned("rollup", skip_missing_inputs=True) is None  # AllPartitions reads complete heads
-    progress[("readings", "day=d1,site=west")] = {"drained": True}
+    drained[("readings", "day=d1,site=west")] = True
     assert planned("rollup", skip_missing_inputs=True) == ["d1"]
 
 

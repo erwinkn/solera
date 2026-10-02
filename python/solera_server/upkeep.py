@@ -114,7 +114,7 @@ class Upkeep:
         in progress still reads."""
 
         needed: dict[tuple, int] = {}
-        for wm in self.m.watermarks.values():
+        for wm in self.m.watermarks():
             key = (wm["output"], wm["up"])
             needed[key] = min(needed.get(key, math.inf), delivery.needs(wm))
         for claim in self.m.claims.values():
