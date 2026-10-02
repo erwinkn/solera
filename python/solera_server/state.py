@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -35,6 +37,10 @@ from solera.objects import create
 
 from .journal import Fenced, Journal, encode
 from .model import Model
+
+log = logging.getLogger(__name__)
+
+EXIT_BROKEN = 70  # EX_SOFTWARE: the process exits for its restart to replay the journal
 
 
 class Unavailable(RuntimeError):
@@ -130,6 +136,7 @@ class State:
         )
 
     broken: BaseException | None = None  # a reducer failed half-way: the model is not the journal's
+    _exit = staticmethod(os._exit)  # how a broken state ends its process (tests record it instead)
 
     @property
     def poisoned(self) -> bool:
@@ -157,12 +164,36 @@ class State:
                 self.model.apply(json.loads(data))
             except Exception as error:
                 # Applied in part, journaled not at all: nothing may build on it.
-                self.broken = error
+                self._break(error)
                 raise Unavailable(
                     f"State failed applying an event ({error}); restart to replay the journal"
                 ) from error
         self.journal.append(*encoded, lazy=lazy)
         self.changed.set()
+
+    def _break(self, error: BaseException) -> None:
+        """The model is no longer a fold of the journal: no checkpoint may
+        be taken of it from now on, and the process exits, so that the
+        platform restarts it and the replay recovers. What was recorded
+        before is written first — it is the journal's; the failed batch
+        never reached it."""
+
+        self.broken = error
+        self.journal.stop_checkpoints()
+        log.critical(
+            "state failed applying an event (%r): exiting for the journal replay to recover it", error
+        )
+        try:
+            asyncio.get_running_loop().create_task(self._die())
+        except RuntimeError:  # no loop to flush on
+            self._exit(EXIT_BROKEN)
+
+    async def _die(self) -> None:
+        try:
+            await self.journal.flush()
+        except Exception:
+            log.exception("flushing before the exit failed: the journal holds what it held")
+        self._exit(EXIT_BROKEN)
 
     @property
     def recorded(self) -> int:

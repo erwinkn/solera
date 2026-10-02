@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+from types import SimpleNamespace
 
 import pytest
 from obstore.store import LocalStore
@@ -24,7 +25,8 @@ def pytest_collection_modifyitems(config, items):
 async def world(monkeypatch):
     """Every engine and state a test makes, torn down after it in order:
     engines stopped (their key services' threads with them), then states
-    closed. Whatever a test stops or closes itself is not done twice."""
+    closed. A state that breaks would exit the process: here its exit codes
+    are recorded in `world.exits` instead."""
 
     from solera_server.engine import Engine
     from solera_server.state import State
@@ -43,7 +45,9 @@ async def world(monkeypatch):
 
     monkeypatch.setattr(Engine, "__init__", made)
     monkeypatch.setattr(State, "open", opened)
-    yield
+    exits: list[int] = []
+    monkeypatch.setattr(State, "_exit", staticmethod(exits.append))
+    yield SimpleNamespace(engines=engines, states=states, exits=exits)
     for engine in engines:
         with contextlib.suppress(Exception):
             await engine.stop()

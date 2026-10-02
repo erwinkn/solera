@@ -229,6 +229,12 @@ class Journal:
 
     # -- appending ----------------------------------------------------------------------
 
+    def stop_checkpoints(self) -> None:
+        """Take no checkpoint from now on: the state it would snapshot is no
+        longer the fold of these segments."""
+
+        self._snapshot = None
+
     def append(self, *events: bytes, lazy: bool = False) -> None:
         """Queue encoded events (`encode`) for the next flush. A `lazy` event
         does not start the flush clock: it is written with whatever comes

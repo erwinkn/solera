@@ -825,6 +825,13 @@ writer id, it has been replaced and shuts down. Segments a replaced
 writer managed to write before the new fence were acknowledged and are
 replayed by the new writer, so no acknowledged work is lost.
 
+**A failed event ends the process.** Events are encoded and checked before
+any is applied; should a reducer still raise half-way, the model is no
+longer the fold of the journal. The writer then takes no checkpoint,
+refuses every later event, writes what it recorded before (the failed
+batch never reached the journal), logs why, and exits with code 70: the
+platform restarts it, and the replay recovers exactly the journal's state.
+
 The slot a replaced writer collides in is always its successor's fence,
 so fence segments are kept for good. Were cleanup to delete one, say
 writer 1001 fenced by 1042 that has since checkpointed past 1042, then

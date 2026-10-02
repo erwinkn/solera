@@ -819,17 +819,29 @@ async def test_a_malformed_worker_result_is_settled_without_its_bad_parts(tmp_pa
     await state.close()
 
 
-async def test_an_event_its_reducer_cannot_apply_poisons_the_state(tmp_path):
-    """Review round 3, B5: should a reducer raise half-way anyway, the model
-    is no longer the journal's: nothing more is recorded until a restart
-    replays it."""
+async def test_an_event_its_reducer_cannot_apply_ends_the_process(tmp_path, world):
+    """Review round 3, B5, and Erwin's decision: should a reducer raise
+    half-way anyway, the model is no longer the journal's. Nothing more is
+    recorded, no checkpoint is taken of it, what was recorded before is
+    written, and the process exits for its restart to replay the journal."""
 
-    from solera_server.state import Unavailable
+    from solera_server.state import EXIT_BROKEN, Unavailable
 
-    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    url = tmp_path.as_uri()
+    state = await State.open(url, "test", flush_interval=60, min_checkpoint=1)
+    state.record(
+        {"type": "AutomationChanged", "name": "before", "enabled": True}
+    )  # buffered, not yet written
     with pytest.raises(Unavailable, match="restart to replay"):
         state.record({"type": "NoSuchEvent"})  # no reducer applies it
     assert state.poisoned
     with pytest.raises(Unavailable):
         state.record({"type": "WriterStarted", "writer": "x"})
-    await state.close()
+    for _ in range(100):
+        if world.exits:
+            break
+        await asyncio.sleep(0.01)
+    assert world.exits == [EXIT_BROKEN]
+    replayed = await State.open(url, "test", writer=False)  # what the restart replays
+    assert replayed.model.applied == state.model.applied - 1  # all but the failed event: it was never written
+    assert state.journal.written == state.journal.appended
