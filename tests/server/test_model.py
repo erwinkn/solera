@@ -425,6 +425,10 @@ async def test_a_recount_meanwhile_does_not_refuse_a_commit(state, clock):
     await settle(engine, (await engine.submit(["files"]))["id"])
     held_engine = engine_on(state, clock, placement="hold")
     run, task_id, attempt = await held(held_engine, ["files"])
+    for _ in range(500):  # launched: its spec written and its launch durable, however busy the host
+        if "launched" in state.model.task(task_id):
+            break
+        await asyncio.sleep(0.01)
     prepared = state.model.task(task_id)["launched"]["prepared"]
     count = state.model.heads[("files", "")]["count"]
     state.record(
