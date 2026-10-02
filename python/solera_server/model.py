@@ -84,6 +84,7 @@ class Model:
                 "applied": self.applied,
                 "writer": self.writer,
                 "revision": self.revision,
+                "epoch": self.epoch,
                 "manifest": self.manifest,
                 "project": self.project,
                 "heads": _nest(self.heads, 2),
@@ -109,6 +110,9 @@ class Model:
         self.applied: int = snap.get("applied") or 0
         self.writer = snap.get("writer")
         self.revision = snap.get("revision")
+        # how many project revisions this namespace has served: the revision
+        # epoch, which gives failed keys one try per deploy (per-key §13)
+        self.epoch: int = snap.get("epoch") or 0
         self.manifest = snap.get("manifest")
         self.project = snap.get("project")
         self.heads: dict[tuple, dict] = _flatten(snap.get("heads"), 2)
@@ -339,6 +343,8 @@ class Model:
 
     def _on_ProjectRegistered(self, e):
         manifest = e["manifest"]
+        if e["revision"] != self.revision:
+            self.epoch += 1
         self.revision, self.manifest, self.project = e["revision"], manifest, e.get("project")
         self._consumed = self._consumed_outputs(manifest)
         renamed = self._apply_aliases(manifest)

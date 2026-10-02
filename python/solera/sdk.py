@@ -12,12 +12,13 @@ import sys
 import typing
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, ClassVar
 from urllib.parse import quote, unquote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from croniter import croniter
+
+from .build import identity as build_identity
 
 NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,127}$")
 DEFAULT_STORE = "default"
@@ -812,13 +813,16 @@ class Project:
         retention: Retention | None = None,
         key_cache: KeyCache | None = DEFAULT_KEY_CACHE,
         errors: Mapping[type, type] | None = None,
+        build: str | None = None,
         name: str = "default",
     ):
         """`default_store` holds every output that names no store: unless
         given, a FileStore. A FileStore without a path keeps its data in
         `.solera/data` next to the file that builds the project, or in
         `$SOLERA_DATA`. `errors` classifies exceptions user code cannot
-        subclass: `{httpx.TimeoutException: Transient}` (`solera.errors`)."""
+        subclass: `{httpx.TimeoutException: Transient}` (`solera.errors`).
+        `build` names the code explicitly (else `$SOLERA_BUILD`, else the
+        work tree's content: `solera.build`); it is part of the revision."""
 
         from .errors import check_mapping
         from .stores import FileStore
@@ -832,7 +836,8 @@ class Project:
         self.key_cache = key_cache
         self.assets: dict[str, Asset] = {}
         self.stores = {DEFAULT_STORE: default_store or FileStore(), **(stores or {})}
-        home = _caller_dir()
+        home = self.home = _caller_dir()
+        self.build = build
         for store in self.stores.values():
             if isinstance(store, FileStore) and store.home is None:
                 store.home = home
@@ -1238,7 +1243,6 @@ class Project:
                 "retention": asset.retention.spec() if asset.retention else None,
                 "aliases": list(asset.aliases),
                 "tags": asset.tags,
-                "code_hash": _code_hash(asset.fn),
                 "doc": inspect.getdoc(asset.fn) or "",
                 "types": {
                     "params": {p: type_name(t) for p, t in hints_by_asset[name].items() if p != "return"},
@@ -1284,6 +1288,7 @@ class Project:
             "automations": automation_records,
             "retention": self.retention.spec() if self.retention else None,
             "key_cache": self.key_cache.spec() if self.key_cache else None,
+            "build": build_identity(self.home, self.build),
         }
         return {**body, "revision": digest(body)}
 
@@ -1320,12 +1325,3 @@ def _default_placement() -> dict:
     from .executors import Local
 
     return Local()().serialized()
-
-
-def _code_hash(fn: Callable) -> str:
-    try:
-        source_file = inspect.getsourcefile(fn)
-        code = Path(source_file).read_text() if source_file else inspect.getsource(fn)
-    except (OSError, TypeError):
-        code = fn.__name__
-    return digest(code)

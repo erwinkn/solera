@@ -5,7 +5,6 @@
       "automations": [
         "fleet_dashboard.onchange.0"
       ],
-      "code_hash": "79f94232eea8519c39b52c7d74f683eb1e58eda481ff48b5515ec867c4e81042",
       "deps": [],
       "doc": "Partitioned upstream, unpartitioned consumer: the site dimension is collapsed.",
       "inputs": {
@@ -70,7 +69,6 @@
       "automations": [
         "graph_delta.every.0"
       ],
-      "code_hash": "79f94232eea8519c39b52c7d74f683eb1e58eda481ff48b5515ec867c4e81042",
       "deps": [],
       "doc": "Poll a site's Graph delta feed; the delta token is the cursor.",
       "inputs": {},
@@ -137,7 +135,6 @@
       "automations": [
         "hillshade.every.0"
       ],
-      "code_hash": "79f94232eea8519c39b52c7d74f683eb1e58eda481ff48b5515ec867c4e81042",
       "deps": [
         "usgs_3dep_tiles"
       ],
@@ -202,7 +199,6 @@
     "leach": {
       "aliases": [],
       "automations": [],
-      "code_hash": "79f94232eea8519c39b52c7d74f683eb1e58eda481ff48b5515ec867c4e81042",
       "deps": [],
       "doc": "The resource tier lives on the asset; no job indirection.",
       "inputs": {
@@ -315,7 +311,6 @@
       "automations": [
         "manual_upload.every.0"
       ],
-      "code_hash": "79f94232eea8519c39b52c7d74f683eb1e58eda481ff48b5515ec867c4e81042",
       "deps": [],
       "doc": "Upload keys are registered externally by the uploads service.",
       "inputs": {},
@@ -377,7 +372,6 @@
       "automations": [
         "psa_mean_data.onchange.0"
       ],
-      "code_hash": "79f94232eea8519c39b52c7d74f683eb1e58eda481ff48b5515ec867c4e81042",
       "deps": [],
       "doc": "",
       "inputs": {
@@ -454,7 +448,6 @@
       "automations": [
         "qaqc_samples.onchange.0"
       ],
-      "code_hash": "79f94232eea8519c39b52c7d74f683eb1e58eda481ff48b5515ec867c4e81042",
       "deps": [],
       "doc": "qaqc_files arrives filtered to the file_ids whose version changed for this site.",
       "inputs": {
@@ -537,7 +530,6 @@
       "automations": [
         "region_rollup.onchange.0"
       ],
-      "code_hash": "79f94232eea8519c39b52c7d74f683eb1e58eda481ff48b5515ec867c4e81042",
       "deps": [],
       "doc": "Static partitions over a site-partitioned input.",
       "inputs": {
@@ -613,7 +605,6 @@
       "automations": [
         "site_health.onchange.0"
       ],
-      "code_hash": "79f94232eea8519c39b52c7d74f683eb1e58eda481ff48b5515ec867c4e81042",
       "deps": [],
       "doc": "In-database: a TableRef in, a statement out; no row enters the harness.\nThe store materializes the SELECT into ops.site_health for this site.",
       "inputs": {
@@ -679,7 +670,6 @@
         "sites.cron.0",
         "sites.ondeploy.0"
       ],
-      "code_hash": "79f94232eea8519c39b52c7d74f683eb1e58eda481ff48b5515ec867c4e81042",
       "deps": [],
       "doc": "Refresh the SharePoint site list daily; new sites surface as missing work.",
       "inputs": {},
@@ -733,7 +723,6 @@
       "automations": [
         "weekly_report.cron.0"
       ],
-      "code_hash": "79f94232eea8519c39b52c7d74f683eb1e58eda481ff48b5515ec867c4e81042",
       "deps": [],
       "doc": "A job: inputs, placement and automations like an asset, no outputs.",
       "inputs": {
@@ -1019,6 +1008,10 @@
       "upstream": false,
       "watched": []
     }
+  },
+  "build": {
+    "id": "snapshot",
+    "source": "explicit"
   },
   "executors": {
     "ingest": {
@@ -1383,7 +1376,7 @@
     }
   },
   "retention": null,
-  "revision": "8c5160395f3fb1fb0a593e6f1c042cca261c090fa69f514cf4a699ee42db374b",
+  "revision": "b52ad204ce5e96654aa0487893fa0d1ebc4b6893094a840991e48a9b742b05cf",
   "sources": {
     "leach_crosswalk": {
       "handle": {

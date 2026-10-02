@@ -40,9 +40,10 @@ def load_brimstone():
     return module.project
 
 
-def test_brimstone_manifest_snapshot():
+def test_brimstone_manifest_snapshot(monkeypatch):
     """§11: the reference project registers and its manifest is stable."""
 
+    monkeypatch.setenv("SOLERA_BUILD", "snapshot")  # not this checkout's content
     project = load_brimstone()
     manifest = json.loads(json.dumps(project.manifest, sort_keys=True))
     if not SNAPSHOT.exists():

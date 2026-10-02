@@ -356,8 +356,8 @@ asset's input and output stores, migration names of the asset's outputs,
 run config, refs of non-incremental inputs and deps)` is stored on the
 watermark. A fingerprint mismatch — a `version` bump, a new migration, or a
 change to any whole input — forces `full=True` on the edge: the delivery
-resets to the whole head. Code changes alone do not: the code hash
-bumps the project revision, not the fingerprint.
+resets to the whole head. Code changes alone do not: the build identity
+(§11) bumps the project revision, not the fingerprint.
 
 A head written before the output was incremental has no delta log: "no keys
 known"; the consumer's watermark starts empty and the next write upserts
@@ -747,9 +747,19 @@ project = Project(
 
 The manifest records assets (`outputs` with `{name, store, key, revision,
 incremental, migrations, config}`, `inputs`, `deps`, `partitions`, `placement`, `retries`,
-`timeout`, `version`, code hash, load types via `typing.get_type_hints`),
+`timeout`, `version`, load types via `typing.get_type_hints`),
 sources, automations, store names with their `Store.version`, executors
-by name, and the project revision.
+by name, the **build identity**, and the project revision — a digest of
+all of it. The build identity says which code this is
+(per-key-processing.md §13): `Project(build=…)` or `$SOLERA_BUILD` when
+given (a CI commit, an image digest); else, in a git work tree, `HEAD`
+plus the content of every path that differs from it, untracked files
+included and ignored ones not; else the content of the Python files under
+the project's directory. A commit and a dirty flag are recorded for
+display only. Where the manifest is built and where workers import the
+project must agree on it — an image without `.git` should set
+`SOLERA_BUILD`. The engine counts the revisions it serves: the **revision
+epoch**.
 
 Registration errors:
 
