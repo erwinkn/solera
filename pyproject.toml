@@ -73,6 +73,7 @@ markers = [
     "s3: requires an S3-compatible HTTP endpoint",
     "live: requires an explicitly supplied isolated test bucket",
     "postgres: requires SOLERA_TEST_DATABASE_URL (docker compose up postgres)",
+    "slow: long growth soaks, run with --slow",
 ]
 
 [tool.ruff]

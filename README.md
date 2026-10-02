@@ -336,6 +336,7 @@ are documented in [docs/architecture.md](docs/architecture.md);
 
 ```bash
 uv run pytest -q            # includes tests/test_demo_e2e.py (server + pool worker, temp file:// store)
+uv run pytest -q --slow     # also the long growth soaks (tests/test_soak.py), minutes
 SOLERA_TEST_DATABASE_URL=postgresql://solera:solera@127.0.0.1:5432/solera uv run pytest -q -m postgres
 SOLERA_TEST_S3=http://user:secret@127.0.0.1:9000/bucket uv run pytest -q   # also against an S3-compatible server
 pnpm install --frozen-lockfile && pnpm -C apps/console exec playwright install chromium && pnpm -C apps/console test

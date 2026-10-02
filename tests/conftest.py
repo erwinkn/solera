@@ -4,6 +4,19 @@ from solera.sdk import Output
 from solera.stores import Scope
 
 
+def pytest_addoption(parser):
+    parser.addoption("--slow", action="store_true", help="also run the long growth soaks")
+
+
+def pytest_collection_modifyitems(config, items):
+    if config.getoption("--slow"):
+        return
+    skip = pytest.mark.skip(reason="a long soak: run with --slow")
+    for item in items:
+        if "slow" in item.keywords:
+            item.add_marker(skip)
+
+
 @pytest.fixture
 def objects(tmp_path):
     """A real object store on file:// (never an in-memory dict)."""

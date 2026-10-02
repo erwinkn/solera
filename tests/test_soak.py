@@ -24,6 +24,7 @@ from collections import Counter
 from pathlib import Path
 
 import obstore
+import pytest
 from solera.ids import ulid_time
 from solera.sdk import Ref
 from solera_server.engine import Engine
@@ -31,6 +32,10 @@ from solera_server.placements.inline import InlinePlacement
 from solera_server.state import State
 
 from tests.conftest import whole
+
+pytestmark = (
+    pytest.mark.slow
+)  # minutes: `pytest --slow`; tests/server/test_scenario.py crosses the same boundaries quickly
 
 BATCHES = int(os.getenv("SOLERA_SOAK_BATCHES", "500"))
 SAMPLE_EVERY = max(1, BATCHES // 10)
