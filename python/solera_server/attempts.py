@@ -150,6 +150,44 @@ class Attempts:
         live.finished = True
         self._stir(attempt)
 
+    async def attempt_resolve(self, attempt: str, body: bytes) -> bytes | None:
+        """A small write's delta from the engine's cache (docs/resolved-commits.md
+        §4), or None when the engine keeps no cache. Every output is checked
+        against what the engine prepared for the attempt, never trusted."""
+
+        from solera.keys.resolver import Prepared, unframe
+
+        live = self._live(attempt)
+        header, _ = unframe(body)
+        await self._bind(attempt, live, header.get("invocation"))
+        if self.keys is None:
+            return None
+        task = self.m.task(self.m.attempts[attempt])
+        launched = task.get("launched") or {}
+        scope, outputs = task["scope"], (launched.get("prepared") or {}).get("outputs") or {}
+
+        def prepared(name):
+            info = outputs.get(name)
+            if not info or "prefix" not in info or "batch" not in info:
+                return None
+            index = self.m.indexes.get((name, scope))
+            head = self.m.heads.get((name, scope)) or {}
+            if index is None and int(info["batch"]) == 0:
+                index = self.m.index(name, scope)  # the first write of the output
+            if index is None or index.prefix != info["prefix"]:
+                return None
+            return Prepared(
+                scope, int(info["batch"]), int(launched["pin"]), index, int(head.get("batch", -1)), True
+            )
+
+        def still_live():
+            if self.m.claimed(attempt) is None:
+                return False
+            return live.cancel is None or live.cancel.phase != "forced"
+
+        resolved = {o.get("name"): prepared(o.get("name")) for o in header.get("outputs") or []}
+        return await self.keys.resolve(attempt, body, resolved.get, still_live)
+
     def attempt_lines(self, attempt: str) -> list[str] | None:
         live = self.live.get(attempt)
         return list(live.lines) if live is not None else None

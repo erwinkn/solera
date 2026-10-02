@@ -13,6 +13,7 @@ pub mod digest;
 pub mod format;
 pub mod garbage;
 pub mod jobs;
+pub mod local;
 mod pyvalue;
 pub mod rows;
 pub mod sort;
@@ -1098,13 +1099,153 @@ impl Job {
     }
 }
 
-// -- content digests ---------------------------------------------------------------------
+// -- the engine cache's local files (docs/resolved-commits.md §5), and content digests ---------
 
 /// A file's content digest: XXH3-128, as hex.
 #[pyfunction]
 fn content_digest(py: Python<'_>, data: PyBackedBytes) -> String {
     let h = py.detach(|| xxhash_rust::xxh3::xxh3_128(&data));
     format!("{h:032x}")
+}
+
+/// The local form of a `.kx` file (`source`, content digest `digest`).
+#[pyfunction]
+fn build_local<'py>(
+    py: Python<'py>,
+    data: PyBackedBytes,
+    source: String,
+    digest: Vec<u8>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let out = py
+        .detach(|| local::build(&data, &source, &digest))
+        .map_err(to_py)?;
+    Ok(PyBytes::new(py, &out))
+}
+
+/// A local file, open, its directory verified and held in memory.
+#[pyclass(module = "solera._native", frozen)]
+struct LocalFile {
+    inner: Arc<local::Local>,
+}
+
+#[pymethods]
+impl LocalFile {
+    #[new]
+    fn open(py: Python<'_>, path: String) -> PyResult<LocalFile> {
+        let inner = py
+            .detach(|| local::Local::open(std::path::Path::new(&path)))
+            .map_err(to_py)?;
+        Ok(LocalFile {
+            inner: Arc::new(inner),
+        })
+    }
+
+    #[getter]
+    fn source(&self) -> String {
+        self.inner.source.clone()
+    }
+
+    #[getter]
+    fn entries(&self) -> u64 {
+        self.inner.entries
+    }
+
+    #[getter]
+    fn size(&self) -> u64 {
+        self.inner.size
+    }
+
+    #[getter]
+    fn blocks(&self) -> usize {
+        self.inner.blocks()
+    }
+
+    #[getter]
+    fn digest<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.inner.digest)
+    }
+}
+
+type Resolved<'py> = (Vec<Bound<'py, PyBytes>>, u64, u64, u64);
+
+/// An index as local files, newest run first, each run in key order.
+#[pyclass(module = "solera._native")]
+struct Snapshot {
+    inner: local::Snapshot,
+}
+
+#[pymethods]
+impl Snapshot {
+    #[new]
+    fn new(runs: Vec<Vec<PyRef<'_, LocalFile>>>) -> Snapshot {
+        Snapshot {
+            inner: local::Snapshot::new(
+                runs.iter()
+                    .map(|r| r.iter().map(|f| f.inner.clone()).collect())
+                    .collect(),
+            ),
+        }
+    }
+
+    #[getter]
+    fn entries(&self) -> u64 {
+        self.inner.entries()
+    }
+
+    /// The delta of `run` (a `.kx` file) against the snapshot, as a patch or
+    /// a `replace`ment, as `.kx` files with added, removed and changed.
+    #[pyo3(signature = (run, *, replace, generation, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864))]
+    #[allow(clippy::too_many_arguments)]
+    fn resolve<'py>(
+        &mut self,
+        py: Python<'py>,
+        run: PyBackedBytes,
+        replace: bool,
+        generation: u64,
+        block_size: usize,
+        level: u32,
+        bits_per_item: u64,
+        k: u8,
+        codec: u8,
+        max_file_bytes: usize,
+    ) -> PyResult<Resolved<'py>> {
+        let o = options(block_size, level, bits_per_item, k, codec);
+        let inner = &mut self.inner;
+        let (files, counts) = py
+            .detach(|| {
+                let mut w = stream::Writer::new(o, max_file_bytes);
+                let counts = inner.resolve(&run, replace, generation, &mut w)?;
+                Ok::<_, Error>((w.files, counts))
+            })
+            .map_err(to_py)?;
+        Ok((
+            files.iter().map(|f| PyBytes::new(py, f)).collect(),
+            counts.0,
+            counts.1,
+            counts.2,
+        ))
+    }
+
+    /// The newest entry of each key — `(version, deleted, locator)` — or None.
+    #[allow(clippy::type_complexity)]
+    fn get<'py>(
+        &mut self,
+        py: Python<'py>,
+        keys: Vec<PyBackedBytes>,
+    ) -> PyResult<Vec<Option<(Bound<'py, PyBytes>, bool, u64)>>> {
+        let inner = &mut self.inner;
+        let hits = py
+            .detach(|| {
+                keys.iter()
+                    .map(|k| inner.get(k))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(to_py)?;
+        Ok(hits
+            .into_iter()
+            .map(|h| h.map(|h| (PyBytes::new(py, &h.version), h.deleted, h.locator)))
+            .collect())
+    }
 }
 
 #[pymodule]
@@ -1129,7 +1270,10 @@ fn solera_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_tail, m)?)?;
     m.add_function(wrap_pyfunction!(check_block, m)?)?;
     m.add_function(wrap_pyfunction!(decode_garbage, m)?)?;
+    m.add_function(wrap_pyfunction!(build_local, m)?)?;
     m.add_function(wrap_pyfunction!(content_digest, m)?)?;
+    m.add_class::<LocalFile>()?;
+    m.add_class::<Snapshot>()?;
     m.add_function(wrap_pyfunction!(encode, m)?)?;
     m.add_function(wrap_pyfunction!(row_digest, m)?)?;
     m.add_function(wrap_pyfunction!(group_digest, m)?)?;

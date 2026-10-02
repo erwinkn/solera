@@ -317,6 +317,13 @@ for the state it pinned, and commits landing while it runs keep their
 its exact count back unless one of those commits was itself inexact.
 Deltas themselves are always exact; only the count is approximate.
 
+**Engine-resolved commits** (`resolved-commits.md`). A small write is first
+offered to the engine over the attempt's channel: it answers from a cache
+of the index files on its local disk — exact, no requests — or declines,
+and the worker resolves the write itself as below. The same cache keeps
+small deltas' entries in memory, so a consumer's next page of a pending
+window can come inline in its spec.
+
 **Read strategy** (`resolved-commits.md` §6). A patch whose run holds
 more than 2% of the index's physical entries streams the whole index —
 every level in 8 MB segments, merged with the sorted run. Otherwise the

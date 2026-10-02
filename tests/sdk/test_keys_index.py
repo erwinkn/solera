@@ -403,12 +403,12 @@ async def test_a_patch_reads_blocks_or_streams():
     assert idx.route == "stream" and h.io.metrics.gets == len(h.state.files)  # each file once, no tail first
 
 
-async def test_get_reads_prior_records_exactly():
+async def test_lookup_reads_prior_records_exactly():
     h = Harness(filtered_options())
     ks = [key(i) for i in range(2000)]
     await h.commit(ks, [b"v1"] * len(ks))
     await h.commit(ks[:10], [b"v2"] * 10, ks[10:20])
-    got = await h.index().get(ks[:30] + [b"zz-absent"])
+    got = await h.index().lookup(ks[:30] + [b"zz-absent"])
     assert got == {**{k: (b"v2", 2) for k in ks[:10]}, **{k: (b"v1", 1) for k in ks[20:30]}}
 
 

@@ -342,15 +342,17 @@ engine for compaction outputs) and recorded with the file in the commit.
 The cache checks a fill against it, and candidates (below) are matched by
 it.
 
-**Local form.** On disk, each file becomes `{name}.kxl`:
+**Local form.** On disk, each file becomes `{name}.kxl` (byte layout in
+`native/src/local.rs`):
 
 ```
-header     magic "KXL1" · format version · source path · source size · source digest
-directory  per block: first key, last key, local offset, length, entries, restart count,
-           CRC32C of the block's entries and restart table
-           CRC32C of header and directory together
-blocks     per block: decompressed entries (key, version, locator, deleted, predecessor if any),
-           then its restart table (offsets of full keys, every 16 entries)
+header     magic "KXL1" · format version · header length · source size · source digest · source path
+           · blocks · entries
+directory  per block: first key, last key, local offset, entries length, restart count, entries,
+           CRC-32 of the block's entries and restart table
+           CRC-32 of header and directory together
+blocks     per block: entries as in a `.kx` block, uncompressed (key, version, locator, deleted,
+           predecessor if any), then its restart table (offsets of full keys, every 16 entries)
 ```
 
 A lookup binary-searches the directory (held in RAM), then the block's
@@ -361,7 +363,7 @@ change.
 **Integrity.** No byte of the local form is used unverified:
 
 - **The directory** — boundaries, offsets, lengths, counts and the source
-  identity — is covered by its own CRC32C, checked whenever the file is
+  identity — is covered by its own CRC-32, checked whenever the file is
   opened: at fill, and on every reopen after an engine restart. A
   corrupted first key would otherwise steer a lookup to a valid block of
   the wrong range, and a live key would read as absent.
@@ -382,10 +384,10 @@ read fails with `corrupt`.
   and reservations. A 100M-key index in steady state holds ~125M physical
   entries across its levels — not 100M — at ~40 B decompressed: ~5 GB
   (estimated from the steady-state level sizes).
-- `cache_ram` (default 512 MB): directories of every local file (~0.01 B
-  per entry: ~1.3 MB at 100M), an LRU of hot decompressed blocks, and the
-  summaries of §7 and the retry pages of §8. Filters are not cached: a warm reader never
-  needs them.
+- memory: directories of every local file (~0.01 B per entry: ~1.3 MB
+  at 100M) and the summaries of §7 (256 MB). Blocks are read through the
+  OS page cache — no block LRU of our own; §9 measures both warmths.
+  Filters are not cached: a warm reader never needs them.
 
 **Pins.** A reader pins the file set it reads; eviction skips pinned
 files. A reader that fetches from S3 is also a reader pin in the garbage
@@ -816,3 +818,48 @@ The follow-up review agrees with all three.
    `Store.acquire` (§9.7), and failure deltas staying out of the gate's
    intents (§9.6); sensors (§11 there) need no attempt validation. Its
    §9.8 collection gains the compaction trigger of §6 here.
+
+## 15. As built
+
+Milestones 3 and 4. Where the code differs from the text above, it says so
+here.
+
+| Piece | Where |
+|---|---|
+| Sparse reader, streaming patch, the two switches, `exact`, `get` | `KeyIndex.resolve` / `changes` / `lookup` (`solera/keys/index.py`); `Job.patch` (`native/src/jobs.rs`) |
+| Compaction garbage | `KeyIndex.compact(garbage=True)`; `.kg` files (`key-index-format.md` § Garbage files) |
+| Repair by store kind, unknown `Sql` writes | `_store_outputs` and `_reconcile` (`solera_worker/worker.py`); acquisition is the lifecycle's |
+| Local form, lookups and merges over it | `native/src/local.rs`: `build_local`, `LocalFile`, `Snapshot` |
+| The cache | `EngineCache` (`solera/keys/cache.py`) |
+| Framing, validation, deduplication, declines | `Resolver`, `request`, `answers` (`solera/keys/resolver.py`) |
+| The route | `POST /api/projects/{p}/attempts/{a}/resolve` (`api.py`), `Engine.attempt_resolve` (`attempts.py`), the channels' `resolve` |
+| The thread, write-through, summaries, inline pages, source commits | `KeyService` (`solera_server/keyservice.py`); `Engine._cache_commit`, `_resolve_source`, `_incremental_plan` |
+
+Differences:
+
+- **Checksums are CRC-32**, as in `.kx` files, not CRC32C.
+- **No block LRU of our own**: blocks are read through the OS page cache,
+  and a resolve keeps the blocks it read for its other keys.
+- **The engine reads a patch by point lookups** while they number under 32
+  per block of the snapshot (a lookup reads one block, ~10 µs from the page
+  cache; a merge decodes every entry, ~0.4 ms per block), else by a merge.
+- **Where the cache lives**: `Engine(resolve_cache=...)`: by default beside
+  the `Local` placements' `key_cache`, as `{its path}-engine`, with its
+  `max_bytes` as the disk budget; `None` or `False` turns the resolver off
+  (every request is answered `503`; workers resolve themselves).
+- **Admission happens on the first decline**: a resolve against a snapshot
+  not warm declines `cold` and queues a fill of the index, which admits it.
+  An empty index is warm: the first write of an output is answered.
+- **After a restart** the cache keeps the local files whose directory checks
+  out, their indexes inactive until a reader asks; temporary files and
+  anything that fails its check are deleted.
+- **Local blocks are 8 KiB**, re-blocked from the source's 64 KiB: a lookup
+  reads one, and at 100M keys the read, not the CPU, is most of a warm
+  resolve (`bench/keys/results.md`, "The engine's warm resolver").
+
+Measured against §9's projections (results.md): a 1K-key resolve takes
+22–27 ms on the engine at 1M–10M keys, as projected; at 100M, 325 ms on
+this machine, 58 ms of it CPU — the rest disk waits, the page cache not
+holding the 3.4 GB of local files (open question 3: it needs to). The fill
+of a 100M-key steady snapshot reads 221 GETs and 3.5 GB in 5.9 s; its local
+files take 3.4 GB, not ~5 GB. HTTP adds under a millisecond.

@@ -32,13 +32,14 @@ from croniter import croniter
 from obstore.exceptions import AlreadyExistsError
 from solera.ids import ulid, ulid_time
 from solera.keys import Rows
-from solera.keys.index import KeyIndex, Options, key_bytes, key_str
+from solera.keys.index import DeltaFiles, FileInfo, KeyIndex, Options, delta_keys, key_bytes, key_str
 from solera.keys.io import ObjectIO, key_cache
 from solera.sdk import TimePartitions, canonical_partition, digest, split_partition
 
 from . import history
 from .attempts import POOL_OFFERED_GRACE, Attempts, Live
 from .history import MAX_METADATA, History, RunFilter
+from .keyservice import KeyService
 from .model import TERMINAL_RUN, delta_reads
 from .placements import PlacementContext, Registry
 from .state import Conflict, LostOwnership, State
@@ -103,6 +104,7 @@ class Engine(Attempts):
         maintenance_concurrency: int = 2,
         retention_interval: float = 60.0,
         history: History | None = None,
+        resolve_cache: str | None | bool = True,
     ):
         import time
 
@@ -141,6 +143,18 @@ class Engine(Attempts):
         self._firing: set[str] = set()
         self.key_options = key_options or Options()
         self._io: ObjectIO | None = None
+        # The key cache and resolver (docs/resolved-commits.md §4–§5): beside the
+        # Local placements' cache, or where `resolve_cache` says; None or False: off.
+        self.keys: KeyService | None = None
+        if resolve_cache:
+            root = resolve_cache if isinstance(resolve_cache, str) else None
+            if root is None:
+                local = key_cache(manifest.get("key_cache"), state.objects_url)
+                root = f"{local.path}-engine" if local is not None else None
+            if root is not None:
+                spec = manifest.get("key_cache") or {}
+                disk = int(spec.get("max_bytes") or 16 * 2**30)
+                self.keys = KeyService(state.objects, root, options=self.key_options, disk=disk)
         self.history = history or History(state, clock=self.clock)
         self.upkeep = Upkeep(
             state,
@@ -151,6 +165,7 @@ class Engine(Attempts):
             recount_interval=recount_interval,
             concurrency=maintenance_concurrency,
             retention_interval=retention_interval,
+            keys=self.keys,
         )
         self._set_dims = {
             dim["output"]
@@ -209,6 +224,8 @@ class Engine(Attempts):
         running, and this engine waits for them and commits their results (§8)."""
 
         self._stopping = False
+        if self.keys is not None:
+            self.keys.start()
         self.runner = asyncio.create_task(self._loop())
         self.upkeep.start()
         self.history.start()
@@ -231,6 +248,8 @@ class Engine(Attempts):
             self.inflight.clear()
         await self.upkeep.stop()
         await self.history.stop()
+        if self.keys is not None:
+            await self.keys.stop()
 
     async def _loop(self):
         """Tick whenever state changes — a submit, a finished attempt, the
@@ -673,6 +692,23 @@ class Engine(Attempts):
         if hold is not None:
             event["hold"] = hold
         self.state.record(event)
+        if self.keys is not None:
+            for name, keys in ((commit or {}).get("keys") or {}).items() if outcome == "succeeded" else ():
+                self._cache_commit(name, task["scope"], keys)
+            self.keys.ended(claim["attempt"])
+
+    def _cache_commit(self, name: str, scope: str, keys: dict | None) -> None:
+        """Keep the engine's cache warm with what a commit installed (§5), and a
+        summary of a small delta for inlined pages (§7)."""
+
+        if not keys or not keys.get("files"):
+            return
+        index = self.m.indexes.get((name, scope))
+        if index is not None:
+            files = [FileInfo.from_json(f) for f in keys["files"]]
+            batch = int(keys["batch"])
+            logged = bool(index.log) and index.log[-1][0] == batch  # a consumer will read it
+            self.keys.committed(index.prefix, index.path, batch, files, logged)
 
     # -- dispatch ---------------------------------------------------------------
 
@@ -1114,6 +1150,12 @@ class Engine(Attempts):
             empty = False
         pinned = index.pinned() if window["full"] else index.pinned(window["from"], window["to"])
         pin = {"ref": ref, "index": pinned.to_json(), "changes": {**window, "limit": limit}}
+        if not window["full"] and not empty and self.keys is not None:
+            # The first page of the pinned window, from summaries in memory (§7 of
+            # docs/resolved-commits.md): the worker then reads no delta file.
+            inline = self.keys.inline(index.prefix, window["from"], window["to"], window["after"], limit)
+            if inline is not None:
+                pin["changes"]["inline"] = inline
         plan = {**base, **window}
         if not window["full"]:  # a window paged over attempts holds its first page's reader pin
             plan["pin"] = wm.get("pin") if window["after"] is not None and wm else claim_pin
@@ -1337,10 +1379,14 @@ class Engine(Attempts):
                 items = upsert.items() if isinstance(upsert, dict) else ((k, "1") for k in upsert or [])
                 new = {str(k): str(v) for k, v in items}
                 removes, replace = [str(k) for k in remove or [] if str(k) not in new], False
-            index = KeyIndex(self._key_io(), None, self.m.index(name, "").pinned(), self.key_options)
+            pinned = self.m.index(name, "").pinned()
+            index = KeyIndex(self._key_io(), None, pinned, self.key_options)
             batch = int((head or {}).get("batch", -1)) + 1
             attempt = ulid(self.clock())
-            if replace:
+            files = await self._resolve_source(index, pinned, new, removes, replace, batch, attempt)
+            if files is not None:
+                files, changed = files
+            elif replace:
                 rows = Rows.pairs(list(new.items()))
                 files, changed = await index.replace(rows, batch, attempt, collect=2 * SOURCE_KEYS_RECORDED)
             else:
@@ -1379,7 +1425,38 @@ class Engine(Attempts):
         event["at"] = self.clock()
         event["run"] = run
         self.state.record(event)
+        if self.keys is not None and "keys" in event:
+            self._cache_commit(name, "", event["keys"])
         return {"changed": True, "ref": ref, "run": run_id}
+
+    async def _resolve_source(self, index, pinned, new, removes, replace, batch, attempt):
+        """A small source commit through the warm resolver, in process
+        (docs/resolved-commits.md §4): its files and changed keys, or None when
+        the cache cannot answer and the commit resolves cold."""
+
+        from solera.keys import encode_file
+        from solera.keys.resolver import Limits
+
+        lim = Limits()
+        size = len(new) + len(removes) + (pinned.count if replace else 0)
+        if self.keys is None or size > (lim.max_entries if replace else lim.max_keys):
+            return None
+        run = sorted(
+            [(key_bytes(k), key_bytes(v), 0) for k, v in new.items()]
+            + [(key_bytes(k), b"", 1) for k in removes]
+        )
+        data = encode_file([e[0] for e in run], [e[1] for e in run], bytes(e[2] for e in run))
+        name = f"{batch:012d}-{attempt}.0000"
+        answer, delta = await self.keys.direct(
+            pinned, "replace" if replace else "patch", data, 0, batch, index.path(name)
+        )
+        if answer["result"] == "empty":
+            return DeltaFiles([], 0, 0, True), ([], [])
+        if answer["result"] != "delta":
+            return None
+        await index.io.write(index.path(name), delta)
+        files = DeltaFiles([FileInfo.describe(name, 0, delta)], answer["added"], answer["removed"], True)
+        return files, delta_keys(delta)
 
     # -- key index upkeep (§6) --------------------------------------------------------
 

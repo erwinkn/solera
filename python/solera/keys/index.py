@@ -34,6 +34,7 @@ from . import (
     bloom_check_pairs,
     bloom_check_tombstones,
     check_block,
+    decode_block,
     jobs,
     lookup,
     merge_range,
@@ -63,6 +64,19 @@ def digest(data: bytes) -> str:
     """A file's content digest: XXH3-128, hex."""
 
     return _native.content_digest(data)
+
+
+def delta_keys(data: bytes) -> tuple[list[bytes], list[bytes]]:
+    """A delta file's written keys and deleted keys."""
+
+    idx = parse_index(data, len(data))
+    upserted, deleted = [], []
+    for _, off, size, _, crc in idx["blocks"]:
+        check_block(data[off : off + size], crc)
+        keys, _, flags, _, _ = decode_block(data[off : off + size], idx["codec"])
+        for k, d in zip(keys, flags, strict=True):
+            (deleted if d else upserted).append(k)
+    return upserted, deleted
 
 
 def index_prefix(output: str, scope: str) -> str:
@@ -380,6 +394,7 @@ class KeyIndex:
         self.o = options or Options()
         self._parsed: dict[str, _Parsed] = {}
         self.route = ""  # how the last resolve read the index: "sparse" or "stream"
+        self.on_write = None  # called with (path, FileInfo, bytes) for every file written
 
     def path(self, name: str) -> str:
         return f"{self.prefix}{name}.kx"
@@ -494,8 +509,12 @@ class KeyIndex:
         keys, versions, removes = self._sorted(keys, versions, removes)
         return await self._patch(keys, versions, removes, generation, exact=exact, switch=False)
 
-    async def get(self, keys: list[bytes]) -> dict[bytes, tuple[bytes, int]]:
-        """The live entries of `keys` — `(version, locator)` — read exactly."""
+    async def lookup(self, keys: list[bytes]) -> dict[bytes, tuple[bytes, int]]:
+        """Exactly, the live `(version, locator)` of each of `keys` the index
+        holds — the newest entry wins, and a deleted key is absent: for
+        selections named outright (a run's `keys=`), immutable stores' reads
+        (docs/lifecycle.md §9.8) and failure indexes' prior records. Every
+        level at once; the filters only skip files that cannot hold a key."""
 
         keys = sorted(set(keys))
         known = (await self._find(keys, {}, exact=True, switch=False))[0]
@@ -582,6 +601,8 @@ class KeyIndex:
         async def put(n: int, data: bytes):
             await self.io.write(self.path(name(n)), data)
             files[n] = FileInfo.describe(name(n), level, data)
+            if self.on_write is not None:
+                self.on_write(self.path(name(n)), files[n], data)
 
         await jobs.run(
             job, self.io, self.path, runs, put, None if isinstance(rows, Rows) else rows, on_garbage
@@ -700,29 +721,6 @@ class KeyIndex:
             for key, entry in part.items():
                 known.setdefault(key, entry)
         return known, inferred
-
-    async def lookup(self, keys: list[bytes]) -> dict[bytes, tuple[bytes, int]]:
-        """Exactly, the live `(version, locator)` of each of `keys` the index
-        holds — the newest entry wins, and a deleted key is absent. Reads only
-        the blocks that may hold them, newest level first: for selections
-        named outright (a run's `keys=`) and immutable stores' reads
-        (docs/lifecycle.md §9.8)."""
-
-        async def one(f: FileInfo, ks: list[bytes]):
-            return await self._lookup(await self._open(f, filters=False), ks)
-
-        unresolved, seen = sorted(set(keys)), {}
-        for level in self.state.newest_first():
-            if not unresolved:
-                break
-            by_name = {f.name: f for f in level}
-            parts = await asyncio.gather(
-                *(one(by_name[name], ks) for name, ks in self._candidates(level, unresolved).items())
-            )
-            for part in parts:
-                seen.update(part)
-            unresolved = [k for k in unresolved if k not in seen]
-        return {k: (v, loc) for k, (live, v, loc) in seen.items() if live}
 
     def _candidates(self, level: list[FileInfo], keys: list[bytes]) -> dict[str, list[bytes]]:
         """Per file of a level, the sorted keys inside its key range."""

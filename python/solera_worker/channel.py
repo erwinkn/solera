@@ -42,6 +42,22 @@ class HttpChannel:
     async def finished(self, body: dict) -> None:
         await asyncio.to_thread(self._post, "finished", body)
 
+    def _resolve(self, body: bytes) -> bytes:
+        from solera.keys.resolver import CONTENT_TYPE
+
+        response = self.client.post(
+            f"{self.base}/resolve", content=body, headers={"Content-Type": CONTENT_TYPE}, timeout=30.0
+        )
+        if response.status_code == 409:
+            raise Ended("ended")
+        response.raise_for_status()
+        return response.content
+
+    async def resolve(self, body: bytes) -> bytes:
+        """A small write's delta, from the engine's cache (docs/resolved-commits.md §4)."""
+
+        return await asyncio.to_thread(self._resolve, body)
+
     def close(self) -> None:
         self.client.close()
 
@@ -66,6 +82,9 @@ class LocalChannel:
 
     async def finished(self, body: dict) -> None:
         await self.engine.attempt_finished(self.attempt, body)
+
+    async def resolve(self, body: bytes) -> bytes:
+        return await self.engine.attempt_resolve(self.attempt, body)
 
     def close(self) -> None:
         pass

@@ -22,7 +22,7 @@ from .history import TERMINAL_RUN, RunFilter
 from .placements.local import load_manifest
 from .state import LostOwnership, State, Unavailable
 
-ATTEMPT_ROUTE = re.compile(r"^/api/projects/[^/]+/attempts/([^/]+)/(start|beat|logs|finished)$")
+ATTEMPT_ROUTE = re.compile(r"^/api/projects/[^/]+/attempts/([^/]+)/(start|beat|logs|resolve|finished)$")
 POOL_ROUTE = re.compile(r"^/api/projects/[^/]+/pools/[^/]+/work$")
 
 
@@ -525,6 +525,22 @@ def create_app(
     async def attempt_live_logs(p: str, attempt: str, request: Request):
         runtime = await project_engine(request, p)
         return await runtime.attempt_logs(attempt, await request.json())
+
+    @app.post("/api/projects/{p}/attempts/{attempt}/resolve")
+    async def attempt_resolve(p: str, attempt: str, request: Request):
+        """A small write's delta from the engine's cache (docs/resolved-commits.md §4):
+        binary, versioned framing both ways."""
+
+        from solera.keys.resolver import CONTENT_TYPE, UnsupportedVersion
+
+        runtime = await project_engine(request, p)
+        try:
+            body = await runtime.attempt_resolve(attempt, await request.body())
+        except UnsupportedVersion as e:
+            return JSONResponse({"detail": str(e)}, status_code=415)
+        if body is None:
+            return Response(status_code=503)
+        return Response(content=body, media_type=CONTENT_TYPE)
 
     @app.post("/api/projects/{p}/attempts/{attempt}/finished", status_code=204)
     async def attempt_finished(p: str, attempt: str, request: Request):

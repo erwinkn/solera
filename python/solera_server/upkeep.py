@@ -46,8 +46,10 @@ class Upkeep:
         retention_interval: float = 60.0,
         gate_days: float = 30.0,
         interval: float = 1.0,
+        keys=None,
     ):
         self.state, self.history, self.manifest, self.clock = state, history, manifest, clock
+        self.keys = keys  # the engine's key cache: compaction outputs go into it as written
         self.key_options = key_options or Options()
         self.recount_interval, self.concurrency = recount_interval, concurrency
         self.retention_interval, self.interval = retention_interval, interval
@@ -164,7 +166,7 @@ class Upkeep:
         loop so merging never blocks the engine."""
 
         cache = key_cache(self.manifest.get("key_cache"), self.state.objects_url)
-        options, objects = self.key_options, self.state.objects
+        options, objects, service = self.key_options, self.state.objects, self.keys
         # An immutable store's compaction lists what its merge dropped: those
         # entries name objects that collection then discards (docs/lifecycle.md §9.8).
         garbage = self.m.immutable(key[0])
@@ -172,6 +174,8 @@ class Upkeep:
         def work():
             async def go():
                 keys = KeyIndex(ObjectIO(objects, cache=cache), None, index, options)
+                if service is not None:
+                    keys.on_write = lambda path, f, data: service.installed(index.prefix, f, path, data)
                 return await (keys.recount() if recount else keys.compact(garbage=garbage))
 
             return asyncio.run(go())

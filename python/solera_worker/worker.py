@@ -31,9 +31,10 @@ from pathlib import Path
 
 from obstore.exceptions import AlreadyExistsError
 from solera import errors, lifecycle
-from solera.keys import Rows
-from solera.keys.index import DeltaFiles, FileInfo, IndexState, KeyIndex, key_bytes, key_str
+from solera.keys import Rows, encode_file
+from solera.keys.index import DeltaFiles, FileInfo, IndexState, KeyIndex, delta_keys, key_bytes, key_str
 from solera.keys.io import ObjectIO, key_cache
+from solera.keys.resolver import Ask, answers, request
 from solera.lifecycle import Cancel, Ended
 from solera.objects import create
 from solera.sdk import (
@@ -324,6 +325,10 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline):
                 index = KeyIndex(keys_io, None, IndexState.from_json(pin["index"]))
                 found = await index.lookup([key_bytes(str(k)) for k in ch["keys"]])
                 upserted, deleted, after = {key_str(k): entry for k, entry in found.items()}, (), None
+            elif "inline" in ch:  # the engine merged this page from its cache
+                page = ch["inline"]
+                upserted = {k: (bytes.fromhex(v), int(loc)) for k, (v, loc) in page["upserted"].items()}
+                deleted, after = tuple(page["deleted"]), page["next"]
             else:
                 index = KeyIndex(keys_io, None, IndexState.from_json(pin["index"]))
                 start = key_bytes(ch["after"]) if ch.get("after") is not None else None
@@ -384,7 +389,17 @@ def _dict_inner(t):
 
 
 async def _store_outputs(
-    spec, project, asset, objects, keys_io, result_value, fence, writes, timeline, invocation=None
+    spec,
+    project,
+    asset,
+    objects,
+    keys_io,
+    result_value,
+    fence,
+    writes,
+    timeline,
+    invocation=None,
+    channel=None,
 ):
     """Store each returned output (§4, §6, §8, §9), in two phases.
 
@@ -443,7 +458,10 @@ async def _store_outputs(
         if getattr(plan["store"], "writes", "overwrite") == "fenced":
             await plan["store"].acquire(scope_of(name, plan))
 
-    # Plan: what each keyed write changes, as delta files.
+    # Plan: what each keyed write changes, as delta files. Small writes are
+    # resolved by the engine from its cache, all of an attempt's in one request
+    # (docs/resolved-commits.md §4); the rest, and any it declines, here.
+    asks, pending = [], {}
     for name, value in values.items():
         plan = plans[name]
         output, store, info, prior = plan["output"], plan["store"], plan["info"], plan["prior"]
@@ -469,47 +487,78 @@ async def _store_outputs(
         batch, attempt = int(info["batch"]), spec["attempt"]
         generation = int(spec.get("generation") or 0)  # each entry's locator (lifecycle.md §9.8)
         rows = await asyncio.to_thread(store_key_rows, store, content, output)
+        p = pending[name] = {
+            "replace": replace,
+            "content": content,
+            "unsettled": unsettled,
+            "batch": batch,
+            "generation": generation,
+            "own": (set(), set()),
+            "intended": set(),
+        }
+        live = int(info["index"].get("count", 0))
         if replace:
-            # Every written key against every live one, streamed: the delta goes out as it fills.
-            try:
-                files, changed = await index.replace(
-                    rows, batch, attempt, collect=LISTED, generation=generation
-                )
-            except ValueError as e:  # a value with no digest, found as the join reaches it
-                raise WriteError(f"{output.name}: {e}") from e
-        else:
-            new = await _versions(output, rows)
-            removes = [str(k) for k in value.remove if str(k) not in new]
-            own = set(new), set(removes)
-            if any(intent.get("unknown") for intent in unsettled):
-                # A dead Sql writer's keys are unknown (docs/resolved-commits.md §3): the index
-                # takes the whole store as it is, with this patch on top, and the store
-                # writes this patch's keys, every one.
-                files, _ = await _reconcile(
-                    output, store, prior, index, new, removes, batch, attempt, generation
-                )
-                changed, intended = None, own[0] | own[1]
+            if len(rows) + live <= RESOLVE_ENTRIES and len(rows) <= RESOLVE_KEYS:
+                keys, versions = await asyncio.to_thread(rows.entries)
+                p["run"] = (keys, versions, [])
             else:
-                intended = set(await _intended(info, keys_io, unsettled)) if unsettled else set()
-                if unsettled:
-                    new, removes = await _repair(
-                        output, store, prior, intended - own[0] - own[1], new, removes
+                p["rows"] = rows
+            continue
+        new = await _versions(output, rows)
+        removes = [str(k) for k in value.remove if str(k) not in new]
+        own = p["own"] = (set(new), set(removes))
+        p["new"], p["removes"] = new, removes
+        if any(intent.get("unknown") for intent in unsettled):
+            # A dead Sql writer's keys are unknown (docs/resolved-commits.md §3): the index
+            # takes the whole store as it is, with this patch on top, and the store
+            # writes this patch's keys, every one.
+            p["files"], _ = await _reconcile(
+                output, store, prior, index, new, removes, batch, attempt, generation
+            )
+            p["changed"], p["intended"] = None, own[0] | own[1]
+            continue
+        if unsettled:
+            p["intended"] = set(await _intended(info, keys_io, unsettled))
+            new, removes = await _repair(output, store, prior, p["intended"] - own[0] - own[1], new, removes)
+            p["new"], p["removes"] = new, removes
+        p["run"] = ([key_bytes(k) for k in new], list(new.values()), [key_bytes(k) for k in removes])
+    for name, p in pending.items():
+        if "run" in p and len(p["run"][0]) + len(p["run"][2]) <= RESOLVE_KEYS:
+            asks.append(_ask_for(name, p, plans[name], spec))
+    engine = await _ask_engine(channel, invocation, asks)
+    for name, p in pending.items():
+        plan, info, output = plans[name], plans[name]["info"], plans[name]["output"]
+        index, replace, own, intended = plan["index"], p["replace"], p["own"], p["intended"]
+        if "files" not in p:
+            answer = engine.get(name)
+            if answer is not None:
+                p["files"], p["changed"] = await _upload(index, p["batch"], spec["attempt"], answer)
+            elif replace:
+                rows = p.get("rows") or Rows.pairs(list(zip(*p["run"][:2], strict=True)))
+                try:
+                    p["files"], p["changed"] = await index.replace(
+                        rows, p["batch"], spec["attempt"], collect=LISTED, generation=p["generation"]
                     )
-                files, changed = await index.resolve(
-                    [key_bytes(k) for k in new],
-                    list(new.values()),
-                    [key_bytes(k) for k in removes],
-                    batch=batch,
-                    attempt=attempt,
-                    generation=generation,
+                except ValueError as e:  # a value with no digest, found as the join reaches it
+                    raise WriteError(f"{output.name}: {e}") from e
+            else:
+                keys, versions, removes = p["run"]
+                p["files"], p["changed"] = await index.resolve(
+                    keys,
+                    versions,
+                    removes,
+                    batch=p["batch"],
+                    attempt=spec["attempt"],
+                    generation=p["generation"],
                     collect=LISTED,
                 )
+        files, changed, unsettled = p["files"], p["changed"], p["unsettled"]
         if not files.files and info.get("exists") and not unsettled:
             entries[name] = {"unchanged": True}
             del plans[name]
             continue
         plan["keys"] = intents[name] = files.to_json()
-        if prior is not None and not (replace and (changed is None or unsettled)):
+        if plan["prior"] is not None and not (replace and (changed is None or unsettled)):
             # The store writes only what changes: the delta, and for a patch whatever a
             # dead attempt may have left half-done among its keys. A replacement with
             # more changes than it lists, or with dead attempts', rewrites the scope;
@@ -525,9 +574,9 @@ async def _store_outputs(
                     plan["removes"] = frozenset(deleted | (own[1] & intended))
         if output.is_partition_set:
             if replace:
-                elements = {str(e) for e in content or ()}
+                elements = {str(e) for e in p["content"] or ()}
             else:
-                elements = (set(info.get("elements") or ()) - set(removes)) | set(new)
+                elements = (set(info.get("elements") or ()) - set(p["removes"])) | set(p["new"])
             plan["elements"] = sorted(elements)
 
     try:
@@ -600,6 +649,51 @@ async def _store_outputs(
 
 REPAIR_PAGE = 100_000
 LISTED = 1_000_000  # changed keys a replacement lists for its store; past it, the store rewrites the scope
+RESOLVE_KEYS = 100_000  # a write the engine resolves: its keys (docs/resolved-commits.md §4)...
+RESOLVE_ENTRIES = 2_000_000  # ...and for a replacement, its keys plus the live ones
+RESOLVE_TIMEOUT = 5.0  # seconds the worker waits for the engine before resolving itself
+
+
+def _ask_for(name: str, p: dict, plan: dict, spec: dict) -> Ask:
+    keys, versions, removes = p["run"]
+    run = sorted([(k, v, 0) for k, v in zip(keys, versions, strict=True)] + [(k, b"", 1) for k in removes])
+    data = encode_file([e[0] for e in run], [e[1] for e in run], bytes(e[2] for e in run))
+    return Ask(
+        name,
+        spec["partition"],
+        "replace" if p["replace"] else "patch",
+        p["batch"],
+        p["generation"],
+        plan["info"]["index"]["prefix"],
+        p["batch"] - 1,
+        data,
+        len(run),
+    )
+
+
+async def _ask_engine(channel, invocation, asks: list[Ask]) -> dict[str, tuple[dict, bytes | None]]:
+    """The engine's answers to the outputs it resolved: a delta or "empty".
+    Unreachable, slow, declining: no answer, and the worker resolves itself."""
+
+    if not asks or channel is None or not hasattr(channel, "resolve"):
+        return {}
+    try:
+        body = await asyncio.wait_for(channel.resolve(request(invocation, asks)), RESOLVE_TIMEOUT)
+        got = answers(body)
+    except Exception:
+        return {}
+    return {name: a for name, a in got.items() if a[0]["result"] in ("delta", "empty")}
+
+
+async def _upload(index: KeyIndex, batch: int, attempt: str, answer) -> tuple[DeltaFiles, tuple]:
+    """The engine's delta, uploaded as this attempt's own delta file."""
+
+    a, data = answer
+    if data is None:
+        return DeltaFiles([], 0, 0, True), ([], [])
+    name = f"{batch:012d}-{attempt}.0000"
+    await index.io.write(index.path(name), data)
+    return DeltaFiles([FileInfo.describe(name, 0, data)], a["added"], a["removed"], True), delta_keys(data)
 
 
 async def _intended(info, keys_io, unsettled) -> list[str]:
@@ -919,7 +1013,17 @@ async def _execute(
         timeline.add("computed")
         metadata = ctx._recorded(value)
         outputs, cursor = await _store_outputs(
-            spec, project, asset, objects, keys_io, value, fence, writes, timeline, invocation
+            spec,
+            project,
+            asset,
+            objects,
+            keys_io,
+            value,
+            fence,
+            writes,
+            timeline,
+            invocation,
+            shipper.channel,
         )
         for name, values in metadata.items():
             if values and "ref" in outputs.get(name, {}):

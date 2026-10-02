@@ -10,11 +10,13 @@ import threading
 
 import pytest
 from solera._native import group_digest
+from solera.keys import resolver
 from solera.keys.index import DeltaFiles, IndexState, KeyIndex, Options
 from solera.keys.io import ObjectIO
 from solera.sdk import Incremental, Output, PartitionSet, Project, Ref, Source, asset
 from solera.stores import FileStore, Patch
 from solera_server.engine import Engine
+from solera_server.keyservice import KeyService
 from solera_server.placements.inline import InlinePlacement
 from solera_server.state import State
 
@@ -451,3 +453,72 @@ async def test_renamed_asset_keeps_its_state(state):
     ref = Ref.from_json(m.heads[("source_feed", "")]["ref"])
     loaded = await project.stores["default"].load(ref, None, await whole(state, "source_feed"))
     assert {r["id"]: r["v"] for r in loaded} == {"a": 1, "b": 2}
+
+
+async def test_small_writes_resolve_in_the_engine_and_pages_come_inline(state, monkeypatch):
+    """docs/resolved-commits.md §4, §7: once the engine's cache holds an index,
+    a small patch's delta comes from the engine — the worker reads no index
+    file — and a consumer's pending page comes inline in its spec."""
+
+    from solera.keys.io import ObjectIO as IO
+
+    pending = {"rows": [{"id": f"k{i}", "v": 1} for i in range(50)]}
+    seen: dict[str, int] = {}
+
+    @asset(outputs=Output("items", key="id", revision="v"))
+    def items():
+        return Patch(pending["rows"])
+
+    @asset(inputs={"items": Incremental(batch_size=100)})
+    def mirror(ctx, items: list):
+        for row in items:
+            seen[row["id"]] = row["v"]
+        for key in ctx.changes["items"].deleted:
+            seen.pop(key, None)
+        return [{"n": len(items)}]
+
+    answers, reads = [], []
+    real_resolve = KeyService.resolve
+
+    async def resolve(self, attempt, body, prepared, live):
+        out = await real_resolve(self, attempt, body, prepared, live)
+        answers.append(resolver.answers(out)["items"][0]["result"] if out else None)
+        return out
+
+    monkeypatch.setattr(KeyService, "resolve", resolve)
+    inlined, real_inline = [], KeyService.inline
+
+    def inline(self, *args):
+        out = real_inline(self, *args)
+        inlined.append(out is not None)
+        return out
+
+    monkeypatch.setattr(KeyService, "inline", inline)
+    engine = engine_for(state, Project(assets=[items, mirror]))
+    await engine.initialize()
+    await run(engine, ["mirror"], upstream=True)
+    for n in range(4):
+        pending["rows"] = [{"id": f"k{i}", "v": n + 2} for i in range(n, 50, 7)]
+        await settle(engine)
+        real_read = IO.read
+
+        async def read(self, path, start, end, size, real_read=real_read):
+            reads.append(path)
+            return await real_read(self, path, start, end, size)
+
+        monkeypatch.setattr(IO, "read", read)
+        reads.clear()  # the last round's: once warm, nothing reads an index file
+        await run(engine, ["items"])
+        await run(engine, ["mirror"])
+        monkeypatch.setattr(IO, "read", real_read)
+        truth = {k: v for k, (v, _) in (await _listed(engine)).items()}
+        assert seen == truth
+    assert set(answers[-3:]) == {"delta"}  # warm: the engine answers
+    assert inlined[-3:] == [True] * 3  # and the consumer's pages come inline
+    assert not [p for p in reads if p.endswith(".kx")]  # so nothing reads an index file
+    await engine.keys.stop()
+
+
+async def _listed(engine):
+    listed = await engine.list_keys("items")
+    return {k: (int(v), 0) for k, v in listed["keys"].items()}

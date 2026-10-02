@@ -1,0 +1,192 @@
+"""The engine's warm resolver against the cold and warm workers
+(docs/resolved-commits.md §9–§10), at 1M–100M keys.
+
+    uv run python bench/keys/warm.py --s3 http://user:secret@127.0.0.1:9100/bucket --sizes 1e6,1e7,1e8
+
+Each index is built as `bench.py` builds it, then given its steady-state
+shape (upper levels filled, seven deltas in level 0). For patches of 1K,
+10K and 100K random keys, half rewritten unchanged, it measures:
+
+- cold worker: `KeyIndex.resolve` with nothing cached;
+- warm worker: the same through a disk cache holding every file (`key_cache`);
+- engine: the resolver's whole request — framing, validation, the lookup
+  over the cache's local files, the delta — with the files in the page
+  cache, and again after dropping it (local SSD only; needs `sudo`).
+
+Also the engine's fill of the snapshot: requests, bytes, time, disk.
+Requests are injected with latency and bandwidth as in `bench.py`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import os
+import random
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from dataclasses import replace
+
+sys.path.insert(0, os.path.dirname(__file__))
+from solera import _native  # noqa: E402
+from solera.keys.cache import EngineCache  # noqa: E402
+from solera.keys.index import KeyIndex, Options  # noqa: E402
+from solera.keys.io import DiskCache, ObjectIO  # noqa: E402
+from solera.keys.resolver import Ask, Prepared, Resolver, answers, request  # noqa: E402
+
+import bench  # noqa: E402
+
+SIZES = (1_000, 10_000, 100_000)
+
+
+def drop_page_cache() -> bool:
+    try:
+        subprocess.run(["sudo", "-n", "sh", "-c", "sync; echo 3 > /proc/sys/vm/drop_caches"], check=True)
+        return True
+    except Exception:
+        return False
+
+
+async def timed(fn):
+    t, cpu = time.perf_counter(), time.process_time()
+    out = await fn()
+    return out, time.perf_counter() - t, time.process_time() - cpu
+
+
+async def run_size(n: int, args) -> list[dict]:
+    prefix = f"{args.prefix}n{n}/"
+    bench.clear_prefix(prefix)
+    rows: list[dict] = []
+    tmp = tempfile.mkdtemp(prefix="solera-warm-")
+    try:
+        opts = Options()
+        setup = ObjectIO(bench.store())
+        state, sample, _, _ = await bench.build(
+            setup, prefix, n, opts, max(1, n // 200_000), max(1, n // 2_000_000)
+        )
+        current = dict(sample)
+        per_entry = sum(f.size for f in state.files) / n
+        upper = await bench.fill_upper(setup, prefix, n, opts, state.depth, per_entry, current)
+        state = replace(state, files=state.files + tuple(upper), prefix=prefix)
+        rng = random.Random(21)
+        for b in range(7):  # level 0 as steady state leaves it
+            items = sorted(rng.sample(list(current.items()), 1000))
+            vers = [rng.randbytes(16) for _ in items]
+            files, _ = await KeyIndex(setup, None, state, opts).resolve(
+                [bench.key_of(i) for i, _ in items], vers, batch=b + 1, attempt="setup", generation=b + 1
+            )
+            state = state.committed(b + 1, files, keep_log=False)
+            current.update((i, v) for (i, _), v in zip(items, vers, strict=True))
+
+        def cold():
+            return ObjectIO(bench.store(), latency=args.latency, bandwidth=args.bandwidth)
+
+        # The engine's fill.
+        cache = EngineCache(os.path.join(tmp, "engine"), disk=200 * 2**30)
+        io = cold()
+        assert cache.admit(state)
+        _, wall, cpu = await timed(lambda: cache.fill(io, state))
+        disk = sum(f.size for f in cache.files.values())
+        rows.append(
+            {
+                "n": n,
+                "op": "engine fill",
+                "wall": wall,
+                "cpu": cpu,
+                "gets": io.metrics.gets,
+                "mb": io.metrics.bytes_in / 1e6,
+                "disk_gb": disk / 1e9,
+            }
+        )
+        resolver = Resolver(cache, cold(), opts)
+        # The warm worker's disk cache.
+        wcache = DiskCache(os.path.join(tmp, "worker"), max_bytes=200 * 2**30)
+        wio = ObjectIO(bench.store(), latency=args.latency, bandwidth=args.bandwidth, cache=wcache)
+        for f in state.files:
+            await wio.read_whole(state.path(f.name), f.size)
+
+        for k in SIZES:
+            items = sorted(rng.sample(list(current.items()), min(k, len(current))))
+            keys = [bench.key_of(i) for i, _ in items]
+            vers = [v if rng.random() < 0.5 else rng.randbytes(16) for _, v in items]
+            row = {"n": n, "op": f"{len(keys):,} keys, half unchanged"}
+            io = cold()
+            (files, _), wall, cpu = await timed(
+                lambda io=io, keys=keys, vers=vers, k=k: KeyIndex(io, None, state, opts).resolve(
+                    keys, vers, batch=99, attempt=f"c{k}"
+                )
+            )
+            row["cold"] = (wall, cpu, io.metrics.gets, io.metrics.bytes_in / 1e6)
+            wio.metrics.reset()
+            _, wall, cpu = await timed(
+                lambda keys=keys, vers=vers, k=k: KeyIndex(wio, None, state, opts).resolve(
+                    keys, vers, batch=99, attempt=f"w{k}"
+                )
+            )
+            row["warm_worker"] = (wall, cpu, wio.metrics.gets, wio.metrics.bytes_in / 1e6)
+            run = _native.encode_file(keys, vers, bytes(len(keys)))
+            body = request("inv", [Ask("out", "", "patch", 100, 1, state.prefix, 99, run, len(keys))])
+            p = Prepared("", 100, 1, state, 99, True)
+            for label in ("engine", "engine_ssd"):
+                if label == "engine_ssd" and not drop_page_cache():
+                    continue
+                out, wall, cpu = await timed(
+                    lambda body=body, p=p, k=k: resolver.resolve(f"e{k}", body, lambda name: p, lambda: True)
+                )
+                answer = answers(out)["out"][0]
+                assert answer["result"] == "delta", answer
+                assert (answer["added"], answer["removed"]) == (files.added, files.removed)
+                row[label] = (wall, cpu, 0, len(body) / 1e6)
+            rows.append(row)
+            print(row, flush=True)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        bench.clear_prefix(prefix)
+    return rows
+
+
+def cell(t) -> str:
+    if t is None:
+        return "—"
+    wall, cpu, gets, mb = t
+    return f"{bench.fmt_s(wall)} · {gets} GET · {mb:.1f} MB · CPU {bench.fmt_s(cpu)}"
+
+
+async def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--sizes", default="1e6,1e7")
+    ap.add_argument("--latency", type=float, default=0.03)
+    ap.add_argument("--bandwidth", type=float, default=80e6)
+    ap.add_argument("--s3", default=os.environ.get("SOLERA_TEST_S3", ""))
+    ap.add_argument("--prefix", default=None)
+    args = ap.parse_args()
+    base = bench.configure(args.s3) if args.s3 else ""
+    args.prefix = base + (args.prefix or f"bench-warm-{uuid.uuid4().hex[:8]}/")
+    rows = []
+    for n in (int(float(x)) for x in args.sizes.split(",")):
+        rows += await run_size(n, args)
+    print("\n| Keys | Patch | Cold worker | Warm worker | Engine, page cache | Engine, SSD only |")
+    print("|---|---|---|---|---|---|")
+    for r in rows:
+        if r["op"] == "engine fill":
+            continue
+        print(
+            f"| {r['n']:,} | {r['op']} | {cell(r.get('cold'))} | {cell(r.get('warm_worker'))} | "
+            f"{cell(r.get('engine'))} | {cell(r.get('engine_ssd'))} |"
+        )
+    print("\n| Keys | Engine fill: time · GETs · MB read · CPU | Local files on disk |")
+    print("|---|---|---|")
+    for r in rows:
+        if r["op"] == "engine fill":
+            print(
+                f"| {r['n']:,} | {bench.fmt_s(r['wall'])} · {r['gets']} GET · {r['mb']:.0f} MB · "
+                f"CPU {bench.fmt_s(r['cpu'])} | {r['disk_gb']:.2f} GB |"
+            )
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
