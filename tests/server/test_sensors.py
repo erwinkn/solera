@@ -621,3 +621,44 @@ async def test_requested_runs_see_the_ticks_own_commits(tmp_path):
     assert [t["scope"] for t in state.model.runs[run]["tasks"].values()] == ["new"]
     assert state.model.heads[("sites", "")]["elements"] == ["new"]
     await state.close()
+
+
+async def test_an_async_observe_is_awaited(tmp_path):
+    """Astra review 2, P2-6."""
+
+    class Feed(Source):
+        async def observe(self, ctx):
+            await asyncio.sleep(0)
+            return "v1"
+
+    project = Project(sources=[Feed("feed", observe=Every(1))])
+    state, engine = await open_engine(tmp_path, project, host=True)
+    await engine.start()
+    await until(lambda: state.model.heads[("feed", "")]["ref"]["version"] == "v1")
+    await engine.stop()
+    await state.close()
+
+
+async def test_an_overrun_does_not_wait_for_other_sensors(tmp_path, monkeypatch):
+    """Astra review 2, P2-7: one tick overruns while another sensor's,
+    with an hour's timeout, is blocked. The host drains briefly and
+    returns; the blocked tick's claim expires on its own."""
+
+    release = threading.Event()
+
+    @sensor(every=1, timeout=0.1)
+    def stuck(ctx):
+        release.wait(10)
+
+    @sensor(every=1, timeout=3600)
+    def slow(ctx):
+        release.wait(10)
+
+    project = Project(sensors=[stuck, slow])
+    state, engine = await open_engine(tmp_path, project)
+    started = asyncio.get_running_loop().time()
+    code = await run_sensor_host(LocalSensorChannel(engine), project, "local", drain=0.2)
+    assert code == OVERRAN and asyncio.get_running_loop().time() - started < 3
+    assert "slow" in state.model.ticks  # left to expire
+    release.set()
+    await state.close()

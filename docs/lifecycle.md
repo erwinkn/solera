@@ -1107,8 +1107,10 @@ on an old revision gets no ticks.
   its runs carry the tags `sensor` and `tick`, its source commits `by:
   "sensor NAME"`.
 - **Hosts.** A host runs up to 4 ticks at once, each body on a daemon
-  thread. After a tick overruns, or after 10,000 ticks, a
-  `solera_worker sensors` process re-executes itself; the engine keeps its
+  thread (an `async` body or `observe()` is awaited there). After a tick
+  overruns, or after 10,000 ticks, a host stops asking, gives the ticks
+  still running five seconds, leaves the rest to expire and tick again,
+  and a `solera_worker sensors` process re-executes itself; the engine keeps its
   local one running, with backoff, beside a served engine (one with an
   engine URL), and authenticates it with a token signed by the engine
   secret. Pool hosts use the pool token.

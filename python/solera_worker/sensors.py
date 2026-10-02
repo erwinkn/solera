@@ -83,10 +83,13 @@ async def run_sensor_host(
     max_ticks: int = 10_000,
     host=None,
     stale_wait: float = 30.0,
+    drain: float = 5.0,
 ) -> int:
     """Run ticks until `max_ticks` ran, one overran, or the engine serves
     another revision (then after `stale_wait`: a host started afresh loads
-    the code as it is now); returns the exit code."""
+    the code as it is now); returns the exit code. Ticks still running
+    `drain` seconds after it stops asking are left: their claims expire,
+    and the sensors tick again on the next host."""
 
     revision = project.manifest["revision"]
     host = host or f"{socket.gethostname()}:{os.getpid()}"
@@ -142,7 +145,9 @@ async def run_sensor_host(
             running.add(task)
             task.add_done_callback(running.discard)
     if running:
-        await asyncio.wait(running)
+        await asyncio.wait(running, timeout=drain)
+        for task in running:
+            task.cancel()
     return OVERRAN if overran.is_set() else 0
 
 

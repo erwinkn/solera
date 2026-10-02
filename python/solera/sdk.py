@@ -277,7 +277,14 @@ class Source:
 
     def _sensor(self) -> Sensor:
         def body(ctx, **resources):
-            return _observed(self.name, self.observe(ctx, **resources))
+            value = self.observe(ctx, **resources)
+            if inspect.isawaitable(value):  # the host runs it, under the tick's timeout
+
+                async def observed():
+                    return _observed(self.name, await value)
+
+                return observed()
+            return _observed(self.name, value)
 
         params = [p for p in inspect.signature(self.observe).parameters if p != "ctx"]
         return Sensor(
