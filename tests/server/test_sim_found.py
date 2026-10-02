@@ -139,3 +139,98 @@ async def test_an_attempt_launched_before_a_rename_settles(state, monkeypatch): 
     except TimeoutError:
         raise AssertionError(f"the run never ends: claims {list(state.model.claims)}") from None
     assert status_of(await drive(engine, await engine.submit(["new"], mode="full"))) == "succeeded"
+
+
+@pytest.mark.xfail(
+    strict=True, reason="sim finding: a firing that resumes a full delivery drops its own change"
+)
+async def test_a_change_made_during_a_full_delivery_reaches_downstream(state):  # noqa: F811
+    """§6, §9: a full keyed delivery begun at batch 0 delivers what changed
+    meanwhile afterwards, as a delta. Interrupted after its first page, then
+    the upstream changes: the firing for that change resumes the delivery —
+    and must also deliver the change, since nothing else will fire for it."""
+
+    from solera.sdk import AutoRefresh
+    from solera.stores import Patch
+
+    content = {"a": "1", "b": "1"}
+
+    @asset(outputs=Output("items", key="id", revision="v"))
+    def items():
+        return [{"id": k, "v": v} for k, v in content.items()]
+
+    @asset(
+        inputs={"items": Incremental(page_size=1)},
+        outputs=Output("out", key="id", revision="v"),
+        automations=AutoRefresh(),
+    )
+    def out(ctx, items: list):
+        return Patch([{"id": r["id"], "v": r["v"]} for r in items], remove=list(ctx.changes["items"].deleted))
+
+    project = Project(assets=[items, out])
+    engine = make_engine(state, project)
+    await engine.initialize()
+    await engine.set_automation("out.onchange.0", False)
+    await drive(engine, await engine.submit(["items"]))
+    run = await engine.submit(["out"])
+    while (state.model.watermarks.get(("out", "items", "")) or {}).get("delivery", {}).get("page") != 1:
+        await engine.tick()
+        await asyncio.sleep(0.01)
+    await engine.cancel(run["id"])  # after its first page: `a` delivered at 1
+    await drive(engine, run)
+    await engine.set_automation("out.onchange.0", True)
+    content.update({"a": "2", "b": "2"})
+    await drive(engine, await engine.submit(["items"]))
+    for _ in range(200):
+        await engine.tick()
+        busy = any(r["status"] not in ("succeeded", "failed", "canceled") for r in state.model.runs.values())
+        if not busy and not state.model.automations["out.onchange.0"]["pending"]:
+            break
+        await asyncio.sleep(0.01)
+    rows = await project.stores["default"].load(
+        _ref(state.model.heads[("out", "")]), list[dict], await whole(state, "out")
+    )
+    assert sorted((r["id"], r["v"]) for r in rows) == [("a", "2"), ("b", "2")]
+
+
+@pytest.mark.xfail(strict=True, reason="sim finding: cleanup deletes segments a writer still opening needs")
+async def test_a_slow_new_writer_never_fences_into_a_deleted_segment(tmp_path):
+    """docs/object-store-state.md §10: a new writer replays the journal after
+    the checkpoint it loaded, then fences at the next free seq. Meanwhile the
+    old writer may append, checkpoint and clean up the segments the new one
+    has not read yet. The fence must not land in such a hole: the new writer
+    then holds a state without acknowledged events, and the old writer's
+    later segments follow a fence that never saw what they build on."""
+
+    from obstore.store import LocalStore
+    from solera_server.journal import Fenced, Journal
+
+    from .test_journal import Counter, add, open_journal
+
+    store = LocalStore(str(tmp_path), mkdir=True)
+    a, sa, _ = await open_journal(store, min_checkpoint=50)
+    await add(a, sa, "x", 1)
+
+    b, sb = Journal(store, "control", flush_interval=0.01), Counter()
+    fence, opened, go = b._fence, asyncio.Event(), asyncio.Event()
+
+    async def slow(apply):  # replayed what it listed; slow before fencing
+        opened.set()
+        await go.wait()
+        return await fence(apply)
+
+    b._fence = slow
+    opening = asyncio.create_task(b.open(sb.restore, sb.apply, sb.snapshot))
+    await opened.wait()
+    acknowledged = 1
+    for _ in range(12):  # the old writer appends, checkpoints and cleans up meanwhile
+        await add(a, sa, "x", 1)
+        acknowledged += 1
+    go.set()
+    try:
+        await opening
+    except Exception:
+        return  # refusing to open is safe
+    assert sb.counts.get("x") == acknowledged, "the new writer lost acknowledged events"
+    with pytest.raises(Fenced):
+        await add(a, sa, "x", 1)
