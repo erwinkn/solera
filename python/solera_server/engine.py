@@ -42,7 +42,7 @@ from .history import MAX_METADATA, History, RunFilter
 from .keyservice import KeyService
 from .model import TERMINAL_RUN, delta_reads
 from .placements import PlacementContext, Registry
-from .sensors import Sensors
+from .sensors import PROJECTED, Sensors
 from .state import Conflict, LostOwnership, State
 from .upkeep import ALIVE, Upkeep
 
@@ -332,7 +332,8 @@ class Engine(Attempts, Sensors):
         `skip_active` and `skip_missing_inputs` leave out the scopes already
         in flight, or with an input never written; `None` if none is left."""
 
-        if command_id and command_id in self.m.receipts:
+        if command_id and command_id in self.m.receipts:  # answered once it is durable
+            await self.state.durable()
             return await self._run_view_of(self.m.receipts[command_id])
         run = await self._plan_run(
             targets,
@@ -515,7 +516,7 @@ class Engine(Attempts, Sensors):
             if kind == "all_partitions" or up_scope in planned.get(owner, ()):
                 continue
             source = owner is None and output in self.manifest["sources"] and up_scope == ""
-            if not source and (output, up_scope) not in self.m.heads:
+            if not source and self._head(output, up_scope) is None:
                 return True
         return False
 
@@ -577,7 +578,7 @@ class Engine(Attempts, Sensors):
             missing = []
             outputs = self.manifest["assets"][asset]["outputs"]
             for scope in current:
-                heads = [self.m.heads.get((o["name"], scope)) for o in outputs]
+                heads = [self._head(o["name"], scope) for o in outputs]
                 if not heads or any(h is None or not h["complete"] for h in heads):
                     missing.append(scope)
             return missing
@@ -599,9 +600,17 @@ class Engine(Attempts, Sensors):
             elif dim["kind"] == "time":
                 out.append(self._time(dim).keys(self._now()))
             else:
-                keys = await self._head_keys(self.m.heads.get((dim["output"], "")))
+                keys = await self._head_keys(self._head(dim["output"], ""))
                 out.append(sorted(keys) if keys else [])
         return out
+
+    def _head(self, output: str, scope: str) -> dict | None:
+        """A head as planning sees it: projected, else the model's."""
+
+        projected = PROJECTED.get() or {}
+        return (
+            projected[(output, scope)] if (output, scope) in projected else self.m.heads.get((output, scope))
+        )
 
     async def _head_keys(self, head) -> list[str] | None:
         """A set dimension's current keys: the element list its head carries (§7)."""

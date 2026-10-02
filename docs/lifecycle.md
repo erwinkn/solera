@@ -995,26 +995,37 @@ dispatched, its cursor and snapshot. Durably, per sensor, it keeps the
 {"cursor": "token-42", "accepted": {"tick": "01J9…", "runs": ["01J9…"], "commits": {"uploads": "h:184731"}}}
 ```
 
-A posted outcome is decided in one synchronous step, in this order:
+A posted outcome is decided in this order. Preparing reads the key index
+and plans runs, so the decision has awaits: it is serialized per tick, not
+synchronous.
 
-1. **Already accepted?** If the record names this tick, the post is a
+1. **A duplicate waits.** If a post of this tick is being decided, a
+   second post waits for that decision and is answered as the first was.
+2. **Already accepted?** If the record names this tick, the post is a
    retry of an outcome already applied: answer it again, apply nothing,
-   delete nothing.
-2. **Current claim?** Otherwise the tick must be the sensor's current
+   delete nothing — once the decision it acknowledges is durable.
+3. **Current claim?** Otherwise the tick must be the sensor's current
    claim; else `409` (a late tick, or one from before a restart).
-3. **Consume the claim**, whatever follows: the tick is decided now.
-4. **Check every snapshot together.** Each commit's source must still have
+4. **Mark the claim deciding.** It stays, and with it the tick's reader
+   pin, until the decision is recorded or its refusal cleaned up: no
+   other tick of the sensor is dispatched meanwhile (which could move the
+   cursor under it), and expiry leaves it alone. Then it is consumed,
+   whatever the outcome.
+5. **Check every snapshot together.** Each commit's source must still have
    the `head` the tick was dispatched with, and be declared; one stale
    source refuses the whole tick (`409`, nothing applied), and the next
    tick observes again. A stale full map must not undo a newer commit.
-5. **Prepare without publishing**: source commits through the commit
-   API's preparation (an identical version or map is no change), run
-   requests through submission's.
-6. **Record everything at once**: the source commits, the run submissions
+6. **Prepare without publishing**: source commits through the commit
+   API's preparation (an identical version or map is no change), then run
+   requests through submission's, planned against the heads those
+   commits will install (a partition set's new elements), never touching
+   the model. The sources' heads are checked again after.
+7. **Record everything at once**: the source commits, the run submissions
    (`command = {tick}/{n}`, so the run receipts deduplicate them too),
    `SensorAdvanced {sensor, cursor}` if the cursor moved, and the new
    accepted-outcome record — one `record()`, so one journal segment holds
-   all or none of it. A tick whose outcome is nothing records nothing.
+   all or none of it — and answer once it is durable. A tick whose
+   outcome is nothing records nothing.
 
 "Unchanged" therefore means no version, no key change and no new cursor
 (review finding 9). A cursor-only tick records only `SensorAdvanced` and

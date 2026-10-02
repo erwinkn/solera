@@ -16,6 +16,7 @@ from solera.sdk import (
     Commit,
     Every,
     Observed,
+    PartitionSet,
     Project,
     RegistrationError,
     RunRequest,
@@ -526,4 +527,97 @@ async def test_a_host_on_old_code_waits_then_starts_afresh(tmp_path):
     assert code == 0 and "watch" not in state.model.ticks
     with pytest.raises(ValueError, match="JSON object"):
         await engine.sensor_post("watch", "t", ["not", "an", "object"])
+    await state.close()
+
+
+async def test_a_decision_under_way_keeps_its_claim_and_pin(tmp_path, monkeypatch):
+    """Astra review 2, P1-2: the first post pauses while planning its run.
+    Meanwhile its claim and reader pin hold: no other tick is dispatched
+    (which could roll the cursor back), expiry leaves it, and a duplicate
+    post waits for the decision and gets its answer."""
+
+    monkeypatch.setattr(engine_sensors, "POST_GRACE", 0.0)
+    project = feed_project(timeout=0.05)
+    state, engine = await open_engine(tmp_path, project)
+    tick = await dispatch(engine, "watch")
+    paused, go = asyncio.Event(), asyncio.Event()
+    plan = engine._plan_run
+
+    async def slow(*args, **kw):
+        paused.set()
+        await go.wait()
+        return await plan(*args, **kw)
+
+    monkeypatch.setattr(engine, "_plan_run", slow)
+    outcome = Tick(cursor="older", runs=[RunRequest("ingest")]).to_json()
+    first = asyncio.create_task(engine.sensor_post("watch", tick["tick"], outcome))
+    await paused.wait()
+    pin = state.model.ticks["watch"]["pin"]
+    await asyncio.sleep(0.1)
+    engine._sensor_sweep()  # past its timeout, but deciding
+    engine.sensor_due.pop("watch", None)
+    assert (await engine.sensor_next("local", engine.manifest["revision"], "t", 8, 0))["ticks"] == []
+    assert state.model.pin_floor() == pin
+    duplicate = asyncio.create_task(engine.sensor_post("watch", tick["tick"], outcome))
+    await asyncio.sleep(0.05)
+    assert not duplicate.done()
+    go.set()
+    answer = await first
+    assert await duplicate == answer and len(answer["runs"]) == 1
+    assert state.model.sensors["watch"]["cursor"] == "older" and "watch" not in state.model.ticks
+    assert state.model.pin_floor() == float("inf")
+    await state.close()
+
+
+async def test_an_answer_waits_for_its_decision_to_be_durable(tmp_path, monkeypatch):
+    """Astra review 2, P1-3: the journal's upload is blocked after the
+    decision was recorded. Neither the post nor its retry is answered
+    until the decision is durable."""
+
+    project = feed_project()
+    state, engine = await open_engine(tmp_path, project)
+    tick = await dispatch(engine, "watch")
+    blocked = asyncio.Event()
+    durable = state.durable
+
+    async def held():
+        await blocked.wait()
+        await durable()
+
+    monkeypatch.setattr(state, "durable", held)
+    outcome = Tick(cursor="c").to_json()
+    first = asyncio.create_task(engine.sensor_post("watch", tick["tick"], outcome))
+    await until(lambda: "watch" in state.model.sensors)  # recorded, not yet durable
+    retry = asyncio.create_task(engine.sensor_post("watch", tick["tick"], outcome))
+    await asyncio.sleep(0.1)
+    assert not first.done() and not retry.done()
+    blocked.set()
+    assert (await retry)["accepted"] and (await first)["accepted"]
+    await state.close()
+
+
+async def test_requested_runs_see_the_ticks_own_commits(tmp_path):
+    """Astra review 2, P1-4: a tick replaces a partition set `[old]` with
+    `[new]` and requests a run over all partitions: the run's tasks are for
+    `new`, planned against the set the tick installs."""
+
+    sites = PartitionSet("sites")
+
+    @asset(partitions=sites)
+    def per_site(ctx) -> int:
+        return 1
+
+    @sensor(every=60, commits=["sites"])
+    def discover(ctx):
+        return None
+
+    project = Project(assets=[per_site], sources=[sites], sensors=[discover])
+    state, engine = await open_engine(tmp_path, project)
+    await engine.commit_source("sites", keys=["old"])
+    tick = await dispatch(engine, "discover")
+    outcome = Tick(commits=[Commit("sites", keys=["new"])], runs=[RunRequest("per_site", partitions="all")])
+    answer = await engine.sensor_post("discover", tick["tick"], outcome.to_json())
+    [run] = answer["runs"]
+    assert [t["scope"] for t in state.model.runs[run]["tasks"].values()] == ["new"]
+    assert state.model.heads[("sites", "")]["elements"] == ["new"]
     await state.close()

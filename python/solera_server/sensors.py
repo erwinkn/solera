@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import logging
 import math
 import os
@@ -25,6 +26,9 @@ log = logging.getLogger(__name__)
 POST_GRACE = 5.0  # seconds past its timeout a tick's outcome is still taken
 SENSOR_MAP_MAX = 1_000_000  # keys of a full map the engine resolves itself (§11.4)
 HOST_TOKEN = "sensors"  # what the local host's token signs (§5.2)
+# Heads a planner sees in place of the model's: a tick's prepared source
+# commits, for the runs it requests in the same decision (§11.4).
+PROJECTED: contextvars.ContextVar[dict | None] = contextvars.ContextVar("projected", default=None)
 
 
 class Sensors:
@@ -80,7 +84,7 @@ class Sensors:
 
         now = asyncio.get_running_loop().time()
         for name, claim in list(self.m.ticks.items()):
-            if now > claim["deadline"]:
+            if now > claim["deadline"] and "deciding" not in claim:  # a decision under way holds its pin
                 del self.m.ticks[name]
                 self._tick_row(name, claim, "failed", error="timed out")
         if any(self._due(name, now) for name in self._sensors()):
@@ -159,24 +163,39 @@ class Sensors:
 
         if not isinstance(outcome, dict):
             raise ValueError("a tick's outcome is a JSON object")
+        claim = self.m.ticks.get(name)
+        if claim is not None and claim["tick"] == tick and "deciding" in claim:
+            await asyncio.shield(claim["deciding"])  # a duplicate: answered as the first is
         accepted = (self.m.sensors.get(name) or {}).get("accepted") or {}
         if accepted.get("tick") == tick:  # a retry of an outcome applied
+            await self.state.durable()  # acknowledged once the decision is
             return {"accepted": True, **{k: accepted[k] for k in ("runs", "commits")}}
         claim = self.m.ticks.get(name)
-        if claim is None or claim["tick"] != tick:
-            raise self.Conflict(f"tick {tick} of {name} is not current: late, or from before a restart")
-        del self.m.ticks[name]  # decided now, whatever follows
-        if outcome.get("error") is not None:
-            self._tick_row(name, claim, "failed", error=str(outcome["error"])[:2000])
-            return {"accepted": False}
+        if claim is None or claim["tick"] != tick or "deciding" in claim:
+            raise self.Conflict(
+                f"tick {tick} of {name} is not current: late, decided, or from before a restart"
+            )
+        # Deciding: the claim, and its reader pin, stay until the decision is
+        # recorded or refused, so no other tick of the sensor is dispatched
+        # and nothing it reads is collected meanwhile.
+        claim["deciding"] = asyncio.get_running_loop().create_future()
         try:
-            return await self._apply_tick(name, claim, outcome)
+            if outcome.get("error") is not None:
+                self._tick_row(name, claim, "failed", error=str(outcome["error"])[:2000])
+                return {"accepted": False}
+            answer = await self._apply_tick(name, claim, outcome)
+            await self.state.durable()
+            return answer
         except self.Conflict as error:
             self._tick_row(name, claim, "refused", error=str(error))
             raise
         except (ValueError, KeyError, TypeError) as error:
             self._tick_row(name, claim, "failed", error=f"{type(error).__name__}: {error}")
             raise ValueError(str(error)) from error
+        finally:
+            if self.m.ticks.get(name) is claim:
+                del self.m.ticks[name]
+            claim["deciding"].set_result(None)
 
     async def _apply_tick(self, name: str, claim: dict, outcome: dict) -> dict:
         sensor = self._sensors()[name]
@@ -203,17 +222,23 @@ class Sensors:
                 )
                 if event is not None:
                     prepared.append(event)
-            for n, request in enumerate(runs):
-                run = await self._plan_run(
-                    request["targets"],
-                    request.get("partitions") or "latest",
-                    config=request.get("config"),
-                    keys=request.get("keys"),
-                    sensor=name,
-                    by=by,
-                    tags={**(request.get("tags") or {}), **tags},
-                )
-                planned.append((f"{claim['tick']}/{n}", run))
+            # The runs are planned against the heads the commits will install —
+            # a partition set's new elements — never the model's until recorded.
+            projected = PROJECTED.set({(e["source"], ""): e["head"] for e in prepared})
+            try:
+                for n, request in enumerate(runs):
+                    run = await self._plan_run(
+                        request["targets"],
+                        request.get("partitions") or "latest",
+                        config=request.get("config"),
+                        keys=request.get("keys"),
+                        sensor=name,
+                        by=by,
+                        tags={**(request.get("tags") or {}), **tags},
+                    )
+                    planned.append((f"{claim['tick']}/{n}", run))
+            finally:
+                PROJECTED.reset(projected)
             if any(self.m.heads.get((source, "")) != head for source, head in heads.items()):
                 raise self.Conflict("a source moved while the tick was applied")
         except BaseException:
