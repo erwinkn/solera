@@ -53,6 +53,42 @@ def _nest(flat: dict, depth: int) -> dict:
     return out
 
 
+class Grouped(dict):
+    """A map keyed by `(name, scope)` that also holds each name's entries
+    together: `of(name)` finds them without looking at any other name's."""
+
+    def __init__(self, items=()):
+        super().__init__()
+        self._of: dict[str, dict] = {}
+        for key, value in dict(items).items():
+            self[key] = value
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        self._of.setdefault(key[0], {})[key[1]] = value
+
+    def __delitem__(self, key):
+        super().__delitem__(key)
+        group = self._of[key[0]]
+        del group[key[1]]
+        if not group:
+            del self._of[key[0]]
+
+    def pop(self, key, *default):
+        if key not in self:
+            if default:
+                return default[0]
+            raise KeyError(key)
+        value = self[key]
+        del self[key]
+        return value
+
+    def of(self, name: str) -> dict:
+        """`{scope: value}` of one name."""
+
+        return self._of.get(name, {})
+
+
 def _flatten(nested: dict, depth: int) -> dict:
     out = {}
 
@@ -139,7 +175,7 @@ class Model:
         self.epoch: int = snap.get("epoch") or 0
         self.manifest = snap.get("manifest")
         self.project = snap.get("project")
-        self.heads: dict[tuple, dict] = _flatten(snap.get("heads"), 2)
+        self.heads = Grouped(_flatten(snap.get("heads"), 2))
         self.indexes: dict[tuple, IndexState] = {
             k: IndexState.from_json(v) for k, v in _flatten(snap.get("indexes"), 2).items()
         }
@@ -271,7 +307,7 @@ class Model:
         return found if found is not None else IndexState(prefix=index_prefix(output, scope))
 
     def heads_of(self, output: str) -> list[tuple[str, dict]]:
-        return sorted((scope, head) for (o, scope), head in self.heads.items() if o == output)
+        return sorted(self.heads.of(output).items())
 
     def outcomes_of(self, asset: str) -> dict[str, dict]:
         return {scope: rec for (a, scope), rec in self.outcomes.items() if a == asset}

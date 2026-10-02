@@ -450,3 +450,27 @@ async def test_a_recount_meanwhile_does_not_refuse_a_commit(state, clock):
     assert (
         state.model.claimed(attempt) is None and state.model.task(task_id)["last"]["outcome"] == "succeeded"
     )
+
+
+def test_one_outputs_heads_are_found_without_looking_at_the_others():
+    """Review round 5, engine #7: `heads_of` scanned every output's heads,
+    so preparing a fan-in grew with the whole namespace. Heads are held by
+    output as well; they stay so across a restore and a move."""
+
+    m = Model()
+    for i in range(1000):
+        m.heads[("other", f"p{i}")] = {"ref": {"version": str(i)}}
+    m.heads[("mine", "b")] = {"ref": {"version": "b"}}
+    m.heads[("mine", "a")] = {"ref": {"version": "a"}}
+
+    def scanned():
+        raise AssertionError("heads_of looked at every head")
+
+    m.heads.items = scanned
+    assert [s for s, _ in m.heads_of("mine")] == ["a", "b"]
+    m.heads[("moved", "a")] = m.heads.pop(("mine", "a"))
+    assert [s for s, _ in m.heads_of("mine")] == ["b"] and [s for s, _ in m.heads_of("moved")] == ["a"]
+    del m.heads.items
+    again = Model()
+    again.restore(m.snapshot())
+    assert len(again.heads_of("other")) == 1000 and again.heads_of("nothing") == []
