@@ -370,10 +370,9 @@ class Lake:
                     if now is None or len(now.get("hidden") or ()) != len(f.get("hidden") or ()):
                         await self._discard(created)
                         return
+            # The files replaced stay cached as long as they exist: a pinned
+            # query may still read them. Collection evicts them as it deletes them.
             self.state.record({"type": f"{self.name}Compacted", "changes": changes, "at": self.clock()})
-            for change in changes:
-                for path in change["removed"]:
-                    self._evict(path)
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -407,6 +406,12 @@ class Lake:
         tmp = target.with_suffix(f".{os.getpid()}.tmp")
         tmp.write_bytes(data)
         tmp.replace(target)
+
+    def evict(self, paths: list[str]) -> None:
+        """Drop the cached copies of files collection deleted."""
+
+        for path in paths:
+            self._evict(path)
 
     def _evict(self, path: str) -> None:
         if self.root is None:

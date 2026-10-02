@@ -262,6 +262,7 @@ class Upkeep:
             return
         await self.state.durable()  # a replay must never reference them again
         await self._delete(due)
+        self.history.lake.evict(due)  # their cached copies live exactly as long
         self.state.record({"type": "GarbageDeleted", "paths": due})
         if self.keys is not None:  # what the engine's cache held of them goes too
             self.keys.retired(due)

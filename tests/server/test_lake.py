@@ -153,3 +153,34 @@ async def test_rows_arriving_during_an_upload_do_not_void_it(tmp_path):
     during.clear()
     await lake.flush(force=True)
     assert await lake.query(rows, ("events",)) == [("a", 1), ("c", 3)]
+
+
+async def test_a_compaction_leaves_cached_files_a_query_still_reads(tmp_path):
+    """Review round 2, system #3: on a remote store, files are read from a
+    local cache. A query chose two files; they are compacted before it
+    reads them. Their cached copies stay until collection deletes the
+    files themselves."""
+
+    store = Store(tmp_path)
+    store.objects_url = "s3://bucket/ns"  # remote: queries read the cache
+    lake = Lake(store, SCHEMA, lambda: store.lake, name="Log", cache=str(tmp_path / "cache"), merge_width=2)
+    for n, run in enumerate("ab", 1):
+        store.lake.append("events", {"run": run, "at": float(n), "n": n})
+        await lake.flush(force=True)
+    old = [f["path"] for f in store.lake.files["events"]]
+    started, go = threading.Event(), threading.Event()
+
+    def slow(con):
+        started.set()
+        go.wait(5)
+        return rows(con)
+
+    pending = asyncio.create_task(lake.query(slow, ("events",)))
+    await asyncio.to_thread(started.wait, 5)
+    lake.maintain()
+    await lake.job
+    assert set(store.garbage) == set(old)  # compacted away, not yet collected
+    go.set()
+    assert await pending == [("a", 1), ("b", 2)]
+    lake.evict(store.garbage)  # what collection does as it deletes them
+    assert not any(Path(lake._local(p)).exists() for p in old)
