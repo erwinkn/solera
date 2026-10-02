@@ -75,6 +75,8 @@
   --head-tracking: -0.015em;
   --head-variation: normal;
   --head-case: none;
+  --head-stretch: 100%; /* a width axis, where the face has one */
+  --head-style: normal;
   --t-2xs: 0.6875rem;
   --t-xs: 0.75rem;
   --t-sm: 0.8125rem;
@@ -132,8 +134,13 @@
   --card-title-weight: var(--head-weight);
   --card-title-case: var(--head-case);
   --card-title-tracking: var(--head-tracking);
+  --card-title-stretch: 100%;
+  --card-title-style: normal;
+  --card-head-bg: transparent; /* a card header as a title bar */
+  --card-head-rule: 0 solid transparent;
   --figure-font: var(--font-ui); /* big numbers */
   --figure-weight: 600;
+  --figure-stretch: 100%;
   --figure-tracking: -0.02em;
   --label-font: var(--font-ui); /* table heads, fact labels */
   --label-tracking: 0.04em;
@@ -693,6 +700,451 @@
   --figure-tracking: -0.035em;
   --nav-bar: var(--accent);
   --live-glow: 0 0 0 3px rgb(90 169 255 / 0.14), 0 0 14px rgb(90 169 255 / 0.5);
+}
+
+/*
+ * Voltage: one current. Paper and ink, and a single electric hue that means
+ * energized: running now, the primary action, the active item, focus. Nothing
+ * else is blue. Grey means fine, red means broken. Tall condensed capitals for
+ * titles and figures, a mono for every label and id, square corners, no
+ * shadows. After Nous Research.
+ */
+[data-theme="voltage"] {
+  --bg: #f2f2f2;
+  --surface: #ffffff;
+  --surface-2: #f7f7f8;
+  --sunken: #ebebec;
+  --overlay: rgb(0 0 24 / 0.5);
+
+  --fg: #0a0a0f;
+  --fg-muted: #45454f;
+  --fg-subtle: #5d5d68;
+  --fg-inverse: #ffffff;
+
+  --line: #e1e1e4;
+  --line-strong: #c3c3c9;
+  --border-w: 1px;
+
+  --accent: #0000f2;
+  --accent-hover: #1a1aff;
+  --accent-fg: #ffffff;
+  --accent-soft: #e6e6ff;
+  --select: #dcdcff;
+  --select-line: #0000f2;
+  --focus: #0000f2;
+  --link: #0000d6;
+
+  --ok: #7a7a85;
+  --ok-soft: #e8eeea;
+  --ok-fg: #2d5a40;
+  --viz-ok: #9a9aa3;
+  --run: #0000f2;
+  --run-soft: #e4e4ff;
+  --run-fg: #0000c8;
+  --wait: #5b5bb8;
+  --wait-soft: #e9e9f8;
+  --wait-fg: #3c3c99;
+  --warn: #c77800;
+  --warn-soft: #fdf0d6;
+  --warn-fg: #7a4a00;
+  --fail: #e8192c;
+  --fail-soft: #ffe3e5;
+  --fail-fg: #b3121f;
+  --idle: #ababb4;
+  --idle-soft: #ececef;
+  --idle-fg: #55555f;
+
+  --ph-1: #c4c4cc;
+  --ph-2: #a3a3ad;
+  --ph-3: #82828d;
+  --ph-4: #61616c;
+  --ph-5: #0000f2;
+  --ph-6: #c77800;
+  --ph-7: #c4c4cc;
+
+  --font-ui: "Archivo Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-head: "Archivo Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-code: "Geist Mono Variable", ui-monospace, monospace;
+  --head-weight: 560;
+  --head-tracking: 0.005em;
+  --head-variation: normal;
+  --head-case: uppercase;
+  --head-stretch: 62%;
+  --t-2xl: 2.25rem;
+  --t-3xl: 3rem;
+
+  --r-xs: 0px;
+  --r-sm: 1px;
+  --r-md: 2px;
+  --r-lg: 2px;
+  --r-pill: 2px;
+  --r-mark: 0px;
+  --shadow-1: none;
+  --shadow-2: none;
+  --shadow-3: 0 12px 32px rgb(0 0 40 / 0.18);
+  --shadow-button: none;
+  --press-x: 0px;
+  --press-y: 1px;
+
+  --ease: cubic-bezier(0.1, 0, 0, 1);
+  --ease-bounce: cubic-bezier(0.1, 0, 0, 1);
+  --dur-1: 60ms;
+  --dur-2: 110ms;
+  --dur-3: 160ms;
+
+  --canvas-dots: rgb(0 0 242 / 0.08);
+  --canvas-pattern:
+    linear-gradient(var(--canvas-dots) 1px, transparent 1px),
+    linear-gradient(90deg, var(--canvas-dots) 1px, transparent 1px);
+  --canvas-size: 24px 24px;
+  --art-opacity: 1;
+  --art-saturate: 1;
+  --art-1: #0a0a0f;
+  --art-2: #0000f2;
+  --art-3: #dcdcff;
+
+  --masthead-rule: 1px solid var(--fg);
+  --masthead-pad: 1rem;
+  --card-title-font: var(--font-head);
+  --card-title-size: var(--t-lg);
+  --card-title-weight: 560;
+  --card-title-case: uppercase;
+  --card-title-tracking: 0.02em;
+  --card-title-stretch: 62%;
+  --figure-font: var(--font-head);
+  --figure-weight: 600;
+  --figure-stretch: 62%;
+  --figure-tracking: 0;
+  --label-font: var(--font-code);
+  --label-tracking: 0.08em;
+  --nav-bar: var(--accent);
+  --nav-active-fg: var(--accent);
+  --chrome-bg: var(--bg);
+  --live-glow: 0 0 0 3px rgb(0 0 242 / 0.18);
+}
+
+/*
+ * Obsidian: editorial authority in the dark. A warm near-black, warm white
+ * ink, rose quartz for every action, hairlines instead of shadows, an italic
+ * serif for titles over a plain grotesk, a tracked mono for labels. Status
+ * colours are the mineral set: jade, light blue, amethyst, citrine, red.
+ * After Hex and Hebbia.
+ */
+[data-theme="obsidian"] {
+  --scheme: dark;
+  --bg: #100f12;
+  --surface: #18171c;
+  --surface-2: #1e1d23;
+  --sunken: #0c0b0e;
+  --overlay: rgb(0 0 0 / 0.65);
+
+  --fg: #f1ece4;
+  --fg-muted: #b3ada3;
+  --fg-subtle: #928c83;
+  --fg-inverse: #100f12;
+
+  --line: #26242c;
+  --line-strong: #35323c;
+  --border-w: 1px;
+
+  --accent: #f5c0c0;
+  --accent-hover: #f9d0d0;
+  --accent-fg: #1a0f12;
+  --accent-soft: #3a2426;
+  --select: #3a2a2c;
+  --select-line: #f5c0c0;
+  --focus: #f5c0c0;
+  --link: #f0b0b0;
+
+  --ok: #5cb198;
+  --ok-soft: #163229;
+  --ok-fg: #8fd4bd;
+  --viz-ok: #2f6b5a;
+  --run: #8abbff;
+  --run-soft: #1b2a44;
+  --run-fg: #a8ccff;
+  --wait: #a477b2;
+  --wait-soft: #2e2238;
+  --wait-fg: #c9a3d6;
+  --warn: #cda849;
+  --warn-soft: #332b12;
+  --warn-fg: #e5c461;
+  --fail: #e54d62;
+  --fail-soft: #3a1a20;
+  --fail-fg: #ff8a98;
+  --idle: #717a94;
+  --idle-soft: #22232c;
+  --idle-fg: #a9afc0;
+
+  --ph-1: #3a363f;
+  --ph-2: #4c4752;
+  --ph-3: #615a67;
+  --ph-4: #7a727f;
+  --ph-5: #8abbff;
+  --ph-6: #cda849;
+  --ph-7: #3a363f;
+
+  --font-ui: "Instrument Sans Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-head: "Instrument Serif", ui-serif, Georgia, serif;
+  --font-code: "Geist Mono Variable", ui-monospace, monospace;
+  --head-weight: 400;
+  --head-tracking: -0.005em;
+  --head-variation: normal;
+  --head-case: none;
+  --head-style: italic;
+  --t-2xl: 2.125rem;
+  --t-3xl: 2.75rem;
+
+  --r-xs: 2px;
+  --r-sm: 3px;
+  --r-md: 4px;
+  --r-lg: 6px;
+  --r-mark: 2px;
+  --shadow-1: inset 0 1px 0 rgb(255 255 255 / 0.03);
+  --shadow-2: inset 0 1px 0 rgb(255 255 255 / 0.04);
+  --shadow-3: inset 0 1px 0 rgb(255 255 255 / 0.05), 0 24px 60px rgb(0 0 0 / 0.7);
+  --shadow-button: inset 0 1px 0 rgb(255 255 255 / 0.06);
+
+  --texture: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24'%3E%3Ccircle cx='1' cy='1' r='0.8' fill='%23fff' fill-opacity='.05'/%3E%3C/svg%3E");
+  --canvas-dots: rgb(245 192 192 / 0.12);
+  --art-opacity: 0.8;
+  --art-saturate: 0.8;
+  --art-1: #b3ada3;
+  --art-2: #f5c0c0;
+  --art-3: #3a2426;
+
+  --masthead-rule: 1px solid var(--line-strong);
+  --masthead-pad: 1rem;
+  --card-title-font: var(--font-head);
+  --card-title-size: var(--t-xl);
+  --card-title-weight: 400;
+  --card-title-tracking: -0.005em;
+  --card-title-style: italic;
+  --figure-font: var(--font-head);
+  --figure-weight: 400;
+  --figure-tracking: -0.01em;
+  --label-font: var(--font-code);
+  --label-tracking: 0.1em;
+  --nav-bar: var(--accent);
+  --chrome-bg: #0c0b0e;
+  --live-glow: 0 0 0 3px rgb(138 187 255 / 0.18), 0 0 12px rgb(138 187 255 / 0.45);
+}
+
+/*
+ * Workbench: everything is an object. A warm grey desk, white panels with a
+ * visible outline and a title bar, flat opaque chips with dark text, a
+ * friendly rounded grotesk, black ink, and one orange for the primary action.
+ * Buttons have a bottom lip and press down. After PostHog.
+ */
+[data-theme="workbench"] {
+  --bg: #eeefe9;
+  --surface: #ffffff;
+  --surface-2: #f6f6f1;
+  --sunken: #e6e7e0;
+  --overlay: rgb(17 17 17 / 0.45);
+
+  --fg: #111111;
+  --fg-muted: #3d3d3a;
+  --fg-subtle: #5e5e59;
+  --fg-inverse: #ffffff;
+
+  --line: #d6d7cf;
+  --line-strong: #b4b5ac;
+  --border-w: 1px;
+
+  --accent: #f54e00;
+  --accent-hover: #ff6a1f;
+  --accent-fg: #111111;
+  --accent-soft: #fde4d6;
+  --select: #fff3c4;
+  --select-line: #f54e00;
+  --focus: #1d4ed8;
+  --link: #b83a00;
+
+  --ok: #2f9e44;
+  --ok-soft: #d3f1d8;
+  --ok-fg: #0f5a23;
+  --run: #1d6fe6;
+  --run-soft: #d6e6ff;
+  --run-fg: #0b3f9b;
+  --wait: #7c4dff;
+  --wait-soft: #e6dcff;
+  --wait-fg: #4a1fb8;
+  --warn: #e6a100;
+  --warn-soft: #fff0b8;
+  --warn-fg: #6b4700;
+  --fail: #e0312b;
+  --fail-soft: #ffd9d6;
+  --fail-fg: #9b1a15;
+  --idle: #8c8d86;
+  --idle-soft: #e5e6df;
+  --idle-fg: #44453f;
+
+  --ph-1: #bcbdb5;
+  --ph-2: #9c9d95;
+  --ph-3: #7d7e76;
+  --ph-4: #5d5e57;
+  --ph-5: #1d6fe6;
+  --ph-6: #c2622f;
+  --ph-7: #bcbdb5;
+
+  --font-ui: "Figtree Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-head: "Figtree Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-code: "IBM Plex Mono", ui-monospace, monospace;
+  --head-weight: 700;
+  --head-tracking: -0.02em;
+  --head-variation: normal;
+  --head-case: none;
+
+  --r-xs: 4px;
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-lg: 10px;
+  --shadow-1: none;
+  --shadow-2: 0 1px 0 rgb(17 17 17 / 0.05);
+  --shadow-3: 0 8px 24px rgb(17 17 17 / 0.18);
+  --shadow-button: 0 2px 0 0 var(--line-strong);
+  --shadow-button-hover: 0 2px 0 0 var(--line-strong);
+  --press-x: 0px;
+  --press-y: 2px;
+
+  --dur-1: 80ms;
+  --dur-2: 140ms;
+  --dur-3: 220ms;
+
+  --canvas-dots: rgb(17 17 17 / 0.1);
+  --art-opacity: 1;
+  --art-saturate: 1;
+  --art-1: #111111;
+  --art-2: #f54e00;
+  --art-3: #ffd166;
+
+  --card-title-size: var(--t-sm);
+  --card-title-weight: 700;
+  --card-head-bg: var(--surface-2);
+  --card-head-rule: 1px solid var(--line);
+  --figure-weight: 800;
+  --figure-tracking: -0.03em;
+  --label-tracking: 0.05em;
+  --nav-bar: var(--accent);
+  --chrome-bg: #e6e7e0;
+  --live-glow: 0 0 0 3px rgb(29 111 230 / 0.2);
+}
+
+/*
+ * Reactor: broadcast graphics. A black void, cool white ink, heavy expanded
+ * capitals for titles, tracked mono labels, zero radius, no shadows. White is
+ * the action; one luminous lime means live, and nothing else is lime. After
+ * the Hermes 4 site.
+ */
+[data-theme="reactor"] {
+  --scheme: dark;
+  --bg: #04050a;
+  --surface: #0b0f1a;
+  --surface-2: #111626;
+  --sunken: #060810;
+  --overlay: rgb(0 0 0 / 0.7);
+
+  --fg: #e8ecff;
+  --fg-muted: #aab3d6;
+  --fg-subtle: #8690b8;
+  --fg-inverse: #04050a;
+
+  --line: #1b2238;
+  --line-strong: #2b3450;
+  --border-w: 1px;
+
+  --accent: #ffffff;
+  --accent-hover: #d9deff;
+  --accent-fg: #04050a;
+  --accent-soft: #1a2140;
+  --select: #1a2140;
+  --select-line: #c6ff2e;
+  --focus: #c6ff2e;
+  --link: #b8c2ff;
+
+  --ok: #5e8f7c;
+  --ok-soft: #10231c;
+  --ok-fg: #8fd1b4;
+  --viz-ok: #3b5a4e;
+  --run: #c6ff2e;
+  --run-soft: #1d2a06;
+  --run-fg: #d4ff5a;
+  --wait: #7f8cff;
+  --wait-soft: #171c3d;
+  --wait-fg: #a9b2ff;
+  --warn: #ffb020;
+  --warn-soft: #2b2008;
+  --warn-fg: #ffc658;
+  --fail: #ff4d5e;
+  --fail-soft: #33101a;
+  --fail-fg: #ff8793;
+  --idle: #4d5570;
+  --idle-soft: #141a2b;
+  --idle-fg: #9aa3c2;
+
+  --ph-1: #2a3250;
+  --ph-2: #3a4466;
+  --ph-3: #4c587f;
+  --ph-4: #627099;
+  --ph-5: #c6ff2e;
+  --ph-6: #ff8c42;
+  --ph-7: #2a3250;
+
+  --font-ui: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-head: "Archivo Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-code: "Martian Mono Variable", ui-monospace, monospace;
+  --head-weight: 800;
+  --head-tracking: 0.04em;
+  --head-variation: normal;
+  --head-case: uppercase;
+  --head-stretch: 125%;
+  --t-2xl: 1.5rem;
+  --t-3xl: 2.125rem;
+
+  --r-xs: 0px;
+  --r-sm: 0px;
+  --r-md: 0px;
+  --r-lg: 0px;
+  --r-pill: 0px;
+  --r-mark: 0px;
+  --shadow-1: none;
+  --shadow-2: none;
+  --shadow-3: 0 24px 60px rgb(0 0 0 / 0.8);
+  --shadow-button: none;
+  --press-x: 0px;
+  --press-y: 1px;
+
+  --ease: cubic-bezier(0.1, 0, 0, 1);
+  --ease-bounce: cubic-bezier(0.1, 0, 0, 1);
+  --dur-1: 60ms;
+  --dur-2: 110ms;
+  --dur-3: 160ms;
+
+  --canvas-dots: rgb(232 236 255 / 0.09);
+  --canvas-size: 20px 20px;
+  --art-opacity: 0.85;
+  --art-saturate: 1;
+  --art-1: #aab3d6;
+  --art-2: #c6ff2e;
+  --art-3: #1a2140;
+
+  --masthead-rule: 1px solid var(--line-strong);
+  --masthead-pad: 1rem;
+  --card-title-font: var(--font-code);
+  --card-title-size: var(--t-2xs);
+  --card-title-weight: 500;
+  --card-title-case: uppercase;
+  --card-title-tracking: 0.14em;
+  --figure-font: var(--font-head);
+  --figure-weight: 800;
+  --figure-stretch: 110%;
+  --figure-tracking: -0.01em;
+  --label-font: var(--font-code);
+  --label-tracking: 0.1em;
+  --nav-bar: #c6ff2e;
+  --chrome-bg: #000000;
+  --live-glow: 0 0 0 3px rgb(198 255 46 / 0.2), 0 0 14px rgb(198 255 46 / 0.55);
 }
 
 @media (prefers-reduced-motion: reduce) {

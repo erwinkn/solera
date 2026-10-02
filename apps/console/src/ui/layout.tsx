@@ -112,7 +112,7 @@ export function CardHeader({
   return (
     <div
       className={cn(
-        "flex flex-wrap items-center justify-between gap-x-4 gap-y-2 px-4 pt-3.5 pb-3",
+        "card-head flex flex-wrap items-center justify-between gap-x-4 gap-y-2 rounded-t-lg px-4 pt-3.5 pb-3",
         className,
       )}
     >

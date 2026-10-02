@@ -65,6 +65,10 @@ for (const [name, ...selectors] of [
   ["cellar", '[data-theme="cellar"]'],
   ["instrument", '[data-theme="instrument"]'],
   ["observatory", '[data-theme="observatory"]'],
+  ["voltage", '[data-theme="voltage"]'],
+  ["obsidian", '[data-theme="obsidian"]'],
+  ["workbench", '[data-theme="workbench"]'],
+  ["reactor", '[data-theme="reactor"]'],
   // The navigation's own scope: a black slab in Brutal.
   ["brutal navigation", '[data-theme="brutal"]', '[data-theme="brutal"] [data-chrome]'],
 ]) {

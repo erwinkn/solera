@@ -128,6 +128,8 @@
 @utility font-display {
   font-family: var(--font-head);
   font-weight: var(--head-weight);
+  font-stretch: var(--head-stretch);
+  font-style: var(--head-style);
   letter-spacing: var(--head-tracking);
   font-variation-settings: var(--head-variation);
   text-transform: var(--head-case);
@@ -155,14 +157,22 @@
   font-family: var(--card-title-font);
   font-size: var(--card-title-size);
   font-weight: var(--card-title-weight);
+  font-stretch: var(--card-title-stretch);
+  font-style: var(--card-title-style);
   letter-spacing: var(--card-title-tracking);
   text-transform: var(--card-title-case);
   font-variation-settings: var(--head-variation);
   line-height: 1.3;
 }
+/* A card's header row: a theme may set it off as a title bar. */
+@utility card-head {
+  background: var(--card-head-bg);
+  border-bottom: var(--card-head-rule);
+}
 @utility figure {
   font-family: var(--figure-font);
   font-weight: var(--figure-weight);
+  font-stretch: var(--figure-stretch);
   letter-spacing: var(--figure-tracking);
   font-variant-numeric: tabular-nums lining-nums;
 }
