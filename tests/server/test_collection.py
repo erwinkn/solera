@@ -428,6 +428,39 @@ async def test_a_slow_reader_holds_back_only_what_it_reads(tmp_path):
     await state.close()
 
 
+async def test_collection_reduces_the_pins_once_per_pass(tmp_path, monkeypatch):
+    """Review round 4, engine #6: a pass costs garbage + pins, not garbage ×
+    pins. 40 output scopes, each with a garbage file and a reader; the even
+    ones' readers pinned before their file was let go of. The pins are
+    walked once, and each odd file goes."""
+
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = engine_for(state, scores_project())
+    await engine.initialize()
+    m = state.model
+    prefixes = [m.index(f"out{i}", "").prefix for i in range(40)]
+    for prefix in prefixes:
+        await state.create_object(f"{prefix}a.kx", b"x")
+    m.applied += 1
+    m.garbage += [[f"{prefix}a.kx", m.applied] for prefix in prefixes]
+    for i, prefix in enumerate(prefixes):
+        m.claims[f"t{i}"] = {"attempt": f"a{i}", "pin": m.applied - (i % 2 == 0), "domains": (prefix,)}
+
+    walks = []
+
+    class Pins(list):
+        def __iter__(self):
+            walks.append(1)
+            return super().__iter__()
+
+    pins = m.pins
+    monkeypatch.setattr(m, "pins", lambda but=None: Pins(pins(but)))
+    await engine.upkeep.collect()
+    assert len(walks) == 1
+    assert [g[0] for g in m.garbage] == [f"{p}a.kx" for p in prefixes[::2]]
+    await state.close()
+
+
 async def test_a_pool_job_with_no_inputs_pins_only_its_output(tmp_path):
     """Engine #8: a launched attempt's pin names what it reads and writes;
     one with no inputs, nothing else of the namespace."""

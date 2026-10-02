@@ -326,16 +326,33 @@ class Model:
         out += self.readers.values()
         return out
 
-    def pin_floor(self, but: str | None = None, path: str | None = None, pins=None) -> float:
+    def floors(self, but: str | None = None) -> tuple[float, dict[str, int]]:
+        """The reader pins reduced, once: the oldest pin of the readers of
+        everything, and per domain the oldest pin of its readers."""
+
+        low, by = math.inf, {}
+        for n, domains in self.pins(but):
+            if domains is None:
+                low = min(low, n)
+            for domain in domains or ():
+                if n < by.get(domain, math.inf):
+                    by[domain] = n
+        return low, by
+
+    def pin_floor(self, but: str | None = None, path: str | None = None, floors=None) -> float:
         """The oldest pin of a reader that may read `path` (any reader, with
         none): what was let go of at or before it is read by no one. One slow
-        reader holds back only what it reads."""
+        reader holds back only what it reads. Domains are directories (they
+        end in `/`), so a path's are found one `/` at a time."""
 
-        pins = self.pins(but) if pins is None else pins
-        return min(
-            (n for n, domains in pins if domains is None or path is None or path.startswith(tuple(domains))),
-            default=math.inf,
-        )
+        low, by = self.floors(but) if floors is None else floors
+        if path is None:
+            return min(low, *by.values()) if by else low
+        end = path.find("/")
+        while end != -1:
+            low = min(low, by.get(path[: end + 1], math.inf))
+            end = path.find("/", end + 1)
+        return low
 
     @contextlib.contextmanager
     def reading(self, *domains: str):

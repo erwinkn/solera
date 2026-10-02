@@ -250,14 +250,14 @@ class Upkeep:
 
         if not self.m.garbage:
             return
-        pins, read = self.m.pins(), self.m.discard_reads()  # pending discards still read them
+        floors, read = self.m.floors(), self.m.discard_reads()  # pending discards still read them
         # The engine's own fills and fetches of index files hold back index files only.
         cache = self.keys.floor() if self.keys is not None else math.inf
 
         def due_now(path: str, n: int) -> bool:
             if path in read or (path.startswith("keys/") and n > cache):
                 return False
-            return n <= self.m.pin_floor(path=path, pins=pins)
+            return n <= self.m.pin_floor(path=path, floors=floors)
 
         due = [path for path, n in self.m.garbage if due_now(path, n)]
         if not due:
