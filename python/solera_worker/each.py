@@ -29,6 +29,7 @@ from solera.stores import Keys, Patch
 
 WALK = 100  # failure records walked per retry page, at most, for each key it may take
 INTERRUPTED = "interrupted"  # a key a drain stopped: canceled or timed out once the result is sealed
+LOOKAHEAD = 100_000  # index entries a page examines at most, to fill itself and to prove it final
 
 
 @dataclass
@@ -67,23 +68,29 @@ async def _fill(chunk, start: bytes | None, limit: int, kind) -> tuple[list, str
     entries as `(key, version, deleted, locator)` in key order past `after`,
     and where to go on (None: exhausted). Past a full page it looks on for
     one more entry it takes, so that a page is `final` exactly when nothing
-    follows and no delivery ends on an empty page (§5); each chunk asks for
-    what the page still lacks and that one more, no further. Returns the
-    page's entries, where the next page starts (None: this one is final),
-    and how many entries were read."""
+    follows and no delivery ends on an empty page (§5).
+
+    Entries are read a page's worth and one more at a time — never just what
+    the page still lacks, so a sparse pattern costs scans in proportion to
+    the entries it passes over, divided by the page — and at most
+    `LOOKAHEAD` of them: past that the page goes as it is — not
+    final, not full, perhaps empty (then its attempt is skipped, the producer
+    not called). The next page starts after the last entry examined, so no
+    entry is read twice. Returns the page's entries, where the next page
+    starts (None: this one is final), and how many entries were read."""
 
     page, cursor, read, last = [], start, 0, None
     while True:
-        entries, nxt = await chunk(cursor, limit - len(page) + 1)
-        read += len(entries)
-        for entry in entries:
+        entries, nxt = await chunk(cursor, limit + 1)
+        for n, entry in enumerate(entries, 1):
             taken = kind(entry)
-            if taken is None:
-                continue
-            if len(page) == limit:  # one more is taken: the page is full, not final
-                return page, key_str(last), read
-            page.append((taken, entry))
-            last = entry[0]
+            if taken is not None:
+                if len(page) == limit:  # one more is taken: the page is full, not final
+                    return page, key_str(last), read
+                page.append((taken, entry))
+            read, last = read + 1, entry[0]
+            if read >= LOOKAHEAD and (n < len(entries) or nxt is not None):
+                return page, key_str(last), read  # examined enough: the rest is the next page's
         if nxt is None:
             return page, None, read
         cursor = nxt

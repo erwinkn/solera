@@ -606,7 +606,10 @@ class Engine(Attempts, Sensors, Views):
                     param: delivery.advance(plan) for param, plan in prepared["plans"].items() if plan
                 }
                 watermarks = {param: wm for param, wm in advanced.items() if wm is not None}
-                self._finish(task, claim, "skipped", commit={"watermarks": watermarks, "drained": True})
+                commit = {"watermarks": watermarks}
+                if not delivery.selects(prepared["plans"]):
+                    commit["drained"] = True
+                self._finish(task, claim, "skipped", commit=commit)
                 return
             stage = await self._launch(task, run, attempt, prepared)
             try:
@@ -772,6 +775,8 @@ class Engine(Attempts, Sensors, Views):
             }
             if generations:
                 pin["generations"] = generations
+        if full and delivery.selects(plans):
+            raise NonRetryable(f"{task['asset']}: a keys= selection cannot run while a full run is due")
         claim = self.m.claimed(attempt) if attempt is not None else None
         if claim is not None:
             # Keep the delta log this attempt reads until it finishes (§6).
@@ -977,6 +982,16 @@ class Engine(Attempts, Sensors, Views):
         head_batch = int(head.get("batch", -1))
         override = (run.get("keys") or {}).get(output)
         wm = self.m.watermarks.get((task["asset"], param, task["scope"]))
+        if isinstance(override, dict) and "keys" in override:
+            # A keys= selection reads the keys it names, whatever the watermark — none
+            # yet, a delivery under way, a reset due — and moves neither it nor the
+            # scope's progress. The edge's patterns still decide which it takes (§11).
+            keys = sorted({str(k) for k in override["keys"]})
+            pin = {"ref": ref, "changes": {"keys": keys, "full": False}}
+            pin["index"] = self.m.index(output, up_scope).pinned().to_json()  # the keys' locators
+            if edge.get("patterns") is not None:
+                pin["patterns"] = edge["patterns"]
+            return pin, {"kind": "selection"}, not keys
         first = int(head.get("base", 0))
         # A `full` run or a keys="full" override starts one pass per run, which the
         # run's later attempts resume (`pass` on the watermark) instead of restarting;
@@ -992,17 +1007,6 @@ class Engine(Attempts, Sensors, Views):
             "pass": run["id"] if reset else wm.get("pass"),
         }
         current = None if reset else wm.get("delivery")
-
-        # A keys= override is a one-off selection — it never moves the watermark. The
-        # edge's patterns still decide which of the keys it takes (per-key §11).
-        if isinstance(override, dict) and "keys" in override and not reset:
-            keys = sorted({str(k) for k in override["keys"]})
-            pin = {"ref": ref, "changes": {"keys": keys, "full": False}}
-            if keyed:  # the keys' versions and locators, for the store to find them
-                pin["index"] = self.m.index(output, up_scope).pinned().to_json()
-            if edge.get("patterns") is not None:
-                pin["patterns"] = edge["patterns"]
-            return pin, None, not keys
 
         if not keyed:
             if current is None:
@@ -1144,7 +1148,7 @@ class Engine(Attempts, Sensors, Views):
         failures = self.m.index(f"@{task['asset']}", task["scope"])
         changes = not empty
         wm = self.m.watermarks.get((task["asset"], param, task["scope"]))
-        whole = plan is not None and plan["delivery"]["mode"] == "full"
+        whole = plan["kind"] == "keys" and plan["delivery"]["mode"] == "full"
         # After a full delivery, the output's keys it no longer names go first (§11).
         reconcile = None if whole else (wm or {}).get("reconcile")
         # A full delivery reprocesses every key, a pattern transition and its cleanup
@@ -1216,8 +1220,7 @@ class Engine(Attempts, Sensors, Views):
             return pin, plan, False
         pin = {**pin, "each": each}
         page = {"kind": "changes", "retries": retries, "pass": retry}
-        # A keys= override is a one-off selection: no watermark moves (plan None).
-        plan = {"kind": "held", "watermark": None, "each": page} if plan is None else {**plan, "each": page}
+        plan = {**plan, "each": page}
         return pin, plan, empty
 
     def _each_commit(self, task, plan: dict, result: dict) -> tuple[dict, bool, dict | None]:
@@ -1438,9 +1441,16 @@ class Engine(Attempts, Sensors, Views):
             # nor does a page whose keys the edge's patterns all left out.
             if prepared["outputs"][name]["head"] is None and failures is None and not result.get("skipped"):
                 raise Conflict(f"omitted output {name} has no head to keep (§2)", retryable=False)
-        # Whether the delivery is done is the scope's, not its outputs': a last page
-        # may write none of them (§7).
-        commit = {"heads": heads, "watermarks": watermarks, "drained": not more}
+        commit = {"heads": heads, "watermarks": watermarks}
+        if not delivery.selects(prepared.get("plans") or {}):
+            # Whether the delivery is done is the scope's, not its outputs' — a last page
+            # may write none of them (§7) — and every edge's: one still delivering, its
+            # watermark untouched by this attempt, keeps the scope from draining.
+            after = [
+                watermarks.get(p) or self.m.watermarks.get((task["asset"], p, task["scope"]))
+                for p in prepared.get("plans") or {}
+            ]
+            commit["drained"] = not more and not any(delivery.outstanding(wm) for wm in after if wm)
         if failures is not None:
             commit["failures"] = failures
             if result.get("key_outcomes"):

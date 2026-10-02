@@ -529,6 +529,13 @@ class Planner:
             unknown = set(keys) - incremental_outputs
             if unknown:
                 raise ValueError(f"keys= names no Incremental edge: {sorted(unknown)}")
+            for output, override in keys.items():
+                if not isinstance(override, dict):
+                    continue
+                if self.manifest["outputs"][output].get("key") is None:
+                    raise ValueError(f"keys= selects keys of {output!r}, which has none")
+                if mode == "full":
+                    raise ValueError("a keys= selection reads the keys it names: it cannot be a full run")
         if skip_active:
             for name in assets:
                 assets[name] = {s for s in assets[name] if not active(name, s)}

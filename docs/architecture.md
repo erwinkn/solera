@@ -337,7 +337,7 @@ is an `Incremental` edge to the engine, with a failure index).
 | Value | Meaning |
 |---|---|
 | `In(output=None, meta=None)` | whole value (or ref) of the output at its pinned head |
-| `Incremental(output=None, page_size=100, meta=None, *, include=None, exclude=None)` | receive only what changed since this consumer's watermark — upserted/deleted keys on a keyed upstream, new batches on an unkeyed one (§6). On a keyed upstream, `include`/`exclude` globs (or `Regex`) select keys by name; pages are formed from the keys they take — read ahead past the others — so no page is empty, a delivery they take nothing from is `skipped` without calling the producer, and a change of patterns cuts over: pending changes finish under the old ones, membership is diffed against the index at the cutover (pinned until the diff ends), then deltas continue under the new (per-key-processing.md §11) |
+| `Incremental(output=None, page_size=100, meta=None, *, include=None, exclude=None)` | receive only what changed since this consumer's watermark — upserted/deleted keys on a keyed upstream, new batches on an unkeyed one (§6). On a keyed upstream, `include`/`exclude` globs (or `Regex`) select keys by name; pages are formed from the keys they take — read ahead past the others, at most 100,000 keys a page — so no page is empty, a delivery they take nothing from is `skipped` without calling the producer, and a change of patterns cuts over: pending changes finish under the old ones, membership is diffed against the index at the cutover (pinned until the diff ends), then deltas continue under the new (per-key-processing.md §11) |
 | `Each(output=None, *, page_size=100, concurrency=16, meta=None)` | an `Incremental` edge on a keyed upstream whose producer is written for **one key**: the parameter is that key's value (a rows upstream: its group), `ctx.key` its key. The worker calls it for every changed key of a page, `concurrency` at a time, stores the keys that succeeded as one `Patch({key: value})` per output, and keeps the ones that raised in the asset's failure index, retried by their error class; deleted keys lose their rows without a call. One per asset, its other inputs whole, every output keyed. per-key-processing.md §5–§10 |
 | `AllPartitions(output=None, meta=None)` | receive every partition of the upstream dimensions this asset lacks (§7) |
 
@@ -357,8 +357,11 @@ of a full delivery (the whole head, after a reset), `page` — the page's
 take when it started (exact without patterns and with an exact key count,
 else an estimate), `first` (`page == 0`), and `final`, set when the
 delivery has run out, never inferred from `pages`. Pages hold only keys the
-edge's patterns take, read ahead past the others, so `final` is always on
-a real page. `upstream` carries facts about the upstream: its `output`,
+edge's patterns take, read ahead past the others, so `final` is on a real
+page — unless a page had to examine more than 100,000 keys to fill itself
+or to prove it is the last: it then goes as it is, not final, and the
+rest, if the patterns take nothing from it, completes the delivery
+without calling the producer. `upstream` carries facts about the upstream: its `output`,
 and for a batch-mode upstream the range of `batches` the page covers. The
 page plan is kept on the edge's watermark while the delivery continues, for
 keyed and unkeyed upstreams, delta windows and full deliveries alike. A

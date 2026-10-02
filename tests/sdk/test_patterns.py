@@ -32,3 +32,13 @@ def test_edges_carry_patterns():
         Each("f", include=[])
     with pytest.raises(RegistrationError):
         Incremental("f", exclude=[""])
+
+
+def test_one_exclude_pattern_is_a_pattern_not_its_characters():
+    """A string `exclude=` is one pattern, as a string `include=` is: `'k1*'`
+    leaves out `k1…` only, never every key through its `'*'`."""
+
+    assert spec(exclude="k1*") == spec(exclude=["k1*"])
+    taken = Matcher(spec(exclude="k1*"))
+    assert taken("k2") and taken("a") and not taken("k10")
+    assert Matcher(spec(include="k*", exclude=Regex("k1.*")))("k2")

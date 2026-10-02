@@ -396,6 +396,49 @@ async def test_run_keys_override(state):
     assert seen[-1] == ["a", "b"]
 
 
+async def test_a_selection_reads_its_keys_and_moves_nothing(state):
+    """Review round 5 (system #3, engine #2): a keys= selection reads the keys
+    it names — on a consumer never run, or one whose full delivery stopped
+    half-way — and moves neither its watermark nor its scope's progress: the
+    interrupted delivery still owes `b`, and resumes."""
+    calls, broken = [], {"page": 1}
+
+    @asset(outputs=Output("files", key="id"))
+    def files():
+        return [{"id": k, "v": 1} for k in "abc"]
+
+    @asset(inputs={"files": Incremental(page_size=1)}, retries=Retry(n=0))
+    def consumer(ctx, files: list):
+        if ctx.changes["files"].page == broken["page"]:
+            raise RuntimeError("stopped half-way")
+        calls.append(sorted(r["id"] for r in files))
+        return []
+
+    project = Project(assets=[files, consumer])
+    engine = make_engine(state, project)
+    await engine.initialize()
+    await drive(engine, await engine.submit(["files"]))
+    detail = await drive(engine, await engine.submit(["consumer"], keys={"files": {"keys": ["b"]}}))
+    assert status_of(detail) == "succeeded" and calls == [["b"]]  # the selection, and nothing else
+    assert ("consumer", "files", "") not in state.model.watermarks
+    assert ("consumer", "") not in state.model.progress
+    calls.clear()
+    await drive(engine, await engine.submit(["consumer"]))  # a full delivery, stopped after `a`
+    stopped = state.model.watermarks[("consumer", "files", "")]
+    assert calls == [["a"]] and stopped["delivery"]["at"] == "a"
+    assert state.model.progress[("consumer", "")] == {"drained": False}
+    calls.clear()
+    await drive(engine, await engine.submit(["consumer"], keys={"files": {"keys": ["c"]}}))
+    assert calls == [["c"]] and state.model.watermarks[("consumer", "files", "")] == stopped
+    assert state.model.progress[("consumer", "")] == {"drained": False}  # `b` is still owed
+    broken["page"] = None
+    calls.clear()
+    await drive(engine, await engine.submit(["consumer"]))
+    assert calls == [["b"], ["c"]] and state.model.progress[("consumer", "")] == {"drained": True}
+    with pytest.raises(ValueError, match="cannot be a full run"):
+        await engine.submit(["consumer"], mode="full", keys={"files": {"keys": ["a"]}})
+
+
 async def test_a_paged_full_override_resumes_its_pass(state):
     """Engine review round 2 #2: `keys={"files": "full"}` starts one pass per
     run and its later pages resume it — the first page is not served again."""
@@ -1300,6 +1343,51 @@ async def test_pages_read_ahead_past_keys_the_patterns_leave_out(state):
     assert calls == [(0, ["k03", "k04"], False), (1, ["k17", "k18"], False), (2, ["k29"], True)]
     detail = await drive(engine, await engine.submit(["none"]))
     assert "none" not in calls and task_statuses(detail)["none"] == "skipped"
+
+
+async def test_a_page_looks_ahead_a_bounded_way(state, monkeypatch):
+    """Review round 5 (system #5): a page reads the index in chunks, whatever
+    it still lacks, and examines at most `LOOKAHEAD` entries — past them it
+    goes as it is, not final; a page left with nothing is skipped without
+    calling the producer, and the delivery still completes."""
+    from solera.keys.index import key_bytes
+    from solera_worker import each
+
+    # The reviewer's case: 100 matches at the head of 10,000 keys, a page of 100.
+    keys = [key_bytes(f"a/{i:05d}") for i in range(10_000)]
+    scans = []
+
+    async def chunk(after, n):
+        scans.append(n)
+        lo = 0 if after is None else keys.index(after) + 1
+        part = keys[lo : lo + n]
+        return [(k, b"v", 0, 0) for k in part], (part[-1] if lo + n < len(keys) else None)
+
+    def kind(entry):
+        return "upsert" if entry[0].startswith(b"a/000") else None
+
+    page, after, read = await each._fill(chunk, None, 100, kind)
+    assert len(page) == 100 and after is None and read == 10_000 and len(scans) == 100  # was 9,900
+
+    calls = []
+
+    @asset(outputs=Output("files", key="id"))
+    def files():
+        return [{"id": f"k{i:02d}", "v": 1} for i in range(20)]
+
+    @asset(inputs={"files": Incremental(page_size=100, include="k0*")})
+    def sparse(ctx, files: list):
+        calls.append((sorted(r["id"] for r in files), ctx.changes["files"].final))
+        return [{"n": len(files)}]
+
+    monkeypatch.setattr(each, "LOOKAHEAD", 5)
+    project = Project(assets=[files, sparse])
+    engine = make_engine(state, project)
+    await engine.initialize()
+    detail = await drive(engine, await engine.submit(["sparse"], upstream=True))
+    assert status_of(detail) == "succeeded"
+    assert calls == [([f"k0{i}" for i in range(5)], False), ([f"k0{i}" for i in range(5, 10)], False)]
+    assert state.model.progress[("sparse", "")] == {"drained": True}  # the empty rest, skipped
 
 
 async def test_an_unchanged_keyed_write_still_applies_its_migrations(state):

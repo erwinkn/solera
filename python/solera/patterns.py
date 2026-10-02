@@ -67,8 +67,9 @@ def spec(include=None, exclude=None) -> dict | None:
         raise ValueError("include= names no pattern")
     if isinstance(exclude, Mapping):
         excludes = [[str(name), _one(p)] for name, p in exclude.items()]
-    else:
-        excludes = [[f"exclude[{n}]", _one(p)] for n, p in enumerate(exclude or ())]
+    else:  # one pattern, as for include=: a string is never its characters
+        listed = [exclude] if isinstance(exclude, str | Regex) else list(exclude or ())
+        excludes = [[f"exclude[{n}]", _one(p)] for n, p in enumerate(listed)]
     return {"include": [_one(p) for p in includes], "exclude": excludes}
 
 

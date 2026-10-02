@@ -34,9 +34,11 @@ The modes:
 A delivery's mode, boundary and page plan are decided when it starts and
 kept until its last page; `next` then moves past it. An attempt is given a
 **plan** — `kind`, the `watermark` it carries forward, and the `delivery`
-its page is on (`hi`, for batches: the page's last batch) — or a `held`
-plan, a page that moves no watermark of its own (an Each retry or
-reconcile page, a `keys=` override).
+its page is on (`hi`, for batches: the page's last batch); a `held` plan,
+a page that moves no watermark of its own (an Each retry or reconcile
+page); or a `selection`, a run's `keys=` selection, which reads the keys it
+names and moves neither the watermark nor the scope's progress, whatever
+they are.
 """
 
 from __future__ import annotations
@@ -47,6 +49,8 @@ def advance(plan: dict, after: str | None = None) -> dict | None:
     page's last key (`None`: the delivery is done) — or `None` if it moves
     none."""
 
+    if plan["kind"] == "selection":
+        return None
     if plan["kind"] == "held":
         return plan["watermark"]
     wm, d = dict(plan["watermark"]), plan["delivery"]
@@ -82,12 +86,26 @@ def continues(plan: dict, after: str | None, wm: dict | None) -> bool:
     delivery not done, a pattern transition's diff still owed, a cleanup
     begun."""
 
-    if plan["kind"] == "held":
+    if plan["kind"] in ("held", "selection"):
         return False
     if plan["kind"] == "batches":
         return plan["hi"] < plan["delivery"]["to"]
     wm = wm or {}
     return after is not None or "rescope" in wm or "reconcile" in wm
+
+
+def selects(plans: dict) -> bool:
+    """Whether an attempt reads a `keys=` selection: it then leaves the
+    scope's progress as it was."""
+
+    return any(p and p["kind"] == "selection" for p in plans.values())
+
+
+def outstanding(wm: dict) -> bool:
+    """Whether an edge still owes its scope delivery: one under way, a
+    pattern transition's diff, an Each cleanup."""
+
+    return "delivery" in wm or "rescope" in wm or "reconcile" in wm
 
 
 def needs(wm: dict) -> int:

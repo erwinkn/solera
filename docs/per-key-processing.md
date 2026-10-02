@@ -1125,7 +1125,12 @@ Where the implementation (`solera/errors.py`, `solera/build.py`,
   are formed from the keys they take, read ahead past the others until a
   page holds `page_size` keys or the delivery runs out, so no page is
   empty; a delivery they take nothing from does not call the producer
-  and ends `skipped`.
+  and ends `skipped`. The read-ahead is bounded: the index is read a page's
+  worth and one more at a time, never only what the page still lacks, and
+  a page examines at most 100,000 entries (`LOOKAHEAD` in
+  `solera_worker/each.py`) — past that it goes as it is,
+  not final; a page so left with nothing is skipped the same way, and the
+  next page resumes after the last key examined.
 - **The rescope cutover** lives on the watermark: `patterns` (what it
   delivers under) and, during a transition, `rescope` {`old`, `new`,
   `cutover`, `snapshot` (the upstream index as of the cutover), `pin`};
