@@ -150,7 +150,7 @@ function ScopeRow({ s }: { s: EdgeScope }) {
   const d = wm?.delivery;
   const at =
     typeof d?.at === "string" ? `after ${d.at}` : typeof d?.at === "number" ? `batch ${count(d.at)}` : null;
-  const position = d ? [at, `page ${d.page + 1} of ${d.pages}`].filter(Boolean).join(" · ") : null;
+  const position = d ? [d.mode, at, `page ${d.page + 1} of ${d.pages}`].filter(Boolean).join(" · ") : null;
   return (
     <Tr>
       <Td className="font-mono text-xs">
