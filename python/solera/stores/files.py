@@ -10,7 +10,6 @@ import json
 import os
 import pickle
 from typing import Any
-from urllib.parse import unquote
 
 from ..sdk import KEYS, ObjectRef, Ref, is_ref_type
 from . import (
@@ -45,7 +44,7 @@ class FileStore:
         {root}/uploads/u-7/9c41e0….184467.pkl   a keyed output: one object per key and version
         {root}/site_files/alpha/f-1/5d2a….184467.json
                                                 keyed and partitioned: the key's rows
-        {root}/site_events/alpha/000000000042.184467.json
+        {root}/site_events/alpha/000000000042/184467.json
                                                 an unkeyed incremental output: one per batch
 
     A name carries the logical version and the writing attempt's generation
@@ -53,14 +52,15 @@ class FileStore:
     ever leaves objects nothing references, and a reader gets exactly the
     version it was pinned to. A keyed read names its objects from the key
     index's `(version, locator)` (`Keys`); a range of batches keeps, per
-    batch, the highest generation, which committed it. Superseded objects
+    batch, the highest generation, which committed it — listed batch by
+    batch, so reading one never lists the others. Superseded objects
     are deleted by `discard`, once nothing can read them.
 
     Content is JSON when it round-trips exactly, pickle otherwise. `path`
     defaults to `$SOLERA_DATA`, else `.solera/data` next to the project
     file."""
 
-    version = "2"
+    version = "3"
     writes = "immutable"
     ref_type = ObjectRef
     shared_table = False
@@ -166,7 +166,7 @@ class FileStore:
             batch = scope.batch
         else:
             batch = int(prior.handle["batches"][1]) + 1 if prior is not None else 0
-        version = await self._put(f"{base}/{batch:012d}.{generation}", items)
+        version = await self._put(f"{base}/{batch:012d}/{generation}", items)
         if prior is None:
             first = batch
         else:
@@ -207,16 +207,19 @@ class FileStore:
             elif kind == "value":
                 names.append(f"{base}@{int(item[1])}")
             elif kind == "batch":
-                names.append(f"{base}/{int(item[1]):012d}.{int(item[2])}")
+                names.append(f"{base}/{int(item[1]):012d}/{int(item[2])}")
             elif kind == "batches":
                 ranges.append((int(item[1]), int(item[2])))
             else:
                 raise StoreError(f"{scope.output.name}: cannot discard {item!r}")
         if ranges:
-            for name in await self._keys(base):
-                batch = name.partition(".")[0]
-                if batch.isdigit() and any(lo <= int(batch) <= hi for lo, hi in ranges):
-                    names.append(f"{base}/{name}")
+            import obstore
+
+            async for chunk in obstore.list(self._objects(), prefix=f"{base}/"):
+                for meta in chunk:
+                    found = _batch_of(base, meta["path"])
+                    if found and any(lo <= found[0] <= hi for lo, hi in ranges):
+                        names.append(f"{base}/{found[0]:012d}/{found[1]}")
         await self._many(lambda n: self._delete(n), names)
 
     # -- reads ------------------------------------------------------------------
@@ -232,10 +235,14 @@ class FileStore:
             if isinstance(selection, Keys):
                 raise StoreError(f"{ref.output}: an unkeyed incremental output takes Batches")
             first, last = (int(b) for b in handle["batches"])
-            lo, hi = (max(first, selection.lo), selection.hi) if selection is not None else (first, last)
+            lo, hi = (
+                (max(first, selection.lo), min(last, selection.hi))
+                if selection is not None
+                else (first, last)
+            )
             names = await self._batches(base, lo, hi)
             # The ref's batches run first..last without a gap: every one a commit wrote.
-            if missing := [b for b in range(lo, min(hi, last) + 1) if b not in names]:
+            if missing := [b for b in range(lo, hi + 1) if b not in names]:
                 raise StoreError(f"{ref.output}: batch {missing[0]} of {base} is gone")
             batches = await self._many(self._found, [names[b] for b in sorted(names)])
             return frames.materialize([item for b in batches for item in b], t)
@@ -281,32 +288,33 @@ class FileStore:
 
     async def _batches(self, base: str, lo: int, hi: int) -> dict[int, str]:
         """Batch `n` -> its committed object, in `[lo, hi]`: of the objects
-        named after `n`, the highest generation's. The attempts that used
+        under `n`'s name, the highest generation's. The attempts that used
         batch `n` all ran between the commits of `n - 1` and `n`, one at a
         time, and the one that committed `n` was the last of them."""
 
         import obstore
 
         objects = self._objects()
-        # Listed from `lo` on: an object store lists in key order, so it stops past
-        # `hi`; a local directory comes in any order, and is read to its end.
-        ordered = type(objects).__name__ != "LocalStore"
-        best: dict[int, tuple[int, str]] = {}
-        async for chunk in obstore.list(objects, prefix=f"{base}/", offset=f"{base}/{lo:012d}"):
-            for meta in chunk:
-                name = meta["path"][len(base) + 1 :]
-                if "/" in name or not name.endswith((".json", ".pkl")):
-                    continue
-                batch, _, generation = unquote(name.rsplit(".", 1)[0]).partition(".")
-                if not (batch.isdigit() and generation.isdigit()) or int(batch) < lo:
-                    continue
-                if int(batch) > hi:
-                    if ordered:
-                        return {b: n for b, (_, n) in best.items()}
-                    continue
-                if int(generation) >= best.get(int(batch), (-1, ""))[0]:
-                    best[int(batch)] = (int(generation), f"{base}/{batch}.{generation}")
-        return {b: n for b, (_, n) in best.items()}
+        best: dict[int, int] = {}
+
+        async def scan(prefix: str, offset: str | None = None) -> None:
+            async for chunk in obstore.list(objects, prefix=prefix, offset=offset):
+                for meta in chunk:
+                    if (found := _batch_of(base, meta["path"])) is None:
+                        continue
+                    batch, generation = found
+                    if batch > hi:
+                        return  # listed in key order: none further is in range
+                    if batch >= lo and generation > best.get(batch, -1):
+                        best[batch] = generation
+
+        if type(objects).__name__ == "LocalStore":
+            # A directory lists in any order, to its end: each batch's own, then.
+            await self._many(lambda b: scan(f"{base}/{b:012d}/"), range(lo, hi + 1))
+        else:
+            # An object store lists in key order, from `lo`: it stops past `hi`.
+            await scan(f"{base}/", f"{base}/{lo:012d}")
+        return {b: f"{base}/{b:012d}/{g}" for b, g in best.items()}
 
     # -- objects ----------------------------------------------------------------
 
@@ -354,19 +362,6 @@ class FileStore:
             except (NotFoundError, FileNotFoundError):
                 pass
 
-    async def _keys(self, base: str) -> set[str]:
-        """The names of the objects in a directory, without their format."""
-
-        import obstore
-
-        found = set()
-        async for chunk in obstore.list(self._objects(), prefix=f"{base}/"):
-            for meta in chunk:
-                name = meta["path"][len(base) + 1 :]
-                if "/" not in name and name.endswith((".json", ".pkl")):
-                    found.add(unquote(name.rsplit(".", 1)[0]))
-        return found
-
     @staticmethod
     async def _many(fn, items) -> list:
         """`fn` of each item, `PARALLEL` at a time, results in order: a fixed
@@ -389,6 +384,17 @@ class FileStore:
         return ObjectRef(
             output=scope.output.name, store="", handle=handle, version=version, partition=scope.partition
         )
+
+
+def _batch_of(base: str, path: str) -> tuple[int, int] | None:
+    """A batch object's `(batch, generation)`, from its name under `base`:
+    `{batch:012d}/{generation}.{format}`. None for any other object."""
+
+    batch, _, name = path[len(base) + 1 :].partition("/")
+    generation, _, fmt = name.partition(".")
+    if batch.isdigit() and generation.isdigit() and fmt in ("json", "pkl"):
+        return int(batch), int(generation)
+    return None
 
 
 class S3Store(FileStore):

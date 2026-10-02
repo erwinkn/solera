@@ -174,12 +174,14 @@ def takes(t: Any, output: Output, *, frames: bool = False, values: bool = True) 
     origin = typing.get_origin(t) or t
     listed = origin in (list, Sequence)
     rows = listed or (frames and _frames_can(t))
+    # Keys are strings: a dict's key type, when it says one, is str.
+    by_key = origin in (dict, Mapping) and (typing.get_args(t) or (str,))[0] in (str, Any)
     if output.key == KEYS:
-        return origin in (dict, Mapping)
+        return by_key
     if output.is_partition_set:
         return listed or origin in (set, frozenset)
     if output.key is not None:
-        return rows or origin in (dict, Mapping)
+        return rows or by_key
     if output.incremental:
         return rows
     return values or rows

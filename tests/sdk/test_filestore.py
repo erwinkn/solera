@@ -242,8 +242,10 @@ def test_the_default_path(tmp_path, monkeypatch):
 
 
 async def test_one_batch_is_read_without_listing_the_history(store, monkeypatch):
-    """A consumer reading the newest batch lists from that batch on, not the
-    output's whole history (§6: hot-path work does not grow with history)."""
+    """A consumer reading one batch — the newest, or the first of a long
+    history — lists that batch's objects, not the output's whole history
+    (§6: hot-path work does not grow with history). A range past the ref's
+    last batch stops at it: a batch no commit wrote yet is not read."""
 
     import obstore
 
@@ -259,14 +261,17 @@ async def test_one_batch_is_read_without_listing_the_history(store, monkeypatch)
     def counting(*args, **kwargs):
         async def chunks():
             async for chunk in real(*args, **kwargs):
-                listed.extend(chunk)
+                listed.append(len(chunk))  # a page: one request to a bucket
                 yield chunk
 
         return chunks()
 
+    await store.store(Patch([{"e": "uncommitted"}]), ref, scope(out, batch=200, generation=300))
     monkeypatch.setattr(obstore, "list", counting)
-    assert await store.load(ref, None, Batches(199, 199)) == [{"e": 199}]
-    assert len(listed) <= 2, len(listed)
+    for lo, hi, read in ((199, 199, [{"e": 199}]), (0, 0, [{"e": 0}]), (199, 205, [{"e": 199}])):
+        listed.clear()
+        assert await store.load(ref, None, Batches(lo, hi)) == read
+        assert len(listed) <= 1, (lo, hi, listed)
 
 
 async def test_many_objects_are_never_many_tasks_at_once(store):

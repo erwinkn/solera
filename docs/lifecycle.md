@@ -698,7 +698,7 @@ attempt's **generation** (§9.7: the claim's event position, in the spec):
 ```
 site_files/alpha/f-1/9c41e0d2….184467.json       a key, at its version, by generation 184467
 site_status/alpha@184467.json                    a value
-site_events/alpha/000000000042.184467.json       batch 42 of an append output, by generation 184467
+site_events/alpha/000000000042/184467.json       batch 42 of an append output, by generation 184467
 ```
 
 Writes are create-only. Two writers of one name are the same attempt (a

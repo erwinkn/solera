@@ -790,7 +790,7 @@ rollup@184467.json                a value, by generation 184467
 site_status/alpha@184467.json     a value, partition alpha
 uploads/u-7/9c41e0d2….184467.json a keyed output: one object per key and version
 site_files/alpha/f-1/9c41….json   keyed and partitioned
-site_events/alpha/000000000042.184467.json
+site_events/alpha/000000000042/184467.json
                                   an unkeyed incremental output: one object per batch
 ```
 

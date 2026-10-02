@@ -44,7 +44,8 @@ class Store(Protocol):
 
     async def discard(self, scope, prior, items) -> None: ...   # immutable
     async def acquire(self, scope) -> None: ...                 # fenced
-    async def migrate(self, output, migrations) -> list[str]: ...  # optional
+    async def migrate(self, output, migrations, scope=None) -> list[str]: ...  # optional
+    def can_migrate(self, t, output) -> bool: ...              # optional: else can_store
     def prepare(self, write, output) -> Prepared: ...          # optional: types of its own
 ```
 
@@ -155,7 +156,11 @@ producer's return annotation.
 
 What a store stores must digest as what `prepare` hashed
 (docs/row-digest.md): take the stored rows from the same reading, and
-refuse a value your backend would read back as another type.
+refuse a value your backend would read back as another value — another
+type, or rounded. PostgresStore refuses 42 in a text column, and, in the
+columns versions digest (every one, or a keyed output's key and
+`revision`), `Decimal("1.234")` in a `numeric(6,2)`, a float a `real`
+would narrow, nanoseconds in a timestamp, and padding a `char(n)` adds.
 
 ## The invariants
 
@@ -247,6 +252,8 @@ migrations to change them): a table a write creates from inferred types
 holds what that first write happened to show. PostgresStore infers them
 when undeclared — from a DataFrame's schema, else from every value not
 null — refuses a column it cannot type, and logs what it inferred.
+`can_migrate` says what a migration's payload may be (PostgresStore:
+SQL text or a callable), when it is not a write.
 
 Write a keyed output page by page: for `whole`, clear the slice first;
 then for each of `write.pages()`, delete its keys and insert their rows
@@ -262,7 +269,7 @@ create-only:
 ```
 {output}/{partition}/{key}/{version}.{generation}.json   a key at a version
 {output}/{partition}@{generation}.json                  a value
-{output}/{partition}/{batch:012d}.{generation}.json      a batch
+{output}/{partition}/{batch:012d}/{generation}.json      a batch
 ```
 
 A keyed load computes names from `Keys` (`(version, locator)` → the
