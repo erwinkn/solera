@@ -1,17 +1,20 @@
-# The attempt lifecycle — target design
+# The attempt lifecycle
 
-Status: **target design, partly built.** Built (milestone 1): the records
-of §2 (`solera/lifecycle.py`), the attempt objects and claims of §2–§4, the
-channel of §5 (`solera_server/attempts.py`, `solera_worker/channel.py`),
-heartbeats as evidence (§6), the two-phase cancel (§7), the clocks of §8,
-retained gates (§2.4) and Pool (§10). Built (milestone 2): store kinds
-and their release rules (§9.5–§9.9), PostgresStore generation fencing
-(§9.7), and FileStore / S3Store unique names with their collection
-(§9.8) — but for the sweep. Built (milestone 5): sensors (§11:
-`solera_server/sensors.py`, `solera_worker/sensors.py`), but for host-side
-map resolution. Where the build departs from the text, it says so in place.
-It replaces the attempt files, heartbeat, pool protocol and write-safety
-rules of `object-store-state.md` §8 and `architecture.md` §10. It settles
+Status: **built** (milestones 1, 2 and 5), but for the §9.8 sweep of what a
+worker writes after its attempt ended, and sensors' host-side resolution
+of bigger maps (§11.7). Where the build departs from the text, it says so
+in place. In order: the records of §2 (`solera/lifecycle.py`), attempt
+objects and claims (§2–§4), the channel (§5: `solera_server/attempts.py`,
+`solera_worker/channel.py`), heartbeats as evidence (§6), the two-phase
+cancel (§7), the clocks (§8), retained gates (§2.4), Pool (§10), store
+kinds and their release rules (§9.5–§9.9), PostgresStore generation
+fencing (§9.7), FileStore / S3Store unique names and their collection
+(§9.8), and sensors (§11: `solera_server/sensors.py`,
+`solera_worker/sensors.py`).
+
+It is the attempt protocol — attempt files, heartbeats, the pool, and the
+write-safety rules — that `object-store-state.md` §8 and `architecture.md`
+§10 summarize. It settles
 D2–D4, and D1 as Erwin decided it after the review: heartbeats are evidence
 only, built-in stores are exact, user overwrite stores choose between a
 bounded wait and holding the scope. Observations are sensors (§11), which

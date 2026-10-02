@@ -5,7 +5,12 @@ solera is an asset-first orchestrator. An **asset** is a function that produces
 outputs changed. Everything else — partitions, incrementality, automations,
 placement — is a small amount of engine state around those three things.
 
-This document is normative and supersedes every earlier design note.
+This document is normative for the model; the designs it points to are
+normative for their parts: `object-store-state.md` (engine state, the key
+index, attempt files, run history, retention), `lifecycle.md` (attempts,
+the worker channel, store kinds, sensors), `per-key-processing.md` (`Each`,
+error classes, build identity), `resolved-commits.md` (the engine's
+resolver), `key-index-format.md` and `row-digest.md` (the byte formats).
 `example/brimstone.py` is the reference example. Sections: 1 Model · 2 Assets
 · 3 Refs · 4 Stores · 5 Inputs · 6 Incrementality · 7 Partitions · 8 Runs ·
 9 Automations · 10 Execution · 11 Registration · 12 Later and non-goals.
@@ -16,14 +21,15 @@ Three rules:
 
 1. **The engine is control-plane only.** It records, for each `(output,
    partition)`, the committed ref and its metadata, plus cursors, per-edge
-   key state and automation state. It never moves, parses or interprets
-   payloads. The one value-derived thing it reads is the **key map**
-   (§6), which it defines.
+   watermarks and automation state. It never moves, parses or interprets
+   payloads. The one value-derived thing it keeps is each keyed output's
+   **key index** (§6): `(key, version)` entries in a format it defines,
+   computed by the harness.
 2. **Stores own data semantics.** Where an output lives, how a write
    applies, how a load materializes, how writes stay correct under replay.
    Core defines no write semantics: a bare return value is a full
-   replacement and every store implements it; the store reports which keys
-   the write left behind (§4). `Patch` is an SDK type for partial writes
+   replacement and every store implements it; the harness works out which
+   keys the write changed, against the key index, and tells the store (§4). `Patch` is an SDK type for partial writes
    that stores opt into, so producers spell them the same way everywhere.
 3. **Consumption semantics live on edges.** Whole, by key, or all
    partitions is a property of `inputs=`. What an output *exposes* (its
@@ -40,18 +46,18 @@ yields an identical version, no changed ref, and wakes nothing.
 | **scope** | One partition key of an asset, or `""` when unpartitioned. |
 | **head** | The committed ref of `(output, scope)`. |
 | **ref** | A self-contained pointer into a store, with a version (§3). |
-| **commit** | The atomic transaction installing an attempt's result: heads, lineage, cursor, key state. |
+| **commit** | The atomic transaction installing an attempt's result: heads, lineage, cursor, watermarks, key index deltas. |
 | **run** | A request to materialize targets. It plans **tasks**, one per `(asset, scope)`. |
 | **attempt** | One execution of a task. |
 | **cursor** | Per-scope JSON state the producer sets and receives back (§6). |
-| **key map** | The complete `key → revision` map of `(output, scope)` at a commit: one object, staged by the harness, read by the engine (§6). |
+| **key index** | The `(key, version)` entries of a keyed output's `(output, scope)`: an engine-owned log-structured index, one delta file per commit that changes it (§6, object-store-state.md §6). |
 | **placement** | Where an attempt runs: a typed request built from a named, project-level executor (§10). |
 
 Three processes:
 
 | Process | Runs | Holds |
 |---|---|---|
-| **server** | engine + API. No user code. | SlateDB state, object store credentials |
+| **server** | engine + API. No user code. | its state, in the object store (object-store-state.md); object store credentials |
 | **harness** | user code: producers, stores, resources. Launched per attempt by a placement. | store/resource secrets via `env:`, object store access via the environment's auth |
 | **console** | UI over the API. | nothing |
 
@@ -205,7 +211,7 @@ class Store(Protocol):
 
 Scope   = (output: Output, partition: str, batch: int | None, attempt: str | None, aliases: tuple,
            upserts: frozenset[str] | None, removes: frozenset[str] | None)
-Written = (ref: Ref, keys: Mapping[str, bytes] | None)   # keys: only for Sql writes the harness never sees
+Written = (ref: Ref, keys: Iterable | None)   # keys: only for Sql writes the harness never sees as rows
 Keys    = (revisions: Mapping[str, bytes])  # revisions as the key index holds them
 Batches = (lo: int, hi: int)  # load rows of batches in [lo, hi]
 ```
@@ -217,6 +223,15 @@ Batches = (lo: int, hi: int)  # load rows of batches in [lo, hi]
 | `store(write, prior, scope)` | Apply the write; return the new ref (version per §3). `scope.batch` is the engine-assigned batch number; for a keyed output `scope.upserts` / `scope.removes` are the keys the write changes (`None`: all of them — write everything, delete the rest). `prior` is withheld on a `full` run. Duplicate keys are a write error. For `partition_column` outputs, stamp the column with `scope.partition` and reject rows that disagree. |
 | `load(ref, t, selection)` | Materialize `t` from what the store holds now; under `Keys`, only the selected keys; under `Batches`, only batches in the range. |
 | `migrate(output, migrations)` | Optional. Apply, in declared order, every migration not yet in the store's own ledger for this output; return the applied names. Must be safe under concurrent attempts of one output (partitions share tables): take a store-level lock and re-read the ledger inside it. Where the backend is transactional, a migration and its ledger row commit together. A store without `migrate` rejects `migrations=` at registration. |
+
+Optional attributes and methods, with defaults: `writes`, `strict`,
+`late_write_grace`, `acquire(scope)` and `discard(scope, prior, items)` —
+how the store writes and what the engine may do once a writer is gone
+(lifecycle.md §9.6–§9.9); `key_rows(write, output)`, `scan(ref, output,
+skip)` and `stamped(output)` — how a write's rows become keys and versions,
+and how a `Sql` write's rows are read back (row-digest.md); `shared_table`
+— one table for every partition, so a partitioned output needs a
+`partition_column` (§3).
 
 ### Migrations
 
@@ -235,8 +250,8 @@ an asset with inputs, not a migration.
 
 A bare value is replace. `Patch` is the SDK's partial write, accepted by
 `FileStore`, `S3Store` and `PostgresStore` (`can_store`) and by any store that opts
-in; it mirrors the commit API's `upsert`/`remove` (§5). The store, not
-the engine, computes the resulting delta:
+in; it mirrors the commit API's `upsert`/`remove` (§5). The harness, not
+the store, works out what changed, against the key index (§6):
 
 | Write | Semantics |
 |---|---|
@@ -320,7 +335,7 @@ client.commit("uploads", upsert=["u-91"], remove=["u-12"])  # PartitionSet: patc
 ```
 
 For a keyed source the server applies the commit as one delta batch against
-the current key map and derives `version` from the result, so an identical
+the source's key index and derives `version` from the result, so an identical
 map is not a change. `upsert` inserts a key or replaces its
 revision; `remove` deletes it.
 
@@ -817,7 +832,7 @@ A bare `DataFrame` to a `primary_key` output is replace, not a `Patch`.
 **Later** (specified when a workload demands it): `route=` broadcast
 optimization for `Incremental`; checks and conditions (`when=`); `OnRunStatus`;
 trigger composition; delta-log compaction for very long histories; data preview, a read-only SQL
-page and a DuckDB store (object-store-state.md §15).
+page and a DuckDB store (object-store-state.md §13).
 
 **Non-goals:** cycles (DAG only, including self-triggers; loop inside a
 producer); dynamic topology (the manifest is static per

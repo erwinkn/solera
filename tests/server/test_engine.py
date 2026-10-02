@@ -1,4 +1,4 @@
-"""Phase 3 — the engine (architecture §2, §5–§10). Small inline projects run
+"""The engine (architecture §2, §5–§10). Small inline projects run
 through InlinePlacement against the real file:// object store."""
 
 import asyncio

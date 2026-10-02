@@ -1,4 +1,4 @@
-"""Phase 7 — the demo project end to end: a real server on a temp file://
+"""The demo project end to end: a real server on a temp file://
 store, the external `uploads` set committed through the API, and a pool
 worker claiming `ingest` work. No external services — `SiteRegistry`,
 `FeedClient`, `UploadReader`, and `Mailer` are in-process fakes."""

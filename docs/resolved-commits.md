@@ -1,11 +1,10 @@
-# Engine-resolved commits — design
+# Engine-resolved commits
 
-Status: **target design**, not built (decision D4), revised after the
-follow-up review. It replaces the object-store `.ask` protocol of the
-earlier proposal; it keeps that proposal's idea, a warm engine cache. It
-changes how a keyed write learns what it changed (`object-store-state.md`
-§6, "Compute a delta"), how a downstream attempt receives small pending
-windows, and what the worker does when no warm reader is available.
+Status: **built** (decision D4); §14 lists where the code departs from the
+text. How a keyed write learns what it changed (`object-store-state.md` §6,
+"Compute a delta"): the engine answers from a warm cache of the key index,
+and the worker resolves locally when it cannot. Also how a downstream
+attempt receives small pending windows inline.
 
 It depends on two other designs, and says where:
 
@@ -24,7 +23,7 @@ It depends on two other designs, and says where:
 A keyed write must know, for each key it writes, whether the key is new,
 changed or unchanged: the index records only real changes, the store writes
 only what must be written, and downstream consumers see only real changes.
-Today the worker answers that against the index on S3, and a worker is
+On its own, a worker answers that against the index on S3, and a worker is
 usually a cold reader.
 
 Measured at 100M keys in steady state (`bench/keys/results.md`, MinIO with
@@ -55,7 +54,7 @@ own delta file and follows its store's write rules — repair, gate, fencing
 — exactly as if it had computed the delta itself. If the engine cannot be
 reached, declines or is too slow, the worker resolves locally: a sparse
 reader for small patches, a streaming merge-join for replacements and
-dense patches. The read planner is deleted. The same cache inlines small
+dense patches. There is no read planner. The same cache inlines small
 pending windows into downstream specs and serves the per-key readers.
 
 Correctness never depends on the resolver: its answer is a pure function
@@ -491,7 +490,7 @@ scheduling, skipping, "unchanged" — reads the count. Dropping the
 pair-filter shortcut would make the count exact here too, at ~1.25 block
 reads per changed key instead of ~0.01: ~1,250 more GETs for 1K keys at
 100M, ~$0.0005 per commit. Indexes over the cache budget take this path on
-every commit, so the design keeps filters and recounts (§13).
+every commit, so the design keeps filters and recounts (§12).
 
 **Predecessors of immutable outputs.** An immutable store collects a
 superseded object by name, `{key}/{version}.{locator}`, so someone must
@@ -748,29 +747,7 @@ reports both.
   — time to delta end to end, engine CPU, RSS, cache disk, with the page
   cache dropped and not; scenario E end to end, counting every request.
 
-## 11. What changes in the code
-
-- `solera/keys`: delete `_plan_reads`, `_read_options`, `Cost`,
-  `_estimate` and the rate options; add the patch variant of the streaming
-  job and the two switch rules; `FileInfo.digest`; locators and
-  predecessors in deltas (on the `.kx` bump of `key-index-format.md`);
-  compaction emitting dropped entries as data garbage; keep filters and
-  `inexact` for the sparse reader.
-- `native/`: the local form (build, verify, lookup), a resolve job over
-  it, the in-RAM window merge.
-- `solera_worker`: the phases of §3 (`acquire` before repair reads, the
-  unknown-writes reconciliation); build the run; ask, wait, fall back;
-  validate and upload the returned delta.
-- `solera_server`: the resolve route and its validation; the cache, its
-  threads, reservations, admission and demotion; candidates; the inlined
-  retry page with its identity; `inline` in prepare.
-- Not here: failure deltas, transitions, the eligibility predicate and
-  minima are the per-key implementation's.
-- Docs: §6 "Compute a delta" and "Deliver pending deltas" in
-  `object-store-state.md`; `key-index-costs.md`; the route's row in
-  `lifecycle.md` §5.1.
-
-## 12. Not in this design
+## 11. Not in this design
 
 - **The canonical row digest** of the earlier proposal is independent of
   resolution and belongs in its own spec next to its code
@@ -787,7 +764,7 @@ reports both.
 - **Later, not v1:** pattern skip hints and coalesced recomputation of
   failure minima (§8).
 
-## 13. Where this departs from the reviews
+## 12. Where this departs from the reviews
 
 The follow-up review agrees with all three.
 
@@ -802,7 +779,7 @@ The follow-up review agrees with all three.
   keeps a declined or over-budget index at ~50 GETs per small commit
   instead of ~1,300, and approximate counts never decide correctness.
 
-## 14. Open questions
+## 13. Open questions
 
 1. **Thresholds.** `stream_density` and `stream_reads` are measured (§6);
    `resolve_max_keys`, `resolve_max_entries` and `resolve_timeout` still
@@ -819,7 +796,7 @@ The follow-up review agrees with all three.
    intents (§9.6); sensors (§11 there) need no attempt validation. Its
    §9.8 collection gains the compaction trigger of §6 here.
 
-## 15. As built
+## 14. As built
 
 Milestones 3 and 4. Where the code differs from the text above, it says so
 here.

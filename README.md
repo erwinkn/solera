@@ -337,8 +337,16 @@ are documented in [docs/architecture.md](docs/architecture.md);
 ```bash
 uv run pytest -q            # includes tests/test_demo_e2e.py (server + pool worker, temp file:// store)
 SOLERA_TEST_DATABASE_URL=postgresql://solera:solera@127.0.0.1:5432/solera uv run pytest -q -m postgres
+SOLERA_TEST_S3=http://user:secret@127.0.0.1:9000/bucket uv run pytest -q   # also against an S3-compatible server
 pnpm install --frozen-lockfile && pnpm -C apps/console exec playwright install chromium && pnpm -C apps/console test
 ```
+
+Tests are the spec's examples: a test of a documented rule names its
+section in its docstring (`"""§6: a version bump reprocesses every key."""`).
+The object store is always real — `file://` through `obstore`, or an
+S3-compatible server — never an in-memory stand-in, so conditional puts
+and listings stay exercised. Postgres and S3 tests skip unless their
+variable is set.
 
 CI runs the Python suite, the Playwright suite on desktop and mobile, and a
 wheel-contents check. `uv.lock` and `pnpm-lock.yaml` are committed; installs

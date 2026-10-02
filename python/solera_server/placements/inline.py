@@ -1,5 +1,5 @@
 """Inline placement for tests: runs the real worker harness in-process against
-the real object store (implementation plan, Phase 3)."""
+the real object store."""
 
 from __future__ import annotations
 

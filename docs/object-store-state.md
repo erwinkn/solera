@@ -1,9 +1,8 @@
 # Object-store state: data model
 
-Status: **implemented** (K0, J1–J5, H1), except where a section says otherwise. Replaces the SlateDB persistence and the
-retention design in `storage-redesign.md` §4–§5. Keeps `Incremental`
-edges, per-batch deltas and watermarks from PR #7, and the in-memory
-engine model from PR #8.
+Status: **built**, except where a section says otherwise; the measured
+key index is in `bench/keys/results.md`. The engine's state, the key index
+of every keyed output, attempt files, run history and retention.
 
 The bet: the engine runs on an object store alone — no database, no other
 infrastructure.
@@ -915,34 +914,7 @@ DELETE /api/projects/{p}/runs/{run}
 POST   /api/projects/{p}/runs:prune   {"before", "asset", "keep", "dry_run"}
 ```
 
-## 12. Removed from earlier drafts
-
-| Removed | Replaced by |
-|---|---|
-| `epochs/` claim objects | writer id = `seq` of its fence segment |
-| sharded, content-addressed checkpoints | one checkpoint object, written when the journal tail exceeds its size |
-| `spill/`, `deltas/`, deltas inside attempt results | delta files in the output's key index (§6) |
-| key maps held by stores (`solera_keys`, JsonStore folds) and by the engine for sources | one engine-defined key index for every keyed output and source |
-| `Page` in the store contract | full delivery pages through the key index and loads with `Keys` |
-| separate commit ids and records | commit = `(run, attempt)`; lineage inputs are in the attempt's `spec` |
-| separate `spec.json`, `result.json`, per-flush log files | one attempt file; one gzip log per attempt, chunked only while running |
-| persisted locks, queue, workers | locks and queue derived from runs and launches; workers re-register |
-| claim events for attempts still preparing | a restart dispatches them again; launches are journaled (`AttemptLaunched`) |
-| `ref.meta.delta` / `.keys` / `.partitions` | engine fields on `Head`: `batch`, `base`, `count`, `elements` |
-| watermark `offset` and `after_key` | one `after` field, plus `full` and `until` |
-| refusing a commit whose inputs moved after pinning | the commit stands: it delivered what it pinned |
-| automation commit watermark | a pending set of `(asset, scope)` |
-| per-automation retention, automation names in run ids | per-asset retention; run id = ULID |
-| `runs/{run}/run.json`, the in-memory recent-runs list and run-id listing, `State.retention` | the run history: Parquet tables queried with DuckDB (§7) |
-| skipped runs kept only in memory | recorded with status `skipped`, hidden by default |
-| pinned runs | nothing but active runs is protected; current state is independent of runs |
-| HTTP-only attempt I/O for pool workers | one uniform attempt-file channel |
-| JsonStore, BlobStore, per-attempt data objects | FileStore / S3Store: one object per value, partition, key version or batch, named by generation, created once |
-| `store.expire`, data retention | stores hold current content only; retention covers runs |
-| per-partition version markers in stores, `StoreConflict`, `StaleRead` | the write fence (§8); store kinds (`lifecycle.md` §9.6) |
-| attempt leases and their sweeps; a restart re-queues running tasks | durable launches: the next engine adopts them (§8) |
-
-## 13. Open questions
+## 12. Open questions
 
 1. **The key index on real S3.** Its parameters and costs are measured at
    1M, 10M and 100M keys against MinIO with 30 ms injected per request and
@@ -953,21 +925,7 @@ POST   /api/projects/{p}/runs:prune   {"before", "asset", "keep", "dry_run"}
    `bench/keys/bench.py --s3 s3://bucket/prefix --latency 0 --bandwidth 0`
    from a worker in the bucket's region settles it.
 
-## 14. Implementation plan
-
-Built on PR #8's branch.
-
-| Phase | Deliverable | Gate |
-|---|---|---|
-| K0 key index | format, pure-Python + Rust implementations, index operations, benchmark report | §13.1 numbers; each implementation reads the other's files and decodes identical content |
-| J1 journal | `solera_server/journal.py`: flush, fencing, checkpoint, replay, cleanup | crash between `PUT` and ack; replaced-writer test; replaying the full journal equals checkpoint + tail; passes on `file://` and S3 |
-| J2 model | events + `apply`; engine and API on `State`; SlateDB removed | full suite; restart tests; a counting object store asserts 0 GETs on plan and API paths |
-| J3 key index | `solera.keys` in the harness, delta files, local compaction + `engine_executor`, `key_cache`, full delivery through the index, sources on the index, aliases | 10k-batch soak: object operations per commit stay flat; `Keys`-only store contract |
-| J4 runs and retention | `runs/` layout, archive, per-asset retention, CLI and API | soak with `Retention(days=1)` on a 10-second poller keeps `runs/` bounded |
-| H1 run history | Parquet history tables, flush, merge, deletion, `run.json` import; filters, facets, histogram, stats, asset history, lineage; tags and metadata; console runs explorer, asset history and lineage | soak: request count per run stays flat, retention keeps the history bounded |
-| J5 fence and stores | durable launches, adoption, heartbeats, write fence, unsettled outputs; FileStore / S3Store; no expiry | a worker killed mid-write is repaired by the next attempt; a restarted engine adopts a running attempt |
-
-## 15. Future ideas
+## 13. Future ideas
 
 Not built; recorded because DuckDB in the engine makes them cheap.
 

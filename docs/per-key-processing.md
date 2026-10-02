@@ -1078,8 +1078,8 @@ Where the implementation (`solera/errors.py`, `solera/build.py`,
   drained: it reprocesses every key anyway.
 - **A retry page walks at most 100 × `batch_size` records** before it ends,
   so a long stretch of keys that are not due spans several pages.
-- **Retry pages are never inlined yet**: the engine cache is not built; the
-  worker pages through the failure index. Transitions read priors with an
+- **Retry pages are not inlined**, though change pages are
+  (`resolved-commits.md` §7–§8): the worker pages through the failure index. Transitions read priors with an
   exact `get` of the touched keys, and the failure delta is resolved locally
   (`KeyIndex.resolve(exact=True)`).
 - **Record times are the worker's clock**; eligibility compares them with

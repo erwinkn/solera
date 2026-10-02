@@ -1,4 +1,4 @@
-"""Phase 5 — the API (§5, §8-§10). httpx over ASGI against a real engine
+"""The API (architecture §5, §8–§10). httpx over ASGI against a real engine
 backed by file:// objects; auth, validation, and every endpoint."""
 
 import httpx

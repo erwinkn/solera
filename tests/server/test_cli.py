@@ -1,4 +1,4 @@
-"""Phase 5 — the CLI. Commands run local (in-process engine on SOLERA_STATE_URL)
+"""The CLI. Commands run local (in-process engine on SOLERA_STATE_URL)
 and remote (SOLERA_SERVER_URL + SOLERA_API_TOKEN against a live server)."""
 
 import json
