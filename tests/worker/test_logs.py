@@ -115,3 +115,27 @@ async def test_a_line_logged_while_a_chunk_compresses_is_kept(tmp_path, monkeypa
     assert await chunk_lines(objects, 0) == ["before"] and shipper.chunks[0][1] == 1
     index = await shipper.finish()
     assert tail_lines(index) == ["during"] and index["lines"] == 2 and "lost" not in index
+
+
+async def test_a_busy_log_starts_one_flush_and_bounds_what_waits(tmp_path, monkeypatch):
+    """Review round 5 #7: lines past a chunk's worth, logged before the loop
+    turns, start one chunk write — not one each. While chunks cannot be
+    written, waiting lines stop at `LOG_PENDING_MAX` bytes; the rest are
+    counted as lost."""
+
+    monkeypatch.setattr(reporting, "LOG_CHUNK_BYTES", 1000)
+    monkeypatch.setattr(reporting, "LOG_PENDING_MAX", 20_000)
+
+    async def failing(store, path, data):
+        raise OSError("the object store is down")
+
+    monkeypatch.setattr(reporting, "create", failing)
+    shipper = LogShipper(LocalStore(tmp_path), "a")
+    before = len(asyncio.all_tasks())
+    for i in range(2000):
+        shipper.append(entry(f"line {i}"))
+    assert len(asyncio.all_tasks()) - before == 1
+    assert shipper.pending_bytes <= 20_000 and shipper.dropped > 0
+    index = await shipper.finish()
+    # What still waited travels in the result's tail; the rest is lost, and counted.
+    assert index["lines"] == 2000 and index["lost"] + len(tail_lines(index)) == 2000

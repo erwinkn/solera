@@ -101,8 +101,10 @@ Output data lives wherever its store puts it: FileStore under
 moves everything held under an alias to the current name: heads, cursors,
 watermarks, key indexes, outcomes, automation state (attached automations
 are named after their asset), retention lists. Outputs named after the
-asset follow. Aliases are also passed to stores, so one that derives a
-physical name from the output (a Postgres table) can rename it.
+asset follow. Stores never rename anything: the committed head's ref
+says where the content is (a FileStore directory, a Postgres table), so
+a renamed output keeps its storage, and every ref to it stays readable;
+the declaration names the storage only of a first write.
 
 ## 3. Journal segment
 
@@ -430,7 +432,7 @@ input versions built this version of `revenue`".
 |---|---|---|
 | `runs` | finished run or source commit | `status` (`succeeded`, `failed`, `canceled`, `skipped`), `trigger` (`manual`, `automation`, `sensor`, `commit`), `automation`, `by`, `retry_of` (the run a retry ran again), `source`, `targets`, `assets`, `committed`, `tags` (map), `task_count`, `failed_count`, `error`, `config` and `keys` (JSON, as submitted) |
 | `tasks` | task of a finished run | `asset`, `scope`, `status`, `started_at`, `finished_at`, `attempts`, `duration`, `wait` (seconds it could have run but didn't), `deps`, `max_attempts`, `retry_delay`, `retry_backoff`, `executor` (of its last attempt) |
-| `attempts` | attempt | `task`, `n`, `outcome`, `started_at`, `finished_at`, `duration`, `preparing`, `provisioning`, `importing`, `loading`, `computing`, `writing`, `settling` (seconds per phase, below), `peak_memory` (bytes; only in a process of its own), `cpu_seconds`, `error`, `executor`, `cpu`, `memory`, `gpu` (requested; all null if it never launched), `options` (map: its other placement options, e.g. `image`), `outputs` (map: output → version committed), `keys` (map: an `Each` attempt's keys by outcome) |
+| `attempts` | attempt | `task`, `n`, `generation` (the one its writes carried), `outcome`, `started_at`, `finished_at`, `duration`, `preparing`, `provisioning`, `importing`, `loading`, `computing`, `writing`, `settling` (seconds per phase, below), `peak_memory` (bytes; only in a process of its own), `cpu_seconds`, `error`, `executor`, `cpu`, `memory`, `gpu` (requested; all null if it never launched), `options` (map: its other placement options, e.g. `image`), `outputs` (map: output → version committed), `keys` (map: an `Each` attempt's keys by outcome) |
 | `run_events` | moment of a run | `n` (its order in the run), `at`, `type`, `task` and `attempt` (null for the run's own events), `by`, `name`, `reason`, `until`, `rows` — the timeline, below |
 | `materializations` | output version a commit installed | `output`, `scope`, `version`, `run`, `attempt`, `at`, `batch`, `added`, `removed`, `added_keys`, `removed_keys` (a source commit's keys, up to 1,000), `rows`, `metadata` (JSON), `generation` (the writing attempt's) |
 | `lineage` | input version an output version was read from, and what a current read saw (stores.md, "What a read sees") | `output`, `scope`, `version`, `input`, `input_scope`, `input_version`, `param`, `input_generation`, `read` (JSON `{generation, keys?, key_count?, mixed?}`, null for a snapshot store) |
@@ -617,7 +619,7 @@ count of a keyed output, else the length of a returned list.
 | finished tasks | `GET /tasks?asset=&status=&run=&since=&before=` | |
 | p50/p95 duration and wait, failure counts, compute hours, per asset and per executor | `GET /stats?since=&asset=&scope=` | |
 | an asset's versions and their metadata | `GET /assets/{name}/history?output=&scope=&before=` | |
-| what a version was built from, or what was built from it | `GET /outputs/{name}/lineage?scope=&version=&direction=upstream\|downstream&depth=5` | each edge's `read`: `{exact: true}`, or `{exact: false, pinned_generation, generation, version, keys?}` — the generation a current read saw, what it committed, and a page's key versions as read |
+| what a version was built from, or what was built from it | `GET /outputs/{name}/lineage?scope=&version=&direction=upstream\|downstream&depth=5` | each edge's `from` is what was read: `version`, `generation`, the writer's `run`, `attempt` and `at`, and — when a current read saw a newer write — a page's `keys` as read. Flags: `uncommitted` (`{attempt, run}`: a write no attempt committed; `version` null) and `mixed` (two moments, two versions). `detail` keeps the pin (`pinned_version`, `pinned_generation`) for debugging |
 | every asset at a glance: scopes by status, newest outcome, failing keys, unsettled scopes | `GET /assets:status` → `{assets: {name: {partitions, partitioned, last, failures, unsettled, updated_at}}}` | |
 | an `Each` asset's failing keys, and each scope's failure record | `GET /assets/{name}/failures?scope=&outcome=&after=&limit=100` → `{scopes, keys, epoch, now, next}` | |
 | what an `Each` asset's keys came to, newest first | `GET /assets/{name}/key-outcomes?scope=&key=&q=&outcome=&run=&before=&limit=100` → `{outcomes, next}` | |
@@ -761,8 +763,7 @@ class Store(Protocol):
 
 - `Scope` carries the engine-assigned `batch`, whether the write is a
   `reset`, the `attempt` id, its
-  `generation` and `invocation` (`lifecycle.md` §9.7–9.8) and the
-  output's `aliases`. A keyed output's write reaches the store as a
+  `generation` and `invocation` (`lifecycle.md` §9.7–9.8). A keyed output's write reaches the store as a
   `KeyedWrite`: read once (`prepared`), and what it changes against the
   key index — `upserts` to write, each to the version the index will hold,
   `removes` to delete — or `whole`, a first write or a reset (a `full`

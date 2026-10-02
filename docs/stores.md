@@ -43,8 +43,8 @@ class Store(Protocol):
     async def load(self, ref, t, selection) -> Any: ...
 
     async def discard(self, scope, prior, items) -> None: ...   # immutable
-    async def acquire(self, scope) -> None: ...                 # fenced
-    async def migrate(self, output, migrations, scope=None) -> list[str]: ...  # optional
+    async def acquire(self, scope, prior) -> None: ...          # fenced
+    async def migrate(self, output, migrations, scope=None, prior=None) -> list[str]: ...  # optional
     def can_migrate(self, t, output) -> bool: ...              # optional: else can_store
     def prepare(self, write, output) -> Prepared: ...          # optional: types of its own
     def reads(self) -> AsyncContextManager[Reader]: ...       # optional: a store of current rows
@@ -67,10 +67,12 @@ class Reader(Protocol):                                        # what `reads()` 
 
 **`store(write, prior, scope) -> Written(ref)`** applies a write and
 returns a ref to the new content, with a `version` that changes when the
-content does. `prior` is the committed head: where the content is (a
-renamed output's objects stay where they were), and what the write builds
-on — unless `scope.reset`, when nothing of it is kept. `None` is a first
-write.
+content does. `prior` is the committed head: where the content is — a
+renamed output's objects, or table, stay where they were, so every ref to
+them stays readable; the declaration names the place only of a first
+write — and what the write builds on, unless `scope.reset`, when nothing
+of it is kept. `None` is a first write. `acquire` and `migrate` get it
+too, to find the same place.
 
 - An unkeyed, non-incremental output's write is a value: replace it.
 - An unkeyed incremental output's write is a `Patch` of rows: append it as
@@ -95,7 +97,11 @@ store takes plain Python.
 …). `selection` is `None` (everything), `Keys` (key → `(version,
 locator)`: only those keys) or `Batches(lo, hi)`. An immutable store needs
 `Keys` to find a keyed output's objects — the locator is the generation
-that wrote each key.
+that wrote each key. With `Keys`, `t` may be `dict[str, T]`
+(`solera.stores.by_key_type(t)` is `T`): each key's rows on their own, as
+`T` — how `Each` reads a page — and a key with no rows absent, since it
+does not exist. `can_load` says which `t` a store loads, by key or not;
+say only what `load` does.
 
 **`discard(scope, prior, items)`** (immutable) deletes objects nothing reads
 any more. `items` name them: `("key", key, version_hex, locator)`,
@@ -103,9 +109,9 @@ any more. `items` name them: `("key", key, version_hex, locator)`,
 `("batches", lo, hi)`. The engine names only objects no reader pins;
 deleting a name twice, or one never written, must be harmless.
 
-**`acquire(scope)`** (fenced) takes the scope's slice for `scope.generation`
-and `scope.invocation`, in a transaction of its own, before the attempt
-reads anything from the store. It must wait for an older writer's open
+**`acquire(scope, prior)`** (fenced) takes the scope's slice for
+`scope.generation` and `scope.invocation`, in a transaction of its own,
+before the attempt reads anything from the store. It must wait for an older writer's open
 transaction on the slice, and refuse (`StoreError`) when a newer
 generation, or another invocation of this generation, holds it.
 
@@ -236,11 +242,12 @@ repeatable — so such a store says what it read, with `reads()`:
   write=True)` in a write, `written(cur, domain, partition)` in a read.
   None if no fenced write changed the slice.
 
-The engine records it as lineage. A snapshot store's read is the pinned
-version, exactly. A current read that saw the pinned head's generation is
-exact too; one that saw another records the pinned generation, the one
-read, and — for a page of keys (`Keys`) — each key's version as read, so
-lineage never claims a version that was not read. The conformance kit's
+The engine records it as lineage, which names what was read: a snapshot
+store's read is the pinned version; a current read is the version its
+generation committed — the pinned one, or a newer one, with each key's
+version as read for a page of keys (`Keys`) — or flagged `uncommitted`
+when no attempt committed what it read, so lineage never claims a
+version that was not read. The conformance kit's
 `READS` scenario checks a store that defines `reads()`.
 
 ## Recipes
@@ -256,7 +263,7 @@ from solera.fencing import fence, fence_table
 class EventsStore:
     writes = "fenced"
 
-    async def acquire(self, scope):
+    async def acquire(self, scope, prior):
         with connect(self.dsn) as conn, conn.cursor() as cur:
             fence(cur, scope, "public.events")
 

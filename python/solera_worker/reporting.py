@@ -103,6 +103,9 @@ LOG_CHUNK_BYTES = 1 << 20
 LOG_TAIL_BYTES = 64 << 10  # a log end smaller than this travels inside the result
 LOG_LIVE_MAX = 10_000  # lines held for the live channel; past it, the oldest are skipped
 LOG_CAP = 100 * 2**20  # compressed bytes per attempt
+LOG_PENDING_MAX = (
+    16 * LOG_CHUNK_BYTES
+)  # lines waiting for a chunk; past it (writes failing), new ones are lost
 
 
 class LogShipper:
@@ -113,7 +116,9 @@ class LogShipper:
     create-only chunks, `{attempt}.log.{n:06d}`, every 30 s or 1 MB; never
     joined. At the end, the lines not yet in a chunk travel inside the
     result (`tail`) when they are under 64 KB, else as one last chunk. Past
-    `LOG_CAP` a truncation marker is written and shipping stops.
+    `LOG_CAP` a truncation marker is written and shipping stops. While
+    chunks cannot be written, lines wait — up to `LOG_PENDING_MAX` bytes;
+    past it they are counted as `lost`.
 
     A chunk is sealed — its number, bytes and lines fixed — before it is
     written, and lines logged meanwhile start the next one: a write retried
@@ -129,7 +134,9 @@ class LogShipper:
         self.sealed: tuple[int, bytes, list] | None = None  # the chunk being written
         self.size = self.lines = 0
         self.truncated = False
+        self.dropped = 0  # lines past LOG_PENDING_MAX
         self._chunked_at = time.monotonic()
+        self._flush: asyncio.Task | None = None  # the one chunk write a full buffer started
         self._lock = asyncio.Lock()  # one chunk written at a time
         # The buffers' one owner: lines come from the loop and from threads (a
         # synchronous Each call), while a chunk is compressed and written.
@@ -140,6 +147,10 @@ class LogShipper:
             return
         line = json.dumps(entry, allow_nan=False) + "\n"
         with self._guard:
+            if self.pending_bytes + len(line) > LOG_PENDING_MAX:
+                self.lines += 1
+                self.dropped += 1
+                return
             self.pending.append((entry["at"], line))
             self.pending_bytes += len(line)
             self.lines += 1
@@ -152,9 +163,9 @@ class LogShipper:
                     del self.live[:drop]
                     self.live_offset += drop
             full = self.pending_bytes >= LOG_CHUNK_BYTES
-        if full:
+        if full and (self._flush is None or self._flush.done()):  # one at a time, however many lines
             try:
-                asyncio.get_running_loop().create_task(self.chunk())
+                self._flush = asyncio.get_running_loop().create_task(self.chunk())
             except RuntimeError:
                 pass  # logging from a thread: the next periodic flush ships it
 
@@ -255,5 +266,5 @@ class LogShipper:
             "bytes": self.size,
             "truncated": self.truncated,
         }
-        lost = len(self.sealed[2] if self.sealed else ()) + len(self.pending)
+        lost = len(self.sealed[2] if self.sealed else ()) + len(self.pending) + self.dropped
         return {**index, "lost": lost} if lost else index

@@ -119,7 +119,7 @@ async def run_sensor_host(
             if value is not None and not isinstance(value, Tick):
                 raise TypeError(f"{sensor.name} returned {type(value).__name__}, not a Tick or None")
             outcome = value.to_json() if value is not None else {}
-        except TimeoutError:
+        except _Overran:
             overran = True  # the engine drops it; its thread runs on, so this host goes
             stop.set()
             return
@@ -204,4 +204,11 @@ async def _call(sensor, project: Project, ctx: SensorContext, timeout: float):
             loop.call_soon_threadsafe(settle, value, error)
 
     threading.Thread(target=work, name=f"sensor {sensor.name}", daemon=True).start()
-    return await asyncio.wait_for(asyncio.shield(future), timeout)
+    done, _ = await asyncio.wait([future], timeout=timeout)
+    if not done:  # the deadline, not the body: a body's own TimeoutError is its outcome
+        raise _Overran()
+    return future.result()
+
+
+class _Overran(Exception):
+    """A tick ran past its timeout."""

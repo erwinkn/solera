@@ -15,7 +15,6 @@ import asyncio
 import functools
 import inspect
 import time
-import typing
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -269,7 +268,7 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
     timeline.add("loaded", param, len(page.upserted))
     ref = Ref.from_json(pin["ref"])
     store = project.stores[ref.store]
-    t = typing.get_type_hints(asset.fn).get(param)
+    t = project.hints[asset.name].get(param)
     loaded = await ctx._observed.load(store, ref, dict[str, t], Keys(page.upserted)) if page.upserted else {}
     await ctx._observed.close()  # the inputs' moment ends before the calls
     up = project.manifest["outputs"][ref.output]

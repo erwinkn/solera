@@ -144,21 +144,39 @@ async def test_keyed_sql_reports_its_keys(store):
     )
 
 
-async def test_aliases_rename_the_table(store):
-    """§2: an output renamed through its asset's aliases takes its table along."""
+async def test_a_renamed_output_keeps_its_table(store):
+    """§2: the committed head says where an output's content is, so an
+    output renamed through its asset's aliases keeps writing — acquiring,
+    migrating — its table, and every ref to it, the old ones included,
+    stays readable. The declaration names a table only for a first write."""
+
+    from solera.sdk import Migration
 
     old = output(key="id", revision="v", primary_key=["id"])
-    first = await store.store([{"id": "a", "v": "1"}], None, scope(old))
+    first = await store.store([{"id": "a", "v": "1"}], None, fenced(old, 1))
     new = output(key="id", revision="v", primary_key=["id"])
-    from solera.stores import Scope
-
-    moved = await store.store(
-        Patch([{"id": "b", "v": "1"}]),
-        first.ref,
-        Scope(output=new, partition="", batch=1, attempt="t", aliases=(old.name,)),
-    )
-    assert new.name in moved.ref.table
+    await store.acquire(fenced(new, 2), first.ref)
+    moved = await store.store(Patch([{"id": "b", "v": "1"}]), first.ref, fenced(new, 2))
+    assert moved.ref.table == first.ref.table and new.name not in moved.ref.table
     assert sorted(r["id"] for r in await store.load(moved.ref, list[dict], None)) == ["a", "b"]
+    # An older ref still reads its table — as it is now: a fenced store keeps one copy.
+    assert sorted(r["id"] for r in await store.load(first.ref, list[dict], None)) == ["a", "b"]
+    migrated = Output(
+        new.name,
+        store="postgres",
+        key="id",
+        revision="v",
+        primary_key=["id"],
+        migrations=[
+            Migration("add_n", lambda cur: cur.execute(f"ALTER TABLE {first.ref.table} ADD COLUMN n bigint"))
+        ],
+    )
+    assert await store.migrate(migrated, migrated.migrations, fenced(migrated, 3), prior=moved.ref) == [
+        "add_n"
+    ]
+    with store._connect() as conn:
+        missing = conn.execute("SELECT to_regclass(%s) AS t", (f'public."{new.name}"',)).fetchone()["t"]
+    assert missing is None  # nothing was created, or renamed, under the new name
 
 
 async def test_batch_snapshot_at_pinned_version(store):
@@ -953,3 +971,22 @@ async def test_a_value_its_column_would_alter_is_refused(store):
     # A revision is all the versions digest: other columns may round as they do.
     revised = output(key="id", revision="v", columns={"d": "numeric(6,2)"})
     await store.store([{"id": "a", "v": "1", "d": D("1.234")}], None, scope(revised))
+
+
+async def test_an_integer_key_is_read_through_an_index(store):
+    """Review round 5 #6: reads and patches name keys as text; an integer
+    key's table gets an index on its key as text, so reading one key is an
+    index scan, not a scan of the table."""
+
+    out = output(key="id", columns={"id": "bigint", "v": "text"})
+    written = await store.store([{"id": i, "v": "x"} for i in range(5000)], None, scope(out))
+    with store._connect() as conn:
+        conn.execute(f"ANALYZE {written.ref.table}")
+        plan = "\n".join(
+            r["QUERY PLAN"]
+            for r in conn.execute(
+                f"EXPLAIN SELECT * FROM {written.ref.table} WHERE id::text = ANY(%s)", (["42"],)
+            )
+        )
+    assert "Index" in plan and "Seq Scan" not in plan, plan
+    assert await store.load(written.ref, list[dict], Keys({"42": (b"", 0)})) == [{"id": 42, "v": "x"}]

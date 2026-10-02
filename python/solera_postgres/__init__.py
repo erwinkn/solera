@@ -65,6 +65,15 @@ def _qname(schema: str, table: str) -> str:
     return f"{_ident(schema)}.{_ident(table)}"
 
 
+def _split(qualified: str) -> tuple[str, str]:
+    """`"schema"."table"`, as `_qname` makes it: its schema and table."""
+
+    found = re.fullmatch(r'"([^"]+)"\."([^"]+)"', qualified)
+    if found is None:
+        raise StoreError(f"not a table this store names: {qualified}")
+    return found.group(1), found.group(2)
+
+
 class PostgresStore:
     version = "1"
     ref_type = TableRef
@@ -119,7 +128,15 @@ class PostgresStore:
 
         return psycopg.connect(resolve_env(self.dsn), row_factory=dict_row, autocommit=False)
 
-    def _table(self, output: Output) -> str:
+    def _table(self, output: Output, prior: Ref | None = None) -> str:
+        """Where the output's content lives: the committed head's table, so a
+        renamed output keeps its table, and every ref to it stays readable
+        (§2); the declaration's (`schema`, `table`, else the output's name)
+        only for a first write."""
+
+        committed = (prior.handle or {}).get("table") if prior is not None else None
+        if committed:
+            return (committed, *_split(committed))
         schema = output.config.get("schema", "public")
         table = output.config.get("table", output.name)
         return _qname(schema, table), schema, table
@@ -150,6 +167,7 @@ class PostgresStore:
         self,
         cur,
         output: Output,
+        table: str,
         rows: Callable[[], Iterable[dict]] | None = None,
         scope: Scope | None = None,
         inferred: dict | None = None,
@@ -162,9 +180,11 @@ class PostgresStore:
         an Arrow schema), else the kind of every value not null in it
         (`rows()`, read only then). Inferred columns are logged, once."""
 
-        table, schema, table_name = self._table(output)
+        schema, table_name = _split(table)
         indexes = self._indexes(output)
         names = [table_name + "_" + "_".join(index) for index in indexes]
+        if key_text := self._key_text(cur, output, schema, table_name):
+            names.append(key_text)
         exists = "SELECT 1 FROM information_schema.tables WHERE table_schema = %s AND table_name = %s"
         indexed = cur.execute(
             "SELECT count(*) AS n FROM pg_indexes WHERE schemaname = %s AND tablename = %s AND indexname = ANY(%s)",
@@ -198,6 +218,11 @@ class PostgresStore:
         cur.execute(f"CREATE TABLE IF NOT EXISTS {table} ({', '.join(defs)})")
         if existed:
             self._check_drift(cur, output, table, schema, table_name, columns, pk)
+        if key_text := self._key_text(cur, output, schema, table_name):
+            # Reads and patches name keys as text (`key::text = ANY(...)`): an index on
+            # the column alone serves only a text key.
+            key = _ident(output.key)
+            cur.execute(f"CREATE INDEX IF NOT EXISTS {_ident(key_text)} ON {table} (({key}::text))")
         for index in indexes:
             cols = ", ".join(_ident(c) for c in index)
             cur.execute(
@@ -289,26 +314,42 @@ class PostgresStore:
         self._fence_table(cur)
         self._take(cur, self._relid(cur, table), scope, write=True)
 
-    async def acquire(self, scope: Scope) -> None:
-        """Take the attempt's generation for the slice it writes, in a
-        transaction of its own, before any read of the store: from here on
-        no older attempt can change it. A table that does not exist yet is
-        acquired when the first write creates it."""
+    async def acquire(self, scope: Scope, prior: Ref | None = None) -> None:
+        """Take the attempt's generation for the slice it writes — in the
+        table `prior`, the committed head, names — in a transaction of its
+        own, before any read of the store: from here on no older attempt can
+        change it. A table that does not exist yet is acquired when the
+        first write creates it."""
 
         if scope.generation is None:
             return
-        await asyncio.to_thread(self._acquire, scope)
+        await asyncio.to_thread(self._acquire, scope, prior)
 
-    def _acquire(self, scope: Scope) -> None:
-        table, _, _ = self._table(scope.output)
+    def _acquire(self, scope: Scope, prior: Ref | None) -> None:
+        table, _, _ = self._table(scope.output, prior)
         with self._connect() as conn, conn.cursor() as cur:
             self._domain(cur, table)
-            self._rename(cur, scope.output, scope)
             relid = self._relid(cur, table)
             if relid is None:
                 return
             self._fence_table(cur)
             self._take(cur, relid, scope)
+
+    def _key_text(self, cur, output: Output, schema: str, table_name: str) -> str | None:
+        """The name of the index on a keyed table's key as text, which the
+        key's own index cannot serve when it is not text (a bigint key):
+        None when it is, or when there is no table yet."""
+
+        if output.key is None:
+            return None
+        found = cur.execute(
+            "SELECT data_type FROM information_schema.columns "
+            "WHERE table_schema = %s AND table_name = %s AND column_name = %s",
+            (schema, table_name, output.key),
+        ).fetchone()
+        if found is None or found["data_type"] in ("text", "character varying", "character"):
+            return None
+        return f"{table_name}_{output.key}_text"
 
     def _indexes(self, output: Output) -> list[list[str]]:
         """The table's indexes: the declared ones, and one on the key column."""
@@ -374,12 +415,11 @@ class PostgresStore:
 
     def _store(self, write, prior: Ref | None, scope: Scope) -> Written:
         output = scope.output
+        table, _, _ = self._table(output, prior)  # where it is, even when a full run starts it over
         if scope.reset:
             prior = None  # a full run keeps nothing of the content
-        table, _, _ = self._table(output)
         with self._connect() as conn, conn.cursor() as cur:
             self._domain(cur, table)
-            self._rename(cur, output, scope)
             partition_col = output.config.get("partition_column")
             slice_where = {partition_col: scope.partition} if partition_col else {}
 
@@ -422,21 +462,6 @@ class PostgresStore:
             keys,
         )
 
-    def _rename(self, cur, output, scope):
-        """An output renamed through its asset's aliases (§2) takes its table
-        along, once: the first write under the new name."""
-
-        if not scope.aliases or "table" in output.config:
-            return
-        schema = output.config.get("schema", "public")
-        exists = "SELECT 1 FROM information_schema.tables WHERE table_schema = %s AND table_name = %s"
-        if cur.execute(exists, (schema, output.name)).fetchone():
-            return
-        for alias in scope.aliases:
-            if cur.execute(exists, (schema, alias)).fetchone():
-                cur.execute(f"ALTER TABLE {_qname(schema, alias)} RENAME TO {_ident(output.name)}")
-                return
-
     def _apply_replace(self, cur, output, write, scope, table, slice_where):
         """An unkeyed output's whole content: its version is the multiset of
         its rows (docs/row-digest.md), before the store stamps them."""
@@ -444,7 +469,7 @@ class PostgresStore:
         rows = frames.rows_of(write, output.name)
         version = _rows_version(rows, [])
         kinds = frames.frame_kinds(write) if frames.is_frame(write) else None
-        types = self._ensure(cur, output, lambda: rows, scope, kinds=kinds)
+        types = self._ensure(cur, output, table, lambda: rows, scope, kinds=kinds)
         self._delete_slice(cur, table, slice_where)
         self._insert(cur, output, table, rows, types, self._stamps(output, scope))
         return version
@@ -463,7 +488,7 @@ class PostgresStore:
             return None
         version = _rows_version(rows, [prior.version if prior else ""])
         rows = [{**row, SEQ_COLUMN: i} for i, row in enumerate(rows)]
-        types = self._ensure(cur, output, lambda: rows, scope)
+        types = self._ensure(cur, output, table, lambda: rows, scope)
         self._delete_slice(cur, table, slice_where if prior is None else {**slice_where, BATCH_COLUMN: batch})
         self._insert(cur, output, table, rows, types, {**self._stamps(output, scope), BATCH_COLUMN: batch})
         return version
@@ -477,7 +502,7 @@ class PostgresStore:
         if not write.whole and write.upserts is None and not write.removes and not len(write.prepared.rows):
             return None  # a patch of nothing: the prior stands
         types = self._ensure(
-            cur, output, lambda: write.prepared.take(None), scope, kinds=write.prepared.kinds
+            cur, output, table, lambda: write.prepared.take(None), scope, kinds=write.prepared.kinds
         )
         stamps = self._stamps(output, scope)
         if write.whole:
@@ -543,7 +568,7 @@ class PostgresStore:
                 )
             }
             inferred = {name: _inferred(types.get(oid)) for name, oid in described}
-            self._ensure(cur, output, scope=scope, inferred=inferred)
+            self._ensure(cur, output, table, scope=scope, inferred=inferred)
             self._delete_slice(cur, table, slice_where)
             selected = ", ".join(_ident(c) for c in columns)
             into = ", ".join(_ident(c) for c in [*columns, *([partition_col] if partition_col else [])])
@@ -625,7 +650,9 @@ class PostgresStore:
             "at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (output, name))"
         )
 
-    async def migrate(self, output: Output, migrations, scope: Scope | None = None) -> list[str]:
+    async def migrate(
+        self, output: Output, migrations, scope: Scope | None = None, prior: Ref | None = None
+    ) -> list[str]:
         """Apply pending migrations in declared order; each migration and its
         ledger row commit in one transaction under an advisory lock keyed on
         the output, so concurrent attempts apply each exactly once (§4).
@@ -636,16 +663,17 @@ class PostgresStore:
         ones until it commits. Before it changes anything it takes the
         attempt's own slice, so an older attempt's migration is refused
         (docs/lifecycle.md §9.7). An operator's migration (no scope) only
-        takes its turn."""
+        takes its turn. The table is the committed head's (`prior`), else the
+        declaration's."""
 
-        return await asyncio.to_thread(self._migrate, output, migrations, scope)
+        return await asyncio.to_thread(self._migrate, output, migrations, scope, prior)
 
-    def _migrate(self, output: Output, migrations, scope: Scope | None) -> list[str]:
+    def _migrate(self, output: Output, migrations, scope: Scope | None, prior: Ref | None) -> list[str]:
 
         with self._connect() as conn, conn.cursor() as cur:
             self._ensure_ledger(cur)
         applied = []
-        table, _, _ = self._table(output)
+        table, _, _ = self._table(output, prior)
         for migration in migrations:
             with self._connect() as conn, conn.cursor() as cur:
                 cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (output.name,))

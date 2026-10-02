@@ -60,6 +60,7 @@ from solera.sdk import (
     Result,
     TimePartitions,
     Upstream,
+    dict_arg,
     split_partition,
 )
 from solera.stores import (
@@ -329,7 +330,7 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
 
     manifest_asset = project.manifest["assets"][asset.name]
     edges = manifest_asset["inputs"]
-    hints = typing.get_type_hints(asset.fn)
+    hints = project.hints[asset.name]  # resolved once, at registration
     args, changes, delivered = {}, {}, {}
     windows = []
     for name, pin in spec["inputs"].items():
@@ -339,7 +340,7 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
         param = name
         t = hints.get(param)
         if "refs" in pin:  # AllPartitions
-            inner = _dict_inner(t)
+            inner = dict_arg(t)
             out = {}
             indexes = pin.get("indexes") or {}
             as_ref = pin.get("load", "data") == "ref"  # decided at registration, as the engine read for it
@@ -437,16 +438,6 @@ def _plain(t) -> bool:
     return t is None or t in (list, dict) or typing.get_origin(t) in (list, dict, Mapping)
 
 
-def _dict_inner(t):
-    if t is None:
-        return None
-    if typing.get_origin(t) in (dict, dict):
-        args_ = typing.get_args(t)
-        if len(args_) == 2:
-            return args_[1]
-    return None
-
-
 async def _store_outputs(
     spec,
     project,
@@ -497,7 +488,7 @@ async def _store_outputs(
         store = project.stores[declared[name]["store"]]
         o = outs[name] = _Out(name, decls[name], store, pinned.get(name) or {}, value)
         if o.kind == "fenced":
-            await store.acquire(o.scope(spec, invocation))
+            await store.acquire(o.scope(spec, invocation), o.prior)
 
     # Prepare and resolve: each keyed write read once, and compared with its key
     # index as pinned in the spec; its changes are the batch's delta file. Small
@@ -558,7 +549,7 @@ async def _store_outputs(
                     f"{output.name}: store {store_name!r} has no migrate for declared migrations"
                 )
             try:
-                applied = await writes.call(migrate(output, output.migrations, scope=scope))
+                applied = await writes.call(migrate(output, output.migrations, scope=scope, prior=o.prior))
             except StoreError:
                 raise
             except Exception as error:
@@ -669,7 +660,6 @@ class _Out:
             partition=spec["partition"],
             batch=self.info.get("batch"),
             attempt=spec["attempt"],
-            aliases=tuple(self.info.get("aliases") or ()),
             reset=self.reset,
             generation=spec.get("generation"),
             invocation=invocation,

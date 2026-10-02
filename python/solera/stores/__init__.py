@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 from urllib.parse import quote
 
-from ..sdk import KEYS, Output, Ref
+from ..sdk import KEYS, Output, Ref, dict_arg
 
 
 class StoreError(Exception):
@@ -67,8 +67,7 @@ class Batches:
 @dataclass(frozen=True)
 class Scope:
     """A write scope (§9): `batch` is the engine-assigned batch number for
-    incremental outputs, `attempt` the writing attempt's id, `aliases` the
-    output's former names. `reset` says the write starts the content over
+    incremental outputs, `attempt` the writing attempt's id. `reset` says the write starts the content over
     (a full run): `prior` still says where the content is, but nothing of
     it is kept — a store's batches start over at `batch`. What a keyed write
     changes is the write's own (`KeyedWrite`)."""
@@ -77,7 +76,6 @@ class Scope:
     partition: str
     batch: int | None = None
     attempt: str | None = None
-    aliases: tuple = ()
     reset: bool = False
     # The attempt's generation and invocation, for a `fenced` store to check
     # (docs/lifecycle.md §9.7); `None` outside an attempt.
@@ -130,7 +128,7 @@ class Store(Protocol):
     async def load(self, ref: Ref, t: type, selection: Keys | Batches | None) -> Any: ...
 
     # immutable: async def discard(self, scope: Scope, prior: Ref | None, items: list) -> None
-    # fenced:    async def acquire(self, scope: Scope) -> None
+    # fenced:    async def acquire(self, scope: Scope, prior: Ref | None) -> None
 
 
 def resolve_env(value: Any) -> Any:
@@ -490,9 +488,8 @@ def by_key_type(t: Any) -> Any:
     """`T` of a `dict[str, T]` load — each key's group on its own, as `Each`
     reads a page (per-key §5) — else `MISSING`."""
 
-    if typing.get_origin(t) in (dict, Mapping) and typing.get_args(t)[:1] == (str,):
-        return typing.get_args(t)[1]
-    return MISSING
+    inner = dict_arg(t)
+    return MISSING if inner is None else inner
 
 
 from .files import FileStore as FileStore  # noqa: E402 — stores, on the core above

@@ -805,8 +805,6 @@ class Engine(Attempts, Sensors, Views):
                     "incremental": output.get("incremental"),
                 },
             }
-            if name == task["asset"] and asset.get("aliases"):
-                info["aliases"] = list(asset["aliases"])
             if output.get("incremental"):
                 info["batch"] = int((head or {}).get("batch", -1)) + 1
             if moved:

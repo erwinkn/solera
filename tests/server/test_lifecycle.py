@@ -289,7 +289,7 @@ async def test_a_fenced_store_runs_its_retry_at_once(tmp_path):
             super().__init__()
             self.acquired = []
 
-        async def acquire(self, scope):
+        async def acquire(self, scope, prior=None):
             self.acquired.append((scope.generation, scope.invocation))
 
     live = Fenced()

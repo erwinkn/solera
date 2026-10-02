@@ -727,14 +727,14 @@ class Model:
         task = run["tasks"].get(e["task"]) if run else None
         if task is None:
             return
-        claim = self.claimed(e["attempt"]) or {}
         self._release_claim(task["id"], e["attempt"])
         self._unsubscribe(task["asset"], task["scope"])  # what it read under an edge since removed
         outcome, at = e["outcome"], e["finished_at"]
         prepared, execution = {}, {}
         launched = task.get("launched")
-        # The generation its writes carry (§9.7): the heads it installs record it.
-        generation = (launched or {}).get("pin", claim.get("pin"))
+        # The generation its writes carried (§9.7), as its launch recorded it: the
+        # heads it installs record it. An attempt never launched wrote nothing.
+        generation = launched["pin"] if (launched or {}).get("attempt") == e["attempt"] else None
         if (launched or {}).get("attempt") == e["attempt"]:
             del task["launched"]
             prepared = launched["prepared"]
@@ -763,6 +763,8 @@ class Model:
         }
         if e.get("error"):
             summary["error"] = e["error"]
+        if generation is not None:
+            summary["generation"] = int(generation)
         commit = e.get("commit")
         if commit:
             summary["outputs"] = {

@@ -182,7 +182,7 @@ def _load_intent(edge, annotation) -> str:
     ("ref") — decided once, from its annotation, and carried in its pin so the
     worker that loads it and the engine that reads ahead for it agree."""
 
-    t = _dict_arg(annotation) if edge.kind == "all_partitions" else annotation
+    t = dict_arg(annotation) if edge.kind == "all_partitions" else annotation
     return "ref" if t is not None and is_ref_type(t) else "data"
 
 
@@ -1097,19 +1097,24 @@ def type_name(t: Any) -> Any:
     return {"repr": str(t)}
 
 
-def hints(fn: Callable) -> dict[str, Any]:
+def hints(name: str, fn: Callable) -> dict[str, Any]:
+    """A producer's annotations, resolved once, at registration: one that
+    does not resolve (a type never imported) is a registration error, not
+    the first run's. `Project.hints` keeps them for the harness."""
+
     try:
         return typing.get_type_hints(fn)
-    except Exception:
-        return {}
+    except Exception as error:
+        raise RegistrationError(f"{name}: its annotations do not resolve: {error}") from error
 
 
-def _dict_arg(t: Any) -> Any | None:
-    """For `dict[str, X]` annotations return X, else None."""
+def dict_arg(t: Any) -> Any | None:
+    """`X` of a `dict[str, X]` or `Mapping[str, X]` annotation — an input by
+    partition (`AllPartitions`) or by key (`Each`'s page) — else None."""
 
-    if typing.get_origin(t) in (dict, dict):
+    if typing.get_origin(t) in (dict, Mapping):
         args = typing.get_args(t)
-        if len(args) == 2:
+        if len(args) == 2 and args[0] is str:
             return args[1]
     return None
 
@@ -1373,7 +1378,7 @@ class Project:
             assets[name] = {"edges": edges, "deps": deps, "dims": dims}
 
         # Edge validity: output exists, projection rule, store checks.
-        hints_by_asset = {n: hints(a.fn) for n, a in self.assets.items()}
+        hints_by_asset = self.hints = {n: hints(n, a.fn) for n, a in self.assets.items()}
         for name, info in assets.items():
             asset = self.assets[name]
             dims = info["dims"] or {}
@@ -1428,7 +1433,7 @@ class Project:
                             f"under {selection.__name__}"
                         )
                 elif isinstance(edge, AllPartitions):
-                    inner = _dict_arg(annotation)
+                    inner = dict_arg(annotation)
                     if inner is None:
                         raise RegistrationError(
                             f"{name}: AllPartitions input {param!r} must be annotated dict[str, T] (§5)"

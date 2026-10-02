@@ -381,6 +381,25 @@ async def test_a_host_whose_tick_overran_exits_and_the_tick_is_dropped(tmp_path,
     await state.close()
 
 
+async def test_a_sensors_own_timeout_is_its_outcome_not_an_overrun(tmp_path):
+    """Review round 5 #4: a body that raises TimeoutError — a remote call
+    that timed out — failed its tick, well within its own timeout: the
+    error is posted, and the host carries on."""
+
+    @sensor(every=1, timeout=60)
+    def remote(ctx):
+        raise TimeoutError("remote request timed out")
+
+    project = Project(sensors=[remote])
+    state, engine = await open_engine(tmp_path, project)
+    code = await asyncio.wait_for(
+        run_sensor_host(LocalSensorChannel(engine), project, "local", max_ticks=1), 5
+    )
+    assert code == 0
+    assert "remote request timed out" in rows(engine)[-1]["error"]
+    await state.close()
+
+
 async def test_tick_rows_are_written_with_the_history_and_expire_after_a_day(tmp_path):
     project = feed_project()
     state, engine = await open_engine(tmp_path, project)

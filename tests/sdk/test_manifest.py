@@ -513,7 +513,7 @@ class Migrating(FileStore):
     def can_store(self, t, output):
         return t is not str and super().can_store(t, output)
 
-    async def migrate(self, output, migrations, scope=None):
+    async def migrate(self, output, migrations, scope=None, prior=None):
         return [m.name for m in migrations]
 
 
@@ -527,3 +527,21 @@ def test_output_names_are_names():
     for bad in ("@parse", "a/b", "<lambda>", ""):
         with pytest.raises(RegistrationError, match="invalid output name"):
             Project(assets=[asset(parse, outputs=Output(bad or "@", keyed=True))])
+
+
+def test_an_annotation_that_does_not_resolve_fails_registration():
+    """Review round 5 #5: annotations resolve once, at registration — one
+    naming a type never imported fails there, not in the first run's
+    worker; the project keeps the resolved ones for the harness."""
+
+    def produce() -> "MissingPayloadType":  # noqa: F821
+        return 1
+
+    with pytest.raises(RegistrationError, match="annotations do not resolve"):
+        Project(assets=[asset(produce)])
+
+    def fine(ctx) -> list[dict]:
+        return []
+
+    project = Project(assets=[asset(fine)])
+    assert project.hints["fine"] == {"return": list[dict]}

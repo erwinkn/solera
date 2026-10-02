@@ -225,9 +225,9 @@ class Store(Protocol):
     def can_store(self, t: type | None, output: Output) -> bool: ...
     async def store(self, write: Any, prior: Ref | None, scope: Scope) -> Written: ...
     async def load(self, ref: Ref, t: type, selection: Keys | Batches | None) -> Any: ...
-    async def migrate(self, output: Output, migrations: Sequence[Migration]) -> list[str]: ...  # optional
+    async def migrate(self, output: Output, migrations: Sequence[Migration], scope=None, prior=None) -> list[str]: ...  # optional
 
-Scope   = (output: Output, partition: str, batch: int | None, attempt: str | None, aliases: tuple,
+Scope   = (output: Output, partition: str, batch: int | None, attempt: str | None, reset: bool,
            generation: int | None, invocation: str | None)
 Prepared   = (output, rows: Rows, take: Callable, patch: bool, removes)  # a keyed write, read once
 KeyedWrite = (prepared: Prepared, upserts: Mapping[str, bytes] | DeltaKeys | None,

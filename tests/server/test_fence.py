@@ -28,7 +28,7 @@ class Gated(FileStore):
 
     writes = "fenced"
 
-    async def acquire(self, scope):
+    async def acquire(self, scope, prior=None):
         pass
 
 
@@ -409,7 +409,7 @@ class LiveStore(FileStore):
         self.rows: dict[str, dict] = {}
         self.die: int | None = None
 
-    async def acquire(self, scope):
+    async def acquire(self, scope, prior=None):
         pass
 
     def can_load(self, t, selection):

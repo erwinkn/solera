@@ -44,7 +44,7 @@ async def run(engine, targets, **kw):
 
 async def edges(engine, state, output):
     version = state.model.heads[(output, "")]["ref"]["version"]
-    return {e["param"]: e["read"] for e in (await engine.history.lineage(output, "", version))["edges"]}
+    return {e["param"]: e for e in (await engine.history.lineage(output, "", version))["edges"]}
 
 
 async def test_lineage_says_what_a_current_read_saw(state):
@@ -81,8 +81,22 @@ async def test_lineage_says_what_a_current_read_saw(state):
 
     # Read as pinned: exact, at the generation that wrote the head.
     await run(engine, ["report", "changes"], upstream=True)
-    pinned = state.model.heads[(name, "")]["generation"]
-    assert (await edges(engine, state, "report")) == {"sites": {"exact": True, "generation": pinned}}
+    head = state.model.heads[(name, "")]
+    edge = (await edges(engine, state, "report"))["sites"]
+    assert edge["from"] == {
+        "output": name,
+        "scope": "",
+        "version": head["ref"]["version"],
+        "generation": head["generation"],
+        "run": head["run"],
+        "attempt": head["attempt"],
+        "at": head["at"],
+    }
+    assert "uncommitted" not in edge and "mixed" not in edge
+    assert edge["detail"] == {
+        "pinned_version": head["ref"]["version"],
+        "pinned_generation": head["generation"],
+    }
 
     # sites commits b=2; then a newer writer's b=3 lands before the readers read,
     # uncommitted (a retry under way, or one that died after its write).
@@ -99,12 +113,76 @@ async def test_lineage_says_what_a_current_read_saw(state):
     )
     await run(engine, ["report", "changes"])
 
-    # A whole read: the generation it saw, which committed nothing yet; no key list.
-    assert (await edges(engine, state, "report")) == {
-        "sites": {"exact": False, "pinned_generation": pinned, "generation": newer, "version": None}
-    }
+    # A whole read of a write no attempt committed: flagged, no version; the pin in `detail`.
+    edge = (await edges(engine, state, "report"))["sites"]
+    assert edge["from"]["generation"] == newer and edge["from"]["version"] is None
+    assert edge["uncommitted"] == {"attempt": None, "run": None}  # written outside the engine
+    assert edge["detail"]["pinned_generation"] == pinned
     # A page of keys (b changed): the versions it read, as the store versions rows.
-    read = (await edges(engine, state, "changes"))["sites"]
-    assert read["generation"] == newer and read["pinned_generation"] == pinned
+    edge = (await edges(engine, state, "changes"))["sites"]
+    assert edge["from"]["generation"] == newer and "uncommitted" in edge
     versions = dict(prepare_for(store, [{"id": "b", "v": "3"}], out).entries())
-    assert read["keys"] == {"b": versions["b"].hex()}
+    assert edge["from"]["keys"] == {"b": versions["b"].hex()}
+
+    # The writer commits after all: the edge then names the version it committed, and who.
+    from solera_server.history import attempt_row
+
+    summary = {"id": "late", "outcome": "succeeded", "started_at": 1.0, "finished_at": 2.0}
+    summary |= {"outputs": {name: "v-late"}, "generation": newer}
+    task = {"id": "t-late", "asset": "sites", "scope": ""}
+    state.model._record("attempts", attempt_row("r-late", task, summary, 1))
+    edge = (await edges(engine, state, "report"))["sites"]
+    assert "uncommitted" not in edge
+    assert {k: edge["from"][k] for k in ("version", "generation", "run", "attempt", "at")} == {
+        "version": "v-late",
+        "generation": newer,
+        "run": "r-late",
+        "attempt": "late",
+        "at": 2.0,
+    }
+
+
+async def test_a_renamed_postgres_output_stays_readable(state):
+    """Review round 5 #1: an asset renamed with `aliases=` that writes the
+    same rows commits nothing new, and its head — the old table — must
+    still load; a changed write lands in that table too. The engine pins
+    the head; the store keeps the table the head names."""
+
+    if not DSN:
+        pytest.skip("SOLERA_TEST_DATABASE_URL is not set")
+    from solera_postgres import PostgresStore
+
+    store = PostgresStore(DSN)
+    schema = f"s_{uuid.uuid4().hex[:8]}"
+    rows = {"v": [{"id": "a", "v": "1"}]}
+
+    def make(project_assets):
+        project = Project(assets=project_assets, stores={"postgres": store})
+        return project, Engine(
+            state,
+            project.manifest,
+            placements={"Local": lambda s, c: InlinePlacement(c, project)},
+            clock=state.clock,
+            eval_interval=0.01,
+        )
+
+    def old():
+        return rows["v"]
+
+    def new():
+        return rows["v"]
+
+    decl = dict(key="id", store="postgres", schema=schema, columns={"id": "text", "v": "text"})
+    _, engine = make([asset(outputs=Output(**decl))(old)])
+    await engine.initialize()
+    await run(engine, ["old"])
+    _, engine = make([asset(outputs=Output(**decl), aliases=["old"])(new)])
+    await engine.initialize()
+    await run(engine, ["new"])  # the same rows: the head stays
+    head = Ref.from_json(state.model.heads[("new", "")]["ref"])
+    assert await store.load(head, list[dict], None) == [{"id": "a", "v": "1"}]
+    rows["v"] = [{"id": "a", "v": "2"}]
+    await run(engine, ["new"])
+    head = Ref.from_json(state.model.heads[("new", "")]["ref"])
+    assert head.table == f'"{schema}"."old"'
+    assert await store.load(head, list[dict], None) == [{"id": "a", "v": "2"}]

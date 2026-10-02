@@ -16,7 +16,10 @@ the kit needs no test framework. With pytest:
 
 The kit drives the store as the harness does: keyed writes arrive as a
 `KeyedWrite`, resolved against what the engine's key index would hold
-(the kit keeps that `Ledger` itself), and keyed loads name their keys."""
+(the kit keeps that `Ledger` itself), keyed loads name their keys, and an
+unkeyed output's value arrives as it is, a plain list. A scenario that
+needs what the harness cannot give (`Harness.hold`) raises `Unverified`:
+not a pass — with pytest, `pytest.skip` it."""
 
 from __future__ import annotations
 
@@ -45,6 +48,10 @@ class Harness:
     hold: Callable[[Scope], Any] | None = None
 
 
+class Unverified(Exception):
+    """A scenario the harness could not run: it proves nothing either way."""
+
+
 @dataclass
 class Ledger:
     """What the engine's key index would hold for one output scope: each
@@ -57,11 +64,16 @@ class Ledger:
 
 
 def scope(
-    out: Output, generation: int, invocation: str = "i", batch: int | None = None, reset: bool = False
+    out: Output,
+    generation: int,
+    invocation: str = "i",
+    batch: int | None = None,
+    reset: bool = False,
+    partition: str = "",
 ) -> Scope:
     return Scope(
         output=out,
-        partition="",
+        partition=partition,
         batch=batch,
         reset=reset,
         attempt=f"kit-{generation}",
@@ -82,6 +94,7 @@ async def write(
     patch: bool = False,
     changed: bool = False,
     invocation: str = "i",
+    partition: str = "",
 ) -> Ref:
     """Write `rows` to a keyed output as the harness would — the scope's whole
     content, or (`patch`) its keys and `remove` — and record in `ledger`
@@ -97,7 +110,7 @@ async def write(
         upserts = {k: v for k, v in current.items() if ledger.entries.get(k, (None,))[0] != v}
         gone = frozenset(set(ledger.entries) - set(current))
         keyed = KeyedWrite(prepared, upserts=upserts, removes=gone, value=rows)
-        written = await store.store(keyed, prior, scope(out, generation, invocation))
+        written = await store.store(keyed, prior, scope(out, generation, invocation, partition=partition))
         for key in gone:
             del ledger.entries[key]
         ledger.entries.update({k: (v, generation) for k, v in upserts.items()})
@@ -110,7 +123,7 @@ async def write(
         prepared = prepare_for(store, rows, out)
         upserts = dict(prepared.entries())
         keyed = KeyedWrite(prepared, whole=True, value=rows)
-    written = await store.store(keyed, prior, scope(out, generation, invocation))
+    written = await store.store(keyed, prior, scope(out, generation, invocation, partition=partition))
     if not patch:
         ledger.entries.clear()
     for key in remove:
@@ -234,6 +247,34 @@ async def a_replacement_writes_only_what_changed(h: Harness) -> None:
 # -- immutable stores ----------------------------------------------------------------------
 
 
+async def an_unkeyed_output_is_its_plain_rows(h: Harness) -> None:
+    """An unkeyed output's value arrives as the producer returned it — a
+    plain list of rows, no `KeyedWrite` — and is its whole content: the
+    next write replaces it."""
+
+    out = h.output()
+    assert h.store.can_store(list[dict], out), "can_store refuses rows for an unkeyed output"
+    first = (await h.store.store([{"id": "a", "v": "1"}], None, scope(out, 1))).ref
+    assert await rows(h, first, None) == [("a", "1")]
+    second = (await h.store.store([{"id": "b", "v": "1"}, {"id": "c", "v": "1"}], first, scope(out, 2))).ref
+    assert await rows(h, second, None) == [("b", "1"), ("c", "1")]
+
+
+async def partitions_never_touch_each_other(h: Harness) -> None:
+    """Two partitions of one output: replacing one leaves the other as it
+    was. (A store that shares one table among partitions declares
+    `shared_table`; its outputs get a `partition_column`.)"""
+
+    shared = getattr(h.store, "shared_table", False)
+    out = h.output(key="id", revision="v", **({"partition_column": "part"} if shared else {}))
+    one, two = Ledger(), Ledger()
+    first = await write(h, out, [{"id": "a", "v": "1"}], 1, one, partition="p1")
+    other = await write(h, out, [{"id": "b", "v": "1"}], 2, two, partition="p2")
+    first = await write(h, out, [{"id": "c", "v": "1"}], 3, one, first, partition="p1")
+    assert await now(h, first, one) == [("c", "1")]
+    assert await now(h, other, two) == [("b", "1")]
+
+
 async def a_pinned_read_returns_its_version(h: Harness) -> None:
     """a at 1 (generation 5), then a at 2 (generation 9): the ref pinned
     before reads a at 1, the newer one a at 2."""
@@ -273,7 +314,7 @@ async def a_stale_writer_is_refused(h: Harness) -> None:
 
     out, ledger = keyed(h), Ledger()
     first = await write(h, out, [{"id": "a", "v": "1"}], 5, ledger)
-    await h.store.acquire(scope(out, 9))
+    await h.store.acquire(scope(out, 9), first)
     second = await write(h, out, [{"id": "a", "v": "2"}], 9, ledger, first)
     with _refused():
         await write(h, out, [{"id": "a", "v": "0"}], 5, Ledger(), first)
@@ -287,12 +328,12 @@ async def one_generation_admits_one_invocation(h: Harness) -> None:
 
     out, ledger = keyed(h), Ledger()
     first = await write(h, out, [{"id": "a", "v": "1"}], 5, ledger)
-    await h.store.acquire(scope(out, 9, "x"))
+    await h.store.acquire(scope(out, 9, "x"), first)
     with _refused():
-        await h.store.acquire(scope(out, 9, "y"))
+        await h.store.acquire(scope(out, 9, "y"), first)
     with _refused():
         await write(h, out, [{"id": "a", "v": "0"}], 9, Ledger(), first, invocation="y")
-    await h.store.acquire(scope(out, 9, "x"))
+    await h.store.acquire(scope(out, 9, "x"), first)
     second = await write(h, out, [{"id": "a", "v": "2"}], 9, ledger, first, invocation="x")
     assert await now(h, second, ledger) == [("a", "2")]
 
@@ -302,7 +343,7 @@ async def a_first_write_acquires(h: Harness) -> None:
     takes it, and an older writer (2) is refused after."""
 
     out, ledger = keyed(h), Ledger()
-    await h.store.acquire(scope(out, 3))
+    await h.store.acquire(scope(out, 3), None)
     first = await write(h, out, [{"id": "a", "v": "1"}], 3, ledger)
     with _refused():
         await write(h, out, [{"id": "a", "v": "0"}], 2, Ledger(), first)
@@ -317,7 +358,7 @@ async def the_next_attempt_replaces_what_a_dead_writer_left(h: Harness) -> None:
     out, ledger = keyed(h), Ledger()
     first = await write(h, out, [{"id": "a", "v": "1"}], 1, ledger)
     await write(h, out, [{"id": "c", "v": "1"}], 5, Ledger(), first, patch=True)  # landed, never committed
-    await h.store.acquire(scope(out, 9))
+    await h.store.acquire(scope(out, 9), first)
     second = await write(h, out, [{"id": "a", "v": "2"}, {"id": "b", "v": "1"}], 9, ledger, first)
     assert await now(h, second, ledger) == [("a", "2"), ("b", "1")]
     with _refused():
@@ -330,13 +371,13 @@ async def a_newer_writer_waits_for_an_open_older_one(h: Harness) -> None:
     `Harness.hold`.)"""
 
     if h.hold is None:
-        return
+        raise Unverified("needs Harness.hold: a write transaction held open")
     out, ledger = keyed(h), Ledger()
     first = await write(h, out, [{"id": "a", "v": "1"}], 5, ledger)
     async with h.hold(scope(out, 5)):
         # A store's calls must not block the event loop: the older writer's
         # transaction commits on this loop while the newer one waits.
-        acquiring = asyncio.create_task(h.store.acquire(scope(out, 9)))
+        acquiring = asyncio.create_task(h.store.acquire(scope(out, 9), first))
         await asyncio.sleep(0.3)
         assert not acquiring.done(), "the newer acquisition did not wait for the open older writer"
     await asyncio.wait_for(acquiring, 10)
@@ -357,7 +398,7 @@ async def a_read_reports_the_generation_it_saw(h: Harness) -> None:
     first, second = keyed(h), keyed(h)
     one = await write(h, first, [{"id": "a", "v": "1"}], 3, Ledger())
     two = await write(h, second, [{"id": "b", "v": "1"}], 3, Ledger())
-    await h.store.acquire(scope(first, 5))
+    await h.store.acquire(scope(first, 5), one)
     async with h.store.reads() as reader:
         assert await _read(reader, one) == ([("a", "1")], 3)
         one = await write(h, first, [{"id": "a", "v": "2"}], 7, Ledger(), one)
@@ -392,6 +433,8 @@ EVERY = [
     a_batch_written_again_lands_once,
     a_full_run_starts_the_batches_over,
     a_replacement_writes_only_what_changed,
+    an_unkeyed_output_is_its_plain_rows,
+    partitions_never_touch_each_other,
 ]
 IMMUTABLE = [a_pinned_read_returns_its_version, discarding_never_takes_what_is_read]
 FENCED = [
