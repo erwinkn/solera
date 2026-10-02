@@ -48,8 +48,10 @@ class TableStore:
         return takes(t, output, values=False)
 
     @staticmethod
-    def _table(output) -> str:
-        return f"rows_{output.name}"
+    def _table(output, prior) -> str:
+        """The committed head's table; the output's name only for a first write."""
+
+        return (prior.handle or {}).get("table") if prior is not None else f"rows_{output.name}"
 
     def _fence(self, scope, table: str) -> tuple | None:
         """The fence row this transaction would write, or `StoreError`."""
@@ -66,10 +68,10 @@ class TableStore:
             )
         return mine
 
-    async def _transaction(self, kind: str, scope, body: Callable[[dict], object]):
+    async def _transaction(self, kind: str, scope, prior, body: Callable[[dict], object]):
         """Lock the slice, fence, apply `body` to a copy of its rows, commit."""
 
-        table = self._table(scope.output)
+        table = self._table(scope.output, prior)
         fate, delay = self.db.fault(kind, scope) if self.db.fault is not None else (None, 0.0)
         async with self.db.lock(table, scope.partition):
             if fate == "error":
@@ -89,24 +91,29 @@ class TableStore:
         return value
 
     async def acquire(self, scope, prior=None) -> None:
-        await self._transaction("acquire", scope, lambda box: None)
+        await self._transaction("acquire", scope, prior, lambda box: None)
 
     async def store(self, write, prior, scope) -> Written:
         out = scope.output
+        table = self._table(out, prior)  # where the content is, even when it starts over
+        reset = getattr(scope, "reset", False)
+        base = None if reset else prior  # what the write builds on
 
         def body(box):
             rows = box["rows"]
             if out.key is None:  # an unkeyed incremental output: a batch of rows
                 batch = list(write.rows)
-                if prior is None:
+                if base is None:
                     rows.clear()
                 else:
                     rows[:] = [r for r in rows if r[1] != scope.batch]
                 rows.extend((None, scope.batch, dict(r)) for r in batch)
-                version = digest([prior.version if prior else "", scope.batch, batch])
-                return Written(Ref(out.name, "", {"batch": scope.batch}, version, scope.partition))
-            keyed = KeyedWrite.of(self, write, out, prior)
-            if keyed.whole:
+                version = digest([base.version if base else "", scope.batch, batch])
+                return Written(
+                    Ref(out.name, "", {"table": table, "batch": scope.batch}, version, scope.partition)
+                )
+            keyed = KeyedWrite.of(self, write, out, base)
+            if keyed.whole or reset:
                 rows.clear()
             for page in keyed.iter_pages():
                 keys = {k for k, _, _ in page}
@@ -115,12 +122,13 @@ class TableStore:
                 rows.extend((k, None, dict(r)) for k, _, group in page for r in group)
             if keyed.removes:
                 rows[:] = [r for r in rows if r[0] not in keyed.removes]
-            return Written(Ref(out.name, "", {}, keyed.version(prior), scope.partition))
+            return Written(Ref(out.name, "", {"table": table}, keyed.version(base), scope.partition))
 
-        return await self._transaction("store", scope, body)
+        return await self._transaction("store", scope, prior, body)
 
     async def load(self, ref, t, selection) -> list[dict]:
-        rows = self.db.tables.get(f"rows_{ref.output}", {}).get(ref.partition, [])
+        table = (ref.handle or {}).get("table") or f"rows_{ref.output}"
+        rows = self.db.tables.get(table, {}).get(ref.partition, [])
         if isinstance(selection, Keys):
             rows = [r for r in rows if r[0] in selection.revisions]
         elif isinstance(selection, Batches):
