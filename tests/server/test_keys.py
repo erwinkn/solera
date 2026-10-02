@@ -39,7 +39,7 @@ def engine_for(state, project, **kw):
 
 async def run(engine, targets, **kw):
     detail = await engine.run_until((await engine.submit(targets, **kw))["id"], 60)
-    assert detail["request"]["status"] == "succeeded", detail
+    assert detail["request"]["status"] == "succeeded", str(detail)[-3000:]
     return detail
 
 
@@ -145,6 +145,38 @@ async def test_row_digests_are_16_bytes_end_to_end(state):
     assert all(len(v) == 16 for v in versions)
     listed = await engine.list_keys("items")
     assert listed["keys"] == {"a": digests[0].hex(), "b": digests[1].hex()}
+
+
+async def test_a_patch_reconciles_what_a_dead_sql_writer_left(state, data):
+    """docs/resolved-commits.md §3: a dead `Sql` writer's intent names no keys.
+    It deleted `a` and inserted `b` and died before reporting; the next patch,
+    of `c`, cannot read back "the intended keys" — it reconciles the whole
+    store against the index, and the commit settles the intent."""
+
+    pending = {"rows": [{"id": "a", "v": 1}]}
+
+    @asset(outputs=Output("items", key="id", revision="v"))
+    def items():
+        return Patch(pending["rows"])
+
+    engine = engine_for(state, Project(assets=[items]))
+    await engine.initialize()
+    await run(engine, ["items"])
+    # What the dead writer did to the store, and the intent its gate left.
+    root = data / "items"
+    (root / "a.json").unlink()
+    (root / "b.json").write_text('[{"id": "b", "v": 1}]')  # a key holds its group of rows
+    key = ("items", "")
+    state.model.unsettled[key] = [
+        {"added": 0, "removed": 0, "exact": True, "files": [], "unknown": True, "run": "r", "attempt": "dead"}
+    ]
+    pending["rows"] = [{"id": "c", "v": 1}]
+    await run(engine, ["items"])
+    assert key not in state.model.unsettled
+    index = state.model.indexes[key]
+    assert index.count == 2 and index.count_exact
+    assert sorted((await engine.list_keys("items"))["keys"]) == ["b", "c"]
+    assert sorted(p.name for p in root.iterdir()) == ["b.json", "c.json"]
 
 
 async def test_compaction_truncation_and_garbage(state):

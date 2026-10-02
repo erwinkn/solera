@@ -31,6 +31,7 @@ from pathlib import Path
 
 from obstore.exceptions import AlreadyExistsError
 from solera import lifecycle
+from solera.keys import Rows
 from solera.keys.index import DeltaFiles, FileInfo, IndexState, KeyIndex, key_bytes, key_str
 from solera.keys.io import ObjectIO, key_cache
 from solera.lifecycle import Cancel, Ended
@@ -448,20 +449,29 @@ async def _store_outputs(
             new = await _versions(output, rows)
             removes = [str(k) for k in value.remove if str(k) not in new]
             own = set(new), set(removes)
-            intended = set(await _intended(info, keys_io, unsettled)) if unsettled else set()
-            if unsettled:
-                new, removes = await _repair(output, store, prior, intended - own[0] - own[1], new, removes)
-            delta = await index.changes(
-                [key_bytes(k) for k in new],
-                list(new.values()),
-                [key_bytes(k) for k in removes],
-                generation=generation,
-            )
-            files = await index.write(batch, attempt, delta)
-            changed = (
-                [k for k, d in zip(delta.keys, delta.deleted, strict=True) if not d],
-                [k for k, d in zip(delta.keys, delta.deleted, strict=True) if d],
-            )
+            if any(intent.get("unknown") for intent in unsettled):
+                # A dead Sql writer's keys are unknown (docs/resolved-commits.md §3): the index
+                # takes the whole store as it is, with this patch on top, and the store
+                # writes this patch's keys, every one.
+                files, _ = await _reconcile(
+                    output, store, prior, index, new, removes, batch, attempt, generation
+                )
+                changed, intended = None, own[0] | own[1]
+            else:
+                intended = set(await _intended(info, keys_io, unsettled)) if unsettled else set()
+                if unsettled:
+                    new, removes = await _repair(
+                        output, store, prior, intended - own[0] - own[1], new, removes
+                    )
+                files, changed = await index.resolve(
+                    [key_bytes(k) for k in new],
+                    list(new.values()),
+                    [key_bytes(k) for k in removes],
+                    batch=batch,
+                    attempt=attempt,
+                    generation=generation,
+                    collect=LISTED,
+                )
         if not files.files and info.get("exists") and not unsettled:
             entries[name] = {"unchanged": True}
             del plans[name]
@@ -470,13 +480,17 @@ async def _store_outputs(
         if prior is not None and not (replace and (changed is None or unsettled)):
             # The store writes only what changes: the delta, and for a patch whatever a
             # dead attempt may have left half-done among its keys. A replacement with
-            # more changes than it lists, or with dead attempts', rewrites the scope.
-            upserted, deleted = ({key_str(k) for k in keys} for keys in changed)
-            if replace:
-                plan["upserts"], plan["removes"] = frozenset(upserted), frozenset(deleted)
+            # more changes than it lists, or with dead attempts', rewrites the scope;
+            # a patch with more than it lists writes all of its own keys.
+            if changed is None:
+                plan["upserts"], plan["removes"] = frozenset(own[0]), frozenset(own[1])
             else:
-                plan["upserts"] = frozenset((upserted & own[0]) | (own[0] & intended))
-                plan["removes"] = frozenset(deleted | (own[1] & intended))
+                upserted, deleted = ({key_str(k) for k in keys} for keys in changed)
+                if replace:
+                    plan["upserts"], plan["removes"] = frozenset(upserted), frozenset(deleted)
+                else:
+                    plan["upserts"] = frozenset((upserted & own[0]) | (own[0] & intended))
+                    plan["removes"] = frozenset(deleted | (own[1] & intended))
         if output.is_partition_set:
             if replace:
                 elements = {str(e) for e in content or ()}
@@ -590,6 +604,20 @@ async def _repair(output, store, prior, left, new, removes):
         new.update(found)
         removes.extend(k for k in page if k not in found)
     return new, removes
+
+
+async def _reconcile(output, store, prior, index, new, removes, batch, attempt, generation):
+    """The delta of a patch over a store a dead `Sql` writer changed in ways no
+    key list records: the store's whole key map as it is, this patch applied
+    on top, against the pinned index — a replacement."""
+
+    loaded = await store.load(prior, None, None)
+    current = await _versions(output, await asyncio.to_thread(store_key_rows, store, loaded, output))
+    current.update(new)
+    for k in removes:
+        current.pop(k, None)
+    pairs = sorted((key_bytes(k), v) for k, v in current.items())
+    return await index.replace(Rows.pairs(pairs), batch, attempt, collect=LISTED, generation=generation)
 
 
 async def _versions(output, rows) -> dict[str, bytes]:
