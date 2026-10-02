@@ -3,7 +3,6 @@ store, the external `uploads` set committed through the API, and a pool
 worker claiming `ingest` work. No external services — `SiteRegistry`,
 `FeedClient`, `UploadReader`, and `Mailer` are in-process fakes."""
 
-import asyncio
 import socket
 import threading
 import time
@@ -69,7 +68,25 @@ def wait(predicate, timeout=120, interval=0.5):
     return predicate()
 
 
-def test_demo_end_to_end(demo):
+@pytest.fixture
+def pool_worker(demo):
+    """`solera worker pool ingest`, as the README runs it: a process of its
+    own, which forks a child per attempt."""
+
+    import os
+    import subprocess
+    import sys
+
+    env = {**os.environ, "SOLERA_PROJECT": PROJECT}
+    worker = subprocess.Popen(
+        [sys.executable, "-m", "solera_worker", "pool", "--pool", "ingest", "--server", demo], env=env
+    )
+    yield worker
+    worker.terminate()
+    worker.wait(10)
+
+
+def test_demo_end_to_end(demo, pool_worker):
     client = httpx.Client(base_url=demo, timeout=15)
     base = "/api/projects/demo"
 
@@ -101,10 +118,7 @@ def test_demo_end_to_end(demo):
     assert committed.status_code == 200 and committed.json()["ref"]["version"]
 
     # `manual_ingest` is placed on Pool("ingest"): only an external worker
-    # can complete it — `solera worker pool ingest` in the README.
-    from solera_worker.worker import run_pool
-
-    threading.Thread(target=lambda: asyncio.run(run_pool("ingest", demo)), daemon=True).start()
+    # can complete it — `pool_worker`, `solera worker pool ingest` in the README.
 
     # The partition set grows one site per run and caps at four. Saturate it
     # first so every downstream run plans the same site scopes.

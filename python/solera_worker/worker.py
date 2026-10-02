@@ -1330,14 +1330,19 @@ async def run_pool(pool: str, server: str, token: str | None = None, *, project:
     on this pool, claim one by creating its `.worker`, run it, repeat. The
     claim decides between workers; discovery is only a hint. `project` is
     the project's name, by default its manifest's: a pool token reaches the
-    pool's routes and nothing else."""
+    pool's routes and nothing else.
+
+    The project is imported once; each attempt runs in a child forked from
+    this warm process, as a process of its own: a forced cancel ends the
+    child, and with it any thread the attempt left running."""
 
     import httpx
 
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     capacity = {"cpu": os.cpu_count(), "memory": None, "gpu": None}
     host = f"{socket.gethostname()}:{os.getpid()}"
-    project = project or load_project(os.environ["SOLERA_PROJECT"]).manifest["name"]
+    loaded = load_project(os.environ["SOLERA_PROJECT"])
+    project = project or loaded.manifest["name"]
     async with httpx.AsyncClient(base_url=server, headers=headers, timeout=60) as client:
         print(f"[pool] {host} polls pool {pool!r}", flush=True)
         while True:
@@ -1353,20 +1358,58 @@ async def run_pool(pool: str, server: str, token: str | None = None, *, project:
                 await asyncio.sleep(1.0)
                 continue
             for stage in stages:
-                try:
-                    code = await run_attempt(
-                        stage["objects"],
-                        stage["attempt"],
-                        os.environ["SOLERA_PROJECT"],
-                        run=stage["run"],
-                        engine_url=server,
-                        pool=True,
-                    )
-                except Exception:  # it could not publish: the engine treats it as dead
-                    traceback.print_exc()
-                    continue
+                code = await _forked(stage, server, loaded)
                 print(f"[pool] {stage['attempt']} exited {code}", flush=True)
-                break  # ask again: what waits has changed
+                if code != LOST:  # it ran: ask again, what waits has changed
+                    break
+
+
+LOST = 4  # the exit code of an attempt that could not publish: the engine treats it as dead
+
+
+async def _forked(stage: dict, server: str, project: Project) -> int:
+    """Run one pool attempt in a child of this process; its exit code. This
+    process must not have used the object store: a forked child cannot use
+    the async runtime it would have started."""
+
+    import multiprocessing
+
+    child = multiprocessing.get_context("fork").Process(
+        target=_child, args=(stage, server, project), name=f"attempt {stage['attempt']}"
+    )
+    child.start()
+    while child.exitcode is None:  # polled: no thread here, so the next fork copies a quiet process
+        await asyncio.sleep(0.1)
+    return child.exitcode
+
+
+def _child(stage: dict, server: str, project: Project) -> None:
+    code = LOST
+    try:
+        code = asyncio.run(
+            run_attempt(
+                stage["objects"],
+                stage["attempt"],
+                project,
+                run=stage["run"],
+                engine_url=server,
+                pool=True,
+                own_process=True,
+            )
+        )
+    except BaseException:
+        traceback.print_exc()
+    _exit(code)
+
+
+def _exit(code: int) -> None:
+    """End an attempt's process once its result is published (or never
+    will be): at once, so threads it abandoned — a canceled synchronous
+    call — end with it rather than keep it alive."""
+
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
 
 
 async def main():
@@ -1383,14 +1426,18 @@ async def main():
     if mode == "run":
         # solera_worker run --objects URL --attempt ID --run RUN (SOLERA_PROJECT env entrypoint)
         options = dict(zip(rest[::2], rest[1::2], strict=True))
-        code = await run_attempt(
-            options["--objects"],
-            options["--attempt"],
-            os.environ["SOLERA_PROJECT"],
-            run=options["--run"],
-            own_process=True,
-        )
-        raise SystemExit(code)
+        code = LOST
+        try:
+            code = await run_attempt(
+                options["--objects"],
+                options["--attempt"],
+                os.environ["SOLERA_PROJECT"],
+                run=options["--run"],
+                own_process=True,
+            )
+        except BaseException:
+            traceback.print_exc()
+        _exit(code)
     if mode == "pool":
         options = dict(zip(rest[::2], rest[1::2], strict=True))
         token = options.get("--token") or os.getenv("SOLERA_POOL_TOKEN") or os.getenv("SOLERA_API_TOKEN")

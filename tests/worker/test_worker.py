@@ -239,3 +239,85 @@ async def test_failed_migration_is_not_retryable(state, tmp_path, monkeypatch):
     assert result["status"] == "failed"
     assert result["error"]["retryable"] is False
     assert "migration failed" in result["error"]["message"]
+
+
+LINGERING = """
+import threading, time
+from solera.executors import Pool
+from solera.sdk import Project, asset
+
+@asset{executor}
+def lingering() -> int:
+    # A call the attempt gave up on — a canceled synchronous Each call — still running.
+    threading.Thread(target=time.sleep, args=(60,)).start()
+    return 1
+
+project = Project(assets=[lingering])
+"""
+
+
+async def test_a_local_attempt_ends_its_process_once_published(state, tmp_path, monkeypatch):
+    """D5: a thread the attempt left running does not keep its process
+    alive: the worker exits as soon as the result is published."""
+
+    from solera_server.placements import local
+
+    pids, launch = [], local.LocalPlacement.launch
+
+    async def recorded(self, stage):
+        handle = await launch(self, stage)
+        pids.append(handle["pid"])
+        return handle
+
+    monkeypatch.setattr(local.LocalPlacement, "launch", recorded)
+    entrypoint = write_project(tmp_path, LINGERING.format(executor=""))
+    engine = make_engine(state, entrypoint, heartbeat_seconds=30)
+    await engine.initialize()
+    detail = await engine.run_until((await engine.submit(["lingering"]))["id"], 60)
+    assert detail["request"]["status"] == "succeeded"
+    for _ in range(100):
+        try:
+            os.kill(pids[0], 0)
+        except ProcessLookupError:
+            break
+        await asyncio.sleep(0.05)
+    else:
+        raise AssertionError("the worker outlived its result")
+
+
+async def test_a_pool_attempt_runs_in_a_child_of_the_warm_worker(state, tmp_path, monkeypatch):
+    """D5: the pool worker forks a child per attempt from its imported
+    project; the child ends with its attempt, threads it left included."""
+
+    import subprocess
+    import sys
+
+    entrypoint = write_project(tmp_path, LINGERING.format(executor='(executor=Pool("ingest")())'))
+    monkeypatch.setenv("SOLERA_PROJECT", entrypoint)
+    engine = make_engine(state, entrypoint, heartbeat_seconds=0.2)
+    await engine.initialize()
+    run = await engine.submit(["lingering"])
+    for _ in range(100):
+        await engine.tick()
+        if state.model.pool:
+            break
+        await asyncio.sleep(0.02)
+    [stage] = await engine.pool_work("ingest", {}, "w1", 0)
+    # A fresh process, as a pool worker is: it forks before touching the object store.
+    worker = (
+        "import asyncio, json, sys\n"
+        "from solera_worker.worker import _forked, load_project\n"
+        "print(asyncio.run(_forked(json.loads(sys.argv[1]), None, load_project(sys.argv[2]))))\n"
+    )
+    started = asyncio.get_running_loop().time()
+    done = await asyncio.to_thread(
+        subprocess.run,
+        [sys.executable, "-c", worker, json.dumps(stage), entrypoint],
+        capture_output=True,
+        text=True,
+        timeout=50,
+    )
+    assert done.stdout.strip().splitlines()[-1] == "0", done.stderr
+    assert asyncio.get_running_loop().time() - started < 30  # not the lingering minute
+    detail = await engine.run_until(run["id"], 30)
+    assert detail["request"]["status"] == "succeeded"

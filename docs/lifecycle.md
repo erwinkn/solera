@@ -912,6 +912,18 @@ memory and rebuilds them after a restart from the journal and `.worker`:
 - **Engine down:** pool workers finish their attempts and get no new ones.
 - The handle is `{attempt, pool}`. A cancel before the claim withdraws the
   attempt from discovery and ends it; after it, cancel is §7.
+- **One process per attempt.** A pool worker imports the project once, and
+  runs each attempt it gets in a child forked from that warm process. The
+  child is the attempt's process: a forced cancel ends it, and it exits the
+  moment its result is published. The parent never uses the object store,
+  so its children can.
+
+**Every attempt process exits at once** (`os._exit`) once its sealed
+result is published, or once it cannot be: Local, ECS and Kubernetes
+workers as much as pool children. A thread the attempt gave up on — a
+synchronous `Each` call canceled mid-flight, say — would otherwise keep
+the process, and its placement, alive until it returned. (Modal runs the
+harness as a function in a container of its own: not this exit.)
 
 ## 11. Sensors
 
