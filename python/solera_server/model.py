@@ -131,6 +131,14 @@ def commit_of(head: dict | None) -> tuple | None:
     )
 
 
+def _delta_files(entries) -> frozenset[str]:
+    """The index files discard entries of kind `delta` read."""
+
+    return frozenset(
+        f"{d['prefix']}{name}.kx" for d in entries if d["kind"] == "delta" for name in d["files"]
+    )
+
+
 class Model:
     def __init__(self):
         self.restore(None)
@@ -448,6 +456,11 @@ class Model:
             "launched": True,
             "reads": delivery.reads(launched["prepared"].get("plans") or {}),
             "domains": tuple(launched["prepared"].get("domains") or ()),
+            "discards": _delta_files(
+                d
+                for info in (launched["prepared"].get("outputs") or {}).values()
+                for d in info.get("discard") or ()
+            ),
         }
         self.attempts[attempt] = task["id"]
         self.locks[(task["asset"], task["scope"])] = attempt
@@ -1128,17 +1141,13 @@ class Model:
         return ((manifest.get("stores") or {}).get(record.get("store")) or {}).get("writes") == "immutable"
 
     def discard_reads(self) -> set[str]:
-        """The index files pending discard entries still read (their delta
-        files name the predecessors): kept until the entries are done, even
-        once the index lets go of them."""
+        """The index files discard entries still read (their delta files name
+        the predecessors): kept while an entry is pending, and while a live
+        attempt holds it in its spec — acknowledged by another meanwhile, it
+        is still being read — even once the index lets go of them."""
 
-        return {
-            f"{d['prefix']}{name}.kx"
-            for entries in self.discards.values()
-            for d in entries
-            if d["kind"] == "delta"
-            for name in d["files"]
-        }
+        pending = _delta_files(d for entries in self.discards.values() for d in entries)
+        return pending.union(*(claim.get("discards") or () for claim in self.claims.values()))
 
     def _collect(self, output: str, scope: str, entry: dict) -> None:
         """Queue data garbage let go of now: `n`, the event position, is

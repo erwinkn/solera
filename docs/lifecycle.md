@@ -837,7 +837,9 @@ engine reader what it reads (`history/` for a history query). Index and
 history files are collected by the same rule, by their paths, so one slow
 reader holds back only what it reads. A delta file
 a pending entry reads is kept, even once the index let go of it, until the
-entry is done. An entry whose files cannot be read stays pending; after
+entry is done — and while an attempt whose spec holds the entry runs, even
+if another acknowledged it meanwhile (the previous attempt's own discards
+after its commit can). An entry whose files cannot be read stays pending; after
 three such attempts it is `stuck`: no longer handed out, listed in
 `/api/diagnostics` and on its scope's head record, until an operator runs
 `solera scopes discards OUTPUT [SCOPE] --clear` (its objects stay). An

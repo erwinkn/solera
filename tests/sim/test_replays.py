@@ -27,17 +27,14 @@ def test_f9_a_key_dropped_by_a_moved_output_leaves_its_consumers():
     state.teardown()
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="F11: a delta a pending discard entry reads is deleted under the attempt reading it "
-    "(the replay's timing no longer reproduces it since keys are versioned by generation)",
-)
 def test_f11_a_discard_entrys_delta_outlives_the_attempt_reading_it():
-    """A `copy` attempt's spec hands it discard entry `delta` naming a delta
-    file compaction let go of before the attempt was claimed; collection
-    deletes that file while the attempt runs, and the attempt finds it gone
-    (docs/lifecycle.md §9.8: such a file is kept until the entry is done).
-    Timing-sensitive: the invariant checks between steps are part of the run."""
+    """F11: a `copy` attempt's spec hands it discard entry `delta` naming a
+    delta file compaction let go of before the attempt was claimed; the
+    entry is acknowledged meanwhile, and collection deleted that file while
+    the attempt ran. The file is kept while an attempt holds the entry
+    (docs/lifecycle.md §9.8; tests/server/test_model.py has the sequence
+    itself). Timing-sensitive: the invariant checks between steps are part
+    of the run."""
 
     state = Simulation()
     state.boot(seed=201, store="table")

@@ -517,3 +517,32 @@ def test_a_rename_moves_a_scopes_record_whole():
     assert m.scope("new", "x") == {**whole, "watermarks": {"feed": wm}}
     assert m.scope("new", "y") == {"last": {"outcome": "succeeded", "run": "r", "attempt": "b", "at": 2.0}}
     assert m.scope("old", "x") == {} and sorted(m.scopes.of("new")) == ["x", "y"]
+
+
+def test_a_discard_entrys_delta_outlives_the_attempt_holding_it():
+    """docs/lifecycle.md §9.8, simulation finding F11: an attempt's spec hands
+    it a discard entry; the previous attempt's own discards (D8) acknowledge
+    that entry meanwhile. The delta file the entry reads stays readable until
+    the attempt holding it ends, not only while the entry is pending."""
+
+    m = Model()
+    entry = {"n": 1, "id": "1.0", "kind": "delta", "prefix": "keys/out/_/", "files": ["000000000003-a"]}
+    path = "keys/out/_/000000000003-a.kx"
+    m.discards[("out", "")] = [entry]
+    task = {
+        "id": "t1",
+        "asset": "out",
+        "scope": "",
+        "launched": {
+            "attempt": "A2",
+            "started_at": 0.0,
+            "pin": 5,
+            "prepared": {"outputs": {"out": {"discard": [entry]}}},
+        },
+    }
+    m._hold(task)
+    assert path in m.discard_reads()
+    m._drop_discards("out", "", ["1.0"])  # acknowledged by the attempt before
+    assert path in m.discard_reads()  # A2 still reads it
+    del m.claims["t1"]  # A2 ended
+    assert path not in m.discard_reads()
