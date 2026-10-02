@@ -222,3 +222,30 @@ async def test_a_canceled_query_keeps_its_pin_until_its_thread_is_done(tmp_path)
     with contextlib.suppress(asyncio.CancelledError):
         await pending
     assert pins == []
+
+
+async def test_a_query_parses_nothing_on_the_event_loop(tmp_path, monkeypatch):
+    """Review round 5, engine #6: mirroring 100,000 buffered rows into
+    DuckDB blocked the event loop for half a second before the threaded
+    query began. Mirroring, and opening the transaction, happen on the
+    preparing thread; queries prepare in the order they took their
+    snapshots, so each still sees its own."""
+
+    store = Store(tmp_path)
+    lake = Lake(store, SCHEMA, lambda: store.lake, name="Log")
+    loop_thread, threads = threading.get_ident(), []
+    mirror = lake._mirror
+
+    def watched(*args):
+        threads.append(threading.get_ident())
+        return mirror(*args)
+
+    monkeypatch.setattr(lake, "_mirror", watched)
+    store.lake.append("events", {"run": "a", "at": 1.0, "n": 1})
+    first = asyncio.create_task(lake.query(rows, ("events",)))
+    await asyncio.sleep(0)  # its snapshot taken: then another row, and a second query
+    store.lake.append("events", {"run": "b", "at": 2.0, "n": 2})
+    second = asyncio.create_task(lake.query(rows, ("events",)))
+    assert await first == [("a", 1)] and await second == [("a", 1), ("b", 2)]
+    assert threads and loop_thread not in threads
+    await lake.stop()

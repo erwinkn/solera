@@ -30,6 +30,7 @@ import math
 import os
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -161,6 +162,9 @@ class Lake:
         self.last_error: str | None = None
         self._db = None  # in-memory DuckDB mirroring the buffers
         self._mirrored: dict[str, tuple] = {}  # table -> (state, generation, first seq, last seq)
+        # One thread mirrors the buffers and opens queries' transactions, in the
+        # order their snapshots were taken: the mirror only ever moves forward.
+        self._preparer: ThreadPoolExecutor | None = None
         # rows of `volatile` tables: memory only, never journaled, until a flush writes them
         self.volatile: dict[str, list[list]] = {table: [] for table in volatile}
         self.pin = pin  # a context in which the files a query chose are not collected
@@ -191,6 +195,9 @@ class Lake:
             job.cancel()
         await asyncio.gather(*jobs, return_exceptions=True)
         self._task = None
+        if self._preparer is not None:
+            self._preparer.shutdown(wait=False)
+            self._preparer = None
 
     def buffer(self, table: str, row: dict) -> None:
         """Buffer a row of a volatile table: no event, so a crash loses it."""
@@ -469,15 +476,14 @@ class Lake:
             self._db = duckdb.connect()
         return self._db
 
-    def _mirror(self, table: str) -> None:
-        """Bring the in-memory copy of `table`'s buffer up to date: drop what
-        was flushed, add what was appended — or, after rows were forgotten
-        or the state replaced, copy it anew."""
+    def _mirror(self, table: str, lake, generation: int, rows: list, seq: int) -> None:
+        """Bring the in-memory copy of `table`'s buffer up to `rows`, as a
+        query's snapshot took them: drop what was flushed, add what was
+        appended — or, after rows were forgotten or the state replaced, copy
+        it anew."""
 
-        lake, db = self.held(), self._database()
-        rows = lake.rows.get(table) or []
+        db = self._database()
         buffer = f'"{table}__buffer"'
-        generation = lake.generation.get(table, 0)
         seen = self._mirrored.get(table)
         if seen is None:
             columns = ", ".join(f'"{c}" {t}' for c, t in self.schema[table].columns.items())
@@ -502,7 +508,7 @@ class Lake:
                     f"INSERT INTO {buffer} SELECT * FROM read_json({_sql_str(path)}, "
                     f"format='newline_delimited', columns={{{columns}, '_seq': 'BIGINT'}})"
                 )
-        first = rows[0][0] if rows else lake.seq + 1
+        first = rows[0][0] if rows else seq + 1
         self._mirrored[table] = (lake, generation, first, max(last, rows[-1][0] if rows else last))
 
     async def query(
@@ -522,7 +528,9 @@ class Lake:
         One snapshot, taken before the first await: the files chosen, their
         hidden keys and the buffers (kept by the transaction) agree, so a
         flush during the download can neither hide a row nor show it twice.
-        The files chosen are pinned until the query ends."""
+        The files chosen are pinned until the query ends. Nothing is parsed
+        on the event loop: the buffers are mirrored, and the transaction
+        opened, on the preparing thread, while the files download."""
 
         with self.pin():
             lake = self.held()
@@ -540,17 +548,18 @@ class Lake:
                     picked.append(f)
                 files[table] = [(self._local(f["path"]), list(f.get("hidden") or ())) for f in picked]
                 chosen += [f["path"] for f in picked]
-            for table in tables:
-                self._mirror(table)
-            con = self._database().cursor()
+            buffers = [
+                (t, lake, lake.generation.get(t, 0), list(lake.rows.get(t) or ()), lake.seq) for t in tables
+            ]
+            if self._preparer is None:
+                self._preparer = ThreadPoolExecutor(1, thread_name_prefix="lake-prepare")
+            preparing = asyncio.get_running_loop().run_in_executor(self._preparer, self._begin, buffers)
+            extra = {t: rows for t, rows in (extra or {}).items() if rows and t in tables}
             try:
-                con.execute("BEGIN TRANSACTION")
-                for table in tables:
-                    con.execute(f'SELECT 1 FROM "{table}__buffer" LIMIT 0').fetchall()
-                extra = {t: rows for t, rows in (extra or {}).items() if rows and t in tables}
                 await self._fetch(chosen)
+                con = await asyncio.shield(preparing)
             except BaseException:
-                con.close()
+                preparing.add_done_callback(lambda f: f.cancelled() or f.exception() or f.result().close())
                 raise
             # The pin lasts as long as the thread reads: a query canceled meanwhile
             # waits for it before letting its files go.
@@ -560,6 +569,22 @@ class Lake:
             except asyncio.CancelledError:
                 await asyncio.wait({reading})
                 raise
+
+    def _begin(self, buffers: list[tuple]):
+        """On the preparing thread: mirror a snapshot's buffers, then open the
+        transaction that keeps them as they are for its query."""
+
+        for buffer in buffers:
+            self._mirror(*buffer)
+        con = self._database().cursor()
+        try:
+            con.execute("BEGIN TRANSACTION")
+            for table, *_ in buffers:
+                con.execute(f'SELECT 1 FROM "{table}__buffer" LIMIT 0').fetchall()
+        except BaseException:
+            con.close()
+            raise
+        return con
 
     def _answer(self, con, work, tables, files, extra):
 
