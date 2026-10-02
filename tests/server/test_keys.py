@@ -556,7 +556,7 @@ async def test_input_reads_come_from_the_engine_once_warm(state, monkeypatch):
             return [{"n": len(items)}]
 
         fn.__name__ = name
-        return asset(inputs={"items": Incremental(batch_size=100)})(fn)
+        return asset(inputs={"items": Incremental(page_size=100)})(fn)
 
     served, real_reads = [], KeyService.reads
 
