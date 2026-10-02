@@ -148,7 +148,9 @@ class State:
         if self.journal.fenced:
             raise Unavailable("This writer was replaced; restart required")
         if self.broken is not None:
-            raise Unavailable(f"State failed applying an event ({self.broken}); restart to replay the journal")
+            raise Unavailable(
+                f"State failed applying an event ({self.broken}); restart to replay the journal"
+            )
         encoded = [encode(event) for event in events]
         for data in encoded:
             try:
@@ -156,7 +158,9 @@ class State:
             except Exception as error:
                 # Applied in part, journaled not at all: nothing may build on it.
                 self.broken = error
-                raise Unavailable(f"State failed applying an event ({error}); restart to replay the journal") from error
+                raise Unavailable(
+                    f"State failed applying an event ({error}); restart to replay the journal"
+                ) from error
         self.journal.append(*encoded, lazy=lazy)
         self.changed.set()
 

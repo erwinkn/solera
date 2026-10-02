@@ -2,6 +2,7 @@
 commit, a compaction or an abandoned attempt let go of is discarded by the
 scope's next attempt, once no reader can still need it."""
 
+import asyncio
 import random
 
 from solera.keys.index import Options
@@ -11,7 +12,7 @@ from solera_server.engine import Engine
 from solera_server.placements.inline import InlinePlacement
 from solera_server.state import State
 
-from tests.conftest import whole
+from tests.conftest import whole, worker_finished
 
 
 def engine_for(state, project, **kw):
@@ -20,8 +21,11 @@ def engine_for(state, project, **kw):
 
 
 async def run(engine, targets):
+    """A run settled, and its workers done: their discards after the commit too."""
+
     detail = await engine.run_until((await engine.submit(targets))["id"], 20)
     assert detail["request"]["status"] == "succeeded", [t.get("error") for t in detail["tasks"]]
+    await worker_finished()
     return detail
 
 
@@ -356,3 +360,31 @@ async def test_a_reader_pin_at_commit_keeps_the_garbage_queued(tmp_path, data):
     assert objects(data, "scores") == await named(state, "scores")
     await engine.stop()
     await state.close()
+
+
+async def test_a_run_is_settled_before_its_worker_has_discarded(tmp_path, data, monkeypatch):
+    """Review round 3, S2: the worker discards after its commit, so a run
+    reads settled while its discards are still under way; tests wait for
+    the worker, never for a while."""
+
+    discard, go = FileStore.discard, asyncio.Event()
+
+    async def held(self, *args, **kw):
+        await go.wait()
+        await discard(self, *args, **kw)
+
+    monkeypatch.setattr(FileStore, "discard", held)
+    project = scores_project()
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = engine_for(state, project)
+    await engine.initialize()
+    await engine.run_until((await engine.submit(["scores"]))["id"], 20)
+    go.set()
+    await worker_finished()
+    go.clear()
+    settled = await engine.run_until((await engine.submit(["scores"]))["id"], 20)
+    assert settled["request"]["status"] == "succeeded"
+    assert objects(data, "scores") != await named(state, "scores")  # the worker is still discarding
+    go.set()
+    await worker_finished()
+    assert objects(data, "scores") == await named(state, "scores")

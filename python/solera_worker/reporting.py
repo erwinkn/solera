@@ -145,7 +145,9 @@ class LogShipper:
             self.lines += 1
             if self.channel is not None:
                 self.live.append(line)
-                if len(self.live) > LOG_LIVE_MAX:  # the channel is not keeping up: a gap, filled by the chunks
+                if (
+                    len(self.live) > LOG_LIVE_MAX
+                ):  # the channel is not keeping up: a gap, filled by the chunks
                     drop = len(self.live) - LOG_LIVE_MAX
                     del self.live[:drop]
                     self.live_offset += drop

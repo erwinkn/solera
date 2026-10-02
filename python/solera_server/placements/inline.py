@@ -42,6 +42,14 @@ class InlinePlacement:
             return {"code": 1, "reason": f"{type(error).__name__}: {error}", "meta": {}}
         return {"code": task.result(), "reason": None, "meta": {}}
 
+    def release(self, run: dict) -> None:
+        """Settled: the worker's task goes once it ends (it may still be
+        discarding after its commit, docs/lifecycle.md §9.8)."""
+
+        task = self._tasks.get(run["id"])
+        if task is not None:
+            task.add_done_callback(lambda _: self._tasks.pop(run["id"], None))
+
     async def cancel(self, run: dict) -> None:
         task = self._tasks.pop(run["id"], None)
         if task is not None:

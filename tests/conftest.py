@@ -1,3 +1,6 @@
+import asyncio
+import contextlib
+
 import pytest
 from obstore.store import LocalStore
 from solera.sdk import Output
@@ -15,6 +18,64 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if "slow" in item.keywords:
             item.add_marker(skip)
+
+
+@pytest.fixture(autouse=True)
+async def world(monkeypatch):
+    """Every engine and state a test makes, torn down after it in order:
+    engines stopped (their key services' threads with them), then states
+    closed. Whatever a test stops or closes itself is not done twice."""
+
+    from solera_server.engine import Engine
+    from solera_server.state import State
+
+    engines, states = [], []
+    init, open_state = Engine.__init__, State.open
+
+    def made(self, *args, **kw):
+        init(self, *args, **kw)
+        engines.append(self)
+
+    async def opened(*args, **kw):
+        state = await open_state(*args, **kw)
+        states.append(state)
+        return state
+
+    monkeypatch.setattr(Engine, "__init__", made)
+    monkeypatch.setattr(State, "open", opened)
+    yield
+    for engine in engines:
+        with contextlib.suppress(Exception):
+            await engine.stop()
+    for state in states:
+        with contextlib.suppress(Exception):
+            await state.close()
+
+
+async def worker_finished() -> None:
+    """Every in-process worker done — past its commit, its discards too
+    (docs/lifecycle.md §9.8): a run is settled before its worker ends."""
+
+    from solera_server.placements.inline import InlinePlacement
+
+    while running := [t for t in InlinePlacement._tasks.values() if not t.done()]:
+        await asyncio.wait(running)
+
+
+async def maintenance_drained(engine) -> None:
+    """Upkeep with nothing left in flight: compactions and recounts done,
+    their results recorded, garbage collected."""
+
+    upkeep = engine.upkeep
+    for _ in range(50):
+        upkeep.truncate()
+        upkeep.maintain()
+        if not upkeep.jobs:
+            await upkeep.collect()
+            if not upkeep.jobs:
+                return
+        await asyncio.gather(*list(upkeep.jobs.values()), return_exceptions=True)
+    raise AssertionError("upkeep never drained")
 
 
 @pytest.fixture
