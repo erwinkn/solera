@@ -657,9 +657,9 @@ class Model:
             summary["outputs"] = {
                 name: h["ref"].get("version") for name, h in commit.get("heads", {}).items()
             }
-        task["attempts"].append(summary)
         if e.get("keys"):
             summary["keys"] = e["keys"]
+        self._tried(run, task, summary)
         if commit and outcome in ("canceled", "failed"):
             # A drained Each page: what finished commits (docs/lifecycle.md §7).
             self._install(task, commit, e, reads)
@@ -681,7 +681,7 @@ class Model:
             task["status"] = "skipped"
             self._finished(run, task, "skipped", e["attempt"], at)
         elif outcome == "failed":
-            failures = sum(1 for a in task["attempts"] if a["outcome"] == "failed")
+            failures = task["outcomes"].get("failed", 0)
             allowed = task["max_attempts"]
             transient = e.get("retry_for") is not None
             if transient:
@@ -701,6 +701,24 @@ class Model:
             self._ready(run, task, at)
         else:
             raise ValueError(f"unknown attempt outcome {outcome!r}")
+
+    def _tried(self, run: dict, task: dict, summary: dict) -> None:
+        """An ended attempt: its row goes to the history now, and its task
+        keeps only what scheduling and the task's own row need — however
+        many pages a task runs, it holds no list of them."""
+
+        task["tries"] = task.get("tries", 0) + 1
+        outcomes = task.setdefault("outcomes", {})
+        outcomes[summary["outcome"]] = outcomes.get(summary["outcome"], 0) + 1
+        task["duration"] = task.get("duration", 0.0) + history.span(summary)
+        task.setdefault("first_at", summary["started_at"])
+        task["last_at"] = summary["finished_at"]
+        task["last"] = {k: summary[k] for k in ("id", "outcome", "error", "outputs") if k in summary}
+        if summary.get("error"):
+            task["error"] = summary["error"]
+        if summary.get("executor"):
+            task["executor"] = summary["executor"]
+        self._record("attempts", history.attempt_row(run["id"], task, summary, task["tries"]))
 
     def _attempt_events(self, run: dict, task: dict, e: dict, launched: dict | None) -> dict[str, float]:
         """Record what the worker says of an ended attempt, then how it

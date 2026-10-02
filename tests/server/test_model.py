@@ -150,7 +150,7 @@ async def test_an_aborted_attempt_can_no_longer_commit(state, clock):
         await asyncio.sleep(0.02)
         if state.model.claimed(attempt) is None:
             break
-    assert state.model.task(task_id)["attempts"][-1]["outcome"] == "canceled"
+    assert state.model.task(task_id)["last"]["outcome"] == "canceled"
     with pytest.raises(LostOwnership):
         await engine.commit_attempt(attempt, {"inputs": {}, "baseline": {}}, {"outputs": {}})
 
@@ -369,3 +369,48 @@ async def test_a_value_the_journal_cannot_hold_changes_nothing(state, clock):
     assert state.model.runs == runs
     await state.durable()
     json.dumps(state.model.snapshot(), allow_nan=False)
+
+
+async def test_a_paged_task_keeps_no_list_of_its_pages(state, clock):
+    """Engine review #6 (D4): a task paging through a backlog holds counts
+    and its last attempt, not one summary per page; every attempt's row is
+    in the history as it ends, and the run's detail lists them all."""
+
+    from solera.stores import Patch
+
+    batch = {}
+
+    @asset(outputs=Output("uploads", keyed=True))
+    def uploads():
+        return Patch(batch)
+
+    @asset(inputs={"uploads": Incremental(batch_size=1)})
+    def each_page(uploads: dict):
+        return [{"n": len(uploads)}]
+
+    project = Project(assets=[uploads, each_page])
+    engine = Engine(
+        state,
+        project.manifest,
+        placements={"Local": lambda s, c: InlinePlacement(c, project)},
+        clock=clock,
+        eval_interval=0.01,
+    )
+    await engine.initialize()
+    sizes = []
+    for n in range(3):
+        batch.clear()
+        batch.update({f"u{n}.{i}": i for i in range(6)})
+        await settle(engine, (await engine.submit(["uploads"]))["id"])
+        run = await engine.submit(["each_page"])
+        task_id = next(iter(state.model.runs[run["id"]]["tasks"]))
+        while state.model.runs.get(run["id"], {}).get("status") not in (None, "succeeded"):
+            await engine.tick()
+            await asyncio.sleep(0.01)
+            task = state.model.task(task_id)
+            if task is not None:
+                assert "attempts" not in task
+                sizes.append(len(json.dumps({k: v for k, v in task.items() if k != "launched"})))
+        detail = await engine.run_detail(run["id"])
+        assert len(detail["attempts"][task_id]) == 6  # one page a key, all in the history
+    assert max(sizes) < min(sizes) + 400  # flat, however many pages

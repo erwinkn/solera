@@ -175,7 +175,7 @@ async def test_an_attempt_its_placement_cannot_see_is_followed_by_its_heartbeat(
     await engine.initialize()
     await until(engine, lambda: state.model.claimed(attempt) is None)
     task = state.model.task(next(iter(state.model.runs[run["id"]]["tasks"])))
-    first = task["attempts"][0]
+    first = (await engine.history.attempts(run["id"]))[task["id"]][0]
     assert first["id"] == attempt and first["outcome"] == "failed"
     assert "no heartbeat" in first["error"]
     assert (await fence(state, run["id"], attempt)) == {"state": "aborted"}
@@ -277,7 +277,8 @@ async def test_a_worker_that_never_reports_is_given_up_on(tmp_path):
     run, attempt = await launched(engine, ["remote"])
     await until(engine, lambda: state.model.claimed(attempt) is None)
     task = state.model.task(next(iter(state.model.runs[run["id"]]["tasks"])))
-    assert "did not report" in task["attempts"][0]["error"] and Stuck.canceled == [attempt]
+    [ended] = (await engine.history.attempts(run["id"]))[task["id"]]
+    assert "did not report" in ended["error"] and Stuck.canceled == [attempt]
     assert (await fence(state, run["id"], attempt)) == {"state": "aborted"}
     await engine.stop()
     await state.close()
@@ -694,7 +695,7 @@ async def test_the_timeout_runs_from_the_first_report(tmp_path):
     await until(engine, lambda: state.model.claimed(attempt) is None)
     assert asyncio.get_running_loop().time() - reported >= 0.5
     task = state.model.task(next(iter(state.model.runs[run["id"]]["tasks"])))
-    assert task["attempts"][0]["error"] == "timeout"
+    assert (await engine.history.attempts(run["id"]))[task["id"]][0]["error"] == "timeout"
 
     run, attempt = await launched(engine, ["brief"])
     await state.put_object(

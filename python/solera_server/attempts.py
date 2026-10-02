@@ -771,14 +771,14 @@ class Attempts:
 
         if error.get("retry_after") is not None:
             return float(error["retry_after"])
-        failures = sum(1 for a in task["attempts"] if a["outcome"] == "failed")
+        failures = (task.get("outcomes") or {}).get("failed", 0)
         return errors.backoff(failures + 1)
 
     def _retry_delay(self, task) -> float:
         retry = task.get("retry") or {}
         delay = float(retry.get("delay", 1.0))
         if retry.get("backoff") == "exponential":
-            failures = sum(1 for a in task["attempts"] if a["outcome"] == "failed")
+            failures = (task.get("outcomes") or {}).get("failed", 0)
             delay *= 2**failures
         return delay
 

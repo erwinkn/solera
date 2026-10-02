@@ -451,7 +451,6 @@ class Engine(Attempts, Sensors, Views):
                     "ready_at": now,
                     "queued_at": now,
                     "wait": 0.0,
-                    "attempts": [],
                 }
         for task_id, task in tasks.items():
             for owner, up_scope in await self._upstream_of(task["asset"], task["scope"]):
@@ -1663,7 +1662,7 @@ class Engine(Attempts, Sensors, Views):
             commit["cursor"] = result["cursor"]
         elif prepared.get("full"):
             commit["cursor"] = None  # a full run clears the committed cursor (§8)
-        worked = any(a["outcome"] == "succeeded" for a in task["attempts"])
+        worked = bool((task.get("outcomes") or {}).get("succeeded"))
         if outcome == "succeeded" and result.get("skipped") and not more and not worked:
             outcome = "skipped"  # the patterns took none of its keys: it did nothing (per-key §11)
         self._finish(
@@ -2205,10 +2204,14 @@ class Engine(Attempts, Sensors, Views):
             raise KeyError(run_id)
         return self._run_view(run)
 
-    def _task_view(self, task: dict, live: bool) -> dict:
-        view = {k: v for k, v in task.items() if k not in ("attempts", "launched", "ready_at", "queued_at")}
+    TASK_INTERNALS = (
+        *("launched", "ready_at", "queued_at"),
+        *("tries", "outcomes", "duration", "first_at", "last_at", "last", "error", "executor"),
+    )
+
+    def _task_view(self, task: dict, attempts: list[dict], live: bool) -> dict:
+        view = {k: v for k, v in task.items() if k not in self.TASK_INTERNALS}
         claim = self.m.claims.get(task["id"]) if live else None
-        attempts = task["attempts"]
         view["status"] = claim["status"] if claim else task["status"]
         view["generation"] = view["attempt_count"] = len(attempts) + (1 if claim else 0)
         latest = attempts[-1] if attempts else None
@@ -2217,9 +2220,9 @@ class Engine(Attempts, Sensors, Views):
             view.setdefault("outputs", latest.get("outputs"))
         return view
 
-    def _attempt_views(self, task: dict, live: bool) -> list[dict]:
+    def _attempt_views(self, task: dict, attempts: list[dict], live: bool) -> list[dict]:
         out = []
-        for n, a in enumerate(task["attempts"], 1):
+        for n, a in enumerate(attempts, 1):
             view = {
                 "id": a["id"],
                 "task": task["id"],
@@ -2267,20 +2270,23 @@ class Engine(Attempts, Sensors, Views):
         )
 
     async def run_detail(self, run_id: str):
-        run = self.m.runs.get(run_id)
-        if run is not None:
-            return self._detail(run, live=True)
-        run = await self.history.run(run_id)
-        if run is None:
-            raise KeyError(run_id)
-        return self._detail(run, live=False)
+        """A run, its tasks and their attempts: ended attempts from the
+        history, whether the run is in progress or finished."""
 
-    def _detail(self, run: dict, live: bool) -> dict:
+        run, live = self.m.runs.get(run_id), True
+        if run is None:
+            run, live = await self.history.run(run_id), False
+            if run is None:
+                raise KeyError(run_id)
+        attempts = await self.history.attempts(run_id) if run.get("tasks") else {}
+        return self._detail(run, live, attempts)
+
+    def _detail(self, run: dict, live: bool, attempts: dict[str, list[dict]]) -> dict:
         tasks = [run["tasks"][tid] for tid in sorted(run.get("tasks") or {})]
         return {
             "request": self._run_view(run),
-            "tasks": [self._task_view(t, live) for t in tasks],
-            "attempts": {t["id"]: self._attempt_views(t, live) for t in tasks},
+            "tasks": [self._task_view(t, attempts.get(t["id"], []), live) for t in tasks],
+            "attempts": {t["id"]: self._attempt_views(t, attempts.get(t["id"], []), live) for t in tasks},
         }
 
     def head_view(self, head: dict) -> dict:

@@ -218,10 +218,9 @@ State
 | `Outcome` | `outcome`, `run`, `attempt`, `at` | assets × partitions |
 | `AutomationState` | `enabled`, `last_fired`, `last_run`, `last_revision`, `pending` (set of `[asset, scope]` for OnChange) | automations × partitions |
 | `Run` | `id`, `request` {targets, partitions, mode, config, keys, automation, tags}, `status`, `paused`, `created_at`, `events` (how many it has recorded), `tasks` {task: `Task`} | in-flight work |
-| `Task` | `status`, `deps`, `ready_at` (now, or a retry's due time), `wait` (seconds counted so far), `queued_at` (when the wait clock last started; null while stopped), `held?` [reason, name] (why the dispatcher last passed it over), `max_attempts`, `attempts` [`Attempt`], `launched?` {`attempt`, `started_at`, `pin` (`applied` when it was claimed), `at`, `execution`, `prepared`, `handle?`, `pool?`, `worker?`, `claimed_at?`} | |
+| `Task` | `status`, `deps`, `ready_at` (now, or a retry's due time), `wait` (seconds counted so far), `queued_at` (when the wait clock last started; null while stopped), `held?` [reason, name] (why the dispatcher last passed it over), `max_attempts`, what its ended attempts add up to — `tries`, `outcomes` {outcome: count}, `duration`, `first_at`, `last_at`, `last` (the latest attempt's `id`, `outcome`, `error?`, `outputs?`), `error?`, `executor?` — never a list of them (each one's row is in the history as it ends), `launched?` {`attempt`, `started_at`, `pin` (`applied` when it was claimed), `at`, `execution`, `prepared`, `handle?`, `pool?`, `worker?`, `claimed_at?`} | |
 | `File` | `path`, `rows`, `bytes`, `at` [lo, hi] (time column), `runs` [first, last], `deleted?` [run] (hidden until rewritten), `deleted_at?` | files per table: ~log(rows) after merging |
 | `Intent` | `added`, `removed`, `exact`, `files` (the dead attempt's delta files), `run`, `attempt` | writers that died mid-write, until the next commit of that output |
-| `Attempt` | `id`, `outcome`, `started_at`, `finished_at`, the seconds of each phase it reached, `cpu_seconds?`, `peak_memory?`, `error?`, `outputs?` {output: ref} | |
 
 **Derived, rebuilt at start:** the claims and scope locks of launched
 attempts (from `Task.launched`), the pool queue, the ready queue and the
@@ -528,8 +527,10 @@ it blocked, with `retry_of` naming it; a run in progress cannot be
 retried. Retries inside a running task are its attempts.
 
 **Where rows come from.** Rows are born inside `apply`, from the events
-that finish things: `RunArchived` yields a run's `runs`, `tasks` and
-`attempts` rows; `AttemptFinished` with a commit yields a
+that finish things: `AttemptFinished` yields the attempt's `attempts` row
+(a task paging through a backlog holds counts, not one summary per page);
+`RunArchived` yields a run's `runs` and `tasks` rows; `AttemptFinished`
+with a commit also yields a
 `materializations` row per changed output, plus `lineage` rows from the
 input versions pinned in the attempt's spec; `SourceCommitted` yields a
 `runs` row and a `materializations` row. From there, they are the **lake's**

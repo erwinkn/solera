@@ -104,7 +104,7 @@ async def test_a_dead_pool_claim_expires_into_a_new_attempt(state):
     [second] = state.model.pool
     assert second != first
     task = state.model.task(state.model.pool[second]["task"])
-    ended = task["attempts"][0]
+    ended = (await engine.history.attempts(task["run"]))[task["id"]][0]
     assert ended["id"] == first and ended["outcome"] == "failed"
     assert json.loads(await state.get_object(f"{base}.writing")) == {"state": "aborted"}
     assert [s["attempt"] for s in await engine.pool_work("ingest", {}, "w2", 0)] == [second]

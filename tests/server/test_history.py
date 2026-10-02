@@ -1,6 +1,8 @@
 """The run history (docs/object-store-state.md §7): rows born in the model,
 flushed to Parquet, merged, hidden when deleted, and queried with DuckDB."""
 
+import copy
+
 import pytest
 from solera.sdk import In, Output, Project, Result, Retry, Source, asset
 from solera_server.engine import Conflict, Engine
@@ -164,17 +166,18 @@ async def test_a_run_reads_the_same_once_archived(state, clock):
     details = {}
     record = state.record
 
-    def spy(*events, **kw):  # the run's detail just before it moves into the history
+    def spy(*events, **kw):  # the run just before it moves into the history
         for e in events:
             if e["type"] == "RunArchived":
-                details[e["run"]] = engine._detail(state.model.runs[e["run"]], live=True)
+                details[e["run"]] = copy.deepcopy(state.model.runs[e["run"]])
         record(*events, **kw)
 
     state.record = spy
     failed = await run(engine, clock, ["revenue"], upstream=True, config={"fail": True}, tags={"env": "prod"})
     commit = await engine.commit_source("uploads", upsert=["a", "b"], by="api")
     state.record = record
-    before = details[failed["id"]]
+    # Its attempts were in the history all along: the same rows, live or archived.
+    before = engine._detail(details[failed["id"]], True, await engine.history.attempts(failed["id"]))
     events = await engine.history.events(failed["id"])
     assert [e["n"] for e in events] == list(range(1, len(events) + 1))
     assert [e["type"] for e in events if e["task"] is None] == ["submitted", "failed"]
@@ -398,6 +401,7 @@ async def test_a_retry_is_a_new_run_and_the_old_one_stays_as_it_ended(state, clo
     assert failed["id"] not in state.model.runs  # archived
     owed = {(t["asset"], t["scope"]) for t in before["tasks"] if t["status"] in ("failed", "blocked")}
     assert owed
+    clock.now += 60
     retried = await engine.retry(failed["id"], by="ops")
     assert retried["id"] != failed["id"]
     again = state.model.runs[retried["id"]]

@@ -262,9 +262,48 @@ def phases(times: dict[str, float], end: float) -> dict[str, float]:
     return {phase: max(0.0, stop - start) for (phase, start), stop in zip(reached, ends, strict=True)}
 
 
-def _span(attempt: dict) -> float:
+def span(attempt: dict) -> float:
     start, end = attempt.get("started_at"), attempt.get("finished_at")
     return max(0.0, end - start) if start is not None and end is not None else 0.0
+
+
+def attempt_row(run_id: str, task: dict, summary: dict, n: int) -> dict:
+    """An ended attempt's `attempts` row, written as it ends: a task in
+    progress keeps only aggregates of the attempts behind it."""
+
+    return {
+        "id": summary["id"],
+        "run": run_id,
+        "task": task["id"],
+        "asset": task["asset"],
+        "scope": task["scope"],
+        "n": n,
+        "outcome": summary["outcome"],
+        "started_at": summary.get("started_at"),
+        "finished_at": summary.get("finished_at"),
+        "duration": span(summary),
+        **{k: summary.get(k) for k in (*PHASES, *USAGE)},
+        "error": summary.get("error"),
+        **{k: summary.get(k) for k in EXECUTION},
+        "options": summary.get("options") or {},
+        "outputs": summary.get("outputs") or {},
+        "keys": summary.get("keys") or {},
+    }
+
+
+def attempt_summary(row: dict) -> dict:
+    """An `attempts` row as the views show an attempt: `attempt_row` backwards."""
+
+    attempt = {k: row[k] for k in ("id", "outcome", "started_at", "finished_at")}
+    attempt |= {k: row[k] for k in (*PHASES, *USAGE) if row[k] is not None}
+    attempt |= {k: row[k] for k in EXECUTION if row[k]}
+    if row["error"]:
+        attempt["error"] = row["error"]
+    if row["outputs"]:
+        attempt["outputs"] = dict(row["outputs"])
+    if row.get("keys"):
+        attempt["keys"] = dict(row["keys"])
+    return attempt
 
 
 def _json(value) -> str | None:
@@ -272,16 +311,14 @@ def _json(value) -> str | None:
 
 
 def run_rows(run: dict, *, live: bool = False) -> dict[str, list[dict]]:
-    """A run's rows in `runs`, `tasks` and `attempts`. `live` describes a run
-    still in progress: no finish time."""
+    """A run's rows in `runs` and `tasks` (its attempts wrote theirs as they
+    ended). `live` describes a run still in progress: no finish time."""
 
     tasks = run["tasks"]
-    task_rows, attempt_rows = [], []
+    task_rows = []
     for tid in sorted(tasks):
         task = tasks[tid]
-        attempts = task["attempts"]
         launched = (task.get("launched") or {}).get("execution")
-        ran = [launched["executor"]] if launched else [a["executor"] for a in attempts if "executor" in a]
         retry = task.get("retry") or {}
         task_rows.append(
             {
@@ -291,44 +328,22 @@ def run_rows(run: dict, *, live: bool = False) -> dict[str, list[dict]]:
                 "scope": task["scope"],
                 "status": task["status"],
                 "created_at": run["created_at"],
-                "started_at": attempts[0].get("started_at") if attempts else None,
-                "finished_at": attempts[-1].get("finished_at") if attempts else None,
-                "attempts": len(attempts),
+                "started_at": task.get("first_at"),
+                "finished_at": task.get("last_at"),
+                "attempts": task.get("tries", 0),
                 "wait": task["wait"],
-                "duration": sum(_span(a) for a in attempts),
-                "error": next((a["error"] for a in reversed(attempts) if a.get("error")), None),
+                "duration": task.get("duration", 0.0),
+                "error": task.get("error"),
                 "deps": task["deps"],
                 "max_attempts": task["max_attempts"],
                 "retry_delay": retry.get("delay"),
                 "retry_backoff": retry.get("backoff"),
-                "executor": ran[-1] if ran else None,
+                "executor": launched["executor"] if launched else task.get("executor"),
             }
         )
-        for n, a in enumerate(attempts, 1):
-            attempt_rows.append(
-                {
-                    "id": a["id"],
-                    "run": run["id"],
-                    "task": tid,
-                    "asset": task["asset"],
-                    "scope": task["scope"],
-                    "n": n,
-                    "outcome": a["outcome"],
-                    "started_at": a.get("started_at"),
-                    "finished_at": a.get("finished_at"),
-                    "duration": _span(a),
-                    **{k: a.get(k) for k in (*PHASES, *USAGE)},
-                    "error": a.get("error"),
-                    **{k: a.get(k) for k in EXECUTION},
-                    "options": a.get("options") or {},
-                    "outputs": a.get("outputs") or {},
-                    "keys": a.get("keys") or {},
-                }
-            )
     status = run["status"]
     quiet = all(
-        t["status"] == "skipped" and all(a["outcome"] == "skipped" for a in t["attempts"])
-        for t in tasks.values()
+        t["status"] == "skipped" and set(t.get("outcomes") or ()) <= {"skipped"} for t in tasks.values()
     )
     if live:
         status = "paused" if run.get("paused") else status
@@ -361,7 +376,7 @@ def run_rows(run: dict, *, live: bool = False) -> dict[str, list[dict]]:
         "config": _json(run.get("config")),
         "keys": _json(run.get("keys")),
     }
-    return {"runs": [row], "tasks": task_rows, "attempts": attempt_rows}
+    return {"runs": [row], "tasks": task_rows}
 
 
 def run_record(rows: dict[str, list[dict]], events: int = 0) -> dict:
@@ -379,18 +394,6 @@ def run_record(rows: dict[str, list[dict]], events: int = 0) -> dict:
                 record["upserted"] = m["added_keys"] if m["added_keys"] is not None else m["added"]
                 record["deleted"] = m["removed_keys"] if m["removed_keys"] is not None else m["removed"]
         return record
-    attempts: dict[str, list[dict]] = {}
-    for a in rows["attempts"]:
-        attempt = {k: a[k] for k in ("id", "outcome", "started_at", "finished_at")}
-        attempt |= {k: a[k] for k in (*PHASES, *USAGE) if a[k] is not None}
-        attempt |= {k: a[k] for k in EXECUTION if a[k]}
-        if a["error"]:
-            attempt["error"] = a["error"]
-        if a["outputs"]:
-            attempt["outputs"] = dict(a["outputs"])
-        if a.get("keys"):
-            attempt["keys"] = dict(a["keys"])
-        attempts.setdefault(a["task"], []).append(attempt)
     tasks = {}
     for t in rows["tasks"]:
         tasks[t["id"]] = {
@@ -405,7 +408,6 @@ def run_record(rows: dict[str, list[dict]], events: int = 0) -> dict:
             if t["retry_delay"] is None
             else {"n": t["max_attempts"] - 1, "delay": t["retry_delay"], "backoff": t["retry_backoff"]},
             "wait": t["wait"],
-            "attempts": attempts.get(t["id"], []),
         }
     partitions = row["partitions"]
     return {
@@ -703,12 +705,7 @@ class History:
 
         def work(con):
             found = {}
-            for table, order in (
-                ("runs", "id"),
-                ("tasks", "id"),
-                ("attempts", "task, n"),
-                ("materializations", "output"),
-            ):
+            for table, order in (("runs", "id"), ("tasks", "id"), ("materializations", "output")):
                 found[table] = _dicts(
                     con.execute(
                         f'SELECT * FROM {table} WHERE "{TABLES[table].key}" = ? ORDER BY {order}', [run_id]
@@ -720,9 +717,20 @@ class History:
             return found
 
         found = await self.query(
-            work, ("runs", "tasks", "attempts", "materializations", "run_events"), run=run_id, live=False
+            work, ("runs", "tasks", "materializations", "run_events"), run=run_id, live=False
         )
         return run_record(found, found.pop("events") or 0) if found["runs"] else None
+
+    async def attempts(self, run_id: str) -> dict[str, list[dict]]:
+        """A run's ended attempts by task, in order — in progress or finished."""
+
+        def work(con):
+            return _dicts(con.execute("SELECT * FROM attempts WHERE run = ? ORDER BY task, n", [run_id]))
+
+        out: dict[str, list[dict]] = {}
+        for row in await self.query(work, ("attempts",), run=run_id, live=False):
+            out.setdefault(row["task"], []).append(attempt_summary(row))
+        return out
 
     async def events(self, run_id: str) -> list[dict]:
         """A run's timeline: its events in the order they happened."""

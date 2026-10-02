@@ -410,7 +410,7 @@ async def test_a_renamed_asset_keeps_its_strict_hold(tmp_path):
     renamed = await engine.submit(["catalog"])
     task = m.task(next(iter(m.runs[renamed["id"]]["tasks"])))
     await until(engine, lambda: task.get("held") == ["uncertain", hold["attempt"]])
-    assert task["status"] == "queued" and not task["attempts"]
+    assert task["status"] == "queued" and not task.get("tries")
     engine.release_scope("catalog", "", "ops@example.com")
     detail = await engine.run_until(renamed["id"], 15)
     assert detail["request"]["status"] == "succeeded"
