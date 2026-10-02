@@ -137,21 +137,27 @@ async def test_removed_keys_lose_their_rows(state):  # noqa: F811
 
 
 async def test_transient_key_retried_when_due(state):  # noqa: F811
-    tries = {"n": 0}
+    """A transient key is retried once its `retry_after` has passed — on the
+    engine's clock, which the test moves instead of waiting on the wall."""
+
+    import time
+
+    tries, skew = {"n": 0}, {"seconds": 0.0}
 
     def parse(file: dict):
         tries["n"] += 1
         if tries["n"] == 1:
-            raise Transient("busy", retry_after=0)
+            raise Transient("busy", retry_after=3600)
         return [{"value": 1}]
 
     project = files_project({"a": {"text": "1"}}, parse)
-    engine = make_engine(state, project)
+    engine = make_engine(state, project, clock=lambda: time.time() + skew["seconds"])
     await engine.initialize()
     await drive(engine, await engine.submit(["parse"], upstream=True))
-    # Due within a second — deadlines round up, never early (§9): the next run takes it.
+    assert tries["n"] == 1  # not due for an hour
+    await drive(engine, await engine.submit(["parse"]))
     assert tries["n"] == 1
-    await asyncio.sleep(1.05)
+    skew["seconds"] = 7200.0  # two hours on
     await drive(engine, await engine.submit(["parse"]))
     assert tries["n"] == 2 and set(await rows_of(engine, project, "samples")) == {"a"}
     record = engine.m.failures[("parse", "")]

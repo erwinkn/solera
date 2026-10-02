@@ -1187,7 +1187,7 @@ class Engine(Attempts, Sensors, Views):
             reset = reset or int(wm["batch"]) < first
             lo = first if reset else int(wm["batch"])
             hi = min(head_batch, lo + limit - 1)
-            pin = {"ref": ref, "changes": {"batches": [lo, hi], "full": reset}}
+            pin = {"ref": ref, "changes": {"batches": [lo, hi], "full": reset, "more": hi < head_batch}}
             update = {**base, "batch": max(lo, hi + 1), "after": None, "full": False}
             return pin, {"update": update, "more": hi < head_batch}, hi < lo
 

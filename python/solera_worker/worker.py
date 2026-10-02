@@ -345,7 +345,13 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline):
             if "batches" in ch:
                 lo, hi = (int(v) for v in ch["batches"])
                 args[param] = await store.load(ref, t, Batches(lo, hi))
-                changes[param] = Changes(rows=args[param], batches=range(lo, hi + 1), full=full)
+                changes[param] = Changes(
+                    rows=args[param],
+                    batches=range(lo, hi + 1),
+                    full=full,
+                    reset=full,  # an unkeyed reset delivery marks its first page only
+                    final=not ch.get("more"),
+                )
                 timeline.add("loaded", param, _rows(args[param]))
                 continue
             # The page — a keys= override, inlined by the engine, or read from the
@@ -355,7 +361,13 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline):
             upserted, deleted, after = window.upserted, window.deleted, window.after
             args[param] = await store.load(ref, t, Keys(upserted))
             changes[param] = Changes(
-                rows=args[param], deleted=deleted, full=full, upserted=tuple(sorted(upserted))
+                rows=args[param],
+                deleted=deleted,
+                full=full,
+                upserted=tuple(sorted(upserted)),
+                # Pages of a full delivery all say `full`; only the first resets.
+                reset=full and ch.get("after") is None and "keys" not in ch,
+                final=after is None,
             )
             delivered[param] = {"after": after, "upserted": sorted(upserted), "deleted": list(deleted)}
             timeline.add("loaded", param, _rows(args[param]))

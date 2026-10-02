@@ -1156,3 +1156,49 @@ async def test_ondeploy_two_registrations_fire_latest_once(state):
     assert calls == [1]
     auto = state.model.automations["deployed.ondeploy.0"]
     assert auto["last_revision"] == project_b.manifest["revision"]
+
+
+async def test_a_paged_full_delivery_resets_on_its_first_page_only(state):
+    """A full delivery spans pages of `batch_size`: `reset` on the first, `full`
+    on all, `final` on the last — so a consumer that rebuilds on `reset`
+    keeps every page (§5)."""
+
+    from solera.stores import Patch
+
+    pages, rebuilt = [], {"keys": []}
+
+    @asset(outputs=Output("files", key="id"))
+    def files():
+        return [{"id": f"k{i}", "v": 1} for i in range(7)]
+
+    @asset(inputs={"files": Incremental(batch_size=3)})
+    def consumer(ctx, files: list):
+        ch = ctx.changes["files"]
+        pages.append((ch.reset, ch.full, ch.final))
+        if ch.reset:
+            rebuilt["keys"] = []
+        rebuilt["keys"] += [r["id"] for r in files]
+        return [{"n": len(files)}]
+
+    @asset(outputs=Output("log", incremental=True))
+    def log(ctx):
+        return Patch([{"n": int(ctx.cursor or 0)}])
+
+    batch_pages = []
+
+    @asset(inputs={"log": Incremental(batch_size=1)})
+    def tail(ctx, log: list):
+        ch = ctx.changes["log"]
+        batch_pages.append((ch.reset, ch.final))
+        return [{"n": len(log)}]
+
+    project = Project(assets=[files, consumer, log, tail])
+    engine = make_engine(state, project)
+    await engine.initialize()
+    await drive(engine, await engine.submit(["consumer"], upstream=True))
+    assert pages == [(True, True, False), (False, True, False), (False, True, True)]
+    assert sorted(rebuilt["keys"]) == [f"k{i}" for i in range(7)]
+    for _ in range(3):
+        await drive(engine, await engine.submit(["log"]))
+    await drive(engine, await engine.submit(["tail"]))
+    assert batch_pages == [(True, False), (False, False), (False, True)]
