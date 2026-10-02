@@ -19,6 +19,7 @@ from solera.sdk import (
     AllPartitions,
     Automation,
     AutoRefresh,
+    Commit,
     Cron,
     Each,
     Every,
@@ -31,9 +32,11 @@ from solera.sdk import (
     Result,
     Source,
     TableRef,
+    Tick,
     TimePartitions,
     asset,
     job,
+    sensor,
 )
 from solera.stores import Patch, S3Store, Sql
 from solera_postgres import PostgresStore
@@ -128,7 +131,8 @@ ingest = Pool("ingest")
 
 # ---------------------------------------------------------------------------
 # Partition sets: `sites` refreshes on a cron and grows; `uploads` is fed from
-# outside through `solera commit uploads --upsert ...` (§5, §7).
+# outside — `solera commit uploads --upsert ...`, or the `upload_drop` sensor
+# below (§5, §7).
 # ---------------------------------------------------------------------------
 
 
@@ -143,6 +147,22 @@ def sites(ctx, registry: SiteRegistry):
 
 
 uploads = PartitionSet("uploads")
+
+UPLOAD_EVERY, UPLOADS = 60, 3
+
+
+@sensor(every=15, commits=["uploads"])
+def upload_drop(ctx) -> Tick | None:
+    """A pretend upload folder, checked every 15 seconds: a new upload lands
+    a minute after the last one, three at most. The cursor holds how many
+    were committed and when the last was, so most ticks find nothing new and
+    are skipped — the tick history shows both (docs/lifecycle.md §11)."""
+    count, last = ctx.cursor or (0, 0.0)
+    now = time.time()
+    if count >= UPLOADS or now - last < UPLOAD_EVERY:
+        return None
+    count += 1
+    return Tick(cursor=[count, now], commits=[Commit("uploads", upsert=[f"drop-{count}"])])
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +244,8 @@ def file_index(ctx, site_files: list[dict]):
 # Per-file processing: an Each edge runs one call per changed file, four at a
 # time; every file's rows go to the store in one write per page, and a file
 # that raises is kept in the asset's failure index, per key, while the others
-# commit (docs/per-key-processing.md §5, §9).
+# commit (docs/per-key-processing.md §5, §9). The edge's patterns leave each
+# site's third file — a draft — out entirely (§11).
 # ---------------------------------------------------------------------------
 
 
@@ -241,12 +262,14 @@ class Unreadable(Rejected):
         migrations=postgres_migrations("file_checks"),
     ),
     partitions={"site": sites},
-    inputs={"file": Each("site_files", batch_size=4, concurrency=4)},
+    inputs={"file": Each("site_files", batch_size=4, concurrency=4, exclude={"drafts": "*-file-2"})},
     automations=AutoRefresh(),
 )
 async def file_checks(ctx, file: list[dict]):
     """One changed file: a row per check. The fourth file of a site is
-    unreadable on odd feed ticks — watch it come and go as a rejected key."""
+    unreadable on odd feed ticks — watch it come and go as a rejected key.
+    The third is a draft: excluded by the edge, never called (`explain` says
+    which rule)."""
     [row] = file
     if row["file_id"].endswith("-file-3") and int(row["version"].lstrip("t")) % 2:
         raise Unreadable(f"{row['path']}: no header row")
@@ -415,8 +438,9 @@ project = Project(
     ],
     sources=[
         Source("roadmap"),  # lineage-only: read via resources, pinned via deps=
-        uploads,  # external PartitionSet, fed by the commit API
+        uploads,  # external PartitionSet, fed by the commit API and `upload_drop`
     ],
+    sensors=[upload_drop],
     stores={
         "postgres": PostgresStore(dsn="env:DATABASE_URL"),
     },

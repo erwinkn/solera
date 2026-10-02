@@ -622,6 +622,12 @@ count of a keyed output, else the length of a returned list.
 | p50/p95 duration and wait, failure counts, compute hours, per asset and per executor | `GET /stats?since=&asset=&scope=` | |
 | an asset's versions and their metadata | `GET /assets/{name}/history?output=&scope=&before=` | |
 | what a version was built from, or what was built from it | `GET /outputs/{name}/lineage?scope=&version=&direction=upstream\|downstream&depth=5` | |
+| every asset at a glance: scopes by status, newest outcome, failing keys, held and unsettled scopes | `GET /assets:status` → `{assets: {name: {partitions, partitioned, last, failures, held, unsettled, updated_at}}}` | |
+| an `Each` asset's failing keys, and each scope's failure record | `GET /assets/{name}/failures?scope=&outcome=&after=&limit=100` → `{scopes, keys, epoch, now, next}` | |
+| what an `Each` asset's keys came to, newest first | `GET /assets/{name}/key-outcomes?scope=&key=&q=&outcome=&run=&before=&limit=100` → `{outcomes, next}` | |
+| why a key is, or is not, in an asset's output (per-key-processing.md §10) | `GET /assets/{name}/explain?key=&scope=&edge=` → `{verdict, patterns, failure, last, last_ok, …}` | |
+| an asset's input edges, with every scope's watermark, lag and state | `GET /assets/{name}/edges` | |
+| scopes held for an uncertain writer, unsettled outputs, stuck discards (lifecycle.md §9.8, §9.9) | `GET /holds` | `solera scopes release`, `solera scopes discards` |
 
 Filter fields combine with AND; repeating one field (`status=failed&status=canceled`)
 matches any of its values. A facet counts its values with every *other*

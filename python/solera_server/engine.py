@@ -23,6 +23,7 @@ import contextlib
 import datetime as dt
 import json
 import logging
+import math
 import secrets
 from itertools import product
 from zoneinfo import ZoneInfo
@@ -45,6 +46,7 @@ from .placements import PlacementContext, Registry
 from .sensors import PROJECTED, Sensors
 from .state import Conflict, LostOwnership, State
 from .upkeep import ALIVE, Upkeep
+from .views import Views
 
 log = logging.getLogger(__name__)
 
@@ -80,7 +82,7 @@ def check_tags(tags) -> dict[str, str]:
     return dict(sorted(tags.items()))
 
 
-class Engine(Attempts, Sensors):
+class Engine(Attempts, Sensors, Views):
     Conflict = Conflict
     GRACE_SECONDS = GRACE_SECONDS
 
@@ -1855,18 +1857,52 @@ class Engine(Attempts, Sensors):
         with self.m.reading():  # its files outlive compaction until the page is read
             index = KeyIndex(self._key_io(), None, state.pinned(), self.key_options)
             keys, versions, _, nxt = await index.page(start, offset + limit)
-        # Versions are a declared revision's text, a source's version, or else a row digest.
-        record = self.manifest["outputs"].get(output) or {}
-        digests = not (record.get("source") or record.get("partition_set") or record.get("revision"))
-        show = bytes.hex if digests else key_str
         return {
             "total": state.count,
             "exact": state.count_exact,
-            "keys": {key_str(k): show(v) for k, v in list(zip(keys, versions, strict=True))[offset:]},
+            "keys": {
+                key_str(k): self._rendered(output, v)
+                for k, v in list(zip(keys, versions, strict=True))[offset:]
+            },
             "next": key_str(nxt) if nxt is not None else None,
         }
 
+    def _rendered(self, output: str, version: bytes) -> str:
+        """A key's version in `output`, as `key_outcomes` shows it: a declared
+        revision's text, a source's version, a set's element — else a row
+        digest, in hex."""
+
+        record = self.manifest["outputs"].get(output) or {}
+        if record.get("source") or record.get("partition_set") or record.get("revision"):
+            return version.decode(errors="replace")
+        return version.hex()
+
     # -- automations (§9) ------------------------------------------------------------
+
+    @staticmethod
+    def _due_at(auto: dict) -> float | None:
+        """When a schedule comes due (§9): `every` its interval after it last
+        fired, at once if it never has; `cron` its next time after it last
+        fired, counted from the epoch if it never has. `None` for the
+        triggers that wait on an event, and for a disabled automation."""
+
+        trigger = auto["trigger"]
+        if not auto["enabled"]:
+            return None
+        if trigger["kind"] == "every":
+            return -math.inf if auto["last_at"] is None else auto["last_at"] + trigger["seconds"]
+        if trigger["kind"] == "cron":
+            zone = ZoneInfo(trigger.get("timezone") or "UTC")
+            base = dt.datetime.fromtimestamp(auto["last_at"] or 0, zone)
+            return croniter(trigger["expression"], base).get_next(dt.datetime).timestamp()
+        return None
+
+    def automation_view(self, auto: dict) -> dict:
+        """An automation as the API shows it: a copy, with `next_at`, when its
+        schedule next fires (now, if it is due), or null."""
+
+        due = self._due_at(auto)
+        return {**auto, "next_at": None if due is None else max(due, self.clock())}
 
     async def _automation_tick(self):
         now = self.clock()
@@ -1875,13 +1911,8 @@ class Engine(Attempts, Sensors):
             if not auto["enabled"] or auto["name"] in self._firing:
                 continue
             trigger = auto["trigger"]
-            if trigger["kind"] == "every":
-                if auto["last_at"] is None or now >= auto["last_at"] + trigger["seconds"]:
-                    fired.append((auto, "schedule"))
-            elif trigger["kind"] == "cron":
-                zone = ZoneInfo(trigger.get("timezone") or "UTC")
-                base = dt.datetime.fromtimestamp(auto["last_at"] or 0, zone)
-                if croniter(trigger["expression"], base).get_next(dt.datetime).timestamp() <= now:
+            if trigger["kind"] in ("every", "cron"):
+                if self._due_at(auto) <= now:
                     fired.append((auto, "schedule"))
             elif trigger["kind"] == "onchange":
                 if auto["pending"]:

@@ -987,6 +987,58 @@ class History:
         cursor = json.dumps([last["at"], last["output"], last["scope"]]) if last else None
         return {"materializations": found, "next": cursor}
 
+    async def key_outcomes(
+        self,
+        asset: str,
+        *,
+        scope: str | None = None,
+        key: str | None = None,
+        q: str | None = None,
+        outcomes: list[str] | None = None,
+        run: str | None = None,
+        before: str | None = None,
+        limit: int = 100,
+    ) -> dict:
+        """What the keys of an `Each` asset came to (per-key-processing.md §10),
+        newest first: `key` exactly, or keys containing `q` (any case). Rows
+        are appended when a page commits, so a run in progress shows the pages
+        it has committed. `next` is the `before` cursor of the following
+        page: `[at, scope, key]` as JSON."""
+
+        clauses, params = ["asset = ?"], [asset]
+        for column, value in (("scope", scope), ("key", key), ("run", run)):
+            if value is not None:
+                clauses.append(f'"{column}" = ?')
+                params.append(value)
+        if q:
+            clauses.append("contains(lower(key), lower(?))")
+            params.append(q)
+        if outcomes:
+            clauses.append("list_contains(?::VARCHAR[], outcome)")
+            params.append(list(outcomes))
+        until = None
+        if before:
+            at, at_scope, at_key = json.loads(before)
+            clauses.append('("at" < ? OR ("at" = ? AND (scope > ? OR (scope = ? AND key > ?))))')
+            params.extend([at, at, at_scope, at_scope, at_key])
+            until = math.nextafter(at, math.inf)
+        where = " AND ".join(clauses)
+
+        def work(con):
+            return _dicts(
+                con.execute(
+                    f'SELECT * FROM key_outcomes WHERE {where} ORDER BY "at" DESC, scope, key LIMIT ?',
+                    [*params, limit + 1],
+                )
+            )
+
+        found = await self.query(work, ("key_outcomes",), until=until, run=run, live=False)
+        more = len(found) > limit
+        found = found[:limit]
+        last = found[-1] if more and found else None
+        cursor = json.dumps([last["at"], last["scope"], last["key"]]) if last else None
+        return {"outcomes": found, "next": cursor}
+
     async def lineage(
         self, output: str, scope: str, version: str, *, downstream: bool = False, depth: int = 5
     ) -> dict:

@@ -55,8 +55,10 @@ The default project is designed to make every architecture feature visible:
 | --- | --- |
 | `sites` | a `PartitionSet` on a `Cron` — the site list grows one site per run (cursor-driven) and caps at four |
 | `uploads` | an external `PartitionSet` source fed by `solera commit` |
+| `upload_drop` | a sensor on `Every(15)` committing to `uploads`: a new upload a minute, three at most — its tick history shows committed and skipped ticks |
 | `site_feed` | per-site cursor asset on `Every(10)`: `site_events` (unkeyed incremental) + `site_files` (keyed inventory), `Patch` both ways |
 | `file_index` | `Incremental(batch_size=2)` consumer — watch `more` continuation; declared `version="2"` |
+| `file_checks` | an `Each` edge: one call per changed file, four at a time; the fourth file is rejected on odd feed ticks (the failure index), and `exclude={"drafts": "*-file-2"}` leaves the third out |
 | `site_digest` | `site × day` two-dimensional asset (`TimePartitions`), `deps=` on the `roadmap` source, a `bytes` output (pickled by FileStore) |
 | `fleet_index` | `AllPartitions` fan-in: `dict[str, list[dict]]` on FileStore, `dict[str, TableRef]` on Postgres |
 | `site_status` | `Sql` asset over a `TableRef` (Postgres); on FileStore it logs that it skipped |
@@ -96,7 +98,8 @@ The `sites.cron.0` automation keeps it fresh on its own once the server is up.
 uv run solera commit uploads --upsert '["u-1", "u-2"]'
 ```
 
-**Sources** in the console lists `uploads` with its committed keys. These keys
+**Sources** in the console lists `uploads` with its committed keys — beside
+`drop-1` to `drop-3`, which the `upload_drop` sensor commits on its own. These keys
 are work for `manual_ingest` (below) — the `Every(30)` schedule with
 `partitions="missing"` plans every key that lacks a complete head, so just
 committing is enough once a pool worker is running.

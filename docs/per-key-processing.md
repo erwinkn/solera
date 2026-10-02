@@ -1097,6 +1097,12 @@ Where the implementation (`solera/errors.py`, `solera/build.py`,
   only scopes with a failure record take the request.
 - **The retry clock** starts a run for a scope with keys due when the asset
   has any enabled automation and the scope is idle.
+- **`explain`** is an API, not yet a CLI: `GET /assets/{name}/explain?key=&scope=`
+  answers with a `verdict` (`ok`, `failing`, `excluded`, `not_matched`,
+  `pending`, `removed`, `absent`) and its evidence — the key's failure
+  record, its newest `key_outcomes` rows, the patterns the edge delivers
+  under and the rule that excluded it (`Engine.explain`). The Keys view
+  reads `GET /assets/{name}/failures` and `GET /assets/{name}/key-outcomes`.
 - **The build identity outside git** hashes the project directory's Python
   files only (data written next to a project would otherwise change it).
 - **PostgresStore** loads an empty group as an empty DataFrame with the

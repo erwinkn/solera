@@ -175,6 +175,12 @@ def create_app(
             raise KeyError(p)
         return runtime
 
+    async def asset_engine(request: Request, p: str, name: str) -> Engine:
+        runtime = await project_engine(request, p)
+        if name not in runtime.manifest["assets"]:
+            raise KeyError(name)
+        return runtime
+
     @app.get("/healthz")
     async def health(request: Request):
         runtime = engine_of(request)
@@ -219,14 +225,69 @@ def create_app(
         runtime = await project_engine(request, p)
         return {"assets": await runtime.catalog()}
 
+    @app.get("/api/projects/{p}/assets:status")
+    async def asset_statuses(p: str, request: Request):
+        runtime = await project_engine(request, p)
+        return {"assets": await runtime.asset_statuses()}
+
     @app.get("/api/projects/{p}/assets/{name}")
     async def asset_detail(p: str, name: str, request: Request):
-        runtime = await project_engine(request, p)
-        if name not in runtime.manifest["assets"]:
-            raise KeyError(name)
+        runtime = await asset_engine(request, p, name)
         detail = await runtime.asset_detail(name)
-        detail["automations"] = [a for a in runtime.m.automations.values() if name in a.get("targets", [])]
+        detail["automations"] = [
+            runtime.automation_view(a) for a in runtime.m.automations.values() if name in a.get("targets", [])
+        ]
         return detail
+
+    @app.get("/api/projects/{p}/assets/{name}/edges")
+    async def asset_edges(p: str, name: str, request: Request):
+        runtime = await asset_engine(request, p, name)
+        return await runtime.asset_edges(name)
+
+    @app.get("/api/projects/{p}/assets/{name}/failures")
+    async def asset_failures(
+        p: str,
+        name: str,
+        request: Request,
+        scope: str | None = None,
+        after: str | None = None,
+        limit: int = Query(default=100, ge=1, le=1000),
+    ):
+        """An Each asset's failing keys (docs/per-key-processing.md §9):
+        `?outcome=rejected&outcome=failed` keeps those classes."""
+
+        runtime = await asset_engine(request, p, name)
+        outcomes = [v for v in request.query_params.getlist("outcome") if v]
+        return await runtime.key_failures(name, scope, outcomes=outcomes, after=after, limit=limit)
+
+    @app.get("/api/projects/{p}/assets/{name}/key-outcomes")
+    async def asset_key_outcomes(
+        p: str,
+        name: str,
+        request: Request,
+        scope: str | None = None,
+        key: str | None = None,
+        q: str | None = None,
+        run: str | None = None,
+        before: str | None = None,
+        limit: int = Query(default=100, ge=1, le=1000),
+    ):
+        """What an Each asset's keys came to (§10), newest first; repeat
+        `outcome` to match any of several."""
+
+        runtime = await asset_engine(request, p, name)
+        outcomes = [v for v in request.query_params.getlist("outcome") if v]
+        page = await runtime.history.key_outcomes(
+            name, scope=scope, key=key, q=q, outcomes=outcomes, run=run, before=before, limit=limit
+        )
+        return {"asset": name, **page}
+
+    @app.get("/api/projects/{p}/assets/{name}/explain")
+    async def asset_explain(
+        p: str, name: str, request: Request, key: str, scope: str = "", edge: str | None = None
+    ):
+        runtime = await asset_engine(request, p, name)
+        return await runtime.explain(name, key, scope, edge)
 
     @app.get("/api/projects/{p}/outputs/{name}/heads")
     async def output_heads(p: str, name: str, request: Request):
@@ -274,47 +335,9 @@ def create_app(
             asset = runtime._asset_of(name)
         except ValueError:
             raise KeyError(name) from None
-        dims = runtime._dims(asset)
-        if not dims:
+        if not runtime._dims(asset):
             raise ValueError(f"{asset} is unpartitioned")
-        keys = await runtime._dim_keys(dims)
-        from itertools import product
-
-        from solera.sdk import canonical_partition
-
-        current = {canonical_partition(dims, dict(zip(dims, combo, strict=True))) for combo in product(*keys)}
-        outputs = runtime.manifest["assets"][asset]["outputs"]
-        scopes = {}
-        for output in outputs:
-            for scope, head in runtime.m.heads_of(output["name"]):
-                scopes[scope] = head
-        # Per-scope outcomes + the pending index — never a task scan (§8).
-        outcomes = {s: runtime.outcome_view(r) for s, r in runtime.m.outcomes_of(asset).items()}
-        running = runtime.m.pending_scopes(asset)
-        out = []
-        for scope in sorted(current | set(scopes) | set(outcomes)):
-            head = scopes.get(scope)
-            record = outcomes.get(scope) or {}
-            status = (
-                "retired"
-                if scope not in current
-                else "complete"
-                if head and head["complete"]
-                else "running"
-                if scope in running
-                else "failed"
-                if record.get("last_outcome") in {"failed", "canceled", "blocked"}
-                else "missing"
-            )
-            out.append(
-                {
-                    "scope": scope,
-                    "status": status,
-                    "last_outcome": record.get("last_outcome"),
-                    "last_attempt": record.get("last_attempt"),
-                }
-            )
-        return {"asset": asset, "partitions": out}
+        return {"asset": asset, "partitions": (await runtime.scope_statuses([asset]))[asset]}
 
     # -- runs -------------------------------------------------------------------
 
@@ -518,6 +541,11 @@ def create_app(
             raise KeyError(f"{run_id}/{attempt}: no result yet")
         return result
 
+    @app.get("/api/projects/{p}/holds")
+    async def holds(p: str, request: Request):
+        runtime = await project_engine(request, p)
+        return runtime.holds_view()
+
     @app.post("/api/projects/{p}/scopes:clear-discards")
     async def clear_discards(p: str, request: Request):
         runtime = await project_engine(request, p)
@@ -633,22 +661,22 @@ def create_app(
     @app.get("/api/projects/{p}/automations")
     async def automations(p: str, request: Request):
         runtime = await project_engine(request, p)
-        return {"automations": list(runtime.m.automations.values())}
+        return {"automations": [runtime.automation_view(a) for a in runtime.m.automations.values()]}
 
     @app.post("/api/projects/{p}/automations/{name}/enable")
     async def automation_enable(p: str, name: str, request: Request):
         runtime = await project_engine(request, p)
-        return await runtime.set_automation(name, True)
+        return runtime.automation_view(await runtime.set_automation(name, True))
 
     @app.post("/api/projects/{p}/automations/{name}/disable")
     async def automation_disable(p: str, name: str, request: Request):
         runtime = await project_engine(request, p)
-        return await runtime.set_automation(name, False)
+        return runtime.automation_view(await runtime.set_automation(name, False))
 
     @app.post("/api/projects/{p}/automations/{name}/run-now", status_code=202)
     async def automation_run_now(p: str, name: str, request: Request):
         runtime = await project_engine(request, p)
-        return await runtime.run_automation(name)
+        return runtime.automation_view(await runtime.run_automation(name))
 
     # -- sources -------------------------------------------------------------------
 
