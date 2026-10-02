@@ -380,9 +380,10 @@ class Model:
     def _apply_aliases(self, manifest) -> dict[str, list[str]]:
         """Move everything held under an asset's former names to its current
         one (§2): cursors, watermarks, outcomes, pending automation entries,
-        and — for outputs named after the asset — heads and key indexes. An
-        index keeps its files where they are (its `prefix`). Returns
-        `{asset: [aliases]}` for the automations to follow."""
+        holds on its scopes, and — for outputs named after the asset — heads,
+        key indexes, unsettled intents and pending discards. A new name never
+        releases a write domain. An index keeps its files where they are (its
+        `prefix`). Returns `{asset: [aliases]}` for the automations to follow."""
 
         assets = {n: a for n, a in manifest["assets"].items() if a.get("aliases")}
         renamed = {}
@@ -398,17 +399,22 @@ class Model:
             if old not in outputs and (outputs.get(new) or {}).get("asset") == new
         }
 
-        def move(table: dict, rename, position: int):
+        def move(table: dict, rename, position: int, merge=None):
             for key in [k for k in table if k[position] in rename]:
                 target = (*key[:position], rename[key[position]], *key[position + 1 :])
                 if target not in table:
                     table[target] = table.pop(key)
+                elif merge is not None:  # lists: both names' entries are owed
+                    table[target] = merge(table[target] + table.pop(key))
 
         move(self.heads, output_map, 0)
         move(self.indexes, output_map, 0)
         move(self.cursors, asset_map, 0)
         move(self.outcomes, asset_map, 0)
         move(self.watermarks, asset_map, 0)
+        move(self.holds, asset_map, 0)
+        move(self.unsettled, output_map, 0, merge=list)
+        move(self.discards, output_map, 0, merge=lambda entries: sorted(entries, key=lambda d: d["n"]))
         for head in self.heads.values():
             if head.get("asset") in asset_map:
                 head["asset"] = asset_map[head["asset"]]

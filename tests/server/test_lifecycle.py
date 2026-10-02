@@ -320,3 +320,37 @@ async def test_a_fenced_stores_scope_is_released_at_once(tmp_path):
     assert second > first and one != other
     await engine.stop()
     await state.close()
+
+
+async def test_a_renamed_asset_keeps_its_strict_hold(tmp_path):
+    """Review P1-3: renaming an asset (`aliases=`) moves its hold, its
+    unsettled intents and its pending discards with it. The writer it waits
+    for may still write the same data under either name, so the new name's
+    run stays held until an operator releases it."""
+
+    engine, state, run, hold, live = await strict_hold(tmp_path)
+    await engine.cancel(run["id"])
+    await engine.stop()
+    m = state.model
+    assert ("items", "") in m.unsettled
+    m.discards[("items", "")] = [{"n": 1, "kind": "items", "items": [["path", "x"]]}]
+
+    @asset(outputs=Output(key="id", revision="v", store="live"), aliases=["items"])
+    def catalog():
+        return [{"id": "a", "v": 3}]
+
+    project = Project(assets=[catalog], stores={"live": live})
+    engine = engine_for(state, project, placement="inline", heartbeat_seconds=0.1)
+    await engine.initialize()
+    assert ("items", "") not in m.holds and m.holds[("catalog", "")]["attempt"] == hold["attempt"]
+    assert ("catalog", "") in m.unsettled and ("items", "") not in m.unsettled
+    assert [d["n"] for d in m.discards[("catalog", "")]] == [1] and ("items", "") not in m.discards
+    renamed = await engine.submit(["catalog"])
+    task = m.task(next(iter(m.runs[renamed["id"]]["tasks"])))
+    await until(engine, lambda: task.get("held") == ["uncertain", hold["attempt"]])
+    assert task["status"] == "queued" and not task["attempts"]
+    engine.release_scope("catalog", "", "ops@example.com")
+    detail = await engine.run_until(renamed["id"], 15)
+    assert detail["request"]["status"] == "succeeded"
+    await engine.stop()
+    await state.close()
