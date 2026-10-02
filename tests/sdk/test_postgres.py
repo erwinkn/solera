@@ -384,3 +384,52 @@ async def test_a_migration_that_replaces_the_table_keeps_its_fence(store):
     with pytest.raises(StoreError, match="newer attempt"):
         await store.store([{"id": "a", "v": "0"}], first.ref, fenced(out, 3))
     await store.store([{"id": "a", "v": "2"}], first.ref, fenced(out, 4))
+
+
+async def test_a_patch_refuses_requested_keys_it_does_not_hold(store):
+    """A key the harness asks the store to write must be in the write: a
+    missing one is an error, never a silent skip."""
+
+    out = output(key="id", revision="v")
+    first = await store.store([{"id": "a", "v": "1"}], None, scope(out))
+    with pytest.raises(StoreError, match="does not hold"):
+        await store.store(
+            Patch([{"id": "a", "v": "2"}]), first.ref, scope(out, upserts=frozenset({"a", "zzz"}))
+        )
+
+
+async def test_reconciliation_streams_the_slice_and_digests_rows_as_written(store, monkeypatch):
+    """After a dead `Sql` writer, a patch reconciles the whole slice: read
+    back through `scan` a chunk at a time — never loaded whole — and digested
+    as written rows are, without the partition column the store stamps. An
+    unchanged stored row stays unchanged."""
+
+    from obstore.store import MemoryStore
+    from solera.keys import _python
+    from solera.keys.index import IndexState, KeyIndex
+    from solera.keys.io import ObjectIO
+    from solera_worker import worker
+
+    out = output(key="id", partition_column="site")
+    rows = [{"id": "a", "x": 1}, {"id": "c", "x": 3}]
+    written = await store.store(rows, None, scope(out, partition="oakland"))
+    io = ObjectIO(MemoryStore())
+    state = IndexState(prefix="keys/")
+    files, _ = await KeyIndex(io, None, state).replace(store.key_rows(rows, out), 0, "w1")
+    state = state.committed(0, files, keep_log=True)
+
+    async def no_load(*args, **kwargs):
+        raise AssertionError("reconciliation streams the slice, it never loads it whole")
+
+    monkeypatch.setattr(store, "load", no_load)
+    patch = [{"id": "b", "x": 2, "site": "oakland"}]  # a row may carry the stamped column, or not
+    keys, versions = store.key_rows(patch, out).entries()
+    new = dict(zip((k.decode() for k in keys), versions, strict=True))
+    delta, _ = await worker._reconcile(
+        out, store, written.ref, KeyIndex(io, None, state), patch, new, ["c"], 1, "w2", 2
+    )
+    got = [
+        e[:3] for f in delta.files for e in _python.iter_file(await io.read_whole(state.path(f.name), f.size))
+    ]
+    assert got == [(b"b", new["b"], 0), (b"c", b"", 1)]  # `a` is unchanged
+    assert new["b"] == store.key_rows([{"id": "b", "x": 2}], out).entries()[1][0]

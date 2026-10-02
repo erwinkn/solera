@@ -27,7 +27,7 @@ use pyo3::create_exception;
 use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
-use pyo3::types::{PyBytes, PyCapsule, PyDict, PyList, PyString};
+use pyo3::types::{PyBool, PyBytes, PyCapsule, PyDict, PyInt, PyList, PyString};
 
 use format::{Error, Options};
 use jobs::{Compact, Count, Patch, Replace, Step};
@@ -452,10 +452,74 @@ fn key_of(obj: &Bound<'_, PyAny>, out: &mut Vec<u8>) -> PyResult<()> {
     Ok(())
 }
 
+/// A row's key, by the one rule rows and stores share (`solera.stores.key_text`):
+/// a `str`, UTF-8 encoded, or an `int` (not a `bool`) as its decimal text.
+fn row_key(obj: &Bound<'_, PyAny>, out: &mut Vec<u8>) -> PyResult<()> {
+    if obj.cast::<PyString>().is_ok()
+        || (obj.cast::<PyInt>().is_ok() && obj.cast::<PyBool>().is_err())
+    {
+        return key_of(obj, out);
+    }
+    Err(PyValueError::new_err(format!(
+        "a key must be a str or an int, not {}",
+        obj.get_type().name()?
+    )))
+}
+
+/// How rows are read: their key column, their revision column if declared,
+/// and the columns their digest leaves out — the key, and any the store adds
+/// itself (a partition column), so a row digests the same wherever it is read.
+struct Records {
+    key: String,
+    revision: Option<String>,
+    skip: Vec<String>,
+}
+
+impl Records {
+    fn new(key: &str, revision: Option<&str>, exclude: Vec<String>) -> Records {
+        let mut skip = vec![key.to_string()];
+        skip.extend(exclude);
+        Records {
+            key: key.into(),
+            revision: revision.map(Into::into),
+            skip,
+        }
+    }
+
+    /// Appends a mapping row's key, and its version: its digest, or its revision's text.
+    fn read<'py>(
+        &self,
+        w: &mut pyvalue::Walker<'py>,
+        row: &Bound<'py, PyAny>,
+        keys: Option<&mut Vec<u8>>,
+        version: &mut Vec<u8>,
+    ) -> PyResult<()> {
+        if let Some(keys) = keys {
+            let k = field(row, &self.key)?.ok_or_else(|| PyKeyError::new_err(self.key.clone()))?;
+            row_key(&k, keys)?;
+        }
+        match &self.revision {
+            None => {
+                let skip: Vec<&str> = self.skip.iter().map(String::as_str).collect();
+                version.extend_from_slice(&w.row(row, &skip)?);
+            }
+            Some(rev) => {
+                let v = field(row, rev)?.ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "a row lacks the declared revision field {rev:?}"
+                    ))
+                })?;
+                w.render(&v, version)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Python rows' versions, a window of rows at a time under the GIL.
 enum PyVersions {
-    /// Mappings: the row digest without the key column, or the revision column's text.
-    Records(Py<PyList>, String, Option<String>),
+    /// Mappings: their digests, or their revision column's text.
+    Records(Py<PyList>, Records),
     /// `(key, value)` pairs: `value(v)`.
     Values(Py<PyList>),
     /// `(key, version)` pairs: the version as given.
@@ -467,23 +531,12 @@ impl PyVersions {
         let mut w = pyvalue::Walker::new(py)?;
         let mut buf = Vec::new();
         match self {
-            PyVersions::Records(list, key, revision) => {
+            PyVersions::Records(list, records) => {
                 let list = list.bind(py);
                 for &r in rows {
-                    let row = list.get_item(r as usize)?;
-                    match revision {
-                        None => out.push(&w.row(&row, Some(key))?),
-                        Some(rev) => {
-                            let v = field(&row, rev)?.ok_or_else(|| {
-                                PyValueError::new_err(format!(
-                                    "a row lacks the declared revision field {rev:?}"
-                                ))
-                            })?;
-                            buf.clear();
-                            w.render(&v, &mut buf)?;
-                            out.push(&buf);
-                        }
-                    }
+                    buf.clear();
+                    records.read(&mut w, &list.get_item(r as usize)?, None, &mut buf)?;
+                    out.push(&buf);
                 }
             }
             PyVersions::Values(list) => {
@@ -513,7 +566,7 @@ impl Versions for PyVersions {
     }
 
     fn rows(&self) -> bool {
-        matches!(self, PyVersions::Records(_, _, None))
+        matches!(self, PyVersions::Records(_, r) if r.revision.is_none())
     }
 }
 
@@ -575,21 +628,31 @@ impl Rows {
 
 #[pymethods]
 impl Rows {
-    /// Rows as mappings: the key is `row[key]` as its `str`; the version is
-    /// the group of the key's row digests, the key column left out, or with
-    /// `revision` that column's text, which the key's rows must share.
+    /// Rows as mappings: the key is `row[key]`, a `str` or an `int`; the
+    /// version is the group of the key's row digests, without the key column
+    /// and the `exclude`d ones, or with `revision` that column's text, which
+    /// the key's rows must share.
     #[staticmethod]
-    #[pyo3(signature = (rows, key, revision=None))]
+    #[pyo3(signature = (rows, key, revision=None, exclude=vec![]))]
     fn records(
         py: Python<'_>,
         rows: Bound<'_, PyList>,
         key: &str,
         revision: Option<&str>,
+        exclude: Vec<String>,
     ) -> PyResult<Rows> {
-        let keys = pack(py, &rows, |row| {
-            field(row, key)?.ok_or_else(|| PyKeyError::new_err(key.to_string()))
-        })?;
-        let versions = PyVersions::Records(rows.unbind(), key.into(), revision.map(Into::into));
+        let mut keys = Arena::default();
+        keys.ends.reserve(rows.len());
+        for (i, row) in rows.iter().enumerate() {
+            let k = field(&row, key)?.ok_or_else(|| PyKeyError::new_err(key.to_string()))?;
+            row_key(&k, &mut keys.data)?;
+            keys.ends.push(keys.data.len());
+            if i % 65536 == 65535 {
+                py.detach(|| ()); // let other threads run: this loop holds the GIL
+            }
+        }
+        keys.data.shrink_to_fit();
+        let versions = PyVersions::Records(rows.unbind(), Records::new(key, revision, exclude));
         Rows::new(py, Box::new(keys), Box::new(versions))
     }
 
@@ -624,20 +687,23 @@ impl Rows {
 
     /// Arrow data (any object with `__arrow_c_stream__`), read in place: keys
     /// from the `key` column, versions from the `revision` column's text, or
-    /// else each key's group of row digests (`arrow.rs`).
+    /// else each key's group of row digests without the `exclude`d columns
+    /// (`arrow.rs`).
     #[staticmethod]
-    #[pyo3(signature = (data, key, revision=None))]
+    #[pyo3(signature = (data, key, revision=None, exclude=vec![]))]
     fn arrow(
         py: Python<'_>,
         data: Bound<'_, PyAny>,
         key: &str,
         revision: Option<&str>,
+        exclude: Vec<String>,
     ) -> PyResult<Rows> {
         let batches = arrow_batches(py, &data)?;
-        let keys = arrow::keys(&batches, key).map_err(to_py)?;
+        let keys = arrow::keys(&batches, key, false).map_err(to_py)?;
+        let records = Records::new(key, revision, exclude);
         let versions: Box<dyn Versions> = match revision {
             Some(r) => Box::new(arrow::Revision::new(&batches, r).map_err(to_py)?),
-            None => Box::new(arrow::RowDigest::new(batches, key).map_err(to_py)?),
+            None => Box::new(arrow::RowDigest::new(batches, &records.skip).map_err(to_py)?),
         };
         Rows::new(py, keys, versions)
     }
@@ -693,7 +759,11 @@ fn row_digest<'py>(
     row: Bound<'py, PyAny>,
     key: Option<&str>,
 ) -> PyResult<Bound<'py, PyBytes>> {
-    Ok(PyBytes::new(py, &pyvalue::Walker::new(py)?.row(&row, key)?))
+    let skip: Vec<&str> = key.into_iter().collect();
+    Ok(PyBytes::new(
+        py,
+        &pyvalue::Walker::new(py)?.row(&row, &skip)?,
+    ))
 }
 
 /// `group(rows)`: the version of a key whose rows these are.
@@ -705,9 +775,10 @@ fn group_digest<'py>(
     key: Option<&str>,
 ) -> PyResult<Bound<'py, PyBytes>> {
     let mut w = pyvalue::Walker::new(py)?;
+    let skip: Vec<&str> = key.into_iter().collect();
     let mut digests: Vec<digest::Digest> = rows
         .try_iter()?
-        .map(|r| w.row(&r?, key))
+        .map(|r| w.row(&r?, &skip))
         .collect::<PyResult<_>>()?;
     Ok(PyBytes::new(py, &digest::group(&mut digests)))
 }
@@ -735,7 +806,7 @@ fn revision_text<'py>(py: Python<'py>, value: Bound<'py, PyAny>) -> PyResult<Bou
 fn chunk(
     py: Python<'_>,
     obj: &Bound<'_, PyAny>,
-    records: Option<&(String, Option<String>)>,
+    records: Option<&Records>,
 ) -> PyResult<(Arena, Arena)> {
     let (mut keys, mut versions) = (Arena::default(), Arena::default());
     if obj.hasattr("__arrow_c_stream__")? {
@@ -745,11 +816,19 @@ fn chunk(
         };
         let schema = first.schema();
         let (kn, mut v): (String, Box<dyn Versions>) = match records {
-            Some((key, None)) => (
+            Some(Records {
+                key,
+                revision: None,
+                skip,
+            }) => (
                 key.clone(),
-                Box::new(arrow::RowDigest::new(batches.clone(), key).map_err(to_py)?),
+                Box::new(arrow::RowDigest::new(batches.clone(), skip).map_err(to_py)?),
             ),
-            Some((key, Some(rev))) => (
+            Some(Records {
+                key,
+                revision: Some(rev),
+                ..
+            }) => (
                 key.clone(),
                 Box::new(arrow::Revision::new(&batches, rev).map_err(to_py)?),
             ),
@@ -763,7 +842,7 @@ fn chunk(
                 ))
             }
         };
-        let k = arrow::keys(&batches, &kn).map_err(to_py)?;
+        let k = arrow::keys(&batches, &kn, records.is_none()).map_err(to_py)?;
         for i in 0..k.len() {
             keys.push(k.key(i));
         }
@@ -779,20 +858,8 @@ fn chunk(
                 key_of(&item.get_item(0)?, &mut keys.data)?;
                 key_of(&item.get_item(1)?, &mut versions.data)?;
             }
-            Some((key, revision)) => {
-                let k = field(&item, key)?.ok_or_else(|| PyKeyError::new_err(key.clone()))?;
-                key_of(&k, &mut keys.data)?;
-                match revision {
-                    None => versions.data.extend_from_slice(&w.row(&item, Some(key))?),
-                    Some(rev) => {
-                        let v = field(&item, rev)?.ok_or_else(|| {
-                            PyValueError::new_err(format!(
-                                "a row lacks the declared revision field {rev:?}"
-                            ))
-                        })?;
-                        w.render(&v, &mut versions.data)?;
-                    }
-                }
+            Some(records) => {
+                records.read(&mut w, &item, Some(&mut keys.data), &mut versions.data)?
             }
         }
         keys.ends.push(keys.data.len());
@@ -818,7 +885,7 @@ enum Kind {
 #[pyclass(module = "solera._native")]
 struct Job {
     kind: Kind,
-    records: Option<(String, Option<String>)>,
+    records: Option<Records>,
 }
 
 impl Job {
@@ -853,12 +920,13 @@ impl Job {
     /// The merge-join of the written content (`rows`, or with None a stream
     /// fed sorted chunks, `feed_rows`) against `runs` existing runs, newest
     /// first. A streamed chunk holds `(key, version)` pairs, or with `key`
-    /// rows keyed by that column: their versions are their digests, folded
-    /// into each key's group, or the `revision` a key's rows share. At most
+    /// rows keyed by that column: their versions are their digests without
+    /// the key and `exclude`d columns, folded into each key's group, or the
+    /// `revision` a key's rows share. At most
     /// `collect` changed keys are kept for `collected`. Written entries carry
     /// `generation` as their locator.
     #[staticmethod]
-    #[pyo3(signature = (rows, runs, *, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864, collect=0, key=None, revision=None, generation=0))]
+    #[pyo3(signature = (rows, runs, *, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864, collect=0, key=None, revision=None, exclude=vec![], generation=0))]
     #[allow(clippy::too_many_arguments)]
     fn replace(
         rows: Option<PyRefMut<'_, Rows>>,
@@ -872,6 +940,7 @@ impl Job {
         collect: usize,
         key: Option<String>,
         revision: Option<String>,
+        exclude: Vec<String>,
         generation: u64,
     ) -> PyResult<Job> {
         let src = match rows {
@@ -892,7 +961,7 @@ impl Job {
                 collect,
                 generation,
             ))),
-            records: key.map(|k| (k, revision)),
+            records: key.map(|k| Records::new(&k, revision.as_deref(), exclude)),
         })
     }
 

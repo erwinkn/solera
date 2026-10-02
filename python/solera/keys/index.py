@@ -285,6 +285,28 @@ class Delta:
 
 
 @dataclass(frozen=True)
+class DeltaKeys:
+    """The keys a commit's delta files write — not those they delete — read a
+    page at a time in key order: a store's selection when there are too many
+    to list (`solera.stores.Scope`)."""
+
+    io: ObjectIO
+    prefix: str
+    files: tuple[FileInfo, ...]
+
+    async def pages(self, size: int = 100_000):
+        index = KeyIndex(self.io, self.prefix, IndexState(log=((0, self.files),), prefix=self.prefix))
+        after = None
+        while self.files:
+            keys, _, deleted, _, after = await index.pending(0, 0, after, size)
+            page = [key_str(k) for k, d in zip(keys, deleted, strict=True) if not d]
+            if page:
+                yield page
+            if after is None:
+                return
+
+
+@dataclass(frozen=True)
 class DeltaFiles:
     files: list[FileInfo]
     added: int
@@ -556,17 +578,19 @@ class KeyIndex:
         collect: int = 0,
         key: str | None = None,
         revision: str | None = None,
+        exclude: tuple[str, ...] = (),
         generation: int = 0,
     ) -> tuple[DeltaFiles, tuple[list[bytes], list[bytes]] | None]:
         """A full replacement: `rows` is the whole new content — a `Rows`, or
         chunks sorted by key, pulled as needed: `(key, version)` pairs, or
         with `key` rows keyed by that column, whose versions are computed
-        natively (docs/row-digest.md). Every live key is compared as the
-        join reaches it; new keys and changed versions are written, live keys
-        not in `rows` deleted, each entry located at `generation` and
-        carrying the key's predecessor `(version, locator)`. The delta goes out
-        as the batch's files as they fill. Returns them and, up to `collect` keys, the written and
-        the deleted keys (None past it)."""
+        natively without the `exclude`d columns (docs/row-digest.md). Every
+        live key is compared as the join reaches it; new keys and changed
+        versions are written, live keys not in `rows` deleted, each entry
+        located at `generation` and carrying the key's predecessor `(version,
+        locator)`. The delta goes out as the batch's files as they fill.
+        Returns them and, up to `collect` keys, the written and the deleted
+        keys (None past it)."""
 
         runs = self.state.newest_first()
         job = Job.replace(
@@ -576,6 +600,7 @@ class KeyIndex:
             collect=collect,
             key=key,
             revision=revision,
+            exclude=list(exclude),
             generation=generation,
         )
         files = await self._run(job, runs, lambda n: f"{batch:012d}-{attempt}.{n:04d}", 0, rows)

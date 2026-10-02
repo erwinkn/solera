@@ -122,20 +122,29 @@ fn column(batches: &[RecordBatch], name: &str) -> Result<Vec<ArrayRef>> {
     Ok(out)
 }
 
-/// The key column: strings and binaries in place, integers as their decimal
-/// text (packed once, like `str(key)`).
-pub fn keys(batches: &[RecordBatch], name: &str) -> Result<Box<dyn Keys + Send>> {
+/// The key column: strings in place, integers as their decimal text (packed
+/// once) — the rule Python rows follow (`solera.stores.key_text`). Binary
+/// columns hold index keys as they are, so they are keys only with `binary`.
+pub fn keys(batches: &[RecordBatch], name: &str, binary: bool) -> Result<Box<dyn Keys + Send>> {
     let cols = column(batches, name)?;
     let at = Chunks::new(cols.iter().map(|a| a.len()));
-    if let Some(chunks) = cols.iter().map(Bytes::of).collect::<Option<Vec<_>>>() {
-        return Ok(Box::new(ArrowKeys { chunks, at }));
+    let is_text = |a: &ArrayRef| {
+        matches!(
+            a.data_type(),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        )
+    };
+    if cols.iter().all(|a| binary || is_text(a)) {
+        if let Some(chunks) = cols.iter().map(Bytes::of).collect::<Option<Vec<_>>>() {
+            return Ok(Box::new(ArrowKeys { chunks, at }));
+        }
     }
     let mut arena = Arena::default();
     let mut buf = Vec::new();
     for a in &cols {
         if !a.data_type().is_integer() {
             return err(format!(
-                "key column {name:?} must hold strings, binaries or integers, not {}",
+                "key column {name:?} must hold strings or integers, not {}",
                 a.data_type()
             ));
         }
@@ -389,14 +398,14 @@ pub struct RowDigest {
 }
 
 impl RowDigest {
-    pub fn new(batches: Vec<RecordBatch>, key: &str) -> Result<RowDigest> {
+    pub fn new(batches: Vec<RecordBatch>, skip: &[String]) -> Result<RowDigest> {
         let mut columns: Vec<(Vec<u8>, usize)> = match batches.first() {
             Some(b) => b
                 .schema()
                 .fields()
                 .iter()
                 .enumerate()
-                .filter(|(_, f)| f.name() != key)
+                .filter(|(_, f)| !skip.contains(f.name()))
                 .map(|(i, f)| (f.name().as_bytes().to_vec(), i))
                 .collect(),
             None => Vec::new(),

@@ -32,7 +32,16 @@ from pathlib import Path
 from obstore.exceptions import AlreadyExistsError
 from solera import errors, lifecycle
 from solera.keys import Rows, encode_file
-from solera.keys.index import DeltaFiles, FileInfo, IndexState, KeyIndex, delta_keys, key_bytes, key_str
+from solera.keys.index import (
+    DeltaFiles,
+    DeltaKeys,
+    FileInfo,
+    IndexState,
+    KeyIndex,
+    delta_keys,
+    key_bytes,
+    key_str,
+)
 from solera.keys.io import ObjectIO, key_cache
 from solera.keys.resolver import Ask, answers, request
 from solera.lifecycle import Cancel, Ended
@@ -56,6 +65,7 @@ from solera.stores import (
     Sql,
     StoreError,
     WriteError,
+    key_text,
     resolve_env,
     store_key_rows,
 )
@@ -505,7 +515,10 @@ async def _store_outputs(
                 p["rows"] = rows
             continue
         new = await _versions(output, rows)
-        removes = [str(k) for k in value.remove if str(k) not in new]
+        try:
+            removes = [k for k in map(key_text, value.remove) if k not in new]
+        except WriteError as e:
+            raise WriteError(f"{output.name}: {e}") from None
         own = p["own"] = (set(new), set(removes))
         p["new"], p["removes"] = new, removes
         if any(intent.get("unknown") for intent in unsettled):
@@ -513,7 +526,7 @@ async def _store_outputs(
             # takes the whole store as it is, with this patch on top, and the store
             # writes this patch's keys, every one.
             p["files"], _ = await _reconcile(
-                output, store, prior, index, new, removes, batch, attempt, generation
+                output, store, prior, index, content, new, removes, batch, attempt, generation
             )
             p["changed"], p["intended"] = None, own[0] | own[1]
             continue
@@ -558,7 +571,16 @@ async def _store_outputs(
             del plans[name]
             continue
         plan["keys"] = intents[name] = files.to_json()
-        if plan["prior"] is not None and not (replace and (changed is None or unsettled)):
+        if getattr(plan["store"], "writes", "overwrite") == "immutable":
+            # Every object it writes must be named by an index entry, or nothing ever
+            # collects it: exactly the keys the delta writes, paged from its files
+            # when there are too many to list (docs/lifecycle.md §9.8).
+            if changed is None:
+                plan["upserts"] = DeltaKeys(keys_io, index.prefix, tuple(files.files))
+            else:
+                plan["upserts"] = frozenset(map(key_str, changed[0]))
+                plan["removes"] = frozenset(map(key_str, changed[1]))
+        elif plan["prior"] is not None and not (replace and (changed is None or unsettled)):
             # The store writes only what changes: the delta, and for a patch whatever a
             # dead attempt may have left half-done among its keys. A replacement with
             # more changes than it lists, or with dead attempts', rewrites the scope;
@@ -732,18 +754,69 @@ async def _repair(output, store, prior, left, new, removes):
     return new, removes
 
 
-async def _reconcile(output, store, prior, index, new, removes, batch, attempt, generation):
+async def _reconcile(output, store, prior, index, content, new, removes, batch, attempt, generation):
     """The delta of a patch over a store a dead `Sql` writer changed in ways no
-    key list records: the store's whole key map as it is, this patch applied
-    on top, against the pinned index — a replacement."""
+    key list records: the store's rows as they are — streamed back sorted a
+    chunk at a time by its `scan`, read as a `Sql` write reports them — with
+    this patch's rows in place of their keys' and its removes gone, against
+    the pinned index: a streamed replacement. Memory is a chunk and the patch."""
 
-    loaded = await store.load(prior, None, None)
-    current = await _versions(output, await asyncio.to_thread(store_key_rows, store, loaded, output))
-    current.update(new)
-    for k in removes:
-        current.pop(k, None)
-    pairs = sorted((key_bytes(k), v) for k, v in current.items())
-    return await index.replace(Rows.pairs(pairs), batch, attempt, collect=LISTED, generation=generation)
+    skip = set(new) | set(removes)
+    patch = sorted(
+        ((key_bytes(key_text(r[output.key])), r) for r in _rows_of(output, content)), key=lambda e: e[0]
+    )
+    scan = getattr(store, "scan", None)
+    if scan is not None:
+        chunks = scan(prior, output, sorted(skip))
+    else:  # a store that cannot stream its rows back: read them whole
+        loaded = _rows_of(output, await store.load(prior, None, None))
+        chunks = [
+            sorted(
+                (r for r in loaded if key_text(r[output.key]) not in skip),
+                key=lambda r: key_bytes(key_text(r[output.key])),
+            )
+        ]
+    stamped = getattr(store, "stamped", None)
+    return await index.replace(
+        _merged(chunks, patch, output.key),
+        batch,
+        attempt,
+        collect=LISTED,
+        key=output.key,
+        revision=output.revision,
+        exclude=tuple(stamped(output)) if stamped else (),
+        generation=generation,
+    )
+
+
+def _rows_of(output, value) -> list:
+    if value is None:
+        return []
+    if type(value).__name__ == "DataFrame":
+        return value.to_dict(orient="records")
+    if not isinstance(value, list):
+        raise WriteError(
+            f"{output.name}: expected rows (list[dict] or DataFrame), got {type(value).__name__}"
+        )
+    return value
+
+
+def _merged(chunks, patch: list, key: str):
+    """Row chunks sorted by key, with `patch` — `(key bytes, row)`, sorted, of
+    keys the chunks do not hold — merged in."""
+
+    i = 0
+    for chunk in chunks:
+        out = []
+        for row in chunk:
+            at = key_bytes(key_text(row[key]))
+            while i < len(patch) and patch[i][0] < at:
+                out.append(patch[i][1])
+                i += 1
+            out.append(row)
+        yield out
+    if i < len(patch):
+        yield [row for _, row in patch[i:]]
 
 
 async def _versions(output, rows) -> dict[str, bytes]:

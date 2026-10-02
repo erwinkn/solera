@@ -522,3 +522,56 @@ async def test_small_writes_resolve_in_the_engine_and_pages_come_inline(state, m
 async def _listed(engine):
     listed = await engine.list_keys("items")
     return {k: (int(v), 0) for k, v in listed["keys"].items()}
+
+
+@pytest.mark.parametrize("patch", [False, True], ids=["replace", "patch"])
+async def test_too_many_changes_to_list_still_write_only_what_the_delta_names(
+    state, data, monkeypatch, patch
+):
+    """docs/lifecycle.md §9.8: an immutable store's every object must be named
+    by an index entry, or nothing collects it. Past what the worker lists
+    (`LISTED`, here 0), the store pages the changed keys from the delta files:
+    an unchanged key gets no new object under a generation no entry names."""
+
+    from solera_worker import worker
+
+    monkeypatch.setattr(worker, "LISTED", 0)
+    rows = {"a": 1, "b": 1}
+
+    @asset(outputs=Output("items", key="id", revision="v"))
+    def items():
+        content = [{"id": k, "v": v} for k, v in rows.items()]
+        return Patch(content) if patch else content
+
+    engine = engine_for(state, Project(assets=[items]))
+    await engine.initialize()
+    await run(engine, ["items"])
+    rows["b"] = 2
+    await run(engine, ["items"])
+    objects = {p.parent.name: [] for p in data.rglob("*.json") if "items" in p.parts}
+    for p in data.rglob("*.json"):
+        if "items" in p.parts:
+            objects[p.parent.name].append(p.name)
+    assert len(objects["a"]) == 1, objects  # unchanged: its first object only
+    assert len(objects["b"]) == 2, objects  # changed: a new one, the old one until collected
+
+
+async def test_a_byte_valued_key_fails_the_write_instead_of_vanishing(state):
+    """A key is a `str` or an `int`, by one rule for the index and the store.
+    A `bytes` key once committed into the index while the store, naming it
+    differently, wrote nothing; now the write fails and nothing changes."""
+
+    pending = {"rows": [{"id": "a", "n": 1}]}
+
+    @asset(outputs=Output("items", key="id"))
+    def items():
+        return Patch(pending["rows"])
+
+    engine = engine_for(state, Project(assets=[items]))
+    await engine.initialize()
+    await run(engine, ["items"])
+    pending["rows"] = [{"id": b"b", "n": 2}]
+    detail = await engine.run_until((await engine.submit(["items"]))["id"], 60)
+    assert detail["request"]["status"] == "failed"
+    assert "a key must be a str or an int" in detail["tasks"][0]["error"]
+    assert sorted((await engine.list_keys("items"))["keys"]) == ["a"]

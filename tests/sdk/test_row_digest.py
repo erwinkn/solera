@@ -218,3 +218,66 @@ def test_keyed_values_and_no_fallback():
     for v in ({1, 2}, object(), D("Infinity")):
         with pytest.raises(ValueError, match="revision="):
             _native.value_digest(v)
+
+
+def test_keys_are_str_or_int_everywhere():
+    """One key rule for native extraction, store grouping and removals: a
+    `str`, or an `int` as its decimal text. Anything else — bytes included —
+    is refused before anything is written."""
+
+    from solera.sdk import Output
+    from solera.stores import WriteError, entries, key_rows, key_text
+
+    assert python([{"id": 7}]).keys() == {b"7"} and key_text(7) == "7"
+    out = Output("t", key="id")
+    for bad in (b"b", True, 1.5, None):
+        with pytest.raises(ValueError, match="a key must be a str or an int"):
+            _native.Rows.records([{"id": bad}], "id")
+        with pytest.raises(WriteError, match="a key must be a str or an int"):
+            key_rows([{"id": bad}], out)
+        with pytest.raises(WriteError, match="a key must be a str or an int"):
+            entries(out, [{"id": bad}])
+    with pytest.raises(ValueError, match="strings or integers"):
+        _native.Rows.arrow(pa.table({"id": pa.array([b"b"], pa.binary())}), "id")
+
+
+def test_numpy_scalars_convert_or_fail_without_crashing():
+    np = pytest.importorskip("numpy")
+    assert _native.encode(np.int32(5)) == _native.encode(5)
+    assert _native.encode(np.uint64(2**64 - 1)) == _native.encode(2**64 - 1)
+    assert _native.encode(np.float32(1.5)) == _native.encode(1.5)
+    assert _native.encode(np.bool_(True)) == _native.encode(True)
+    for bad in (np.complex128(1j), np.datetime64("2026-01-01")):
+        with pytest.raises(ValueError, match="revision="):
+            _native.encode(bad)
+    # Extended precision once recursed forever and killed the process: run it apart.
+    import subprocess
+    import sys
+
+    code = (
+        "import numpy as np\nfrom solera import _native\n"
+        "try:\n    _native.encode(np.longdouble('1.25'))\nexcept ValueError as e:\n    print('refused', e)\n"
+    )
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, (done.returncode, done.stderr[-500:])
+    assert done.stdout.startswith("refused")
+
+
+def test_memoryview_is_bytes():
+    data = b"abcdef"
+    assert _native.encode(memoryview(data)) == _native.encode(data)
+    assert _native.encode(memoryview(data)[1:4]) == _native.encode(b"bcd")
+    assert _native.encode(memoryview(data)[::2]) == _native.encode(b"ace")  # not contiguous: logical order
+    same(pa.array([data], pa.binary()), [memoryview(data)])
+
+
+def test_duplicate_names_are_errors_even_when_null():
+    for values in ([None, 1], [1, None], [None, None]):
+        maps = pa.array([[("x", values[0]), ("x", values[1])]], pa.map_(pa.string(), pa.int64()))
+        with pytest.raises(ValueError, match="appears twice"):
+            arrow(pa.table({"id": ["k"], "m": maps}))
+        struct = pa.StructArray.from_arrays(
+            [pa.array([values[0]], pa.int64()), pa.array([values[1]], pa.int64())], names=["x", "x"]
+        )
+        with pytest.raises(ValueError, match="appears twice"):
+            arrow(pa.table({"id": ["k"], "s": struct}))

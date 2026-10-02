@@ -116,10 +116,13 @@ async def test_a_keyed_output_is_one_object_per_key_and_version(store):
 async def test_a_keyed_write_touches_only_what_the_harness_says(store):
     out = Output("uploads", keyed=True)
     content = {"a": 1, "b": 20, "c": 3}
-    only = scope(out, upserts=frozenset({"b", "zzz"}), removes=frozenset({"a"}), generation=3)
+    only = scope(out, upserts=frozenset({"b"}), removes=frozenset({"a"}), generation=3)
     await store.store(content, None, only)
     # `c` is in the write but not in upserts: the harness knows it is there already.
     assert [p.split("/")[1] for p in await paths(store)] == ["b"]
+    # A requested key the write does not hold is an error, never a silent skip.
+    with pytest.raises(StoreError, match="zzz"):
+        await store.store(content, None, scope(out, upserts=frozenset({"b", "zzz"}), generation=4))
 
 
 async def test_a_keyed_output_takes_a_dict_of_str(store):

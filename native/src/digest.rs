@@ -258,15 +258,11 @@ impl Entries {
         &mut self.data
     }
 
-    /// Ends the entry started last; a null value is dropped.
+    /// Ends the entry started last. A null value is kept until `write`,
+    /// which checks names for duplicates before leaving nulls out.
     pub fn end(&mut self) {
         let last = self.spans.last_mut().unwrap();
-        if &self.data[last.1..] == b"n" {
-            self.data.truncate(last.0);
-            self.spans.pop();
-        } else {
-            last.2 = self.data.len();
-        }
+        last.2 = self.data.len();
     }
 
     /// Writes the entries as a record (`r`, names length-prefixed) or a map
@@ -284,9 +280,10 @@ impl Entries {
                 ));
             }
         }
+        let present = |&&(_, v, e): &&(usize, usize, usize)| &data[v..e] != b"n";
         out.push(if record { b'r' } else { b'm' });
-        put_varint(out, self.spans.len() as u64);
-        for &(n, v, e) in &self.spans {
+        put_varint(out, self.spans.iter().filter(present).count() as u64);
+        for &(n, v, e) in self.spans.iter().filter(present) {
             if record {
                 put_len(out, &data[n..v]);
             } else {
@@ -395,12 +392,16 @@ mod tests {
         let mut out = Vec::new();
         e.write(&mut out, true).unwrap();
         assert_eq!(out, b"r\x02\x02a2o\x01\x01bi\x011");
-        let mut e = Entries::default();
-        for name in ["x", "x"] {
-            Scalar::Int(1).encode(e.name(name.as_bytes()));
-            e.end();
+        // A repeated name is an error even when null hides one, or both.
+        for values in [[1, 1], [0, 1], [1, 0], [0, 0]] {
+            let mut e = Entries::default();
+            for v in values {
+                let s = if v == 0 { Scalar::Null } else { Scalar::Int(1) };
+                s.encode(e.name(b"x"));
+                e.end();
+            }
+            assert!(e.write(&mut Vec::new(), true).is_err());
         }
-        assert!(e.write(&mut Vec::new(), true).is_err());
     }
 
     #[test]

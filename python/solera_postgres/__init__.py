@@ -26,6 +26,8 @@ from solera.stores import (
     StoreError,
     WriteError,
     Written,
+    key_rows,
+    key_text,
     resolve_env,
 )
 
@@ -360,7 +362,7 @@ class PostgresStore:
     def _apply_patch(self, cur, output, write: Patch, scope, table, slice_where, prior, batch):
         if not output.incremental:
             raise WriteError(f"{output.name}: Patch requires an incremental output")
-        remove = {str(k) for k in write.remove}
+        remove = {_key(output, k) for k in write.remove}
         rows = _coerce_rows(write.rows)
         if not rows and not remove and prior is not None:
             return None
@@ -399,6 +401,10 @@ class PostgresStore:
             self._delete_slice(cur, table, slice_where)
         else:
             keys = scope.upserts if scope.upserts is not None else written
+            if missing := set(keys) - set(written):
+                raise StoreError(
+                    f"{output.name}: asked to write keys the patch does not hold: {sorted(missing)[:5]}"
+                )
             inserted = [r for r, k in zip(rows, written, strict=True) if k in keys]
             gone = set(keys) | (scope.removes if scope.removes is not None else remove)
             if gone:
@@ -452,11 +458,29 @@ class PostgresStore:
         keys = self._sorted_rows(table, output, slice_where) if output.key else None
         return digest([prior.version if prior else "", digest(write.stmt)]), keys
 
-    def _sorted_rows(self, table, output: Output, where: dict):
+    def stamped(self, output: Output) -> tuple[str, ...]:
+        """Columns the store adds to every row — the partition column — which
+        a row's digest leaves out, however it is read (docs/row-digest.md)."""
+
+        column = output.config.get("partition_column")
+        return (column,) if column and column != output.key else ()
+
+    def key_rows(self, write, output: Output):
+        return key_rows(write, output, self.stamped(output))
+
+    def scan(self, ref: Ref, output: Output, skip=()):
+        """A slice's rows as they are, sorted by key, a chunk at a time — as a
+        `Sql` write reports them — but those of the keys in `skip`."""
+
+        handle = ref.handle or {}
+        return self._sorted_rows(handle["table"], output, dict(handle.get("where") or {}), skip)
+
+    def _sorted_rows(self, table, output: Output, where: dict, skip=()):
         """The slice's rows sorted by the key's bytes, a chunk at a time from a
         server-side cursor once the write has committed, for the harness to
         version as it versions any rows: the key (as text) and the declared
-        revision, or every column but the partition column, typed."""
+        revision, or every column but the partition column, typed. Keys in
+        `skip` are left out."""
 
         import psycopg
         from psycopg.rows import dict_row
@@ -473,8 +497,8 @@ class PostgresStore:
             with conn.cursor(name="solera_keys") as cur:
                 cur.execute(
                     f"SELECT {select} FROM {table} WHERE {self._where_sql(where)} "
-                    f"ORDER BY convert_to({key}::text, 'UTF8')",
-                    params,
+                    f"AND NOT ({key}::text = ANY(%s)) ORDER BY convert_to({key}::text, 'UTF8')",
+                    [*params, sorted(skip)],
                 )
                 while chunk := cur.fetchmany(KEY_CHUNK):
                     yield chunk
@@ -589,9 +613,16 @@ def _keys(output: Output, rows: list[dict]) -> list[str]:
     """Each row's key; a row without the key column is a write error."""
 
     try:
-        return [str(row[output.key]) for row in rows]
+        return [_key(output, row[output.key]) for row in rows]
     except KeyError:
         raise WriteError(f"{output.name}: row lacks the declared key column {output.key!r}") from None
+
+
+def _key(output: Output, value) -> str:
+    try:
+        return key_text(value)
+    except WriteError as e:
+        raise WriteError(f"{output.name}: {e}") from None
 
 
 def _coerce_rows(write: Any) -> list[dict]:

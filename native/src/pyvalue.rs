@@ -4,8 +4,8 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{
-    PyBool, PyByteArray, PyBytes, PyDict, PyFloat, PyInt, PyList, PyMapping, PyString, PyTuple,
-    PyType,
+    PyBool, PyByteArray, PyBytes, PyDict, PyFloat, PyInt, PyList, PyMapping, PyMemoryView,
+    PyString, PyTuple, PyType,
 };
 
 use crate::digest::{self, Digest, Entries, Scalar};
@@ -69,7 +69,7 @@ impl<'py> Walker<'py> {
         depth: usize,
     ) -> PyResult<()> {
         if let Ok(d) = v.cast_exact::<PyDict>() {
-            return self.mapping(d.iter(), None, out, depth);
+            return self.mapping(d.iter(), &[], out, depth);
         }
         if let Ok(l) = v.cast_exact::<PyList>() {
             digest::list(out, l.len());
@@ -92,7 +92,7 @@ impl<'py> Walker<'py> {
             let items = m.items()?;
             let pairs: Vec<(Bound<'py, PyAny>, Bound<'py, PyAny>)> =
                 items.iter().map(|p| p.extract()).collect::<PyResult<_>>()?;
-            return self.mapping(pairs.into_iter(), None, out, depth);
+            return self.mapping(pairs.into_iter(), &[], out, depth);
         }
         if v.cast::<PyList>().is_ok() || v.cast::<PyTuple>().is_ok() {
             let items: Vec<Bound<'py, PyAny>> = v.try_iter()?.collect::<PyResult<_>>()?;
@@ -105,11 +105,11 @@ impl<'py> Walker<'py> {
         Err(unsupported(v))
     }
 
-    /// A record (all keys strings) or a map, `skip`ping one field.
+    /// A record (all keys strings) or a map, leaving out the fields in `skip`.
     fn mapping(
         &mut self,
         items: impl Iterator<Item = (Bound<'py, PyAny>, Bound<'py, PyAny>)>,
-        skip: Option<&str>,
+        skip: &[&str],
         out: &mut Vec<u8>,
         depth: usize,
     ) -> PyResult<()> {
@@ -124,7 +124,7 @@ impl<'py> Walker<'py> {
         for (k, v) in &items {
             let name = if record {
                 let s = k.cast::<PyString>()?.to_str()?;
-                if skip == Some(s) {
+                if skip.contains(&s) {
                     continue;
                 }
                 key.clear();
@@ -167,6 +167,10 @@ impl<'py> Walker<'py> {
             f(Scalar::Bytes(b.as_bytes()));
         } else if let Ok(b) = v.cast::<PyByteArray>() {
             f(Scalar::Bytes(&b.to_vec()));
+        } else if v.cast::<PyMemoryView>().is_ok() {
+            // Its bytes in logical (C) order, whatever its shape, strides or format.
+            let b = v.call_method0("tobytes")?;
+            f(Scalar::Bytes(b.cast::<PyBytes>()?.as_bytes()));
         } else if v.is_instance(&self.datetime)? {
             let tname = v.get_type().name()?;
             if tname == "NaTType" {
@@ -220,20 +224,20 @@ impl<'py> Walker<'py> {
             }
             f(Scalar::Decimal(s, -exp));
         } else if let Some(item) = self.foreign(v)? {
-            return match item {
-                Some(x) => self.scalar(&x, f),
-                None => {
-                    f(Scalar::Null);
-                    Ok(Some(()))
-                }
-            };
+            match item {
+                // A builtin bool, int or float: classified above, so this ends.
+                Some(x) => return self.scalar(&x, f),
+                None => f(Scalar::Null),
+            }
         } else {
             return Ok(None);
         }
         Ok(Some(()))
     }
 
-    /// numpy scalars, as the Python scalar they hold; pandas' missing markers, as None.
+    /// A NumPy scalar as the builtin it equals — a bool, an int, or a float of
+    /// at most 64 bits — and pandas' missing markers as None; other NumPy
+    /// scalars (extended precision, complex, datetime64, …) are an error.
     #[allow(clippy::type_complexity)]
     fn foreign(&self, v: &Bound<'py, PyAny>) -> PyResult<Option<Option<Bound<'py, PyAny>>>> {
         let t = v.get_type();
@@ -241,13 +245,25 @@ impl<'py> Walker<'py> {
         if module.starts_with("pandas") && matches!(&*t.name()?.to_string(), "NAType" | "NaTType") {
             return Ok(Some(None));
         }
-        if module == "numpy" && v.hasattr("dtype")? {
-            let kind: String = v.getattr("dtype")?.getattr("kind")?.extract()?;
-            if matches!(kind.as_str(), "b" | "i" | "u" | "f" | "U" | "S") {
-                return Ok(Some(Some(v.call_method0("item")?)));
-            }
+        if module != "numpy" || !v.hasattr("dtype")? {
+            return Ok(None);
         }
-        Ok(None)
+        let dtype = v.getattr("dtype")?;
+        let kind: String = dtype.getattr("kind")?.extract()?;
+        let size: usize = dtype.getattr("itemsize")?.extract()?;
+        let py = v.py();
+        let builtin = match kind.as_str() {
+            "b" => py.get_type::<PyBool>().call1((v.is_truthy()?,))?,
+            "i" | "u" => py.get_type::<PyInt>().call1((v,))?,
+            "f" if size <= 8 => py.get_type::<PyFloat>().call1((v,))?,
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "cannot digest a NumPy {}: declare `revision=` on the output",
+                    dtype.str()?
+                )))
+            }
+        };
+        Ok(Some(Some(builtin)))
     }
 
     /// A subclass's extra integer attribute (pandas' nanoseconds), else 0.
@@ -278,12 +294,12 @@ impl<'py> Walker<'py> {
         )
     }
 
-    /// `row(r)` of a row — a mapping of column names — without its `key` column.
-    pub fn row(&mut self, r: &Bound<'py, PyAny>, key: Option<&str>) -> PyResult<Digest> {
+    /// `row(r)` of a row — a mapping of column names — without the columns in `skip`.
+    pub fn row(&mut self, r: &Bound<'py, PyAny>, skip: &[&str]) -> PyResult<Digest> {
         let mut buf = std::mem::take(&mut self.buf);
         buf.clear();
         let res = match r.cast_exact::<PyDict>() {
-            Ok(d) => self.mapping(d.iter(), key, &mut buf, 0),
+            Ok(d) => self.mapping(d.iter(), skip, &mut buf, 0),
             Err(_) => match r.cast::<PyMapping>() {
                 Ok(m) => {
                     let pairs: Vec<(Bound<'py, PyAny>, Bound<'py, PyAny>)> = m
@@ -291,7 +307,7 @@ impl<'py> Walker<'py> {
                         .iter()
                         .map(|p| p.extract())
                         .collect::<PyResult<_>>()?;
-                    self.mapping(pairs.into_iter(), key, &mut buf, 0)
+                    self.mapping(pairs.into_iter(), skip, &mut buf, 0)
                 }
                 Err(_) => Err(PyValueError::new_err(format!(
                     "a row must be a mapping of column names, not {}",

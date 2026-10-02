@@ -21,13 +21,24 @@ holds them all. The version of a key is:
 
 ```
 digest(x)    = XXH3-128(x), seed 0, as 16 bytes, little-endian
-row(r)       = digest(0x01 ‖ "R" ‖ record(r without the key column))
+row(r)       = digest(0x01 ‖ "R" ‖ record(r without the key column and the store's own columns))
 group(rows)  = digest(0x01 ‖ "G" ‖ varint(n) ‖ row(r₁) ‖ … ‖ row(rₙ))   — the n row digests sorted bytewise
 value(v)     = digest(0x01 ‖ "V" ‖ enc(v))
 ```
 
 `0x01` is the grammar version; a change to anything below bumps it, and
 every key's version changes once.
+
+**Keys.** A key is a `str`, as its UTF-8 bytes, or an `int` (not a `bool`)
+as its decimal text — in Arrow, a string or integer column. Native
+extraction, store grouping (`solera.stores.key_text`) and removals follow
+this one rule; any other key — `bytes`, a float, None — fails the write
+before anything is written.
+
+**A store's own columns.** A column the store adds to every row itself —
+PostgresStore's `partition_column` — is no part of the row: a row digests
+the same whether it is written with or without it, or read back with it
+(`Store.stamped`, passed as `exclude`).
 
 So a group is order-free (rows in another order: the same version), counts
 duplicates (a row written twice: a different version), and ignores whether
@@ -43,10 +54,10 @@ little-endian; `varint` is unsigned LEB128; `len` is a varint byte count.
 | `n` | null | — | `None`, `pandas.NA`, `pandas.NaT` | a null slot, `Null` |
 | `o` | boolean | 1 byte, 0 or 1 | `bool`, `numpy.bool_` (checked before `int`) | `Boolean` |
 | `i` | integer | `len`, ASCII decimal: no leading zeros, `-` only when negative | `int` of any size, `numpy` integers | every signed and unsigned width |
-| `f` | float | f64 bits, 8 bytes; `-0.0` as `0.0`, every NaN as `0x7FF8000000000000` | `float`, `numpy` floats | `Float16`, `Float32`, `Float64` (widened exactly) |
+| `f` | float | f64 bits, 8 bytes; `-0.0` as `0.0`, every NaN as `0x7FF8000000000000` | `float`, `numpy` floats of at most 64 bits (extended precision is refused) | `Float16`, `Float32`, `Float64` (widened exactly) |
 | `e` | decimal | `len`, ASCII decimal unscaled value; zigzag varint exponent | `decimal.Decimal` (finite) | `Decimal128`, `Decimal256` |
 | `s` | string | `len`, UTF-8 | `str` | `Utf8`, `LargeUtf8`, `Utf8View` |
-| `b` | bytes | `len`, bytes | `bytes`, `bytearray`, `memoryview` | `Binary`, `LargeBinary`, `BinaryView`, `FixedSizeBinary` |
+| `b` | bytes | `len`, bytes | `bytes`, `bytearray`, `memoryview` (its bytes in logical C order, whatever its shape or strides) | `Binary`, `LargeBinary`, `BinaryView`, `FixedSizeBinary` |
 | `D` | date | days since 1970-01-01, i64 | `datetime.date` | `Date32`; `Date64` (rounded down to whole days) |
 | `h` | time of day | nanoseconds since midnight, i64 | `datetime.time` without a timezone | `Time32`, `Time64` |
 | `t` | timestamp, naive | nanoseconds since 1970-01-01T00:00, wall clock, i128 | `datetime.datetime` without a timezone; `pandas.Timestamp` with its nanoseconds | `Timestamp` without a timezone, any unit |
@@ -82,8 +93,10 @@ Rules where representations could disagree:
 - **Records versus maps.** A string-keyed mapping is a record whether it is
   a Python `dict`, an Arrow `Struct` or an Arrow `Map<Utf8, …>`. Duplicate
   names or keys — a struct with two fields of one name, a map entry
-  repeated — and null map keys are errors.
-- **Not supported** — sets, NaN and infinite decimals, any other object: an
+  repeated — and null map keys are errors, checked before null fields are
+  left out: `[("x", None), ("x", 1)]` is an error, not `{"x": 1}`.
+- **Not supported** — sets, NaN and infinite decimals, NumPy scalars other
+  than booleans, integers and floats of at most 64 bits, any other object: an
   error asking for an explicit `revision=` on the output. There is no
   fallback encoding: a value either has a canonical form or the write
   fails.
@@ -124,7 +137,10 @@ store reads them back sorted by key — the key and the revision column, or
 every column without one (the partition column aside) — a chunk at a time,
 and the harness versions them as any rows, natively. PostgresStore's
 values arrive as psycopg's Python types, so a row written by `Sql` and the
-same row returned from Python digest alike.
+same row returned from Python digest alike. The same read-back (`scan`)
+serves a patch that must take in what a dead `Sql` writer left: the slice
+streams back a chunk at a time, the patch's rows merged in, into the
+native replacement — memory is a chunk and the patch, not the slice.
 
 ## Golden vectors
 

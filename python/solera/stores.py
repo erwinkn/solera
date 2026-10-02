@@ -68,14 +68,18 @@ class Scope:
     For a keyed output the harness says which keys the write changes against
     the key index: `upserts` are the keys to write, `removes` the keys to
     delete. A store may write only those; `None` means unknown — everything
-    in the write, and for a replacement, every key not in it goes."""
+    in the write, and for a replacement, every key not in it goes. Past
+    what fits in a list, an immutable store's `upserts` is a
+    `solera.keys.index.DeltaKeys`, whose `pages()` read them from the
+    commit's delta files. Asked to write a key the write does not hold, a
+    store raises: a requested write never silently disappears."""
 
     output: Output
     partition: str
     batch: int | None = None
     attempt: str | None = None
     aliases: tuple = ()
-    upserts: frozenset[str] | None = None
+    upserts: Any = None  # frozenset[str], a `DeltaKeys`, or None
     removes: frozenset[str] | None = None
     # The attempt's generation and invocation, for a `fenced` store to check
     # (docs/lifecycle.md §9.7); `None` outside an attempt.
@@ -186,6 +190,18 @@ def encode(value: Any) -> tuple[bytes, str]:
     return pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL), "pkl"
 
 
+def key_text(value: Any) -> str:
+    """A key as the index and every store name it: a `str` as it is, an `int`
+    (not a `bool`) as its decimal text. Nothing else is a key — the same
+    rule native row extraction follows."""
+
+    if isinstance(value, str):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    raise WriteError(f"a key must be a str or an int, not {type(value).__name__}")
+
+
 def entries(output: Output, value: Any) -> dict[str, Any]:
     """A keyed write's content as `key -> entry` (§4): a `keyed=True`
     output's dict, a partition set's elements, or rows grouped by their key
@@ -205,16 +221,21 @@ def entries(output: Output, value: Any) -> dict[str, Any]:
     for row in _rows(value, output.name):
         if output.key not in row:
             raise WriteError(f"{output.name}: row lacks the declared key column {output.key!r}")
-        result.setdefault(str(row[output.key]), []).append(row)
+        try:
+            result.setdefault(key_text(row[output.key]), []).append(row)
+        except WriteError as e:
+            raise WriteError(f"{output.name}: {e}") from None
     return result
 
 
-def key_rows(write: Any, output: Output):
+def key_rows(write: Any, output: Output, exclude: tuple[str, ...] = ()):
     """A keyed write's content for the key index (`solera.keys.Rows`), every
     key the group of rows that carry it, with versions computed natively as
     the index reaches each key (docs/row-digest.md). Arrow data (anything
     with `__arrow_c_stream__`) is read in place; a DataFrame becomes Arrow
-    through DuckDB."""
+    through DuckDB. A row's digest leaves out its key column and the
+    `exclude`d ones — columns its store adds, so a row digests the same as
+    written and as read back."""
 
     from .keys import Rows
 
@@ -233,15 +254,15 @@ def key_rows(write: Any, output: Output):
 
             write = duckdb.connect().from_df(write)
         if hasattr(write, "__arrow_c_stream__"):
-            return Rows.arrow(write, output.key, output.revision)
+            return Rows.arrow(write, output.key, output.revision, list(exclude))
         if write is None:
             write = []
         if not isinstance(write, list) or not all(isinstance(r, Mapping) for r in write):
             raise WriteError(f"{name}: expected rows (list[dict] or DataFrame), got {type(write).__name__}")
-        return Rows.records(write, output.key, output.revision)
+        return Rows.records(write, output.key, output.revision, list(exclude))
     except KeyError as e:
         raise WriteError(f"{name}: row lacks the declared key column {output.key!r}") from e
-    except ValueError as e:  # Arrow data without the columns, a value with no digest
+    except ValueError as e:  # a key that is not one, Arrow data without the columns, a value with no digest
         raise WriteError(f"{name}: {e}") from e
 
 
@@ -382,28 +403,37 @@ class FileStore:
 
     async def _store_keyed(self, write, prior, scope, base, generation) -> Written:
         """One object per key and version. The harness says which keys
-        changed (`Scope.upserts`); only those are written, at the versions
-        the key index will hold. Removed keys need no write: the index stops
-        naming them, and `discard` deletes what nothing reads."""
+        changed (`Scope.upserts`) — listed, or paged from the commit's delta
+        files when there are too many to list; only those are written, at
+        the versions the key index will hold, so no object goes unnamed.
+        Removed keys need no write: the index stops naming them, and
+        `discard` deletes what nothing reads."""
 
         output = scope.output
         patch = isinstance(write, Patch)
-        content = entries(output, write.rows if patch else write)
+        rows = write.rows if patch else write
+        content = entries(output, rows)
         from .keys.index import key_str
 
-        keys, versions = store_key_rows(self, write.rows if patch else write, output).entries()
+        keys, versions = store_key_rows(self, rows, output).entries()
         version_of = {key_str(k): v for k, v in zip(keys, versions, strict=True)}
-        upserts = list(content) if scope.upserts is None else [k for k in scope.upserts if k in content]
-        written = await self._many(
-            lambda k: self._put(self.key_name(base, k, version_of[k], generation), content[k]), upserts
-        )
+
+        async def put(key: str) -> str:
+            if key not in content:
+                raise StoreError(f"{output.name}: asked to write key {key!r}, which the write does not hold")
+            return await self._put(self.key_name(base, key, version_of[key], generation), content[key])
+
+        start = "" if (not patch or prior is None) else prior.version
+        digest = hashlib.sha256(json.dumps([start, scope.batch]).encode())
+        async for page in _pages(scope.upserts, content):
+            for key, revision in zip(page, await self._many(put, page), strict=True):
+                digest.update(json.dumps([key, revision]).encode())
         removes = (
             sorted(scope.removes)
             if scope.removes is not None
-            else sorted(str(k) for k in (write.remove if patch else ()))
+            else sorted(key_text(k) for k in (write.remove if patch else ()))
         )
-        start = "" if (not patch or prior is None) else prior.version
-        version = _digest([start, scope.batch, sorted(zip(upserts, written, strict=True)), removes])
+        version = _digest([digest.hexdigest(), removes])
         handle = {"mode": "keyed", "path": base, "key": output.key}
         return Written(self._ref(scope, handle, version))
 
@@ -630,6 +660,19 @@ class S3Store(FileStore):
 
             self._stores[""] = obstore.store.from_url(resolve_env(self.url), **resolve_env(self.options))
         return self._stores[""]
+
+
+async def _pages(upserts, content: dict):
+    """The keys a keyed write writes, sorted, a page at a time: every key of
+    the content, the listed ones, or the pages of a delta's selection."""
+
+    if upserts is None:
+        yield sorted(content)
+    elif isinstance(upserts, (set, frozenset)):
+        yield sorted(upserts)
+    else:
+        async for page in upserts.pages():
+            yield page
 
 
 def _digest(value: Any) -> str:
