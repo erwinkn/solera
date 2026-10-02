@@ -134,9 +134,7 @@ export interface SensorDecl {
 export interface StoreDecl {
   version: string;
   ref: string;
-  writes: "immutable" | "fenced" | "overwrite";
-  strict: boolean;
-  late_write_grace: number;
+  writes: "immutable" | "fenced";
 }
 
 export interface Manifest {
@@ -204,7 +202,6 @@ export interface AssetStatus {
     attempt: string | null;
   } | null;
   failures: Partial<Record<FailureClass, number>> | null;
-  held: number;
   unsettled: number;
   updated_at: number | null;
 }
@@ -619,17 +616,8 @@ export interface Worker {
   [key: string]: Json | undefined;
 }
 
+/** GET /holds: what writers that died left for an operator (or the next attempt) to settle. */
 export interface Holds {
-  holds: {
-    asset: string;
-    scope: string;
-    attempt: string;
-    run: string;
-    mode: "grace" | "strict";
-    at: number;
-    grace: number | null;
-    releases_at: number | null;
-  }[];
   unsettled: {
     output: string;
     scope: string;

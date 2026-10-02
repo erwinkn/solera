@@ -394,13 +394,7 @@ function Declaration({ asset, manifest }: { asset: AssetDecl; manifest: Manifest
                 <Row key={o.name} name={o.name}>
                   <span>
                     {o.store} store
-                    {store && (
-                      <span className="text-fg-subtle">
-                        {" "}
-                        ({store.writes}
-                        {store.strict ? ", strict" : ""})
-                      </span>
-                    )}
+                    {store && <span className="text-fg-subtle"> ({store.writes})</span>}
                   </span>
                   {o.partition_set && <Tag>partition set</Tag>}
                   {o.key && !o.partition_set && <Tag>key {o.key}</Tag>}

@@ -13,8 +13,8 @@ Five questions drive every screen, in this order:
    keys with their message, one click from the traceback or log line.
 3. **What's stale?** Partitions missing or failed, edges behind their
    upstream (lag in batches), keys whose output lags their input revision.
-4. **What's held?** Scopes blocked on an uncertain writer, unsettled writes,
-   stuck discards: each with the operator action that clears it.
+4. **What's left behind?** Unsettled writes and stuck discards from writers
+   that died, with the action that clears what an operator must.
 5. **What's next?** Automations by their next fire, keys due for retry.
 
 Dense where the data is dense (runs, keys, logs, events: tables with
@@ -40,7 +40,7 @@ states).
 | `/sensors`, `/sensors/$sensor` | sensors, hosts, tick history |
 | `/sources`, `/sources/$source` | head, keys, commit history, commit form |
 | `/executors` | executors with in-flight vs limit, pool workers, sensor hosts |
-| `/health` | holds (release), unsettled writes, stuck discards (clear), engine diagnostics, stores |
+| `/health` | engine diagnostics, unsettled writes, stuck discards (clear), store kinds |
 
 Navigation state lives in the URL: filters, the selected scope, task,
 attempt and tab are search params validated per route, so every view is a
@@ -140,10 +140,10 @@ read-only endpoints instead (with tests in `tests/server`):
 
 | Route | For |
 |---|---|
-| `GET /assets:status` | per-asset rollup for the graph and the overview: partition counts, last outcome, failing keys, holds |
+| `GET /assets:status` | per-asset rollup for the graph and the overview: partition counts, last outcome, failing keys, unsettled writes |
 | `GET /assets/{a}/failures` | the failure index: failing keys with class, tries, due, message |
 | `GET /assets/{a}/key-outcomes` | the `key_outcomes` history, searchable by key |
 | `GET /assets/{a}/explain?key=` | why a key is (not) in the output: patterns, failure, last outcome, revisions |
 | `GET /assets/{a}/edges` | every edge's watermark per scope, with lag in batches |
-| `GET /holds` | held scopes, unsettled writes, stuck discards |
+| `GET /holds` | unsettled writes and stuck discards |
 | `next_at` on automations | the next scheduled fire, from the engine's own clock rule |

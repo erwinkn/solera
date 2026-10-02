@@ -56,9 +56,7 @@ export function Overview() {
   const failing = status ? Object.entries(status).filter(([, s]) => failingKeys(s) > 0) : [];
   const keys = failing.reduce((sum, [, s]) => sum + failingKeys(s), 0);
   const starved = useStarvedPools();
-  const operator = holds
-    ? holds.holds.length + holds.unsettled.length + holds.discards.length + starved.length
-    : undefined;
+  const operator = holds ? holds.unsettled.length + holds.discards.length + starved.length : undefined;
   const failedTotal = failed?.pages[0]?.total;
   const navigate = useNavigate();
 
@@ -127,14 +125,13 @@ export function Overview() {
             holds
               ? operator
                 ? [
-                    holds.holds.length && plural(holds.holds.length, "held scope"),
                     holds.unsettled.length && `${holds.unsettled.length} unsettled`,
                     holds.discards.length && `${holds.discards.length} stuck`,
                     starved.length && plural(starved.length, "idle pool"),
                   ]
                     .filter(Boolean)
                     .join(", ")
-                : "nothing held, stuck or starved"
+                : "nothing unsettled, stuck or starved"
               : undefined
           }
         />
@@ -311,7 +308,7 @@ function AttentionAssets({ status }: { status: Record<string, AssetStatus> | und
           name,
           s,
           keys: failingKeys(s),
-          score: s.partitions.failed * 100 + failingKeys(s) * 10 + s.held * 50 + s.partitions.missing,
+          score: s.partitions.failed * 100 + failingKeys(s) * 10 + s.partitions.missing,
         }))
         .filter((r) => r.score > 0)
         .sort((a, b) => b.score - a.score)
@@ -321,7 +318,7 @@ function AttentionAssets({ status }: { status: Record<string, AssetStatus> | und
     <Card>
       <CardHeader
         title="Assets needing attention"
-        description="Failed or missing partitions, failing keys, held scopes"
+        description="Failed or missing partitions, failing keys"
         actions={
           <Link to="/assets" className={moreClass}>
             <More />
@@ -332,7 +329,7 @@ function AttentionAssets({ status }: { status: Record<string, AssetStatus> | und
         <ListSkeleton />
       ) : rows.length === 0 ? (
         <Empty compact title={`All ${plural(total, "asset")} current`}>
-          No failed or missing partitions, failing keys or held scopes.
+          No failed or missing partitions, and no failing keys.
         </Empty>
       ) : (
         <ul className="flex flex-col pb-2">
@@ -357,7 +354,6 @@ function AttentionAssets({ status }: { status: Record<string, AssetStatus> | und
                     )}
                     {s.partitions.missing > 0 && <Flag tone="idle">{s.partitions.missing} missing</Flag>}
                     {keys > 0 && <Flag tone="warn">{plural(keys, "failing key")}</Flag>}
-                    {s.held > 0 && <Flag tone="warn">{s.held} held</Flag>}
                   </span>
                 </span>
                 {s.partitioned ? (

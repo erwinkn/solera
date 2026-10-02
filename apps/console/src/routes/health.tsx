@@ -1,37 +1,34 @@
 import type { ReactNode } from "react";
 import { useQuery, useSuspenseQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
-import { Eraser, Unlock } from "lucide-react";
+import { Eraser } from "lucide-react";
 import { q, useManifest, useProject } from "@/api/queries";
-import { useClearDiscards, useReleaseScope } from "@/api/mutations";
-import { useNow } from "@/lib/clock";
-import { plural, shortId, until } from "@/lib/format";
+import { useClearDiscards } from "@/api/mutations";
+import { plural, shortId } from "@/lib/format";
 import { Button } from "@/ui/button";
-import { CopyButton, Empty, Time } from "@/ui/data";
+import { CopyButton, Empty } from "@/ui/data";
 import { Card, CardHeader, Fact, Facts, Page, PageHeader } from "@/ui/layout";
 import { Confirm } from "@/ui/overlay";
 import { StatusBadge, StatusIcon } from "@/ui/status";
 import { Table, TableScroll, Td, Th, Tr } from "@/ui/table";
 
 /**
- * What an operator has to clear by hand (docs/lifecycle.md §9), and the
- * engine's own state. Holds keep a scope from running while an ended
- * attempt's writes might still land; stuck discards are garbage whose names
- * couldn't be read.
+ * The engine's own state, and what writers that died left behind
+ * (docs/lifecycle.md §9): unsettled writes, which the scope's next attempt
+ * repairs, and stuck discards, garbage whose names couldn't be read.
  */
 export function Health() {
   const project = useProject();
   const { data: holds } = useSuspenseQuery(q.holds(project));
-  const total = holds.holds.length + holds.unsettled.length + holds.discards.length;
+  const total = holds.unsettled.length + holds.discards.length;
   return (
     <Page>
       <PageHeader
         title="Health"
-        description="The engine, and what is waiting on an operator."
-        meta={<span>{total ? `${plural(total, "item")} need attention` : "Nothing needs an operator"}</span>}
+        description="The engine, and what writers that died left behind."
+        meta={<span>{total ? `${plural(total, "item")} need attention` : "Nothing left behind"}</span>}
       />
       <Engine />
-      <Holds holds={holds.holds} />
       <div className="grid gap-4 lg:grid-cols-2">
         <Unsettled rows={holds.unsettled} />
         <Discards rows={holds.discards} />
@@ -94,103 +91,6 @@ function Engine() {
           <span className="font-mono text-xs break-all">{d.objects}</span>
         </Fact>
       </Facts>
-    </Card>
-  );
-}
-
-function Holds({
-  holds,
-}: {
-  holds: {
-    asset: string;
-    scope: string;
-    attempt: string;
-    run: string;
-    mode: "grace" | "strict";
-    at: number;
-    grace: number | null;
-    releases_at: number | null;
-  }[];
-}) {
-  const release = useReleaseScope();
-  const now = useNow();
-  return (
-    <Card>
-      <CardHeader
-        title="Held scopes"
-        description="An attempt ended while its writes to an overwrite store might still land. Nothing runs on the scope until it is released: after a grace period, when the writer's result arrives, or by you."
-      />
-      {holds.length === 0 ? (
-        <Empty compact title="No held scopes" />
-      ) : (
-        <TableScroll className="border-t border-line">
-          <Table>
-            <thead>
-              <tr>
-                <Th>Scope</Th>
-                <Th>Hold</Th>
-                <Th>Held since</Th>
-                <Th>Releases</Th>
-                <Th>Writer</Th>
-                <Th />
-              </tr>
-            </thead>
-            <tbody>
-              {holds.map((h) => (
-                <Tr key={`${h.asset}/${h.scope}`}>
-                  <Td>
-                    <Link
-                      to="/assets/$asset"
-                      params={{ asset: h.asset }}
-                      search={{ scope: h.scope || undefined }}
-                      className="font-medium hover:underline"
-                    >
-                      {h.asset}
-                    </Link>
-                    {h.scope && <span className="ml-2 font-mono text-xs text-fg-muted">{h.scope}</span>}
-                  </Td>
-                  <Td>
-                    <StatusBadge
-                      status={h.mode}
-                      text={h.mode === "strict" ? "strict: waiting for the writer" : "grace period"}
-                    />
-                  </Td>
-                  <Td className="text-fg-muted">
-                    <Time at={h.at} />
-                  </Td>
-                  <Td className="text-fg-muted">
-                    {h.releases_at ? until(h.releases_at, now) : "only when completion is known"}
-                  </Td>
-                  <Td>
-                    <Link
-                      to="/runs/$run"
-                      params={{ run: h.run }}
-                      search={{ attempt: h.attempt }}
-                      className="font-mono text-xs text-link hover:underline"
-                    >
-                      {shortId(h.attempt)}
-                    </Link>
-                  </Td>
-                  <Td className="text-right">
-                    <Confirm
-                      trigger={
-                        <Button size="sm" icon={<Unlock />}>
-                          Release
-                        </Button>
-                      }
-                      title={`Release ${h.asset}${h.scope ? ` · ${h.scope}` : ""}?`}
-                      description="The next attempt runs at once and repairs the writer's intents. If the old writer is still writing, its writes may land after the next commit. Recorded with your name, as `solera scopes release` is."
-                      action="Release scope"
-                      danger
-                      onConfirm={() => release.mutate({ asset: h.asset, scope: h.scope })}
-                    />
-                  </Td>
-                </Tr>
-              ))}
-            </tbody>
-          </Table>
-        </TableScroll>
-      )}
     </Card>
   );
 }
@@ -293,10 +193,8 @@ function Discards({
 }
 
 const KIND_RULE: Record<string, ReactNode> = {
-  immutable: "Writes only new names; abandoned writes are unreferenced. Never held.",
-  fenced:
-    "Every write checks a generation; the next attempt's acquisition fences the old writer. Never held.",
-  overwrite: "Gate, intents and repair. An uncertain writer holds its scope for a grace period.",
+  immutable: "Writes only new names, so an abandoned write is unreferenced garbage, discarded later.",
+  fenced: "Every write checks a generation: the next attempt's acquisition fences the old writer out.",
 };
 
 function Stores() {
@@ -313,7 +211,7 @@ function Stores() {
             <tr>
               <Th>Store</Th>
               <Th>Writes</Th>
-              <Th>When a writer is uncertain</Th>
+              <Th>When a writer dies mid-write</Th>
               <Th>Version</Th>
             </tr>
           </thead>
@@ -321,21 +219,8 @@ function Stores() {
             {Object.entries(manifest.stores).map(([name, s]) => (
               <Tr key={name}>
                 <Td className="font-medium">{name}</Td>
-                <Td>
-                  {s.writes}
-                  {s.strict && (
-                    <span className="ml-1.5 rounded-full bg-warn-soft px-1.5 text-2xs text-warn-fg">
-                      strict
-                    </span>
-                  )}
-                </Td>
-                <Td className="text-xs text-fg-muted">
-                  {s.writes === "overwrite" && s.strict
-                    ? "Held until the writer's result proves completion, or an operator releases it."
-                    : s.writes === "overwrite"
-                      ? `Held for ${Math.round(s.late_write_grace)}s, then released.`
-                      : KIND_RULE[s.writes]}
-                </Td>
+                <Td>{s.writes}</Td>
+                <Td className="text-xs text-fg-muted">{KIND_RULE[s.writes]}</Td>
                 <Td className="font-mono text-xs text-fg-muted">{s.version}</Td>
               </Tr>
             ))}

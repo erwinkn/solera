@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
-import { Boxes, Briefcase, Database, KeyRound, ListTree, Lock } from "lucide-react";
+import { Boxes, Briefcase, Database, KeyRound, ListTree } from "lucide-react";
 import type { AssetDecl, AssetStatus, Manifest } from "@/api/types";
 import { cn } from "@/lib/cn";
 import { plural } from "@/lib/format";
@@ -97,7 +97,7 @@ export function assetTone(status: AssetStatus | undefined): Tone {
   const tones: Tone[] = [];
   const p = status.partitions;
   if (p.failed) tones.push("fail");
-  if (Object.entries(status.failures ?? {}).some(([k, n]) => k !== "canceled" && (n ?? 0) > 0) || status.held)
+  if (Object.entries(status.failures ?? {}).some(([k, n]) => k !== "canceled" && (n ?? 0) > 0))
     tones.push("warn");
   if (p.running) tones.push("run");
   if (p.complete) tones.push("ok");
@@ -301,18 +301,6 @@ function Node({ node, status }: { node: GraphNode; status: AssetStatus | undefin
             >
               <KeyRound className="size-2.5" />
               {failing}
-            </span>
-          )}
-          {!!status?.held && (
-            <span
-              className={cn(
-                "inline-flex items-center gap-0.5 rounded-full px-1.5 font-medium",
-                toneSoft.warn,
-              )}
-              title={`${status.held} held`}
-            >
-              <Lock className="size-2.5" />
-              {status.held}
             </span>
           )}
           {status?.updated_at != null && <Time at={status.updated_at} />}

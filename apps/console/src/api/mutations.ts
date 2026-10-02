@@ -171,23 +171,6 @@ export function useCommitSource() {
   });
 }
 
-export function useReleaseScope() {
-  const project = useProject();
-  const client = useQueryClient();
-  return useMutation({
-    mutationFn: ({ asset, scope }: { asset: string; scope: string }) =>
-      api(`/projects/${enc(project)}/scopes:release`, {
-        body: { asset, scope, by: "console" },
-      }),
-    onSuccess: (_, { asset, scope }) => {
-      notify("Scope released", scope ? `${asset} · ${scope}` : asset);
-      client.invalidateQueries({ queryKey: ["holds"] });
-      client.invalidateQueries({ queryKey: ["assets"] });
-    },
-    onError: (error) => complain("Couldn't release the scope", error),
-  });
-}
-
 export function useClearDiscards() {
   const project = useProject();
   const client = useQueryClient();

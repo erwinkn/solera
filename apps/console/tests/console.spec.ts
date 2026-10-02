@@ -180,7 +180,8 @@ test("automations toggle and health", async ({ page }) => {
   await expect(page.getByRole("switch", { name: /Disable refresh-index/ })).toBeChecked();
 
   await page.goto("/health");
-  await expect(page.getByRole("heading", { name: "Held scopes" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Unsettled writes" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Stuck discards" })).toBeVisible();
   await expect(page.getByText("browser", { exact: true })).toBeVisible();
 });
 

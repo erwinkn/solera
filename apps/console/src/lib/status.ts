@@ -57,9 +57,6 @@ const TONES: Record<string, Tone> = {
   excluded: "idle",
   not_matched: "idle",
   absent: "idle",
-  // holds
-  grace: "wait",
-  strict: "warn",
 };
 
 export function tone(status: string | null | undefined): Tone {

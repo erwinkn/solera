@@ -133,12 +133,12 @@ function useAttention() {
         (a) => a.partitions.failed > 0 || Object.values(a.failures ?? {}).some((n) => (n ?? 0) > 0),
       ).length
     : 0;
-  const held = holds ? holds.holds.length + holds.unsettled.length + holds.discards.length : 0;
-  return { running: diagnostics?.active_runs ?? 0, failing, held };
+  const leftover = holds ? holds.unsettled.length + holds.discards.length : 0;
+  return { running: diagnostics?.active_runs ?? 0, failing, leftover };
 }
 
 function Nav({ onNavigate }: { onNavigate?: () => void }) {
-  const { running, failing, held } = useAttention();
+  const { running, failing, leftover } = useAttention();
   const items: {
     to: string;
     label: string;
@@ -170,7 +170,7 @@ function Nav({ onNavigate }: { onNavigate?: () => void }) {
       to: "/health",
       label: "Health",
       icon: <HeartPulse />,
-      badge: held,
+      badge: leftover,
       tone: "warn",
     },
   ];
