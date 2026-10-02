@@ -302,7 +302,6 @@ class Simulation(RuleBasedStateMachine):
         old = world.slot
         if change is not None:
             self.variant = VARIANTS[change](self.variant)
-        self.renames += change == "rename"
             self.renames += change == "rename"
             self.project = self._build()
         self._ensure_engine(self.project)
