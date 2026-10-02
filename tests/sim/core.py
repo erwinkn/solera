@@ -88,13 +88,14 @@ class SimLoop(asyncio.SelectorEventLoop):
     def run_in_executor(self, executor, func, *args):
         """Run `func` to its end on a thread of its own while the loop waits:
         deterministic, and a function that runs a loop of its own (upkeep's
-        compactions) still can. A function marked `__sim_async__` (a channel
-        call that needs this very loop) is awaited here instead."""
+        compactions) still can. A method marked `__sim_async__` (a channel call
+        that needs this very loop) names its coroutine twin, awaited instead."""
 
         target = func.args[0] if isinstance(func, functools.partial) and func.args else func
-        if hasattr(target, "__sim_async__"):
+        if hasattr(target, "__sim_async__"):  # names the coroutine method on the same object
             rest = func.args[1:] if target is not func else args
-            return asyncio.ensure_future(target.__sim_async__(*rest, **getattr(func, "keywords", {})))
+            method = getattr(target.__self__, target.__sim_async__)
+            return asyncio.ensure_future(method(*rest, **getattr(func, "keywords", {})))
         future = self.create_future()
         box: dict = {}
 
