@@ -23,7 +23,9 @@ Admission is by index, with hysteresis: an index is admitted when its
 snapshot, plus a compaction's overlap, fits beside the indexes active in
 the last `window` seconds; eviction takes retired files (inputs of a
 published compaction), then files of inactive or demoted indexes, never
-pinned files or an active index's.
+pinned files or an active index's. A file's local size is estimated from
+its source until one is built; from then on the size it built to counts,
+so an index shown not to fit is not fetched again until room changes.
 
 A cached file is the object it claims to be: what is installed or kept
 after a restart has the size and digest of the `FileInfo` that names it,
@@ -47,6 +49,7 @@ from .io import ObjectIO
 
 GROWTH = 2.0  # local bytes per compressed data byte, reserved before a build (extended if it needs more)
 RETIRED = 10_000  # paths of retired files remembered, so a fill finishing late does not keep one
+OBSERVED = 100_000  # local sizes remembered, per source file
 
 
 @dataclass
@@ -141,6 +144,7 @@ class EngineCache:
         self._fills: dict[str, asyncio.Future] = {}
         self._builds = asyncio.Semaphore(builds)
         self._retired: OrderedDict[str, None] = OrderedDict()
+        self._observed: OrderedDict[tuple[str, str], int] = OrderedDict()  # (path, digest) -> built size
         # After a restart: local files whose directory checks out are kept, their
         # indexes not admitted until a reader asks again; anything else goes.
         for name in os.listdir(root):
@@ -216,9 +220,17 @@ class EngineCache:
         with contextlib.suppress(OSError):
             os.unlink(f.local)
 
-    @staticmethod
-    def _estimate(f: FileInfo) -> int:
-        return int(GROWTH * max(0, f.size - f.tail)) + 4096
+    def _estimate(self, path: str, f: FileInfo) -> int:
+        """The local size of `f`: as it built before, or from its compressed data."""
+
+        built = self._observed.get((path, f.digest))
+        return built if built is not None else int(GROWTH * max(0, f.size - f.tail)) + 4096
+
+    def _built(self, path: str, f: FileInfo, size: int) -> None:
+        self._observed[(path, f.digest)] = size
+        self._observed.move_to_end((path, f.digest))
+        while len(self._observed) > OBSERVED:
+            self._observed.popitem(last=False)
 
     def _present(self, path: str, f: FileInfo) -> _File | None:
         """The cached copy of `f`, if it is that object; a copy that is not goes."""
@@ -255,7 +267,7 @@ class EngineCache:
 
         levels: dict[int, int] = {}
         for f in state.files:
-            levels[f.level] = levels.get(f.level, 0) + self._estimate(f)
+            levels[f.level] = levels.get(f.level, 0) + self._estimate(state.path(f.name), f)
         return sum(levels.values()) + max(levels.values(), default=0)
 
     def demote(self, prefix: str) -> None:
@@ -320,7 +332,7 @@ class EngineCache:
 
     async def _do_fill(self, io: ObjectIO, prefix: str, path: str, f: FileInfo) -> bool:
         async with self._builds:  # the fetched bytes and the build: bounded together
-            need = self._estimate(f)
+            need = self._estimate(path, f)
             if not self._evict(need, keep=prefix):
                 self.demote(prefix)
                 return False
@@ -341,6 +353,7 @@ class EngineCache:
             body = await _in_thread(lambda: _native.build_local(data, path, bytes.fromhex(f.digest)))
         except ValueError as e:
             raise Corrupt(f"{path}: {e}") from e
+        self._built(path, f, len(body))
         extra = max(0, len(body) - reserved)
         if extra and not self._evict(extra, keep=prefix):
             self.demote(prefix)
@@ -378,7 +391,7 @@ class EngineCache:
             return self._present(path, f) is not None
         verify(f, path, data)
         async with self._builds:
-            need = self._estimate(f)
+            need = self._estimate(path, f)
             if not self._evict(need, keep=prefix):
                 self.demote(prefix)
                 return False

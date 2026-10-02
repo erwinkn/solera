@@ -57,6 +57,17 @@ impl SortedRun {
             + 8 * self.locators.capacity()
     }
 
+    /// Gives back what building over-allocated: a run is held as long as it is read.
+    fn shrink(mut self) -> SortedRun {
+        self.keys.data.shrink_to_fit();
+        self.keys.ends.shrink_to_fit();
+        self.versions.data.shrink_to_fit();
+        self.versions.ends.shrink_to_fit();
+        self.deleted.shrink_to_fit();
+        self.locators.shrink_to_fit();
+        self
+    }
+
     fn push(&mut self, key: &[u8], version: &[u8], deleted: bool, locator: u64) -> Result<()> {
         if let Some(last) = self.keys.len().checked_sub(1) {
             if key <= self.keys.get(last) {
@@ -182,7 +193,7 @@ impl SortedRun {
         {
             return fmt_err("the keys do not match the index's range");
         }
-        Ok(run)
+        Ok(run.shrink())
     }
 
     /// The transport form: one `.kx` file.
@@ -294,7 +305,7 @@ impl<'a> Builder<'a> {
         for k in &self.removes[self.next..] {
             self.run.push(k, b"", true, 0)?;
         }
-        Ok(self.run)
+        Ok(self.run.shrink())
     }
 }
 

@@ -228,7 +228,10 @@ class Engine(Attempts, Sensors):
 
         self._stopping = False
         if self.keys is not None:
-            self.keys.start()
+            try:
+                self.keys.start()
+            except Exception as e:  # an accelerator: without it, workers resolve their writes
+                log.warning("key cache disabled: %s", e)
         self.runner = asyncio.create_task(self._loop())
         self.upkeep.start()
         self.history.start()

@@ -408,7 +408,7 @@ against `cache_disk`:
 
 | Operation | Reserves | Released |
 |---|---|---|
-| fill of a file | its decompressed size, estimated from entries × the index's mean raw entry size, plus 10% | when installed, or when the fill fails or is canceled (its temporary file deleted) |
+| fill of a file | its local size: what it built to before, else estimated from its compressed data | when installed, or when the fill fails or is canceled (its temporary file deleted) |
 | compaction | its outputs' estimated size, while its inputs stay pinned by readers | when the outputs are installed and the inputs unpinned and evicted |
 | candidate | its delta's decompressed size (below) | when installed, dropped or evicted |
 
@@ -465,6 +465,9 @@ So the cache admits by index and evicts by file, with hysteresis:
   active index.
 - An admitted index whose new snapshot no longer fits after a compaction
   or growth is demoted, as above, and re-admitted under the same rule.
+  Admission counts a file at the size its local form built to once one
+  was built, so a file shown not to fit is not fetched again until the
+  budget, the other indexes' use or the snapshot changes.
 - In the example, A is admitted and B declined; B's writers pay the cold
   path until A has been idle for the window. Two indexes that both fit are
   both warm.
@@ -612,12 +615,14 @@ name without a LIST.
   with a cursor would not advance.
 - **Bounded work in prepare.** Prepare reads only RAM. At commit, on a
   maintenance thread, the engine keeps for each committed delta of at most
-  `inline_max` entries (10K) its sorted entries as a **summary**, within
-  `cache_ram`, preferably until the consumers' watermarks pass the batch;
-  the budget evicts the oldest first. A window is inlined only when every
-  batch in it has a summary, it spans at most `inline_max_batches` (64)
-  summaries, and their entries total at most `inline_max_merge` (100K):
-  then prepare merges them (a k-way merge of small sorted lists). Anything
+  `inline_max` entries (10K) its sorted entries as a **summary** — native
+  sorted runs, accounted at the bytes they hold — within `cache_ram`,
+  preferably until the consumers' watermarks pass the batch; the budget
+  evicts the oldest first. A window is inlined only when every batch in it
+  has a summary and it spans at most `inline_max_batches` (64) summaries:
+  then prepare merges them from the cursor, newest batch winning, and
+  stops at the page (a binary search per summary, then a k-way merge of
+  `limit` entries), so its work is the page's, not the window's. Anything
   else — after a restart, a big batch, a lagging consumer with thousands
   of batches — goes out as today, and the worker pages the window.
 
@@ -755,8 +760,8 @@ reports both.
   selected by themselves (the per-key predicate).
 - **Inlining.** Inlined pages equal `pending` pages for the same pinned
   window, including a later batch that must not leak in, tombstones, the
-  byte cap, an oversized first entry (no inline), the summary and merge
-  caps, and the continuation cursor.
+  byte cap, an oversized first entry (no inline), the summary cap, and
+  the continuation cursor.
 - **Benchmarks.** The crossover grid of §6; warm resolves at 1K/10K/100K
   keys into 1M/10M/100M against the cold-worker and warm-worker baselines
   — time to delta end to end, engine CPU, RSS, cache disk, with the page

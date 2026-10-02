@@ -4,10 +4,12 @@ thread of their own: nothing here runs on the engine's event loop.
 - `resolve` answers a worker's request from the cache, or declines.
 - `committed` keeps the cache warm with what a commit installed — a delta
   the resolver returned is a candidate already, installed without a GET —
-  and keeps small deltas' entries in memory as summaries.
+  and keeps small deltas' entries in memory as summaries: native sorted
+  runs, accounted at the bytes they hold.
 - `installed` takes a file the engine wrote (a compaction output).
 - `inline` merges summaries into the first page of a pending window, for
-  prepare: memory only, never waiting.
+  prepare: memory only, never waiting, its work the page's, not the
+  window's.
 
 Whatever here reads index files from the object store holds a reader pin
 (`hold`) at the event position it read the index at, until its reads are
@@ -25,7 +27,7 @@ import math
 import threading
 from collections import OrderedDict
 
-from solera.keys import SortedRun, decode_block, parse_index
+from solera.keys import SortedRun
 from solera.keys.cache import Corrupt, EngineCache, verify
 from solera.keys.index import FileInfo, Options
 from solera.keys.io import ObjectIO
@@ -35,7 +37,6 @@ log = logging.getLogger(__name__)
 
 INLINE_MAX = 10_000  # entries of a delta kept as a summary
 INLINE_BATCHES = 64  # summaries one inlined page may merge
-INLINE_MERGE = 100_000  # entries one inlined page may merge
 INLINE_BYTES = 2**20  # serialized page
 
 
@@ -56,8 +57,8 @@ class KeyService:
         self.disk, self.candidates, self.window = disk, candidates, window
         self.limits = limits or Limits()
         self.summary_bytes = summary_bytes
-        # (prefix, batch) -> (keys, versions, deleted, locators), sorted: read from any thread.
-        self.summaries: OrderedDict[tuple, tuple] = OrderedDict()
+        # (prefix, batch) -> (its delta's files as sorted runs, their bytes): read from any thread.
+        self.summaries: OrderedDict[tuple, tuple[list[SortedRun], int]] = OrderedDict()
         self._summary_size = 0
         self.loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
@@ -87,25 +88,38 @@ class KeyService:
     # -- the thread -----------------------------------------------------------------------
 
     def start(self) -> None:
-        if self.loop is not None:
+        """Start the thread; raises what its setup raised (a cache directory
+        that cannot be made), and is not tried again: every resolve then
+        declines, and workers resolve themselves."""
+
+        if self.loop is not None or self._stopped:
             return
-        self._stopped = False
-        ready = threading.Event()
+        started: concurrent.futures.Future = concurrent.futures.Future()
 
         def run():
-            self.loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.loop)
-            self.io = ObjectIO(self.objects)
-            self.cache = EngineCache(
-                self.root, disk=self.disk, candidates=self.candidates, window=self.window
-            )
-            self.resolver = Resolver(self.cache, self.io, self.options, self.limits, holds=self)
-            ready.set()
-            self.loop.run_forever()
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                self.io = ObjectIO(self.objects)
+                self.cache = EngineCache(
+                    self.root, disk=self.disk, candidates=self.candidates, window=self.window
+                )
+                self.resolver = Resolver(self.cache, self.io, self.options, self.limits, holds=self)
+            except BaseException as e:
+                loop.close()
+                started.set_exception(e)
+                return
+            started.set_result(loop)
+            loop.run_forever()
 
-        self._thread = threading.Thread(target=run, name="solera-keys", daemon=True)
-        self._thread.start()
-        ready.wait()
+        thread = threading.Thread(target=run, name="solera-keys", daemon=True)
+        thread.start()
+        try:
+            loop = started.result()
+        except BaseException:
+            self._stopped = True
+            raise
+        self._thread, self.loop = thread, loop
 
     async def stop(self) -> None:
         self._stopped = True
@@ -124,10 +138,13 @@ class KeyService:
         await asyncio.to_thread(self._thread.join, 5)
 
     def _running(self) -> bool:
-        """Started on first use; not again once stopped."""
+        """Started on first use; not again once stopped, or once it failed to start."""
 
         if self.loop is None and not self._stopped:
-            self.start()
+            try:
+                self.start()
+            except Exception as e:
+                log.warning("key cache: cannot start: %s", e)
         return self.loop is not None
 
     def _submit(self, coro) -> concurrent.futures.Future:
@@ -217,53 +234,43 @@ class KeyService:
                     data = data or await self.io.read_whole(p, f.size)
                     verify(f, p, data)  # a summary says what the committed file holds, or nothing
                     parts.append(data)
-        except Corrupt as e:
+            if small:
+                self._summarize(prefix, batch, parts)
+        except (Corrupt, ValueError) as e:
             log.warning("key cache: %s", e)
-            return
-        if small:
-            self._summarize(prefix, batch, parts)
 
     def _summarize(self, prefix: str, batch: int, parts: list[bytes]) -> None:
-        keys, versions, deleted, locators, size = [], [], bytearray(), [], 0
-        for data in parts:
-            idx = parse_index(data, len(data))
-            for _, off, sz, _, _ in idx["blocks"]:
-                k, v, d, loc, _ = decode_block(data[off : off + sz], idx["codec"])
-                keys += k
-                versions += v
-                deleted += bytes(d)
-                locators += loc
-                size += sum(map(len, k)) + sum(map(len, v)) + 24 * len(k)
-        self.summaries[(prefix, batch)] = (keys, versions, bytes(deleted), locators, size)
+        runs = [SortedRun.decode(data) for data in parts]
+        size = sum(r.nbytes for r in runs)
+        old = self.summaries.pop((prefix, batch), None)
+        if old is not None:
+            self._summary_size -= old[1]
+        self.summaries[(prefix, batch)] = (runs, size)
         self._summary_size += size
         while self._summary_size > self.summary_bytes and self.summaries:
             _, old = self.summaries.popitem(last=False)
-            self._summary_size -= old[4]
+            self._summary_size -= old[1]
 
     # -- inline pages (§7) -----------------------------------------------------------------
 
     def inline(self, prefix: str, lo: int, hi: int, after: str | None, limit: int) -> dict | None:
         """The first page of the pending window `[lo, hi]` past `after`, merged
         from summaries — newest batch winning, deletions kept — or None when a
-        batch has none, or the merge or the page would be too big."""
+        batch has none, or the page would be too big."""
 
         if hi < lo or hi - lo + 1 > INLINE_BATCHES:
             return None
         parts = [self.summaries.get((prefix, b)) for b in range(hi, lo - 1, -1)]  # newest first
-        if any(p is None for p in parts) or sum(len(p[0]) for p in parts) > INLINE_MERGE:
+        if any(p is None for p in parts):
             return None
         start = after.encode("utf-8", "surrogateescape") if after is not None else None
-        seen: dict[bytes, tuple] = {}
-        for keys, versions, deleted, locators, _ in parts:
-            for k, v, d, loc in zip(keys, versions, deleted, locators, strict=True):
-                if (start is None or k > start) and k not in seen:
-                    seen[k] = (v, d, loc)
-        order = sorted(seen)
+        # A batch's files never overlap: each is a run of its own, at its batch's rank.
+        runs = [r for p in parts for r in p[0]]
+        keys, versions, deleted, locators, more = SortedRun.merge(runs, start, limit)
         # The page's size as the spec serializes it (`json.dumps`, its default separators):
         # with `next` null; a cursor replaces that with a key.
         upserted, removed, size, last = {}, [], len(json.dumps(inline_page({}, [], None))), None
-        for k in order[:limit]:
-            v, d, loc = seen[k]
+        for k, v, d, loc in zip(keys, versions, deleted, locators, strict=True):
             key = k.decode("utf-8", "surrogateescape")
             entry = len(json.dumps(key) if d else json.dumps({key: [v.hex(), loc]})[1:-1]) + 2
             if size + entry + len(json.dumps(key)) > INLINE_BYTES:  # this key may be the cursor
@@ -276,7 +283,7 @@ class KeyService:
             else:
                 upserted[key] = [v.hex(), loc]
             last = key
-        return inline_page(upserted, removed, last if len(order) > limit else None)
+        return inline_page(upserted, removed, last if more else None)
 
 
 def inline_page(upserted: dict, deleted: list, nxt) -> dict:
