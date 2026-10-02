@@ -29,6 +29,10 @@ class Journal:
     finished: dict[str, list[tuple[int, dict]]] = field(default_factory=lambda: defaultdict(list))
     launched: dict[str, dict] = field(default_factory=dict)  # attempt -> AttemptLaunched
     problems: list[str] = field(default_factory=list)
+    twice: list[tuple] = field(
+        default_factory=list
+    )  # (seq, path, when): segments that landed again, other bytes
+    now: object = None  # the world's clock
     applied_commits: set = field(default_factory=set)  # attempts some engine committed in memory
     reads: list = field(default_factory=list)  # AttemptFinished events that report what their reads saw
 
@@ -39,7 +43,7 @@ class Journal:
         seq = body["seq"]
         if seq in self.segments:
             if self.segments[seq] != body:
-                self.problems.append(f"segment {seq} landed twice with different bytes")
+                self.twice.append((seq, path, self.now()))
             return
         self.segments[seq] = body
         for event in body["events"]:
@@ -47,6 +51,13 @@ class Journal:
                 self.finished[event["attempt"]].append((seq, event))
             elif event["type"] == "AttemptLaunched":
                 self.launched[event["attempt"]] = event
+
+    def overwritten(self, deleted: dict, now: float) -> list[int]:
+        """Segments that landed twice with different bytes, the second still
+        there a minute later. (An opener whose fence lands in a hole cleanup
+        left deletes it at once and opens again: transient, by design.)"""
+
+        return [seq for seq, path, at in self.twice if path not in deleted and now - at > 60.0]
 
     def recorded(self, events) -> None:
         """Events an engine applied (durable or not yet): what its model knows."""

@@ -74,7 +74,7 @@ class Simulation(RuleBasedStateMachine):
     def boot(self, seed, store="file"):
         self.trace.append(f"boot(seed={seed}, store={store!r})")
         self.world = world = World(self.tmp, seed, key_options=Options(l0_max_files=2))
-        self.journal = Journal()
+        self.journal = Journal(now=world.now)
         world.objects.tap = self.journal.landed
         world.on_record = self.journal.recorded
         self.db, self.outside = Database(), External()
@@ -340,6 +340,10 @@ class Simulation(RuleBasedStateMachine):
             return
         if self.journal.problems:
             raise Violation("; ".join(self.journal.problems))
+        if overwritten := self.journal.overwritten(self.world.objects.deleted, self.world.now()):
+            raise Violation(
+                f"journal segments {overwritten} landed twice with different bytes, both readable"
+            )
         for attempt, ends in self.journal.finished.items():
             if len(ends) > 1:
                 raise Violation(

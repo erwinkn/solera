@@ -94,7 +94,7 @@ Checked after every step:
 | Invariant | Example of a violation |
 |---|---|
 | **No state breaks.** No engine's `State` fails applying an event (which would exit the process with code 70). | a reducer raising on a replayed event |
-| **One end per attempt.** The journal holds at most one `AttemptFinished` per attempt, and no segment lands twice with different bytes. | a zombie engine and its successor both ending attempt `A` |
+| **One end per attempt.** The journal holds at most one `AttemptFinished` per attempt, and no segment lands twice with different bytes and stays (an opener whose fence lands in a hole cleanup left deletes it and opens again, by design). | a zombie engine and its successor both ending attempt `A` |
 | **Nothing is read after collection.** No live attempt or serving engine finds an index file or data object gone because garbage collection deleted it. | a delta window's reader pin not holding its files |
 | **Reads say what they read.** A PostgresStore read reports the generation that wrote the rows it loaded, the newest committed before its snapshot — never one that only acquired the slice — and the key versions an attempt reports are those of the rows it loaded. | an attempt that acquired and died surfacing as the read generation |
 | **Committed keys are readable.** Every key an immutable store's head lists loads back at its indexed version, from an object a committed attempt wrote. | a stale writer's object referenced by the index |
