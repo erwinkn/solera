@@ -67,13 +67,16 @@ write is the scope's whole content (a first write, or a `full` run).
 - An unkeyed incremental output's write is a `Patch` of rows: append it as
   batch `scope.batch`.
 - A keyed output's write arrives as a `KeyedWrite`, already resolved
-  against the engine's key index: `upserts` (key → version) are the keys
-  to write — `write.prepared.groups(keys)` gives each key's rows — and
-  `removes` the keys to delete; every other key stays as it is. With
-  `whole`, the write is the scope's entire content: delete every key it
-  does not hold. A key with zero rows does not exist. Plain values (a
-  list of rows, a `Patch`) may also arrive outside the engine:
-  `KeyedWrite.of(store, write, output, prior)` turns them into one.
+  against the engine's key index. A store reads it four ways: `whole` —
+  the write is the scope's entire content, so clear the scope first;
+  `pages()` — the keys to write, a page at a time, each `(key, version,
+  rows)`, only that page taken from the write (`iter_pages()` for a store
+  writing on a thread of its own); `removes` — the keys to delete; and
+  `version(prior)`. Every other key stays as it is. A key with zero rows
+  does not exist. Plain values (a list of rows, a `Patch`) may also arrive
+  outside the engine: `KeyedWrite.of(store, write, output, prior)` turns
+  them into one. A store reading values of its own type defines
+  `prepare(write, output)`.
 
 **`load(ref, t, selection)`** materializes `t` (`list[dict]`, a DataFrame,
 …). `selection` is `None` (everything), `Keys` (key → `(version,

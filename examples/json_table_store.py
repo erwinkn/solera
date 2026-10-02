@@ -57,22 +57,23 @@ class JsonTableStore:
                 version = digest([prior.version if prior else "", scope.batch, rows])
                 return Written(Ref(out.name, "", {"batch": scope.batch}, version, scope.partition))
             write = KeyedWrite.of(self, write, out, prior)
-            entries = dict(write.prepared.entries())
-            keys = sorted(entries if write.upserts is None else write.upserts)
-            if write.whole:
+            if write.whole:  # the scope's whole content: clear it first
                 cur.execute(f"DELETE FROM {table} WHERE part = %s", (scope.partition,))
-            else:
-                gone = sorted(set(keys) | set(write.removes))
-                cur.execute(f"DELETE FROM {table} WHERE part = %s AND k = ANY(%s)", (scope.partition, gone))
-            groups = write.prepared.groups(keys)
-            cur.executemany(
-                f"INSERT INTO {table} VALUES (%s, %s, NULL, %s)",
-                [
-                    (scope.partition, k, Jsonb(dict(r)))
-                    for k, group in zip(keys, groups, strict=True)
-                    for r in group
-                ],
-            )
+            async for page in write.pages():  # the keys to write: (key, version, rows)
+                keys = [k for k, _, _ in page]
+                if not write.whole:
+                    cur.execute(
+                        f"DELETE FROM {table} WHERE part = %s AND k = ANY(%s)", (scope.partition, keys)
+                    )
+                cur.executemany(
+                    f"INSERT INTO {table} VALUES (%s, %s, NULL, %s)",
+                    [(scope.partition, k, Jsonb(dict(r))) for k, _, group in page for r in group],
+                )
+            if write.removes:
+                cur.execute(
+                    f"DELETE FROM {table} WHERE part = %s AND k = ANY(%s)",
+                    (scope.partition, sorted(write.removes)),
+                )
             return Written(Ref(out.name, "", {}, write.version(prior), scope.partition))
 
     async def load(self, ref, t, selection) -> list[dict]:
