@@ -261,3 +261,39 @@ async def test_a_batch_upstream_reset_right_after_a_delivery_is_delivered_in_ful
     assert state.model.heads[("log", "")]["base"] == 1
     assert seen[-1][0], f"the reset was delivered as a delta: {seen}"
     assert state.model.scope("tally", "")["cursor"] == 1
+
+
+@pytest.mark.xfail(
+    strict=True, reason="sim finding F10: a reset delivery its patterns take nothing from is skipped"
+)
+async def test_a_full_delivery_that_takes_no_key_still_starts_over(state):  # noqa: F811
+    """§5, §8: a full run makes the output equal to exactly its write, and a
+    full delivery starts its consumer over. When the edge's patterns take
+    none of the upstream's keys, the delivery is skipped without calling
+    the producer — so nothing starts over, and keys the consumer holds from
+    before stay, though its upstream holds them no longer."""
+
+    from solera.stores import Patch
+
+    content = {"rows": [{"id": "a", "v": "1"}]}
+
+    @asset(outputs=Output("items", key="id", revision="v"))
+    def items():
+        return content["rows"]
+
+    @asset(inputs={"items": Incremental(exclude=["k*"])}, outputs=Output("mirror", key="id", revision="v"))
+    def mirror(ctx, items: list):
+        changes = ctx.changes["items"]
+        rows = [{"id": r["id"], "v": r["v"]} for r in items]
+        return rows if changes.full and changes.first else Patch(rows, remove=list(changes.deleted))
+
+    engine = make_engine(state, Project(assets=[items, mirror]))
+    await engine.initialize()
+    await drive(engine, await engine.submit(["mirror"], upstream=True))  # mirror holds a
+    content["rows"] = [{"id": "k1", "v": "1"}]  # a is gone; k1 is excluded
+    await drive(engine, await engine.submit(["items"]))
+    await drive(engine, await engine.submit(["mirror"], mode="full"))
+    rows = await FileStore().load(
+        _ref(state.model.heads[("mirror", "")]), list[dict], await whole(state, "mirror")
+    )
+    assert rows == []
