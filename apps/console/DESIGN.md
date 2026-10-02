@@ -85,6 +85,27 @@ that lift on hover (`lift-*`, `shadow-button-hover`) and press flat.
 Names are never case-transformed: headings that are an asset, a run's
 targets or a sensor (`ident`) keep their case in every theme.
 
+A theme may also change a little structure, through tokens with a
+default in `:root`: a rule under page headers (`masthead-rule`), the role
+of card titles (`card-title-*`: font, size, weight, case, tracking, a width
+axis, italic), a card header as a title bar (`card-head-bg`, `card-head-rule`),
+the figure and label fonts (`figure-*`, `label-*`), a display width and style
+(`head-stretch`, `head-style`, for variable faces with a width axis and for
+italic display faces), registration marks at card corners (`tick`), a bar
+beside the active navigation item (`nav-bar`), the navigation's own
+background (`chrome-bg`), a glow around things running now (`live-glow`),
+and the color scheme (`scheme`, so native controls follow a dark theme).
+
+Four draft directions for the console's voice sit beside the three themes
+above and the earlier drafts (Cellar, Instrument, Observatory):
+
+| Draft | Idea | After |
+|---|---|---|
+| **Voltage** (light) | one current: paper and ink, and a single electric blue that means energized (running, the primary action, the active item, focus); grey means fine, red means broken; tall condensed capitals for titles and figures, a mono for labels, square corners, no shadows | Nous Research |
+| **Obsidian** (dark) | editorial authority in the dark: a warm near-black, rose quartz for every action, hairlines instead of shadows, an italic serif for titles over a plain grotesk, mineral status colours | Hex, Hebbia |
+| **Workbench** (light) | everything is an object: a warm grey desk, white panels with an outline and a title bar, flat opaque chips, a friendly rounded grotesk, one orange action, buttons with a bottom lip | PostHog |
+| **Reactor** (dark) | broadcast graphics: a black void, cool white ink, heavy expanded capitals, tracked mono labels, zero radius, white for the action and one luminous lime for live | Hermes 4 |
+
 The illustrations (empty states: a stack of solera barrels, the
 fractional-blending system the product is named after) are one SVG
 component drawn with `currentColor` and status tokens; the theme decides how
