@@ -150,25 +150,28 @@ async def test_row_digests_are_16_bytes_end_to_end(state):
     assert listed["keys"] == {"a": digests[0].hex(), "b": digests[1].hex()}
 
 
-async def test_a_patch_reconciles_what_a_dead_sql_writer_left(state, data):
+async def test_a_patch_reconciles_what_a_dead_sql_writer_left(state):
     """docs/resolved-commits.md §3: a dead `Sql` writer's intent names no keys.
     It deleted `a` and inserted `b` and died before reporting; the next patch,
     of `c`, cannot read back "the intended keys" — it reconciles the whole
-    store against the index, and the commit settles the intent."""
+    store against the index, and the commit settles the intent. (An
+    overwrite store: an immutable one never has such an intent.)"""
 
+    from tests.server.test_fence import LiveStore
+
+    live = LiveStore()
     pending = {"rows": [{"id": "a", "v": 1}]}
 
-    @asset(outputs=Output("items", key="id", revision="v"))
+    @asset(outputs=Output("items", key="id", revision="v", store="live"))
     def items():
         return Patch(pending["rows"])
 
-    engine = engine_for(state, Project(assets=[items]))
+    engine = engine_for(state, Project(assets=[items], stores={"live": live}))
     await engine.initialize()
     await run(engine, ["items"])
     # What the dead writer did to the store, and the intent its gate left.
-    root = data / "items"
-    (root / "a.json").unlink()
-    (root / "b.json").write_text('[{"id": "b", "v": 1}]')  # a key holds its group of rows
+    del live.rows["a"]
+    live.rows["b"] = {"id": "b", "v": 1}
     key = ("items", "")
     state.model.unsettled[key] = [
         {"added": 0, "removed": 0, "exact": True, "files": [], "unknown": True, "run": "r", "attempt": "dead"}
@@ -179,7 +182,7 @@ async def test_a_patch_reconciles_what_a_dead_sql_writer_left(state, data):
     index = state.model.indexes[key]
     assert index.count == 2 and index.count_exact
     assert sorted((await engine.list_keys("items"))["keys"]) == ["b", "c"]
-    assert sorted(p.name for p in root.iterdir()) == ["b.json", "c.json"]
+    assert sorted(live.rows) == ["b", "c"]
 
 
 async def test_compaction_truncation_and_garbage(state):
