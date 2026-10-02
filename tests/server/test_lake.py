@@ -143,7 +143,9 @@ async def test_rows_arriving_during_an_upload_do_not_void_it(tmp_path):
     store.lake.append("events", {"run": "a", "at": 1.0, "n": 1})
     during.append(lambda: store.lake.append("events", {"run": "b", "at": 2.0, "n": 2}))
     await lake.flush(force=True)
-    assert len(store.lake.files["events"]) == 1 and [values[0] for _, values in store.lake.rows["events"]] == ["b"]
+    assert len(store.lake.files["events"]) == 1 and [
+        values[0] for _, values in store.lake.rows["events"]
+    ] == ["b"]
     during[:] = [lambda: store.lake.forget({"b"}, at=3.0)]
     store.lake.append("events", {"run": "c", "at": 3.0, "n": 3})
     await lake.flush(force=True)

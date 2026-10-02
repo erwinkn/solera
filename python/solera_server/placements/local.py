@@ -24,12 +24,29 @@ import uuid
 from pathlib import Path
 
 ENV_BLOCKLIST_PREFIXES = ("AWS_", "SOLERA_API_TOKEN", "GITHUB_", "GH_TOKEN", "RAILWAY_TOKEN")
+# What an S3 client reads to reach the state's bucket: a worker on the engine's
+# host gets these back, and only these, when the state lives on S3.
+OBJECT_STORE_ENV = (
+    *("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE"),
+    *("AWS_REGION", "AWS_DEFAULT_REGION", "AWS_ENDPOINT", "AWS_ENDPOINT_URL", "AWS_ALLOW_HTTP"),
+    *("AWS_VIRTUAL_HOSTED_STYLE_REQUEST", "AWS_SKIP_SIGNATURE", "AWS_S3_EXPRESS"),
+    *("AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_ROLE_ARN", "AWS_ROLE_SESSION_NAME"),
+    *("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "AWS_CONTAINER_CREDENTIALS_FULL_URI"),
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+)
 _running: dict[str, asyncio.subprocess.Process] = {}  # launch id -> this process's child
 _tails: dict[str, list[bytearray]] = {}
 
 
-def _env() -> dict:
+def _env(objects_url: str | None = None) -> dict:
+    """The environment of a process the engine starts on its host: its own,
+    without cloud and API credentials — but for what reaching the state's
+    object store needs (`objects_url` on S3), which the worker's first read,
+    its spec, already does."""
+
     env = {k: v for k, v in os.environ.items() if not k.startswith(ENV_BLOCKLIST_PREFIXES)}
+    if (objects_url or "").startswith("s3://"):
+        env.update({k: os.environ[k] for k in OBJECT_STORE_ENV if k in os.environ})
     return env
 
 
@@ -69,7 +86,7 @@ class LocalPlacement:
         self.ctx, self.log_limit = ctx, log_limit
 
     async def launch(self, stage: dict) -> dict:
-        env = _env()
+        env = _env(stage["objects"])
         env["SOLERA_PROJECT"] = self.ctx.project
         process = await asyncio.create_subprocess_exec(
             sys.executable,

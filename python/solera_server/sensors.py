@@ -332,7 +332,7 @@ class Sensors:
             await asyncio.sleep(delay)
 
     async def _host_process(self) -> None:
-        env = _env()
+        env = _env(self.state.objects_url)
         env["SOLERA_PROJECT"] = self.project
         env["SOLERA_SENSOR_TOKEN"] = lifecycle.token(await self._load_secret(), HOST_TOKEN)
         process = await asyncio.create_subprocess_exec(

@@ -390,3 +390,49 @@ def test_a_worker_of_plain_rows_imports_no_dataframe_library(tmp_path):
     records = sorted(tmp_path.glob("modules-*.txt"))
     assert len(records) >= 4  # the manifest, and an attempt of each asset
     assert {r.name: r.read_text() for r in records if r.read_text()} == {}
+
+
+async def test_a_local_worker_reaches_state_on_a_private_object_store(tmp_path, monkeypatch):
+    """Review round 2, system #2: the engine's state on a private S3
+    (MinIO here), configured by `AWS_*` in its environment. A Local worker
+    gets those back — and its first read, the spec, succeeds — while other
+    credentials stay out."""
+
+    import uuid
+    from urllib.parse import urlsplit
+
+    url = os.environ.get("SOLERA_TEST_S3")
+    if not url:
+        pytest.skip("set SOLERA_TEST_S3 to run against an S3-compatible server")
+    u = urlsplit(url)
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", u.username)
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", u.password)
+    monkeypatch.setenv("AWS_ENDPOINT", f"{u.scheme}://{u.hostname}:{u.port}")
+    monkeypatch.setenv("AWS_ALLOW_HTTP", "true")
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    monkeypatch.setenv("GH_TOKEN", "not for workers")
+    entrypoint = write_project(
+        tmp_path,
+        """
+import os
+from solera.sdk import Project, asset
+
+@asset
+def leak() -> dict:
+    return {"gh": os.environ.get("GH_TOKEN")}
+
+project = Project(assets=[leak])
+""",
+    )
+    state = await State.open(
+        f"s3://{u.path.strip('/')}/local-{uuid.uuid4().hex}", "test", flush_interval=0.001
+    )
+    try:
+        engine = make_engine(state, entrypoint, heartbeat_seconds=30)
+        await engine.initialize()
+        detail = await engine.run_until((await engine.submit(["leak"]))["id"], 60)
+        assert detail["request"]["status"] == "succeeded", detail
+        [written] = (tmp_path / "data").glob("leak@*.json")
+        assert json.loads(written.read_text()) == {"gh": None}
+    finally:
+        await state.close()
