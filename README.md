@@ -373,7 +373,9 @@ configuration but see far less exercise than `Local`/`Pool`. There is no
 retained historical code image. Read
 [docs/object-store-state.md](docs/object-store-state.md) for the storage
 design and [docs/architecture.md](docs/architecture.md) before extending the
-backend.
+backend. To write a store, follow [docs/stores.md](docs/stores.md): the
+contract, its invariants, recipes, and the conformance kit
+(`solera.testing.stores`) that checks a store against them.
 
 ## License
 

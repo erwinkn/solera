@@ -1,0 +1,292 @@
+# Writing a store
+
+A store is where an asset's outputs live: files, a bucket, a database. The
+engine never touches its data; workers call the store, and the engine
+records what they committed. This page is the contract a store implements,
+the invariants it must hold, recipes for common backends, and the
+scenarios — runnable, in `solera.testing.stores` — that check them.
+
+If you are implementing a store: read **The contract**, pick a **kind**,
+follow its **recipe**, then make the **conformance kit** pass.
+
+## The problem a store solves
+
+An attempt W1 can still write after the engine gave up on it: it lost its
+connection but runs on, it paused (GC, a VM migration), a request it sent
+is still queued at the backend, or it was started twice. Meanwhile its
+retry W2 commits. If W1's late write lands, the store holds something the
+engine never committed — a key regressed to an old version, a deleted key
+back, a batch replaced.
+
+Waiting longer only makes that less likely. So every store guarantees it
+cannot happen, in one of two ways — its **kind**:
+
+| Kind | How a late writer is made harmless | Implement | A read sees |
+|---|---|---|---|
+| `immutable` | It writes only names no other attempt uses. A late write creates an object nothing references; the engine has it deleted later. | `discard` | exactly the pinned version |
+| `fenced` | Every write checks, atomically, that its attempt still holds the slice. A newer attempt takes it first (`acquire`), so the older one is refused. | `acquire` | the current rows |
+
+There is no third kind: registration refuses a store that declares
+anything else, or lacks the method its kind needs.
+
+## The contract
+
+```python
+class Store(Protocol):
+    writes: str                    # "immutable" or "fenced"
+    version: str = "1"             # bump when the stored format changes
+    ref_type: type[Ref] = Ref
+
+    def can_load(self, t, selection) -> bool: ...           # at registration
+    def can_store(self, t, output) -> bool: ...             # at registration
+    async def store(self, write, prior, scope) -> Written: ...
+    async def load(self, ref, t, selection) -> Any: ...
+
+    async def discard(self, scope, prior, items) -> None: ...   # immutable
+    async def acquire(self, scope) -> None: ...                 # fenced
+    async def migrate(self, output, migrations) -> list[str]: ...  # optional
+```
+
+**`Scope`** — what a write belongs to:
+
+| Field | Meaning |
+|---|---|
+| `output` | the `Output` declaration: `name`, `key`, `revision`, `incremental`, `config` |
+| `partition` | the partition key, `""` for an unpartitioned output |
+| `batch` | for an incremental output, the batch number the engine assigned |
+| `attempt` | the writing attempt's id |
+| `generation` | a number the engine assigns each attempt on a scope, larger for every later attempt; `None` outside an attempt |
+| `invocation` | which process runs the attempt: an attempt started twice has one generation and two invocations, and only the first to claim it may write |
+
+**`store(write, prior, scope) -> Written(ref)`** applies a write and
+returns a ref to the new content, with a `version` that changes when the
+content does. `prior` is the head the write builds on; `None` means the
+write is the scope's whole content (a first write, or a `full` run).
+
+- An unkeyed, non-incremental output's write is a value: replace it.
+- An unkeyed incremental output's write is a `Patch` of rows: append it as
+  batch `scope.batch`.
+- A keyed output's write arrives as a `KeyedWrite`, already resolved
+  against the engine's key index: `upserts` (key → version) are the keys
+  to write — `write.prepared.groups(keys)` gives each key's rows — and
+  `removes` the keys to delete; every other key stays as it is. With
+  `whole`, the write is the scope's entire content: delete every key it
+  does not hold. A key with zero rows does not exist. Plain values (a
+  list of rows, a `Patch`) may also arrive outside the engine:
+  `KeyedWrite.of(store, write, output, prior)` turns them into one.
+
+**`load(ref, t, selection)`** materializes `t` (`list[dict]`, a DataFrame,
+…). `selection` is `None` (everything), `Keys` (key → `(version,
+locator)`: only those keys) or `Batches(lo, hi)`. An immutable store needs
+`Keys` to find a keyed output's objects — the locator is the generation
+that wrote each key.
+
+**`discard(scope, prior, items)`** (immutable) deletes objects nothing reads
+any more. `items` name them: `("key", key, version_hex, locator)`,
+`("path", path)`, `("value", generation)`, `("batch", n, generation)`, or
+`("batches", lo, hi)`. The engine names only objects no reader pins;
+deleting a name twice, or one never written, must be harmless.
+
+**`acquire(scope)`** (fenced) takes the scope's slice for `scope.generation`
+and `scope.invocation`, in a transaction of its own, before the attempt
+reads anything from the store. It must wait for an older writer's open
+transaction on the slice, and refuse (`StoreError`) when a newer
+generation, or another invocation of this generation, holds it.
+
+**Errors.** Raise `WriteError` for a malformed write (duplicate keys, a
+wrong shape), `StoreError` for anything else the store refuses. A store
+call that raises after the attempt began writing leaves its writes
+*uncertain*: the next attempt repairs them (fenced stores keep the
+attempt's intents for that).
+
+## The invariants
+
+A store of either kind:
+
+1. **A write is the content the engine will record.** After `store`
+   returns, a load of its ref (with the keys the index will hold) returns
+   exactly the write applied to `prior`: a replacement drops the keys it
+   does not name, a patch changes only its keys and removes, and a key
+   written with zero rows is gone.
+2. **An attempt's repeated write is one write.** The same attempt —
+   generation and invocation — writing the same content again (a retried
+   call) leaves the same content and version.
+
+An `immutable` store:
+
+3. **Names are never reused.** Every object's name includes the writing
+   attempt's generation (or another value no other attempt uses), and
+   writes are create-only. So nothing an attempt writes can replace what
+   another wrote.
+4. **A pinned read returns its version.** A ref and selection read before a
+   newer commit return the same content after it.
+5. **Discard deletes only what it names.** Discarding superseded names, an
+   abandoned attempt's names, or names never written leaves every object a
+   current or pinned reader needs.
+
+A `fenced` store:
+
+6. **A stale writer changes nothing.** Once generation g acquired a slice,
+   every write of an older generation to it is refused, before it changes
+   anything — including writes already queued at the backend.
+7. **One generation, one invocation.** A second invocation of the
+   generation holding the slice can neither acquire nor write; the holding
+   invocation acquiring again succeeds (its own retry).
+8. **A newer writer waits for an open older one.** `acquire` waits until an
+   older writer's open transaction ends, so the newer attempt's repair
+   reads see everything the older one committed; from then on the older
+   one is refused.
+9. **Fencing covers the whole write domain.** If one write can affect
+   several partitions' data (a table-wide migration, a shared table
+   rewrite), it must fence all of them, or serialize against every
+   writer of the table (PostgresStore holds a table-wide lock for its
+   migrations).
+
+## What a read sees
+
+An immutable store keeps every version until no reader pins it, so a
+run reads exactly the versions it pinned. A fenced store keeps one copy:
+a load returns the rows as they are now. So a run can read two outputs at
+different moments, and a row changed after the run pinned it is read in
+its newer form — and delivered again with the change that made it, a
+harmless repeat. Fencing makes writes safe; it does not make reads
+repeatable.
+
+## Recipes
+
+### A SQL table: `fence()` in every write transaction
+
+`solera.fencing.fence(cur, scope, domain)` makes a SQL store fenced. Call
+it first in every write transaction, and as `acquire`:
+
+```python
+from solera.fencing import fence, fence_table
+
+class EventsStore:
+    writes = "fenced"
+
+    async def acquire(self, scope):
+        with connect(self.dsn) as conn, conn.cursor() as cur:
+            fence(cur, scope, "public.events")
+
+    async def store(self, write, prior, scope):
+        with connect(self.dsn) as conn, conn.cursor() as cur:   # one transaction
+            fence(cur, scope, "public.events")                   # before any change
+            ...                                                   # DELETE / INSERT / MERGE
+```
+
+`fence` upserts `(domain, partition) → (generation, invocation)` in the
+`solera_fences` table (`fence_table(cur)` creates it, once), keeps the row
+locked until the transaction ends, and raises `StoreError` when a newer
+generation or another invocation holds it. The row lock is what makes a
+newer `acquire` wait for an older open transaction. The SQL is
+PostgreSQL's; `param=` adapts placeholders for another driver, and any
+database with `INSERT … ON CONFLICT … DO UPDATE … WHERE … RETURNING` and
+row locks works the same way.
+
+Write keyed outputs as delete-then-insert of the keys in `upserts` and
+`removes` (or the whole slice for `whole`), or as a `MERGE`. A complete
+example, which passes the conformance kit, is
+[`examples/json_table_store.py`](../examples/json_table_store.py).
+
+### An object store: immutable names
+
+Name each object with the writing attempt's generation and write it
+create-only:
+
+```
+{output}/{partition}/{key}/{version}.{generation}.json   a key at a version
+{output}/{partition}@{generation}.json                  a value
+{output}/{partition}/{batch:012d}.{generation}.json      a batch
+```
+
+A keyed load computes names from `Keys` (`(version, locator)` → the
+object), never by listing. Batches: several attempts may write batch n
+(a retry reuses its number); the committed one is the highest generation.
+`discard` deletes the names it is given. FileStore and S3Store
+(`solera.stores`) are this recipe.
+
+### A key-value store: conditional puts
+
+Either kind works. Immutable: keys like `{key}@{version}.{generation}`,
+written with put-if-absent, read through `Keys`. Fenced: keep a fence
+record per partition and make every write conditional on it — a
+transaction or compare-and-set that checks the fence record holds
+`(generation, invocation)` in the same atomic operation as the write. A
+check followed by a separate write is not a fence: the write can land
+after a newer attempt took over.
+
+### Append-only sinks
+
+A sink that can only append (a log, a stream) is immutable when each
+record carries `(batch, generation)` and readers keep, per batch, the
+highest generation: an abandoned attempt's records are then never read.
+
+## Scenarios
+
+The conformance kit runs these sequences against your store. Each states
+the exact outcome. (`gN` is generation N; content is `{key: version}`.)
+
+| Kind | Scenario | Sequence | Expected |
+|---|---|---|---|
+| all | a replacement is the scope's whole content | g1 writes {a:1, b:1}; g2 replaces with {b:1, c:1} | the scope holds b:1, c:1 |
+| all | a patch changes only its keys | g1 writes {a:1, b:1, d:1}; g2 patches b:2, c:1, removes a | b:2, c:1, d:1 |
+| all | an empty replacement holds no key | g1 writes {a:1}; g2 replaces with zero rows | nothing |
+| all | a write repeated by its attempt lands once | g4 writes {a:1, b:1}; g4 (same invocation) writes it again | same version; a:1, b:1 |
+| all | batches append and load by range | g1 appends batch 3 {a}; g2 batch 4 {b} | whole: a, b; `Batches(4, 4)`: b |
+| immutable | a pinned read returns its version | g5 writes {a:1}, pin; g9 writes {a:2} | the pin reads a:1; the new ref a:2 |
+| immutable | discarding never takes what is read | g5 writes {a:1}; g7 writes b (never committed); g9 writes {a:2}; discard a@g5, b@g7 and a name never written, twice | the new ref reads a:2 |
+| fenced | a stale writer is refused | g5 writes {a:1}; g9 acquires, writes {a:2}; g5 writes {a:0} | g5 refused (`StoreError`); a:2 |
+| fenced | one generation admits one invocation | g5 writes; g9 acquires as x; g9 as y acquires, then writes | y refused both times; x acquiring again succeeds; x's write stands |
+| fenced | a first write acquires | g3 acquires an empty slice, writes {a:1}; g2 writes | g2 refused; a:1 |
+| fenced | the next attempt replaces what a dead writer left | g1 writes {a:1}; g5's patch of c lands, then g5 dies; g9 acquires, replaces with {a:2, b:1}; g5 patches again | a:2, b:1 (c gone); g5 refused |
+| fenced | a newer writer waits for an open older one | g5's write transaction is open; g9 acquires | g9 waits until g5 commits, then takes the slice; g5's next write refused |
+
+The last scenario needs a hook only you can write: `Harness.hold(scope)`,
+an async context manager that opens a write transaction of `scope`
+holding its fence until the block ends, then commits.
+
+## The conformance kit
+
+```python
+import uuid
+import pytest
+from solera.sdk import Output
+from solera.testing.stores import Harness, scenarios
+
+@pytest.fixture
+def harness():
+    return Harness(
+        store=MyStore(DSN),
+        output=lambda **decl: Output(f"t_{uuid.uuid4().hex[:12]}", store="mine", **decl),
+        hold=None,  # or your open-transaction hook, for a fenced store
+    )
+
+@pytest.mark.parametrize("scenario", scenarios(MyStore), ids=lambda s: s.__name__)
+async def test_my_store_conforms(harness, scenario):
+    await scenario(harness)
+```
+
+`output(**decl)` must return a fresh output on your store each call
+(scenarios never share data), accepting the declarations the scenarios use:
+`key="id", revision="v"` (rows `{"id", "v"}` keyed by `id`),
+`incremental=True` (batches of rows), or none. The scenarios drive the
+store as the engine does — keyed writes as `KeyedWrite`s resolved against a
+key index the kit keeps, keyed loads through `Keys` — and raise
+`AssertionError` with the scenario's expectation when the store answers
+otherwise. FileStore, S3Store, PostgresStore and the example SQL store
+pass it in Solera's own tests (`tests/sdk/test_store_conformance.py`),
+where the example store with its fence left out fails it.
+
+## What the engine guarantees a store
+
+- One attempt at a time works on a scope (an attempt holds the scope's
+  lock while it runs); a second invocation of an attempt, or a writer the
+  engine gave up on, is exactly what your kind makes harmless.
+- A fenced store's `acquire` is called after the producer computed and
+  before the attempt reads the store, every time.
+- Generations only grow for a scope: every later attempt's is larger.
+- The engine records a commit only after `store` returned; a ref it
+  records is one your store returned.
+- `discard` is called only with names no reader pins, in the scope's next
+  attempt or right after a commit (`lifecycle.md` §9.8).
