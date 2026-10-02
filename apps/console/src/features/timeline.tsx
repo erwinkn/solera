@@ -1,6 +1,6 @@
 import type { CSSProperties } from "react";
 import { Link } from "@tanstack/react-router";
-import { PHASES, type Attempt, type Phase, type Task } from "@/api/types";
+import { PHASES, type Attempt, type Phase, type RunEvent, type Task } from "@/api/types";
 import { useNow } from "@/lib/clock";
 import { cn } from "@/lib/cn";
 import { duration } from "@/lib/format";
@@ -123,6 +123,7 @@ export function Waterfall({
   start,
   end,
   selected,
+  events = [],
 }: {
   run: string;
   tasks: Task[];
@@ -130,6 +131,8 @@ export function Waterfall({
   start: number;
   end: number | null;
   selected: { task?: string; attempt?: string };
+  /** The run's timeline: its own cancels, pauses and outages are drawn across every row. */
+  events?: RunEvent[];
 }) {
   const now = useNow();
   const finish = end ?? now;
@@ -144,11 +147,33 @@ export function Waterfall({
   const span = Math.max(0.001, latest - start);
   const ticks = niceTicks(span);
   const x = (t: number) => `${(100 * Math.min(Math.max(t - start, 0), span)) / span}%`;
+  const marks = events.filter((e) => e.task === null && MARKS[e.type]);
+  const across = (
+    <>
+      {marks.map((m) =>
+        m.type === "outage" && m.until ? (
+          <span
+            key={m.n}
+            aria-hidden
+            className="absolute inset-y-0 bg-[repeating-linear-gradient(135deg,var(--idle-soft)_0_3px,transparent_3px_6px)]"
+            style={{ left: x(m.at), width: `calc(${x(m.until)} - ${x(m.at)})` }}
+          />
+        ) : (
+          <span
+            key={m.n}
+            aria-hidden
+            className={cn("absolute inset-y-0 w-0 border-l-[1.5px] border-dashed", MARKS[m.type]!.line)}
+            style={{ left: x(m.at) }}
+          />
+        ),
+      )}
+    </>
+  );
   return (
     <div className="flex flex-col">
       <div className="grid grid-cols-[minmax(9rem,14rem)_minmax(0,1fr)] gap-x-3 border-b border-line pb-1.5 text-2xs text-fg-subtle tabular">
         <span className="pl-4">Task</span>
-        <div className="relative mr-4 h-4">
+        <div className={cn("relative mr-4 h-4", marks.length > 0 && "mt-5")}>
           {ticks.map((t) => (
             <span
               key={t}
@@ -156,6 +181,22 @@ export function Waterfall({
               style={{ left: `${(100 * t) / span}%` }}
             >
               {duration(t)}
+            </span>
+          ))}
+          {marks.map((m) => (
+            <span
+              key={m.n}
+              className={cn(
+                "absolute -top-4 rounded-xs px-1 font-medium whitespace-nowrap",
+                (m.at - start) / span > 0.7
+                  ? "-translate-x-full"
+                  : (m.at - start) / span > 0.1 && "-translate-x-1/2",
+                MARKS[m.type]!.label,
+              )}
+              style={{ left: x(m.at) }}
+            >
+              {MARKS[m.type]!.text}
+              {m.by && m.by !== "engine" ? ` · ${m.by}` : ""}
             </span>
           ))}
         </div>
@@ -195,6 +236,7 @@ export function Waterfall({
                     style={{ left: `${(100 * t) / span}%` }}
                   />
                 ))}
+                {across}
                 {list[0]?.started_at != null && list[0].started_at > start && (
                   <span
                     aria-hidden
@@ -262,6 +304,13 @@ export function Waterfall({
     </div>
   );
 }
+
+const MARKS: Record<string, { text: string; line: string; label: string }> = {
+  canceled: { text: "cancel requested", line: "border-fail", label: "bg-fail-soft text-fail-fg" },
+  paused: { text: "paused", line: "border-wait", label: "bg-wait-soft text-wait-fg" },
+  resumed: { text: "resumed", line: "border-wait", label: "bg-wait-soft text-wait-fg" },
+  outage: { text: "engine down", line: "border-idle", label: "bg-idle-soft text-idle-fg" },
+};
 
 function niceTicks(span: number): number[] {
   const steps = [

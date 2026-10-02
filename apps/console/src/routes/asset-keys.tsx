@@ -10,7 +10,7 @@ import { join, list } from "@/router";
 import { useNow } from "@/lib/clock";
 import { cn } from "@/lib/cn";
 import { count, plural, shortId, until } from "@/lib/format";
-import { label, tone, toneSoft } from "@/lib/status";
+import { label, tone, toneSoft, toneText } from "@/lib/status";
 import { Button } from "@/ui/button";
 import { Empty, ErrorNote, Skeleton, Time } from "@/ui/data";
 import { Chip, Input, SearchInput, Select } from "@/ui/form";
@@ -325,15 +325,10 @@ function Answer({ explain: e }: { explain: Explain }) {
       </>
     ),
   };
-  const t = tone(e.verdict);
+  const t = e.verdict === "failing" && e.failure ? tone(e.failure.outcome) : tone(e.verdict);
   return (
     <div className="mx-4 mb-4 flex flex-col gap-3 rounded-md border-theme border-line p-4">
-      <p
-        className={cn(
-          "flex items-start gap-2 text-sm font-medium",
-          t === "ok" ? "text-ok-fg" : t === "fail" ? "text-fail-fg" : "text-fg",
-        )}
-      >
+      <p className={cn("flex items-start gap-2 text-sm font-medium", toneText[t])}>
         <StatusIcon tone={t} className="mt-0.5 size-4" />
         <span className="min-w-0 break-words">{headline[e.verdict]}</span>
       </p>

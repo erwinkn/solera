@@ -4,6 +4,7 @@ import { MutationCache, QueryCache, QueryClient, QueryClientProvider } from "@ta
 import { RouterProvider } from "@tanstack/react-router";
 import { ApiError } from "@/api/client";
 import { makeRouter } from "@/router";
+import { listenForPalette } from "@/lib/palette";
 import "@/styles/app.css";
 
 const unauthorized = (error: unknown) => error instanceof ApiError && error.status === 401;
@@ -26,6 +27,7 @@ const queryClient = new QueryClient({
 });
 
 const router = makeRouter(queryClient);
+listenForPalette();
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>

@@ -1,1 +1,0 @@
-import{Dn as e,kn as t}from"./layout-B1odusNW.js";function n(n,r){return e(n,t,r)}export{n as t};

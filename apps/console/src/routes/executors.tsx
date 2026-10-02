@@ -1,6 +1,7 @@
 import { useQuery, useSuspenseQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { q, useManifest, useProject } from "@/api/queries";
+import { StarvedPools } from "@/features/starved";
 import type { Executor, Json } from "@/api/types";
 import { cn } from "@/lib/cn";
 import { count, duration } from "@/lib/format";
@@ -24,6 +25,7 @@ export function Executors() {
         title="Executors"
         description="Where attempts run. Each counts its attempts in flight against its own limit."
       />
+      <StarvedPools />
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
         {executors.map((e) => {
           const s = stats?.executors?.find((x) => x.executor === e.name) as

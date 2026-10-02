@@ -167,3 +167,22 @@ test("automations toggle and health", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "Held scopes" })).toBeVisible();
   await expect(page.getByText("browser", { exact: true })).toBeVisible();
 });
+
+test("jump anywhere from the keyboard", async ({ page }) => {
+  test.skip(mobile(page), "a keyboard shortcut");
+  await connect(page);
+  await expect(page.getByRole("heading", { name: "Overview", level: 1 })).toBeVisible();
+  await page.keyboard.press("Control+k");
+  const input = page.getByRole("combobox", { name: "Jump to" });
+  await input.fill("file_ch");
+  await expect(page.getByRole("option", { name: /file_checks/ }).first()).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+  await input.press("Enter");
+  await expect(page.getByRole("heading", { name: "file_checks", level: 1 })).toBeVisible();
+  // A run id goes straight to the run.
+  await page.keyboard.press("Control+k");
+  await page.getByRole("combobox", { name: "Jump to" }).fill("01M3Y6KRZKEDY3BR0EN6J58M9T");
+  await expect(page.getByRole("option", { name: /run/ })).toBeVisible();
+});

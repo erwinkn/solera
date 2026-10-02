@@ -40,6 +40,8 @@ const root = createRootRouteWithContext<{ queryClient: QueryClient }>()({
 const overview = createRoute({
   getParentRoute: () => root,
   path: "/",
+  validateSearch: (s: Record<string, unknown>) =>
+    optional({ activity: oneOf("6h", "24h", "7d")(s.activity) }),
   component: lazyRouteComponent(() => import("@/routes/overview"), "Overview"),
 });
 

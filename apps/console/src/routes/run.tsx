@@ -36,6 +36,7 @@ export function Run() {
   const { data } = useSuspenseQuery(q.run(project, id));
   const { request, tasks, attempts } = data;
   const live = ACTIVE_RUN.has(request.status);
+  const events = useQuery(q.runEvents(project, id, live)).data;
   const end = live ? null : (request.finished_at ?? request.updated_at);
 
   const task = tasks.find((t) => t.id === search.task) ?? defaultTask(tasks);
@@ -147,6 +148,7 @@ export function Run() {
             actions={<PhaseLegend className="hidden md:flex" />}
           />
           <Waterfall
+            events={events}
             run={id}
             tasks={tasks}
             attempts={attempts}
@@ -466,7 +468,56 @@ function AttemptSummary({ run, attempt }: { run: string; attempt: Attempt }) {
         </div>
       )}
 
-      {error && <ErrorBlock error={error} run={run} attempt={attempt} />}
+      <CancelNote run={run} attempt={attempt} />
+      {/* A cancel's "error" is the cancel itself, which the note above explains. */}
+      {error && error.message !== "canceled" && <ErrorBlock error={error} run={run} attempt={attempt} />}
+    </div>
+  );
+}
+
+const REASON: Record<string, string> = {
+  user: "a user canceled the run",
+  canceled: "a user canceled the run",
+  timeout: "it ran past its timeout",
+  provisioning: "no worker reported before the provisioning deadline",
+};
+
+/**
+ * How a cancel or a timeout ended this attempt (docs/lifecycle.md §7): asked
+ * to stop, a worker drains — finished work is written and committed — or,
+ * past the grace period, the engine aborts it and nothing of it commits.
+ */
+function CancelNote({ run, attempt }: { run: string; attempt: Attempt }) {
+  const project = useProject();
+  const ended = ["canceled", "aborted", "timed_out"].includes(attempt.status);
+  const result = useQuery({ ...q.attemptResult(project, run, attempt.id), enabled: ended }).data;
+  const closing = useQuery({ ...q.runEvents(project, run, false), enabled: ended }).data?.find(
+    (e) => e.attempt === attempt.id && (e.type === "aborted" || e.type === "canceled"),
+  );
+  if (!ended && !result?.cancel) return null;
+  const record = result?.cancel;
+  const reason = record?.reason ?? closing?.reason ?? "user";
+  const drained = result?.status === "canceled" && record?.phase === "requested";
+  return (
+    <div className="flex items-start gap-2.5 rounded-md border-theme border-line bg-surface-2 px-3 py-2.5 text-sm">
+      <StatusIcon status="canceled" className="mt-0.5 size-4" />
+      <div className="flex flex-col gap-0.5">
+        <p className="text-fg">
+          {drained
+            ? "Stopped and drained: the work it finished was written and committed."
+            : record
+              ? "Stopped before it reached its writes: it committed nothing."
+              : "Aborted: it never drained, so nothing of it committed."}
+        </p>
+        <p className="text-xs text-fg-muted">
+          Cancel {record ? `${record.phase} — ` : ""}because {REASON[reason] ?? reason}.
+          {reason === "user" || reason === "canceled"
+            ? " Keys it didn't finish are recorded as canceled and wait for a retry."
+            : reason === "timeout"
+              ? " Keys it didn't finish count a try and come due again."
+              : ""}
+        </p>
+      </div>
     </div>
   );
 }

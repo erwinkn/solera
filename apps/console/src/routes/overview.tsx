@@ -1,18 +1,20 @@
 import { cloneElement, type ReactElement, type ReactNode } from "react";
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
-import { Link, useNavigate } from "@tanstack/react-router";
+import { getRouteApi, Link, useNavigate } from "@tanstack/react-router";
 import { Activity, ArrowRight, Hand, KeyRound, Play, XCircle } from "lucide-react";
 import { q, useManifest, useProject } from "@/api/queries";
 import type { AssetStatus, Automation } from "@/api/types";
 import { MaterializeButton } from "@/features/materialize";
 import { RunHistogram, RunsTable } from "@/features/runs";
 import { describeTrigger } from "@/features/triggers";
+import { StarvedPools, useStarvedPools } from "@/features/starved";
 import { useNow } from "@/lib/clock";
 import { cn } from "@/lib/cn";
 import { compact, plural, until } from "@/lib/format";
 import { toneText, type Tone } from "@/lib/status";
 import { Empty, SegmentBar, Skeleton, Time } from "@/ui/data";
 import { Card, CardHeader, Page, PageHeader } from "@/ui/layout";
+import { Segmented } from "@/ui/form";
 import { StatusIcon } from "@/ui/status";
 
 const FAILING = ["failed", "rejected", "retrying", "timed_out"] as const;
@@ -21,20 +23,27 @@ export function failingKeys(status: AssetStatus | undefined): number {
   return FAILING.reduce((sum, k) => sum + (status?.failures?.[k] ?? 0), 0);
 }
 
+const route = getRouteApi("/");
+const BARS = { "6h": 72, "24h": 48, "7d": 56 } as const;
+
 export function Overview() {
+  const { activity = "24h" } = route.useSearch();
   const project = useProject();
   const manifest = useManifest();
   const diagnostics = useQuery(q.diagnostics()).data;
   const active = useInfiniteQuery(q.runs(project, { status: ["running", "queued"] }, 8)).data;
   const failed = useInfiniteQuery(q.runs(project, { status: ["failed"], range: "24h" }, 5)).data;
   const day = useInfiniteQuery(q.runs(project, { range: "24h" }, 1)).data;
-  const histogram = useQuery(q.runHistogram(project, { range: "24h" }, 48)).data;
+  const histogram = useQuery(q.runHistogram(project, { range: activity }, BARS[activity])).data;
   const status = useQuery(q.assetStatus(project)).data;
   const holds = useQuery(q.holds(project)).data;
 
   const failing = status ? Object.entries(status).filter(([, s]) => failingKeys(s) > 0) : [];
   const keys = failing.reduce((sum, [, s]) => sum + failingKeys(s), 0);
-  const operator = holds ? holds.holds.length + holds.unsettled.length + holds.discards.length : undefined;
+  const starved = useStarvedPools();
+  const operator = holds
+    ? holds.holds.length + holds.unsettled.length + holds.discards.length + starved.length
+    : undefined;
   const failedTotal = failed?.pages[0]?.total;
   const navigate = useNavigate();
 
@@ -59,6 +68,8 @@ export function Overview() {
         }
         actions={<MaterializeButton icon={<Play />} />}
       />
+
+      <StarvedPools />
 
       <div className="grid grid-cols-2 gap-3 sm:gap-4 xl:grid-cols-4">
         <Vital
@@ -100,8 +111,8 @@ export function Overview() {
           detail={
             holds
               ? operator
-                ? "held scopes, unsettled writes, stuck discards"
-                : "nothing held or stuck"
+                ? "holds, unsettled writes, stuck discards, idle pools"
+                : "nothing held, stuck or starved"
               : undefined
           }
         />
@@ -110,7 +121,26 @@ export function Overview() {
       <Card>
         <CardHeader
           title="Activity"
-          description="Runs started in the last 24 hours, by outcome. Select a column to see its runs."
+          description={`Runs started in the last ${activity === "7d" ? "week" : activity === "6h" ? "6 hours" : "day"}, by outcome. Select a column to see its runs.`}
+          actions={
+            <Segmented
+              size="sm"
+              label="Activity range"
+              value={activity}
+              onChange={(value) =>
+                navigate({
+                  to: "/",
+                  search: { activity: value === "24h" ? undefined : value },
+                  replace: true,
+                })
+              }
+              options={[
+                { value: "6h", label: "6h" },
+                { value: "24h", label: "24h" },
+                { value: "7d", label: "7d" },
+              ]}
+            />
+          }
         />
         <div className="px-4 pb-4">
           {histogram ? (

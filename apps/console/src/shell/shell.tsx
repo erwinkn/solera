@@ -13,6 +13,7 @@ import {
   LogOut,
   Menu as MenuIcon,
   Radar,
+  Search,
   Sparkles,
   Briefcase,
   X,
@@ -27,6 +28,9 @@ import { Input, Segmented } from "@/ui/form";
 import { TooltipProvider } from "@/ui/overlay";
 import { StatusDot } from "@/ui/status";
 import { Toasts } from "./toasts";
+import { Palette } from "./palette";
+import { palette } from "@/lib/palette";
+import { Kbd } from "@/ui/data";
 
 export function Shell() {
   const { locked } = useSession();
@@ -53,6 +57,7 @@ export function Shell() {
           </main>
         </div>
       )}
+      {!locked && <Palette />}
       <Toasts />
     </TooltipProvider>
   );
@@ -62,6 +67,18 @@ function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
   return (
     <div className="flex h-full flex-col gap-6 px-3 py-4">
       <Brand />
+      <button
+        type="button"
+        onClick={() => {
+          onNavigate?.();
+          palette.set(true);
+        }}
+        className="flex h-8 items-center gap-2 rounded-sm border-theme border-line bg-surface px-2.5 text-sm text-fg-subtle motion-1 transition-colors hover:text-fg [&>svg]:size-3.5"
+      >
+        <Search aria-hidden />
+        <span className="flex-1 text-left">Jump to…</span>
+        <Kbd>⌘K</Kbd>
+      </button>
       <Nav onNavigate={onNavigate} />
       <div className="mt-auto flex flex-col gap-3">
         <EngineStatus />
