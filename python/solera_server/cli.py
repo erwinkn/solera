@@ -156,7 +156,7 @@ def main():
     commit.add_argument("--version")
     commit.add_argument("--keys", help="Complete key map as JSON, or a JSON list for a partition set")
     commit.add_argument("--upsert", help="Key patch as JSON object (or JSON list for a partition set)")
-    commit.add_argument("--remove", action="append", default=[])
+    commit.add_argument("--remove", action="append", default=None)
     commit.add_argument("--by", default="cli", help="Who is committing (recorded on the commit's run)")
 
     worker = commands.add_parser("worker", help="Run a pool worker (§10), or a pool's sensor host")

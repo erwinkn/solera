@@ -57,7 +57,11 @@ def test_brimstone_revision_changes_on_change():
 
     project = load_brimstone()
     assert project.manifest["revision"] == project.manifest["revision"]
-    other = Project(assets=[asset(lambda: 1)])
+
+    def other_asset():
+        return 1
+
+    other = Project(assets=[asset(other_asset)])
     assert other.manifest["revision"] != project.manifest["revision"]
 
 
@@ -434,3 +438,15 @@ class Migrating(FileStore):
 
     async def migrate(self, output, migrations, scope=None):
         return [m.name for m in migrations]
+
+
+def test_output_names_are_names():
+    """An output is named like everything else — never `@asset`, the
+    namespace of Each failure indexes, which would share its key files."""
+
+    def parse():
+        return {}
+
+    for bad in ("@parse", "a/b", "<lambda>", ""):
+        with pytest.raises(RegistrationError, match="invalid output name"):
+            Project(assets=[asset(parse, outputs=Output(bad or "@", keyed=True))])

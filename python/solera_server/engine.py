@@ -36,7 +36,7 @@ from solera.keys.index import DeltaFiles, FileInfo, KeyIndex, Options, delta_key
 from solera.keys.io import ObjectIO, key_cache
 from solera.sdk import TimePartitions, canonical_partition, digest, split_partition
 
-from . import history
+from . import history, planning
 from .attempts import POOL_OFFERED_GRACE, Attempts, Live
 from .history import MAX_METADATA, History, RunFilter
 from .keyservice import KeyService
@@ -545,64 +545,36 @@ class Engine(Attempts, Sensors):
         ]
 
     async def _scopes(self, asset: str, selection) -> list[str]:
-        """`partitions` selects keys from the current set (§7, §8)."""
+        """`partitions` selects keys from the current set (§7, §8): what
+        `planning.select_scopes` answers from the asset's dimensions, now, and
+        the heads as planning sees them."""
 
-        dims = self._dims(asset)
-        if not dims:
-            current = [""]
-        else:
-            keys = await self._dim_keys(dims)
-            current = [
-                canonical_partition(dims, parts)
-                for parts in (dict(zip(dims, combo, strict=True)) for combo in product(*keys))
-            ]
-        if selection == "all" or selection is None:
-            return current
-        if selection == "latest":
-            if not dims:
-                return current
-            chosen = []
-            keys = await self._dim_keys(dims)
-            for name, dim in dims.items():
-                if dim["kind"] == "time":
-                    latest = self._time(dim).latest(self._now())
-                    chosen.append([latest] if latest else [])
-                else:
-                    chosen.append(keys[list(dims).index(name)])
-            return [
-                canonical_partition(dims, dict(zip(dims, combo, strict=True)))
-                for combo in product(*chosen)
-                if all(v is not None for v in combo)
-            ]
-        if selection == "missing":
-            missing = []
-            outputs = self.manifest["assets"][asset]["outputs"]
-            for scope in current:
-                heads = [self._head(o["name"], scope) for o in outputs]
-                if not heads or any(h is None or not h["complete"] for h in heads):
-                    missing.append(scope)
-            return missing
-        if isinstance(selection, dict):
-            selection = selection.get(asset, [])
-        wanted = {self._canon(dims, k) for k in (selection or [])} if dims else set(selection or [])
-        return [s for s in current if s in wanted]
+        outputs = self.manifest["assets"][asset]["outputs"]
+
+        def missing(scope: str) -> bool:
+            heads = [self._head(o["name"], scope) for o in outputs]
+            return not heads or any(h is None or not h["complete"] for h in heads)
+
+        return planning.select_scopes(
+            self._dims(asset),
+            selection,
+            now=self._now(),
+            elements=self._elements,
+            missing=missing,
+            what=asset,
+        )
 
     def _canon(self, dims: dict, key: str) -> str:
-        if len(dims) == 1:
-            return str(key)
-        return canonical_partition(dims, split_partition(dims, key))
+        return planning.canonical(dims, key)
 
     async def _dim_keys(self, dims: dict) -> list[list[str]]:
-        out = []
-        for dim in dims.values():
-            if dim["kind"] == "static":
-                out.append([str(k) for k in dim["keys"]])
-            elif dim["kind"] == "time":
-                out.append(self._time(dim).keys(self._now()))
-            else:
-                keys = await self._head_keys(self._head(dim["output"], ""))
-                out.append(sorted(keys) if keys else [])
-        return out
+        return [planning.dim_keys(dim, self._now(), self._elements) for dim in dims.values()]
+
+    def _elements(self, output: str) -> list[str] | None:
+        """A set dimension's current keys: the element list its head carries (§7)."""
+
+        head = self._head(output, "")
+        return None if head is None else [str(e) for e in head.get("elements") or ()]
 
     def _head(self, output: str, scope: str) -> dict | None:
         """A head as planning sees it: projected, else the model's."""
@@ -612,22 +584,8 @@ class Engine(Attempts, Sensors):
             projected[(output, scope)] if (output, scope) in projected else self.m.heads.get((output, scope))
         )
 
-    async def _head_keys(self, head) -> list[str] | None:
-        """A set dimension's current keys: the element list its head carries (§7)."""
-
-        if head is None:
-            return None
-        return [str(e) for e in head.get("elements") or ()]
-
     def _time(self, dim: dict) -> TimePartitions:
-        return TimePartitions(
-            dim["start"],
-            dim["every"],
-            end=dim.get("end"),
-            end_offset=dim.get("end_offset"),
-            timezone=dim.get("timezone") or "UTC",
-            format=dim.get("format"),
-        )
+        return planning.time_partitions(dim)
 
     def _now(self) -> dt.datetime:
         return dt.datetime.fromtimestamp(self.clock(), dt.UTC)
@@ -1746,6 +1704,8 @@ class Engine(Attempts, Sensors):
         source = self.manifest["sources"].get(name)
         if source is None:
             raise KeyError(name)
+        # Adapters say "no removals" as an empty list: the same as none, for any source.
+        remove = remove or None
         head = self.m.heads.get((name, ""))
         keyed = source.get("key") is not None
         if not keyed and (keys is not None or upsert is not None or remove is not None):
@@ -2039,23 +1999,33 @@ class Engine(Attempts, Sensors):
         """Project each changed upstream scope to the target's scopes (§7, §9),
         then drop the consumed changes from the pending set."""
 
-        consumed = [list(p) for p in auto["pending"]]
-        per_asset = {}
-        for producer, scope in consumed:
+        consumed, per_asset = [], {}
+        for producer, scope in (list(p) for p in auto["pending"]):
+            owed = {}
             for target in auto["targets"]:
                 t_dims = self._dims(target)
-                if producer is None or not t_dims:
-                    per_asset.setdefault(target, set()).add("")
+                if not t_dims:
+                    owed.setdefault(target, set()).add("")
                     continue
-                pinned = self._project_downstream(producer, scope, target)
-                # target-only dims expand over their current key sets
+                # Dimensions the change pins; the target's others — all of them for an
+                # external source, which has none — expand over their current keys.
+                pinned = self._project_downstream(producer, scope, target) if producer is not None else {}
                 free = {n: d for n, d in t_dims.items() if n not in pinned}
                 dim_keys = await self._dim_keys(free)
                 missing_dims = list(free)
                 for combo in product(*dim_keys) if dim_keys else [()]:
                     merged = dict(pinned)
                     merged.update(dict(zip(missing_dims, combo, strict=True)))
-                    per_asset.setdefault(target, set()).add(canonical_partition(t_dims, merged))
+                    owed.setdefault(target, set()).add(canonical_partition(t_dims, merged))
+            if any(self._scope_active_claim(t, s) for t, scopes in owed.items() for s in scopes):
+                # A running attempt pinned its inputs before this change: it cannot cover
+                # it. The change stays pending until that attempt ends, then fires.
+                continue
+            consumed.append([producer, scope])
+            for target, scopes in owed.items():
+                per_asset.setdefault(target, set()).update(scopes)
+        if not consumed:
+            return
         last_run = None
         for target, scopes in per_asset.items():
             if not scopes:

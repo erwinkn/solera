@@ -51,7 +51,7 @@ class SourceCommitInput(BaseModel):
     keys: dict | list | None = None
     upsert: dict | list | None = None
     by: str | None = Field(default=None, max_length=200)
-    remove: list[str] = Field(default_factory=list, max_length=100000)
+    remove: list[str] | None = Field(default=None, max_length=100000)
 
 
 def create_app(

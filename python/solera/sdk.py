@@ -24,7 +24,7 @@ from .errors import describe as describe_errors
 NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,127}$")
 DEFAULT_STORE = "default"
 KEYS = "<keys>"  # the key of a keyed output: its value is a dict[str, Any]
-MAX_PARTITION_KEYS = 5000
+MAX_PARTITION_KEYS = 100_000  # enumerated keys of one dimension, at most: past it, an error
 
 
 class RegistrationError(ValueError):
@@ -521,32 +521,104 @@ class TimePartitions:
             "format": self.format,
         }
 
-    def _window_starts(self, as_of: dt.datetime) -> list[dt.datetime]:
+    def _horizon(self, as_of: dt.datetime) -> tuple[dt.datetime, dt.datetime]:
+        """`(start, horizon)` in the partitions' zone: windows ending at or
+        before the horizon exist — `as_of` less `end_offset`, capped by `end`."""
+
         start = _parse_dt(self.start, self.zone)
         horizon = as_of.astimezone(self.zone)
         if self.end_offset:
             horizon -= _duration(self.end_offset)
         if self.end:
             horizon = min(horizon, _parse_dt(self.end, self.zone))
+        return start, horizon
+
+    def _complete(self, start: dt.datetime, horizon: dt.datetime) -> int:
+        """How many fixed-length windows have closed by the horizon. Datetimes
+        in one zone subtract and add as wall-clock times, as windows step."""
+
         if horizon <= start:
-            return []
-        starts = []
+            return 0
+        n = int((horizon - start) / self.duration)
+        while n > 0 and start + n * self.duration > horizon:
+            n -= 1
+        while start + (n + 1) * self.duration <= horizon:
+            n += 1
+        return n
+
+    def _last_fire(self, start: dt.datetime, horizon: dt.datetime) -> dt.datetime | None:
+        """A cron `every`'s latest fire after `start`, at or before the horizon:
+        where the last complete window ends."""
+
+        if horizon <= start:
+            return None
+        fire = croniter(self.every, horizon + dt.timedelta(microseconds=1)).get_prev(dt.datetime)
+        return fire if fire > start else None
+
+    def latest(self, as_of: dt.datetime | None = None) -> str | None:
+        """The last complete window's key, computed directly — never by
+        listing the windows before it."""
+
+        start, horizon = self._horizon(as_of or dt.datetime.now(dt.UTC))
         if self.duration is not None:
-            current = start
-            while current + self.duration <= horizon and len(starts) < MAX_PARTITION_KEYS:
-                starts.append(current)
-                current += self.duration
-        else:
-            # Calendar slices: a window closes when the next cron fire passes.
-            fires = croniter(self.every, start)
-            previous = start
-            while len(starts) < MAX_PARTITION_KEYS:
-                nxt = fires.get_next(dt.datetime)
-                if nxt > horizon:
-                    break
-                starts.append(previous)
-                previous = nxt
-        return starts
+            n = self._complete(start, horizon)
+            return self.key(start + (n - 1) * self.duration) if n else None
+        fire = self._last_fire(start, horizon)
+        if fire is None:
+            return None
+        before = croniter(self.every, fire).get_prev(dt.datetime)
+        return self.key(before if before > start else start)
+
+    def contains(self, key: str, as_of: dt.datetime | None = None) -> bool:
+        """Whether `key` names a complete window: well formed, aligned, and
+        between the first window and the latest."""
+
+        try:
+            begin = dt.datetime.strptime(key, self.format).replace(tzinfo=self.zone)
+        except ValueError:
+            return False
+        if self.key(begin) != key:
+            return False
+        start, horizon = self._horizon(as_of or dt.datetime.now(dt.UTC))
+        if begin < start:
+            return False
+        if self.duration is not None:
+            n = round((begin - start) / self.duration)
+            return start + n * self.duration == begin and begin + self.duration <= horizon
+        if begin != start and not croniter.match(self.every, begin):
+            return False
+        return croniter(self.every, begin).get_next(dt.datetime) <= horizon
+
+    def count(self, as_of: dt.datetime | None = None, limit: int | None = None) -> int:
+        """How many windows have closed; with a cron `every`, counting stops
+        past `limit`."""
+
+        start, horizon = self._horizon(as_of or dt.datetime.now(dt.UTC))
+        if self.duration is not None:
+            return self._complete(start, horizon)
+        n, fires = 0, croniter(self.every, start)
+        while limit is None or n <= limit:
+            if fires.get_next(dt.datetime) > horizon:
+                break
+            n += 1
+        return n
+
+    def _window_starts(self, as_of: dt.datetime, limit: int) -> list[dt.datetime]:
+        start, horizon = self._horizon(as_of)
+        if self.count(as_of, limit) > limit:
+            raise ValueError(
+                f"time partitions from {self.start} every {self.every} have more than {limit} windows: "
+                "select partitions explicitly, or the latest"
+            )
+        if self.duration is not None:
+            return [start + i * self.duration for i in range(self._complete(start, horizon))]
+        starts, previous, fires = [], start, croniter(self.every, start)
+        while True:
+            nxt = fires.get_next(dt.datetime)
+            if nxt > horizon:
+                return starts
+            starts.append(previous)
+            previous = nxt
 
     def key(self, window_start: dt.datetime) -> str:
         return window_start.strftime(self.format)
@@ -558,13 +630,12 @@ class TimePartitions:
         nxt = croniter(self.every, naive).get_next(dt.datetime)
         return naive.isoformat(), nxt.isoformat()
 
-    def keys(self, as_of: dt.datetime | None = None) -> list[str]:
-        as_of = as_of or dt.datetime.now(dt.UTC)
-        return [self.key(s) for s in self._window_starts(as_of)]
+    def keys(self, as_of: dt.datetime | None = None, limit: int = MAX_PARTITION_KEYS) -> list[str]:
+        """Every complete window's key. More than `limit` is an error, never a
+        silent truncation: the domain is not what fits in memory."""
 
-    def latest(self, as_of: dt.datetime | None = None) -> str | None:
-        keys = self.keys(as_of)
-        return keys[-1] if keys else None
+        as_of = as_of or dt.datetime.now(dt.UTC)
+        return [self.key(s) for s in self._window_starts(as_of, limit)]
 
     def __eq__(self, other):
         return type(other) is TimePartitions and other.spec() == self.spec()
@@ -1163,6 +1234,10 @@ class Project:
             seen = set()
             for output in asset.outputs:
                 output.name = output.name or default
+                if not NAME.fullmatch(output.name):
+                    # Names are letters, digits, `_.-`: never `@asset`, the namespace of
+                    # failure indexes (docs/per-key-processing.md §9), nor a path.
+                    raise RegistrationError(f"{asset.name}: invalid output name {output.name!r}")
                 if output.name in table or output.name in seen:
                     raise RegistrationError(f"Duplicate output name: {output.name}")
                 seen.add(output.name)

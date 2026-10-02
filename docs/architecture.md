@@ -459,7 +459,7 @@ A run is `{targets, partitions, mode, upstream, config, keys}`:
 | Field | Meaning |
 |---|---|
 | `targets` | assets (or outputs) to materialize |
-| `partitions` | `[k…]` · `"all"` (current key set) · `"missing"` (no complete head) · `"latest"` (newest window of each time dimension, every key of the others) · default `"latest"` |
+| `partitions` | `[k…]` · `"all"` (current key set) · `"missing"` (no complete head) · `"latest"` (newest window of each time dimension, every key of the others) · default `"latest"`. Explicit keys are checked part by part and `"latest"` is computed directly, so neither depends on the size of the domain; `"all"` and `"missing"` enumerate it, up to 100,000 scopes — past that the request is refused, never truncated |
 | `mode` | `incremental` (default) or `full` |
 | `upstream` | also plan the upstream closure; default false: **targets only, inputs pinned to current heads**, so a rebuild never re-polls an external system |
 | `config` | JSON passed as `ctx.config` |
@@ -561,7 +561,7 @@ the run's own vocabulary (§8): `partitions`, `mode`, `upstream`, `config`,
 | `name` | required; key for toggles | derived `{asset}.{trigger}.{index}` |
 | `targets` | required: assets, singleton or list | the asset |
 | `trigger` | required | required |
-| `partitions` | `"latest"` · `"missing"` · `"all"` · `[k…]`; default `"latest"` for `Every`/`Cron`, the projection of the changed scope for `OnChange` | same |
+| `partitions` | `"latest"` · `"missing"` · `"all"` · `[k…]`; default `"latest"` for `Every`/`Cron`, the projection of the changed scope for `OnChange` — a source has no dimensions, so its change reaches every scope of the target. A change whose target scope has an attempt running stays pending until that attempt ends: it pinned its inputs before the change | same |
 | `enabled` | default `True` | default `True` |
 
 | Trigger | Fires |
