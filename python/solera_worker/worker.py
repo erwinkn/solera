@@ -351,7 +351,6 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline):
                 changes[param] = Changes(
                     rows=args[param],
                     batches=range(lo, hi + 1),
-                    full=full,
                     reset=full,  # an unkeyed reset delivery marks its first page only
                     final=not ch.get("more"),
                 )
@@ -366,9 +365,8 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline):
             changes[param] = Changes(
                 rows=args[param],
                 deleted=deleted,
-                full=full,
                 upserted=tuple(sorted(upserted)),
-                # Pages of a full delivery all say `full`; only the first resets.
+                # Only the first page of a full delivery resets.
                 reset=full and ch.get("after") is None and "keys" not in ch,
                 final=after is None,
             )

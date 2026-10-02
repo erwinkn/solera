@@ -306,7 +306,7 @@ async def test_soak_with_retention(tmp_path, monkeypatch):
 
     @asset(partitions={"site": demo.sites}, inputs={"site_files": Incremental(batch_size=100)})
     def late_reader(ctx, site_files: list):
-        seen[ctx.partition] = (ctx.changes["site_files"].full, sorted(r["file_id"] for r in site_files))
+        seen[ctx.partition] = (ctx.changes["site_files"].reset, sorted(r["file_id"] for r in site_files))
         return []
 
     later = Project(

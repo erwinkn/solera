@@ -209,7 +209,7 @@ async def test_compaction_truncation_and_garbage(state):
     @asset(inputs={"items": Incremental(batch_size=7)})
     def mirror(ctx, items: list):
         changes = ctx.changes["items"]
-        if changes.full:
+        if changes.reset:
             seen.clear()
         for row in items:
             seen[row["id"]] = row["v"]
@@ -336,7 +336,7 @@ async def test_a_consumer_without_a_log_starts_over(state):
 
     @asset(inputs={"items": Incremental()})
     def mirror(ctx, items: list):
-        deliveries.append((ctx.changes["items"].full, sorted(r["id"] for r in items)))
+        deliveries.append((ctx.changes["items"].reset, sorted(r["id"] for r in items)))
         return []
 
     project = Project(assets=[items, mirror])
@@ -424,7 +424,7 @@ async def test_renamed_asset_keeps_its_state(state):
     rows = {"v": [{"id": "a", "v": 1}, {"id": "b", "v": 1}]}
 
     def mirror(ctx, feed: list):
-        delivered.append((ctx.changes["feed"].full, sorted(r["id"] for r in feed)))
+        delivered.append((ctx.changes["feed"].reset, sorted(r["id"] for r in feed)))
         return []
 
     def feed():

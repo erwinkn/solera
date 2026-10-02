@@ -35,10 +35,10 @@ async def test_every_boundary_once(tmp_path):
     def items():
         return Patch(pending["rows"], remove=pending["remove"])
 
-    @asset(inputs={"items": Incremental(batch_size=100)})  # one page: `full` is on every page of a full read
+    @asset(inputs={"items": Incremental(batch_size=5)})  # a full read spans pages: wipe on `reset` only
     def mirror(ctx, items: list):
         changes = ctx.changes["items"]
-        if changes.full:
+        if changes.reset:
             seen.clear()
         seen.update({row["id"]: row["v"] for row in items})
         for key in changes.deleted:

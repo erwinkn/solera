@@ -437,12 +437,11 @@ class Changes:
     `rows` (same object the parameter received), the removed `deleted` keys
     (keyed upstreams), the delivered `batches` range (batch-mode upstreams),
     `upserted` — the delivered key list for keyed upstreams — and where the
-    page sits in its delivery. A full delivery may span many pages:
+    page sits in its delivery. A full delivery (the whole head, after a
+    reset) may span many pages:
 
     - `reset`: the first page of a full delivery — start over now; what was
       built from this edge before is superseded. Never set on later pages.
-    - `full`: the page belongs to a full delivery (the whole head, not a
-      delta); on a keyed upstream every page of it says so.
     - `final`: no page of this delivery follows.
 
     A consumer that rebuilds wipes on `reset`, appends every page, and
@@ -451,7 +450,6 @@ class Changes:
     rows: Any = ()
     deleted: tuple = ()
     batches: range | None = None
-    full: bool = False
     upserted: tuple = ()
     reset: bool = False
     final: bool = True

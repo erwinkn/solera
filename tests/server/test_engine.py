@@ -258,7 +258,7 @@ async def test_config_change_reprocesses_everything(state):
     @asset(inputs={"files": Incremental()})
     def consumer(ctx, files: list):
         seen.setdefault("batches", []).append([r["id"] for r in files])
-        seen.setdefault("full", []).append(ctx.changes["files"].full)
+        seen.setdefault("full", []).append(ctx.changes["files"].reset)
         return []
 
     project = Project(assets=[files, consumer])
@@ -281,7 +281,7 @@ async def test_full_run_resets_watermark(state):
 
     @asset(inputs={"files": Incremental()})
     def consumer(ctx, files: list):
-        seen.append((sorted(r["id"] for r in files), ctx.changes["files"].full))
+        seen.append((sorted(r["id"] for r in files), ctx.changes["files"].reset))
         return [{"n": len(files)}]
 
     project = Project(assets=[files, consumer])
@@ -1174,7 +1174,7 @@ async def test_a_paged_full_delivery_resets_on_its_first_page_only(state):
     @asset(inputs={"files": Incremental(batch_size=3)})
     def consumer(ctx, files: list):
         ch = ctx.changes["files"]
-        pages.append((ch.reset, ch.full, ch.final))
+        pages.append((ch.reset, ch.final))
         if ch.reset:
             rebuilt["keys"] = []
         rebuilt["keys"] += [r["id"] for r in files]
@@ -1196,7 +1196,7 @@ async def test_a_paged_full_delivery_resets_on_its_first_page_only(state):
     engine = make_engine(state, project)
     await engine.initialize()
     await drive(engine, await engine.submit(["consumer"], upstream=True))
-    assert pages == [(True, True, False), (False, True, False), (False, True, True)]
+    assert pages == [(True, False), (False, False), (False, True)]
     assert sorted(rebuilt["keys"]) == [f"k{i}" for i in range(7)]
     for _ in range(3):
         await drive(engine, await engine.submit(["log"]))
