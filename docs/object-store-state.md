@@ -821,6 +821,15 @@ another writer appended: `GET` it, apply it, retry at the next `seq`.
 Then adopt every launched attempt (§8); tasks that were preparing are
 dispatched again.
 
+The writer still running may checkpoint and clean up while the new one
+opens, deleting segments the new one has not read yet. A segment that is
+missing (a gap, a `GET` that finds nothing, or a fence create that
+succeeds) where a checkpoint at or past it exists was written, then
+deleted: cleanup deletes nothing a checkpoint does not cover. The new
+writer then deletes the fence it may have created in that hole, which
+the old writer would never collide with, and opens again from the newer
+checkpoint.
+
 **Fencing.** Every segment write is create-only at `seq+1`. A writer
 whose create collides reads the colliding segment: if it has another
 writer id, it has been replaced and shuts down. Segments a replaced

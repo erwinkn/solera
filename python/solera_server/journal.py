@@ -59,6 +59,11 @@ from solera.objects import create
 log = logging.getLogger(__name__)
 
 
+class _Behind(Exception):
+    """The writer checkpointed past what an opener had read, and cleaned up
+    segments it had yet to read: it opens again, from the newer checkpoint."""
+
+
 class Fenced(RuntimeError):
     """Another writer took over this namespace; this one must stop."""
 
@@ -163,13 +168,34 @@ class Journal:
         writer: bool = True,
     ) -> OpenResult:
         """Load the newest readable checkpoint, replay the segments after it,
-        then fence: from here on this process is the only writer.
+        then fence: from here on this process is the only writer. A writer
+        still running may checkpoint and clean up meanwhile, deleting
+        segments not yet read: then everything starts again, from its newer
+        checkpoint.
 
         `writer=False` opens read-only: nothing is fenced and appends fail —
         for tools that inspect a namespace a server may be writing."""
 
         self._snapshot = snapshot
+        while True:
+            try:
+                loaded = await self._load(restore)
+                replayed = await self._replay(apply)
+                if not writer:
+                    self.fenced = True  # read-only: every append fails
+                    return OpenResult(seq=None, replayed=replayed, checkpoint=loaded)
+                await self._fence(apply)
+                break
+            except _Behind:
+                log.warning("the journal was cleaned up past what this writer had read; opening again")
+        self._task = asyncio.create_task(self._run())
+        return OpenResult(seq=self.writer, replayed=replayed, checkpoint=loaded)
+
+    async def _load(self, restore) -> int | None:
+        """Restore the newest readable checkpoint; its seq, or None."""
+
         self._checkpoints = await self._list("checkpoints")
+        self.fences, self._since_checkpoint, self._last_checkpoint_size = [], 0, 0
         loaded = None
         for seq in reversed(self._checkpoints):
             try:
@@ -184,24 +210,34 @@ class Journal:
         if loaded is None:
             restore(None)
         self.seq = loaded or 0
-        replayed = await self._replay(apply)
-        if not writer:
-            self.fenced = True  # read-only: every append fails
-            return OpenResult(seq=None, replayed=replayed, checkpoint=loaded)
-        await self._fence(apply)
-        self._task = asyncio.create_task(self._run())
-        return OpenResult(seq=self.writer, replayed=replayed, checkpoint=loaded)
+        return loaded
 
     async def _replay(self, apply) -> int:
         count = 0
         for seq in await self._list("journal", after=self.seq):
             if seq != self.seq + 1:
+                await self._behind(self.seq + 1)
                 raise JournalCorrupt(f"journal gap: expected segment {self.seq + 1}, found {seq}")
-            body = await self._get_json(self._segment(seq))
+            body = await self._read_segment(seq)
             self._apply_segment(seq, body, apply)
             self._since_checkpoint += len(_dumps(body))
             count += 1
         return count
+
+    async def _read_segment(self, seq: int) -> dict:
+        try:
+            return await self._get_json(self._segment(seq))
+        except NotFoundError:  # listed, or found taken, then cleaned up
+            await self._behind(seq)
+            raise
+
+    async def _behind(self, seq: int) -> None:
+        """Raise `_Behind` if segment `seq` is missing because a checkpoint
+        covers it: cleanup deletes a segment only once two checkpoints at or
+        past it exist, so one there means it was written, then deleted."""
+
+        if any(c >= seq for c in await self._list("checkpoints")):
+            raise _Behind(seq)
 
     async def _fence(self, apply) -> None:
         while True:
@@ -212,8 +248,16 @@ class Journal:
                 await create(self.store, self._segment(seq), _dumps(body))
             except AlreadyExistsError:
                 # Another writer appended since we listed: apply it and try the next seq.
-                self._apply_segment(seq, await self._get_json(self._segment(seq)), apply)
+                self._apply_segment(seq, await self._read_segment(seq), apply)
                 continue
+            try:
+                # Created where cleanup had deleted a segment of the writer still
+                # running: a fence it never sees, after events this one never read.
+                await self._behind(seq)
+            except _Behind:
+                with contextlib.suppress(NotFoundError):
+                    await obstore.delete_async(self.store, self._segment(seq))
+                raise
             apply(fence)
             self.seq = seq
             self.writer = seq

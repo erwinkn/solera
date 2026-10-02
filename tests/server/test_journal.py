@@ -258,3 +258,36 @@ async def test_two_writers_never_take_the_same_fence(store):
     await b.close()
     _, again, _ = await open_journal(store)
     assert again.counts == {"y": 1}
+
+
+async def test_an_opener_whose_segments_were_cleaned_up_opens_again(tmp_path):
+    """Simulation finding F7: a new writer loads a checkpoint, and before it
+    lists the segments after it, the old writer appends, checkpoints and
+    cleans those segments up. The gap is not corruption: the new writer
+    opens again from the newer checkpoint, with every acknowledged event,
+    and fences the old one."""
+
+    store = LocalStore(str(tmp_path), mkdir=True)
+    a, sa, _ = await open_journal(store, min_checkpoint=50)
+    await add(a, sa, "x")
+    b, sb = Journal(store, "control", flush_interval=0.01), Counter()
+    replay, loaded, go = b._replay, asyncio.Event(), asyncio.Event()
+
+    async def slow(apply):  # loaded its checkpoint; slow to list what follows
+        if not loaded.is_set():
+            loaded.set()
+            await go.wait()
+        return await replay(apply)
+
+    b._replay = slow
+    opening = asyncio.create_task(b.open(sb.restore, sb.apply, sb.snapshot))
+    await loaded.wait()
+    for _ in range(12):
+        await add(a, sa, "x")
+    assert names(store, "journal")[0] != "00000000000000000002.json"  # cleaned up past it
+    go.set()
+    await opening
+    assert sb.counts["x"] == 13
+    with pytest.raises(Fenced):
+        await add(a, sa, "x")
+    await b.close()

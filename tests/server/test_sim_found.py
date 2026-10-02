@@ -193,7 +193,6 @@ async def test_a_change_made_during_a_full_delivery_reaches_downstream(state):  
     assert sorted((r["id"], r["v"]) for r in rows) == [("a", "2"), ("b", "2")]
 
 
-@pytest.mark.xfail(strict=True, reason="sim finding: cleanup deletes segments a writer still opening needs")
 async def test_a_slow_new_writer_never_fences_into_a_deleted_segment(tmp_path):
     """docs/object-store-state.md §10: a new writer replays the journal after
     the checkpoint it loaded, then fences at the next free seq. Meanwhile the
