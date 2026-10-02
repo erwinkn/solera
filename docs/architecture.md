@@ -316,8 +316,9 @@ filtered to the delivered keys or batches; `ctx.changes[name]` carries the
 rest — `deleted` keys, the `batches` range, and where the page sits in its
 delivery. A full delivery (the whole head, after a reset) may span many
 pages of `batch_size`: `reset` is set on its **first page only** — the
-signal to start over — and `final` on the last page of any delivery. A
-consumer that rebuilds wipes on `reset` and finalizes on `final`.
+signal to start over — `full` on every page of it, and `final` on the last
+page of any delivery. A consumer that rebuilds wipes on `reset`, never on
+`full`, or each page would erase the ones before it.
 
 **`deps=`** are unbound inputs: planned, pinned into lineage, part of the
 interpretation fingerprint (§6), watched by `AutoRefresh`, bound to no
