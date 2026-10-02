@@ -98,6 +98,16 @@ export function Hash({ value, className }: { value: string | null | undefined; c
   );
 }
 
+/** A version: the generation of the write that made it (docs/versions.md). */
+export function Generation({ value, className }: { value: number | null | undefined; className?: string }) {
+  if (value == null) return <span className="text-fg-subtle">—</span>;
+  return (
+    <Tooltip content="The generation of the write that made this version">
+      <span className={cn("font-mono text-[0.92em] text-fg-muted", className)}>g{value}</span>
+    </Tooltip>
+  );
+}
+
 /** Proportions as one bar of tone segments; the label says the numbers. */
 export function SegmentBar({
   parts,

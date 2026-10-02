@@ -11,7 +11,6 @@ export interface OutputDecl {
   name: string;
   store: string;
   key: string | null;
-  revision: string | null;
   incremental: boolean;
   migrations: string[] | { name: string }[];
   config: Record<string, Json>;
@@ -81,8 +80,9 @@ export interface Ref {
   output: string;
   store: string;
   handle: Record<string, Json>;
-  version: string;
   partition: string;
+  /** Its version: the generation of the write that made it. */
+  generation: number;
   meta: Record<string, Json>;
 }
 
@@ -235,6 +235,7 @@ export interface PartitionRow {
 export interface OutputHead {
   scope: string;
   ref: Ref;
+  /** The asset's code version; a source's own version, as its last commit gave it. */
   version: string | null;
   key_count: number | null;
   batch: number | null;
@@ -250,7 +251,8 @@ export interface KeyPage {
   scope: string;
   total: number;
   exact: boolean;
-  keys: Record<string, string>;
+  /** Each key, and the generation that last wrote it: its version. */
+  keys: Record<string, number>;
   next: string | null;
 }
 
@@ -265,7 +267,8 @@ export interface FailureKey {
   last: number;
   next_at: number | null;
   until: number | null;
-  revision: string;
+  /** The generation of the upstream key it failed at. */
+  generation: number;
   message: string;
   eligible: boolean;
 }
@@ -299,7 +302,8 @@ export interface KeyOutcome {
   asset: string;
   scope: string;
   key: string;
-  revision: string | null;
+  /** The generation of the upstream key it processed. */
+  generation: number | null;
   outcome: KeyOutcomeKind;
   error: string | null;
   duration: number | null;
@@ -314,9 +318,9 @@ export interface Explain {
   upstream: string;
   upstream_asset: string | null;
   up_scope: string;
-  upstream_revision: string | null;
+  upstream_generation: number | null;
   edge_state: EdgeState;
-  outputs: Record<string, { present: boolean; revision: string | null }>;
+  outputs: Record<string, { present: boolean; generation: number | null }>;
   patterns: {
     spec: Patterns | null;
     included: boolean;
@@ -382,7 +386,6 @@ export interface Materialization {
   output: string;
   asset: string | null;
   scope: string;
-  version: string;
   store: string;
   run: string;
   attempt: string | null;
@@ -395,12 +398,13 @@ export interface Materialization {
   rows: number | null;
   complete: boolean | null;
   metadata: Json;
+  generation: number;
 }
 
 export interface LineageNode {
   output: string;
   scope: string;
-  version: string;
+  generation: number;
   asset: string | null;
   run: string | null;
   attempt: string | null;
@@ -410,12 +414,12 @@ export interface LineageNode {
 }
 
 export interface Lineage {
-  root: { output: string; scope: string; version: string };
+  root: { output: string; scope: string; generation: number };
   direction: "upstream" | "downstream";
   nodes: LineageNode[];
   edges: {
-    from: { output: string; scope: string; version: string };
-    to: { output: string; scope: string; version: string };
+    from: { output: string; scope: string; generation: number };
+    to: { output: string; scope: string; generation: number };
     param: string;
     run: string;
   }[];
@@ -508,7 +512,7 @@ export interface Task {
   generation: number;
   attempt_count: number;
   error: string | null;
-  outputs: Record<string, string> | null;
+  outputs: string[] | null;
   held?: [string, string | null] | null;
   started_at?: number | null;
   finished_at?: number | null;
@@ -533,7 +537,7 @@ export interface Attempt extends Partial<Record<Phase, number>> {
   started_at: number | null;
   finished_at?: number | null;
   error?: AttemptError | string | null;
-  outputs?: Record<string, string>;
+  outputs?: string[];
   commit?: string;
   keys?: Partial<Record<KeyOutcomeKind, number>>;
   executor?: string | null;

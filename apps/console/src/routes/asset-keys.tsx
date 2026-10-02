@@ -12,7 +12,7 @@ import { cn } from "@/lib/cn";
 import { count, plural, shortId, until } from "@/lib/format";
 import { label, tone, toneSoft, toneText } from "@/lib/status";
 import { Button } from "@/ui/button";
-import { Empty, ErrorNote, Skeleton, Time } from "@/ui/data";
+import { Empty, ErrorNote, Generation, Skeleton, Time } from "@/ui/data";
 import { Chip, Input, SearchInput, Select } from "@/ui/form";
 import { Card, CardHeader } from "@/ui/layout";
 import { Menu, MenuItem, Tooltip } from "@/ui/overlay";
@@ -322,12 +322,13 @@ function Answer({ explain: e }: { explain: Explain }) {
   const headline: Record<Explain["verdict"], ReactNode> = {
     ok: (
       <>
-        In the output, from {e.upstream} revision <Rev value={e.last_ok?.revision ?? e.upstream_revision} />
+        In the output, from {e.upstream} at{" "}
+        <Generation value={e.last_ok?.generation ?? e.upstream_generation} />
       </>
     ),
     failing: (
       <>
-        {label(e.failure?.outcome)} at revision <Rev value={e.failure?.revision} />: {e.failure?.message}
+        {label(e.failure?.outcome)} at <Generation value={e.failure?.generation} />: {e.failure?.message}
       </>
     ),
     excluded: (
@@ -338,7 +339,7 @@ function Answer({ explain: e }: { explain: Explain }) {
     not_matched: <>Not matched: outside the edge's include patterns</>,
     pending: (
       <>
-        Waiting: {e.upstream} has revision <Rev value={e.upstream_revision} />, not processed yet
+        Waiting: {e.upstream} wrote it at <Generation value={e.upstream_generation} />, not processed yet
       </>
     ),
     removed: Object.values(e.outputs).some((o) => o.present) ? (
@@ -364,9 +365,9 @@ function Answer({ explain: e }: { explain: Explain }) {
         <li>
           Upstream <span className="text-fg">{e.upstream}</span>
           {e.up_scope && <span className="font-mono"> · {e.up_scope}</span>}:{" "}
-          {e.upstream_revision ? (
+          {e.upstream_generation != null ? (
             <>
-              has it at <Rev value={e.upstream_revision} />
+              has it at <Generation value={e.upstream_generation} />
             </>
           ) : (
             "doesn't have it"
@@ -380,10 +381,10 @@ function Answer({ explain: e }: { explain: Explain }) {
             {o.present ? (
               <>
                 holds it
-                {o.revision && (
+                {o.generation != null && (
                   <>
                     {" "}
-                    at <Rev value={o.revision} />
+                    at <Generation value={o.generation} />
                   </>
                 )}
               </>
@@ -415,7 +416,7 @@ function Answer({ explain: e }: { explain: Explain }) {
             <span className={cn(toneSoft[tone(e.last.outcome)], "rounded-xs px-1")}>
               {label(e.last.outcome)}
             </span>{" "}
-            at <Rev value={e.last.revision} /> <Time at={e.last.at} /> in run{" "}
+            at <Generation value={e.last.generation} /> <Time at={e.last.at} /> in run{" "}
             <Link
               to="/runs/$run"
               params={{ run: e.last.run }}
@@ -428,7 +429,7 @@ function Answer({ explain: e }: { explain: Explain }) {
         )}
         {e.last_ok && e.last_ok !== e.last && (
           <li>
-            Last success at <Rev value={e.last_ok.revision} /> <Time at={e.last_ok.at} />
+            Last success at <Generation value={e.last_ok.generation} /> <Time at={e.last_ok.at} />
           </li>
         )}
         {e.patterns.spec && (
@@ -439,15 +440,6 @@ function Answer({ explain: e }: { explain: Explain }) {
         )}
       </ul>
     </div>
-  );
-}
-
-function Rev({ value }: { value: string | null | undefined }) {
-  if (!value) return <span>—</span>;
-  return (
-    <code className="rounded-xs bg-sunken px-1 font-mono">
-      {value.length > 16 ? value.slice(0, 12) + "…" : value}
-    </code>
   );
 }
 
@@ -500,7 +492,7 @@ function KeyOutcomes({ name }: { name: string }) {
                 <Th>Key</Th>
                 {!scope && <Th>Partition</Th>}
                 <Th>Outcome</Th>
-                <Th>Revision</Th>
+                <Th>Generation</Th>
                 <Th>Error</Th>
                 <Th>When</Th>
                 <Th>Run</Th>
@@ -514,7 +506,9 @@ function KeyOutcomes({ name }: { name: string }) {
                   <Td>
                     <StatusBadge status={o.outcome} />
                   </Td>
-                  <Td className="font-mono text-xs text-fg-muted">{o.revision}</Td>
+                  <Td>
+                    <Generation value={o.generation} />
+                  </Td>
                   <Td className="max-w-80 truncate text-xs text-fail-fg" title={o.error ?? undefined}>
                     {o.error}
                   </Td>
@@ -586,9 +580,7 @@ function LiveKeys({ name, asset }: { name: string; asset: AssetDecl }) {
               ""
             )}
             {first && ` · ${first.exact ? "" : "about "}${plural(first.total, "key")}`}
-            {chosen.revision
-              ? ` · revision is ${chosen.revision}`
-              : " · revision is a digest of each key's rows"}
+            {" · a key's version is the generation that last wrote it"}
           </>
         }
         actions={
@@ -635,16 +627,14 @@ function LiveKeys({ name, asset }: { name: string; asset: AssetDecl }) {
             <thead className="sticky top-0 bg-surface">
               <tr>
                 <Th>Key</Th>
-                <Th>Revision</Th>
+                <Th>Generation</Th>
               </tr>
             </thead>
             <tbody>
-              {entries.map(([k, rev]) => (
+              {entries.map(([k, generation]) => (
                 <Tr key={k}>
                   <Td className="font-mono text-xs">{k}</Td>
-                  <Td className="font-mono text-xs text-fg-muted">
-                    {rev.length > 24 ? `${rev.slice(0, 16)}…` : rev}
-                  </Td>
+                  <Td className="font-mono text-xs text-fg-muted">g{generation}</Td>
                 </Tr>
               ))}
             </tbody>

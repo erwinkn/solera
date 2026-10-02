@@ -15,7 +15,7 @@ import { cn } from "@/lib/cn";
 import { count, duration, plural, until } from "@/lib/format";
 import { toneSoft } from "@/lib/status";
 import { Button } from "@/ui/button";
-import { Empty, Hash, JsonView, Skeleton, Time } from "@/ui/data";
+import { Empty, Generation, JsonView, Skeleton, Time } from "@/ui/data";
 import { Select, Switch } from "@/ui/form";
 import { Card, CardHeader, Crumb, Fact, Facts, Page, PageHeader } from "@/ui/layout";
 import { Tooltip } from "@/ui/overlay";
@@ -324,13 +324,13 @@ function Heads({
                       to="/assets/$asset/history"
                       params={{ asset }}
                       search={{
-                        version: head.ref.version,
+                        generation: String(head.ref.generation),
                         vout: output,
                         vscope: s || undefined,
                       }}
                       className="hover:underline"
                     >
-                      <Hash value={head.ref.version} />
+                      <Generation value={head.ref.generation} />
                     </Link>
                   </Td>
                   <Td className="text-right">{head.count != null ? count(head.count) : "—"}</Td>
@@ -398,7 +398,6 @@ function Declaration({ asset, manifest }: { asset: AssetDecl; manifest: Manifest
                   </span>
                   {o.partition_set && <Tag>partition set</Tag>}
                   {o.key && !o.partition_set && <Tag>key {o.key}</Tag>}
-                  {o.revision && <Tag>revision {o.revision}</Tag>}
                   {o.incremental && !o.partition_set && <Tag>incremental</Tag>}
                   {o.migrations.length > 0 && <Tag>{plural(o.migrations.length, "migration")}</Tag>}
                 </Row>

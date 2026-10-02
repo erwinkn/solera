@@ -149,7 +149,7 @@ export function useRunAutomation() {
 export interface CommitInput {
   source: string;
   version?: string;
-  upsert?: string[] | Record<string, string>;
+  upsert?: string[] | Record<string, string | null>;
   remove?: string[];
 }
 

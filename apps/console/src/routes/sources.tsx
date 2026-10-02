@@ -8,7 +8,7 @@ import type { Manifest, SourceDecl } from "@/api/types";
 import { RunsTable } from "@/features/runs";
 import { count, plural } from "@/lib/format";
 import { Button } from "@/ui/button";
-import { Empty, ErrorNote, Hash, LoadMore, Skeleton, Time } from "@/ui/data";
+import { Empty, ErrorNote, Generation, LoadMore, Skeleton, Time } from "@/ui/data";
 import { Field, Input, Segmented, Textarea } from "@/ui/form";
 import { Card, CardHeader, Crumb, Fact, Facts, Page, PageHeader } from "@/ui/layout";
 import { Table, TableScroll, Td, Th, Tr } from "@/ui/table";
@@ -105,7 +105,7 @@ function SourceRow({
       <Td className="text-fg-muted">{kind}</Td>
       <Td>
         <span className="flex items-center gap-2">
-          <Hash value={head?.ref.version ?? source.head.version} />
+          <Generation value={head?.ref.generation ?? source.head.generation} />
           {head && (
             <span className="text-xs text-fg-subtle">
               <Time at={head.at} />
@@ -167,9 +167,10 @@ export function Source() {
           <Card>
             <CardHeader title="Head" />
             <Facts className="px-4 pb-4">
-              <Fact label="Version">
-                <Hash value={head?.ref.version ?? source.head.version} />
+              <Fact label="Generation">
+                <Generation value={head?.ref.generation ?? source.head.generation} />
               </Fact>
+              {kind === "unkeyed" && <Fact label="Version">{head?.version ?? "—"}</Fact>}
               {kind !== "unkeyed" && (
                 <Fact label="Keys">{head?.key_count != null ? count(head.key_count) : "—"}</Fact>
               )}
@@ -262,14 +263,14 @@ function SourceKeys({ name }: { name: string }) {
             <thead className="sticky top-0 bg-surface">
               <tr>
                 <Th>Key</Th>
-                <Th>Revision</Th>
+                <Th>Generation</Th>
               </tr>
             </thead>
             <tbody>
-              {entries.map(([k, v]) => (
+              {entries.map(([k, generation]) => (
                 <Tr key={k}>
                   <Td className="font-mono text-xs">{k}</Td>
-                  <Td className="font-mono text-xs text-fg-muted">{v}</Td>
+                  <Td className="font-mono text-xs text-fg-muted">g{generation}</Td>
                 </Tr>
               ))}
             </tbody>
@@ -287,7 +288,7 @@ function CommitForm({ name, kind }: { name: string; kind: Kind }) {
   const [action, setAction] = useState<"upsert" | "remove">("upsert");
   const [text, setText] = useState("");
   // Keys are one per line, never split on commas (a key may hold one); a pair splits
-  // at its first "=", so a revision keeps its own. An unkeyed version is taken verbatim.
+  // at its first "=", so a version keeps its own. An unkeyed version is taken verbatim.
   const items = text
     .split("\n")
     .map((t) => t.trim())
@@ -299,9 +300,8 @@ function CommitForm({ name, kind }: { name: string; kind: Kind }) {
           return at < 0 ? [i, undefined] : [i.slice(0, at).trim(), i.slice(at + 1).trim()];
         })
       : [];
-  const invalid =
-    (kind === "unkeyed" ? !text.trim() : items.length === 0) ||
-    (kind === "keyed" && action === "upsert" && pairs.some(([, v]) => !v));
+  // A key with no version is written as a change (docs/versions.md §2).
+  const invalid = kind === "unkeyed" ? !text.trim() : items.length === 0;
   return (
     <Card className="self-start">
       <CardHeader title="Commit" description="Advance this source through the commit API" />
@@ -317,13 +317,14 @@ function CommitForm({ name, kind }: { name: string; kind: Kind }) {
                 ? { source: name, remove: items }
                 : {
                     source: name,
-                    upsert: kind === "keyed" ? Object.fromEntries(pairs as [string, string][]) : items,
+                    upsert:
+                      kind === "keyed" ? Object.fromEntries(pairs.map(([k, v]) => [k, v ?? null])) : items,
                   };
           commit.mutate(body, { onSuccess: () => setText("") });
         }}
       >
         {kind === "unkeyed" ? (
-          <Field label="New version" hint="Any string; an identical version is no change">
+          <Field label="New version" hint="Any string; the version it has is no change">
             <Input value={text} onChange={(e) => setText(e.target.value)} placeholder="2026-10-02T09:00Z" />
           </Field>
         ) : (
@@ -342,7 +343,9 @@ function CommitForm({ name, kind }: { name: string; kind: Kind }) {
             />
             <Field
               label={
-                kind === "keyed" && action === "upsert" ? "key=revision, one per line" : "Keys, one per line"
+                kind === "keyed" && action === "upsert"
+                  ? "key, or key=version, one per line"
+                  : "Keys, one per line"
               }
             >
               <Textarea

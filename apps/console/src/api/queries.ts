@@ -271,15 +271,15 @@ export const q = {
     project: string,
     output: string,
     scope: string,
-    version: string | undefined,
+    generation: number | undefined,
     direction: "upstream" | "downstream",
   ) =>
     queryOptions({
-      queryKey: ["outputs", output, "lineage", scope, version ?? "head", direction],
+      queryKey: ["outputs", output, "lineage", scope, generation ?? "head", direction],
       queryFn: ({ signal }) =>
         api<Lineage>(`${p(project)}/outputs/${enc(output)}/lineage`, {
           signal,
-          query: { scope, version, direction, depth: 4 },
+          query: { scope, generation, direction, depth: 4 },
         }),
     }),
 

@@ -10,7 +10,7 @@ import { Logs, type LogLevel } from "@/features/logs";
 import { PHASE_LABEL, PhaseBar, PhaseLegend, phaseColor, phasesOf, Waterfall } from "@/features/timeline";
 import { useNow } from "@/lib/clock";
 import { cn } from "@/lib/cn";
-import { bytes, duration, firstLine, plural, shortHash, shortId } from "@/lib/format";
+import { bytes, duration, firstLine, plural, shortId } from "@/lib/format";
 import { label, tone, toneSoft } from "@/lib/status";
 import { Button } from "@/ui/button";
 import { rove } from "@/ui/form";
@@ -465,15 +465,13 @@ function AttemptSummary({ run, attempt, live }: { run: string; attempt: Attempt;
         </div>
       )}
 
-      {attempt.outputs && Object.keys(attempt.outputs).length > 0 && (
+      {attempt.outputs && attempt.outputs.length > 0 && (
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
           <span className="text-fg-subtle">Committed</span>
-          {Object.entries(attempt.outputs).map(([output, version]) => (
+          {attempt.outputs.map((output) => (
             <span key={output} className="inline-flex items-center gap-1.5">
               <span className="text-fg">{output}</span>
-              <Tooltip content={<span className="font-mono break-all">{version}</span>}>
-                <span className="font-mono text-fg-muted">{shortHash(version)}</span>
-              </Tooltip>
+              <span className="font-mono text-fg-muted">g{attempt.generation}</span>
             </span>
           ))}
         </div>
@@ -634,7 +632,7 @@ function ResultTab({ run, attempt }: { run: string; attempt: Attempt }) {
               <tr>
                 <th className="px-3 py-1.5 font-medium">Key</th>
                 <th className="px-3 py-1.5 font-medium">Outcome</th>
-                <th className="px-3 py-1.5 font-medium">Revision</th>
+                <th className="px-3 py-1.5 font-medium">Generation</th>
                 <th className="px-3 py-1.5 font-medium">Error</th>
                 <th className="px-3 py-1.5 text-right font-medium">Time</th>
               </tr>
@@ -646,7 +644,9 @@ function ResultTab({ run, attempt }: { run: string; attempt: Attempt }) {
                   <td className="px-3 py-1.5">
                     <StatusBadge status={k.outcome} />
                   </td>
-                  <td className="px-3 py-1.5 font-mono text-fg-muted">{k.revision}</td>
+                  <td className="px-3 py-1.5 font-mono text-fg-muted">
+                    {k.generation != null ? `g${k.generation}` : "—"}
+                  </td>
                   <td className="max-w-80 truncate px-3 py-1.5 text-fail-fg" title={k.error ?? undefined}>
                     {k.error}
                   </td>
@@ -675,7 +675,7 @@ function SpecTab({ run, attempt }: { run: string; attempt: Attempt }) {
   const inputs = (data.inputs ?? {}) as Record<
     string,
     {
-      ref?: { output: string; version: string; partition: string };
+      ref?: { output: string; generation: number; partition: string };
       changes?: Record<string, Json>;
       refs?: Record<string, Json>;
     }
@@ -693,7 +693,7 @@ function SpecTab({ run, attempt }: { run: string; attempt: Attempt }) {
                   <span className="text-fg-muted">
                     {pin.ref.output}
                     {pin.ref.partition && ` · ${pin.ref.partition}`} @{" "}
-                    <span className="font-mono">{shortHash(pin.ref.version)}</span>
+                    <span className="font-mono">g{pin.ref.generation}</span>
                   </span>
                 )}
                 {pin.refs && (

@@ -101,9 +101,14 @@ const assetHistory = createRoute({
   getParentRoute: () => asset,
   path: "/history",
   validateSearch: (s: Record<string, unknown>) =>
-    // `output` and the asset's `scope` filter the list; `version` with `vout` and
+    // `output` and the asset's `scope` filter the list; `generation` with `vout` and
     // `vscope` names the version whose lineage shows, wherever it is in the list.
-    optional({ output: str(s.output), version: str(s.version), vout: str(s.vout), vscope: str(s.vscope) }),
+    optional({
+      output: str(s.output),
+      generation: str(s.generation),
+      vout: str(s.vout),
+      vscope: str(s.vscope),
+    }),
   component: lazyRouteComponent(() => import("@/routes/asset-history"), "AssetHistory"),
 });
 

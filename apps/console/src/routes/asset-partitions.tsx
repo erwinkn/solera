@@ -7,7 +7,7 @@ import { MaterializeButton } from "@/features/materialize";
 import { cn } from "@/lib/cn";
 import { count, plural } from "@/lib/format";
 import { label, tone, toneSolid, toneSoft } from "@/lib/status";
-import { Empty, Hash, Time } from "@/ui/data";
+import { Empty, Generation, Time } from "@/ui/data";
 import { Card, CardHeader, Fact, Facts } from "@/ui/layout";
 import { Tooltip } from "@/ui/overlay";
 import { StatusBadge, StatusIcon } from "@/ui/status";
@@ -232,7 +232,7 @@ function ScopePanel({ name, row, detail }: { name: string; row?: PartitionRow; d
             {heads.map(({ output, head }) => (
               <li key={output} className="flex flex-wrap items-center gap-x-3 gap-y-0.5 px-3 py-2">
                 <span className="font-medium">{output}</span>
-                <Hash value={head.ref.version} />
+                <Generation value={head.ref.generation} />
                 {head.count != null && (
                   <span className="text-xs text-fg-muted">{plural(head.count, "key")}</span>
                 )}
