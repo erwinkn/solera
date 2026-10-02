@@ -1,11 +1,9 @@
-//! Ordering written keys: the permutation that sorts them.
-//!
-//! Several strategies, benchmarked against each other by `examples/sort.rs`
-//! (bench/keys/results.md); `order` is the one the index uses. Every strategy
-//! returns the same permutation of row indices, as `u32`.
+//! Ordering written keys: the permutation that sorts them, as `u32` row
+//! indices. Keys are bucketed by their first varying bytes, then each bucket
+//! sorted as prefix pairs on every core — the strategy the benchmarks in
+//! bench/keys/results.md picked over plain and radix sorts of the keys.
 
 use rayon::prelude::*;
-use std::cmp::Ordering;
 
 /// Random access to the keys being sorted.
 pub trait Keys: Sync {
@@ -21,38 +19,25 @@ pub fn is_sorted<K: Keys + ?Sized>(keys: &K) -> bool {
     (1..keys.len()).all(|i| keys.key(i - 1) <= keys.key(i))
 }
 
-/// The permutation that sorts `keys`, by the strategy the benchmarks picked:
-/// as fast as sorting prefix pairs on every core, at a third of the memory.
+/// The permutation that sorts `keys`: as fast as sorting prefix pairs on
+/// every core, at a third of the memory. Bucketed by the two key bytes
+/// after the common prefix, each bucket then sorted as prefix pairs
+/// (`sort_buckets`); peaks at the permutation plus the pairs of the buckets
+/// being sorted at once.
 pub fn order<K: Keys + ?Sized>(keys: &K) -> Vec<u32> {
-    buckets_par(keys)
-}
-
-// -- strategies -----------------------------------------------------------------------
-
-/// A bare permutation, compared through the keys.
-pub fn perm<K: Keys + ?Sized>(keys: &K) -> Vec<u32> {
-    let mut p: Vec<u32> = (0..keys.len() as u32).collect();
-    p.sort_unstable_by(|&a, &b| keys.key(a as usize).cmp(keys.key(b as usize)));
-    p
-}
-
-/// A bare permutation, sorted on every core.
-pub fn perm_par<K: Keys + ?Sized>(keys: &K) -> Vec<u32> {
-    let mut p: Vec<u32> = (0..keys.len() as u32).collect();
-    p.par_sort_unstable_by(|&a, &b| keys.key(a as usize).cmp(keys.key(b as usize)));
-    p
+    buckets(keys, (keys.len() / 64).max(1 << 16))
 }
 
 /// 12 bytes per key: the 8 key bytes after the prefix all keys share, and the row.
 #[derive(Clone, Copy)]
 #[repr(C, packed(4))]
-pub struct Pair {
+struct Pair {
     prefix: u64,
     row: u32,
 }
 
 /// Bytes every key starts with.
-pub fn common_prefix<K: Keys + ?Sized>(keys: &K) -> usize {
+fn common_prefix<K: Keys + ?Sized>(keys: &K) -> usize {
     if keys.is_empty() {
         return 0;
     }
@@ -75,162 +60,6 @@ fn prefix_at(key: &[u8], skip: usize) -> u64 {
     let m = tail.len().min(8);
     b[..m].copy_from_slice(&tail[..m]);
     u64::from_be_bytes(b)
-}
-
-fn make_pairs<K: Keys + ?Sized>(keys: &K, skip: usize) -> Vec<Pair> {
-    (0..keys.len())
-        .into_par_iter()
-        .map(|i| Pair {
-            prefix: prefix_at(keys.key(i), skip),
-            row: i as u32,
-        })
-        .collect()
-}
-
-#[inline]
-fn cmp_pairs<K: Keys + ?Sized>(keys: &K, skip: usize, a: &Pair, b: &Pair) -> Ordering {
-    let (pa, pb) = (a.prefix, b.prefix);
-    pa.cmp(&pb).then_with(|| {
-        let (ra, rb) = (a.row as usize, b.row as usize);
-        keys.key(ra)[skip..].cmp(&keys.key(rb)[skip..])
-    })
-}
-
-/// Reuse the pairs' allocation for the permutation: row `j` goes where pair
-/// `j`'s first 4 bytes were, never past a pair not yet read.
-fn into_rows(pairs: Vec<Pair>) -> Vec<u32> {
-    let n = pairs.len();
-    let mut pairs = std::mem::ManuallyDrop::new(pairs);
-    let (ptr, cap) = (pairs.as_mut_ptr(), pairs.capacity());
-    let rows = ptr as *mut u32;
-    for j in 0..n {
-        // SAFETY: pair j starts at byte 12j >= 4j; each pair is read before its bytes are reused.
-        unsafe {
-            let row = std::ptr::addr_of!((*ptr.add(j)).row).read_unaligned();
-            rows.add(j).write(row);
-        }
-    }
-    // SAFETY: same allocation, alignment 4 for both types, capacity scaled by 12/4.
-    let mut out = unsafe { Vec::from_raw_parts(rows, n, cap * 3) };
-    out.shrink_to_fit();
-    out
-}
-
-/// Prefix pairs, compared by prefix and through the keys on a tie.
-pub fn pairs<K: Keys + ?Sized>(keys: &K) -> Vec<u32> {
-    let skip = common_prefix(keys);
-    let mut p = make_pairs(keys, skip);
-    p.sort_unstable_by(|a, b| cmp_pairs(keys, skip, a, b));
-    into_rows(p)
-}
-
-/// Prefix pairs, sorted on every core.
-pub fn pairs_par<K: Keys + ?Sized>(keys: &K) -> Vec<u32> {
-    let skip = common_prefix(keys);
-    let mut p = make_pairs(keys, skip);
-    p.par_sort_unstable_by(|a, b| cmp_pairs(keys, skip, a, b));
-    into_rows(p)
-}
-
-/// Sorts runs of pairs with equal prefixes through the keys.
-fn fix_ties<K: Keys + ?Sized>(keys: &K, skip: usize, p: &mut [Pair]) {
-    let mut i = 0;
-    while i < p.len() {
-        let pi = p[i].prefix;
-        let mut j = i + 1;
-        while j < p.len() && p[j].prefix == pi {
-            j += 1;
-        }
-        if j - i > 1 {
-            p[i..j].sort_unstable_by(|a, b| cmp_pairs(keys, skip, a, b));
-        }
-        i = j;
-    }
-}
-
-/// Prefix pairs, least-significant-digit radix sort on the prefix (a scratch
-/// copy of the pairs), then ties through the keys.
-pub fn pairs_lsd<K: Keys + ?Sized>(keys: &K) -> Vec<u32> {
-    let skip = common_prefix(keys);
-    let mut p = make_pairs(keys, skip);
-    let mut scratch = p.clone();
-    for byte in 0..8 {
-        let shift = byte * 8;
-        let mut counts = [0usize; 256];
-        for x in &p {
-            counts[((x.prefix >> shift) & 0xFF) as usize] += 1;
-        }
-        if counts.contains(&p.len()) {
-            continue; // this byte never varies
-        }
-        let mut at = 0;
-        for c in counts.iter_mut() {
-            let n = *c;
-            *c = at;
-            at += n;
-        }
-        for x in &p {
-            let d = ((x.prefix >> shift) & 0xFF) as usize;
-            scratch[counts[d]] = *x;
-            counts[d] += 1;
-        }
-        std::mem::swap(&mut p, &mut scratch);
-    }
-    drop(scratch);
-    fix_ties(keys, skip, &mut p);
-    into_rows(p)
-}
-
-/// Prefix pairs, one in-place most-significant-digit pass on the first
-/// varying prefix byte, then the 256 buckets sorted on every core.
-pub fn pairs_msd_par<K: Keys + ?Sized>(keys: &K) -> Vec<u32> {
-    let skip = common_prefix(keys);
-    let mut p = make_pairs(keys, skip);
-    let n = p.len();
-    let mut shift = 56;
-    let mut counts;
-    loop {
-        counts = [0usize; 256];
-        for x in &p {
-            counts[((x.prefix >> shift) & 0xFF) as usize] += 1;
-        }
-        if shift == 0 || !counts.contains(&n) {
-            break;
-        }
-        shift -= 8;
-    }
-    // American flag sort: permute in place into bucket order.
-    let mut starts = [0usize; 257];
-    for d in 0..256 {
-        starts[d + 1] = starts[d] + counts[d];
-    }
-    let mut next = starts;
-    for d in 0..256 {
-        while next[d] < starts[d + 1] {
-            let mut x = p[next[d]];
-            loop {
-                let e = ((x.prefix >> shift) & 0xFF) as usize;
-                if e == d {
-                    break;
-                }
-                std::mem::swap(&mut x, &mut p[next[e]]);
-                next[e] += 1;
-            }
-            p[next[d]] = x;
-            next[d] += 1;
-        }
-    }
-    let mut buckets: Vec<&mut [Pair]> = Vec::with_capacity(256);
-    let mut rest: &mut [Pair] = &mut p;
-    for d in 0..256 {
-        let (b, r) = rest.split_at_mut(starts[d + 1] - starts[d]);
-        buckets.push(b);
-        rest = r;
-    }
-    buckets
-        .into_par_iter()
-        .for_each(|b| b.sort_unstable_by(|x, y| cmp_pairs(keys, skip, x, y)));
-    into_rows(p)
 }
 
 /// Sorts pairs whose keys share `depth` bytes (the prefix holding the next
@@ -400,13 +229,6 @@ fn sort_buckets<K: Keys + ?Sized>(
     }
 }
 
-/// A permutation bucketed by the two key bytes after the common prefix, each
-/// bucket then sorted as prefix pairs on every core (`sort_buckets`). Peaks at
-/// the permutation plus the pairs of the buckets being sorted at once.
-pub fn buckets_par<K: Keys + ?Sized>(keys: &K) -> Vec<u32> {
-    buckets(keys, (keys.len() / 64).max(1 << 16))
-}
-
 fn buckets<K: Keys + ?Sized>(keys: &K, limit: usize) -> Vec<u32> {
     let skip = common_prefix(keys);
     let mut perm = vec![0u32; keys.len()];
@@ -430,7 +252,7 @@ mod tests {
     }
 
     #[test]
-    fn strategies_agree() {
+    fn orders_agree_with_a_plain_sort() {
         let mut x: u64 = 7;
         let mut keys = V((0..20_000)
             .map(|i| {
@@ -467,16 +289,8 @@ mod tests {
             keys.0.swap(i, (r >> 33) as usize % (i + 1));
         }
         assert!(!is_sorted(&keys));
-        for f in [
-            perm,
-            perm_par,
-            pairs,
-            pairs_par,
-            pairs_lsd,
-            pairs_msd_par,
-            buckets_par,
-        ] {
-            let o = f(&keys);
+        // As the index sorts, and with buckets small enough to be split again.
+        for o in [order(&keys), buckets(&keys, 16)] {
             let got: Vec<Vec<u8>> = o.iter().map(|&i| keys.0[i as usize].clone()).collect();
             assert_eq!(got, sorted);
         }
@@ -488,8 +302,7 @@ mod tests {
             b"2".to_vec(),
             b"1".to_vec(),
         ]);
-        for f in [buckets_par, pairs_par, perm] {
-            let o = f(&dup);
+        for o in [order(&dup), buckets(&dup, 1)] {
             let got: Vec<&[u8]> = o.iter().map(|&i| dup.key(i as usize)).collect();
             assert_eq!(got, [b"1", b"1", b"2", b"2"]);
         }

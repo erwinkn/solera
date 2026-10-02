@@ -346,7 +346,7 @@ DuckDB to get there), Python keys are packed once into one buffer (~28 B
 per key). One O(n) pass finds whether they arrive sorted; if not, a
 permutation sorts them — bucketed by the two key bytes after the prefix
 they all share, each bucket sorted as 12-byte (prefix, row) pairs on every
-core, ~4.5 B per key at the peak (`native/examples/sort.rs`). A merge-join
+core, ~4.5 B per key at the peak (bench/keys/results.md, "Sorting the written keys"). A merge-join
 then walks the sorted keys and the index's newest-wins view together, each
 level fed a segment of 8 MB of consecutive blocks at a time, a few ahead.
 A key's version — every key is the group of rows that carry it — is

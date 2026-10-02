@@ -452,10 +452,13 @@ merge-join in Rust, and compaction and recount stream too
 with 30 ms per request and 80 MB/s per connection, 64 requests in
 parallel. Nothing here ran on real S3.
 
-    cargo run --release --example sort -- 1e8 ids        # in native/; also uuids, paths
     uv run python bench/keys/bulk.py --s3 http://solera:solera-bench-secret@127.0.0.1:9100/solera-test --sizes 1e6,1e7,1e8
 
-### Sorting the written keys (`native/examples/sort.rs`)
+### Sorting the written keys
+
+`native/examples/sort.rs` at `f198382`; only the chosen strategy stayed in
+`native/src/sort.rs` (`cargo run --release --example sort -- 1e8 ids` at
+that commit reruns the comparison).
 
 Keys in one packed buffer with `u32` offsets, as in an Arrow string column,
 in random order. Time, and the heap each strategy adds at its peak per key
