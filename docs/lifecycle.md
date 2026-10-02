@@ -582,12 +582,20 @@ class MyStore(Store):
     writes = "overwrite"   # the default: gate, intents, repair; released by policy (§9.9)
 ```
 
-| Kind | Gate and intents | Repair | Released when the engine ends the attempt with `writes: uncertain` |
-|---|---|---|---|
-| `immutable` | none | none: abandoned writes are unreferenced | at once |
-| `fenced` | gate with intents (repair, and the unknown-writes intent of `Sql`, below) | after `acquire` (`resolved-commits.md` §3) | at once: the next attempt's acquisition fences the old writer |
-| `overwrite`, default | gate with intents | as today | after `late_write_grace` (§9.9), marked in the history |
-| `overwrite`, `strict` | gate with intents | as today | when completion is established (§9.9) |
+| Kind | Gate and intents | Repair | Released when the engine ends the attempt with `writes: uncertain` | A read sees |
+|---|---|---|---|---|
+| `immutable` | none | none: abandoned writes are unreferenced | at once | the pinned version, exactly |
+| `fenced` | gate with intents (repair, and the unknown-writes intent of `Sql`, below) | after `acquire` (`resolved-commits.md` §3) | at once: the next attempt's acquisition fences the old writer | current rows |
+| `overwrite`, default | gate with intents | as today | after `late_write_grace` (§9.9), marked in the history | current rows |
+| `overwrite`, `strict` | gate with intents | as today | when completion is established (§9.9) | current rows |
+
+**Reads.** Only an immutable store can return a pinned version after a
+newer one committed: its names are never reused. A fenced or overwrite
+store keeps one copy, so its loads read current rows: a run may read two
+outputs at different moments, and a row changed since its pin is read in
+its newer form and delivered again with its own change, a harmless repeat
+(`architecture.md` §3, "What a read sees"). Fencing makes writes safe; it
+does not make reads repeatable. No setting changes this.
 
 With `writes: none` or `complete`, every kind releases at once. An
 attempt whose outputs use several stores follows the strictest rule among

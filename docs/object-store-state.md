@@ -769,12 +769,14 @@ class Store(Protocol):
   upserts, and the store reads only their groups.
 - `Written.keys` is only for writes the harness never sees as rows
   (§6); for everything else the harness computes keys itself.
-- **Reads are pinned by immutable stores only.** FileStore and S3Store
-  never overwrite, so a load reads the version its consumer pinned; a
-  superseded object lingers until no reader pin predates it. A store that
-  overwrites (PostgresStore, user stores) holds one copy: a consumer pinned
-  to version 12 that loads after version 13 committed gets version 13's
-  content.
+- **What a read sees depends on the store's kind** (`architecture.md` §3,
+  `lifecycle.md` §9.6). FileStore and S3Store (`immutable`) never
+  overwrite, so a load reads exactly the version its consumer pinned; a
+  superseded object lingers until no reader pin predates it. PostgresStore
+  (`fenced`) and user stores (`overwrite`) hold one copy: a load reads the
+  current rows, so a consumer pinned to version 12 that loads after
+  version 13 committed gets version 13's content, and a changed row may be
+  delivered twice. `Store.load` makes no promise beyond its kind's.
 - **Nothing expires.** A store holds the current content of each output,
   plus, for an immutable store, what pinned readers still need.
 

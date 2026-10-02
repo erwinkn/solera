@@ -178,17 +178,30 @@ Replay-stable without hashing tables. Accepted imprecision: a `full` run or
 converging incremental writes may give different versions for identical
 content (over-eager, never wrong).
 
-### Stores are mutable
+### What a read sees
 
-A store holds each output's current content, overwritten in place, and a
-ref names where it lives: **reads are not pinned.** A consumer pinned to
-version 12 that loads after version 13 committed reads version 13's
-content. Nothing needs to expire, and no store keeps version markers.
-What keeps a dead attempt from writing over a live one is the engine's
-write fence (object-store-state.md §8): exactly one of the harness (about
-to write) and the engine (about to cancel, time out or fail the attempt)
-creates `{attempt}.writing`, so an aborted attempt writes nothing and a
-writing one is always committed.
+A run pins the versions it reads; whether a load returns exactly those
+depends on the store's kind (`lifecycle.md` §9.6). There is no setting:
+it is what each kind can promise.
+
+- **Snapshot: FileStore and S3Store** (`immutable`). Every object is
+  written once under a name no other attempt uses, so a load returns
+  exactly the pinned version: a keyed load names its objects from the
+  pinned index's `(version, locator)`, a value its head's object, a batch
+  range the committed object of each batch. A newer commit does not
+  change what a pinned reader sees; superseded objects stay until no
+  reader pin predates them.
+- **Current data: PostgresStore** (`fenced`) **and stores that overwrite**
+  (`overwrite`, the default for user stores). One copy per row, changed in
+  place: a load returns the rows as they are now. A consumer pinned to
+  version 12 that loads after version 13 committed reads version 13's
+  rows, so one run can see different outputs at different moments. An
+  `Incremental` edge still delivers the keys of its pinned window; a row
+  changed since is read in its newer form (and delivered again with the
+  window that changed it: a harmless repeat), and a row deleted since may
+  be missing. Writers are safe all the same: a fenced store refuses an
+  older attempt's writes, an overwrite store's attempts take the write
+  gate (`lifecycle.md` §9.5–§9.9).
 
 **Keyed outputs.** Stores keep no key maps: the engine's key index does
 (§6). The harness reads a keyed write once (`Scope.prepared`) and tells

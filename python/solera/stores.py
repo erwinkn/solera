@@ -118,7 +118,12 @@ class Store(Protocol):
     `discard`), `"fenced"` (it implements `acquire`, and every write checks
     the generation atomically), or `"overwrite"`, the default (a scope whose
     writer may still write is held `late_write_grace` seconds, or — with
-    `strict` — until the writer's completion is established)."""
+    `strict` — until the writer's completion is established).
+
+    It also says what a load sees (docs/architecture.md §3): an immutable
+    store returns exactly the version a ref and selection pin; a fenced or
+    overwrite store returns its current rows, so a reader may see a newer
+    version than it pinned."""
 
     version: str = "1"
     ref_type: type[Ref] = Ref
