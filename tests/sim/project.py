@@ -91,6 +91,15 @@ def _text(version) -> str:
     return version.decode() if isinstance(version, bytes) else str(version)
 
 
+def rebuild(changes, rows: list[dict]):
+    """A keyed consumer's write for one page: a full delivery (a reset) starts
+    the output over on its first page (architecture.md §5), then patches."""
+
+    if changes.full and changes.first:
+        return rows
+    return Patch(rows, remove=list(changes.deleted))
+
+
 def f_items(v: str, version: str) -> str:
     return f"{v}.{version}"
 
@@ -119,13 +128,12 @@ def build(variant: Variant, data_root, db: Database, outside: External, pg: str 
     )
     def items(ctx, feed: list):
         rows = [{"id": r["id"], "v": f_items(r["v"], variant.items_version)} for r in feed]
-        return Patch(rows, remove=list(ctx.changes["feed"].deleted))
+        return rebuild(ctx.changes["feed"], rows)
 
     copy_kw = {"aliases": ["copy"]} if variant.copy_name == "mirror" else {}
 
     def copy_fn(ctx, items: list):
-        changes = ctx.changes["items"]
-        return Patch([{"id": r["id"], "v": r["v"]} for r in items], remove=list(changes.deleted))
+        return rebuild(ctx.changes["items"], [{"id": r["id"], "v": r["v"]} for r in items])
 
     copy_fn.__name__ = variant.copy_name
     copy = asset(
