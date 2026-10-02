@@ -620,7 +620,7 @@ class Attempts:
             reason = (result.get("cancel") or {}).get("reason") or "user"
             user = reason == "user"
             try:
-                await self.commit_attempt(
+                self.commit_attempt(
                     attempt,
                     prepared,
                     result,
@@ -668,7 +668,7 @@ class Attempts:
             )
             return
         try:
-            await self.commit_attempt(attempt, prepared, result)
+            self.commit_attempt(attempt, prepared, result)
         except LostOwnership:
             return
         except self.Conflict as error:

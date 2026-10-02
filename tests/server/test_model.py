@@ -137,7 +137,7 @@ async def test_failed_precondition_changes_nothing(state, clock):
     prepared = {"inputs": {}, "baseline": {"files": None}, "scope_complete": True}  # a stale baseline
     ref = {"output": "files", "store": "default", "handle": {}, "version": "v2", "partition": "", "meta": {}}
     with pytest.raises(Conflict):
-        await engine.commit_attempt(attempt, prepared, {"outputs": {"files": ref}})
+        engine.commit_attempt(attempt, prepared, {"outputs": {"files": ref}})
     assert durable(state.model) == before
 
 
@@ -152,7 +152,7 @@ async def test_an_aborted_attempt_can_no_longer_commit(state, clock):
             break
     assert state.model.task(task_id)["last"]["outcome"] == "canceled"
     with pytest.raises(LostOwnership):
-        await engine.commit_attempt(attempt, {"inputs": {}, "baseline": {}}, {"outputs": {}})
+        engine.commit_attempt(attempt, {"inputs": {}, "baseline": {}}, {"outputs": {}})
 
 
 async def test_a_moved_input_still_commits(state, clock):
@@ -442,7 +442,7 @@ async def test_a_recount_meanwhile_does_not_refuse_a_commit(state, clock):
         }
     )
     assert state.model.heads[("files", "")]["count"] != count
-    await held_engine.commit_attempt(attempt, prepared, {"outputs": {"files": {"unchanged": True}}})
+    held_engine.commit_attempt(attempt, prepared, {"outputs": {"files": {"unchanged": True}}})
     assert (
         state.model.claimed(attempt) is None and state.model.task(task_id)["last"]["outcome"] == "succeeded"
     )

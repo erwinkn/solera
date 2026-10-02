@@ -200,7 +200,7 @@ async def test_a_change_waits_for_work_already_queued(state):  # noqa: F811
     await engine.pause(queued["id"])
     value["v"] = 2
     await engine.commit_source("feed", version="v2")
-    await engine._automation_tick()
+    engine._automation_tick()
     assert state.model.automations["both"]["pending"]  # owed `root` is queued elsewhere
     await engine.pause(queued["id"], False)
     await drive(engine, queued)

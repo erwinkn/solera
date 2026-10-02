@@ -7,7 +7,9 @@ State lives in the model (model.py), changed only by events the engine records
 (docs/object-store-state.md §3, §4). Recording is synchronous and never waits
 on storage: the journal writes in the background. A precondition check and
 the event that depends on it happen in one synchronous step, so no other
-coroutine can interleave between them. The one wait is before launching an
+coroutine can interleave between them: planning and submitting a run,
+preparing an attempt, installing its commit and firing an automation are
+plain functions, never suspended. The one wait is before launching an
 attempt, until its launch is durable: an engine that restarts adopts it,
 waits for its worker, and commits its result (§8). Storage upkeep (upkeep.py)
 and the history lake run on loops of their own.
@@ -142,7 +144,6 @@ class Engine(Attempts, Sensors, Views):
         self.runner: asyncio.Task | None = None
         self.last_error = None
         self._stopping = False
-        self._firing: set[str] = set()
         self.key_options = key_options or Options()
         self._io: ObjectIO | None = None
         # The key cache and resolver (docs/resolved-commits.md §4–§5): where
@@ -294,7 +295,7 @@ class Engine(Attempts, Sensors, Views):
         self._adopt()
         self._dispatch_due()
         self._sensor_sweep()
-        await self._automation_tick()
+        self._automation_tick()
         await self._retry_tick()
         self._archive_due()
 
@@ -361,8 +362,6 @@ class Engine(Attempts, Sensors, Views):
         )
         if run is None:
             return None
-        if command_id and command_id in self.m.receipts:  # submitted while we planned
-            return await self._run_view_of(self.m.receipts[command_id])
         self.state.record({"type": "RunSubmitted", "run": run, "command": command_id})
         return self._run_view(self.m.runs.get(run["id"]) or run)
 
@@ -587,18 +586,15 @@ class Engine(Attempts, Sensors, Views):
                 return
             run = self.m.runs[task["run"]]
             try:
-                prepared = await self._prepare(task, run, attempt)
+                prepared = self._prepare(task, run, attempt)
             except (Retryable, NonRetryable, Conflict) as error:
-                if self.m.claimed(attempt) is not None:
-                    self._finish(
-                        task,
-                        claim,
-                        "failed",
-                        error=error,
-                        retryable=not isinstance(error, NonRetryable) and getattr(error, "retryable", True),
-                    )
-                return
-            if self.m.claimed(attempt) is None:
+                self._finish(
+                    task,
+                    claim,
+                    "failed",
+                    error=error,
+                    retryable=not isinstance(error, NonRetryable) and getattr(error, "retryable", True),
+                )
                 return
             if prepared.get("skip"):
                 advanced = {
@@ -670,7 +666,7 @@ class Engine(Attempts, Sensors, Views):
 
     # -- input resolution + Incremental plans (§5, §6, §8) --------------------------
 
-    async def _prepare(self, task: dict, run: dict, attempt: str | None = None) -> dict:
+    def _prepare(self, task: dict, run: dict, attempt: str | None = None) -> dict:
         """Pin heads at attempt start; plan Incremental edges; decide skip (§8).
 
         Each output the attempt may write is pinned with its batch number and,
@@ -1304,7 +1300,7 @@ class Engine(Attempts, Sensors, Views):
 
     # -- the commit (§8) ---------------------------------------------------------------
 
-    async def commit_attempt(
+    def commit_attempt(
         self,
         attempt: str,
         prepared: dict,
@@ -1317,10 +1313,7 @@ class Engine(Attempts, Sensors, Views):
     ) -> dict:
         """Install an attempt's result: heads, cursor, edge watermarks (§8).
         A drained Each page commits as the attempt it ended as: `canceled`, or
-        `failed` (a timeout, retryable).
-
-        Every precondition is checked against the model, and the event recorded,
-        without an await in between."""
+        `failed` (a timeout, retryable)."""
 
         from solera.sdk import UNSET
 
@@ -1675,11 +1668,11 @@ class Engine(Attempts, Sensors, Views):
         due = self._due_at(auto)
         return {**auto, "next_at": None if due is None else max(due, self.clock())}
 
-    async def _automation_tick(self):
+    def _automation_tick(self):
         now = self.clock()
         fired = []
         for auto in list(self.m.automations.values()):
-            if not auto["enabled"] or auto["name"] in self._firing:
+            if not auto["enabled"]:
                 continue
             trigger = auto["trigger"]
             if trigger["kind"] in ("every", "cron"):
@@ -1692,16 +1685,12 @@ class Engine(Attempts, Sensors, Views):
                 if auto.get("last_revision") != self.manifest["revision"]:
                     fired.append((auto, "ondeploy"))
         for auto, why in fired:
-            self._firing.add(auto["name"])
-            try:
-                if why == "onchange":
-                    await self._fire_onchange(auto)
-                elif why == "ondeploy":
-                    await self._fire_ondeploy(auto)
-                else:
-                    await self._fire(auto, auto.get("partitions") or "latest")
-            finally:
-                self._firing.discard(auto["name"])
+            if why == "onchange":
+                self._fire_onchange(auto)
+            elif why == "ondeploy":
+                self._fire_ondeploy(auto)
+            else:
+                self._fire(auto, auto.get("partitions") or "latest")
 
     async def _retry_tick(self):
         """The retry clock (docs/per-key-processing.md §9): an automated Each
@@ -1789,7 +1778,7 @@ class Engine(Attempts, Sensors, Views):
         }
         self.state.record(*submitted, {**fired, **fields})
 
-    async def _fire(self, auto, partitions):
+    def _fire(self, auto, partitions):
         run = None
         try:
             run = self._automation_run(auto, partitions)
@@ -1797,7 +1786,7 @@ class Engine(Attempts, Sensors, Views):
             self.last_error = f"automation {auto['name']}: {error}"
         self._fired(auto, run)
 
-    async def _fire_ondeploy(self, auto):
+    def _fire_ondeploy(self, auto):
         """§9: fire once for the served revision, then record it. A planning
         error leaves last_revision unset so the next tick retries."""
 
@@ -1808,7 +1797,7 @@ class Engine(Attempts, Sensors, Views):
             return
         self._fired(auto, run, revision=self.manifest["revision"])
 
-    async def _fire_onchange(self, auto):
+    def _fire_onchange(self, auto):
         """One run per firing (§9). Each target's scopes are the automation's
         `partitions`, if it names them, else every changed upstream scope's
         projection onto the target (§7); planned together, a target that
@@ -1850,7 +1839,7 @@ class Engine(Attempts, Sensors, Views):
         auto = self.m.automations.get(name)
         if auto is None:
             raise KeyError(name)
-        await self._fire(auto, auto.get("partitions") or "latest")
+        self._fire(auto, auto.get("partitions") or "latest")
         return self.m.automations[name]
 
     # -- run control ------------------------------------------------------------------
