@@ -552,7 +552,14 @@ class Lake:
             except BaseException:
                 con.close()
                 raise
-            return await asyncio.to_thread(self._answer, con, work, tables, files, extra)
+            # The pin lasts as long as the thread reads: a query canceled meanwhile
+            # waits for it before letting its files go.
+            reading = asyncio.ensure_future(asyncio.to_thread(self._answer, con, work, tables, files, extra))
+            try:
+                return await asyncio.shield(reading)
+            except asyncio.CancelledError:
+                await asyncio.wait({reading})
+                raise
 
     def _answer(self, con, work, tables, files, extra):
 

@@ -184,3 +184,41 @@ async def test_a_compaction_leaves_cached_files_a_query_still_reads(tmp_path):
     assert await pending == [("a", 1), ("b", 2)]
     lake.evict(store.garbage)  # what collection does as it deletes them
     assert not any(Path(lake._local(p)).exists() for p in old)
+
+
+async def test_a_canceled_query_keeps_its_pin_until_its_thread_is_done(tmp_path):
+    """Review round 3, B4: a query is canceled while its thread reads. The
+    files it chose stay pinned until the thread has finished."""
+
+    import contextlib
+
+    store = Store(tmp_path)
+    pins = []
+
+    @contextlib.contextmanager
+    def pin():
+        pins.append(1)
+        try:
+            yield
+        finally:
+            pins.pop()
+
+    lake = Lake(store, SCHEMA, lambda: store.lake, name="Log", pin=pin)
+    store.lake.append("events", {"run": "a", "at": 1.0, "n": 1})
+    await lake.flush(force=True)
+    started, go = threading.Event(), threading.Event()
+
+    def slow(con):
+        started.set()
+        go.wait(5)
+        return rows(con)
+
+    pending = asyncio.create_task(lake.query(slow, ("events",)))
+    await asyncio.to_thread(started.wait, 5)
+    pending.cancel()
+    await asyncio.sleep(0.05)
+    assert pins == [1]  # the thread still reads: still pinned
+    go.set()
+    with contextlib.suppress(asyncio.CancelledError):
+        await pending
+    assert pins == []
