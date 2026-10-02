@@ -279,3 +279,21 @@ def test_key_rows_shapes():
     assert content(files) == [(b"1", b"a", 0), (b"2", b"b", 0)]
     with pytest.raises(WriteError, match="key column"):
         key_rows([{"x": 1}], declared)
+
+
+def test_one_join_whatever_the_content_comes_as():
+    """Review round 2, finding 5: one merge-join serves rows and sorted runs;
+    a replacement and a patch differ only in what becomes of the index keys
+    the content leaves out."""
+
+    live, written, runs = scenario(seed=5)
+    items = sorted(written.items())
+    by_rows, files = replace(_native.Rows.pairs(items), runs)
+    run = _native.SortedRun.of([k for k, _ in items], [v for _, v in items])
+    by_run = _native.Job.patch(run, len(runs), replace=True, max_file_bytes=4096, collect=10**6, **OPTS)
+    assert content(drive(by_run, runs, ())) == content(files) == expected(live, written)
+    assert (by_run.added, by_run.removed, by_run.changed) == (by_rows.added, by_rows.removed, by_rows.changed)
+    assert by_run.collected() == by_rows.collected()
+    patch = _native.Job.patch(run, len(runs), max_file_bytes=4096, **OPTS)
+    assert content(drive(patch, runs, ())) == [e for e in expected(live, written) if not e[2]]
+    assert patch.removed == 0

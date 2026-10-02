@@ -5,23 +5,25 @@
 //! a restart point every `RESTART` entries — an entry with its whole key —
 //! so a lookup is a binary search over the directory (held in memory), then
 //! over the block's restart points, then a scan of at most `RESTART`
-//! entries. Nothing is used unverified: the header and directory carry one
-//! CRC, checked on open, and each block one over its entries and restart
-//! table, checked on every read.
+//! entries. Nothing is used unverified: the tail — identity and directory —
+//! carries one CRC, checked on open, and each block one over its entries and
+//! restart table, checked on every read. A file is written front to back as
+//! its blocks fill, its tail and footer last, so a build holds one block, not
+//! the file, and stops at a ceiling before writing past it.
 //!
 //! ```text
-//! file       := header directory crc blocks
-//! header     := "KXL1" · version u16 · 0 u16 · header length u32 (header and directory)
-//!               · source size u64 · source digest (16 bytes) · source path (u32 len + bytes)
-//!               · blocks u32 · entries u64
-//! directory  := per block: first key, last key (varint len + bytes) · offset u64 (from the
-//!               first block) · entries length u32 · restarts u32 · entries u32 · crc u32
-//! crc        := u32, CRC-32 of header and directory
+//! file       := "KXL2" · blocks · tail · footer
 //! block      := entries (as in `.kx` blocks, uncompressed) · restart offsets (u32 each)
+//! tail       := source size u64 · source digest (16 bytes) · source path (u32 len + bytes)
+//!               · blocks u32 · entries u64 · directory
+//! directory  := per block: first key, last key (varint len + bytes) · offset u64 (from the
+//!               file's start) · entries length u32 · restarts u32 · entries u32 · crc u32
+//! footer     := tail offset u64 · tail length u32 · tail crc u32 · "KXL2"
 //! ```
 
 use std::collections::VecDeque;
 use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
@@ -29,15 +31,16 @@ use std::sync::Arc;
 use crate::delta::{Delta, Old};
 use crate::format::Options;
 use crate::format::{
-    file_blocks, fmt_err, get_bytes, put_bytes, shared_prefix, slice_at, Error, Result,
+    fmt_err, get_bytes, parse_index, put_bytes, shared_prefix, slice_at, Error, Result,
 };
-use crate::jobs::{Patch, Step};
+use crate::jobs::{Join, Step};
+use crate::rows::Source;
 use crate::run::SortedRun;
 use crate::stream::{read_entry, write_entry, Block, Merge, Next};
 
-pub const MAGIC: &[u8; 4] = b"KXL1";
-pub const VERSION: u16 = 1;
+pub const MAGIC: &[u8; 4] = b"KXL2";
 pub const RESTART: usize = 16;
+const FOOTER: usize = 20;
 
 struct Dir {
     first: Vec<u8>,
@@ -59,10 +62,10 @@ impl Dir {
 /// a lookup's read small; the directory holds a few dozen bytes per block.
 const LOCAL_BLOCK: usize = 8 * 1024;
 
-/// A local block being written: its entries go to the body as they come.
+/// A local block being written.
 #[derive(Default)]
 struct LocalBlock {
-    start: usize,
+    buf: Vec<u8>,
     entries: u32,
     restarts: Vec<u32>,
     first: Vec<u8>,
@@ -72,7 +75,6 @@ struct LocalBlock {
 impl LocalBlock {
     fn push(
         &mut self,
-        body: &mut Vec<u8>,
         key: &[u8],
         version: &[u8],
         deleted: bool,
@@ -80,17 +82,16 @@ impl LocalBlock {
         predecessor: Option<(&[u8], u64)>,
     ) {
         if self.entries == 0 {
-            self.start = body.len();
             self.first = key.to_vec();
         }
         let shared = if (self.entries as usize).is_multiple_of(RESTART) {
-            self.restarts.push((body.len() - self.start) as u32);
+            self.restarts.push(self.buf.len() as u32);
             0
         } else {
             shared_prefix(&self.prev, key)
         };
         write_entry(
-            body,
+            &mut self.buf,
             shared,
             &key[shared..],
             version,
@@ -103,90 +104,126 @@ impl LocalBlock {
         self.entries += 1;
     }
 
-    /// Appends the restart table; the block's directory entry.
-    fn close(&mut self, body: &mut Vec<u8>) -> Dir {
-        let entries_len = (body.len() - self.start) as u32;
+    /// Appends the restart table; the block's bytes and directory entry, at `offset`.
+    fn close(&mut self, offset: u64) -> (Vec<u8>, Dir) {
+        let entries_len = self.buf.len() as u32;
+        let mut buf = std::mem::take(&mut self.buf);
         for r in &self.restarts {
-            body.extend_from_slice(&r.to_le_bytes());
+            buf.extend_from_slice(&r.to_le_bytes());
         }
         let d = Dir {
             first: std::mem::take(&mut self.first),
             last: self.prev.clone(),
-            offset: self.start as u64,
+            offset,
             entries_len,
             restarts: self.restarts.len() as u32,
             entries: self.entries,
-            crc: crc32fast::hash(&body[self.start..]),
+            crc: crc32fast::hash(&buf),
         };
         *self = LocalBlock::default();
-        d
+        (buf, d)
     }
 }
 
-/// Builds the local form of the `.kx` file `kx`, named `source` and with
-/// content digest `digest`, after checking its CRCs.
-pub fn build(kx: &[u8], source: &str, digest: &[u8]) -> Result<Vec<u8>> {
+/// A file being written that may not grow past `max` bytes.
+struct Bounded {
+    w: BufWriter<File>,
+    written: u64,
+    max: u64,
+}
+
+impl Bounded {
+    fn write(&mut self, b: &[u8]) -> Result<()> {
+        if self.written + b.len() as u64 > self.max {
+            return Err(Error::Limit(format!(
+                "a local file over {} bytes",
+                self.max
+            )));
+        }
+        self.w
+            .write_all(b)
+            .map_err(|e| Error::Format(format!("cannot write a local file: {e}")))?;
+        self.written += b.len() as u64;
+        Ok(())
+    }
+}
+
+/// Writes the local form of the `.kx` file `kx` — named `source`, with
+/// content digest `digest` — to `out`, after checking its CRCs: at most
+/// `max_bytes` (`Error::Limit` past them, the file then partial). Returns
+/// its size.
+pub fn build(kx: &[u8], source: &str, digest: &[u8], out: &Path, max_bytes: u64) -> Result<u64> {
     if digest.len() != 16 {
         return Err(Error::Value("a digest is 16 bytes".into()));
     }
-    let (codec, metas) = file_blocks(kx)?;
+    let idx = parse_index(kx, kx.len() as u64)?;
+    let file =
+        File::create(out).map_err(|e| Error::Format(format!("cannot create {out:?}: {e}")))?;
+    let mut w = Bounded {
+        w: BufWriter::new(file),
+        written: 0,
+        max: max_bytes,
+    };
+    w.write(MAGIC)?;
     let mut dir: Vec<Dir> = Vec::new();
-    let mut body = Vec::with_capacity(kx.len() * 2);
     let mut total = 0u64;
     let mut local = LocalBlock::default();
-    for m in &metas {
-        let Some(raw) = slice_at(kx, m.offset, m.size) else {
+    for (_, offset, size, _, crc) in &idx.blocks {
+        let Some(raw) = slice_at(kx, *offset, *size) else {
             return fmt_err("block out of bounds");
         };
-        if crc32fast::hash(raw) != m.crc {
+        if crc32fast::hash(raw) != *crc {
             return fmt_err("block checksum mismatch");
         }
-        let b = Block::decode(raw, codec)?;
+        // A source block decompresses to no more than the file may hold.
+        let b = Block::decode_at_most(raw, idx.footer.codec, max_bytes)?;
         for i in 0..b.len() {
             local.push(
-                &mut body,
                 b.key(i),
                 b.version(i),
                 b.deleted(i),
                 b.locator(i),
                 b.predecessor(i),
             );
-            if body.len() - local.start >= LOCAL_BLOCK {
-                dir.push(local.close(&mut body));
+            if local.buf.len() >= LOCAL_BLOCK {
+                let (bytes, d) = local.close(w.written);
+                w.write(&bytes)?;
+                dir.push(d);
             }
         }
         total += b.len() as u64;
     }
     if local.entries > 0 {
-        dir.push(local.close(&mut body));
+        let (bytes, d) = local.close(w.written);
+        w.write(&bytes)?;
+        dir.push(d);
     }
-    let mut head = Vec::with_capacity(64 + dir.len() * 64);
-    head.extend_from_slice(MAGIC);
-    head.extend_from_slice(&VERSION.to_le_bytes());
-    head.extend_from_slice(&0u16.to_le_bytes());
-    head.extend_from_slice(&0u32.to_le_bytes()); // the header length, filled in below
-    head.extend_from_slice(&(kx.len() as u64).to_le_bytes());
-    head.extend_from_slice(digest);
-    head.extend_from_slice(&(source.len() as u32).to_le_bytes());
-    head.extend_from_slice(source.as_bytes());
-    head.extend_from_slice(&(dir.len() as u32).to_le_bytes());
-    head.extend_from_slice(&total.to_le_bytes());
+    let mut tail = Vec::with_capacity(64 + dir.len() * 64);
+    tail.extend_from_slice(&(kx.len() as u64).to_le_bytes());
+    tail.extend_from_slice(digest);
+    tail.extend_from_slice(&(source.len() as u32).to_le_bytes());
+    tail.extend_from_slice(source.as_bytes());
+    tail.extend_from_slice(&(dir.len() as u32).to_le_bytes());
+    tail.extend_from_slice(&total.to_le_bytes());
     for d in &dir {
-        put_bytes(&mut head, &d.first);
-        put_bytes(&mut head, &d.last);
-        head.extend_from_slice(&d.offset.to_le_bytes());
-        head.extend_from_slice(&d.entries_len.to_le_bytes());
-        head.extend_from_slice(&d.restarts.to_le_bytes());
-        head.extend_from_slice(&d.entries.to_le_bytes());
-        head.extend_from_slice(&d.crc.to_le_bytes());
+        put_bytes(&mut tail, &d.first);
+        put_bytes(&mut tail, &d.last);
+        tail.extend_from_slice(&d.offset.to_le_bytes());
+        tail.extend_from_slice(&d.entries_len.to_le_bytes());
+        tail.extend_from_slice(&d.restarts.to_le_bytes());
+        tail.extend_from_slice(&d.entries.to_le_bytes());
+        tail.extend_from_slice(&d.crc.to_le_bytes());
     }
-    let n = head.len() as u32;
-    head[8..12].copy_from_slice(&n.to_le_bytes());
-    let crc = crc32fast::hash(&head);
-    head.extend_from_slice(&crc.to_le_bytes());
-    head.extend_from_slice(&body);
-    let _ = codec;
-    Ok(head)
+    let mut footer = Vec::with_capacity(FOOTER);
+    footer.extend_from_slice(&w.written.to_le_bytes());
+    footer.extend_from_slice(&(tail.len() as u32).to_le_bytes());
+    footer.extend_from_slice(&crc32fast::hash(&tail).to_le_bytes());
+    footer.extend_from_slice(MAGIC);
+    w.write(&tail)?;
+    w.write(&footer)?;
+    w.w.flush()
+        .map_err(|e| Error::Format(format!("cannot write a local file: {e}")))?;
+    Ok(w.written)
 }
 
 /// An entry found by a lookup.
@@ -205,7 +242,6 @@ pub struct Local {
     pub entries: u64,
     pub size: u64,
     dir: Vec<Dir>,
-    blocks_at: u64,
     file: File,
 }
 
@@ -218,7 +254,7 @@ fn u64_at(b: &[u8], at: usize) -> u64 {
 }
 
 impl Local {
-    /// Opens a local file, verifying its header and directory.
+    /// Opens a local file, verifying its tail.
     pub fn open(path: &Path) -> Result<Local> {
         let file =
             File::open(path).map_err(|e| Error::Format(format!("cannot open {path:?}: {e}")))?;
@@ -226,67 +262,72 @@ impl Local {
             .metadata()
             .map_err(|e| Error::Format(format!("cannot stat {path:?}: {e}")))?
             .len();
-        let mut fixed = [0u8; 12];
-        if size < 16 || file.read_exact_at(&mut fixed, 0).is_err() {
+        let mut footer = [0u8; FOOTER];
+        if size < (MAGIC.len() + FOOTER) as u64
+            || file
+                .read_exact_at(&mut footer, size - FOOTER as u64)
+                .is_err()
+        {
             return fmt_err("local file too short");
         }
-        if &fixed[0..4] != MAGIC {
+        if &footer[16..20] != MAGIC {
             return fmt_err("not a local key index file");
         }
-        let version = u16::from_le_bytes([fixed[4], fixed[5]]);
-        if version != VERSION {
-            return fmt_err(format!("unsupported local file version {version}"));
+        let (at, n, crc) = (
+            u64_at(&footer, 0),
+            u32_at(&footer, 8) as usize,
+            u32_at(&footer, 12),
+        );
+        if at < MAGIC.len() as u64 || at + n as u64 + FOOTER as u64 != size {
+            return fmt_err("bad local tail");
         }
-        let n = u32_at(&fixed, 8) as usize;
-        if n < 12 || n as u64 + 4 > size {
-            return fmt_err("bad local header length");
-        }
-        let mut head = vec![0u8; n + 4];
-        file.read_exact_at(&mut head, 0)
+        let mut h = vec![0u8; n];
+        file.read_exact_at(&mut h, at)
             .map_err(|e| Error::Format(format!("cannot read {path:?}: {e}")))?;
-        if crc32fast::hash(&head[..n]) != u32_at(&head, n) {
+        if crc32fast::hash(&h) != crc {
             return fmt_err("local directory checksum mismatch");
         }
-        let h = &head[..n];
-        let mut pos = 12;
+        let mut pos = 0;
         let need = |pos: usize, k: usize| -> Result<()> {
             if pos + k > n {
-                fmt_err("truncated local header")
+                fmt_err("truncated local tail")
             } else {
                 Ok(())
             }
         };
         need(pos, 8 + 16 + 4)?;
-        let source_size = u64_at(h, pos);
+        let source_size = u64_at(&h, pos);
         let mut digest = [0u8; 16];
         digest.copy_from_slice(&h[pos + 8..pos + 24]);
-        let plen = u32_at(h, pos + 24) as usize;
+        let plen = u32_at(&h, pos + 24) as usize;
         pos += 28;
         need(pos, plen + 12)?;
         let source = String::from_utf8_lossy(&h[pos..pos + plen]).into_owned();
         pos += plen;
-        let blocks = u32_at(h, pos) as usize;
-        let entries = u64_at(h, pos + 4);
+        let blocks = u32_at(&h, pos) as usize;
+        let entries = u64_at(&h, pos + 4);
         pos += 12;
-        let mut dir = Vec::with_capacity(blocks);
+        let mut dir = Vec::with_capacity(blocks.min(n / 24));
         for _ in 0..blocks {
-            let first = get_bytes(h, &mut pos)?.to_vec();
-            let last = get_bytes(h, &mut pos)?.to_vec();
+            let first = get_bytes(&h, &mut pos)?.to_vec();
+            let last = get_bytes(&h, &mut pos)?.to_vec();
             need(pos, 24)?;
             dir.push(Dir {
                 first,
                 last,
-                offset: u64_at(h, pos),
-                entries_len: u32_at(h, pos + 8),
-                restarts: u32_at(h, pos + 12),
-                entries: u32_at(h, pos + 16),
-                crc: u32_at(h, pos + 20),
+                offset: u64_at(&h, pos),
+                entries_len: u32_at(&h, pos + 8),
+                restarts: u32_at(&h, pos + 12),
+                entries: u32_at(&h, pos + 16),
+                crc: u32_at(&h, pos + 20),
             });
             pos += 24;
         }
-        let blocks_at = n as u64 + 4;
-        if dir.iter().any(|d| blocks_at + d.offset + d.len() > size) {
-            return fmt_err("local directory points past the file");
+        if dir
+            .iter()
+            .any(|d| d.offset < MAGIC.len() as u64 || d.offset + d.len() > at)
+        {
+            return fmt_err("local directory points past the blocks");
         }
         Ok(Local {
             source,
@@ -295,7 +336,6 @@ impl Local {
             entries,
             size,
             dir,
-            blocks_at,
             file,
         })
     }
@@ -335,7 +375,7 @@ impl Local {
     fn read(&self, i: usize) -> Result<Vec<u8>> {
         let d = &self.dir[i];
         let mut buf = vec![0u8; d.len() as usize];
-        if let Err(e) = self.file.read_exact_at(&mut buf, self.blocks_at + d.offset) {
+        if let Err(e) = self.file.read_exact_at(&mut buf, d.offset) {
             return self.bad(format!("cannot read a block: {e}"));
         }
         if crc32fast::hash(&buf) != d.crc {
@@ -486,8 +526,8 @@ impl Snapshot {
             d.finish()?;
             return Ok(d);
         }
-        let mut job = Patch::new(
-            run.clone(),
+        let mut job = Join::new(
+            Source::Run(run.clone(), 0),
             replace,
             self.runs.len(),
             o,
@@ -650,7 +690,7 @@ mod tests {
 
     fn local(dir: &Path, name: &str, data: &[u8]) -> Arc<Local> {
         let path = dir.join(name);
-        std::fs::write(&path, build(data, name, &[7; 16]).unwrap()).unwrap();
+        build(data, name, &[7; 16], &path, u64::MAX).unwrap();
         Arc::new(Local::open(&path).unwrap())
     }
 
@@ -689,16 +729,25 @@ mod tests {
         // A corrupted directory is refused on open; a corrupted block on read.
         let path = dir.join("old");
         let mut bytes = std::fs::read(&path).unwrap();
-        bytes[60] ^= 1;
+        let tail = u64_at(&bytes, bytes.len() - FOOTER) as usize;
+        bytes[tail + 40] ^= 1;
         std::fs::write(dir.join("bad-dir"), &bytes).unwrap();
         assert!(Local::open(&dir.join("bad-dir")).is_err());
         let mut bytes = std::fs::read(&path).unwrap();
-        let last = bytes.len() - 10;
-        bytes[last] ^= 1;
+        bytes[tail - 10] ^= 1; // the last block
         std::fs::write(dir.join("bad-block"), &bytes).unwrap();
         let bad = Arc::new(Local::open(&dir.join("bad-block")).unwrap());
         let mut s = Snapshot::new(vec![vec![bad]]);
         assert!(s.get(b"k019999").is_err());
+
+        // A build stops at its ceiling, before writing past it.
+        let big = kx(20_000, "o", 1, 1);
+        let out = dir.join("capped");
+        assert!(matches!(
+            build(&big, "capped", &[7; 16], &out, 10_000),
+            Err(Error::Limit(_))
+        ));
+        assert!(std::fs::metadata(&out).unwrap().len() <= 10_000);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

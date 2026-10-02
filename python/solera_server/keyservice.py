@@ -89,6 +89,7 @@ class KeyService:
         self._holds: dict[int, float] = {}  # token -> event position: readers of index files
         self._hold_lock = threading.Lock()
         self._tokens = itertools.count()
+        self._owners: set[asyncio.Task] = set()  # operations running on the loop
 
     # -- reader pins ----------------------------------------------------------------------
 
@@ -145,20 +146,32 @@ class KeyService:
         self._thread, self.loop = thread, loop
 
     async def stop(self) -> None:
+        """Cancel what this service runs — requests, fills, computations — and
+        wait for each to end: one waiting on a thread (a build, a resolve)
+        ends once its thread does, its room and temporary files released
+        then, not before. Then the loop's threads, then the loop."""
+
         self._stopped = True
         if self.loop is None:
             return
         loop, self.loop = self.loop, None
 
         async def drain():
-            tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-            for t in tasks:
+            owners = (
+                set(self._owners)
+                | set(self.resolver._fills)
+                | set(self.resolver._inflight.values())
+                | set(self.cache._fills.values())
+            )
+            for t in owners:
                 t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(*owners, return_exceptions=True)
+            await loop.shutdown_default_executor()
 
         await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(drain(), loop))
         loop.call_soon_threadsafe(loop.stop)
-        await asyncio.to_thread(self._thread.join, 5)
+        await asyncio.to_thread(self._thread.join)
+        loop.close()
 
     def _running(self) -> bool:
         """Started on first use; not again once stopped, or once it failed to start."""
@@ -171,7 +184,17 @@ class KeyService:
         return self.loop is not None
 
     def _submit(self, coro) -> concurrent.futures.Future:
-        return asyncio.run_coroutine_threadsafe(coro, self.loop)
+        return asyncio.run_coroutine_threadsafe(self._own(coro), self.loop)
+
+    async def _own(self, coro):
+        """Runs `coro` as one of this service's operations: `stop` cancels and waits for it."""
+
+        task = asyncio.current_task()
+        self._owners.add(task)
+        try:
+            return await coro
+        finally:
+            self._owners.discard(task)
 
     def _fire(self, make) -> None:
         if self._running():

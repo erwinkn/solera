@@ -6,8 +6,15 @@
 //! their locators.
 
 use crate::format::{
-    decompress_at_most, fmt_err, parse_index, slice_at, sort_order, Error, Options, Result,
+    decompress_at_most, fmt_err, parse_index_at_most, slice_at, sort_order, Error, Index, Options,
+    Result,
 };
+
+/// What a parsed index holds, in bytes: its share of a decoding budget.
+fn index_bytes(idx: &Index) -> u64 {
+    let blocks: usize = idx.blocks.iter().map(|b| b.0.len() + 32).sum();
+    (idx.min_key.len() + idx.max_key.len() + blocks) as u64
+}
 use crate::rows::{Arena, Source};
 use crate::stream::{read_entry, State, Writer};
 
@@ -126,7 +133,7 @@ impl SortedRun {
     /// and versions decoded): past either, an `Error::Limit`, whatever the
     /// file claims.
     pub fn decode(kx: &[u8], max_entries: u64, max_bytes: u64) -> Result<SortedRun> {
-        let idx = parse_index(kx, kx.len() as u64)?;
+        let idx = parse_index_at_most(kx, kx.len() as u64, max_bytes)?;
         let declared = idx.footer.entries;
         if declared > max_entries {
             return limit(format!("{declared} entries, over {max_entries}"));
@@ -139,7 +146,8 @@ impl SortedRun {
             return fmt_err("the index's entries do not match the footer");
         }
         let mut run = SortedRun::default();
-        let mut budget = max_bytes;
+        // One budget: the index decoded, then the blocks, then their keys and versions.
+        let mut budget = max_bytes.saturating_sub(index_bytes(&idx));
         let take = |budget: &mut u64, n: usize| -> Result<()> {
             match budget.checked_sub(n as u64) {
                 Some(left) => {

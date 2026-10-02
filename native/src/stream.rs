@@ -10,8 +10,9 @@ use rayon::prelude::*;
 use xxhash_rust::xxh3::xxh3_128;
 
 use crate::format::{
-    compress, decompress, filter_nbits, fmt_err, get_varint, hash_positions, key_item, pair_item,
-    put_bytes, put_varint, shared_prefix, tomb_item, Error, Options, Result, FORMAT_VERSION, MAGIC,
+    compress, decompress_at_most, filter_nbits, fmt_err, get_varint, hash_positions, key_item,
+    pair_item, put_bytes, put_varint, shared_prefix, tomb_item, Error, Options, Result,
+    FORMAT_VERSION, MAGIC,
 };
 
 /// Bytes owned elsewhere — a Python `bytes`, or a `Vec` in tests.
@@ -120,7 +121,12 @@ pub struct Block {
 
 impl Block {
     pub fn decode(data: &[u8], codec: u8) -> Result<Block> {
-        let raw = decompress(data, codec)?;
+        Block::decode_at_most(data, codec, u64::MAX)
+    }
+
+    /// `decode`, decompressing at most `limit` bytes (`Error::Limit` past them).
+    pub fn decode_at_most(data: &[u8], codec: u8, limit: u64) -> Result<Block> {
+        let raw = decompress_at_most(data, codec, limit)?;
         let mut keys: Vec<u8> = Vec::with_capacity(raw.len());
         let mut ents = Vec::new();
         let (mut pos, mut prev, mut prev_len) = (0usize, 0usize, 0usize);

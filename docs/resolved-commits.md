@@ -301,7 +301,7 @@ are §6's:
 |---|---|---|
 | `resolve_max_keys` | 100K run entries | patches |
 | `resolve_max_bytes` | 16 MB | request and response bodies |
-| `resolve_max_decoded` | 64 MB | a run decoded: decompressed blocks, and its keys and versions |
+| `resolve_max_decoded` | 64 MB | a run decoded: its index, its decompressed blocks, its keys and versions — one budget |
 | `resolve_max_entries` | 2M physical entries in the snapshot | replacements: the engine merges the run with every entry |
 | `resolve_queue_bytes` | 64 MB of queued payloads | admission; beyond it, `busy` at once |
 | `resolve_concurrency` | 2 | resolves in flight, on their own threads, apart from compaction's |
@@ -356,18 +356,23 @@ engine for compaction outputs) and recorded with the file in the commit.
 The cache checks a fill against it, and candidates (below) are matched by
 it.
 
-**Local form.** On disk, each file becomes `{name}.kxl` (byte layout in
-`native/src/local.rs`):
+**Local form.** On disk, each file becomes `{hash of its path}.kxl` — a
+fixed-length name whatever the scope's length; the file names its source —
+(byte layout in `native/src/local.rs`):
 
 ```
-header     magic "KXL1" · format version · header length · source size · source digest · source path
-           · blocks · entries
-directory  per block: first key, last key, local offset, entries length, restart count, entries,
-           CRC-32 of the block's entries and restart table
-           CRC-32 of header and directory together
+file       magic "KXL2" · blocks · tail · footer
 blocks     per block: entries as in a `.kx` block, uncompressed (key, version, locator, deleted,
            predecessor if any), then its restart table (offsets of full keys, every 16 entries)
+tail       source size · source digest · source path · blocks · entries · the directory: per
+           block first key, last key, offset, entries length, restart count, entries, CRC-32
+           of the block's entries and restart table
+footer     tail offset · tail length · CRC-32 of the tail · magic
 ```
+
+It is written front to back as its blocks fill, the tail last: a build
+holds one block in memory, never the file, and stops at the room it was
+given before writing past it.
 
 A lookup binary-searches the directory (held in RAM), then the block's
 restart points, then scans at most 16 entries — where a cold or warm
@@ -870,7 +875,7 @@ here.
 
 | Piece | Where |
 |---|---|
-| Sparse reader, streaming patch, the two switches, `exact`, `get` | `KeyIndex.resolve` / `changes` / `lookup` (`solera/keys/index.py`); `Job.patch` (`native/src/jobs.rs`) |
+| Sparse reader, streaming patch, the two switches, `exact`, `get` | `KeyIndex.resolve` / `changes` / `lookup` (`solera/keys/index.py`), its per-key state native (`native/src/sparse.rs`: filters, block reads, the delta by position); `Job.patch` and `Job.replace`, one merge-join (`native/src/jobs.rs`) |
 | Compaction garbage | `KeyIndex.compact(garbage=True)`; `.kg` files (`key-index-format.md` § Garbage files) |
 | Repair by store kind, unknown `Sql` writes | `_store_outputs` and `_reconcile` (`solera_worker/worker.py`); acquisition is the lifecycle's |
 | Local form, lookups and merges over it | `native/src/local.rs`: `build_local`, `LocalFile`, `Snapshot` |

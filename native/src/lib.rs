@@ -19,6 +19,7 @@ mod pyvalue;
 pub mod rows;
 pub mod run;
 pub mod sort;
+pub mod sparse;
 pub mod stream;
 
 use std::sync::Arc;
@@ -32,7 +33,7 @@ use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::{PyBool, PyBytes, PyCapsule, PyDict, PyInt, PyList, PyString};
 
 use format::{Error, Options};
-use jobs::{Compact, Count, Patch, Replace, Step};
+use jobs::{Compact, Count, Join, Step};
 use pyo3::types::PyTuple;
 use rayon::prelude::*;
 use rows::{Arena, Constant, Cursor, Source, Stream, Table, Versions};
@@ -1007,14 +1008,6 @@ fn sorted_run(r: format::Result<run::SortedRun>) -> PyResult<SortedRun> {
     })
 }
 
-/// What the sparse reader found for a key: `(live, version, locator)`, the
-/// version None where the filters alone said "live at another version".
-enum Sparse {
-    Absent,
-    Live(Vec<u8>, u64),
-    Other,
-}
-
 #[pymethods]
 impl SortedRun {
     /// Upserts of `keys` at `versions` (any order, each key once), and the
@@ -1111,62 +1104,6 @@ impl SortedRun {
         ))
     }
 
-    /// The delta of this run over what the sparse reader `found` — per key,
-    /// `(live, version, locator)`, the version None where the filters alone
-    /// said "live at another version"; a key it lacks is absent — as `.kx`
-    /// files of about `max_file_bytes`, with added, removed, changed, and up
-    /// to `collect` changed keys (`Job.collected`).
-    #[pyo3(signature = (found, *, generation, collect=0, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864))]
-    #[allow(clippy::too_many_arguments)]
-    fn delta<'py>(
-        &self,
-        py: Python<'py>,
-        found: Bound<'py, PyDict>,
-        generation: u64,
-        collect: usize,
-        block_size: usize,
-        level: u32,
-        bits_per_item: u64,
-        k: u8,
-        codec: u8,
-        max_file_bytes: usize,
-    ) -> PyResult<(Resolved<'py>, Option<Changed<'py>>)> {
-        let r = &self.inner;
-        let mut olds = Vec::with_capacity(r.len());
-        for i in 0..r.len() {
-            let hit = found.get_item(PyBytes::new(py, r.key(i)))?;
-            olds.push(match hit {
-                None => Sparse::Absent,
-                Some(t) => {
-                    let (live, version, locator): (bool, Option<Vec<u8>>, Option<u64>) =
-                        t.extract()?;
-                    match (live, version) {
-                        (false, _) => Sparse::Absent,
-                        (true, None) => Sparse::Other,
-                        (true, Some(v)) => Sparse::Live(v, locator.unwrap_or(0)),
-                    }
-                }
-            });
-        }
-        let o = options(block_size, level, bits_per_item, k, codec);
-        let d = py
-            .detach(|| {
-                let mut d = delta::Delta::new(o, max_file_bytes, collect, generation);
-                for (i, old) in olds.iter().enumerate() {
-                    let was = match old {
-                        Sparse::Absent => delta::Old::Absent,
-                        Sparse::Live(v, l) => delta::Old::Live(v, *l),
-                        Sparse::Other => delta::Old::Other,
-                    };
-                    d.apply(r.key(i), r.write(i), was)?;
-                }
-                d.finish()?;
-                Ok(d)
-            })
-            .map_err(to_py)?;
-        Ok((delta_files(py, &d), changed(py, &d.collected)?))
-    }
-
     /// Up to `limit` entries of the newest-wins merge of `runs` (newest
     /// first) past `after`: keys, versions, deleted flags, locators, and
     /// whether any key lies past them.
@@ -1201,11 +1138,152 @@ impl SortedRun {
     }
 }
 
+/// The sparse reader's state over a sorted run (`sparse.rs`): Python
+/// fetches what it asks for, entries are named by their position.
+#[pyclass(module = "solera._native")]
+struct Sparse {
+    inner: sparse::Sparse,
+}
+
+fn filter_of(f: &(u64, u8, PyBackedBytes)) -> sparse::Filter<'_> {
+    (f.0, f.1, f.2.as_ref())
+}
+
+#[pymethods]
+impl Sparse {
+    #[new]
+    fn new(run: PyRef<'_, SortedRun>) -> Sparse {
+        Sparse {
+            inner: sparse::Sparse::new(run.inner.clone()),
+        }
+    }
+
+    /// Entries still undecided.
+    #[getter]
+    fn unknown(&self) -> usize {
+        self.inner.unknown()
+    }
+
+    /// Entries an exact read must decide.
+    #[getter]
+    fn maybe(&self) -> usize {
+        self.inner.maybe()
+    }
+
+    /// Whether a count change was inferred from the filters.
+    #[getter]
+    fn inferred(&self) -> bool {
+        self.inner.inferred
+    }
+
+    /// The positions `[lo, hi)` of the run's keys in `[min, max]`.
+    fn span(&self, min: &[u8], max: &[u8]) -> (usize, usize) {
+        self.inner.span(min, max)
+    }
+
+    /// The blocks a read of one file needs, by its blocks' first keys: with
+    /// `file`, for the entries its filters left to it; else the undecided
+    /// ones in `[lo, hi)`.
+    #[pyo3(signature = (firsts, *, file=None, lo=0, hi=0))]
+    fn blocks(
+        &self,
+        firsts: Vec<PyBackedBytes>,
+        file: Option<usize>,
+        lo: usize,
+        hi: usize,
+    ) -> Vec<usize> {
+        self.inner.blocks(&slices(&firsts), file, lo, hi)
+    }
+
+    /// Reads those entries in one file's fetched `blocks`, `(index, bytes)`.
+    #[pyo3(signature = (blocks, codec, firsts, *, file=None, lo=0, hi=0))]
+    #[allow(clippy::too_many_arguments)]
+    fn read(
+        &mut self,
+        py: Python<'_>,
+        blocks: Vec<(usize, PyBackedBytes)>,
+        codec: u8,
+        firsts: Vec<PyBackedBytes>,
+        file: Option<usize>,
+        lo: usize,
+        hi: usize,
+    ) -> PyResult<()> {
+        let inner = &mut self.inner;
+        py.detach(|| {
+            let blocks: Vec<(usize, &[u8])> =
+                blocks.iter().map(|(i, b)| (*i, b.as_ref())).collect();
+            inner.read(&blocks, codec, &slices(&firsts), file, lo, hi)
+        })
+        .map_err(to_py)
+    }
+
+    /// Runs one file's filters — `(nbits, k, bits)` each, as its tail holds
+    /// them — over the undecided entries in `[lo, hi)`.
+    fn filter(
+        &mut self,
+        file: usize,
+        lo: usize,
+        hi: usize,
+        keys: (u64, u8, PyBackedBytes),
+        tombs: (u64, u8, PyBackedBytes),
+        pairs: (u64, u8, PyBackedBytes),
+    ) {
+        self.inner.filter(
+            file,
+            lo,
+            hi,
+            filter_of(&keys),
+            filter_of(&tombs),
+            filter_of(&pairs),
+        );
+    }
+
+    /// Decides what the filters can (`exact`: no change from filters alone).
+    fn classify(&mut self, exact: bool) {
+        self.inner.classify(exact);
+    }
+
+    /// Each live entry read: `{key: (version, locator)}`.
+    fn live<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let out = PyDict::new(py);
+        for (p, v, l) in self.inner.live() {
+            out.set_item(
+                PyBytes::new(py, self.inner.run.key(p)),
+                (PyBytes::new(py, v), l),
+            )?;
+        }
+        Ok(out)
+    }
+
+    /// The run's delta over what was read: `.kx` files with added, removed
+    /// and changed, and up to `collect` changed keys (`Job.collected`).
+    #[pyo3(signature = (*, generation, collect=0, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864))]
+    #[allow(clippy::too_many_arguments)]
+    fn delta<'py>(
+        &self,
+        py: Python<'py>,
+        generation: u64,
+        collect: usize,
+        block_size: usize,
+        level: u32,
+        bits_per_item: u64,
+        k: u8,
+        codec: u8,
+        max_file_bytes: usize,
+    ) -> PyResult<(Resolved<'py>, Option<Changed<'py>>)> {
+        let o = options(block_size, level, bits_per_item, k, codec);
+        let inner = &self.inner;
+        let d = py
+            .detach(|| inner.delta(o, max_file_bytes, collect, generation))
+            .map_err(to_py)?;
+        Ok((delta_files(py, &d), changed(py, &d.collected)?))
+    }
+}
+
 // -- jobs -------------------------------------------------------------------------------
 
 enum Kind {
-    Replace(Box<Replace>),
-    Patch(Box<Patch>),
+    Join(Box<Join>),
     Compact(Box<Compact>),
     Count(Count),
 }
@@ -1225,8 +1303,7 @@ struct Job {
 
 fn merge_of(kind: &mut Kind) -> &mut stream::Merge {
     match kind {
-        Kind::Replace(j) => &mut j.merge,
-        Kind::Patch(j) => &mut j.merge,
+        Kind::Join(j) => &mut j.merge,
         Kind::Compact(j) => &mut j.merge,
         Kind::Count(j) => &mut j.merge,
     }
@@ -1237,18 +1314,17 @@ impl Job {
         merge_of(&mut self.kind)
     }
 
-    fn replacement(&mut self) -> PyResult<&mut Replace> {
+    fn join(&mut self) -> PyResult<&mut Join> {
         match &mut self.kind {
-            Kind::Replace(j) => Ok(j),
-            _ => Err(PyTypeError::new_err("not a replacement")),
+            Kind::Join(j) => Ok(j),
+            _ => Err(PyTypeError::new_err("not a replacement or a patch")),
         }
     }
 
     /// A replacement's or a patch's delta.
     fn delta(&self) -> PyResult<&delta::Delta> {
         match &self.kind {
-            Kind::Replace(j) => Ok(&j.delta),
-            Kind::Patch(j) => Ok(&j.delta),
+            Kind::Join(j) => Ok(&j.delta),
             _ => Err(PyTypeError::new_err("not a replacement or a patch")),
         }
     }
@@ -1288,14 +1364,10 @@ impl Job {
         };
         let o = options(block_size, level, bits_per_item, k, codec);
         Ok(Job {
-            kind: Kind::Replace(Box::new(Replace::new(
-                src,
-                runs,
-                o,
-                max_file_bytes,
-                collect,
-                generation,
-            ))),
+            kind: Kind::Join(Box::new(
+                Join::new(src, true, runs, o, max_file_bytes, collect, generation)
+                    .map_err(to_py)?,
+            )),
             records: key.map(|k| Records::new(&k, revision.as_deref(), exclude)),
             local: None,
         })
@@ -1322,20 +1394,13 @@ impl Job {
         generation: u64,
     ) -> PyResult<Job> {
         let o = options(block_size, level, bits_per_item, k, codec);
-        let job = Patch::new(
-            run.inner.clone(),
-            replace,
-            runs,
-            o,
-            max_file_bytes,
-            collect,
-            generation,
-        )
-        .map_err(to_py)?;
+        let src = Source::Run(run.inner.clone(), 0);
+        let job =
+            Join::new(src, replace, runs, o, max_file_bytes, collect, generation).map_err(to_py)?;
         Ok(Job {
             records: None,
             local: None,
-            kind: Kind::Patch(Box::new(job)),
+            kind: Kind::Join(Box::new(job)),
         })
     }
 
@@ -1412,14 +1477,14 @@ impl Job {
 
     fn feed_rows(&mut self, py: Python<'_>, rows: Bound<'_, PyAny>) -> PyResult<()> {
         let (k, v) = chunk(py, &rows, self.records.as_ref())?;
-        match &mut self.replacement()?.src {
+        match &mut self.join()?.src {
             Source::Stream(s) => s.feed(k, v).map_err(to_py),
-            Source::Table(_) => Err(PyTypeError::new_err("not a streamed replacement")),
+            _ => Err(PyTypeError::new_err("not a streamed replacement")),
         }
     }
 
     fn end_rows(&mut self) -> PyResult<()> {
-        if let Source::Stream(s) = &mut self.replacement()?.src {
+        if let Source::Stream(s) = &mut self.join()?.src {
             s.end();
         }
         Ok(())
@@ -1434,8 +1499,7 @@ impl Job {
             .detach(|| {
                 let step = loop {
                     let step = match kind {
-                        Kind::Replace(j) => j.step()?,
-                        Kind::Patch(j) => j.step()?,
+                        Kind::Join(j) => j.step()?,
                         Kind::Compact(j) => j.step()?,
                         Kind::Count(j) => j.step()?,
                     };
@@ -1445,8 +1509,7 @@ impl Job {
                     }
                 };
                 let file = match (&step, kind) {
-                    (Step::File, Kind::Replace(j)) => j.delta.writer.files.pop_front(),
-                    (Step::File, Kind::Patch(j)) => j.delta.writer.files.pop_front(),
+                    (Step::File, Kind::Join(j)) => j.delta.writer.files.pop_front(),
                     (Step::File, Kind::Compact(j)) => j.writer.files.pop_front(),
                     (Step::Garbage, Kind::Compact(j)) => {
                         j.garbage.as_mut().and_then(|g| g.files.pop_front())
@@ -1516,18 +1579,28 @@ fn content_digest(py: Python<'_>, data: PyBackedBytes) -> String {
     format!("{h:032x}")
 }
 
-/// The local form of a `.kx` file (`source`, content digest `digest`).
+/// Writes the local form of a `.kx` file (`source`, content digest
+/// `digest`) to `path`, as it is built: at most `max_bytes` (`LimitError`
+/// past them, the file partial). Returns its size.
 #[pyfunction]
-fn build_local<'py>(
-    py: Python<'py>,
+fn build_local(
+    py: Python<'_>,
     data: PyBackedBytes,
     source: String,
     digest: Vec<u8>,
-) -> PyResult<Bound<'py, PyBytes>> {
-    let out = py
-        .detach(|| local::build(&data, &source, &digest))
-        .map_err(to_py)?;
-    Ok(PyBytes::new(py, &out))
+    path: String,
+    max_bytes: u64,
+) -> PyResult<u64> {
+    py.detach(|| {
+        local::build(
+            &data,
+            &source,
+            &digest,
+            std::path::Path::new(&path),
+            max_bytes,
+        )
+    })
+    .map_err(to_py)
 }
 
 /// A local file, open, its directory verified and held in memory.
@@ -1717,6 +1790,7 @@ fn solera_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("FormatError", m.py().get_type::<FormatError>())?;
     m.add("LimitError", m.py().get_type::<LimitError>())?;
     m.add_class::<SortedRun>()?;
+    m.add_class::<Sparse>()?;
     m.add_function(wrap_pyfunction!(encode_file, m)?)?;
     m.add_function(wrap_pyfunction!(write_files, m)?)?;
     m.add_function(wrap_pyfunction!(decode_block, m)?)?;

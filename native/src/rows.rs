@@ -16,6 +16,7 @@ use rayon::prelude::*;
 
 use crate::digest::{self, Digest};
 use crate::format::{Error, Result};
+use crate::run::SortedRun;
 use crate::sort::{self, Keys};
 use crate::stream::State;
 
@@ -485,15 +486,22 @@ impl Stream {
     }
 }
 
-/// The new side of a replacement.
+/// The written side of a merge-join: rows, sorted chunks as they stream, or
+/// a sorted run (whose entries may be removes).
 pub enum Source {
     Table(Box<Cursor>),
     Stream(Stream),
+    Run(Arc<SortedRun>, usize),
 }
 
 impl Source {
     pub fn state(&mut self) -> Result<State> {
         match self {
+            Source::Run(run, i) => Ok(if *i < run.len() {
+                State::Ready
+            } else {
+                State::Done
+            }),
             Source::Table(t) => {
                 if !t.ready {
                     if !t.read()? {
@@ -513,6 +521,16 @@ impl Source {
         match self {
             Source::Table(t) => &t.group.key,
             Source::Stream(s) => &s.group.key,
+            Source::Run(run, i) => run.key(*i),
+        }
+    }
+
+    /// The current write: its version, or None for a remove.
+    #[inline]
+    pub fn write(&self) -> Option<&[u8]> {
+        match self {
+            Source::Run(run, i) => run.write(*i),
+            _ => Some(self.entry().1),
         }
     }
 
@@ -521,6 +539,7 @@ impl Source {
         match self {
             Source::Table(t) => (&t.group.key, &t.group.version),
             Source::Stream(s) => (&s.group.key, &s.group.version),
+            Source::Run(run, i) => (run.key(*i), run.versions.get(*i)),
         }
     }
 
@@ -528,6 +547,7 @@ impl Source {
         match self {
             Source::Table(t) => t.ready = false,
             Source::Stream(s) => s.ready = false,
+            Source::Run(_, i) => *i += 1,
         }
     }
 }

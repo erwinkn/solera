@@ -382,3 +382,33 @@ def test_a_sorted_run_round_trips_and_checks_what_it_decodes():
         _native.SortedRun.of([b"a"], [b"1"], [b"a"])  # written and removed
     with pytest.raises(ValueError):
         _native.SortedRun.of([b"a", b"a"], [b"1", b"2"])
+
+
+def test_a_runs_index_is_inside_its_decoding_budget():
+    """Review round 2, finding 1: an empty file whose index decompresses to
+    128 MiB — three bytes of grammar, then zeros — is refused at the
+    caller's byte limit, not decoded whole; and an index with bytes past its
+    grammar is malformed whatever the limit."""
+
+    import struct
+    import zlib
+
+    data = bytearray(_native.encode_file([], [], b""))
+    foot = len(data) - _native.FOOTER_SIZE
+    at, length = struct.unpack_from("<Q", data, foot + 28)[0], struct.unpack_from("<I", data, foot + 36)[0]
+
+    def with_index(raw: bytes) -> bytes:
+        packed = zlib.compress(raw, 9)
+        out = bytearray(data[:at]) + packed + data[at + length :]
+        f = len(out) - _native.FOOTER_SIZE
+        struct.pack_into("<I", out, f + 36, len(packed))
+        struct.pack_into("<I", out, f + 40, zlib.crc32(packed))
+        return bytes(out)
+
+    bomb = with_index(b"\0\0\0" + bytes(128 * 2**20))
+    assert len(bomb) < 2**20
+    with pytest.raises(_native.LimitError):
+        _native.SortedRun.decode(bomb, max_bytes=2**20)
+    with pytest.raises(_native.FormatError):
+        _native.SortedRun.decode(with_index(b"\0\0\0" + bytes(100)))  # trailing bytes
+    assert len(_native.SortedRun.decode(with_index(b"\0\0\0"))) == 0

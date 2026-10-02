@@ -9,11 +9,11 @@ warm snapshots, and pin the files they read.
 
 Budgets:
 - disk: local files, candidates, temporary files and reservations. Every
-  operation that adds bytes reserves them first, and again for whatever
-  its output turns out to need beyond the estimate before it writes a
-  byte; a fill or an install that cannot reserve, even after eviction, is
-  not done, and an index whose snapshot no longer fits is demoted (its
-  files become evictable). At most `builds` whole files are in memory at
+  operation that adds bytes reserves them first; a build writes into the
+  room it holds and stops at its edge, then reserves more and builds again
+  or gives up. A fill or an install that cannot reserve, even after
+  eviction, is not done, and an index whose snapshot no longer fits is
+  demoted (its files become evictable). At most `builds` whole files are in memory at
   once, fetched or being built.
 - candidates: deltas the resolver returned, kept until their attempt
   commits them (then installed without a GET) or ends; their own budget,
@@ -36,12 +36,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import os
 import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from urllib.parse import quote
 
 from .. import _native
 from .index import FileInfo, IndexState, digest
@@ -179,7 +179,10 @@ class EngineCache:
         )
 
     def _local(self, path: str) -> str:
-        return os.path.join(self.root, quote(path, safe="") + ".kxl")
+        """A local file's name: a fixed-length hash of its object's path, whatever
+        the path's length (a scope is domain data); the file names its source."""
+
+        return os.path.join(self.root, hashlib.sha256(path.encode()).hexdigest()[:32] + ".kxl")
 
     def _active(self, now: float) -> set[str]:
         return {p for p, ix in self.indexes.items() if ix.admitted and now - ix.used <= self.window}
@@ -368,30 +371,35 @@ class EngineCache:
                 self.reserved -= need
 
     async def _put(self, prefix: str, path: str, f: FileInfo, data: bytes, reserved: int) -> bool:
-        """Build, write and open the local form of `data`, a verified copy of
-        `f`, holding `reserved` bytes: more are reserved before writing if the
-        build needs them, else nothing is written and the index is demoted."""
+        """Build and open the local form of `data`, a verified copy of `f`,
+        written as it is built into the `reserved` bytes held: a build that
+        reaches them stops, and runs again in more room if room can be had —
+        else nothing is kept and the index is demoted. Memory is a block, not
+        the file."""
 
-        try:
-            body = await _in_thread(lambda: _native.build_local(data, path, bytes.fromhex(f.digest)))
-        except ValueError as e:
-            raise Corrupt(f"{path}: {e}") from e
-        self._built(path, f, len(body))
-        extra = max(0, len(body) - reserved)
-        if extra and not self._evict(extra, keep=prefix):
-            self.demote(prefix)
-            return False
-        self.reserved += extra
         local = self._local(path)
         tmp = f"{local}.{uuid.uuid4().hex}.tmp"
-
-        def write():
-            with open(tmp, "wb") as out:
-                out.write(body)
-            return _native.LocalFile(tmp)
-
+        digest_ = bytes.fromhex(f.digest)
+        extra = 0
         try:
-            handle = await _in_thread(write)
+            while True:  # written as built, into the room held: past it, more room or none
+                ceiling = reserved + extra
+                try:
+                    size = await _in_thread(
+                        lambda c=ceiling: _native.build_local(data, path, digest_, tmp, c)
+                    )
+                    break
+                except _native.LimitError:
+                    self._built(path, f, ceiling + 1)  # at least this: what the next admission counts
+                    if not self._evict(ceiling, keep=prefix):
+                        self.demote(prefix)
+                        return False
+                    self.reserved += ceiling
+                    extra += ceiling
+                except ValueError as e:
+                    raise Corrupt(f"{path}: {e}") from e
+            self._built(path, f, size)
+            handle = await _in_thread(lambda: _native.LocalFile(tmp))
             # Published only if no other copy got there first and the file still matters.
             if path in self.files or path in self._retired:
                 return path in self.files
@@ -400,7 +408,7 @@ class EngineCache:
             self.reserved -= extra
             with contextlib.suppress(OSError):
                 os.unlink(tmp)
-        self._add(_File(path, local, len(body), prefix, handle, self.clock(), f.size, f.digest))
+        self._add(_File(path, local, size, prefix, handle, self.clock(), f.size, f.digest))
         return True
 
     async def install(self, prefix: str, f: FileInfo, path: str, data: bytes) -> bool:

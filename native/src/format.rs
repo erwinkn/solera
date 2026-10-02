@@ -103,6 +103,9 @@ pub(crate) fn decompress(data: &[u8], codec: u8) -> Result<Vec<u8>> {
 /// `data` decompressed, unless that is more than `limit` bytes: an
 /// `Error::Limit` then, after reading no more than `limit + 1`.
 pub(crate) fn decompress_at_most(data: &[u8], codec: u8, limit: u64) -> Result<Vec<u8>> {
+    if codec == CODEC_NONE && data.len() as u64 > limit {
+        return Err(Error::Limit(format!("more than {limit} bytes decoded")));
+    }
     let out = match codec {
         CODEC_ZLIB => {
             let mut out = Vec::with_capacity(data.len().saturating_mul(3).min(limit as usize));
@@ -168,6 +171,11 @@ pub(crate) fn pair_item(buf: &mut Vec<u8>, key: &[u8], version: &[u8]) {
     put_varint(buf, key.len() as u64);
     buf.extend_from_slice(key);
     buf.extend_from_slice(version);
+}
+
+/// Whether a filter may hold `item` (a `key_item`, `tomb_item` or `pair_item`).
+pub(crate) fn may_hold(bits: &[u8], item: &[u8], nbits: u64, k: u8) -> bool {
+    test_bits(bits, item, nbits, k)
 }
 
 fn test_bits(bits: &[u8], item: &[u8], nbits: u64, k: u8) -> bool {
@@ -361,6 +369,16 @@ pub struct Index {
 
 /// A file's block index from its last bytes (`part` ends at `file_size`).
 pub fn parse_index(part: &[u8], file_size: u64) -> Result<Index> {
+    parse_index_at_most(part, file_size, u64::MAX)
+}
+
+/// The smallest index entry of a block: an empty first key, three one-byte
+/// varints and a CRC.
+const MIN_INDEX_ENTRY: usize = 1 + 3 + 4;
+
+/// `parse_index`, decompressing at most `limit` bytes of index (`Error::Limit`
+/// past it). The index's grammar must use every byte.
+pub fn parse_index_at_most(part: &[u8], file_size: u64, limit: u64) -> Result<Index> {
     if part.len() < FOOTER_SIZE {
         return fmt_err("index part too short");
     }
@@ -378,12 +396,15 @@ pub fn parse_index(part: &[u8], file_size: u64) -> Result<Index> {
     if crc32fast::hash(raw) != footer.index_crc {
         return fmt_err("index checksum mismatch");
     }
-    let idx = decompress(raw, footer.codec)?;
+    let idx = decompress_at_most(raw, footer.codec, limit)?;
     let mut pos = 0;
     let min_key = get_bytes(&idx, &mut pos)?.to_vec();
     let max_key = get_bytes(&idx, &mut pos)?.to_vec();
     let nblocks = get_varint(&idx, &mut pos)?;
-    let mut blocks = Vec::with_capacity(nblocks.min(1 << 20) as usize);
+    if nblocks > ((idx.len() - pos) / MIN_INDEX_ENTRY) as u64 {
+        return fmt_err("more blocks than the index has room for");
+    }
+    let mut blocks = Vec::with_capacity(nblocks as usize);
     for _ in 0..nblocks {
         let first = get_bytes(&idx, &mut pos)?.to_vec();
         let offset = get_varint(&idx, &mut pos)?;
@@ -395,6 +416,9 @@ pub fn parse_index(part: &[u8], file_size: u64) -> Result<Index> {
         let crc = u32_at(crc, 0);
         pos += 4;
         blocks.push((first, offset, size, entries, crc));
+    }
+    if pos != idx.len() {
+        return fmt_err("bytes past the end of the index");
     }
     Ok(Index {
         footer,

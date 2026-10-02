@@ -180,6 +180,12 @@ async def built_index_at(io, state):
     return state.committed(0, files, keep_log=False)
 
 
+def tail_of(local: bytes) -> int:
+    """Where a local file's tail — its identity and directory — starts (its footer says)."""
+
+    return struct.unpack_from("<Q", local, len(local) - 20)[0]
+
+
 async def test_corruption_is_refetched(io, tmp_path):
     state = await built_index(io, commits=2)
     cache = EngineCache(str(tmp_path))
@@ -188,7 +194,7 @@ async def test_corruption_is_refetched(io, tmp_path):
     path = state.path(state.files[0].name)
     local = cache.files[path].local
     data = bytearray(open(local, "rb").read())
-    data[-5] ^= 0xFF  # a block
+    data[10] ^= 0xFF  # a block
     open(local, "wb").write(bytes(data))
     a = ask(state, [key(i) for i in range(0, 3000, 7)], [b"x"] * 429)
     assert (await engine_answer(resolver, state, a))[0]["reason"] == "cold"
@@ -196,7 +202,7 @@ async def test_corruption_is_refetched(io, tmp_path):
     assert (await engine_answer(resolver, state, a))[0]["result"] == "delta"
     # A corrupted directory is refused on open, as after a restart.
     data = bytearray(open(cache.files[path].local, "rb").read())
-    data[40] ^= 0xFF
+    data[tail_of(data) + 40] ^= 0xFF
     bad = os.path.join(str(tmp_path), "bad.kxl")
     open(bad, "wb").write(bytes(data))
     with pytest.raises(ValueError):
@@ -242,7 +248,7 @@ async def test_a_restart_keeps_what_checks_out(io, tmp_path):
     assert await cache.fill(io, state)
     path = state.path(state.files[0].name)
     data = bytearray(open(cache.files[path].local, "rb").read())
-    data[40] ^= 0xFF  # one directory goes bad while the engine is down
+    data[tail_of(data) + 40] ^= 0xFF  # one directory goes bad while the engine is down
     open(cache.files[path].local, "wb").write(bytes(data))
     open(os.path.join(str(tmp_path), "x.kxl.1.tmp"), "wb").write(b"half")
     again = EngineCache(str(tmp_path))
@@ -620,7 +626,8 @@ async def test_admission_remembers_what_a_file_built_to(io, tmp_path):
         assert not await cache.fill(io, state)
         gets.append(io.metrics.gets)
     assert gets == [1, 1, 1, 1]  # built once, then known not to fit
-    cache.disk = 2 * cache.need(state)  # its real size: room now
+    assert cache.need(state) > 2 * EngineCache(str(tmp_path / "fresh")).need(state)  # what it reached
+    cache.disk = 2**26  # room now
     assert await cache.fill(io, state) and io.metrics.gets == 2
 
 
@@ -764,3 +771,77 @@ async def test_a_record_answers_its_calls_and_nothing_else(io, tmp_path):
         await KeyIndex(ObjectIO(None, local=pin.handles, served=small), None, state, OPTS).page(None, 300)
     assert len(small) == 0
     pin.__exit__(None, None, None)
+
+
+# -- review round 2 ---------------------------------------------------------------------------
+
+
+async def test_a_build_stops_at_the_room_it_holds(io, tmp_path):
+    """Round 2, finding 2: a local file is written as it is built, into the
+    room reserved for it; one whose local form outgrows the disk stops there
+    — 10K keys with a 4 KiB revision expand to ~39 MB — and its size, at
+    least what it reached, is what the next admission counts: no refetch."""
+
+    keys = [key(i) for i in range(10_000)]
+    data = _native.encode_file(keys, [b"r" * 4096] * len(keys), bytes(len(keys)))
+    f = FileInfo.describe("c1-0000", 1, data)
+    state = IndexState(prefix="keys/out/_/", files=(f,))
+    await io.write(state.path(f.name), data)
+    cache = EngineCache(str(tmp_path), candidates=0)
+    cache.disk = 2 * cache.need(state)
+    assert not await cache.fill(io, state)
+    assert cache.reserved == 0 and cache.used <= cache.disk and not os.listdir(str(tmp_path))
+    gets = io.metrics.gets
+    assert not await cache.fill(io, state) and io.metrics.gets == gets
+    with pytest.raises(_native.LimitError):
+        _native.build_local(data, "x", bytes(16), str(tmp_path / "capped"), 2**20)
+    assert os.path.getsize(tmp_path / "capped") <= 2**20
+
+
+async def test_long_paths_make_short_local_names(io, tmp_path):
+    """Round 2, finding 3: a local file is named by a hash of its object's
+    path, so a long scope fills like any other."""
+
+    state = IndexState(prefix=f"keys/out/{'s' * 180}/")
+    files, _ = await KeyIndex(io, None, state, OPTS).resolve(
+        SortedRun.of([key(i) for i in range(100)], [b"v"] * 100), batch=0, attempt="0" * 26
+    )
+    state = state.committed(0, files, keep_log=False)
+    cache = EngineCache(str(tmp_path))
+    assert await cache.fill(io, state)
+    assert {len(name) for name in os.listdir(str(tmp_path))} == {len("0" * 32 + ".kxl")}
+    assert EngineCache(str(tmp_path)).warm(state)  # and found again after a restart
+
+
+async def test_stopping_waits_for_a_build_in_flight(io, tmp_path, monkeypatch):
+    """Round 2, finding 4: `stop` cancels the service's operations and waits
+    for each — a fill's build runs on its thread to the end, its room and
+    temporary file its own until then."""
+
+    import threading
+
+    from solera.keys import cache as cache_module
+    from solera_server.keyservice import KeyService
+
+    state = await built_index(io, commits=1)
+    started, go = threading.Event(), threading.Event()
+    real = cache_module._native.build_local
+
+    def paused(*args):
+        started.set()
+        go.wait(5)
+        return real(*args)
+
+    monkeypatch.setattr(cache_module._native, "build_local", paused)
+    service = KeyService(io.store, str(tmp_path))
+    service.start()
+    cache = service.cache
+    service._submit(cache.fill(service.io, state))
+    await asyncio.to_thread(started.wait, 5)
+    stopping = asyncio.ensure_future(service.stop())
+    await asyncio.sleep(0.1)
+    assert not stopping.done() and cache.reserved > 0  # the build still owns its room
+    go.set()
+    await asyncio.wait_for(stopping, 10)
+    assert cache.reserved == 0
+    assert not [n for n in os.listdir(str(tmp_path)) if n.endswith(".tmp")]

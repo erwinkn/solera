@@ -32,12 +32,8 @@ from . import (
     Job,
     Rows,
     SortedRun,
-    bloom_check_keys,
-    bloom_check_pairs,
-    bloom_check_tombstones,
     check_block,
     jobs,
-    lookup,
     merge_range,
     parse_footer,
     parse_index,
@@ -375,13 +371,6 @@ class _Parsed:
     def __post_init__(self):
         self.firsts = [b[0] for b in self.tail["blocks"]]
 
-    def block_of(self, key: bytes) -> int:
-        """Index of the only block that could hold `key`, or -1."""
-
-        if not self.tail["blocks"] or key < self.info.min or key > self.info.max:
-            return -1
-        return bisect.bisect_right(self.firsts, key) - 1
-
     def runs(self, wanted) -> list[list[int]]:
         """Sorted block indexes grouped into range reads: consecutive blocks, up to `RANGE` each."""
 
@@ -516,18 +505,13 @@ class KeyIndex:
     async def _sparse(self, run: SortedRun, generation: int, *, exact: bool, collect: int, switch: bool):
         """The sparse reader's delta; None when `switch` and streaming would read less."""
 
-        found, inferred = {}, False
-        if self.state.files:
-            keys, versions, deleted, _ = run.entries()
-            want = {k: v for k, v, d in zip(keys, versions, deleted, strict=True) if not d}
-            got = await self._find(keys, want, exact=exact, switch=switch)
-            if got is None:
-                return None
-            found, inferred = got
+        sparse = await self._find(run, exact=exact, switch=switch)
+        if sparse is None:
+            return None
         (files, added, removed, _), listed = await asyncio.to_thread(
-            run.delta, found, generation=generation, collect=collect, **self._writer()
+            sparse.delta, generation=generation, collect=collect, **self._writer()
         )
-        return Delta(files, added, removed, not inferred, listed)
+        return Delta(files, added, removed, not sparse.inferred, listed)
 
     async def lookup(self, keys: list[bytes]) -> dict[bytes, tuple[bytes, int]]:
         """Exactly, the live `(version, locator)` of each of `keys` the index
@@ -539,8 +523,8 @@ class KeyIndex:
         keys = sorted(set(keys))
 
         async def store():
-            known = (await self._find(keys, {}, exact=True, switch=False))[0]
-            return {k: (v, loc) for k, (live, v, loc) in known.items() if live}
+            run = SortedRun.of(keys, [b""] * len(keys))
+            return (await self._find(run, exact=True, switch=False)).live()
 
         async def local(snap):
             hits = await asyncio.to_thread(snap.get, keys)
@@ -665,171 +649,76 @@ class KeyIndex:
         )
         return [files[n] for n in sorted(files)]
 
-    async def _find(self, keys: list[bytes], want: dict, *, exact: bool, switch: bool):
-        """`(live, version, locator)` of every key some file holds — the
-        version None where the filters alone said "live at another version"
-        — and whether any was so inferred. Newest first, levels small enough
-        are read whole, all at once; from the first larger one on, every
-        level goes through its filters, since "definitely changed" must hold
-        across every level that could hold the key. Only keys the filters
-        cannot clear get block reads, in the files whose key filter matched,
-        all levels at once. With `switch`, None once those reads would touch
-        more blocks than streaming the index costs segments × `stream_reads`."""
+    async def _find(self, run: SortedRun, *, exact: bool, switch: bool):
+        """What the index holds for each entry of `run`, as a native `Sparse`
+        state — read live or deleted, absent by the key filters, or live at
+        another version by the pair and tombstone filters. Newest first, levels
+        small enough are read whole, all at once; from the first larger one
+        on, every level goes through its filters, since "definitely changed"
+        must hold across every level that could hold the key. Only entries
+        the filters cannot clear get block reads, in the files whose key
+        filter matched, all levels at once. With `switch`, None once those
+        reads would touch more blocks than streaming the index costs segments
+        × `stream_reads`. Python chooses files and fetches; no key becomes a
+        Python object."""
 
-        known: dict[bytes, tuple] = {}
-        inferred = False
+        sparse = _native.Sparse(run)
         levels = self.state.newest_first()
         n = next((i for i, level in enumerate(levels) if not self._read_whole(level)), len(levels))
         whole, filtered = levels[:n], levels[n:]
-        unresolved = keys
 
         # 1. The whole levels, fetched at once and then consulted newest first.
+        spans = {f.name: sparse.span(f.min, f.max) for level in levels for f in level}
         await asyncio.gather(
             *(
                 self._open(f, data=True)
                 for level in whole
                 for f in level
-                if f.name in self._candidates(level, unresolved)
+                if spans[f.name][0] < spans[f.name][1]
             )
         )
         for level in whole:
-            if not unresolved:
-                break
-            found = await self._exact(level, self._candidates(level, unresolved))
-            known.update(found)
-            unresolved = [k for k in unresolved if k not in found]
-        if not unresolved or not filtered:
-            return known, inferred
+            for f in level:
+                lo, hi = spans[f.name]
+                if lo == hi or not sparse.unknown:
+                    continue
+                p = self._parsed[f.name]
+                got = await self._blocks(p, sparse.blocks(p.firsts, lo=lo, hi=hi))
+                await asyncio.to_thread(
+                    sparse.read, list(got.items()), p.tail["codec"], p.firsts, lo=lo, hi=hi
+                )
+        if not sparse.unknown or not filtered:
+            return sparse
 
         # 2. The rest through their filters.
-        verdicts, holders = await self._filter(filtered, unresolved, want)
-        maybe = []
-        for key in unresolved:
-            verdict = verdicts[key]
-            if verdict == "changed" and not exact:
-                # Live at another version — or, behind a false-positive key
-                # filter, not there at all: counted as an existing key.
-                inferred = True
-                known[key] = (True, None, None)
-            elif verdict != "absent":
-                maybe.append(key)
-        if not maybe:
-            return known, inferred
+        files = [f for level in filtered for f in level if spans[f.name][0] < spans[f.name][1]]
+        parsed = await asyncio.gather(*(self._open(f) for f in files))
+        for i, p in enumerate(parsed):
+            tail = p.tail
+            sparse.filter(
+                i, *spans[p.info.name], tail["key_filter"], tail["tomb_filter"], tail["pair_filter"]
+            )
+        sparse.classify(exact)
+        if not sparse.maybe:
+            return sparse
 
         # 3. Exact reads of the rest, in every file whose key filter matched them.
-        wanted = set(maybe)
-        needs = []
-        for level in filtered:
-            for f in level:
-                ks = [k for k in holders.get(f.name, ()) if k in wanted]
-                if ks:
-                    needs.append((self._parsed[f.name], ks))
+        needs = [(i, p, sparse.blocks(p.firsts, file=i)) for i, p in enumerate(parsed)]
+        needs = [(i, p, blocks) for i, p, blocks in needs if blocks]
         if switch:
-            reads = sum(len({p.block_of(k) for k in ks} - {-1}) for p, ks in needs)
+            reads = sum(len(blocks) for _, _, blocks in needs)
             size = sum(f.size for f in self.state.files)
             if reads > self.o.stream_reads * math.ceil(size / jobs.SEGMENT):
                 return None
-        parts = await asyncio.gather(*(self._lookup(p, ks) for p, ks in needs))
-        for part in parts:  # newest first
-            for key, entry in part.items():
-                known.setdefault(key, entry)
-        return known, inferred
-
-    def _candidates(self, level: list[FileInfo], keys: list[bytes]) -> dict[str, list[bytes]]:
-        """Per file of a level, the sorted keys inside its key range."""
-
-        out: dict[str, list[bytes]] = {}
-        if len(level) == 1:
-            f = level[0]
-            lo, hi = bisect.bisect_left(keys, f.min), bisect.bisect_right(keys, f.max)
-            if lo < hi:
-                out[f.name] = keys[lo:hi]
-            return out
-        mins = [f.min for f in level]  # a level 1+ has non-overlapping files, sorted by min
-        for key in keys:
-            i = bisect.bisect_right(mins, key) - 1
-            if i >= 0 and key <= level[i].max:
-                out.setdefault(level[i].name, []).append(key)
-        return out
+        fetched = await asyncio.gather(*(self._blocks(p, blocks) for _, p, blocks in needs))
+        for (i, p, _), got in zip(needs, fetched, strict=True):  # newest first: its entry wins
+            await asyncio.to_thread(sparse.read, list(got.items()), p.tail["codec"], p.firsts, file=i)
+        return sparse
 
     def _read_whole(self, level: list[FileInfo]) -> bool:
         """Whether a level is small enough to read whole without looking at its filters."""
 
         return sum(f.size for f in level) <= self.o.whole_threshold
-
-    async def _exact(self, level, candidates) -> dict[bytes, tuple[bool, bytes, int]]:
-        by_name = {f.name: f for f in level}
-
-        async def one(name: str, keys: list[bytes]):
-            return await self._lookup(await self._open(by_name[name], data=True), keys)
-
-        found: dict[bytes, tuple[bool, bytes, int]] = {}
-        for part in await asyncio.gather(*(one(name, keys) for name, keys in candidates.items())):
-            found.update(part)
-        return found
-
-    async def _lookup(self, p: _Parsed, keys: list[bytes]) -> dict[bytes, tuple[bool, bytes, int]]:
-        """`(live, version, locator)` of each of the sorted `keys` the file holds."""
-
-        blocks_for: dict[int, list[bytes]] = {}
-        for key in keys:
-            b = p.block_of(key)
-            if b >= 0:
-                blocks_for.setdefault(b, []).append(key)
-        if not blocks_for:
-            return {}
-        fetched = await self._blocks(p, blocks_for)
-        found = {}
-        for b, bkeys in blocks_for.items():
-            hit, vers, dels, locs = lookup([fetched[b]], p.tail["codec"], bkeys)
-            for key, h, v, d, loc in zip(bkeys, hit, vers, dels, locs, strict=True):
-                if h:
-                    found[key] = (not d, v, loc)
-        return found
-
-    async def _filter(self, levels, keys, want):
-        """Classify keys with the filters of every file that could hold them:
-        "absent" (no key filter matches), "changed" (a written key that no pair
-        filter and no tombstone filter matches: live, at another version), or
-        "maybe" (needs an exact read). Also returns, per file, the keys its key
-        filter matched — the only files an exact read of them needs."""
-
-        key_hit = dict.fromkeys(keys, False)
-        pair_hit = dict.fromkeys(keys, False)
-        tomb_hit = dict.fromkeys(keys, False)
-        holders: dict[str, list[bytes]] = {}
-        per_file = []
-        for level in levels:
-            by_name = {f.name: f for f in level}
-            per_file += [(by_name[n], ks) for n, ks in self._candidates(level, keys).items()]
-        parsed = await asyncio.gather(*(self._open(f) for f, _ in per_file))
-        for p, (_, ks) in zip(parsed, per_file, strict=True):
-            nb, kk, bits = p.tail["key_filter"]
-            held = [k for k, h in zip(ks, bloom_check_keys(bits, nb, kk, ks), strict=True) if h]
-            if not held:
-                continue
-            holders[p.info.name] = held
-            for k in held:
-                key_hit[k] = True
-            nb, kk, bits = p.tail["tomb_filter"]
-            for k, h in zip(held, bloom_check_tombstones(bits, nb, kk, held), strict=True):
-                tomb_hit[k] = tomb_hit[k] or bool(h)
-            pks = [k for k in held if k in want]
-            if pks:
-                nb, kk, bits = p.tail["pair_filter"]
-                for k, h in zip(
-                    pks, bloom_check_pairs(bits, nb, kk, pks, [want[k] for k in pks]), strict=True
-                ):
-                    pair_hit[k] = pair_hit[k] or bool(h)
-        out = {}
-        for k in keys:
-            if not key_hit[k]:
-                out[k] = "absent"
-            elif k in want and not pair_hit[k] and not tomb_hit[k]:
-                out[k] = "changed"
-            else:
-                out[k] = "maybe"
-        return out, holders
 
     # -- writing ------------------------------------------------------------------------
 

@@ -1,18 +1,14 @@
-//! The streaming jobs over an index: a full replacement (the merge-join of
-//! the written content with the index), a patch (the merge-join of a sorted
-//! run of upserts and removes with it, or of a run that replaces it all), a
-//! compaction, and a recount. Each is
+//! The streaming jobs over an index: the merge-join of written content with
+//! it — a patch, or a full replacement — a compaction, and a recount. Each is
 //! driven by `step`, which runs until it needs input or has a file to hand
 //! over; the caller does the I/O.
 
 use std::cmp::Ordering;
-use std::sync::Arc;
 
 use crate::delta::{Delta, Old};
 use crate::format::{Error, Options, Result};
 use crate::garbage::GarbageWriter;
 use crate::rows::Source;
-use crate::run::SortedRun;
 use crate::stream::{Merge, Next, State, Writer};
 
 pub enum Step {
@@ -27,32 +23,42 @@ pub enum Step {
     Done,
 }
 
-/// A full replacement: every written key against the live keys of the index
-/// (`delta.rs` decides each), live keys not written deleted.
-pub struct Replace {
+/// The merge-join of written content — rows, a stream of sorted chunks, or
+/// a sorted run — with the live keys of the index, each key as `delta.rs`
+/// decides. A patch passes over the index keys it does not mention and
+/// stops reading the index once its content is done; a replacement
+/// (`replace`) is the whole new content, and live keys it omits are deleted.
+pub struct Join {
     pub src: Source,
     pub merge: Merge,
     pub delta: Delta,
+    replace: bool,
     old: Option<bool>, // Some(true): the merge holds a live entry; Some(false): exhausted
     done: bool,
 }
 
-impl Replace {
+impl Join {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         src: Source,
+        replace: bool,
         runs: usize,
         o: Options,
         max_file_bytes: usize,
         collect: usize,
         generation: u64,
-    ) -> Replace {
-        Replace {
+    ) -> Result<Join> {
+        if replace && matches!(&src, Source::Run(run, _) if run.removes() > 0) {
+            return Err(Error::Value("a replacement has no removes".into()));
+        }
+        Ok(Join {
             src,
             merge: Merge::new(runs),
             delta: Delta::new(o, max_file_bytes, collect, generation),
+            replace,
             old: None,
             done: false,
-        }
+        })
     }
 
     pub fn step(&mut self) -> Result<Step> {
@@ -63,6 +69,15 @@ impl Replace {
             if self.done {
                 return Ok(Step::Done);
             }
+            let new = match self.src.state()? {
+                State::Starved => return Ok(Step::Rows),
+                s => s == State::Ready,
+            };
+            if !new && !self.replace {
+                self.delta.finish()?; // a patch is done with its content
+                self.done = true;
+                continue;
+            }
             if self.old.is_none() {
                 match self.merge.next_key()? {
                     Next::Entry if self.merge.deleted() => {}
@@ -72,10 +87,6 @@ impl Replace {
                 }
                 continue;
             }
-            let new = match self.src.state()? {
-                State::Starved => return Ok(Step::Rows),
-                s => s == State::Ready,
-            };
             let old = self.old == Some(true);
             let ord = match (new, old) {
                 (false, false) => {
@@ -90,117 +101,22 @@ impl Replace {
             let m = &self.merge;
             match ord {
                 Ordering::Less => {
-                    let (k, v) = self.src.entry();
-                    self.delta.apply(k, Some(v), Old::Absent)?;
-                    self.src.advance();
-                }
-                Ordering::Greater => {
-                    let was = Old::Live(m.version(), m.locator());
-                    self.delta.apply(m.key(), None, was)?;
-                    self.old = None;
-                }
-                Ordering::Equal => {
-                    let (k, v) = self.src.entry();
                     self.delta
-                        .apply(k, Some(v), Old::Live(m.version(), m.locator()))?;
+                        .apply(self.src.key(), self.src.write(), Old::Absent)?;
                     self.src.advance();
-                    self.old = None;
                 }
-            }
-        }
-    }
-}
-
-/// A sorted run against the index: a patch — keys it does not mention
-/// passed over, reading stops once the run is done — or with `replace` the
-/// whole new content, live keys it omits deleted. Each key as `delta.rs`
-/// decides.
-pub struct Patch {
-    pub merge: Merge,
-    pub delta: Delta,
-    run: Arc<SortedRun>,
-    replace: bool,
-    i: usize,
-    old: Option<bool>, // Some(true): the merge holds an entry; Some(false): exhausted
-    done: bool,
-}
-
-impl Patch {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        run: Arc<SortedRun>,
-        replace: bool,
-        runs: usize,
-        o: Options,
-        max_file_bytes: usize,
-        collect: usize,
-        generation: u64,
-    ) -> Result<Patch> {
-        if replace && run.removes() > 0 {
-            return Err(Error::Value("a replacement has no removes".into()));
-        }
-        Ok(Patch {
-            merge: Merge::new(runs),
-            delta: Delta::new(o, max_file_bytes, collect, generation),
-            run,
-            replace,
-            i: 0,
-            old: None,
-            done: false,
-        })
-    }
-
-    pub fn step(&mut self) -> Result<Step> {
-        loop {
-            if !self.delta.writer.files.is_empty() {
-                return Ok(Step::File);
-            }
-            if self.done {
-                return Ok(Step::Done);
-            }
-            let ended = self.i == self.run.len();
-            if ended && (!self.replace || self.old == Some(false)) {
-                self.delta.finish()?;
-                self.done = true;
-                continue;
-            }
-            if self.old.is_none() {
-                self.old = Some(match self.merge.next_key()? {
-                    Next::Entry => true,
-                    Next::Need(r) => return Ok(Step::Run(r)),
-                    Next::End => false,
-                });
-                continue;
-            }
-            let m = &self.merge;
-            let held = self.old == Some(true);
-            let was = if held && !m.deleted() {
-                Old::Live(m.version(), m.locator())
-            } else {
-                Old::Absent
-            };
-            let ord = match (ended, held) {
-                (true, _) => Ordering::Greater,
-                (false, true) => self.run.key(self.i).cmp(m.key()),
-                (false, false) => Ordering::Less,
-            };
-            match ord {
                 Ordering::Greater => {
-                    // An index key the run does not mention: gone, in a replacement.
+                    // An index key the content does not mention: gone, in a replacement.
                     if self.replace {
+                        let was = Old::Live(m.version(), m.locator());
                         self.delta.apply(m.key(), None, was)?;
                     }
                     self.old = None;
                 }
-                Ordering::Less => {
-                    let (k, w) = (self.run.key(self.i), self.run.write(self.i));
-                    self.delta.apply(k, w, Old::Absent)?;
-                    self.i += 1;
-                }
                 Ordering::Equal => {
-                    let (k, w) = (self.run.key(self.i), self.run.write(self.i));
-                    self.delta.apply(k, w, was)?;
-                    self.i += 1;
+                    let was = Old::Live(m.version(), m.locator());
+                    self.delta.apply(self.src.key(), self.src.write(), was)?;
+                    self.src.advance();
                     self.old = None;
                 }
             }
