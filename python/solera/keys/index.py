@@ -564,7 +564,7 @@ class KeyIndex:
         else:
             out = await store()
         if served is not None and served.recording:
-            served.record(self.identity, call, args, out)
+            await asyncio.to_thread(served.record, self.identity, call, args, out)  # encoded off the loop
         return out
 
     async def _stream(self, run: SortedRun, batch, attempt, generation, collect):

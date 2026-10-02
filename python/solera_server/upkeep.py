@@ -19,10 +19,10 @@ import contextlib
 import json
 import logging
 import math
-import re
 import time
 
 from solera.ids import ulid
+from solera.keys import LocalError
 from solera.keys.index import IndexState, KeyIndex, Options
 from solera.keys.io import ObjectIO
 
@@ -185,11 +185,8 @@ class Upkeep:
                 return asyncio.run(go(None))
             try:
                 return asyncio.run(go(pin.handles))
-            except ValueError as e:
-                bad = re.match(r"local file (\S+): ", str(e))
-                if bad is None:
-                    raise
-                service.corrupt(bad.group(1))  # dropped, fetched again by a fill; this run reads the store
+            except LocalError as e:
+                service.corrupt(e.path)  # dropped, fetched again by a fill; this run reads the store
             finally:
                 service.unpin(pin)
             return asyncio.run(go(None))

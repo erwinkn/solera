@@ -28,6 +28,8 @@ pub enum Error {
     Callback(Box<dyn std::error::Error + Send + Sync>),
     /// Well-formed input over a caller's limit: more entries or bytes than it takes.
     Limit(String),
+    /// An engine cache's local copy failed a check: `(its source's path, what)`.
+    Local(String, String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -263,9 +263,8 @@ class EngineCache:
         ix.used = now
         if ix.admitted:
             return True
-        others = sum(
-            f.size for f in self.files.values() if f.prefix in self._active(now) and f.prefix != state.prefix
-        )
+        active = self._active(now)
+        others = sum(f.size for f in self.files.values() if f.prefix in active and f.prefix != state.prefix)
         if self.need(state) + others + self.candidate_budget <= self.disk:
             ix.admitted = True
         return ix.admitted
@@ -307,6 +306,7 @@ class EngineCache:
         """Whatever of the snapshot's files and logged deltas the cache holds,
         pinned: a reader that takes what is local and does without the rest."""
 
+        self.admit(state)  # a read: the index is active, and a recovered one is admitted again
         now, files = self.clock(), []
         for f in {**{f.name: f for f in _logged(state)}, **{f.name: f for f in state.files}}.values():
             local = self._present(state.path(f.name), f)
@@ -321,8 +321,8 @@ class EngineCache:
 
         if not self.warm(state):
             return None
+        self.admit(state)  # a read: the index is active, and a recovered one is admitted again
         now = self.clock()
-        self.indexes.setdefault(state.prefix, _Index()).used = now
         held, runs = [], []
         for level in state.newest_first():
             run = []

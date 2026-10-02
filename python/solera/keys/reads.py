@@ -66,8 +66,12 @@ class Reads:
     # -- the engine's side -----------------------------------------------------------
 
     def record(self, identity: str, call: str, args: tuple, result) -> None:
-        """Keep `result`; `Full` once it would pass the bounds."""
+        """Keep `result`; `Full` once it would pass the bounds — its entries
+        checked before anything is encoded, its bytes after."""
 
+        entries = len(result) if call == "lookup" else len(result[0])
+        if self.entries + entries > self.max_entries:
+            raise Full(call)
         if call == "lookup":
             keys = sorted(result)
             run = encode_file(

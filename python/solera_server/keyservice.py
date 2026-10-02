@@ -33,7 +33,7 @@ import threading
 from collections import OrderedDict
 from urllib.parse import unquote, urlsplit
 
-from solera.keys import SortedRun
+from solera.keys import LocalError, SortedRun
 from solera.keys.cache import Corrupt, EngineCache, verify
 from solera.keys.index import FileInfo, IndexState, KeyIndex, Options
 from solera.keys.io import ObjectIO
@@ -42,6 +42,7 @@ from solera.keys.resolver import Limits, Prepared, Resolver
 
 log = logging.getLogger(__name__)
 
+INSTALL_QUEUE = 128 * 2**20  # bytes of written files waiting to be installed: two full outputs
 READS_MAX_ENTRIES = 1_000_000  # entries one start reply's reads may carry
 READS_MAX_BYTES = 16 * 2**20  # ...and bytes, encoded
 READS_TIMEOUT = 2.0  # seconds the engine spends on them before answering without
@@ -90,6 +91,7 @@ class KeyService:
         self._hold_lock = threading.Lock()
         self._tokens = itertools.count()
         self._owners: set[asyncio.Task] = set()  # operations running on the loop
+        self._installing = 0  # bytes of `installed` files waiting
 
     # -- reader pins ----------------------------------------------------------------------
 
@@ -321,6 +323,9 @@ class KeyService:
                                 break
                 except Cold:
                     cold = True  # this input's later reads go to the store; fetch it for the next
+                except LocalError as e:
+                    self.cache.corrupt(e.path)  # as cold: dropped, fetched again, what was recorded kept
+                    cold = True
         except Full:
             pass  # the rest go to the store
         finally:
@@ -333,7 +338,29 @@ class KeyService:
         return reads.to_json() if len(reads) else None
 
     def installed(self, prefix: str, f: FileInfo, path: str, data: bytes) -> None:
-        self._fire(lambda: self.cache.install(prefix, f, path, data))
+        """A file the engine wrote (a compaction output), for the cache. Waiting,
+        it holds its bytes: past `INSTALL_QUEUE` waiting it is skipped, and its
+        index demoted — a fill fetches what is missing once there is room."""
+
+        if not self._running():
+            return
+        with self._hold_lock:
+            take = self._installing + len(data) <= INSTALL_QUEUE
+            if take:
+                self._installing += len(data)
+        if not take:
+            self._fire(lambda: self._demote(prefix))
+            return
+        fut = self._submit(self.cache.install(prefix, f, path, data))
+        fut.add_done_callback(_logged)
+        fut.add_done_callback(lambda _f: self._installed(len(data)))
+
+    def _installed(self, n: int) -> None:
+        with self._hold_lock:
+            self._installing -= n
+
+    async def _demote(self, prefix: str) -> None:
+        self.cache.demote(prefix)
 
     def retired(self, paths: list[str]) -> None:
         """A published compaction let go of these files."""

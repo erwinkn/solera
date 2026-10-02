@@ -845,3 +845,130 @@ async def test_stopping_waits_for_a_build_in_flight(io, tmp_path, monkeypatch):
     await asyncio.wait_for(stopping, 10)
     assert cache.reserved == 0
     assert not [n for n in os.listdir(str(tmp_path)) if n.endswith(".tmp")]
+
+
+# -- review round 3 ---------------------------------------------------------------------------
+
+
+async def test_installs_waiting_are_bounded_in_bytes(io, tmp_path, monkeypatch):
+    """Round 3: files waiting to be installed hold their bytes; past the
+    queue's bound one is skipped and its index demoted, not kept waiting."""
+
+    import threading
+
+    from solera.keys import cache as cache_module
+    from solera_server import keyservice
+
+    monkeypatch.setattr(keyservice, "INSTALL_QUEUE", 4 * 2**20)
+    go = threading.Event()
+    real = cache_module._native.build_local
+    monkeypatch.setattr(cache_module._native, "build_local", lambda *a: (go.wait(5), real(*a))[1])
+    state = IndexState(prefix="keys/out/_/")
+    service = keyservice.KeyService(io.store, str(tmp_path), disk=2**31)
+    service.start()
+    try:
+        await asyncio.wrap_future(service._submit(asyncio.sleep(0)))
+        service.cache.admit(state)
+        rng = random.Random(2)
+        for i in range(30):
+            ks = [key(j) for j in range(2000)]
+            data = _native.encode_file(ks, [rng.randbytes(500) for _ in ks], bytes(len(ks)), codec=0)
+            f = FileInfo.describe(f"c{i:04d}-0000", 1, data)
+            service.installed(state.prefix, f, state.path(f.name), data)
+            assert service._installing <= keyservice.INSTALL_QUEUE
+        await asyncio.wrap_future(service._submit(asyncio.sleep(0)))
+        assert not service.cache.indexes[state.prefix].admitted  # skipped ones demoted it
+        go.set()
+        for _ in range(200):
+            if not service._installing:
+                break
+            await asyncio.sleep(0.02)
+        assert service._installing == 0
+    finally:
+        go.set()
+        await service.stop()
+
+
+def test_admission_finds_the_active_indexes_once(tmp_path, monkeypatch):
+    """Round 3: admission computes the active set once, not once per file."""
+
+    cache = EngineCache(str(tmp_path))
+    calls = []
+    real = cache._active
+    monkeypatch.setattr(cache, "_active", lambda now: (calls.append(now), real(now))[1])
+    for i in range(50):
+        cache._add(_file_stub(f"keys/out/p{i}/f.kx", f"keys/out/p{i}/"))
+        cache.indexes[f"keys/out/p{i}/"].admitted = True
+    calls.clear()
+    cache.admit(IndexState(prefix="keys/out/new/"))
+    assert len(calls) == 1
+
+
+def _file_stub(path, prefix):
+    from solera.keys.cache import _File
+
+    return _File(path, path, 4096, prefix, None, 0.0, 4096, "")
+
+
+async def test_a_local_read_keeps_its_index_active_and_admitted(io, tmp_path):
+    """Round 3: reading local copies — a resolve's pin or a start read's —
+    marks the index active, and admits one recovered after a restart."""
+
+    state = await built_index(io, commits=1)
+    now = [0.0]
+    cache = EngineCache(str(tmp_path), window=10, clock=lambda: now[0])
+    assert await cache.fill(io, state)
+    now[0] = 11.0
+    assert state.prefix not in cache._active(now[0])
+    with cache.held(state):
+        pass
+    assert state.prefix in cache._active(now[0])
+    again = EngineCache(str(tmp_path), window=10, clock=lambda: now[0])
+    assert not again.indexes[state.prefix].admitted  # recovered: kept, not admitted
+    with again.held(state):
+        assert again.indexes[state.prefix].admitted
+
+
+async def test_a_corrupt_copy_recovers_through_start_reads(io, tmp_path):
+    """Round 3: a start read that meets a corrupt local copy drops it and
+    fills it again, as a cold index; the next attempt is answered."""
+
+    from solera_server.keyservice import KeyService
+
+    state = await built_index(io, commits=1)
+    spec = {
+        "inputs": {"x": {"index": state.to_json(), "changes": {"full": True, "after": None, "limit": 50}}}
+    }
+    service = KeyService(io.store, str(tmp_path))
+    service.start()
+    try:
+        await asyncio.wrap_future(service._submit(service.cache.fill(service.io, state)))
+        assert await service.reads(spec, set(), 0) is not None
+        local = service.cache.files[state.path(state.files[0].name)].local
+        data = bytearray(open(local, "rb").read())
+        data[10] ^= 0xFF
+        open(local, "wb").write(bytes(data))
+        assert await service.reads(spec, set(), 0) is None
+        for _ in range(200):
+            if (record := await service.reads(spec, set(), 0)) is not None:
+                break
+            await asyncio.sleep(0.02)
+        assert record is not None  # refetched, warm again
+    finally:
+        await service.stop()
+
+
+def test_a_record_refuses_entries_before_encoding(monkeypatch):
+    """Round 3: a result past the entry allowance is refused before any of it
+    is encoded."""
+
+    from solera.keys import reads as reads_module
+
+    encoded = []
+    real = reads_module.encode_file
+    monkeypatch.setattr(reads_module, "encode_file", lambda *a, **k: (encoded.append(1), real(*a, **k))[1])
+    reads = reads_module.Reads(recording=True, max_entries=10, max_bytes=2**20)
+    keys = [key(i) for i in range(11)]
+    with pytest.raises(reads_module.Full):
+        reads.record("i", "page", (None, 11), (keys, [b"v"] * 11, [0] * 11, None))
+    assert not encoded

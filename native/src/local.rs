@@ -368,7 +368,7 @@ impl Local {
 
     /// An error naming this file: the cache drops it and fetches its source again.
     fn bad<T>(&self, what: impl std::fmt::Display) -> Result<T> {
-        fmt_err(format!("local file {}: {what}", self.source))
+        Err(Error::Local(self.source.clone(), what.to_string()))
     }
 
     /// Block `i`'s bytes — entries, then restart offsets — after its CRC.

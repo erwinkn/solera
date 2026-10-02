@@ -342,7 +342,10 @@ readers (§8). It runs on maintenance threads, never on the engine's event
 loop. A compaction or a recount of an index the cache holds warm pins its
 local copies and streams them (`Job.local`), reading nothing from the
 store; otherwise, or if a copy fails its check mid-way, it reads the
-store.
+store. Any reader of local copies — a resolve, a start read, maintenance —
+counts as a use of its index: it stays active, and one recovered after a
+restart is admitted again. A copy that fails a check is named by the
+error (`LocalError.path`), dropped, and fetched again by a fill.
 
 **Unit: an immutable file.** Entries are keyed by object path; a path is
 never reused, so an entry is never stale, only evicted. An index is
@@ -437,6 +440,9 @@ next commit is warm.
 **Write-through.** The engine does not read back what it produced or saw:
 
 - compaction outputs are installed from the bytes the engine has in hand;
+  waiting to be built they hold those bytes, so at most 128 MB of them
+  wait: past that, one is skipped and its index demoted, and a fill
+  fetches it once there is room;
 - a resolve keeps the delta it returned as a **candidate**, keyed by
   `(path the worker will use, size, digest)`: present on disk, invisible as
   index state. The worker uploads exactly those bytes and its result's

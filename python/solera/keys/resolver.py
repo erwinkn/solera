@@ -22,13 +22,12 @@ import asyncio
 import json
 import logging
 import math
-import re
 import struct
 from collections.abc import Callable
 from dataclasses import dataclass
 
 from .. import _native
-from .._native import LimitError, SortedRun
+from .._native import LimitError, LocalError, SortedRun
 from .cache import EngineCache
 from .index import IndexState, Options
 from .io import ObjectIO
@@ -272,13 +271,12 @@ class Resolver:
                         generation=p.generation,
                         **_writer(self.o, lim.max_bytes),
                     )
-                except ValueError as e:
-                    bad = re.match(r"local file (\S+): ", str(e))
-                    if bad is None:
-                        return {**declined, "reason": "invalid"}, None
-                    self.cache.corrupt(bad.group(1))  # refetched by the fill
+                except LocalError as e:
+                    self.cache.corrupt(e.path)  # refetched by the fill
                     self._background_fill(p.index, p.position)
                     return {**declined, "reason": "cold"}, None
+                except ValueError:
+                    return {**declined, "reason": "invalid"}, None
         if not files:
             return {"result": "empty"}, None
         if len(files) > 1 or len(files[0]) > lim.max_bytes:

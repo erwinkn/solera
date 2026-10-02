@@ -47,6 +47,12 @@ create_exception!(
 );
 create_exception!(
     _native,
+    LocalError,
+    FormatError,
+    "An engine cache's local copy failed a check; `path` is its source's path."
+);
+create_exception!(
+    _native,
     LimitError,
     PyValueError,
     "Well-formed input over a limit: more entries or bytes than the caller takes."
@@ -57,6 +63,13 @@ fn to_py(e: Error) -> PyErr {
         Error::Format(m) => FormatError::new_err(m),
         Error::Value(m) => PyValueError::new_err(m),
         Error::Limit(m) => LimitError::new_err(m),
+        Error::Local(path, what) => Python::attach(|py| {
+            let e = LocalError::new_err(format!("local file {path}: {what}"));
+            match e.value(py).setattr("path", path) {
+                Ok(()) => e,
+                Err(set) => set,
+            }
+        }),
         Error::Callback(e) => match e.downcast::<PyErr>() {
             Ok(e) => *e,
             Err(e) => PyValueError::new_err(e.to_string()),
@@ -129,16 +142,19 @@ fn encode_file<'py>(
 ) -> PyResult<Bound<'py, PyBytes>> {
     let o = options(block_size, level, bits_per_item, k, codec);
     let (locators, predecessors) = extra(keys.len(), locators, predecessors)?;
-    let predecessors: Vec<format::Predecessor> = predecessors.iter().map(prev).collect();
-    let out = format::encode_file(
-        &slices(&keys),
-        &slices(&versions),
-        &deleted,
-        &locators,
-        &predecessors,
-        o,
-    )
-    .map_err(to_py)?;
+    let out = py
+        .detach(|| {
+            let predecessors: Vec<format::Predecessor> = predecessors.iter().map(prev).collect();
+            format::encode_file(
+                &slices(&keys),
+                &slices(&versions),
+                &deleted,
+                &locators,
+                &predecessors,
+                o,
+            )
+        })
+        .map_err(to_py)?;
     Ok(PyBytes::new(py, &out))
 }
 
@@ -1935,6 +1951,7 @@ fn solera_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("FOOTER_SIZE", format::FOOTER_SIZE)?;
     m.add("FormatError", m.py().get_type::<FormatError>())?;
     m.add("LimitError", m.py().get_type::<LimitError>())?;
+    m.add("LocalError", m.py().get_type::<LocalError>())?;
     m.add_class::<SortedRun>()?;
     m.add_class::<Sparse>()?;
     m.add_function(wrap_pyfunction!(encode_file, m)?)?;
