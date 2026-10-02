@@ -177,8 +177,10 @@ Each(output=None, *, include=None, exclude=None, batch_size=100, concurrency=16,
 - **Every output of the asset is keyed by the input's key** — `key=`
   (the rows the call returns, any number) or `keyed=True` (one value).
   Unkeyed outputs are rejected at registration. The call returns a value
-  (one output) or `Result(outputs=…)`. An output the call does not return
-  holds nothing for that key.
+  (one output) or `Result(outputs=…)`. An output the call does not return,
+  or returns as `None`, is left as it is for that key: no change. Removal
+  is explicit — `Patch(None, remove=[ctx.key])` takes the key out of that
+  output.
 - **Deleted keys never call the function**: their rows are removed.
 - **Other inputs are whole and shared**: loaded once per attempt, given to
   every call. A change to one resets the edge, as today: every key is
@@ -1063,8 +1065,11 @@ Where the implementation (`solera/errors.py`, `solera/build.py`,
 - **The value of a key** is what the upstream store hands out for it under
   `dict[str, T]`: for a rows upstream, its group — `file: list[dict]`, one
   row for a file inventory; for `keyed=True`, its value.
-- **An output a call omits, or returns as `None`,** holds nothing for that
-  key: the key is removed from it. `[]` is an empty group: a live key.
+- **An output a call omits, or returns as `None`,** is not changed for
+  that key (decision D7): its previous content stays. Removing the key from
+  an output is explicit, `Patch(None, remove=[ctx.key])`; a `Patch` that
+  writes rows or removes another key fails the call. `[]` is an empty
+  group: a live key.
 - **An output with nothing to write is left out of the commit;** an `Each`
   page whose keys all failed makes no head yet, and an `Each` asset skips
   without heads when nothing is pending.

@@ -258,9 +258,11 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
     durations: dict[str, float] = {}
     abort: list[BaseException] = []
 
-    def split(value) -> dict:
+    def split(key: str, value) -> dict:
         """One call's value per output: a bare value for a single output, or
-        `Result(outputs=…)`; an output it does not return holds nothing."""
+        `Result(outputs=…)`. An output it does not return, or returns as
+        `None`, is left as it is for this key; `Patch(None, remove=[key])`
+        removes the key from it (§5)."""
 
         if isinstance(value, Result):
             if value.cursor is not UNSET:
@@ -268,10 +270,17 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
             unknown = set(value.outputs) - set(decls)
             if unknown:
                 raise errors.Failed(f"returned undeclared output {sorted(unknown)[0]!r}")
-            return dict(value.outputs)
-        if len(decls) == 1:
-            return {next(iter(decls)): value}
-        raise errors.Failed("a multi-output Each asset returns Result(outputs={...})")
+            values = dict(value.outputs)
+        elif len(decls) == 1:
+            values = {next(iter(decls)): value}
+        else:
+            raise errors.Failed("a multi-output Each asset returns Result(outputs={...})")
+        for name, v in values.items():
+            if isinstance(v, Patch) and (v.rows or [str(k) for k in v.remove] != [key]):
+                raise errors.Failed(
+                    f"{name}: an Each call removes its own key, Patch(None, remove=[ctx.key]), nothing else"
+                )
+        return values
 
     async def one(key: str):
         version = page.upserted[key][0]
@@ -301,7 +310,7 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
                 value = await loop.run_in_executor(pool, functools.partial(asset.fn, **kwargs))
                 if inspect.isawaitable(value):
                     value = await value
-            outputs[key] = split(value)
+            outputs[key] = split(key, value)
             outcomes[key] = Outcome("ok", version)
         except asyncio.CancelledError:
             raise
@@ -356,10 +365,11 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
     removes = {name: {*page.deleted, *page.unmatched} for name in decls}
     for key, values in outputs.items():
         for name in decls:
-            if values.get(name) is None:
+            value = values.get(name)
+            if isinstance(value, Patch):  # an explicit removal of this key
                 removes[name].add(key)
-            else:
-                groups[name][key] = values[name]
+            elif value is not None:  # None, or not returned: no change for this key
+                groups[name][key] = value
     exists = {name for name, info in (spec.get("outputs") or {}).items() if info.get("exists")}
     values = {
         name: Patch(groups[name], remove=sorted(removes[name] - set(groups[name])))

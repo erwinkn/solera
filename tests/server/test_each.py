@@ -268,7 +268,7 @@ async def test_multi_output_result_and_keyed_values(state):  # noqa: F811
     )
     def parse(ctx, file: int):
         if ctx.key == "b":
-            return Result(outputs={"rows": [{"n": file}]})  # holds nothing in `meta`
+            return Result(outputs={"rows": [{"n": file}]})  # `meta` not returned: no change
         return Result(outputs={"rows": [{"n": file}], "meta": {"seen": file}})
 
     project = Project(assets=[files, parse])
@@ -574,3 +574,36 @@ async def test_a_rescope_pins_its_snapshot_between_attempts(state):  # noqa: F81
     del engine.m.watermarks[("parse", "file", "")]
     await engine.upkeep.collect()
     assert await state.get_object(path) is None
+
+
+async def test_none_is_no_change_and_removal_is_explicit(state):  # noqa: F811
+    """D7: an output an Each call returns as None (or omits) keeps its
+    previous content for that key; `Patch(None, remove=[ctx.key])` removes
+    the key; a Patch for anything else fails the call."""
+
+    from solera.stores import Patch
+
+    content = {"a": {"v": 1}, "b": {"v": 1}, "c": {"v": 1}}
+    mode = {"a": "rows", "b": "rows", "c": "rows"}
+
+    def parse(ctx, file: dict):
+        if mode[ctx.key] == "none":
+            return None
+        if mode[ctx.key] == "remove":
+            return Patch(None, remove=[ctx.key])
+        if mode[ctx.key] == "other":
+            return Patch(None, remove=["a"])
+        return [{"v": file["v"]}]
+
+    project = files_project(content, parse)
+    engine = make_engine(state, project)
+    await engine.initialize()
+    await drive(engine, await engine.submit(["parse"], upstream=True))
+    assert set(await rows_of(engine, project, "samples")) == {"a", "b", "c"}
+    for key in content:
+        content[key] = {"v": 2}
+    mode.update(a="none", b="remove", c="other")
+    await drive(engine, await engine.submit(["parse"], upstream=True))
+    got = await rows_of(engine, project, "samples")
+    assert {k: v[0]["v"] for k, v in got.items()} == {"a": 1, "c": 1}  # a unchanged, b removed, c kept
+    assert (await records(engine, "parse"))["c"].outcome == FAILED
