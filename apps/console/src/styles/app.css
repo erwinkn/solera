@@ -154,6 +154,7 @@
 }
 
 @utility card-title {
+  counter-increment: card;
   font-family: var(--card-title-font);
   font-size: var(--card-title-size);
   font-weight: var(--card-title-weight);
@@ -163,6 +164,12 @@
   text-transform: var(--card-title-case);
   font-variation-settings: var(--head-variation);
   line-height: 1.3;
+  /* A theme may number the cards of a page, like the sections of a spec. */
+  &::before {
+    content: var(--card-number);
+    color: var(--card-number-color);
+    font-variant-numeric: tabular-nums;
+  }
 }
 /* A card's header row: a theme may set it off as a title bar. */
 @utility card-head {
@@ -178,6 +185,7 @@
 }
 @utility label-font {
   font-family: var(--label-font);
+  font-stretch: var(--label-stretch);
   letter-spacing: var(--label-tracking);
 }
 @utility masthead {
@@ -263,6 +271,13 @@
   }
   button:disabled {
     cursor: default;
+  }
+  main {
+    counter-reset: card;
+  }
+  /* Every other row of a table, where a theme rules its ledger. */
+  tbody > tr:nth-child(even) {
+    background-color: var(--row-alt);
   }
 }
 
