@@ -446,6 +446,16 @@ attempt, so exactly one side wins (object-store-state.md §8). Outcomes:
 | `failed` | retryable → `retries=` applies with backoff; non-retryable (revision mismatch, version-mismatch without `on_version_change="full"`) → task fails |
 | `canceled` | run canceled before the attempt began writing; an attempt already writing is committed instead |
 
+**Errors in user code** are classified by the class they subclass
+(`solera.Rejected`, `Failed`, `Transient`, `Abort`), or by
+`Project(errors={ExceptionType: Class})` for types users cannot subclass;
+the first match along the error's method resolution order wins, and
+anything else is `Failed` (per-key-processing.md §8). For an attempt:
+`Rejected` fails the task without retries; `Failed` and `Abort` follow
+`retries=`; `Transient(retry_after=, retry_for=)` is retried after
+`retry_after`, else one minute doubling to six hours, past `retries=`,
+until `retry_for` (24 h by default) has passed since its first failure.
+
 A commit installs heads, `input_refs`, the cursor, per-edge watermarks and a
 `changed` list, and pends `OnChange` automations in the same transaction.
 Every terminal task outcome also records `{last_outcome, last_attempt, at}`
@@ -674,7 +684,8 @@ code.
  "delivered": {"qaqc_files": {"after": null, "upserted": ["f1"], "deleted": ["f0"]}},
  "cursor": "token-42"}
 {"status": "failed",
- "error": {"type": "ValueError", "message": "…", "traceback": "…", "retryable": true}}
+ "error": {"type": "Throttled", "message": "…", "traceback": "…", "retryable": true,
+           "class": "transient", "retry_after": 30.0, "retry_for": 7200.0}}
 ```
 
 The result is the attempt's commit request: per returned output its ref

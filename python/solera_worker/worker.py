@@ -30,7 +30,7 @@ import typing
 from pathlib import Path
 
 from obstore.exceptions import AlreadyExistsError
-from solera import lifecycle
+from solera import errors, lifecycle
 from solera.keys import Rows
 from solera.keys.index import DeltaFiles, FileInfo, IndexState, KeyIndex, key_bytes, key_str
 from solera.keys.io import ObjectIO, key_cache
@@ -812,16 +812,29 @@ async def _await_owner(objects, base: str, poll: float) -> None:
         await asyncio.sleep(poll)
 
 
-def _failed(error: BaseException, retryable: bool) -> dict:
-    return {
-        "status": "failed",
-        "error": {
-            "type": type(error).__name__,
-            "message": str(error),
-            "traceback": "".join(traceback.format_exception(error))[-32000:],
-            "retryable": retryable,
-        },
+def _failed(
+    error: BaseException, retryable: bool, kind: str | None = None, timing: dict | None = None
+) -> dict:
+    told = {
+        "type": type(error).__name__,
+        "message": str(error),
+        "traceback": "".join(traceback.format_exception(error))[-32000:],
+        "retryable": retryable,
     }
+    if kind is not None:
+        told["class"] = kind
+        told.update({k: v for k, v in (timing or {}).items() if v is not None})
+    return {"status": "failed", "error": told}
+
+
+def _user_failed(error: BaseException, project: Project) -> dict:
+    """A failure of user code, by the class it says it is
+    (docs/per-key-processing.md §8): `Rejected` is not retried; `Failed`
+    and `Abort` follow `retries=`; `Transient` is retried with its own
+    timing, which the engine applies."""
+
+    kind, timing = errors.classify(error, project.errors)
+    return _failed(error, kind != errors.REJECTED, kind, timing)
 
 
 PUBLISH_TRIES = 6
@@ -923,7 +936,7 @@ async def _execute(
     except StoreError as error:
         return _failed(error, getattr(error, "retryable", False))
     except Exception as error:
-        return _failed(error, True)
+        return _user_failed(error, project)
 
 
 async def _discard_due(spec, project, asset, objects, writes) -> dict:

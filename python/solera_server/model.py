@@ -644,7 +644,13 @@ class Model:
         elif outcome == "failed":
             failures = sum(1 for a in task["attempts"] if a["outcome"] == "failed")
             allowed = task["max_attempts"] * (1 + task.get("retried", 0))
-            if e.get("retryable") and failures < allowed:
+            transient = e.get("retry_for") is not None
+            if transient:
+                # A Transient error retries past `retries=`, for its `retry_for`
+                # from the first one (docs/per-key-processing.md §8).
+                since = task.setdefault("transient_since", at)
+                transient = at < since + float(e["retry_for"])
+            if e.get("retryable") and (failures < allowed or transient):
                 self._ready(run, task, at, float(e.get("delay") or 0))
             else:
                 task["status"] = "failed"

@@ -811,15 +811,22 @@ class Project:
         automations: list[Automation] | None = None,
         retention: Retention | None = None,
         key_cache: KeyCache | None = DEFAULT_KEY_CACHE,
+        errors: Mapping[type, type] | None = None,
         name: str = "default",
     ):
         """`default_store` holds every output that names no store: unless
         given, a FileStore. A FileStore without a path keeps its data in
         `.solera/data` next to the file that builds the project, or in
-        `$SOLERA_DATA`."""
+        `$SOLERA_DATA`. `errors` classifies exceptions user code cannot
+        subclass: `{httpx.TimeoutException: Transient}` (`solera.errors`)."""
 
+        from .errors import check_mapping
         from .stores import FileStore
 
+        try:
+            self.errors = check_mapping(errors)
+        except ValueError as error:
+            raise RegistrationError(str(error)) from None
         self.name = name
         self.retention = retention
         self.key_cache = key_cache

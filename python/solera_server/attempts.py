@@ -18,7 +18,7 @@ from collections import deque
 from dataclasses import dataclass, field
 
 from obstore.exceptions import AlreadyExistsError
-from solera import lifecycle
+from solera import errors, lifecycle
 from solera.lifecycle import Cancel, Ended
 
 from .state import LostOwnership
@@ -443,13 +443,15 @@ class Attempts:
             return
         if status == "failed":
             error = result.get("error") or {}
+            transient = error.get("class") == errors.TRANSIENT
             await self._fail(
                 task_id,
                 attempt,
                 f"{error.get('type', 'Error')}: {error.get('message', '')}",
                 retryable=bool(error.get("retryable")),
-                delay=self._retry_delay(task),
+                delay=self._transient_delay(task, error) if transient else self._retry_delay(task),
                 result=result,
+                retry_for=error.get("retry_for") if transient else None,
             )
             return
         try:
@@ -590,6 +592,7 @@ class Attempts:
         result=None,
         end=None,
         reason=None,
+        retry_for=None,
     ):
         """End a launched attempt without a commit. Its gate is taken as
         `aborted` first, so it can never write after this, and the gate
@@ -626,6 +629,7 @@ class Attempts:
             reason=reason,
             writes=writes,
             hold=hold,
+            retry_for=retry_for,
         )
         await self._discard(attempt, prepared, keep=set(unsettled))
 
@@ -644,6 +648,15 @@ class Attempts:
             prefix = f"{info['prefix']}{int(info['batch']):012d}-{attempt}"
             with contextlib.suppress(Exception):
                 await self.state.delete_objects(await self.state.list_objects(prefix))
+
+    def _transient_delay(self, task, error: dict) -> float:
+        """A `Transient` failure's wait (docs/per-key-processing.md §8):
+        its `retry_after`, else one minute doubling to six hours."""
+
+        if error.get("retry_after") is not None:
+            return float(error["retry_after"])
+        failures = sum(1 for a in task["attempts"] if a["outcome"] == "failed")
+        return errors.backoff(failures + 1)
 
     def _retry_delay(self, task) -> float:
         retry = task.get("retry") or {}

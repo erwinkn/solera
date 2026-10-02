@@ -629,6 +629,7 @@ class Engine(Attempts):
         reason=None,
         writes=None,
         hold=None,
+        retry_for=None,
     ):
         """End an attempt. `worker` is what its worker reported — its result,
         or its last heartbeat: the events it recorded and what it used. `end`
@@ -650,6 +651,8 @@ class Engine(Attempts):
             event["retryable"] = bool(retryable)
             if delay:
                 event["delay"] = float(delay)
+            if retry_for is not None:
+                event["retry_for"] = float(retry_for)
         if commit is not None:
             event["commit"] = commit
         if more:

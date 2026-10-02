@@ -1,3 +1,4 @@
+from .errors import Abort, Failed, Rejected, Transient
 from .executors import AWSECS, K8sJob, Local, Modal, Placement, Pool
 from .sdk import (
     KEYS,
@@ -50,6 +51,7 @@ from .stores import (
 
 __all__ = [
     "AWSECS",
+    "Abort",
     "AllPartitions",
     "Asset",
     "Automation",
@@ -58,6 +60,7 @@ __all__ = [
     "Changes",
     "Cron",
     "Every",
+    "Failed",
     "FileStore",
     "In",
     "Incremental",
@@ -78,6 +81,7 @@ __all__ = [
     "Pool",
     "Project",
     "Ref",
+    "Rejected",
     "RegistrationError",
     "Result",
     "Retention",
@@ -91,6 +95,7 @@ __all__ = [
     "StoreError",
     "TableRef",
     "TimePartitions",
+    "Transient",
     "UNSET",
     "WriteError",
     "Written",
