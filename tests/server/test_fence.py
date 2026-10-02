@@ -72,9 +72,9 @@ async def until(engine, done, timeout=10.0):
         await asyncio.sleep(0.02)
 
 
-async def finish_as_worker(state, run_id, attempt, output, invocation="w"):
+async def finish_as_worker(state, run_id, attempt, output, invocation="w", **extra):
     """What a worker does (docs/lifecycle.md §3): claim, take the gate, write,
-    then seal its result."""
+    then seal its result (with `extra` fields)."""
 
     base = state.attempt_path(run_id, attempt)
     with contextlib.suppress(AlreadyExistsError):
@@ -92,6 +92,7 @@ async def finish_as_worker(state, run_id, attempt, output, invocation="w"):
         "status": "succeeded",
         "writes": "complete",
         "outputs": {output: {"ref": {**ref, "meta": {}}}},
+        **extra,
     }
     await state.create_object(f"{base}.result", json.dumps(result).encode())
 
@@ -796,4 +797,39 @@ async def test_an_adopted_attempt_commits_under_the_contract_it_was_launched_wit
     assert detail["request"]["status"] == "succeeded"
     assert state.model.heads[("remote", "")]["version"] == "1"
     await engine.stop()
+    await state.close()
+
+
+async def test_a_malformed_worker_result_is_settled_without_its_bad_parts(tmp_path):
+    """Review round 3, B5: a worker's result carries a timeline event whose
+    time is not a number, and usage that is not either. The attempt is
+    settled from the rest; the model never parses what a worker sent."""
+
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = engine_for(state, REMOTE)
+    await engine.initialize()
+    run, attempt = await launched(engine, ["remote"])
+    events = [{"type": "imported", "at": "not-a-number"}, {"type": "computing", "at": state.clock()}]
+    await finish_as_worker(state, run["id"], attempt, "remote", events=events, usage={"cpu_seconds": "x"})
+    detail = await engine.run_until(run["id"], 10)
+    assert detail["request"]["status"] == "succeeded" and not state.poisoned
+    timeline = [e["type"] for e in await engine.history.events(run["id"])]
+    assert "computing" in timeline and "imported" not in timeline
+    await engine.stop()
+    await state.close()
+
+
+async def test_an_event_its_reducer_cannot_apply_poisons_the_state(tmp_path):
+    """Review round 3, B5: should a reducer raise half-way anyway, the model
+    is no longer the journal's: nothing more is recorded until a restart
+    replays it."""
+
+    from solera_server.state import Unavailable
+
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    with pytest.raises(Unavailable, match="restart to replay"):
+        state.record({"type": "NoSuchEvent"})  # no reducer applies it
+    assert state.poisoned
+    with pytest.raises(Unavailable):
+        state.record({"type": "WriterStarted", "writer": "x"})
     await state.close()

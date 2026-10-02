@@ -129,9 +129,11 @@ class State:
             clock=clock,
         )
 
+    broken: BaseException | None = None  # a reducer failed half-way: the model is not the journal's
+
     @property
     def poisoned(self) -> bool:
-        return self.journal.fenced
+        return self.journal.fenced or self.broken is not None
 
     def record(self, *events: dict, lazy: bool = False) -> None:
         """Apply events to the model now, and make them durable in the
@@ -145,9 +147,16 @@ class State:
 
         if self.journal.fenced:
             raise Unavailable("This writer was replaced; restart required")
+        if self.broken is not None:
+            raise Unavailable(f"State failed applying an event ({self.broken}); restart to replay the journal")
         encoded = [encode(event) for event in events]
         for data in encoded:
-            self.model.apply(json.loads(data))
+            try:
+                self.model.apply(json.loads(data))
+            except Exception as error:
+                # Applied in part, journaled not at all: nothing may build on it.
+                self.broken = error
+                raise Unavailable(f"State failed applying an event ({error}); restart to replay the journal") from error
         self.journal.append(*encoded, lazy=lazy)
         self.changed.set()
 

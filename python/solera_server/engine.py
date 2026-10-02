@@ -29,6 +29,7 @@ from zoneinfo import ZoneInfo
 
 from croniter import croniter
 from obstore.exceptions import AlreadyExistsError
+from solera import lifecycle
 from solera.failures import lower
 from solera.ids import ulid, ulid_time
 from solera.keys import Rows, SortedRun
@@ -46,7 +47,7 @@ from solera.keys.io import ObjectIO
 from solera.sdk import digest
 
 from . import history, planning
-from .attempts import POOL_OFFERED_GRACE, Attempts, Live
+from .attempts import POOL_OFFERED_GRACE, Attempts, Live, worker_report
 from .history import MAX_METADATA, History, RunFilter
 from .keyservice import KeyService, cache_root
 from .model import TERMINAL_RUN, commit_of, delta_reads
@@ -432,7 +433,12 @@ class Engine(Attempts, Sensors, Views):
             event["more"] = True
         if unsettled:
             event["unsettled"] = unsettled
-        if worker:
+        worker = worker_report(worker)  # values the model applies with no parsing
+        if keys is not None:
+            keys = worker_report({"keys": keys}).get("keys")
+        if writes not in (None, lifecycle.NONE, lifecycle.COMPLETE, lifecycle.UNCERTAIN):
+            writes = lifecycle.UNCERTAIN  # what a worker cannot say plainly is not known
+        if worker.get("events") or worker.get("usage"):
             event["worker"] = {k: worker[k] for k in ("events", "usage") if worker.get(k)}
         if end is not None:
             event["end"] = end

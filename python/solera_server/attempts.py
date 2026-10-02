@@ -46,6 +46,61 @@ async def _unless(stirred: asyncio.Event, work):
     return job.result() if not job.cancelled() else None
 
 
+def _number(value) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return float(value) if math.isfinite(value) else None
+
+
+def _names(value) -> dict[str, list[str]]:
+    if not isinstance(value, dict):
+        return {}
+    return {str(k): [str(i) for i in v] for k, v in value.items() if isinstance(v, list)}
+
+
+def worker_report(worker: dict | None) -> dict:
+    """What a worker's result or report may put in an event, as values the
+    model applies with no parsing (review round 3, B5): its timeline
+    events, its usage, the data garbage it discarded, and its keys by
+    outcome. A malformed part is left out; a worker cannot make a reducer
+    fail half-way."""
+
+    if not isinstance(worker, dict):
+        return {}
+    out = {}
+    events = []
+    for event in worker.get("events") or ():
+        if not isinstance(event, dict) or not isinstance(event.get("type"), str):
+            continue
+        at = _number(event.get("at"))
+        if at is None:
+            continue
+        kept = {"type": event["type"][:64], "at": at}
+        if isinstance(event.get("name"), str):
+            kept["name"] = event["name"][:200]
+        if isinstance(event.get("rows"), int) and not isinstance(event.get("rows"), bool):
+            kept["rows"] = event["rows"]
+        events.append(kept)
+    if events:
+        out["events"] = events
+    usage = worker.get("usage") if isinstance(worker.get("usage"), dict) else {}
+    usage = {k: _number(v) for k, v in usage.items() if isinstance(k, str)}
+    if usage := {k: v for k, v in usage.items() if v is not None}:
+        out["usage"] = usage
+    for name in ("discarded", "discard_unresolved"):
+        if found := _names(worker.get(name)):
+            out[name] = found
+    files = worker.get("discarded_files")
+    if isinstance(files, list) and (files := [str(f) for f in files]):
+        out["discarded_files"] = files
+    keys = worker.get("keys")
+    if isinstance(keys, dict) and (
+        keys := {str(k): int(v) for k, v in keys.items() if _number(v) is not None}
+    ):
+        out["keys"] = keys
+    return out
+
+
 @dataclass
 class Live:
     """What the engine knows of a launched attempt's worker, in memory only:
