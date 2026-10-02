@@ -1,10 +1,13 @@
 """A fenced SQL store in one page (docs/stores.md, "Recipe: a SQL table"):
 each output is a PostgreSQL table of JSON rows, one row per input row,
 with its key and batch alongside. `fence()` at the top of every write
-transaction, and as `acquire`, is all the fencing it needs; the
+transaction, and as `acquire`, is all the fencing it needs. Each call's
+transaction runs on a thread, off the worker's event loop. The
 conformance kit (`solera.testing.stores`) checks it like any store."""
 
 from __future__ import annotations
+
+import asyncio
 
 import psycopg
 from psycopg.types.json import Jsonb
@@ -39,11 +42,17 @@ class JsonTableStore:
         return conn, cur
 
     async def acquire(self, scope) -> None:
+        await asyncio.to_thread(self._acquire, scope)
+
+    def _acquire(self, scope) -> None:
         conn, cur = self._transaction(scope.output)
         with conn:
             fence(cur, scope, self._table(scope.output))
 
     async def store(self, write, prior, scope) -> Written:
+        return await asyncio.to_thread(self._store, write, prior, scope)
+
+    def _store(self, write, prior, scope) -> Written:
         out, table = scope.output, self._table(scope.output)
         conn, cur = self._transaction(out)
         with conn:
@@ -59,7 +68,7 @@ class JsonTableStore:
             write = KeyedWrite.of(self, write, out, prior)
             if write.whole:  # the scope's whole content: clear it first
                 cur.execute(f"DELETE FROM {table} WHERE part = %s", (scope.partition,))
-            async for page in write.pages():  # the keys to write: (key, version, rows)
+            for page in write.iter_pages():  # the keys to write: (key, version, rows)
                 keys = [k for k, _, _ in page]
                 if not write.whole:
                     cur.execute(
@@ -77,6 +86,9 @@ class JsonTableStore:
             return Written(Ref(out.name, "", {}, write.version(prior), scope.partition))
 
     async def load(self, ref, t, selection) -> list[dict]:
+        return await asyncio.to_thread(self._load, ref, selection)
+
+    def _load(self, ref, selection) -> list[dict]:
         sql, params = f'SELECT row FROM "rows_{ref.output}" WHERE part = %s', [ref.partition]
         if isinstance(selection, Keys):
             sql, params = sql + " AND k = ANY(%s)", [*params, sorted(selection.revisions)]

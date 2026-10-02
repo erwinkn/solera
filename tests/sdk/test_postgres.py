@@ -799,3 +799,48 @@ async def test_a_write_waits_on_a_thread_not_on_the_event_loop(store):
     await store.store(Sql("SELECT 'a'::text AS id, pg_sleep(0.4)::text AS slept"), None, scope(out))
     await ticking
     assert late[0] < 0.2, late
+
+
+async def test_a_repair_read_back_waits_off_the_event_loop(store, monkeypatch):
+    """After a failed Sql write, the store's rows are read back (`scan`) a
+    chunk at a time on a thread: a slow read leaves the event loop free."""
+
+    import asyncio
+    import time
+
+    from obstore.store import MemoryStore
+    from solera.keys.index import IndexState, KeyIndex
+    from solera.keys.io import ObjectIO
+    from solera_worker import worker
+
+    out = output(key="id")
+    rows = [{"id": "a", "x": 1}]
+    written = await store.store(rows, None, scope(out))
+    io = ObjectIO(MemoryStore())
+    state = IndexState(prefix="keys/")
+    files, _ = await KeyIndex(io, None, state).replace(prepare_for(store, rows, out).rows, 0, "w1")
+    state = state.committed(0, files, keep_log=True)
+    scan = store.scan
+
+    def slow(ref, output, skip=()):
+        time.sleep(0.4)  # a database that takes its time
+        yield from scan(ref, output, skip)
+
+    monkeypatch.setattr(store, "scan", slow)
+    patch = Patch([{"id": "b", "x": 2}])
+    o = worker._Out("t", out, store, {"batch": 1, "unsettled": [{"unknown": True}]}, written.ref, patch)
+    o.index = KeyIndex(io, None, state)
+    o.prepared = prepare_for(store, patch, out)
+    o.run = SortedRun.from_rows(o.prepared.rows)
+    late = []
+
+    async def tick():
+        start = time.perf_counter()
+        await asyncio.sleep(0.02)
+        late.append(time.perf_counter() - start)
+
+    ticking = asyncio.create_task(tick())
+    await asyncio.sleep(0)
+    await worker._reconcile(o, {"attempt": "w2", "generation": 2})
+    await ticking
+    assert late[0] < 0.2, late

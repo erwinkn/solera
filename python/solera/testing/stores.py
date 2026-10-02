@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -279,19 +278,13 @@ async def a_newer_writer_waits_for_an_open_older_one(h: Harness) -> None:
         return
     out, ledger = keyed(h), Ledger()
     first = await write(h, out, [{"id": "a", "v": "1"}], 5, ledger)
-    acquired = threading.Event()
-
-    def newer():  # a writer of its own, in another process as far as the store can tell
-        asyncio.run(h.store.acquire(scope(out, 9)))
-        acquired.set()
-
     async with h.hold(scope(out, 5)):
-        acquiring = threading.Thread(target=newer)
-        acquiring.start()
+        # A store's calls must not block the event loop: the older writer's
+        # transaction commits on this loop while the newer one waits.
+        acquiring = asyncio.create_task(h.store.acquire(scope(out, 9)))
         await asyncio.sleep(0.3)
-        assert not acquired.is_set(), "the newer acquisition did not wait for the open older writer"
-    assert await asyncio.to_thread(acquired.wait, 10)
-    acquiring.join()
+        assert not acquiring.done(), "the newer acquisition did not wait for the open older writer"
+    await asyncio.wait_for(acquiring, 10)
     with _refused():
         await write(h, out, [{"id": "a", "v": "0"}], 5, Ledger(), first)
 
