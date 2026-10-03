@@ -42,6 +42,8 @@ def put_varint(out: bytearray, n: int) -> None:
 def get_varint(buf, pos: int) -> tuple[int, int]:
     n = shift = 0
     while True:
+        if pos >= len(buf):
+            raise FormatError("truncated varint")
         b = buf[pos]
         pos += 1
         if shift >= 64 or (shift == 63 and b > 0x01):  # past a u64: as native refuses it
@@ -343,6 +345,8 @@ def parse_tail(tail, file_size: int) -> dict:
     parsed = []
     for _ in range(2):
         nbits, pos = get_varint(filters, pos)
+        if pos >= len(filters):
+            raise FormatError("truncated filters")
         k = filters[pos]
         pos += 1
         nbytes = nbits // 8

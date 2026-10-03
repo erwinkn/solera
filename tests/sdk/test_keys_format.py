@@ -4,6 +4,8 @@ extension against the pure-Python reference, each reading the other's files."""
 import random
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 from solera import _native
 
 from . import keys_reference as _python
@@ -470,3 +472,98 @@ def test_an_overlong_varint_is_refused_by_the_reference():
     assert _python.get_varint(b"\xff" * 9 + b"\x01", 0) == (2**64 - 1, 10)
     with pytest.raises(ValueError, match="too long"):
         _python.get_varint(b"\xff" * 9 + b"\x7f", 0)
+
+
+# -- the readers' varints and filters, native against the reference ------------------------
+# (what Kani once proved for small inputs: docs/verification.md, "Kani: tried, then dropped")
+
+
+def _generation_read(impl, varint: bytes):
+    """The generation a block entry with this varint reads as, or "refused"."""
+
+    try:
+        return impl.decode_block(b"\x00\x01a\x00" + varint, 0)[1][0]
+    except ValueError:
+        return "refused"
+
+
+def _leb128(data: bytes) -> int | None:
+    """The exact value of a varint that ends at its last byte, or None."""
+
+    if not data or data[-1] >= 0x80 or any(b < 0x80 for b in data[:-1]):
+        return None
+    return sum((b & 0x7F) << (7 * i) for i, b in enumerate(data))
+
+
+def _varint_edges():
+    for length in range(1, 12):
+        for fill in (0x80, 0xFF):  # continuation bytes holding all zeros, or all ones
+            for last in range(256):
+                yield bytes([fill] * (length - 1) + [last])
+    for fill in (0x80, 0xFF):  # every pattern of the ninth and tenth bytes
+        for ninth in range(256):
+            for tenth in range(256):
+                yield bytes([fill] * 8 + [ninth, tenth])
+
+
+def test_varints_read_alike_and_whole():
+    """F23's property, at every length from 1 to 11 bytes and every pattern
+    of the ninth and tenth bytes: native and the reference read the same
+    generation or both refuse, and what they read is the bytes' exact value,
+    below 2^64. (Before ab0c346 native read ff x 9, 7f as 2^64 - 1.)"""
+
+    for varint in _varint_edges():
+        native, reference = _generation_read(_native, varint), _generation_read(_python, varint)
+        assert native == reference, (varint.hex(), native, reference)
+        if native != "refused":
+            assert native == _leb128(varint) and native < 2**64, (varint.hex(), native)
+
+
+@pytest.mark.parametrize("writer,reader", CROSS)
+def test_generations_at_the_varint_edges_round_trip(writer, reader):
+    """Every u64 edge, written as a generation and a predecessor, reads back."""
+
+    edges = sorted(
+        {0, 2**64 - 1} | {2**k + d for k in range(64) for d in (-1, 0, 1) if 0 <= 2**k + d < 2**64}
+    )
+    keys = [f"k{i:03d}".encode() for i in range(len(edges))]
+    data = encode(writer, keys, edges, bytes(len(keys)), predecessors=edges[::-1], codec=0)
+    _, _, generations, _, _ = decode_all(reader, data)
+    assert generations == edges
+
+
+@settings(max_examples=300, deadline=None)
+@given(filters=st.binary(max_size=80), matching=st.booleans(), short=st.integers(0, 3))
+def test_filters_read_alike_whatever_they_hold(filters, matching, short):
+    """Any bytes where a file's filters go, with a checksum that matches or
+    not, and a length the footer may cut short: native and the reference
+    read the same filters, of exactly nbits / 8 bytes each, or both refuse.
+    (Any offsets are the kx-file fuzz target's, which makes the CRC match.)"""
+
+    import struct
+    import zlib
+
+    base = encode(_native, [b"a", b"b"], [1, 2], b"\x00\x01")
+    footer = bytearray(base[-_python.FOOTER_SIZE :])
+    f_at, i_at, i_len = (
+        struct.unpack_from("<Q", footer, 16)[0],
+        struct.unpack_from("<Q", footer, 28)[0],
+        struct.unpack_from("<I", footer, 36)[0],
+    )
+    region = filters + (struct.pack("<I", zlib.crc32(filters)) if matching else b"\x00\x00\x00\x00")
+    struct.pack_into("<I", footer, 24, max(0, len(region) - short))
+    struct.pack_into("<Q", footer, 28, f_at + len(region))
+    data = base[:f_at] + region + base[i_at : i_at + i_len] + bytes(footer)
+
+    def read(impl):
+        try:
+            tail = impl.parse_tail(data, len(data))
+        except ValueError:
+            return "refused"
+        return tail["key_filter"], tail["tomb_filter"]
+
+    native, reference = read(_native), read(_python)
+    assert native == reference
+    if native != "refused":
+        for nbits, _, bits in native:
+            assert len(bits) == nbits // 8
