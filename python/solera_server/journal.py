@@ -219,7 +219,7 @@ class Journal:
                 await self._behind(self.seq + 1)
                 raise JournalCorrupt(f"journal gap: expected segment {self.seq + 1}, found {seq}")
             body = await self._read_segment(seq)
-            self._apply_segment(seq, body, apply)
+            await self._apply_read(seq, body, apply)
             self._since_checkpoint += len(_dumps(body))
             count += 1
         return count
@@ -239,6 +239,41 @@ class Journal:
         if any(c >= seq for c in await self._list("checkpoints")):
             raise _Behind(seq)
 
+    async def _hole(self, seq: int) -> bool | None:
+        """The hole test for a fence segment at `seq` (docs/object-store-state.md
+        §10, "Fences in holes"): True if it was created in a hole cleanup left,
+        False if it is real, None if every listed checkpoint at or past it is
+        unreadable. Cleanup deletes a segment only once two checkpoints at or
+        past it exist and never deletes a fence, and every checkpoint written
+        after a real fence lists it: so fewer than two means real, and any one
+        readable checkpoint at or past `seq` decides. Never one below it."""
+
+        while True:
+            covering = [c for c in await self._list("checkpoints") if c >= seq]
+            if len(covering) < 2:
+                return False
+            gone = False
+            for c in reversed(covering):
+                try:
+                    fences = (await self._get_json(self._checkpoint(c)))["fences"]
+                except (NotFoundError, FileNotFoundError):  # cleaned up since the LIST: list again
+                    gone = True
+                    break
+                except (ValueError, KeyError, TypeError) as error:
+                    log.warning("checkpoint %s unreadable (%s); trying another for the hole test", c, error)
+                    continue
+                return seq not in fences
+            if not gone:
+                return None
+
+    async def _apply_read(self, seq: int, body: dict, apply) -> None:
+        """Apply a segment read from the journal — unless it is a fence created
+        in a hole: then this opener is behind, and opens again (F15)."""
+
+        if any(e["type"] == "EngineStarted" for e in body["events"]) and await self._hole(seq) is not False:
+            raise _Behind(seq)
+        self._apply_segment(seq, body, apply)
+
     async def _fence(self, apply) -> None:
         while True:
             seq = self.seq + 1
@@ -248,15 +283,20 @@ class Journal:
                 await create(self.store, self._segment(seq), _dumps(body))
             except AlreadyExistsError:
                 # Another writer appended since we listed: apply it and try the next seq.
-                self._apply_segment(seq, await self._read_segment(seq), apply)
+                await self._apply_read(seq, await self._read_segment(seq), apply)
                 continue
+            except (NotFoundError, FileNotFoundError):
+                # The create's read-back found the slot emptied by cleanup: behind.
+                raise _Behind(seq) from None
             try:
-                # Created where cleanup had deleted a segment of the writer still
-                # running: a fence it never sees, after events this one never read.
+                # A checkpoint at or past the fence: a newer writer replayed it (it
+                # stays, and this one opens again behind it, F14), or it landed in a
+                # hole cleanup left (it goes). Neither when that cannot be told.
                 await self._behind(seq)
             except _Behind:
-                with contextlib.suppress(NotFoundError):
-                    await obstore.delete_async(self.store, self._segment(seq))
+                if await self._hole(seq):
+                    with contextlib.suppress(NotFoundError):
+                        await obstore.delete_async(self.store, self._segment(seq))
                 raise
             apply(fence)
             self.seq = seq

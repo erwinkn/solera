@@ -299,7 +299,6 @@ def segment(seq):
     return f"{seq:020d}.json"
 
 
-@pytest.mark.xfail(strict=True, reason="journal spec F14: an opener deletes a fence a newer engine read")
 async def test_a_fence_a_newer_engine_moved_past_stays(tmp_path):
     """Journal spec finding F14 (docs/verification.md, "Journal spec"): B
     creates its fence at 2, which fences A. Before B checks for a hole, C
@@ -338,7 +337,6 @@ async def test_a_fence_a_newer_engine_moved_past_stays(tmp_path):
     assert again.counts.get("x", 0) == acknowledged
 
 
-@pytest.mark.xfail(strict=True, reason="journal spec F15: an opener replays a fence made in a hole")
 async def test_an_opener_never_replays_a_fence_created_in_a_hole(tmp_path):
     """Journal spec finding F15 (docs/verification.md, "Journal spec"): B
     replays segment 1 and is slow to fence; C loads no checkpoint and is
@@ -391,3 +389,71 @@ async def test_an_opener_never_replays_a_fence_created_in_a_hole(tmp_path):
     for j in (b, c):
         await j.close()
     assert sc.counts.get("x") == sa.counts["x"]
+
+
+def put_checkpoint(store, seq, fences, data=None):
+    body = {"seq": seq, "engine": 1, "at": 0, "fences": fences, "state": {}}
+    obstore.put(store, f"control/checkpoints/{seq:020d}.json", data or json.dumps(body).encode())
+
+
+async def test_the_hole_test_lists_again_when_its_checkpoint_is_gone(tmp_path):
+    """docs/object-store-state.md §10, step 3: the checkpoint the LIST showed
+    is cleaned up before its GET. The test lists again and decides from what
+    is there now — never from a checkpoint that is gone."""
+
+    store = LocalStore(str(tmp_path), mkdir=True)
+    put_checkpoint(store, 4, [1])
+    put_checkpoint(store, 5, [1])
+    j = Journal(store, "control")
+    get, calls = j._get_json, []
+
+    async def racing(path):
+        calls.append(path)
+        if len(calls) == 1:  # a newer checkpoint lands and cleanup deletes the one asked for
+            put_checkpoint(store, 6, [1])
+            obstore.delete(store, path)
+        return await get(path)
+
+    j._get_json = racing
+    assert await j._hole(3) is True  # 4 and 6 cover 3, and 6 does not list it
+    assert len(calls) == 2 and calls[1].endswith(f"{6:020d}.json")
+
+
+async def test_the_hole_test_reads_past_an_unreadable_checkpoint(tmp_path):
+    """§10, step 3: a checkpoint that cannot be parsed is passed over for
+    another at or past the fence; with none readable the test decides
+    nothing, so the fence is neither applied nor deleted."""
+
+    store = LocalStore(str(tmp_path), mkdir=True)
+    put_checkpoint(store, 4, [1, 3])
+    put_checkpoint(store, 5, [], data=b"not json")
+    j = Journal(store, "control")
+    assert await j._hole(3) is False  # 4 lists the fence at 3: real
+    put_checkpoint(store, 4, [], data=b"{")
+    assert await j._hole(3) is None
+    put_checkpoint(store, 2, [])  # below the fence: never asked
+    assert await j._hole(3) is None
+
+
+async def test_a_fence_whose_read_back_finds_nothing_opens_again(tmp_path, monkeypatch):
+    """create()'s read-back may find the slot it collided in deleted by
+    cleanup: the opener is behind, and opens again rather than failing."""
+
+    from solera_server import journal as module
+
+    store = LocalStore(str(tmp_path), mkdir=True)
+    a, sa, _ = await open_journal(store)
+    await add(a, sa, "x")
+    await a.close()
+    real, tries = module.create, []
+
+    async def flaky(*args, **kw):
+        tries.append(1)
+        if len(tries) == 1:
+            raise obstore.exceptions.NotFoundError("read back: gone")
+        return await real(*args, **kw)
+
+    monkeypatch.setattr(module, "create", flaky)
+    b, sb, _ = await open_journal(store)
+    await b.close()
+    assert sb.counts["x"] == 1 and len(tries) >= 2

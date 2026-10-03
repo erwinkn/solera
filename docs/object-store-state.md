@@ -838,9 +838,9 @@ past it exists was written, then deleted: cleanup deletes nothing a
 checkpoint does not cover. The new writer opens again from the newer
 checkpoint.
 
-**Fences in holes.** *To build: findings F14 and F15
-(`verification.md`, "Formal model: the journal"); the journal spec checks
-this rule.* A fence create can also land in such a hole, and until it is
+**Fences in holes.** *Findings F14 and F15 (`verification.md`, "Formal
+model: the journal"); the journal spec checks this rule, and
+`Journal._hole` is it.* A fence create can also land in such a hole, and until it is
 deleted another opener can read that fence in place of the event cleanup
 removed. A checkpoint at or past the fence does not tell the two apart:
 it may be a newer writer's that replayed a real fence and moved past it.
