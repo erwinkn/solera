@@ -17,7 +17,6 @@ import tempfile
 import traceback
 from pathlib import Path
 
-from hypothesis import assume
 from hypothesis import strategies as st
 from hypothesis.stateful import RuleBasedStateMachine, initialize, invariant, precondition, rule
 from solera.keys.index import Options
@@ -47,7 +46,6 @@ STATS = {
     "steps": 0,
     "virtual": 0.0,
     "seconds": 0.0,
-    "known": {},
 }  # across runs of this process
 
 KEYS = ["k0", "k1", "k2", "k3", "k10", "k11"]
@@ -65,11 +63,7 @@ TERMINAL = {"succeeded", "failed", "canceled", "skipped"}
 # of the simulation's index files, or for none of them.
 CACHE = {None: None, "tight": (6 * 1024, 2 * 1024), "starved": (2 * 1024, 512)}
 STORES = ["file", "table"] + (["pg"] if postgres.DSN else [])  # where `items` lives
-# Re-registrations the rules make. Those that trip an open finding on most
-# runs are left out until it is fixed (tests/server/test_sim_found.py);
-# SOLERA_SIM_KNOWN=1 puts them back.
-KNOWN: dict[str, str] = {}
-CHANGES = sorted(set(VARIANTS) - (set() if os.environ.get("SOLERA_SIM_KNOWN") else set(KNOWN)))
+CHANGES = sorted(VARIANTS)  # re-registrations the rules make
 
 
 fates = st.one_of(
@@ -175,16 +169,6 @@ class Simulation(RuleBasedStateMachine):
                 raise
             self.trace.append(f"  # {what} failed: {type(error).__name__}: {str(error)[:120]}")
             return None
-
-    def _known(self, finding: str, detail: str) -> None:
-        """An open finding struck (tests/server/test_sim_found.py): the run
-        is set aside, unless SOLERA_SIM_KNOWN asks to see it fail."""
-
-        self.trace.append(f"  # known {finding}: {detail}")
-        STATS["known"][finding] = STATS["known"].get(finding, 0) + 1
-        if os.environ.get("SOLERA_SIM_KNOWN"):
-            raise Violation(f"{finding}: {detail}")
-        assume(False)
 
     # -- clients ------------------------------------------------------------------------
 

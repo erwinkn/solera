@@ -1,16 +1,9 @@
 """Simulation runs that found a bug, replayed step for step: each a strict
 xfail while its finding is open (docs/verification.md, "Findings"), an
-ordinary test once fixed. Open findings are not set aside here."""
-
-import pytest
+ordinary test once fixed."""
 
 from .machine import Simulation
 from .world import Fate
-
-
-@pytest.fixture(autouse=True)
-def unmasked(monkeypatch):
-    monkeypatch.setenv("SOLERA_SIM_KNOWN", "1")
 
 
 def test_f9_a_key_dropped_by_a_moved_output_leaves_its_consumers():

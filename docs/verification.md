@@ -134,7 +134,6 @@ uv run pytest tests/sim -q                       # the CI budget: 20 runs, about
 SOLERA_TEST_DATABASE_URL=postgresql://… uv run pytest tests/sim -q   # items may also live in Postgres
 uv run pytest tests/sim -q --slow                # 400 runs with shrinking: tens of minutes
 SOLERA_SIM_EXAMPLES=2000 SOLERA_SIM_STEPS=60 uv run pytest tests/sim -q --slow
-SOLERA_SIM_KNOWN=1 uv run pytest tests/sim -q    # do not set open findings aside
 SOLERA_SIM_TRACE=1 uv run pytest tests/sim -q -s # print every run's trace
 ```
 
@@ -142,13 +141,12 @@ The CI budget is derandomized: the same runs every time. `--slow` draws new
 ones on every worker and reports throughput, e.g. `simulation: 400 runs,
 15,880 steps, 61.2 h virtual in 8.5 min (112,000 steps/hour)`.
 
-**Open findings are set aside.** A run that trips a finding still open (its
-signature is recognized in `machine.py`, `_known`) is set aside rather than
-failed, and counted, so the simulation keeps looking for new bugs; a
-re-registration that would trip one on almost every run is left out until
-its fix (`KNOWN`). None today.
-A signature is coarser than its bug and can hide another; each goes with its
-fix. `SOLERA_SIM_KNOWN=1` puts all of it back.
+**An open finding fails runs like any other bug.** It gets a strict-xfail
+replay (`test_replays.py`) or engine-level test. If it trips most runs while
+its fix is pending, `machine.py` may discard the runs it matches
+(`assume(False)` on its signature) so the sweeps can look past it. That
+check lands with the finding and leaves with the fix. A signature is
+coarser than its bug and can hide another. None is set aside today.
 
 ## Reading a failure
 

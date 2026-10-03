@@ -19,5 +19,4 @@ def pytest_terminal_summary(terminalreporter):
     terminalreporter.write_line(
         f"simulation: {STATS['examples']} runs, {STATS['steps']} steps, "
         f"{STATS['virtual'] / 3600:.1f} h virtual in {hours * 60:.1f} min{rate}"
-        + (f"; set aside as known findings: {STATS['known']}" if STATS["known"] else "")
     )
