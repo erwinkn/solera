@@ -1418,7 +1418,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
                 pin["patterns"] = position["patterns"]
             return (
                 pin,
-                {"kind": "held", "position": position, "each": {"kind": "reconcile", "batch": changes}},
+                {"kind": "held", "position": position, "each": {"kind": "reconcile", "changes": changes}},
                 False,
             )
         if kind == "retry":
@@ -1443,7 +1443,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
             plan = {
                 "kind": "held",
                 "position": position,
-                "each": {"kind": "retry", "pass": retry, "batch": changes},
+                "each": {"kind": "retry", "pass": retry, "changes": changes},
             }
             return pin, plan, False
         pin = {**pin, "each": each}
@@ -1505,7 +1505,8 @@ class Engine(Attempts, Sensors, Staleness, Views):
             if after is None:  # the pass is complete: its accumulators are the exact bounds
                 due, deploy_min = retry["due_acc"], retry["deploy_acc"]
                 commit.update({"passes": retry["pass"], "done_forced": retry["forced_at"], "retry": None})
-                more = bool(batch.get("changes")) or forced_after
+                # A pass of changes under way, or pending, is never dropped (F31).
+                more = bool(batch.get("changes")) or forced_after or outstanding(plan.get("position") or {})
             else:
                 commit["retry"] = {**retry, "after": after}
                 more = True
