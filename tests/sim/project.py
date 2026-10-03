@@ -43,7 +43,7 @@ from solera.sdk import (
     job,
     sensor,
 )
-from solera.stores import FileStore, Keys, Patch
+from solera.stores import MISSING, FileStore, Keys, Patch, by_key_type
 
 from .stores import Database, TableStore
 
@@ -115,9 +115,12 @@ class SourceStore(FileStore):
 
     async def load(self, ref, t, selection):
         current = self.outside.feed if ref.output == "feed" else self.outside.keys
+        rows = []
         if isinstance(selection, Keys):
-            return [{"id": k, "v": current[k]} for k in sorted(selection.generations) if k in current]
-        return []
+            rows = [{"id": k, "v": current[k]} for k in sorted(selection.generations) if k in current]
+        if by_key_type(t) is not MISSING:  # dict[str, T]: each key's rows (an Each page)
+            return {r["id"]: [r] for r in rows}
+        return rows
 
 
 def rebuild(changes, rows: list[dict]):

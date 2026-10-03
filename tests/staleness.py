@@ -38,6 +38,8 @@ that use this module are strict xfails or off):
 - A plain incremental partition is stale while some change past its
   snapshot, under the patterns, is covered by no entry, or while a full
   pass is due and unfinished; its keys share the partition's answer.
+- "Changed" is the net delta: a key added and removed again past a read,
+  or updated and reverted, has not changed.
 - Staleness is transitive (K46): a unit is also stale when an upstream unit
   it depends on is. Each stale status says why: "input changed", "upstream
   stale", "definition changed", one or more.
@@ -175,7 +177,8 @@ class ByPartition:
 
 
 class Reference:
-    """`feed` (a keyed source) -> `items` (plain incremental, run by hand) ->
+    """`feed` (a keyed source, its keys versioned) -> `items` (plain
+    incremental, run by hand) and `fchecks` (each=True); `items` ->
     `checks` (each=True, with the source `knob` a dep), `copy` (plain
     incremental, keyed) and `count` (plain incremental, unkeyed). What
     K43–K46 say of each after any history of feed commits, runs of `items`,
@@ -185,10 +188,14 @@ class Reference:
     def __init__(self, takes: Callable[[str], bool] = everything, cap: int = 10_000):
         self.cap = cap  # keys= runs a plain incremental partition takes between default runs
         self.now = 0
-        self.feed: dict[str, int] = {}
-        self.unread: set[str] = set()  # feed keys changed since `items` last ran
-        self.up: dict[str, int] = {}  # `items`: key -> the counter of its write
+        self.feed: dict[str, str] = {}  # key -> its version
+        self.feed_read: dict[str, str] = {}  # `feed` as `items` last read it
+        self.up: dict[str, int] = {}  # `items`: key -> the counter of its write (its generation)
         self.changed: dict[str, int] = {}  # `items` key -> the counter of its last change, a removal too
+        self.history: dict[
+            str, list[tuple[int, int | None]]
+        ] = {}  # `items` key -> (when, generation or None)
+        self.fchecks = EachAsset()  # each=True over `feed`: held = key -> (version read, written)
         self.last_commit = 0  # `items`' newest commit
         self.knob = 0
         self.checks = EachAsset(takes=takes)
@@ -200,29 +207,42 @@ class Reference:
 
     # history
 
-    def commit_feed(self, upserts: set[str], removes: set[str]) -> None:
+    def commit_feed(self, upserts: set[str] | dict[str, str], removes: set[str]) -> None:
+        """Upserts at the versions given, or at fresh ones (a set)."""
+
         t = self._tick()
-        removes = {k for k in removes - upserts if k in self.feed}
-        for k in upserts:
-            self.feed[k] = t
-        for k in removes:
-            del self.feed[k]
-        self.unread |= upserts | removes
+        versions = upserts if isinstance(upserts, dict) else dict.fromkeys(upserts, f"v{t}")
+        for k in removes - set(versions):
+            self.feed.pop(k, None)
+        self.feed.update(versions)
+
+    def _write(self, k: str, generation: int | None, t: int) -> None:
+        if generation is None:
+            self.up.pop(k, None)
+        else:
+            self.up[k] = generation
+        self.changed[k] = t
+        self.history.setdefault(k, []).append((t, generation))
+        self.last_commit = t
 
     def run_items(self) -> None:
-        """`items` reads what `feed` changed, and commits it."""
+        """`items` reads the net delta of `feed` since it last read it."""
 
         t = self._tick()
-        for k in self.unread:
-            if k in self.feed:
-                self.up[k] = t
-            elif k in self.up:
-                del self.up[k]
-            else:
-                continue
-            self.changed[k] = t
-            self.last_commit = t
-        self.unread = set()
+        for k in sorted(set(self.feed) | set(self.feed_read)):
+            if self.feed.get(k) != self.feed_read.get(k):
+                self._write(k, t if k in self.feed else None, t)
+        self.feed_read = dict(self.feed)
+
+    def _at(self, k: str, when: int | None) -> int | None:
+        """`items`' key `k` as of counter `when`: its generation, or None."""
+
+        state = None
+        for at, generation in self.history.get(k, ()):
+            if when is not None and at > when:
+                break
+            state = generation
+        return state
 
     def commit(self, upserts: set[str], removes: set[str]) -> None:
         """A feed commit, and the run of `items` that takes it."""
@@ -235,11 +255,9 @@ class Reference:
         its consumers owe a full pass."""
 
         t = self._tick()
-        for k in set(self.up) - set(self.feed):
-            self.changed[k] = t
-        self.up = dict.fromkeys(self.feed, t)
-        self.changed.update(dict.fromkeys(self.up, t))
-        self.last_commit, self.unread = t, set()
+        for k in sorted(set(self.up) | set(self.feed)):
+            self._write(k, t if k in self.feed else None, t)
+        self.feed_read = dict(self.feed)
         for o in self.others.values():
             self._owe_a_pass(o, INPUT)
 
@@ -332,14 +350,35 @@ class Reference:
             present = {k for k in self.up if o.takes(k) and o.passed.get(k) != self.changed[k]}
             gone = {k for k, v in o.passed.items() if k not in self.up and v != self.changed[k]}
             return present | gone
-        return {
+        return {  # the net delta: a key back where it was at the snapshot has not changed
             k
             for k, t in self.changed.items()
-            if t > o.snapshot and o.takes(k) and not any(k in named and at >= t for at, named in o.entries)
+            if o.takes(k)
+            and self._at(k, o.snapshot) != self.up.get(k)
+            and not any(k in named and at >= t for at, named in o.entries)
         }
 
     def items_stale(self) -> bool:
-        return bool(self.unread)
+        return self.feed != self.feed_read  # the net delta
+
+    def run_fchecks(self, keys: set[str] | None = None) -> None:
+        """A run of `fchecks`, each=True over `feed`: every key (default), or
+        the named ones (keys=), made to match `feed`."""
+
+        t = self._tick()
+        f = self.fchecks
+        f.built = True
+        for k in set(self.feed) | set(f.held) if keys is None else keys:
+            if k in self.feed:
+                f.held[k] = (self.feed[k], t)
+            else:
+                f.held.pop(k, None)
+
+    def fchecks_stale_keys(self) -> set[str]:
+        f = self.fchecks
+        return {
+            k for k in set(self.feed) | set(f.held) if k not in f.held or f.held[k][0] != self.feed.get(k)
+        }
 
     def direct_stale_keys(self) -> dict[str, set[str]]:
         """`checks`' stale keys by its own inputs, with why."""
@@ -382,6 +421,8 @@ class Reference:
 
         if name == "items":
             return {INPUT} if self.items_stale() else set()
+        if name == "fchecks":
+            return {INPUT} if self.fchecks.built and self.fchecks_stale_keys() else set()
         if name == "checks":
             if not self.checks.built:
                 return set()  # never built: `missing`, not `stale`

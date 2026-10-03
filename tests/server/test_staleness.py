@@ -89,10 +89,14 @@ def project(
         before = 0 if changes.full and changes.first else (ctx.load() or {"rows": 0})["rows"]
         return {"rows": before + len(changes.added) - len(changes.removed)}
 
+    @asset(inputs={"row": Each("feed")}, outputs=Output("fchecks", key="id"))
+    async def fchecks(ctx, row: list):
+        return [{"v": row[0]["v"]}]
+
     outside.delivered = getattr(outside, "delivered", set())
     outside.started_over = getattr(outside, "started_over", False)
     return Project(
-        assets=[items, checks, copy, count, tally],
+        assets=[items, checks, copy, count, tally, fchecks],
         sources=[Source("feed", key="id", store="ext"), Source("knob")],
         stores={
             "ext": SourceStore(root / "ext", outside),
@@ -108,7 +112,7 @@ async def boot(engine, outside: External, keys: dict[str, str]):
 
     outside.feed.update(keys)
     await engine.commit_source("knob", version="0")
-    await engine.commit_source("feed", upsert=sorted(keys))
+    await engine.commit_source("feed", upsert=dict(keys))  # versioned: a revert is no change
     await drive(engine, await engine.submit(["items"]))
 
 
@@ -143,7 +147,7 @@ class Staleness(RuleBasedStateMachine):
         self._deploy()
         self._run(boot(self.engine, self.outside, {"k1": "0", "k2": "0"}))
         self.ref.change_knob()
-        self.ref.commit({"k1", "k2"}, set())
+        self.ref.commit({"k1": "0", "k2": "0"}, set())
 
     def _deploy(self):
         async def go():
@@ -164,16 +168,25 @@ class Staleness(RuleBasedStateMachine):
 
     # -- history ----------------------------------------------------------------------
 
-    @rule(upserts=st.sets(st.sampled_from(KEYS)), removes=st.sets(st.sampled_from(KEYS), max_size=2))
+    @rule(
+        upserts=st.dictionaries(st.sampled_from(KEYS), st.sampled_from(["1", "2"])),
+        removes=st.sets(st.sampled_from(KEYS), max_size=2),
+    )
     def commit_feed(self, upserts, removes):
-        removes -= upserts
-        self.serial += 1
-        for k in upserts:
-            self.outside.feed[k] = str(self.serial)
+        """Two versions a key moves between: updates revert, removals come
+        back, and the net delta decides what changed."""
+
+        removes -= set(upserts)
+        self.outside.feed.update(upserts)
         for k in removes:
             self.outside.feed.pop(k, None)
-        self._run(self.engine.commit_source("feed", upsert=sorted(upserts), remove=sorted(removes)))
-        self.ref.commit_feed(upserts, removes)
+        self._run(self.engine.commit_source("feed", upsert=dict(upserts), remove=sorted(removes)))
+        self.ref.commit_feed(dict(upserts), removes)
+
+    @rule(keys=st.one_of(st.none(), st.sets(st.sampled_from(KEYS), min_size=1)))
+    def run_fchecks(self, keys):
+        self._submit(["fchecks"], keys=keys and {"feed": {"keys": sorted(keys)}})
+        self.ref.run_fchecks(keys)
 
     @rule()
     def run_items(self):
@@ -255,7 +268,12 @@ class Staleness(RuleBasedStateMachine):
             got = await staleness.stale_keys(e, "copy")
             assert got == ref.stale_keys_of("copy"), f"copy's stale keys {got}: all its keys or none"
             assert await staleness.stale_keys(e, "count") is None, "count has no keys"
-            for name in ("items", "checks", "copy", "count"):
+            if ref.fchecks.built:
+                got = await staleness.stale_keys(e, "fchecks")
+                assert got == ref.fchecks_stale_keys(), (
+                    f"fchecks' stale keys {got}, not {ref.fchecks_stale_keys()}"
+                )
+            for name in ("items", "fchecks", "checks", "copy", "count"):
                 want = ref.stale(name)
                 assert await staleness.partition_stale(e, name) == want, f"{name}: partition stale != {want}"
                 assert await staleness.asset_stale(e, name) == want, f"{name}: asset stale != {want}"
@@ -571,6 +589,46 @@ async def test_a_stale_status_carries_every_reason_that_holds(state, tmp_path):
     assert await staleness.stale_reasons(engine, "copy") == {staleness.DEFINITION, staleness.UPSTREAM}
 
 
+@pending
+async def test_a_key_added_and_removed_past_the_read_changes_nothing(state, tmp_path):
+    """The net delta, through `items`: k4 is added and removed again past
+    what `copy`, `count` and `checks` read. None of them is stale, and a
+    default run of `copy` delivers nothing."""
+
+    engine, outside = await _built(state, tmp_path, {"k1": "1", "k2": "1"})
+    for change in ({"upsert": {"k4": "1"}}, {"remove": ["k4"]}):
+        outside.feed.update(change.get("upsert", {}))
+        outside.feed.pop("k4", None) if "remove" in change else None
+        await engine.commit_source("feed", **change)
+        await drive(engine, await engine.submit(["items"]))
+    for name in ("checks", "copy", "count"):
+        assert not await staleness.partition_stale(engine, name), name
+    assert await staleness.stale_keys(engine, "checks") == set()
+    outside.delivered.clear()
+    await drive(engine, await engine.submit(["copy"]))
+    assert outside.delivered == set()
+
+
+@pending
+async def test_a_key_updated_and_reverted_changes_nothing(state, tmp_path):
+    """The net delta, at a versioned source: `feed`'s k1 goes from version 1
+    to 2 and back to 1 before anyone reads it. Neither `items` (plain
+    incremental) nor `fchecks` (each=True) is stale, and `items`' next run
+    writes nothing."""
+
+    engine, outside = await _built(state, tmp_path, {"k1": "1", "k2": "1"})
+    await drive(engine, await engine.submit(["fchecks"]))
+    for version in ("2", "1"):
+        outside.feed["k1"] = version
+        await engine.commit_source("feed", upsert={"k1": version})
+    assert not await staleness.partition_stale(engine, "items")
+    assert not await staleness.partition_stale(engine, "fchecks")
+    assert await staleness.stale_keys(engine, "fchecks") == set()
+    before = await index_entries(state, "items", "")
+    await drive(engine, await engine.submit(["items"]))
+    assert await index_entries(state, "items", "") == before
+
+
 def test_the_reference_reads_the_worked_examples():
     """The reference itself on the examples above: what the tests hold the
     engine to."""
@@ -647,6 +705,22 @@ def test_the_reference_reads_the_worked_examples():
     assert ref.reasons("copy") == {DEF, UP}
     ref.run_items()
     assert ref.reasons("copy") == {DEF} and ref.reasons("count") == {IN}
+
+    net = staleness.Reference(takes=taken)  # the net delta
+    net.change_knob()
+    net.commit({"k1": "1", "k2": "1"}, set())
+    for name in ("checks", "copy", "count"):
+        net.run_default(name)
+    net.run_fchecks()
+    net.commit({"k4": "1"}, set())
+    net.commit(set(), {"k4"})  # added and removed past the reads
+    assert not any(net.stale(n) for n in ("checks", "copy", "count"))
+    assert net.run_default("copy") == (set(), False)
+    net.commit_feed({"k1": "2"}, set())
+    net.commit_feed({"k1": "1"}, set())  # updated and reverted
+    assert not net.stale("items") and not net.stale("fchecks")
+    net.commit_feed({"k1": "2"}, set())
+    assert net.reasons("items") == {IN} and net.fchecks_stale_keys() == {"k1"}
 
     capped = staleness.Reference(takes=taken, cap=2)  # the cap counts keys= runs
     capped.commit({"k1"}, set())
