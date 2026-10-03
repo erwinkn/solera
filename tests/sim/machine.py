@@ -47,7 +47,6 @@ STORES = ["file", "table"] + (["pg"] if postgres.DSN else [])  # where `items` l
 # runs are left out until it is fixed (tests/server/test_sim_found.py);
 # SOLERA_SIM_KNOWN=1 puts them back.
 KNOWN = {
-    "table": "a consumer keeps a key its upstream dropped when it moved store (F9)",
     "exclude": "a reset delivery its patterns take nothing from never starts the consumer over (F10)",
 }
 CHANGES = sorted(set(VARIANTS) - (set() if os.environ.get("SOLERA_SIM_KNOWN") else set(KNOWN)))

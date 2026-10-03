@@ -5,7 +5,7 @@ import asyncio
 
 import pytest
 from solera.sdk import Incremental, Output, Project, asset
-from solera.stores import FileStore
+from solera.stores import FileStore, Patch
 
 from ..conftest import whole
 from .test_engine import drive, make_engine, state, status_of  # noqa: F401
@@ -342,3 +342,49 @@ async def test_a_name_removed_and_added_back_starts_over(state):  # noqa: F811
     assert ("copy", "") not in m.heads
     assert m.heads[("mirror", "")]["ref"]["generation"] == copied  # copy's state, not the first life
 
+
+async def test_a_key_a_moved_output_dropped_leaves_its_consumer(state, tmp_path):  # noqa: F811
+    """F9: a keyed output moved to another store starts its index over, and
+    the move's first write holds only upserts. `copy`, planned under the new
+    project but against the old index, commits its delivery after the move
+    landed: its watermark then reaches the move's batch, and the move must
+    not be read as a plain delta — `k11`, which the move dropped, goes."""
+
+    rows = {"items": [{"id": "k10"}, {"id": "k11"}]}
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    def project(store):
+        @asset(outputs=Output("items", key="id", store=store))
+        def items():
+            return rows["items"]
+
+        @asset(outputs=Output("copy", key="id"), inputs={"items": Incremental()})
+        async def copy(ctx, items: list):
+            if store is not None and not entered.is_set():  # hold until the move landed
+                entered.set()
+                await release.wait()
+            changes = ctx.changes["items"]
+            return items if changes.full else Patch(items, remove=changes.deleted)
+
+        return Project(assets=[items, copy], stores={"other": FileStore(tmp_path / "other")})
+
+    engine = make_engine(state, project(None))
+    await engine.initialize()
+    assert status_of(await drive(engine, await engine.submit(["copy"], upstream=True))) == "succeeded"
+    rows["items"] = [{"id": "k10"}, {"id": "k11"}, {"id": "k12"}]
+    assert status_of(await drive(engine, await engine.submit(["items"]))) == "succeeded"
+    await engine.stop()
+
+    engine = make_engine(state, project("other"))
+    await engine.initialize()
+    held = await engine.submit(["copy"])  # planned against the old index
+    while not entered.is_set():
+        await engine.tick()
+        await asyncio.sleep(0.01)
+    rows["items"] = [{"id": "k10"}, {"id": "k12"}]  # the move drops k11
+    assert status_of(await drive(engine, await engine.submit(["items"]))) == "succeeded"
+    assert state.model.heads[("items", "")]["ref"]["store"] == "other"
+    release.set()
+    assert status_of(await drive(engine, held)) == "succeeded"
+    assert status_of(await drive(engine, await engine.submit(["copy"]))) == "succeeded"
+    assert sorted((await engine.list_keys("copy"))["keys"]) == ["k10", "k12"]

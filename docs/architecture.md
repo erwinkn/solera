@@ -447,7 +447,8 @@ generation)` files (object-store-state.md §6): the harness resolves each
 write against it, skips the store entirely when the write changes nothing
 (an empty patch, a set listed again), and otherwise writes the keys it
 writes and removes, at the attempt's generation, as the batch's delta file. An unkeyed output's batches
-are its store's; `head.base` is the first batch after its last reset. The
+are its store's; `head.base` is the first batch after its last reset (for a
+keyed output, its last move to another store, which starts its index over). The
 engine keeps a per-edge **watermark** — the consumer's position: `next`,
 the first upstream batch not yet delivered, and while a delivery is under
 way, `delivery` `{mode, from, to, at, page, pages}`: `full` or `delta`, its

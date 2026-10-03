@@ -981,6 +981,13 @@ class Engine(Attempts, Sensors, Views):
         if not reset and not keyed:
             under_way = wm.get("delivery")
             reset = int(under_way["from"]) < first if under_way else int(wm["next"]) <= first
+        elif not reset and first:
+            # A keyed upstream that moved store started its index over at `base`, the
+            # move's batch, whose delta holds only upserts: a delivery begun at or
+            # before it — planned against the old index — starts over (F9).
+            under_way = wm.get("delivery") or {}
+            start = under_way.get("from", wm.get("next"))
+            reset = start is not None and int(start) <= first
         carried = {
             "kind": "keys" if keyed else "batches",
             "output": output,
@@ -1415,6 +1422,12 @@ class Engine(Attempts, Sensors, Views):
                     if delta["files"] or moved(info):
                         head["batch"] = int(info["batch"])
                     keys[name] = {**delta, "batch": head["batch"]}
+                # A move starts the index over at its batch, as a reset starts a batch
+                # output over: no delivery begun before it reads it as a delta (F9).
+                if moved(info):
+                    head["base"] = head["batch"]
+                elif (before or {}).get("base"):
+                    head["base"] = before["base"]
                 if "elements" in info:
                     head["elements"] = entry.get("elements", info["elements"])
             elif decl.get("incremental"):
