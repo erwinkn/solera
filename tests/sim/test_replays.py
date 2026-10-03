@@ -230,10 +230,6 @@ def test_f11_a_discard_entrys_delta_outlives_the_attempt_reading_it():
     state.teardown()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="F12: renames back and forth over rolling deploys leave a consumer a key deleted meanwhile",
-)
 def test_f12_a_rename_back_and_forth_over_rolling_deploys_keeps_up():
     """`copy` renamed to `mirror` and back over rolling deploys (the old
     engine runs on a minute): `mirror` ends holding `k1`, which `items`

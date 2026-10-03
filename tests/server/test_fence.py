@@ -942,7 +942,9 @@ async def test_an_adopted_attempt_fails_under_the_contract_it_was_launched_with(
     """Review round 4, engine #3: launched writing `remote` on a fenced
     store, failed after a restart that serves `remote` removed, or on an
     immutable store. Its failure is still a fenced one: the scope is
-    released, and the intents its gate lists stay unsettled for repair."""
+    released, and the intents its gate lists stay unsettled for repair —
+    unless `remote` is gone: settled, a removed name holds no state, and
+    if it comes back its first write is whole, clearing what this left (F12)."""
 
     url = tmp_path.as_uri()
     state = await State.open(url, "test", flush_interval=0.001)
@@ -964,7 +966,10 @@ async def test_an_adopted_attempt_fails_under_the_contract_it_was_launched_with(
     await failed_writing(state, run["id"], attempt, intents)
     await until(engine, lambda: state.model.claimed(attempt) is None)
     assert state.model.runs[run["id"]]["status"] == "failed"
-    assert [i["attempt"] for i in state.model.unsettled[("remote", "")]] == [attempt]
+    if change == "removed":
+        assert ("remote", "") not in state.model.unsettled
+    else:
+        assert [i["attempt"] for i in state.model.unsettled[("remote", "")]] == [attempt]
     await engine.stop()
     await state.close()
 

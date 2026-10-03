@@ -297,3 +297,48 @@ async def test_a_full_delivery_that_takes_no_key_still_starts_over(state):  # no
         _ref(state.model.heads[("mirror", "")]), list[dict], await whole(state, "mirror")
     )
     assert rows == []
+
+
+async def test_a_name_removed_and_added_back_starts_over(state):  # noqa: F811
+    """F12: a name the project no longer declares holds no live state. `copy`
+    renamed to `mirror` and back without an alias left `mirror`'s first life
+    in place, and the next rename onto `mirror` kept it — under a watermark
+    already past a deletion. Removed, a name's head, index and scope go (its
+    index files to collection); renamed onto, it takes the old name's state."""
+
+    @asset(outputs=Output("items", key="id"))
+    def items():
+        return [{"id": "a"}, {"id": "b"}]
+
+    def project(name, aliases=()):
+        def body(items: list):
+            return items
+
+        body.__name__ = name
+        copy = asset(outputs=Output(name, key="id"), inputs={"items": Incremental()}, aliases=list(aliases))(
+            body
+        )
+        return Project(assets=[items, copy])
+
+    m = state.model
+    engine = make_engine(state, project("mirror"))
+    await engine.initialize()
+    assert status_of(await drive(engine, await engine.submit(["mirror"], upstream=True))) == "succeeded"
+    first = m.indexes[("mirror", "")]
+    files = {first.path(n) for n in first.referenced()}
+    await engine.stop()
+
+    engine = make_engine(state, project("copy"))  # `mirror` removed: no alias carries it over
+    await engine.initialize()
+    assert ("mirror", "") not in m.heads and ("mirror", "") not in m.indexes
+    assert not m.scope("mirror", "")
+    assert files <= {path for path, _ in m.garbage}
+    assert status_of(await drive(engine, await engine.submit(["copy"]))) == "succeeded"
+    copied = m.heads[("copy", "")]["ref"]["generation"]
+    await engine.stop()
+
+    engine = make_engine(state, project("mirror", aliases=["copy"]))  # renamed onto `mirror`
+    await engine.initialize()
+    assert ("copy", "") not in m.heads
+    assert m.heads[("mirror", "")]["ref"]["generation"] == copied  # copy's state, not the first life
+

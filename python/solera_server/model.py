@@ -517,6 +517,7 @@ class Model:
         self._consumed = self._consumed_outputs(manifest)
         renamed, output_map = self._apply_aliases(manifest)
         self._reconcile_tasks(manifest, renamed, output_map, e["at"])
+        self._retire_removed()
         self._unsubscribe()
         automations = {}
         for name, auto in manifest["automations"].items():
@@ -628,6 +629,40 @@ class Model:
                 del marks[edge]
             if not marks:
                 del self.scopes[key]["watermarks"]
+
+    def _retire_removed(self) -> None:
+        """Live state of names the project no longer declares goes: heads,
+        key indexes (their files become garbage), scope records and unsettled
+        intents. A name that comes back — added again, or the target of a
+        rename — starts over and never resumes an earlier life (F12: a rename
+        back without an alias left `mirror`'s first life in place, and the
+        next rename onto it kept that). History keeps the records, and pending
+        discards stay: their objects are still owed. An asset with an attempt
+        in flight keeps its state until that attempt settles."""
+
+        manifest = self.manifest or {}
+        outputs, assets = set(manifest.get("outputs") or ()), set(manifest.get("assets") or ())
+        busy = {t["asset"] for tid in self.claims if (t := self.task(tid)) is not None}
+
+        def gone(asset) -> bool:
+            return asset not in assets and asset not in busy
+
+        owner = {key: head.get("asset") for key, head in self.heads.items()}
+
+        def removed(key) -> bool:
+            if key[0].startswith("@"):  # an Each asset's failure index
+                return gone(key[0][1:])
+            return key[0] not in outputs and gone(owner.get(key))
+
+        for key in [k for k in self.heads if removed(k)]:
+            del self.heads[key]
+        for key in [k for k in self.indexes if removed(k)]:
+            index = self.indexes.pop(key)
+            self.garbage.extend([index.path(name), self.applied] for name in sorted(index.referenced()))
+        for key in [k for k in self.unsettled if removed(k)]:
+            del self.unsettled[key]
+        for key in [k for k in self.scopes if gone(k[0])]:
+            del self.scopes[key]
 
     def _apply_aliases(self, manifest) -> tuple[dict[str, list[str]], dict[str, str]]:
         """Move everything held under an asset's former names to its current
@@ -787,10 +822,15 @@ class Model:
             launched["handle"] = e["handle"]
 
     def _on_AttemptFinished(self, e):
+        task = self._attempt_finished(e)
+        if task is not None and task["asset"] not in ((self.manifest or {}).get("assets") or {}):
+            self._retire_removed()  # an asset removed while this attempt ran: settled now
+
+    def _attempt_finished(self, e) -> dict | None:
         run = self.runs.get(e["run"])
         task = run["tasks"].get(e["task"]) if run else None
         if task is None:
-            return
+            return None
         self._release_claim(task["id"], e["attempt"])
         self._unsubscribe(task["asset"], task["scope"])  # what it read under an edge since removed
         outcome, at = e["outcome"], e["finished_at"]
@@ -843,7 +883,7 @@ class Model:
             # writing still commits: its data landed (§8).
             if outcome == "succeeded" and commit:
                 self._install(task, commit, e, prepared)
-            return
+            return task
         if outcome == "succeeded":
             self._install(task, commit or {}, e, prepared)
             if e.get("more"):
@@ -876,6 +916,7 @@ class Model:
             self._ready(run, task, at)
         else:
             raise ValueError(f"unknown attempt outcome {outcome!r}")
+        return task
 
     def _tried(self, run: dict, task: dict, summary: dict) -> None:
         """An ended attempt: its row goes to the history now, and its task

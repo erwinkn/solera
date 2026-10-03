@@ -107,6 +107,17 @@ says where the content is (a FileStore directory, a Postgres table), so
 a renamed output keeps its storage, and every ref to it stays readable;
 the declaration names the storage only of a first write.
 
+**Removals.** A name the project no longer declares, as an asset or an
+output, and that no alias carries over, holds no live state: on
+registration its heads, key indexes (their files go to collection), scope
+records and unsettled intents go — those of an asset with an attempt in
+flight once that attempt settles. History keeps its records, and its
+pending discards stay, still owed. A name that comes back, added again or
+the target of a rename, starts over: it never resumes an earlier life
+(simulation finding F12: `copy` renamed to `mirror` and back without an
+alias left `mirror`'s first life, which the next rename onto `mirror`
+kept, under a watermark already past a deletion).
+
 ## 3. Journal segment
 
 One object per flush. There is one way to change state:
@@ -165,7 +176,7 @@ status are derived inside `apply`; they are not events.
 | Event | Fields | Effect |
 |---|---|---|
 | `WriterStarted` | `writer`, `nonce` | first event of every writer; its segment's `seq` becomes the writer id; `nonce` is random, so no two writers' fences have the same bytes |
-| `ProjectRegistered` | `revision`, `manifest` | replaces the manifest; applies aliases; reconciles automation state |
+| `ProjectRegistered` | `revision`, `manifest` | replaces the manifest; applies aliases; retires removed names (§2); reconciles automation state |
 | `RunSubmitted` | `run` (id, request, tasks) | adds an active run |
 | `RunControlled` | `run`, `action` (`cancel` \| `pause` \| `resume`) | |
 | `AttemptLaunched` | `run`, `task`, `attempt`, `started_at`, `pin`, `at`, `execution`, `prepared`, `pool?` | the attempt file exists and a placement is about to start it: its claim and scope lock become durable (§8) |
