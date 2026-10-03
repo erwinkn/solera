@@ -116,6 +116,24 @@ fan-in, and its heads are kept, unread.
 scope; "retired" for a removed one. *Example:* `alpha`;
 `day=2026-09-01,site=alpha` for two dimensions (sorted by dimension name).
 
+**output unit**. The grain at which an asset stores and versions data: a
+key within a partition if the output is keyed, else the partition. What
+is stale, and what a run can name. *Edge case:* an unpartitioned asset is
+one partition (`""` in code); the console and the CLI never show it or
+ask for it, so its output units are its keys, or the asset itself.
+*Example:* `alpha-file-2` in `file_index/alpha`; `daily/2026-09-18`.
+
+**input unit**. Per input, what one output unit can be traced to: one
+upstream key for an `each=True` asset, else the upstream partition(s)
+the input reads. An output unit is stale when an input unit it depends on
+changed after it was written. *Edge case:* a keyed asset that is not
+`each` cannot say which upstream keys made which of its keys, so all its
+keys depend on the whole input unit together: they are stale together,
+and `keys=` is refused for it ("rerun the partition").
+*Example:* `file_index` (`each`) key `alpha-file-2` traces to
+`site_files`' key `alpha-file-2`; every key of `tally/alpha` traces to
+all of `site_files/alpha`.
+
 **dimension**. One axis of partitions: `StaticPartitions` (a fixed list),
 `TimePartitions` (windows of a duration or cron), or dynamic partitions.
 *Example:* `site_digest` has dimensions `site` and `day`.
