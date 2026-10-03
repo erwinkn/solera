@@ -287,7 +287,6 @@ _steps = st.lists(
 )
 
 
-@pytest.mark.xfail(strict=True, reason="F16: level-0 files moved into level 1 unmerged, overlapping")
 @settings(max_examples=150, deadline=None)
 @given(steps=_steps)
 @example(  # F16: a removed key comes back
@@ -305,8 +304,9 @@ def test_any_workload_of_a_few_keys_matches_a_dict(steps):
     """Patches, removals, replacements (empty ones too) and compactions
     over six keys, level 0 compacting at two files. A compaction runs in
     the background in the engine: one `late` is applied after the next
-    commit. After every step the index pages back the dict, and levels 1+
-    never overlap."""
+    commit, unless another took its inputs meanwhile (upkeep then drops it).
+    After every step the index pages back the dict, and levels 1+ never
+    overlap."""
 
     async def workload():
         h = Harness(small_options(l0_max_files=2))
@@ -321,8 +321,10 @@ def test_any_workload_of_a_few_keys_matches_a_dict(steps):
                     await h.commit(ks, None, sorted(set(rm) - set(ks)))
                 else:
                     await h.commit(ks, replace=True)
-                if late is not None:
-                    h.state, late = h.state.compacted(*late[:2]), None
+                if late is not None:  # as upkeep does: dropped if its inputs went meanwhile
+                    if set(late[1]) <= {f.name for f in h.state.files}:
+                        h.state = h.state.compacted(*late[:2])
+                    late = None
             await h.check()
 
     asyncio.run(workload())

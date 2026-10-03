@@ -338,7 +338,6 @@ def test_f13_a_key_removed_after_a_store_move_leaves_its_consumers():
     state.teardown()
 
 
-@pytest.mark.xfail(strict=True, reason="F16: level-0 files moved into level 1 unmerged, overlapping")
 def test_f16_a_compaction_landing_after_a_commit_keeps_the_newest_entry():
     """F16: the feed removes every key of `items`; the compaction that
     empties `items`' index lands after a newer commit went to level 0;

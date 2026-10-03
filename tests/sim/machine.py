@@ -602,8 +602,8 @@ class Simulation(RuleBasedStateMachine):
     def index_levels_never_overlap(self):
         """docs/key-index-format.md: an index's level 0 holds one file per
         commit, overlapping; within each deeper level, files cover disjoint
-        key ranges, so a read takes one file per level. While F16 is open,
-        an overlap sets the run aside."""
+        key ranges, so a read takes one file per level (F16: level 0 moved
+        down unmerged)."""
 
         engine = self.world.engine if self.world is not None else None
         if engine is None:
@@ -613,8 +613,9 @@ class Simulation(RuleBasedStateMachine):
                 files = sorted(index.level(level), key=lambda f: f.min)
                 for a, b in zip(files, files[1:], strict=False):
                     if a.max >= b.min:
-                        detail = f"{output}[{partition!r}] level {level}: {a.name} and {b.name} overlap"
-                        self._known("F16", detail)
+                        raise Violation(
+                            f"{output}[{partition!r}] level {level}: {a.name} and {b.name} overlap"
+                        )
 
     @invariant()
     def committed_keys_are_readable(self):
@@ -624,7 +625,7 @@ class Simulation(RuleBasedStateMachine):
         world = self.world
         if world is None or world.engine is None:
             return
-        self.index_levels_never_overlap()  # a read of overlapping levels is F16's, not this one's
+        self.index_levels_never_overlap()  # a read of overlapping levels fails as that, not as this
         engine = world.engine
 
         async def check():
