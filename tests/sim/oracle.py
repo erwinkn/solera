@@ -11,6 +11,7 @@ import json
 from collections import defaultdict
 from dataclasses import dataclass, field
 
+from solera import lifecycle
 from solera.keys.index import KeyIndex, key_str
 from solera.keys.io import ObjectIO
 from solera.sdk import Ref
@@ -34,8 +35,14 @@ class Journal:
     )  # (seq, path, when): segments that landed again, other bytes
     now: object = None  # the world's clock
     applied_commits: set = field(default_factory=set)  # attempts some engine committed in memory
+    gates: dict[str, tuple] = field(default_factory=dict)  # attempt -> (state, invocation, landed at)
 
     def landed(self, path: str, data: bytes) -> None:
+        if path.endswith(lifecycle.GATE):
+            gate = json.loads(data)
+            attempt = path.rsplit("/", 1)[-1].removesuffix(lifecycle.GATE)
+            self.gates.setdefault(attempt, (gate["state"], gate.get("invocation"), self.now()))
+            return
         if "/control/journal/" not in path:
             return
         body = json.loads(data)
@@ -75,6 +82,25 @@ class Journal:
         for seq in sorted(self.segments):
             for event in self.segments[seq]["events"]:
                 yield seq, event
+
+    def two_attempts_at_once(self, same=lambda partition: partition) -> str | None:
+        """The first durable launch of an attempt on an asset partition
+        another launched attempt still holds (`same` names a partition the
+        way a rename keeps it), or None."""
+
+        holder: dict[str, str] = {}
+        for seq, event in self.events():
+            if event["type"] not in ("AttemptLaunched", "AttemptFinished"):
+                continue
+            partition = same(event["task"].split("/", 1)[1])
+            if event["type"] == "AttemptFinished":
+                if holder.get(partition) == event["attempt"]:
+                    del holder[partition]
+            elif holder.get(partition, event["attempt"]) != event["attempt"]:
+                return f"{event['attempt']} launched on {partition} at seq {seq}, held by {holder[partition]}"
+            else:
+                holder[partition] = event["attempt"]
+        return None
 
     def generation(self, attempt: str) -> int | None:
         launched = self.launched.get(attempt)

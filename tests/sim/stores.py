@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from solera.sdk import Ref
 from solera.stores import MISSING, Batches, KeyedWrite, Keys, StoreError, Written, by_key_type, takes
 
+from .core import actor
+
 
 @dataclass
 class Database:
@@ -27,6 +29,8 @@ class Database:
     fences: dict[tuple[str, str], tuple[int, str]] = field(default_factory=dict)
     locks: dict[tuple[str, str], asyncio.Lock] = field(default_factory=dict)
     commits: int = 0
+    # Every committed store transaction: (began at, actor, generation, invocation)
+    writes: list[tuple] = field(default_factory=list)
     # (kind, scope) -> None | "error" | "lost", plus a delay: the simulation's say over one transaction
     fault: Callable[[str, object], tuple[str | None, float]] | None = None
 
@@ -74,6 +78,7 @@ class TableStore:
         table = self._table(context.output, prior)
         fate, delay = self.db.fault(kind, context) if self.db.fault is not None else (None, 0.0)
         async with self.db.lock(table, context.partition):
+            began = asyncio.get_running_loop().time()
             if fate == "error":
                 raise StoreError(f"injected: the database refused the {kind} transaction")
             fenced = self._fence(context, table)  # the fence row is ours until the commit
@@ -86,6 +91,8 @@ class TableStore:
                 self.db.fences[(table, context.partition)] = fenced
             self.db.tables.setdefault(table, {})[context.partition] = box["rows"]
             self.db.commits += 1
+            if kind == "store":
+                self.db.writes.append((began, actor.get(), context.generation, context.invocation))
         if fate == "lost":
             raise StoreError(f"injected: the {kind} transaction committed, its answer was lost")
         return value

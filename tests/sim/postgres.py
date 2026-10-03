@@ -11,8 +11,11 @@ from __future__ import annotations
 
 import itertools
 import os
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
+
+from .core import EPOCH
 
 DSN = os.environ.get("SOLERA_TEST_DATABASE_URL")
 _schemas = itertools.count()
@@ -27,6 +30,9 @@ class Write:
     seq: int
     generation: int | None
     rows: frozenset  # (id, v) after the transaction
+    who: tuple | None = None
+    invocation: str | None = None
+    at: float = 0.0  # when the transaction began
 
 
 @dataclass
@@ -70,12 +76,20 @@ def patches(ledger: Ledger, current_actor) -> list[tuple]:
         return table
 
     def _store(self, write, prior, context):
+        at = time.time() - EPOCH  # virtual: the loop waits for this thread
         written = store_real(self, write, prior, context)
         ref = written.ref
         table = (ref.handle or {}).get("table") or table_of(self, context.output, prior)
         rows = self._load(ref, list[dict], None)
         ledger.writes[(table, context.partition)].append(
-            Write(ledger.tick(), context.generation, frozenset(_pairs(rows)))
+            Write(
+                ledger.tick(),
+                context.generation,
+                frozenset(_pairs(rows)),
+                current_actor(),
+                context.invocation,
+                at,
+            )
         )
         return written
 

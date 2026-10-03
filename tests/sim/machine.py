@@ -291,11 +291,12 @@ class Simulation(RuleBasedStateMachine):
             self._run(asyncio.sleep(down))
         self._ensure_engine(self.project)
 
-    @rule(zombie=st.sampled_from([0.0, 5.0, 60.0]), change=st.sampled_from([None, *CHANGES]))
+    @rule(zombie=st.sampled_from([0.0, 5.0, 60.0, 600.0]), change=st.sampled_from([None, *CHANGES]))
     def takeover(self, zombie, change):
         """A second engine starts while the first still runs (a rolling
         deploy, a split brain); the platform kills the first `zombie`
-        seconds later. With `change`, the newcomer serves a new variant."""
+        seconds later, so takeovers within that time leave several engines
+        running at once. With `change`, the newcomer serves a new variant."""
 
         self.trace.append(f"takeover(zombie={zombie}, change={change!r})")
         world = self.world
@@ -410,6 +411,52 @@ class Simulation(RuleBasedStateMachine):
             for out in (spec.get("outputs") or {}).values()
             for entry in out.get("discard") or ()
         )
+
+    @invariant()
+    def one_attempt_per_partition(self):
+        """A claim holds an asset partition for one attempt at a time: no
+        attempt launches on one another launched attempt holds, in the
+        journal or in the serving engine's memory."""
+
+        if self.world is None:
+            return
+        if clash := self.journal.two_attempts_at_once(_renamed):
+            raise Violation(f"two attempts at once: {clash}")
+        engine = self.world.engine
+        if engine is None:
+            return
+        held: dict[str, str] = {}
+        for task_id, claim in list(engine.m.claims.items()):
+            partition = _renamed(task_id.split("/", 1)[1])
+            if partition in held:
+                raise Violation(f"{partition} claimed by {held[partition]} and {claim['attempt']} at once")
+            held[partition] = claim["attempt"]
+
+    @invariant()
+    def fenced_writes_hold_their_gate(self):
+        """docs/lifecycle.md §2.4, §3: a worker writes to a fenced store only
+        after it took its attempt's gate (`writing`, its own invocation): an
+        attempt the engine ended (`aborted`, `closed`), or a duplicate
+        invocation, writes nothing."""
+
+        if self.world is None:
+            return
+        db, pg = getattr(self, "_gates_checked", (0, 0))
+        writes = [(at, who, invocation) for at, who, _, invocation in self.db.writes[db:]]
+        if self.world.pg is not None:
+            writes += [
+                (w.at, w.who, w.invocation) for ws in self.world.pg.writes.values() for w in ws if w.seq > pg
+            ]
+        self._gates_checked = (len(self.db.writes), self.world.pg.seq if self.world.pg is not None else 0)
+        for at, who, invocation in writes:
+            if who is None or who[0] != "worker":
+                continue
+            gate = self.journal.gates.get(who[1])
+            if gate is None or gate[0] != "writing" or gate[1] != invocation or gate[2] > at:
+                raise Violation(
+                    f"{who} wrote to a fenced store at t={at:g} (invocation {invocation}); "
+                    f"its gate: {gate and gate[:2]}{f' from t={gate[2]:g}' if gate else ''}"
+                )
 
     @invariant()
     def committed_keys_are_readable(self):
@@ -563,6 +610,8 @@ class Simulation(RuleBasedStateMachine):
         self._settle()
         self._check_content(automated=False)
         self._check_replay()
+        self.one_attempt_per_partition()  # convergence ran no invariant
+        self.fenced_writes_hold_their_gate()
 
     def _asset(self, target: str) -> str | None:
         if target == "copy":
@@ -631,6 +680,12 @@ class Simulation(RuleBasedStateMachine):
                 raise Violation(f"replaying the journal gives another state: {diff}")
 
         self._run(check())
+
+
+def _renamed(partition: str) -> str:
+    """An asset partition under the name a rename keeps (`mirror` is `copy`)."""
+
+    return partition.replace("mirror:", "copy:", 1) if partition.startswith("mirror:") else partition
 
 
 def _normal(snapshot: dict) -> dict:
