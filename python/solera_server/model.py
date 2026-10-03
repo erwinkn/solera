@@ -552,11 +552,19 @@ class Model:
                     existing = self.automations.get(f"{old}.{rest}")
                     if existing is not None:
                         break
-            record = {**auto, "last_fired": None, "last_run": None, "last_deploy": None, "pending": []}
+            # `since`: when it was declared, which a schedule's first time counts from.
+            record = {
+                **auto,
+                "since": e["at"],
+                "last_fired": None,
+                "last_run": None,
+                "last_deploy": None,
+                "pending": [],
+            }
             if existing is not None:
                 record["enabled"] = existing["enabled"]
                 if existing["trigger"] == auto["trigger"]:
-                    for field in ("last_fired", "last_run", "last_deploy", "pending"):
+                    for field in ("since", "last_fired", "last_run", "last_deploy", "pending"):
                         record[field] = existing.get(field, record[field])
             automations[name] = record
         self.automations = automations

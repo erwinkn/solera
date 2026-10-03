@@ -25,7 +25,6 @@ import contextlib
 import datetime as dt
 import json
 import logging
-import math
 import secrets
 from zoneinfo import ZoneInfo
 
@@ -1773,19 +1772,20 @@ class Engine(Attempts, Sensors, Views):
 
     @staticmethod
     def _due_at(auto: dict) -> float | None:
-        """When a schedule comes due (§9): `every` its interval after it last
-        fired, at once if it never has; `cron` its next time after it last
-        fired, counted from the epoch if it never has. `None` for the
-        triggers that wait on an event, and for a disabled automation."""
+        """When a schedule comes due (§9): `every` its interval, `cron` its next
+        time, after it last fired — or, if it never has, after it was declared
+        (`since`): a schedule waits for its next time, a new one too. `None`
+        for the triggers that wait on an event, and for a disabled automation."""
 
         trigger = auto["trigger"]
         if not auto["enabled"]:
             return None
+        last = auto["last_fired"] if auto["last_fired"] is not None else auto["since"]
         if trigger["kind"] == "every":
-            return -math.inf if auto["last_fired"] is None else auto["last_fired"] + trigger["seconds"]
+            return last + trigger["seconds"]
         if trigger["kind"] == "cron":
             zone = ZoneInfo(trigger.get("timezone") or "UTC")
-            base = dt.datetime.fromtimestamp(auto["last_fired"] or 0, zone)
+            base = dt.datetime.fromtimestamp(last, zone)
             return croniter(trigger["expression"], base).get_next(dt.datetime).timestamp()
         return None
 

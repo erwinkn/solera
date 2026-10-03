@@ -722,7 +722,8 @@ async def test_cancel_run(state):
 
 async def test_every_and_cron_fire(state):
     """§9: Every fires on its interval; Cron fires when a tick passes; both
-    submit runs in the run vocabulary."""
+    submit runs in the run vocabulary. A schedule waits for its next time,
+    a new one too: nothing fires at declaration."""
     calls = {"n": 0}
 
     @asset(automations=Every(1))
@@ -739,6 +740,13 @@ async def test_every_and_cron_fire(state):
     await engine.initialize()
     await engine.tick()
     auto = state.model.automations["polled.every.0"]
+    assert auto["last_fired"] is None  # not at once: its first time is a second away
+    for _ in range(40):
+        await asyncio.sleep(0.1)
+        await engine.tick()
+        auto = state.model.automations["polled.every.0"]
+        if auto["last_fired"] is not None:
+            break
     assert auto["last_fired"] is not None and auto["last_run"]
     await engine.run_until(auto["last_run"], 10)
 
@@ -804,8 +812,12 @@ async def test_an_automation_can_skip_until_its_inputs_are_written(state):
     project = Project(assets=[index, digest])
     engine = make_engine(state, project)
     await engine.initialize()
-    await engine.tick()
-    auto = state.model.automations["digest.every.0"]
+    for _ in range(40):  # its first time is a second away
+        await asyncio.sleep(0.1)
+        await engine.tick()
+        auto = state.model.automations["digest.every.0"]
+        if auto["last_fired"] is not None:
+            break
     assert auto["last_fired"] is not None and auto["last_run"] is None and not state.model.runs
     run = await engine.submit(["digest"], upstream=True, skip_missing_inputs=True)
     assert run is not None and sorted(run["targets"]) == ["digest", "index"]

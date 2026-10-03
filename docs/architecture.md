@@ -677,8 +677,8 @@ the run's own vocabulary (§8): `partitions`, `mode`, `upstream`, `config`,
 
 | Trigger | Fires |
 |---|---|
-| `Every(seconds)` | on an interval, with a floor; a tick is skipped for any partition still running |
-| `Cron(expr, timezone="UTC")` | on schedule; same skip rule |
+| `Every(seconds)` | on an interval, with a floor, the first `seconds` after it is declared (never at once); a tick is skipped for any partition still running |
+| `Cron(expr, timezone="UTC")` | on schedule, the first at its next time after it is declared; same skip rule |
 | `OnChange(*outputs)` | when a listed output's head changes; no args = every input and dep of the target. May not name an output of the target itself |
 | `OnDeploy()` | once per new deploy (§11), for the latest deploy only: the automation records the deploy it last fired for, so a restart on the same deploy is silent and back-to-back deploys fire once. Default `partitions="latest"` |
 

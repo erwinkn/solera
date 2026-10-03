@@ -180,7 +180,8 @@ Its automations then decide, each by its own criterion:
   recording the deploy (`FiringsOwed`); no tick checks it again, so a run
   of it that fails is not submitted on every tick (F20). After a rename the
   firing is a skip: the state carried over is caught up.
-- A schedule fires at its next time (a new one has never fired: at once);
+- A schedule fires at its next time — a new one too, counted from when it
+  was declared, never at once;
   `OnDeploy` and sensors keep their criteria.
 - With no automation nothing runs. The partition shows `stale` —
   materialized, but caught up (`caught_up_at`) before its asset's last

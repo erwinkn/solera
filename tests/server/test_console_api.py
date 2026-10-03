@@ -427,10 +427,10 @@ async def test_automations_say_when_they_next_fire(tmp_path):
             autos = (await client.get(f"{base}/automations")).json()["automations"]
             return {a["name"]: a["next_at"] for a in autos}
 
-        now = engine.clock()
         due = await next_at()
-        # Never fired: due at once, as the eval loop would fire them.
-        assert now <= due["hourly"] <= engine.clock() and now <= due["weekly"] <= engine.clock()
+        # Never fired: a schedule waits for its next time after it was declared.
+        assert due["hourly"] == engine.m.automations["hourly"]["since"] + 3600 > engine.clock()
+        assert due["weekly"] > engine.clock()
         assert due["follow"] is None
 
         for name in ("hourly", "weekly"):

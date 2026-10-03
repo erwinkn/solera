@@ -975,7 +975,8 @@ async def test_an_asset_change_is_built_by_its_automation_or_marked_stale(state,
     """Erwin's asset-change rule: a deploy that adds an asset (again),
     renames it, changes its declaration or resets it leaves its OnChange
     automation owing a firing, once, per partition whose inputs have heads:
-    it is built at once. A schedule waits for its next tick and no
+    it is built at once. A schedule waits for its next time (a new one
+    too: it never fires at declaration) and no
     automation runs nothing: the partition shows `stale` (or `missing`) until
     a run catches it up, and then `materialized`."""
 
@@ -1004,9 +1005,7 @@ async def test_an_asset_change_is_built_by_its_automation_or_marked_stale(state,
     engine = make_engine(state, project)
     await engine.initialize()
     await quiet(engine)
-    if automation == "onchange" or (automation == "schedule" and kind == "added"):
-        # built at once: by the firing the deploy owes OnChange, or by a new
-        # schedule's own criterion — never having fired, it is due now
+    if automation == "onchange":  # built at once, by the firing the deploy owes it
         assert await status(engine, name) == ["materialized"]
         if kind == "renamed":  # its state carried over: the firing is a skip, no call
             assert True not in calls
