@@ -279,6 +279,8 @@ New sweeps since that summary:
 | Run | Code | Seed | Runs × steps | Stores | Result |
 |---|---|---|---|---|---|
 | Z4 | F21 fixed (b8bf1a4), nothing set aside | 941 | 203 runs, 14,284 steps, 61 h | default | green |
+| Z5 | the journal object (cfdc723) and weeds (fedf1b2) | 951 | 250 runs × 50 steps | default | F24 (an engine fences itself after its checkpoint move's answer is lost) |
+| Z6 | as Z5 | 952 | 265 runs, 16,102 steps, 64 h | pg | green |
 
 ## Formal model: execution semantics (`spec/tla/Execution.tla`)
 
