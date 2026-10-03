@@ -34,6 +34,7 @@ from .project import (
     expected_checks,
     expected_copy,
     expected_items,
+    expected_split,
 )
 from .stores import Database
 from .world import POINTS, Fate, World
@@ -49,8 +50,13 @@ STATS = {
 
 KEYS = ["k0", "k1", "k2", "k3", "k10", "k11"]
 SITES = ["east", "west", "north"]
-TARGETS = ["items", "copy", "per_site", "log", "tally", "summary", "checks"]
-KEYED_INPUT = {"items": "feed", "copy": "items", "checks": "items"}  # what a run's `keys=` overrides
+TARGETS = ["items", "copy", "per_site", "log", "tally", "summary", "checks", "split"]
+KEYED_INPUT = {
+    "items": "feed",
+    "copy": "items",
+    "checks": "items",
+    "split": "items",
+}  # what a run's `keys=` overrides
 TERMINAL = {"succeeded", "failed", "canceled", "skipped"}
 STORES = ["file", "table"] + (["pg"] if postgres.DSN else [])  # where `items` lives
 # Re-registrations the rules make. Those that trip an open finding on most
@@ -676,6 +682,10 @@ class Simulation(RuleBasedStateMachine):
             copy = await keyed_content(engine, project, variant.copy_name, whole=True)
             if copy != expected_copy(want, variant):
                 raise Violation(f"{variant.copy_name} {stage}: {copy} != {expected_copy(want, variant)}")
+            for output, want_split in zip(("odd", "even"), expected_split(want), strict=True):
+                got = await keyed_content(engine, project, output, whole=True)
+                if got != want_split:
+                    raise Violation(f"{output} {stage}: {got} != {want_split}")
             checks = await keyed_content(engine, project, "checks", whole=True, column="w")
             if checks != expected_checks(want):
                 raise Violation(f"checks {stage}: {checks} != {expected_checks(want)}")

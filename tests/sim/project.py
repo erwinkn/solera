@@ -7,6 +7,7 @@ output from the sources alone.
     knob (version) ──dep──▶ per_site[site ∈ sites] ──AllPartitions──▶ summary
     knob ──dep──▶ log (batches) ──Incremental──▶ tally
     items ──Each(page 2)──▶ checks (fails while a key is flaky, by error class)
+    items ──Incremental(page 2)──▶ split ──▶ odd (table store), even (FileStore)
     outside (keyed source) ◀── watch (a sensor over an external map)
 
 Variants (`Variant`): `items` on a FileStore or the simulation's fenced
@@ -189,7 +190,32 @@ def build(variant: Variant, data_root, db: Database, outside: External, pg: str 
             raise FLAKY[outside.flaky[ctx.key]](ctx.key)
         return [{"w": f"x{item[0]['v']}"}]
 
-    assets = [items, copy, per_site, log, tally, checks]
+    @asset(
+        outputs=[Output("odd", key="id", store="db"), Output("even", key="id")],
+        inputs={"items": Incremental(page_size=2)},
+        automations=AutoRefresh(),
+        retries=Retry(3, delay=1.0),
+        timeout=300,
+    )
+    def split(ctx, items: list):
+        """Each key in `odd` or `even` by its feed version: a key whose
+        version flips moves from one output to the other in one commit, one
+        output fenced, the other immutable."""
+
+        changes = ctx.changes["items"]
+        odd = [r for r in items if is_odd(r["v"])]
+        even = [r for r in items if not is_odd(r["v"])]
+        if changes.full and changes.first:
+            return Result(outputs={"odd": odd, "even": even})
+        gone = list(changes.deleted)
+        return Result(
+            outputs={
+                "odd": Patch(odd, remove=[r["id"] for r in even] + gone),
+                "even": Patch(even, remove=[r["id"] for r in odd] + gone),
+            }
+        )
+
+    assets = [items, copy, per_site, log, tally, checks, split]
     if variant.summary:
 
         @asset(inputs={"per_site": AllPartitions()}, automations=AutoRefresh())
@@ -230,6 +256,17 @@ def _postgres(schema: str | None) -> dict:
     from .postgres import DSN
 
     return {"pg": PostgresStore(DSN)}
+
+
+def is_odd(v: str) -> bool:
+    """Whether an `items` value comes from an odd feed version."""
+
+    return int(v.split(".", 1)[0]) % 2 == 1
+
+
+def expected_split(items: dict[str, str]) -> tuple[dict[str, str], dict[str, str]]:
+    odd = {k: v for k, v in items.items() if is_odd(v)}
+    return odd, {k: v for k, v in items.items() if k not in odd}
 
 
 def expected_checks(items: dict[str, str]) -> dict[str, str]:
