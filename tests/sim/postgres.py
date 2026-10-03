@@ -18,7 +18,33 @@ DSN = os.environ.get("SOLERA_TEST_DATABASE_URL")
 _schemas = itertools.count()
 
 
+# The columns PostgresStore gives its fence table (`solera_postgres._fence_table`).
+FENCE_COLUMNS = {"relid", "part", "generation", "worker_id", "written"}
+_fence_checked = False
+
+
 def fresh_schema() -> str:
+    """A schema of its own for one run. The fence table is shared by every
+    run on the database: one created by an older PostgresStore (before a
+    rename of its columns, say) is dropped first, once per process, so a
+    reused database never refuses every write. One of the current shape is
+    kept: other processes' runs may be using it."""
+
+    global _fence_checked
+    if not _fence_checked:
+        import psycopg
+
+        with psycopg.connect(DSN, autocommit=True) as conn:
+            columns = {
+                name
+                for (name,) in conn.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = 'public' AND table_name = 'solera_generations'"
+                )
+            }
+            if columns and columns != FENCE_COLUMNS:
+                conn.execute("DROP TABLE public.solera_generations")
+        _fence_checked = True
     return f"sim_{os.getpid()}_{next(_schemas)}"
 
 
