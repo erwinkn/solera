@@ -35,7 +35,9 @@ CONSTANTS
                  \* and nobody else ever creates it
     TakeWriting, \* a worker marks the file `writing` before its first write
     EngineSwaps, \* the engine ends an attempt with If-Match, not a blind PUT
-    Classify     \* ended from `writing`, its write evidence is `writing`
+    Classify,    \* ended from `writing`, its write evidence is `writing`
+    OfferDurable \* a worker learns of an attempt (its launch, a pool's offer)
+                 \* only once its AttemptLaunched is durable (F26)
 
 Attempts == 1..N               \* an attempt's number is its generation
 Workers == Attempts \X Copies  \* <<attempt, copy>>
@@ -46,6 +48,10 @@ VARIABLES
     purged,      \* the attempts whose files retention deleted
     \* The fenced store (lifecycle.md §9.7): the newest generation acquired, by whom.
     fence, fenceBy,
+    \* The engine's memory, before its launch is durable.
+    created,     \* attempts whose control file the engine created
+    abandoned,   \* created, but the engine was fenced or crashed before
+                 \* AttemptLaunched landed: no engine knows of them
     \* The journal, as far as it matters here.
     launched,    \* attempts whose AttemptLaunched is durable
     decided,     \* [Attempts -> what AttemptFinished says of its writes]
@@ -62,8 +68,8 @@ VARIABLES
     last,        \* the generation of the last write that landed
     inOrder      \* no write landed after a newer generation's
 
-vars == <<control, purged, fence, fenceBy, launched, decided, requested, eseen, restarts,
-          wpc, wseen, wrote, landed, last, inOrder>>
+vars == <<control, purged, fence, fenceBy, created, abandoned, launched, decided, requested,
+          eseen, restarts, wpc, wseen, wrote, landed, last, inOrder>>
 
 -----------------------------------------------------------------------------
 Att(w) == w[1]
@@ -96,6 +102,8 @@ Init ==
     /\ purged = {}
     /\ fence = 0
     /\ fenceBy = Missing
+    /\ created = {}
+    /\ abandoned = {}
     /\ launched = {}
     /\ decided = [i \in Attempts |-> "undecided"]
     /\ requested = {}
@@ -108,7 +116,7 @@ Init ==
     /\ last = 0
     /\ inOrder = TRUE
 
-engine == <<launched, decided, requested, eseen, restarts>>
+engine == <<created, abandoned, launched, decided, requested, eseen, restarts>>
 worker == <<wpc, wseen, wrote>>
 ghost == <<landed, last, inOrder>>
 
@@ -117,29 +125,47 @@ Set(f, i, v) == [f EXCEPT ![i] = v]
 -----------------------------------------------------------------------------
 (* The engine.                                                            *)
 
-\* Claim the partition and launch attempt i once the one before it has
-\* ended: create its control file `open` (with PreCreate), then make
-\* AttemptLaunched durable. (A crash between the two leaves an `open` file
-\* no worker is launched for; one step here.)
-Launch(i) ==
-    /\ i \notin launched
-    /\ \A j \in Attempts : j < i => j \in launched /\ decided[j] # "undecided"
-    /\ launched' = launched \cup {i}
+\* Claim the partition for attempt i once the one before it has ended (or
+\* was abandoned): create its control file `open` (with PreCreate).
+Create(i) ==
+    /\ i \notin created
+    /\ \A j \in Attempts : j < i => j \in abandoned \/ (j \in launched /\ decided[j] # "undecided")
+    /\ created' = created \cup {i}
     /\ control' = IF PreCreate THEN Set(control, i, Open) ELSE control
-    /\ UNCHANGED <<purged, fence, fenceBy, decided, requested, eseen, restarts, worker, ghost>>
+    /\ UNCHANGED <<purged, fence, fenceBy, abandoned, launched, decided, requested, eseen, restarts,
+                   worker, ghost>>
+
+\* Make AttemptLaunched durable: the launch is authorized.
+Launch(i) ==
+    /\ i \in created \ (launched \cup abandoned)
+    /\ launched' = launched \cup {i}
+    /\ UNCHANGED <<control, purged, fence, fenceBy, created, abandoned, decided, requested, eseen,
+                   restarts, worker, ghost>>
+
+\* The engine is fenced, or crashes, before AttemptLaunched lands: the
+\* attempt goes with its memory. The next engine never learns of it and
+\* claims the partition for the next attempt; the file stays `open`.
+Abandon(i) ==
+    /\ i \in created \ (launched \cup abandoned)
+    /\ restarts < MaxRestarts
+    /\ abandoned' = abandoned \cup {i}
+    /\ restarts' = restarts + 1
+    /\ eseen' = [j \in Attempts |-> Unread]
+    /\ UNCHANGED <<control, purged, fence, fenceBy, created, launched, decided, requested, worker,
+                   ghost>>
 
 \* GET the control file of an attempt the engine is about to end.
 Read(i) ==
     /\ i \in launched /\ decided[i] = "undecided"
     /\ eseen' = Set(eseen, i, control[i])
-    /\ UNCHANGED <<control, purged, fence, fenceBy, launched, decided, requested, restarts, worker, ghost>>
+    /\ UNCHANGED <<control, purged, fence, fenceBy, created, abandoned, launched, decided, requested, restarts, worker, ghost>>
 
 \* A cancel is requested (a user cancel, a timeout): the worker hears it in
 \* a beat's answer and drains. Forcing it is End.
 Request(i) ==
     /\ i \in launched /\ decided[i] = "undecided" /\ i \notin requested
     /\ requested' = requested \cup {i}
-    /\ UNCHANGED <<control, purged, fence, fenceBy, launched, decided, eseen, restarts, worker, ghost>>
+    /\ UNCHANGED <<control, purged, fence, fenceBy, created, abandoned, launched, decided, eseen, restarts, worker, ghost>>
 
 \* End it, on the body read: `ended`, with what that body establishes.
 \* Refused (the worker moved, or another engine ended it): read again.
@@ -152,7 +178,7 @@ End(i) ==
        THEN control' = Set(control, i, Ended(TheEngine, Evidence(eseen[i])))
        ELSE control' = control
     /\ eseen' = Set(eseen, i, Unread)
-    /\ UNCHANGED <<purged, fence, fenceBy, launched, decided, requested, restarts, worker, ghost>>
+    /\ UNCHANGED <<purged, fence, fenceBy, created, abandoned, launched, decided, requested, restarts, worker, ghost>>
 
 \* Settle: the file is final, sealed or ended, by whoever. AttemptFinished
 \* records what it establishes, durable.
@@ -160,7 +186,7 @@ Decide(i) ==
     /\ i \in launched /\ decided[i] = "undecided"
     /\ Final(control[i])
     /\ decided' = Set(decided, i, control[i].ev)
-    /\ UNCHANGED <<control, purged, fence, fenceBy, launched, requested, eseen, restarts, worker,
+    /\ UNCHANGED <<control, purged, fence, fenceBy, created, abandoned, launched, requested, eseen, restarts, worker,
                    ghost>>
 
 \* An old engine, fenced out of the journal, ends an attempt on what it
@@ -176,7 +202,7 @@ Restart ==
     /\ restarts < MaxRestarts
     /\ restarts' = restarts + 1
     /\ eseen' = [i \in Attempts |-> Unread]
-    /\ UNCHANGED <<control, purged, fence, fenceBy, launched, decided, requested, worker, ghost>>
+    /\ UNCHANGED <<control, purged, fence, fenceBy, created, abandoned, launched, decided, requested, worker, ghost>>
 
 \* Retention deletes the attempt's spec and control file, any time after
 \* its end is durable. Nothing is kept.
@@ -189,9 +215,11 @@ Purge(i) ==
 -----------------------------------------------------------------------------
 (* A worker process w of attempt Att(w).                                  *)
 
-\* Boot: GET the spec. Gone, the worker stops.
+\* Boot: GET the spec. Gone, the worker stops. A worker exists once its
+\* attempt is offered: with OfferDurable, once its launch is durable;
+\* without, once the engine has created it (F26: a pool host offered it).
 Boot(w) ==
-    /\ wpc[w] = "idle" /\ Att(w) \in launched
+    /\ wpc[w] = "idle" /\ Att(w) \in (IF OfferDurable THEN launched ELSE created)
     /\ wpc' = Set(wpc, w, IF Att(w) \in purged THEN "stopped" ELSE "read")
     /\ UNCHANGED <<control, purged, fence, fenceBy, engine, wseen, wrote, ghost>>
 
@@ -309,7 +337,9 @@ Crash(w) ==
 EngineProgress(i) == Read(i) \/ End(i) \/ Decide(i)
 
 Next ==
-    \/ \E i \in Attempts : Launch(i) \/ Request(i) \/ EngineProgress(i) \/ ZombieEnd(i) \/ Purge(i)
+    \/ \E i \in Attempts :
+          Create(i) \/ Launch(i) \/ Abandon(i) \/ Request(i) \/ EngineProgress(i) \/ ZombieEnd(i)
+          \/ Purge(i)
     \/ Restart
     \/ \E w \in Workers :
           Boot(w) \/ ReadControl(w) \/ Own(w) \/ Acquire(w) \/ Drain(w) \/ Gate(w) \/ Write(w)
@@ -331,6 +361,10 @@ TypeOK ==
 \* No write after an abort is decided: an attempt the journal says wrote
 \* nothing has no store write that landed, before or after.
 NoWriteAfterNone == \A i \in Attempts : decided[i] = "none" => i \notin landed
+
+\* Every store write that landed is of an attempt the journal launched:
+\* none of an attempt no engine knows, which nothing commits or repairs.
+NoOrphanWrite == landed \subseteq launched
 
 \* What a result calls complete did land.
 CompleteLanded == \A i \in Attempts : decided[i] = "complete" => i \in landed

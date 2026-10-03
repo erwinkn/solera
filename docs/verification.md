@@ -604,8 +604,10 @@ attempts' store writes landed, and in what order.
 
 **Actions.**
 - *The engine:*
-  - launches the next attempt once the last one has ended, creating its
-    file `open` first;
+  - claims the partition for the next attempt once the last one has
+    ended, creating its file `open`, then makes `AttemptLaunched`
+    durable; fenced or crashed in between, it abandons the attempt, which
+    the next engine never learns of;
   - asks a worker to cancel (it drains);
   - reads a file, then ends the attempt on what it read: a swap to
     `ended`, recording `none` from `open` or `owned` and `writing` from
@@ -615,7 +617,9 @@ attempts' store writes landed, and in what order.
   - restarts, forgetting what it read.
 - *A zombie engine* ends any live file.
 - *Retention* deletes a settled attempt's files at any time.
-- *A worker* boots (stopping if its spec is gone), reads the file, swaps
+- *A worker* exists once its attempt's launch is durable (`OfferDurable`;
+  without it, once the engine created it, as F26's pool offer did). It
+  boots (stopping if its spec is gone), reads the file, swaps
   it to `owned`, acquires its generation at the store, swaps it to
   `writing`, writes (the transaction checks the generation), and swaps it
   to `sealed`. A requested cancel lets it drain before `writing`. Its
@@ -628,6 +632,7 @@ attempts' store writes landed, and in what order.
 | Property | Kind | Says |
 |---|---|---|
 | `NoWriteAfterNone` | safety | an attempt whose `AttemptFinished` says it wrote nothing has no store write that landed, before or after the decision: no write after an abort is decided |
+| `NoOrphanWrite` | safety | every store write that landed is of an attempt the journal launched: none of an attempt no engine knows, which nothing ends, commits or repairs |
 | `CompleteLanded` | safety | a result that calls its writes complete did land them |
 | `WritesInOrder` | safety | store writes land in generation order: one attempt writes the partition at a time, and an older attempt never writes over a newer one |
 | `OneOutcome` | action | a final file (`sealed` or `ended`) never changes, only goes with its run; a decision is made once. So the worker's seal and the engine's end, racing on one version, cannot both land |
@@ -674,6 +679,7 @@ by a step between runs):
 | `PreCreate`: the engine creates the file before the launch, and nobody else creates it | `NoWriteAfterNone`, 11 to 12 steps | The create-if-absent gate with nothing retained, the case the old design kept gates `gate_days` for. The engine ends A before its worker reports, creating the file `ended` (`none`), and settles. A's worker boots and reads its spec, and retention deletes A's files. The worker finds no file, creates it `owned`, acquires (no later attempt has), marks `writing` and writes. |
 | `TakeWriting`: the worker marks `writing` before its first write | `NoWriteAfterNone`, 10 to 11 steps | The worker owns A and acquires; the engine ends A from `owned` (`none`); the worker writes anyway |
 | `EngineSwaps`: the engine ends with `If-Match`, not a blind PUT | `NoWriteAfterNone`, 11 to 12 steps | The engine reads `open`. The worker owns A, acquires and marks `writing`. The engine's blind PUT replaces `writing` with `ended` (`none`, from the `open` it read), and the worker's write lands. With `OneOutcome` also checked, TLC finds that first (5 steps): a blind end overwrites the zombie's. |
+| `OfferDurable`: no worker learns of an attempt before its `AttemptLaunched` is durable | `NoOrphanWrite`, 8 steps | F26. The engine creates attempt 1's file `open` and is fenced before `AttemptLaunched` lands. A worker already offered the attempt owns the `open` file, acquires generation 1, marks `writing` and writes: rows of an attempt no engine knows |
 | `Classify`: ended from `writing`, the evidence is `writing` | `NoWriteAfterNone`, 10 to 11 steps | The worker marks `writing` and writes; the engine ends from `writing` but records `none` |
 
 **Bounds and cost** (TLC 2.19; 3 workers, 6 GB, on a shared 8-core VM;
@@ -681,9 +687,9 @@ one engine restart, the zombie, lost answers):
 
 | Model | Attempts | Workers each | Distinct states | Depth | Time |
 |---|---|---|---|---|---|
-| `small` | 2 | 1 | 1,948,128 | 30 | 42 s |
-| `dup`: a duplicate worker | 1 | 2 | 41,018 | 19 | 2 s |
-| `live`: liveness, the engine fair | 2 | 1 | 1,948,128 | 30 | 3 min 59 s |
+| `small` | 2 | 1 | 1,954,036 | 32 | 42 s |
+| `dup`: a duplicate worker | 1 | 2 | 41,024 | 20 | 2 s |
+| `live`: liveness, the engine fair | 2 | 1 | 1,954,036 | 32 | 3 min 59 s |
 
 Two attempts with a duplicate worker each (`check.sh attempt big`) is
 too large to finish here. An earlier version, without draining, passed

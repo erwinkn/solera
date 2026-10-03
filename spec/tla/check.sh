@@ -81,6 +81,7 @@ model() {
         attempt/take-writing) changes=(TakeWriting=FALSE) ;;
         attempt/engine-swaps) changes=(EngineSwaps=FALSE -OneOutcome) ;;
         attempt/classify) changes=(Classify=FALSE) ;;
+        attempt/offer) changes=(OfferDurable=FALSE) ;;
         *) echo "no model $2 of $1" >&2; exit 2 ;;
     esac
 }
@@ -127,6 +128,10 @@ calibration() {
             calibrate engine-swaps NoWriteAfterNone
             # Ended from `writing`, the writes are taken for none.
             calibrate classify NoWriteAfterNone
+            # F26: a worker offered an attempt before its AttemptLaunched is
+            # durable runs it though its engine was fenced first: its rows
+            # land under an attempt no engine knows, which nothing commits.
+            calibrate offer NoOrphanWrite
             ;;
     esac
 }

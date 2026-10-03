@@ -196,6 +196,18 @@ never races a decision.
 | `sealed` | the owner | `owned`, `writing` | once, at the end | the result (§2.1), with its write evidence (§2.3) |
 | `ended` | the engine | `open`, `owned`, `writing` | it gives up: a forced cancel, a timeout, the provisioning deadline, a lost worker | `write`: `none` (from `open` or `owned`), or `writing` with the intents (from `writing`); the engine id |
 
+**Nobody learns of an attempt before its launch is durable.** No launch,
+no pool host's offer, no API answer names the attempt until
+`AttemptLaunched` is durable (§3, step 3). The engine may be fenced or
+crash after creating the file `open` and before that event lands; the
+attempt then goes with its memory, and the next engine never learns of it.
+If a worker had been offered it, that worker would own the `open` file,
+acquire, write, and seal, under an attempt that no engine ends, settles or
+repairs: rows nobody committed (F26). Under the rule, no worker exists for
+it, and its spec and `open` file wait for retention to delete them with
+the run. (TLC: `OfferDurable` in `Attempt.tla`; without it, `NoOrphanWrite`
+fails in 8 steps.)
+
 `sealed` and `ended` are final: nothing changes them, and retention
 deletes the file with its run. Every body names its writer, a worker id
 or an engine id, so no two writes have the same bytes. `swap` relies on
@@ -280,7 +292,9 @@ ECS, engine up throughout.
    control file `runs/R/A.control`, `open` (§2.4).
 3. **Authorize**: record `AttemptLaunched`, await `durable()`. A replaced
    engine fails here and launches nothing. This is the durable launch
-   authorization every later step rests on.
+   authorization every later step rests on: nothing outside the engine
+   learns of the attempt before it, neither a placement nor a pool host
+   polling for work (§2.4).
 4. **Launch**: `placement.launch(stage)` with the provider's name for `A`
    (ECS `clientToken`, Kubernetes job name); record `AttemptPlaced`.
 5. **Own**: the worker boots, reads the spec, generates a worker id
