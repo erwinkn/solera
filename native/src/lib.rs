@@ -413,6 +413,33 @@ fn merge_page<'py>(
     })
 }
 
+/// Prototype (docs/presence-at-position.md): `format::presence` over the
+/// delta log's runs, newest first: counts `[added, updated, removed,
+/// neither]`, and with `with_keys` the keys and their classes.
+#[pyfunction]
+#[pyo3(signature = (runs, codecs, with_keys=false))]
+#[allow(clippy::type_complexity)]
+fn presence<'py>(
+    py: Python<'py>,
+    runs: Vec<Vec<PyBackedBytes>>,
+    codecs: Vec<u8>,
+    with_keys: bool,
+) -> PyResult<(Vec<u64>, Bound<'py, PyList>, Bound<'py, PyBytes>)> {
+    guard(|| {
+        let (counts, keys, classes) = py
+            .detach(|| {
+                let runs: Vec<Vec<&[u8]>> = runs.iter().map(|r| slices(r)).collect();
+                format::presence(&runs, &codecs, with_keys)
+            })
+            .map_err(to_py)?;
+        Ok((
+            counts.to_vec(),
+            list_of_bytes(py, &keys)?,
+            PyBytes::new(py, &classes),
+        ))
+    })
+}
+
 /// Every entry of a garbage file (docs/key-index-format.md § Garbage files):
 /// keys, generations.
 #[pyfunction]
@@ -1771,6 +1798,7 @@ fn solera_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bloom_check_tombstones, m)?)?;
     m.add_function(wrap_pyfunction!(lookup, m)?)?;
     m.add_function(wrap_pyfunction!(merge_range, m)?)?;
+    m.add_function(wrap_pyfunction!(presence, m)?)?;
     m.add_function(wrap_pyfunction!(merge_page, m)?)?;
     m.add_function(wrap_pyfunction!(filter_nbits, m)?)?;
     m.add_function(wrap_pyfunction!(_panic, m)?)?;

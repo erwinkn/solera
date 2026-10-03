@@ -441,6 +441,16 @@ impl Merge {
         self.runs[self.cur.0].block().payload(self.cur.1)
     }
 
+    /// Prototype (docs/presence-at-position.md): whether the current key was
+    /// live before the oldest of its entries the merge holds. A tombstone is
+    /// written only over a live key, an upsert names its predecessor when
+    /// the key was live: exact when every writer resolves exactly.
+    pub fn existed(&self) -> bool {
+        let (r, i) = self.shadowed.last().copied().unwrap_or(self.cur);
+        let b = self.runs[r].block();
+        b.deleted(i) || b.predecessor(i).is_some()
+    }
+
     /// The older entries of the current key the merge passed over, newest
     /// first: `(deleted, generation)`. Readable until the next call.
     pub fn shadowed(&self) -> impl Iterator<Item = (bool, u64)> + '_ {

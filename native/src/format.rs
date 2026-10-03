@@ -636,6 +636,59 @@ pub fn merge_page(
     }
 }
 
+/// Prototype (docs/presence-at-position.md): the delta log's runs (newest
+/// first) merged, each key classed by its state before the oldest run and
+/// after the newest: 0 added, 1 updated, 2 removed, 3 neither (added and
+/// removed within the range). Returns the counts, and the keys and classes
+/// with `with_keys`.
+pub fn presence(
+    runs: &[Vec<&[u8]>],
+    codecs: &[u8],
+    with_keys: bool,
+) -> Result<([u64; 4], Vec<Vec<u8>>, Vec<u8>)> {
+    if codecs.len() != runs.len() {
+        return Err(Error::Value("a codec per run".into()));
+    }
+    let mut m = Merge::new(runs.len());
+    for ((r, blocks), &codec) in runs.iter().enumerate().zip(codecs) {
+        let mut data = Vec::new();
+        let mut metas = Vec::new();
+        for b in blocks {
+            metas.push((data.len(), b.len(), crc32fast::hash(b)));
+            data.extend_from_slice(b);
+        }
+        let data: Bytes = Arc::new(data);
+        for meta in metas {
+            m.runs[r].feed(Segment {
+                data: data.clone(),
+                blocks: vec![meta],
+                codec,
+            });
+        }
+        m.runs[r].end();
+    }
+    let (mut counts, mut keys, mut classes) = ([0u64; 4], Vec::new(), Vec::new());
+    loop {
+        match m.next_key()? {
+            Next::Entry => {
+                let class = match (m.existed(), m.deleted()) {
+                    (false, false) => 0,
+                    (true, false) => 1,
+                    (true, true) => 2,
+                    (false, true) => 3,
+                };
+                counts[class as usize] += 1;
+                if with_keys {
+                    keys.push(m.key().to_vec());
+                    classes.push(class);
+                }
+            }
+            Next::Need(_) => unreachable!("every run is fed whole"),
+            Next::End => return Ok((counts, keys, classes)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
