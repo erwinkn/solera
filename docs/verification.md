@@ -52,6 +52,7 @@ stop where they are, and their `finally` blocks find the store gone.
 ```
 feed (keyed source) ──Incremental──▶ items ──Incremental(page 2)──▶ copy
 items ──Each(page 2)──▶ checks              (fails while a key is "flaky")
+items ──Incremental(page 2)──▶ split ──▶ odd (table store), even (FileStore)
 knob (version) ──dep──▶ per_site[site ∈ sites] ──AllPartitions──▶ summary
 knob ──dep──▶ log (batches) ──Incremental──▶ tally
 outside (keyed source) ◀── watch (a sensor over an external map)
@@ -60,7 +61,10 @@ outside (keyed source) ◀── watch (a sensor over an external map)
 Every producer is a pure function of its inputs, so the oracle computes what
 each output must hold from the sources alone: `items` is `feed` with the
 asset's version appended to each value, `copy` is `items` minus excluded keys,
-`checks` is `x` + each `items` value, `tally` counts `log`'s rows, and so on.
+`checks` is `x` + each `items` value, `split` puts each `items` key in `odd`
+or `even` by its feed version (so a key whose version flips moves between
+two outputs on two kinds of store in one commit), `tally` counts `log`'s
+rows, and so on.
 Re-registration moves between *variants*: `items` on either store, its declared
 version bumped, `copy` renamed to `mirror` (with an alias), `summary` removed,
 `copy`'s edge excluding `k1*`.
@@ -76,8 +80,9 @@ arguments, up to 40 per run.
 | `commit_sites(op, site)` | `commit_sites('upsert', 'west')` | a partition set growing and shrinking |
 | `commit_knob()` | | an unkeyed source's new version: `OnChange` over every scope |
 | `change_outside(keys)` / `sensor_round(delay, twice)` | `sensor_round(delay=90, twice=True)` | a sensor tick posted late, or twice |
-| `flaky(keys)` | `flaky(['k2'])` | `Each` keys failing with `Transient` |
-| `submit(asset, mode, upstream, partitions)` | `submit('copy', mode='full', upstream=False, partitions='all')` | manual runs |
+| `flaky(keys, error)` | `flaky(['k2'], 'failed')` | `Each` keys failing by error class: `Transient` (retried on its backoff), `Failed` (once per deploy), `Rejected` (when the input changes), `Abort` (the whole attempt, per `retries=`) |
+| `retry_keys(classes)` | `retry_keys(['rejected'])` | a forced retry of failing keys, as `solera keys retry` asks for one |
+| `submit(asset, mode, upstream, partitions, keys)` | `submit('checks', mode='incremental', upstream=False, partitions='all', keys=('k1', 'k10'))` | manual runs; `keys=` makes the target's keyed input read a full pass (`'full'`) or the keys named |
 | `cancel(newest)` | | a user cancel of a live run |
 | `wait(seconds)` | `wait(700)` | time passing: retries, timeouts, schedules |
 | `doom_next_worker(fate)` | `doom_next_worker(Fate('die', 'gate', 'after'))` | the next launched worker dies or pauses before or after its claim, start, delta upload, gate, store write, result or `finished`; is muted (cannot reach the engine); or is started twice |
@@ -103,7 +108,9 @@ Checked after every step:
 | **A fenced write holds its gate.** Every write a worker makes to a fenced store (the table store, Postgres) comes after its attempt's gate was created `writing` with that worker's id (`lifecycle.md` §2.4, §3). | a worker paused before its gate, whose attempt the engine closed meanwhile, writing `items` when it wakes; the twin of a `twice` worker writing beside the owner |
 
 Checked once the system is quiet, at the end of every run (`_converge`): faults
-off, zombies killed, a fresh change to every source, then:
+off, zombies killed, a fresh change to every source, a forced retry of every
+failed, rejected and canceled key (which by design come back only on request),
+then:
 
 | Check | Example of a violation |
 |---|---|
