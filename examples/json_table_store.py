@@ -20,7 +20,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 from solera.fencing import fence, fence_table, written
 from solera.sdk import Ref
-from solera.stores import MISSING, Batches, KeyedWrite, Keys, Patch, Written, by_key_type, takes
+from solera.stores import MISSING, Commits, KeyedWrite, Keys, Patch, Written, by_key_type, takes
 
 ROWS = (None, list, list[dict])  # what a load gives: rows, as a list
 
@@ -90,13 +90,15 @@ class JsonTableStore:
                 else:
                     cur.execute(
                         f"DELETE FROM {table} WHERE part = %s AND batch = %s",
-                        (context.partition, context.batch),
+                        (context.partition, context.commit_number),
                     )
                 cur.executemany(
                     f"INSERT INTO {table} VALUES (%s, NULL, %s, %s)",
-                    [(context.partition, context.batch, Jsonb(r)) for r in rows],
+                    [(context.partition, context.commit_number, Jsonb(r)) for r in rows],
                 )
-                return Written(Ref(out.name, "", {**handle, "batch": context.batch}, context.partition))
+                return Written(
+                    Ref(out.name, "", {**handle, "commit_number": context.commit_number}, context.partition)
+                )
             write = KeyedWrite.of(self, write, out, prior)
             if write.whole:  # the scope's whole content: clear it first
                 cur.execute(f"DELETE FROM {table} WHERE part = %s", (context.partition,))
@@ -165,10 +167,10 @@ class JsonTableStore:
         sql, params = f"SELECT k, row FROM {ref.handle['table']} WHERE part = %s", [ref.partition]
         if isinstance(selection, Keys):
             sql, params = sql + " AND k = ANY(%s)", [*params, sorted(selection.generations)]
-        elif isinstance(selection, Batches):
+        elif isinstance(selection, Commits):
             sql, params = sql + " AND batch BETWEEN %s AND %s", [*params, selection.lo, selection.hi]
-        elif (ref.handle or {}).get("batch") is not None:
-            sql, params = sql + " AND batch <= %s", [*params, ref.handle["batch"]]
+        elif (ref.handle or {}).get("commit_number") is not None:
+            sql, params = sql + " AND batch <= %s", [*params, ref.handle["commit_number"]]
         found = conn.execute(sql, params).fetchall()
         if by_key_type(t) is not MISSING:  # each key's rows; a key with none does not exist
             groups: dict[str, list] = {}

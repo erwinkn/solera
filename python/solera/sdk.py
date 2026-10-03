@@ -138,13 +138,13 @@ class TableRef(Ref):
         return self.handle.get("where") or {}
 
     @property
-    def batch(self) -> int | None:
-        return self.handle.get("batch")
+    def commit_number(self) -> int | None:
+        return self.handle.get("commit_number")
 
     def where_sql(self) -> str:
         clauses = [f"{_ident(k)} = {_literal(v)}" for k, v in sorted(self.where.items())]
-        if self.batch is not None:
-            clauses.append(f"_batch <= {int(self.batch)}")
+        if self.commit_number is not None:
+            clauses.append(f"_commit <= {int(self.commit_number)}")
         return " AND ".join(clauses) or "TRUE"
 
     def sql(self) -> str:
@@ -448,7 +448,7 @@ class Upstream:
     commits the page covers."""
 
     output: str | None = None
-    batches: range | None = None
+    commits: range | None = None
 
 
 @dataclass(frozen=True)
@@ -1425,8 +1425,8 @@ class Project:
                         )
                     if annotation is None:
                         raise RegistrationError(f"{name}: store-bound input {param!r} is unannotated (§11)")
-                    Keys, Batches = _selection_classes()
-                    selection = Keys if upstream["key"] is not None else Batches
+                    Keys, Commits = _selection_classes()
+                    selection = Keys if upstream["key"] is not None else Commits
                     loaded = dict[str, annotation] if isinstance(edge, Each) else annotation
                     if not store.can_load(loaded, selection):
                         raise RegistrationError(
@@ -1710,9 +1710,9 @@ class Project:
 
 
 def _selection_classes():
-    from .stores import Batches, Keys
+    from .stores import Commits, Keys
 
-    return Keys, Batches
+    return Keys, Commits
 
 
 def _builtin_kinds() -> dict:

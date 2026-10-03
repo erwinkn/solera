@@ -190,7 +190,7 @@ async def value_content(engine, project, output: str, scope: str = ""):
         ) from error
 
 
-async def batch_rows(engine, project, output: str, scope: str = "") -> list:
+async def commit_rows(engine, project, output: str, scope: str = "") -> list:
     head = engine.state.model.heads.get((output, scope))
     if head is None:
         return []

@@ -16,7 +16,7 @@ import pytest
 from solera.keys.index import key_str
 from solera.sdk import KEYS, Output, PartitionSet, Ref, RegistrationError
 from solera.stores import (
-    Batches,
+    Commits,
     FileStore,
     KeyedWrite,
     Keys,
@@ -176,13 +176,17 @@ async def test_rows_by_key_column(store):
 async def test_unkeyed_incremental_is_one_object_per_batch(store):
     out = Output("events", incremental=True)
     with pytest.raises(WriteError, match="Patch"):
-        await store.store([{"e": 0}], None, context(out, batch=0))
-    first = await store.store(Patch([{"e": 1}]), None, context(out, batch=3, generation=10))
-    second = await store.store(Patch([{"e": 2}, {"e": 3}]), first.ref, context(out, batch=4, generation=11))
-    assert second.ref.handle == {"mode": "batches", "path": "events", "batches": [3, 4]}
+        await store.store([{"e": 0}], None, context(out, commit_number=0))
+    first = await store.store(Patch([{"e": 1}]), None, context(out, commit_number=3, generation=10))
+    second = await store.store(
+        Patch([{"e": 2}, {"e": 3}]), first.ref, context(out, commit_number=4, generation=11)
+    )
+    assert second.ref.handle == {"mode": "commits", "path": "events", "commits": [3, 4]}
     assert await store.load(second.ref, None, None) == [{"e": 1}, {"e": 2}, {"e": 3}]
-    assert await store.load(second.ref, None, Batches(4, 4)) == [{"e": 2}, {"e": 3}]
-    assert (await store.store(Patch([]), second.ref, context(out, batch=5, generation=12))).ref is second.ref
+    assert await store.load(second.ref, None, Commits(4, 4)) == [{"e": 2}, {"e": 3}]
+    assert (
+        await store.store(Patch([]), second.ref, context(out, commit_number=5, generation=12))
+    ).ref is second.ref
 
 
 async def test_a_batchs_committed_object_is_its_highest_generation(store):
@@ -191,11 +195,11 @@ async def test_a_batchs_committed_object_is_its_highest_generation(store):
     committed, is the one read. A full run starts over at a later batch."""
 
     out = Output("events", incremental=True)
-    first = await store.store(Patch([{"e": 1}]), None, context(out, batch=3, generation=10))
-    await store.store(Patch([{"e": "dead"}]), first.ref, context(out, batch=4, generation=11))
-    retry = await store.store(Patch([{"e": 2}]), first.ref, context(out, batch=4, generation=12))
+    first = await store.store(Patch([{"e": 1}]), None, context(out, commit_number=3, generation=10))
+    await store.store(Patch([{"e": "dead"}]), first.ref, context(out, commit_number=4, generation=11))
+    retry = await store.store(Patch([{"e": 2}]), first.ref, context(out, commit_number=4, generation=12))
     assert await store.load(retry.ref, None, None) == [{"e": 1}, {"e": 2}]
-    reset = await store.store(Patch([{"e": 9}]), None, context(out, batch=6, generation=13))
+    reset = await store.store(Patch([{"e": 9}]), None, context(out, commit_number=6, generation=13))
     assert await store.load(reset.ref, None, None) == [{"e": 9}]
 
 
@@ -250,9 +254,13 @@ async def test_one_batch_is_read_without_listing_the_history(store, monkeypatch)
 
     out = Output("events", incremental=True)
     ref = None
-    for batch in range(200):
+    for commit_number in range(200):
         ref = (
-            await store.store(Patch([{"e": batch}]), ref, context(out, batch=batch, generation=batch + 1))
+            await store.store(
+                Patch([{"e": commit_number}]),
+                ref,
+                context(out, commit_number=commit_number, generation=commit_number + 1),
+            )
         ).ref
     listed = []
     real = obstore.list
@@ -265,11 +273,11 @@ async def test_one_batch_is_read_without_listing_the_history(store, monkeypatch)
 
         return chunks()
 
-    await store.store(Patch([{"e": "uncommitted"}]), ref, context(out, batch=200, generation=300))
+    await store.store(Patch([{"e": "uncommitted"}]), ref, context(out, commit_number=200, generation=300))
     monkeypatch.setattr(obstore, "list", counting)
     for lo, hi, read in ((199, 199, [{"e": 199}]), (0, 0, [{"e": 0}]), (199, 205, [{"e": 199}])):
         listed.clear()
-        assert await store.load(ref, None, Batches(lo, hi)) == read
+        assert await store.load(ref, None, Commits(lo, hi)) == read
         assert len(listed) <= 1, (lo, hi, listed)
 
 
@@ -331,11 +339,11 @@ async def test_a_missing_object_a_commit_names_fails_the_read(store, data):
     with pytest.raises(StoreError, match="'a'.* is gone"):
         await store.load(written.ref, None, keys)
     events = Output("events", incremental=True)
-    batch = await store.store(Patch([{"e": 1}]), None, context(events, batch=0, generation=1))
-    names = await store._batches(batch.ref.handle["path"], 0, 0)
+    commit_number = await store.store(Patch([{"e": 1}]), None, context(events, commit_number=0, generation=1))
+    names = await store._commits(commit_number.ref.handle["path"], 0, 0)
     await obstore.delete_async(store._objects(), f"{names[0]}.json")
     with pytest.raises(StoreError, match="is gone"):
-        await store.load(batch.ref, None, None)
+        await store.load(commit_number.ref, None, None)
 
 
 async def test_a_store_reads_its_own_types(store):

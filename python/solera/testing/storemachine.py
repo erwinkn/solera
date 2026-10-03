@@ -43,7 +43,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from ..sdk import Ref
-from ..stores import Batches, KeyedWrite, Keys, Patch, StoreError, prepare_for
+from ..stores import Commits, KeyedWrite, Keys, Patch, StoreError, prepare_for
 from .stores import Harness, Ledger, context
 
 KEYS = ["a", "b", "c", "d"]
@@ -52,7 +52,7 @@ KEYS = ["a", "b", "c", "d"]
 @dataclass
 class Attempt:
     generation: int
-    invocation: str
+    worker_id: str
     last: tuple | None = None  # its write call, to retry: (keyed write, prior, written ref)
     fenced: bool = False  # it holds the slice: acquired once the slice existed, or wrote
 
@@ -65,9 +65,9 @@ class Pin:
 
 
 @dataclass
-class BatchModel:
+class CommitModel:
     head: Ref | None = None
-    batch: int = -1  # the last committed
+    commit_number: int = -1  # the last committed
     rows: dict[int, list[tuple[str, str]]] = field(default_factory=dict)  # committed batches
     last: tuple | None = None  # (write, prior, generation, batch, reset): the last call, to retry
 
@@ -98,8 +98,8 @@ def stateful(make_harness: Callable[[], Harness]):
             self.fence = 0  # the newest generation holding the slice (fenced)
             self.written: set[tuple[str, int]] = set()  # (key, generation) names ever written
             self.pins: list[Pin] = []
-            self.batches_out = None
-            self.batches = BatchModel()
+            self.commits_out = None
+            self.commits = CommitModel()
 
         def teardown(self):
             self.loop.close()
@@ -213,7 +213,7 @@ def stateful(make_harness: Callable[[], Harness]):
             """A second invocation of the current attempt: refused, both to
             acquire and to write, once the attempt holds the slice."""
 
-            twin = Attempt(self.current.generation, self.current.invocation + "-twin")
+            twin = Attempt(self.current.generation, self.current.worker_id + "-twin")
             with _refused("a duplicate invocation's acquire"):
                 self.run(self.store.acquire(self._scope(twin), self.head))
             rows = [{"id": "a", "v": "0"}]
@@ -275,34 +275,40 @@ def stateful(make_harness: Callable[[], Harness]):
             """The next batch of an unkeyed incremental output: appended, or
             (reset) starting the output over; maybe sent twice."""
 
-            if self.batches_out is None:
-                self.batches_out = self.h.output(incremental=True)
-            model = self.batches
+            if self.commits_out is None:
+                self.commits_out = self.h.output(incremental=True)
+            model = self.commits
             self.generation += 1
-            batch = model.batch + 1
-            rows = [{"id": f"r{batch}-{i}", "v": str(batch)} for i in range(n)]
-            sc = context(self.batches_out, self.generation, f"i{self.generation}", batch=batch, reset=reset)
+            commit_number = model.commit_number + 1
+            rows = [{"id": f"r{commit_number}-{i}", "v": str(commit_number)} for i in range(n)]
+            sc = context(
+                self.commits_out,
+                self.generation,
+                f"i{self.generation}",
+                commit_number=commit_number,
+                reset=reset,
+            )
             written = None
             for _ in range(2 if retried else 1):
                 written = self.run(self.store.store(Patch(rows), model.head, sc))
             if reset:
                 model.rows.clear()
-            model.rows[batch] = sorted((r["id"], r["v"]) for r in rows)
-            model.head, model.batch = written.ref, batch
-            model.last = (rows, batch)
+            model.rows[commit_number] = sorted((r["id"], r["v"]) for r in rows)
+            model.head, model.commit_number = written.ref, commit_number
+            model.last = (rows, commit_number)
 
-        @precondition(lambda self: self.batches.last is not None)
+        @precondition(lambda self: self.commits.last is not None)
         @rule()
-        def stale_batch(self):
+        def stale_commit(self):
             """An attempt the engine gave up on rewrites the last batch with
             other rows; then the next batch is written as usual. A fenced
             store refuses the stale write; an immutable one keeps, per batch,
             what the highest generation wrote."""
 
-            model = self.batches
-            rows, batch = model.last
-            stale = context(self.batches_out, 0, "stale", batch=batch)
-            junk = Patch([{"id": f"stale-{batch}", "v": "x"}])
+            model = self.commits
+            rows, commit_number = model.last
+            stale = context(self.commits_out, 0, "stale", commit_number=commit_number)
+            junk = Patch([{"id": f"stale-{commit_number}", "v": "x"}])
             if self.kind == "fenced":
                 with contextlib.suppress(StoreError):
                     self.run(self.store.store(junk, model.head, stale))
@@ -334,7 +340,7 @@ def stateful(make_harness: Callable[[], Harness]):
 
         @invariant()
         def batches_read_back(self):
-            model = self.batches
+            model = self.commits
             if model.head is None:
                 return
             want = sorted(p for rows in model.rows.values() for p in rows)
@@ -342,15 +348,15 @@ def stateful(make_harness: Callable[[], Harness]):
             if got != want:
                 raise AssertionError(f"the batches read {got}; committed were {want}")
             lo = min(model.rows)
-            for b in (lo, model.batch):
-                got = self._rows(model.head, Batches(b, b))
+            for b in (lo, model.commit_number):
+                got = self._rows(model.head, Commits(b, b))
                 if got != model.rows[b]:
                     raise AssertionError(f"batch {b} reads {got}; committed was {model.rows[b]}")
 
         # -- helpers ----------------------------------------------------------------------
 
         def _scope(self, attempt: Attempt):
-            return context(self.out, attempt.generation, attempt.invocation)
+            return context(self.out, attempt.generation, attempt.worker_id)
 
         def _resolve(self, kind: str, rows: list[dict], removes: list[str]):
             """A write as the worker hands it to the store, resolved against

@@ -149,7 +149,7 @@ async def _dead_write(state, landed: bool):  # noqa: F811
 
     index = state.model.index("items", "")
     files, _ = await KeyIndex(ObjectIO(state.objects), None, index.pinned()).resolve(
-        SortedEntries.of([b"k"]), batch=1, attempt="dead", generation=12
+        SortedEntries.of([b"k"]), commit_number=1, attempt="dead", generation=12
     )
     state.model.unsettled[("items", "")] = [{**files.to_json(), "run": "r", "attempt": "dead"}]
     assert status_of(await drive(engine, await engine.submit(["items"]))) == "succeeded"

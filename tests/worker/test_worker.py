@@ -60,7 +60,7 @@ project = Project(assets=[feed, consumer])
     attempt = detail["attempts"][task["id"]][0]["id"]
     # the harness wrote the batch's delta file into the output's key index
     head = state.model.heads[("feed", "")]
-    assert head["count"] == 2 and head["batch"] == 0
+    assert head["count"] == 2 and head["commit_number"] == 0
     index = state.model.indexes[("feed", "")]
     [delta] = index.files
     assert await state.get_object(index.path(delta.name)) is not None
@@ -69,7 +69,7 @@ project = Project(assets=[feed, consumer])
     # what was delivered, and the log: short enough to travel inside it)
     assert (await state.attempt_spec(detail["request"]["id"], attempt))["asset"] == "consumer"
     result = await state.attempt_result(detail["request"]["id"], attempt)
-    assert result["status"] == "succeeded" and result["writes"] == "complete"
+    assert result["status"] == "succeeded" and result["write"] == "complete"
     assert result["delivered"]["feed"] == {"after": None, "upserted": ["a", "b"], "deleted": []}
     assert result["log"]["lines"] == 1 and result["log"]["chunks"] == [] and result["log"]["tail"]
     log = await state.attempt_log(detail["request"]["id"], attempt)

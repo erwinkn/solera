@@ -75,14 +75,14 @@ async def until(engine, done, timeout=10.0):
         await asyncio.sleep(0.02)
 
 
-async def finish_as_worker(state, run_id, attempt, output, invocation="w", **extra):
+async def finish_as_worker(state, run_id, attempt, output, worker_id="w", **extra):
     """What a worker does (docs/lifecycle.md §3): claim, take the gate, write,
     then seal its result (with `extra` fields)."""
 
     base = state.attempt_path(run_id, attempt)
     with contextlib.suppress(AlreadyExistsError):
-        await state.create_object(f"{base}.worker", json.dumps({"invocation": invocation}).encode())
-    await state.create_object(f"{base}.writing", lifecycle.gate("writing", invocation, {}))
+        await state.create_object(f"{base}.worker", json.dumps({"worker_id": worker_id}).encode())
+    await state.create_object(f"{base}.writing", lifecycle.gate("writing", worker_id, {}))
     ref = {
         "output": output,
         "store": "default",
@@ -91,9 +91,9 @@ async def finish_as_worker(state, run_id, attempt, output, invocation="w", **ext
         "partition": "",
     }
     result = {
-        "invocation": invocation,
+        "worker_id": worker_id,
         "status": "succeeded",
-        "writes": "complete",
+        "write": "complete",
         "outputs": {output: {"ref": {**ref, "meta": {}}}},
         **extra,
     }
@@ -172,7 +172,7 @@ async def test_an_attempt_its_placement_cannot_see_is_followed_by_its_heartbeat(
     await engine.initialize()
     run, attempt = await launched(engine, ["remote"])
     await state.put_object(
-        f"{state.attempt_path(run['id'], attempt)}.worker", json.dumps({"invocation": "w"}).encode()
+        f"{state.attempt_path(run['id'], attempt)}.worker", json.dumps({"worker_id": "w"}).encode()
     )
     state, engine = await restart(state, engine, url, REMOTE, worker=Blind, heartbeat_seconds=0.1)
     assert state.model.task(state.model.attempts[attempt])["launched"]["handle"] == {
@@ -315,7 +315,7 @@ async def test_a_cancel_waits_for_a_worker_that_is_writing(tmp_path):
     await engine.initialize()
     run, attempt = await launched(engine, ["remote"])
     base = state.attempt_path(run["id"], attempt)
-    await state.create_object(f"{base}.worker", json.dumps({"invocation": "w"}).encode())
+    await state.create_object(f"{base}.worker", json.dumps({"worker_id": "w"}).encode())
     await until(engine, lambda: engine.live[attempt].started)
     await engine.cancel(run["id"])
     await until(
@@ -341,7 +341,7 @@ async def test_a_drain_that_outlives_its_grace_is_forced_and_uncertain(tmp_path)
     await engine.initialize()
     run, attempt = await launched(engine, ["remote"])
     base = state.attempt_path(run["id"], attempt)
-    await state.create_object(f"{base}.worker", json.dumps({"invocation": "w"}).encode())
+    await state.create_object(f"{base}.worker", json.dumps({"worker_id": "w"}).encode())
     intents = {"remote": {"files": [], "added": 0, "removed": 0, "exact": True}}
     await state.create_object(f"{base}.writing", lifecycle.gate("writing", "w", intents))
     await until(engine, lambda: engine.live[attempt].started)
@@ -702,7 +702,7 @@ async def test_the_timeout_runs_from_the_first_report(tmp_path):
         await engine.tick()
         await asyncio.sleep(0.02)
     assert state.model.claimed(attempt) is not None
-    await state.put_object(beat, json.dumps({"invocation": "w"}).encode())
+    await state.put_object(beat, json.dumps({"worker_id": "w"}).encode())
     reported = asyncio.get_running_loop().time()
     await until(engine, lambda: state.model.claimed(attempt) is None)
     assert asyncio.get_running_loop().time() - reported >= 0.5
@@ -711,7 +711,7 @@ async def test_the_timeout_runs_from_the_first_report(tmp_path):
 
     run, attempt = await launched(engine, ["brief"])
     await state.put_object(
-        f"{state.attempt_path(run['id'], attempt)}.worker", json.dumps({"invocation": "w"}).encode()
+        f"{state.attempt_path(run['id'], attempt)}.worker", json.dumps({"worker_id": "w"}).encode()
     )
     state, engine = await restart(
         state, engine, url, project, worker=Quiet, heartbeat_seconds=0.1, cancel_grace=0.1
@@ -750,7 +750,7 @@ async def test_an_attempt_that_wrote_nothing_still_leaves_a_gate(tmp_path):
         gate = json.loads(
             await state.get_object(f"{state.attempt_path(detail['request']['id'], attempt['id'])}.writing")
         )
-        gates.append((result["writes"], gate["state"]))
+        gates.append((result["write"], gate["state"]))
     assert gates == [("complete", "writing"), ("none", "closed")]
     await engine.stop()
     await state.close()
@@ -910,7 +910,7 @@ async def test_a_replaced_engine_stops_acting(tmp_path):
     await engine.initialize()
     run, attempt = await launched(engine, ["brief"])
     base = state.attempt_path(run["id"], attempt)
-    await state.create_object(f"{base}.worker", json.dumps({"invocation": "w"}).encode())  # it runs
+    await state.create_object(f"{base}.worker", json.dumps({"worker_id": "w"}).encode())  # it runs
     await engine.start()
     successor = await State.open(url, "test", flush_interval=0.001)  # B takes the namespace over
     with contextlib.suppress(Unavailable):
@@ -920,7 +920,7 @@ async def test_a_replaced_engine_stops_acting(tmp_path):
     await asyncio.sleep(1.0)  # A's timeout and cancel grace pass
     assert await state.get_object(f"{base}.writing") is None and Watching.canceled == []
     with pytest.raises(Unavailable):
-        await engine.attempt_beat(attempt, {"invocation": "w", "seq": 1})
+        await engine.attempt_beat(attempt, {"worker_id": "w", "seq": 1})
     assert successor.model.claimed(attempt) is not None  # B still owns it, and adopts it
     await engine.stop()
     await successor.close()
@@ -930,10 +930,10 @@ async def failed_writing(state, run_id, attempt, intents):
     """A worker that took the gate listing `intents`, then failed."""
 
     base = state.attempt_path(run_id, attempt)
-    await state.create_object(f"{base}.worker", json.dumps({"invocation": "w"}).encode())
+    await state.create_object(f"{base}.worker", json.dumps({"worker_id": "w"}).encode())
     await state.create_object(f"{base}.writing", lifecycle.gate("writing", "w", intents))
     error = {"type": "ValueError", "message": "boom", "retryable": False}
-    result = {"invocation": "w", "status": "failed", "writes": "uncertain", "error": error}
+    result = {"worker_id": "w", "status": "failed", "write": "writing", "error": error}
     await state.create_object(f"{base}.result", json.dumps(result).encode())
 
 
@@ -1035,9 +1035,9 @@ async def test_a_removed_assets_launched_attempt_is_not_retried(tmp_path):
     state, engine = await restart(state, engine, url, Project(assets=[other], executors=[Fake("fake")]))
     await engine.initialize()
     base = state.attempt_path(run["id"], attempt)
-    await state.create_object(f"{base}.worker", json.dumps({"invocation": "w"}).encode())
+    await state.create_object(f"{base}.worker", json.dumps({"worker_id": "w"}).encode())
     error = {"type": "ValueError", "message": "boom", "retryable": True}
-    result = {"invocation": "w", "status": "failed", "writes": "none", "error": error}
+    result = {"worker_id": "w", "status": "failed", "write": "none", "error": error}
     await state.create_object(f"{base}.result", json.dumps(result).encode())
     detail = await engine.run_until(run["id"], 10)
     [task] = (await engine.history.tasks(run=run["id"]))["tasks"]

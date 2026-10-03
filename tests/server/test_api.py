@@ -319,23 +319,23 @@ async def test_worker_pull_path_and_channel(engine, monkeypatch):
 
         spec = await engine.state.attempt_spec(stage["run"], stage["attempt"])
         base = lifecycle.base(stage["run"], stage["attempt"])
-        await engine.state.create_object(f"{base}.worker", json.dumps({"invocation": "mine"}).encode())
+        await engine.state.create_object(f"{base}.worker", json.dumps({"worker_id": "mine"}).encode())
         routes = f"/api/projects/{p}/attempts/{stage['attempt']}"
         token = {"Authorization": f"Bearer {spec['token']}"}
-        assert (await client.post(f"{routes}/start", json={"invocation": "mine"})).status_code == 401
-        started = await client.post(f"{routes}/start", json={"invocation": "mine"}, headers=token)
+        assert (await client.post(f"{routes}/start", json={"worker_id": "mine"})).status_code == 401
+        started = await client.post(f"{routes}/start", json={"worker_id": "mine"}, headers=token)
         assert started.status_code == 200 and started.json() == {"cancel": None}
-        stranger = await client.post(f"{routes}/beat", json={"invocation": "theirs", "seq": 1}, headers=token)
+        stranger = await client.post(f"{routes}/beat", json={"worker_id": "theirs", "seq": 1}, headers=token)
         assert stranger.status_code == 409 and stranger.json()["detail"] == "not_owner"
-        beat = await client.post(f"{routes}/beat", json={"invocation": "mine", "seq": 1}, headers=token)
+        beat = await client.post(f"{routes}/beat", json={"worker_id": "mine", "seq": 1}, headers=token)
         assert beat.json() == {"cancel": None}
 
         lines = ['{"message": "a"}\n', '{"message": "b"}\n']
         sent = await client.post(
-            f"{routes}/logs", json={"invocation": "mine", "offset": 0, "lines": lines}, headers=token
+            f"{routes}/logs", json={"worker_id": "mine", "offset": 0, "lines": lines}, headers=token
         )
         again = await client.post(
-            f"{routes}/logs", json={"invocation": "mine", "offset": 0, "lines": lines}, headers=token
+            f"{routes}/logs", json={"worker_id": "mine", "offset": 0, "lines": lines}, headers=token
         )
         assert sent.json() == again.json() == {"offset": 2}  # a retried batch is not shown twice
         assert engine.attempt_lines(stage["attempt"]) == lines
@@ -353,11 +353,11 @@ async def test_worker_pull_path_and_channel(engine, monkeypatch):
         )
         assert stranger.status_code == 409
         for nobody in ("", None):  # no identity is never the owner's, bound or not
-            anonymous = resolver.frame({"invocation": nobody, "outputs": []}, [])
+            anonymous = resolver.frame({"worker_id": nobody, "outputs": []}, [])
             assert (
                 await client.post(f"{routes}/resolve", content=anonymous, headers=token)
             ).status_code == 409
-        torn = resolver.frame({"invocation": "mine", "outputs": [{"name": "x", "offset": 0, "size": 9}]}, [])
+        torn = resolver.frame({"worker_id": "mine", "outputs": [{"name": "x", "offset": 0, "size": 9}]}, [])
         assert (await client.post(f"{routes}/resolve", content=torn, headers=token)).status_code == 400
         huge = await client.post(
             f"{routes}/resolve", content=b"\x01" + bytes(resolver.MAX_BODY), headers=token
@@ -370,14 +370,14 @@ async def test_worker_pull_path_and_channel(engine, monkeypatch):
         other = lifecycle.token(engine.secret, "another-attempt")
         forged = await client.post(
             f"{routes}/beat",
-            json={"invocation": "mine", "seq": 2},
+            json={"worker_id": "mine", "seq": 2},
             headers={"Authorization": f"Bearer {other}"},
         )
         assert forged.status_code == 401
         from solera_server import attempts
 
         monkeypatch.setattr(attempts, "AFTER_COMMIT_WAIT", 0.1)  # nothing settles it here
-        finished = await client.post(f"{routes}/finished", json={"invocation": "mine"}, headers=token)
+        finished = await client.post(f"{routes}/finished", json={"worker_id": "mine"}, headers=token)
         assert finished.status_code == 200  # what is due for discarding once committed: here nothing
 
 

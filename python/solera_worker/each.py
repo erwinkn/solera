@@ -473,7 +473,7 @@ async def _failures(spec, each: dict, page: Page, outcomes: dict, keys_io) -> di
     index = KeyIndex(keys_io, None, IndexState.from_json(each["failures"]))
     files, _ = await index.resolve(
         SortedEntries.of(upsert_keys, upsert_records, removes),
-        batch=int(each["batch"]),
+        commit_number=int(each["commit_number"]),
         attempt=spec["attempt"],
         generation=int(spec.get("generation") or 0),
         exact=True,

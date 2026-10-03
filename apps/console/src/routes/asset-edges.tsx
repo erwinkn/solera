@@ -40,7 +40,7 @@ const KIND: Record<Edge["kind"], { name: string; means: string }> = {
 
 const STATE_HINT: Record<EdgeState, string> = {
   never: "Nothing delivered yet: the first delivery is the whole head.",
-  caught_up: "Every committed batch delivered.",
+  caught_up: "Every commit delivered.",
   behind: "Batches committed upstream wait to be delivered.",
   paging: "A window is being delivered over several attempts.",
   full: "A full delivery (a reset or a full run) is in progress.",
@@ -145,11 +145,11 @@ function ScopeRow({ s }: { s: EdgeScope }) {
   const wm = s.watermark;
   const delivered = wm ? wm.next - 1 : null;
   const lag = s.lag ?? 0;
-  const head = s.head_batch ?? 0;
+  const head = s.head_commit ?? 0;
   const done = head + 1 - lag;
   const d = wm?.delivery;
   const at =
-    typeof d?.at === "string" ? `after ${d.at}` : typeof d?.at === "number" ? `batch ${count(d.at)}` : null;
+    typeof d?.at === "string" ? `after ${d.at}` : typeof d?.at === "number" ? `commit ${count(d.at)}` : null;
   const position = d ? [d.mode, at, `page ${d.page + 1} of ${d.pages}`].filter(Boolean).join(" · ") : null;
   return (
     <Tr>
@@ -165,13 +165,13 @@ function ScopeRow({ s }: { s: EdgeScope }) {
         </Tooltip>
       </Td>
       <Td className="text-right text-fg-muted">
-        {delivered != null && delivered >= 0 ? `batch ${count(delivered)}` : "—"}
+        {delivered != null && delivered >= 0 ? `commit ${count(delivered)}` : "—"}
       </Td>
       <Td className="text-right text-fg-muted">
-        {s.head_batch != null ? `batch ${count(s.head_batch)}` : "—"}
+        {s.head_commit != null ? `commit ${count(s.head_commit)}` : "—"}
       </Td>
       <Td>
-        {s.state === "never" && !s.head_batch ? (
+        {s.state === "never" && !s.head_commit ? (
           <span className="text-xs text-fg-subtle">—</span>
         ) : (
           <span className="flex items-center gap-2">
@@ -184,7 +184,7 @@ function ScopeRow({ s }: { s: EdgeScope }) {
               />
             </span>
             <span className={cn("text-xs tabular", lag ? "font-medium text-warn-fg" : "text-fg-subtle")}>
-              {lag ? plural(lag, "batch", "batches") : "none"}
+              {lag ? plural(lag, "commit") : "none"}
             </span>
           </span>
         )}

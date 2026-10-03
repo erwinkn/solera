@@ -217,21 +217,21 @@ class _Got:
 class _Listing:
     """A listing collected at once, iterable either way, in batches."""
 
-    def __init__(self, batches):
-        self.batches = batches
+    def __init__(self, commits):
+        self.commits = commits
 
     def __iter__(self):
-        return iter(self.batches)
+        return iter(self.commits)
 
     def __aiter__(self):
         async def gen():
-            for batch in self.batches:
-                yield batch
+            for commit_number in self.commits:
+                yield commit_number
 
         return gen()
 
     def collect(self):
-        return [m for b in self.batches for m in b]
+        return [m for b in self.commits for m in b]
 
     async def collect_async(self):
         return self.collect()
@@ -413,8 +413,8 @@ class Objects:
         args = {"prefix": prefix} if prefix is not None else {}
         if offset is not None:
             args["offset"] = offset
-        batches = [list(b) for b in real(store, **args)]
-        return _Listing(batches)
+        commits = [list(b) for b in real(store, **args)]
+        return _Listing(commits)
 
     def put(self, store, path, data, **kw):
         return self._real["put"](store, path, data, **kw)

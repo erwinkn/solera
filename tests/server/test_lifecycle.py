@@ -32,7 +32,7 @@ async def test_a_duplicate_invocation_waits_for_the_owner_and_writes_nothing(tmp
     await engine.initialize()
     run, attempt = await launched(engine, ["items"])
 
-    def invocation():
+    def worker_id():
         return run_attempt(
             state.objects_url,
             attempt,
@@ -42,15 +42,15 @@ async def test_a_duplicate_invocation_waits_for_the_owner_and_writes_nothing(tmp
             loser_poll=0.05,
         )
 
-    owner = asyncio.create_task(invocation())
+    owner = asyncio.create_task(worker_id())
     await asyncio.sleep(0.05)
-    loser = asyncio.create_task(invocation())
+    loser = asyncio.create_task(worker_id())
     await asyncio.sleep(0.1)
     assert not loser.done()  # waiting for the owner, not exiting
     assert await asyncio.wait_for(asyncio.gather(owner, loser), 10) == [0, 0]
     claim = json.loads(await state.get_object(f"{lifecycle.base(run['id'], attempt)}.worker"))
     result = await state.attempt_result(run["id"], attempt)
-    assert result["invocation"] == claim["invocation"]
+    assert result["worker_id"] == claim["worker_id"]
     await until(engine, lambda: state.model.claimed(attempt) is None)
     assert state.model.heads[("items", "")]["attempt"] == attempt
     await engine.stop()
@@ -71,7 +71,7 @@ async def test_a_loser_exits_once_the_engine_says_the_attempt_ended(tmp_path):
     engine = engine_for(state, project, cancel_grace=0.1)
     await engine.initialize()
     run, attempt = await launched(engine, ["items"])
-    await state.create_object(f"{lifecycle.base(run['id'], attempt)}.worker", b'{"invocation": "dead"}')
+    await state.create_object(f"{lifecycle.base(run['id'], attempt)}.worker", b'{"worker_id": "dead"}')
     loser = asyncio.create_task(
         run_attempt(
             state.objects_url,
@@ -108,7 +108,7 @@ async def test_a_loser_without_a_channel_exits_on_a_terminal_gate(tmp_path):
     await engine.initialize()
     run, attempt = await launched(engine, ["items"])
     base = lifecycle.base(run["id"], attempt)
-    await state.create_object(f"{base}.worker", b'{"invocation": "dead"}')
+    await state.create_object(f"{base}.worker", b'{"worker_id": "dead"}')
     loser = asyncio.create_task(
         run_attempt(state.objects_url, attempt, project, run=run["id"], loser_poll=0.05)
     )
@@ -139,15 +139,15 @@ async def test_a_duplicates_exit_does_not_end_the_owners_attempt(tmp_path):
     await until(engine, lambda: Remote.launches)
     attempt = Remote.launches[0]
     base = lifecycle.base(run["id"], attempt)
-    await state.create_object(f"{base}.worker", json.dumps({"invocation": "owner"}).encode())
-    await engine.attempt_start(attempt, {"invocation": "owner"})
+    await state.create_object(f"{base}.worker", json.dumps({"worker_id": "owner"}).encode())
+    await engine.attempt_start(attempt, {"worker_id": "owner"})
     for seq in range(1, 6):
-        await engine.attempt_beat(attempt, {"invocation": "owner", "seq": seq})
+        await engine.attempt_beat(attempt, {"worker_id": "owner", "seq": seq})
         await engine.tick()
         await asyncio.sleep(0.05)
     assert state.model.claimed(attempt) is not None  # the exit did not end it
-    await finish_as_worker(state, run["id"], attempt, "remote", invocation="owner")
-    await engine.attempt_finished(attempt, {"invocation": "owner"})
+    await finish_as_worker(state, run["id"], attempt, "remote", worker_id="owner")
+    await engine.attempt_finished(attempt, {"worker_id": "owner"})
     await until(engine, lambda: state.model.claimed(attempt) is None)
     assert state.model.heads[("remote", "")]["attempt"] == attempt
     await engine.stop()
@@ -178,7 +178,7 @@ async def test_a_requested_cancel_drains_into_a_canceled_result(tmp_path):
     assert detail["request"]["status"] == "canceled"
     [attempt] = detail["attempts"][detail["tasks"][0]["id"]]
     result = await state.attempt_result(run["id"], attempt["id"])
-    assert result["status"] == "canceled" and result["writes"] == "none"
+    assert result["status"] == "canceled" and result["write"] == "none"
     assert result["cancel"]["phase"] == "requested" and result["cancel"]["reason"] == "user"
     assert (
         await state.get_object(f"{lifecycle.base(run['id'], attempt['id'])}.writing") is None
@@ -224,20 +224,20 @@ async def test_a_restarted_engine_binds_the_claims_owner(tmp_path):
     await engine.initialize()
     run, attempt = await launched(engine, ["remote"])
     await state.create_object(
-        f"{lifecycle.base(run['id'], attempt)}.worker", json.dumps({"invocation": "own"}).encode()
+        f"{lifecycle.base(run['id'], attempt)}.worker", json.dumps({"worker_id": "own"}).encode()
     )
-    await engine.attempt_start(attempt, {"invocation": "own"})
+    await engine.attempt_start(attempt, {"worker_id": "own"})
     await engine.stop()
     await state.close()
     state = await State.open(url, "test", flush_interval=0.001)
     engine = engine_for(state, REMOTE)
     await engine.initialize()
     try:
-        await engine.attempt_beat(attempt, {"invocation": "other", "seq": 1})
+        await engine.attempt_beat(attempt, {"worker_id": "other", "seq": 1})
         raise AssertionError("another invocation was accepted")
     except Ended as error:
         assert error.reason == "not_owner"
-    assert await engine.attempt_beat(attempt, {"invocation": "own", "seq": 7}) == {"cancel": None}
+    assert await engine.attempt_beat(attempt, {"worker_id": "own", "seq": 7}) == {"cancel": None}
     await engine.stop()
     await state.close()
 
@@ -290,7 +290,7 @@ async def test_a_fenced_store_runs_its_retry_at_once(tmp_path):
             self.acquired = []
 
         async def acquire(self, context, prior=None):
-            self.acquired.append((context.generation, context.invocation))
+            self.acquired.append((context.generation, context.worker_id))
 
     live = Fenced()
     writes = [Patch([{"id": "a", "v": 1}, {"id": "b", "v": 1}]), Patch([{"id": "a", "v": 2}])]

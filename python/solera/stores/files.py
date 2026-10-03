@@ -14,7 +14,7 @@ from ..sdk import KEYS, ObjectRef, Ref, is_ref_type
 from . import (
     MISSING,
     PARALLEL,
-    Batches,
+    Commits,
     KeyedWrite,
     Keys,
     Patch,
@@ -114,7 +114,7 @@ class FileStore:
         if output.incremental:
             if not patch:
                 raise WriteError(f"{output.name}: an unkeyed incremental output only accepts Patch writes")
-            return await self._store_batch(write, prior, context, base, generation)
+            return await self._store_commit(write, prior, context, base, generation)
         name = f"{base}@{generation}"
         await self._put(name, write)
         return Written(self._ref(context, {"mode": "value", "path": name, "base": base}))
@@ -145,7 +145,7 @@ class FileStore:
             await self._many(put, chunk)
         return Written(self._ref(context, {"mode": "keyed", "path": base, "key": context.output.key}))
 
-    async def _store_batch(self, write: Patch, prior, context, base, generation) -> Written:
+    async def _store_commit(self, write: Patch, prior, context, base, generation) -> Written:
         """An unkeyed incremental write: its items, as one object per batch.
         With no prior (a first write, or a reset) the output starts over at
         this batch; earlier ones are no longer read, and go with `discard`."""
@@ -160,13 +160,13 @@ class FileStore:
             raise WriteError(f"{output.name}: a batch is a list, got {type(items).__name__}")
         if not items and prior is not None:
             return Written(prior)
-        if context.batch is not None:
-            batch = context.batch
+        if context.commit_number is not None:
+            commit_number = context.commit_number
         else:
-            batch = int(prior.handle["batches"][1]) + 1 if prior is not None else 0
-        await self._put(f"{base}/{batch:012d}/{generation}", items)
-        first = batch if prior is None else int(prior.handle["batches"][0])
-        handle = {"mode": "batches", "path": base, "batches": [first, batch]}
+            commit_number = int(prior.handle["commits"][1]) + 1 if prior is not None else 0
+        await self._put(f"{base}/{commit_number:012d}/{generation}", items)
+        first = commit_number if prior is None else int(prior.handle["commits"][0])
+        handle = {"mode": "commits", "path": base, "commits": [first, commit_number]}
         return Written(self._ref(context, handle))
 
     @staticmethod
@@ -191,9 +191,9 @@ class FileStore:
                 names.append(item[1])
             elif kind == "value":
                 names.append(f"{base}@{int(item[1])}")
-            elif kind == "batch":
+            elif kind == "commit_number":
                 names.append(f"{base}/{int(item[1]):012d}/{int(item[2])}")
-            elif kind == "batches":
+            elif kind == "commits":
                 ranges.append((int(item[1]), int(item[2])))
             else:
                 raise StoreError(f"{context.output.name}: cannot discard {item!r}")
@@ -202,35 +202,35 @@ class FileStore:
 
             async for chunk in obstore.list(self._objects(), prefix=f"{base}/"):
                 for meta in chunk:
-                    found = _batch_of(base, meta["path"])
+                    found = _commit_of(base, meta["path"])
                     if found and any(lo <= found[0] <= hi for lo, hi in ranges):
                         names.append(f"{base}/{found[0]:012d}/{found[1]}")
         await self._many(lambda n: self._delete(n), names)
 
     # -- reads ------------------------------------------------------------------
 
-    async def load(self, ref: Ref, t, selection: Keys | Batches | None) -> Any:
+    async def load(self, ref: Ref, t, selection: Keys | Commits | None) -> Any:
         if is_ref_type(t):
             return ref
         handle = ref.handle or {}
         mode, base = handle.get("mode"), handle.get("path")
         if base is None:
             raise StoreError(f"{ref.output}: not a {type(self).__name__} ref")
-        if mode == "batches":
+        if mode == "commits":
             if isinstance(selection, Keys):
                 raise StoreError(f"{ref.output}: an unkeyed incremental output takes Batches")
-            first, last = (int(b) for b in handle["batches"])
+            first, last = (int(b) for b in handle["commits"])
             lo, hi = (
                 (max(first, selection.lo), min(last, selection.hi))
                 if selection is not None
                 else (first, last)
             )
-            names = await self._batches(base, lo, hi)
+            names = await self._commits(base, lo, hi)
             # The ref's batches run first..last without a gap: every one a commit wrote.
             if missing := [b for b in range(lo, hi + 1) if b not in names]:
                 raise StoreError(f"{ref.output}: batch {missing[0]} of {base} is gone")
-            batches = await self._many(self._found, [names[b] for b in sorted(names)])
-            return frames.materialize([item for b in batches for item in b], t)
+            commits = await self._many(self._found, [names[b] for b in sorted(names)])
+            return frames.materialize([item for b in commits for item in b], t)
         if mode == "keyed":
             if not isinstance(selection, Keys):
                 raise StoreError(
@@ -271,7 +271,7 @@ class FileStore:
             raise StoreError(f"{what}{base} is gone")
         return value
 
-    async def _batches(self, base: str, lo: int, hi: int) -> dict[int, str]:
+    async def _commits(self, base: str, lo: int, hi: int) -> dict[int, str]:
         """Batch `n` -> its committed object, in `[lo, hi]`: of the objects
         under `n`'s name, the highest generation's. The attempts that used
         batch `n` all ran between the commits of `n - 1` and `n`, one at a
@@ -285,13 +285,13 @@ class FileStore:
         async def scan(prefix: str, offset: str | None = None) -> None:
             async for chunk in obstore.list(objects, prefix=prefix, offset=offset):
                 for meta in chunk:
-                    if (found := _batch_of(base, meta["path"])) is None:
+                    if (found := _commit_of(base, meta["path"])) is None:
                         continue
-                    batch, generation = found
-                    if batch > hi:
+                    commit_number, generation = found
+                    if commit_number > hi:
                         return  # listed in key order: none further is in range
-                    if batch >= lo and generation > best.get(batch, -1):
-                        best[batch] = generation
+                    if commit_number >= lo and generation > best.get(commit_number, -1):
+                        best[commit_number] = generation
 
         if type(objects).__name__ == "LocalStore":
             # A directory lists in any order, to its end: each batch's own, then.
@@ -368,14 +368,14 @@ class FileStore:
         return ObjectRef(output=context.output.name, store="", handle=handle, partition=context.partition)
 
 
-def _batch_of(base: str, path: str) -> tuple[int, int] | None:
+def _commit_of(base: str, path: str) -> tuple[int, int] | None:
     """A batch object's `(batch, generation)`, from its name under `base`:
     `{batch:012d}/{generation}.{format}`. None for any other object."""
 
-    batch, _, name = path[len(base) + 1 :].partition("/")
+    commit_number, _, name = path[len(base) + 1 :].partition("/")
     generation, _, fmt = name.partition(".")
-    if batch.isdigit() and generation.isdigit() and fmt in ("json", "pkl"):
-        return int(batch), int(generation)
+    if commit_number.isdigit() and generation.isdigit() and fmt in ("json", "pkl"):
+        return int(commit_number), int(generation)
     return None
 
 

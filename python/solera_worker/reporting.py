@@ -36,8 +36,8 @@ class Reporter:
     record gets stronger; `on_ended()` once the engine says the attempt is
     over for this invocation."""
 
-    def __init__(self, objects, base, invocation, channel, interval, timeline, on_cancel, on_ended):
-        self.objects, self.base, self.invocation = objects, base, invocation
+    def __init__(self, objects, base, worker_id, channel, interval, timeline, on_cancel, on_ended):
+        self.objects, self.base, self.worker_id = objects, base, worker_id
         self.channel, self.interval, self.timeline = channel, interval, timeline
         self.on_cancel, self.on_ended = on_cancel, on_ended
         self.cancel: Cancel | None = None
@@ -62,7 +62,7 @@ class Reporter:
 
         while not self._stop.is_set() and not self.ended:
             self.seq += 1
-            report = {"invocation": self.invocation, "seq": self.seq, **self.timeline.report()}
+            report = {"worker_id": self.worker_id, "seq": self.seq, **self.timeline.report()}
             if self.channel is not None:
                 try:
                     self.latch(self.channel.beat(report).get("cancel"))
@@ -124,8 +124,8 @@ class LogShipper:
     written, and lines logged meanwhile start the next one: a write retried
     after an unknown outcome rewrites exactly what may have landed."""
 
-    def __init__(self, objects, base: str, channel=None, invocation: str | None = None):
-        self.objects, self.base, self.channel, self.invocation = objects, base, channel, invocation
+    def __init__(self, objects, base: str, channel=None, worker_id: str | None = None):
+        self.objects, self.base, self.channel, self.worker_id = objects, base, channel, worker_id
         self.pending: list[tuple[float, str]] = []  # lines not yet in a chunk
         self.pending_bytes = 0
         self.live: list[str] = []  # lines not yet sent live
@@ -225,9 +225,7 @@ class LogShipper:
         with self._guard:
             lines, offset = list(self.live), self.live_offset
         with contextlib.suppress(Exception):
-            answer = await self.channel.logs(
-                {"invocation": self.invocation, "offset": offset, "lines": lines}
-            )
+            answer = await self.channel.logs({"worker_id": self.worker_id, "offset": offset, "lines": lines})
             acknowledged = offset + max(0, int(answer.get("offset", offset + len(lines))) - offset)
             with self._guard:  # lines dropped meanwhile moved the offset already
                 gone = max(0, acknowledged - self.live_offset)

@@ -312,12 +312,12 @@ async def test_edges_report_every_scope_and_its_lag(world):
     assert edges["files"]["scopes"] == [] and edges["files"]["source"] is False
     scopes = {s["scope"]: s for s in edges["parts"]["scopes"]}
     assert scopes["x"]["state"] == "caught_up" and scopes["x"]["lag"] == 0
-    assert scopes["x"]["watermark"]["next"] == scopes["x"]["head_batch"] + 1
+    assert scopes["x"]["watermark"]["next"] == scopes["x"]["head_commit"] + 1
     assert scopes["y"] == {
         "scope": "y",
         "up_scope": "y",
         "watermark": None,
-        "head_batch": 0,
+        "head_commit": 0,
         "lag": 1,
         "state": "never",
     }

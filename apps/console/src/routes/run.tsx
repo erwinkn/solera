@@ -601,15 +601,15 @@ function ResultTab({ run, attempt }: { run: string; attempt: Attempt }) {
         <Fact label="Status">
           <StatusBadge status={data.status} />
         </Fact>
-        <Fact label="Writes">
-          <Tooltip content="Write-completion evidence: none (no store call), complete (every call returned), uncertain (one may still land).">
+        <Fact label="Write">
+          <Tooltip content="Where the attempt's store writes got to: none (no store call), writing (a call may still land), complete (every call returned).">
             <span
               className={cn(
                 "underline decoration-dotted underline-offset-2",
-                data.writes === "uncertain" && "text-warn-fg",
+                data.write === "writing" && "text-warn-fg",
               )}
             >
-              {data.writes ?? "—"}
+              {data.write ?? "—"}
             </span>
           </Tooltip>
         </Fact>
@@ -712,7 +712,7 @@ function SpecTab({ run, attempt }: { run: string; attempt: Attempt }) {
   );
 }
 
-/** What an incremental pin delivers, in the spec's own terms: pages of keys, or a batch range. */
+/** What an incremental pin delivers, in the spec's own terms: pages of keys, or a commit range. */
 function windowOf(changes: Record<string, Json>): string {
   const page =
     typeof changes.page === "number"
@@ -723,8 +723,8 @@ function windowOf(changes: Record<string, Json>): string {
   else if (changes.retry) parts.push("retry page");
   else if (changes.reconcile) parts.push("cleanup page");
   else if (changes.keys) parts.push("explicit keys");
-  else if (Array.isArray(changes.batches)) parts.push(`batches ${changes.batches.join("–")}`);
-  else if (changes.from !== undefined) parts.push(`batches ${String(changes.from)}–${String(changes.to)}`);
+  else if (Array.isArray(changes.commits)) parts.push(`commits ${changes.commits.join("–")}`);
+  else if (changes.from !== undefined) parts.push(`commits ${String(changes.from)}–${String(changes.to)}`);
   if (page) parts.push(page);
   if (typeof changes.limit === "number") parts.push(`${changes.limit} keys a page`);
   return parts.join(" · ");

@@ -7,7 +7,7 @@ Each (asset, edge, scope) keeps a **watermark**:
       "kind": "keys" | "batches",   # a keyed upstream, read by key; or batch by batch
       "output", "up",               # the upstream output and scope it reads
       "fingerprint",                # the interpretation it was delivered under (§6)
-      "pass": run id,               # the run whose reset began the current pass
+      "reset_by": run id,           # the run whose reset began the current pass
       "next": int,                  # the first upstream batch not yet delivered
       "delivery": {                 # a delivery under way, paged over attempts
         "mode": "full" | "delta" | "diff",
@@ -15,7 +15,7 @@ Each (asset, edge, scope) keeps a **watermark**:
         "at": key | batch | None,   # its position: the last key delivered, the next batch
         "page": int, "pages": int,  # where the next page sits in its plan
         "pin": int,                 # a delta window's reader pin (lifecycle.md §9.8)
-        "cleanup": bool,            # a full Each delivery owes a reconcile after (§11)
+        "reconcile": bool,          # a full Each delivery owes a reconcile after (§11)
       },
       "patterns": ...,              # keys: the patterns it delivers under (per-key §11)
       "rescope": {"old", "new", "cutover", "snapshot", "pin"},  # a pattern transition
@@ -54,7 +54,7 @@ def advance(plan: dict, after: str | None = None) -> dict | None:
     if plan["kind"] == "held":
         return plan["watermark"]
     wm, d = dict(plan["watermark"]), plan["delivery"]
-    if plan["kind"] == "batches":
+    if plan["kind"] == "commits":
         if plan["hi"] < d["to"]:
             wm["delivery"] = {**d, "at": plan["hi"] + 1, "page": d["page"] + 1}
         else:
@@ -72,7 +72,7 @@ def advance(plan: dict, after: str | None = None) -> dict | None:
             wm["patterns"] = rescope["new"]
     elif d["mode"] == "full":
         wm["next"] = d["from"]
-        if d.get("cleanup"):
+        if d.get("reconcile"):
             # An Each output may hold keys the delivery no longer names — gone
             # upstream, or left out by the patterns: reconcile them next (§11).
             wm["reconcile"] = {"after": None}
@@ -94,7 +94,7 @@ def continues(plan: dict, after: str | None, wm: dict | None) -> bool:
     # Behind: known only once the page's watermark is (`wm`, after `advance`).
     behind = wm is not None and "delivery" not in wm and int(wm["next"]) <= int(plan.get("head", -1))
     wm = wm or {}
-    if plan["kind"] == "batches":
+    if plan["kind"] == "commits":
         return plan["hi"] < plan["delivery"]["to"] or behind
     return after is not None or "rescope" in wm or "reconcile" in wm or behind
 

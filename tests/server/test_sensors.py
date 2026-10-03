@@ -331,7 +331,7 @@ async def test_observable_sources_commit_on_their_schedule(tmp_path):
     m = state.model
     await until(lambda: (m.sensors.get("events.observe") or {}).get("cursor") == "p3")
     await until(lambda: m.heads[("table", "")].get("version") == "2026-10-02")
-    await until(lambda: m.heads[("landing", "")].get("batch") is not None)
+    await until(lambda: m.heads[("landing", "")].get("commit_number") is not None)
     assert list((await engine.list_keys("landing"))["keys"]) == ["a", "b"]
     assert (await engine.list_keys("events"))["keys"] == {}  # x came, then went
     assert {r["outcome"] for r in rows(engine, "events.observe")} >= {"committed", "advanced"}

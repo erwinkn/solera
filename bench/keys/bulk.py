@@ -161,7 +161,7 @@ async def build(n: int, prefix: str, path: str) -> None:
     state = IndexState().committed(0, files, keep_log=False)
     idx = KeyIndex(io, prefix, state, opts)
     patch = SortedEntries.of(key_list(n, False, "k LIKE '%00'"))
-    files, _ = await idx.resolve(patch, batch=1, attempt="delta", generation=2)
+    files, _ = await idx.resolve(patch, commit_number=1, attempt="delta", generation=2)
     state = state.committed(1, files, keep_log=False)
     with open(path, "w") as f:
         json.dump(state.to_json(), f)

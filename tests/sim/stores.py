@@ -14,7 +14,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from solera.sdk import Ref
-from solera.stores import MISSING, Batches, KeyedWrite, Keys, StoreError, Written, by_key_type, takes
+from solera.stores import MISSING, Commits, KeyedWrite, Keys, StoreError, Written, by_key_type, takes
 
 from .core import actor
 
@@ -64,11 +64,11 @@ class TableStore:
             return None
         key = (table, context.partition)
         held = self.db.fences.get(key)
-        mine = (int(context.generation), context.invocation or "")
+        mine = (int(context.generation), context.worker_id or "")
         if held is not None and not (held[0] < mine[0] or held == mine):
             raise StoreError(
                 f"{context.output.name}: a newer attempt holds {table} {context.partition!r} "
-                f"(generation {context.generation} of {context.invocation!r} refused)"
+                f"(generation {context.generation} of {context.worker_id!r} refused)"
             )
         return mine
 
@@ -109,13 +109,20 @@ class TableStore:
         def body(box):
             rows = box["rows"]
             if out.key is None:  # an unkeyed incremental output: a batch of rows
-                batch = list(write.rows)
+                commit_number = list(write.rows)
                 if base is None:
                     rows.clear()
                 else:
-                    rows[:] = [r for r in rows if r[1] != context.batch]
-                rows.extend((None, context.batch, dict(r)) for r in batch)
-                return Written(Ref(out.name, "", {"table": table, "batch": context.batch}, context.partition))
+                    rows[:] = [r for r in rows if r[1] != context.commit_number]
+                rows.extend((None, context.commit_number, dict(r)) for r in commit_number)
+                return Written(
+                    Ref(
+                        out.name,
+                        "",
+                        {"table": table, "commit_number": context.commit_number},
+                        context.partition,
+                    )
+                )
             keyed = KeyedWrite.of(self, write, out, base)
             if keyed.whole or reset:
                 rows.clear()
@@ -143,10 +150,10 @@ class TableStore:
         rows = self.db.tables.get(table, {}).get(ref.partition, [])
         if isinstance(selection, Keys):
             rows = [r for r in rows if r[0] in selection.generations]
-        elif isinstance(selection, Batches):
+        elif isinstance(selection, Commits):
             rows = [r for r in rows if r[1] is not None and selection.lo <= r[1] <= selection.hi]
-        elif (ref.handle or {}).get("batch") is not None:
-            rows = [r for r in rows if r[1] is None or r[1] <= ref.handle["batch"]]
+        elif (ref.handle or {}).get("commit_number") is not None:
+            rows = [r for r in rows if r[1] is None or r[1] <= ref.handle["commit_number"]]
         if by_key_type(t) is not MISSING:  # dict[str, T]: each key's group (an Each page)
             groups: dict[str, list] = {}
             for k, _, row in rows:

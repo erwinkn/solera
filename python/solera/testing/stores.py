@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..sdk import Output, Ref
-from ..stores import Batches, KeyedWrite, Keys, Patch, StoreError, WriteContext, prepare_for
+from ..stores import Commits, KeyedWrite, Keys, Patch, StoreError, WriteContext, prepare_for
 
 
 @dataclass
@@ -64,19 +64,19 @@ class Ledger:
 def context(
     out: Output,
     generation: int,
-    invocation: str = "i",
-    batch: int | None = None,
+    worker_id: str = "i",
+    commit_number: int | None = None,
     reset: bool = False,
     partition: str = "",
 ) -> WriteContext:
     return WriteContext(
         output=out,
         partition=partition,
-        batch=batch,
+        commit_number=commit_number,
         reset=reset,
         attempt=f"kit-{generation}",
         generation=generation,
-        invocation=invocation,
+        worker_id=worker_id,
     )
 
 
@@ -91,7 +91,7 @@ async def write(
     remove=(),
     patch: bool = False,
     changed: bool = False,
-    invocation: str = "i",
+    worker_id: str = "i",
     partition: str = "",
 ) -> Ref:
     """Write `rows` to a keyed output as the harness would — the scope's whole
@@ -107,7 +107,7 @@ async def write(
         prepared = prepare_for(store, rows, out)
         gone = frozenset(set(ledger.entries) - set(written_keys))
         keyed = KeyedWrite(prepared, upserts=frozenset(written_keys), removes=gone, value=rows)
-        written = await store.store(keyed, prior, context(out, generation, invocation, partition=partition))
+        written = await store.store(keyed, prior, context(out, generation, worker_id, partition=partition))
         for key in gone:
             del ledger.entries[key]
         ledger.entries.update(dict.fromkeys(written_keys, generation))
@@ -120,7 +120,7 @@ async def write(
     else:
         prepared = prepare_for(store, rows, out)
         keyed = KeyedWrite(prepared, whole=True, value=rows)
-    written = await store.store(keyed, prior, context(out, generation, invocation, partition=partition))
+    written = await store.store(keyed, prior, context(out, generation, worker_id, partition=partition))
     if not patch:
         ledger.entries.clear()
     for key in remove:
@@ -200,20 +200,20 @@ async def batches_append_and_load_by_range(h: Harness) -> None:
     by range."""
 
     out = h.output(incremental=True)
-    first = await h.store.store(Patch([{"id": "a", "v": "1"}]), None, context(out, 1, batch=3))
-    second = await h.store.store(Patch([{"id": "b", "v": "1"}]), first.ref, context(out, 2, batch=4))
+    first = await h.store.store(Patch([{"id": "a", "v": "1"}]), None, context(out, 1, commit_number=3))
+    second = await h.store.store(Patch([{"id": "b", "v": "1"}]), first.ref, context(out, 2, commit_number=4))
     assert await rows(h, second.ref, None) == [("a", "1"), ("b", "1")]
-    assert await rows(h, second.ref, Batches(4, 4)) == [("b", "1")]
+    assert await rows(h, second.ref, Commits(4, 4)) == [("b", "1")]
 
 
 async def a_batch_written_again_lands_once(h: Harness) -> None:
     """Batch 3, written twice by its attempt (a retried call): its rows once."""
 
     out = h.output(incremental=True)
-    first = await h.store.store(Patch([{"id": "a", "v": "1"}]), None, context(out, 1, batch=3))
-    again = await h.store.store(Patch([{"id": "a", "v": "1"}]), None, context(out, 1, batch=3))
-    second = await h.store.store(Patch([{"id": "b", "v": "1"}]), first.ref, context(out, 2, batch=4))
-    second = await h.store.store(Patch([{"id": "b", "v": "1"}]), first.ref, context(out, 2, batch=4))
+    first = await h.store.store(Patch([{"id": "a", "v": "1"}]), None, context(out, 1, commit_number=3))
+    again = await h.store.store(Patch([{"id": "a", "v": "1"}]), None, context(out, 1, commit_number=3))
+    second = await h.store.store(Patch([{"id": "b", "v": "1"}]), first.ref, context(out, 2, commit_number=4))
+    second = await h.store.store(Patch([{"id": "b", "v": "1"}]), first.ref, context(out, 2, commit_number=4))
     assert await rows(h, again.ref, None) == [("a", "1")]
     assert await rows(h, second.ref, None) == [("a", "1"), ("b", "1")]
 
@@ -222,9 +222,9 @@ async def a_full_run_starts_the_batches_over(h: Harness) -> None:
     """Batch 3, then batch 4 reset (a full run): only batch 4."""
 
     out = h.output(incremental=True)
-    first = await h.store.store(Patch([{"id": "a", "v": "1"}]), None, context(out, 1, batch=3))
+    first = await h.store.store(Patch([{"id": "a", "v": "1"}]), None, context(out, 1, commit_number=3))
     reset = await h.store.store(
-        Patch([{"id": "b", "v": "1"}]), first.ref, context(out, 2, batch=4, reset=True)
+        Patch([{"id": "b", "v": "1"}]), first.ref, context(out, 2, commit_number=4, reset=True)
     )
     assert await rows(h, reset.ref, None) == [("b", "1")]
 
@@ -329,9 +329,9 @@ async def one_generation_admits_one_invocation(h: Harness) -> None:
     with _refused():
         await h.store.acquire(context(out, 9, "y"), first)
     with _refused():
-        await write(h, out, [{"id": "a", "v": "0"}], 9, Ledger(), first, invocation="y")
+        await write(h, out, [{"id": "a", "v": "0"}], 9, Ledger(), first, worker_id="y")
     await h.store.acquire(context(out, 9, "x"), first)
-    second = await write(h, out, [{"id": "a", "v": "2"}], 9, ledger, first, invocation="x")
+    second = await write(h, out, [{"id": "a", "v": "2"}], 9, ledger, first, worker_id="x")
     assert await now(h, second, ledger) == [("a", "2")]
 
 

@@ -33,17 +33,17 @@ def chunk(n: int) -> str:
 
 # -- write-completion evidence (§2.3) ------------------------------------------------
 
-NONE, COMPLETE, UNCERTAIN = "none", "complete", "uncertain"
+NONE, COMPLETE = "none", "complete"  # and WRITING, as the gate says: a call may have landed
 
 # -- the gate ------------------------------------------------------------------------
 
 WRITING, ABORTED, CLOSED = "writing", "aborted", "closed"
 
 
-def gate(state: str, invocation: str | None = None, intents: dict | None = None) -> bytes:
+def gate(state: str, worker_id: str | None = None, intents: dict | None = None) -> bytes:
     body: dict = {"state": state}
-    if invocation is not None:
-        body["invocation"] = invocation
+    if worker_id is not None:
+        body["worker_id"] = worker_id
     if intents is not None:
         body["intents"] = intents
     return json.dumps(body, sort_keys=True).encode()

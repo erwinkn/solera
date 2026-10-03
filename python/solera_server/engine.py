@@ -413,7 +413,7 @@ class Engine(Attempts, Sensors, Views):
         worker=None,
         end=None,
         reason=None,
-        writes=None,
+        write=None,
         retry_for=None,
         keys=None,
     ):
@@ -448,16 +448,16 @@ class Engine(Attempts, Sensors, Views):
         worker = worker_report(worker)  # values the model applies with no parsing
         if keys is not None:
             keys = worker_report({"keys": keys}).get("keys")
-        if writes not in (None, lifecycle.NONE, lifecycle.COMPLETE, lifecycle.UNCERTAIN):
-            writes = lifecycle.UNCERTAIN  # what a worker cannot say plainly is not known
+        if write not in (None, lifecycle.NONE, lifecycle.COMPLETE, lifecycle.WRITING):
+            write = lifecycle.WRITING  # what a worker cannot say plainly is not known
         if worker.get("events") or worker.get("usage"):
             event["worker"] = {k: worker[k] for k in ("events", "usage") if worker.get(k)}
         if end is not None:
             event["end"] = end
         if reason is not None:
             event["reason"] = str(reason)[:200]
-        if writes is not None:
-            event["writes"] = writes
+        if write is not None:
+            event["write"] = write
         prepared = (task.get("launched") or {}).get("prepared") or {}
         for field in ("discarded", "discard_unresolved"):  # data garbage (§9.8)
             if worker.get(field):
@@ -739,7 +739,7 @@ class Engine(Attempts, Sensors, Views):
         if full and run["mode"] == "full" and incremental:
             # This run's reset began the pass every edge is on: resume it, page by page.
             started = [
-                (self.m.watermark(task["asset"], e.param, scope) or {}).get("pass") for e in incremental
+                (self.m.watermark(task["asset"], e.param, scope) or {}).get("reset_by") for e in incremental
             ]
             if all(s == run["id"] for s in started):
                 full = False
@@ -766,7 +766,7 @@ class Engine(Attempts, Sensors, Views):
         if claim is not None:
             # Keep the delta log this attempt reads until it finishes (§6).
             claim["reads"] = delivery.reads(plans)
-        more = any(p["kind"] == "batches" and delivery.continues(p, None, None) for p in plans.values() if p)
+        more = any(p["kind"] == "commits" and delivery.continues(p, None, None) for p in plans.values() if p)
         skip = bool(incremental) and all_empty and not more and not full
         # An Each asset whose keys all failed so far has no head yet: nothing to wait for.
         if skip and each_page is None and not planner.complete(task["asset"], scope):
@@ -795,12 +795,12 @@ class Engine(Attempts, Sensors, Views):
             elsewhere = moved(info)
             info["reset"] = reset or head is None or elsewhere
             if output.get("incremental"):
-                info["batch"] = int((head or {}).get("batch", -1)) + 1
+                info["commit_number"] = int((head or {}).get("commit_number", -1)) + 1
             if output.get("key") is not None and elsewhere:
                 # Its key index names the old store's objects: it starts over too, at
                 # a prefix of its own, and the commit replaces it (`Model._commit_keys`).
                 current = self.m.index(name, scope)
-                info["index"] = IndexState(prefix=f"{current.prefix}{info['batch']:012d}/").to_json()
+                info["index"] = IndexState(prefix=f"{current.prefix}{info['commit_number']:012d}/").to_json()
             elif output.get("key") is not None:
                 info["index"] = self.m.index(name, scope).pinned().to_json()
                 if (name, scope) in self.m.unsettled:
@@ -835,7 +835,7 @@ class Engine(Attempts, Sensors, Views):
             if each_page is None
             else {
                 "prefix": self.m.index(f"@{task['asset']}", scope).prefix,
-                "batch": each_page["batch"],
+                "commit_number": each_page["commit_number"],
             },
         }
 
@@ -953,7 +953,9 @@ class Engine(Attempts, Sensors, Views):
         # pages read, and what lineage says they read (docs/versions.md §6).
         latest_generation = int(ref.get("generation") or 0)
         head = self.m.heads.get((output, up_scope)) or {}
-        head_batch = latest = int(head.get("batch", -1))  # `latest`: the head this page is planned against
+        head_commit = latest = int(
+            head.get("commit_number", -1)
+        )  # `latest`: the head this page is planned against
         override = (run.get("keys") or {}).get(output)
         wm = self.m.watermark(task["asset"], param, task["scope"])
         if isinstance(override, dict) and "keys" in override:
@@ -972,7 +974,7 @@ class Engine(Attempts, Sensors, Views):
         # a batch upstream that started over since the edge last read it (its `base`
         # past a delivery's start, or at or past `next`: a reset always lands past the
         # batches that existed) is delivered again in full.
-        again = override == "full" and (wm or {}).get("pass") != run["id"]
+        again = override == "full" and (wm or {}).get("reset_by") != run["id"]
         reset = full or wm is None or wm.get("fingerprint") != fingerprint or again
         if not reset and not keyed:
             under_way = wm.get("delivery")
@@ -985,11 +987,11 @@ class Engine(Attempts, Sensors, Views):
             start = under_way.get("from", wm.get("next"))
             reset = start is not None and int(start) <= first
         carried = {
-            "kind": "keys" if keyed else "batches",
+            "kind": "keys" if keyed else "commits",
             "output": output,
             "up": up_scope,
             "fingerprint": fingerprint,
-            "pass": run["id"] if reset else wm.get("pass"),
+            "reset_by": run["id"] if reset else wm.get("reset_by"),
         }
         current = None if reset else wm.get("delivery")
 
@@ -997,20 +999,20 @@ class Engine(Attempts, Sensors, Views):
             if current is None:
                 lo = first if reset else int(wm["next"])
                 mode = "full" if reset else "delta"
-                current = {"mode": mode, "from": lo, "to": head_batch, "at": lo, "page": 0}
-                current["pages"] = _pages(head_batch - lo + 1, limit)
+                current = {"mode": mode, "from": lo, "to": head_commit, "at": lo, "page": 0}
+                current["pages"] = _pages(head_commit - lo + 1, limit)
                 current["generation"] = latest_generation
             lo = int(current["at"])
             hi = min(current["to"], lo + limit - 1)
             changes = {
-                "batches": [lo, hi],
+                "commits": [lo, hi],
                 "full": current["mode"] == "full",
                 "more": hi < current["to"],
                 "page": current["page"],
                 "pages": current["pages"],
             }
             carried["next"] = current["from"] if reset else int(wm["next"])
-            plan = {"kind": "batches", "watermark": carried, "delivery": current, "hi": hi, "head": latest}
+            plan = {"kind": "commits", "watermark": carried, "delivery": current, "hi": hi, "head": latest}
             return {"ref": {**ref, "generation": current["generation"]}, "changes": changes}, plan, hi < lo
 
         index = self.m.index(output, up_scope)
@@ -1025,7 +1027,7 @@ class Engine(Attempts, Sensors, Views):
             rescope = {
                 "old": wm.get("patterns"),
                 "new": patterns,
-                "cutover": head_batch,
+                "cutover": head_commit,
                 "generation": latest_generation,
                 "snapshot": index.pinned().to_json(),
                 "pin": claim_pin if claim_pin is not None else self.m.applied,
@@ -1050,35 +1052,35 @@ class Engine(Attempts, Sensors, Views):
                 if carried["patterns"] is None:
                     carried.pop("patterns")
                 return pin, {"kind": "keys", "watermark": carried, "delivery": current, "head": latest}, False
-            if head_batch > rescope["cutover"]:  # finish: under the old patterns, up to the cutover
-                head_batch, latest_generation = rescope["cutover"], rescope["generation"]
+            if head_commit > rescope["cutover"]:  # finish: under the old patterns, up to the cutover
+                head_commit, latest_generation = rescope["cutover"], rescope["generation"]
         each = edge.get("each") is not None
         held = [o["name"] for o in self.manifest["assets"][task["asset"]]["outputs"]] + [f"@{task['asset']}"]
         empty = False
         if current is None and reset:
             # A full delivery of an Each edge ends with a cleanup of the keys it no
             # longer names — needed only if the asset held keys when it began (§11).
-            current = {"mode": "full", "from": head_batch + 1, "at": None}
+            current = {"mode": "full", "from": head_commit + 1, "at": None}
             if each:
-                current["cleanup"] = any(self.m.index(name, task["scope"]).count for name in held)
+                current["reconcile"] = any(self.m.index(name, task["scope"]).count for name in held)
             empty = index.count == 0 and not index.files
         elif current is None:
             current = {
                 "mode": "delta",
                 "from": carried["next"],
-                "to": head_batch,
+                "to": head_commit,
                 "at": None,
                 "generation": latest_generation,
             }
-            empty = carried["next"] > head_batch
+            empty = carried["next"] > head_commit
         if current["mode"] == "delta" and not index.covers(current["from"], current["to"]):
             # The log no longer holds this window: deliver everything again. What it held
             # — deletions, keys the patterns now leave out — the cleanup after finds (§11).
             current = {
                 "mode": "full",
-                "from": head_batch + 1,
+                "from": head_commit + 1,
                 "at": None,
-                **({"cleanup": True} if each else {}),
+                **({"reconcile": True} if each else {}),
             }
             empty = False
             if rescope is not None:  # a full delivery is under the new patterns: no diff left
@@ -1169,7 +1171,7 @@ class Engine(Attempts, Sensors, Views):
             "now": self.clock(),
             "retries": asset.get("retries", {}).get("n", 0),
             "failures": failures.pinned().to_json(),
-            "batch": int(record.get("batch", -1)) + 1,
+            "commit_number": int(record.get("commit_number", -1)) + 1,
             "pass_after": (retry or {}).get("after"),
         }
         limit = int(edge.get("page_size") or 100)
@@ -1239,7 +1241,7 @@ class Engine(Attempts, Sensors, Views):
         page = plan["each"]
         commit = {
             "keys": report.get("keys") or {"files": []},
-            "batch": int(record.get("batch", -1)) + 1,
+            "commit_number": int(record.get("commit_number", -1)) + 1,
             "counts": counts,
             "last": page["kind"],
             # The configuration the scope runs under, for the runs retries start (§9).
@@ -1413,26 +1415,29 @@ class Engine(Attempts, Sensors, Views):
                 delta = entry.get("keys")
                 if delta is None and not entry.get("unchanged"):
                     raise Conflict(f"keyed output {name}: the result carries no key delta", retryable=False)
-                head["batch"] = int((before or {}).get("batch", -1))
+                head["commit_number"] = int((before or {}).get("commit_number", -1))
                 if delta is not None:
                     if delta["files"] or moved(info):
-                        head["batch"] = int(info["batch"])
-                    keys[name] = {**delta, "batch": head["batch"]}
+                        head["commit_number"] = int(info["commit_number"])
+                    keys[name] = {**delta, "commit_number": head["commit_number"]}
                 # A move starts the index over at its batch, as a reset starts a batch
                 # output over: no delivery begun before it reads it as a delta (F9).
                 if moved(info):
-                    head["base"] = head["batch"]
+                    head["base"] = head["commit_number"]
                 elif (before or {}).get("base"):
                     head["base"] = before["base"]
                 if "elements" in info:
                     head["elements"] = entry.get("elements", info["elements"])
             elif decl.get("incremental"):
                 if info["reset"]:  # starts over at its batch, whatever its content
-                    head["batch"] = head["base"] = int(info["batch"])
+                    head["commit_number"] = head["base"] = int(info["commit_number"])
                 elif before["ref"].get("generation") == ref.get("generation"):  # appended nothing
-                    head["batch"], head["base"] = before.get("batch", -1), before.get("base", 0)
+                    head["commit_number"], head["base"] = (
+                        before.get("commit_number", -1),
+                        before.get("base", 0),
+                    )
                 else:
-                    head["batch"], head["base"] = int(info["batch"]), before.get("base", 0)
+                    head["commit_number"], head["base"] = int(info["commit_number"]), before.get("base", 0)
             heads[name] = head
         for name in set(declared) - set(outputs):
             # An Each page whose keys all failed writes nothing, and makes no head yet;
@@ -1492,7 +1497,7 @@ class Engine(Attempts, Sensors, Views):
             commit=commit,
             more=more and outcome == "succeeded",
             worker=result,
-            writes=result.get("writes"),
+            write=result.get("write"),
             error=error,
             retryable=retryable,
             delay=delay,
@@ -1578,7 +1583,7 @@ class Engine(Attempts, Sensors, Views):
             else:
                 new = versions(upsert)
                 removes, replace = [str(k) for k in remove or [] if str(k) not in new], False
-            batch = int((head or {}).get("batch", -1)) + 1
+            commit_number = int((head or {}).get("commit_number", -1)) + 1
             attempt = ulid(self.clock())
             sorted_run = SortedEntries.of(
                 [key_bytes(k) for k in new], list(new.values()), [key_bytes(k) for k in removes]
@@ -1587,14 +1592,14 @@ class Engine(Attempts, Sensors, Views):
                 pinned = self.m.index(name, "").pinned()
                 index = KeyIndex(self._key_io(), None, pinned, self.key_options)
                 files = await self._resolve_source(
-                    index, pinned, sorted_run, replace, batch, attempt, generation
+                    index, pinned, sorted_run, replace, commit_number, attempt, generation
                 )
                 if files is not None:
                     files, changed = files
                 elif replace:
                     files, changed = await index.replace(
                         Rows.pairs([(key_bytes(k), r) for k, r in new.items()]),
-                        batch,
+                        commit_number,
                         attempt,
                         collect=2 * SOURCE_KEYS_RECORDED,
                         generation=generation,
@@ -1602,19 +1607,19 @@ class Engine(Attempts, Sensors, Views):
                 else:
                     files, changed = await index.resolve(
                         sorted_run,
-                        batch=batch,
+                        commit_number=commit_number,
                         attempt=attempt,
                         generation=generation,
                         collect=2 * SOURCE_KEYS_RECORDED,
                     )
             if not files.files:
                 return None, head["ref"] if head is not None else source["head"]
-            record["batch"] = batch
+            record["commit_number"] = commit_number
             if listed is not None:
                 before = set((head or {}).get("elements") or ())
                 record["elements"] = sorted(set(new) if replace else (before - set(removes)) | set(new))
-            event["keys"] = {**files.to_json(), "batch": batch}
-            run["batch"] = batch
+            event["keys"] = {**files.to_json(), "commit_number": commit_number}
+            run["commit_number"] = commit_number
             counts = (sum(f.entries for f in files.files) - files.removed, files.removed)
             for field, keys, count in zip(
                 ("upserted", "deleted"), changed or (None, None), counts, strict=True
@@ -1648,7 +1653,7 @@ class Engine(Attempts, Sensors, Views):
         if paths:
             await self.state.delete_objects(paths)
 
-    async def _resolve_source(self, index, pinned, run, replace, batch, attempt, generation):
+    async def _resolve_source(self, index, pinned, run, replace, commit_number, attempt, generation):
         """A small source commit through the warm resolver, in process
         (docs/resolved-commits.md §4): its files and changed keys, or None when
         the cache cannot answer and the commit resolves cold."""
@@ -1659,13 +1664,13 @@ class Engine(Attempts, Sensors, Views):
         size = len(run) + (pinned.count if replace else 0)
         if self.keys is None or size > (lim.max_entries if replace else lim.max_keys):
             return None
-        name = f"{batch:012d}-{attempt}.0000"
+        name = f"{commit_number:012d}-{attempt}.0000"
         answer, delta = await self.keys.direct(
             pinned,
             "replace" if replace else "patch",
             run,
             generation,
-            batch,
+            commit_number,
             index.path(name),
             self.m.applied,
         )

@@ -288,7 +288,10 @@ async def grid(prefix, state, sample, opts, cold, label, sizes=GRID) -> list[dic
                     f"{k} keys, {route}",
                     io,
                     lambda idx=idx, keys=keys, vers=vers, n=n, route=route: idx.resolve(
-                        run_of(keys, vers), batch=10**9, attempt=f"grid-{label}-{n}-{route}", generation=2
+                        run_of(keys, vers),
+                        commit_number=10**9,
+                        attempt=f"grid-{label}-{n}-{route}",
+                        generation=2,
                     ),
                 )
                 r.pop("out")
@@ -371,7 +374,7 @@ async def steady(n, prefix, state, sample, opts, cold, with_grid=False) -> tuple
     upper = await fill_upper(setup, prefix, n, opts, state.depth, per_entry, current)
     st = replace(state, files=state.files + tuple(upper))
     rng = random.Random(21)
-    batch = 1
+    commit_number = 1
 
     def pick(k):
         """k sampled keys, each with its current payload."""
@@ -386,7 +389,7 @@ async def steady(n, prefix, state, sample, opts, cold, with_grid=False) -> tuple
         l1 = sum(f.size for f in st.level(1))
         items = pick(min(len(current), round(l1 / opts.fanout / 2 / per_entry)))
         vers = [version(rng) for _ in items]
-        g = 100 + batch
+        g = 100 + commit_number
         data = K.encode_file(
             [key_of(i) for i, _ in items],
             [g] * len(items),
@@ -399,15 +402,17 @@ async def steady(n, prefix, state, sample, opts, cold, with_grid=False) -> tuple
         current.update((i, (g, v)) for (i, _), v in zip(items, vers, strict=True))
 
     async def commit(io):
-        nonlocal st, batch
+        nonlocal st, commit_number
         items = pick(1000)
         vers = [version(rng) for _ in items]
         idx = KeyIndex(io, prefix, st, opts)
-        g = 100 + batch
+        g = 100 + commit_number
         delta = await idx.changes(run_of([key_of(i) for i, _ in items], vers), generation=g)
-        st = st.committed(batch, await idx.write(batch, f"steady{batch}", delta), keep_log=False)
+        st = st.committed(
+            commit_number, await idx.write(commit_number, f"steady{commit_number}", delta), keep_log=False
+        )
         current.update((i, (g, v)) for (i, _), v in zip(items, vers, strict=True))
-        batch += 1
+        commit_number += 1
 
     await fill_l0(f"{0:012d}-fill")
     for _ in range(opts.l0_max_files - 2):  # level 0 one delta short of a compaction
@@ -461,7 +466,7 @@ async def steady(n, prefix, state, sample, opts, cold, with_grid=False) -> tuple
     )
     io = cold()
     rows.append(await measure("steady: compaction: level 0, 8 files", io, lambda io=io: compact(io)))
-    await fill_l0(f"{batch:012d}-fill")
+    await fill_l0(f"{commit_number:012d}-fill")
     io = cold()
     l0 = st.level(0)
     lo, hi = min(f.min for f in l0), max(f.max for f in l0)
@@ -605,18 +610,19 @@ async def _run_size(n: int, prefix: str, args) -> dict:
         # Commit a delta, then eight more, then compact level 0.
         io = cold()
         s2 = state
-        batch = 0
+        commit_number = 0
 
         async def commit_one(io=io):
-            nonlocal s2, batch
+            nonlocal s2, commit_number
             idx = KeyIndex(io, prefix, s2, opts)
             items = sorted(pick(1000))
             delta = await idx.changes(
-                run_of([key_of(i) for i, _ in items], [version(rng) for _ in items]), generation=2 + batch
+                run_of([key_of(i) for i, _ in items], [version(rng) for _ in items]),
+                generation=2 + commit_number,
             )
-            files = await idx.write(batch, f"bench{batch}", delta)
-            s2 = s2.committed(batch, files, keep_log=True)
-            batch += 1
+            files = await idx.write(commit_number, f"bench{commit_number}", delta)
+            s2 = s2.committed(commit_number, files, keep_log=True)
+            commit_number += 1
 
         rows.append(await measure("commit: 1K random changes + delta write", io, commit_one))
         for _ in range(opts.l0_max_files - 1):

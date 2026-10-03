@@ -204,7 +204,14 @@ class KeyService:
             self.release(token)
 
     async def direct(
-        self, index, kind: str, run: SortedEntries, generation: int, batch: int, path: str, position: float
+        self,
+        index,
+        kind: str,
+        run: SortedEntries,
+        generation: int,
+        commit_number: int,
+        path: str,
+        position: float,
     ):
         """A resolve of a sorted run against `index` as the engine holds it at
         `position` — a source commit's, in process (docs/resolved-commits.md
@@ -212,7 +219,7 @@ class KeyService:
 
         if not self._running():
             return {"result": "declined", "reason": "busy"}, None
-        p = Prepared("", batch, generation, index, batch - 1, True, position)
+        p = Prepared("", commit_number, generation, index, commit_number - 1, True, position)
         token = self.hold(position)
         try:
             return await asyncio.wrap_future(self._submit(self.resolver.compute(p, kind, run, path)))

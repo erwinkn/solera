@@ -168,7 +168,7 @@ def sim_reporter_class():
                 while worker is not None and loop.time() < worker.paused_until:
                     await asyncio.sleep(worker.paused_until - loop.time())
                 self.seq += 1
-                report = {"invocation": self.invocation, "seq": self.seq, **self.timeline.report()}
+                report = {"worker_id": self.worker_id, "seq": self.seq, **self.timeline.report()}
                 if self.channel is not None:
                     try:
                         self.latch((await self.channel.abeat(report)).get("cancel"))

@@ -23,7 +23,7 @@ from typing import Any
 from solera.sdk import KEYS, Output, Ref, TableRef
 from solera.stores import (
     MISSING,
-    Batches,
+    Commits,
     KeyedWrite,
     Keys,
     Patch,
@@ -43,15 +43,15 @@ log = logging.getLogger("solera.postgres")
 
 LEDGER_TABLE = "public.solera_migrations"
 FENCE_TABLE = "public.solera_generations"
-BATCH_COLUMN = "_batch"
+COMMIT_COLUMN = "_commit"
 SEQ_COLUMN = "_seq"
 KEY_CHUNK = 100_000  # keys per chunk `keys` reads
 
 
-def _assigned_batch(context: WriteContext, prior: Ref | None) -> int:
-    if context.batch is not None:
-        return context.batch
-    last = (prior.handle or {}).get("batch") if prior is not None else None
+def _assigned_commit(context: WriteContext, prior: Ref | None) -> int:
+    if context.commit_number is not None:
+        return context.commit_number
+    last = (prior.handle or {}).get("commit_number") if prior is not None else None
     return int(last) + 1 if last is not None else 0
 
 
@@ -144,16 +144,16 @@ class PostgresStore:
         partition_col = output.config.get("partition_column")
         if partition_col:
             columns.setdefault(partition_col, "text")
-        batch_mode = output.incremental and output.key is None
-        if batch_mode:
-            columns.setdefault(BATCH_COLUMN, "integer")
+        commit_mode = output.incremental and output.key is None
+        if commit_mode:
+            columns.setdefault(COMMIT_COLUMN, "integer")
             columns.setdefault(SEQ_COLUMN, "integer")
         # A key names a group of rows, not one: it is never a primary key by itself.
         pk = list(output.config.get("primary_key") or [])
-        if partition_col and partition_col not in pk and (pk or batch_mode):
+        if partition_col and partition_col not in pk and (pk or commit_mode):
             pk = [*pk, partition_col]
-        if batch_mode:
-            for c in (BATCH_COLUMN, SEQ_COLUMN):
+        if commit_mode:
+            for c in (COMMIT_COLUMN, SEQ_COLUMN):
                 if c not in pk:
                     pk = [*pk, c]
         return columns, pk
@@ -245,16 +245,15 @@ class PostgresStore:
 
         if cur.execute(
             "SELECT 1 FROM information_schema.columns WHERE table_schema = %s AND table_name = %s "
-            "AND column_name = 'written'",
+            "AND column_name = 'worker_id'",
             tuple(FENCE_TABLE.split(".")),
         ).fetchone():
             return
         cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (FENCE_TABLE,))
         cur.execute(
             f"CREATE TABLE IF NOT EXISTS {FENCE_TABLE} (relid oid NOT NULL, part text NOT NULL, "
-            "generation bigint NOT NULL, invocation text NOT NULL, written bigint, PRIMARY KEY (relid, part))"
+            "generation bigint NOT NULL, worker_id text NOT NULL, written bigint, PRIMARY KEY (relid, part))"
         )
-        cur.execute(f"ALTER TABLE {FENCE_TABLE} ADD COLUMN IF NOT EXISTS written bigint")
 
     def _take(self, cur, relid: int, context: WriteContext, write: bool = False) -> None:
         """Take `scope`'s generation for (relid, partition), holding the row's
@@ -266,22 +265,22 @@ class PostgresStore:
         written = ", written = EXCLUDED.written" if write else ""
         taken = cur.execute(
             f"INSERT INTO {FENCE_TABLE} VALUES (%s, %s, %s, %s, %s) ON CONFLICT (relid, part) "
-            f"DO UPDATE SET generation = EXCLUDED.generation, invocation = EXCLUDED.invocation{written} "
+            f"DO UPDATE SET generation = EXCLUDED.generation, worker_id = EXCLUDED.worker_id{written} "
             f"WHERE {FENCE_TABLE}.generation < EXCLUDED.generation "
-            f"OR ({FENCE_TABLE}.generation = EXCLUDED.generation AND {FENCE_TABLE}.invocation = EXCLUDED.invocation) "
-            "RETURNING invocation",
+            f"OR ({FENCE_TABLE}.generation = EXCLUDED.generation AND {FENCE_TABLE}.worker_id = EXCLUDED.worker_id) "
+            "RETURNING worker_id",
             (
                 relid,
                 context.partition,
                 context.generation,
-                context.invocation,
+                context.worker_id,
                 context.generation if write else None,
             ),
         ).fetchone()
         if taken is None:
             raise StoreError(
                 f"{context.output.name}: a newer attempt holds this slice (generation {context.generation} "
-                f"of {context.invocation} refused)"
+                f"of {context.worker_id} refused)"
             )
 
     def _domain(self, cur, table: str, exclusive: bool = False) -> None:
@@ -417,7 +416,7 @@ class PostgresStore:
             partition_col = output.config.get("partition_column")
             slice_where = {partition_col: context.partition} if partition_col else {}
 
-            batch = _assigned_batch(context, prior) if output.incremental else None
+            commit_number = _assigned_commit(context, prior) if output.incremental else None
             keys = None
             if isinstance(write, Sql):
                 self._apply_sql(cur, output, write, context, table, slice_where)
@@ -433,7 +432,9 @@ class PostgresStore:
                     return Written(None)  # a first write of nothing: no table to make
                 self._apply_keyed(cur, output, write, context, table, slice_where)
             elif isinstance(write, Patch):
-                if not self._apply_batch(cur, output, write, context, table, slice_where, prior, batch):
+                if not self._apply_commit(
+                    cur, output, write, context, table, slice_where, prior, commit_number
+                ):
                     return Written(prior)
             else:
                 if output.incremental:
@@ -441,7 +442,7 @@ class PostgresStore:
                         f"{output.name}: an unkeyed incremental output only accepts Patch writes"
                     )
                 self._apply_replace(cur, output, write, context, table, slice_where)
-        batch_mode = output.key is None and output.incremental
+        commit_mode = output.key is None and output.incremental
         return Written(
             TableRef(
                 output=output.name,
@@ -449,8 +450,8 @@ class PostgresStore:
                 handle={
                     "table": table,
                     "where": slice_where,
-                    "key": BATCH_COLUMN if batch_mode else output.key,
-                    "batch": batch if batch_mode else None,
+                    "key": COMMIT_COLUMN if commit_mode else output.key,
+                    "commit_number": commit_number if commit_mode else None,
                 },
                 partition=context.partition,
             ),
@@ -466,7 +467,7 @@ class PostgresStore:
         self._delete_slice(cur, table, slice_where)
         self._insert(cur, output, table, rows, self._stamps(output, context))
 
-    def _apply_batch(self, cur, output, write: Patch, context, table, slice_where, prior, batch):
+    def _apply_commit(self, cur, output, write: Patch, context, table, slice_where, prior, commit_number):
         """An unkeyed incremental output's batch: its rows stamped with the
         batch columns, in place of this batch's (a retry's) — or, with no
         prior (a first write, or a reset), of every batch."""
@@ -480,8 +481,12 @@ class PostgresStore:
             return False
         rows = [{**row, SEQ_COLUMN: i} for i, row in enumerate(rows)]
         self._ensure(cur, output, table, lambda: rows, context)
-        self._delete_slice(cur, table, slice_where if prior is None else {**slice_where, BATCH_COLUMN: batch})
-        self._insert(cur, output, table, rows, {**self._stamps(output, context), BATCH_COLUMN: batch})
+        self._delete_slice(
+            cur, table, slice_where if prior is None else {**slice_where, COMMIT_COLUMN: commit_number}
+        )
+        self._insert(
+            cur, output, table, rows, {**self._stamps(output, context), COMMIT_COLUMN: commit_number}
+        )
         return True
 
     def _apply_keyed(self, cur, output, write: KeyedWrite, context, table, slice_where) -> None:
@@ -720,7 +725,7 @@ class PostgresStore:
 
     # -- reads ----------------------------------------------------------------
 
-    async def load(self, ref: Ref, t, selection: Keys | Batches | None) -> Any:
+    async def load(self, ref: Ref, t, selection: Keys | Commits | None) -> Any:
         if isinstance(t, type) and issubclass(t, Ref):
             return ref
         return await asyncio.to_thread(self._load, ref, t, selection)
@@ -753,7 +758,7 @@ class PostgresStore:
         ).fetchone()
         return None if found is None or found["written"] is None else int(found["written"])
 
-    def _load(self, ref: Ref, t, selection: Keys | Batches | None, conn=None) -> Any:
+    def _load(self, ref: Ref, t, selection: Keys | Commits | None, conn=None) -> Any:
         handle = ref.handle or {}
         with contextlib.nullcontext(conn) if conn else self._connect() as conn, conn.cursor() as cur:
             table = handle.get("table") or _qname(handle.get("schema", "public"), handle["name"])
@@ -761,11 +766,11 @@ class PostgresStore:
             sql, params = f"SELECT * FROM {table}", []
             clauses = [f"{_ident(k)} = %s" for k in sorted(where)]
             params += [where[k] for k in sorted(where)]
-            if handle.get("batch") is not None:
-                clauses.append(f"{_ident(BATCH_COLUMN)} <= %s")
-                params.append(handle["batch"])
-            if isinstance(selection, Batches):
-                clauses.append(f"{_ident(BATCH_COLUMN)} BETWEEN %s AND %s")
+            if handle.get("commit_number") is not None:
+                clauses.append(f"{_ident(COMMIT_COLUMN)} <= %s")
+                params.append(handle["commit_number"])
+            if isinstance(selection, Commits):
+                clauses.append(f"{_ident(COMMIT_COLUMN)} BETWEEN %s AND %s")
                 params += [selection.lo, selection.hi]
             elif selection is not None:
                 key_col = handle.get("key")
@@ -778,8 +783,8 @@ class PostgresStore:
             found = cur.execute(sql, params)
             rows = found.fetchall()
             columns = [d.name for d in found.description or ()]
-            if handle.get("batch") is not None:
-                internal = {BATCH_COLUMN, SEQ_COLUMN}
+            if handle.get("commit_number") is not None:
+                internal = {COMMIT_COLUMN, SEQ_COLUMN}
                 rows = [{k: v for k, v in r.items() if k not in internal} for r in rows]
         inner = by_key_type(t)
         if inner is not MISSING and isinstance(selection, Keys):
@@ -872,7 +877,7 @@ class _Reader:
     def __init__(self, store: PostgresStore, conn):
         self.store, self.conn, self.lock = store, conn, asyncio.Lock()
 
-    async def load(self, ref: Ref, t, selection: Keys | Batches | None) -> tuple[Any, int | None]:
+    async def load(self, ref: Ref, t, selection: Keys | Commits | None) -> tuple[Any, int | None]:
         if isinstance(t, type) and issubclass(t, Ref):
             return ref, None  # nothing read: the producer reads it itself
 

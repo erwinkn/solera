@@ -64,7 +64,7 @@ from solera.sdk import (
     split_partition,
 )
 from solera.stores import (
-    Batches,
+    Commits,
     KeyedWrite,
     Keys,
     Patch,
@@ -363,9 +363,9 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
         if "changes" in pin:  # Incremental: selection + ctx.changes (§5.1)
             ch = pin["changes"]
             full = bool(ch.get("full"))
-            if "batches" in ch:
-                lo, hi = (int(v) for v in ch["batches"])
-                args[param] = await observed.load(store, ref, t, Batches(lo, hi))
+            if "commits" in ch:
+                lo, hi = (int(v) for v in ch["commits"])
+                args[param] = await observed.load(store, ref, t, Commits(lo, hi))
                 changes[param] = Changes(
                     rows=args[param],
                     full=full,
@@ -456,7 +456,7 @@ async def _store_outputs(
     fence,
     writes,
     timeline,
-    invocation=None,
+    worker_id=None,
     channel=None,
 ):
     """Store each returned output (§4, §6, §8, §9), in two phases.
@@ -498,7 +498,7 @@ async def _store_outputs(
         store = project.stores[declared[name]["store"]]
         o = outs[name] = _Out(name, decls[name], store, pinned.get(name) or {}, value)
         if o.kind == "fenced":
-            await store.acquire(o.context(spec, invocation), o.prior)
+            await store.acquire(o.context(spec, worker_id), o.prior)
 
     # Prepare and resolve: each keyed write read once, and compared with its key
     # index as pinned in the spec; its changes are the batch's delta file. Small
@@ -507,7 +507,7 @@ async def _store_outputs(
     for o in outs.values():
         await _prepare(o, spec, keys_io)
     asks = [_ask_for(o, spec) for o in outs.values() if o.asks()]
-    engine = await _ask_engine(channel, invocation, asks)
+    engine = await _ask_engine(channel, worker_id, asks)
     intents, entries = {}, {}
     for name, o in list(outs.items()):
         if o.index is None:
@@ -550,7 +550,7 @@ async def _store_outputs(
     # Write: nothing reaches a store before the fence is ours.
     for name, o in outs.items():
         output, store, store_name = o.output, o.store, declared[name]["store"]
-        context = o.context(spec, invocation)
+        context = o.context(spec, worker_id)
         schema = None
         if output.migrations:
             migrate = getattr(store, "migrate", None)
@@ -579,7 +579,7 @@ async def _store_outputs(
                 raise StoreError(f"{output.name}: store {store_name!r} reported no keys for a Sql write")
             files, _ = await o.index.replace(
                 written.keys,
-                int(o.info["batch"]),
+                int(o.info["commit_number"]),
                 spec["attempt"],
                 generation=int(spec.get("generation") or 0),
             )
@@ -666,15 +666,15 @@ class _Out:
     def unsettled(self) -> list:
         return self.info.get("unsettled") or []
 
-    def context(self, spec, invocation) -> WriteContext:
+    def context(self, spec, worker_id) -> WriteContext:
         return WriteContext(
             output=self.output,
             partition=spec["partition"],
-            batch=self.info.get("batch"),
+            commit_number=self.info.get("commit_number"),
             attempt=spec["attempt"],
             reset=self.reset,
             generation=spec.get("generation"),
-            invocation=invocation,
+            worker_id=worker_id,
         )
 
     def asks(self) -> bool:
@@ -739,17 +739,17 @@ async def _resolve(o: _Out, spec, answer) -> None:
     """The write's delta: the engine's answer, uploaded as this attempt's
     own; or a replacement streamed against the whole index; or a patch."""
 
-    batch, attempt = int(o.info["batch"]), spec["attempt"]
+    commit_number, attempt = int(o.info["commit_number"]), spec["attempt"]
     generation = int(spec.get("generation") or 0)  # each key's version (docs/versions.md)
     if answer is not None:
-        o.files, o.changed = await _upload(o.index, batch, attempt, answer)
+        o.files, o.changed = await _upload(o.index, commit_number, attempt, answer)
     elif o.replace:
         o.files, o.changed = await o.index.replace(
-            o.prepared.rows, batch, attempt, collect=LISTED, generation=generation
+            o.prepared.rows, commit_number, attempt, collect=LISTED, generation=generation
         )
     else:
         o.files, o.changed = await o.index.resolve(
-            o.run, batch=batch, attempt=attempt, generation=generation, collect=LISTED
+            o.run, commit_number=commit_number, attempt=attempt, generation=generation, collect=LISTED
         )
 
 
@@ -791,40 +791,40 @@ def _keyed_write(o: _Out, keys_io) -> KeyedWrite:
 
 def _ask_for(o: _Out, spec: dict) -> Ask:
     run = SortedEntries.from_rows(o.prepared.rows) if o.replace else o.run
-    batch = int(o.info["batch"])
+    commit_number = int(o.info["commit_number"])
     return Ask(
         o.name,
         spec["partition"],
         "replace" if o.replace else "patch",
-        batch,
+        commit_number,
         int(spec.get("generation") or 0),
         o.info["index"]["prefix"],
-        batch - 1,
+        commit_number - 1,
         run,
     )
 
 
-async def _ask_engine(channel, invocation, asks: list[Ask]) -> dict[str, tuple[dict, bytes | None]]:
+async def _ask_engine(channel, worker_id, asks: list[Ask]) -> dict[str, tuple[dict, bytes | None]]:
     """The engine's answers to the outputs it resolved: a delta or "empty".
     Unreachable, slow, declining: no answer, and the worker resolves itself."""
 
     if not asks or channel is None or not hasattr(channel, "resolve"):
         return {}
     try:
-        body = await asyncio.wait_for(channel.resolve(request(invocation, asks)), RESOLVE_TIMEOUT)
+        body = await asyncio.wait_for(channel.resolve(request(worker_id, asks)), RESOLVE_TIMEOUT)
         got = answers(body)
     except Exception:
         return {}
     return {name: a for name, a in got.items() if a[0]["result"] in ("delta", "empty")}
 
 
-async def _upload(index: KeyIndex, batch: int, attempt: str, answer) -> tuple[DeltaFiles, tuple]:
+async def _upload(index: KeyIndex, commit_number: int, attempt: str, answer) -> tuple[DeltaFiles, tuple]:
     """The engine's delta, uploaded as this attempt's own delta file."""
 
     a, data = answer
     if data is None:
         return DeltaFiles([], 0, 0, True), ([], [])
-    name = f"{batch:012d}-{attempt}.0000"
+    name = f"{commit_number:012d}-{attempt}.0000"
     await index.io.write(index.path(name), data)
     return DeltaFiles([FileInfo.describe(name, 0, data)], a["added"], a["removed"], True), delta_keys(data)
 
@@ -881,7 +881,7 @@ async def _reconcile(o: _Out, spec):
 
     return await o.index.replace(
         o.store.keys(o.prior, None),
-        int(o.info["batch"]),
+        int(o.info["commit_number"]),
         spec["attempt"],
         collect=LISTED,
         generation=int(spec.get("generation") or 0),
@@ -891,14 +891,14 @@ async def _reconcile(o: _Out, spec):
 
 class Writes:
     """Write-completion evidence (docs/lifecycle.md §2.3): `none` until a
-    store call starts; `uncertain` while one runs, or if one raised or was
+    store call starts; `writing` while one runs, or if one raised or was
     abandoned; `complete` once every call made has returned."""
 
     def __init__(self):
         self.state = lifecycle.NONE
 
     async def call(self, work):
-        self.state = lifecycle.UNCERTAIN
+        self.state = lifecycle.WRITING
         result = await work
         self.state = lifecycle.COMPLETE
         return result
@@ -947,8 +947,8 @@ async def run_attempt(
     if data is None:
         raise StoreError(f"No spec at {base}{lifecycle.SPEC}")
     spec = json.loads(data)
-    invocation = secrets.token_hex(8)
-    claim = {"invocation": invocation, "host": socket.gethostname(), "pid": os.getpid(), "at": time.time()}
+    worker_id = secrets.token_hex(8)
+    claim = {"worker_id": worker_id, "host": socket.gethostname(), "pid": os.getpid(), "at": time.time()}
     if channel is None and (engine_url or spec.get("engine")):
         from .channel import HttpChannel
 
@@ -957,7 +957,7 @@ async def run_attempt(
         await create(objects, f"{base}{lifecycle.WORKER}", json.dumps(claim).encode())
     except AlreadyExistsError:
         if not pool:
-            await _await_owner(objects, base, loser_poll, channel, invocation)
+            await _await_owner(objects, base, loser_poll, channel, worker_id)
         return 0
     loop = asyncio.get_running_loop()
     control = {"cancel": None, "writing": False, "stopped": False, "forced": False}
@@ -990,13 +990,13 @@ async def run_attempt(
             started = None  # unreachable for now: the reporter falls back to `.worker`
     else:
         started = None
-    shipper = LogShipper(objects, base, channel, invocation)
+    shipper = LogShipper(objects, base, channel, worker_id)
     writes = Writes()
     execution = asyncio.create_task(
-        _execute(objects, base, spec, entrypoint, timeline, shipper, writes, invocation, control)
+        _execute(objects, base, spec, entrypoint, timeline, shipper, writes, worker_id, control)
     )
     reporter = Reporter(
-        objects, base, invocation, channel, spec.get("heartbeat", 10), timeline, on_cancel, on_ended
+        objects, base, worker_id, channel, spec.get("heartbeat", 10), timeline, on_cancel, on_ended
     )
     if started is not None:
         reporter.cancel = started
@@ -1012,12 +1012,12 @@ async def run_attempt(
             result = {"status": "canceled"}  # requested before the gate: nothing written
         if result is None or control["forced"]:
             return ENDED
-        await _publish(objects, base, result, invocation, writes, control["cancel"], timeline, shipper)
+        await _publish(objects, base, result, worker_id, writes, control["cancel"], timeline, shipper)
         flusher.cancel()
         if channel is not None:
             with contextlib.suppress(Exception):
-                answer = await channel.finished({"invocation": invocation})
-                await _discard_after(answer, spec, control.get("project"), objects, channel, invocation)
+                answer = await channel.finished({"worker_id": worker_id})
+                await _discard_after(answer, spec, control.get("project"), objects, channel, worker_id)
         return 1 if result["status"] == "failed" else 0
     except asyncio.CancelledError:
         if control["forced"] and not asyncio.current_task().cancelling():
@@ -1030,7 +1030,7 @@ async def run_attempt(
             channel.close()
 
 
-async def _await_owner(objects, base: str, poll: float, channel=None, invocation: str = "") -> None:
+async def _await_owner(objects, base: str, poll: float, channel=None, worker_id: str = "") -> None:
     """A losing invocation: wait until the attempt is over before exiting —
     the owner's result exists, the engine closed or aborted its gate, the
     engine says `ended` (`not_owner` is no news), or its objects are gone."""
@@ -1043,7 +1043,7 @@ async def _await_owner(objects, base: str, poll: float, channel=None, invocation
             return
         if channel is not None:
             try:
-                await asyncio.to_thread(channel.beat, {"invocation": invocation, "seq": 0})
+                await asyncio.to_thread(channel.beat, {"worker_id": worker_id, "seq": 0})
             except Ended as answer:
                 if answer.reason != "not_owner":
                     return
@@ -1080,7 +1080,7 @@ def _user_failed(error: BaseException, project: Project) -> dict:
 PUBLISH_TRIES = 6
 
 
-async def _publish(objects, base, result, invocation, writes, cancel, timeline, shipper) -> None:
+async def _publish(objects, base, result, worker_id, writes, cancel, timeline, shipper) -> None:
     """Seal the result once and create `.result` with exactly those bytes,
     retried as they are: a failure to publish never changes what is
     published. A worker that cannot publish raises, and the engine treats
@@ -1090,7 +1090,7 @@ async def _publish(objects, base, result, invocation, writes, cancel, timeline, 
     timeline.add("finished")
 
     def seal(result: dict) -> bytes:
-        body = {"invocation": invocation, **result, "writes": writes.state, **timeline.report(), "log": log}
+        body = {"worker_id": worker_id, **result, "write": writes.state, **timeline.report(), "log": log}
         if cancel is not None and "cancel" not in body:  # an Each page sealed its own record
             body["cancel"] = cancel.to_json()
         return json.dumps(body, allow_nan=False).encode()
@@ -1112,7 +1112,7 @@ async def _publish(objects, base, result, invocation, writes, cancel, timeline, 
 
 
 async def _execute(
-    objects, base, spec, entrypoint, timeline, shipper, writes, invocation, control
+    objects, base, spec, entrypoint, timeline, shipper, writes, worker_id, control
 ) -> dict | None:
     """Run the attempt: its result, or `None` once the engine ended it."""
 
@@ -1127,7 +1127,7 @@ async def _execute(
         if gated:
             try:
                 await create(
-                    objects, f"{base}{lifecycle.GATE}", lifecycle.gate(lifecycle.WRITING, invocation, intents)
+                    objects, f"{base}{lifecycle.GATE}", lifecycle.gate(lifecycle.WRITING, worker_id, intents)
                 )
             except AlreadyExistsError:
                 raise Aborted(spec["attempt"]) from None
@@ -1193,7 +1193,7 @@ async def _execute(
             fence,
             writes,
             timeline,
-            invocation,
+            worker_id,
             shipper.channel,
         )
         for name, values in metadata.items():
@@ -1230,7 +1230,7 @@ async def _execute(
             await observed.close()
 
 
-async def _discard_after(answer, spec, project, objects, channel, invocation) -> None:
+async def _discard_after(answer, spec, project, objects, channel, worker_id) -> None:
     """Discard what the engine says is due in this attempt's scope now that
     its commit is durable (docs/lifecycle.md §9.8), and say so. Anything
     that fails here leaves the entries queued for the scope's next attempt:
@@ -1241,7 +1241,7 @@ async def _discard_after(answer, spec, project, objects, channel, invocation) ->
     due = {"outputs": answer["discard"], "partition": spec["partition"], "attempt": spec["attempt"]}
     done = await _discard_due(due, project, project.assets[spec["asset"]], objects, Writes())
     if done:
-        await channel.discarded({"invocation": invocation, "scope": answer["scope"], **done})
+        await channel.discarded({"worker_id": worker_id, "scope": answer["scope"], **done})
 
 
 def _file_entries(data: bytes):
@@ -1301,17 +1301,17 @@ async def _discard_due(spec, project, asset, objects, writes) -> dict:
             elif kind == "abandoned":  # all an uncommitted attempt wrote carries its generation
                 generation = entry["generation"]
                 if "prefix" in entry:  # keyed: its delta files name every object it could have written
-                    stem = f"{int(entry['batch']):012d}-{entry['attempt']}"
-                    async for batch in obstore.list(objects, prefix=prefix):
-                        for meta in batch:
+                    stem = f"{int(entry['commit_number']):012d}-{entry['attempt']}"
+                    async for commit_number in obstore.list(objects, prefix=prefix):
+                        for meta in commit_number:
                             if meta["path"][len(prefix) :].startswith(stem):
                                 data = await read(meta["path"])
                                 for key, _, deleted, _, _ in _file_entries(data) if data else ():
                                     if not deleted:
                                         items.append(("key", key_str(key), generation))
                                 files.append(meta["path"])
-                elif entry.get("batch") is not None:
-                    items.append(("batch", entry["batch"], generation))
+                elif entry.get("commit_number") is not None:
+                    items.append(("commit_number", entry["commit_number"], generation))
                 else:
                     items.append(("value", generation))
             else:

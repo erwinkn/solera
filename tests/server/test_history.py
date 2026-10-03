@@ -213,7 +213,7 @@ async def test_a_run_reads_the_same_once_archived(state, clock):
         "id": commit["run"],
         "source": "uploads",
         "by": "api",
-        "batch": 0,
+        "commit_number": 0,
         "upserted": ["a", "b"],
         "deleted": [],
     }

@@ -106,7 +106,7 @@ async def test_lineage_says_what_a_current_read_saw(state):
     await store.store(
         landed,
         Ref.from_json(head),
-        WriteContext(output=out, partition="", attempt="x", generation=newer, invocation="x"),
+        WriteContext(output=out, partition="", attempt="x", generation=newer, worker_id="x"),
     )
     await run(engine, ["report", "changes"])
 

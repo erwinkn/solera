@@ -176,7 +176,7 @@ export interface Head {
   complete: boolean;
   asset?: string | null;
   version?: string;
-  batch?: number;
+  commit_number?: number;
   base?: number;
   run?: string;
   attempt?: string;
@@ -238,7 +238,7 @@ export interface OutputHead {
   /** The asset's code version; a source's own version, as its last commit gave it. */
   version: string | null;
   key_count: number | null;
-  batch: number | null;
+  commit_number: number | null;
   complete: boolean;
   cursor: boolean;
   at: number;
@@ -336,15 +336,15 @@ export interface Explain {
 export type EdgeState = "never" | "caught_up" | "behind" | "paging" | "full" | "rescope" | "reconcile";
 
 /** An edge's delivery progress (python/solera_server/delivery.py): `next`,
- * the first upstream batch not yet delivered; `delivery`, one under way —
+ * the first upstream commit not yet delivered; `delivery`, one under way —
  * its mode, boundary (`from`..`to`) and position (`at`: the last key
- * delivered, or the next batch). */
+ * delivered, or the next commit). */
 export interface Watermark {
-  kind: "keys" | "batches";
+  kind: "keys" | "commits";
   output: string;
   up: string;
   fingerprint: string;
-  pass?: string | null;
+  reset_by?: string | null;
   next: number;
   delivery?: {
     mode: "full" | "delta" | "diff";
@@ -354,7 +354,7 @@ export interface Watermark {
     page: number;
     pages: number;
     pin?: number | null;
-    cleanup?: boolean;
+    reconcile?: boolean;
   };
   patterns?: Json;
   rescope?: { old: Json; new: Json; cutover: number; pin: number };
@@ -365,7 +365,7 @@ export interface EdgeScope {
   scope: string;
   up_scope: string;
   watermark: Watermark | null;
-  head_batch: number | null;
+  head_commit: number | null;
   lag: number | null;
   state: EdgeState;
 }
@@ -390,7 +390,7 @@ export interface Materialization {
   run: string;
   attempt: string | null;
   at: number;
-  batch: number | null;
+  commit_number: number | null;
   added: number | null;
   removed: number | null;
   added_keys: string[] | null;
@@ -586,7 +586,7 @@ export interface LogLine {
 
 export interface AttemptResult {
   status: string;
-  writes?: "none" | "complete" | "uncertain";
+  write?: "none" | "writing" | "complete";
   outputs?: Record<string, { ref?: Ref; unchanged?: boolean; keys?: Json }>;
   delivered?: Record<string, Json>;
   key_outcomes?: Omit<KeyOutcome, "run" | "attempt" | "asset" | "scope" | "at">[];

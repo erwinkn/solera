@@ -175,7 +175,7 @@ class Live:
     """What the engine knows of a launched attempt's worker, in memory only:
     rebuilt from `.worker` after a restart (§5.3)."""
 
-    invocation: str | None = None  # the bound invocation: the claim's owner
+    worker_id: str | None = None  # the bound invocation: the claim's owner
     started: bool = False  # it reported: the runtime clock runs
     started_at: float = 0.0  # monotonic
     reported: float | None = None  # when it last reported (monotonic)
@@ -240,23 +240,23 @@ class Attempts:
     async def _owner(self, attempt: str) -> str | None:
         task = self.m.task(self.m.attempts.get(attempt, ""))
         data = await self.state.get_object(f"{lifecycle.base(task['run'], attempt)}{lifecycle.WORKER}")
-        return json.loads(data)["invocation"] if data else None
+        return json.loads(data)["worker_id"] if data else None
 
-    async def _bind(self, attempt: str, live: Live, invocation: str, start: bool = False) -> None:
+    async def _bind(self, attempt: str, live: Live, worker_id: str, start: bool = False) -> None:
         """The first `start` of an attempt this engine launched binds its
         invocation: only the claim's winner sends one. Any other token, or
         any request after a restart, is checked against the claim itself
         (§5.3)."""
 
-        if live.invocation == invocation:
+        if live.worker_id == worker_id:
             return
-        if start and live.invocation is None and live.fresh:
-            live.invocation = invocation
+        if start and live.worker_id is None and live.fresh:
+            live.worker_id = worker_id
             return
         owner = await self._owner(attempt)
-        if owner != invocation:
+        if owner != worker_id:
             raise Ended("not_owner")
-        live.invocation = owner
+        live.worker_id = owner
 
     def _cancel_answer(self, live: Live) -> dict:
         return {"cancel": live.cancel.to_json() if live.cancel else None}
@@ -266,7 +266,7 @@ class Attempts:
     async def attempt_start(self, attempt: str, body: dict) -> dict:
         self._serving()
         live = self._live(attempt)
-        await self._bind(attempt, live, body["invocation"], start=True)
+        await self._bind(attempt, live, body["worker_id"], start=True)
         live.heard(asyncio.get_running_loop().time(), "channel")
         self._stir(attempt)
         answer = self._cancel_answer(live)
@@ -281,7 +281,7 @@ class Attempts:
     async def attempt_beat(self, attempt: str, body: dict) -> dict:
         self._serving()
         live = self._live(attempt)
-        await self._bind(attempt, live, body["invocation"])
+        await self._bind(attempt, live, body["worker_id"])
         if int(body.get("seq", 0)) > live.seq:  # a retried or reordered beat changes nothing
             live.seq = int(body["seq"])
             live.report = {k: body[k] for k in ("events", "usage") if k in body}
@@ -291,7 +291,7 @@ class Attempts:
     async def attempt_logs(self, attempt: str, body: dict) -> dict:
         self._serving()
         live = self._live(attempt)
-        await self._bind(attempt, live, body["invocation"])
+        await self._bind(attempt, live, body["worker_id"])
         offset, lines = int(body["offset"]), list(body["lines"])
         if offset > live.log_offset:  # lines lost for good: the chunks hold them
             live.log_offset = offset
@@ -303,7 +303,7 @@ class Attempts:
     async def attempt_finished(self, attempt: str, body: dict) -> dict:
         self._serving()
         live = self._live(attempt)
-        await self._bind(attempt, live, body["invocation"])
+        await self._bind(attempt, live, body["worker_id"])
         task_id = self.m.attempts.get(attempt)
         live.finished = True
         self._stir(attempt)
@@ -356,10 +356,10 @@ class Attempts:
             raise Malformed(f"a body over {MAX_BODY} bytes")
         header, payloads = unframe(body)
         outputs_asked = _outputs(header, payloads)
-        invocation = header.get("invocation")
-        if not isinstance(invocation, str) or not invocation:
+        worker_id = header.get("worker_id")
+        if not isinstance(worker_id, str) or not worker_id:
             raise Ended("not_owner")  # no identity is never the owner's
-        await self._bind(attempt, live, invocation)
+        await self._bind(attempt, live, worker_id)
         if self.keys is None:
             return None
         task = self.m.task(self.m.attempts[attempt])
@@ -368,20 +368,20 @@ class Attempts:
 
         def prepared(name):
             info = outputs.get(name)
-            if not info or "prefix" not in info or "batch" not in info:
+            if not info or "prefix" not in info or "commit_number" not in info:
                 return None
             index = self.m.indexes.get((name, scope))
             head = self.m.heads.get((name, scope)) or {}
-            if index is None and int(info["batch"]) == 0:
+            if index is None and int(info["commit_number"]) == 0:
                 index = self.m.index(name, scope)  # the first write of the output
             if index is None or index.prefix != info["prefix"]:
                 return None
             return Prepared(
                 scope,
-                int(info["batch"]),
+                int(info["commit_number"]),
                 int(launched["pin"]),
                 index,
-                int(head.get("batch", -1)),
+                int(head.get("commit_number", -1)),
                 True,
                 self.m.applied,  # the index as of now: what a fill of it reads
             )
@@ -530,9 +530,9 @@ class Attempts:
             return
         live.worker = data
         body = json.loads(data)
-        if live.invocation is None:
-            live.invocation = body["invocation"]
-        if body["invocation"] != live.invocation:
+        if live.worker_id is None:
+            live.worker_id = body["worker_id"]
+        if body["worker_id"] != live.worker_id:
             return
         if body.get("events") is not None:
             live.report = {k: body[k] for k in ("events", "usage") if k in body}
@@ -753,7 +753,7 @@ class Attempts:
                 reason="conflict",
             )
             return
-        if result.get("writes") == lifecycle.NONE and self._gated(prepared):
+        if result.get("write") == lifecycle.NONE and self._gated(prepared):
             with contextlib.suppress(Exception):
                 await self._gate(task["run"], attempt, lifecycle.CLOSED)
 
@@ -800,7 +800,7 @@ class Attempts:
         """Create the attempt's gate as `state` (`aborted` or `closed`), or
         find the one there: the write-completion evidence it establishes
         (§2.3) and the gate found. Winning: `none` — the worker never took
-        it, and now never can. Finding `writing`: `uncertain`. An object
+        it, and now never can. Finding it `writing`: so is the write. An object
         store that does not answer establishes nothing: retried, then raised."""
 
         path = f"{lifecycle.base(run_id, attempt)}{lifecycle.GATE}"
@@ -812,7 +812,7 @@ class Attempts:
             except AlreadyExistsError:
                 found = json.loads(await self.state.get_object(path))
                 if found["state"] == lifecycle.WRITING:
-                    return lifecycle.UNCERTAIN, found
+                    return lifecycle.WRITING, found
                 return lifecycle.NONE, found
             except Exception:
                 if retry == 5:
@@ -842,11 +842,11 @@ class Attempts:
 
         task = self.m.task(task_id)
         prepared = self._launched(task, attempt)["prepared"]
-        writes, gate = lifecycle.NONE, None
+        write, gate = lifecycle.NONE, None
         if self._gated(prepared):
-            writes, gate = await self._gate(task["run"], attempt, lifecycle.ABORTED)
+            write, gate = await self._gate(task["run"], attempt, lifecycle.ABORTED)
         if result is not None:
-            writes = result.get("writes", writes)
+            write = result.get("write", write)
         unsettled = current_names(
             prepared,
             (gate or {}).get("intents") or {} if (gate or {}).get("state") == lifecycle.WRITING else {},
@@ -866,7 +866,7 @@ class Attempts:
             worker=worker,
             end=end,
             reason=reason,
-            writes=writes,
+            write=write,
             retry_for=retry_for,
         )
         await self._discard(attempt, prepared, keep=set(unsettled))
@@ -883,13 +883,13 @@ class Attempts:
         for name, info in (prepared.get("outputs") or {}).items():
             if info.get("prefix") is None or name in keep or info["contract"]["writes"] == "immutable":
                 continue  # an immutable output's are collected with what they name (§9.8)
-            prefix = f"{info['prefix']}{int(info['batch']):012d}-{attempt}"
+            prefix = f"{info['prefix']}{int(info['commit_number']):012d}-{attempt}"
             self._authority()
             with contextlib.suppress(Exception):
                 await self.state.delete_objects(await self.state.list_objects(prefix))
         failures = prepared.get("failures")
         if failures is not None:  # an Each page's failure delta (docs/per-key-processing.md §9)
-            prefix = f"{failures['prefix']}{int(failures['batch']):012d}-{attempt}"
+            prefix = f"{failures['prefix']}{int(failures['commit_number']):012d}-{attempt}"
             self._authority()
             with contextlib.suppress(Exception):
                 await self.state.delete_objects(await self.state.list_objects(prefix))

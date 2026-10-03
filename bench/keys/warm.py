@@ -132,7 +132,7 @@ async def run_size(n: int, args) -> list[dict]:
             vers = [rng.randbytes(16) for _ in items]
             files, _ = await KeyIndex(setup, None, state, opts).resolve(
                 SortedEntries.of([bench.key_of(i) for i, _ in items], vers),
-                batch=b + 1,
+                commit_number=b + 1,
                 attempt="setup",
                 generation=100 + b,
             )
@@ -145,7 +145,7 @@ async def run_size(n: int, args) -> list[dict]:
                 vers = [rng.randbytes(16) for _ in items]
                 files, _ = await KeyIndex(setup, None, state, opts).resolve(
                     SortedEntries.of([bench.key_of(i) for i, _ in items], vers),
-                    batch=b,
+                    commit_number=b,
                     attempt="setup",
                     generation=100 + b,
                 )
@@ -199,7 +199,7 @@ async def run_size(n: int, args) -> list[dict]:
             io = cold()
             (files, _), wall, cpu = await timed(
                 lambda io=io, keys=keys, vers=vers, k=k: KeyIndex(io, None, state, opts).resolve(
-                    SortedEntries.of(keys, vers), batch=99, attempt=f"c{k}", generation=1
+                    SortedEntries.of(keys, vers), commit_number=99, attempt=f"c{k}", generation=1
                 )
             )
             row["cold"] = (wall, cpu, io.metrics.gets, io.metrics.bytes_in / 1e6)

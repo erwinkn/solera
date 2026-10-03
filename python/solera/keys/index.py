@@ -222,12 +222,12 @@ class IndexState:
 
     # -- transitions (pure) ----------------------------------------------------------------
 
-    def committed(self, batch: int, delta: DeltaFiles, *, keep_log: bool) -> IndexState:
+    def committed(self, commit_number: int, delta: DeltaFiles, *, keep_log: bool) -> IndexState:
         """Install a commit's delta files. An empty index takes them straight into level 1."""
 
         level = 1 if not self.files else 0
         placed = tuple(replace(f, level=level) for f in delta.files)
-        log = self.log + ((batch, placed),) if keep_log and placed else self.log
+        log = self.log + ((commit_number, placed),) if keep_log and placed else self.log
         return IndexState(
             count=self.count + delta.added - delta.removed,
             inexact=self.inexact + int(not delta.exact),
@@ -249,12 +249,12 @@ class IndexState:
 
         return replace(self, count=live + self.count - pinned_count, inexact=self.inexact - pinned_inexact)
 
-    def truncated(self, lowest_needed_batch: int | None) -> IndexState:
+    def truncated(self, lowest_needed_commit: int | None) -> IndexState:
         """Drop log entries no consumer still needs (`None`: no consumers at all)."""
 
-        if lowest_needed_batch is None:
+        if lowest_needed_commit is None:
             return replace(self, log=())
-        return replace(self, log=tuple(e for e in self.log if e[0] >= lowest_needed_batch))
+        return replace(self, log=tuple(e for e in self.log if e[0] >= lowest_needed_commit))
 
 
 @dataclass(frozen=True)
@@ -485,7 +485,7 @@ class KeyIndex:
         self,
         run: SortedEntries,
         *,
-        batch: int,
+        commit_number: int,
         attempt: str,
         generation: int = 0,
         exact: bool = False,
@@ -503,12 +503,12 @@ class KeyIndex:
 
         entries = sum(f.entries for f in self.state.files)
         if entries and len(run) > self.o.stream_density * entries:
-            return await self._stream(run, batch, attempt, generation, collect)
+            return await self._stream(run, commit_number, attempt, generation, collect)
         delta = await self._sparse(run, generation, exact=exact, collect=collect, switch=True)
         if delta is None:
-            return await self._stream(run, batch, attempt, generation, collect)
+            return await self._stream(run, commit_number, attempt, generation, collect)
         self.route = "sparse"
-        return await self.write(batch, attempt, delta), delta.listed
+        return await self.write(commit_number, attempt, delta), delta.listed
 
     async def changes(self, run: SortedEntries, *, generation: int = 0, exact: bool = False) -> Delta:
         """A patch's delta through the sparse reader whatever its size, not written."""
@@ -589,19 +589,19 @@ class KeyIndex:
             await in_thread(served.record, self.identity, call, args, out, page)
         return out
 
-    async def _stream(self, run: SortedEntries, batch, attempt, generation, collect):
+    async def _stream(self, run: SortedEntries, commit_number, attempt, generation, collect):
         """The streaming merge-join of a patch with every level."""
 
         self.route = "stream"
         runs = self.state.newest_first()
         job = Merge.patch(run, len(runs), **self._writer(), collect=collect, generation=generation)
-        files = await self._run(job, runs, lambda n: f"{batch:012d}-{attempt}.{n:04d}", 0)
+        files = await self._run(job, runs, lambda n: f"{commit_number:012d}-{attempt}.{n:04d}", 0)
         return DeltaFiles(files, job.added, job.removed, True), job.collected()
 
     async def replace(
         self,
         rows: Rows | Iterable,
-        batch: int,
+        commit_number: int,
         attempt: str,
         *,
         collect: int = 0,
@@ -630,7 +630,7 @@ class KeyIndex:
             generation=generation,
             overlay=overlay,
         )
-        files = await self._run(job, runs, lambda n: f"{batch:012d}-{attempt}.{n:04d}", 0, rows)
+        files = await self._run(job, runs, lambda n: f"{commit_number:012d}-{attempt}.{n:04d}", 0, rows)
         return DeltaFiles(files, job.added, job.removed, True), job.collected()
 
     def _writer(self) -> dict:
@@ -738,12 +738,13 @@ class KeyIndex:
 
     # -- writing ------------------------------------------------------------------------
 
-    async def write(self, batch: int, attempt: str, delta: Delta) -> DeltaFiles:
+    async def write(self, commit_number: int, attempt: str, delta: Delta) -> DeltaFiles:
         """Write a patch's delta as the batch's files, `{batch}-{attempt}.{n}`:
         the attempt id keeps a retried batch from colliding with its own upload."""
 
         files = [
-            FileInfo.describe(f"{batch:012d}-{attempt}.{n:04d}", 0, d) for n, d in enumerate(delta.files)
+            FileInfo.describe(f"{commit_number:012d}-{attempt}.{n:04d}", 0, d)
+            for n, d in enumerate(delta.files)
         ]
         await asyncio.gather(
             *(self.io.write(self.path(f.name), d) for f, d in zip(files, delta.files, strict=True))
@@ -824,16 +825,16 @@ class KeyIndex:
 
         return await self._read("page", (after, limit), levels, local, store)
 
-    async def pending(self, first_batch: int, last_batch: int, after: bytes | None, limit: int):
-        """Changes in batches `[first_batch, last_batch]`, newest winning, keys > `after`:
+    async def pending(self, first_commit: int, last_commit: int, after: bytes | None, limit: int):
+        """Changes in commits `[first_commit, last_commit]`, newest winning, keys > `after`:
         keys, generations, deleted flags, payloads, and the next cursor (`None` when done)."""
 
         logged = dict(self.state.log)
-        missing = [b for b in range(first_batch, last_batch + 1) if b not in logged]
+        missing = [b for b in range(first_commit, last_commit + 1) if b not in logged]
         if missing:
             raise LookupError(f"delta log no longer holds batches {missing[:5]}")
         # Each batch is a level of its own: its files (a split delta) never overlap.
-        levels = [list(logged[b]) for b in range(last_batch, first_batch - 1, -1)]
+        levels = [list(logged[b]) for b in range(last_commit, first_commit - 1, -1)]
 
         async def store():
             return await self._scan(levels, after, limit, drop_deleted=False)
@@ -842,7 +843,7 @@ class KeyIndex:
             page, nxt = await _scan_local(snap, after, limit, True, ceiling)
             return (*page.entries(), nxt), page
 
-        args = (first_batch, last_batch, after, limit)
+        args = (first_commit, last_commit, after, limit)
         return await self._read("pending", args, levels, local, store)
 
     async def recount(self) -> int:

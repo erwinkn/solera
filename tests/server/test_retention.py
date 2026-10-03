@@ -139,7 +139,7 @@ async def test_source_commits_are_recorded_as_runs(state, clock):
         "id": second["run"],
         "source": "uploads",
         "by": "api",
-        "batch": 1,
+        "commit_number": 1,
         "upserted": ["u-7"],
         "deleted": ["u-6"],
     }

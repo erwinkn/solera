@@ -55,7 +55,7 @@ class Keys:
 
 
 @dataclass(frozen=True)
-class Batches:
+class Commits:
     """An inclusive `[lo, hi]` batch-range selection passed to `store.load`
     on an unkeyed incremental output (§2.2)."""
 
@@ -73,13 +73,13 @@ class WriteContext:
 
     output: Output
     partition: str
-    batch: int | None = None
+    commit_number: int | None = None
     attempt: str | None = None
     reset: bool = False
     # The attempt's generation and invocation, for a `fenced` store to check
     # (docs/lifecycle.md §9.7); `None` outside an attempt.
     generation: int | None = None
-    invocation: str | None = None
+    worker_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -124,7 +124,7 @@ class Store(Protocol):
     def can_load(self, t: type | None, selection: type | None) -> bool: ...
     def can_store(self, t: type | None, output: Output) -> bool: ...
     async def store(self, write: Any, prior: Ref | None, context: WriteContext) -> Written: ...
-    async def load(self, ref: Ref, t: type, selection: Keys | Batches | None) -> Any: ...
+    async def load(self, ref: Ref, t: type, selection: Keys | Commits | None) -> Any: ...
 
     # immutable: async def discard(self, scope: Scope, prior: Ref | None, items: list) -> None
     # fenced:    async def acquire(self, scope: Scope, prior: Ref | None) -> None

@@ -92,14 +92,14 @@ async def test_every_write_is_a_change_and_an_empty_patch_none(state):
     await engine.initialize()
     await run(engine, ["items"])
     first = dict(state.model.heads[("items", "")])
-    assert store.stored == 1 and first["batch"] == 0 and first["count"] == 2
+    assert store.stored == 1 and first["commit_number"] == 0 and first["count"] == 2
     await run(engine, ["items"])  # identical rows: written again
     second = state.model.heads[("items", "")]
-    assert store.stored == 2 and second["batch"] == 1 and second["count"] == 2
+    assert store.stored == 2 and second["commit_number"] == 1 and second["count"] == 2
     assert second["ref"]["generation"] > first["ref"]["generation"]
     rows["v"] = Patch([])
     await run(engine, ["items"])
-    assert store.stored == 2 and state.model.heads[("items", "")]["batch"] == 1
+    assert store.stored == 2 and state.model.heads[("items", "")]["commit_number"] == 1
 
 
 async def test_a_keyed_write_reaches_the_store_as_its_delta(state, data):
@@ -243,10 +243,10 @@ async def test_compaction_truncation_and_garbage(state):
     index = state.model.indexes[("items", "")]
     assert index.count == len(truth) and index.count_exact
     assert len(index.level(0)) < 3 and index.depth >= 1  # compacted
-    head_batch = state.model.heads[("items", "")]["batch"]
+    head_commit = state.model.heads[("items", "")]["commit_number"]
     watermark = state.model.watermark("mirror", "items", "")
-    assert watermark["next"] == head_batch + 1
-    assert all(batch >= watermark["next"] for batch, _ in index.log)  # truncated behind it
+    assert watermark["next"] == head_commit + 1
+    assert all(commit_number >= watermark["next"] for commit_number, _ in index.log)  # truncated behind it
     read = state.model.discard_reads()  # kept for the discards still pending (docs/lifecycle.md §9.8)
     assert {path for path, _ in state.model.garbage} <= read
     assert on_disk(state, index) == {index.path(n) for n in index.referenced()} | read
@@ -379,7 +379,7 @@ async def test_keyed_source_commits_go_through_the_index(state):
     await run(engine, ["ingest"])
     assert got == [(["a", "b"], []), (["b", "c"], ["a"])]
     head = state.model.heads[("uploads", "")]
-    assert head["batch"] == 1 and head["count"] == 2
+    assert head["commit_number"] == 1 and head["count"] == 2
 
 
 async def test_partition_set_elements_ride_on_the_head(state):
@@ -393,7 +393,7 @@ async def test_partition_set_elements_ride_on_the_head(state):
     await run(engine, ["sites"])
     await run(engine, ["sites"])  # the same element again: nothing changes
     head = state.model.heads[("sites", "")]
-    assert head["elements"] == ["east"] and head["count"] == 1 and head["batch"] == 0
+    assert head["elements"] == ["east"] and head["count"] == 1 and head["commit_number"] == 0
 
 
 async def test_only_the_engine_caches_index_files(state, tmp_path):
@@ -459,7 +459,7 @@ async def test_renamed_asset_keeps_its_state(state):
     assert m.watermark("mirror", "feed", "")["output"] == "source_feed"
     rows["v"] = Patch([{"id": "b", "v": 2}])
     await run(engine, ["mirror"], upstream=True)
-    assert m.heads[("source_feed", "")]["batch"] == 1
+    assert m.heads[("source_feed", "")]["commit_number"] == 1
     assert delivered == [(True, ["a", "b"]), (False, ["b"])]  # only the change, not everything
     ref = Ref.from_json(m.heads[("source_feed", "")]["ref"])
     loaded = await project.stores["default"].load(ref, None, await whole(state, "source_feed"))

@@ -29,7 +29,7 @@ from .stores import StoreError, WriteContext
 FENCE_TABLE = "solera_fences"
 FENCE_DDL = (
     "CREATE TABLE IF NOT EXISTS {table} (domain text NOT NULL, part text NOT NULL, "
-    "generation bigint NOT NULL, invocation text NOT NULL, written bigint, PRIMARY KEY (domain, part))"
+    "generation bigint NOT NULL, worker_id text NOT NULL, written bigint, PRIMARY KEY (domain, part))"
 )
 
 
@@ -38,12 +38,6 @@ def fence_table(cur, table: str = FENCE_TABLE) -> None:
     transactions creating it at once may collide)."""
 
     cur.execute(FENCE_DDL.format(table=table))
-    cur.execute(
-        "SELECT 1 FROM information_schema.columns WHERE table_name = %s AND column_name = 'written'",
-        (table.rsplit(".", 1)[-1],),
-    )
-    if cur.fetchone() is None:  # a table made before `written`
-        cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS written bigint")
 
 
 def fence(
@@ -67,18 +61,18 @@ def fence(
     p = param
     generation = int(context.generation)
     cur.execute(
-        f"INSERT INTO {table} (domain, part, generation, invocation, written) VALUES ({p}, {p}, {p}, {p}, {p}) "
+        f"INSERT INTO {table} (domain, part, generation, worker_id, written) VALUES ({p}, {p}, {p}, {p}, {p}) "
         f"ON CONFLICT (domain, part) DO UPDATE SET generation = EXCLUDED.generation, "
-        f"invocation = EXCLUDED.invocation{', written = EXCLUDED.written' if write else ''} "
+        f"worker_id = EXCLUDED.worker_id{', written = EXCLUDED.written' if write else ''} "
         f"WHERE {table}.generation < EXCLUDED.generation "
-        f"OR ({table}.generation = EXCLUDED.generation AND {table}.invocation = EXCLUDED.invocation) "
-        "RETURNING invocation",
-        (domain, context.partition, generation, context.invocation or "", generation if write else None),
+        f"OR ({table}.generation = EXCLUDED.generation AND {table}.worker_id = EXCLUDED.worker_id) "
+        "RETURNING worker_id",
+        (domain, context.partition, generation, context.worker_id or "", generation if write else None),
     )
     if cur.fetchone() is None:
         raise StoreError(
             f"{context.output.name}: a newer attempt holds {domain} {context.partition!r} "
-            f"(generation {context.generation} of {context.invocation!r} refused)"
+            f"(generation {context.generation} of {context.worker_id!r} refused)"
         )
 
 

@@ -179,7 +179,7 @@ async def test_soak(tmp_path, monkeypatch):
         on_disk = {str(p.relative_to(root)) for p in (root / index.prefix).glob("*.kx")}
         assert on_disk == referenced, (output, scope, sorted(on_disk - referenced)[:5])
     assert _count(root, "deltas") == 0, "delta files live in the key index (§6)"
-    assert state.model.heads[("site_events", "alpha")]["batch"] == BATCHES - 1
+    assert state.model.heads[("site_events", "alpha")]["commit_number"] == BATCHES - 1
     # The index agrees with what the store holds.
     for site in ("alpha", "bravo"):
         ref = Ref.from_json(state.model.heads[("site_files", site)]["ref"])

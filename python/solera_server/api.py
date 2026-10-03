@@ -307,7 +307,7 @@ def create_app(
                     "ref": head["ref"],
                     "version": head.get("version"),
                     "key_count": head.get("count"),
-                    "batch": head.get("batch"),
+                    "commit_number": head.get("commit_number"),
                     "complete": planner.head_complete(name, scope),
                     "cursor": cursor,
                     "at": head["at"],

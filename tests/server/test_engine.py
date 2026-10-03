@@ -257,7 +257,7 @@ async def test_config_change_reprocesses_everything(state):
 
     @asset(inputs={"files": Incremental()})
     def consumer(ctx, files: list):
-        seen.setdefault("batches", []).append([r["id"] for r in files])
+        seen.setdefault("commits", []).append([r["id"] for r in files])
         seen.setdefault("full", []).append(ctx.changes["files"].full)
         return []
 
@@ -266,7 +266,7 @@ async def test_config_change_reprocesses_everything(state):
     await engine.initialize()
     await drive(engine, await engine.submit(["consumer"], upstream=True))
     await drive(engine, await engine.submit(["consumer"], upstream=True, config={"threshold": 2}))
-    assert seen["batches"] == [["a"], ["a"]]
+    assert seen["commits"] == [["a"], ["a"]]
     assert seen["full"] == [True, True]  # first delivery + fingerprint reset
 
 
@@ -295,12 +295,12 @@ async def test_full_run_resets_watermark(state):
         "fingerprint": first["fingerprint"],
         "output": "files",
         "up": "",
-        "pass": first["pass"],  # the run whose reset began the delivery
+        "reset_by": first["reset_by"],  # the run whose reset began the delivery
     }
     detail = await drive(engine, await engine.submit(["consumer"], mode="full"))
     assert task_statuses(detail)["consumer"] == "succeeded"  # never skipped on full
     second = state.model.watermark("consumer", "files", "")
-    assert second == {**first, "pass": detail["request"]["id"]}  # back at head+1, nothing left mid-way
+    assert second == {**first, "reset_by": detail["request"]["id"]}  # back at head+1, nothing left mid-way
     # Both deliveries were full-head reads.
     assert seen == [(["a", "b"], True), (["a", "b"], True)]
 
@@ -349,7 +349,7 @@ async def test_version_bump_fails_then_full_recovers(state):
 async def test_incremental_batching_and_more(state):
     """§6: work is batched by page_size; `more` re-queues the task;
     scope_complete lands on the head only with the last batch."""
-    batches = []
+    commits = []
 
     @asset(outputs=Output("files", key="id"))
     def files():
@@ -357,7 +357,7 @@ async def test_incremental_batching_and_more(state):
 
     @asset(inputs={"files": Incremental(page_size=2)})
     def consumer(ctx, files: list):
-        batches.append([r["id"] for r in files])
+        commits.append([r["id"] for r in files])
         return []
 
     project = Project(assets=[files, consumer])
@@ -365,7 +365,7 @@ async def test_incremental_batching_and_more(state):
     await engine.initialize()
     detail = await drive(engine, await engine.submit(["consumer"], upstream=True))
     assert status_of(detail) == "succeeded"
-    assert batches == [["k0", "k1"], ["k2", "k3"], ["k4"]]
+    assert commits == [["k0", "k1"], ["k2", "k3"], ["k4"]]
     assert state.model.scope("consumer", "")["drained"] is True
     task = [t for t in detail["tasks"] if t["asset"] == "consumer"][0]
     assert len(detail["attempts"][task["id"]]) == 3  # three batches, three attempts
@@ -927,7 +927,7 @@ async def test_timeout_fails_retryably(state):
     class Running(FakePlacement):
         async def launch(self, stage):  # the worker starts: its claim is its first report
             path = f"{self.ctx.state.attempt_path(stage['run'], stage['attempt'])}.worker"
-            await self.ctx.state.put_object(path, json.dumps({"invocation": "w"}).encode())
+            await self.ctx.state.put_object(path, json.dumps({"worker_id": "w"}).encode())
             return await super().launch(stage)
 
     @asset(executor=Fake("fake")(), timeout=1, retries=Retry(0))
@@ -963,7 +963,7 @@ async def test_harness_exit_without_result_fails_retryably(state):
         async def launch(self, stage):
             # What the worker said before it went silent, by a clock far off.
             beat = {
-                "invocation": "w",
+                "worker_id": "w",
                 "seq": 1,
                 "events": [{"type": "booted", "at": 0}, {"type": "computing", "at": 1e12}],
             }
@@ -1264,7 +1264,7 @@ async def test_a_delivery_says_where_each_page_sits(state):
     @asset(inputs={"log": Incremental(page_size=1)})
     def tail(ctx, log: list):
         ch = ctx.changes["log"]
-        batch_pages.append((ch.page, ch.pages, ch.first, ch.final, list(ch.upstream.batches), ch.full))
+        batch_pages.append((ch.page, ch.pages, ch.first, ch.final, list(ch.upstream.commits), ch.full))
         return [{"n": len(log)}]
 
     project = Project(assets=[files, consumer, log, tail])
@@ -1423,6 +1423,9 @@ async def test_an_unchanged_keyed_write_still_applies_its_migrations(state):
     assert store.calls == ["files"]
     after = head(state, "files")
     assert after["ref"]["handle"]["schema"] == "m1"
-    assert after["ref"]["generation"] == before["ref"]["generation"] and after["batch"] == before["batch"]
+    assert (
+        after["ref"]["generation"] == before["ref"]["generation"]
+        and after["commit_number"] == before["commit_number"]
+    )
     await drive(engine2, await engine2.submit(["files"]))
     assert store.calls == ["files"]  # applied, and known to be: not asked again

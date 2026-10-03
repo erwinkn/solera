@@ -83,7 +83,7 @@ class Harness:
         self.exact = exact
         self.state = IndexState()
         self.model: dict[bytes, tuple[int, bytes | None]] = {}  # key -> (generation, payload)
-        self.batch = 0
+        self.commit_number = 0
         self.created: set[tuple] = set()
         self.named: set[tuple] = set()  # superseded objects a delta or a garbage file named
         self.routes: list[str] = []
@@ -100,18 +100,18 @@ class Harness:
         payloads = list(payloads) if payloads is not None else [None] * len(keys)
         before = dict(self.model)
         idx = self.index()
-        gen = self.batch + 1
+        gen = self.commit_number + 1
         if replace:
             items = list(zip(keys, payloads, strict=True))
             random.Random(len(items)).shuffle(items)
             files, changed = await idx.replace(
-                Rows.pairs(items), self.batch, f"a{self.batch}", collect=10**6, generation=gen
+                Rows.pairs(items), self.commit_number, f"a{self.commit_number}", collect=10**6, generation=gen
             )
         else:
             files, changed = await idx.resolve(
                 run(keys, payloads, removes),
-                batch=self.batch,
-                attempt=f"a{self.batch}",
+                commit_number=self.commit_number,
+                attempt=f"a{self.commit_number}",
                 generation=gen,
                 exact=self.exact,
                 collect=10**6,
@@ -161,8 +161,8 @@ class Harness:
         if self.exact:
             assert delta.exact
         self.created |= {(k, g) for k, (g, _) in after.items()}
-        self.state = self.state.committed(self.batch, files, keep_log=True)
-        self.batch += 1
+        self.state = self.state.committed(self.commit_number, files, keep_log=True)
+        self.commit_number += 1
         self.model = after
         return delta
 
@@ -419,13 +419,13 @@ async def test_a_patch_reads_blocks_or_streams():
 
     # Observed again at their versions: every key needs its block, more than streaming costs.
     idx = h.index()
-    files_out, _ = await idx.resolve(run(probe, same), batch=9, attempt="x")
+    files_out, _ = await idx.resolve(run(probe, same), commit_number=9, attempt="x")
     assert idx.route == "stream" and not files_out.files
 
     # Dense: more of the index than `stream_density` streams at once.
     idx = KeyIndex(h.io, "keys/out/p", h.state, filtered_options(stream_density=0.01))
     h.io.metrics.reset()
-    await idx.resolve(run(ks[::50]), batch=9, attempt="y")
+    await idx.resolve(run(ks[::50]), commit_number=9, attempt="y")
     assert idx.route == "stream" and h.io.metrics.gets == len(h.state.files)  # each file once, no tail first
 
 

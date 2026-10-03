@@ -126,7 +126,7 @@ def commit_of(head: dict | None) -> tuple | None:
         head.get("run"),
         head.get("attempt"),
         head["ref"].get("generation"),
-        head.get("batch"),
+        head.get("commit_number"),
         head.get("n"),
     )
 
@@ -1032,13 +1032,15 @@ class Model:
         delta, and the counts, bounds and retry-pass state the engine worked
         out from it (docs/per-key-processing.md §9)."""
 
-        record = self._scope(asset, scope).setdefault("failures", {"batch": -1, "forced": {}})
+        record = self._scope(asset, scope).setdefault("failures", {"commit_number": -1, "forced": {}})
         keys = f.get("keys") or {}
         if keys.get("files"):
             name = f"@{asset}"
-            index = self.index(name, scope).committed(f["batch"], DeltaFiles.from_json(keys), keep_log=False)
+            index = self.index(name, scope).committed(
+                f["commit_number"], DeltaFiles.from_json(keys), keep_log=False
+            )
             self.indexes[(name, scope)] = index
-            record["batch"] = f["batch"]
+            record["commit_number"] = f["commit_number"]
         for field in ("counts", "due", "deploy_min", "retry", "passes", "done_forced", "last", "config"):
             if field in f:
                 record[field] = f[field]
@@ -1161,14 +1163,14 @@ class Model:
                 # store, and its index starts over there. Every file of the old one —
                 # and the intents of what dead attempts meant to write in the old
                 # store — goes once no reader pins it.
-                fresh = IndexState(prefix=prefix).committed(keys["batch"], delta, keep_log=keep_log)
+                fresh = IndexState(prefix=prefix).committed(keys["commit_number"], delta, keep_log=keep_log)
                 if (output, scope) in self.indexes:
                     self._replace_index((output, scope), fresh)
                 for intent in self.unsettled.pop((output, scope), ()):
                     self.garbage.extend([index.path(f["name"]), self.applied] for f in intent["files"])
                 index = fresh
             elif keys["files"]:
-                index = index.committed(keys["batch"], delta, keep_log=keep_log)
+                index = index.committed(keys["commit_number"], delta, keep_log=keep_log)
             self.indexes[(output, scope)] = index
         index = self.indexes.get((output, scope))
         if index is not None:
@@ -1220,13 +1222,13 @@ class Model:
         )
         if old.get("mode") in ("value", "set") and old.get("path") != new.get("path"):
             self._collect(output, scope, {"kind": "items", "items": [["path", old["path"]]]})
-        if old.get("mode") == "batches" and new.get("mode") == "batches":
-            first, last = old["batches"]
-            if int(new["batches"][0]) > int(first):
+        if old.get("mode") == "commits" and new.get("mode") == "commits":
+            first, last = old["commits"]
+            if int(new["commits"][0]) > int(first):
                 self._collect(
                     output,
                     scope,
-                    {"kind": "items", "items": [["batches", int(first), int(new["batches"][0]) - 1]]},
+                    {"kind": "items", "items": [["commits", int(first), int(new["commits"][0]) - 1]]},
                 )
 
     def _abandoned(self, scope: str, attempt: str, launched: dict) -> None:
@@ -1239,7 +1241,7 @@ class Model:
                     "kind": "abandoned",
                     "attempt": attempt,
                     "generation": launched["pin"],
-                    "batch": info.get("batch"),
+                    "commit_number": info.get("commit_number"),
                 }
                 if info.get("prefix") is not None:
                     entry["prefix"] = info["prefix"]
@@ -1257,7 +1259,7 @@ class Model:
                 if d["id"] in done and d["kind"] == "sidecar":
                     named |= {f"{d['prefix']}{f}.kg" for f in d["files"]}
                 elif d["id"] in done and d["kind"] == "abandoned" and "prefix" in d:
-                    named.add(f"{d['prefix']}{int(d['batch']):012d}-{d['attempt']}")
+                    named.add(f"{d['prefix']}{int(d['commit_number']):012d}-{d['attempt']}")
             self._drop_discards(output, scope, done)
         for output, missed in (e.get("discard_unresolved") or {}).items():
             for d in self.discards.get((output, scope), []):

@@ -174,9 +174,9 @@ async def test_batch_snapshot_at_pinned_version(store):
     pinned batch, even after later writes."""
 
     out = output(incremental=True, partition_column="site")
-    first = await store.store(Patch([{"e": 1}]), None, context(out, partition="s1", batch=0))
-    second = await store.store(Patch([{"e": 2}]), first.ref, context(out, partition="s1", batch=1))
-    assert first.ref.handle["batch"] == 0 and second.ref.handle["batch"] == 1
+    first = await store.store(Patch([{"e": 1}]), None, context(out, partition="s1", commit_number=0))
+    second = await store.store(Patch([{"e": 2}]), first.ref, context(out, partition="s1", commit_number=1))
+    assert first.ref.handle["commit_number"] == 0 and second.ref.handle["commit_number"] == 1
     at_first = await store.load(first.ref, list[dict], None)
     assert [r["e"] for r in at_first] == [1]
     at_second = await store.load(second.ref, list[dict], None)
@@ -310,8 +310,8 @@ async def test_migration_can_reconcile_drift(store):
     assert await store.load(written.ref, list[dict], None) == [{"id": "a", "v": "1"}]
 
 
-def fenced(out, generation, invocation="i", partition=""):
-    return context(out, partition, generation=generation, invocation=invocation)
+def fenced(out, generation, worker_id="i", partition=""):
+    return context(out, partition, generation=generation, worker_id=worker_id)
 
 
 async def test_a_newer_generation_fences_older_writers(store):
@@ -461,7 +461,7 @@ async def test_reconciliation_streams_the_slice_s_keys(store, monkeypatch):
             "t",
             out,
             store,
-            {"batch": 1, "unsettled": [{"unknown": True}], "before": written.ref.to_json()},
+            {"commit_number": 1, "unsettled": [{"unknown": True}], "before": written.ref.to_json()},
             patch,
         )
         o.index = KeyIndex(io, None, state)
@@ -558,17 +558,17 @@ async def test_a_migration_waits_for_every_slices_open_writer(store):
 
     out = output(key="id", partition_column="site")
     first = await store.store(
-        [{"id": "a", "v": "1"}], None, context(out, partition="p1", generation=4, invocation="i")
+        [{"id": "a", "v": "1"}], None, context(out, partition="p1", generation=4, worker_id="i")
     )
     await store.store(
-        [{"id": "b", "v": "1"}], None, context(out, partition="p2", generation=3, invocation="i")
+        [{"id": "b", "v": "1"}], None, context(out, partition="p2", generation=3, worker_id="i")
     )
     table, _, _ = store._table(out)
     conn = store._connect()
     cur = conn.cursor()
     store._domain(cur, table)  # p2's writer, open: as every write transaction begins
-    store._fence(cur, table, context(out, partition="p2", generation=3, invocation="i"))
-    p1 = context(out, partition="p1", generation=4, invocation="i")
+    store._fence(cur, table, context(out, partition="p2", generation=3, worker_id="i"))
+    p1 = context(out, partition="p1", generation=4, worker_id="i")
     migrating, migrated, errors = in_thread(
         store.migrate(out, [Migration("all", f"UPDATE {table} SET v = 'm'")], p1)
     )
@@ -691,7 +691,7 @@ async def test_a_partitions_first_write_waits_for_a_migration(store):
     name = f"t_{uuid.uuid4().hex[:12]}"
     out = output(name, key="id", partition_column="site")
     await store.store(
-        [{"id": "a", "v": "1"}], None, context(out, partition="p1", generation=4, invocation="i")
+        [{"id": "a", "v": "1"}], None, context(out, partition="p1", generation=4, worker_id="i")
     )
     copied, go = threading.Event(), threading.Event()
 
@@ -701,10 +701,10 @@ async def test_a_partitions_first_write_waits_for_a_migration(store):
         assert go.wait(10)
         cur.execute(f'DROP TABLE public."{name}"; ALTER TABLE public."{name}_new" RENAME TO "{name}"')
 
-    p1 = context(out, partition="p1", generation=4, invocation="i")
+    p1 = context(out, partition="p1", generation=4, worker_id="i")
     migrating, migrated, errors = in_thread(store.migrate(out, [Migration("swap", swap)], p1))
     assert copied.wait(10)
-    p2 = context(out, partition="p2", generation=5, invocation="i")
+    p2 = context(out, partition="p2", generation=5, worker_id="i")
 
     async def first_write():
         await store.acquire(p2)
@@ -882,7 +882,7 @@ async def test_a_repair_read_back_waits_off_the_event_loop(store, monkeypatch):
         "t",
         out,
         store,
-        {"batch": 1, "unsettled": [{"unknown": True}], "before": written.ref.to_json()},
+        {"commit_number": 1, "unsettled": [{"unknown": True}], "before": written.ref.to_json()},
         patch,
     )
     o.index = KeyIndex(io, None, state)

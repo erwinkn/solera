@@ -44,7 +44,7 @@ from .sdk import (
     split_partition,
 )
 from .stores import (
-    Batches,
+    Commits,
     FileStore,
     Keys,
     Patch,
@@ -64,7 +64,7 @@ __all__ = [
     "Asset",
     "Automation",
     "AutoRefresh",
-    "Batches",
+    "Commits",
     "Changes",
     "Commit",
     "Cron",

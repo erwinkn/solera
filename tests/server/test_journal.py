@@ -79,7 +79,9 @@ async def add(j, state, key, n=1):
 
 def names(store, kind):
     return sorted(
-        m["path"].rsplit("/", 1)[-1] for batch in obstore.list(store, f"control/{kind}/") for m in batch
+        m["path"].rsplit("/", 1)[-1]
+        for commit_number in obstore.list(store, f"control/{kind}/")
+        for m in commit_number
     )
 
 

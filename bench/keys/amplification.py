@@ -111,10 +111,10 @@ class Sim:
             self.puts += len(added)
         self.state = self.state.compacted(added, [f.name for f in inputs])
 
-    def commit(self, batch: int, k: int, rng: random.Random):
+    def commit(self, commit_number: int, k: int, rng: random.Random):
         xs = [rng.random() for _ in range(k)]
         lo, hi = min(xs), max(xs)
-        name = f"{batch:012d}-a"
+        name = f"{commit_number:012d}-a"
         f = self.info(name, 0, lo, hi, k)
         self.density[name] = k / self.n / (hi - lo)
         self.state = replace(self.state, files=self.state.files + (f,))
@@ -127,14 +127,14 @@ def run(n: int, commits: int, k: int, policy: str) -> dict:
     sim = Sim(n, Options(), policy)
     rng = random.Random(1)
     l0_files = l0_bytes = 0
-    for batch in range(commits):
-        if batch == commits // 2:
+    for commit_number in range(commits):
+        if commit_number == commits // 2:
             sim.written = sim.committed = sim.gets = sim.puts = 0
-        if batch >= commits // 2:
+        if commit_number >= commits // 2:
             l0 = sim.state.level(0)
             l0_files += len(l0)
             l0_bytes += sum(f.size for f in l0)
-        sim.commit(batch, k, rng)
+        sim.commit(commit_number, k, rng)
     half = commits - commits // 2
     levels = {}
     for f in sim.state.files:

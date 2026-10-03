@@ -269,11 +269,11 @@ class Views:
             except (ValueError, KeyError, StopIteration):
                 up_scope = None
         head = self.m.heads.get((edge["output"], up_scope)) if up_scope is not None else None
-        head_batch = int(head.get("batch", -1)) if head is not None else None
+        head_commit = int(head.get("commit_number", -1)) if head is not None else None
         lag = 0
-        if head_batch is not None:
+        if head_commit is not None:
             first = int(head.get("base", 0))
-            lag = max(0, head_batch + 1 - max(int(wm["next"]) if wm else first, first))
+            lag = max(0, head_commit + 1 - max(int(wm["next"]) if wm else first, first))
         mode = ((wm or {}).get("delivery") or {}).get("mode")
         if wm is None:
             state = "never"
@@ -296,7 +296,7 @@ class Views:
             "scope": scope,
             "up_scope": up_scope,
             "watermark": view,
-            "head_batch": head_batch,
+            "head_commit": head_commit,
             "lag": lag,
             "state": state,
         }

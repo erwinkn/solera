@@ -307,9 +307,9 @@ function Heads({
               <tr>
                 <Th>Output</Th>
                 <Th>Partition</Th>
-                <Th>Version</Th>
+                <Th>Generation</Th>
                 <Th className="text-right">Keys</Th>
-                <Th className="text-right">Batch</Th>
+                <Th className="text-right">Commit</Th>
                 <Th>State</Th>
                 <Th>Committed</Th>
               </tr>
@@ -334,7 +334,7 @@ function Heads({
                     </Link>
                   </Td>
                   <Td className="text-right">{head.count != null ? count(head.count) : "—"}</Td>
-                  <Td className="text-right text-fg-muted">{head.batch ?? "—"}</Td>
+                  <Td className="text-right text-fg-muted">{head.commit_number ?? "—"}</Td>
                   <Td>
                     {head.complete ? (
                       <StatusBadge status="complete" />

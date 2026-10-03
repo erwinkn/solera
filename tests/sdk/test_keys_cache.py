@@ -41,7 +41,7 @@ async def built_index(io, n=3000, commits=12, seed=1):
         rm = sorted({key(rng.randrange(n)) for _ in range(30)} - set(ks)) if b else []
         files, _ = await KeyIndex(io, None, state, OPTS).resolve(
             SortedEntries.of(ks, [rng.randbytes(8) for _ in ks], rm),
-            batch=b,
+            commit_number=b,
             attempt=f"w{b}",
             generation=b + 1,
         )
@@ -51,18 +51,25 @@ async def built_index(io, n=3000, commits=12, seed=1):
     return state
 
 
-def prepared(state, batch=99, generation=100, replace=True):
-    return Prepared(scope="", batch=batch, generation=generation, index=state, head_batch=98, replace=replace)
+def prepared(state, commit_number=99, generation=100, replace=True):
+    return Prepared(
+        scope="",
+        commit_number=commit_number,
+        generation=generation,
+        index=state,
+        head_commit=98,
+        replace=replace,
+    )
 
 
-def ask(state, keys, versions, removes=(), kind="patch", batch=99, generation=100):
+def ask(state, keys, versions, removes=(), kind="patch", commit_number=99, generation=100):
     run = SortedEntries.of(list(keys), list(versions), list(removes))
-    return Ask("out", "", kind, batch, generation, state.prefix, 98, run)
+    return Ask("out", "", kind, commit_number, generation, state.prefix, 98, run)
 
 
-async def engine_answer(resolver, state, a, invocation="inv", p=None, live=True):
+async def engine_answer(resolver, state, a, worker_id="inv", p=None, live=True):
     body = await resolver.resolve(
-        "att", request(invocation, [a]), lambda name: p or prepared(state), lambda: live
+        "att", request(worker_id, [a]), lambda name: p or prepared(state), lambda: live
     )
     return answers(body)["out"]
 
@@ -101,7 +108,7 @@ async def test_engine_and_cold_resolves_agree(io, tmp_path):
             )
         else:
             files, _ = await idx.resolve(
-                SortedEntries.of(ks, vs, rm), batch=99, attempt=f"c{step}", generation=100, exact=True
+                SortedEntries.of(ks, vs, rm), commit_number=99, attempt=f"c{step}", generation=100, exact=True
             )
         cold = decoded([await io.read_whole(state.path(f.name), f.size) for f in files.files])
         if answer["result"] == "empty":
@@ -120,7 +127,10 @@ async def test_declines(io, tmp_path):
     a = ask(state, [key(1)], [b"x"])
     reason = lambda ans: ans[0].get("reason")  # noqa: E731
     assert reason(await engine_answer(resolver, state, a, live=False)) == "not_live"
-    assert reason(await engine_answer(resolver, state, ask(state, [key(1)], [b"x"], batch=7))) == "invalid"
+    assert (
+        reason(await engine_answer(resolver, state, ask(state, [key(1)], [b"x"], commit_number=7)))
+        == "invalid"
+    )
     assert (
         reason(await engine_answer(resolver, state, ask(state, [key(1)], [b"x"], generation=7))) == "invalid"
     )
@@ -639,7 +649,7 @@ async def logged_index(io, seed=3):
         rm = sorted({key(rng.randrange(2000)) for _ in range(40)} - set(ks)) if b else []
         files, _ = await KeyIndex(io, None, state, OPTS).resolve(
             SortedEntries.of(ks, [rng.randbytes(8) for _ in ks], rm),
-            batch=b,
+            commit_number=b,
             attempt=f"w{b}",
             generation=b + 1,
         )
@@ -767,7 +777,7 @@ async def test_long_paths_make_short_local_names(io, tmp_path):
 
     state = IndexState(prefix=f"keys/out/{'s' * 180}/")
     files, _ = await KeyIndex(io, None, state, OPTS).resolve(
-        SortedEntries.of([key(i) for i in range(100)], [b"v"] * 100), batch=0, attempt="0" * 26
+        SortedEntries.of([key(i) for i in range(100)], [b"v"] * 100), commit_number=0, attempt="0" * 26
     )
     state = state.committed(0, files, keep_log=False)
     cache = EngineCache(str(tmp_path))

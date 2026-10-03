@@ -190,7 +190,7 @@ async def test_a_moved_input_still_commits(state, clock):
             # The upstream moves (and commits) while this attempt is still running.
             rows["v"] = Patch([{"id": "c"}])
             await settle(engine2, (await engine2.submit(["items"]))["id"])
-            assert state.model.heads[("items", "")]["batch"] == 1
+            assert state.model.heads[("items", "")]["commit_number"] == 1
         return []
 
     project = Project(assets=[items, reader])
@@ -394,11 +394,11 @@ async def test_a_paged_task_keeps_no_list_of_its_pages(state, clock):
 
     from solera.stores import Patch
 
-    batch = {}
+    commit_number = {}
 
     @asset(outputs=Output("uploads", keyed=True))
     def uploads():
-        return Patch(batch)
+        return Patch(commit_number)
 
     @asset(inputs={"uploads": Incremental(page_size=1)})
     def each_page(uploads: dict):
@@ -415,8 +415,8 @@ async def test_a_paged_task_keeps_no_list_of_its_pages(state, clock):
     await engine.initialize()
     sizes = []
     for n in range(3):
-        batch.clear()
-        batch.update({f"u{n}.{i}": i for i in range(6)})
+        commit_number.clear()
+        commit_number.update({f"u{n}.{i}": i for i in range(6)})
         await settle(engine, (await engine.submit(["uploads"]))["id"])
         run = await engine.submit(["each_page"])
         task_id = next(iter(state.model.runs[run["id"]]["tasks"]))
@@ -500,7 +500,7 @@ def test_a_rename_moves_a_scopes_record_whole():
         "last": {"outcome": "failed", "run": "r", "attempt": "a", "at": 1.0},
         "drained": True,
         "watermarks": {"feed": wm, "gone": {**wm, "output": "elsewhere"}},
-        "failures": {"batch": 0, "forced": {}, "counts": {"failed": 1}},
+        "failures": {"commit_number": 0, "forced": {}, "counts": {"failed": 1}},
     }
     m = Model()
     m.scopes[("old", "x")] = copy.deepcopy(whole)

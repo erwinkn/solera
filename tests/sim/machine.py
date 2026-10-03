@@ -24,7 +24,7 @@ from solera.sdk import Ref
 
 from . import postgres
 from .core import EPOCH, Killed
-from .oracle import Journal, Violation, batch_rows, index_entries, keyed_content, value_content
+from .oracle import Journal, Violation, commit_rows, index_entries, keyed_content, value_content
 from .project import VARIANTS, External, Variant, build, expected_checks, expected_copy, expected_items
 from .stores import Database
 from .world import POINTS, Fate, World
@@ -650,7 +650,7 @@ class Simulation(RuleBasedStateMachine):
                 if got is not None and sorted(got) != heads and not automated:
                     raise Violation(f"summary {stage}: {got} != {heads}")
             if not automated:
-                rows = await batch_rows(engine, project, "log")
+                rows = await commit_rows(engine, project, "log")
                 tally = await value_content(engine, project, "tally")
                 if tally != {"rows": len(rows)}:
                     if tally and tally["rows"] > len(rows):

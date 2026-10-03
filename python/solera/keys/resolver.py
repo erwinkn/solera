@@ -102,10 +102,10 @@ class Prepared:
     request is checked against it, never trusted."""
 
     scope: str
-    batch: int
+    commit_number: int
     generation: int
     index: IndexState  # the index the engine holds for the scope now
-    head_batch: int
+    head_commit: int
     replace: bool  # whether a replacement is allowed
     position: float = math.inf  # the event position the index was read at: a fill's reader pin
 
@@ -173,7 +173,7 @@ class Resolver:
         outputs = _outputs(header, payloads)
         out_header, out_payloads, offset = [], [], 0
         for o, data in outputs:
-            answer, delta = await self._one(attempt, header.get("invocation"), o, data, prepared, live)
+            answer, delta = await self._one(attempt, header.get("worker_id"), o, data, prepared, live)
             if delta is not None:
                 answer.update(offset=offset, size=len(delta))
                 out_payloads.append(delta)
@@ -181,7 +181,7 @@ class Resolver:
             out_header.append({"name": o["name"], **answer})
         return frame({"outputs": out_header}, out_payloads)
 
-    async def _one(self, attempt, invocation, o, view: memoryview, prepared, live):
+    async def _one(self, attempt, worker_id, o, view: memoryview, prepared, live):
         declined = {"result": "declined"}
         p = prepared(o["name"])
         if p is None or not live():
@@ -189,7 +189,7 @@ class Resolver:
         kind, keys = o.get("kind"), o.get("keys")
         if (
             o.get("scope") != p.scope
-            or o.get("batch") != p.batch
+            or o.get("commit_number") != p.commit_number
             or o.get("generation") != p.generation
             or (o.get("base") or {}).get("prefix") != p.index.prefix
             or kind not in ("patch", "replace")
@@ -197,7 +197,7 @@ class Resolver:
             or not isinstance(keys, int)
         ):
             return {**declined, "reason": "invalid"}, None
-        if (o.get("base") or {}).get("head_batch") != p.head_batch:
+        if (o.get("base") or {}).get("head_commit") != p.head_commit:
             return {**declined, "reason": "stale"}, None
         if len(view) > self.limits.max_bytes:
             return {**declined, "reason": "too_big"}, None
@@ -207,14 +207,14 @@ class Resolver:
             return {**declined, "reason": "invalid"}, None
         key = (
             attempt,
-            invocation,
+            worker_id,
             o["name"],
             p.scope,
             kind,
-            p.batch,
+            p.commit_number,
             p.generation,
             p.index.prefix,
-            p.head_batch,
+            p.head_commit,
             actual,
             keys,
         )
@@ -223,7 +223,7 @@ class Resolver:
             if not self._reserve(len(data)):
                 return {**declined, "reason": "busy"}, None
             # The worker uploads the delta under its own name: kept as a candidate under it.
-            path = p.index.path(f"{p.batch:012d}-{attempt}.0000")
+            path = p.index.path(f"{p.commit_number:012d}-{attempt}.0000")
             fut = self._inflight[key] = asyncio.ensure_future(self._compute(p, kind, data, live, path, keys))
 
             size = len(data)
@@ -346,14 +346,14 @@ class Ask:
     name: str
     scope: str
     kind: str  # "patch" or "replace"
-    batch: int
+    commit_number: int
     generation: int
     prefix: str
-    head_batch: int
+    head_commit: int
     run: SortedEntries
 
 
-def request(invocation: str, asks: list[Ask]) -> bytes:
+def request(worker_id: str, asks: list[Ask]) -> bytes:
     outputs, offset, payloads = [], 0, []
     for a in asks:
         payload = a.run.encode()
@@ -363,9 +363,9 @@ def request(invocation: str, asks: list[Ask]) -> bytes:
                 "name": a.name,
                 "scope": a.scope,
                 "kind": a.kind,
-                "batch": a.batch,
+                "commit_number": a.commit_number,
                 "generation": a.generation,
-                "base": {"prefix": a.prefix, "head_batch": a.head_batch},
+                "base": {"prefix": a.prefix, "head_commit": a.head_commit},
                 "keys": len(a.run),
                 "offset": offset,
                 "size": len(payload),
@@ -373,7 +373,7 @@ def request(invocation: str, asks: list[Ask]) -> bytes:
             }
         )
         offset += len(payload)
-    return frame({"invocation": invocation, "outputs": outputs}, payloads)
+    return frame({"worker_id": worker_id, "outputs": outputs}, payloads)
 
 
 def answers(body: bytes) -> dict[str, tuple[dict, bytes | None]]:

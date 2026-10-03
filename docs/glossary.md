@@ -544,7 +544,7 @@ chunks), *snapshot* (a database's), *kind*, *slot*, *digest* (any hash),
 *materialize* (what a run does; the state is **materialized**, the act a
 commit), *domain* (a fence row's key, internal), *write* (the act; the
 value is the output's), *trigger*, *firing*, *delivery*, *page*,
-*watermark*, *drained*, *complete*, *retired*, *landed*, *revision*,
+*watermark*, *drained*, *complete*, *retired*, *revision*,
 *invocation*, *host*, *observation*, *harness*, *scope*, *edge* (graph
 drawing only).
 
@@ -587,12 +587,11 @@ target. Each needs a code change; none is in the rename plan.
    *Fixes:* a dep or whole input that is rewritten hourly (even
    identically: a new generation) no longer forces a full pass hourly;
    alternating configs no longer thrash.
-5. **`landed` goes.** The worker's `none | complete | uncertain` (the
-   result's `writes`) is read once: to skip closing the gate after a
-   commit when the worker never wrote. The gate already says it: the
-   engine tries the create-only `closed` after every gated commit, and
-   finds `writing` if the worker wrote. One more object-store request per
-   gated commit.
+5. **`landed` stays, renamed `write`** (Erwin). The result's and
+   `AttemptFinished`'s `write` is `none` (no store call), `writing` (a
+   call may still land: the gate's word) or `complete` (every call
+   returned); it was `writes`, with `uncertain` for `writing`. It saves
+   closing the gate after a commit when the worker never wrote.
 6. **Lineage's `mixed` flag goes** (in flight): two reads of one input
    seeing two generations is reported as two reads, not a flag.
 
@@ -629,7 +628,7 @@ Each line: what goes, what replaces it, and why it does not earn a name.
 | rescope, pattern transition, cutover | **pattern change** | One procedure, four names |
 | cleanup (pass flag) | **reconcile** | |
 | unsettled, settled (outputs) | **repair**, owes a repair | "settle" stays the engine's decision on an attempt |
-| landed, `writes` | the **gate**'s state | Model change 5 |
+| landed, `writes`, `uncertain` | **`write`**: `none`, `writing`, `complete` | Model change 5 |
 | garbage, discard, data garbage | **cleanup** | One rule (delete once no pin predates it), two places |
 | mixed (lineage) | two reads | Model change 6 |
 | failure index | **failed keys** | |

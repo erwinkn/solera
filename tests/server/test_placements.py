@@ -95,7 +95,7 @@ async def test_a_dead_pool_claim_expires_into_a_new_attempt(state):
     [first] = await pool_attempt(engine, state)
     await engine.pool_work("ingest", {}, "w1", 0)
     base = state.attempt_path(run["id"], first)
-    await state.create_object(f"{base}.worker", json.dumps({"invocation": "dead"}).encode())
+    await state.create_object(f"{base}.worker", json.dumps({"worker_id": "dead"}).encode())
     for _ in range(200):
         await engine.tick()
         await asyncio.sleep(0.02)
@@ -128,7 +128,7 @@ async def test_a_dead_pool_claim_that_took_its_gate_is_uncertain(state):
     [first] = await pool_attempt(engine, state)
     await engine.pool_work("ingest", {}, "w1", 0)
     base = state.attempt_path(run["id"], first)
-    await state.create_object(f"{base}.worker", json.dumps({"invocation": "dead"}).encode())
+    await state.create_object(f"{base}.worker", json.dumps({"worker_id": "dead"}).encode())
     intents = {"job": {"files": [], "added": 0, "removed": 0, "exact": True}}
     await state.create_object(f"{base}.writing", lifecycle.gate("writing", "dead", intents))
     detail = await engine.run_until(run["id"], 10)
@@ -492,11 +492,11 @@ async def test_after_a_restart_a_start_is_checked_against_the_claim(state):
     await engine.initialize()
     run = await engine.submit(["job"])
     [attempt] = await pool_attempt(engine, state)
-    await state.create_object(f"{state.attempt_path(run['id'], attempt)}.worker", b'{"invocation": "owner"}')
+    await state.create_object(f"{state.attempt_path(run['id'], attempt)}.worker", b'{"worker_id": "owner"}')
     await engine.stop()
     engine = make_engine(state, project)
     await engine.initialize()
     with pytest.raises(Ended, match="not_owner"):
-        await engine.attempt_start(attempt, {"invocation": "intruder"})
-    await engine.attempt_start(attempt, {"invocation": "owner"})
-    assert engine.live[attempt].invocation == "owner"
+        await engine.attempt_start(attempt, {"worker_id": "intruder"})
+    await engine.attempt_start(attempt, {"worker_id": "owner"})
+    assert engine.live[attempt].worker_id == "owner"

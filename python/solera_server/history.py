@@ -153,7 +153,7 @@ TABLES = {
             "run": "VARCHAR",
             "attempt": "VARCHAR",
             "at": "DOUBLE",
-            "batch": "BIGINT",
+            "commit_number": "BIGINT",
             "added": "BIGINT",
             "removed": "BIGINT",
             "added_keys": "VARCHAR[]",  # a source commit's keys, listed up to 1,000
@@ -407,10 +407,10 @@ def run_record(rows: dict[str, list[dict]], events: int = 0) -> dict:
     if row["trigger"] == "commit":
         record = {"id": row["id"], "source": row["source"], "by": row["by"]}
         for m in rows.get("materializations") or ():
-            if m["batch"] is None:
+            if m["commit_number"] is None:
                 record["version"] = json.loads(m["metadata"] or "{}").get("version")
             else:
-                record["batch"] = m["batch"]
+                record["commit_number"] = m["commit_number"]
                 record["upserted"] = m["added_keys"] if m["added_keys"] is not None else m["added"]
                 record["deleted"] = m["removed_keys"] if m["removed_keys"] is not None else m["removed"]
         return record
@@ -499,7 +499,7 @@ def materialization(
         "run": head.get("run"),
         "attempt": head.get("attempt"),
         "at": head["at"],
-        "batch": head.get("batch"),
+        "commit_number": head.get("commit_number"),
         "added": (keys or {}).get("added"),
         "removed": (keys or {}).get("removed"),
         # listed up to 1,000, counted past that
