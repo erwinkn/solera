@@ -20,7 +20,7 @@ fn main() {
         .collect();
     keys.sort();
     keys.dedup();
-    // Generations as a namespace's event positions spread them: a few dozen writers.
+    // Generations as a namespace's event counters spread them: a few dozen writers.
     let gens: Vec<u64> = keys.iter().map(|_| 1_000_000 + rnd() % 64 * 997).collect();
     let ks: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
     let del = vec![0u8; ks.len()];

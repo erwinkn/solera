@@ -272,7 +272,7 @@ def test_an_explicit_selection_is_linear():
 
 async def test_a_removed_consumer_lets_go_of_its_upstreams_log(state):
     """Review round 5, engine #3 and system #2: `gone` and `keep` read
-    `feed` incrementally. `gone` is removed: its bookmark goes with it, so
+    `feed` incrementally. `gone` is removed: its position goes with it, so
     the log of `feed`'s later commits is kept only as long as `keep` needs
     it."""
 
@@ -297,7 +297,7 @@ async def test_a_removed_consumer_lets_go_of_its_upstreams_log(state):
 
     engine = make_engine(state, Project(assets=[feed, keep]))
     await engine.initialize()
-    assert sorted(a for (a, _), r in state.model.partitions.items() if r.get("bookmarks")) == ["keep"]
+    assert sorted(a for (a, _), r in state.model.partitions.items() if r.get("positions")) == ["keep"]
     for key in ("b", "c", "d"):
         rows.append({"id": key})
         await drive(engine, await engine.submit(["keep"], upstream=True))
@@ -371,7 +371,7 @@ async def test_an_each_delivery_resumed_by_a_firing_takes_its_change(state):
     await engine.set_automation("out.onchange.0", False)
     await drive(engine, await engine.submit(["items"]))
     run = await engine.submit(["out"])
-    while (state.model.bookmark("out", "item", "") or {}).get("pass", {}).get("batch") != 1:
+    while (state.model.position("out", "item", "") or {}).get("pass", {}).get("batch") != 1:
         await engine.tick()
         await asyncio.sleep(0.01)
     await engine.cancel(run["id"])

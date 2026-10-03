@@ -265,7 +265,7 @@ class Sensors:
         accepted = {
             "tick": claim["tick"],
             "runs": [run["id"] for _, run in planned],
-            # each commit's head identity: the position its event is applied at
+            # each commit's head identity: the event counter its event is applied at
             "commits": {e["source"]: f"h:{base + i + 1}" for i, e in enumerate(prepared)},
         }
         self.state.record(

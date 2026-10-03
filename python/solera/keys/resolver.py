@@ -107,7 +107,7 @@ class Prepared:
     index: IndexState  # the index the engine holds for the partition now
     head_commit: int
     replace: bool  # whether a replacement is allowed
-    position: float = math.inf  # the event counter the index was read at: a fill's reader pin
+    at: float = math.inf  # the event counter the index was read at: a fill's reader pin
 
 
 @dataclass
@@ -123,7 +123,7 @@ class Limits:
 class Resolver:
     """`resolve(attempt, body, prepared)`: `prepared(name)` returns the
     output's `Prepared`, or None when the attempt does not hold it. `pins`,
-    when given, keeps fills in collection's reader pins: `pin(position)`
+    when given, keeps fills in collection's reader pins: `pin(at)`
     returns a token for `unpin`."""
 
     def __init__(
@@ -256,7 +256,7 @@ class Resolver:
         most = lim.max_keys if kind == "patch" else lim.max_entries - indexed
         local = self.cache.open(p.index)
         if local is None:
-            self._background_fill(p.index, p.position)
+            self._background_fill(p.index, p.at)
             return {**declined, "reason": "cold"}, None
         with local:
             async with self._sem:
@@ -288,7 +288,7 @@ class Resolver:
                     )
                 except LocalError as e:
                     self.cache.corrupt(e.path)  # refetched by the fill
-                    self._background_fill(p.index, p.position)
+                    self._background_fill(p.index, p.at)
                     return {**declined, "reason": "cold"}, None
                 except ValueError:
                     return {**declined, "reason": "invalid"}, None
@@ -305,12 +305,12 @@ class Resolver:
             "file": {"size": len(delta), "digest": self.cache.offer(path, delta)},
         }, delta
 
-    def _background_fill(self, index: IndexState, position: float) -> None:
+    def _background_fill(self, index: IndexState, at: float) -> None:
         """Fill a cold index, a reader of its files until every fetch is done:
         collection keeps what it reads (taken now, while the request that
         found it cold still holds its own)."""
 
-        token = self.pins.pin(position) if self.pins is not None else None
+        token = self.pins.pin(at) if self.pins is not None else None
 
         async def fill():
             try:

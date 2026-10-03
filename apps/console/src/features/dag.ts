@@ -15,7 +15,7 @@ export interface LayoutInput {
 }
 
 export interface Layout {
-  positions: Map<string, { x: number; y: number; layer: number }>;
+  coords: Map<string, { x: number; y: number; layer: number }>;
   width: number;
   height: number;
 }
@@ -105,16 +105,16 @@ export function layout({ nodes, edges, width, height, gapX, gapY }: LayoutInput)
   }
 
   const top = Math.min(0, ...y.values());
-  const positions = new Map<string, { x: number; y: number; layer: number }>();
+  const coords = new Map<string, { x: number; y: number; layer: number }>();
   let maxY = 0;
   for (const n of nodes) {
     const layer = layerOf.get(n)!;
     const py = y.get(n)! - top;
-    positions.set(n, { x: layer * (width + gapX), y: py, layer });
+    coords.set(n, { x: layer * (width + gapX), y: py, layer });
     maxY = Math.max(maxY, py + height);
   }
   return {
-    positions,
+    coords,
     width: layers.length * (width + gapX) - gapX,
     height: maxY,
   };

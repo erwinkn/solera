@@ -323,7 +323,7 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
     An Incremental input over a keyed upstream reads its batch from the pinned
     key index — the pending deltas in `[from, to]`, or the whole index for a
     full pass — and loads just those keys. `delivered` reports where the
-    batch ended, for the engine's bookmark (§6). Each input loaded is a
+    batch ended, for the engine's position (§6). Each input loaded is a
     `loaded` event; `observed` records what each read saw."""
 
     manifest_asset = project.manifest["assets"][asset.name]
@@ -1166,7 +1166,7 @@ async def _execute(
             delivered[each_input[0]] = ran["delivered"]
         elif filtered:
             # The inputs' patterns took none of the batch's keys: the producer has
-            # nothing to see, and the batch commits only its bookmark (per-key §11).
+            # nothing to see, and the batch commits only its position (per-key §11).
             return {"status": "succeeded", "skipped": True, "outputs": {}, "delivered": delivered}
         else:
             await observed.close()  # the inputs' moment ends: a long producer holds no snapshot

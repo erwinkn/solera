@@ -375,7 +375,7 @@ class In:
 
 
 class Incremental(In):
-    """Delta input: the bookmark-planned changes since last pass (§5, §6).
+    """Delta input: the position-planned changes since last pass (§5, §6).
     On a keyed upstream, `include` and `exclude` select the keys it takes
     by name (`solera.patterns`, docs/per-key-processing.md §11)."""
 
@@ -967,7 +967,7 @@ class Retention:
 
     `days`: runs older than that go. `runs`: keep the runs of the newest
     `runs` commits. Both: whichever keeps more. `forever=True` keeps everything, overriding a project default.
-    Current state — heads, key indexes, cursors, bookmarks, and the data
+    Current state — heads, key indexes, cursors, positions, and the data
     in stores — never expires, and neither does a run still in progress."""
 
     days: float | None = None

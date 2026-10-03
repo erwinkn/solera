@@ -255,25 +255,25 @@ class Views:
     # -- inputs (§6; per-key-processing.md §11) -----------------------------------------------
 
     def _input_partition(self, asset: str, param: str, input: dict, partition: str) -> dict:
-        """One partition of an Incremental input: its bookmark and how far it is
+        """One partition of an Incremental input: its position and how far it is
         behind the upstream head.
 
-        `bookmark.next` is the first upstream commit the input has not yet
+        `position.next` is the first upstream commit the input has not yet
         delivered (`pass`, a pass under way, keeps its boundary and
-        position until its last batch — see `pass`). So `lag` = head
+        cursor until its last batch — see `pass`). So `lag` = head
         commit + 1 − `next`: the upstream commits not yet
         delivered in full — counted from the head's `base` for an unkeyed
-        upstream, which starts over there; every commit without a bookmark.
+        upstream, which starts over there; every commit without a position.
         A change of fingerprint (the asset's version, its run config, a
         pinned input) resets the input at its next run: not shown here.
 
-        `state`: `never` (no bookmark), `pattern change` (a pattern change,
+        `state`: `never` (no position), `pattern change` (a pattern change,
         per-key §11), `full` (a full pass under way), `reconcile` (the
         cleanup after a full Each pass), `delta` (a delta pass delivered over
         several attempts), `behind` (lag), else `caught_up`."""
 
-        wm = self.m.bookmark(asset, param, partition)
-        upstream_partition = (wm or {}).get("upstream_partition")
+        position = self.m.position(asset, param, partition)
+        upstream_partition = (position or {}).get("upstream_partition")
         if upstream_partition is None:
             try:
                 upstream_partition = next(
@@ -290,29 +290,31 @@ class Views:
         lag = 0
         if head_commit is not None:
             first = int(head.get("base", 0))
-            lag = max(0, head_commit + 1 - max(int(wm["next"]) if wm else first, first))
-        mode = ((wm or {}).get("pass") or {}).get("mode")
-        if wm is None:
+            lag = max(0, head_commit + 1 - max(int(position["next"]) if position else first, first))
+        mode = ((position or {}).get("pass") or {}).get("mode")
+        if position is None:
             state = "never"
-        elif wm.get("pattern_change"):
+        elif position.get("pattern_change"):
             state = "pattern_change"
         elif mode == "full":
             state = "full"
-        elif wm.get("reconcile") is not None:
+        elif position.get("reconcile") is not None:
             state = "reconcile"
         elif mode is not None:
             state = "delta"
         else:
             state = "behind" if lag else "caught_up"
         view = None
-        if wm is not None:  # less the pattern change's snapshot: an index state, too big to show
-            view = dict(wm)
-            if wm.get("pattern_change"):
-                view["pattern_change"] = {k: v for k, v in wm["pattern_change"].items() if k != "snapshot"}
+        if position is not None:  # less the pattern change's snapshot: an index state, too big to show
+            view = dict(position)
+            if position.get("pattern_change"):
+                view["pattern_change"] = {
+                    k: v for k, v in position["pattern_change"].items() if k != "snapshot"
+                }
         return {
             "partition": partition,
             "upstream_partition": upstream_partition,
-            "bookmark": view,
+            "position": view,
             "head_commit": head_commit,
             "lag": lag,
             "state": state,
@@ -320,15 +322,15 @@ class Views:
 
     async def asset_inputs(self, asset: str) -> dict:
         """Every input of an asset, deps included (kind `dep`); for an
-        Incremental or Each input, each partition's bookmark and lag — the
-        asset's current partitions and every partition with a bookmark."""
+        Incremental or Each input, each partition's position and lag — the
+        asset's current partitions and every partition with a position."""
 
         info = self.manifest["assets"][asset]
         inputs = [*info["inputs"].items(), *((d, {"kind": "dep", "output": d}) for d in info["deps"])]
         current = set(self.planner().partitions(asset, "all"))
         marked: dict[str, set] = {}
         for partition, record in self.m.partitions.of(asset).items():
-            for param in record.get("bookmarks") or ():
+            for param in record.get("positions") or ():
                 marked.setdefault(param, set()).add(partition)
         out = []
         for param, input in inputs:
@@ -391,7 +393,7 @@ class Views:
         - `pending`: the upstream holds a write of it the input has not
           delivered yet.
 
-        The patterns are those the input delivers under — its bookmark's,
+        The patterns are those the input delivers under — its position's,
         else the manifest's; `pending` the manifest's, when a transition to
         them has yet to run."""
 
@@ -413,7 +415,7 @@ class Views:
         spec, is_each = keyed[input], keyed[input].get("each") is not None
         if (
             partition not in self.planner().partitions(asset, [partition])
-            and self.m.bookmark(asset, input, partition) is None
+            and self.m.position(asset, input, partition) is None
         ):
             raise KeyError(f"{asset}/{partition}")
         output = spec["output"]
@@ -439,8 +441,8 @@ class Views:
                 kept = last_ok = settled
             elif settled is not None:
                 last_ok = await self._newest_outcome(asset, partition, key, [OK])
-        wm = self.m.bookmark(asset, input, partition)
-        served = wm.get("patterns") if wm is not None else spec.get("patterns")
+        position = self.m.position(asset, input, partition)
+        served = position.get("patterns") if position is not None else spec.get("patterns")
         matcher = Matcher(served)
         included, excluded_by = matcher.included(key), matcher.excluded_by(key)
         generation = upstream[0] if upstream is not None else None

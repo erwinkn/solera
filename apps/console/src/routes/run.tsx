@@ -714,7 +714,7 @@ function SpecTab({ run, attempt }: { run: string; attempt: Attempt }) {
 
 /** What an incremental pin delivers, in the spec's own terms: batches of keys, or a commit range. */
 function describeBatch(batch: Record<string, Json>): string {
-  const position =
+  const progress =
     typeof batch.index === "number"
       ? `batch ${batch.index + 1}${typeof batch.count === "number" ? ` of ${batch.count}` : ""}`
       : null;
@@ -725,7 +725,7 @@ function describeBatch(batch: Record<string, Json>): string {
   else if (batch.keys) parts.push("explicit keys");
   else if (Array.isArray(batch.commits)) parts.push(`commits ${batch.commits.join("–")}`);
   else if (batch.from !== undefined) parts.push(`commits ${String(batch.from)}–${String(batch.to)}`);
-  if (position) parts.push(position);
+  if (progress) parts.push(progress);
   if (typeof batch.limit === "number") parts.push(`${batch.limit} keys a batch`);
   return parts.join(" · ");
 }

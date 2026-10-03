@@ -107,7 +107,7 @@ def durable(model: Model) -> dict:
     return json.loads(json.dumps(model.snapshot(), sort_keys=True))
 
 
-async def test_commit_installs_heads_cursor_watermarks_and_pends_onchange(state, clock):
+async def test_commit_installs_heads_cursor_positions_and_pends_onchange(state, clock):
     engine = engine_on(state, clock)
     await engine.initialize()
     detail = await settle(engine, (await engine.submit(["consumer"], upstream=True))["id"])
@@ -115,7 +115,7 @@ async def test_commit_installs_heads_cursor_watermarks_and_pends_onchange(state,
     m = state.model
     assert m.heads[("files", "")]["run"] == detail["request"]["id"]
     assert m.partition("consumer", "")["caught_up"] is True
-    assert m.bookmark("consumer", "files", "")["next"] == 1
+    assert m.position("consumer", "files", "")["next"] == 1
     # files changed and consumer watches it: the change pended, and the next tick
     # (run_until ticks) fired the OnChange automation and consumed it — without a
     # new run, since this run's consumer task was still pending (§9).
@@ -301,7 +301,7 @@ def test_finishing_a_task_touches_only_its_dependents():
             "outcome": "succeeded",
             "started_at": 1,
             "finished_at": 2,
-            "commit": {"heads": {}, "bookmarks": {}},
+            "commit": {"heads": {}, "positions": {}},
         }
     )
     assert Counting.scans == 0
@@ -493,17 +493,17 @@ def test_one_outputs_heads_are_found_without_looking_at_the_others():
 
 
 def test_a_rename_moves_a_scopes_record_whole():
-    """§2, §5: a partition's cursor, outcome, completeness, bookmarks and
+    """§2, §5: a partition's cursor, outcome, completeness, positions and
     failing keys are one record, and `aliases=` moves it as one. A name
     that already has a record keeps its own: two assets' states never mix.
-    A bookmark of an input the project no longer declares goes."""
+    A position of an input the project no longer declares goes."""
 
-    wm = {"kind": "keys", "output": "feed", "upstream_partition": "", "next": 3}
+    position = {"kind": "keys", "output": "feed", "upstream_partition": "", "next": 3}
     whole = {
         "cursor": "c1",
         "last": {"outcome": "failed", "run": "r", "attempt": "a", "at": 1.0},
         "caught_up": True,
-        "bookmarks": {"feed": wm, "gone": {**wm, "output": "elsewhere"}},
+        "positions": {"feed": position, "gone": {**position, "output": "elsewhere"}},
         "failures": {"commit_number": 0, "forced": {}, "counts": {"failed": 1}},
     }
     m = Model()
@@ -518,7 +518,7 @@ def test_a_rename_moves_a_scopes_record_whole():
         "automations": {},
     }
     m.apply({"type": "ProjectRegistered", "deploy": "r2", "manifest": manifest, "at": 3.0})
-    assert m.partition("new", "x") == {**whole, "bookmarks": {"feed": wm}}
+    assert m.partition("new", "x") == {**whole, "positions": {"feed": position}}
     assert m.partition("new", "y") == {
         "last": {"outcome": "succeeded", "run": "r", "attempt": "b", "at": 2.0}
     }

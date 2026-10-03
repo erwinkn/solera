@@ -89,7 +89,7 @@ async def test_a_removed_assets_last_attempt_ends_its_run(state, monkeypatch):
         tasks = state.model.runs[run["id"]]["tasks"].values()
         raise AssertionError(f"the run never ends: {[(t['status'], t.get('held')) for t in tasks]}") from None
     assert status_of(detail) in {"succeeded", "failed", "canceled"}
-    assert not state.model.partition("batches", "").get("bookmarks")  # its pass ends with it
+    assert not state.model.partition("batches", "").get("positions")  # its pass ends with it
 
 
 async def test_an_attempt_launched_before_a_rename_settles(state, monkeypatch):
@@ -168,7 +168,7 @@ async def test_a_change_made_during_a_full_pass_reaches_downstream(state):
     await engine.set_automation("out.onchange.0", False)
     await drive(engine, await engine.submit(["items"]))
     run = await engine.submit(["out"])
-    while (state.model.bookmark("out", "items", "") or {}).get("pass", {}).get("batch") != 1:
+    while (state.model.position("out", "items", "") or {}).get("pass", {}).get("batch") != 1:
         await engine.tick()
         await asyncio.sleep(0.01)
     await engine.cancel(run["id"])  # after its first batch: `a` delivered at 1
@@ -354,7 +354,7 @@ async def test_an_each_full_pass_that_takes_no_key_drops_its_keys(state):
 async def test_a_name_removed_and_added_back_starts_over(state):
     """F12: a name the project no longer declares holds no live state. `copy`
     renamed to `mirror` and back without an alias left `mirror`'s first life
-    in place, and the next rename onto `mirror` kept it — under a bookmark
+    in place, and the next rename onto `mirror` kept it — under a position
     already past a deletion. Removed, a name's head, index and partition go (its
     index files to collection); renamed onto, it takes the old name's state."""
 
@@ -438,7 +438,7 @@ async def test_a_key_a_moved_output_dropped_leaves_its_consumer(state, tmp_path,
 
     engine = make_engine(state, project("other"))
     await engine.initialize()
-    assert ("items", "") not in state.model.heads and not state.model.bookmark("copy", "items", "")
+    assert ("items", "") not in state.model.heads and not state.model.position("copy", "items", "")
     rows["items"] = [{"id": "k10"}, {"id": "k12"}]  # the move's first write drops k11
     assert status_of(await drive(engine, await engine.submit(["items"]))) == "succeeded"
     assert state.model.heads[("items", "")]["ref"]["store"] == "other"
@@ -469,7 +469,7 @@ async def test_a_name_removed_while_its_attempt_runs_and_added_back_starts_over(
     """F19, across a live attempt: removing `copy` resets it at
     that deploy, though its attempt still runs — nothing waits for it, as it
     can commit nothing — so adding it back starts it over: no head, no
-    bookmarks of the first life."""
+    positions of the first life."""
 
     await _first_life_across_a_readd(state, monkeypatch, "fails", "before", fresh=True)
 
@@ -529,7 +529,7 @@ async def _first_life_across_a_readd(state, monkeypatch, ends: str, when: str, f
     if fresh:
         release.set()  # the held worker goes on; what it does is the other test's
         assert ("copy", "") not in state.model.heads, "the second life starts with the first's head"
-        assert not state.model.partition("copy", "").get("bookmarks"), "and its bookmarks"
+        assert not state.model.partition("copy", "").get("positions"), "and its positions"
         return
     new = await engine.submit(["copy"], mode="full") if when == "during" else None
     if ends == "lost":
@@ -570,7 +570,7 @@ def _moving(tmp_path, rows: dict, seen: list):
 async def test_a_move_and_back_with_no_write_between_resets(state, tmp_path):
     """K10: each move makes a new output, so `items` moved away and back with
     nothing written in between is reset all the same: its head and index go
-    at the deploy, with `copy`'s bookmark on it, and both start over."""
+    at the deploy, with `copy`'s position on it, and both start over."""
 
     rows, seen = {"items": [{"id": "a"}, {"id": "b"}]}, []
     project = _moving(tmp_path, rows, seen)
@@ -583,7 +583,7 @@ async def test_a_move_and_back_with_no_write_between_resets(state, tmp_path):
         engine = make_engine(state, project(store))
         await engine.initialize()
     assert ("items", "") not in m.heads and ("items", "") not in m.indexes
-    assert m.reset_at[("output", "items")] == m.deploy_number and not m.bookmark("copy", "items", "")
+    assert m.reset_at[("output", "items")] == m.deploy_number and not m.position("copy", "items", "")
     rows["items"] = [{"id": "a"}]  # the new `items` holds no `b`
     assert status_of(await drive(engine, await engine.submit(["copy"], upstream=True))) == "succeeded"
     assert seen[-1] == (True, ["a"])
@@ -629,7 +629,7 @@ async def test_an_attempt_launched_before_its_output_moved_commits_nothing(state
 
 async def test_a_keys_run_after_a_move_reads_a_whole_full_pass(state, tmp_path):
     """K10, the review's example: `copy` holds {a, b}, moves, and runs
-    keys=(a). A move takes its bookmarks, so the run reads a full pass —
+    keys=(a). A move takes its positions, so the run reads a full pass —
     every batch of it before it succeeds — not the one key: the new store
     holds {a, b}, and no pass is left half way."""
 
@@ -655,7 +655,7 @@ async def test_a_keys_run_after_a_move_reads_a_whole_full_pass(state, tmp_path):
     assert status_of(detail) == "succeeded"
     assert sorted((await engine.list_keys("copy"))["keys"]) == ["a", "b"]
     assert state.model.heads[("copy", "")]["ref"]["store"] == "other"
-    assert "pass" not in state.model.bookmark("copy", "items", "")
+    assert "pass" not in state.model.position("copy", "items", "")
     assert "reset" not in state.model.partition("copy", "")
 
 
@@ -792,7 +792,7 @@ async def test_a_job_added_back_does_not_take_its_first_lifes_commit(state, monk
     """F21: `seen` has no output, so no output's reset covers it.
     Removed while its attempt runs and added back before that attempt
     succeeds, it must not take that attempt's commit — its cursor and
-    bookmarks belong to the first life."""
+    positions belong to the first life."""
 
     from solera.sdk import Result, job
     from solera_server import attempts
@@ -843,7 +843,7 @@ async def test_a_job_removed_while_its_attempt_runs_and_added_back_starts_over(s
     `items` incrementally; its cursor is what it saw. Removed while its
     attempt runs, and added back (version 2), it starts over: its partition
     state went at the removal, and the attempt — launched before — commits
-    neither its cursor nor its bookmarks into the new `seen`: its run carries
+    neither its cursor nor its positions into the new `seen`: its run carries
     on with a fresh attempt of the new code, as a renamed asset's does."""
 
     from solera.sdk import Result, job

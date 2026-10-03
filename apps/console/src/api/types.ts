@@ -218,7 +218,7 @@ export interface AssetDetail {
   asset: AssetDecl;
   heads: Record<string, [string, Head][]>;
   cursor: Json;
-  bookmarks: Record<string, Bookmark | null>;
+  positions: Record<string, Position | null>;
   current_keys: string[][];
   repairs: Record<string, string[]>;
   partitions: Record<string, PartitionOutcome>;
@@ -335,11 +335,11 @@ export interface Explain {
 
 export type InputState = "never" | "caught_up" | "behind" | "delta" | "full" | "pattern_change" | "reconcile";
 
-/** An input's bookmark (python/solera_server/bookmarks.py): `next`,
+/** An input's position (python/solera_server/positions.py): `next`,
  * the first upstream commit not yet delivered; `pass`, one under way —
- * its mode, boundary (`from`..`to`) and position (`at`: the last key
+ * its mode, boundary (`from`..`to`) and cursor (`at`: the last key
  * delivered, or the next commit). */
-export interface Bookmark {
+export interface Position {
   kind: "keys" | "commits";
   output: string;
   up: string;
@@ -364,7 +364,7 @@ export interface Bookmark {
 export interface InputPartition {
   partition: string;
   upstream_partition: string;
-  bookmark: Bookmark | null;
+  position: Position | null;
   head_commit: number | null;
   lag: number | null;
   state: InputState;

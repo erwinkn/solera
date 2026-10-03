@@ -676,8 +676,8 @@ identity. This doc implements none of that differently; it calls the same
 SDK predicate.
 
 In v1 the cache's per-key reader is the start read (§7): an `Each`
-attempt's retry batch — the walk of its failed keys from the pass
-position, keeping the keys `eligible` says are due, then their upstream
+attempt's retry batch — the walk of its failed keys from the pass's
+cursor, keeping the keys `eligible` says are due, then their upstream
 entries — is the worker's own read code, recorded over local copies like
 any input read, and bound the same way to the failed keys the spec
 pins. Without a record, the worker walks the failed keys itself.

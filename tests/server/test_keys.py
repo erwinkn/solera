@@ -186,7 +186,7 @@ async def test_a_patch_reconciles_what_a_dead_sql_writer_left(state, arrow):
 
 async def test_compaction_truncation_and_garbage(state):
     """§6: level 0 is compacted once it holds `l0_max_files` files; the delta
-    log keeps only what the consumer's bookmark still needs; files nothing
+    log keeps only what the consumer's position still needs; files nothing
     references are deleted — and every pass stays exact throughout."""
 
     rng = random.Random(7)
@@ -237,9 +237,9 @@ async def test_compaction_truncation_and_garbage(state):
     assert index.count == len(truth) and index.count_exact
     assert len(index.level(0)) < 3 and index.depth >= 1  # compacted
     head_commit = state.model.heads[("items", "")]["commit_number"]
-    bookmark = state.model.bookmark("mirror", "items", "")
-    assert bookmark["next"] == head_commit + 1
-    assert all(commit_number >= bookmark["next"] for commit_number, _ in index.log)  # truncated behind it
+    position = state.model.position("mirror", "items", "")
+    assert position["next"] == head_commit + 1
+    assert all(commit_number >= position["next"] for commit_number, _ in index.log)  # truncated behind it
     read = state.model.cleanup_reads()  # kept for the cleanups still pending (docs/lifecycle.md §9.8)
     assert {path for path, _ in state.model.garbage} <= read
     assert on_disk(state, index) == {index.path(n) for n in index.referenced()} | read
@@ -318,7 +318,7 @@ def test_a_recount_stays_inexact_if_a_later_commit_was():
 
 
 async def test_a_consumer_without_a_log_starts_over(state):
-    """§6: a bookmark whose delta the log no longer holds gets a full pass."""
+    """§6: a position whose delta the log no longer holds gets a full pass."""
 
     @asset(outputs=Output("items", key="id"))
     def items():
@@ -336,8 +336,11 @@ async def test_a_consumer_without_a_log_starts_over(state):
     await engine.initialize()
     await run(engine, ["mirror"], upstream=True)
     engine.upkeep.truncate()
-    wm = state.model.bookmark("mirror", "items", "")
-    state.model.partition("mirror", "")["bookmarks"]["items"] = {**wm, "next": 0}  # behind the (empty) log
+    position = state.model.position("mirror", "items", "")
+    state.model.partition("mirror", "")["positions"]["items"] = {
+        **position,
+        "next": 0,
+    }  # behind the (empty) log
     await run(engine, ["mirror"])
     assert deliveries == [(True, ["a", "b"]), (True, ["a", "b"])]
 
@@ -410,7 +413,7 @@ async def test_only_the_engine_caches_index_files(state, tmp_path):
 
 
 async def test_renamed_asset_keeps_its_state(state):
-    """§2: `aliases=` moves heads, key indexes, cursors, bookmarks and
+    """§2: `aliases=` moves heads, key indexes, cursors, positions and
     automation state to the new name; a consumer continues incrementally."""
 
     delivered = []
@@ -449,7 +452,7 @@ async def test_renamed_asset_keeps_its_state(state):
     assert ("feed", "") not in m.heads and m.heads[("source_feed", "")]["ref"] == before["ref"]
     assert m.heads[("source_feed", "")]["asset"] == "source_feed"
     assert m.indexes[("source_feed", "")].prefix == "keys/feed/_/"  # files stay where they are
-    assert m.bookmark("mirror", "feed", "")["output"] == "source_feed"
+    assert m.position("mirror", "feed", "")["output"] == "source_feed"
     rows["v"] = Patch([{"id": "b", "v": 2}])
     await run(engine, ["mirror"], upstream=True)
     assert m.heads[("source_feed", "")]["commit_number"] == 1
@@ -484,8 +487,8 @@ async def test_small_writes_resolve_in_the_engine_and_batches_come_with_start(st
     answers, reads = [], []
     real_resolve = KeyService.resolve
 
-    async def resolve(self, attempt, body, prepared, live, position):
-        out = await real_resolve(self, attempt, body, prepared, live, position)
+    async def resolve(self, attempt, body, prepared, live, at):
+        out = await real_resolve(self, attempt, body, prepared, live, at)
         answers.append(resolver.answers(out)["items"][0]["result"] if out else None)
         return out
 
@@ -552,8 +555,8 @@ async def test_input_reads_come_from_the_engine_once_warm(state, monkeypatch):
 
     served, real_reads = [], KeyService.reads
 
-    async def reads(self, spec, position):
-        out = await real_reads(self, spec, position)
+    async def reads(self, spec, at):
+        out = await real_reads(self, spec, at)
         served.append(out is not None)
         return out
 
@@ -793,9 +796,9 @@ async def test_load_intent_is_decided_once(state, monkeypatch):
 
     real = KeyService.reads
 
-    async def reads(self, spec, position):
+    async def reads(self, spec, at):
         specs.append(spec)
-        return await real(self, spec, position)
+        return await real(self, spec, at)
 
     monkeypatch.setattr(KeyService, "reads", reads)
     project = Project(assets=[items, by_ref, by_data])

@@ -5,7 +5,7 @@ The model is plain data changed only by `apply(event)`, so replaying the
 journal reproduces it exactly. It has three layers:
 
 - **Durable**: the project, heads, key indexes, each asset partition's record
-  (cursor, last outcome, completeness, bookmarks, failing keys),
+  (cursor, last outcome, completeness, positions, failing keys),
   automation state, active runs
   (tasks nested inside, each launched attempt on its task), outputs owing a repair, idempotency
   receipts, files awaiting deletion, and the run history's files and the
@@ -21,7 +21,7 @@ Events carry every timestamp they need; `apply` never reads a clock.
 `applied` counts the events applied: the model's own clock, the same in
 every engine that replays the journal. What must not be compared across
 hosts' wall clocks is ordered by it: an attempt pins the files it may read
-at its claim's position, and a file let go of at a later one waits for it.
+at its claim's event counter, and a file let go of at a later one waits for it.
 """
 
 from __future__ import annotations
@@ -32,8 +32,9 @@ import math
 
 from solera.keys.index import DeltaFiles, FileInfo, IndexState, index_prefix
 
-from . import bookmarks, history
+from . import history
 from .lake import LakeState
+from .positions import pins, reads
 
 TERMINAL_TASK = frozenset({"succeeded", "skipped", "failed", "blocked", "canceled"})
 TERMINAL_RUN = frozenset({"succeeded", "failed", "canceled"})
@@ -194,8 +195,8 @@ class Model:
         self.deleted: list[str] = snap.get("deleted") or []
         # (asset, partition) -> the partition's record (§5): its `cursor`; `last`, its last
         # terminal outcome; `caught_up`, whether its last commit finished the pass
-        # it was on — its completeness, whatever its outputs wrote; `bookmarks`
-        # {input: Bookmark}; `reset`, set when a reset took bookmarks, until a full
+        # it was on — its completeness, whatever its outputs wrote; `positions`
+        # {input: Position}; `reset`, set when a reset took positions, until a full
         # pass catches it up (keys= runs read one meanwhile); and an Each asset's `failures` record
         # (docs/per-key-processing.md §9), whose index lives in `indexes` under
         # ("@asset", partition). A rename moves it, retirement trims it: one record.
@@ -229,7 +230,7 @@ class Model:
         self.pool: dict[str, dict] = {}  # attempt id -> pool work
         # sensor -> the tick dispatched and not yet decided: {tick, cursor, snapshot, pin, ...}
         self.ticks: dict[str, dict] = {}
-        self.readers: dict[object, tuple] = {}  # the engine's own readers: (position, domains)
+        self.readers: dict[object, tuple] = {}  # the engine's own readers: (event counter, domains)
         self._reindex()
 
     def _reindex(self) -> None:
@@ -330,14 +331,14 @@ class Model:
 
         return self.partitions.get((asset, partition)) or {}
 
-    def bookmark(self, asset: str, input: str, partition: str) -> dict | None:
-        return (self.partition(asset, partition).get("bookmarks") or {}).get(input)
+    def position(self, asset: str, input: str, partition: str) -> dict | None:
+        return (self.partition(asset, partition).get("positions") or {}).get(input)
 
-    def bookmarks(self):
-        """Every Incremental input's bookmark, of every partition."""
+    def positions(self):
+        """Every Incremental input's position, of every partition."""
 
         for record in self.partitions.values():
-            yield from (record.get("bookmarks") or {}).values()
+            yield from (record.get("positions") or {}).values()
 
     def _partition(self, asset: str, partition: str) -> dict:
         """An asset partition's record, to change: made if it has none."""
@@ -397,9 +398,9 @@ class Model:
             for c in self.claims.values()
             if c["attempt"] != but and "generation" in c
         ]
-        for wm in self.bookmarks():
-            upstream = (self.index(wm["output"], wm["upstream_partition"]).prefix,)
-            out += [(pin, upstream) for pin in bookmarks.pins(wm)]
+        for position in self.positions():
+            upstream = (self.index(position["output"], position["upstream_partition"]).prefix,)
+            out += [(pin, upstream) for pin in pins(position)]
         for tick in self.ticks.values():
             out.append(
                 (tick["pin"], tuple(self.index(source, "").prefix for source in tick.get("snapshot") or ()))
@@ -469,7 +470,7 @@ class Model:
             "generation": launched["generation"],
             "status": status,
             "launched": True,
-            "reads": bookmarks.reads(launched["prepared"].get("plans") or {}),
+            "reads": reads(launched["prepared"].get("plans") or {}),
             "prefixes": tuple(launched["prepared"].get("prefixes") or ()),
             "cleanups": _delta_files(
                 d
@@ -637,18 +638,18 @@ class Model:
         self.unfinished.pop(task["id"], None)
         self._finished(run, task, "canceled", None, at)
 
-    def _subscribed(self, asset: str, input: str, wm: dict) -> bool:
+    def _subscribed(self, asset: str, input: str, position: dict) -> bool:
         """Whether the project still declares the Incremental input a
-        bookmark keeps the pass of: the same asset, parameter and
+        position keeps the pass of: the same asset, parameter and
         upstream output."""
 
         spec = ((self.manifest or {}).get("assets") or {}).get(asset, {}).get("inputs", {}).get(input) or {}
-        return spec.get("kind") == "incremental" and spec.get("output") == wm.get("output")
+        return spec.get("kind") == "incremental" and spec.get("output") == position.get("output")
 
     def _unsubscribe(self, asset: str | None = None, partition: str | None = None) -> None:
         """Retire the pass obligations of inputs the project no longer
         declares (a removed consumer, a renamed parameter, another
-        upstream): their bookmarks, which would keep the upstream's delta
+        upstream): their positions, which would keep the upstream's delta
         log and pin its files for good. A partition with an attempt in flight
         keeps them until it settles: that attempt still reads them. With
         `asset` and `partition`, only that partition's — one whose attempt ended."""
@@ -656,22 +657,26 @@ class Model:
         live = {(t["asset"], t["partition"]) for tid in self.claims if (t := self.task(tid)) is not None}
         keys = list(self.partitions) if asset is None else [(asset, partition)]
         for key in keys:
-            marks = self.partitions.get(key, {}).get("bookmarks")
-            if not marks or key in live:
+            positions = self.partitions.get(key, {}).get("positions")
+            if not positions or key in live:
                 continue
-            for input in [input for input, wm in marks.items() if not self._subscribed(key[0], input, wm)]:
-                del marks[input]
-            if not marks:
-                del self.partitions[key]["bookmarks"]
+            for input in [
+                input
+                for input, position in positions.items()
+                if not self._subscribed(key[0], input, position)
+            ]:
+                del positions[input]
+            if not positions:
+                del self.partitions[key]["positions"]
 
     def _reset(self, stores: dict[str, str], assets_before: set[str]) -> set[str]:
         """A deploy that removes an asset, or removes an output or declares it
         on another store than `stores` says it was on, resets it: what comes
         back under that name, or what the new store holds, is a new one (K10).
         An output's heads, key indexes (their files become garbage) and repair
-        intents go now, with the bookmarks that read it or are its asset's:
+        intents go now, with the positions that read it or are its asset's:
         every consumer and its producer start over, with full passes. A
-        removed asset's partition records go — cursor, bookmarks, failed
+        removed asset's partition records go — cursor, positions, failed
         keys — a job's included, which has no output. `reset_at` keeps the
         deploy number, by output and by asset; an attempt launched before the
         reset commits nothing of it (`Engine.commit_attempt`), so nothing
@@ -712,16 +717,20 @@ class Model:
             if key[0] not in assets:
                 del self.partitions[key]
                 continue
-            marks = self.partitions[key].get("bookmarks")
-            if not marks:
+            positions = self.partitions[key].get("positions")
+            if not positions:
                 continue
-            dropped = [i for i, wm in marks.items() if key[0] in producers or wm.get("output") in reset]
+            dropped = [
+                i
+                for i, position in positions.items()
+                if key[0] in producers or position.get("output") in reset
+            ]
             for input in dropped:
-                del marks[input]
+                del positions[input]
             if dropped:
                 self.partitions[key]["reset"] = True  # until a full pass catches it up
-            if not marks:
-                del self.partitions[key]["bookmarks"]
+            if not positions:
+                del self.partitions[key]["positions"]
         return producers
         return producers
 
@@ -748,9 +757,9 @@ class Model:
             if old not in outputs and (outputs.get(new) or {}).get("asset") == new
         }
 
-        def move(table: dict, rename, position: int, merge=None):
-            for key in [k for k in table if k[position] in rename]:
-                target = (*key[:position], rename[key[position]], *key[position + 1 :])
+        def move(table: dict, rename, slot: int, merge=None):
+            for key in [k for k in table if k[slot] in rename]:
+                target = (*key[:slot], rename[key[slot]], *key[slot + 1 :])
                 if target not in table:
                     table[target] = table.pop(key)
                 elif merge is not None:  # lists: both names' entries are owed
@@ -767,9 +776,9 @@ class Model:
         for head in self.heads.values():
             if head.get("asset") in asset_map:
                 head["asset"] = asset_map[head["asset"]]
-        for wm in self.bookmarks():
-            if wm.get("output") in output_map:
-                wm["output"] = output_map[wm["output"]]
+        for position in self.positions():
+            if position.get("output") in output_map:
+                position["output"] = output_map[position["output"]]
         for auto in self.automations.values():
             auto["pending"] = [[asset_map.get(a, a), s] for a, s in auto.get("pending") or []]
         return renamed, output_map
@@ -1067,9 +1076,9 @@ class Model:
                 record.pop("cursor", None)
             else:
                 record["cursor"] = commit["cursor"]
-        for input, wm in commit.get("bookmarks", {}).items():
-            if self._subscribed(asset, input, wm):  # an input removed while it ran keeps no pass
-                record.setdefault("bookmarks", {})[input] = wm
+        for input, position in commit.get("positions", {}).items():
+            if self._subscribed(asset, input, position):  # an input removed while it ran keeps no pass
+                record.setdefault("positions", {})[input] = position
         if "failures" in commit:
             self._failures(asset, partition, commit["failures"])
         for row in commit.get("key_outcomes") or ():
@@ -1123,7 +1132,7 @@ class Model:
 
     def _on_KeysRetryRequested(self, e):
         """`solera retry ASSET --failed …`: a forced request, identified by its
-        position in the event order, for each class it names
+        event counter, for each class it names
         (docs/per-key-processing.md §9)."""
 
         for partition, record in self.partitions.of(e["asset"]).items():

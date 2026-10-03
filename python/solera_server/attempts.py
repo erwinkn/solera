@@ -677,7 +677,7 @@ class Attempts:
         status = result.get("status")
         if status == "canceled" and "failures" in result:
             # A drained Each batch (docs/lifecycle.md §7): what finished commits, as one
-            # decision with its interrupted keys and its bookmark.
+            # decision with its interrupted keys and its position.
             reason = (result.get("cancel") or {}).get("reason") or "user"
             user = reason == "user"
             try:

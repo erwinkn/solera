@@ -73,7 +73,7 @@ def test_eligibility_is_causal():
     assert not eligible(retrying, 1059, 3, {}) and eligible(retrying, 1060, 3, {})
     failed = step(None, "failed", deploy=3)
     assert not eligible(failed, 10**9, 3, {}) and eligible(failed, 0, 4, {})  # one try per deploy
-    # Forced requests are positions: a try under position 4031 satisfies it, whatever the clocks.
+    # Forced requests are event counters: a try under event counter 4031 satisfies it, whatever the clocks.
     tried = step(None, "failed", deploy=3, forced=4031, now=10**9)
     assert not eligible(tried, 0, 3, {"failed": 4031}) and eligible(tried, 0, 3, {"failed": 4032})
     assert not eligible(tried, 0, 3, {"rejected": 9999})  # another class's request

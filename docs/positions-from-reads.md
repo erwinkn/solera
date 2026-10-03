@@ -1,7 +1,6 @@
 # One record of what each output unit saw (design note, K41/K42)
 
-Status: **proposal**, for Erwin. Not built. "Position" is the bookmark,
-by its coming name.
+Status: **proposal**, for Erwin. Not built.
 
 ## The rule
 
@@ -34,9 +33,9 @@ index planning uses for incremental reads, derived from the records.
 
 | Grain | Record | Where | Exists today? |
 |---|---|---|---|
-| partition, incremental input | the snapshot: the upstream commit through which every key it takes was seen, **the position** (`next`, and the pass under way) | partition record | yes (the bookmark), but moved from the plan (below) |
+| partition, incremental input | the snapshot: the upstream commit through which every key it takes was seen, **the position** (`next`, and the pass under way) | partition record | yes, but moved from the plan (below) |
 | partition (not `each=True`), keys read ahead | `{key: version}` read past the position by `keys=` runs; it empties when the position passes them | partition record, capped (say 10,000 keys): past the cap the partition simply stays stale until a default run | no: new, small, and only after a selection |
-| partition, whole or dep input | the head generation read (a digest of the refs, for a fan-in) | partition record | folded into the bookmark's fingerprint digest; the history's lineage has each one |
+| partition, whole or dep input | the head generation read (a digest of the refs, for a fan-in) | partition record | folded into the position's fingerprint digest; the history's lineage has each one |
 | partition, the declaration | the asset change it last caught up to | partition record | yes: `caught_up_at`, against `changed_at` |
 | key (`each=True` only) | the upstream key's generation it was built from: its read-ahead entry, per key | the output key index entry's payload (v3 has one; sources use it for their version) | no: new, the per-key datum |
 | key (`each=True`), shared whole or dep inputs | nothing extra: the key's own generation, the claim's event counter, against the shared input's head commit position | — | yes |
@@ -106,9 +105,9 @@ comparison: the work it would do is exactly the stale part.
 - **Gone:** the partition record's `reset` flag, and the clause that
   promoted a `keys=` run (both on the parked `held/keys-rule` commit).
 - **Gone:** the `selection` plan kind's special case in
-  `bookmarks.advance`, and K36's "a keys= run never moves a position".
+  `positions.advance`, and K36's "a keys= run never moves a position".
 - **Changed:** today a position is moved by the spec's plan
-  (`engine.py`, `commit_attempt`: `bookmarks.advance(plan, after)`). The
+  (`engine.py`, `commit_attempt`: `positions.advance(plan, after)`). The
   plan's range and batch become what the attempt reports it read
   (`delivered`: the keys, and the commits through which it read).
 - **Gone:** the fingerprint's `refs` part. Each whole or dep input's

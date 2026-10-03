@@ -8,7 +8,7 @@ for >= 500 commits per site, and nothing may grow faster than the work does.
 - finished runs leave memory and land under `runs/`;
 - `keys/` — the key indexes — stays bounded by live keys plus the delta log
   a consumer still needs: compaction folds delta files together, the log is
-  truncated behind the consumer's bookmark, and unreferenced files are
+  truncated behind the consumer's position, and unreferenced files are
   deleted.
 
 The real engine, FileStore and LocalStore all run in-process; `time.time` is
@@ -116,7 +116,7 @@ async def test_soak(tmp_path, monkeypatch):
         assert detail["request"]["status"] == "succeeded", detail["request"]["id"]
         if (i + 1) % 100 == 50:
             # Keep a live incremental consumer: file_index drains site_files
-            # per site and advances its bookmarks.
+            # per site and advances its positions.
             run = await engine.submit(["file_index"], partitions="all")
             detail = await engine.run_until(run["id"], timeout=1e9)
             submitted += 1

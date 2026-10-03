@@ -227,7 +227,7 @@ def test_f12_a_rename_back_and_forth_over_rolling_deploys_keeps_up():
     engine runs on a minute): `mirror` ends holding `k1`, which `items`
     deleted while the name `mirror` was not served — the move of `copy`'s
     state onto a name that held state before keeps the old index under a
-    bookmark already past the deletion. Timing-sensitive: keep the steps."""
+    position already past the deletion. Timing-sensitive: keep the steps."""
 
     state = Simulation()
     state.boot(store="file", seed=14094)
@@ -437,7 +437,7 @@ def test_f13_a_key_removed_after_a_takeover_moved_its_upstream_leaves_its_consum
 def test_f17_an_output_moved_away_and_back_keeps_its_keys():
     """F17: `items` holds `k10` on FileStore; a takeover moves it to the
     table store, where only a `keys=` run writes (a fresh index, the
-    bookmark unmoved); a takeover moves it back; the next write is a delta
+    position unmoved); a takeover moves it back; the next write is a delta
     of `k3` and starts the index over again: `k10` is lost."""
 
     state = Simulation()

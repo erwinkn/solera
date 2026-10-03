@@ -1,5 +1,5 @@
 """The console's read models over the API (§8, §10): asset rollups, an Each
-asset's failing keys, key outcomes, explain, inputs with their bookmarks,
+asset's failing keys, key outcomes, explain, inputs with their positions,
 holds, and when schedules next fire."""
 
 import json
@@ -322,11 +322,11 @@ async def test_edges_report_every_scope_and_its_lag(world):
     assert inputs["files"]["partitions"] == [] and inputs["files"]["source"] is False
     partitions = {s["partition"]: s for s in inputs["parts"]["partitions"]}
     assert partitions["x"]["state"] == "caught_up" and partitions["x"]["lag"] == 0
-    assert partitions["x"]["bookmark"]["next"] == partitions["x"]["head_commit"] + 1
+    assert partitions["x"]["position"]["next"] == partitions["x"]["head_commit"] + 1
     assert partitions["y"] == {
         "partition": "y",
         "upstream_partition": "y",
-        "bookmark": None,
+        "position": None,
         "head_commit": 0,
         "lag": 1,
         "state": "never",

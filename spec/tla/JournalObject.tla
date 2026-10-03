@@ -191,7 +191,7 @@ Succeed(e, kind, body, serial) ==
               /\ UNCHANGED <<state, acked>>
          [] kind = "append" ->
               /\ state' = [state EXCEPT ![e] = Append(@, Event(e))]
-              /\ acked' = acked \cup {[pos |-> Len(state[e]) + 1, by |-> e,
+              /\ acked' = acked \cup {[at |-> Len(state[e]) + 1, by |-> e,
                                        serial |-> serial, fence |-> fence[e]]}
               /\ Goto(e, "serve")
               /\ UNCHANGED <<fence, took>>
@@ -386,7 +386,7 @@ Recovered ==
 
 IsPrefix(st) == Len(st) <= Len(history) /\ SubSeq(history, 1, Len(st)) = st
 
-Holds(st, a) == a.pos <= Len(st) /\ st[a.pos] = Event(a.by)
+Holds(st, a) == a.at <= Len(st) /\ st[a.at] = Event(a.by)
 
 \* No acknowledged event is ever lost: an engine opening now recovers it.
 NoAckedLoss == \A a \in acked : Holds(Recovered, a)
@@ -403,8 +403,8 @@ FencedSeesAcked ==
         fence[e] > 0 /\ a.serial < fence[e] => Holds(state[e], a)
 
 \* Every state an engine acts on, every checkpoint and what an opener would
-\* recover are prefixes of the one history, so position n names the same
-\* event everywhere.
+\* recover are prefixes of the one history, so event counter n names the
+\* same event everywhere.
 StatesArePrefixes ==
     /\ \A e \in Engines : fence[e] > 0 \/ pc[e] = "read" => IsPrefix(state[e])
     /\ \A c \in DOMAIN checkpoints : IsPrefix(checkpoints[c])

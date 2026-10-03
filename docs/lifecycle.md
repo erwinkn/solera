@@ -25,7 +25,7 @@ Ticks are sensors (§11), which are not attempts at all.
 It assumes the journal's fencing (`object-store-state.md` §10), and what
 is built: create-only writes that recognize their own bytes
 (`solera.objects.create`), results sealed once, durable retirement,
-event-position garbage pins, recorded placement handles, per-placement
+event-counter garbage pins, recorded placement handles, per-placement
 "can't tell", a provisioning deadline, and a timeout that runs from the
 worker's first report.
 
@@ -310,7 +310,7 @@ ECS, engine up throughout.
     against the owner, validates it, records `AttemptFinished` and makes
     it durable. One journal decision installs the output deltas, the failure
     index delta (`per-key-processing.md` §9), the cursor and the
-    bookmarks together.
+    positions together.
 
 A failed attempt follows the same path with `status: failed`. Canceling
 and timing out are §7.
@@ -497,7 +497,7 @@ happens to the work left undone.
    - work that finished is written and published — for a per-key batch, the
      finished keys' outputs plus the interrupted holes in its failure
      index — as one result with `status: canceled`, which the engine
-     commits as one journal decision (outputs, failure delta, bookmark
+     commits as one journal decision (outputs, failure delta, position
      past the whole batch);
    - a plain asset that had not reached its writes publishes `canceled`
      with no outputs and `write: none`; one that had taken the gate
@@ -860,7 +860,7 @@ still need it. The pins, all by event counter (`object-store-state.md`
 
 - every live claim (as today);
 - **durable multi-attempt reads**, recorded with their pin in the
-  bookmark state, so the pin holds in the gaps between attempts and
+  position state, so the pin holds in the gaps between attempts and
   across engine restarts, until the read ends:
   - a **delta pass over several batches**: an `Incremental` input delivering one pinned
     range `from…to` over several attempts (`after` set). A later commit
@@ -933,7 +933,7 @@ abandoned attempt's keyed names come from listing its own delta files
 (`{commit_number:012d}-{attempt}*` under the index prefix, complete because
 deltas are uploaded before data), not from a sweep; those delta files and
 consumed compaction sidecars then go through the ordinary index garbage.
-A pattern change drain's snapshot pin (`bookmark.pattern change.pin`) holds both
+A pattern change drain's snapshot pin (`position.pattern change.pin`) holds both
 index-file garbage and data cleanups, as a live claim does; a retry pass
 needs none, since each of its batches reads the state of its own prepare
 (`per-key-processing.md` §20). Not built: the sweep, so a worker that
@@ -1091,7 +1091,7 @@ What a tick observed against, sent with it, per declared source:
 - **`index`**, for keyed sources, is the pinned key index — the same
   record a spec pins — so a host that resolves a big map itself reads
   exactly that file set.
-- **The tick holds a reader pin** at its dispatch position (§9.8) until
+- **The tick holds a reader pin** at its dispatch event counter (§9.8) until
   it is applied, refused or dropped, so the files it reads are not
   collected under it. The pin is memory-only, like the tick: after a
   restart the tick's post is refused anyway.

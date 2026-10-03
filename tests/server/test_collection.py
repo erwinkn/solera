@@ -174,7 +174,7 @@ async def test_a_reader_pin_holds_collection_back(tmp_path):
     m.claims["reader"] = {"attempt": "r", "generation": 9, "started_at": 0, "status": "running"}
     assert engine._due_cleanups("scores", "", "me") == []
     m.claims["reader"]["generation"] = 10
-    m._partition("c", "")["bookmarks"] = {
+    m._partition("c", "")["positions"] = {
         "e": {
             "kind": "keys",
             "output": "scores",

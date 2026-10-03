@@ -151,7 +151,7 @@ async def read_each_batch(spec: dict, pin: dict, keys_io) -> Batch:
         priors = await failures.lookup(touched) if touched else {}
         batch.priors = {key_str(k): Record.decode(p) for k, (_, p) in priors.items()}
         return batch
-    # A retry batch: walk the failed keys from the pass's position, taking the
+    # A retry batch: walk the failed keys from the pass's cursor, taking the
     # keys that are due, `limit` at most (§9).
     limit = int(pin["batch"]["limit"])
     after = pin["batch"]["retry"].get("after")
@@ -374,7 +374,7 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
     if abort:
         return {"abort": abort[0]}
     for key, generation in batch.upserted.items():
-        # Every key of the batch has an outcome before its bookmark moves past it.
+        # Every key of the batch has an outcome before its position moves past it.
         outcomes.setdefault(key, Outcome(INTERRUPTED, generation))
     for key in batch.deleted:
         outcomes[key] = Outcome(REMOVED)
@@ -443,7 +443,7 @@ async def _failures(spec, each: dict, batch: Batch, outcomes: dict, keys_io) -> 
     failed keys's delta, and report the outcome counts' transitions and
     the bounds the commit lowers or accumulates."""
 
-    deploy, forced = int(each["deploy"]), int(each.get("forced_pos") or 0)
+    deploy, forced = int(each["deploy"]), int(each.get("forced_at") or 0)
     retries = int(each.get("retries") or 0)
     records, transitions = {}, Counter()
     upsert_keys, upsert_records, removes = [], [], []

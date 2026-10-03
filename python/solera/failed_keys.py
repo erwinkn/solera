@@ -39,7 +39,7 @@ KINDS = {
 @dataclass(frozen=True)
 class Record:
     """One failing key. Times are whole seconds; `deploy` and `forced` are the
-    engine's positions the last try ran under, copied from the spec — never a
+    engine's event counters the last try ran under, copied from the spec — never a
     worker's clock — so whether a key had its deploy or forced retry is
     decided causally. `last`, `next_at` and `until` are worker times, for
     display and scheduling only."""
@@ -106,7 +106,7 @@ def transition(
 ) -> Record | None:
     """The key's record after `outcome` (§9's transition table): `None` for
     no record — nothing, or a tombstone where `prior` existed. `deploy` and
-    `forced` are the batch's positions; `retries` the asset's `retries=`,
+    `forced` are the batch's event counters; `retries` the asset's `retries=`,
     which bounds timeouts."""
 
     if outcome.kind in GONE:
@@ -138,7 +138,7 @@ def transition(
 def eligible(record: Record, now: float, deploy: int, forced: dict[str, int]) -> bool:
     """Whether a retry pass takes `record`'s key (§9). Each clause retires
     itself: a retried key's `next_at` moves on, its `deploy` becomes the
-    pass's, its `forced` the pass's position. A canceled key matches only a
+    pass's, its `forced` the pass's event counter. A canceled key matches only a
     forced request."""
 
     return (

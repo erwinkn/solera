@@ -82,10 +82,10 @@ class KeyService:
 
     # -- reader pins ----------------------------------------------------------------------
 
-    def pin(self, position: float) -> int:
+    def pin(self, at: float) -> int:
         with self._lock:
             token = next(self._tokens)
-            self._pins[token] = position
+            self._pins[token] = at
             return token
 
     def unpin(self, token: int) -> None:
@@ -93,7 +93,7 @@ class KeyService:
             self._pins.pop(token, None)
 
     def floor(self) -> float:
-        """The oldest position a reader here holds: for collection's `pin_floor`."""
+        """The oldest event counter a reader here holds: for collection's `pin_floor`."""
 
         with self._lock:
             return min(self._pins.values(), default=math.inf)
@@ -191,12 +191,12 @@ class KeyService:
 
     # -- requests ---------------------------------------------------------------------------
 
-    async def resolve(self, attempt: str, body: bytes, prepared, live, position: float) -> bytes | None:
-        """A worker's request, its indexes read at `position` (held meanwhile)."""
+    async def resolve(self, attempt: str, body: bytes, prepared, live, at: float) -> bytes | None:
+        """A worker's request, its indexes read at the event counter `at` (held meanwhile)."""
 
         if not self._running():
             return None
-        token = self.pin(position)
+        token = self.pin(at)
         try:
             return await asyncio.wrap_future(
                 self._submit(self.resolver.resolve(attempt, body, prepared, live))
@@ -212,27 +212,27 @@ class KeyService:
         generation: int,
         commit_number: int,
         path: str,
-        position: float,
+        at: float,
     ):
         """A resolve of a sorted run against `index` as the engine holds it at
-        `position` — a source commit's, in process (docs/resolved-commits.md
+        `at` — a source commit's, in process (docs/resolved-commits.md
         §4): `(answer, delta)`, under the resolver's limits."""
 
         if not self._running():
             return {"result": "declined", "reason": "busy"}, None
-        p = Prepared("", commit_number, generation, index, commit_number - 1, True, position)
-        token = self.pin(position)
+        p = Prepared("", commit_number, generation, index, commit_number - 1, True, at)
+        token = self.pin(at)
         try:
             return await asyncio.wrap_future(self._submit(self.resolver.compute(p, kind, run, path)))
         finally:
             self.unpin(token)
 
-    def committed(self, prefix: str, path, files: list[FileInfo], position: float) -> None:
-        """A commit at `position` installed `files` (a commit's delta) into the index at `prefix`."""
+    def committed(self, prefix: str, path, files: list[FileInfo], at: float) -> None:
+        """A commit at the event counter `at` installed `files` (a commit's delta) into the index at `prefix`."""
 
         if not self._running():
             return
-        token = self.pin(position)
+        token = self.pin(at)
         fut = self._submit(self._committed(prefix, path, files))
         fut.add_done_callback(_logged)
         fut.add_done_callback(lambda _f: self.unpin(token))
@@ -269,7 +269,7 @@ class KeyService:
     async def _corrupt(self, path: str) -> None:
         self.cache.corrupt(path)
 
-    async def reads(self, spec: dict, position: float) -> dict | None:
+    async def reads(self, spec: dict, at: float) -> dict | None:
         """The input reads of the attempt `spec` describes, answered from
         local copies (docs/resolved-commits.md §7): a `Reads` record as JSON,
         or None when there is nothing to answer or no time to. An input the
@@ -278,9 +278,9 @@ class KeyService:
 
         if not self._running():
             return None
-        token = self.pin(position)
+        token = self.pin(at)
         try:
-            fut = self._submit(self._admitted(spec, position))
+            fut = self._submit(self._admitted(spec, at))
             try:
                 return await asyncio.wait_for(asyncio.wrap_future(fut), READS_TIMEOUT)
             except TimeoutError:
@@ -291,14 +291,14 @@ class KeyService:
         finally:
             self.unpin(token)
 
-    async def _admitted(self, spec: dict, position: float) -> dict | None:
+    async def _admitted(self, spec: dict, at: float) -> dict | None:
         """`_reads` under the resolver's admission (`Resolver.admitted`), holding
         the reply's bound of its queue until its work — native threads too —
         has ended, whenever its start stopped waiting."""
 
-        return await self.resolver.admitted(READS_MAX_BYTES, lambda: self._reads(spec, position))
+        return await self.resolver.admitted(READS_MAX_BYTES, lambda: self._reads(spec, at))
 
-    async def _reads(self, spec: dict, position: float) -> dict | None:
+    async def _reads(self, spec: dict, at: float) -> dict | None:
         from solera_worker import each
         from solera_worker.worker import REPAIR_PAGE
 
@@ -345,7 +345,7 @@ class KeyService:
         if cold:
             for st in states.values():
                 if st.files:
-                    self.resolver._background_fill(st, position)
+                    self.resolver._background_fill(st, at)
         return reads.to_json() if len(reads) else None
 
     def installed(self, prefix: str, f: FileInfo, path: str, data: bytes) -> None:

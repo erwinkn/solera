@@ -166,8 +166,8 @@ def test_demo_end_to_end(demo, pool_worker):
     # version and never changes.)
     #
     # The concurrent runs above commit site_files deltas that can land after
-    # a sibling run's last file_index drain — real work the bookmark must
-    # not skip. Drain the log first so every bookmark sits at head.
+    # a sibling run's last file_index drain — real work the position must
+    # not skip. Drain the log first so every position sits at head.
     drain = submit(["file_index"], partitions="all", upstream=False)
     assert wait(lambda: run_done(drain)) and run_status(drain) == "succeeded"
     site_files = {h["partition"]: h["ref"]["generation"] for h in heads("site_files")}
@@ -182,7 +182,7 @@ def test_demo_end_to_end(demo, pool_worker):
     assert {h["partition"]: h["ref"]["generation"] for h in heads("site_files")} == site_files
 
     # The Incremental consumer over unchanged upstream state skips every
-    # partition — the delta log holds nothing past its bookmark.
+    # partition — the delta log holds nothing past its position.
     again = submit(["file_index"], partitions=sorted(site_files), upstream=False)
     assert wait(lambda: run_done(again)) and run_status(again) == "succeeded"
     detail = client.get(f"{base}/runs/{again}").json()

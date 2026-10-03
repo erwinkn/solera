@@ -148,7 +148,7 @@ export function AssetGraph({
 }) {
   const [hover, setHover] = useState<string | null>(null);
   const { nodes, edges } = graphOf(manifest);
-  const { positions, width, height } = layout({
+  const { coords, width, height } = layout({
     nodes: nodes.map((n) => n.id),
     edges,
     width: W,
@@ -180,8 +180,8 @@ export function AssetGraph({
             </marker>
           </defs>
           {edges.map((edge) => {
-            const a = positions.get(edge.from);
-            const b = positions.get(edge.to);
+            const a = coords.get(edge.from);
+            const b = coords.get(edge.to);
             if (!a || !b) return null;
             const style = EDGE_STYLE[edge.kind];
             const x1 = a.x + W + pad;
@@ -209,8 +209,8 @@ export function AssetGraph({
           })}
         </svg>
         {nodes.map((node) => {
-          const pos = positions.get(node.id);
-          if (!pos) return null;
+          const xy = coords.get(node.id);
+          if (!xy) return null;
           return (
             <div
               key={node.id}
@@ -219,8 +219,8 @@ export function AssetGraph({
                 (near && !near.has(node.id)) || !match(node.id) ? "opacity-35" : "opacity-100",
               )}
               style={{
-                left: pos.x + pad,
-                top: pos.y + pad,
+                left: xy.x + pad,
+                top: xy.y + pad,
                 width: W,
                 height: H,
               }}

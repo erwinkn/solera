@@ -30,7 +30,7 @@ project ── one deploy at a time (numbered)
 run ─▶ task (asset partition) ─▶ attempt (one generation, one batch) ─▶ worker
 attempt ─ commit ─▶ head (output partition) ─▶ ref ─▶ the data, in the store
                       └─ keyed: key index, one delta per commit number
-incremental input ─ bookmark ─▶ pass (full | delta | diff) ─▶ batches
+incremental input ─ position ─▶ pass (full | delta | diff) ─▶ batches
 ```
 
 Relations, in words:
@@ -47,7 +47,7 @@ Relations, in words:
   changed; a head holds a **ref**, which points into the store.
 - A keyed output partition has a **key index**; each commit that changes
   it adds a **delta**, numbered by its **commit number**.
-- An **incremental input** keeps a **bookmark** per partition; a **pass**
+- An **incremental input** keeps a **position** per partition; a **pass**
   reads the upstream in **batches**, one per attempt.
 
 ## Authoring
@@ -107,7 +107,7 @@ keys, failures are per key, the key index lists them.
 **partition**. One slice of an asset along its dimensions, named by a
 string; `""` when the asset is unpartitioned. An **asset partition**
 (asset × partition) is what a task runs, a claim holds, and a cursor,
-bookmark and outcome belong to. An **output partition** (output ×
+position and outcome belong to. An **output partition** (output ×
 partition) is what a head, a key index, cleanups and repairs belong to.
 A partition exists while its dimension lists it: one removed from its
 dynamic partitions (or outside its time range) leaves fan-out and
@@ -134,7 +134,7 @@ window", which are passes.
 asset reads one **upstream** output:
 
 - **whole** (`In`, or a plain `str`): the head's whole value, or its ref.
-- **incremental** (`Incremental`): what changed since its bookmark, in
+- **incremental** (`Incremental`): what changed since its position, in
   batches; keyed upstreams by key, unkeyed ones by commit.
 - **`Each`**: an incremental input over a keyed upstream whose asset is
   written for one key: one call per changed key (`ctx.key`),
@@ -160,8 +160,8 @@ producer or sensor parameter of the same name. Never an input.
 **cursor**. JSON state a producer sets (`Result(cursor=…)`) and gets back
 as `ctx.cursor`, per asset partition; a sensor keeps one too. Committed
 with the outputs, so a refused commit asks the same question again.
-*Not:* a bookmark (the engine's record of what an input has read).
-*Example:* `site_feed` stores the feed's position.
+*Not:* a position (the engine's record of how far an input has read).
+*Example:* `site_feed` stores the id of the last item it fetched.
 
 **version**. What tells whether something changed, read by its subject:
 
@@ -205,7 +205,7 @@ full pass. *Why reset is a word:* an unkeyed output appends one commit at
 a time; only a reset tells the store to drop the earlier ones. A deploy
 that removes an output or moves it to another store resets it too, as a
 whole: the output under that name is a new one, its heads, index and the
-bookmarks on it go at that deploy, and an attempt launched before commits
+positions on it go at that deploy, and an attempt launched before commits
 nothing (object-store-state.md §2).
 *Not:* a full pass of one input (`keys={"x": "full"}`), which rewrites
 nothing by itself. *Was:* `KeyedWrite.whole`.
@@ -374,7 +374,7 @@ same in every engine that replays the journal. Generations and pins are
 values of it. *Was:* event position, `applied` (code).
 
 **commit**. The atomic install of new heads, all in one event: an
-attempt's result (heads, key-index deltas, cursor, bookmarks, failed keys),
+attempt's result (heads, key-index deltas, cursor, positions, failed keys),
 or a source's new content from outside (`solera commit`, `POST
 …/sources/{name}/commit`, a tick): a version (unkeyed), a full key map,
 or a patch (`upsert`, `remove`). History keeps one row per output
@@ -396,7 +396,7 @@ written by generation 184467.
 
 **commit number**. The n-th commit of an incremental output partition:
 0, 1, 2… with no gaps, since a failed attempt's number goes to its retry.
-The delta log and bookmarks count in it. *Why, beside the generation:*
+The delta log and positions count in it. *Why, beside the generation:*
 `site_events` appends rows tagged with their commit number; an attempt
 writes half of commit 42 and dies; its retry writes commit 42 again and
 the store keeps only the retry's, so a reader of commits 40–42 never sees
@@ -413,7 +413,7 @@ filter, locator (removed by `versions.md`).
 
 **delta**. The keys one commit changed: upserted and removed, one delta
 file per commit number. The **delta log** is the deltas from the furthest
-bookmark behind to the head.
+position behind to the head.
 
 **fence**. A newer writer's mark that refuses an older writer's
 writes. A fenced store keeps one per output partition, by generation
@@ -422,11 +422,11 @@ namespace's. *Not:* the gate.
 
 ## Reading inputs
 
-**bookmark**. What an incremental input has read of its upstream, per
-asset partition: the first commit not yet read (`next`), the pass under
-way if any, and the patterns it reads under. The engine sends the input
-what lies past it. *Not:* a cursor (the user's state). *Was:* watermark.
-*Example:* `file_index`/`alpha`'s bookmark on `site_files` is at commit
+**position**. How far an incremental input has read its upstream, per
+asset partition: the first commit not yet read (`next`), any pass under
+way, the patterns it reads under. The engine sends the input what lies
+past it. *Not:* a cursor (the user's state). *Was:* bookmark, watermark.
+*Example:* `file_index`/`alpha`'s position on `site_files` is at commit
 56: commits 56 onwards are next.
 
 **pass**. One read of an upstream, fixed when it starts, done in batches
@@ -434,7 +434,7 @@ over one or more attempts:
 
 - **full**: the whole head (first read, full run, fingerprint change,
   `keys=full`);
-- **delta**: the commits since the bookmark, removed keys included: an
+- **delta**: the commits since the position, removed keys included: an
   `each` asset drops them from its outputs;
 - **diff**: after a pattern change, the keys whose match changed.
 
@@ -607,7 +607,7 @@ Each line: what goes, what replaces it, and why it does not earn a name.
 | scope lock, lock | **claim** | |
 | batch (output side) | **commit number** | Frees "batch" for what an attempt reads |
 | page, `Changes` | **batch** | |
-| watermark | **bookmark** | It records how far an input has read |
+| watermark, bookmark | **position** | It records how far an input has read |
 | delivery, window (delta), change window | **pass** | |
 | interpretation fingerprint | **fingerprint** | It is the asset's; no other fingerprint is a domain term |
 | rescope, pattern transition, cutover | **pattern change** | One procedure, four names |
@@ -639,7 +639,7 @@ Each line: what goes, what replaces it, and why it does not earn a name.
   the engine's (who wrote it, its commit number, key count).
 - **executor and placement.** One executor serves many assets with
   different `cpu`/`memory`; a name means one kind and configuration.
-- **cursor and bookmark.** The user's state versus the engine's record.
+- **cursor and position.** The user's state versus the engine's record.
 - **gate and fence.** The gate decides once, worker versus engine, for one
   attempt; a fence orders attempts (or engines) by generation.
 - **claim and fence.** The claim keeps two attempts of one partition from

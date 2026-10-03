@@ -235,9 +235,9 @@ async def test_config_change_reprocesses_everything(state):
     assert seen["full"] == [True, True]  # first pass + fingerprint reset
 
 
-async def test_full_run_resets_watermark(state):
-    """§2.2: a `full` run resets the input bookmark — the consumer re-reads
-    the whole head (not a diff) and the bookmark lands past the head commit."""
+async def test_full_run_resets_position(state):
+    """§2.2: a `full` run resets the input position — the consumer re-reads
+    the whole head (not a diff) and the position lands past the head commit."""
     seen = []
 
     @asset(outputs=Output("files", key="id"))
@@ -253,7 +253,7 @@ async def test_full_run_resets_watermark(state):
     engine = make_engine(state, project)
     await engine.initialize()
     await drive(engine, await engine.submit(["consumer"], upstream=True))
-    first = state.model.bookmark("consumer", "files", "")
+    first = state.model.position("consumer", "files", "")
     assert first == {
         "kind": "keys",
         "next": 1,  # the head's next commit: nothing under way
@@ -264,7 +264,7 @@ async def test_full_run_resets_watermark(state):
     }
     detail = await drive(engine, await engine.submit(["consumer"], mode="full"))
     assert task_statuses(detail)["consumer"] == "succeeded"  # never skipped on full
-    second = state.model.bookmark("consumer", "files", "")
+    second = state.model.position("consumer", "files", "")
     assert second == {**first, "reset_by": detail["request"]["id"]}  # back at head+1, nothing left mid-way
     # Both passes were full-head reads.
     assert seen == [(["a", "b"], True), (["a", "b"], True)]
@@ -338,7 +338,7 @@ async def test_incremental_batching_and_more(state):
 
 async def test_run_keys_override(state):
     """§8: `keys=` explicit list is a one-off selection that never moves the
-    bookmark; 'full' drains the folded key map as a reset."""
+    position; 'full' drains the folded key map as a reset."""
     seen = []
 
     @asset(outputs=Output("files", key="id"))
@@ -364,7 +364,7 @@ async def test_run_keys_override(state):
 async def test_a_selection_reads_its_keys_and_moves_nothing(state):
     """Review round 5 (system #3, engine #2): a keys= selection reads the keys
     it names — on a consumer never run, or one whose full pass stopped
-    half-way — and moves neither its bookmark nor its partition's progress: the
+    half-way — and moves neither its position nor its partition's progress: the
     interrupted pass still owes `b`, and resumes."""
     calls, broken = [], {"batch": 1}
 
@@ -385,16 +385,16 @@ async def test_a_selection_reads_its_keys_and_moves_nothing(state):
     await drive(engine, await engine.submit(["files"]))
     detail = await drive(engine, await engine.submit(["consumer"], keys={"files": {"keys": ["b"]}}))
     assert status_of(detail) == "succeeded" and calls == [["b"]]  # the selection, and nothing else
-    assert state.model.bookmark("consumer", "files", "") is None
+    assert state.model.position("consumer", "files", "") is None
     assert "caught_up" not in state.model.partition("consumer", "")
     calls.clear()
     await drive(engine, await engine.submit(["consumer"]))  # a full pass, stopped after `a`
-    stopped = state.model.bookmark("consumer", "files", "")
+    stopped = state.model.position("consumer", "files", "")
     assert calls == [["a"]] and stopped["pass"]["at"] == "a"
     assert state.model.partition("consumer", "")["caught_up"] is False
     calls.clear()
     await drive(engine, await engine.submit(["consumer"], keys={"files": {"keys": ["c"]}}))
-    assert calls == [["c"]] and state.model.bookmark("consumer", "files", "") == stopped
+    assert calls == [["c"]] and state.model.position("consumer", "files", "") == stopped
     assert state.model.partition("consumer", "")["caught_up"] is False  # `b` is still owed
     broken["batch"] = None
     calls.clear()

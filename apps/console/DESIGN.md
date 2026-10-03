@@ -31,7 +31,7 @@ states).
 | `/assets/$asset` | declaration, heads per output × scope, cursor, automations |
 | `…/partitions` | the partition grid (1-D strip, 2-D matrix) colored by status |
 | `…/keys` | failing keys (failure index), per-key outcomes, **explain a key**, live key browser, forced retries |
-| `…/edges` | every input edge: kind, patterns, per-scope watermark and lag |
+| `…/edges` | every input edge: kind, patterns, per-partition position and lag |
 | `…/history` | materializations (versions, rows, metadata) and lineage |
 | `…/runs` | runs that touched the asset |
 | `/runs` | filterable run history (facets, histogram, text search), all in the URL |
@@ -144,6 +144,6 @@ read-only endpoints instead (with tests in `tests/server`):
 | `GET /assets/{a}/failures` | the failure index: failing keys with class, tries, due, message |
 | `GET /assets/{a}/key-outcomes` | the `key_outcomes` history, searchable by key |
 | `GET /assets/{a}/explain?key=` | why a key is (not) in the output: patterns, failure, last outcome, revisions |
-| `GET /assets/{a}/edges` | every edge's watermark per scope, with lag in batches |
+| `GET /assets/{a}/edges` | every input's position per partition, with lag in batches |
 | `GET /holds` | unsettled writes and stuck discards |
 | `next_at` on automations | the next scheduled fire, from the engine's own clock rule |

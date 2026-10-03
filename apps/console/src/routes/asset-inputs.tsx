@@ -22,7 +22,7 @@ const KIND: Record<Input["kind"], { name: string; means: string }> = {
   },
   incremental: {
     name: "Incremental",
-    means: "Only what changed since this asset's bookmark, a batch at a time.",
+    means: "Only what changed since this asset's position, a batch at a time.",
   },
   each: {
     name: "Each",
@@ -126,7 +126,7 @@ function EdgeCard({ input, partition }: { input: Input; partition?: string }) {
                 <Th className="text-right">Delivered to</Th>
                 <Th className="text-right">Upstream head</Th>
                 <Th>Lag</Th>
-                <Th>Position</Th>
+                <Th>Progress</Th>
               </tr>
             </thead>
             <tbody>
@@ -142,15 +142,15 @@ function EdgeCard({ input, partition }: { input: Input; partition?: string }) {
 }
 
 function PartitionRow({ s }: { s: InputPartition }) {
-  const wm = s.bookmark;
-  const delivered = wm ? wm.next - 1 : null;
+  const position = s.position;
+  const delivered = position ? position.next - 1 : null;
   const lag = s.lag ?? 0;
   const head = s.head_commit ?? 0;
   const done = head + 1 - lag;
-  const d = wm?.pass;
+  const d = position?.pass;
   const at =
     typeof d?.at === "string" ? `after ${d.at}` : typeof d?.at === "number" ? `commit ${count(d.at)}` : null;
-  const position = d ? [d.mode, at, `batch ${d.batch + 1} of ${d.batches}`].filter(Boolean).join(" · ") : null;
+  const progress = d ? [d.mode, at, `batch ${d.batch + 1} of ${d.batches}`].filter(Boolean).join(" · ") : null;
   return (
     <Tr>
       <Td className="font-mono text-xs">
@@ -191,7 +191,7 @@ function PartitionRow({ s }: { s: InputPartition }) {
           </span>
         )}
       </Td>
-      <Td className="max-w-64 truncate font-mono text-xs text-fg-muted">{position ?? "—"}</Td>
+      <Td className="max-w-64 truncate font-mono text-xs text-fg-muted">{progress ?? "—"}</Td>
     </Tr>
   );
 }

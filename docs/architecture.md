@@ -22,7 +22,7 @@ Three rules:
 
 1. **The engine is control-plane only.** It records, for each `(output,
    partition)`, the committed ref and its metadata, plus cursors, per-input
-   bookmarks and automation state. It never moves, parses or interprets
+   positions and automation state. It never moves, parses or interprets
    payloads. The one value-derived thing it keeps is each keyed output's
    **key index** (§6): per key, the generation that last wrote it, in a
    format it defines, computed by the worker.
@@ -50,7 +50,7 @@ etag) commits only the keys whose version moved.
 | **partition** | One partition key of an asset, or `""` when unpartitioned. |
 | **head** | The committed ref of `(output, partition)`. |
 | **ref** | A self-contained pointer into a store, with the generation that wrote it (§3). |
-| **commit** | The atomic transaction installing an attempt's result: heads, lineage, cursor, bookmarks, key index deltas. |
+| **commit** | The atomic transaction installing an attempt's result: heads, lineage, cursor, positions, key index deltas. |
 | **run** | A request to materialize targets. It plans **tasks**, one per `(asset, partition)`. |
 | **attempt** | One execution of a task. |
 | **cursor** | Per-partition JSON state the producer sets and receives back (§6). |
@@ -108,7 +108,7 @@ store-specific config validated by `can_store` at registration.
 |---|---|
 | `keyed` | The output is a `dict[str, Any]`: its keys are the keys, its values the content. Excludes `key`. |
 | `key` | Column identifying what was materialized. Declared once, here; consumers never name columns. A key holds every row that carries it — one, or the many rows parsed from one file. Independent of `primary_key` (storage identity). |
-| `incremental` | The output is committed in engine-numbered commits: a keyed output's changes land in its key index (object-store-state.md §6), an unkeyed one's rows in its store; `Incremental()` consumers read what arrived after their bookmark. `key=` implies it. Default false — a value output is one object per version. |
+| `incremental` | The output is committed in engine-numbered commits: a keyed output's changes land in its key index (object-store-state.md §6), an unkeyed one's rows in its store; `Incremental()` consumers read what arrived after their position. `key=` implies it. Default false — a value output is one object per version. |
 | `migrations` | Ordered `Migration(name, payload)` list owned by this output. The store applies pending ones before its first write to the output in an attempt (§4). Payload type is store-defined (`can_store`). The applied set travels in the handle (§3) and the declared list is in the fingerprint (§6). |
 | `**config` | Store-specific: `schema`, `primary_key`, `columns`, `indexes`, `partition_column`, … |
 
@@ -344,7 +344,7 @@ is an `Incremental` input to the engine, with a failed keys).
 | Value | Meaning |
 |---|---|
 | `In(output=None, meta=None)` | whole value (or ref) of the output at its pinned head |
-| `Incremental(output=None, batch_size=100, meta=None, *, include=None, exclude=None)` | receive only what changed since this consumer's bookmark — upserted/deleted keys on a keyed upstream, new batches on an unkeyed one (§6). On a keyed upstream, `include`/`exclude` globs (or `Regex`) select keys by name; pages are formed from the keys they take — read ahead past the others, at most 100,000 keys a page — so no page is empty, a pass they take nothing from is `skipped` without calling the producer, and a change of patterns cuts over: pending changes finish under the old ones, membership is diffed against the index at the pattern change (pinned until the diff ends), then deltas continue under the new (per-key-processing.md §11) |
+| `Incremental(output=None, batch_size=100, meta=None, *, include=None, exclude=None)` | receive only what changed since this consumer's position — upserted/deleted keys on a keyed upstream, new batches on an unkeyed one (§6). On a keyed upstream, `include`/`exclude` globs (or `Regex`) select keys by name; pages are formed from the keys they take — read ahead past the others, at most 100,000 keys a page — so no page is empty, a pass they take nothing from is `skipped` without calling the producer, and a change of patterns cuts over: pending changes finish under the old ones, membership is diffed against the index at the pattern change (pinned until the diff ends), then deltas continue under the new (per-key-processing.md §11) |
 | `Each(output=None, *, batch_size=100, concurrency=16, meta=None)` | an `Incremental` input on a keyed upstream whose producer is written for **one key**: the parameter is that key's value (a rows upstream: its group), `ctx.key` its key. The worker calls it for every changed key of a page, `concurrency` at a time, stores the keys that succeeded as one `Patch({key: value})` per output, and keeps the ones that raised in the asset's failed keys, retried by their error class; deleted keys lose their rows without a call. One per asset, its other inputs whole, every output keyed. per-key-processing.md §5–§10 |
 | `AllPartitions(output=None, meta=None)` | receive every partition of the upstream dimensions this asset lacks (§7) |
 
@@ -375,7 +375,7 @@ and `final` — and returns its new, empty content; an `Each` producer,
 written for one key, is not called, and the cleanup after the full pass
 drops the keys its asset holds that the input no longer has. `upstream` carries facts about the upstream: its `output`,
 and for an unkeyed incremental upstream the range of `commits` the batch
-covers. The pass's plan is kept on the input's bookmark while it
+covers. The pass's plan is kept on the input's position while it
 continues, for keyed and unkeyed upstreams, delta passes and full passes
 alike. A consumer that rebuilds starts over when `full and first` —
 never on `full` alone, or each batch would erase the ones before it.
@@ -455,16 +455,16 @@ write against it, skips the store entirely when the write changes nothing
 writes and removes, at the attempt's generation, as the commit's delta file. An unkeyed output's commits
 are its store's; `head.base` is the first commit after its last reset. A move to another
 store resets the output altogether (object-store-state.md §2). The
-engine keeps a per-input **bookmark** — the consumer's position: `next`,
+engine keeps a per-input **position** — how far the consumer has read: `next`,
 the first upstream commit not yet delivered, and while a pass is under
 way, `pass` `{mode, from, to, at, batch, batches}`: `full` or `delta`, its
-boundary, and its position (the last key delivered, or the next commit),
+boundary, and its cursor (the last key delivered, or the next commit),
 all decided when it starts and kept until its last batch. For a keyed
 upstream the spec pins the index and a range — the delta log from `next`
 to the head, or the whole index for a full pass — and the worker reads
 one batch of it (`batch_size` keys), loads those keys with `Keys(…)`, and
 reports where the batch ended (`after`); for an unkeyed one the engine plans
-a `Commits(lo, hi)` range. Each batch's commit advances the bookmark by
+a `Commits(lo, hi)` range. Each batch's commit advances the position by
 what it delivered (`pass.advance`); `more` re-queues the task. A
 pass's boundary is fixed when it starts, so one that ends behind the
 head its last batch was planned against — interrupted, then resumed after
@@ -479,7 +479,7 @@ and the console all ask that one question.
 The **fingerprint** `H(version, store versions of the
 asset's input and output stores, migration names of the asset's outputs,
 run config, and the non-incremental inputs and deps as output, partition and
-generation)` is stored on the bookmark. A whole input written again, even
+generation)` is stored on the position. A whole input written again, even
 with the same content, is a new generation, so it resets the input
 (`versions.md` §7). A fingerprint mismatch — a `version` bump, a new
 migration, or a change to any whole input — forces `full=True` on the input: the pass
@@ -487,7 +487,7 @@ resets to the whole head. Code changes alone do not: the build identity
 (§11) bumps the deploy, not the fingerprint.
 
 A head written before the output was incremental has no delta log: "no keys
-known"; the consumer's bookmark starts empty and the next write upserts
+known"; the consumer's position starts empty and the next write upserts
 everything. A `version` mismatch between committed and declared makes an
 incremental attempt fail non-retryably, or, with
 `on_version_change="full"`, turns the next attempt of each partition into
@@ -577,8 +577,8 @@ A run is `{targets, partitions, mode, upstream, config, keys}`:
 | `keys` | per-input override `{"qaqc_files": {"keys": [...]} \| "full"}`: explicit keys are delivered as that input's selection; `full` resets the input — the whole head as a reset pass |
 
 **Modes.** `incremental`: the store builds on `prior` = head, the cursor is
-kept, `Incremental` inputs get the bookmark diff. `full`: a reset write, no
-cursor, every incremental input resets to the whole head and its bookmark
+kept, `Incremental` inputs get the position diff. `full`: a reset write, no
+cursor, every incremental input resets to the whole head and its position
 lands past the head commit; the store makes the output equal to
 exactly this write. `keys=full` resets one input only: `prior` is kept.
 
@@ -607,7 +607,7 @@ anything else is `Failed` (per-key-processing.md §8). For an attempt:
 `retry_after`, else one minute doubling to six hours, past `retries=`,
 until `retry_for` (24 h by default) has passed since its first failure.
 
-A commit installs heads, `input_refs`, the cursor, per-input bookmarks and a
+A commit installs heads, `input_refs`, the cursor, per-input positions and a
 `changed` list, and pends `OnChange` automations in the same transaction.
 Every terminal task outcome also records `{last_outcome, last_attempt, at}`
 on the `(asset, partition)` record, and queued or running tasks are indexed per
@@ -633,7 +633,7 @@ engine outages don't count as wait.
 **Retention.** `@asset(retention=Retention(days=…, runs=…))` bounds an
 asset's history; `Project(retention=…)` sets the default and
 `Retention(forever=True)` opts out of it (object-store-state.md §11). Current
-state — heads, key indexes, cursors, bookmarks — never depends on runs and
+state — heads, key indexes, cursors, positions — never depends on runs and
 never expires. Every `retention_interval` (60 s) the engine deletes finished
 runs — their attempt files and logs under `runs/{run}/`, and their history
 rows — that every asset they ran has let go of; only runs in progress are protected. Data never

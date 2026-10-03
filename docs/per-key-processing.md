@@ -39,7 +39,7 @@ Three things in Solera force that shape:
    key ("duplicate key in write"), so a file that yields 40 samples cannot
    be the key of its rows. `example/brimstone.py`'s `qaqc_samples` returns
    exactly this and cannot run today.
-2. **No per-key failure.** One bad file fails the batch; the bookmark stays
+2. **No per-key failure.** One bad file fails the batch; the position stays
    where it was, and every retry hits the same file first — a poison pill.
    The only escape is to swallow the error, and then nothing ever retries
    the file or shows that it failed.
@@ -68,7 +68,7 @@ keys, generations and sources' versions only.
 
 | Piece | Lives in | Knows |
 |---|---|---|
-| Key indexes, bookmarks, the failed keys, key patterns | engine | key strings, generations, payloads (opaque bytes), outcome classes |
+| Key indexes, positions, the failed keys, key patterns | engine | key strings, generations, payloads (opaque bytes), outcome classes |
 | The per-key loop, concurrency, error classification | worker | a batch of keys; each key's value is opaque |
 | Splitting a batch into per-key values; reading a write's keys; stamping the key column; replacing a key's rows | store | its own types |
 | SharePoint, samples, what counts as unprocessable | user code | everything else |
@@ -203,7 +203,7 @@ batch: a b c d (changed), e (deleted)
   d → TimeoutError                       failed (unclassified)
   e                                      removed
 store.store(Patch({a: …, b: …}, remove=[e]))      one write per output
-commit: delta files · bookmark → commit 42 · failed keys: +c, +d
+commit: delta files · position → commit 42 · failed keys: +c, +d
 ```
 
 **Cancel and timeout keep finished keys.** They follow the attempt's
@@ -217,7 +217,7 @@ two-phase cancel (`lifecycle.md` §7); for a per-key batch the phases are:
    batch — records the keys it did not finish as **interrupted** in the
    failure delta by the record's `reason` (table below), and publishes
    all of it as one result with `status: canceled`, carrying the record
-   as §2.2 says. The engine commits outputs, failure delta and bookmark
+   as §2.2 says. The engine commits outputs, failure delta and position
    as one journal decision.
 2. **Forced abort,** after `cancel_grace` without a result: the record's
    phase becomes `forced` and the attempt ends as `lifecycle.md` §7
@@ -228,14 +228,14 @@ two-phase cancel (`lifecycle.md` §7); for a per-key batch the phases are:
 
 Finished keys need not be a key-order prefix of the batch — with
 `concurrency=16`, `a c d` may finish while `b` is still reading. So the
-bookmark does not stop at the first unfinished key: it moves past the
+position does not stop at the first unfinished key: it moves past the
 whole batch, exactly as on success, and the holes are carried by the
 failed keys instead.
 
 ```
 batch: a b c d e(deleted)   cancel requested while b, d are in flight
 store.store(Patch({a: …, c: …}, remove=[e]))
-result status: canceled → one commit: bookmark past e · failed keys +b, +d interrupted
+result status: canceled → one commit: position past e · failed keys +b, +d interrupted
 ```
 
 What happens to the holes depends on the record's `reason`:
@@ -295,7 +295,7 @@ replacement simply leaves it out).
 
 "Processed, produced nothing" is not output content: a key's existence is
 its rows. That a key was processed is recorded by its outcome
-(`key_outcomes`, §10) and by the bookmark that moved past it; the output,
+(`key_outcomes`, §10) and by the position that moved past it; the output,
 the index and every store hold only keys with rows, so no store has to
 tell an empty group from an absent key — a table cannot.
 
@@ -454,7 +454,7 @@ outcome u8 · tries varint · deploy varint · forced varint · since varint · 
 | `outcome` | rejected, failed, retrying, canceled, timed out (the last two are interrupted keys, §5) |
 | `tries` | calls at this `upstream`; a varint, since a record can outlive any fixed width |
 | `deploy` | the deploy number (§13) the last try ran under, copied from the spec |
-| `forced` | the position of the latest forced request the last try ran under (below), copied from the spec; 0 if none |
+| `forced` | the event counter of the latest forced request the last try ran under (below), copied from the spec; 0 if none |
 | `since` | first failure at this `upstream` |
 | `last` | time of the last try: display only |
 | `next_at` | when a retrying or timed-out key is due: scheduling only |
@@ -490,7 +490,7 @@ intents, and an attempt that never commits leaves it as garbage.
 | any → another class | the new class, `tries + 1`, `since` kept; `until` set when it becomes retrying |
 
 Every record a try writes takes `deploy` and `forced` from the batch's
-spec — engine-assigned positions, never the worker's clock — so whether a
+spec — engine-assigned event counters, never the worker's clock — so whether a
 key has had its deploy retry or its forced retry is decided causally.
 `last`, `next_at` and `until` are worker times; a skewed clock shifts when
 a key is retried, never whether it is.
@@ -500,7 +500,7 @@ retrying adds and removes no key, so the index's own key count says
 nothing about outcomes. The worker's result carries, per outcome, the
 change its transitions made (`{failed: −1, retrying: +1}`); the engine
 applies them in the same commit as the output deltas, the failure delta
-and the bookmark, so a batch's outputs, position and failures land
+and the position, so a batch's outputs, position and failures land
 together, and the counts are exact because every prior was read exactly.
 Scheduling never depends on the index's approximate cardinality.
 
@@ -512,7 +512,7 @@ Failures  index: KeyIndex
           counts: {rejected, failed, retrying, canceled, timed_out}   exact (transitions)
           due_min                                                 ≤ every retrying or timed-out next_at
           deploy_min                                              ≤ every failed entry's deploy
-          forced: {class: position}                               latest forced request per class
+          forced: {class: event counter}                          latest forced request per class
 ```
 
 **One eligibility predicate**, in the SDK, used by the engine to decide
@@ -527,18 +527,18 @@ def eligible(entry, now, deploy, forced) -> bool:
     )
 ```
 
-**Forced requests are positions, not times.** `solera retry icp --failed`
+**Forced requests are event counters, not times.** `solera retry icp --failed`
 (or `--rejected`, `--canceled`, `--all`) is journaled as an event; its
-journal position is the request's identity, and `forced[class]` keeps the
-latest position per class — constant size, and a request for one class
+event counter is the request's identity, and `forced[class]` keeps the
+latest event counter per class — constant size, and a request for one class
 never cancels a pending one for another. A pass runs under the forced
-positions as they were when it started (`forced_pos`, their maximum), and
-every record it writes carries `forced = forced_pos`. A key has satisfied
+event counters as they were when it started (`forced_at`, their maximum), and
+every record it writes carries `forced = forced_at`. A key has satisfied
 a request exactly when its record's `forced` is at least that request's
-position.
+event counter.
 
 Each clause retires itself: a retried key's `next_at` moves on, its
-`deploy` becomes the pass's, its `forced` the pass's position. None loops.
+`deploy` becomes the pass's, its `forced` the pass's `forced_at`. None loops.
 A `canceled` key matches no clause but the forced one: only a request, or
 a new change of the key, brings it back.
 
@@ -565,29 +565,29 @@ never retry it:
 ```
 
 A partition has retries when `due_min ≤ now`, `deploy_min < deploy`, or a
-forced request is newer than the `forced_pos` of the last completed pass. Only automated
+forced request is newer than the `forced_at` of the last completed pass. Only automated
 assets are started by the clock; an asset run by hand picks up due keys
 on its next run.
 
 **Every eligible key is retried**; the only question is pacing. Retries
 form **batches of their own**, up to `batch_size` keys, in a **retry pass**:
-a walk over the failed keys in key order, with its position in the
-bookmark:
+a walk over the failed keys in key order, with its cursor in the
+position:
 
 ```
-retry: {pass: 7, deploy: 12, forced_pos: 4031, after: "ICP/Results/run-17.csv",
+retry: {pass: 7, deploy: 12, forced_at: 4031, after: "ICP/Results/run-17.csv",
         due_acc: 10:42, deploy_acc: 11}
 ```
 
 | Field | |
 |---|---|
-| `pass`, `deploy`, `forced_pos` | the pass's identity: its number and the predicate inputs it runs under |
+| `pass`, `deploy`, `forced_at` | the pass's identity: its number and the predicate inputs it runs under |
 | `after` | the last key the pass has walked |
 | `due_acc`, `deploy_acc` | minima over the **resulting records** of every key at or before `after`: `next_at` over retrying and timed-out records, `deploy` over failed ones |
 
 - **Each retry batch** walks the index from `after` until it has
   `batch_size` eligible keys or reaches the end. Its commit — atomic with
-  the outputs, failure delta and bookmark — advances `after` and folds
+  the outputs, failure delta and position — advances `after` and folds
   into the accumulators every record in the walked range *as it is after
   the batch's transitions*, eligible or not. The worker computes that from
   what it read, whether the store or the engine's start reply answered.
@@ -595,7 +595,7 @@ retry: {pass: 7, deploy: 12, forced_pos: 4031, after: "ICP/Results/run-17.csv",
   or before `after` into the accumulators (records past `after` will be
   walked). A change can only lower an accumulator or leave a stale
   lower value behind — conservative either way.
-- **A restart** — `deploy` or `forced_pos` changes mid-pass, from a deploy
+- **A restart** — `deploy` or `forced_at` changes mid-pass, from a deploy
   or a new `solera retry` — starts a new pass from the first key, with
   empty accumulators, so no key before `after` is skipped. The global
   bounds stay as they were until a pass completes.
@@ -608,7 +608,7 @@ retry: {pass: 7, deploy: 12, forced_pos: 4031, after: "ICP/Results/run-17.csv",
   answered with its `start` reply (`resolved-commits.md` §7).
 
 When both retries and new changes are pending, the partition **alternates**: a
-retry batch, then a change batch — the bookmark records which kind went
+retry batch, then a change batch — the position records which kind went
 last. Neither starves and there is no fraction to tune: a retry storm of
 1M failed keys after a deploy halves the pace of new files instead of
 stopping them. When only one kind is pending, every batch is that kind.
@@ -682,7 +682,7 @@ by engine and worker.
 never depends on what the engine knew. In v1 the engine does not evaluate
 patterns: a delta with changes launches an attempt, and a batch whose
 keys all fall outside the patterns ends `skipped` after advancing the
-bookmark.
+position.
 
 *Later: engine-side skip hints.* An optimization once wasted launches are
 measured; the engine would evaluate patterns only to skip work, and only
@@ -702,7 +702,7 @@ from what it already holds:
    a zero counted for old patterns never lets the engine skip a commit the
    new ones might match.
 3. **At prepare, from those counts.** A delta whose commits all matched
-   nothing advances the bookmark with no attempt (the existing `skipped`
+   nothing advances the position with no attempt (the existing `skipped`
    outcome). Anything
    unknown — after a restart, or a delta never cached — is launched, and
    the worker filters it.
@@ -717,12 +717,12 @@ the wrong patterns. Take an `archive` exclusion deployed while the input
 has unconsumed deltas:
 
 ```
-bookmark at commit 40, head at 45; the new manifest adds exclude "archive"
+position at commit 40, head at 45; the new manifest adds exclude "archive"
 commit 43 deleted archive/a.csv, which still has rows downstream
 ```
 
 1. **Cut over.** The engine fixes `c` = the upstream head when it serves
-   the new patterns (45) and records the transition on the bookmark:
+   the new patterns (45) and records the transition on the position:
    `pattern_change: {old, new, at: 45, snapshot: <files at 45>}`.
 2. **Finish under the old patterns.** Deltas up to `c` are delivered
    under the patterns they were committed for: commit 43's deletion of
@@ -749,7 +749,7 @@ Adding an `archive` exclusion removes the archived keys and processes
 nothing else. **Pattern changes are serialized:** a manifest that changes
 the patterns again while a transition runs does not interrupt it; when
 the transition ends, if the served patterns differ from its `to`, the
-next transition starts with its own pattern change. The bookmark holds at most
+next transition starts with its own pattern change. The position holds at most
 one transition. Patterns are not part of the fingerprint.
 
 **Matching is by key segments, not substrings.** Monolith's
@@ -929,7 +929,7 @@ is below the current one.
   superseded: a key's version is a generation (`versions.md`), and the
   grammar is gone.
 - `Rows` must group natively, and patches must move onto `Rows` (§7).
-- The bookmark gains two positions: the pattern change drain (§11) and the retry
+- The position gains two cursors: the pattern change drain (§11) and the retry
   pass (§9).
 - Cancel commits a partial batch (§5): it needs the lifecycle's two-phase
   cancel, with a drain before any forced abort.
@@ -976,8 +976,8 @@ is below the current one.
   outcomes, the failure delta, retry and pattern change batches, partial commits on
   cancel.
 - `python/solera_server/engine.py`: the `Failures` record, the due clock,
-  deploy numbers, pattern change and retry positions on the
-  bookmark, alternation of retry and change batches, the cancel drain.
+  deploy numbers, pattern change and retry cursors on the
+  position, alternation of retry and change batches, the cancel drain.
 - `python/solera_server/history.py`: `key_outcomes`; per-key counts on
   `attempts`.
 - `native/`: the group digest and grouping in `Rows` (in progress), the
@@ -1000,7 +1000,7 @@ is below the current one.
   once per deploy and never more.
 - Cancel: the failure delta follows the `reason` of the record the worker
   sealed with; a drain within `cancel_grace` commits finished keys whatever
-  their order, the interrupted holes and the bookmark as one decision;
+  their order, the interrupted holes and the position as one decision;
   canceled keys never come due by themselves; timed-out keys count a try
   and end `failed` past `retries=`; a forced abort commits nothing, or
   ends with the evidence `lifecycle.md` §2.3 assigns; a late drain result is
@@ -1017,7 +1017,7 @@ is below the current one.
   alternate when both are pending; a due key changed upstream is
   processed once.
 - Patterns: a batch with no matching key ends `skipped` with its
-  bookmark advanced; a pattern change with
+  position advanced; a pattern change with
   pending deletions of newly excluded keys removes their rows; the drain
   delivers exactly the symmetric difference at the pattern change snapshot,
   whatever is committed meanwhile; a second pattern change waits for the
@@ -1106,10 +1106,10 @@ Where the implementation (`solera/errors.py`, `solera/build.py`,
   `solera_worker/each.py`) — past that it goes as it is,
   not final; a batch so left with nothing is skipped the same way, and the
   next batch resumes after the last key examined.
-- **The pattern change pattern change** lives on the bookmark: `patterns` (what it
+- **The pattern change pattern change** lives on the position: `patterns` (what it
   delivers under) and, during a transition, `pattern change` {`old`, `new`,
   `pattern change`, `snapshot` (the upstream index as of the pattern change), `pin`};
-  the diff is a pass of mode `diff`, its position the bookmark's
+  the diff is a pass of mode `diff`, its cursor the position's
   `pass.at`. The diff reads the whole snapshot (`batch_size` keys
   read per batch), not only the key ranges the patterns' prefixes cover.
   A newer pattern change waits for the transition to end, then cuts over
@@ -1122,7 +1122,7 @@ Where the implementation (`solera/errors.py`, `solera/build.py`,
   reads the failed keys and the upstream as they are at its own prepare,
   and the accumulators absorb what changes between batches.
 - **After the v1 review** (thr_9ezn6cyar5):
-  - Every key of a batch gets an outcome before its bookmark moves past
+  - Every key of a batch gets an outcome before its position moves past
     it — a key a cancel reaches while it waits for a concurrency slot is
     interrupted like one in flight. Interrupted keys become canceled or
     timed out by the cancel record the result is sealed with, decided
@@ -1130,11 +1130,11 @@ Where the implementation (`solera/errors.py`, `solera/build.py`,
   - A full pass of an `Each` input keeps patch semantics: a key that
     fails keeps its last good output. If the asset held keys when the
     pass began (or the delta log was lost mid-pattern change), the pass
-    ends with a **cleanup** (`reconcile` on the bookmark): the outputs'
+    ends with a **cleanup** (`reconcile` on the position): the outputs'
     and failed keys's keys, a batch at a time, against the current
     upstream and patterns; those it no longer has are removed. Retries
     wait for it.
-  - A reset begins a **pass** (`pass` on the bookmark: the run that began
+  - A reset begins a **pass** (`pass` on the position: the run that began
     it); a `full` run's later attempts resume it instead of starting over.
   - A partition's failure record keeps the configuration it last ran under;
     the retry clock, `solera keys retry` and the API submit retries under

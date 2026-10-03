@@ -327,7 +327,7 @@ def test_registration():
 async def test_a_user_cancel_commits_finished_keys_and_leaves_the_rest_dormant(tmp_path):
     """Cancel requested: no key starts, the calls in flight are cancelled, the
     keys that finished commit with the interrupted ones' records and the
-    bookmark past the whole batch (§5); canceled keys never come due by
+    position past the whole batch (§5); canceled keys never come due by
     themselves (§9)."""
 
     from solera.failed_keys import CANCELED
@@ -364,7 +364,7 @@ async def test_a_user_cancel_commits_finished_keys_and_leaves_the_rest_dormant(t
     assert set(await rows_of(engine, project, "rows")) == {"a"}
     found = await records(engine, "parse")
     assert {k: r.outcome for k, r in found.items()} == {"b": CANCELED, "c": CANCELED}
-    assert "pass" not in engine.m.bookmark("parse", "file", "")  # past the whole batch
+    assert "pass" not in engine.m.position("parse", "file", "")  # past the whole batch
     # Dormant: a later run finds nothing to do.
     release.set()
     detail = await engine.run_until((await engine.submit(["parse"]))["id"], 10)
@@ -569,10 +569,10 @@ async def test_a_pattern_change_cuts_over(state):
     assert status_of(detail) == "succeeded"
     assert set(await rows_of(engine, new, "samples")) == {"a/1.csv", "b/3.csv", "b/4.csv"}
     assert sorted(seen) == ["b/3.csv", "b/4.csv"]  # a/1.csv matched both times: not reprocessed
-    wm = engine.m.bookmark("parse", "file", "")
+    position = engine.m.position("parse", "file", "")
     assert (
-        "pattern_change" not in wm
-        and wm["patterns"] == new.manifest["assets"]["parse"]["inputs"]["file"]["patterns"]
+        "pattern_change" not in position
+        and position["patterns"] == new.manifest["assets"]["parse"]["inputs"]["file"]["patterns"]
     )
     # From here on, deltas under the new patterns.
     content["b/5.csv"] = {"n": 5}
@@ -594,7 +594,7 @@ async def test_a_rescope_pins_its_snapshot_between_attempts(state):
     path = "keys/files/_/old.kx"
     await state.put_object(path, b"x")
     engine.m.garbage.append([path, engine.m.event_counter + 5])  # let go of after the pin below
-    engine.m._partition("parse", "")["bookmarks"] = {
+    engine.m._partition("parse", "")["positions"] = {
         "file": {
             "kind": "keys",
             "output": "files",
@@ -606,7 +606,7 @@ async def test_a_rescope_pins_its_snapshot_between_attempts(state):
     }
     await engine.upkeep.collect()
     assert await state.get_object(path) is not None
-    del engine.m.partitions[("parse", "")]["bookmarks"]
+    del engine.m.partitions[("parse", "")]["positions"]
     await engine.upkeep.collect()
     assert await state.get_object(path) is None
 

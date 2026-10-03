@@ -148,7 +148,7 @@ async def test_4_a_rescope_without_its_log_still_removes_left_out_and_deleted_ke
     detail = await drive(engine, await engine.submit(["parse"]))
     assert detail["request"]["status"] == "succeeded"
     assert set(await rows_of(engine, new, "samples")) == {"a/1"}
-    assert "reconcile" not in engine.m.bookmark("parse", "file", "")
+    assert "reconcile" not in engine.m.position("parse", "file", "")
 
 
 async def test_5_a_user_cancel_during_a_timeout_drain_makes_its_keys_canceled(tmp_path, monkeypatch):

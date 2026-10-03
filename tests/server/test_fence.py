@@ -657,7 +657,7 @@ async def test_a_result_that_fails_to_publish_stays_what_it_was(tmp_path, monkey
 async def test_garbage_waits_for_attempts_claimed_before_it_whatever_the_clocks(tmp_path):
     """The engine that launched this attempt ran an hour fast; the one that
     adopted it is right. A file let go of after the claim is kept until the
-    attempt ends: both are placed by their position in the journal, which
+    attempt ends: both are placed by their event counter in the journal, which
     every engine replays alike, not by either engine's clock."""
 
     import time
@@ -671,7 +671,7 @@ async def test_garbage_waits_for_attempts_claimed_before_it_whatever_the_clocks(
     await engine.initialize()
     path = f"{state.model.index('remote', '').prefix}merged-away.kx"  # a file of what it writes
     await state.put_object(path, b"entries")
-    state.record({"type": "AutomationChanged", "name": "none", "enabled": True})  # a later position
+    state.record({"type": "AutomationChanged", "name": "none", "enabled": True})  # a later event counter
     state.model.garbage.append([path, state.model.event_counter])
     await engine.upkeep.collect()
     assert await state.get_object(path) is not None  # the attempt may still read it

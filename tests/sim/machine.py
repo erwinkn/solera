@@ -331,7 +331,7 @@ class Simulation(RuleBasedStateMachine):
     def round_trip(self, between, clean):
         """`items` moves to its other store and back (st1 -> st2 -> st1):
         with nothing written on st2, only a `keys=` run (which moves no
-        bookmark), or a feed change its automation writes. Its steps
+        position), or a feed change its automation writes. Its steps
         are rules of their own: the trace replays them."""
 
         self.redeploy("table", clean)

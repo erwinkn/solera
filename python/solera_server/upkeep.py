@@ -26,7 +26,8 @@ from solera.keys import LocalError
 from solera.keys.index import IndexState, KeyIndex, Options
 from solera.keys.io import ObjectIO
 
-from . import bookmarks, history
+from . import history
+from .positions import needs
 
 log = logging.getLogger(__name__)
 
@@ -110,13 +111,13 @@ class Upkeep:
     # -- key indexes (§6) --------------------------------------------------------------
 
     def truncate(self) -> None:
-        """Drop the delta log commits no consumer's bookmark and no attempt
+        """Drop the delta log commits no consumer's position and no attempt
         in progress still reads."""
 
         needed: dict[tuple, int] = {}
-        for wm in self.m.bookmarks():
-            key = (wm["output"], wm["upstream_partition"])
-            needed[key] = min(needed.get(key, math.inf), bookmarks.needs(wm))
+        for position in self.m.positions():
+            key = (position["output"], position["upstream_partition"])
+            needed[key] = min(needed.get(key, math.inf), needs(position))
         for claim in self.m.claims.values():
             for output, up, first in claim.get("reads") or ():
                 needed[(output, up)] = min(needed.get((output, up), math.inf), int(first))
@@ -241,7 +242,7 @@ class Upkeep:
     async def collect(self) -> None:
         """Delete the files nothing references, once no reader pinned before
         they were let go of — an attempt, a delta pass over several batches, a sensor
-        tick — still reads. Both are positions in the model's event order,
+        tick — still reads. Both are event counters of the model's order,
         never wall clocks: two engines' clocks may disagree, the order they
         replay may not."""
 

@@ -123,7 +123,7 @@ Output data lives wherever its store puts it: FileStore under
 
 **Renames.** `@asset(aliases=["old_name"])`. On registration the engine
 moves everything held under an alias to the current name: its partition
-records (cursor, outcome, completeness, bookmarks, failing keys — one
+records (cursor, outcome, completeness, positions, failing keys — one
 record per partition, moved whole), heads, key indexes, automation state
 (attached automations are named after their asset), retention lists. Outputs named after the
 asset follow. Stores never rename anything: the committed head's ref
@@ -138,12 +138,12 @@ store holds, is a new one (K10). At that deploy, not later:
 
 - its heads, key indexes (their files go to collection) and repair intents
   go;
-- every bookmark that reads it goes, and every bookmark of the asset that
+- every position that reads it goes, and every position of the asset that
   writes it: its consumers re-read it from scratch, and its asset reads
   each of its inputs in a full pass. A `keys=` run of a partition that lost
-  bookmarks this way reads that full pass too, to its last batch, before
+  positions this way reads that full pass too, to its last batch, before
   it succeeds;
-- a removed asset loses its partition records — cursor, bookmarks, failed
+- a removed asset loses its partition records — cursor, positions, failed
   keys — a job's too, which has no output (F21).
 
 An attempt launched before the reset commits nothing of it: one of a
@@ -233,7 +233,7 @@ retention (§11).
                                "files": [{"name": "000000000057-01J8ZC7R…", "level": 0, "entries": 2,
                                           "min": "alpha-file-1", "max": "alpha-file-3", "…": "…"}]}},
        "cursor": "5921",
-       "bookmarks": {}
+       "positions": {}
      }},
     {"type": "AutomationFired", "name": "site_feed.every.0", "at": 1790074866.1, "run": "01J8ZC7S…"}
   ]
@@ -253,7 +253,7 @@ status are derived inside `apply`; they are not events.
 | `RunControlled` | `run`, `action` (`cancel` \| `pause` \| `resume`) | |
 | `AttemptLaunched` | `run`, `task`, `attempt`, `started_at`, `pin`, `at`, `execution`, `prepared`, `pool?` | the attempt file exists and a placement is about to start it: its claim becomes durable (§8) |
 | `AttemptPlaced` | `attempt`, `handle` | the placement started it: where it runs, for whichever engine follows it (§8) |
-| `AttemptFinished` | `run`, `task`, `attempt`, `outcome` (`succeeded` \| `failed` \| `skipped` \| `canceled`), `started_at`, `finished_at`, `error?`, `retryable?`, `commit?`, `owing a repair?`, `writes?` | records the attempt; on commit, installs heads, the partition's record (cursor, bookmarks, completeness), and each keyed output's new delta file; `repairs` keeps the intents of a writer that died (§8) |
+| `AttemptFinished` | `run`, `task`, `attempt`, `outcome` (`succeeded` \| `failed` \| `skipped` \| `canceled`), `started_at`, `finished_at`, `error?`, `retryable?`, `commit?`, `owing a repair?`, `writes?` | records the attempt; on commit, installs heads, the partition's record (cursor, positions, completeness), and each keyed output's new delta file; `repairs` keeps the intents of a writer that died (§8) |
 | `SourceCommitted` | `source`, `head`, `keys?`, `at`, `run?` | installs a source head and its delta file; a commit that changed something records `run` in the history (§7) |
 | `IndexCompacted` | `output`, `partition`, `added` [file], `removed` [name], `at` | swaps compacted files into a key index |
 | `IndexRecounted` | `output`, `partition`, `live`, `pinned_count`, `pinned_inexact` | a recount found `live` keys where the state it scanned said `pinned_count`: the count becomes `live` plus what commits since added, and `inexact` drops by `pinned_inexact` (§6) |
@@ -295,10 +295,10 @@ State
 | Type | Fields | Bounded by |
 |---|---|---|
 | `Head` | `ref` (from the store), `run`, `attempt` (may point at a deleted run), `commit_number` (incremental outputs: the last commit that changed it, −1 before any), `base` (the first commit after the last reset of an unkeyed incremental output), `count` (keyed: live keys), `partitions?` (dynamic partitions: the partitions it lists), `version` (declared asset version), `asset`, `at`, `n?` (a source's: the event counter of its commit) | outputs × partitions |
-| `PartitionRecord` | `cursor?` (json), `last?` (`Outcome`: its last terminal result), `caught_up?` (whether its last commit finished the pass it was on — the partition's completeness, whatever its outputs wrote), `caught_up_at?` (the event counter of the commit that last caught it up: before its asset's `changed_at`, it is `stale`), `bookmarks?` {input: `Bookmark`}, `reset?` (a reset took its bookmarks: `keys=` runs read a full pass until one catches it up), `failures?` (`Failures`: an Each asset's failing keys, per-key-processing.md §9). Registration moves it whole under a rename, drops the bookmarks of inputs the project no longer declares, and those a reset takes (§2). | assets × partitions |
-| `Failures` | `commit_number` (the record's last commit), `counts` {outcome: keys}, `due` and `deploy_min` (lower bounds), `retry?` {`pass`, `deploy`, `forced_pos`, `after`, `due_acc`, `deploy_acc`}, `passes`, `done_forced`, `last` (`changes` or `retry`), `forced` {class: position} — its index is `indexes["@asset"][partition]` (per-key-processing.md §9) | Each assets × partitions |
+| `PartitionRecord` | `cursor?` (json), `last?` (`Outcome`: its last terminal result), `caught_up?` (whether its last commit finished the pass it was on — the partition's completeness, whatever its outputs wrote), `caught_up_at?` (the event counter of the commit that last caught it up: before its asset's `changed_at`, it is `stale`), `positions?` {input: `Position`}, `reset?` (a reset took its positions: `keys=` runs read a full pass until one catches it up), `failures?` (`Failures`: an Each asset's failing keys, per-key-processing.md §9). Registration moves it whole under a rename, drops the positions of inputs the project no longer declares, and those a reset takes (§2). | assets × partitions |
+| `Failures` | `commit_number` (the record's last commit), `counts` {outcome: keys}, `due` and `deploy_min` (lower bounds), `retry?` {`pass`, `deploy`, `forced_at`, `after`, `due_acc`, `deploy_acc`}, `passes`, `done_forced`, `last` (`changes` or `retry`), `forced` {class: position} — its index is `indexes["@asset"][partition]` (per-key-processing.md §9) | Each assets × partitions |
 | `KeyIndex` | `prefix` (where its files live — kept across renames), `count`, `inexact` (commits since the last recount whose count came from filters; the count is exact at 0), `files` [{`name`, `level`, `min`, `max`, `entries`, `size`, `tail`, `index`}], `log` [[`batch`, [file]], …] — see §6 | a few dozen files per index |
-| `Bookmark` | `kind` (`keys` or `commits`), `next` (the first upstream commit not yet delivered), `pass` (one under way: its `mode` — `full`, `delta`, or a pattern change's `diff` — its boundary `from`..`to`, its position `at` — the last key delivered, or the next batch — its `page` of `pages`, a delta pass's reader `pin`; a full keyed pass's `from` is the head's commit number + 1 when it began, so changes made meanwhile arrive afterwards as deltas), `fingerprint`, `output` and `up` (the upstream index it reads), and per-key `patterns`, `pattern change`, `reconcile` (`python/solera_server/bookmarks.py`) | inputs × partitions |
+| `Position` | `kind` (`keys` or `commits`), `next` (the first upstream commit not yet delivered), `pass` (one under way: its `mode` — `full`, `delta`, or a pattern change's `diff` — its boundary `from`..`to`, its cursor `at` — the last key delivered, or the next batch — its `page` of `pages`, a delta pass's reader `pin`; a full keyed pass's `from` is the head's commit number + 1 when it began, so changes made meanwhile arrive afterwards as deltas), `fingerprint`, `output` and `up` (the upstream index it reads), and per-key `patterns`, `pattern change`, `reconcile` (`python/solera_server/positions.py`) | inputs × partitions |
 | `Outcome` | `outcome`, `run`, `attempt`, `at` | assets × partitions |
 | `AutomationState` | `enabled`, `last_fired`, `last_run`, `last_revision`, `pending` (set of `[asset, partition]` for OnChange) | automations × partitions |
 | `Run` | `id`, `request` {targets, partitions, mode, config, keys, automation, tags}, `status`, `paused`, `created_at`, `events` (how many it has recorded), `tasks` {task: `Task`} | in-flight work |
@@ -335,7 +335,7 @@ Example (abridged):
              "file_index": {"alpha": {
                "last": {"outcome": "succeeded", "run": "01J8ZB3K…", "attempt": "01J8ZB3M…", "at": 1790074800.0},
                "drained": true,
-               "bookmarks": {"site_files": {"kind": "keys", "next": 56, "fingerprint": "8d46…",
+               "positions": {"site_files": {"kind": "keys", "next": 56, "fingerprint": "8d46…",
                                              "output": "site_files", "up": "alpha"}}}}},
   "automations": {"site_feed.every.0": {"enabled": true, "last_fired": 1790074866.1,
                   "last_run": "01J8ZC7S…", "last_revision": "c0ffee…", "pending": []}},
@@ -369,7 +369,7 @@ change or delete, which compaction drops.
 - **Newest wins:** a key's current entry is its entry in the newest file
   containing it; a `deleted` entry hides older ones.
 - **`log`** lists the delta files by commit number, from the lowest consumer
-  bookmark to the head. A delta file stays readable while it is in the
+  position to the head. A delta file stays readable while it is in the
   log, even after compaction has merged it out of the levels.
 
 **File layout.** `[data blocks][filters][block index][footer]`, byte
@@ -457,10 +457,10 @@ None)`), and the replacement streams them, so nothing is sorted or held.
 |---|---|---|
 | Compute a delta | worker, at write time | Read the write's keys once (`Prepared`, `per-key-processing.md` §7), against the index **as pinned in the spec**. A patch is checked with the filters and the read strategy above: every key it writes, at the attempt's generation, plus `deleted` entries for removed keys that may exist. A full replacement is the streaming merge-join above. Either way the result is the batch's delta files, split at ~64 MB. |
 | Commit | engine | Add the delta file to level 0 and to `log`; `count += added − removed`, and `inexact += 1` if the count change came from filters. The claim — one attempt per (asset, partition) from launch to settlement — guarantees the index didn't change underneath. |
-| Deliver pending deltas | worker, for an `Incremental` input | Read the `log` files from the bookmark to the head; chunk by `batch_size` in key order; ask the upstream store for those rows with `Keys(…)`. |
+| Deliver pending deltas | worker, for an `Incremental` input | Read the `log` files from the position to the head; chunk by `batch_size` in key order; ask the upstream store for those rows with `Keys(…)`. |
 | Full pass | worker | Page through the merged view of all levels from `after`, `batch_size` keys at a time, and ask the store for them with `Keys(…)`. Per level, only the files covering the page are opened, and only their index parts are read — or the whole file, once, when it is small (below one request's latency worth of transfer, ~2.4 MB). A multi-page scan keeps each file's last fetched blocks for the next page, so it reads every block once. |
 | Compaction | the engine's machine by default (§6, *Engine work*) | Once level 0 holds ~8 files, merge them into one level-0 file — or, once level 0 holds a tenth of level 1's bytes, into level 1 with the level-1 files it overlaps (all of them, for random keys). A level over its target pushes one file down, merging it with the files it overlaps there. A merge streams, a few segments per input and one output file at a time. Commit with `IndexCompacted`. Each merge into a level rewrites about ten times the bytes it brings: ~20–30× over an entry's life with random keys (`bench/keys/amplification.py`). |
-| Truncate the log | engine | Drop `log` entries below the lowest consumer bookmark and below every delta an in-flight attempt was given (`IndexTruncated`); an output with no `Incremental` consumers keeps none. A consumer whose delta the log no longer holds gets a full pass. |
+| Truncate the log | engine | Drop `log` entries below the lowest consumer position and below every delta an in-flight attempt was given (`IndexTruncated`); an output with no `Incremental` consumers keeps none. A consumer whose delta the log no longer holds gets a full pass. |
 | Delete files | engine | A file in neither `files` nor `log` joins `garbage`, and is deleted once every attempt that could have pinned it has finished (`FilesCleanedUp`): every attempt claimed before the event that let go of it. Both are positions in event order (`applied`), the same in every engine that replays the journal — never wall clocks, which two engines may disagree on. A delta file of an attempt that never committed is deleted when the attempt ends, unless it is an repair intent (§8). |
 
 Writes that never pass through the worker as rows — `Sql` materialized
@@ -707,7 +707,7 @@ count of a keyed output, else the length of a returned list.
 | an `Each` asset's failing keys, and each partition's failure record | `GET /assets/{name}/failed-keys?partition=&outcome=&after=&limit=100` → `{partitions, keys, deploy, now, next}` | |
 | what an `Each` asset's keys came to, newest first | `GET /assets/{name}/key-outcomes?partition=&key=&q=&outcome=&run=&before=&limit=100` → `{outcomes, next}` | |
 | why a key is, or is not, in an asset's output (per-key-processing.md §10) | `GET /assets/{name}/explain?key=&partition=&input=` → `{verdict, patterns, failure, last, last_ok, …}` | |
-| an asset's input inputs, with every partition's bookmark, lag and state | `GET /assets/{name}/inputs` | |
+| an asset's input inputs, with every partition's position, lag and state | `GET /assets/{name}/inputs` | |
 | outputs owing a repair, stuck cleanups (lifecycle.md §9.6, §9.8) | `GET /repairs`, `GET /cleanups` | `solera cleanups` |
 
 Filter fields combine with AND; repeating one field (`status=failed&status=canceled`)
@@ -1029,7 +1029,7 @@ Project(retention=Retention(days=30))          # default, including source commi
 Retention(forever=True)
 ```
 
-**Current state never depends on runs.** Heads, cursors, bookmarks and
+**Current state never depends on runs.** Heads, cursors, positions and
 key indexes stand on their own; a head keeps its `run` and `attempt`
 references even after that run is deleted ("produced 45 days ago, run
 expired"). The only runs that cannot be deleted are active ones.

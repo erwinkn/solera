@@ -533,7 +533,7 @@ async def test_a_reader_does_not_evict_what_compaction_wrote(io, tmp_path):
 
 
 async def test_a_background_fill_is_a_reader_pin(io, tmp_path, monkeypatch):
-    """Review 8: a fill started by a cold decline holds the position it read
+    """Review 8: a fill started by a cold decline holds the event counter it read
     the index at until its fetches are done."""
 
     from solera_server.keyservice import KeyService
@@ -551,7 +551,7 @@ async def test_a_background_fill_is_a_reader_pin(io, tmp_path, monkeypatch):
 
         asyncio_loop = asyncio.get_running_loop()
         monkeypatch.setattr(EngineCache, "fill", held)
-        p = Prepared("", 99, 100, state, 98, True, position=7)
+        p = Prepared("", 99, 100, state, 98, True, at=7)
         body = request("inv", [ask(state, [key(1)], [b"x"])])
         out = await service.resolve("att", body, lambda n: p, lambda: True, 7)
         assert answers(out)["out"][0]["reason"] == "cold"
