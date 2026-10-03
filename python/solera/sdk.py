@@ -180,12 +180,12 @@ def _payload_type(t: Any) -> Any:
     return t
 
 
-def _load_intent(edge, annotation) -> str:
+def _load_intent(input, annotation) -> str:
     """What an input receives: its store's data ("data"), or a `Ref` to it
     ("ref") — decided once, from its annotation, and carried in its pin so the
     worker that loads it and the engine that reads ahead for it agree."""
 
-    t = dict_arg(annotation) if edge.kind == "all_partitions" else annotation
+    t = dict_arg(annotation) if input.kind == "all_partitions" else annotation
     return "ref" if t is not None and is_ref_type(t) else "data"
 
 
@@ -214,7 +214,7 @@ class Output:
     `keyed=True` makes the value a `dict[str, Any]`, one entry per key;
     `key="id"` makes it rows, keyed by their `id` column."""
 
-    is_partition_set = False
+    is_dynamic_partitions = False
 
     def __init__(
         self,
@@ -254,17 +254,17 @@ class Output:
             "incremental": self.incremental,
             "migrations": [m.name for m in self.migrations],
             "config": self.config,
-            "partition_set": self.is_partition_set,
+            "dynamic_partitions": self.is_dynamic_partitions,
         }
 
 
-class PartitionSet(Output):
+class DynamicPartitions(Output):
     """An output whose value is a list of partition keys (§2, §7)."""
 
-    is_partition_set = True
+    is_dynamic_partitions = True
 
     def __init__(self, name: str | None = None, store: str | None = None, **config: Any):
-        super().__init__(name, store, key="<elements>", incremental=True, **config)
+        super().__init__(name, store, key="<partitions>", incremental=True, **config)
 
 
 class Source:
@@ -321,10 +321,10 @@ class Source:
         )
 
     @classmethod
-    def _from_partition_set(cls, ps: PartitionSet) -> Source:
+    def _from_dynamic_partitions(cls, ps: DynamicPartitions) -> Source:
         if ps.name is None:
             raise RegistrationError("A source PartitionSet requires an explicit name")
-        source = cls(ps.name, store=ps.store, key="<elements>", **{})
+        source = cls(ps.name, store=ps.store, key="<partitions>", **{})
         source.handle = {"name": ps.name}
         return source
 
@@ -1141,7 +1141,7 @@ class Project:
     def __init__(
         self,
         assets: list[Asset] | None = None,
-        sources: list[Source | PartitionSet] | None = None,
+        sources: list[Source | DynamicPartitions] | None = None,
         *,
         stores: dict[str, Any] | None = None,
         default_store: Any = None,
@@ -1182,8 +1182,8 @@ class Project:
         self.resources = dict(resources or {})
         self.sources: dict[str, Source] = {}
         for source in sources or ():
-            if isinstance(source, PartitionSet):
-                source = Source._from_partition_set(source)
+            if isinstance(source, DynamicPartitions):
+                source = Source._from_dynamic_partitions(source)
             if source.name in self.sources:
                 raise RegistrationError(f"Duplicate source: {source.name}")
             self.sources[source.name] = source
@@ -1222,10 +1222,10 @@ class Project:
             name = dim_name
             if isinstance(dim, StaticPartitions | TimePartitions):
                 spec = dim.spec()
-            elif isinstance(dim, PartitionSet):
+            elif isinstance(dim, DynamicPartitions):
                 if dim.name is None and dim_name == "_":
                     raise RegistrationError(f"{asset_name}: a PartitionSet dimension requires a name")
-                spec = {"kind": "set", "output": dim.name}
+                spec = {"kind": "dynamic", "output": dim.name}
                 if dim_name == "_":
                     name = dim.name
             elif isinstance(dim, Asset):
@@ -1233,11 +1233,11 @@ class Project:
                     raise RegistrationError(
                         f"{asset_name}: partitions= asset {dim.name} must have exactly one output"
                     )
-                spec = {"kind": "set", "output": dim.outputs[0].name or dim.name}
+                spec = {"kind": "dynamic", "output": dim.outputs[0].name or dim.name}
                 if dim_name == "_":
                     name = spec["output"]
             elif isinstance(dim, str):
-                spec = {"kind": "set", "output": dim}
+                spec = {"kind": "dynamic", "output": dim}
                 if dim_name == "_":
                     name = dim
             else:
@@ -1261,7 +1261,7 @@ class Project:
                 "incremental": source.key is not None,
                 "migrations": [],
                 "config": source.handle,
-                "partition_set": source.key == "<elements>",
+                "dynamic_partitions": source.key == "<partitions>",
                 "dims": None,
             }
         for asset in self.assets.values():
@@ -1289,12 +1289,12 @@ class Project:
                     "incremental": output.incremental,
                     "migrations": [m.name for m in output.migrations],
                     "config": output.config,
-                    "partition_set": output.is_partition_set,
+                    "dynamic_partitions": output.is_dynamic_partitions,
                     "output": output,
                 }
         return table
 
-    def _edge(self, value, param, asset_name) -> In:
+    def _input(self, value, param, asset_name) -> In:
         if isinstance(value, str):
             value = In(value)
         if type(value) not in (In, Incremental, Each, AllPartitions):
@@ -1311,7 +1311,7 @@ class Project:
 
         if upstream["key"] is None:
             raise RegistrationError(f"{name}: Each edge {param!r} needs a keyed upstream")
-        others = [p for p, e in info["edges"].items() if p != param and isinstance(e, Incremental)]
+        others = [p for p, e in info["inputs"].items() if p != param and isinstance(e, Incremental)]
         if others:
             raise RegistrationError(
                 f"{name}: an Each asset reads its other inputs whole; {others[0]!r} is Incremental"
@@ -1319,7 +1319,7 @@ class Project:
         if not asset.outputs:
             raise RegistrationError(f"{name}: an Each asset needs outputs")
         for output in asset.outputs:
-            if output.key is None or output.is_partition_set:
+            if output.key is None or output.is_dynamic_partitions:
                 raise RegistrationError(
                     f"{name}: output {output.name} of an Each asset must be keyed (key= or keyed=True)"
                 )
@@ -1355,15 +1355,15 @@ class Project:
                 if asset.inputs is not None
                 else {p: In() for p in params if p != "ctx" and p not in self.resources}
             )
-            edges = {param: self._edge(v, param, name) for param, v in declared.items()}
-            for param in edges:
+            inputs = {param: self._input(v, param, name) for param, v in declared.items()}
+            for param in inputs:
                 if param not in params:
                     raise RegistrationError(f"{name}: input {param!r} is not a producer parameter")
                 if param in self.resources or param == "ctx":
                     raise RegistrationError(f"{name}: input {param!r} collides with a resource/ctx")
             for param, p in params.items():
                 if (
-                    param not in edges
+                    param not in inputs
                     and param not in self.resources
                     and param != "ctx"
                     and p.default is p.empty
@@ -1373,18 +1373,18 @@ class Project:
             for dep in deps:
                 if not isinstance(dep, str) or dep not in outputs:
                     raise RegistrationError(f"{name}: deps entry {dep!r} names an unknown output")
-                if dep in (e.output or p for p, e in edges.items()):
+                if dep in (e.output or p for p, e in inputs.items()):
                     raise RegistrationError(f"{name}: dep {dep!r} is already a bound input")
             dims = self._dim_spec(asset.partitions, name)
-            assets[name] = {"edges": edges, "deps": deps, "dims": dims}
+            assets[name] = {"inputs": inputs, "deps": deps, "dims": dims}
 
         # Edge validity: output exists, projection rule, store checks.
         hints_by_asset = self.hints = {n: hints(n, a.fn) for n, a in self.assets.items()}
         for name, info in assets.items():
             asset = self.assets[name]
             dims = info["dims"] or {}
-            for param, edge in info["edges"].items():
-                output_name = edge.output or param
+            for param, input in info["inputs"].items():
+                output_name = input.output or param
                 if output_name not in outputs:
                     raise RegistrationError(f"{name}: input {param!r} names unknown output {output_name!r}")
                 upstream = outputs[output_name]
@@ -1398,14 +1398,14 @@ class Project:
                         raise RegistrationError(
                             f"{name}: dimension {d!r} differs from upstream {output_name}"
                         )
-                if missing and not isinstance(edge, AllPartitions):
+                if missing and not isinstance(input, AllPartitions):
                     raise RegistrationError(
                         f"{name}: {output_name} has upstream-only dimensions {sorted(missing)}; "
                         "collapse them with AllPartitions() (§7)"
                     )
-                if isinstance(edge, Each):
+                if isinstance(input, Each):
                     self._check_each(name, asset, info, param, upstream)
-                if isinstance(edge, Incremental):
+                if isinstance(input, Incremental):
                     if missing:
                         raise RegistrationError(
                             f"{name}: Incremental edge {param!r} cannot have upstream-only dimensions (§7)"
@@ -1415,7 +1415,7 @@ class Project:
                             f"{name}: Incremental edge {param!r} upstream {output_name} "
                             "is not incremental (declare incremental=True) (§2.1)"
                         )
-                    if edge.patterns is not None and upstream["key"] is None:
+                    if input.patterns is not None and upstream["key"] is None:
                         raise RegistrationError(
                             f"{name}: include=/exclude= on {param!r} select keys; {output_name} has none"
                         )
@@ -1427,13 +1427,13 @@ class Project:
                         raise RegistrationError(f"{name}: store-bound input {param!r} is unannotated (§11)")
                     Keys, Commits = _selection_classes()
                     selection = Keys if upstream["key"] is not None else Commits
-                    loaded = dict[str, annotation] if isinstance(edge, Each) else annotation
+                    loaded = dict[str, annotation] if isinstance(input, Each) else annotation
                     if not store.can_load(loaded, selection):
                         raise RegistrationError(
                             f"{name}: store {upstream['store']} cannot load {annotation} "
                             f"under {selection.__name__}"
                         )
-                elif isinstance(edge, AllPartitions):
+                elif isinstance(input, AllPartitions):
                     inner = dict_arg(annotation)
                     if inner is None:
                         raise RegistrationError(
@@ -1462,7 +1462,7 @@ class Project:
             for output in asset.outputs:
                 record = outputs[output.name]
                 store = self.stores[record["store"]]
-                each = any(isinstance(e, Each) for e in info["edges"].values())
+                each = any(isinstance(e, Each) for e in info["inputs"].values())
                 # An Each producer returns one key's value: the output holds them all.
                 t = _payload_type(return_t) if len(asset.outputs) == 1 and not each else None
                 if not store.can_store(t, output):
@@ -1499,7 +1499,7 @@ class Project:
                         f"{record['store']} lacks partition_column (§3)"
                     )
             for spec in (info["dims"] or {}).values():
-                if spec["kind"] == "set":
+                if spec["kind"] == "dynamic":
                     target = outputs.get(spec["output"])
                     if target is None:
                         raise RegistrationError(f"{name}: partitions= names unknown output {spec['output']}")
@@ -1517,7 +1517,7 @@ class Project:
             if n in visited:
                 return
             visiting.add(n)
-            for output_name in [e.output or p for p, e in assets[n]["edges"].items()] + assets[n]["deps"]:
+            for output_name in [e.output or p for p, e in assets[n]["inputs"].items()] + assets[n]["deps"]:
                 owner = outputs[output_name]["asset"]
                 if owner:
                     visit(owner)
@@ -1550,7 +1550,7 @@ class Project:
                 if not watched:
                     for target in targets:
                         info = assets[target]
-                        watched += [e.output or p for p, e in info["edges"].items()] + info["deps"]
+                        watched += [e.output or p for p, e in info["inputs"].items()] + info["deps"]
                     watched = sorted(set(watched))
                 own = {o.name for t in targets for o in self.assets[t].outputs}
                 if set(watched) & own:
@@ -1604,7 +1604,7 @@ class Project:
                 "outputs": [o.spec(asset.name) for o in asset.outputs],
                 "inputs": {
                     p: {**e.spec(p), "load": _load_intent(e, hints_by_asset[name].get(p))}
-                    for p, e in info["edges"].items()
+                    for p, e in info["inputs"].items()
                 },
                 "deps": info["deps"],
                 "partitions": {"dims": info["dims"]} if info["dims"] else None,

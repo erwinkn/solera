@@ -4,7 +4,7 @@ import { FilterX, Play } from "lucide-react";
 import { q, useProject, type RunFilter } from "@/api/queries";
 import type { Facet } from "@/api/types";
 import { RunHistogram, RunsTable } from "@/features/runs";
-import { MaterializeButton } from "@/features/materialize";
+import { RunButton } from "@/features/run-dialog";
 import { count, plural } from "@/lib/format";
 import { label } from "@/lib/status";
 import { join, list, RANGES, type RunSearch } from "@/router";
@@ -65,7 +65,7 @@ export function Runs() {
       <PageHeader
         title="Runs"
         description="Every run, live and finished. Filters live in the address bar, so any view here is a link."
-        actions={<MaterializeButton icon={<Play />} />}
+        actions={<RunButton icon={<Play />} />}
       />
 
       <div className="flex flex-col gap-3">
@@ -186,7 +186,7 @@ export function Runs() {
                 <Empty title={filtered ? "No runs match" : "No runs yet"}>
                   {filtered
                     ? "Nothing in the history matches these filters. Skipped runs only show when you ask for them."
-                    : "Materialize an asset, or wait for an automation to fire."}
+                    : "Run an asset, or wait for an automation to fire."}
                 </Empty>
               }
             />

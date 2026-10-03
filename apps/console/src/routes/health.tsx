@@ -14,13 +14,14 @@ import { Table, TableScroll, Td, Th, Tr } from "@/ui/table";
 
 /**
  * The engine's own state, and what writers that died left behind
- * (docs/lifecycle.md §9): unsettled writes, which the partition's next attempt
- * repairs, and stuck cleanups, garbage whose names couldn't be read.
+ * (docs/lifecycle.md §9): repairs, which the partition's next attempt makes,
+ * and stuck cleanups, whose names couldn't be read.
  */
 export function Health() {
   const project = useProject();
-  const { data: holds } = useSuspenseQuery(q.holds(project));
-  const total = holds.unsettled.length + holds.cleanups.length;
+  const { data: repairs } = useSuspenseQuery(q.repairs(project));
+  const { data: cleanups } = useSuspenseQuery(q.cleanups(project));
+  const total = repairs.length + cleanups.length;
   return (
     <Page>
       <PageHeader
@@ -30,8 +31,8 @@ export function Health() {
       />
       <Engine />
       <div className="grid gap-4 lg:grid-cols-2">
-        <Unsettled rows={holds.unsettled} />
-        <Cleanups rows={holds.cleanups} />
+        <Repairs rows={repairs} />
+        <Cleanups rows={cleanups} />
       </div>
       <Stores />
     </Page>
@@ -95,7 +96,7 @@ function Engine() {
   );
 }
 
-function Unsettled({
+function Repairs({
   rows,
 }: {
   rows: {
@@ -107,11 +108,11 @@ function Unsettled({
   return (
     <Card>
       <CardHeader
-        title="Unsettled writes"
+        title="Repairs owed"
         description="Outputs an attempt died writing. The next attempt of the partition reads the keys back and folds what landed into its commit."
       />
       {rows.length === 0 ? (
-        <Empty compact title="Nothing unsettled" />
+        <Empty compact title="No repair owed" />
       ) : (
         <ul className="flex flex-col divide-y divide-line border-t border-line">
           {rows.map((r) => (

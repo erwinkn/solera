@@ -21,11 +21,11 @@
           "config": {
             "schema": "ops"
           },
+          "dynamic_partitions": false,
           "incremental": false,
           "key": null,
           "migrations": [],
           "name": "fleet_dashboard",
-          "partition_set": false,
           "store": "postgres"
         }
       ],
@@ -79,27 +79,27 @@
             "partition_column": "site",
             "schema": "sharepoint"
           },
+          "dynamic_partitions": false,
           "incremental": true,
           "key": null,
           "migrations": [],
           "name": "change_events",
-          "partition_set": false,
           "store": "postgres"
         },
         {
           "config": {},
+          "dynamic_partitions": false,
           "incremental": true,
           "key": "file_id",
           "migrations": [],
           "name": "qaqc_files",
-          "partition_set": false,
           "store": "default"
         }
       ],
       "partitions": {
         "dims": {
           "sites": {
-            "kind": "set",
+            "kind": "dynamic",
             "output": "sites"
           }
         }
@@ -142,11 +142,11 @@
       "outputs": [
         {
           "config": {},
+          "dynamic_partitions": false,
           "incremental": false,
           "key": null,
           "migrations": [],
           "name": "hillshade",
-          "partition_set": false,
           "store": "blob"
         }
       ],
@@ -162,7 +162,7 @@
             "timezone": "UTC"
           },
           "site": {
-            "kind": "set",
+            "kind": "dynamic",
             "output": "sites"
           }
         }
@@ -242,22 +242,22 @@
           "config": {
             "schema": "leaching"
           },
+          "dynamic_partitions": false,
           "incremental": false,
           "key": null,
           "migrations": [],
           "name": "leach_kinetics",
-          "partition_set": false,
           "store": "postgres"
         },
         {
           "config": {
             "schema": "datasmart"
           },
+          "dynamic_partitions": false,
           "incremental": false,
           "key": null,
           "migrations": [],
           "name": "leach_invalid_sample_id_log",
-          "partition_set": false,
           "store": "postgres"
         }
       ],
@@ -322,18 +322,18 @@
             "partition_column": "upload_id",
             "schema": "uploads"
           },
+          "dynamic_partitions": false,
           "incremental": false,
           "key": null,
           "migrations": [],
           "name": "manual_upload",
-          "partition_set": false,
           "store": "postgres"
         }
       ],
       "partitions": {
         "dims": {
           "uploads": {
-            "kind": "set",
+            "kind": "dynamic",
             "output": "uploads"
           }
         }
@@ -406,11 +406,11 @@
             ],
             "schema": "analytical"
           },
+          "dynamic_partitions": false,
           "incremental": false,
           "key": null,
           "migrations": [],
           "name": "psa_mean_data",
-          "partition_set": false,
           "store": "postgres"
         }
       ],
@@ -474,6 +474,7 @@
             ],
             "schema": "qaqc"
           },
+          "dynamic_partitions": false,
           "incremental": true,
           "key": "file_id",
           "migrations": [
@@ -481,14 +482,13 @@
             "0002_measured_tz"
           ],
           "name": "qaqc_samples",
-          "partition_set": false,
           "store": "postgres"
         }
       ],
       "partitions": {
         "dims": {
           "sites": {
-            "kind": "set",
+            "kind": "dynamic",
             "output": "sites"
           }
         }
@@ -549,11 +549,11 @@
             "partition_column": "region",
             "schema": "ops"
           },
+          "dynamic_partitions": false,
           "incremental": false,
           "key": null,
           "migrations": [],
           "name": "region_rollup",
-          "partition_set": false,
           "store": "postgres"
         }
       ],
@@ -624,18 +624,18 @@
             "partition_column": "site",
             "schema": "ops"
           },
+          "dynamic_partitions": false,
           "incremental": false,
           "key": null,
           "migrations": [],
           "name": "site_health",
-          "partition_set": false,
           "store": "postgres"
         }
       ],
       "partitions": {
         "dims": {
           "sites": {
-            "kind": "set",
+            "kind": "dynamic",
             "output": "sites"
           }
         }
@@ -679,11 +679,11 @@
       "outputs": [
         {
           "config": {},
+          "dynamic_partitions": true,
           "incremental": true,
-          "key": "<elements>",
+          "key": "<partitions>",
           "migrations": [],
           "name": "sites",
-          "partition_set": true,
           "store": "default"
         }
       ],
@@ -1015,7 +1015,7 @@
     "id": "snapshot",
     "source": "explicit"
   },
-  "deploy": "5b511e7b31082c25eb095b11a99cb1f157ffa7504b80c3c552bb4249e3fa7387",
+  "deploy": "6c420b090b5047e8967b016d469ed00bbb24f3282446b4cd694f3ea9db3e6fa2",
   "errors": [],
   "executors": {
     "ingest": {
@@ -1042,11 +1042,11 @@
         "partition_column": "site",
         "schema": "sharepoint"
       },
+      "dynamic_partitions": false,
       "incremental": true,
       "key": null,
       "migrations": [],
       "name": "change_events",
-      "partition_set": false,
       "source": false,
       "store": "postgres"
     },
@@ -1055,22 +1055,22 @@
       "config": {
         "schema": "ops"
       },
+      "dynamic_partitions": false,
       "incremental": false,
       "key": null,
       "migrations": [],
       "name": "fleet_dashboard",
-      "partition_set": false,
       "source": false,
       "store": "postgres"
     },
     "hillshade": {
       "asset": "hillshade",
       "config": {},
+      "dynamic_partitions": false,
       "incremental": false,
       "key": null,
       "migrations": [],
       "name": "hillshade",
-      "partition_set": false,
       "source": false,
       "store": "blob"
     },
@@ -1080,11 +1080,11 @@
         "schema": "datasmart"
       },
       "dims": null,
+      "dynamic_partitions": false,
       "incremental": false,
       "key": null,
       "migrations": [],
       "name": "leach_crosswalk",
-      "partition_set": false,
       "source": true,
       "store": "postgres"
     },
@@ -1093,11 +1093,11 @@
       "config": {
         "schema": "datasmart"
       },
+      "dynamic_partitions": false,
       "incremental": false,
       "key": null,
       "migrations": [],
       "name": "leach_invalid_sample_id_log",
-      "partition_set": false,
       "source": false,
       "store": "postgres"
     },
@@ -1106,11 +1106,11 @@
       "config": {
         "schema": "leaching"
       },
+      "dynamic_partitions": false,
       "incremental": false,
       "key": null,
       "migrations": [],
       "name": "leach_kinetics",
-      "partition_set": false,
       "source": false,
       "store": "postgres"
     },
@@ -1120,11 +1120,11 @@
         "partition_column": "upload_id",
         "schema": "uploads"
       },
+      "dynamic_partitions": false,
       "incremental": false,
       "key": null,
       "migrations": [],
       "name": "manual_upload",
-      "partition_set": false,
       "source": false,
       "store": "postgres"
     },
@@ -1134,11 +1134,11 @@
         "schema": "datasmart"
       },
       "dims": null,
+      "dynamic_partitions": false,
       "incremental": false,
       "key": null,
       "migrations": [],
       "name": "pmpt_project_matrix",
-      "partition_set": false,
       "source": true,
       "store": "postgres"
     },
@@ -1148,11 +1148,11 @@
         "schema": "datasmart"
       },
       "dims": null,
+      "dynamic_partitions": false,
       "incremental": false,
       "key": null,
       "migrations": [],
       "name": "project_team_map",
-      "partition_set": false,
       "source": true,
       "store": "postgres"
     },
@@ -1162,11 +1162,11 @@
         "schema": "datasmart"
       },
       "dims": null,
+      "dynamic_partitions": false,
       "incremental": false,
       "key": null,
       "migrations": [],
       "name": "psa_data",
-      "partition_set": false,
       "source": true,
       "store": "postgres"
     },
@@ -1187,11 +1187,11 @@
         ],
         "schema": "analytical"
       },
+      "dynamic_partitions": false,
       "incremental": false,
       "key": null,
       "migrations": [],
       "name": "psa_mean_data",
-      "partition_set": false,
       "source": false,
       "store": "postgres"
     },
@@ -1201,22 +1201,22 @@
         "schema": "datasmart"
       },
       "dims": null,
+      "dynamic_partitions": false,
       "incremental": false,
       "key": null,
       "migrations": [],
       "name": "psa_samples",
-      "partition_set": false,
       "source": true,
       "store": "postgres"
     },
     "qaqc_files": {
       "asset": "graph_delta",
       "config": {},
+      "dynamic_partitions": false,
       "incremental": true,
       "key": "file_id",
       "migrations": [],
       "name": "qaqc_files",
-      "partition_set": false,
       "source": false,
       "store": "default"
     },
@@ -1230,6 +1230,7 @@
         ],
         "schema": "qaqc"
       },
+      "dynamic_partitions": false,
       "incremental": true,
       "key": "file_id",
       "migrations": [
@@ -1237,7 +1238,6 @@
         "0002_measured_tz"
       ],
       "name": "qaqc_samples",
-      "partition_set": false,
       "source": false,
       "store": "postgres"
     },
@@ -1247,11 +1247,11 @@
         "partition_column": "region",
         "schema": "ops"
       },
+      "dynamic_partitions": false,
       "incremental": false,
       "key": null,
       "migrations": [],
       "name": "region_rollup",
-      "partition_set": false,
       "source": false,
       "store": "postgres"
     },
@@ -1261,11 +1261,11 @@
         "schema": "datasmart"
       },
       "dims": null,
+      "dynamic_partitions": false,
       "incremental": false,
       "key": null,
       "migrations": [],
       "name": "sample_id_crosswalk",
-      "partition_set": false,
       "source": true,
       "store": "postgres"
     },
@@ -1275,22 +1275,22 @@
         "partition_column": "site",
         "schema": "ops"
       },
+      "dynamic_partitions": false,
       "incremental": false,
       "key": null,
       "migrations": [],
       "name": "site_health",
-      "partition_set": false,
       "source": false,
       "store": "postgres"
     },
     "sites": {
       "asset": "sites",
       "config": {},
+      "dynamic_partitions": true,
       "incremental": true,
-      "key": "<elements>",
+      "key": "<partitions>",
       "migrations": [],
       "name": "sites",
-      "partition_set": true,
       "source": false,
       "store": "default"
     },
@@ -1300,11 +1300,11 @@
         "name": "uploads"
       },
       "dims": null,
+      "dynamic_partitions": true,
       "incremental": true,
-      "key": "<elements>",
+      "key": "<partitions>",
       "migrations": [],
       "name": "uploads",
-      "partition_set": true,
       "source": true,
       "store": "default"
     },
@@ -1312,11 +1312,11 @@
       "asset": null,
       "config": {},
       "dims": null,
+      "dynamic_partitions": false,
       "incremental": false,
       "key": null,
       "migrations": [],
       "name": "usgs_3dep_tiles",
-      "partition_set": false,
       "source": true,
       "store": "default"
     },
@@ -1326,11 +1326,11 @@
         "schema": "datasmart"
       },
       "dims": null,
+      "dynamic_partitions": false,
       "incremental": false,
       "key": null,
       "migrations": [],
       "name": "xrd_profex",
-      "partition_set": false,
       "source": true,
       "store": "postgres"
     },
@@ -1340,11 +1340,11 @@
         "schema": "datasmart"
       },
       "dims": null,
+      "dynamic_partitions": false,
       "incremental": false,
       "key": null,
       "migrations": [],
       "name": "xrf",
-      "partition_set": false,
       "source": true,
       "store": "postgres"
     }
@@ -1494,7 +1494,7 @@
         "partition": "",
         "store": "default"
       },
-      "key": "<elements>",
+      "key": "<partitions>",
       "name": "uploads",
       "store": "default"
     },

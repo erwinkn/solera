@@ -84,7 +84,7 @@ const assetKeys = createRoute({
     optional({
       outcome: str(s.outcome),
       key: str(s.key),
-      edge: str(s.edge),
+      input: str(s.input),
       q: str(s.q),
       output: str(s.output),
     }),
@@ -93,8 +93,8 @@ const assetKeys = createRoute({
 
 const assetEdges = createRoute({
   getParentRoute: () => asset,
-  path: "/edges",
-  component: lazyRouteComponent(() => import("@/routes/asset-edges"), "AssetEdges"),
+  path: "/inputs",
+  component: lazyRouteComponent(() => import("@/routes/asset-inputs"), "AssetInputs"),
 });
 
 const assetHistory = createRoute({

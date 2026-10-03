@@ -4,7 +4,7 @@ import { getRouteApi, Link, useNavigate } from "@tanstack/react-router";
 import { Activity, ArrowRight, Hand, KeyRound, Play, XCircle } from "lucide-react";
 import { q, useManifest, useProject } from "@/api/queries";
 import type { AssetStatus, Automation } from "@/api/types";
-import { MaterializeButton } from "@/features/materialize";
+import { RunButton } from "@/features/run-dialog";
 import { RunHistogram, RunsTable } from "@/features/runs";
 import { describeTrigger } from "@/features/triggers";
 import { StarvedPools, useStarvedPools } from "@/features/starved";
@@ -51,12 +51,13 @@ export function Overview() {
       ? "the project's life so far"
       : "the project's life";
   const status = useQuery(q.assetStatus(project)).data;
-  const holds = useQuery(q.holds(project)).data;
+  const repairs = useQuery(q.repairs(project)).data;
+  const cleanups = useQuery(q.cleanups(project)).data;
 
   const failing = status ? Object.entries(status).filter(([, s]) => failingKeys(s) > 0) : [];
   const keys = failing.reduce((sum, [, s]) => sum + failingKeys(s), 0);
   const starved = useStarvedPools();
-  const operator = holds ? holds.unsettled.length + holds.cleanups.length + starved.length : undefined;
+  const operator = repairs && cleanups ? repairs.length + cleanups.length + starved.length : undefined;
   const failedTotal = failed?.pages[0]?.total;
   const navigate = useNavigate();
 
@@ -79,7 +80,7 @@ export function Overview() {
             {plural(Object.keys(manifest.automations).length, "automation")}
           </>
         }
-        actions={<MaterializeButton icon={<Play />} />}
+        actions={<RunButton icon={<Play />} />}
       />
 
       <StarvedPools />
@@ -122,16 +123,16 @@ export function Overview() {
           value={operator}
           tone={operator ? "warn" : "ok"}
           detail={
-            holds
+            repairs && cleanups
               ? operator
                 ? [
-                    holds.unsettled.length && `${holds.unsettled.length} unsettled`,
-                    holds.cleanups.length && `${holds.cleanups.length} stuck`,
+                    repairs.length && `${repairs.length} owing a repair`,
+                    cleanups.length && `${cleanups.length} stuck`,
                     starved.length && plural(starved.length, "idle pool"),
                   ]
                     .filter(Boolean)
                     .join(", ")
-                : "nothing unsettled, stuck or starved"
+                : "nothing to repair, stuck or starved"
               : undefined
           }
         />

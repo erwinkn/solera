@@ -506,9 +506,9 @@ def test_a_rename_moves_a_scopes_record_whole():
     m.partitions[("old", "x")] = copy.deepcopy(whole)
     m.partitions[("old", "y")] = {"cursor": "old's"}
     m.partitions[("new", "y")] = {"last": {"outcome": "succeeded", "run": "r", "attempt": "b", "at": 2.0}}
-    edge = {"kind": "incremental", "output": "feed"}
+    input = {"kind": "incremental", "output": "feed"}
     manifest = {
-        "assets": {"new": {"aliases": ["old"], "inputs": {"feed": edge}, "outputs": []}},
+        "assets": {"new": {"aliases": ["old"], "inputs": {"feed": input}, "outputs": []}},
         "outputs": {},
         "sources": {},
         "automations": {},

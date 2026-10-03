@@ -103,7 +103,7 @@ async def test_soak(tmp_path, monkeypatch):
         run = await engine.submit(["sites"])
         detail = await engine.run_until(run["id"], timeout=1e9)
         assert detail["request"]["status"] == "succeeded"
-    assert len(state.model.heads[("sites", "")]["elements"]) == 4
+    assert len(state.model.heads[("sites", "")]["partitions"]) == 4
 
     samples = []  # (committed runs, data bytes, control bytes, keys bytes, object requests)
     checkpoints_peak = runs_in_memory_peak = 0

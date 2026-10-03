@@ -4,7 +4,7 @@ import { List, Network, Play } from "lucide-react";
 import { q, useManifest, useProject } from "@/api/queries";
 import type { AssetStatus, Manifest } from "@/api/types";
 import { AssetGraph, assetTone, KIND_ICON, KIND_LABEL, kindOf } from "@/features/graph";
-import { MaterializeButton } from "@/features/materialize";
+import { RunButton } from "@/features/run-dialog";
 import { describeTrigger } from "@/features/triggers";
 import { failingKeys } from "@/routes/overview";
 import { cn } from "@/lib/cn";
@@ -75,7 +75,7 @@ export function Assets() {
                 },
               ]}
             />
-            <MaterializeButton icon={<Play />} />
+            <RunButton icon={<Play />} />
           </>
         }
       />

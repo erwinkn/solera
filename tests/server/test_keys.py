@@ -11,7 +11,7 @@ import threading
 import pytest
 from solera.keys import resolver
 from solera.keys.index import DeltaFiles, IndexState, KeyIndex, Options
-from solera.sdk import Incremental, Output, PartitionSet, Project, Ref, Source, asset
+from solera.sdk import DynamicPartitions, Incremental, Output, Project, Ref, Source, asset
 from solera.stores import FileStore, Patch
 from solera_server.engine import Engine
 from solera_server.keyservice import KeyService
@@ -179,12 +179,12 @@ async def test_a_patch_reconciles_what_a_dead_sql_writer_left(state, arrow):
     del live.rows["a"]
     live.rows["b"] = {"id": "b", "v": 1}
     key = ("items", "")
-    state.model.unsettled[key] = [
+    state.model.repairs[key] = [
         {"added": 0, "removed": 0, "exact": True, "files": [], "unknown": True, "run": "r", "attempt": "dead"}
     ]
     pending["rows"] = [{"id": "c", "v": 1}]
     await run(engine, ["items"])
-    assert key not in state.model.unsettled
+    assert key not in state.model.repairs
     index = state.model.indexes[key]
     assert index.count == 2 and index.count_exact
     assert sorted((await engine.list_keys("items"))["keys"]) == ["b", "c"]
@@ -383,7 +383,7 @@ async def test_keyed_source_commits_go_through_the_index(state):
 
 
 async def test_partition_set_elements_ride_on_the_head(state):
-    @asset(outputs=PartitionSet("sites"))
+    @asset(outputs=DynamicPartitions("sites"))
     def sites():
         return Patch(["east"])
 
@@ -393,7 +393,7 @@ async def test_partition_set_elements_ride_on_the_head(state):
     await run(engine, ["sites"])
     await run(engine, ["sites"])  # the same element again: nothing changes
     head = state.model.heads[("sites", "")]
-    assert head["elements"] == ["east"] and head["count"] == 1 and head["commit_number"] == 0
+    assert head["partitions"] == ["east"] and head["count"] == 1 and head["commit_number"] == 0
 
 
 async def test_only_the_engine_caches_index_files(state, tmp_path):

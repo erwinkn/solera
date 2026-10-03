@@ -120,10 +120,8 @@ function Mark() {
 function useAttention() {
   const diagnostics = useQuery(q.diagnostics()).data;
   const project = diagnostics?.project;
-  const holds = useQuery({
-    ...q.holds(project ?? ""),
-    enabled: !!project,
-  }).data;
+  const repairs = useQuery({ ...q.repairs(project ?? ""), enabled: !!project }).data;
+  const cleanups = useQuery({ ...q.cleanups(project ?? ""), enabled: !!project }).data;
   const status = useQuery({
     ...q.assetStatus(project ?? ""),
     enabled: !!project,
@@ -133,7 +131,7 @@ function useAttention() {
         (a) => a.partitions.failed > 0 || Object.values(a.failures ?? {}).some((n) => (n ?? 0) > 0),
       ).length
     : 0;
-  const leftover = holds ? holds.unsettled.length + holds.cleanups.length : 0;
+  const leftover = (repairs?.length ?? 0) + (cleanups?.length ?? 0);
   return { running: diagnostics?.active_runs ?? 0, failing, leftover };
 }
 

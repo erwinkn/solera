@@ -36,7 +36,7 @@ async def records(engine, asset_name, partition=""):
     return {key_str(k): Record.decode(p) for k, p in zip(keys, payloads, strict=True)}
 
 
-def files_project(content, fn, *, written=None, **edge):
+def files_project(content, fn, *, written=None, **input):
     """`files`, a producer that writes what changed in `content` since it
     last ran — a `Patch`, as one does to make its consumers reprocess no
     more (docs/versions.md §1) — and `parse`, `fn` over each of its keys.
@@ -52,7 +52,7 @@ def files_project(content, fn, *, written=None, **edge):
         written.update(copy.deepcopy(content))
         return Patch(changed, remove=gone)
 
-    parse = asset(fn, inputs={"file": Each("files", **edge)}, outputs=Output("samples", key="path"))
+    parse = asset(fn, inputs={"file": Each("files", **input)}, outputs=Output("samples", key="path"))
     return Project(assets=[files, parse])
 
 

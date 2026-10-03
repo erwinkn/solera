@@ -349,7 +349,7 @@ async def test_a_drain_that_outlives_its_grace_is_forced_and_uncertain(tmp_path)
     await until(engine, lambda: state.model.claimed(attempt) is None)
     events = [e for e in await engine.history.events(run["id"]) if e["attempt"] == attempt]
     assert events[-1]["type"] == "aborted"
-    assert state.model.unsettled[("remote", "")][0]["attempt"] == attempt
+    assert state.model.repairs[("remote", "")][0]["attempt"] == attempt
     await engine.stop()
     await state.close()
 
@@ -473,9 +473,9 @@ async def test_a_worker_that_dies_writing_leaves_its_output_unsettled_and_the_re
     seen = []
 
     async def watch():
-        while not state.model.unsettled:
+        while not state.model.repairs:
             await asyncio.sleep(0.002)
-        seen.append({k: len(v) for k, v in state.model.unsettled.items()})
+        seen.append({k: len(v) for k, v in state.model.repairs.items()})
 
     watcher = asyncio.create_task(watch())
     live.die = 1
@@ -483,7 +483,7 @@ async def test_a_worker_that_dies_writing_leaves_its_output_unsettled_and_the_re
     watcher.cancel()
     assert detail["request"]["status"] == "succeeded", detail
     assert seen == [{("items", ""): 1}]  # the dead attempt left `items` unsettled
-    assert state.model.unsettled == {}  # the retry's commit settled it
+    assert state.model.repairs == {}  # the retry's commit settled it
     assert live.rows == {"a": {"id": "a", "v": 2}, "b": {"id": "b", "v": 1}, "c": {"id": "c", "v": 1}}
     assert state.model.heads[("items", "")]["count"] == 3
     await engine.stop()
@@ -556,7 +556,7 @@ async def test_a_dead_immutable_write_leaves_nothing_to_repair(tmp_path, data, m
     assert detail["request"]["status"] == "succeeded", detail
     first, second = detail["attempts"][detail["tasks"][0]["id"]]
     assert first["status"] == "failed" and second["status"] == "succeeded"
-    assert state.model.unsettled == {}
+    assert state.model.repairs == {}
     ref = Ref.from_json(state.model.heads[("scores", "")]["ref"])
     assert await project.stores["default"].load(ref, None, await whole(state, "scores")) == {"a": 1, "b": 1}
     await engine.stop()
@@ -595,7 +595,7 @@ async def test_a_create_whose_response_was_lost_is_its_own(tmp_path, monkeypatch
     detail = await engine.run_until((await engine.submit(["scores"]))["id"], 10)
     assert detail["request"]["status"] == "succeeded", detail
     assert {"json", "kx", "writing"} <= set(retried)
-    assert state.model.heads[("scores", "")]["count"] == 2 and state.model.unsettled == {}
+    assert state.model.heads[("scores", "")]["count"] == 2 and state.model.repairs == {}
     with pytest.raises(AlreadyExistsError):  # another writer's object is still a collision
         await create(state.objects, f"{state.attempt_path(detail['request']['id'], 'x')}.writing", b"a")
         await create(state.objects, f"{state.attempt_path(detail['request']['id'], 'x')}.writing", b"b")
@@ -967,9 +967,9 @@ async def test_an_adopted_attempt_fails_under_the_contract_it_was_launched_with(
     await until(engine, lambda: state.model.claimed(attempt) is None)
     assert state.model.runs[run["id"]]["status"] == "failed"
     if change == "removed":
-        assert ("remote", "") not in state.model.unsettled
+        assert ("remote", "") not in state.model.repairs
     else:
-        assert [i["attempt"] for i in state.model.unsettled[("remote", "")]] == [attempt]
+        assert [i["attempt"] for i in state.model.repairs[("remote", "")]] == [attempt]
     await engine.stop()
     await state.close()
 

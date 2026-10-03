@@ -6,7 +6,7 @@ import { q, useManifest, useProject } from "@/api/queries";
 import { useAutomationToggle, useRunAutomation } from "@/api/mutations";
 import type { AssetDecl, Automation, DimDecl, Head, Json, Manifest } from "@/api/types";
 import { assetTone, KIND_ICON, KIND_LABEL, kindOf } from "@/features/graph";
-import { MaterializeButton } from "@/features/materialize";
+import { RunButton } from "@/features/run-dialog";
 import { RunsTable } from "@/features/runs";
 import { describeTrigger } from "@/features/triggers";
 import { PatternList } from "@/features/patterns";
@@ -24,14 +24,14 @@ import { Table, TableScroll, Td, Th, Tr } from "@/ui/table";
 
 const route = getRouteApi("/assets/$asset");
 
-/** Which tabs an asset has: keys only where keys exist, edges only with inputs. */
+/** Which tabs an asset has: keys only where keys exist, inputs only with inputs. */
 export function tabsOf(asset: AssetDecl) {
   const each = Object.values(asset.inputs).some((e) => e.each);
   const keyed = asset.outputs.some((o) => o.key);
   return {
     partitions: !!asset.partitions,
     keys: each || keyed,
-    edges: Object.keys(asset.inputs).length > 0 || asset.deps.length > 0,
+    inputs: Object.keys(asset.inputs).length > 0 || asset.deps.length > 0,
   };
 }
 
@@ -117,11 +117,11 @@ export function AssetLayout() {
                 ))}
               </Select>
             )}
-            <MaterializeButton
+            <RunButton
               targets={[name]}
               partition={partition}
               icon={<Play />}
-              label={partition ? "Materialize partition" : "Materialize"}
+              label={partition ? "Run partition" : "Run"}
             />
           </>
         }
@@ -169,9 +169,9 @@ export function AssetLayout() {
             )}
           </Tab>
         )}
-        {tabs.edges && (
-          <Tab to="/assets/$asset/edges" name={name}>
-            Edges
+        {tabs.inputs && (
+          <Tab to="/assets/$asset/inputs" name={name}>
+            Inputs
           </Tab>
         )}
         <Tab to="/assets/$asset/history" name={name}>
@@ -196,7 +196,7 @@ function Tab({
     | "/assets/$asset"
     | "/assets/$asset/partitions"
     | "/assets/$asset/keys"
-    | "/assets/$asset/edges"
+    | "/assets/$asset/inputs"
     | "/assets/$asset/history"
     | "/assets/$asset/runs";
   name: string;
@@ -299,7 +299,7 @@ function Heads({
       <CardHeader title="Heads" description="The committed version of each output, per partition" />
       {rows.length === 0 ? (
         <Empty compact title="Nothing committed yet">
-          Materialize the asset to give its outputs heads.
+          Run the asset to give its outputs heads.
         </Empty>
       ) : (
         <TableScroll className="max-h-[28rem] overflow-y-auto">
@@ -367,7 +367,7 @@ function Heads({
 }
 
 function dimText(dim: DimDecl): ReactNode {
-  if (dim.kind === "set") {
+  if (dim.kind === "dynamic") {
     return (
       <>
         keys of{" "}
@@ -397,9 +397,9 @@ function Declaration({ asset, manifest }: { asset: AssetDecl; manifest: Manifest
                     {o.store} store
                     {store && <span className="text-fg-subtle"> ({store.writes})</span>}
                   </span>
-                  {o.partition_set && <Tag>partition set</Tag>}
-                  {o.key && !o.partition_set && <Tag>key {o.key}</Tag>}
-                  {o.incremental && !o.partition_set && <Tag>incremental</Tag>}
+                  {o.dynamic_partitions && <Tag>dynamic partitions</Tag>}
+                  {o.key && !o.dynamic_partitions && <Tag>key {o.key}</Tag>}
+                  {o.incremental && !o.dynamic_partitions && <Tag>incremental</Tag>}
                   {o.migrations.length > 0 && <Tag>{plural(o.migrations.length, "migration")}</Tag>}
                 </Row>
               );
@@ -408,25 +408,25 @@ function Declaration({ asset, manifest }: { asset: AssetDecl; manifest: Manifest
         )}
         {(Object.keys(asset.inputs).length > 0 || asset.deps.length > 0) && (
           <Section title="Inputs">
-            {Object.entries(asset.inputs).map(([param, edge]) => (
+            {Object.entries(asset.inputs).map(([param, input]) => (
               <Row key={param} name={param}>
                 <span>
                   <span className="text-fg-subtle">
-                    {edge.each
+                    {input.each
                       ? "Each"
-                      : edge.kind === "in"
+                      : input.kind === "in"
                         ? "In"
-                        : edge.kind === "incremental"
+                        : input.kind === "incremental"
                           ? "Incremental"
                           : "AllPartitions"}
                     (
                   </span>
-                  {edge.output}
+                  {input.output}
                   <span className="text-fg-subtle">)</span>
                 </span>
-                {edge.page_size != null && <Tag>{edge.page_size} keys a page</Tag>}
-                {edge.each && <Tag>{edge.each.concurrency} at a time</Tag>}
-                {edge.patterns && <PatternList patterns={edge.patterns} />}
+                {input.page_size != null && <Tag>{input.page_size} keys a page</Tag>}
+                {input.each && <Tag>{input.each.concurrency} at a time</Tag>}
+                {input.patterns && <PatternList patterns={input.patterns} />}
               </Row>
             ))}
             {asset.deps.map((dep) => (

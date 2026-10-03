@@ -6,11 +6,11 @@ import pytest
 from solera.executors import Pool
 from solera.sdk import (
     Automation,
+    DynamicPartitions,
     Every,
     Incremental,
     OnChange,
     Output,
-    PartitionSet,
     Project,
     Retry,
     Source,
@@ -38,7 +38,7 @@ def build_project():
     def daily(ctx):
         return {"day": ctx.partition}
 
-    sites = PartitionSet("sites")
+    sites = DynamicPartitions("sites")
 
     @asset(partitions={"site": sites})
     def by_site(ctx):

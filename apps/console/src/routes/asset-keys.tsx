@@ -231,7 +231,7 @@ function nextTry(k: FailureKey, now: number): ReactNode {
 
 // -- explain ----------------------------------------------------------------------
 
-/** The edges `explain` can answer for: keyed incremental ones, an Each edge first. */
+/** The inputs `explain` can answer for: keyed incremental ones, an Each input first. */
 function explainable(asset: AssetDecl): string[] {
   return Object.entries(asset.inputs)
     .filter(([, e]) => e.kind === "incremental")
@@ -240,9 +240,9 @@ function explainable(asset: AssetDecl): string[] {
 }
 
 function ExplainKey({ name, asset }: { name: string; asset: AssetDecl }) {
-  const { key, partition, edge } = route.useSearch();
-  const edges = explainable(asset);
-  const chosenEdge = edge ?? edges[0];
+  const { key, partition, input } = route.useSearch();
+  const inputs = explainable(asset);
+  const chosenInput = input ?? inputs[0];
   const navigate = route.useNavigate();
   const project = useProject();
   const partitions = useQuery({
@@ -253,7 +253,7 @@ function ExplainKey({ name, asset }: { name: string; asset: AssetDecl }) {
     partition ?? (asset.partitions ? partitions?.find((p) => p.status !== "retired")?.partition : "");
   const [draft, setDraft] = useState(key ?? "");
   const answer = useQuery({
-    ...q.explain(project, name, key ?? "", effectivePartition ?? "", chosenEdge),
+    ...q.explain(project, name, key ?? "", effectivePartition ?? "", chosenInput),
     enabled: !!key && effectivePartition !== undefined,
   });
 
@@ -281,14 +281,14 @@ function ExplainKey({ name, asset }: { name: string; asset: AssetDecl }) {
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
         />
-        {edges.length > 1 && (
+        {inputs.length > 1 && (
           <Select
-            aria-label="Edge"
+            aria-label="Input"
             className="w-auto font-mono text-xs"
-            value={chosenEdge}
-            onChange={(e) => navigate({ search: (s) => ({ ...s, edge: e.target.value }), replace: true })}
+            value={chosenInput}
+            onChange={(e) => navigate({ search: (s) => ({ ...s, input: e.target.value }), replace: true })}
           >
-            {edges.map((param) => (
+            {inputs.map((param) => (
               <option key={param} value={param}>
                 through {param}
               </option>
@@ -333,10 +333,10 @@ function Answer({ explain: e }: { explain: Explain }) {
     ),
     excluded: (
       <>
-        Excluded by the edge's pattern <code className="font-mono">{e.patterns.excluded_by}</code>
+        Excluded by the input's pattern <code className="font-mono">{e.patterns.excluded_by}</code>
       </>
     ),
-    not_matched: <>Not matched: outside the edge's include patterns</>,
+    not_matched: <>Not matched: outside the input's include patterns</>,
     pending: (
       <>
         Waiting: {e.upstream} wrote it at <Generation value={e.upstream_generation} />, not processed yet
@@ -372,8 +372,8 @@ function Answer({ explain: e }: { explain: Explain }) {
           ) : (
             "doesn't have it"
           )}
-          {" · edge "}
-          {label(e.edge_state)}
+          {" · input "}
+          {label(e.input_state)}
         </li>
         {Object.entries(e.outputs).map(([output, o]) => (
           <li key={output}>

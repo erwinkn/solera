@@ -3,7 +3,7 @@ import { getRouteApi, Link } from "@tanstack/react-router";
 import { Play } from "lucide-react";
 import { q, useManifest, useProject } from "@/api/queries";
 import type { AssetDetail, PartitionRow, PartitionStatus } from "@/api/types";
-import { MaterializeButton } from "@/features/materialize";
+import { RunButton } from "@/features/run-dialog";
 import { cn } from "@/lib/cn";
 import { count, plural } from "@/lib/format";
 import { label, tone, toneSolid, toneSoft } from "@/lib/status";
@@ -60,7 +60,7 @@ export function AssetPartitions() {
         <div className="px-4 pb-4">
           {rows.length === 0 ? (
             <Empty compact title="No partition keys yet">
-              The partition set this asset is bound to has no keys.
+              The dynamic partitions this asset is bound to have none yet.
             </Empty>
           ) : dims.length === 2 ? (
             <Matrix rows={rows} dims={dims} selected={partition} />
@@ -243,11 +243,11 @@ function PartitionPanel({ name, row, detail }: { name: string; row?: PartitionRo
             ))}
           </ul>
         )}
-        <MaterializeButton
+        <RunButton
           targets={[name]}
           partition={row.partition}
           icon={<Play />}
-          label="Materialize this partition"
+          label="Run this partition"
           variant="secondary"
         />
       </div>

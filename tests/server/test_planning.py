@@ -11,9 +11,9 @@ import pytest
 from solera.sdk import (
     AllPartitions,
     Automation,
+    DynamicPartitions,
     OnChange,
     Output,
-    PartitionSet,
     Project,
     Source,
     StaticPartitions,
@@ -61,22 +61,22 @@ def test_one_explicit_scope_never_enumerates_the_domain():
         "b": {"kind": "static", "keys": [f"b{i}" for i in range(1000)]},
     }
     now = dt.datetime(2026, 10, 2, tzinfo=UTC)
-    pick = select_partitions(dims, ["a=a7,b=b9"], now=now, elements=lambda o: None, missing=lambda s: True)
+    pick = select_partitions(dims, ["a=a7,b=b9"], now=now, partitions=lambda o: None, missing=lambda s: True)
     start = time.perf_counter()
     for _ in range(100):
         select_partitions(
-            dims, ["a=a7,b=b9", "a=nope,b=b9"], now=now, elements=lambda o: None, missing=lambda s: True
+            dims, ["a=a7,b=b9", "a=nope,b=b9"], now=now, partitions=lambda o: None, missing=lambda s: True
         )
     assert time.perf_counter() - start < 1.0  # 1,000,000 possible scopes, none listed
     assert len(pick) == 1
     with pytest.raises(ValueError, match=f"more than {MAX_PARTITIONS}"):
-        select_partitions(dims, "all", now=now, elements=lambda o: None, missing=lambda s: True)
+        select_partitions(dims, "all", now=now, partitions=lambda o: None, missing=lambda s: True)
     hourly = {"t": {"kind": "time", "start": "2020-01-01", "every": "1h", "format": "%Y-%m-%dT%H:00"}}
-    assert select_partitions(hourly, "latest", now=now, elements=lambda o: None, missing=lambda s: True) == [
-        "2026-10-01T23:00"
-    ]
     assert select_partitions(
-        hourly, ["2026-10-01T22:00"], now=now, elements=lambda o: None, missing=lambda s: True
+        hourly, "latest", now=now, partitions=lambda o: None, missing=lambda s: True
+    ) == ["2026-10-01T23:00"]
+    assert select_partitions(
+        hourly, ["2026-10-01T22:00"], now=now, partitions=lambda o: None, missing=lambda s: True
     )
 
 
@@ -86,19 +86,19 @@ def test_membership_and_size_agree_with_the_enumeration():
         "site": {"kind": "set", "output": "sites"},
         "tier": {"kind": "static", "keys": ["a,b", "c"]},
     }
-    now, elements = dt.datetime(2026, 10, 2, tzinfo=UTC), {"sites": ["Richmond", "Oslo"]}.get
-    listed = enumerate_partitions(dims, now, elements)
-    member = membership(dims, now, elements)
-    assert size(dims, now, elements) == len(listed) == 4 * 2 * 2 and all(member(s) for s in listed)
+    now, partitions = dt.datetime(2026, 10, 2, tzinfo=UTC), {"sites": ["Richmond", "Oslo"]}.get
+    listed = enumerate_partitions(dims, now, partitions)
+    member = membership(dims, now, partitions)
+    assert size(dims, now, partitions) == len(listed) == 4 * 2 * 2 and all(member(s) for s in listed)
     assert member("day=2026-09-28,site=Oslo,tier=a%2Cb")
     assert not member("day=2026-10-02,site=Oslo,tier=c")  # its window is still open
     assert not member("day=2026-09-28,site=Paris,tier=c")
     assert not member("site=Oslo,day=2026-09-28,tier=c")  # not canonical: never listed
     assert not member("day=2026-09-28,site=Oslo,tier=a,b") and not member("day=2026-09-28")
-    assert membership({}, now, elements)("") and not membership({}, now, elements)("x")
-    assert size({}, now, elements) == 1
+    assert membership({}, now, partitions)("") and not membership({}, now, partitions)("x")
+    assert size({}, now, partitions) == 1
     big = {d: {"kind": "static", "keys": [f"{d}{i}" for i in range(1000)]} for d in "ab"}
-    assert size(big, now, elements) == 1_000_000 > MAX_PARTITIONS  # counted, not listed
+    assert size(big, now, partitions) == 1_000_000 > MAX_PARTITIONS  # counted, not listed
 
 
 async def test_a_fan_in_reads_the_heads_that_exist(state):  # noqa: F811
@@ -222,7 +222,7 @@ async def test_a_fan_in_reads_only_current_partitions(state):  # noqa: F811
     dep across the dimension, not a missing-input check."""
     members, seen = {"keys": ["east", "west"]}, {}
 
-    @asset(outputs=PartitionSet("sites"))
+    @asset(outputs=DynamicPartitions("sites"))
     def sites():
         return members["keys"]
 

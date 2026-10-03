@@ -461,7 +461,7 @@ async def test_reconciliation_streams_the_slice_s_keys(store, monkeypatch):
             "t",
             out,
             store,
-            {"commit_number": 1, "unsettled": [{"unknown": True}], "before": written.ref.to_json()},
+            {"commit_number": 1, "repairs": [{"unknown": True}], "before": written.ref.to_json()},
             patch,
         )
         o.index = KeyIndex(io, None, state)
@@ -882,7 +882,7 @@ async def test_a_repair_read_back_waits_off_the_event_loop(store, monkeypatch):
         "t",
         out,
         store,
-        {"commit_number": 1, "unsettled": [{"unknown": True}], "before": written.ref.to_json()},
+        {"commit_number": 1, "repairs": [{"unknown": True}], "before": written.ref.to_json()},
         patch,
     )
     o.index = KeyIndex(io, None, state)

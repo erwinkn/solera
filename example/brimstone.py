@@ -22,12 +22,12 @@ from solera.sdk import (
     Automation,
     AutoRefresh,
     Cron,
+    DynamicPartitions,
     Each,
     Every,
     Migration,
     OnDeploy,
     Output,
-    PartitionSet,
     Project,
     Result,
     Retry,
@@ -92,7 +92,7 @@ ingest = Pool("ingest")
 
 
 @asset(
-    outputs=PartitionSet(),  # name defaults to the function name
+    outputs=DynamicPartitions(),  # name defaults to the function name
     # Daily, and once per deploy so a fresh revision starts from a current list.
     automations=[Automation(trigger=Cron("0 6 * * *")), Automation(trigger=OnDeploy())],
 )
@@ -103,7 +103,7 @@ def sites(graph: GraphClient) -> list[str]:
 
 # The upload set is fed from outside: the uploads service calls
 #   client.commit("uploads", upsert=["u-91"], remove=["u-12"])
-uploads = PartitionSet("uploads")
+uploads = DynamicPartitions("uploads")
 
 
 # ---------------------------------------------------------------------------

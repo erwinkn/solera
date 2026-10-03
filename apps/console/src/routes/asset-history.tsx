@@ -2,7 +2,7 @@ import { keepPreviousData, useInfiniteQuery, useQuery } from "@tanstack/react-qu
 import { getRouteApi, Link } from "@tanstack/react-router";
 import { ArrowDownRight, ArrowUpLeft } from "lucide-react";
 import { q, useManifest, useProject } from "@/api/queries";
-import type { Lineage, Materialization } from "@/api/types";
+import type { Lineage, Commit } from "@/api/types";
 import { cn } from "@/lib/cn";
 import { compact, shortId } from "@/lib/format";
 import { Button } from "@/ui/button";
@@ -24,14 +24,14 @@ export function AssetHistory() {
     ...q.history(project, name, { output, partition }),
     placeholderData: keepPreviousData,
   });
-  const rows = history.data?.pages.flatMap((p) => p.materializations) ?? [];
+  const rows = history.data?.pages.flatMap((p) => p.commits) ?? [];
   const only = outputs.length === 1 ? outputs[0]!.name : undefined;
   const selectedOutput = vout ?? output ?? only;
   const selected =
     generation && selectedOutput
       ? { output: selectedOutput, partition: vpartition ?? partition ?? "", generation: Number(generation) }
       : undefined;
-  const isSelected = (m: Materialization) =>
+  const isSelected = (m: Commit) =>
     !!selected &&
     m.generation === selected.generation &&
     m.output === selected.output &&
@@ -40,7 +40,7 @@ export function AssetHistory() {
   if (outputs.length === 0) {
     return (
       <Card>
-        <Empty title="A job makes no versions">Its runs are its history: see the Runs tab.</Empty>
+        <Empty title="A job makes no commits">Its runs are its history: see the Runs tab.</Empty>
       </Card>
     );
   }
@@ -48,7 +48,7 @@ export function AssetHistory() {
     <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_24rem]">
       <Card>
         <CardHeader
-          title="Versions"
+          title="Commits"
           description="Every version a commit installed, newest first, with what changed and its metadata"
           actions={
             outputs.length > 1 && (
@@ -83,7 +83,7 @@ export function AssetHistory() {
         ) : !history.data ? (
           <Skeleton className="mx-4 mb-4 h-40" />
         ) : rows.length === 0 ? (
-          <Empty compact title="No versions yet">
+          <Empty compact title="No commits yet">
             Nothing has been committed{partition ? " for this partition" : ""}.
           </Empty>
         ) : (
@@ -134,7 +134,7 @@ function VersionRow({
   showOutput,
   showPartition,
 }: {
-  m: Materialization;
+  m: Commit;
   selected: boolean;
   showOutput: boolean;
   showPartition: boolean;

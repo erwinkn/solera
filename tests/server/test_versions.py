@@ -49,7 +49,7 @@ async def test_a_paged_delta_window_says_the_generation_it_read(state):  # noqa:
     assert g3 > g2
     assert seen == [(False, [("a", 2)]), (False, [("b", 2)]), (False, [("b", 3)])]
 
-    made = (await engine.history.materializations(outputs=["copy"]))["materializations"]
+    made = (await engine.history.commits(outputs=["copy"]))["commits"]
     pages = sorted(m["generation"] for m in made)[-3:]  # the three pages of the second run
     read = []
     for generation in pages:
@@ -151,9 +151,9 @@ async def _dead_write(state, landed: bool):  # noqa: F811
     files, _ = await KeyIndex(ObjectIO(state.objects), None, index.pinned()).resolve(
         SortedEntries.of([b"k"]), commit_number=1, attempt="dead", generation=12
     )
-    state.model.unsettled[("items", "")] = [{**files.to_json(), "run": "r", "attempt": "dead"}]
+    state.model.repairs[("items", "")] = [{**files.to_json(), "run": "r", "attempt": "dead"}]
     assert status_of(await drive(engine, await engine.submit(["items"]))) == "succeeded"
-    assert ("items", "") not in state.model.unsettled
+    assert ("items", "") not in state.model.repairs
     return engine, live
 
 

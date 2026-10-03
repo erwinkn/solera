@@ -11,7 +11,7 @@ import { layout } from "./dag";
 
 // -- the model ---------------------------------------------------------------------
 
-export type NodeKind = "asset" | "job" | "partition-set" | "source";
+export type NodeKind = "asset" | "job" | "dynamic-partitions" | "source";
 export type EdgeKind = "in" | "incremental" | "each" | "all_partitions" | "dep" | "partitions";
 
 export interface GraphNode {
@@ -30,25 +30,25 @@ export interface GraphEdge {
 
 export function kindOf(asset: AssetDecl): NodeKind {
   if (asset.outputs.length === 0) return "job";
-  if (asset.outputs.some((o) => o.partition_set)) return "partition-set";
+  if (asset.outputs.some((o) => o.dynamic_partitions)) return "dynamic-partitions";
   return "asset";
 }
 
 export const KIND_LABEL: Record<NodeKind, string> = {
   asset: "asset",
   job: "job",
-  "partition-set": "partition set",
+  "dynamic-partitions": "dynamic partitions",
   source: "source",
 };
 
 export const KIND_ICON: Record<NodeKind, ReactNode> = {
   asset: <Boxes />,
   job: <Briefcase />,
-  "partition-set": <ListTree />,
+  "dynamic-partitions": <ListTree />,
   source: <Database />,
 };
 
-/** Assets and sources as nodes; inputs, deps and partition sets as edges, by kind. */
+/** Assets and sources as nodes; inputs, deps and dynamic partitions as edges, by kind. */
 export function graphOf(manifest: Manifest): {
   nodes: GraphNode[];
   edges: GraphEdge[];
@@ -85,7 +85,7 @@ export function graphOf(manifest: Manifest): {
     }
     for (const dep of asset.deps) add({ from: owner(dep), to: id, kind: "dep" });
     for (const dim of Object.values(asset.partitions?.dims ?? {})) {
-      if (dim.kind === "set") add({ from: owner(dim.output), to: id, kind: "partitions" });
+      if (dim.kind === "dynamic") add({ from: owner(dim.output), to: id, kind: "partitions" });
     }
   }
   return { nodes, edges };
@@ -190,7 +190,7 @@ export function AssetGraph({
             const y2 = b.y + H / 2 + pad;
             const dx = Math.max(40, (x2 - x1) / 2);
             const lit = near ? edge.from === hover || edge.to === hover : null;
-            // A partition set feeds the key sets of many assets: drawn only for the node in hand.
+            // Dynamic partitions feed the key sets of many assets: drawn only for the node in hand.
             if (edge.kind === "partitions" && !lit) return null;
             return (
               <path

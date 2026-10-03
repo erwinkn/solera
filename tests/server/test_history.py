@@ -76,9 +76,7 @@ async def test_versions_carry_metadata_and_lineage(state, clock):
     await engine.initialize()
     await run(engine, clock, ["revenue"], upstream=True, config={"n": 4})
     await run(engine, clock, ["ranked"])
-    made = (await engine.history.materializations(outputs=["orders", "revenue", "ranked"]))[
-        "materializations"
-    ]
+    made = (await engine.history.commits(outputs=["orders", "revenue", "ranked"]))["commits"]
     by = {m["output"]: m for m in made}
     assert by["orders"]["metadata"] == {"rows": 4, "source": "shop"}
     assert by["orders"]["rows"] == 4
@@ -88,10 +86,8 @@ async def test_versions_carry_metadata_and_lineage(state, clock):
     # Paging one version at a time walks them all, even those made at the same moment.
     paged, cursor = [], None
     while True:
-        page = await engine.history.materializations(
-            outputs=["orders", "revenue", "ranked"], before=cursor, limit=1
-        )
-        paged += page["materializations"]
+        page = await engine.history.commits(outputs=["orders", "revenue", "ranked"], before=cursor, limit=1)
+        paged += page["commits"]
         if (cursor := page["next"]) is None:
             break
     assert paged == made
@@ -246,7 +242,7 @@ async def test_flush_merge_delete_and_purge(state, clock):
     await lake.job
     assert "hidden" not in files["runs"][0] and files["runs"][0]["rows"] == 3
     assert hidden["path"] in {path for path, _ in state.model.garbage}
-    made = (await engine.history.materializations(outputs=["orders"]))["materializations"]
+    made = (await engine.history.commits(outputs=["orders"]))["commits"]
     assert runs[1] not in {m["run"] for m in made}
 
 

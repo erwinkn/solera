@@ -1,6 +1,6 @@
 /**
  * What each state means to an operator, as one of six tones. Every status
- * shown anywhere — runs, tasks, attempts, partitions, keys, ticks, edges —
+ * shown anywhere — runs, tasks, attempts, partitions, keys, ticks, inputs —
  * maps here, so "red" means the same thing on every screen.
  *
  *   ok    done and current            run   working right now
@@ -44,7 +44,7 @@ const TONES: Record<string, Tone> = {
   advanced: "run",
   requested: "ok",
   refused: "warn",
-  // edges and explain
+  // inputs and explain
   caught_up: "ok",
   behind: "warn",
   paging: "run",

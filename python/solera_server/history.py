@@ -7,7 +7,7 @@ Eight tables, each row about one:
     runs              finished run or source commit: how it was asked for, how it ended
     tasks             task of a finished run: timings, retries, executor
     attempts          attempt of a finished run: its phases, and the outputs it committed
-    materializations  output version a commit installed, with its metadata
+    commits  output version a commit installed, with its metadata
     lineage           input version an output version was built from, and what its read saw
 
 A version is the generation of the write that made it (docs/versions.md):
@@ -142,7 +142,7 @@ TABLES = {
             "keys": "MAP(VARCHAR, BIGINT)",  # an Each attempt's keys by outcome: ok, failed…
         },
     ),
-    "materializations": Table(
+    "commits": Table(
         "run",
         "at",
         {
@@ -401,12 +401,12 @@ def run_row(run: dict, *, live: bool = False) -> dict:
 
 def run_record(rows: dict[str, list[dict]], events: int = 0) -> dict:
     """A finished run as the model held it, from its rows — `run_rows` (or
-    `commit_row`) backwards — and how many events it has had."""
+    `source_run_row`) backwards — and how many events it has had."""
 
     [row] = rows["runs"]
     if row["trigger"] == "commit":
         record = {"id": row["id"], "source": row["source"], "by": row["by"]}
-        for m in rows.get("materializations") or ():
+        for m in rows.get("commits") or ():
             if m["commit_number"] is None:
                 record["version"] = json.loads(m["metadata"] or "{}").get("version")
             else:
@@ -453,7 +453,7 @@ def run_record(rows: dict[str, list[dict]], events: int = 0) -> dict:
     }
 
 
-def commit_row(run: dict, at: float) -> dict:
+def source_run_row(run: dict, at: float) -> dict:
     """The `runs` row of a source commit (§5): `run` is its record."""
 
     return {
@@ -480,7 +480,7 @@ def commit_row(run: dict, at: float) -> dict:
     }
 
 
-def materialization(
+def commit_row(
     output, asset, partition, head, *, keys=None, rows=None, metadata=None, listed=None, complete=True
 ) -> dict:
     """The row of an output version a commit installed: `head` is the head
@@ -769,7 +769,7 @@ class History:
 
         def work(con):
             found = {}
-            for table, order in (("runs", "id"), ("tasks", "id"), ("materializations", "output")):
+            for table, order in (("runs", "id"), ("tasks", "id"), ("commits", "output")):
                 found[table] = _dicts(
                     con.execute(
                         f'SELECT * FROM {table} WHERE "{TABLES[table].key}" = ? ORDER BY {order}', [run_id]
@@ -780,9 +780,7 @@ class History:
             ).fetchall()
             return found
 
-        found = await self.query(
-            work, ("runs", "tasks", "materializations", "run_events"), run=run_id, live=False
-        )
+        found = await self.query(work, ("runs", "tasks", "commits", "run_events"), run=run_id, live=False)
         return run_record(found, found.pop("events") or 0) if found["runs"] else None
 
     async def attempts(self, run_id: str) -> dict[str, list[dict]]:
@@ -1014,7 +1012,7 @@ class History:
         # Not pruned by `until`: an attempt may start after it, its task before.
         return await self.query(work, ("tasks", "attempts"), since=since, live=False)
 
-    async def materializations(
+    async def commits(
         self,
         *,
         outputs: list[str] | None = None,
@@ -1044,12 +1042,12 @@ class History:
         def work(con):
             return _dicts(
                 con.execute(
-                    f'SELECT * FROM materializations WHERE {where} ORDER BY "at" DESC, output, partition LIMIT ?',
+                    f'SELECT * FROM commits WHERE {where} ORDER BY "at" DESC, output, partition LIMIT ?',
                     [*params, limit + 1],
                 )
             )
 
-        found = await self.query(work, ("materializations",), until=until, live=False)
+        found = await self.query(work, ("commits",), until=until, live=False)
         more = len(found) > limit
         found = found[:limit]
         for row in found:
@@ -1057,7 +1055,7 @@ class History:
                 row["metadata"] = json.loads(row["metadata"])
         last = found[-1] if more and found else None
         cursor = json.dumps([last["at"], last["output"], last["partition"]]) if last else None
-        return {"materializations": found, "next": cursor}
+        return {"commits": found, "next": cursor}
 
     async def key_outcomes(
         self,
@@ -1133,7 +1131,7 @@ class History:
                 m.generation IS NOT NULL AS committed,
                 a.id AS writer, a.run AS writer_run, a.finished_at AS writer_at
             FROM lineage l
-            LEFT JOIN (SELECT DISTINCT output, partition, generation FROM materializations) m
+            LEFT JOIN (SELECT DISTINCT output, partition, generation FROM commits) m
                 ON m.output = l.input AND m.partition = l.input_partition
                 AND m.generation = coalesce(l.read_generation, l.input_generation)
             LEFT JOIN attempts a
@@ -1172,13 +1170,13 @@ class History:
                 for row in _dicts(
                     con.execute(
                         "SELECT m.output, m.partition, m.generation, m.asset, m.run, m.attempt, m.at, m.rows "
-                        "FROM materializations m JOIN wanted USING (output, partition, generation)"
+                        "FROM commits m JOIN wanted USING (output, partition, generation)"
                     )
                 ):
                     nodes[(row["output"], row["partition"], row["generation"])] = row
             return edges, keys, nodes
 
-        edges, keys, nodes = await self.query(work, ("lineage", "materializations", "attempts"), live=False)
+        edges, keys, nodes = await self.query(work, ("lineage", "commits", "attempts"), live=False)
         m = self.m
         out_nodes = []
         for key in sorted(keys, key=_node_order):

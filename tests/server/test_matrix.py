@@ -261,7 +261,7 @@ def test_an_explicit_selection_is_linear():
         dims,
         keys + keys[:10],
         now=dt.datetime(2026, 10, 2, tzinfo=dt.UTC),
-        elements=lambda o: None,
+        partitions=lambda o: None,
         missing=bool,
     )
     assert len(picked) == 80_000 and time.perf_counter() - start < 3.0  # ~25 s when quadratic

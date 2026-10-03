@@ -241,10 +241,10 @@ def create_app(
         ]
         return detail
 
-    @app.get("/api/projects/{p}/assets/{name}/edges")
-    async def asset_edges(p: str, name: str, request: Request):
+    @app.get("/api/projects/{p}/assets/{name}/inputs")
+    async def asset_inputs(p: str, name: str, request: Request):
         runtime = await asset_engine(request, p, name)
-        return await runtime.asset_edges(name)
+        return await runtime.asset_inputs(name)
 
     @app.get("/api/projects/{p}/assets/{name}/failures")
     async def asset_failures(
@@ -286,10 +286,10 @@ def create_app(
 
     @app.get("/api/projects/{p}/assets/{name}/explain")
     async def asset_explain(
-        p: str, name: str, request: Request, key: str, partition: str = "", edge: str | None = None
+        p: str, name: str, request: Request, key: str, partition: str = "", input: str | None = None
     ):
         runtime = await asset_engine(request, p, name)
-        return await runtime.explain(name, key, partition, edge)
+        return await runtime.explain(name, key, partition, input)
 
     @app.get("/api/projects/{p}/outputs/{name}/heads")
     async def output_heads(p: str, name: str, request: Request):
@@ -448,9 +448,7 @@ def create_app(
             if output not in names:
                 raise KeyError(output)
             names = [output]
-        page = await runtime.history.materializations(
-            outputs=names, partition=partition, before=before, limit=limit
-        )
+        page = await runtime.history.commits(outputs=names, partition=partition, before=before, limit=limit)
         return {"asset": name, **page}
 
     @app.get("/api/projects/{p}/outputs/{name}/lineage")
@@ -546,10 +544,15 @@ def create_app(
             raise KeyError(f"{run_id}/{attempt}: no result yet")
         return result
 
-    @app.get("/api/projects/{p}/holds")
-    async def holds(p: str, request: Request):
+    @app.get("/api/projects/{p}/repairs")
+    async def repairs(p: str, request: Request):
         runtime = await project_engine(request, p)
-        return runtime.holds_view()
+        return {"repairs": runtime.repairs_view()}
+
+    @app.get("/api/projects/{p}/cleanups")
+    async def cleanups(p: str, request: Request):
+        runtime = await project_engine(request, p)
+        return {"cleanups": runtime.cleanups_view()}
 
     @app.post("/api/projects/{p}/cleanups:clear")
     async def clear_cleanups(p: str, request: Request):

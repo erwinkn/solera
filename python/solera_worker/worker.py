@@ -333,13 +333,13 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
     `loaded` event; `observed` records what each read saw."""
 
     manifest_asset = project.manifest["assets"][asset.name]
-    edges = manifest_asset["inputs"]
+    inputs = manifest_asset["inputs"]
     hints = project.hints[asset.name]  # resolved once, at registration
     args, changes, delivered = {}, {}, {}
     windows = []
     for name, pin in spec["inputs"].items():
-        edge = edges.get(name)
-        if edge is None or "each" in pin:  # a dep pin: recorded, never bound; an Each page: per key
+        input = inputs.get(name)
+        if input is None or "each" in pin:  # a dep pin: recorded, never bound; an Each page: per key
             continue
         param = name
         t = hints.get(param)
@@ -521,7 +521,7 @@ async def _store_outputs(
             continue
         if o.files is None:
             await _resolve(o, spec, engine.get(name))
-        if not o.files.files and o.prior is not None and not o.unsettled:
+        if not o.files.files and o.prior is not None and not o.repairs:
             if not _schema_due(o):
                 entries[name] = {"unchanged": True}
                 del outs[name]
@@ -586,8 +586,8 @@ async def _store_outputs(
             entry["keys"] = files.to_json()
         elif o.index is not None:
             entry["keys"] = intents[name]
-            if o.elements is not None:
-                entry["elements"] = o.elements
+            if o.partitions is not None:
+                entry["partitions"] = o.partitions
         if written.ref is None:
             continue
         ref = dataclasses.replace(written.ref, store=store_name)
@@ -630,7 +630,7 @@ class _Out:
     files: DeltaFiles | None = None
     changed: tuple | None = None  # ([written key], [removed key]), or None past LISTED
     write: KeyedWrite | None = None
-    elements: list[str] | None = None
+    partitions: list[str] | None = None
     schema_only: bool = False  # unchanged content, migrations to apply
 
     @property
@@ -663,8 +663,8 @@ class _Out:
         return not isinstance(self.value, Patch) or self.reset
 
     @property
-    def unsettled(self) -> list:
-        return self.info.get("unsettled") or []
+    def repairs(self) -> list:
+        return self.info.get("repairs") or []
 
     def context(self, spec, worker_id) -> WriteContext:
         return WriteContext(
@@ -711,7 +711,7 @@ async def _prepare(o: _Out, spec, keys_io) -> None:
         return
     o.index = KeyIndex(keys_io, None, IndexState.from_json(o.info["index"]))
     if o.sql:
-        if o.output.is_partition_set:
+        if o.output.is_dynamic_partitions:
             raise WriteError(f"{o.output.name}: Sql writes need a table output")
         return
     o.prepared = await asyncio.to_thread(prepare_for, o.store, o.value, o.output)
@@ -722,14 +722,14 @@ async def _prepare(o: _Out, spec, keys_io) -> None:
         o.run = await asyncio.to_thread(SortedEntries.from_rows, o.prepared.rows, removes)
     except ValueError as e:  # a key both written and removed
         raise WriteError(f"{o.output.name}: {e}") from e
-    if any(intent.get("unknown") for intent in o.unsettled):
+    if any(intent.get("unknown") for intent in o.repairs):
         # A dead Sql writer's keys are unknown (docs/versions.md §5): the index takes
         # every key the store holds, with this patch on top, and the store writes
         # this patch's keys, every one.
         o.files, _ = await _reconcile(o, spec)
         return
-    if o.unsettled:
-        o.intended = frozenset(await _intended(o.info, keys_io, o.unsettled))
+    if o.repairs:
+        o.intended = frozenset(await _intended(o.info, keys_io, o.repairs))
         left = [k for k in o.intended if k not in o.prepared.rows and k not in o.prepared.removes]
         if left:
             o.run = await _repair(o, sorted(left))
@@ -758,12 +758,12 @@ def _keyed_write(o: _Out, keys_io) -> KeyedWrite:
     deletes — or the write whole."""
 
     p, changed = o.prepared, o.changed
-    if o.output.is_partition_set:
+    if o.output.is_dynamic_partitions:
         own = set(p.take(None))
         if o.replace:
-            o.elements = sorted(own)
+            o.partitions = sorted(own)
         else:
-            o.elements = sorted((set(o.info.get("elements") or ()) - set(p.removes)) | own)
+            o.partitions = sorted((set(o.info.get("partitions") or ()) - set(p.removes)) | own)
     if changed is not None:
         upserted = frozenset(map(key_str, changed[0]))
         deleted = frozenset(map(key_str, changed[1]))
@@ -774,7 +774,7 @@ def _keyed_write(o: _Out, keys_io) -> KeyedWrite:
         if changed is None:
             return KeyedWrite(p, DeltaKeys(keys_io, o.index.prefix, tuple(o.files.files)), whole=o.replace)
         return KeyedWrite(p, upserted, deleted, whole=o.replace)
-    if o.reset or (o.replace and (changed is None or o.unsettled)):
+    if o.reset or (o.replace and (changed is None or o.repairs)):
         # A first write, or a replacement with more changes than it lists, or with
         # dead attempts': the scope rewritten.
         return KeyedWrite(p, whole=True)
@@ -829,7 +829,7 @@ async def _upload(index: KeyIndex, commit_number: int, attempt: str, answer) -> 
     return DeltaFiles([FileInfo.describe(name, 0, data)], a["added"], a["removed"], True), delta_keys(data)
 
 
-async def _intended(info, keys_io, unsettled) -> list[str]:
+async def _intended(info, keys_io, repairs) -> list[str]:
     """The keys dead attempts meant to change (§8): each unsettled intent
     lists the delta files of an attempt that died while writing, and any of
     those writes may have landed."""
@@ -837,13 +837,13 @@ async def _intended(info, keys_io, unsettled) -> list[str]:
     state = IndexState(
         prefix=info["index"]["prefix"],
         log=tuple(
-            (n, tuple(FileInfo.from_json(f) for f in intent["files"])) for n, intent in enumerate(unsettled)
+            (n, tuple(FileInfo.from_json(f) for f in intent["files"])) for n, intent in enumerate(repairs)
         ),
     )
     index = KeyIndex(keys_io, None, state)
     found, after = [], None
     while True:
-        keys, _, _, _, after = await index.pending(0, len(unsettled) - 1, after, REPAIR_PAGE)
+        keys, _, _, _, after = await index.pending(0, len(repairs) - 1, after, REPAIR_PAGE)
         found.extend(map(key_str, keys))
         if after is None:
             return found

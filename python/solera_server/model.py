@@ -159,7 +159,7 @@ class Model:
                 "garbage": self.garbage,
                 "retired": self.retired,
                 "partitions": _nest(self.partitions, 2),
-                "unsettled": _nest(self.unsettled, 2),
+                "repairs": _nest(self.repairs, 2),
                 "cleanups": _nest(self.cleanups, 2),
                 "automations": self.automations,
                 "sensors": self.sensors,
@@ -196,7 +196,7 @@ class Model:
         # ("@asset", scope). A rename moves it, retirement trims it: one record.
         self.partitions = Grouped(_flatten(snap.get("partitions"), 2))
         # (output, scope) -> intents of attempts that died while writing it (§8)
-        self.unsettled: dict[tuple, list] = _flatten(snap.get("unsettled"), 2)
+        self.repairs: dict[tuple, list] = _flatten(snap.get("repairs"), 2)
         # (output, scope) -> data garbage of an immutable store, each entry at the
         # event position that let go of it: for the scope's next attempt to discard
         # once no reader pins it (docs/lifecycle.md §9.8)
@@ -285,10 +285,10 @@ class Model:
         indexes keep a delta log (§6)."""
 
         return {
-            edge["output"]
+            input["output"]
             for asset in ((manifest or {}).get("assets") or {}).values()
-            for edge in asset["inputs"].values()
-            if edge["kind"] == "incremental"
+            for input in asset["inputs"].values()
+            if input["kind"] == "incremental"
         }
 
     # -- reads ---------------------------------------------------------------------------
@@ -317,8 +317,8 @@ class Model:
 
         return self.partitions.get((asset, partition)) or {}
 
-    def watermark(self, asset: str, edge: str, partition: str) -> dict | None:
-        return (self.partition(asset, partition).get("watermarks") or {}).get(edge)
+    def watermark(self, asset: str, input: str, partition: str) -> dict | None:
+        return (self.partition(asset, partition).get("watermarks") or {}).get(input)
 
     def watermarks(self):
         """Every Incremental edge's watermark, of every scope."""
@@ -603,12 +603,12 @@ class Model:
         self.unfinished.pop(task["id"], None)
         self._finished(run, task, "canceled", None, at)
 
-    def _subscribed(self, asset: str, edge: str, wm: dict) -> bool:
+    def _subscribed(self, asset: str, input: str, wm: dict) -> bool:
         """Whether the project still declares the Incremental edge a
         watermark keeps the delivery of: the same asset, parameter and
         upstream output."""
 
-        spec = ((self.manifest or {}).get("assets") or {}).get(asset, {}).get("inputs", {}).get(edge) or {}
+        spec = ((self.manifest or {}).get("assets") or {}).get(asset, {}).get("inputs", {}).get(input) or {}
         return spec.get("kind") == "incremental" and spec.get("output") == wm.get("output")
 
     def _unsubscribe(self, asset: str | None = None, partition: str | None = None) -> None:
@@ -625,8 +625,8 @@ class Model:
             marks = self.partitions.get(key, {}).get("watermarks")
             if not marks or key in live:
                 continue
-            for edge in [edge for edge, wm in marks.items() if not self._subscribed(key[0], edge, wm)]:
-                del marks[edge]
+            for input in [input for input, wm in marks.items() if not self._subscribed(key[0], input, wm)]:
+                del marks[input]
             if not marks:
                 del self.partitions[key]["watermarks"]
 
@@ -659,8 +659,8 @@ class Model:
         for key in [k for k in self.indexes if removed(k)]:
             index = self.indexes.pop(key)
             self.garbage.extend([index.path(name), self.applied] for name in sorted(index.referenced()))
-        for key in [k for k in self.unsettled if removed(k)]:
-            del self.unsettled[key]
+        for key in [k for k in self.repairs if removed(k)]:
+            del self.repairs[key]
         for key in [k for k in self.partitions if gone(k[0])]:
             del self.partitions[key]
 
@@ -701,7 +701,7 @@ class Model:
         move(self.partitions, asset_map, 0)
         # An Each asset's failure index (`@asset`), whose files stay under their prefix.
         move(self.indexes, {f"@{old}": f"@{new}" for old, new in asset_map.items()}, 0)
-        move(self.unsettled, output_map, 0, merge=list)
+        move(self.repairs, output_map, 0, merge=list)
         move(self.cleanups, output_map, 0, merge=_renumbered)
         for head in self.heads.values():
             if head.get("asset") in asset_map:
@@ -849,8 +849,8 @@ class Model:
             launched = None
             self._claimed(run, task, e["attempt"], e["started_at"])
         times = self._attempt_events(run, task, e, launched)
-        for output, intent in (e.get("unsettled") or {}).items():
-            intents = self.unsettled.setdefault((output, task["partition"]), [])
+        for output, intent in (e.get("intents") or {}).items():
+            intents = self.repairs.setdefault((output, task["partition"]), [])
             intents.append({**intent, "run": e["run"], "attempt": e["attempt"]})
         self._cleaned_up(task["partition"], e)
         if launched is not None and not e.get("commit"):
@@ -984,11 +984,11 @@ class Model:
                 self._superseded(name, partition, before, head, keys, prefix)
             self.heads[(name, partition)] = {**head, "run": e["run"], "attempt": e["attempt"], "at": at}
             self._commit_keys(name, partition, keys, prefix)
-            if name in commit.get("settled", ()):
+            if name in commit.get("repaired", ()):
                 # The commit's delta took in what the dead attempts left (§8):
                 # their intent files are no longer needed.
                 index = self.index(name, partition)
-                for intent in self.unsettled.pop((name, partition), ()):
+                for intent in self.repairs.pop((name, partition), ()):
                     self.garbage.extend([index.path(f["name"]), self.applied] for f in intent["files"])
         record = self._partition(asset, partition)
         if "drained" in commit:
@@ -998,9 +998,9 @@ class Model:
                 record.pop("cursor", None)
             else:
                 record["cursor"] = commit["cursor"]
-        for edge, wm in commit.get("watermarks", {}).items():
-            if self._subscribed(asset, edge, wm):  # an edge removed while it ran keeps no delivery
-                record.setdefault("watermarks", {})[edge] = wm
+        for input, wm in commit.get("watermarks", {}).items():
+            if self._subscribed(asset, input, wm):  # an edge removed while it ran keeps no delivery
+                record.setdefault("watermarks", {})[input] = wm
         if "failures" in commit:
             self._failures(asset, partition, commit["failures"])
         for row in commit.get("key_outcomes") or ():
@@ -1018,8 +1018,8 @@ class Model:
         for name in changed:
             head = self.heads[(name, partition)]
             self._record(
-                "materializations",
-                history.materialization(
+                "commits",
+                history.commit_row(
                     name,
                     asset,
                     partition,
@@ -1173,7 +1173,7 @@ class Model:
                 fresh = IndexState(prefix=prefix).committed(keys["commit_number"], delta, keep_log=keep_log)
                 if (output, partition) in self.indexes:
                     self._replace_index((output, partition), fresh)
-                for intent in self.unsettled.pop((output, partition), ()):
+                for intent in self.repairs.pop((output, partition), ()):
                     self.garbage.extend([index.path(f["name"]), self.applied] for f in intent["files"])
                 index = fresh
             elif keys["files"]:
@@ -1341,7 +1341,7 @@ class Model:
         self._commit_keys(e["source"], "", e.get("keys"))
         run = e.get("run")
         if run is not None:
-            self._record("runs", history.commit_row(run, e["at"]))
+            self._record("runs", history.source_run_row(run, e["at"]))
             self._record(
                 "run_events",
                 {
@@ -1356,8 +1356,8 @@ class Model:
             installed = {**self.heads[(e["source"], "")], "run": run["id"], "attempt": None}
             version = {"version": head["version"]} if head.get("version") is not None else None
             self._record(
-                "materializations",
-                history.materialization(
+                "commits",
+                history.commit_row(
                     e["source"], None, "", installed, keys=e.get("keys"), listed=run, metadata=version
                 ),
             )

@@ -181,7 +181,7 @@ def takes(t: Any, output: Output, *, frames: bool = False, values: bool = True) 
     by_key = origin in (dict, Mapping) and (typing.get_args(t) or (str,))[0] in (str, Any)
     if output.key == KEYS:
         return by_key
-    if output.is_partition_set:
+    if output.is_dynamic_partitions:
         return listed or origin in (set, frozenset)
     if output.key is not None:
         return rows or by_key
@@ -214,7 +214,7 @@ def by_key(write: Any, output: Output) -> tuple[Any, list[str]] | None:
     for any other write. Rows that carry the key column already must agree
     with their key. Each group is a list of mappings."""
 
-    if output.key in (None, KEYS) or output.is_partition_set or not isinstance(write, Mapping):
+    if output.key in (None, KEYS) or output.is_dynamic_partitions or not isinstance(write, Mapping):
         return None
     column, rows, empty = output.key, [], []
     for key, group in write.items():
@@ -274,7 +274,7 @@ class Prepared:
                 f"{self.output.name}: asked to write key {e.args[0]!r}, which the write does not hold"
             ) from None
         picked = self.take(rows)
-        if self.output.is_partition_set:
+        if self.output.is_dynamic_partitions:
             return picked
         if self.output.key == KEYS:
             return [value for _, value in picked]
@@ -368,12 +368,12 @@ def prepare(write: Any, output: Output, read: Callable | None = None) -> Prepare
     empty: list[str] = []
     kinds = None
     try:
-        got = read(content, output) if read is not None and not output.is_partition_set else None
+        got = read(content, output) if read is not None and not output.is_dynamic_partitions else None
         if got is not None:
             rows, take, empty, kinds = got
-        elif output.is_partition_set:
-            elements = [str(e) for e in content or ()]
-            rows, take = Rows.keys(elements, b""), _taker(elements)
+        elif output.is_dynamic_partitions:
+            partitions = [str(e) for e in content or ()]
+            rows, take = Rows.keys(partitions, b""), _taker(partitions)
         elif output.key == KEYS:
             if content is None:
                 content = {}

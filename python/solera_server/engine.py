@@ -166,11 +166,11 @@ class Engine(Attempts, Sensors, Views):
             keys=self.keys,
         )
         self._sensors_init(sensor_host)
-        self._set_dims = {
+        self._dynamic_dims = {
             dim["output"]
             for a in manifest["assets"].values()
             for dim in ((a.get("partitions") or {}).get("dims") or {}).values()
-            if dim["kind"] == "set"
+            if dim["kind"] == "dynamic"
         }
 
     @property
@@ -409,7 +409,7 @@ class Engine(Attempts, Sensors, Views):
         delay=0.0,
         commit=None,
         more=False,
-        unsettled=None,
+        repairs=None,
         worker=None,
         end=None,
         reason=None,
@@ -443,8 +443,8 @@ class Engine(Attempts, Sensors, Views):
             event["commit"] = commit
         if more:
             event["more"] = True
-        if unsettled:
-            event["unsettled"] = unsettled
+        if repairs:
+            event["intents"] = repairs
         worker = worker_report(worker)  # values the model applies with no parsing
         if keys is not None:
             keys = worker_report({"keys": keys}).get("keys")
@@ -698,43 +698,43 @@ class Engine(Attempts, Sensors, Views):
                     )
         planner = self.planner()
         try:
-            edges = planner.edges(task["asset"], partition)
+            inputs = planner.inputs(task["asset"], partition)
         except planning.UpstreamOnly as error:
             raise Conflict(str(error)) from None
         # Pass 1: pin every non-Incremental edge; their refs enter the fingerprint (§6).
-        inputs, pinned = {}, {}
+        pins, pinned = {}, {}
         incremental = []
-        for edge in edges:
-            param, output = edge.param, edge.output
+        for input in inputs:
+            param, output = input.param, input.output
             load = (asset["inputs"].get(param) or {}).get("load", "data")  # registration decided it
-            if edge.kind == "all_partitions":
-                refs = self._all_partitions(planner, edge)
-                inputs[param] = {"refs": refs, "load": load}
+            if input.kind == "all_partitions":
+                refs = self._all_partitions(planner, input)
+                pins[param] = {"refs": refs, "load": load}
                 indexes = (
                     {k: self._whole_index(output, ref) for k, ref in refs.items()} if load == "data" else {}
                 )
                 if any(i is not None for i in indexes.values()):
-                    inputs[param]["indexes"] = {k: i for k, i in indexes.items() if i is not None}
+                    pins[param]["indexes"] = {k: i for k, i in indexes.items() if i is not None}
                 pinned[param] = {k: self._logical(output, r) for k, r in refs.items()}
-            elif edge.kind == "dep":
+            elif input.kind == "dep":
                 # Across upstream-only dimensions, a dep pins the heads that exist and
                 # agree with this scope's keys; otherwise its one projected head (§7).
-                if edge.fan_in:
-                    refs = {k: h["ref"] for k, h in planner.fan_in(edge, complete=False).items()}
+                if input.fan_in:
+                    refs = {k: h["ref"] for k, h in planner.fan_in(input, complete=False).items()}
                 else:
-                    refs = {edge.partition: self._pin_at(output, edge.partition)}
-                inputs[param] = {"refs": refs}
+                    refs = {input.partition: self._pin_at(output, input.partition)}
+                pins[param] = {"refs": refs}
                 # A bound partition set pins into lineage, but it is the dimension — not
                 # interpretation: adding a key must not invalidate existing ones.
-                if not edge.set_dim:
+                if not input.set_dim:
                     pinned[param] = {k: self._logical(output, r) for k, r in refs.items()}
-            elif edge.kind == "incremental":
-                incremental.append(edge)
+            elif input.kind == "incremental":
+                incremental.append(input)
             else:
-                inputs[param] = {"ref": self._pin_at(output, edge.partition), "load": load}
-                if load == "data" and (index := self._whole_index(output, inputs[param]["ref"])) is not None:
-                    inputs[param]["index"] = index
-                pinned[param] = self._logical(output, inputs[param]["ref"])
+                pins[param] = {"ref": self._pin_at(output, input.partition), "load": load}
+                if load == "data" and (index := self._whole_index(output, pins[param]["ref"])) is not None:
+                    pins[param]["index"] = index
+                pinned[param] = self._logical(output, pins[param]["ref"])
         fingerprint = self._fingerprint(asset, run, pinned)
         if full and run["mode"] == "full" and incremental:
             # This run's reset began the pass every edge is on: resume it, page by page.
@@ -746,14 +746,14 @@ class Engine(Attempts, Sensors, Views):
                 full = False
         # Pass 2: Incremental plans against the fingerprinted interpretation (§2.2).
         plans, all_empty, each_page = {}, True, None
-        for edge in incremental:
-            param, upstream_partition = edge.param, edge.partition
-            ref = self._pin_at(edge.output, upstream_partition)
+        for input in incremental:
+            param, upstream_partition = input.param, input.partition
+            ref = self._pin_at(input.output, upstream_partition)
             claim = self.m.claimed(attempt) if attempt is not None else None
             pin, plan, empty = self._incremental_plan(
                 task,
                 param,
-                edge.spec,
+                input.spec,
                 ref,
                 upstream_partition,
                 fingerprint,
@@ -761,12 +761,12 @@ class Engine(Attempts, Sensors, Views):
                 full,
                 (claim or {}).get("pin"),
             )
-            if edge.spec.get("each") is not None:
+            if input.spec.get("each") is not None:
                 pin, plan, empty = self._each_plan(
-                    task, asset, param, edge.spec, ref, upstream_partition, pin, plan, empty
+                    task, asset, param, input.spec, ref, upstream_partition, pin, plan, empty
                 )
                 each_page = pin["each"]
-            inputs[param] = pin
+            pins[param] = pin
             plans[param] = plan
             all_empty = all_empty and empty
         if full and delivery.selects(plans):
@@ -812,25 +812,25 @@ class Engine(Attempts, Sensors, Views):
                 info["index"] = IndexState(prefix=f"{current.prefix}{info['commit_number']:012d}/").to_json()
             elif output.get("key") is not None:
                 info["index"] = self.m.index(name, partition).pinned().to_json()
-                if (name, partition) in self.m.unsettled:
-                    info["unsettled"] = self.m.unsettled[(name, partition)]
-                if output.get("partition_set") or name in self._set_dims:
-                    info["elements"] = list((head or {}).get("elements") or ())
+                if (name, partition) in self.m.repairs:
+                    info["repairs"] = self.m.repairs[(name, partition)]
+                if output.get("dynamic_partitions") or name in self._dynamic_dims:
+                    info["partitions"] = list((head or {}).get("partitions") or ())
             if due := self._due_cleanups(name, partition, attempt):
                 info["cleanup"] = due
             outputs[name] = info
         # The input versions its outputs will be built from, for the history (§7):
         # each pinned ref's generation (docs/versions.md §6).
         lineage = []
-        for edge in edges:
-            pin = inputs.get(edge.param) or {}
+        for input in inputs:
+            pin = pins.get(input.param) or {}
             refs = [pin["ref"]] if pin.get("ref") else list((pin.get("refs") or {}).values())
             for ref in refs:
-                lineage.append([edge.output, ref.get("partition") or "", ref.get("generation"), edge.param])
+                lineage.append([input.output, ref.get("partition") or "", ref.get("generation"), input.param])
         return {
             "version": asset["version"],
-            "domains": self._domains(inputs, outputs, task),
-            "inputs": inputs,
+            "domains": self._domains(pins, outputs, task),
+            "inputs": pins,
             "lineage": lineage,
             "plans": plans,
             "more": more,
@@ -917,28 +917,32 @@ class Engine(Attempts, Sensors, Views):
 
         record = self.manifest["outputs"].get(output) or {}
         store = self.manifest["stores"].get(record.get("store")) or {}
-        if record.get("key") is None or record.get("partition_set") or store.get("writes") != "immutable":
+        if (
+            record.get("key") is None
+            or record.get("dynamic_partitions")
+            or store.get("writes") != "immutable"
+        ):
             return None
         return self.m.index(output, ref.get("partition") or "").pinned().to_json()
 
     @staticmethod
-    def _all_partitions(planner: planning.Planner, edge: planning.Edge) -> dict:
+    def _all_partitions(planner: planning.Planner, input: planning.Input) -> dict:
         """AllPartitions pins every current upstream partition with a complete
         head that agrees with this scope's shared keys, keyed by the dimensions
         it collapses (§7) — chosen among the heads that exist, never by
         expanding the partition domain."""
 
-        if not edge.fan_in:
-            head = planner.head(edge.output, edge.partition)
+        if not input.fan_in:
+            head = planner.head(input.output, input.partition)
             return (
                 {"": head["ref"]}
-                if head is not None and planner.head_complete(edge.output, edge.partition)
+                if head is not None and planner.head_complete(input.output, input.partition)
                 else {}
             )
-        return {edge.key(s): h["ref"] for s, h in planner.fan_in(edge, complete=True).items()}
+        return {input.key(s): h["ref"] for s, h in planner.fan_in(input, complete=True).items()}
 
     def _incremental_plan(
-        self, task, param, edge, ref, upstream_partition, fingerprint, run, full, claim_pin=None
+        self, task, param, input, ref, upstream_partition, fingerprint, run, full, claim_pin=None
     ):
         """Plan one Incremental edge's page from its watermark (`delivery`):
         returns the pin for the spec, the plan its commit `advance`s the
@@ -955,9 +959,9 @@ class Engine(Attempts, Sensors, Views):
         finishes its old changes up to a cutover, then diffs membership
         (per-key §11)."""
 
-        output = edge["output"]
+        output = input["output"]
         keyed = self.manifest["outputs"][output].get("key") is not None
-        limit = int(edge.get("page_size") or 100)
+        limit = int(input.get("page_size") or 100)
         # The generation of the head a page is planned against. A delivery that
         # reads a fixed snapshot over its pages — a delta window, a rescope's
         # diff, a range of batches — keeps the one it started at: what its
@@ -976,8 +980,8 @@ class Engine(Attempts, Sensors, Views):
             keys = sorted({str(k) for k in override["keys"]})
             pin = {"ref": ref, "changes": {"keys": keys, "full": False}}
             pin["index"] = self.m.index(output, upstream_partition).pinned().to_json()  # the keys' locators
-            if edge.get("patterns") is not None:
-                pin["patterns"] = edge["patterns"]
+            if input.get("patterns") is not None:
+                pin["patterns"] = input["patterns"]
             return pin, {"kind": "selection"}, not keys
         first = int(head.get("base", 0))
         # A `full` run or a keys="full" override starts one pass per run, which the
@@ -1027,7 +1031,7 @@ class Engine(Attempts, Sensors, Views):
             return {"ref": {**ref, "generation": current["generation"]}, "changes": changes}, plan, hi < lo
 
         index = self.m.index(output, upstream_partition)
-        patterns = edge.get("patterns")
+        patterns = input.get("patterns")
         carried["next"] = None if reset else int(wm["next"])
         carried["patterns"] = patterns
         rescope = None if reset else wm.get("rescope")
@@ -1065,7 +1069,7 @@ class Engine(Attempts, Sensors, Views):
                 return pin, {"kind": "keys", "watermark": carried, "delivery": current, "head": latest}, False
             if head_commit > rescope["cutover"]:  # finish: under the old patterns, up to the cutover
                 head_commit, latest_generation = rescope["cutover"], rescope["generation"]
-        each = edge.get("each") is not None
+        each = input.get("each") is not None
         held = [o["name"] for o in self.manifest["assets"][task["asset"]]["outputs"]] + [f"@{task['asset']}"]
         empty = False
         if current is None and reset:
@@ -1145,7 +1149,7 @@ class Engine(Attempts, Sensors, Views):
             or self._forced_pos(record) > int(record.get("done_forced") or 0)
         )
 
-    def _each_plan(self, task, asset, param, edge, ref, upstream_partition, pin, plan, empty):
+    def _each_plan(self, task, asset, param, input, ref, upstream_partition, pin, plan, empty):
         """An Each edge's page: the changes of its window, or the keys its
         failure index has due again. When both are pending they alternate —
         neither starves, and there is no fraction to tune (§9). A full
@@ -1175,7 +1179,7 @@ class Engine(Attempts, Sensors, Views):
             retry = None  # its predicate's inputs moved: the pass starts over (§9)
         each = {
             "kind": kind,
-            "concurrency": edge["each"]["concurrency"],
+            "concurrency": input["each"]["concurrency"],
             "deploy": self.m.deploy_number,
             "forced": forced,
             "forced_pos": current,
@@ -1185,11 +1189,11 @@ class Engine(Attempts, Sensors, Views):
             "commit_number": int(record.get("commit_number", -1)) + 1,
             "pass_after": (retry or {}).get("after"),
         }
-        limit = int(edge.get("page_size") or 100)
+        limit = int(input.get("page_size") or 100)
         if kind == "reconcile":
             pin = {
                 "ref": ref,
-                "index": self.m.index(edge["output"], upstream_partition).pinned().to_json(),
+                "index": self.m.index(input["output"], upstream_partition).pinned().to_json(),
                 "changes": {"reconcile": {"after": reconcile["after"]}, "limit": limit},
                 "each": each,
             }
@@ -1213,7 +1217,7 @@ class Engine(Attempts, Sensors, Views):
             each["pass_after"] = retry["after"]
             pin = {
                 "ref": ref,
-                "index": self.m.index(edge["output"], upstream_partition).pinned().to_json(),
+                "index": self.m.index(input["output"], upstream_partition).pinned().to_json(),
                 "changes": {"retry": {"after": retry["after"]}, "limit": limit},
                 "each": each,
             }
@@ -1335,8 +1339,8 @@ class Engine(Attempts, Sensors, Views):
         stores = set()
         for output in asset["outputs"]:
             stores.add(output["store"])
-        for edge in asset["inputs"].values():
-            stores.add(self.manifest["outputs"][edge["output"]]["store"])
+        for input in asset["inputs"].values():
+            stores.add(self.manifest["outputs"][input["output"]]["store"])
         for dep in asset["deps"]:
             stores.add(self.manifest["outputs"][dep]["store"])
         return digest(
@@ -1437,8 +1441,8 @@ class Engine(Attempts, Sensors, Views):
                     head["base"] = head["commit_number"]
                 elif (before or {}).get("base"):
                     head["base"] = before["base"]
-                if "elements" in info:
-                    head["elements"] = entry.get("elements", info["elements"])
+                if "partitions" in info:
+                    head["partitions"] = entry.get("partitions", info["partitions"])
             elif decl.get("incremental"):
                 if info["reset"]:  # starts over at its batch, whatever its content
                     head["commit_number"] = head["base"] = int(info["commit_number"])
@@ -1486,14 +1490,13 @@ class Engine(Attempts, Sensors, Views):
             commit["metadata"] = metadata
         if rows:
             commit["rows"] = rows
-        settled = sorted(
+        repaired = sorted(
             name
             for name, entry in outputs.items()
-            if ((prepared.get("outputs") or {}).get(name) or {}).get("unsettled")
-            and not entry.get("unchanged")
+            if ((prepared.get("outputs") or {}).get(name) or {}).get("repairs") and not entry.get("unchanged")
         )
-        if settled:
-            commit["settled"] = settled
+        if repaired:
+            commit["repaired"] = repaired
         if result.get("cursor", UNSET) is not UNSET:
             commit["cursor"] = result["cursor"]
         elif prepared.get("full"):
@@ -1582,7 +1585,7 @@ class Engine(Attempts, Sensors, Views):
             record["version"] = run["version"] = str(version)
         else:
             # A partition set's elements carry an empty version: listed again, unchanged.
-            listed = b"" if source.get("key") == "<elements>" or name in self._set_dims else None
+            listed = b"" if source.get("key") == "<partitions>" or name in self._dynamic_dims else None
 
             def versions(given):
                 if isinstance(given, dict):
@@ -1627,8 +1630,8 @@ class Engine(Attempts, Sensors, Views):
                 return None, head["ref"] if head is not None else source["head"]
             record["commit_number"] = commit_number
             if listed is not None:
-                before = set((head or {}).get("elements") or ())
-                record["elements"] = sorted(set(new) if replace else (before - set(removes)) | set(new))
+                before = set((head or {}).get("partitions") or ())
+                record["partitions"] = sorted(set(new) if replace else (before - set(removes)) | set(new))
             event["keys"] = {**files.to_json(), "commit_number": commit_number}
             run["commit_number"] = commit_number
             counts = (sum(f.entries for f in files.files) - files.removed, files.removed)
@@ -2157,8 +2160,8 @@ class Engine(Attempts, Sensors, Views):
         }
         watermarks = {
             param: self.m.watermark(asset, param, partition)
-            for param, edge in info["inputs"].items()
-            if edge["kind"] == "incremental"
+            for param, input in info["inputs"].items()
+            if input["kind"] == "incremental"
         }
         dims = self.planner().dims(asset)
         return {
@@ -2167,8 +2170,8 @@ class Engine(Attempts, Sensors, Views):
             "cursor": self.m.partition(asset, partition).get("cursor"),
             "watermarks": watermarks,
             "current_keys": self.planner().dim_keys(dims) if dims else [],
-            "unsettled": {
-                o["name"]: sorted(s for (n, s) in self.m.unsettled if n == o["name"]) for o in info["outputs"]
+            "repairs": {
+                o["name"]: sorted(s for (n, s) in self.m.repairs if n == o["name"]) for o in info["outputs"]
             },
             "partitions": {
                 s: self.outcome_view(r["last"]) for s, r in self.m.partitions.of(asset).items() if "last" in r

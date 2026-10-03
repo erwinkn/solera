@@ -181,7 +181,7 @@ export function useClearCleanups() {
       }),
     onSuccess: (_, { output, partition }) => {
       notify("Stuck cleanups cleared", partition ? `${output} · ${partition}` : output);
-      client.invalidateQueries({ queryKey: ["holds"] });
+      client.invalidateQueries({ queryKey: ["cleanups"] });
       client.invalidateQueries({ queryKey: ["diagnostics"] });
       client.invalidateQueries({ queryKey: ["outputs", output] });
     },

@@ -54,7 +54,7 @@ class Views:
                 listed = set(planner.partitions(asset, "all"))
                 partitions, current = partitions | listed, listed.__contains__
             else:
-                current = planning.membership(planner.dims(asset), planner.time, planner.elements)
+                current = planning.membership(planner.dims(asset), planner.time, planner.dynamic_partitions)
             rows = out[asset] = []
             for partition in sorted(partitions):
                 head, record = scoped.get(partition), recorded.get(partition)
@@ -98,7 +98,7 @@ class Views:
         planner, out = self.planner(), {}
         for name in names:
             counts = Counter(row["status"] for row in statuses[name])
-            total = planning.size(planner.dims(name), planner.time, planner.elements)
+            total = planning.size(planner.dims(name), planner.time, planner.dynamic_partitions)
             missing = total - counts["complete"] - counts["failed"] - counts["running"]
             out[name] = {
                 "partitions": {
@@ -108,8 +108,8 @@ class Views:
                 },
                 "partitioned": bool(planner.dims(name)),
                 "last": None,
-                "failures": {} if self._each_edge(name) else None,
-                "unsettled": 0,
+                "failures": {} if self._each_input(name) else None,
+                "repairs": 0,
                 "updated_at": None,
             }
         for (output, _), head in self.m.heads.items():
@@ -131,14 +131,14 @@ class Views:
             if (failures := (out.get(asset) or {}).get("failures")) is not None:
                 for name, n in ((state.get("failures") or {}).get("counts") or {}).items():
                     failures[name] = failures.get(name, 0) + n
-        for output, _ in self.m.unsettled:
+        for output, _ in self.m.repairs:
             if (entry := out.get(owner.get(output))) is not None:
-                entry["unsettled"] += 1
+                entry["repairs"] += 1
         return out
 
     # -- failing keys (docs/per-key-processing.md §9) -------------------------------------
 
-    def _each_edge(self, asset: str) -> tuple[str, dict] | None:
+    def _each_input(self, asset: str) -> tuple[str, dict] | None:
         inputs = self.manifest["assets"][asset]["inputs"]
         return next(((p, e) for p, e in inputs.items() if e.get("each") is not None), None)
 
@@ -196,7 +196,7 @@ class Views:
         `SCAN` entries per key it may return, so a rare class can come back
         as a short page with a `next`."""
 
-        if self._each_edge(asset) is None:
+        if self._each_input(asset) is None:
             raise ValueError(f"{asset} has no Each edge: it keeps no failing keys")
         unknown = set(outcomes) - set(NAMES.values())
         if unknown:
@@ -249,7 +249,7 @@ class Views:
 
     # -- edges (§6; per-key-processing.md §11) -----------------------------------------------
 
-    def _input_partition(self, asset: str, param: str, edge: dict, partition: str) -> dict:
+    def _input_partition(self, asset: str, param: str, input: dict, partition: str) -> dict:
         """One scope of an Incremental edge: its watermark and how far it is
         behind the upstream head.
 
@@ -272,12 +272,14 @@ class Views:
         if upstream_partition is None:
             try:
                 upstream_partition = next(
-                    e.partition for e in self.planner().edges(asset, partition) if e.param == param
+                    e.partition for e in self.planner().inputs(asset, partition) if e.param == param
                 )
             except (ValueError, KeyError, StopIteration):
                 upstream_partition = None
         head = (
-            self.m.heads.get((edge["output"], upstream_partition)) if upstream_partition is not None else None
+            self.m.heads.get((input["output"], upstream_partition))
+            if upstream_partition is not None
+            else None
         )
         head_commit = int(head.get("commit_number", -1)) if head is not None else None
         lag = 0
@@ -311,39 +313,39 @@ class Views:
             "state": state,
         }
 
-    async def asset_edges(self, asset: str) -> dict:
+    async def asset_inputs(self, asset: str) -> dict:
         """Every input edge of an asset, deps included (kind `dep`); for an
         Incremental or Each edge, each scope's watermark and lag — the
         asset's current scopes and every scope with a watermark."""
 
         info = self.manifest["assets"][asset]
-        edges = [*info["inputs"].items(), *((d, {"kind": "dep", "output": d}) for d in info["deps"])]
+        inputs = [*info["inputs"].items(), *((d, {"kind": "dep", "output": d}) for d in info["deps"])]
         current = set(self.planner().partitions(asset, "all"))
         marked: dict[str, set] = {}
         for partition, record in self.m.partitions.of(asset).items():
             for param in record.get("watermarks") or ():
                 marked.setdefault(param, set()).add(partition)
         out = []
-        for param, edge in edges:
-            output = edge["output"]
+        for param, input in inputs:
+            output = input["output"]
             partitions = []
-            if edge["kind"] == "incremental":
+            if input["kind"] == "incremental":
                 for partition in sorted(current | marked.get(param, set())):
-                    partitions.append(self._input_partition(asset, param, edge, partition))
+                    partitions.append(self._input_partition(asset, param, input, partition))
             out.append(
                 {
                     "param": param,
-                    "kind": "each" if edge.get("each") is not None else edge["kind"],
+                    "kind": "each" if input.get("each") is not None else input["kind"],
                     "output": output,
                     "upstream_asset": self.manifest["outputs"][output].get("asset"),
                     "source": output in self.manifest["sources"],
-                    "page_size": edge.get("page_size"),
-                    "concurrency": (edge.get("each") or {}).get("concurrency"),
-                    "patterns": edge.get("patterns"),
+                    "page_size": input.get("page_size"),
+                    "concurrency": (input.get("each") or {}).get("concurrency"),
+                    "patterns": input.get("patterns"),
                     "partitions": partitions,
                 }
             )
-        return {"asset": asset, "edges": out}
+        return {"asset": asset, "inputs": out}
 
     # -- explain (per-key-processing.md §10) -------------------------------------------------
 
@@ -366,7 +368,7 @@ class Views:
         )
         return next(iter(found["outcomes"]), None)
 
-    async def explain(self, asset: str, key: str, partition: str = "", edge: str | None = None) -> dict:
+    async def explain(self, asset: str, key: str, partition: str = "", input: str | None = None) -> dict:
         """Why `key` is, or is not, in an asset's output (§10), through one
         Incremental edge: `edge`, else its Each edge, else its one keyed
         Incremental edge. The verdict is the first of these that holds:
@@ -394,23 +396,23 @@ class Views:
             for p, e in info["inputs"].items()
             if e["kind"] == "incremental" and self.manifest["outputs"][e["output"]].get("key") is not None
         }
-        if edge is None:
-            each = self._each_edge(asset)
+        if input is None:
+            each = self._each_input(asset)
             if each is None and len(keyed) != 1:
                 raise ValueError(
-                    f"{asset} has {len(keyed) or 'no'} keyed Incremental edges: name one with edge="
+                    f"{asset} has {len(keyed) or 'no'} keyed Incremental inputs: name one with input="
                 )
-            edge = each[0] if each is not None else next(iter(keyed))
-        if edge not in keyed:
-            raise ValueError(f"{asset} has no keyed Incremental edge {edge!r}")
-        spec, is_each = keyed[edge], keyed[edge].get("each") is not None
+            input = each[0] if each is not None else next(iter(keyed))
+        if input not in keyed:
+            raise ValueError(f"{asset} has no keyed Incremental edge {input!r}")
+        spec, is_each = keyed[input], keyed[input].get("each") is not None
         if (
             partition not in self.planner().partitions(asset, [partition])
-            and self.m.watermark(asset, edge, partition) is None
+            and self.m.watermark(asset, input, partition) is None
         ):
             raise KeyError(f"{asset}/{partition}")
         output = spec["output"]
-        where = self._input_partition(asset, edge, spec, partition)
+        where = self._input_partition(asset, input, spec, partition)
         if where["upstream_partition"] is None:
             raise ValueError(f"{asset}: no upstream partition for {partition!r}")
         outputs = [o["name"] for o in info["outputs"] if o.get("key") is not None]
@@ -432,7 +434,7 @@ class Views:
                 kept = last_ok = settled
             elif settled is not None:
                 last_ok = await self._newest_outcome(asset, partition, key, [OK])
-        wm = self.m.watermark(asset, edge, partition)
+        wm = self.m.watermark(asset, input, partition)
         served = wm.get("patterns") if wm is not None else spec.get("patterns")
         matcher = Matcher(served)
         included, excluded_by = matcher.included(key), matcher.excluded_by(key)
@@ -458,12 +460,12 @@ class Views:
             "asset": asset,
             "partition": partition,
             "key": key,
-            "edge": edge,
+            "input": input,
             "upstream": output,
             "upstream_asset": self.manifest["outputs"][output].get("asset"),
             "upstream_partition": where["upstream_partition"],
             "upstream_generation": generation,
-            "edge_state": where["state"],
+            "input_state": where["state"],
             "outputs": {
                 name: {"present": v is not None, "generation": None if v is None else v[0]}
                 for name, v in zip(outputs, held, strict=True)
@@ -482,12 +484,11 @@ class Views:
 
     # -- what an operator may clear (docs/lifecycle.md §9.6, §9.8) -----------------------------------------
 
-    def holds_view(self) -> dict:
-        """What an operator may need to clear: outputs left unsettled by
-        writers that died, with each intent's files, for the next attempt's
-        repair; and the scopes whose data garbage has stuck entries."""
+    def repairs_view(self) -> list[dict]:
+        """Output partitions a writer that died left owing a repair, with each
+        intent's files, for the next attempt (docs/lifecycle.md §9.6)."""
 
-        unsettled = [
+        return [
             {
                 "output": output,
                 "partition": partition,
@@ -500,11 +501,15 @@ class Views:
                     for i in intents
                 ],
             }
-            for (output, partition), intents in sorted(self.m.unsettled.items())
+            for (output, partition), intents in sorted(self.m.repairs.items())
         ]
-        cleanups = [
+
+    def cleanups_view(self) -> list[dict]:
+        """Output partitions whose cleanups have stuck entries, for an operator
+        to clear (docs/lifecycle.md §9.8)."""
+
+        return [
             self.partition_cleanups(output, partition)
             for (output, partition), entries in sorted(self.m.cleanups.items())
             if any(e.get("stuck") for e in entries)
         ]
-        return {"unsettled": unsettled, "cleanups": cleanups}

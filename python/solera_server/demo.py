@@ -21,13 +21,13 @@ from solera.sdk import (
     AutoRefresh,
     Commit,
     Cron,
+    DynamicPartitions,
     Each,
     Every,
     Incremental,
     Migration,
     OnDeploy,
     Output,
-    PartitionSet,
     Project,
     Result,
     Source,
@@ -136,7 +136,7 @@ ingest = Pool("ingest")
 # ---------------------------------------------------------------------------
 
 
-@asset(outputs=PartitionSet(), automations=Automation(trigger=Cron("* * * * *")))
+@asset(outputs=DynamicPartitions(), automations=Automation(trigger=Cron("* * * * *")))
 def sites(ctx, registry: SiteRegistry):
     """The site list is a partition set; each run may surface a new site.
 
@@ -146,7 +146,7 @@ def sites(ctx, registry: SiteRegistry):
     return Result(outputs={"sites": registry.list_sites(seen)}, cursor=str(seen + 1))
 
 
-uploads = PartitionSet("uploads")
+uploads = DynamicPartitions("uploads")
 
 UPLOAD_EVERY, UPLOADS = 60, 3
 

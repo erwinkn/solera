@@ -852,7 +852,7 @@ class Attempts:
             write, gate = await self._gate(task["run"], attempt, lifecycle.ABORTED)
         if result is not None:
             write = result.get("write", write)
-        unsettled = current_names(
+        repairs = current_names(
             prepared,
             (gate or {}).get("intents") or {} if (gate or {}).get("state") == lifecycle.WRITING else {},
         )
@@ -867,14 +867,14 @@ class Attempts:
             error=error,
             retryable=retryable,
             delay=delay,
-            unsettled=unsettled,
+            repairs=repairs,
             worker=worker,
             end=end,
             reason=reason,
             write=write,
             retry_for=retry_for,
         )
-        await self._cleanup(attempt, prepared, keep=set(unsettled))
+        await self._cleanup(attempt, prepared, keep=set(repairs))
 
     def _last_report(self, attempt: str) -> dict:
         live = self.live.get(attempt)

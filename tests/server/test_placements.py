@@ -133,7 +133,7 @@ async def test_a_dead_pool_claim_that_took_its_gate_is_uncertain(state):
     await state.create_object(f"{base}.writing", lifecycle.gate("writing", "dead", intents))
     detail = await engine.run_until(run["id"], 10)
     assert detail["request"]["status"] == "failed"
-    assert state.model.unsettled[("job", "")][0]["attempt"] == first
+    assert state.model.repairs[("job", "")][0]["attempt"] == first
 
 
 async def test_a_pool_attempt_canceled_before_its_claim_is_withdrawn(state):

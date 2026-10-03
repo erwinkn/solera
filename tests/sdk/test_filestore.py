@@ -14,7 +14,7 @@ from urllib.parse import unquote, urlsplit
 import pandas as pd
 import pytest
 from solera.keys.index import key_str
-from solera.sdk import KEYS, Output, PartitionSet, Ref, RegistrationError
+from solera.sdk import KEYS, DynamicPartitions, Output, Ref, RegistrationError
 from solera.stores import (
     Commits,
     FileStore,
@@ -204,7 +204,7 @@ async def test_a_batchs_committed_object_is_its_highest_generation(store):
 
 
 async def test_a_partition_set_is_its_element_list(store):
-    out = PartitionSet("sites")
+    out = DynamicPartitions("sites")
     written = await store.store(["Richmond", "Perth"], None, context(out, generation=1))
     assert await store.load(written.ref, list, None) == ["Richmond", "Perth"]
     assert await store.load(written.ref, list, Keys({"Perth": 1})) == ["Perth"]

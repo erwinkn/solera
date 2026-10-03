@@ -130,7 +130,7 @@ def _main():
 
     commands.add_parser("manifest", help="Print the project manifest", parents=[common])
 
-    run = commands.add_parser("run", help="Materialize assets", parents=[common])
+    run = commands.add_parser("run", help="Run assets", parents=[common])
     run.add_argument("targets", nargs="+")
     run.add_argument("--partition", action="append", default=[])
     run.add_argument("--partitions", choices=["latest", "all", "missing"])
@@ -333,8 +333,8 @@ def _parse_keys(specs):
         return None
     out = {}
     for spec in specs:
-        edge, _, value = spec.partition("=")
-        out[edge] = value if value == "full" else [k for k in value.split(",") if k]
+        input, _, value = spec.partition("=")
+        out[input] = value if value == "full" else [k for k in value.split(",") if k]
     return out
 
 

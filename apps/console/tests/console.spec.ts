@@ -90,11 +90,11 @@ test("the theme switches by tokens alone and persists", async ({ page }) => {
 test("materialize an asset and follow its run to the logs", async ({ page }) => {
   await connect(page, "/assets/site_feed");
   await expect(page.getByRole("heading", { name: "site_feed", level: 1 })).toBeVisible();
-  await page.getByRole("button", { name: "Materialize", exact: true }).click();
-  const dialog = page.getByRole("dialog", { name: "Materialize" });
+  await page.getByRole("button", { name: "Run", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Run" });
   await expect(dialog.getByRole("checkbox", { name: "site_feed" })).toBeChecked();
   await dialog.getByRole("radio", { name: "All" }).click();
-  await dialog.getByRole("button", { name: "Start materialization" }).click();
+  await dialog.getByRole("button", { name: "Start the run" }).click();
   await expect(page).toHaveURL(/\/runs\/[0-9A-Z]{26}/);
   await expect(page.getByRole("heading", { name: "site_feed", level: 1 })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Timeline" })).toBeVisible();
@@ -117,11 +117,11 @@ test("commit to a source, then cancel the run waiting for a pool worker", async 
 
   // manual_ingest runs on Pool("ingest"): with no worker, its attempt waits.
   await page.goto("/assets/manual_ingest");
-  await page.getByRole("button", { name: "Materialize", exact: true }).click();
-  const dialog = page.getByRole("dialog", { name: "Materialize" });
+  await page.getByRole("button", { name: "Run", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Run" });
   await dialog.getByRole("radio", { name: "Pick…" }).click();
   await dialog.getByLabel("Partition keys").fill(upload);
-  await dialog.getByRole("button", { name: "Start materialization" }).click();
+  await dialog.getByRole("button", { name: "Start the run" }).click();
   await expect(page).toHaveURL(/\/runs\//);
   await page.getByRole("button", { name: "Cancel run" }).click();
   await page.getByRole("alertdialog").getByRole("button", { name: "Cancel run" }).click();
@@ -157,11 +157,14 @@ test("assets graph, keys and explain", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "file_checks", level: 1 })).toBeVisible();
   await page.getByRole("navigation", { name: "Asset sections" }).getByRole("link", { name: /Keys/ }).click();
   await expect(page.getByRole("heading", { name: "Failing keys" })).toBeVisible();
-  // alpha-file-2 is excluded by the edge's "drafts" pattern: explain says so.
+  // alpha-file-2 is excluded by the input's "drafts" pattern: explain says so.
   await page.getByLabel("Key to explain").fill("alpha-file-2");
   await page.getByRole("button", { name: "Explain" }).click();
-  await expect(page.getByText(/Excluded by the edge's pattern/)).toBeVisible({ timeout: 45_000 });
-  await page.getByRole("navigation", { name: "Asset sections" }).getByRole("link", { name: "Edges" }).click();
+  await expect(page.getByText(/Excluded by the input's pattern/)).toBeVisible({ timeout: 45_000 });
+  await page
+    .getByRole("navigation", { name: "Asset sections" })
+    .getByRole("link", { name: "Inputs" })
+    .click();
   await expect(page.getByText("Each(")).toBeVisible();
   await page.goto("/assets?view=list");
   await expect(page.getByRole("link", { name: /file_index/ })).toBeVisible();
@@ -178,8 +181,8 @@ test("automations toggle and health", async ({ page }) => {
   await expect(page.getByRole("switch", { name: /Disable refresh-index/ })).toBeChecked();
 
   await page.goto("/health");
-  await expect(page.getByRole("heading", { name: "Unsettled writes" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Stuck discards" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Repairs owed" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Stuck cleanups" })).toBeVisible();
   await expect(page.getByText("browser", { exact: true })).toBeVisible();
 });
 

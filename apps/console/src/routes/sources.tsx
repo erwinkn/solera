@@ -16,12 +16,12 @@ import { Table, TableScroll, Td, Th, Tr } from "@/ui/table";
 /**
  * Sources (architecture.md §5): outputs with no producer, advanced from
  * outside through the commit API or by a sensor. A keyed source and a
- * partition set are consumed exactly like keyed outputs.
+ * dynamic partitions are consumed exactly like keyed outputs.
  */
 
-type Kind = "partition set" | "keyed" | "unkeyed";
+type Kind = "dynamic partitions" | "keyed" | "unkeyed";
 const kindOf = (s: SourceDecl, manifest: Manifest): Kind =>
-  manifest.outputs[s.name]?.partition_set ? "partition set" : s.key ? "keyed" : "unkeyed";
+  manifest.outputs[s.name]?.dynamic_partitions ? "dynamic partitions" : s.key ? "keyed" : "unkeyed";
 
 function consumers(manifest: Manifest, source: string): string[] {
   return Object.entries(manifest.assets)
@@ -29,7 +29,7 @@ function consumers(manifest: Manifest, source: string): string[] {
       ([, a]) =>
         Object.values(a.inputs).some((e) => e.output === source) ||
         a.deps.includes(source) ||
-        Object.values(a.partitions?.dims ?? {}).some((d) => d.kind === "set" && d.output === source),
+        Object.values(a.partitions?.dims ?? {}).some((d) => d.kind === "dynamic" && d.output === source),
     )
     .map(([name]) => name);
 }
@@ -336,7 +336,7 @@ function CommitForm({ name, kind }: { name: string; kind: Kind }) {
               options={[
                 {
                   value: "upsert",
-                  label: kind === "partition set" ? "Add keys" : "Upsert",
+                  label: kind === "dynamic partitions" ? "Add keys" : "Upsert",
                 },
                 { value: "remove", label: "Remove" },
               ]}

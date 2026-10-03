@@ -42,36 +42,36 @@ def canonical(dims: dict, key: str) -> str:
     return canonical_partition(dims, split_partition(dims, key))
 
 
-def dim_keys(dim: dict, now: dt.datetime, elements: Callable[[str], list[str] | None]) -> list[str]:
+def dim_keys(dim: dict, now: dt.datetime, partitions: Callable[[str], list[str] | None]) -> list[str]:
     """One dimension's current keys, enumerated."""
 
     if dim["kind"] == "static":
         return [str(k) for k in dim["keys"]]
     if dim["kind"] == "time":
         return time_partitions(dim).keys(now, MAX_PARTITION_KEYS)
-    return sorted(elements(dim["output"]) or ())
+    return sorted(partitions(dim["output"]) or ())
 
 
-def _size(dim: dict, now: dt.datetime, elements) -> int:
+def _size(dim: dict, now: dt.datetime, partitions) -> int:
     if dim["kind"] == "static":
         return len(dim["keys"])
     if dim["kind"] == "time":
         return time_partitions(dim).count(now, MAX_PARTITIONS)
-    return len(elements(dim["output"]) or ())
+    return len(partitions(dim["output"]) or ())
 
 
-def size(dims: dict, now: dt.datetime, elements) -> int:
+def size(dims: dict, now: dt.datetime, partitions) -> int:
     """How many scopes `dims` spans, counted per dimension — never enumerated.
     A cron time dimension is counted only to just past `MAX_SCOPES`."""
 
     total = 1
     for dim in dims.values():
-        total *= _size(dim, now, elements)
+        total *= _size(dim, now, partitions)
     return total
 
 
 def enumerate_partitions(
-    dims: dict, now: dt.datetime, elements, *, pinned: Mapping[str, str] | None = None, what: str = ""
+    dims: dict, now: dt.datetime, partitions, *, pinned: Mapping[str, str] | None = None, what: str = ""
 ) -> list[str]:
     """Every scope of `dims` — those in `pinned` held at one key each — in
     dimension order: counted first, refused past `MAX_SCOPES`."""
@@ -80,20 +80,20 @@ def enumerate_partitions(
         return [""]
     pinned = pinned or {}
     free = {name: dim for name, dim in dims.items() if name not in pinned}
-    total = size(free, now, elements)
+    total = size(free, now, partitions)
     if total > MAX_PARTITIONS:
         raise ValueError(
             f"{what or 'the selection'} spans {total} partitions, more than {MAX_PARTITIONS}: "
             "select partitions explicitly"
         )
-    keys = [dim_keys(dim, now, elements) for dim in free.values()]
+    keys = [dim_keys(dim, now, partitions) for dim in free.values()]
     return [
         canonical_partition(dims, {**pinned, **dict(zip(free, combo, strict=True))})
         for combo in product(*keys)
     ]
 
 
-def membership(dims: dict, now: dt.datetime, elements) -> Callable[[str], bool]:
+def membership(dims: dict, now: dt.datetime, partitions) -> Callable[[str], bool]:
     """Whether a scope is one `enumerate_scopes` would list: canonical, each
     of its parts a member of its dimension — checked part by part, never by
     enumeration. Each dimension's members are read once, for any number of
@@ -108,7 +108,7 @@ def membership(dims: dict, now: dt.datetime, elements) -> Callable[[str], bool]:
         elif dim["kind"] == "static":
             checks[name] = {str(k) for k in dim["keys"]}.__contains__
         else:
-            checks[name] = set(elements(dim["output"]) or ()).__contains__
+            checks[name] = set(partitions(dim["output"]) or ()).__contains__
 
     def member(partition: str) -> bool:
         try:
@@ -127,7 +127,7 @@ def select_partitions(
     selection,
     *,
     now: dt.datetime,
-    elements: Callable[[str], list[str] | None],
+    partitions: Callable[[str], list[str] | None],
     missing: Callable[[str], bool],
     what: str = "",
 ) -> list[str]:
@@ -137,9 +137,9 @@ def select_partitions(
     head."""
 
     if selection is None or selection == "all":
-        return enumerate_partitions(dims, now, elements, what=what)
+        return enumerate_partitions(dims, now, partitions, what=what)
     if selection == "missing":
-        return [s for s in enumerate_partitions(dims, now, elements, what=what) if missing(s)]
+        return [s for s in enumerate_partitions(dims, now, partitions, what=what) if missing(s)]
     if selection == "latest":  # each time dimension at its latest window; the others in full
         pinned = {}
         for name, dim in dims.items():
@@ -147,11 +147,11 @@ def select_partitions(
                 if (latest := time_partitions(dim).latest(now)) is None:
                     return []
                 pinned[name] = latest
-        return enumerate_partitions(dims, now, elements, pinned=pinned, what=what)
+        return enumerate_partitions(dims, now, partitions, pinned=pinned, what=what)
     wanted = list(dict.fromkeys(selection or ()))
     if not dims:
         return [""] if "" in wanted else []
-    member, out, seen = membership(dims, now, elements), [], set()
+    member, out, seen = membership(dims, now, partitions), [], set()
     for key in wanted:
         try:
             partition = canonical(dims, key)
@@ -186,7 +186,7 @@ COLLAPSING = frozenset({"all_partitions", "dep"})  # edge kinds that may read ac
 
 
 @dataclass(frozen=True)
-class Edge:
+class Input:
     """One read of a scope (§5, §7): an input, a dep, or the dep a
     partition-set dimension implies (`set_dim`: lineage, never the
     fingerprint). Of the owner's dimensions `dims`, the consumer shares
@@ -280,11 +280,11 @@ class Planner:
         owner = self.owner(output)
         return owner is None or self.drained(owner, partition)
 
-    def elements(self, output: str) -> list[str] | None:
+    def dynamic_partitions(self, output: str) -> list[str] | None:
         """A set dimension's current keys: the element list its head carries (§7)."""
 
         head = self.head(output, "")
-        return None if head is None else [str(e) for e in head.get("elements") or ()]
+        return None if head is None else [str(e) for e in head.get("partitions") or ()]
 
     # -- dimensions --------------------------------------------------------------
 
@@ -297,7 +297,7 @@ class Planner:
         return self.manifest["outputs"][output].get("asset")
 
     def dim_keys(self, dims: dict) -> list[list[str]]:
-        return [dim_keys(dim, self.time, self.elements) for dim in dims.values()]
+        return [dim_keys(dim, self.time, self.dynamic_partitions) for dim in dims.values()]
 
     def shared(self, consumer: dict, consumer_partition: str, upstream_dims: dict) -> tuple[dict, dict]:
         """`(pinned, free)`: the upstream dimensions the consumer shares, at its
@@ -349,12 +349,16 @@ class Planner:
 
         pinned = self.project_downstream(producer, partition, target)
         return enumerate_partitions(
-            self.dims(target), self.time, self.elements, pinned=pinned, what=f"a change reaching {target}"
+            self.dims(target),
+            self.time,
+            self.dynamic_partitions,
+            pinned=pinned,
+            what=f"a change reaching {target}",
         )
 
     # -- edges -------------------------------------------------------------------
 
-    def edges(self, asset: str, partition: str) -> list[Edge]:
+    def inputs(self, asset: str, partition: str) -> list[Input]:
         """What (asset, scope) reads: its inputs, its deps, then the partition
         sets its dimensions are bound to. An edge that is no fan-in may not
         lack an upstream dimension (`UpstreamOnly`)."""
@@ -365,7 +369,7 @@ class Planner:
         named += [
             (d["output"], {"kind": "dep", "output": d["output"], "set_dim": True})
             for d in self.dims(asset).values()
-            if d["kind"] == "set" and d["output"] not in outputs
+            if d["kind"] == "dynamic" and d["output"] not in outputs
         ]
         out = []
         for param, spec in named:
@@ -375,7 +379,7 @@ class Planner:
             if free and spec["kind"] not in COLLAPSING:
                 raise UpstreamOnly(f"upstream-only dimension {next(iter(free))!r} requires AllPartitions")
             out.append(
-                Edge(
+                Input(
                     param,
                     spec["kind"],
                     spec["output"],
@@ -389,34 +393,34 @@ class Planner:
             )
         return out
 
-    def fan_in(self, edge: Edge, *, complete: bool) -> dict[str, dict]:
+    def fan_in(self, input: Input, *, complete: bool) -> dict[str, dict]:
         """The heads a fan-in reads, by upstream scope: among those that exist,
         the current partitions — a retired one's head is kept, never read —
         that agree with its shared keys (`complete` ones only, for
         `AllPartitions`). Never by expanding the domain: the owner's heads are
         grouped by their shared keys once per planner."""
 
-        names = tuple(sorted(edge.pinned))
-        groups = self._groups.get((edge.output, names))
+        names = tuple(sorted(input.pinned))
+        groups = self._groups.get((input.output, names))
         if groups is None:
-            member, groups = membership(edge.dims, self.time, self.elements), {}
-            for upstream_partition, head in sorted(self.heads_of(edge.output).items()):
+            member, groups = membership(input.dims, self.time, self.dynamic_partitions), {}
+            for upstream_partition, head in sorted(self.heads_of(input.output).items()):
                 if member(upstream_partition):
-                    parts = split_partition(edge.dims, upstream_partition)
+                    parts = split_partition(input.dims, upstream_partition)
                     groups.setdefault(tuple(parts[n] for n in names), {})[upstream_partition] = head
-            self._groups[(edge.output, names)] = groups
-        heads = groups.get(tuple(edge.pinned[n] for n in names)) or {}
-        return {s: h for s, h in heads.items() if not complete or self.head_complete(edge.output, s)}
+            self._groups[(input.output, names)] = groups
+        heads = groups.get(tuple(input.pinned[n] for n in names)) or {}
+        return {s: h for s, h in heads.items() if not complete or self.head_complete(input.output, s)}
 
-    def spread(self, edge: Edge) -> list[str]:
+    def spread(self, input: Input) -> list[str]:
         """Every upstream scope an edge could read: for a fan-in, the domain
         across its free dimensions, enumerated — only to build upstream work,
         and bounded by `MAX_SCOPES`."""
 
-        if not edge.fan_in:
-            return [edge.partition]
+        if not input.fan_in:
+            return [input.partition]
         return enumerate_partitions(
-            edge.dims, self.time, self.elements, pinned=edge.pinned, what="an upstream build"
+            input.dims, self.time, self.dynamic_partitions, pinned=input.pinned, what="an upstream build"
         )
 
     def missing(self, asset: str, partition: str, planned: Mapping[str, Collection[str]]) -> bool:
@@ -425,32 +429,32 @@ class Planner:
         so it is missing only when there is nothing: no current upstream head
         agrees with its shared keys (a complete one, for `AllPartitions`)."""
 
-        for edge in self.edges(asset, partition):
-            built = planned.get(edge.owner) or () if edge.owner is not None else ()
-            if edge.fan_in:
-                if any(self._agrees(edge, s) for s in built):
+        for input in self.inputs(asset, partition):
+            built = planned.get(input.owner) or () if input.owner is not None else ()
+            if input.fan_in:
+                if any(self._agrees(input, s) for s in built):
                     continue
-                if not self.fan_in(edge, complete=edge.kind == "all_partitions"):
+                if not self.fan_in(input, complete=input.kind == "all_partitions"):
                     return True
-            elif edge.kind != "all_partitions" and edge.partition not in built:
+            elif input.kind != "all_partitions" and input.partition not in built:
                 source = (
-                    edge.owner is None and edge.output in self.manifest["sources"] and edge.partition == ""
+                    input.owner is None and input.output in self.manifest["sources"] and input.partition == ""
                 )
-                if not source and self.head(edge.output, edge.partition) is None:
+                if not source and self.head(input.output, input.partition) is None:
                     return True
         return False
 
     @staticmethod
-    def _agrees(edge: Edge, upstream_partition: str) -> bool:
-        parts = split_partition(edge.dims, upstream_partition)
-        return all(parts.get(name) == value for name, value in edge.pinned.items())
+    def _agrees(input: Input, upstream_partition: str) -> bool:
+        parts = split_partition(input.dims, upstream_partition)
+        return all(parts.get(name) == value for name, value in input.pinned.items())
 
     def partitions(self, asset: str, selection) -> list[str]:
         return select_partitions(
             self.dims(asset),
             selection,
             now=self.time,
-            elements=self.elements,
+            partitions=self.dynamic_partitions,
             missing=lambda partition: not self.complete(asset, partition),
             what=asset,
         )
@@ -509,19 +513,19 @@ class Planner:
             seen = set(queue)
             while queue:
                 name, partition = queue.pop()
-                for edge in self.edges(name, partition):
-                    if edge.owner is None:
+                for input in self.inputs(name, partition):
+                    if input.owner is None:
                         continue
-                    for upstream_partition in self.spread(edge):
-                        if (edge.owner, upstream_partition) in seen:
+                    for upstream_partition in self.spread(input):
+                        if (input.owner, upstream_partition) in seen:
                             continue
-                        seen.add((edge.owner, upstream_partition))
+                        seen.add((input.owner, upstream_partition))
                         if len(seen) > MAX_PARTITIONS:
                             raise ValueError(
                                 f"the run spans more than {MAX_PARTITIONS} tasks: select fewer partitions"
                             )
-                        assets.setdefault(edge.owner, set()).add(upstream_partition)
-                        queue.append((edge.owner, upstream_partition))
+                        assets.setdefault(input.owner, set()).add(upstream_partition)
+                        queue.append((input.owner, upstream_partition))
         if keys:
             incremental_outputs = {
                 e["output"]
@@ -601,22 +605,22 @@ class Planner:
         groups: dict[tuple, dict] = {}
         for task in tasks.values():
             deps = {}
-            for edge in self.edges(task["asset"], task["partition"]):
-                planned = assets.get(edge.owner)
+            for input in self.inputs(task["asset"], task["partition"]):
+                planned = assets.get(input.owner)
                 if not planned:
                     continue
-                if edge.fan_in:
-                    names = tuple(sorted(edge.pinned))
-                    if (edge.owner, names) not in groups:
-                        grouped = groups[(edge.owner, names)] = {}
+                if input.fan_in:
+                    names = tuple(sorted(input.pinned))
+                    if (input.owner, names) not in groups:
+                        grouped = groups[(input.owner, names)] = {}
                         for upstream_partition in sorted(planned):
-                            parts = split_partition(edge.dims, upstream_partition)
+                            parts = split_partition(input.dims, upstream_partition)
                             grouped.setdefault(tuple(parts[n] for n in names), []).append(upstream_partition)
-                    ups = groups[(edge.owner, names)].get(tuple(edge.pinned[n] for n in names), ())
+                    ups = groups[(input.owner, names)].get(tuple(input.pinned[n] for n in names), ())
                 else:
-                    ups = (edge.partition,) if edge.partition in planned else ()
+                    ups = (input.partition,) if input.partition in planned else ()
                 for upstream_partition in ups:
-                    dep_id = f"{task['run']}/{edge.owner}:{upstream_partition}"
+                    dep_id = f"{task['run']}/{input.owner}:{upstream_partition}"
                     if dep_id != task["id"]:
                         deps[dep_id] = None
             if deps:
@@ -627,7 +631,7 @@ class Planner:
 def same_dim(a: dict, b: dict) -> bool:
     if a["kind"] != b["kind"]:
         return False
-    if a["kind"] == "set":
+    if a["kind"] == "dynamic":
         return a["output"] == b["output"]
     return a == b
 

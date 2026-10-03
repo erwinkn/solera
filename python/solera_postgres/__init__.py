@@ -111,7 +111,7 @@ class PostgresStore:
         return False
 
     def can_store(self, t, output) -> bool:
-        if output.is_partition_set or output.key == KEYS:
+        if output.is_dynamic_partitions or output.key == KEYS:
             return False  # partition sets and dict outputs live on the default store
         return t is Sql or takes(t, output, frames=True, values=False)  # rows, DataFrames, Arrow
 

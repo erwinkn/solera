@@ -118,7 +118,7 @@ async def test_lineage_says_what_a_current_read_saw(state):
         assert edge["detail"]["pinned_generation"] == pinned
 
     # Its attempt is known: the edge names it, still uncommitted.
-    from solera_server.history import attempt_row, materialization
+    from solera_server.history import attempt_row, commit_row
 
     summary = {"id": "late", "outcome": "failed", "started_at": 1.0, "finished_at": 2.0, "generation": newer}
     state.model._record(
@@ -129,7 +129,7 @@ async def test_lineage_says_what_a_current_read_saw(state):
 
     # A commit installs that generation (a repair's, say): the edge then names who made it.
     late = {"ref": {**head, "generation": newer}, "run": "r-repair", "attempt": "repair", "at": 3.0}
-    state.model._record("materializations", materialization(name, "sites", "", late))
+    state.model._record("commits", commit_row(name, "sites", "", late))
     edge = (await edges(engine, state, "report"))["sites"]
     assert "uncommitted" not in edge
     assert {k: edge["from"][k] for k in ("generation", "run", "attempt", "at")} == {

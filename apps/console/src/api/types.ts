@@ -14,18 +14,18 @@ export interface OutputDecl {
   incremental: boolean;
   migrations: string[] | { name: string }[];
   config: Record<string, Json>;
-  partition_set: boolean;
+  dynamic_partitions: boolean;
   keyed?: boolean;
 }
 
-/** An edge's key patterns as the manifest records them: globs or regexes, excludes named. */
+/** An input's key patterns as the manifest records them: globs or regexes, excludes named. */
 export interface Patterns {
   include?: PatternSpec[] | null;
   exclude?: [string | null, PatternSpec][] | null;
 }
 export type PatternSpec = { glob?: string; regex?: string };
 
-export interface EdgeDecl {
+export interface InputDecl {
   kind: "in" | "incremental" | "all_partitions";
   output: string;
   meta: Json;
@@ -35,7 +35,7 @@ export interface EdgeDecl {
 }
 
 export type DimDecl =
-  | { kind: "set"; output: string }
+  | { kind: "dynamic"; output: string }
   | { kind: "static"; keys: string[] }
   | {
       kind: "time";
@@ -56,7 +56,7 @@ export interface Placement {
 
 export interface AssetDecl {
   outputs: OutputDecl[];
-  inputs: Record<string, EdgeDecl>;
+  inputs: Record<string, InputDecl>;
   deps: string[];
   partitions: { dims: Record<string, DimDecl> } | null;
   placement: Placement;
@@ -182,7 +182,7 @@ export interface Head {
   attempt?: string;
   at: number;
   count?: number;
-  elements?: string[];
+  partitions?: string[];
   commit: string | null;
   schema?: string;
 }
@@ -202,7 +202,7 @@ export interface AssetStatus {
     attempt: string | null;
   } | null;
   failures: Partial<Record<FailureClass, number>> | null;
-  unsettled: number;
+  repairs: number;
   updated_at: number | null;
 }
 
@@ -220,7 +220,7 @@ export interface AssetDetail {
   cursor: Json;
   watermarks: Record<string, Watermark | null>;
   current_keys: string[][];
-  unsettled: Record<string, string[]>;
+  repairs: Record<string, string[]>;
   partitions: Record<string, PartitionOutcome>;
   automations: Automation[];
 }
@@ -314,12 +314,12 @@ export interface Explain {
   asset: string;
   partition: string;
   key: string;
-  edge: string;
+  input: string;
   upstream: string;
   upstream_asset: string | null;
   upstream_partition: string;
   upstream_generation: number | null;
-  edge_state: EdgeState;
+  input_state: InputState;
   outputs: Record<string, { present: boolean; generation: number | null }>;
   patterns: {
     spec: Patterns | null;
@@ -333,9 +333,9 @@ export interface Explain {
   verdict: "ok" | "failing" | "excluded" | "not_matched" | "pending" | "removed" | "absent";
 }
 
-export type EdgeState = "never" | "caught_up" | "behind" | "paging" | "full" | "rescope" | "reconcile";
+export type InputState = "never" | "caught_up" | "behind" | "paging" | "full" | "rescope" | "reconcile";
 
-/** An edge's delivery progress (python/solera_server/delivery.py): `next`,
+/** An input's delivery progress (python/solera_server/delivery.py): `next`,
  * the first upstream commit not yet delivered; `delivery`, one under way —
  * its mode, boundary (`from`..`to`) and position (`at`: the last key
  * delivered, or the next commit). */
@@ -367,10 +367,10 @@ export interface InputPartition {
   watermark: Watermark | null;
   head_commit: number | null;
   lag: number | null;
-  state: EdgeState;
+  state: InputState;
 }
 
-export interface Edge {
+export interface Input {
   param: string;
   kind: "incremental" | "each" | "in" | "all_partitions" | "dep";
   output: string;
@@ -382,7 +382,7 @@ export interface Edge {
   partitions: InputPartition[];
 }
 
-export interface Materialization {
+export interface Commit {
   output: string;
   asset: string | null;
   partition: string;
@@ -650,19 +650,19 @@ export interface Worker {
   [key: string]: Json | undefined;
 }
 
-/** GET /holds: what writers that died left for an operator (or the next attempt) to settle. */
-export interface Holds {
-  unsettled: {
-    output: string;
-    partition: string;
-    intents: { run: string; attempt: string; files?: string[] }[];
-  }[];
-  cleanups: {
-    output: string;
-    partition: string;
-    pending: number;
-    stuck: { id: string; [key: string]: Json }[];
-  }[];
+/** GET /repairs: output partitions a writer that died left owing a repair, for the next attempt. */
+export interface Repair {
+  output: string;
+  partition: string;
+  intents: { run: string; attempt: string; files?: string[] }[];
+}
+
+/** GET /cleanups: output partitions whose cleanups have stuck entries, for an operator to clear. */
+export interface Cleanup {
+  output: string;
+  partition: string;
+  pending: number;
+  stuck: { id: string; [key: string]: Json }[];
 }
 
 export interface Stats {

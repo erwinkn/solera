@@ -582,7 +582,7 @@ class Simulation(RuleBasedStateMachine):
                 store = self.project.stores.get(head["ref"]["store"])
                 if getattr(store, "writes", None) != "fenced":
                     continue
-                if (output, partition) in m.unsettled or (head.get("asset"), partition) in m.locks:
+                if (output, partition) in m.repairs or (head.get("asset"), partition) in m.locks:
                     continue
                 if (output, partition) in m.indexes:
                     await keyed_content(

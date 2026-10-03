@@ -10,6 +10,7 @@ from solera.sdk import (
     AllPartitions,
     Automation,
     Cron,
+    DynamicPartitions,
     Every,
     In,
     Incremental,
@@ -17,7 +18,6 @@ from solera.sdk import (
     OnChange,
     OnDeploy,
     Output,
-    PartitionSet,
     Project,
     Ref,
     Result,
@@ -513,7 +513,7 @@ async def test_all_partitions_values(state, data):
     """§7: AllPartitions yields dict[key, value] over upstream-only dimensions,
     resolved to keys with complete heads at pin time."""
 
-    @asset(outputs=PartitionSet("sites"))
+    @asset(outputs=DynamicPartitions("sites"))
     def sites():
         return ["east", "west"]
 
@@ -572,7 +572,7 @@ async def test_external_partition_set_via_commit(state):
         ran.append(ctx.partition)
         return [{"u": ctx.partition}]
 
-    project = Project(assets=[per_upload], sources=[PartitionSet("uploads")])
+    project = Project(assets=[per_upload], sources=[DynamicPartitions("uploads")])
     engine = make_engine(state, project)
     await engine.initialize()
     await engine.commit_source("uploads", upsert=["u-1", "u-2"])
@@ -593,7 +593,7 @@ async def test_two_dimension_broadcast_and_collapse(state):
     collapses via AllPartitions."""
     seen = []
 
-    @asset(outputs=PartitionSet("sites"))
+    @asset(outputs=DynamicPartitions("sites"))
     def sites():
         return ["s1", "s2"]
 
@@ -631,7 +631,7 @@ async def test_retired_keys_leave_fanout(state):
     """§7: retired keys leave fan-out but their heads persist read-only."""
     members = {"keys": ["a", "b"]}
 
-    @asset(outputs=PartitionSet("things"))
+    @asset(outputs=DynamicPartitions("things"))
     def things():
         return members["keys"]
 
@@ -783,7 +783,7 @@ async def test_onchange_fans_out_by_projection(state):
     scopes by the projection rule."""
     seen = []
 
-    @asset(outputs=PartitionSet("sites"))
+    @asset(outputs=DynamicPartitions("sites"))
     def sites():
         return ["s1", "s2"]
 
@@ -897,7 +897,7 @@ async def test_missing_on_schedule_picks_up_new_keys(state):
     ran = []
     members = {"keys": ["a"]}
 
-    @asset(outputs=PartitionSet("things"))
+    @asset(outputs=DynamicPartitions("things"))
     def things():
         return members["keys"]
 

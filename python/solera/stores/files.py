@@ -108,7 +108,7 @@ class FileStore:
         if output.key is not None:
             if not isinstance(write, KeyedWrite):
                 write = await asyncio.to_thread(KeyedWrite.of, self, write, output, prior)
-            if output.is_partition_set:
+            if output.is_dynamic_partitions:
                 return await self._store_set(write, prior, context, base, generation)
             return await self._store_keyed(write, prior, context, base, generation)
         if output.incremental:
@@ -122,12 +122,12 @@ class FileStore:
     async def _store_set(self, write: KeyedWrite, prior, context, base, generation) -> Written:
         """A partition set: its element list, as one value."""
 
-        elements = write.prepared.take(None)
+        partitions = write.prepared.take(None)
         if not write.whole and prior is not None:
-            drop = set(write.removes) | set(write.prepared.removes) | set(elements)
-            elements = [e for e in await self._elements(prior) if e not in drop] + elements
+            drop = set(write.removes) | set(write.prepared.removes) | set(partitions)
+            partitions = [e for e in await self._partitions(prior) if e not in drop] + partitions
         name = f"{base}@{generation}"
-        await self._put(name, elements)
+        await self._put(name, partitions)
         return Written(self._ref(context, {"mode": "set", "path": name, "base": base}))
 
     async def _store_keyed(self, write: KeyedWrite, prior, context, base, generation) -> Written:
@@ -258,7 +258,7 @@ class FileStore:
             raise StoreError(f"{ref.output}: an unkeyed output cannot serve a selection")
         return value
 
-    async def _elements(self, ref: Ref) -> list[str]:
+    async def _partitions(self, ref: Ref) -> list[str]:
         return list(await self._found((ref.handle or {}).get("path", "")))
 
     async def _found(self, base: str, key: str | None = None):

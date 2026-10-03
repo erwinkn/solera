@@ -1,0 +1,1 @@
+import{An as e,Mn as t}from"./layout-CpaOZoTc.js";function n(n,r){return e(n,t,r)}export{n as t};

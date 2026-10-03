@@ -4,7 +4,7 @@ import { cn } from "@/lib/cn";
 const text = (spec: PatternSpec) => (spec.regex ? `/${spec.regex}/` : (spec.glob ?? JSON.stringify(spec)));
 
 /**
- * An edge's key patterns (docs/per-key-processing.md §11): includes as they
+ * An input's key patterns (docs/per-key-processing.md §11): includes as they
  * are, excludes with the name `explain` cites. Globs match key segments:
  * `**` crosses `/`, `*` does not.
  */

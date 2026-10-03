@@ -9,19 +9,20 @@ import type {
   Automation,
   CatalogAsset,
   Diagnostics,
-  Edge,
+  Input,
   Executor,
   Explain,
   Facets,
   Failures,
   Histogram,
-  Holds,
+  Repair,
+  Cleanup,
   KeyOutcome,
   KeyPage,
   Lineage,
   LogLine,
   Manifest,
-  Materialization,
+  Commit,
   OutputHead,
   PartitionRow,
   RunDetail,
@@ -232,22 +233,22 @@ export const q = {
       refetchInterval: LIST,
     }),
 
-  explain: (project: string, name: string, key: string, partition: string, edge?: string) =>
+  explain: (project: string, name: string, key: string, partition: string, input?: string) =>
     queryOptions({
-      queryKey: ["assets", name, "explain", partition, key, edge ?? null],
+      queryKey: ["assets", name, "explain", partition, key, input ?? null],
       queryFn: ({ signal }) =>
         api<Explain>(`${p(project)}/assets/${enc(name)}/explain`, {
           signal,
-          query: { key, partition, edge },
+          query: { key, partition, input },
         }),
       refetchInterval: LIST,
     }),
 
-  edges: (project: string, name: string) =>
+  inputs: (project: string, name: string) =>
     queryOptions({
-      queryKey: ["assets", name, "edges"],
+      queryKey: ["assets", name, "inputs"],
       queryFn: async ({ signal }) =>
-        (await api<{ edges: Edge[] }>(`${p(project)}/assets/${enc(name)}/edges`, { signal })).edges,
+        (await api<{ inputs: Input[] }>(`${p(project)}/assets/${enc(name)}/inputs`, { signal })).inputs,
       refetchInterval: LIST,
     }),
 
@@ -255,13 +256,10 @@ export const q = {
     infiniteQueryOptions({
       queryKey: ["assets", name, "history", filter],
       queryFn: ({ signal, pageParam }) =>
-        api<{ materializations: Materialization[]; next: string | null }>(
-          `${p(project)}/assets/${enc(name)}/history`,
-          {
-            signal,
-            query: { ...filter, before: pageParam, limit: 50 },
-          },
-        ),
+        api<{ commits: Commit[]; next: string | null }>(`${p(project)}/assets/${enc(name)}/history`, {
+          signal,
+          query: { ...filter, before: pageParam, limit: 50 },
+        }),
       initialPageParam: undefined as string | undefined,
       getNextPageParam: (page) => page.next ?? undefined,
       refetchInterval: LIST,
@@ -426,10 +424,19 @@ export const q = {
       refetchInterval: LIST,
     }),
 
-  holds: (project: string) =>
+  repairs: (project: string) =>
     queryOptions({
-      queryKey: ["holds"],
-      queryFn: ({ signal }) => api<Holds>(`${p(project)}/holds`, { signal }),
+      queryKey: ["repairs"],
+      queryFn: async ({ signal }) =>
+        (await api<{ repairs: Repair[] }>(`${p(project)}/repairs`, { signal })).repairs,
+      refetchInterval: LIST,
+    }),
+
+  cleanups: (project: string) =>
+    queryOptions({
+      queryKey: ["cleanups"],
+      queryFn: async ({ signal }) =>
+        (await api<{ cleanups: Cleanup[] }>(`${p(project)}/cleanups`, { signal })).cleanups,
       refetchInterval: LIST,
     }),
 };

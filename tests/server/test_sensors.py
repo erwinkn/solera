@@ -15,9 +15,9 @@ from solera import lifecycle
 from solera.executors import AWSECS, Pool
 from solera.sdk import (
     Commit,
+    DynamicPartitions,
     Every,
     Observed,
-    PartitionSet,
     Project,
     RegistrationError,
     RunRequest,
@@ -624,7 +624,7 @@ async def test_requested_runs_see_the_ticks_own_commits(tmp_path):
     `[new]` and requests a run over all partitions: the run's tasks are for
     `new`, planned against the set the tick installs."""
 
-    sites = PartitionSet("sites")
+    sites = DynamicPartitions("sites")
 
     @asset(partitions=sites)
     def per_site(ctx) -> int:
@@ -642,7 +642,7 @@ async def test_requested_runs_see_the_ticks_own_commits(tmp_path):
     answer = await engine.sensor_post("discover", tick["tick"], outcome.to_json())
     [run] = answer["runs"]
     assert [t["partition"] for t in state.model.runs[run]["tasks"].values()] == ["new"]
-    assert state.model.heads[("sites", "")]["elements"] == ["new"]
+    assert state.model.heads[("sites", "")]["partitions"] == ["new"]
     await state.close()
 
 
