@@ -235,8 +235,6 @@ async def test_keys_runs_after_an_upstream_reset_merge_and_together_catch_up(sta
     assert not await staleness.partition_stale(engine, "checks"), (
         "keys= runs covering every key catch up (R4)"
     )
-    caught_up = state.model.partition("checks", "")
-    assert caught_up.get("caught_up") and caught_up.get("caught_up_at")
     settled = await index_entries(state, "checks", "")
     await drive(engine, await engine.submit(["checks"]))
     assert await index_entries(state, "checks", "") == settled, "the next default run reads nothing new"
@@ -299,9 +297,9 @@ def test_the_reference_reads_the_coordinators_example():
     ref.reset_upstream()
     assert ref.stale_keys() == {"k1", "k2", "k3"}
     ref.run_keys({"k1", "k2"})
-    assert ref.stale_keys() == {"k3"} and ref.per_key.position is None  # R5
+    assert ref.stale_keys() == {"k3"} and ref.per_key_stale()
     ref.run_keys({"k3"})
-    assert ref.stale_keys() == set() and ref.per_key.position == ref.up_changed  # R4
+    assert ref.stale_keys() == set() and not ref.per_key_stale()  # R4
     ref.commit({"k4"}, set())
     assert ref.stale_keys() == {"k4"}  # missing counts
     ref.commit(set(), {"k1"})

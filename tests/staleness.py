@@ -15,11 +15,13 @@ that use this module are strict xfails or off):
   last read, if the upstream has it and the output does not, if the output
   has it and the upstream removed it, or if it was written before its
   asset's last change.
-- R4. A per-key partition is stale exactly when one of its keys is. Any
-  other partition is stale when an upstream it reads changed past its
-  position, or its asset changed, until a default run catches it up.
-  `keys=` runs that leave no stale key catch the partition up.
-- R5. A `keys=` run that leaves a key stale moves no position.
+- R4. A per-key partition is stale exactly when one of its keys is: `keys=`
+  runs that leave no stale key leave it fresh. Any other partition is stale
+  when an upstream it reads changed past its position, or its asset
+  changed, until a run catches it up.
+- R5 is withdrawn (K41): a position follows what an attempt read and
+  committed, not the run's spec, so nothing here says when a `keys=` run
+  moves one.
 - R6. An output reset itself starts empty: a `keys=` run leaves just its
   keys; the next default run converges.
 - K38. An asset is stale exactly when one of its partitions is.
@@ -97,13 +99,11 @@ class PerKey:
     """A per-key output: whether it has a head (without one it is
     `missing`, never `stale`); for each key it holds, the upstream version
     it read and the counter of its write; `changed_at`, its asset's last
-    change; `position`, the upstream counter it is caught up to (None: a
-    default run reads a full pass)."""
+    change."""
 
     built: bool = False
     held: dict[str, tuple[int, int]] = field(default_factory=dict)
     changed_at: int = 0
-    position: int | None = None
 
 
 @dataclass
@@ -151,7 +151,6 @@ class Reference:
         t = self._tick()
         self.up.versions = dict.fromkeys(self.up.versions, t)
         self.up_changed = t
-        self.per_key.position = None
         self.unkeyed.position = None
 
     def reset_per_key(self) -> None:
@@ -165,14 +164,12 @@ class Reference:
         t = self._tick()
         if which == "per_key":
             self.per_key.changed_at = t
-            self.per_key.position = None  # a new fingerprint reads a full pass
         else:
             self.unkeyed.changed_at = t
             self.unkeyed.position = None
 
     def run_keys(self, keys: set[str]) -> None:
-        """R2 on the per-key output; R4/R5: catches it up only if no key is
-        left stale."""
+        """R2 on the per-key output."""
 
         t = self._tick()
         self.per_key.built = True
@@ -181,8 +178,6 @@ class Reference:
                 self.per_key.held[k] = (self.up.versions[k], t)
             else:
                 self.per_key.held.pop(k, None)
-        if not self.stale_keys():
-            self.per_key.position = self.up_changed
 
     def run_default(self, which: str) -> None:
         """A default run, caught up at its end: every key fresh."""
@@ -191,7 +186,6 @@ class Reference:
         if which == "per_key":
             self.per_key.built = True
             self.per_key.held = {k: (v, t) for k, v in self.up.versions.items()}
-            self.per_key.position = self.up_changed
         else:
             self.unkeyed.caught_up_at = t
             self.unkeyed.position = self.up_changed
