@@ -24,7 +24,6 @@ def project(root, outside, copy_v="1"):
         inputs={"items": Incremental()},
         outputs=Output("copy", key="id"),
         version=copy_v,
-        on_version_change="full",
     )
     def copy(ctx, items: list):
         return rebuild(ctx.batch["items"], [{"id": r["id"], "v": r["v"]} for r in items])

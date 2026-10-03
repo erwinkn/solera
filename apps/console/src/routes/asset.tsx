@@ -460,7 +460,6 @@ function Declaration({ asset, manifest }: { asset: AssetDecl; manifest: Manifest
             {asset.retries.n} · {asset.retries.backoff} from {duration(asset.retries.delay)}
           </Fact>
           <Fact label="Timeout">{duration(asset.timeout)}</Fact>
-          <Fact label="On version change">{asset.on_version_change}</Fact>
           {asset.aliases.length > 0 && <Fact label="Formerly">{asset.aliases.join(", ")}</Fact>}
         </Facts>
       </div>

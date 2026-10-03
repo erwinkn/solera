@@ -65,7 +65,6 @@ def project(
         deps=["knob"],
         outputs=Output("checks", key="id", store=checks_store),
         version=checks_v,
-        on_version_change="full",
     )
     async def checks(ctx, item: list):
         return [{"v": f"{item[0]['v']}.{checks_v}"}]
@@ -74,7 +73,6 @@ def project(
         inputs={"items": Incremental(exclude=["x*"])},
         outputs=Output("copy", key="id"),
         version=copy_v,
-        on_version_change="full",
     )
     def copy(ctx, items: list):
         changes = ctx.batch["items"]
@@ -82,9 +80,7 @@ def project(
         outside.started_over |= changes.full and changes.first
         return rebuild(changes, [{"id": r["id"], "v": r["v"]} for r in items])
 
-    @asset(
-        inputs={"items": Incremental()}, outputs=Output("count"), version=count_v, on_version_change="full"
-    )
+    @asset(inputs={"items": Incremental()}, outputs=Output("count"), version=count_v)
     def count(ctx, items: list):
         return {"rows": len(items)}
 

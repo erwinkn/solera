@@ -802,19 +802,11 @@ class Engine(Attempts, Sensors, Staleness, Views):
         heads = {}
         for output in asset["outputs"]:
             head = heads[output["name"]] = self.m.heads.get((output["name"], partition))
-            if (
-                not full
-                and head is not None
-                and head.get("version") is not None
-                and head["version"] != asset["version"]
-            ):
-                if asset.get("on_version_change") == "full":
-                    full = True
-                else:
-                    raise NonRetryable(
-                        f"{task['asset']}: committed version {head['version']} != declared "
-                        f"{asset['version']}: a full run is required"
-                    )
+            # A version bump is an asset change like any other: what the old version
+            # built is rebuilt, the next attempt starting over; the full pass it begins
+            # may be completed by any runs (docs/positions-from-reads.md).
+            if head is not None and head.get("version") not in (None, asset["version"]):
+                full = True
         planner = self.planner()
         try:
             inputs = planner.inputs(task["asset"], partition)

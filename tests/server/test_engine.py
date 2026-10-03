@@ -286,45 +286,31 @@ async def test_full_run_resets_position(state):
     assert seen == [(["a", "b"], True), (["a", "b"], True)]
 
 
-async def test_version_bump_fails_then_full_recovers(state):
-    """§6: a version mismatch between committed and declared fails an
-    incremental attempt non-retryably; on_version_change='full' turns the
-    next attempt of the partition into a full run."""
+async def test_a_version_bump_starts_the_next_run_over(state):
+    """§6, Erwin's (a): a version bump is an asset change like any other. The
+    next run, a plain one, starts over: no operator, no failure, and the
+    partition is stale until then (definition changed)."""
     count = {"n": 0}
 
-    @asset(version="1")
-    def versioned():
-        count["n"] += 1
-        return [count["n"]]
+    def project(version):
+        @asset(version=version)
+        def versioned():
+            count["n"] += 1
+            return [count["n"]]
 
-    project = Project(assets=[versioned])
-    engine = make_engine(state, project)
+        return Project(assets=[versioned])
+
+    engine = make_engine(state, project("1"))
     await engine.initialize()
     await drive(engine, await engine.submit(["versioned"]))
-
-    @asset(version="2")
-    def versioned():  # noqa: F811 — same asset name, bumped version
-        count["n"] += 1
-        return [count["n"]]
-
-    project2 = Project(assets=[versioned])
-    engine2 = make_engine(state, project2)
-    await engine2.initialize()
-    detail = await drive(engine2, await engine2.submit(["versioned"]))
-    assert status_of(detail) == "failed"
-    task = detail["tasks"][0]
-    assert "full run is required" in task["error"]
-
-    @asset(version="2", on_version_change="full")
-    def versioned():  # noqa: F811
-        count["n"] += 1
-        return [count["n"]]
-
-    project3 = Project(assets=[versioned])
-    engine3 = make_engine(state, project3)
-    await engine3.initialize()
-    detail = await drive(engine3, await engine3.submit(["versioned"]))
-    assert status_of(detail) == "succeeded"
+    await engine.stop()
+    engine = make_engine(state, project("2"))
+    await engine.initialize()
+    assert await engine.stale_reasons("versioned", "") == ["definition changed"]
+    detail = await drive(engine, await engine.submit(["versioned"]))
+    assert status_of(detail) == "succeeded" and count["n"] == 2
+    assert state.model.heads[("versioned", "")]["version"] == "2"
+    assert await engine.stale_reasons("versioned", "") == []
 
 
 async def test_incremental_batching_and_more(state):

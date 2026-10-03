@@ -149,7 +149,6 @@ def build(variant: Variant, data_root, db: Database, outside: External, pg: str 
         outputs=items_output,
         inputs={"feed": Incremental()},
         version=variant.items_version,
-        on_version_change="full",
         automations=AutoRefresh(),
         retries=Retry(3, delay=1.0),
         timeout=300,

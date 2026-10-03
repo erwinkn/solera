@@ -1035,7 +1035,6 @@ class Asset:
         retries: Retry | None = None,
         timeout: float = 3600,
         version: str = "1",
-        on_version_change: str = "fail",
         retention: Retention | None = None,
         automations: Any = (),
         aliases: tuple | list = (),
@@ -1057,9 +1056,6 @@ class Asset:
         self.retries = retries or Retry()
         self.timeout = timeout
         self.version = str(version)
-        if on_version_change not in ("fail", "full"):
-            raise RegistrationError(f"{self.name}: on_version_change must be 'fail' or 'full'")
-        self.on_version_change = on_version_change
         self.retention = retention
         if isinstance(automations, Automation) or automations.__class__ in (Every, Cron, OnChange, OnDeploy):
             automations = (automations,)
@@ -1614,7 +1610,6 @@ class Project:
                 "retries": asset.retries.spec(),
                 "timeout": asset.timeout,
                 "version": asset.version,
-                "on_version_change": asset.on_version_change,
                 "retention": asset.retention.spec() if asset.retention else None,
                 "aliases": list(asset.aliases),
                 "tags": asset.tags,

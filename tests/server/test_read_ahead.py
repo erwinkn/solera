@@ -22,7 +22,6 @@ def project(root, outside, seen, retention=None, version="1"):
         outputs=Output("copy", key="id"),
         retention=retention,
         version=version,
-        on_version_change="full",
     )
     def copy(ctx, feed: list):
         seen.append((sorted(ctx.batch["feed"].upserted), sorted(ctx.batch["feed"].removed)))

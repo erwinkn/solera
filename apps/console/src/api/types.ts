@@ -63,7 +63,6 @@ export interface AssetDecl {
   retries: { n: number; delay: number; backoff: string };
   timeout: number;
   version: string;
-  on_version_change: string;
   retention: Json;
   aliases: string[];
   tags: Record<string, string>;

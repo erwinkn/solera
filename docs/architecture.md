@@ -92,8 +92,7 @@ async def qaqc_samples(ctx, qaqc_files: pd.DataFrame, sharepoint): ...
 | `partitions` | partition declaration (§7) | unpartitioned |
 | `executor` | placement (§10) | `Local()()` |
 | `retries` / `timeout` | `Retry(n, delay, backoff)` / seconds | `Retry(3)` / `3600` |
-| `version` | opaque string; bump to invalidate incremental state (§6) | `"1"` |
-| `on_version_change` | `"fail"` (attempts fail until an operator runs `full`) or `"full"` (the next attempt of each partition is a full run) | `"fail"` |
+| `version` | opaque string; bump to rebuild: an asset change, so what the old version built is stale and the next run starts over (§6) | `"1"` |
 | `automations` | attached automations (§9) | `()` |
 
 Resources (`Project(resources={...})`) bind by parameter name. `ctx` is
@@ -488,10 +487,10 @@ resets to the whole head. Code changes alone do not: the build identity
 
 A head written before the output was incremental has no delta log: "no keys
 known"; the consumer's position starts empty and the next write upserts
-everything. A `version` mismatch between committed and declared makes an
-incremental attempt fail non-retryably, or, with
-`on_version_change="full"`, turns the next attempt of each partition into
-a full run.
+everything. A `version` bump is an asset change like any other: the next
+attempt of each partition starts over, and the full pass it begins may be
+completed by any runs, `keys=` ones included (`positions-from-reads.md`);
+until then the partition is stale, `definition changed`.
 
 ## 7. Partitions
 
@@ -594,7 +593,7 @@ attempt, so exactly one side wins (object-store-state.md §8). Outcomes:
 |---|---|
 | `succeeded` | committed |
 | `skipped` | every `Incremental` input was already at its head (empty diff) and the partition is complete: no worker launched, nothing changes |
-| `failed` | retryable → `retries=` applies with backoff; non-retryable (deploy mismatch, version-mismatch without `on_version_change="full"`) → task fails |
+| `failed` | retryable → `retries=` applies with backoff; non-retryable (deploy mismatch) → task fails |
 | `canceled` | run canceled before the attempt began writing; an attempt already writing is committed instead |
 
 **Errors in user code** are classified by the class they subclass
