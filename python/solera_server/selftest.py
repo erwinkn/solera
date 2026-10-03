@@ -46,13 +46,16 @@ async def key_index_probe(objects):
     io = ObjectIO(objects)
     state = IndexState(prefix="conformance/keys/")
     index = KeyIndex(io, None, state)
-    files, _ = await index.replace(Rows.keys([b"b", b"a"], b"1"), 0, uuid.uuid4().hex)
+    files, _ = await index.replace(Rows.keys([b"b", b"a"], b"1"), 0, uuid.uuid4().hex, generation=7)
     state = state.committed(0, files, keep_log=True)
     try:
         index = KeyIndex(io, None, state)
-        keys, versions, _, _ = await index.page(None, 10)
-        check(keys == [b"a", b"b"] and versions == [b"1", b"1"], "Key index page read back wrong")
-        check(await index.lookup([b"b"]) == {b"b": (b"1", 0)}, "Key index lookup read back wrong")
+        keys, generations, versions, _ = await index.page(None, 10)
+        check(
+            keys == [b"a", b"b"] and generations == [7, 7] and versions == [b"1", b"1"],
+            "Key index page read back wrong",
+        )
+        check(await index.lookup([b"b"]) == {b"b": (7, b"1")}, "Key index lookup read back wrong")
         changes = await index.pending(0, 0, None, 10)
         check(changes[0] == [b"a", b"b"], "Key index delta log read back wrong")
     finally:
