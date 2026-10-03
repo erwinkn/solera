@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Model-check the journal spec (docs/verification.md, "Formal model: the journal").
 #
-#   spec/tla/check-journal.sh              the small model, as built
-#   spec/tla/check-journal.sh fixed        three engines, four segments, with the F14 and F15 fix
+#   spec/tla/check-journal.sh              the small model: two engines, as built
+#   spec/tla/check-journal.sh fixed        three engines, four segments
 #   spec/tla/check-journal.sh big          the same, five segments
 #   spec/tla/check-journal.sh live         liveness, engines one at a time
 #   spec/tla/check-journal.sh calibrate    each fix put back out: TLC must find its bug
@@ -71,7 +71,7 @@ calibrate() {
     # be the only property checked.
     if [[ $found == *" $expected "* ]] ||
         { [[ $found == Temporal* ]] && grep -qE "^PROPERTY +$expected *$" "$cfg"; }; then
-        printf '   %-12s %s violated in %s steps\n' "$name" "$expected" "$(grep -cE '^State [0-9]+:' "$log")"
+        printf '   %-13s %s violated in %s steps\n' "$name" "$expected" "$(grep -cE '^State [0-9]+:' "$log")"
     else
         tail -40 "$log"
         echo "FAIL: $name: expected $expected violated, got: ${found:-no violation}"
@@ -92,16 +92,16 @@ calibration() {
     calibrate 0b3e226 big NoAckedLoss KeepFences=FALSE -FencesStay -OneWriter
     # f300500: two engines fence at one seq with the same bytes; both serve.
     calibrate f300500 big OneWriter FenceNonce=FALSE
-    # F14, F15: each half of the hole test off, then both (as built). Without
+    # F14, F15: each half of the hole test off, then both (before 1367919). Without
     # FixF14 an opener deletes real fences, so HolesTwiceCovered, a lemma of
     # the fixed rule, fails first: it is left out to reach the lost event.
     calibrate f14 big NoAckedLoss FixF14=FALSE Unreadable=FALSE -HolesTwiceCovered
     calibrate f15 big StatesArePrefixes FixF15=FALSE
     calibrate f15-writer big FencedSeesAcked FixF15=FALSE -StatesArePrefixes
-    calibrate as-built big NoAckedLoss FixF14=FALSE FixF15=FALSE Unreadable=FALSE -HolesTwiceCovered
-    # As built, F14 needs only two engines once a checkpoint can be
-    # unreadable: an opener deletes its fence after its successor read it.
-    calibrate f14-two small CleanupCovered Unreadable=TRUE
+    calibrate pre-1367919 big NoAckedLoss FixF14=FALSE FixF15=FALSE Unreadable=FALSE -HolesTwiceCovered
+    # Before 1367919, F14 needed only two engines once a checkpoint could be
+    # unreadable: an opener deleted its fence after its successor read it.
+    calibrate f14-two small CleanupCovered FixF14=FALSE FixF15=FALSE -HolesTwiceCovered
     # A create that does not know its own bytes fences out a lone engine.
     calibrate own-bytes live AppendsAlone OwnBytes=FALSE -OpensAlone
     # The design does not keep a segment an opener listed until it reads it.
@@ -110,7 +110,6 @@ calibration() {
 
 live() {
     check live live
-    check live-fixed live FixF14=TRUE FixF15=TRUE
 }
 
 case ${1:-small} in

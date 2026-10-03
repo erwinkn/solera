@@ -436,7 +436,7 @@ crashes between any two steps; a restart is the next engine starting.
 | `StatesArePrefixes` | The segments folded into every state an engine acts on (once it has fenced, or what a read-only open returns), and into every checkpoint, are a prefix of one history of landed segments. It says nothing of events an engine has applied and not yet flushed, which may differ between engines. |
 | `CountersDense` | Nothing lands at seq n before n − 1 has. |
 | `CleanupCovered` | A segment that landed and is gone is covered by a readable checkpoint still there, which holds it (`StatesArePrefixes`). |
-| `HolesTwiceCovered` | A segment that landed and is gone is covered by two checkpoints still there. The hole test relies on it; it holds with the F14 and F15 fix (as built, F14 breaks it). |
+| `HolesTwiceCovered` | A segment that landed and is gone is covered by two checkpoints still there. The hole test relies on it; before the F14 and F15 fix (1367919), F14 broke it. |
 | `FencesStay` | A fence an engine serves under is never deleted. |
 | `OpensNeverFail` | No opener gives up on the journal (before F7's fix, a gap was "journal corrupt"). |
 | `Monotonic` | Once an engine serves, its state only grows, and the newest checkpoint only moves forward. |
@@ -501,11 +501,10 @@ between objects beyond the above.
 
 | Model | Engines | Segments | Distinct states | Depth | Time |
 |---|---|---|---|---|---|
-| `Journal-small.cfg`: as built, checkpoints readable | 2 | 6 | 108,551 | 49 | 3 s |
-| `fixed` (`Journal-big.cfg`, four segments): the F14 and F15 fix, one checkpoint possibly unreadable | 3 | 4 | 2,044,229 | 55 | 53 s |
+| `Journal-small.cfg`: as built (with 1367919's fix), one checkpoint possibly unreadable | 2 | 6 | 665,146 | 55 | 21 s |
+| `fixed` (`Journal-big.cfg`, four segments): the same | 3 | 4 | 2,044,229 | 55 | 53 s |
 | `Journal-big.cfg`: the same, five segments (5 GB heap) | 3 | 5 | 23,314,158 | 62 | 23 min 39 s |
-| `Journal-live.cfg`: as built, one engine at a time | 3 | 5 | 279,168 | 42 | 59 s |
-| the same, with the F14 and F15 fix | 3 | 5 | 284,784 | 44 | 1 min 22 s |
+| `Journal-live.cfg`: as built, one engine at a time | 3 | 5 | 284,784 | 44 | 53 s |
 
 Two engines (an old one and its successor, as in the simulation's
 takeovers) are enough for F7 and every earlier journal bug. F14 needs
@@ -525,11 +524,11 @@ first, in plain words (A is the old engine):
 | `OwnBytes` | none: `_put_segment` always compared bytes | `AppendsAlone`, 15 to 21 steps (a liveness trace varies between runs) | A lone engine's create lands with its answer lost; the retry takes the segment for another engine's, and the engine stops. |
 | `FixF14` | F14's half of the hole test | `NoAckedLoss`, 30 steps (checkpoints readable) | F14 (below). |
 | `FixF15` | F15's half of the hole test | `StatesArePrefixes`, 29 steps; `FencedSeesAcked`, 31 | F15 (below): a read-only open, then a serving engine. |
-| `FixF14`, `FixF15` | the design as built | `NoAckedLoss`, 27 steps (checkpoints readable) | F14. |
-| `FixF14`, `FixF15` | the design as built, two engines | `CleanupCovered`, 17 steps | B fences at 1; C reads it, fences at 2 and checkpoints at 2, unreadable; B deletes its fence as a hole's. Segment 1 is now covered by no readable checkpoint: every later opener finds it missing, loads nothing, and opens again forever. |
+| `FixF14`, `FixF15` | before 1367919 | `NoAckedLoss`, 27 steps (checkpoints readable) | F14. |
+| `FixF14`, `FixF15` | before 1367919, two engines | `CleanupCovered`, 17 steps | B fences at 1; C reads it, fences at 2 and checkpoints at 2, unreadable; B deletes its fence as a hole's. Segment 1 is now covered by no readable checkpoint: every later opener finds it missing, loads nothing, and opens again forever. |
 
-With every switch on, every model passes; as built, the small model passes
-too. `spec/tla/check-journal.sh calibrate` runs all of the above and fails
+With every switch on, the design as built since 1367919, every model
+passes. `spec/tla/check-journal.sh calibrate` runs all of the above and fails
 unless each named property is the one violated.
 
 **F14 and F15** (Findings, below). Both come from one wrong inference in
@@ -584,14 +583,30 @@ reopening while an old engine keeps checkpointing (bounded seqs end it).
 
 **Where the docs and the code differ.**
 
-1. §10 of `object-store-state.md` reasons that "a fence create that
-   succeeds where a checkpoint at or past it exists" landed in a hole.
-   That is F14. The code does what the doc says.
-2. `solera.objects.create` reads a colliding object back. If cleanup
-   deleted that object meanwhile, the GET raises `NotFoundError`, which
-   `_fence` does not catch: opening fails with that error, where §10 says
-   a GET that finds nothing makes the opener start over. A restart opens
-   again, so this costs only time.
+1. Fixed in 1367919: §10 reasoned that "a fence create that succeeds
+   where a checkpoint at or past it exists" landed in a hole (F14), and
+   `_fence` let the `NotFoundError` of `create`'s read-back end the open
+   instead of opening again.
+2. `journal.py` as of 1367919 (`_hole`, `_apply_read`, `_fence`) follows
+   the modeled hole test request by request, with three differences, none
+   unsafe. The engine whose fence create succeeded LISTs twice (`_behind`,
+   then `_hole`), where the model uses the first listing: `_hole` is a
+   fresh test, which the model has as its "LIST again" path. If that
+   second listing shows fewer than two covering checkpoints, the code
+   keeps the fence and opens again, where the model would serve: opening
+   again is always safe. And `_hole` returns "undecidable" when every
+   covering checkpoint listed is unreadable; the model has that outcome
+   but never reaches it, since it allows one unreadable checkpoint and
+   the test only reads with two or more covering. With two unreadable
+   covering checkpoints, beyond what the design survives, a lone engine
+   reopens forever, the loop the first version of the rule had. Usually
+   the journal is lost then anyway: the two newest checkpoints are
+   unreadable, and cleanup removed what lies below the previous one. Only
+   if cleanup did not run after them (a crash) does an older checkpoint
+   and the journal after it remain, and the loop blocks a recovery the
+   code before 1367919 would have made. Applying an undecidable fence
+   instead would bring F15 back, so the code is right to refuse it; the
+   way out is an operator, or a newer readable checkpoint.
 3. `glossary.md` lists `seq` among the old names of the event counter.
    In `object-store-state.md` and `journal.py`, `seq` numbers segments, and
    a segment holds many events, so the two are different counters. The
@@ -601,10 +616,10 @@ reopening while an old engine keeps checkpointing (bounded seqs end it).
 1.7.4 into `spec/tla/.tools/` (gitignored).
 
 ```bash
-spec/tla/check-journal.sh              # the small model, as built: seconds
-spec/tla/check-journal.sh fixed        # three engines, four segments, with the F14 and F15 fix: ~1 min
+spec/tla/check-journal.sh              # the small model, two engines: ~20 s
+spec/tla/check-journal.sh fixed        # three engines, four segments: ~1 min
 spec/tla/check-journal.sh big          # the same, five segments: ~25 min
-spec/tla/check-journal.sh live         # liveness, as built and with the fix: ~2 min
+spec/tla/check-journal.sh live         # liveness: ~1 min
 spec/tla/check-journal.sh calibrate    # every fix switched off in turn: ~2 min
 spec/tla/check-journal.sh ci           # small, fixed, live and calibrate
 ```
