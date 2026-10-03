@@ -239,8 +239,9 @@ with Hypothesis drawing the inputs (in CI, a few seconds each):
   `tests/staleness.py`): random histories of upstream commits and resets,
   shared-input changes, an output's own reset, asset changes, `keys=` and
   default runs; after each step the engine's stale keys and its partition
-  and asset statuses must equal a reference model's (K43). Strict xfails
-  until the design is built. One part runs now: on FileStore, PostgresStore
+  and asset statuses must equal a reference model's (K43, K45), and a plain
+  incremental asset is delivered exactly what its record lacks, nothing
+  twice. Strict xfails until the design is built. One part runs now: on FileStore, PostgresStore
   and S3Store, a `keys=` run never touches a key it does not name.
 
 ## Kani: tried, then dropped
