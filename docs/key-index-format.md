@@ -57,7 +57,7 @@ the file's codec (footer).
 
 ```
 filters := filter(keys) filter(tombstones) crc32
-filter  := nbits varint, k u8, bits (ceil(nbits / 8) bytes)
+filter  := nbits varint, k u8, bits (nbits / 8 bytes)
 crc32   := u32, CRC-32 of the two filters' bytes
 ```
 
