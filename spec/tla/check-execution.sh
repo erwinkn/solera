@@ -3,7 +3,7 @@
 #
 #   spec/tla/check-execution.sh             the smoke model and the calibrations (CI)
 #   spec/tla/check-execution.sh design      the design with liveness: deploys, faults, each=True
-#   spec/tla/check-execution.sh safety      safety only, two deploys and two faults
+#   spec/tla/check-execution.sh safety      every kind at once, two deploys and two faults: random behaviours (SAFETY_TRACES)
 #   spec/tla/check-execution.sh calibrate   each fix put back out: TLC must find its bug
 #   spec/tla/check-execution.sh all
 #
@@ -21,27 +21,30 @@ fi
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-tlc() {  # tlc CONFIG LOG
+tlc() {  # tlc CONFIG LOG [TLC options]
+    local cfg=$1 log=$2
+    shift 2
     local args=(-XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers auto -deadlock -lncheck final
-                -metadir "$work/states" -config "$1" Execution.tla)
+                -metadir "$work/states" "$@" -config "$cfg" Execution.tla)
     if command -v java >/dev/null; then
-        java "${args[@]}" > "$2" 2>&1 || true
+        java "${args[@]}" > "$log" 2>&1 || true
     else
         docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/w -v "$work":"$work" -w /w \
-            eclipse-temurin:21-jre java "${args[@]}" > "$2" 2>&1 || true
+            eclipse-temurin:21-jre java "${args[@]}" > "$log" 2>&1 || true
     fi
     rm -rf "$work/states"
-    if [ -n "${TLA_LOGS:-}" ]; then mkdir -p "$TLA_LOGS"; cp "$2" "$TLA_LOGS/"; fi
+    if [ -n "${TLA_LOGS:-}" ]; then mkdir -p "$TLA_LOGS"; cp "$log" "$TLA_LOGS/"; fi
 }
 
-check() {  # check NAME: the model must pass
-    local log="$work/$1.log"
-    echo "== $1"
-    tlc "Execution-$1.cfg" "$log"
-    grep -E "distinct states found|^Finished in" "$log" | sed 's/^/   /'
-    if ! grep -q "No error has been found" "$log"; then
+check() {  # check NAME [TLC options]: the model must pass
+    local name=$1 log="$work/$1.log"
+    shift
+    echo "== $name"
+    tlc "Execution-$name.cfg" "$log" "$@"
+    grep -E "distinct states found|states checked|^Finished in" "$log" | tail -2 | sed 's/^/   /'
+    if grep -qE "^Error|violated" "$log" || ! grep -q "^Finished in" "$log"; then
         cat "$log"
-        echo "FAIL: $1"
+        echo "FAIL: $name"
         exit 1
     fi
 }
@@ -71,8 +74,8 @@ calibration() {
 case "${1:-ci}" in
     ci) check smoke; calibration ;;
     design) check deploys; check faults; check each ;;
-    safety) check safety ;;
+    safety) check safety -simulate "num=${SAFETY_TRACES:-100000}" -depth 150 ;;
     calibrate) calibration ;;
-    all) check smoke; calibration; check deploys; check faults; check each; check safety ;;
+    all) check smoke; calibration; check deploys; check faults; check each; check safety -simulate "num=${SAFETY_TRACES:-100000}" -depth 150 ;;
     *) echo "usage: $0 [ci|design|safety|calibrate|all]" >&2; exit 2 ;;
 esac
