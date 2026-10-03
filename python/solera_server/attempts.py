@@ -233,7 +233,9 @@ class Attempts:
         """The worker that owns the attempt, as its control file says (§2.4)."""
 
         found = await self._control_file(run_id, attempt)
-        return found[0].get("worker_id") if found is not None else None
+        if found is None or found[0]["state"] not in (lifecycle.OWNED, lifecycle.WRITING, lifecycle.SEALED):
+            return None  # nobody owns an open, ended or malformed file
+        return found[0]["worker_id"]
 
     async def _bind(self, attempt: str, live: Live, worker_id: str, start: bool = False) -> None:
         """The first `start` of an attempt this engine launched binds its

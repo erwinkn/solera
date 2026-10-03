@@ -63,9 +63,20 @@ class Malformed(ValueError):
         self.etag = etag
 
 
+# What each state's writers put in a body (§2.4), and nothing else.
+FIELDS = {
+    OPEN: {"state", "engine"},
+    OWNED: {"state", "worker_id", "host", "pid", "at"},
+    WRITING: {"state", "worker_id", "intents"},
+    SEALED: {"state", "worker_id", "result"},
+    ENDED: {"state", "engine", "write", "intents"},
+}
+
+
 def check_control(data: bytes, etag: str) -> dict:
     """A control file's body, or `Malformed`: a JSON object in a known state,
-    with what that state adds."""
+    with what that state adds and no field it cannot have (F32: an `open`
+    file naming a worker would have the engine wait on one that never was)."""
 
     try:
         body = json.loads(data)
@@ -74,8 +85,10 @@ def check_control(data: bytes, etag: str) -> dict:
     if not isinstance(body, dict):
         raise Malformed("not an object", etag)
     state = body.get("state")
-    if state not in (OPEN, OWNED, WRITING, SEALED, ENDED):
+    if state not in FIELDS:
         raise Malformed(f"unknown state {state!r}", etag)
+    if extra := sorted(set(body) - FIELDS[state]):
+        raise Malformed(f"{state} with fields it cannot have: {', '.join(extra)}", etag)
     if state in (OWNED, WRITING, SEALED) and not isinstance(body.get("worker_id"), str):
         raise Malformed(f"{state} names no worker", etag)
     if state == WRITING and not isinstance(body.get("intents", {}), dict):

@@ -272,7 +272,6 @@ async def _with_control_file(tmp_path, body: bytes):
         await state.close()
 
 
-@pytest.mark.xfail(strict=True, raises=(TimeoutError, AssertionError), reason="F32: open")
 async def test_an_open_control_file_naming_a_worker_fails_its_attempt(tmp_path):
     """F32 (the control-file fuzzer, after F30's fix): an `open` file that
     names a worker, which no writer writes (a worker swaps to `owned`),
