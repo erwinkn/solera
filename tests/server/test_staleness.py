@@ -1,7 +1,8 @@
-"""Staleness at every level (K36–K38; tests/staleness.py states the rules):
+"""Staleness at every level (K36–K41; tests/staleness.py states the rules):
 the engine's stale keys, partition and asset statuses against a reference
-model, over random histories; and the coordinator's worked example. Strict
-xfails until W22 builds the rules (`staleness.LANDED`)."""
+model, over random histories; worked examples and calibrations; and R2 on
+every built-in store. Strict xfails until W22 builds the rules
+(`staleness.LANDED`)."""
 
 import asyncio
 
@@ -19,39 +20,62 @@ from tests.sim.project import External, SourceStore, rebuild
 
 from .engines import drive, make_engine
 
-KEYS = ["k1", "k2", "k3", "k4"]
+KEYS = ["k1", "k2", "k3", "x1"]  # `x*`: what `checks` and `copy` exclude
 pending = pytest.mark.xfail(
     not staleness.LANDED,
     strict=True,
     raises=(staleness.NotBuilt, AssertionError),
-    reason="K36–K38: not built",
+    reason="K36–K41: not built",
 )
 
 
-def project(root, outside: External, *, items_store="a", checks_store="a", checks_v="1", count_v="1"):
+def taken(key: str) -> bool:
+    return not key.startswith("x")
+
+
+def project(
+    root,
+    outside: External,
+    *,
+    items_store="a",
+    checks_store="a",
+    checks_v="1",
+    copy_v="1",
+    count_v="1",
+):
     """`feed` (a keyed source) -> `items` (a keyed copy, run by hand) ->
-    `checks` (per key: an `Each`) and `count` (unkeyed). No automations:
-    staleness stays until someone runs."""
+    `checks` (each=True, excluding `x*`, with the unkeyed source `knob` a
+    dep), `copy` (keyed, incremental, excluding `x*`) and `count`
+    (unkeyed). No automations: staleness stays until someone runs."""
 
     @asset(inputs={"feed": Incremental()}, outputs=Output("items", key="id", store=items_store))
     def items(ctx, feed: list):
         return rebuild(ctx.batch["feed"], [{"id": r["id"], "v": r["v"]} for r in feed])
 
     @asset(
-        inputs={"item": Each("items", batch_size=2)},
+        inputs={"item": Each("items", batch_size=2, exclude=["x*"])},
+        deps=["knob"],
         outputs=Output("checks", key="id", store=checks_store),
         version=checks_v,
     )
     async def checks(ctx, item: list):
         return [{"v": f"{item[0]['v']}.{checks_v}"}]
 
+    @asset(
+        inputs={"items": Incremental(exclude=["x*"])},
+        outputs=Output("copy", key="id"),
+        version=copy_v,
+    )
+    def copy(ctx, items: list):
+        return rebuild(ctx.batch["items"], [{"id": r["id"], "v": r["v"]} for r in items])
+
     @asset(inputs={"items": Incremental()}, outputs=Output("count"), version=count_v)
     def count(ctx, items: list):
         return {"rows": len(items)}
 
     return Project(
-        assets=[items, checks, count],
-        sources=[Source("feed", key="id", store="ext")],
+        assets=[items, checks, copy, count],
+        sources=[Source("feed", key="id", store="ext"), Source("knob")],
         stores={
             "ext": SourceStore(root / "ext", outside),
             "a": FileStore(root / "a"),
@@ -61,24 +85,34 @@ def project(root, outside: External, *, items_store="a", checks_store="a", check
     )
 
 
+async def boot(engine, outside: External, keys: dict[str, str]):
+    """`knob` at version 0, and `items` holding `keys`."""
+
+    outside.feed.update(keys)
+    await engine.commit_source("knob", version="0")
+    await engine.commit_source("feed", upsert=sorted(keys))
+    await drive(engine, await engine.submit(["items"]))
+
+
 class Staleness(RuleBasedStateMachine):
-    """Random histories of upstream changes, upstream resets, the per-key
-    output's own resets, asset changes, `keys=` runs and default runs.
-    After every step the engine says what the reference says."""
+    """Random histories of upstream commits (excluded keys too), upstream
+    resets, shared-input changes, `checks`' own resets, asset changes,
+    `keys=` runs and default runs. After every step the engine says what
+    the reference says."""
 
     def __init__(self):
         super().__init__()
         self.loop = asyncio.new_event_loop()
-        self.ref = staleness.Reference()
+        self.ref = staleness.Reference(takes=taken)
         self.outside = External()
-        self.decl = {"items_store": "a", "checks_store": "a", "checks_v": "1", "count_v": "1"}
+        self.decl = {"items_store": "a", "checks_store": "a", "checks_v": "1", "copy_v": "1", "count_v": "1"}
         self.serial = 0
 
     def _run(self, coro):
         return self.loop.run_until_complete(coro)
 
     @initialize()
-    def boot(self):
+    def start(self):
         import tempfile
         from pathlib import Path
 
@@ -87,7 +121,9 @@ class Staleness(RuleBasedStateMachine):
         self.state = self._run(State.open((self.root / "state").as_uri(), "test", flush_interval=0.001))
         self.engine = None
         self._deploy()
-        self.commit({"k1", "k2"}, set())  # `items` has a head from here on
+        self._run(boot(self.engine, self.outside, {"k1": "0", "k2": "0"}))
+        self.ref.change_knob()
+        self.ref.commit({"k1", "k2"}, set())
 
     def _deploy(self):
         async def go():
@@ -118,7 +154,13 @@ class Staleness(RuleBasedStateMachine):
             self.outside.feed.pop(k, None)
         self._run(self.engine.commit_source("feed", upsert=sorted(upserts), remove=sorted(removes)))
         self._submit(["items"])
-        self.ref.commit(upserts, {k for k in removes if k in self.ref.up.versions})
+        self.ref.commit(upserts, removes)
+
+    @rule()
+    def change_knob(self):
+        self.serial += 1
+        self._run(self.engine.commit_source("knob", version=str(self.serial)))
+        self.ref.change_knob()
 
     @rule()
     def reset_upstream(self):
@@ -131,24 +173,24 @@ class Staleness(RuleBasedStateMachine):
     def reset_checks(self):
         self.decl["checks_store"] = "b" if self.decl["checks_store"] == "a" else "a"
         self._deploy()
-        self.ref.reset_per_key()
+        self.ref.reset_checks()
 
-    @rule(which=st.sampled_from(["checks", "count"]))
-    def change_asset(self, which):
-        key = f"{which}_v"
+    @rule(name=st.sampled_from(["checks", "copy", "count"]))
+    def change_asset(self, name):
+        key = f"{name}_v"
         self.decl[key] = str(int(self.decl[key]) + 1)
         self._deploy()
-        self.ref.change_asset("per_key" if which == "checks" else "unkeyed")
+        self.ref.change_asset(name)
 
-    @rule(keys=st.sets(st.sampled_from(KEYS), min_size=1))
-    def run_keys(self, keys):
-        self._submit(["checks"], keys={"items": {"keys": sorted(keys)}})
-        self.ref.run_keys(keys)
+    @rule(name=st.sampled_from(["checks", "copy"]), keys=st.sets(st.sampled_from(KEYS), min_size=1))
+    def run_keys(self, name, keys):
+        self._submit([name], keys={"items": {"keys": sorted(keys)}})
+        self.ref.run_keys(name, keys)
 
-    @rule(which=st.sampled_from(["checks", "count"]))
-    def run_default(self, which):
-        self._submit([which])
-        self.ref.run_default("per_key" if which == "checks" else "unkeyed")
+    @rule(name=st.sampled_from(["checks", "copy", "count"]))
+    def run_default(self, name):
+        self._submit([name])
+        self.ref.run_default(name)
 
     # -- what the engine says ----------------------------------------------------------
 
@@ -159,10 +201,13 @@ class Staleness(RuleBasedStateMachine):
 
         async def check():
             e, ref = self.engine, self.ref
-            if ref.per_key.built:
+            if ref.checks.built:
                 got = await staleness.stale_keys(e, "checks")
                 assert got == ref.stale_keys(), f"checks' stale keys {got}, expected {ref.stale_keys()}"
-            for name, want in (("checks", ref.per_key_stale()), ("count", ref.unkeyed_stale())):
+            for name in ("copy", "count"):
+                assert await staleness.stale_keys(e, name) is None, f"{name}: not tracked per key"
+            for name in ("checks", "copy", "count"):
+                want = ref.stale(name)
                 assert await staleness.partition_stale(e, name) == want, f"{name}: partition stale != {want}"
                 assert await staleness.asset_stale(e, name) == want, f"{name}: asset stale != {want}"
 
@@ -194,7 +239,7 @@ def test_staleness_matches_the_reference_over_any_history():
     Staleness.TestCase().runTest()
 
 
-# -- worked examples ------------------------------------------------------------------
+# -- worked examples and calibrations ---------------------------------------------------
 
 
 async def _quiet_rounds(engine, n=20):
@@ -203,19 +248,23 @@ async def _quiet_rounds(engine, n=20):
         await asyncio.sleep(0.01)
 
 
+async def _built(state, tmp_path, keys, **decl):
+    outside = External()
+    engine = make_engine(state, project(tmp_path, outside, **decl))
+    await engine.initialize()
+    await boot(engine, outside, keys)
+    await drive(engine, await engine.submit(["checks", "copy", "count"]))
+    return engine, outside
+
+
 @pending
 async def test_keys_runs_after_an_upstream_reset_merge_and_together_catch_up(state, tmp_path):
     """The coordinator's example (R2, R4): `items` is reset; `checks` holds
     k1, k2, k3. keys=(k1, k2) updates those two, leaves k3 untouched and
-    `checks` stale with stale keys {k3}; keys=(k3) then catches it up, and
-    its next default run reads nothing."""
+    `checks` stale with stale keys {k3}; keys=(k3) then leaves it fresh, and
+    its next default run writes nothing."""
 
-    outside = External()
-    outside.feed.update(k1="1", k2="1", k3="1")
-    engine = make_engine(state, project(tmp_path, outside))
-    await engine.initialize()
-    await engine.commit_source("feed", upsert=["k1", "k2", "k3"])
-    await drive(engine, await engine.submit(["checks"], upstream=True))
+    engine, outside = await _built(state, tmp_path, {"k1": "1", "k2": "1", "k3": "1"})
     before = await index_entries(state, "checks", "")
     await engine.stop()
 
@@ -232,12 +281,10 @@ async def test_keys_runs_after_an_upstream_reset_merge_and_together_catch_up(sta
 
     await drive(engine, await engine.submit(["checks"], keys={"items": {"keys": ["k3"]}}))
     assert await staleness.stale_keys(engine, "checks") == set()
-    assert not await staleness.partition_stale(engine, "checks"), (
-        "keys= runs covering every key catch up (R4)"
-    )
+    assert not await staleness.partition_stale(engine, "checks"), "keys= runs covering every stale key"
     settled = await index_entries(state, "checks", "")
     await drive(engine, await engine.submit(["checks"]))
-    assert await index_entries(state, "checks", "") == settled, "the next default run reads nothing new"
+    assert await index_entries(state, "checks", "") == settled, "the next default run writes nothing"
 
 
 @pending
@@ -245,14 +292,8 @@ async def test_a_reset_output_holds_only_what_keys_runs_wrote_until_a_default_ru
     """R6: `checks` itself reset (moved) starts empty; keys=(k1) leaves k1
     alone in it, stale keys {k2, k3} (missing); a default run converges."""
 
-    outside = External()
-    outside.feed.update(k1="1", k2="1", k3="1")
-    engine = make_engine(state, project(tmp_path, outside))
-    await engine.initialize()
-    await engine.commit_source("feed", upsert=["k1", "k2", "k3"])
-    await drive(engine, await engine.submit(["checks"], upstream=True))
+    engine, outside = await _built(state, tmp_path, {"k1": "1", "k2": "1", "k3": "1"})
     await engine.stop()
-
     p = project(tmp_path, outside, checks_store="b")
     engine = make_engine(state, p)
     await engine.initialize()
@@ -269,48 +310,109 @@ async def test_an_unkeyed_partition_stays_stale_until_it_reruns(state, tmp_path)
     """K38's calibration: `count` (unkeyed) built, then `items` changes:
     `count` is stale, through any number of ticks, until a run of it."""
 
-    outside = External()
-    outside.feed.update(k1="1")
-    engine = make_engine(state, project(tmp_path, outside))
-    await engine.initialize()
-    await engine.commit_source("feed", upsert=["k1"])
-    await drive(engine, await engine.submit(["count"], upstream=True))
+    engine, outside = await _built(state, tmp_path, {"k1": "1"})
     assert not await staleness.partition_stale(engine, "count")
     outside.feed["k2"] = "1"
     await engine.commit_source("feed", upsert=["k2"])
     await drive(engine, await engine.submit(["items"]))
     await _quiet_rounds(engine)
-    assert await staleness.partition_stale(engine, "count"), "an upstream changed past its position"
+    assert await staleness.partition_stale(engine, "count"), "an upstream changed since its catch-up"
     assert await staleness.asset_stale(engine, "count")
     await drive(engine, await engine.submit(["count"]))
     assert not await staleness.partition_stale(engine, "count")
     assert not await staleness.asset_stale(engine, "count")
 
 
-def test_the_reference_reads_the_coordinators_example():
-    """The reference itself, on the worked example: it is what the tests
-    above hold the engine to."""
+@pending
+async def test_a_commit_of_excluded_keys_alone_leaves_their_consumers_fresh(state, tmp_path):
+    """K39's calibration: `items` commits only `x1`, which `checks` and `copy`
+    exclude: neither is stale (the plain "position behind" rule says both
+    are). Then a commit of `k1`: both are, and `count`, which takes every
+    key, was already."""
 
-    ref = staleness.Reference()
+    engine, outside = await _built(state, tmp_path, {"k1": "1", "k2": "1"})
+    outside.feed["x1"] = "1"
+    await engine.commit_source("feed", upsert=["x1"])
+    await drive(engine, await engine.submit(["items"]))
+    assert await staleness.stale_keys(engine, "checks") == set()
+    assert not await staleness.partition_stale(engine, "checks"), "only an excluded key changed"
+    assert not await staleness.partition_stale(engine, "copy"), "only an excluded key changed"
+    assert await staleness.partition_stale(engine, "count")
+    outside.feed["k1"] = "2"
+    await engine.commit_source("feed", upsert=["k1"])
+    await drive(engine, await engine.submit(["items"]))
+    assert await staleness.stale_keys(engine, "checks") == {"k1"}
+    assert await staleness.partition_stale(engine, "copy")
+
+
+@pending
+async def test_a_shared_input_change_makes_every_key_stale(state, tmp_path):
+    """K40's calibration: `knob`, a dep every key of `checks` shares,
+    changes: every key is stale, though no upstream key changed. keys= runs
+    covering them all leave `checks` fresh; on `copy` (not each=True) a
+    keys= run never does, a default run does."""
+
+    engine, outside = await _built(state, tmp_path, {"k1": "1", "k2": "1"})
+    await engine.commit_source("knob", version="1")
+    assert await staleness.stale_keys(engine, "checks") == {"k1", "k2"}
+    assert await staleness.partition_stale(engine, "checks") and await staleness.asset_stale(engine, "checks")
+    await drive(engine, await engine.submit(["checks"], keys={"items": {"keys": ["k1", "k2"]}}))
+    assert not await staleness.partition_stale(engine, "checks")
+
+    outside.feed["k1"] = "2"
+    await engine.commit_source("feed", upsert=["k1"])
+    await drive(engine, await engine.submit(["items"]))
+    await drive(engine, await engine.submit(["copy"], keys={"items": {"keys": ["k1"]}}))
+    assert await staleness.partition_stale(engine, "copy"), "a keys= run never clears a partition-level asset"
+    assert await staleness.stale_keys(engine, "copy") is None
+    await drive(engine, await engine.submit(["copy"]))
+    assert not await staleness.partition_stale(engine, "copy")
+
+
+def test_the_reference_reads_the_worked_examples():
+    """The reference itself on the examples above: what the tests hold the
+    engine to."""
+
+    ref = staleness.Reference(takes=taken)
+    ref.change_knob()
     ref.commit({"k1", "k2", "k3"}, set())
-    ref.run_default("per_key")
+    for name in ("checks", "copy", "count"):
+        ref.run_default(name)
     ref.reset_upstream()
     assert ref.stale_keys() == {"k1", "k2", "k3"}
-    ref.run_keys({"k1", "k2"})
-    assert ref.stale_keys() == {"k3"} and ref.per_key_stale()
-    ref.run_keys({"k3"})
-    assert ref.stale_keys() == set() and not ref.per_key_stale()  # R4
+    ref.run_keys("checks", {"k1", "k2"})
+    assert ref.stale_keys() == {"k3"} and ref.stale("checks")
+    ref.run_keys("checks", {"k3"})
+    assert ref.stale_keys() == set() and not ref.stale("checks")
     ref.commit({"k4"}, set())
     assert ref.stale_keys() == {"k4"}  # missing counts
     ref.commit(set(), {"k1"})
     assert ref.stale_keys() == {"k1", "k4"}  # so does a key the upstream removed
-    ref.change_asset("per_key")
-    ref.run_keys({"k1", "k4"})
+    ref.change_asset("checks")
+    ref.run_keys("checks", {"k1", "k4"})
     assert ref.stale_keys() == {"k2", "k3"}  # written before the change
-    ref.reset_per_key()
-    assert not ref.per_key_stale()  # no head: missing, not stale
-    ref.run_keys({"k2"})
+    ref.reset_checks()
+    assert not ref.stale("checks")  # no head: missing, not stale
+    ref.run_keys("checks", {"k2"})
     assert ref.stale_keys() == {"k3", "k4"}
+
+    ref = staleness.Reference(takes=taken)  # K39
+    ref.change_knob()
+    ref.commit({"k1"}, set())
+    for name in ("checks", "copy", "count"):
+        ref.run_default(name)
+    ref.commit({"x1"}, set())
+    assert not ref.stale("checks") and not ref.stale("copy") and ref.stale("count")
+    ref.commit({"k1"}, set())
+    assert ref.stale("checks") and ref.stale("copy")
+
+    ref.run_default("checks")  # K40: a shared input
+    ref.change_knob()
+    assert ref.stale_keys() == {"k1"}
+    ref.run_keys("copy", {"k1"})
+    assert ref.stale("copy")
+    ref.run_default("copy")
+    assert not ref.stale("copy")
 
 
 # -- the keyed merge on every built-in store (R2) ----------------------------------------
