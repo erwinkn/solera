@@ -112,6 +112,7 @@ class Simulation(RuleBasedStateMachine):
         self.knob = "0"
         self.runs: list[str] = []
         self.serial = 0
+        self.moves = 0
         self._ensure_engine()
         world.start_pool_hosts(POOL, 2)
 
@@ -358,8 +359,7 @@ class Simulation(RuleBasedStateMachine):
         world = self.world
         old = world.slot
         if change is not None:
-            self.variant = VARIANTS[change](self.variant)
-            self.project = self._build()
+            self._change(change)
         self._ensure_engine(self.project)
 
         async def reap():
@@ -372,13 +372,20 @@ class Simulation(RuleBasedStateMachine):
             else:
                 self._run(world.crash(old))
 
+    def _change(self, change: str) -> None:
+        """The project moves to another variant (`VARIANTS`)."""
+
+        before = self.variant.items_store
+        self.variant = VARIANTS[change](self.variant)
+        self.project = self._build()
+        self.moves += self.variant.items_store != before  # how often `items` changed store
+
     @rule(change=st.sampled_from(CHANGES), clean=st.booleans())
     def redeploy(self, change, clean):
         """Register a changed project: the engine restarts on it."""
 
         self.trace.append(f"redeploy({change!r}, clean={clean})")
-        self.variant = VARIANTS[change](self.variant)
-        self.project = self._build()
+        self._change(change)
         world = self.world
         self._run(world.stop() if clean else world.crash())
         self._ensure_engine(self.project)
@@ -436,8 +443,6 @@ class Simulation(RuleBasedStateMachine):
             elif op.who[0] == "engine" and world.slots[op.who[1]] is not world.slot:
                 continue  # a zombie engine
             when, by = op.gone
-            if op.who[0] == "worker" and self._handed_to_cleanup(op.who[1], op.path):
-                self._known("F11", f"{op.who} read a delta its discard entry names, deleted at t={when:g}")
             raise Violation(
                 f"{op.who} read {op.path.removeprefix(str(self.tmp))} at t={op.at:g}, "
                 f"deleted at t={when:g} by {by}"
@@ -453,20 +458,6 @@ class Simulation(RuleBasedStateMachine):
         if world is None or world.pg is None:
             return
         self._pg_checked = postgres.check(world.pg, self._pg_checked)
-
-    def _handed_to_cleanup(self, attempt: str, path: str) -> bool:
-        """F11's signature: the file is named by a discard entry of the attempt's spec."""
-
-        launched = self.journal.launched.get(attempt)
-        if launched is None or self.world.engine is None:
-            return False
-        spec = self._run(self.world.engine.state.attempt_spec(launched["run"], attempt)) or {}
-        name = path.rsplit("/", 1)[-1].removesuffix(".kx")
-        return any(
-            name in entry.get("files", ())
-            for out in (spec.get("outputs") or {}).values()
-            for entry in out.get("cleanup") or ()
-        )
 
     @invariant()
     def one_attempt_per_partition(self):
@@ -721,13 +712,19 @@ class Simulation(RuleBasedStateMachine):
         async def check():
             items = await keyed_content(engine, project, "items", whole=True)
             want = expected_items(self.feed, variant)
+            if set(want) - set(items) and self.moves >= 2:
+                self._known(
+                    "F17", f"items lacks {sorted(set(want) - set(items))} after {self.moves} store moves"
+                )
             if items != want:
                 raise Violation(f"items {stage}: {items} != {want} (feed {self.feed})")
             copy = await keyed_content(engine, project, variant.copy_name, whole=True)
+            self._moved_upstream_kept(variant.copy_name, copy, expected_copy(want, variant))
             if copy != expected_copy(want, variant):
                 raise Violation(f"{variant.copy_name} {stage}: {copy} != {expected_copy(want, variant)}")
             for output, want_split in zip(("odd", "even"), expected_split(want), strict=True):
                 got = await keyed_content(engine, project, output, whole=True)
+                self._moved_upstream_kept(output, got, want_split)
                 if got != want_split:
                     raise Violation(f"{output} {stage}: {got} != {want_split}")
             checks = await keyed_content(engine, project, "checks", whole=True, column="w")
@@ -759,6 +756,13 @@ class Simulation(RuleBasedStateMachine):
                     raise Violation(f"tally {stage}: {tally} for {len(rows)} rows of log")
 
         self._run(check())
+
+    def _moved_upstream_kept(self, output: str, got: dict, want: dict) -> None:
+        """F13's signature: an incremental consumer of `items` keeps keys
+        `items` let go of, in a run where `items` changed store."""
+
+        if set(got) - set(want) and self.moves:
+            self._known("F13", f"{output} keeps {sorted(set(got) - set(want))} after `items` moved store")
 
     def _check_replay(self) -> None:
         """The journal alone rebuilds the engine's state."""

@@ -409,3 +409,62 @@ def test_f16_a_compaction_landing_after_a_commit_keeps_the_newest_entry():
     state.one_end_per_attempt()
     state.reads_say_what_they_read()
     state.teardown()
+
+
+@pytest.mark.xfail(strict=True, reason="F13: a key removed after its upstream moved store stays downstream")
+def test_f13_a_key_removed_after_a_takeover_moved_its_upstream_leaves_its_consumers():
+    """F13 by another route, no crash: `k0`, `k11` committed; a takeover
+    moves `items` from FileStore to the table store; the feed removes both.
+    `copy` and `split`'s `odd` keep them; `checks` drops them."""
+
+    state = Simulation()
+    state.boot(seed=88, store="file")
+    state.commit_feed(keys={"k11", "k0"}, op="replace", version="1")
+    state.a_fenced_scope_at_rest_holds_its_index_keys()
+    state.committed_keys_are_readable()
+    state.fenced_writes_hold_their_gate()
+    state.commit_knob()
+    state.a_fenced_scope_at_rest_holds_its_index_keys()
+    state.committed_keys_are_readable()
+    state.fenced_writes_hold_their_gate()
+    state.commit_knob()
+    state.a_fenced_scope_at_rest_holds_its_index_keys()
+    state.committed_keys_are_readable()
+    state.fenced_writes_hold_their_gate()
+    state.store_weather(delay=1.0, error=0.0, lost=0.0)
+    state.a_fenced_scope_at_rest_holds_its_index_keys()
+    state.committed_keys_are_readable()
+    state.fenced_writes_hold_their_gate()
+    state.takeover(change="table", zombie=0.0)
+    state.a_fenced_scope_at_rest_holds_its_index_keys()
+    state.committed_keys_are_readable()
+    state.fenced_writes_hold_their_gate()
+    state.commit_feed(keys={"k11", "k0"}, op="remove", version="2")
+    state.a_fenced_scope_at_rest_holds_its_index_keys()
+    state.committed_keys_are_readable()
+    state.fenced_writes_hold_their_gate()
+    state.teardown()
+
+
+@pytest.mark.xfail(
+    strict=True, reason="F17: an output moved away and back loses the keys its last write lacked"
+)
+def test_f17_an_output_moved_away_and_back_keeps_its_keys():
+    """F17: `items` holds `k10` on FileStore; a takeover moves it to the
+    table store, where only a `keys=` run writes (a fresh index, the
+    bookmark unmoved); a takeover moves it back; the next write is a delta
+    of `k3` and starts the index over again: `k10` is lost."""
+
+    state = Simulation()
+    state.boot(seed=88, store="file")
+    state.commit_feed(keys={"k10"}, op="replace", version="1")
+    state.a_fenced_scope_at_rest_holds_its_index_keys()
+    state.takeover(change="table", zombie=60.0)
+    state.a_fenced_scope_at_rest_holds_its_index_keys()
+    state.wait(seconds=10.0)
+    state.a_fenced_scope_at_rest_holds_its_index_keys()
+    state.submit(asset="items", keys=("k1", "k10"), mode="incremental", partitions="latest", upstream=True)
+    state.a_fenced_scope_at_rest_holds_its_index_keys()
+    state.takeover(change="table", zombie=0.0)
+    state.a_fenced_scope_at_rest_holds_its_index_keys()
+    state.teardown()
