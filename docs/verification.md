@@ -270,82 +270,112 @@ rules, not invariant checks. `pg`: `items` may also live in Postgres.
 
 The simulation samples interleavings of the real code; the model checker
 TLC explores **every** interleaving of the design, at small bounds. The
-model is the design as decided (`glossary.md`, including its model
-changes), not the code: where they differ, the code is the suspect.
+model is the design as decided (`glossary.md`, with its model changes),
+not the code: where they differ, the code is the suspect.
+
+```bash
+spec/tla/check-execution.sh            # smoke and calibrations (CI): about a minute
+spec/tla/check-execution.sh design     # deploys, faults, each=True, with liveness
+spec/tla/check-execution.sh all
+```
 
 **State.**
 
-- Three output partitions in a chain: a keyed **source** `S`, an asset `A`
-  reading it incrementally, an asset `B` reading `A` incrementally (with
-  patterns, optionally `each=True`). Each has a **commit log**: one entry
-  per commit, `[up, rm, reset]` over a set of keys. Its content is the
-  log's fold; a prefix's fold is what a bookmark at that commit number has
-  read.
-- Per incremental input, a **bookmark**: `next` (commits read), the
-  **pass** under way (`full` with its position and the head it resumes
-  deltas from, `delta`, or a pattern change's `diff`), the **fingerprint**
-  and **patterns** it reads under.
+- Three output partitions in a chain: a keyed **source** `S` (holding
+  keys 1 and 2), an asset `A` reading it incrementally, an asset `B`
+  reading `A` incrementally (with patterns; `each=True` in one
+  configuration). Each has a **commit log**, `[up, rm, reset]` per commit
+  over a set of keys: its content is the log's fold, and a prefix's fold
+  is what a bookmark at that commit number has read.
+- Per incremental input, a **bookmark**: `next`, the **pass** under way (a
+  `full` pass's position and the head it resumes deltas from; `delta` and
+  `diff` passes are one batch each), and the **fingerprint** and
+  **patterns** it reads under. The fingerprint is a value of the
+  declaration (the asset's version and its output's store), so moving a
+  store back restores the old one, as a digest does.
 - Per output, two **fenced stores** (`A` can move between them) holding
-  rows, a **fence** generation per store, and the **repair** intents owed.
-- **Runs** (one target, as an automation submits), **attempts** with their
-  **generation**, planned **batch**, worker progress, **gate**
-  (`none`/`writing`/`aborted`) and **cancel** request. Claims are the
-  attempts in `prepared` or `launched`.
-- The **manifest**: `A`'s store, each asset's fingerprint, `B`'s patterns
-  and whether `B` is declared. **Engines**: one serving (or none, after a
-  crash), and possibly a zombie (rolling deploy).
+  rows, a **fence** generation per store, the store the head is in, and
+  the **repair** intents owed.
+- **Runs** of one target (as an automation submits them, or a user with
+  `keys=`), **attempts** with their **generation**, planned **batch**,
+  worker progress, **gate** (`none`, `writing`, `aborted`) and **cancel**
+  request. Claims are the attempts `prep`ared or launched.
+- The **manifest** (`A`'s store, versions, `B`'s patterns, whether `B` is
+  declared) and the **engines**: one serving (none after a crash) and
+  possibly a zombie (a rolling deploy).
 
 **Actions.** The environment: commits to `S`; deploys (move `A`'s store,
-change `B`'s patterns, bump `B`'s version, remove or re-add `B`); worker
-crashes; engine crash, restart and takeover; timeouts; user cancels.
-The engine: automations firing (`OnChange`), preparing an attempt (claim,
-pin, plan the batch), launching, settling (commit, cancel, or lost: take
-the gate, owe a repair). Workers: start, acquire the fence and read back
-owed repairs, take the gate (or drain on a requested cancel), write, seal.
-A zombie engine can only take gates (`aborted`): its journal writes are
-fenced. Every action of the environment but the last commit to `S` happens
-before it, so that "after quiescence" is a state the model reaches.
+change `B`'s patterns, bump `B`'s version, remove and re-add `B`); `keys=`
+runs of `A`; worker crashes; engine crash, restart and takeover; timeouts;
+user cancels. The engine: automations firing (`OnChange`), preparing an
+attempt (claim, pin, plan the batch), launching, settling (commit; a
+drained cancel; or lost: take the gate, owe a repair). Workers: start and
+acquire the fence (reading back owed repairs), take the gate (or drain a
+requested cancel), write (checking the fence), seal. A worker runs on
+after the engine gave up on it. A zombie engine can only take gates
+(`aborted`): its journal writes are fenced. Everything but the last
+commit to `S` happens before it, so "after quiescence" is a state the
+model reaches.
 
 **Properties.**
 
-- *One attempt per partition:* at most one prepared or launched attempt
-  per asset partition.
-- *Bookmarks are honest:* with no pass under way, an output's content is
-  what its bookmark says it read: its upstream's content at `next`, under
-  its patterns. (A bookmark never passes a change it did not deliver.)
-- *Stores match the journal:* with no attempt in flight, no repair owed
-  and no stale writer holding its gate, a store holds exactly its
-  output's committed content.
-- *Every run ends* (under weak fairness for workers and the engine, strong
-  for claims and automations).
-- *Convergence:* eventually and forever, `A` holds `S`'s keys and `B`
-  holds `A`'s under its patterns.
+| Property | Kind | Says |
+|---|---|---|
+| `OneAttemptPerPartition` | safety | at most one prepared or launched attempt per asset partition |
+| `BookmarkHonest` | safety | with no pass under way, every key no later commit touched is in the output exactly when it was in the upstream at the bookmark, under its patterns: a bookmark never passes a change it did not deliver |
+| `StoreMatchesJournal` | safety | with no attempt in flight, no repair owed and no stale writer at its gate, a store holds exactly its output's committed content |
+| `Quiesces` | liveness | eventually and forever, no run is active (every run ends) and `A` holds `S`'s keys, `B` holds `A`'s under its patterns (convergence) |
+
+Liveness assumes weak fairness of all engine and worker steps together
+(each behaviour takes finitely many: everything is bounded), of an engine
+restarting after a crash, and of the final commit to `S`.
 
 **Abstracted, and why.**
 
 - *One partition per asset:* claims, bookmarks and passes are per asset
   partition and do not interact; fan-in reads committed heads only.
 - *Key sets, not versions:* the properties are about which keys an output
-  holds; a re-upsert of a present key is a no-op here.
-- *One key per full-pass batch, one batch per delta pass:* enough to
-  interrupt a full pass between batches (F6) and to pin a delta.
+  holds; a re-upsert of a present key changes nothing here.
+- *One key per full-pass batch, one batch per delta or diff pass:* enough
+  to interrupt a full pass between batches (F6) and to pin a delta.
 - *Fenced stores only:* an immutable store's stale write is unreferenced
-  by construction; the fenced kind is where the gate, fence and repair
-  interact.
+  by construction; the fenced kind is where gates, fences and repairs
+  meet. A write lands whole or not at all.
 - *Renames:* a rename moves state wholesale; its risks (F5, F12) were in
-  how code looks names up, which the simulation covers. Removal and
-  re-adding are modelled.
+  how code looks names up, which the simulation covers. Removing and
+  re-adding an asset is modelled (its state goes with its name).
 - *Time:* no clocks; a timeout or a silent worker is an action the
   engine may take at any moment, bounded in number.
-- *Retries exhausted:* the retry budget exceeds the fault budget, so a run
-  fails only by design choice the model does not explore.
+- *Retries exhausted:* the retry budget exceeds the fault budget, so no
+  run fails by exhausting it (a design choice the model does not explore:
+  a failed run leaves its change unconsumed only until the next change).
+- *Finished records are forgotten:* a settled attempt whose worker ended,
+  and an ended run, keep only what other records refer to, so that
+  histories differing only there are one state.
 
-**Calibration.** Each known bug is a switch restoring its pre-fix rule; the
-model must find it: `FixF6` (a pass that ends behind the head goes on to
-it), `FixF9` (a reset upstream commit makes its consumers read a full
-pass), `FixF10` (a full pass reaches the consumer even when its patterns
-take no key; `each` reconciles), `FixF13` (moving an output's store
-changes its asset's fingerprint, so its inputs read a full pass).
+**Calibration.** Each known bug is a switch restoring its pre-fix rule,
+and TLC must find it (`check-execution.sh calibrate`):
+
+| Switch | Rule as designed | Counterexample with it off |
+|---|---|---|
+| `FixF6` | a pass that ends behind the head goes on to it | `A` reads keys 1 and 2 in a full pass; key 1 commits; a cancel stops the run; `S` drops key 1; the firing resumes the pass, delivers key 2, and the task ends behind the head: `A` keeps 1 for good (`Quiesces`, 36 steps) |
+| `FixF9` | a reset upstream commit makes its consumers read a full pass | (needed by the others; F9's own bug is the simulation's) |
+| `FixF10` | a full pass reaches the consumer even when its patterns take no key; `each` reconciles at its end | `B` holds 1 and 2; `B` excludes key 2 and its version is bumped; `S` drops key 1, so `A` holds 2 alone; `B`'s full pass takes no key and is skipped: `B` keeps 1 (`BookmarkHonest`, 41 steps) |
+| `FixF13` | moving a store changes the asset's fingerprint, so its inputs read a full pass | `A`'s full pass commits key 1 into store 1; `A` moves to store 2; the pass's next batch, key 2, starts store 2 over: `A` holds 2 alone, its bookmark says 1 and 2 (`BookmarkHonest`, 17 steps) |
+| `FixF17` | a write that starts the output over (into a store the head is not in) reads a full pass, also for a `keys=` run | `A` holds 1 and 2 in store 1; `A` moves to store 2; a `keys=` run for key 1 starts store 2 over with key 1 alone and moves no bookmark (still store 1's fingerprint): `A` lacks 2 though nothing removed it (`BookmarkHonest`, 25 steps). Moving back makes it permanent: the fingerprint matches again, so nothing reads a full pass (the simulation's F17) |
+
+**Results.** With every fix on, the model passes (TLC 1.7.4, 8 workers):
+
+| Configuration | Deploys | Faults | States (distinct) | Time |
+|---|---|---|---|---|
+| `smoke` | none | none | 10,852 | 2 s |
+| `deploys` | 2 of every kind, a `keys=` run | none | in progress |  |
+| `faults` | none | 2 of every kind | in progress |  |
+| `each` (`B` is `each=True`) | 1 of every kind | 1 of every kind but takeovers | in progress |  |
+
+One configuration with one deploy and one fault of every kind together
+exceeded 22 million distinct states unfinished; the split above keeps
+each check in reach. Wider combinations are the next step.
 
 ## Formal model: the journal (`spec/tla/Journal.tla`)
 

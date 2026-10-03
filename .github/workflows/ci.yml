@@ -124,3 +124,13 @@ jobs:
       - run: spec/tla/check-journal.sh small
       - run: spec/tla/check-journal.sh live
       - run: spec/tla/check-journal.sh calibrate
+  execution-spec:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - run: spec/tla/check-execution.sh
