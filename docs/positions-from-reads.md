@@ -104,7 +104,14 @@ locates the spec), and stores no per-key version. The record is snapshot
   rename changes no definition: an attempt in flight commits under the new
   name.
 - **A pattern change under way** decides membership first: a `keys=` run
-  meanwhile merges the keys it names and records nothing.
+  meanwhile merges the keys it names and records nothing. Read-ahead
+  entries recorded before it stay right: the change finishes the delta
+  under the old patterns, which they were read under, then diffs
+  membership without consulting them, so a key the old patterns excluded
+  is delivered by the diff, and each key once
+  (`test_a_pattern_change_after_a_keys_run_delivers_each_key_once`). A
+  batch planned under the old patterns commits a position that names them,
+  so the next plan finds the change and diffs.
 
 `each=True` keeps per-key records in its output's key index instead, with
 no cap.

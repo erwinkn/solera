@@ -16,9 +16,9 @@ from tests.sim.project import External, SourceStore, rebuild
 from .engines import drive, make_engine
 
 
-def project(root, outside, seen, retention=None, version="1"):
+def project(root, outside, seen, retention=None, version="1", exclude=None):
     @asset(
-        inputs={"feed": Incremental()},
+        inputs={"feed": Incremental(exclude=exclude)},
         outputs=Output("copy", key="id"),
         retention=retention,
         version=version,
@@ -202,3 +202,31 @@ async def test_the_latest_read_of_a_key_wins(state, tmp_path):
     await drive(engine, await engine.submit(["copy"]))
     assert seen[2:] == [(["k2"], [])]
     assert await engine.stale_reasons("copy", "") == []
+
+
+async def test_a_pattern_change_after_a_keys_run_delivers_each_key_once(state, tmp_path):
+    """The coordinator's check: read-ahead entries recorded under the old
+    patterns. keys=(k1, x1) under exclude x*: k1 is delivered, x1 is not
+    taken. The patterns then take x*. The pattern change finishes the old
+    delta under the old patterns (k2; k1 skipped, read ahead), then diffs
+    membership (x1, newly taken, at its snapshot version): each key once,
+    none dropped."""
+
+    outside, seen = External(), []
+    engine = make_engine(state, project(tmp_path, outside, seen, exclude=["x*"]))
+    await engine.initialize()
+    outside.feed.update(k1="1", k2="1")
+    await engine.commit_source("feed", upsert=["k1", "k2"])
+    await drive(engine, await engine.submit(["copy"]))
+    outside.feed.update(k1="2", k2="2", x1="1")
+    await engine.commit_source("feed", upsert=["k1", "k2", "x1"])
+    seen.clear()
+    await drive(engine, await engine.submit(["copy"], keys={"feed": {"keys": ["k1", "x1"]}}))
+    assert seen == [(["k1"], [])] and len(ahead(engine)) == 1
+    await engine.stop()
+    engine = make_engine(state, project(tmp_path, outside, seen))  # x* taken now
+    await engine.initialize()
+    await drive(engine, await engine.submit(["copy"]))
+    delivered = [k for upserted, _ in seen[1:] for k in upserted]
+    assert sorted(delivered) == ["k2", "x1"], "each key once: k1 was read ahead, x1 newly taken"
+    assert sorted((await engine.list_keys("copy"))["keys"]) == ["k1", "k2", "x1"]
