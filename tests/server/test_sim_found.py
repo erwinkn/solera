@@ -891,12 +891,12 @@ async def test_a_job_removed_while_its_attempt_runs_and_added_back_starts_over(s
     assert record["cursor"] == {"life": "2"} and record["last"]["attempt"] != held, record
 
 
-async def test_an_onchange_asset_added_back_is_built(state):  # noqa: F811
+async def test_an_onchange_asset_added_back_is_built(state):
     """F22: `copy` (OnChange on `items`) removed and added back was not built
     until `items` next changed: its automation came back with nothing
     pending. A deploy leaves each OnChange automation owing a firing for
     every partition with no head whose inputs have heads — once, at the
-    deploy, never re-checked by a tick (F20)."""
+    deploy, never re-checked by a tick."""
 
     from solera.sdk import AutoRefresh
 
@@ -971,7 +971,7 @@ def _changing(tmp_path, kind: str, automation: str, after: bool, calls: list):
 
 @pytest.mark.parametrize("automation", ["onchange", "schedule", "none"])
 @pytest.mark.parametrize("kind", ["added", "renamed", "changed", "reset"])
-async def test_an_asset_change_is_built_by_its_automation_or_marked_stale(state, tmp_path, kind, automation):  # noqa: F811
+async def test_an_asset_change_is_built_by_its_automation_or_marked_stale(state, tmp_path, kind, automation):
     """Erwin's asset-change rule: a deploy that adds an asset (again),
     renames it, changes its declaration or resets it leaves its OnChange
     automation owing a firing, once, per partition whose inputs have heads:
