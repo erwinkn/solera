@@ -123,7 +123,7 @@ class Engine(Attempts, Sensors, Views):
         self.heartbeat_seconds, self.concurrency = heartbeat_seconds, concurrency
         self.provision_seconds, self.cancel_grace = provision_seconds, cancel_grace
         # Where workers reach this engine (docs/lifecycle.md §5); without one,
-        # they report through `.worker` alone.
+        # they report through `.beat` alone.
         self.engine_url = engine_url
         self.pool_offered_grace = pool_offered_grace
         self.secret: bytes | None = None  # signs attempt tokens; stable across restarts
@@ -708,7 +708,12 @@ class Engine(Attempts, Sensors, Views):
             return
         with contextlib.suppress(Exception):
             if claim.get("launched"):
-                await self._fail(task_id, attempt, f"engine: {error}", retryable=True, reason="engine")
+                # A sealed result that could not be settled fails with its own evidence:
+                # settling it again would fail again.
+                result = await self.state.attempt_result(task["run"], attempt)
+                await self._fail(
+                    task_id, attempt, f"engine: {error}", retryable=True, reason="engine", result=result
+                )
             else:
                 self._finish(task, claim, "failed", error=f"engine: {error}", retryable=True, reason="engine")
 

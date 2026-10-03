@@ -12,8 +12,6 @@ import base64
 import contextlib
 import gzip
 import json
-import os
-import socket
 import threading
 import time
 
@@ -22,15 +20,15 @@ from solera import lifecycle
 from solera.lifecycle import Cancel, Ended
 from solera.objects import create
 
-FALLBACK_AFTER = 2  # failed beats before the worker also reports through `.worker`
+FALLBACK_AFTER = 2  # failed beats before the worker also reports through `.beat`
 
 
 class Reporter:
     """Beats from a thread of its own, so a producer that blocks its event
     loop still beats. Over the channel every `interval`; while the channel
-    fails (or there is none), also through `.worker` every two intervals,
-    reading the gate each time — an `aborted` or `closed` gate is the only
-    cancel that reaches a worker the engine cannot answer.
+    fails (or there is none), also through `.beat` every two intervals,
+    reading the control file each time — `ended` (or no file) is the only
+    cancel that reaches a worker the engine cannot answer (§2.4).
 
     `on_cancel(record)` runs, from this thread, each time the latched cancel
     record gets stronger; `on_ended()` once the engine says the attempt is
@@ -79,15 +77,14 @@ class Reporter:
             ):
                 self._fallback_at = now
                 with contextlib.suppress(Exception):
-                    body = {**report, "host": socket.gethostname(), "pid": os.getpid(), "at": time.time()}
-                    obstore.put(self.objects, f"{self.base}{lifecycle.WORKER}", json.dumps(body).encode())
+                    obstore.put(self.objects, f"{self.base}{lifecycle.BEAT}", json.dumps(report).encode())
                     try:
-                        gate = json.loads(
-                            bytes(obstore.get(self.objects, f"{self.base}{lifecycle.GATE}").bytes())
+                        control = json.loads(
+                            bytes(obstore.get(self.objects, f"{self.base}{lifecycle.CONTROL}").bytes())
                         )
                     except (NotFoundError, FileNotFoundError):
-                        gate = None
-                    if gate is not None and gate["state"] != lifecycle.WRITING:
+                        control = {"state": lifecycle.ENDED}  # retention took it: as good as ended
+                    if control["state"] == lifecycle.ENDED:
                         reason = self.cancel.reason if self.cancel else "user"
                         self.latch({"phase": "forced", "reason": reason, "since": 0})
             self._stop.wait(self.interval)

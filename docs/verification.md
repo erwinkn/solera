@@ -297,10 +297,11 @@ Known gaps, most valuable first; each says what would close it.
 - **Migrations** in the simulation: no rule runs `migrate` yet. Nothing
   blocks one since F18's fix; it would run on `pg`.
 - **A worker that resumes after its run was purged**: with the control
-  file (`lifecycle.md` §2.4, decided, not built) it finds the file gone
-  and stops, however long it paused; `Attempt.tla` checks it ("Formal
-  model: the attempt control file"). Once built, the simulation can purge
-  runs within its hours and resume stale workers after.
+  file (`lifecycle.md` §2.4) it finds the file gone and stops, however
+  long it paused; `Attempt.tla` checks it ("Formal model: the attempt
+  control file"), and `tests/server/test_retention.py` plays it. The
+  simulation does not purge runs within its hours yet, so it cannot
+  resume a stale worker after one.
 
 Closed in this round: the key index format, merges, compactions and
 resolves against a dict (property tests, and F16); glob patterns; resolve
@@ -647,7 +648,7 @@ spec/tla/check.sh journal big   # three engines, six writes: ~9 min
 
 ## Formal model: the attempt control file (`spec/tla/Attempt.tla`)
 
-Decided (K18), not built yet: one control file per attempt, swapped with
+Decided (K18) and built: one control file per attempt, swapped with
 `If-Match`, replaces ownership (`.worker`), the gate (`.writing`) and the
 result (`.result`) (`lifecycle.md` §2.4). The model is the protocol at the
 level of requests. The durable state is apart from each actor's view of
@@ -738,7 +739,9 @@ a real one: an engine that keeps crashing ends nothing.
 
 **Calibration.** Each rule is a switch, and with it off TLC must find the
 bug (`check.sh attempt calibrate`; with several TLC workers, a trace's length varies
-by a step between runs):
+by a step between runs). Each trace is also a test against the code, in
+`tests/server/test_control_file.py`: the scenario plays out and the bug
+does not happen (switching the rule off in the code fails its test):
 
 | Rule off | TLC finds | Trace |
 |---|---|---|

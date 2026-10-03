@@ -34,13 +34,14 @@ class Journal:
     body: tuple = (None, [])  # the last landed (checkpoint, events)
     now: object = None  # the world's clock
     applied_commits: set = field(default_factory=set)  # attempts some engine committed in memory
-    gates: dict[str, tuple] = field(default_factory=dict)  # attempt -> (state, worker id, landed at)
+    gates: dict[str, tuple] = field(default_factory=dict)  # attempt -> (writing, worker id, landed at)
 
     def landed(self, path: str, data: bytes) -> None:
-        if path.endswith(lifecycle.GATE):
-            gate = json.loads(data)
-            attempt = path.rsplit("/", 1)[-1].removesuffix(lifecycle.GATE)
-            self.gates.setdefault(attempt, (gate["state"], gate.get("worker_id"), self.now()))
+        if path.endswith(lifecycle.CONTROL):  # the gate: its first `writing` (docs/lifecycle.md §2.4)
+            body = json.loads(data)
+            if body["state"] == lifecycle.WRITING:
+                attempt = path.rsplit("/", 1)[-1].removesuffix(lifecycle.CONTROL)
+                self.gates.setdefault(attempt, (body["state"], body["worker_id"], self.now()))
             return
         if not path.endswith("/control/journal.json"):
             return

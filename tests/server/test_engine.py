@@ -30,6 +30,7 @@ from solera.stores import FileStore, Patch
 from solera_server.executors.inline import InlinePlacement
 
 from .engines import drive, make_engine, status_of, task_statuses
+from .test_fence import own
 
 
 class Fake(Executor):
@@ -917,9 +918,8 @@ async def test_timeout_fails_retryably(state):
     attempt fails retryably."""
 
     class Running(FakePlacement):
-        async def launch(self, stage):  # the worker starts: its claim is its first report
-            path = f"{self.ctx.state.attempt_path(stage['run'], stage['attempt'])}.worker"
-            await self.ctx.state.put_object(path, json.dumps({"worker_id": "w"}).encode())
+        async def launch(self, stage):  # the worker starts: owning is its first report
+            await own(self.ctx.state, stage["run"], stage["attempt"])
             return await super().launch(stage)
 
     @asset(executor=Fake("fake")(), timeout=1, retries=Retry(0))
@@ -959,7 +959,8 @@ async def test_harness_exit_without_result_fails_retryably(state):
                 "seq": 1,
                 "events": [{"type": "booted", "at": 0}, {"type": "computing", "at": 1e12}],
             }
-            path = f"{self.ctx.state.attempt_path(stage['run'], stage['attempt'])}.worker"
+            await own(self.ctx.state, stage["run"], stage["attempt"])
+            path = f"{self.ctx.state.attempt_path(stage['run'], stage['attempt'])}.beat"
             await self.ctx.state.put_object(path, json.dumps(beat).encode())
             return await super().launch(stage)
 

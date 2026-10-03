@@ -1,7 +1,7 @@
 """How a worker reaches the engine (docs/lifecycle.md §5): over HTTPS, or in
 process for workers the engine runs itself. Every call is a signal, never
 the only copy of a fact: a failed call costs latency, and the worker falls
-back to its `.worker` object (§6).
+back to its `.beat` object and its control file (§6, §2.4).
 
 A channel answers `start` and `beat` with `{"cancel": record | None}`,
 raises `Ended` when the engine says the attempt is over for this

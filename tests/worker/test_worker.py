@@ -65,8 +65,8 @@ project = Project(assets=[feed, consumer])
     [delta] = index.files
     assert await state.get_object(index.path(delta.name)) is not None
     assert delta.name.startswith("000000000000-") and delta.entries == 2
-    # the spec, the claim, and the sealed result (the commit request, with
-    # what was delivered, and the log: short enough to travel inside it)
+    # the spec, and the control file with the sealed result (the commit request,
+    # with what was delivered, and the log: short enough to travel inside it)
     assert (await state.attempt_spec(detail["request"]["id"], attempt))["asset"] == "consumer"
     result = await state.attempt_result(detail["request"]["id"], attempt)
     assert result["status"] == "succeeded" and result["write"] == "complete"
@@ -76,8 +76,10 @@ project = Project(assets=[feed, consumer])
     assert json.loads(log.splitlines()[0])["message"] == "consumed"
     paths = await state.list_objects(f"runs/{detail['request']['id']}/")
     names = {p.rsplit("/", 1)[-1] for p in paths if p.rsplit("/", 1)[-1].startswith(attempt)}
-    # no log object, and no gate: a FileStore is immutable (docs/lifecycle.md §9.6)
-    assert names == {f"{attempt}{s}" for s in (".spec", ".worker", ".result")}
+    # its reports through `.beat` (it has no channel), no log object, and no gate
+    # taken: a FileStore is immutable (docs/lifecycle.md §9.6)
+    assert names <= {f"{attempt}{s}" for s in (".spec", ".control", ".beat")}
+    assert {f"{attempt}.spec", f"{attempt}.control"} <= names and "intents" not in result
 
 
 async def test_revision_mismatch_writes_failed_result(state, tmp_path):

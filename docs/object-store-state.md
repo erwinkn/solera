@@ -44,8 +44,9 @@ infrastructure.
   written by `swap` names its writer, and never repeats (the journal's:
   §10).
 - **`file://` has no `If-Match`, so `swap` takes a lock.** It takes
-  `fcntl.flock` on `{path}.lock` and compares the file's SHA-256, which
-  serves as the ETag there, with `etag`. Then it writes a temporary file,
+  `fcntl.flock` on the object's directory (no file of its own) and
+  compares the file's SHA-256, which serves as the ETag there, with
+  `etag`. Then it writes a temporary file,
   fsyncs it, `os.replace`s it over the object, and unlocks. The kernel
   drops the lock when its process dies, so a crash leaves nothing to clean
   up. A lock file created with `O_EXCL` instead would outlive a crash, and
@@ -720,11 +721,7 @@ requested number of bars. `next` is a cursor: the last run id of the page.
 ## 8. Attempt objects — `runs/{run}/{attempt}.*`
 
 The protocol is `lifecycle.md`'s, which this section summarizes; the
-records the engine and the worker share are `solera/lifecycle.py`. The
-control file is decided (K18) and not built yet: as built, the claim is
-`{attempt}.worker` (create-only), the gate `{attempt}.writing`
-(create-only, retained `gate_days` past its run) and the result
-`{attempt}.result` (create-only).
+records the engine and the worker share are `solera/lifecycle.py`.
 
 **Spec and control file.** The engine writes `{attempt}.spec`, immutable,
 then creates `{attempt}.control` `open`, both before `AttemptLaunched`.

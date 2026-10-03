@@ -32,7 +32,6 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from obstore.exceptions import AlreadyExistsError
 from solera import errors, lifecycle
 from solera.keys import SortedEntries
 from solera.keys.index import (
@@ -49,7 +48,7 @@ from solera.keys.io import ObjectIO
 from solera.keys.reads import Reads
 from solera.keys.resolver import Ask, answers, request
 from solera.lifecycle import Cancel, Ended
-from solera.objects import create
+from solera.objects import Conflict, swap
 from solera.sdk import (
     UNSET,
     Asset,
@@ -903,6 +902,51 @@ class _Stop(Exception):
     """A cancel was requested before the gate: stop, writing nothing."""
 
 
+class ControlFile:
+    """The attempt's control file as this worker last read or wrote it
+    (docs/lifecycle.md §2.4): each swap names that version. A worker never
+    creates the file: the engine did, before the launch."""
+
+    def __init__(self, objects, run: str, attempt: str, worker_id: str):
+        self.objects, self.run, self.attempt, self.worker_id = objects, run, attempt, worker_id
+        self.path = f"{lifecycle.base(run, attempt)}{lifecycle.CONTROL}"
+        self.etag: str | None = None
+        self.intents: dict | None = None  # what it meant to write, once it took the gate
+
+    async def own(self, claim: dict) -> str:
+        """Swap `open` to `owned`: `owned` if this worker now owns the
+        attempt, `lost` if another worker does, `ended` if the engine ended
+        it or the file is gone."""
+
+        found = await lifecycle.read_control(self.objects, self.run, self.attempt)
+        while True:
+            if found is None or found[0]["state"] == lifecycle.ENDED:
+                return lifecycle.ENDED
+            if found[0]["state"] != lifecycle.OPEN:
+                return "lost"
+            body = lifecycle.control(lifecycle.OWNED, worker_id=self.worker_id, **claim)
+            try:
+                self.etag = await swap(self.objects, self.path, body, found[1])
+                return lifecycle.OWNED
+            except Conflict:  # another worker, or the engine, came first: see which
+                found = await lifecycle.read_control(self.objects, self.run, self.attempt)
+
+    async def move(self, state: str, **fields) -> bool:
+        """Swap to `state` from the version this worker last wrote: `False`
+        if refused. Only the engine writes over an owner, so a refusal means
+        it ended the attempt (or retention took the file): write nothing
+        more."""
+
+        body = lifecycle.control(state, worker_id=self.worker_id, **fields)
+        try:
+            self.etag = await swap(self.objects, self.path, body, self.etag)
+        except Conflict:
+            return False
+        if state == lifecycle.WRITING:
+            self.intents = fields.get("intents") or {}
+        return True
+
+
 ENDED = ABORTED = 3  # the exit code of an attempt the engine ended: no result was published
 LOSER_POLL = 30.0  # how often an worker that lost the claim looks for the owner's result
 
@@ -919,14 +963,14 @@ async def run_attempt(
     own_process: bool = False,
     loser_poll: float = LOSER_POLL,
 ) -> int:
-    """Run one attempt (docs/lifecycle.md §3): read its spec, claim it, run
-    it, seal its result.
+    """Run one attempt (docs/lifecycle.md §3): read its spec, own it, run
+    it, seal its result — each a swap of its control file (§2.4).
 
-    The claim is the first write: an worker that loses it touches
-    nothing and, unless it is a pool worker (`pool`), waits for the owner's
-    result before exiting, so its exit never reads as the attempt's. The
+    Owning is the first write: a worker that loses it touches nothing and,
+    unless it is a pool worker (`pool`), waits for the attempt to end before
+    exiting, so its exit never reads as the attempt's. The
     engine is reached through `channel`, or over HTTPS at `engine_url` (else
-    the spec's); without one, the worker reports through `.worker` alone.
+    the spec's); without one, the worker reports through `.beat` alone.
 
     Returns 0 once a result is published (succeeded or canceled), 1 for a
     failed result, and 3 when the engine ended the attempt first: then no
@@ -943,16 +987,18 @@ async def run_attempt(
         raise StoreError(f"No spec at {base}{lifecycle.SPEC}")
     spec = json.loads(data)
     worker_id = secrets.token_hex(8)
-    claim = {"worker_id": worker_id, "host": socket.gethostname(), "pid": os.getpid(), "at": time.time()}
+    claim = {"host": socket.gethostname(), "pid": os.getpid(), "at": time.time()}
     if channel is None and (engine_url or spec.get("engine")):
         from .channel import HttpChannel
 
         channel = HttpChannel(engine_url or spec["engine"], spec["project"], attempt, spec["token"])
-    try:
-        await create(objects, f"{base}{lifecycle.WORKER}", json.dumps(claim).encode())
-    except AlreadyExistsError:
+    control_file = ControlFile(objects, run, attempt, worker_id)
+    owned = await control_file.own(claim)
+    if owned == lifecycle.ENDED:
+        return ENDED
+    if owned != lifecycle.OWNED:
         if not pool:
-            await _await_owner(objects, base, loser_poll, channel, worker_id)
+            await _await_owner(objects, run, attempt, loser_poll, channel, worker_id)
         return 0
     loop = asyncio.get_running_loop()
     control = {"cancel": None, "writing": False, "stopped": False, "forced": False}
@@ -976,19 +1022,19 @@ async def run_attempt(
 
     if channel is not None:
         try:
-            answer = await channel.start({**claim})
+            answer = await channel.start({"worker_id": worker_id, **claim})
             started = Cancel.from_json(answer.get("cancel"))
             control["reads"] = Reads.from_json(answer.get("reads"))  # the engine's answers to its reads
         except Ended:
             return ENDED
         except Exception:
-            started = None  # unreachable for now: the reporter falls back to `.worker`
+            started = None  # unreachable for now: the reporter falls back to `.beat`
     else:
         started = None
     shipper = LogShipper(objects, base, channel, worker_id)
     writes = Writes()
     execution = asyncio.create_task(
-        _execute(objects, base, spec, entrypoint, timeline, shipper, writes, worker_id, control)
+        _execute(objects, base, spec, entrypoint, timeline, shipper, writes, control_file, control)
     )
     reporter = Reporter(
         objects, base, worker_id, channel, spec.get("heartbeat", 10), timeline, on_cancel, on_ended
@@ -1007,7 +1053,8 @@ async def run_attempt(
             result = {"status": "canceled"}  # requested before the gate: nothing written
         if result is None or control["forced"]:
             return ENDED
-        await _publish(objects, base, result, worker_id, writes, control["cancel"], timeline, shipper)
+        if not await _publish(control_file, result, writes, control["cancel"], timeline, shipper):
+            return ENDED  # the engine ended the attempt first: its result is not taken
         flusher.cancel()
         if channel is not None:
             with contextlib.suppress(Exception):
@@ -1025,16 +1072,14 @@ async def run_attempt(
             channel.close()
 
 
-async def _await_owner(objects, base: str, poll: float, channel=None, worker_id: str = "") -> None:
+async def _await_owner(objects, run: str, attempt: str, poll: float, channel=None, worker_id="") -> None:
     """A losing worker: wait until the attempt is over before exiting —
-    the owner's result exists, the engine closed or aborted its gate, the
-    engine says `ended` (`not_owner` is no news), or its objects are gone."""
+    its control file is final (sealed or ended) or gone, or the engine says
+    `ended` (`not_owner` is no news)."""
 
-    while await _get(objects, f"{base}{lifecycle.SPEC}") is not None:
-        if await _get(objects, f"{base}{lifecycle.RESULT}") is not None:
-            return
-        gate = await _get(objects, f"{base}{lifecycle.GATE}")
-        if gate is not None and json.loads(gate)["state"] in (lifecycle.ABORTED, lifecycle.CLOSED):
+    while True:
+        found = await lifecycle.read_control(objects, run, attempt)
+        if found is None or found[0]["state"] in lifecycle.FINAL:
             return
         if channel is not None:
             try:
@@ -1075,31 +1120,38 @@ def _user_failed(error: BaseException, project: Project) -> dict:
 PUBLISH_TRIES = 6
 
 
-async def _publish(objects, base, result, worker_id, writes, cancel, timeline, shipper) -> None:
-    """Seal the result once and create `.result` with exactly those bytes,
-    retried as they are: a failure to publish never changes what is
-    published. A worker that cannot publish raises, and the engine treats
-    it as a worker that died."""
+async def _publish(control_file, result, writes, cancel, timeline, shipper) -> bool:
+    """Seal the result once into the control file (`sealed`), retried with
+    exactly those bytes: a failure to publish never changes what is
+    published. `False` if the engine ended the attempt first: then the
+    result is not taken. A worker that cannot publish raises, and the
+    engine treats it as a worker that died."""
 
     log = await shipper.finish()
     timeline.add("finished")
 
-    def seal(result: dict) -> bytes:
-        body = {"worker_id": worker_id, **result, "write": writes.state, **timeline.report(), "log": log}
+    def seal(result: dict) -> dict:
+        body = {
+            "worker_id": control_file.worker_id,
+            **result,
+            "write": writes.state,
+            **timeline.report(),
+            "log": log,
+        }
         if cancel is not None and "cancel" not in body:  # an Each batch sealed its own record
             body["cancel"] = cancel.to_json()
-        return json.dumps(body, allow_nan=False).encode()
+        if control_file.intents is not None:  # what a repair reads back, if this one fails
+            body["intents"] = control_file.intents
+        lifecycle.control(lifecycle.SEALED, result=body)  # raises for what JSON cannot hold
+        return body
 
     try:
-        data = seal(result)
+        body = seal(result)
     except (TypeError, ValueError) as error:  # the result cannot be told as it is
-        data = seal(_failed(error, True))
+        body = seal(_failed(error, True))
     for attempt in range(PUBLISH_TRIES):
         try:
-            await create(objects, f"{base}{lifecycle.RESULT}", data)
-            return
-        except AlreadyExistsError:
-            raise  # only the claim's owner writes it: someone else's bytes are a bug
+            return await control_file.move(lifecycle.SEALED, result=body)
         except Exception:
             if attempt == PUBLISH_TRIES - 1:
                 raise
@@ -1107,25 +1159,23 @@ async def _publish(objects, base, result, worker_id, writes, cancel, timeline, s
 
 
 async def _execute(
-    objects, base, spec, entrypoint, timeline, shipper, writes, worker_id, control
+    objects, base, spec, entrypoint, timeline, shipper, writes, control_file, control
 ) -> dict | None:
     """Run the attempt: its result, or `None` once the engine ended it."""
 
+    worker_id = control_file.worker_id
+
     async def fence(intents: dict, gated: bool):
         """Begin writing — unless a cancel was requested: then stop, writing
-        nothing. Writing to a store that takes a gate, take it first
-        (docs/lifecycle.md §2.4): one already there means the engine ended
-        this attempt. From here on, a requested cancel drains."""
+        nothing. Writing to a store that takes a gate, take it first: swap
+        the control file to `writing`, with the intents (docs/lifecycle.md
+        §2.4). Refused, the engine ended this attempt. From here on, a
+        requested cancel drains."""
 
         if control["stopped"]:
             raise _Stop()
-        if gated:
-            try:
-                await create(
-                    objects, f"{base}{lifecycle.GATE}", lifecycle.gate(lifecycle.WRITING, worker_id, intents)
-                )
-            except AlreadyExistsError:
-                raise Aborted(spec["attempt"]) from None
+        if gated and not await control_file.move(lifecycle.WRITING, intents=intents):
+            raise Aborted(spec["attempt"])
         control["writing"] = True
         timeline.add("writing")
 
@@ -1326,8 +1376,8 @@ async def _cleanup_due(spec, project, asset, objects, writes) -> dict:
 
 async def run_pool(pool: str, server: str, token: str | None = None, *, project: str | None = None):
     """Pull path (docs/lifecycle.md §10): ask the engine which attempts wait
-    on this pool, claim one by creating its `.worker`, run it, repeat. The
-    claim decides between workers; discovery is only a hint. `project` is
+    on this pool, own one by swapping its control file, run it, repeat. The
+    control file decides between workers; discovery is only a hint. `project` is
     the project's name, by default its manifest's: a pool token reaches the
     pool's routes and nothing else.
 

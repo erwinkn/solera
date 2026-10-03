@@ -1,6 +1,6 @@
 """Pool placement (docs/lifecycle.md §10): the pull path. `launch` makes no
 call — the durable `AttemptLaunched` makes the attempt discoverable, and a
-pool worker claims it by creating its `.worker`. There is no provider to
+pool worker owns it by swapping its control file. There is no provider to
 ask, so there is no handle: the engine follows the worker's reports, and a
 cancel before the claim simply ends the attempt."""
 

@@ -1,6 +1,7 @@
 """Records the engine and the worker share (docs/lifecycle.md §2): where an
-attempt's objects live, the cancel record, write-completion evidence, the
-gate, and the per-attempt token. One implementation, imported by both."""
+attempt's objects live, its control file, the cancel record,
+write-completion evidence, and the per-attempt token. One implementation,
+imported by both."""
 
 from __future__ import annotations
 
@@ -12,6 +13,8 @@ import json
 from dataclasses import dataclass
 from urllib.parse import quote
 
+from solera.objects import read
+
 # -- objects (§2.1) ------------------------------------------------------------------
 
 
@@ -22,9 +25,8 @@ def base(run: str, attempt: str) -> str:
 
 
 SPEC = ".spec"  # immutable, the engine's
-WORKER = ".worker"  # the claim; then the owner's reports while HTTP fails
-RESULT = ".result"  # immutable, sealed: its existence means the worker is done
-GATE = ".writing"  # the gate; outlives its run (§2.4)
+CONTROL = ".control"  # who owns the attempt, the gate, the sealed result or the end (§2.4)
+BEAT = ".beat"  # the owner's reports while HTTP fails: evidence, never a decision
 
 
 def chunk(n: int) -> str:
@@ -35,18 +37,28 @@ def chunk(n: int) -> str:
 
 NONE, COMPLETE = "none", "complete"  # and WRITING, as the gate says: a call may have landed
 
-# -- the gate ------------------------------------------------------------------------
+# -- the control file (§2.4) ---------------------------------------------------------
 
-WRITING, ABORTED, CLOSED = "writing", "aborted", "closed"
+# Created `open` by the engine before the launch; then only swapped (`If-Match`):
+# `owned` and `writing` (the gate) by the first worker, `sealed` (its result) by it,
+# or `ended` by the engine. `sealed` and `ended` are final.
+OPEN, OWNED, WRITING, SEALED, ENDED = "open", "owned", "writing", "sealed", "ended"
+FINAL = (SEALED, ENDED)
 
 
-def gate(state: str, worker_id: str | None = None, intents: dict | None = None) -> bytes:
-    body: dict = {"state": state}
-    if worker_id is not None:
-        body["worker_id"] = worker_id
-    if intents is not None:
-        body["intents"] = intents
-    return json.dumps(body, sort_keys=True).encode()
+def control(state: str, **fields) -> bytes:
+    """A control file body: its state and what the state adds. Every body
+    names its writer (`worker_id` or `engine`), so no two writers' bodies
+    are the same bytes: `swap` relies on that to settle a lost answer."""
+
+    return json.dumps({"state": state, **fields}, sort_keys=True, allow_nan=False).encode()
+
+
+async def read_control(store, run: str, attempt: str) -> tuple[dict, str] | None:
+    """The attempt's control file and its version, or `None` if there is none."""
+
+    found = await read(store, f"{base(run, attempt)}{CONTROL}")
+    return (json.loads(found[0]), found[1]) if found is not None else None
 
 
 # -- the cancel record (§2.2) --------------------------------------------------------

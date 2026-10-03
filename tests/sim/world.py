@@ -15,7 +15,6 @@ import contextvars
 import json
 import logging
 import random
-import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -59,17 +58,17 @@ class Fate:
         return f"{self.kind} {self.when} {self.point}{tail}"
 
 
-def point_of(full: str, kind: str, data_root: str) -> str | None:
-    """Which lifecycle step a worker's request is (`POINTS`), if any."""
+CONTROL_POINTS = {lifecycle.OWNED: "claim", lifecycle.WRITING: "gate", lifecycle.SEALED: "result"}
 
+
+def point_of(full: str, kind: str, data_root: str, data: bytes | None = None) -> str | None:
+    """Which lifecycle step a worker's request is (`POINTS`), if any: its
+    control file's swaps own the attempt, take the gate and seal the result."""
+
+    if full.endswith(lifecycle.CONTROL):
+        return CONTROL_POINTS.get(json.loads(data)["state"]) if kind == "swap" and data else None
     if kind not in ("create", "put"):
         return None
-    if full.endswith(lifecycle.WORKER) and kind == "create":
-        return "claim"
-    if full.endswith(lifecycle.GATE):
-        return "gate"
-    if full.endswith(lifecycle.RESULT):
-        return "result"
     if "/keys/" in full and full.endswith(".kx"):
         return "delta"
     if full.startswith(data_root):
@@ -185,15 +184,14 @@ def sim_reporter_class():
                 ):
                     self._fallback_at = now
                     with contextlib.suppress(Exception):
-                        body = {**report, "host": "sim", "pid": 0, "at": time.time()}
-                        path = f"{self.base}{lifecycle.WORKER}"
-                        await obstore.put_async(self.objects, path, json.dumps(body).encode())
+                        path = f"{self.base}{lifecycle.BEAT}"
+                        await obstore.put_async(self.objects, path, json.dumps(report).encode())
                         try:
-                            got = await obstore.get_async(self.objects, f"{self.base}{lifecycle.GATE}")
-                            gate = json.loads(bytes(await got.bytes_async()))
+                            got = await obstore.get_async(self.objects, f"{self.base}{lifecycle.CONTROL}")
+                            control = json.loads(bytes(await got.bytes_async()))
                         except (NotFoundError, FileNotFoundError):
-                            gate = None
-                        if gate is not None and gate["state"] != lifecycle.WRITING:
+                            control = {"state": lifecycle.ENDED}  # retention took it
+                        if control["state"] == lifecycle.ENDED:
                             reason = self.cancel.reason if self.cancel else "user"
                             self.latch({"phase": "forced", "reason": reason, "since": 0})
                 await asyncio.sleep(self.interval)
@@ -612,7 +610,7 @@ class World:
             worker.paused_until = self.loop._now + fate.seconds
             await asyncio.sleep(fate.seconds)
 
-    async def _hook(self, who, kind: str, full: str, when: str) -> None:
+    async def _hook(self, who, kind: str, full: str, when: str, data: bytes | None = None) -> None:
         if who is None or who[0] != "worker":
             return
         worker = self.workers.get(who)
@@ -622,7 +620,7 @@ class World:
         if (
             fate.kind in ("die", "pause")
             and fate.when == when
-            and point_of(full, kind, self.data_root) == fate.point
+            and point_of(full, kind, self.data_root, data) == fate.point
         ):
             await self._strike(worker)
 

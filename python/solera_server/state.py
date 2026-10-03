@@ -217,26 +217,25 @@ class State:
     def attempt_path(self, run_id: str, attempt: str) -> str:
         return f"runs/{esc(run_id)}/{esc(attempt)}"
 
-    async def delete_run(self, run_id: str) -> list[str]:
-        """Delete a run's attempt objects and logs, except its gates, which
-        outlive it as tombstones (docs/lifecycle.md §2.4). Returns them."""
+    async def delete_run(self, run_id: str) -> None:
+        """Delete a run's attempt objects and logs, control files included:
+        a worker that wakes later finds no file and writes nothing
+        (docs/lifecycle.md §2.4)."""
 
         from solera.stores import remove_empty_dirs
 
-        paths = await self.list_objects(f"runs/{esc(run_id)}/")
-        gates = [p for p in paths if p.endswith(lifecycle.GATE)]
-        await self.delete_objects([p for p in paths if not p.endswith(lifecycle.GATE)])
-        if not gates:
-            remove_empty_dirs(self.objects, [f"runs/{esc(run_id)}"])
-        return gates
+        await self.delete_objects(await self.list_objects(f"runs/{esc(run_id)}/"))
+        remove_empty_dirs(self.objects, [f"runs/{esc(run_id)}"])
 
     async def attempt_spec(self, run_id: str, attempt: str) -> dict | None:
         data = await self.get_object(f"{lifecycle.base(run_id, attempt)}{lifecycle.SPEC}")
         return json.loads(data) if data is not None else None
 
     async def attempt_result(self, run_id: str, attempt: str) -> dict | None:
-        data = await self.get_object(f"{lifecycle.base(run_id, attempt)}{lifecycle.RESULT}")
-        return json.loads(data) if data is not None else None
+        """The result its worker sealed into its control file, if any (§2.4)."""
+
+        found = await lifecycle.read_control(self.objects, run_id, attempt)
+        return found[0]["result"] if found is not None and found[0]["state"] == lifecycle.SEALED else None
 
     async def attempt_finished(self, run_id: str, attempt: str) -> bool:
         return await self.attempt_result(run_id, attempt) is not None

@@ -1,6 +1,6 @@
 """The attempt lifecycle on the engine (docs/lifecycle.md §3–§8, §10): the
 launch, what workers report over the channel, watching, the two-phase
-cancel, and how an attempt ends — from its result, or from its gate.
+cancel, and how an attempt ends — from its result, or from its control file.
 
 Mixed into `Engine`. Liveness is evidence only: reports decide when the
 engine stops waiting, never whether an attempt's writes may still land
@@ -17,10 +17,10 @@ import math
 from collections import deque
 from dataclasses import dataclass, field
 
-from obstore.exceptions import AlreadyExistsError
 from solera import errors, lifecycle
 from solera.build import method_note
 from solera.lifecycle import Cancel, Ended
+from solera.objects import Conflict, swap
 
 from .state import LostOwnership, Unavailable
 
@@ -164,16 +164,16 @@ def _read(entry) -> dict | None:
 @dataclass
 class Live:
     """What the engine knows of a launched attempt's worker, in memory only:
-    rebuilt from `.worker` after a restart (§5.3)."""
+    rebuilt from the control file and `.beat` after a restart (§5.3)."""
 
     worker_id: str | None = None  # the bound worker: the claim's owner
     started: bool = False  # it reported: the runtime clock runs
     started_at: float = 0.0  # monotonic
     reported: float | None = None  # when it last reported (monotonic)
-    via: str = "channel"  # how: over the channel, or through `.worker`
+    via: str = "channel"  # how: over the channel, or through the object store
     seq: int = 0
     report: dict = field(default_factory=dict)  # its last timeline and usage
-    worker: bytes | None = None  # the `.worker` bytes last read
+    beat: bytes | None = None  # the `.beat` bytes last read
     cancel: Cancel | None = None  # the latched cancel record (§2.2)
     finished: bool = False  # the worker said its result is written
     offered_at: float | None = None  # a pool attempt: when discovery first offered it
@@ -222,17 +222,18 @@ class Attempts:
 
     def _speaking(self, live: Live, now: float) -> bool:
         """Has the worker reported recently: three beats over the channel,
-        three `.worker` updates (two beats apart) through the object store."""
+        three `.beat` updates (two beats apart) through the object store."""
 
         if live.reported is None:
             return False
         window = 3 if live.via == "channel" else 6
         return now - live.reported <= window * self.heartbeat_seconds
 
-    async def _owner(self, attempt: str) -> str | None:
-        task = self.m.task(self.m.attempts.get(attempt, ""))
-        data = await self.state.get_object(f"{lifecycle.base(task['run'], attempt)}{lifecycle.WORKER}")
-        return json.loads(data)["worker_id"] if data else None
+    async def _owner(self, run_id: str, attempt: str) -> str | None:
+        """The worker that owns the attempt, as its control file says (§2.4)."""
+
+        found = await lifecycle.read_control(self.state.objects, run_id, attempt)
+        return found[0].get("worker_id") if found is not None else None
 
     async def _bind(self, attempt: str, live: Live, worker_id: str, start: bool = False) -> None:
         """The first `start` of an attempt this engine launched binds its
@@ -245,7 +246,7 @@ class Attempts:
         if start and live.worker_id is None and live.fresh:
             live.worker_id = worker_id
             return
-        owner = await self._owner(attempt)
+        owner = await self._owner(self.m.task(self.m.attempts[attempt])["run"], attempt)
         if owner != worker_id:
             raise Ended("not_owner")
         live.worker_id = owner
@@ -463,8 +464,13 @@ class Attempts:
         }
         if prepared["cursor"] is not None:
             spec["cursor"] = prepared["cursor"]
-        path = f"{lifecycle.base(task['run'], attempt)}{lifecycle.SPEC}"
-        await self.state.create_object(path, json.dumps(spec).encode())
+        base = lifecycle.base(task["run"], attempt)
+        await self.state.create_object(f"{base}{lifecycle.SPEC}", json.dumps(spec).encode())
+        # Its control file, before the launch: a worker never creates it, so one that
+        # finds none stops (§2.4). An engine replaced before `AttemptLaunched` is
+        # durable leaves the file `open`, and no worker ever learns of it (F26).
+        opened = lifecycle.control(lifecycle.OPEN, engine=self.state.journal.engine)
+        await self.state.create_object(f"{base}{lifecycle.CONTROL}", opened)
         if self.keys is not None:  # what `start` answers its reads from (resolved-commits.md §7)
             live.reads = {"inputs": spec["inputs"], "outputs": spec["outputs"]}
         claim = self.m.claimed(attempt)
@@ -499,7 +505,7 @@ class Attempts:
     def _placed(self, attempt: str, handle: dict | None) -> None:
         """Record where a launched attempt runs, so a restarted engine follows
         it there. Lazily: it rides the next journal segment (§13); a handle
-        lost to a crash is found again by `resume`, or through `.worker`."""
+        lost to a crash is found again by `resume`, or through the control file."""
 
         if handle is not None and self.m.claimed(attempt) is not None:
             self.state.record({"type": "AttemptPlaced", "attempt": attempt, "handle": handle}, lazy=True)
@@ -514,22 +520,27 @@ class Attempts:
 
     # -- watching (§6–§8) ----------------------------------------------------------------
 
-    async def _read_worker(self, base: str, live: Live, now: float) -> None:
-        """The worker's claim, or its reports while its channel fails: a
-        change is evidence that it lives, and the claim rebuilds the
-        binding after a restart."""
+    async def _read_worker(self, run_id: str, attempt: str, live: Live, now: float) -> None:
+        """The worker's ownership, from the control file until it is known,
+        then its reports while its channel fails, from `.beat`: a change is
+        evidence that it lives, and the owner rebuilds the binding after a
+        restart (§2.4, §6)."""
 
-        data = await self.state.get_object(f"{base}{lifecycle.WORKER}")
-        if data is None or data == live.worker:
-            return
-        live.worker = data
-        body = json.loads(data)
+        heard = False
         if live.worker_id is None:
-            live.worker_id = body["worker_id"]
-        if body["worker_id"] != live.worker_id:
+            owner = await self._owner(run_id, attempt)
+            if owner is None:
+                return
+            live.worker_id, heard = owner, True
+        data = await self.state.get_object(f"{lifecycle.base(run_id, attempt)}{lifecycle.BEAT}")
+        if data is not None and data != live.beat:
+            live.beat = data
+            body = json.loads(data)
+            if body["worker_id"] == live.worker_id:
+                live.report = {k: body[k] for k in ("events", "usage") if k in body}
+                heard = True
+        if not heard:
             return
-        if body.get("events") is not None:
-            live.report = {k: body[k] for k in ("events", "usage") if k in body}
         if live.reported is None or live.via == "worker" or not self._speaking(live, now):
             live.heard(now, "worker")
 
@@ -537,7 +548,7 @@ class Attempts:
         """Wait for a launched attempt to end, then settle it (§7).
 
         Evidence comes from the worker's reports — over the channel, else
-        through `.worker`, read only while the channel is quiet — and from
+        through the object store, read only while the channel is quiet — and from
         the placement's handle, where there is one. A provider exit while
         the claim's owner still reports is a duplicate's (§4). Until its
         first report the attempt is provisioning, under a deadline of its
@@ -548,7 +559,6 @@ class Attempts:
 
         task = self.m.task(task_id)
         run_id, launched = task["run"], self._launched(task, attempt)
-        base = lifecycle.base(run_id, attempt)
         live = self.live.setdefault(attempt, Live())
         loop = asyncio.get_running_loop()
         heartbeat = self.heartbeat_seconds
@@ -563,14 +573,16 @@ class Attempts:
             provisioned_by = began + (self._left(launched, provision) if adopted else provision)
         forced_by = math.inf  # the end of a requested cancel's grace
         read_at = -math.inf
-        if adopted:  # it may have ended, or been claimed, while no engine looked: look now
-            result = await self.state.attempt_result(run_id, attempt)
-            if result is not None:
+        if adopted:  # it may have ended, or been owned, while no engine looked: look now
+            found = await lifecycle.read_control(self.state.objects, run_id, attempt)
+            if found is not None and found[0]["state"] == lifecycle.SEALED:
                 return await self._settle(
-                    task_id, attempt, result, {"code": None, "reason": None, "meta": {}}
+                    task_id, attempt, found[0]["result"], {"code": None, "reason": None, "meta": {}}
                 )
+            if found is not None and found[0]["state"] == lifecycle.ENDED:  # by an engine since gone
+                return await self._fail(task_id, attempt, "ended by a replaced engine", retryable=True)
             read_at = loop.time()
-            await self._read_worker(base, live, read_at)
+            await self._read_worker(run_id, attempt, live, read_at)
         poll = heartbeat / 3
         stirred = self._stirred.setdefault(attempt, asyncio.Event())
 
@@ -601,9 +613,9 @@ class Attempts:
             )
             if quiet and (offered or live.started) and now - read_at >= heartbeat:
                 read_at = now
-                await self._read_worker(base, live, now)
+                await self._read_worker(run_id, attempt, live, now)
             # Only reports the engine received itself prove the owner outlived
-            # the exit: a `.worker` seen now may have been written before it.
+            # the exit: a `.beat` seen now may have been written before it.
             if (
                 exit_ is not None
                 and not live.finished
@@ -747,9 +759,6 @@ class Attempts:
                 reason="conflict",
             )
             return
-        if result.get("write") == lifecycle.NONE and self._gated(prepared):
-            with contextlib.suppress(Exception):
-                await self._gate(task["run"], attempt, lifecycle.CLOSED)
 
     @staticmethod
     def _launched(task: dict | None, attempt: str) -> dict:
@@ -757,15 +766,6 @@ class Attempts:
         if launched is None or launched["attempt"] != attempt:
             raise LostOwnership(attempt)  # it finished meanwhile
         return launched
-
-    @staticmethod
-    def _gated(prepared: dict) -> bool:
-        """Whether the attempt writes outputs on fenced stores, which take a
-        gate and its intents for the next attempt's repair (§9.6)."""
-
-        return any(
-            info["contract"]["writes"] == "fenced" for info in (prepared.get("outputs") or {}).values()
-        )
 
     def partition_cleanups(self, output: str, partition: str) -> dict:
         """An output partition's cleanup awaiting its next attempt (§9.8):
@@ -795,24 +795,35 @@ class Attempts:
             self.state.record({"type": "CleanupsCleared", **event})
         return {"output": output, "partition": partition, "cleared": stuck}
 
-    async def _gate(self, run_id: str, attempt: str, state: str) -> tuple[str, dict | None]:
-        """Create the attempt's gate as `state` (`aborted` or `closed`), or
-        find the one there: the write-completion evidence it establishes
-        (§2.3) and the gate found. Winning: `none` — the worker never took
-        it, and now never can. Finding it `writing`: so is the write. An object
-        store that does not answer establishes nothing: retried, then raised."""
+    async def _end(self, run_id: str, attempt: str) -> dict | None:
+        """End the attempt in its control file (§2.4), on what it reads
+        there: the final body, `sealed` or `ended`, found or written. Ended
+        from `open` or `owned`, its evidence is `none` — the worker never
+        took the gate, and now never can; from `writing`, `writing`, with
+        its intents (§2.3). A refused swap reads again and decides again.
+        `None` if there is no file. An object store that does not answer
+        establishes nothing: retried, then raised."""
 
-        path = f"{lifecycle.base(run_id, attempt)}{lifecycle.GATE}"
+        path = f"{lifecycle.base(run_id, attempt)}{lifecycle.CONTROL}"
         for retry in range(6):
-            self._authority()
             try:
-                await self.state.create_object(path, lifecycle.gate(state))
-                return lifecycle.NONE, None
-            except AlreadyExistsError:
-                found = json.loads(await self.state.get_object(path))
-                if found["state"] == lifecycle.WRITING:
-                    return lifecycle.WRITING, found
-                return lifecycle.NONE, found
+                found = await lifecycle.read_control(self.state.objects, run_id, attempt)
+                while found is not None and found[0]["state"] not in lifecycle.FINAL:
+                    body, version = found
+                    end = {"engine": self.state.journal.engine, "write": lifecycle.NONE}
+                    if body["state"] == lifecycle.WRITING:
+                        end.update(write=lifecycle.WRITING, intents=body.get("intents") or {})
+                    self._authority()
+                    try:
+                        await swap(
+                            self.state.objects, path, lifecycle.control(lifecycle.ENDED, **end), version
+                        )
+                        return {"state": lifecycle.ENDED, **end}
+                    except Conflict:  # the worker moved on, or another engine ended it
+                        found = await lifecycle.read_control(self.state.objects, run_id, attempt)
+                return found[0] if found is not None else None
+            except LostOwnership:
+                raise
             except Exception:
                 if retry == 5:
                     raise
@@ -832,24 +843,25 @@ class Attempts:
         reason=None,
         retry_for=None,
     ):
-        """End a launched attempt without a commit. Its gate is taken as
-        `aborted` first, so it can never write after this, and the gate
-        found says what it may have written (§2.3). If it had begun writing,
-        the keyed outputs it meant to change stay owing a repair until a later
+        """End a launched attempt without a commit. With no result, its
+        control file is ended first, so it can never write after this, and
+        what was there says what it may have written (§2.3); a result sealed
+        meanwhile stands, and is settled instead. If it had begun writing, the
+        keyed outputs it meant to change stay owing a repair until a later
         commit takes in what landed; their intent files are kept for that.
-        `result` is the worker's, when it published one."""
+        `result` is the worker's, when it sealed one."""
 
         task = self.m.task(task_id)
         prepared = self._launched(task, attempt)["prepared"]
-        write, gate = lifecycle.NONE, None
-        if self._gated(prepared):
-            write, gate = await self._gate(task["run"], attempt, lifecycle.ABORTED)
-        if result is not None:
-            write = result.get("write", write)
-        repairs = current_names(
-            prepared,
-            (gate or {}).get("intents") or {} if (gate or {}).get("state") == lifecycle.WRITING else {},
-        )
+        if result is None:
+            final = await self._end(task["run"], attempt) or {}
+            if final.get("state") == lifecycle.SEALED:
+                exit_ = {"code": None, "reason": "done", "meta": {}}
+                return await self._settle(task_id, attempt, final["result"], exit_)
+        else:
+            final = result
+        write = final.get("write", lifecycle.NONE)
+        repairs = current_names(prepared, final.get("intents") or {})
         worker = result if result is not None else self._last_report(attempt)
         claim = self.m.claimed(attempt)
         if claim is None:

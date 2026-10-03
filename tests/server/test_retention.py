@@ -52,10 +52,9 @@ async def history_ids(engine) -> list[str]:
 
 
 async def run_dirs(state) -> set[str]:
-    """Runs whose objects are there; a deleted run leaves only its gates
-    (docs/lifecycle.md §2.4)."""
+    """Runs whose objects are there: a deleted run leaves none (docs/lifecycle.md §2.4)."""
 
-    return {p.split("/")[1] for p in await state.list_objects("runs/") if not p.endswith(".writing")}
+    return {p.split("/")[1] for p in await state.list_objects("runs/")}
 
 
 async def run(engine, targets, **kw):
@@ -203,32 +202,30 @@ async def test_a_run_retires_for_good_before_its_files_go(tmp_path, state, clock
     await again.close()
 
 
-async def test_a_deleted_runs_gates_outlive_it(state, clock):
-    """docs/lifecycle.md §2.4: deleting a run keeps its gates, so a worker
-    that resumes after its run is gone cannot take its gate and write.
-    They go `gate_days` after the run."""
+async def test_a_deleted_run_takes_its_control_files_and_a_late_worker_writes_nothing(state, clock):
+    """docs/lifecycle.md §2.4 ("a worker paused for a week"): deleting a run
+    deletes everything of it, control files included, and nothing is kept
+    for later. A worker that resumes then swaps on the version it last
+    read; the file is gone, so the swap is refused, and it writes nothing
+    (a worker never creates the file)."""
 
-    from obstore.exceptions import AlreadyExistsError
     from solera import lifecycle
+    from solera.objects import Conflict, swap
 
     from tests.server.test_fence import Gated
 
     engine = engine_for(state, Project(assets=[plain], default_store=Gated()), clock)  # gated
     await engine.initialize()
     gone = await run(engine, ["plain"])
+    [attempt] = {p.rsplit("/", 1)[-1].split(".")[0] for p in await state.list_objects(f"runs/{gone}/")}
+    _, version = await lifecycle.read_control(state.objects, gone, attempt)
     await engine.history.lake.flush(force=True)
     await engine.delete_run(gone)
-    left = await state.list_objects(f"runs/{gone}/")
-    assert left and all(p.endswith(".writing") for p in left)
-    with pytest.raises(AlreadyExistsError):  # what a resumed worker's gate create meets
-        await state.create_object(left[0], lifecycle.gate("writing", "late", {}))
-    clock.now += 29 * 86400
-    await engine.upkeep.sweep()
-    assert await state.list_objects(f"runs/{gone}/") == left
-    clock.now += 2 * 86400
-    await engine.upkeep.sweep()
     assert await state.list_objects(f"runs/{gone}/") == []
-    assert await state.list_objects("control/gates/") == []
+    body = lifecycle.control(lifecycle.WRITING, worker_id="late", intents={})
+    with pytest.raises(Conflict):  # what a resumed worker's gate meets
+        await swap(state.objects, f"runs/{gone}/{attempt}{lifecycle.CONTROL}", body, version)
+    assert await state.list_objects(f"runs/{gone}/") == []
 
 
 async def test_runs_kept_forever_do_not_crowd_out_expired_ones(state, clock):

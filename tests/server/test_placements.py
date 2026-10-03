@@ -2,7 +2,6 @@
 cancel) and the remote kinds against stubbed SDK clients."""
 
 import asyncio
-import json
 import os
 import re
 import sys
@@ -16,7 +15,7 @@ from solera_server.engine import Engine
 from solera_server.executors import PlacementContext
 from solera_worker.worker import run_attempt
 
-from tests.server.test_fence import Gated
+from tests.server.test_fence import Gated, as_worker, fence, own
 
 
 def make_engine(state, project, placements=None, **kw):
@@ -104,11 +103,11 @@ async def test_an_attempt_whose_launch_is_in_flight_shows_as_launching(state):
 
 
 async def test_a_dead_pool_claim_expires_into_a_new_attempt(state):
-    """A worker claims, then dies before it says anything. The engine finds
-    the claim, waits for a report, and ends the attempt lost; its writes are
-    classified from its gate, never from progress (§2.3): the engine's
-    `aborted` create wins, so `none`. The retry is a new attempt id, which
-    another worker can claim — never the old claim with a new owner."""
+    """A worker owns the attempt, then dies before it says anything. The
+    engine finds the owner, waits for a report, and ends the attempt lost;
+    its writes are classified from its control file, never from progress
+    (§2.3): ended from `owned`, so `none`. The retry is a new attempt id,
+    which another worker can own — never the old attempt with a new owner."""
 
     @asset(executor=Pool("ingest")(), retries=Retry(1, delay=0))
     def job():
@@ -120,8 +119,7 @@ async def test_a_dead_pool_claim_expires_into_a_new_attempt(state):
     run = await engine.submit(["job"])
     [first] = await pool_attempt(engine, state)
     await engine.pool_work("ingest", {}, "w1", 0)
-    base = state.attempt_path(run["id"], first)
-    await state.create_object(f"{base}.worker", json.dumps({"worker_id": "dead"}).encode())
+    await own(state, run["id"], first, "dead")
     for _ in range(200):
         await engine.tick()
         await asyncio.sleep(0.02)
@@ -132,14 +130,14 @@ async def test_a_dead_pool_claim_expires_into_a_new_attempt(state):
     task = state.model.task(state.model.pool[second]["task"])
     ended = (await engine.history.attempts(task["run"]))[task["id"]][0]
     assert ended["id"] == first and ended["outcome"] == "failed"
-    assert json.loads(await state.get_object(f"{base}.writing")) == {"state": "aborted"}
+    assert await fence(state, run["id"], first) == ("ended", "none")
     assert [s["attempt"] for s in await engine.pool_work("ingest", {}, "w2", 0)] == [second]
 
 
 async def test_a_dead_pool_claim_that_took_its_gate_is_still_writing(state):
     """The claimant took its gate and entered a store call before it could
     report again: the engine finds `writing`, so its write is `writing`
-    and the intents stay owing a repair — whatever `.worker` showed."""
+    and the intents stay owing a repair — whatever its reports showed."""
 
     from solera import lifecycle
 
@@ -153,10 +151,9 @@ async def test_a_dead_pool_claim_that_took_its_gate_is_still_writing(state):
     run = await engine.submit(["job"])
     [first] = await pool_attempt(engine, state)
     await engine.pool_work("ingest", {}, "w1", 0)
-    base = state.attempt_path(run["id"], first)
-    await state.create_object(f"{base}.worker", json.dumps({"worker_id": "dead"}).encode())
+    await own(state, run["id"], first, "dead")
     intents = {"job": {"files": [], "added": 0, "removed": 0, "exact": True}}
-    await state.create_object(f"{base}.writing", lifecycle.gate("writing", "dead", intents))
+    await as_worker(state, run["id"], first, lifecycle.WRITING, "dead", intents=intents)
     detail = await engine.run_until(run["id"], 10)
     assert detail["request"]["status"] == "failed"
     assert state.model.repairs[("job", "")][0]["attempt"] == first
@@ -183,8 +180,7 @@ async def test_a_pool_attempt_canceled_before_its_claim_is_withdrawn(state):
         if not state.model.pool:
             break
     assert await engine.pool_work("ingest", {}, "w1", 0) == []
-    gate = json.loads(await state.get_object(f"{state.attempt_path(run['id'], attempt)}.writing"))
-    assert gate == {"state": "aborted"}
+    assert await fence(state, run["id"], attempt) == ("ended", "none")
 
 
 # -- remote placements against stubbed SDKs ---------------------------------------
@@ -518,7 +514,7 @@ async def test_after_a_restart_a_start_is_checked_against_the_claim(state):
     await engine.initialize()
     run = await engine.submit(["job"])
     [attempt] = await pool_attempt(engine, state)
-    await state.create_object(f"{state.attempt_path(run['id'], attempt)}.worker", b'{"worker_id": "owner"}')
+    await own(state, run["id"], attempt, "owner")
     await engine.stop()
     engine = make_engine(state, project)
     await engine.initialize()

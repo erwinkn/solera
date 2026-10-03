@@ -253,7 +253,7 @@ class Op:
 class Objects:
     """Every obstore request of the process, answered synchronously through
     the real store, with the fault plan applied to the simulation loop's
-    requests. `hook(who, kind, path, when)` runs before (`when="before"`)
+    requests. `hook(who, kind, path, when, data)` runs before (`when="before"`)
     and after each one: the world uses it to kill or pause an actor at a
     lifecycle step. `log` keeps the requests that matter to invariants."""
 
@@ -341,7 +341,7 @@ class Objects:
             raise Killed(f"{who} is dead")
         fate, delay = self.plan.decide() if on_loop and who is not None else (None, 0.0)
         if on_loop and self.hook is not None:
-            await self.hook(who, kind, full, "before")
+            await self.hook(who, kind, full, "before", data)
         if delay:
             await asyncio.sleep(delay)
             if who is not None and who in self.dead:
@@ -380,7 +380,7 @@ class Objects:
             if self.tap is not None:
                 self.tap(full, data)
         if on_loop and self.hook is not None:
-            await self.hook(who, kind, full, "after")
+            await self.hook(who, kind, full, "after", data)
         if fate == "lost":
             raise GenericError(f"injected: connection reset after the request landed ({kind} {path})")
         return value

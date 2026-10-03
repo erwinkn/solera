@@ -557,9 +557,9 @@ class Simulation(RuleBasedStateMachine):
     @invariant()
     def fenced_writes_hold_their_gate(self):
         """docs/lifecycle.md §2.4, §3: a worker writes to a fenced store only
-        after it took its attempt's gate (`writing`, its own worker id): an
-        attempt the engine ended (`aborted`, `closed`), or a duplicate
-        worker, writes nothing."""
+        after it took its attempt's gate (its control file `writing`, its own
+        worker id): an attempt the engine ended, or a duplicate worker,
+        writes nothing."""
 
         if self.world is None:
             return

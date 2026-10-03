@@ -22,6 +22,8 @@ from solera_server.engine import Engine
 from solera_server.executors.inline import InlinePlacement
 from solera_server.state import State
 
+from tests.server.test_fence import own
+
 
 def build_project():
     feed_keys = {"rows": [{"k": "a", "v": 1}, {"k": "b", "v": 2}]}
@@ -298,11 +300,9 @@ async def test_executors_and_workers(client, base):
 
 async def test_worker_pull_path_and_channel(engine, monkeypatch):
     """docs/lifecycle.md §5, §10: a pool worker discovers work that fits it
-    (pool token), claims it by creating `.worker`, and reports on the
+    (pool token), owns it by swapping its control file, and reports on the
     attempt's routes with the attempt's own token; another worker, or
     another attempt's token, gets nothing."""
-
-    import json
 
     from solera import lifecycle
 
@@ -328,8 +328,7 @@ async def test_worker_pull_path_and_channel(engine, monkeypatch):
         assert {w["id"] for w in workers} == {"w1", "w2"}
 
         spec = await engine.state.attempt_spec(stage["run"], stage["attempt"])
-        base = lifecycle.base(stage["run"], stage["attempt"])
-        await engine.state.create_object(f"{base}.worker", json.dumps({"worker_id": "mine"}).encode())
+        await own(engine.state, stage["run"], stage["attempt"], "mine")
         routes = f"/api/projects/{p}/attempts/{stage['attempt']}"
         token = {"Authorization": f"Bearer {spec['token']}"}
         assert (await client.post(f"{routes}/start", json={"worker_id": "mine"})).status_code == 401

@@ -3,12 +3,12 @@ write fence, adoption after a restart, heartbeats, and outputs owing a repair.""
 
 import asyncio
 import contextlib
-import json
 
 import pytest
 from obstore.exceptions import AlreadyExistsError
 from solera import lifecycle
 from solera.executors import Executor
+from solera.objects import swap
 from solera.sdk import Output, Project, Ref, Result, Retry, asset
 from solera.stores import FileStore, KeyedWrite, Keys, Patch, Written
 from solera_server.engine import Engine
@@ -75,14 +75,30 @@ async def until(engine, done, timeout=10.0):
         await asyncio.sleep(0.02)
 
 
-async def finish_as_worker(state, run_id, attempt, output, worker_id="w", **extra):
-    """What a worker does (docs/lifecycle.md §3): claim, take the gate, write,
-    then seal its result (with `extra` fields)."""
+async def as_worker(state, run_id, attempt, to, worker_id="w", **fields):
+    """Swap the attempt's control file to `to`, as worker `worker_id` would
+    (docs/lifecycle.md §2.4). Raises `Conflict` where a worker is refused."""
 
-    base = state.attempt_path(run_id, attempt)
-    with contextlib.suppress(AlreadyExistsError):
-        await state.create_object(f"{base}.worker", json.dumps({"worker_id": worker_id}).encode())
-    await state.create_object(f"{base}.writing", lifecycle.gate("writing", worker_id, {}))
+    found = await lifecycle.read_control(state.objects, run_id, attempt)
+    body = lifecycle.control(to, worker_id=worker_id, **fields)
+    path = f"{state.attempt_path(run_id, attempt)}{lifecycle.CONTROL}"
+    await swap(state.objects, path, body, found[1] if found is not None else None)
+
+
+async def own(state, run_id, attempt, worker_id="w"):
+    """A worker's first write: the attempt's control file, `open` → `owned`."""
+
+    await as_worker(state, run_id, attempt, lifecycle.OWNED, worker_id)
+
+
+async def finish_as_worker(state, run_id, attempt, output, worker_id="w", **extra):
+    """What a worker does (docs/lifecycle.md §3): own the attempt, take the
+    gate, write, then seal its result (with `extra` fields)."""
+
+    found = await lifecycle.read_control(state.objects, run_id, attempt)
+    if found[0]["state"] == lifecycle.OPEN:
+        await own(state, run_id, attempt, worker_id)
+    await as_worker(state, run_id, attempt, lifecycle.WRITING, worker_id, intents={})
     ref = {
         "output": output,
         "store": "default",
@@ -97,12 +113,17 @@ async def finish_as_worker(state, run_id, attempt, output, worker_id="w", **extr
         "outputs": {output: {"ref": {**ref, "meta": {}}}},
         **extra,
     }
-    await state.create_object(f"{base}.result", json.dumps(result).encode())
+    await as_worker(state, run_id, attempt, lifecycle.SEALED, worker_id, result=result)
 
 
 async def fence(state, run_id, attempt):
-    data = await state.get_object(f"{state.attempt_path(run_id, attempt)}.writing")
-    return json.loads(data) if data is not None else None
+    """The attempt's control file as `(state, write evidence)`, or `None`."""
+
+    found = await lifecycle.read_control(state.objects, run_id, attempt)
+    if found is None:
+        return None
+    body = found[0]
+    return body["state"], body.get("write", (body.get("result") or {}).get("write"))
 
 
 async def launched(engine, targets):
@@ -171,9 +192,7 @@ async def test_an_attempt_its_placement_cannot_see_is_followed_by_its_heartbeat(
     engine = engine_for(state, REMOTE)
     await engine.initialize()
     run, attempt = await launched(engine, ["remote"])
-    await state.put_object(
-        f"{state.attempt_path(run['id'], attempt)}.worker", json.dumps({"worker_id": "w"}).encode()
-    )
+    await own(state, run["id"], attempt)
     state, engine = await restart(state, engine, url, REMOTE, worker=Blind, heartbeat_seconds=0.1)
     assert state.model.task(state.model.attempts[attempt])["launched"]["handle"] == {
         "id": attempt,
@@ -185,7 +204,7 @@ async def test_an_attempt_its_placement_cannot_see_is_followed_by_its_heartbeat(
     first = (await engine.history.attempts(run["id"]))[task["id"]][0]
     assert first["id"] == attempt and first["outcome"] == "failed"
     assert "no heartbeat" in first["error"]
-    assert (await fence(state, run["id"], attempt)) == {"state": "aborted"}
+    assert (await fence(state, run["id"], attempt)) == ("ended", "none")
     await engine.stop()
     await state.close()
 
@@ -288,7 +307,7 @@ async def test_a_worker_that_never_reports_is_given_up_on(tmp_path):
     task = state.model.task(next(iter(state.model.runs[run["id"]]["tasks"])))
     [ended] = (await engine.history.attempts(run["id"]))[task["id"]]
     assert "did not report" in ended["error"] and Stuck.canceled == [attempt]
-    assert (await fence(state, run["id"], attempt)) == {"state": "aborted"}
+    assert (await fence(state, run["id"], attempt)) == ("ended", "none")
     await engine.stop()
     await state.close()
 
@@ -316,8 +335,7 @@ async def test_a_cancel_waits_for_a_worker_that_is_writing(tmp_path):
     engine = engine_for(state, REMOTE, cancel_grace=5)
     await engine.initialize()
     run, attempt = await launched(engine, ["remote"])
-    base = state.attempt_path(run["id"], attempt)
-    await state.create_object(f"{base}.worker", json.dumps({"worker_id": "w"}).encode())
+    await own(state, run["id"], attempt)
     await until(engine, lambda: engine.live[attempt].started)
     await engine.cancel(run["id"])
     await until(
@@ -342,10 +360,9 @@ async def test_a_drain_that_outlives_its_grace_is_forced_and_still_writing(tmp_p
     engine = engine_for(state, REMOTE, cancel_grace=0.3)
     await engine.initialize()
     run, attempt = await launched(engine, ["remote"])
-    base = state.attempt_path(run["id"], attempt)
-    await state.create_object(f"{base}.worker", json.dumps({"worker_id": "w"}).encode())
+    await own(state, run["id"], attempt)
     intents = {"remote": {"files": [], "added": 0, "removed": 0, "exact": True}}
-    await state.create_object(f"{base}.writing", lifecycle.gate("writing", "w", intents))
+    await as_worker(state, run["id"], attempt, lifecycle.WRITING, intents=intents)
     await until(engine, lambda: engine.live[attempt].started)
     await engine.cancel(run["id"])
     await until(engine, lambda: state.model.claimed(attempt) is None)
@@ -363,7 +380,7 @@ async def test_a_cancel_aborts_a_worker_that_is_not_writing(tmp_path):
     run, attempt = await launched(engine, ["remote"])
     await engine.cancel(run["id"])
     await until(engine, lambda: state.model.claimed(attempt) is None)
-    assert (await fence(state, run["id"], attempt)) == {"state": "aborted"}
+    assert (await fence(state, run["id"], attempt)) == ("ended", "none")
     assert ("remote", "") not in state.model.heads
     await engine.stop()
     await state.close()
@@ -397,7 +414,7 @@ async def test_a_cancel_lands_at_once_however_long_the_wait(tmp_path):
     await engine.cancel(run["id"])
     await until(engine, lambda: state.model.claimed(attempt) is None)
     assert asyncio.get_running_loop().time() - started < 1.0
-    assert (await fence(state, run["id"], attempt)) == {"state": "aborted"}
+    assert (await fence(state, run["id"], attempt)) == ("ended", "none")
     await engine.stop()
     await state.close()
 
@@ -493,10 +510,10 @@ async def test_a_worker_that_dies_writing_leaves_its_output_unsettled_and_the_re
 
 
 async def test_an_aborted_worker_writes_nothing(tmp_path):
-    """A worker the engine cannot reach learns of the end from its gate,
-    which its reports read while its channel fails (§6), and stops while it
-    computes; one past its producer by then finds the gate taken and writes
-    nothing (§2.4). Neither publishes a result."""
+    """A worker the engine cannot reach learns of the end from its control
+    file, which its reports read while its channel fails (§6), and stops
+    while it computes; one that boots after the end finds the file `ended`
+    and writes nothing (§2.4). Neither publishes a result."""
 
     from solera_worker.worker import ENDED, run_attempt
 
@@ -515,12 +532,14 @@ async def test_an_aborted_worker_writes_nothing(tmp_path):
     await engine.initialize()
     for name in ("slow", "quick"):
         run, attempt = await launched(engine, [name])
-        assert await engine._gate(run["id"], attempt, "aborted") == ("none", None)
-        code = await asyncio.wait_for(run_attempt(state.objects_url, attempt, project, run=run["id"]), 5)
-        assert code == ENDED
+        worker = asyncio.create_task(run_attempt(state.objects_url, attempt, project, run=run["id"]))
+        if name == "slow":  # ended while it computes
+            await until(engine, lambda w=worker, a=attempt: w.done() or engine.live[a].worker_id is not None)
+            await asyncio.sleep(0.1)
+        assert (await engine._end(run["id"], attempt))["write"] == "none"
+        assert await asyncio.wait_for(worker, 5) == ENDED
         assert await state.attempt_result(run["id"], attempt) is None
-        claim = json.loads(await state.get_object(f"{state.attempt_path(run['id'], attempt)}.worker"))
-        assert "writing" not in [e["type"] for e in claim.get("events", [])]
+        assert await fence(state, run["id"], attempt) == ("ended", "none")
     await engine.stop()
     await state.close()
 
@@ -572,7 +591,6 @@ async def test_a_create_whose_response_was_lost_is_its_own(tmp_path, monkeypatch
     the worker writes and commits rather than taking itself for aborted."""
 
     import obstore
-    from obstore.exceptions import AlreadyExistsError
     from solera.objects import create
 
     put = obstore.put_async
@@ -596,36 +614,36 @@ async def test_a_create_whose_response_was_lost_is_its_own(tmp_path, monkeypatch
     await engine.initialize()
     detail = await engine.run_until((await engine.submit(["scores"]))["id"], 10)
     assert detail["request"]["status"] == "succeeded", detail
-    assert {"json", "kx", "writing"} <= set(retried)
+    assert {"json", "kx", "control"} <= set(retried)
     assert state.model.heads[("scores", "")]["count"] == 2 and state.model.repairs == {}
     with pytest.raises(AlreadyExistsError):  # another writer's object is still a collision
-        await create(state.objects, f"{state.attempt_path(detail['request']['id'], 'x')}.writing", b"a")
-        await create(state.objects, f"{state.attempt_path(detail['request']['id'], 'x')}.writing", b"b")
+        await create(state.objects, f"{state.attempt_path(detail['request']['id'], 'x')}.spec", b"a")
+        await create(state.objects, f"{state.attempt_path(detail['request']['id'], 'x')}.spec", b"b")
     await engine.stop()
     await state.close()
 
 
 async def test_a_result_that_fails_to_publish_stays_what_it_was(tmp_path, monkeypatch):
-    """Publishing is not executing. The result's create lands but loses its
+    """Publishing is not executing. The seal's swap lands but loses its
     response: the retry finds the very same bytes, so the success stays a
     success. A worker that cannot publish at all leaves no result — never a
     failure it did not have — and the engine retries it as dead."""
 
     from solera_worker import worker
 
-    create, puts, broken = worker.create, [], {"on": False}
+    swap, puts, broken = worker.swap, [], {"on": False}
 
-    async def flaky(objects, key, value):
-        if key.endswith(".result"):
+    async def flaky(objects, key, value, etag):
+        if b'"state":"sealed"' in value.replace(b" ", b""):
             puts.append(value)
             if broken["on"]:
                 raise OSError("store unreachable")
             if len(puts) == 1:
-                await create(objects, key, value)
+                await swap(objects, key, value, etag)
                 raise OSError("the response was lost")
-        await create(objects, key, value)
+        return await swap(objects, key, value, etag)
 
-    monkeypatch.setattr(worker, "create", flaky)
+    monkeypatch.setattr(worker, "swap", flaky)
     monkeypatch.setattr(worker, "PUBLISH_TRIES", 2)
     calls = []
 
@@ -699,12 +717,11 @@ async def test_the_timeout_runs_from_the_first_report(tmp_path):
     engine = engine_for(state, project, worker=Quiet, heartbeat_seconds=0.3, cancel_grace=0.1)
     await engine.initialize()
     run, attempt = await launched(engine, ["brief"])
-    beat = f"{state.attempt_path(run['id'], attempt)}.worker"
     for _ in range(50):  # a second of provisioning, twice the timeout
         await engine.tick()
         await asyncio.sleep(0.02)
     assert state.model.claimed(attempt) is not None
-    await state.put_object(beat, json.dumps({"worker_id": "w"}).encode())
+    await own(state, run["id"], attempt)  # its first report
     reported = asyncio.get_running_loop().time()
     await until(engine, lambda: state.model.claimed(attempt) is None)
     assert asyncio.get_running_loop().time() - reported >= 0.5
@@ -712,9 +729,7 @@ async def test_the_timeout_runs_from_the_first_report(tmp_path):
     assert (await engine.history.attempts(run["id"]))[task["id"]][0]["error"] == "timeout"
 
     run, attempt = await launched(engine, ["brief"])
-    await state.put_object(
-        f"{state.attempt_path(run['id'], attempt)}.worker", json.dumps({"worker_id": "w"}).encode()
-    )
+    await own(state, run["id"], attempt)
     state, engine = await restart(
         state, engine, url, project, worker=Quiet, heartbeat_seconds=0.1, cancel_grace=0.1
     )
@@ -727,11 +742,11 @@ async def test_the_timeout_runs_from_the_first_report(tmp_path):
     await state.close()
 
 
-async def test_an_attempt_that_wrote_nothing_still_leaves_a_gate(tmp_path):
+async def test_an_attempt_that_wrote_nothing_still_ends_in_a_final_file(tmp_path):
     """An attempt that commits without a store call (its output unchanged:
-    an empty patch) took no gate; the engine closes it, so no delayed
-    worker can take it later (§2.4). One that wrote keeps the worker's
-    `writing` gate."""
+    an empty patch) took no gate, yet its control file is `sealed`, final,
+    so no delayed worker can take the gate later (§2.4). One that wrote
+    took it first, and its sealed result carries the intents."""
 
     calls = []
 
@@ -749,19 +764,16 @@ async def test_an_attempt_that_wrote_nothing_still_leaves_a_gate(tmp_path):
         detail = await engine.run_until((await engine.submit(["same"]))["id"], 10)
         [attempt] = detail["attempts"][detail["tasks"][0]["id"]]
         result = await state.attempt_result(detail["request"]["id"], attempt["id"])
-        gate = json.loads(
-            await state.get_object(f"{state.attempt_path(detail['request']['id'], attempt['id'])}.writing")
-        )
-        gates.append((result["write"], gate["state"]))
-    assert gates == [("complete", "writing"), ("none", "closed")]
+        gates.append((await fence(state, detail["request"]["id"], attempt["id"]), "intents" in result))
+    assert gates == [(("sealed", "complete"), True), (("sealed", "none"), False)]
     await engine.stop()
     await state.close()
 
 
 async def test_only_stores_that_take_a_gate_get_one(tmp_path):
-    """Review P3-9: an attempt writing only immutable outputs creates no
-    `.writing` (§9.6: no gate, no intents); one writing an overwrite store
-    does, listing only that store's intents."""
+    """Review P3-9: an attempt writing only immutable outputs takes no gate
+    (§9.6: no `writing`, no intents); one writing an overwrite store does,
+    listing only that store's intents."""
 
     @asset(outputs=Output("scores", keyed=True))
     def scores():
@@ -779,8 +791,8 @@ async def test_only_stores_that_take_a_gate_get_one(tmp_path):
         detail = await engine.run_until((await engine.submit([target]))["id"], 10)
         assert detail["request"]["status"] == "succeeded"
         attempt = detail["attempts"][detail["tasks"][0]["id"]][0]["id"]
-        gate = await state.get_object(f"{state.attempt_path(detail['request']['id'], attempt)}.writing")
-        assert (sorted(json.loads(gate)["intents"]) if gate else None) == gated
+        result = await state.attempt_result(detail["request"]["id"], attempt)
+        assert (sorted(result["intents"]) if "intents" in result else None) == gated
     await engine.stop()
     await state.close()
 
@@ -913,8 +925,7 @@ async def test_a_replaced_engine_stops_acting(tmp_path):
     engine = engine_for(state, project, worker=Watching, cancel_grace=0.1)
     await engine.initialize()
     run, attempt = await launched(engine, ["brief"])
-    base = state.attempt_path(run["id"], attempt)
-    await state.create_object(f"{base}.worker", json.dumps({"worker_id": "w"}).encode())  # it runs
+    await own(state, run["id"], attempt)  # it runs
     await engine.start()
     successor = await State.open(url, "test", flush_interval=0.001)  # B takes the namespace over
     with contextlib.suppress(Unavailable):
@@ -922,7 +933,7 @@ async def test_a_replaced_engine_stops_acting(tmp_path):
         await state.durable()  # A's next write collides with B's fence
     assert state.poisoned
     await asyncio.sleep(1.0)  # A's timeout and cancel grace pass
-    assert await state.get_object(f"{base}.writing") is None and Watching.canceled == []
+    assert await fence(state, run["id"], attempt) == ("owned", None) and Watching.canceled == []
     with pytest.raises(Unavailable):
         await engine.attempt_beat(attempt, {"worker_id": "w", "seq": 1})
     assert successor.model.claimed(attempt) is not None  # B still owns it, and adopts it
@@ -933,12 +944,11 @@ async def test_a_replaced_engine_stops_acting(tmp_path):
 async def failed_writing(state, run_id, attempt, intents):
     """A worker that took the gate listing `intents`, then failed."""
 
-    base = state.attempt_path(run_id, attempt)
-    await state.create_object(f"{base}.worker", json.dumps({"worker_id": "w"}).encode())
-    await state.create_object(f"{base}.writing", lifecycle.gate("writing", "w", intents))
+    await own(state, run_id, attempt)
+    await as_worker(state, run_id, attempt, lifecycle.WRITING, intents=intents)
     error = {"type": "ValueError", "message": "boom", "retryable": False}
-    result = {"worker_id": "w", "status": "failed", "write": "writing", "error": error}
-    await state.create_object(f"{base}.result", json.dumps(result).encode())
+    result = {"worker_id": "w", "status": "failed", "write": "writing", "error": error, "intents": intents}
+    await as_worker(state, run_id, attempt, lifecycle.SEALED, result=result)
 
 
 @pytest.mark.parametrize("change", ["removed", "immutable"])
@@ -1038,11 +1048,10 @@ async def test_a_removed_assets_launched_attempt_is_not_retried(tmp_path):
     run, attempt = await launched(engine, ["doomed"])
     state, engine = await restart(state, engine, url, Project(assets=[other], executors=[Fake("fake")]))
     await engine.initialize()
-    base = state.attempt_path(run["id"], attempt)
-    await state.create_object(f"{base}.worker", json.dumps({"worker_id": "w"}).encode())
+    await own(state, run["id"], attempt)
     error = {"type": "ValueError", "message": "boom", "retryable": True}
     result = {"worker_id": "w", "status": "failed", "write": "none", "error": error}
-    await state.create_object(f"{base}.result", json.dumps(result).encode())
+    await as_worker(state, run["id"], attempt, lifecycle.SEALED, result=result)
     detail = await engine.run_until(run["id"], 10)
     [task] = (await engine.history.tasks(run=run["id"]))["tasks"]
     assert (task["status"], task["error"]) == ("canceled", "asset 'doomed' is no longer in the project")

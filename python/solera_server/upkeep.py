@@ -19,9 +19,7 @@ import contextlib
 import json
 import logging
 import math
-import time
 
-from solera.ids import ulid
 from solera.keys import LocalError
 from solera.keys.index import IndexState, KeyIndex, Options
 from solera.keys.io import ObjectIO
@@ -31,7 +29,6 @@ from .positions import needs
 
 log = logging.getLogger(__name__)
 
-GATES = "control/gates/"  # per day, the gates of runs deleted that day (docs/lifecycle.md §2.4)
 ALIVE = "engine/alive.json"  # when the engine last said it was up, while runs were in progress
 ALIVE_SECONDS = 30.0
 
@@ -48,7 +45,6 @@ class Upkeep:
         recount_interval: float = 3600.0,
         concurrency: int = 2,
         retention_interval: float = 60.0,
-        gate_days: float = 30.0,
         interval: float = 1.0,
         keys=None,
     ):
@@ -62,7 +58,6 @@ class Upkeep:
         self._recounted: dict[tuple, float] = {}  # when each index was last recounted
         self._checked: dict[tuple, IndexState] = {}  # the state last found needing nothing
         self._swept = -math.inf
-        self.gate_days = gate_days
         self._alive = -math.inf
         self._task: asyncio.Task | None = None
         self.retiring = asyncio.Lock()  # one retirement at a time
@@ -302,7 +297,6 @@ class Upkeep:
         if now - self._swept < self.retention_interval:
             return
         self._swept = now
-        await self.expire_gates()
         self.expire_ticks()
         policies = {name: self.m.policy(name) for name in self.manifest["assets"]}
         keeps = {name: int(p["runs"]) for name, p in policies.items() if p and p.get("runs")}
@@ -332,11 +326,7 @@ class Upkeep:
                 return
             await self.state.durable()
             for run_id in list(self.m.deleted):
-                gates = await self.state.delete_run(run_id)
-                if gates:  # tombstones outlive the run (docs/lifecycle.md §2.4): note where
-                    day = time.strftime("%Y-%m-%d", time.gmtime(self.clock()))
-                    note = f"{GATES}{day}/{ulid(self.clock())}.json"
-                    await self.state.create_object(note, json.dumps(gates).encode())
+                await self.state.delete_run(run_id)
                 self.state.record({"type": "RunsPurged", "runs": [run_id]})
 
     def expire_ticks(self) -> None:
@@ -353,15 +343,3 @@ class Upkeep:
         ]
         if old:
             self.state.record({"type": "HistoryCompacted", "changes": [{"table": "ticks", "removed": old}]})
-
-    async def expire_gates(self) -> None:
-        """Delete the gates retired runs left, `gate_days` after the day
-        their run was deleted."""
-
-        horizon = time.strftime("%Y-%m-%d", time.gmtime(self.clock() - self.gate_days * 86400))
-        for note in await self.state.list_objects(GATES):
-            if note[len(GATES) :].split("/", 1)[0] >= horizon:
-                continue
-            gates = json.loads(await self.state.get_object(note) or b"[]")
-            await self._delete(gates)
-            await self._delete([note])

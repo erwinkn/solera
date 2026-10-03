@@ -112,8 +112,9 @@ async def test_a_refusal_that_changed_nothing_writes_again(monkeypatch):
 
 async def test_on_a_file_the_etag_is_the_digest_and_the_lock_is_dropped(tmp_path):
     """`file://` has no `If-Match`: the ETag is the content's SHA-256, a swap
-    holds an `flock` only while it runs, and an earlier try of the same body
-    reads as landed."""
+    holds an `flock` on the directory only while it runs and leaves no file
+    of its own, and an earlier try of the same body reads as landed. A swap
+    from a version of a file that is gone creates nothing."""
 
     import hashlib
 
@@ -123,6 +124,10 @@ async def test_on_a_file_the_etag_is_the_digest_and_the_lock_is_dropped(tmp_path
     assert await swap(store, "control/head", b"w1-1", None) == etag  # its own earlier try
     import fcntl
 
-    with open(tmp_path / "control" / "head.lock", "a") as lock:  # not held after the swap
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        fcntl.flock(lock, fcntl.LOCK_UN)
+    lock = os.open(tmp_path / "control", os.O_RDONLY)  # not held after the swap
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    os.close(lock)
+    assert sorted(p.name for p in (tmp_path / "control").iterdir()) == ["head"]
+    with pytest.raises(Conflict):
+        await swap(store, "gone/head", b"w2-1", etag)
+    assert not (tmp_path / "gone").exists()

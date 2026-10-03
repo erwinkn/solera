@@ -116,13 +116,20 @@ def _digest(data: bytes) -> str:
 
 
 def _put_file_if(full: str, data: bytes, etag: str | None) -> str:
-    """A conditional write of a local file: under an `flock` on
-    `{full}.lock`, which the kernel drops if the process dies, compare the
+    """A conditional write of a local file: under an `flock` on its
+    directory, which the kernel drops if the process dies, compare the
     file's digest with `etag`, then write a temporary file, fsync it and
-    replace the object. Refused (`PreconditionError`) if the digest differs."""
+    replace the object. Refused (`PreconditionError`) if the digest differs.
+    The lock leaves nothing behind, and a swap from a version of a file that
+    is gone creates nothing, not even its directory: a run deleted under a
+    late worker stays deleted."""
 
-    os.makedirs(os.path.dirname(full), exist_ok=True)
-    with open(f"{full}.lock", "a") as lock:
+    directory = os.path.dirname(full)
+    if etag is not None and not os.path.exists(full):
+        raise PreconditionError(f"{full}: there is no object to replace")
+    os.makedirs(directory, exist_ok=True)
+    lock = os.open(directory, os.O_RDONLY)
+    try:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
             try:
@@ -138,11 +145,9 @@ def _put_file_if(full: str, data: bytes, etag: str | None) -> str:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, full)
-            directory = os.open(os.path.dirname(full), os.O_RDONLY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
+            os.fsync(lock)  # the directory: the replace is durable
             return _digest(data)
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
+    finally:
+        os.close(lock)

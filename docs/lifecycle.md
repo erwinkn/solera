@@ -1,10 +1,8 @@
 # The attempt lifecycle
 
 Status: **built** (milestones 1, 2 and 5), but for the §9.8 sweep of what a
-worker writes after its attempt ended, sensors' host-side resolution
-of bigger maps (§11.7), and the control file (§2.4: decided in K18, not
-built yet), which replaces `.worker` (ownership), the gate object `.writing`
-and `.result`; this doc describes it as the target. Where the build departs from the text, it says so
+worker writes after its attempt ended, and sensors' host-side resolution
+of bigger maps (§11.7). Where the build departs from the text, it says so
 in place. In order: the records of §2 (`solera/lifecycle.py`), attempt
 objects and ownership (§2–§4), the channel (§5: `solera_server/attempts.py`,
 `solera_worker/channel.py`), heartbeats as evidence (§6), the two-phase
@@ -176,8 +174,9 @@ all on `immutable` stores take no gate; their evidence is the result's, or
 
 ### 2.4 The control file
 
-*Decided (K18), not built yet; checked in TLA+ (`spec/tla/Attempt.tla`,
-`verification.md`, "Formal model: the attempt control file").*
+*Decided (K18) and built; checked in TLA+ (`spec/tla/Attempt.tla`,
+`verification.md`, "Formal model: the attempt control file"), and each of
+its calibrations played against the code (`tests/server/test_control_file.py`).*
 
 Every attempt has one control file, `runs/{run}/{attempt}.control`. The
 engine creates it before the launch. From then on it changes only by
@@ -193,12 +192,15 @@ never races a decision.
 | `open` | the engine, create-only | nothing | after the spec, before `AttemptLaunched` | the engine id |
 | `owned` | the first worker | `open` | its first write (§4) | its worker id, host, pid |
 | `writing` | the owner | `owned` | before its first mutation of a `fenced` store; only attempts with outputs on one take it (the gate) | the intents (§9.6) |
-| `sealed` | the owner | `owned`, `writing` | once, at the end | the result (§2.1), with its write evidence (§2.3) |
+| `sealed` | the owner | `owned`, `writing` | once, at the end | the result (§2.1), with its write evidence (§2.3) and, if it took the gate, its intents |
 | `ended` | the engine | `open`, `owned`, `writing` | it gives up: a forced cancel, a timeout, the provisioning deadline, a lost worker | `write`: `none` (from `open` or `owned`), or `writing` with the intents (from `writing`); the engine id |
 
-**Nobody learns of an attempt before its launch is durable.** No launch,
-no pool host's offer, no API answer names the attempt until
-`AttemptLaunched` is durable (§3, step 3). The engine may be fenced or
+**Nobody learns of an attempt before its launch is durable.** Nothing
+that can act on the attempt learns of it until `AttemptLaunched` is
+durable (§3, step 3): no placement launches it, no pool host is offered
+it, and the channel serves only a worker holding its token, which only
+the spec carries. An operator's view may show it before, marked
+`launching`: an operator cannot act on it as a worker would. The engine may be fenced or
 crash after creating the file `open` and before that event lands; the
 attempt then goes with its memory, and the next engine never learns of it.
 If a worker had been offered it, that worker would own the `open` file,
