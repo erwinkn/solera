@@ -60,6 +60,9 @@ KEYED_INPUT = {
     "split": "items",
 }  # what a run's `keys=` overrides
 TERMINAL = {"succeeded", "failed", "canceled", "skipped"}
+# Key cache budgets, (disk, candidates) bytes: the default, or room for a few
+# of the simulation's index files, or for none of them.
+CACHE = {None: None, "tight": (6 * 1024, 2 * 1024), "starved": (2 * 1024, 512)}
 STORES = ["file", "table"] + (["pg"] if postgres.DSN else [])  # where `items` lives
 # Re-registrations the rules make. Those that trip an open finding on most
 # runs are left out until it is fixed (tests/server/test_sim_found.py);
@@ -91,10 +94,11 @@ class Simulation(RuleBasedStateMachine):
 
     # -- setup ----------------------------------------------------------------------------
 
-    @initialize(seed=st.integers(0, 2**16), store=st.sampled_from(STORES))
-    def boot(self, seed, store="file"):
-        self.trace.append(f"boot(seed={seed}, store={store!r})")
+    @initialize(seed=st.integers(0, 2**16), store=st.sampled_from(STORES), cache=st.sampled_from(list(CACHE)))
+    def boot(self, seed, store="file", cache=None):
+        self.trace.append(f"boot(seed={seed}, store={store!r}" + (f", cache={cache!r})" if cache else ")"))
         self.world = world = World(self.tmp, seed, key_options=Options(l0_max_files=2))
+        world.cache_budget = CACHE[cache]
         self.journal = Journal(now=world.now)
         world.objects.tap = self.journal.landed
         world.on_record = self.journal.recorded
@@ -312,6 +316,21 @@ class Simulation(RuleBasedStateMachine):
                     lambda e, t=tick, o=outcome: e.sensor_post(t["sensor"], t["tick"], o), "sensor post"
                 )
         del world
+
+    @rule(cache=st.sampled_from(list(CACHE)))
+    def cache_budget(self, cache):
+        """The key cache budget of engines started from now on (`CACHE`)."""
+
+        self.trace.append(f"cache_budget({cache!r})")
+        self.world.cache_budget = CACHE[cache]
+
+    @rule(kind=st.sampled_from(["wipe", "corrupt"]))
+    def cache_trouble(self, kind):
+        """The serving engine's key cache files are deleted, or a byte of each
+        flipped, under it."""
+
+        self.trace.append(f"cache_trouble({kind!r})")
+        self.world.cache_trouble(kind)
 
     @rule(broken=st.booleans())
     def break_watch(self, broken):

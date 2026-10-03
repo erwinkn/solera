@@ -217,14 +217,15 @@ def sim_key_service_class():
 
     class SimKeyService(KeyService):
         loop_of: SimLoop | None = None
+        world: World | None = None
 
         def start(self):
             if self.loop is not None or self._stopped:
                 return
             self.io = ObjectIO(self.objects)
-            self.cache = EngineCache(
-                self.root, disk=self.disk, candidates=self.candidates, window=self.window
-            )
+            budget = SimKeyService.world.cache_budget if SimKeyService.world is not None else None
+            disk, candidates = budget or (self.disk, self.candidates)
+            self.cache = EngineCache(self.root, disk=disk, candidates=candidates, window=self.window)
             self.resolver = Resolver(self.cache, self.io, self.options, self.limits, holds=self)
             self.loop = SimKeyService.loop_of
 
@@ -328,6 +329,7 @@ class World:
         self.on_record: Callable | None = None  # events an engine applied, as it applies them
         self.pg = None  # a postgres.Ledger, when the project writes to Postgres
         self.pool_hosts = 1  # how many pool hosts poll (`start_pool_hosts`)
+        self.cache_budget: tuple[int, int] | None = None  # (disk, candidates) of engines started from now on
 
     # -- running ------------------------------------------------------------------------
 
@@ -339,7 +341,7 @@ class World:
         reporter = sim_reporter_class()
         reporter.world = self
         keys = sim_key_service_class()
-        keys.loop_of = self.loop
+        keys.loop_of, keys.world = self.loop, self
         world = self
 
         def exit_(code):
@@ -631,6 +633,25 @@ class World:
         fate = worker.fate
         if fate.kind in ("die", "pause") and fate.point == point:
             await self._strike(worker)
+
+    def cache_trouble(self, kind: str) -> list[str]:
+        """Something outside the engine at its key cache's files, under it:
+        `wipe` deletes them (a temporary-files cleaner), `corrupt` flips a
+        byte in the middle of each (bit rot). Returns the files touched."""
+
+        root = self.root / "key-cache"
+        touched = []
+        for path in sorted(root.glob("*")) if root.exists() else ():
+            if kind == "wipe":
+                path.unlink(missing_ok=True)
+            else:
+                with open(path, "r+b") as f:
+                    f.seek(path.stat().st_size // 2)
+                    byte = f.read(1)
+                    f.seek(-len(byte), 1)
+                    f.write(bytes([byte[0] ^ 0xFF]) if byte else b"")
+            touched.append(path.name)
+        return touched
 
     def live_workers(self) -> list[Worker]:
         return [w for w in self.workers.values() if not w.task.done()]
