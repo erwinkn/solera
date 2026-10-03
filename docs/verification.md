@@ -604,7 +604,7 @@ spec/tla/check-journal.sh calibrate    # every fix switched off in turn: ~2 min
 spec/tla/check-journal.sh ci           # small, fixed, live and calibrate
 ```
 
-CI's `journal-spec` job runs `ci`.
+CI's `journal-spec` job runs `ci`: about ten minutes on a GitHub runner.
 
 ## Findings
 

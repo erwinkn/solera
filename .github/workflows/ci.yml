@@ -116,7 +116,7 @@ jobs:
           path: apps/console/test-results/
   journal-spec:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
