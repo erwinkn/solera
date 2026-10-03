@@ -10,3 +10,6 @@ node_modules/
 apps/console/test-results/
 native/target/
 python/solera/_native*.so
+spec/tla/.tools/
+spec/tla/states/
+spec/tla/*_TTrace_*
