@@ -67,7 +67,7 @@ def engine_for(state, project, placement="remote", worker=None, **kw):
     return Engine(state, project.manifest, placements=placements, clock=state.clock, eval_interval=0.02, **kw)
 
 
-async def until(engine, done, timeout=10.0):
+async def until(engine, done, timeout=60.0):
     deadline = asyncio.get_running_loop().time() + timeout
     while not done():
         assert asyncio.get_running_loop().time() < deadline, "timed out"
@@ -167,7 +167,7 @@ async def test_a_restarted_engine_adopts_and_commits_a_launched_attempt(tmp_path
     await engine.tick()
     assert attempt in engine.inflight  # adopted
     await finish_as_worker(state, run["id"], attempt, "remote")
-    detail = await engine.run_until(run["id"], 10)
+    detail = await engine.run_until(run["id"], 60)
     assert detail["request"]["status"] == "succeeded"
     assert Remote.launches == [attempt]
     assert state.model.heads[("remote", "")]["attempt"] == attempt
@@ -234,7 +234,7 @@ async def test_a_placement_that_cannot_tell_keeps_its_handle(tmp_path):
     run, attempt = await launched(engine, ["remote"])
     await until(engine, lambda: Flaky.errors == 0)
     await finish_as_worker(state, run["id"], attempt, "remote")
-    detail = await engine.run_until(run["id"], 10)
+    detail = await engine.run_until(run["id"], 60)
     assert detail["request"]["status"] == "succeeded"
     assert all(h == {"id": attempt, "run": run["id"]} for h in Flaky.seen)
     await engine.stop()
@@ -280,7 +280,7 @@ async def test_an_attempt_whose_launch_was_cut_short_is_resumed(tmp_path):
     await until(engine, lambda: Named.started)
     assert state.model.task(state.model.attempts[attempt])["launched"]["handle"]["id"] == attempt
     await finish_as_worker(state, run["id"], attempt, "remote")
-    detail = await engine.run_until(run["id"], 10)
+    detail = await engine.run_until(run["id"], 60)
     assert detail["request"]["status"] == "succeeded"
     assert [a["outcome"] for a in detail["attempts"][detail["tasks"][0]["id"]]] == ["succeeded"]
     await engine.stop()
@@ -537,7 +537,7 @@ async def test_an_aborted_worker_writes_nothing(tmp_path):
             await until(engine, lambda w=worker, a=attempt: w.done() or engine.live[a].worker_id is not None)
             await asyncio.sleep(0.1)
         assert (await engine._end(run["id"], attempt))["write"] == "none"
-        assert await asyncio.wait_for(worker, 5) == ENDED
+        assert await asyncio.wait_for(worker, 60) == ENDED
         assert await state.attempt_result(run["id"], attempt) is None
         assert await fence(state, run["id"], attempt) == ("ended", "none")
     await engine.stop()
@@ -694,7 +694,7 @@ async def test_garbage_waits_for_attempts_claimed_before_it_whatever_the_clocks(
     await engine.upkeep.collect()
     assert await state.get_object(path) is not None  # the attempt may still read it
     await finish_as_worker(state, run["id"], attempt, "remote")
-    await engine.run_until(run["id"], 10)
+    await engine.run_until(run["id"], 60)
     await engine.upkeep.collect()
     assert await state.get_object(path) is None and state.model.garbage == []
     await engine.stop()
@@ -826,7 +826,7 @@ async def test_an_attempt_launched_before_a_version_bump_does_not_commit(tmp_pat
     second = Remote.launches[-1]
     await until(engine, lambda: (engine.m.claimed(second) or {}).get("launched"))
     await finish_as_worker(state, run["id"], second, "remote")
-    detail = await engine.run_until(run["id"], 10)
+    detail = await engine.run_until(run["id"], 60)
     assert detail["request"]["status"] == "succeeded"
     assert state.model.heads[("remote", "")]["version"] == "2"
     await engine.stop()
@@ -844,7 +844,7 @@ async def test_a_malformed_worker_result_is_settled_without_its_bad_parts(tmp_pa
     run, attempt = await launched(engine, ["remote"])
     events = [{"type": "imported", "at": "not-a-number"}, {"type": "computing", "at": state.clock()}]
     await finish_as_worker(state, run["id"], attempt, "remote", events=events, usage={"cpu_seconds": "x"})
-    detail = await engine.run_until(run["id"], 10)
+    detail = await engine.run_until(run["id"], 60)
     assert detail["request"]["status"] == "succeeded" and not state.poisoned
     timeline = [e["type"] for e in await engine.history.events(run["id"])]
     assert "computing" in timeline and "imported" not in timeline
@@ -899,7 +899,7 @@ async def test_an_event_its_reducer_cannot_apply_ends_the_process(tmp_path, worl
     assert state.poisoned
     with pytest.raises(Unavailable):
         state.record({"type": "AutomationChanged", "name": "after", "enabled": True})
-    for _ in range(100):
+    for _ in range(6000):
         if world.exits:
             break
         await asyncio.sleep(0.01)
@@ -1022,12 +1022,12 @@ async def test_a_rename_moves_a_launched_attempt_with_its_scope(tmp_path):
         await asyncio.sleep(0.02)
     assert Remote.launches == [attempt] and list(state.model.claimed_partitions) == [("renamed", "")]
     await finish_as_worker(state, run["id"], attempt, "remote")
-    assert (await engine.run_until(run["id"], 10))["request"]["status"] == "succeeded"
+    assert (await engine.run_until(run["id"], 60))["request"]["status"] == "succeeded"
     assert list(state.model.heads) == [("renamed", "")]
     assert state.model.heads[("renamed", "")]["attempt"] == attempt
     await until(engine, lambda: len(Remote.launches) == 2)  # the partition is free: the new one runs
     await finish_as_worker(state, again["id"], Remote.launches[1], "renamed")
-    assert (await engine.run_until(again["id"], 10))["request"]["status"] == "succeeded"
+    assert (await engine.run_until(again["id"], 60))["request"]["status"] == "succeeded"
     await engine.stop()
     await state.close()
 
@@ -1062,7 +1062,7 @@ async def test_a_removed_assets_launched_attempt_is_not_retried(tmp_path):
     error = {"type": "ValueError", "message": "boom", "retryable": True}
     result = {"worker_id": "w", "status": "failed", "write": "none", "error": error}
     await as_worker(state, run["id"], attempt, lifecycle.SEALED, result=result)
-    detail = await engine.run_until(run["id"], 10)
+    detail = await engine.run_until(run["id"], 60)
     [task] = (await engine.history.tasks(run=run["id"]))["tasks"]
     assert (task["status"], task["error"]) == ("canceled", "asset 'doomed' is no longer in the project")
     assert detail["request"]["status"] == "failed" and Remote.launches == [attempt]

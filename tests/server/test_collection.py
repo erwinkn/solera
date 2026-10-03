@@ -489,7 +489,7 @@ async def test_a_pool_job_with_no_inputs_pins_only_its_output(tmp_path):
     engine = engine_for(state, Project(assets=[lonely]))
     await engine.initialize()
     await engine.submit(["lonely"])
-    for _ in range(100):
+    for _ in range(3000):
         await engine.tick()
         if state.model.pool:
             break

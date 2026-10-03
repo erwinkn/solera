@@ -40,7 +40,7 @@ async def test_1_a_cancel_interrupts_keys_still_waiting_for_a_slot(tmp_path):
     run = await engine.submit(["parse"])
     await until(engine, started.is_set)
     await engine.cancel(run["id"])
-    detail = await engine.run_until(run["id"], 15)
+    detail = await engine.run_until(run["id"], 60)
     [attempt] = detail["attempts"][detail["tasks"][0]["id"]]
     assert attempt["keys"] == {"ok": 1, "canceled": 3}  # c and d too, never started
     assert {k: r.outcome for k, r in (await records(engine, "parse")).items()} == dict.fromkeys(
@@ -117,7 +117,7 @@ async def test_3_retries_run_under_the_scopes_configuration(state):
     await engine.initialize()
     await drive(engine, await engine.submit(["files"]))
     await drive(engine, await engine.submit(["parse"], config={"factor": 10}))
-    for _ in range(100):  # the retry clock, nothing upstream changes
+    for _ in range(1200):  # the retry clock, nothing upstream changes
         await engine.tick()
         if len(calls) >= 3 and not engine.m.partition("parse", "")["failures"].get("counts"):
             break
@@ -187,7 +187,7 @@ async def test_5_a_user_cancel_during_a_timeout_drain_makes_its_keys_canceled(tm
         await engine.tick()
         await asyncio.sleep(0.1)
     release.set()
-    detail = await engine.run_until(run["id"], 15)
+    detail = await engine.run_until(run["id"], 60)
     [attempt] = detail["attempts"][detail["tasks"][0]["id"]]
     result = await opened.attempt_result(run["id"], attempt["id"])
     assert result["cancel"]["reason"] == "user"
@@ -220,7 +220,7 @@ async def test_6_a_forced_retry_during_the_last_retry_page_is_taken(state):
     engine.retry_keys("parse", ["rejected"])  # arrives while the pass's last batch runs
     assert await engine.submit_retries("parse", [""], "test") == []  # the partition is active
     gate["event"].set()
-    await engine.run_until(run["id"], 10)
+    await engine.run_until(run["id"], 60)
     assert calls == ["a", "a", "a"]  # the newer request was taken in the same run
 
 

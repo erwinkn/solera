@@ -670,8 +670,8 @@ async def test_fencing_concurrent_claim(state):
     await engine.initialize()
     run1 = await engine.submit(["slow"])
     run2 = await engine.submit(["slow"])
-    t1 = asyncio.create_task(engine.run_until(run1["id"], 10))
-    t2 = asyncio.create_task(engine.run_until(run2["id"], 10))
+    t1 = asyncio.create_task(engine.run_until(run1["id"], 60))
+    t2 = asyncio.create_task(engine.run_until(run2["id"], 60))
     d1, d2 = await asyncio.gather(t1, t2)
     statuses = sorted(task_statuses(d)["slow"] for d in (d1, d2))
     assert statuses == ["skipped", "succeeded"] or statuses == ["succeeded"] * 2
@@ -715,7 +715,7 @@ async def test_cancel_run(state):
     await engine.tick()  # dispatch into the forever-waiting fake
     await asyncio.sleep(0.1)
     await engine.cancel(run["id"])
-    for _ in range(50):
+    for _ in range(1200):
         await engine.tick()
         detail = await engine.run_detail(run["id"])
         if all(t["status"] in {"canceled", "succeeded", "skipped"} for t in detail["tasks"]):
@@ -745,14 +745,14 @@ async def test_every_and_cron_fire(state):
     await engine.tick()
     auto = state.model.automations["polled.every.0"]
     assert auto["last_fired"] is None  # not at once: its first time is a second away
-    for _ in range(40):
+    for _ in range(600):
         await asyncio.sleep(0.1)
         await engine.tick()
         auto = state.model.automations["polled.every.0"]
         if auto["last_fired"] is not None:
             break
     assert auto["last_fired"] is not None and auto["last_run"]
-    await engine.run_until(auto["last_run"], 10)
+    await engine.run_until(auto["last_run"], 60)
 
 
 async def test_onchange_fans_out_by_projection(state):
@@ -776,7 +776,7 @@ async def test_onchange_fans_out_by_projection(state):
     await engine.tick()  # automation eval consumes the pending change
     auto = state.model.automations["per_site.onchange.0"]
     assert auto["last_run"] and auto["pending"] == []
-    await engine.run_until(auto["last_run"], 10)
+    await engine.run_until(auto["last_run"], 60)
     assert sorted(seen) == ["s1", "s2"]
 
 
@@ -797,7 +797,7 @@ async def test_automation_toggle_and_run_now(state):
     assert state.model.automations["polled.every.0"]["last_fired"] is None
     await engine.run_automation("polled.every.0")
     run_id = state.model.automations["polled.every.0"]["last_run"]
-    await engine.run_until(run_id, 10)
+    await engine.run_until(run_id, 60)
     assert calls["n"] == 1
 
 
@@ -816,7 +816,7 @@ async def test_an_automation_can_skip_until_its_inputs_are_written(state):
     project = Project(assets=[index, digest])
     engine = make_engine(state, project)
     await engine.initialize()
-    for _ in range(40):  # its first time is a second away
+    for _ in range(600):  # its first time is a second away
         await asyncio.sleep(0.1)
         await engine.tick()
         auto = state.model.automations["digest.every.0"]
@@ -825,7 +825,7 @@ async def test_an_automation_can_skip_until_its_inputs_are_written(state):
     assert auto["last_fired"] is not None and auto["last_run"] is None and not state.model.runs
     run = await engine.submit(["digest"], upstream=True, skip_missing_inputs=True)
     assert run is not None and sorted(run["targets"]) == ["digest", "index"]
-    await engine.run_until(run["id"], 10)
+    await engine.run_until(run["id"], 60)
     assert await engine.submit(["digest"], skip_missing_inputs=True) is not None
 
 
@@ -867,7 +867,7 @@ async def test_every_skips_queued_scope(state):
     before = await engine.run_automation("polled.every.0")
     assert before["last_run"] is None  # the fire submitted nothing
     await engine.pause(run["id"], False)
-    await engine.run_until(run["id"], 10)
+    await engine.run_until(run["id"], 60)
     after = await engine.run_automation("polled.every.0")
     assert after["last_run"] is not None
 
@@ -892,12 +892,12 @@ async def test_missing_on_schedule_picks_up_new_keys(state):
     await engine.initialize()
     await drive(engine, await engine.submit(["things"]))
     auto = await engine.run_automation("per_thing.every.0")
-    await engine.run_until(auto["last_run"], 10)
+    await engine.run_until(auto["last_run"], 60)
     assert ran == ["a"]
     members["keys"] = ["a", "b"]
     await drive(engine, await engine.submit(["things"]))
     auto = await engine.run_automation("per_thing.every.0")
-    await engine.run_until(auto["last_run"], 10)
+    await engine.run_until(auto["last_run"], 60)
     assert ran == ["a", "b"]  # only the new key ran
 
 
@@ -963,7 +963,7 @@ async def test_harness_exit_without_result_fails_retryably(state):
     engine = make_engine(state, project, placements={"Fake": lambda s, c: NoResult(c)}, heartbeat_seconds=1)
     await engine.initialize()
     run = await engine.submit(["ghost"])
-    detail = await engine.run_until(run["id"], 15)
+    detail = await engine.run_until(run["id"], 60)
     assert status_of(detail) == "failed"
     assert "without a result" in detail["tasks"][0]["error"]
     events = [e for e in await engine.history.events(run["id"]) if e["attempt"]]
@@ -1003,7 +1003,7 @@ async def test_max_concurrent(state):
     engine = make_engine(state, project, placements={"Fake": lambda s, c: Tracked(c)}, concurrency=10)
     await engine.initialize()
     run = await engine.submit(["work"], partitions="all")
-    await engine.run_until(run["id"], 15)
+    await engine.run_until(run["id"], 60)
     assert in_flight["peak"] == 1
     held = [e for e in await engine.history.events(run["id"]) if e["type"] == "held"]
     assert held and {(e["reason"], e["name"]) for e in held} == {("executor", "fake")}

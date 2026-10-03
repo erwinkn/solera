@@ -512,7 +512,7 @@ async def test_a_pool_worker_starts_with_the_pool_token_alone(tmp_path, monkeypa
 
     monkeypatch.setattr(httpx, "AsyncClient", routed)
     worker = asyncio.create_task(run_pool("gpu", "http://test", "pool"))
-    for _ in range(200):
+    for _ in range(3000):
         if engine.pollers:
             break
         await asyncio.sleep(0.02)

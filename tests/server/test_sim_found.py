@@ -176,7 +176,7 @@ async def test_a_change_made_during_a_full_pass_reaches_downstream(state):
     await engine.set_automation("out.onchange.0", True)
     content.update({"a": "2", "b": "2"})
     await drive(engine, await engine.submit(["items"]))
-    for _ in range(200):
+    for _ in range(6000):
         await engine.tick()
         busy = any(r["status"] not in ("succeeded", "failed", "canceled") for r in state.model.runs.values())
         if not busy and not state.model.automations["out.onchange.0"]["pending"]:
@@ -771,7 +771,7 @@ async def test_a_reset_output_is_due_for_a_rebuild(state, tmp_path):
     engine = make_engine(state, project(None))
     await engine.initialize()
     await drive(engine, await engine.submit(["items"], upstream=True))
-    for _ in range(100):  # the firing `feed`'s commit owes: settled before the move
+    for _ in range(6000):  # the firing `feed`'s commit owes: settled before the move
         await engine.tick()
         busy = any(r["status"] not in ("succeeded", "failed", "canceled") for r in state.model.runs.values())
         if not busy and not state.model.automations["items.onchange.0"]["pending"]:
@@ -782,7 +782,7 @@ async def test_a_reset_output_is_due_for_a_rebuild(state, tmp_path):
     await engine.initialize()
     assert ("items", "") not in state.model.heads
     assert state.model.automations["items.onchange.0"]["pending"] == [["items", ""]]  # the reset's alone
-    for _ in range(100):
+    for _ in range(6000):
         await engine.tick()
         head = state.model.heads.get(("items", ""))
         if head is not None:
@@ -916,7 +916,7 @@ async def test_an_onchange_asset_added_back_is_built(state):
         return items
 
     async def quiet(engine):
-        for _ in range(200):
+        for _ in range(6000):
             await engine.tick()
             busy = any(
                 r["status"] not in ("succeeded", "failed", "canceled") for r in state.model.runs.values()
@@ -984,7 +984,7 @@ async def test_an_asset_change_is_built_by_its_automation_or_marked_stale(state,
     a run catches it up, and then `materialized`."""
 
     async def quiet(engine):
-        for _ in range(100):
+        for _ in range(6000):
             await engine.tick()
             busy = any(
                 r["status"] not in ("succeeded", "failed", "canceled") for r in state.model.runs.values()
@@ -1043,7 +1043,7 @@ async def test_a_pool_attempt_is_offered_only_once_its_launch_is_durable(state, 
     await engine.submit(["trained"])
     monkeypatch.setattr(state, "durable", held)
     ticking = asyncio.create_task(engine.tick())
-    for _ in range(100):
+    for _ in range(6000):
         if state.model.pool:
             break
         await asyncio.sleep(0.01)

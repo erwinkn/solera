@@ -150,6 +150,6 @@ async def test_mapped_exception_is_transient(state):
     # The mapped class has no retry_after: the backoff's first wait is a minute.
     run = await engine.submit(["timeouts"])
     with pytest.raises(TimeoutError):
-        await engine.run_until(run["id"], 1)
+        await engine.run_until(run["id"], 1)  # deliberately short: the backoff waits a minute
     detail = await engine.run_detail(run["id"])
     assert calls["n"] == 1 and detail["tasks"][0]["status"] == "queued"

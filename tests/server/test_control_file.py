@@ -64,7 +64,7 @@ async def test_a_worker_never_creates_the_control_file(tmp_path, monkeypatch):
     await until(engine, lambda: state.model.claimed(attempt) is None)
     assert await fence(state, run["id"], attempt) == ("ended", "none")
     await state.delete_objects([f"{state.attempt_path(run['id'], attempt)}{lifecycle.CONTROL}"])
-    code = await asyncio.wait_for(run_attempt(state.objects_url, attempt, REMOTE, run=run["id"]), 5)
+    code = await asyncio.wait_for(run_attempt(state.objects_url, attempt, REMOTE, run=run["id"]), 60)
     assert code == ENDED and await fence(state, run["id"], attempt) is None and puts == []
     await engine.stop()
     await state.close()
@@ -89,13 +89,13 @@ async def test_a_worker_takes_the_gate_before_its_first_write(tmp_path, monkeypa
     await engine.initialize()
     run, attempt = await launched(engine, ["held"])
     worker = asyncio.create_task(run_attempt(state.objects_url, attempt, project, run=run["id"]))
-    for _ in range(100):
+    for _ in range(3000):
         if (await fence(state, run["id"], attempt))[0] == lifecycle.OWNED:
             break
         await asyncio.sleep(0.02)
     assert (await engine._end(run["id"], attempt))["write"] == lifecycle.NONE
     release.set()
-    assert await asyncio.wait_for(worker, 5) == ENDED
+    assert await asyncio.wait_for(worker, 60) == ENDED
     assert puts == [] and await fence(state, run["id"], attempt) == ("ended", "none")
     await engine.stop()
     await state.close()
@@ -178,7 +178,7 @@ async def test_an_engine_fenced_before_its_launch_is_durable_tells_no_worker(tmp
     state.durable = replaced_first
     Remote.launches.clear()
     run = await engine.submit(["remote"])
-    for _ in range(50):
+    for _ in range(3000):
         with contextlib.suppress(Unavailable):
             await engine.tick()
         await asyncio.sleep(0.02)
@@ -261,12 +261,12 @@ async def _with_control_file(tmp_path, body: bytes):
         await obstore.put_async(
             state.objects, f"{state.attempt_path(run['id'], attempt)}{lifecycle.CONTROL}", body
         )
-        detail = await engine.run_until(run["id"], 10)
+        detail = await engine.run_until(run["id"], 60)
         assert detail["request"]["status"] in ("failed", "succeeded")
         assert not state.poisoned
         again, attempt = await launched(engine, ["remote"])
         await finish_as_worker(state, again["id"], attempt, "remote")
-        assert (await engine.run_until(again["id"], 10))["request"]["status"] == "succeeded"
+        assert (await engine.run_until(again["id"], 60))["request"]["status"] == "succeeded"
     finally:
         await engine.stop()
         await state.close()

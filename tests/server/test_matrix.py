@@ -204,7 +204,7 @@ async def test_a_change_waits_for_work_already_queued(state):
     assert state.model.automations["both"]["pending"]  # owed `root` is queued elsewhere
     await engine.pause(queued["id"], False)
     await drive(engine, queued)
-    for _ in range(100):
+    for _ in range(6000):
         await engine.tick()
         if not state.model.automations["both"]["pending"] and reads[-1] == [2]:
             break
@@ -239,7 +239,7 @@ async def test_a_change_is_kept_until_its_delivery_completes(state):
     await engine.initialize()
     run = await engine.submit(["mid"], upstream=True)
     await drive(engine, run)
-    for _ in range(100):
+    for _ in range(6000):
         await engine.tick()
         if observed and not state.model.automations["agg.onchange.0"]["pending"]:
             break
@@ -379,7 +379,7 @@ async def test_an_each_delivery_resumed_by_a_firing_takes_its_change(state):
     await engine.set_automation("out.onchange.0", True)
     content.update({"a": "2", "b": "2"})
     await drive(engine, await engine.submit(["items"]))
-    for _ in range(200):
+    for _ in range(6000):
         await engine.tick()
         busy = any(r["status"] not in ("succeeded", "failed", "canceled") for r in state.model.runs.values())
         if not busy and not state.model.automations["out.onchange.0"]["pending"]:

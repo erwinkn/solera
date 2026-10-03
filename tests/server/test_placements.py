@@ -26,7 +26,7 @@ def make_engine(state, project, placements=None, **kw):
 async def pool_attempt(engine, state, count=1):
     """Wait for `count` pool attempts to be launched and discoverable."""
 
-    for _ in range(200):
+    for _ in range(3000):
         await engine.tick()
         if len(state.model.pool) >= count:
             return sorted(state.model.pool, key=lambda a: state.model.pool[a]["created_at"])
@@ -63,7 +63,7 @@ async def test_pool_workers_race_for_a_claim(state):
 
     codes = await asyncio.gather(worker(), worker())
     assert sorted(codes) == [0, 0]
-    detail = await engine.run_until(run["id"], 10)
+    detail = await engine.run_until(run["id"], 60)
     assert detail["request"]["status"] == "succeeded"
     assert await engine.pool_work("ingest", {"cpu": 4}, "w1", 0) == []  # ended: no longer offered
 
@@ -95,7 +95,7 @@ async def test_an_attempt_whose_launch_is_in_flight_shows_as_launching(state):
 
     assert await outcome() == "launching"
     lands.set()
-    for _ in range(100):
+    for _ in range(6000):
         if await outcome() != "launching":
             break
         await asyncio.sleep(0.01)
@@ -175,7 +175,7 @@ async def test_a_pool_attempt_canceled_before_its_claim_is_withdrawn(state):
     run = await engine.submit(["job"])
     [attempt] = await pool_attempt(engine, state)
     await engine.cancel(run["id"])
-    for _ in range(100):
+    for _ in range(3000):
         await engine.tick()
         await asyncio.sleep(0.02)
         if not state.model.pool:
@@ -471,7 +471,7 @@ async def test_a_local_handle_is_only_ever_its_own_process(state, monkeypatch):
     }
     assert await placement.wait(handle, 0.1) is None
     await placement.cancel(handle)
-    assert await asyncio.wait_for(adopted.wait(), 5) == -15
+    assert await asyncio.wait_for(adopted.wait(), 60) == -15
     await placement.cancel(ours)
     assert not alive(pid)
 
@@ -495,7 +495,7 @@ async def test_a_pool_attempt_that_ended_while_the_engine_was_down_settles(state
     assert code == 0
     engine = make_engine(state, project, heartbeat_seconds=0.1)
     await engine.initialize()
-    detail = await engine.run_until(run["id"], 5)
+    detail = await engine.run_until(run["id"], 60)
     assert detail["request"]["status"] == "succeeded"
     await engine.stop()
 

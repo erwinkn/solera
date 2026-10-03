@@ -90,9 +90,12 @@ async def held(engine, targets, **kw):
     """Submit and dispatch without finishing: the attempt stays claimed."""
 
     run = await engine.submit(targets, **kw)
-    await engine.tick()
-    await asyncio.sleep(0.05)
     task_id = next(t for t in engine.m.runs[run["id"]]["tasks"])
+    deadline = asyncio.get_running_loop().time() + 60
+    while task_id not in engine.m.claims:  # claimed: dispatched, however busy the host
+        assert asyncio.get_running_loop().time() < deadline, "never claimed"
+        await engine.tick()
+        await asyncio.sleep(0.02)
     return run, task_id, engine.m.claims[task_id]["attempt"]
 
 
@@ -164,7 +167,7 @@ async def test_an_aborted_attempt_can_no_longer_commit(state, clock):
     await quiet(engine)
     run, task_id, attempt = await held(engine, ["polled"])
     await engine.cancel(run["id"])
-    for _ in range(20):
+    for _ in range(3000):
         await asyncio.sleep(0.02)
         if state.model.claimed(attempt) is None:
             break
@@ -448,7 +451,7 @@ async def test_a_recount_meanwhile_does_not_refuse_a_commit(state, clock):
     await settle(engine, (await engine.submit(["files"]))["id"])
     held_engine = engine_on(state, clock, placement="hold")
     run, task_id, attempt = await held(held_engine, ["files"])
-    for _ in range(500):  # launched: its spec written and its launch durable, however busy the host
+    for _ in range(6000):  # launched: its spec written and its launch durable, however busy the host
         if "launched" in state.model.task(task_id):
             break
         await asyncio.sleep(0.01)

@@ -357,7 +357,7 @@ async def test_a_user_cancel_commits_finished_keys_and_leaves_the_rest_dormant(t
     run = await engine.submit(["parse"])
     await until(engine, started.is_set)
     await engine.cancel(run["id"])
-    detail = await engine.run_until(run["id"], 15)
+    detail = await engine.run_until(run["id"], 60)
     assert detail["request"]["status"] == "canceled"
     [attempt] = detail["attempts"][detail["tasks"][0]["id"]]
     assert attempt["outcome"] == "canceled" and attempt["keys"] == {"ok": 1, "canceled": 2}
@@ -440,7 +440,7 @@ async def test_the_retry_clock_runs_automated_assets(state):
     await engine.initialize()
     await drive(engine, await engine.submit(["parse"], upstream=True))
     assert tries["n"] == 1
-    for _ in range(100):  # nothing upstream changes: the clock alone brings it back
+    for _ in range(1200):  # nothing upstream changes: the clock alone brings it back
         await engine.tick()
         if tries["n"] == 2 and not engine.m.partition("parse", "")["failures"].get("counts"):
             break

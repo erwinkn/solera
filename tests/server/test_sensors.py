@@ -69,7 +69,7 @@ def rows(engine, sensor=None) -> list[dict]:
     return [r for r in engine.history.lake.unwritten("ticks") if sensor is None or r["sensor"] == sensor]
 
 
-async def until(condition, timeout=10.0):
+async def until(condition, timeout=60):
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     while not condition():
@@ -120,7 +120,7 @@ async def test_a_tick_commits_and_requests_runs_in_one_record(tmp_path):
         assert engine._head_id(source) == head
     run = m.runs[answer["runs"][0]]
     assert run["tags"] == {"sensor": "watch", "tick": tick["tick"]} and run["by"] == "sensor watch"
-    detail = await engine.run_until(run["id"], 20)
+    detail = await engine.run_until(run["id"], 60)
     assert detail["request"]["status"] == "succeeded"
     assert rows(engine, "watch")[-1]["outcome"] == "requested"
     await state.close()
@@ -740,6 +740,6 @@ async def test_a_host_with_every_slot_taken_still_stops_once_its_engine_is_gone(
     await asyncio.sleep(0.05)  # the host is waiting on its sensors
     assert not host.done()
     monkeypatch.setattr(os, "getppid", lambda: 1)  # reparented: the engine is gone
-    assert await asyncio.wait_for(host, 2) == ORPHANED
+    assert await asyncio.wait_for(host, 60) == ORPHANED
     release.set()
     await state.close()

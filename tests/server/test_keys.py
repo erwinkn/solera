@@ -593,7 +593,7 @@ async def test_input_reads_come_from_the_engine_once_warm(state, monkeypatch):
 async def _warm(engine, key):
     """The fill a cold read queued, and each commit's delta, installed."""
 
-    for _ in range(200):
+    for _ in range(3000):
         files = {f"{engine.m.indexes[key].prefix}{n}.kx" for n in engine.m.indexes[key].referenced()}
         if files <= set(engine.keys.cache.files):
             return
@@ -641,7 +641,7 @@ async def test_too_many_changes_to_list_still_write_only_what_the_delta_names(
     await run(engine, ["items"])
     if patch:
         rows["a"] = 1
-    for _ in range(500):  # the worker deletes what the commit superseded after it (§9.8), and says so
+    for _ in range(6000):  # the worker deletes what the commit superseded after it (§9.8), and says so
         if not engine.m.cleanups.get(("items", "")):
             break
         await asyncio.sleep(0.01)

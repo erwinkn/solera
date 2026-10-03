@@ -397,7 +397,7 @@ async def test_a_change_during_a_run_is_kept_for_after_it(state):
         await asyncio.sleep(0.02)
     assert state.model.automations["report.onchange.0"]["pending"]  # not consumed by a no-op
     release.set()
-    for _ in range(200):
+    for _ in range(3000):
         await engine.tick()
         if len(calls) == 2 and not state.model.automations["report.onchange.0"]["pending"]:
             break

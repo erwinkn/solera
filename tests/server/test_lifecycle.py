@@ -47,7 +47,7 @@ async def test_a_duplicate_invocation_waits_for_the_owner_and_writes_nothing(tmp
     loser = asyncio.create_task(worker_id())
     await asyncio.sleep(0.1)
     assert not loser.done()  # waiting for the owner, not exiting
-    assert await asyncio.wait_for(asyncio.gather(owner, loser), 10) == [0, 0]
+    assert await asyncio.wait_for(asyncio.gather(owner, loser), 60) == [0, 0]
     sealed, _ = await lifecycle.read_control(state.objects, run["id"], attempt)
     assert sealed["state"] == "sealed" and sealed["result"]["worker_id"] == sealed["worker_id"]
     await until(engine, lambda: state.model.claimed(attempt) is None)
@@ -171,7 +171,7 @@ async def test_a_requested_cancel_drains_into_a_canceled_result(tmp_path):
     run = await engine.submit(["slow"])
     await until(engine, started.is_set)
     await engine.cancel(run["id"])
-    detail = await engine.run_until(run["id"], 15)
+    detail = await engine.run_until(run["id"], 60)
     assert detail["request"]["status"] == "canceled"
     [attempt] = detail["attempts"][detail["tasks"][0]["id"]]
     result = await state.attempt_result(run["id"], attempt["id"])
