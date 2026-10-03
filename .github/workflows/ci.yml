@@ -123,9 +123,7 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
-      - run: spec/tla/check-journal.sh small
-      - run: spec/tla/check-journal.sh live
-      - run: spec/tla/check-journal.sh calibrate
+      - run: spec/tla/check-journal.sh ci
   execution-spec:
     runs-on: ubuntu-latest
     timeout-minutes: 15

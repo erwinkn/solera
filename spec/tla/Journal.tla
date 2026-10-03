@@ -31,17 +31,17 @@ CONSTANTS
     FenceNonce,       \* f300500: a fence carries its engine's random nonce
     OwnBytes,         \* solera.objects.create: a create that finds its own
                       \* bytes succeeded (always so for segments)
-    \* Candidate fixes for what this spec found; FALSE is the design as built.
-    \* A fence segment at s is a hole's (created where cleanup had deleted
-    \* a segment) exactly when a checkpoint at or past s exists and the
-    \* newest does not list s among its fences.
-    FixF14,           \* the engine that created a fence tells a hole's so
-    FixF15            \* an opener that reads a fence tells a hole's so
+    Unreadable,       \* one checkpoint may be written that cannot be parsed
+    \* The fix for what this spec found (the hole test, HoleList and
+    \* HoleGet); FALSE is the design as built.
+    FixF14,           \* the engine that created a fence runs the hole test
+    FixF15            \* an opener runs it on every fence it reads
 
 VARIABLES
     \* The object store: two maps, one per prefix.
     journal,      \* seq -> segment
     checkpoints,  \* seq -> the state it holds
+    torn,         \* the checkpoints that cannot be parsed (at most one)
     \* Each engine.
     pc,           \* where it is
     state,        \* its state: the segments folded into it, in seq order
@@ -50,13 +50,14 @@ VARIABLES
     fence,        \* the seq of its fence segment, 0 before it has one
     doomed,       \* the objects its cleanup has yet to delete
     closing,      \* it is shutting down cleanly
+    check,        \* a fence it is checking for a hole's (FixF14, FixF15)
     \* History, for the properties only: no engine reads it.
     history,      \* seq -> the first segment that landed there
     acked,        \* the segments whose create an engine saw succeed
     took          \* <<seq, engine>>: the fences engines serve under
 
-store == <<journal, checkpoints>>
-local == <<pc, state, listed, known, fence, doomed, closing>>
+store == <<journal, checkpoints, torn>>
+local == <<pc, state, listed, known, fence, doomed, closing, check>>
 ghost == <<history, acked, took>>
 vars == <<store, local, ghost>>
 
@@ -88,12 +89,18 @@ Covered(s) == \E c \in DOMAIN checkpoints : c >= s
 NewestCheckpoint ==
     IF DOMAIN checkpoints = {} THEN 0 ELSE Max(DOMAIN checkpoints)
 
-\* A fence at `s` that cleanup's hole holds, not history: covered by a
-\* checkpoint, and not among the newest checkpoint's fences.
-HoleFence(s) == Covered(s) /\ s \notin FencesIn(checkpoints[NewestCheckpoint])
+Readable == DOMAIN checkpoints \ torn
 
-\* Whether an opener takes segment `s` as it finds it.
-Takes(s) == ~(FixF15 /\ journal[s].fence /\ HoleFence(s))
+\* At least two of the checkpoints `cs` are at or past `s`.
+CoveringTwice(cs, s) == Cardinality({c \in cs : c >= s}) >= 2
+
+\* The hole test (FixF14, FixF15) on the fence at seq s: LIST checkpoints/;
+\* fewer than two at or past s, the fence is real (a hole needs a cleanup,
+\* and a cleanup leaves two: HolesTwiceCovered); otherwise GET any of those
+\* listed and look for s among its `fences`. `check` holds where the fence came from (`own`: this engine
+\* created it; `replay`, `fenceRead`: it read it), the fence, and the
+\* checkpoints listed and not yet found unreadable.
+NoCheck == [from |-> "none", seg |-> Fence(Nobody), listed |-> {}]
 
 Terminal == {"dead", "stopped", "failed", "read"}
 
@@ -101,6 +108,7 @@ Terminal == {"dead", "stopped", "failed", "read"}
 Init ==
     /\ journal = <<>>
     /\ checkpoints = <<>>
+    /\ torn = {}
     /\ pc = [e \in Engines |-> "idle"]
     /\ state = [e \in Engines |-> <<>>]
     /\ listed = [e \in Engines |-> {}]
@@ -108,6 +116,7 @@ Init ==
     /\ fence = [e \in Engines |-> 0]
     /\ doomed = [e \in Engines |-> {}]
     /\ closing = [e \in Engines |-> FALSE]
+    /\ check = [e \in Engines |-> NoCheck]
     /\ history = <<>>
     /\ acked = {}
     /\ took = {}
@@ -129,6 +138,7 @@ Halt(e, how) ==
     /\ fence' = [fence EXCEPT ![e] = 0]
     /\ doomed' = [doomed EXCEPT ![e] = {}]
     /\ closing' = [closing EXCEPT ![e] = FALSE]
+    /\ check' = [check EXCEPT ![e] = NoCheck]
 
 \* A segment `s` an opener needs is missing: a gap in the listing, a GET
 \* that finds nothing (with FixF15, a hole's fence). With FixF7, a
@@ -137,6 +147,7 @@ Halt(e, how) ==
 Behind(e, s) ==
     IF FixF7 /\ Covered(s)
     THEN /\ Goto(e, "open")
+         /\ check' = [check EXCEPT ![e] = NoCheck]
          /\ UNCHANGED <<state, listed, known, fence, doomed, closing>>
     ELSE Halt(e, "failed")
 
@@ -147,25 +158,25 @@ Start(e) ==
     /\ pc[e] = "idle"
     /\ Overlap \/ \A f \in Engines \ {e} : pc[f] \in {"idle"} \cup Terminal
     /\ Goto(e, "open")
-    /\ UNCHANGED <<store, state, listed, known, fence, doomed, closing, ghost>>
+    /\ UNCHANGED <<store, state, listed, known, fence, doomed, closing, check, ghost>>
 
 \* LIST checkpoints/.
 ListCheckpoints(e) ==
     /\ pc[e] = "open"
     /\ listed' = [listed EXCEPT ![e] = DOMAIN checkpoints]
     /\ Goto(e, "load")
-    /\ UNCHANGED <<store, state, known, fence, doomed, closing, ghost>>
+    /\ UNCHANGED <<store, state, known, fence, doomed, closing, check, ghost>>
 
-\* GET the newest listed checkpoint still there (or, with none, start
-\* from nothing). Every listed one becomes known, read or not.
+\* GET the newest listed checkpoint still there and readable (or, with
+\* none, start from nothing). Every listed one becomes known, read or not.
 Load(e) ==
     /\ pc[e] = "load"
-    /\ LET there == listed[e] \cap DOMAIN checkpoints
+    /\ LET there == listed[e] \cap Readable
        IN  state' = [state EXCEPT ![e] =
                         IF there = {} THEN <<>> ELSE checkpoints[Max(there)]]
     /\ known' = [known EXCEPT ![e] = listed[e]]
     /\ Goto(e, "list")
-    /\ UNCHANGED <<store, listed, fence, doomed, closing, ghost>>
+    /\ UNCHANGED <<store, listed, fence, doomed, closing, check, ghost>>
 
 \* LIST journal/ after the loaded seq.
 ListJournal(e) ==
@@ -173,25 +184,46 @@ ListJournal(e) ==
     /\ LET after == {s \in DOMAIN journal : s > At(e)}
        IN  /\ listed' = [listed EXCEPT ![e] = after]
            /\ Goto(e, IF after = {} THEN "fence" ELSE "replay")
-    /\ UNCHANGED <<store, state, known, fence, doomed, closing, ghost>>
+    /\ UNCHANGED <<store, state, known, fence, doomed, closing, check, ghost>>
+
+\* Apply segment `seg`, read at the next seq, and go on: with the replay,
+\* or (`fenceRead`) with the fence.
+Take(e, seg, from) ==
+    /\ state' = [state EXCEPT ![e] = Append(@, seg)]
+    /\ IF from = "replay"
+       THEN /\ listed' = [listed EXCEPT ![e] = @ \ {Next(e)}]
+            /\ Goto(e, IF listed[e] = {Next(e)} THEN "fence" ELSE "replay")
+       ELSE /\ Goto(e, "fence")
+            /\ UNCHANGED listed
+    /\ check' = [check EXCEPT ![e] = NoCheck]
+    /\ UNCHANGED <<known, fence, doomed, closing>>
+
+\* GET a segment read at the next seq: with FixF15, a fence is checked for
+\* a hole's before it is applied.
+Read(e, from) ==
+    LET s == Next(e) IN
+    IF s \in DOMAIN journal
+    THEN IF FixF15 /\ journal[s].fence
+         THEN /\ check' = [check EXCEPT ![e] =
+                               [from |-> from, seg |-> journal[s], listed |-> {}]]
+              /\ Goto(e, "holeList")
+              /\ UNCHANGED <<state, listed, known, fence, doomed, closing>>
+         ELSE Take(e, journal[s], from)
+    ELSE Behind(e, s)
 
 \* GET the next listed segment and apply it.
 Replay(e) ==
     /\ pc[e] = "replay"
-    /\ LET s == Next(e) IN
-       IF Min(listed[e]) = s /\ s \in DOMAIN journal /\ Takes(s)
-       THEN /\ state' = [state EXCEPT ![e] = Append(@, journal[s])]
-            /\ listed' = [listed EXCEPT ![e] = @ \ {s}]
-            /\ Goto(e, IF listed[e] = {s} THEN "fence" ELSE "replay")
-            /\ UNCHANGED <<known, fence, doomed, closing>>
-       ELSE Behind(e, s)
+    /\ IF Min(listed[e]) = Next(e)
+       THEN Read(e, "replay")
+       ELSE Behind(e, Next(e))
     /\ UNCHANGED <<store, ghost>>
 
 \* A read-only open (`writer=False`) ends here, with the state replayed.
 ReadOnly(e) ==
     /\ pc[e] = "fence"
     /\ Goto(e, "read")
-    /\ UNCHANGED <<store, state, listed, known, fence, doomed, closing, ghost>>
+    /\ UNCHANGED <<store, state, listed, known, fence, doomed, closing, check, ghost>>
 
 \* Create the fence segment at the next seq. If another engine's segment
 \* is there, read it next and try the seq after.
@@ -205,7 +237,7 @@ CreateFence(e) ==
                THEN Goto(e, "fenceCheck")
                ELSE Goto(e, "fenceRead")
             /\ UNCHANGED <<journal, history>>
-    /\ UNCHANGED <<checkpoints, state, listed, known, fence, doomed, closing,
+    /\ UNCHANGED <<checkpoints, torn, state, listed, known, fence, doomed, closing, check,
                    acked, took>>
 
 \* The same create, landing with its answer lost: the engine tries again.
@@ -215,43 +247,101 @@ CreateFenceUnheard(e) ==
     /\ Next(e) <= MaxSeq
     /\ Next(e) \notin DOMAIN journal
     /\ Land(Next(e), Fence(e))
-    /\ UNCHANGED <<checkpoints, local, acked, took>>
+    /\ UNCHANGED <<checkpoints, torn, local, acked, took>>
 
 \* GET the segment that was in the fence's way.
 FenceRead(e) ==
     /\ pc[e] = "fenceRead"
-    /\ LET s == Next(e) IN
-       IF s \in DOMAIN journal /\ Takes(s)
-       THEN /\ state' = [state EXCEPT ![e] = Append(@, journal[s])]
-            /\ Goto(e, "fence")
-            /\ UNCHANGED <<listed, known, fence, doomed, closing>>
-       ELSE Behind(e, s)
+    /\ Read(e, "fenceRead")
     /\ UNCHANGED <<store, ghost>>
 
-\* LIST checkpoints/: a checkpoint at or past the fence means it landed in
-\* a hole cleanup left, after segments this engine never read (as built).
-\* With FixF14, also GET the newest: if it lists this fence, a newer engine
-\* read the fence and moved past it, so the fence stays.
+\* Serve under the fence just created.
+TakeFence(e) ==
+    /\ state' = [state EXCEPT ![e] = Append(@, Fence(e))]
+    /\ fence' = [fence EXCEPT ![e] = Next(e)]
+    /\ took' = took \cup {<<Next(e), e>>}
+    /\ check' = [check EXCEPT ![e] = NoCheck]
+    /\ Goto(e, "serve")
+
+\* LIST checkpoints/ after creating the fence. As built, a checkpoint at or
+\* past it means it landed in a hole cleanup left, after segments this
+\* engine never read: delete it and open again. With FixF14, this LIST is
+\* the hole test's first request, and HoleGet its second.
 FenceCheck(e) ==
     /\ pc[e] = "fenceCheck"
-    /\ LET s == Next(e) IN
-       IF FixF7 /\ Covered(s)
-       THEN /\ IF FixF14 /\ ~HoleFence(s)
-               THEN Goto(e, "open")
-               ELSE Goto(e, "unfence")
-            /\ UNCHANGED <<state, fence, took>>
-       ELSE /\ state' = [state EXCEPT ![e] = Append(@, Fence(e))]
-            /\ fence' = [fence EXCEPT ![e] = s]
-            /\ took' = took \cup {<<s, e>>}
-            /\ Goto(e, "serve")
+    /\ IF FixF7 /\ Covered(Next(e))
+       THEN IF FixF14
+            THEN /\ check' = [check EXCEPT ![e] =
+                       [from |-> "own", seg |-> Fence(e), listed |-> DOMAIN checkpoints]]
+                 /\ IF CoveringTwice(DOMAIN checkpoints, Next(e))
+                    THEN Goto(e, "holeGet")
+                    ELSE Goto(e, "open")   \* real, and a newer engine moved past it
+                 /\ UNCHANGED <<state, fence, took>>
+            ELSE /\ Goto(e, "unfence")
+                 /\ UNCHANGED <<check, state, fence, took>>
+       ELSE TakeFence(e)
     /\ UNCHANGED <<store, listed, known, doomed, closing, history, acked>>
+
+\* The hole test's verdict on the fence at the next seq: `uncovered` (no
+\* checkpoint at or past it), `real` (the checkpoint read lists it),
+\* `hole` (it does not), or `unknown` (every one listed is unreadable).
+\*              uncovered       real                 hole                 unknown
+\*   created it: serve under it; keep it, open again; delete it, open again; keep it, open again
+\*   read it:    apply it;       apply it;            open again;           open again
+Verdict(e, v) ==
+    IF check[e].from = "own"
+    THEN CASE v = "uncovered" -> TakeFence(e) /\ UNCHANGED <<listed, known, doomed, closing>>
+           [] v \in {"real", "unknown"} -> /\ Goto(e, "open")
+                           /\ check' = [check EXCEPT ![e] = NoCheck]
+                           /\ UNCHANGED <<state, listed, known, fence, doomed, closing, took>>
+           [] v = "hole" -> /\ Goto(e, "unfence")
+                           /\ check' = [check EXCEPT ![e] = NoCheck]
+                           /\ UNCHANGED <<state, listed, known, fence, doomed, closing, took>>
+    ELSE /\ IF v \in {"hole", "unknown"}
+            THEN /\ Goto(e, "open")
+                 /\ check' = [check EXCEPT ![e] = NoCheck]
+                 /\ UNCHANGED <<state, listed, known, fence, doomed, closing>>
+            ELSE Take(e, check[e].seg, check[e].from)
+         /\ UNCHANGED took
+
+\* LIST checkpoints/ to check a fence read (or, after a GET found nothing,
+\* one's own).
+HoleList(e) ==
+    /\ pc[e] = "holeList"
+    /\ LET cs == DOMAIN checkpoints IN
+       CASE CoveringTwice(cs, Next(e)) ->
+              /\ check' = [check EXCEPT ![e].listed = cs]
+              /\ Goto(e, "holeGet")
+              /\ UNCHANGED <<state, listed, known, fence, doomed, closing, took>>
+         [] \E c \in cs : c >= Next(e) -> Verdict(e, "real")
+         [] OTHER -> Verdict(e, "uncovered")
+    /\ UNCHANGED <<store, history, acked>>
+
+\* GET one of the listed checkpoints at or past the fence, any of them:
+\* every readable one agrees. Gone (cleanup deleted it since the LIST),
+\* LIST again; unreadable, try another; none left, the verdict is unknown.
+HoleGet(e) ==
+    /\ pc[e] = "holeGet"
+    /\ LET left == {c \in check[e].listed : c >= Next(e)} IN
+       IF left = {}
+       THEN Verdict(e, "unknown")
+       ELSE \E c \in left :
+              CASE c \notin DOMAIN checkpoints ->
+                     /\ Goto(e, "holeList")
+                     /\ UNCHANGED <<state, listed, known, fence, doomed, closing, check, took>>
+                [] c \in torn ->
+                     /\ check' = [check EXCEPT ![e].listed = @ \ {c}]
+                     /\ UNCHANGED <<pc, state, listed, known, fence, doomed, closing, took>>
+                [] OTHER ->
+                     Verdict(e, IF Next(e) \in FencesIn(checkpoints[c]) THEN "real" ELSE "hole")
+    /\ UNCHANGED <<store, history, acked>>
 
 \* DELETE the fence created in the hole, and open again.
 Unfence(e) ==
     /\ pc[e] = "unfence"
     /\ journal' = Drop(journal, Next(e))
     /\ Goto(e, "open")
-    /\ UNCHANGED <<checkpoints, state, listed, known, fence, doomed, closing,
+    /\ UNCHANGED <<checkpoints, torn, state, listed, known, fence, doomed, closing, check,
                    ghost>>
 
 -----------------------------------------------------------------------------
@@ -261,7 +351,7 @@ BeginAppend(e) ==
     /\ pc[e] = "serve"
     /\ Next(e) <= MaxSeq
     /\ Goto(e, "append")
-    /\ UNCHANGED <<store, state, listed, known, fence, doomed, closing, ghost>>
+    /\ UNCHANGED <<store, state, listed, known, fence, doomed, closing, check, ghost>>
 
 \* Create the next segment. Success acknowledges its event; a checkpoint
 \* may then be due. Another engine's segment there means this engine was
@@ -272,14 +362,14 @@ AppendSegment(e) ==
            ack == /\ state' = [state EXCEPT ![e] = Append(@, Event(e))]
                   /\ acked' = acked \cup {[seq |-> s, by |-> e, fence |-> fence[e]]}
                   /\ \E then \in {"serve", "checkpoint"} : Goto(e, then)
-                  /\ UNCHANGED <<listed, known, fence, doomed, closing>>
+                  /\ UNCHANGED <<listed, known, fence, doomed, closing, check>>
        IN
        IF s \notin DOMAIN journal
        THEN Land(s, Event(e)) /\ ack
        ELSE IF OwnBytes /\ journal[s] = Event(e)
        THEN ack /\ UNCHANGED <<journal, history>>
        ELSE Halt(e, "stopped") /\ UNCHANGED <<journal, history, acked>>
-    /\ UNCHANGED <<checkpoints, took>>
+    /\ UNCHANGED <<checkpoints, torn, took>>
 
 \* The same create, landing with its answer lost: the engine tries again.
 AppendUnheard(e) ==
@@ -287,29 +377,33 @@ AppendUnheard(e) ==
     /\ pc[e] = "append"
     /\ Next(e) \notin DOMAIN journal
     /\ Land(Next(e), Event(e))
-    /\ UNCHANGED <<checkpoints, local, acked, took>>
+    /\ UNCHANGED <<checkpoints, torn, local, acked, took>>
 
 \* A clean shutdown: a last checkpoint unless this seq has one, then stop.
 Close(e) ==
     /\ pc[e] = "serve"
     /\ closing' = [closing EXCEPT ![e] = TRUE]
     /\ Goto(e, IF At(e) \in known[e] THEN "stopped" ELSE "checkpoint")
-    /\ UNCHANGED <<store, state, listed, known, fence, doomed, ghost>>
+    /\ UNCHANGED <<store, state, listed, known, fence, doomed, check, ghost>>
 
 AfterCleanup(e) == IF closing[e] THEN "stopped" ELSE "serve"
 
 \* Create the checkpoint at this engine's seq. One already there with other
-\* bytes: no cleanup this time.
+\* bytes: no cleanup this time. With Unreadable, the first checkpoint
+\* written may turn out unparseable to every reader (a bug in the
+\* snapshot, say): the case the previous checkpoint is kept for.
 WriteCheckpoint(e) ==
     /\ pc[e] = "checkpoint"
     /\ LET c == At(e) IN
        IF c \notin DOMAIN checkpoints \/ checkpoints[c] = state[e]
        THEN /\ checkpoints' = Put(checkpoints, c, state[e])
+            /\ \/ UNCHANGED torn
+               \/ Unreadable /\ torn = {} /\ c \notin DOMAIN checkpoints /\ torn' = {c}
             /\ known' = [known EXCEPT ![e] = @ \cup {c}]
             /\ Goto(e, "cleanup")
        ELSE /\ Goto(e, AfterCleanup(e))
-            /\ UNCHANGED <<checkpoints, known>>
-    /\ UNCHANGED <<journal, state, listed, fence, doomed, closing, ghost>>
+            /\ UNCHANGED <<checkpoints, torn, known>>
+    /\ UNCHANGED <<journal, state, listed, fence, doomed, closing, check, ghost>>
 
 \* Journal cleanup (`_collect`), LIST journal/: keep the newest known
 \* checkpoint and the one before it (`previous`), and every segment past
@@ -328,7 +422,7 @@ Cleanup(e) ==
                                s \in {s \in DOMAIN journal : s <= previous /\ s \notin keep}}]
                 /\ known' = [known EXCEPT ![e] = {c \in @ : c >= previous}]
                 /\ Goto(e, "delete")
-    /\ UNCHANGED <<store, state, listed, fence, closing, ghost>>
+    /\ UNCHANGED <<store, state, listed, fence, closing, check, ghost>>
 
 \* DELETE the doomed objects one by one, in any order.
 Delete(e) ==
@@ -339,12 +433,12 @@ Delete(e) ==
        ELSE \E p \in doomed[e] :
               /\ IF p[1] = "segment"
                  THEN /\ journal' = Drop(journal, p[2])
-                      /\ UNCHANGED checkpoints
+                      /\ UNCHANGED <<checkpoints, torn>>
                  ELSE /\ checkpoints' = Drop(checkpoints, p[2])
-                      /\ UNCHANGED journal
+                      /\ UNCHANGED <<journal, torn>>
               /\ doomed' = [doomed EXCEPT ![e] = @ \ {p}]
               /\ UNCHANGED pc
-    /\ UNCHANGED <<state, listed, known, fence, closing, ghost>>
+    /\ UNCHANGED <<state, listed, known, fence, closing, check, ghost>>
 
 \* The process dies between two requests: what landed stays.
 Crash(e) ==
@@ -359,6 +453,7 @@ Crash(e) ==
 Progress(e) ==
     \/ ListCheckpoints(e) \/ Load(e) \/ ListJournal(e) \/ Replay(e)
     \/ CreateFence(e) \/ FenceRead(e) \/ FenceCheck(e) \/ Unfence(e)
+    \/ HoleList(e) \/ HoleGet(e)
     \/ AppendSegment(e) \/ WriteCheckpoint(e) \/ Cleanup(e) \/ Delete(e)
 
 Step(e) ==
@@ -382,14 +477,14 @@ TypeOK ==
     /\ \A e \in Engines : At(e) <= MaxSeq /\ state[e] \in Seq(Segment)
 
 \* What an engine opening right now, with nothing in its way, would load:
-\* the newest checkpoint, then every segment after it, in order.
+\* the newest readable checkpoint, then every segment after it, in order.
 RECURSIVE Extend(_)
 Extend(st) ==
     IF Len(st) + 1 \in DOMAIN journal
     THEN Extend(Append(st, journal[Len(st) + 1]))
     ELSE st
 Recovered ==
-    Extend(IF NewestCheckpoint = 0 THEN <<>> ELSE checkpoints[NewestCheckpoint])
+    Extend(IF Readable = {} THEN <<>> ELSE checkpoints[Max(Readable)])
 
 IsPrefix(st) ==
     \A i \in 1..Len(st) : i \in DOMAIN history /\ st[i] = history[i]
@@ -428,7 +523,12 @@ CountersDense ==
 \* its event (StatesArePrefixes); an opener that finds it missing loads
 \* that checkpoint instead.
 CleanupCovered ==
-    \A s \in DOMAIN history \ DOMAIN journal : Covered(s)
+    \A s \in DOMAIN history \ DOMAIN journal : \E c \in Readable : c >= s
+
+\* What the hole test relies on: a segment that landed and is gone was
+\* deleted by a cleanup, and is covered by two checkpoints from then on.
+HolesTwiceCovered ==
+    \A s \in DOMAIN history \ DOMAIN journal : CoveringTwice(DOMAIN checkpoints, s)
 
 \* Fence segments are kept for good.
 FencesStay == \A t \in took : t[1] \in DOMAIN journal /\ journal[t[1]] = Fence(t[2])

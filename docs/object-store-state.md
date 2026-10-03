@@ -833,12 +833,57 @@ dispatched again.
 
 The writer still running may checkpoint and clean up while the new one
 opens, deleting segments the new one has not read yet. A segment that is
-missing (a gap, a `GET` that finds nothing, or a fence create that
-succeeds) where a checkpoint at or past it exists was written, then
-deleted: cleanup deletes nothing a checkpoint does not cover. The new
-writer then deletes the fence it may have created in that hole, which
-the old writer would never collide with, and opens again from the newer
+missing (a gap, or a `GET` that finds nothing) where a checkpoint at or
+past it exists was written, then deleted: cleanup deletes nothing a
+checkpoint does not cover. The new writer opens again from the newer
 checkpoint.
+
+**Fences in holes.** *To build: findings F14 and F15
+(`verification.md`, "Formal model: the journal"); the journal spec checks
+this rule.* A fence create can also land in such a hole, and until it is
+deleted another opener can read that fence in place of the event cleanup
+removed. A checkpoint at or past the fence does not tell the two apart:
+it may be a newer writer's that replayed a real fence and moved past it.
+The **hole test** for a fence segment at seq `s`:
+
+1. `LIST control/checkpoints/`. Fewer than two at or past `s`: the fence
+   is real.
+2. Otherwise `GET` a listed checkpoint at or past `s`, any of them (every
+   readable one agrees; the newest is the natural choice). Its `fences`
+   lists `s`: the fence is real. It does not: the fence is a hole's.
+3. The `GET` finds nothing (cleanup deleted it since the `LIST`): back to
+   1. The checkpoint cannot be parsed: `GET` another listed one at or past
+   `s`.
+
+Never decide from a checkpoint below `s`, nor take a checkpoint that is
+gone for one that does not exist. Why it is exact:
+
+- A hole at `s` is a cleanup's doing, and cleanup deletes `s` only once
+  two checkpoints at or past `s` exist (the previous one and the newest),
+  and from then on keeps two. So fewer than two means no hole, and with
+  two, at most one of them unreadable (the case the previous checkpoint is
+  kept for), one `GET` in step 2 succeeds.
+- Cleanup never deletes a fence, so a slot cleanup emptied held an
+  ordinary segment, and no checkpoint lists a fence there.
+- Every checkpoint at or past a real fence was written by a writer that
+  replayed it, so it lists it; and no writer applies a hole's fence, so no
+  checkpoint ever lists one.
+
+Who runs it:
+
+- **The writer whose fence create at `s` succeeded**, before it applies
+  its fence. Real, with no checkpoint at or past `s`: it serves. Real,
+  with one or more: a newer writer has replayed the fence, so it keeps the
+  fence, deletes nothing and opens again. A hole's: it deletes the fence
+  and opens again.
+- **Every opener that reads a fence segment** (`EngineStarted`), while
+  replaying or in its fence's way, read-only opens included, before it
+  applies it. Real: it applies it. A hole's: it opens again, without
+  applying it.
+
+Should every checkpoint at or past `s` that the `LIST` showed be
+unreadable (two bad checkpoints, beyond what the design survives), the
+engine neither applies nor deletes the fence, and opens again.
 
 **Fencing.** Every segment write is create-only at `seq+1`. A writer
 whose create collides reads the colliding segment: if it has another
