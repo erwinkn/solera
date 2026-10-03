@@ -203,8 +203,9 @@ class Model:
         # event counter that let go of it: for the partition's next attempt to clean up
         # once no reader pins it (docs/lifecycle.md §9.8)
         self.cleanups: dict[tuple, list] = _flatten(snap.get("cleanups"), 2)
-        # output -> the deploy number that last reset it: removed, or moved to
-        # another store. An attempt launched under an earlier one commits nothing.
+        # output, or `@asset` -> the deploy number that last reset it: removed, or
+        # (an output) moved to another store. An attempt launched under an earlier
+        # one commits nothing of it.
         self.reset_at: dict[str, int] = snap.get("reset_at") or {}
         self.automations: dict[str, dict] = snap.get("automations") or {}
         # sensor -> {cursor, accepted}: the last tick that changed something (docs/lifecycle.md §11.4)
@@ -521,11 +522,16 @@ class Model:
         if e["deploy"] != self.deploy:
             self.deploy_number += 1
         previous = (self.manifest or {}).get("outputs") or {}
+        assets_before = set((self.manifest or {}).get("assets") or ())
         self.deploy, self.manifest, self.project = e["deploy"], manifest, e.get("project")
         self._consumed = self._consumed_outputs(manifest)
         renamed, output_map = self._apply_aliases(manifest)
         self._reconcile_tasks(manifest, renamed, output_map, e["at"])
-        lost = self._reset({output_map.get(name, name): o.get("store") for name, o in previous.items()})
+        carried = {old for olds in renamed.values() for old in olds}  # by an alias: not removed
+        lost = self._reset(
+            {output_map.get(name, name): o.get("store") for name, o in previous.items()},
+            assets_before - carried,
+        )
         self._unsubscribe()
         automations = {}
         for name, auto in manifest["automations"].items():
@@ -647,22 +653,26 @@ class Model:
             if not marks:
                 del self.partitions[key]["bookmarks"]
 
-    def _reset(self, stores: dict[str, str]) -> set[tuple[str, str]]:
-        """A deploy that removes an output, or declares it on another store
-        than `stores` says it was on, resets it: the output that comes back
-        under that name, or that the new store holds, is a new one (K10). Its
-        heads, key indexes (their files become garbage) and repair intents go
-        now, with the bookmarks that read it or are its asset's: every
-        consumer and its producer start over, with full passes. The same for
-        an asset the project no longer declares: its partition records go.
-        An attempt launched before the reset commits nothing
-        (`Engine.commit_attempt`), so nothing waits for one in flight. History
-        keeps the records, and pending cleanups stay: their objects are still
-        owed (F12, F13, F17, F19). Returns the (asset, partition) pairs that
-        lost a head, due for a rebuild."""
+    def _reset(self, stores: dict[str, str], assets_before: set[str]) -> set[tuple[str, str]]:
+        """A deploy that removes an asset, or removes an output or declares it
+        on another store than `stores` says it was on, resets it: what comes
+        back under that name, or what the new store holds, is a new one (K10).
+        An output's heads, key indexes (their files become garbage) and repair
+        intents go now, with the bookmarks that read it or are its asset's:
+        every consumer and its producer start over, with full passes. A
+        removed asset's partition records go — cursor, bookmarks, failed
+        keys — a job's included, which has no output (F21). `reset_at` keeps
+        the deploy number, by output name and by `@asset`; an attempt launched
+        before the reset commits nothing of it (`Engine.commit_attempt`), so
+        nothing waits for one in flight. History keeps the records, and
+        pending cleanups stay: their objects are still owed (F12, F13, F17,
+        F19, F21). Returns the (asset, partition) pairs that lost a head, due
+        for a rebuild."""
 
         manifest = self.manifest or {}
         outputs, assets = manifest.get("outputs") or {}, manifest.get("assets") or {}
+        for asset in assets_before - set(assets):
+            self.reset_at[f"@{asset}"] = self.deploy_number
         reset = {
             name
             for name, store in stores.items()

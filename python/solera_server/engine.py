@@ -1387,9 +1387,10 @@ class Engine(Attempts, Sensors, Views):
         upstreams = [
             p["bookmark"]["output"] for p in (prepared.get("plans") or {}).values() if p and "bookmark" in p
         ]
-        for output in [*(prepared.get("outputs") or {}), *upstreams]:
-            if self.m.reset_at.get(output, 0) > prepared["deploy_number"]:
-                raise Conflict(f"output {output} was reset since this attempt launched")
+        for name in [f"@{task['asset']}", *(prepared.get("outputs") or {}), *upstreams]:
+            if self.m.reset_at.get(name, 0) > prepared["deploy_number"]:
+                what = f"asset {name[1:]}" if name.startswith("@") else f"output {name}"
+                raise Conflict(f"{what} was reset since this attempt launched")
         outputs = current_names(prepared, result.get("outputs") or {})
         # Settled under the contract it was launched with, not today's manifest.
         declared = {name: info["contract"] for name, info in (prepared.get("outputs") or {}).items()}

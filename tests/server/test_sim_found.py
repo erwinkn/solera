@@ -786,7 +786,6 @@ async def test_a_reset_output_is_due_for_a_rebuild(state, tmp_path):  # noqa: F8
     assert head is not None and head["ref"]["store"] == "other", "items stays empty until feed changes"
 
 
-@pytest.mark.xfail(strict=True, reason="F21: a job added back takes its first life's commit")
 async def test_a_job_added_back_does_not_take_its_first_lifes_commit(state, monkeypatch):  # noqa: F811
     """F19 for a job: `seen` has no output, so no output's reset covers it.
     Removed while its attempt runs and added back before that attempt
@@ -835,3 +834,56 @@ async def test_a_job_added_back_does_not_take_its_first_lifes_commit(state, monk
     await drive(engine, old, timeout=10)
     cursor = state.model.partition("seen", "").get("cursor")
     assert cursor is None or cursor["life"] == "2", f"the second life took the first's commit: {cursor}"
+
+
+async def test_a_job_removed_while_its_attempt_runs_and_added_back_starts_over(state, monkeypatch):  # noqa: F811
+    """F21: the reset rule for an asset with no output. Job `seen` reads
+    `items` incrementally; its cursor is what it saw. Removed while its
+    attempt runs, and added back (version 2), it starts over: its partition
+    state went at the removal, and the attempt — launched before — commits
+    neither its cursor nor its bookmarks into the new `seen`: its run carries
+    on with a fresh attempt of the new code, as a renamed asset's does."""
+
+    from solera.sdk import Result, job
+    from solera_server import attempts
+
+    monkeypatch.setattr(attempts, "AFTER_COMMIT_WAIT", 0.2)  # the stopped engine's answer to `finished`
+    entered, release, calls = asyncio.Event(), asyncio.Event(), []
+
+    @asset(outputs=Output("items", key="id"))
+    def items():
+        return [{"id": "a"}]
+
+    def project(life):
+        if life is None:
+            return Project(assets=[items])
+
+        @job(inputs={"items": Incremental()}, version=life)
+        async def seen(ctx, items: list):
+            calls.append(life)
+            if calls == ["1", "1"]:  # its second run is held across the removal
+                entered.set()
+                await release.wait()
+            return Result(outputs={}, cursor={"life": life})
+
+        return Project(assets=[items, seen])
+
+    engine = make_engine(state, project("1"))
+    await engine.initialize()
+    assert status_of(await drive(engine, await engine.submit(["seen"], upstream=True))) == "succeeded"
+    old = await engine.submit(["seen"], mode="full")
+    while not entered.is_set():
+        await engine.tick()
+        await asyncio.sleep(0.01)
+    (held,) = [c["attempt"] for c in state.model.claims.values()]
+    await engine.stop()
+    for life in (None, "2"):  # removed, and added back
+        engine = make_engine(state, project(life))
+        await engine.initialize()
+        if life is None:
+            await engine.stop()
+    assert not state.model.partition("seen", ""), "the second life starts with the first's state"
+    release.set()
+    await drive(engine, old, timeout=10)  # refused, and carried on by the new life's code
+    record = state.model.partition("seen", "")
+    assert record["cursor"] == {"life": "2"} and record["last"]["attempt"] != held, record

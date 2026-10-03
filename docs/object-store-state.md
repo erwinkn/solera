@@ -131,10 +131,10 @@ says where the content is (a FileStore directory, a Postgres table), so
 a renamed output keeps its storage, and every ref to it stays readable;
 the declaration names the storage only of a first write.
 
-**Removals and moves reset an output.** A deploy that removes an output
-(no alias carries it over), or declares it on another store than before,
-resets it: what comes back under that name, or what the new store holds,
-is a new output (K10). At that deploy, not later:
+**Removals and moves reset.** A deploy that removes an asset, or removes
+an output or declares it on another store than before (no alias carrying
+it over), resets it: what comes back under that name, or what the new
+store holds, is a new one (K10). At that deploy, not later:
 
 - its heads, key indexes (their files go to collection) and repair intents
   go;
@@ -143,18 +143,19 @@ is a new output (K10). At that deploy, not later:
   each of its inputs in a full pass. A `keys=` run of a partition that lost
   bookmarks this way reads that full pass too, to its last batch, before
   it succeeds;
-- an asset the project no longer declares loses its partition records;
+- a removed asset loses its partition records — cursor, bookmarks, failed
+  keys — a job's too, which has no output (F21);
 - what lost a head is due for a rebuild: each `OnChange` automation of its
   asset owes it a firing, as for a change of its own, so it is written
   again at once — not when its upstream next changes, with every consumer
   waiting meanwhile. An asset with no such automation waits for its next
   run.
 
-An attempt launched before the reset commits nothing: one that writes a
-reset output or reads one incrementally is refused at commit, as a
-stale head is (`reset_at` in the model, the deploy number of the output's
-last reset, against the one the attempt launched under), and its task
-tries again under the new output. So nothing waits for an attempt in
+An attempt launched before the reset commits nothing of it: one of a
+reset asset, or that writes a reset output or reads one incrementally, is
+refused at commit, as a stale head is (`reset_at` in the model, the deploy
+number of the last reset, by output name and by `@asset`, against the one
+the attempt launched under), and its task tries again under the new one. So nothing waits for an attempt in
 flight. History keeps the old records, and pending cleanups stay, still
 owed. Moving away and back with nothing written in between is two
 resets all the same. Which store holds an output is therefore not in the
@@ -169,7 +170,7 @@ life 3's — and a keyed read names only the objects its fresh key index
 holds. Findings this closes: F12 (`copy` renamed to `mirror` and back kept
 `mirror`'s first life), F13 (a key removed after a move stayed
 downstream), F17 (moved away and back, an output lost keys), F19 (removed
-while its attempt ran and added back, an asset resumed its first life).
+while its attempt ran and added back, an asset resumed its first life), F21 (the same, for a job).
 
 ## 3. Journal
 
