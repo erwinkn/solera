@@ -341,6 +341,8 @@ New sweeps since that summary:
 | Z8 | as Z7 | 962 | 250 runs × 50 steps | pg | F31 |
 | Z9 | K45 read-ahead, K46 reasons (35c0766) | 971 | 266 runs, 14,913 steps, 74 h | default | green |
 | Z10 | as Z9 | 972 | 263 runs, 14,304 steps, 58 h | pg | green |
+| Z11 | F31, F32 and the reasons ruling fixed (bf17f26) | 981 | 250 runs × 50 steps | default | two attempts claimed `mirror` at once (one attempt per partition); Hypothesis could not replay it (its re-run drew differently): unreplayed |
+| Z12 | as Z11 | 982 | 250 runs × 50 steps | pg | `items` missed a feed key (`k1`) after automations; the printed 51-step case passes standalone: unreplayed |
 
 ## Formal model: execution semantics (`spec/tla/Execution.tla`)
 
