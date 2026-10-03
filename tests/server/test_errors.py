@@ -6,7 +6,7 @@ from solera import Abort, Failed, Rejected, Transient
 from solera.errors import ABORT, FAILED, REJECTED, TRANSIENT, backoff, classify, seconds
 from solera.sdk import Project, RegistrationError, Retry, asset
 
-from .test_engine import drive, make_engine, state, status_of  # noqa: F401
+from .engines import drive, make_engine, status_of
 
 
 class Unprocessable(Rejected):
@@ -58,7 +58,7 @@ def test_errors_mapping_is_checked_at_registration():
         Project(errors={"KeyError": Abort})
 
 
-async def test_rejected_fails_without_retries(state):  # noqa: F811
+async def test_rejected_fails_without_retries(state):
     calls = {"n": 0}
 
     @asset(retries=Retry(3, delay=0.01))
@@ -74,7 +74,7 @@ async def test_rejected_fails_without_retries(state):  # noqa: F811
     assert "Unprocessable: empty file" in detail["attempts"][detail["tasks"][0]["id"]][0]["error"]
 
 
-async def test_failed_and_abort_follow_retries(state):  # noqa: F811
+async def test_failed_and_abort_follow_retries(state):
     calls = {"failed": 0, "abort": 0}
 
     @asset(retries=Retry(1, delay=0.01))
@@ -95,7 +95,7 @@ async def test_failed_and_abort_follow_retries(state):  # noqa: F811
     assert calls == {"failed": 2, "abort": 2}
 
 
-async def test_transient_retries_past_retries_within_its_budget(state):  # noqa: F811
+async def test_transient_retries_past_retries_within_its_budget(state):
     """A Transient error is retried after its `retry_after` even with no
     retries left, until `retry_for` has passed since the first one."""
 
@@ -115,7 +115,7 @@ async def test_transient_retries_past_retries_within_its_budget(state):  # noqa:
     assert status_of(detail) == "succeeded" and calls["n"] == 4
 
 
-async def test_transient_gives_up_after_retry_for(state):  # noqa: F811
+async def test_transient_gives_up_after_retry_for(state):
     calls = {"n": 0}
 
     @asset(retries=Retry(0))
@@ -131,7 +131,7 @@ async def test_transient_gives_up_after_retry_for(state):  # noqa: F811
     assert 2 <= calls["n"] <= 6
 
 
-async def test_mapped_exception_is_transient(state):  # noqa: F811
+async def test_mapped_exception_is_transient(state):
     calls = {"n": 0}
 
     @asset(retries=Retry(0))

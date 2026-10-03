@@ -21,13 +21,6 @@ from solera_server.state import State
 from tests.conftest import whole
 
 
-@pytest.fixture
-async def state(tmp_path):
-    opened = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
-    yield opened
-    await opened.close()
-
-
 def engine_for(state, project, **kw):
     return Engine(
         state,

@@ -9,8 +9,8 @@ from solera.failed_keys import CANCELED
 from solera.sdk import Each, Incremental, Output, Project, asset
 from solera_server.state import State
 
+from .engines import drive, make_engine, task_statuses
 from .test_each import files_project, records, rows_of
-from .test_engine import drive, make_engine, state, task_statuses  # noqa: F401
 from .test_fence import engine_for, until
 
 
@@ -54,7 +54,7 @@ async def test_1_a_cancel_interrupts_keys_still_waiting_for_a_slot(tmp_path):
     await opened.close()
 
 
-async def test_2_a_full_run_keeps_a_failing_keys_last_good_output(state):  # noqa: F811
+async def test_2_a_full_run_keeps_a_failing_keys_last_good_output(state):
     broken = {"b": False}
 
     def parse(ctx, file: dict):
@@ -73,7 +73,7 @@ async def test_2_a_full_run_keeps_a_failing_keys_last_good_output(state):  # noq
     assert {k: [r["n"] for r in v] for k, v in got.items()} == {"a": [1], "b": [2]}
 
 
-async def test_2_a_full_run_removes_what_upstream_no_longer_has(state):  # noqa: F811
+async def test_2_a_full_run_removes_what_upstream_no_longer_has(state):
     content = {"a": {"n": 1}, "b": {"n": 2}}
 
     def parse(file: dict):
@@ -92,7 +92,7 @@ async def test_2_a_full_run_removes_what_upstream_no_longer_has(state):  # noqa:
     assert set(await rows_of(engine, project, "samples")) == {"a"}
 
 
-async def test_3_retries_run_under_the_scopes_configuration(state):  # noqa: F811
+async def test_3_retries_run_under_the_scopes_configuration(state):
     from solera.sdk import Automation, Every
 
     calls = []
@@ -127,7 +127,7 @@ async def test_3_retries_run_under_the_scopes_configuration(state):  # noqa: F81
     assert {k: v[0]["n"] for k, v in got.items()} == {"a": 10, "b": 20}
 
 
-async def test_4_a_rescope_without_its_log_still_removes_left_out_and_deleted_keys(state):  # noqa: F811
+async def test_4_a_rescope_without_its_log_still_removes_left_out_and_deleted_keys(state):
     content = {"a/1": {"n": 1}, "old/2": {"n": 2}, "gone/3": {"n": 3}}
 
     def parse(file: dict):
@@ -197,7 +197,7 @@ async def test_5_a_user_cancel_during_a_timeout_drain_makes_its_keys_canceled(tm
     await opened.close()
 
 
-async def test_6_a_forced_retry_during_the_last_retry_page_is_taken(state):  # noqa: F811
+async def test_6_a_forced_retry_during_the_last_retry_page_is_taken(state):
     calls, gate = [], {"event": None}
 
     async def parse(ctx, file: dict):
@@ -224,7 +224,7 @@ async def test_6_a_forced_retry_during_the_last_retry_page_is_taken(state):  # n
     assert calls == ["a", "a", "a"]  # the newer request was taken in the same run
 
 
-async def test_7_a_keys_override_obeys_the_patterns(state):  # noqa: F811
+async def test_7_a_keys_override_obeys_the_patterns(state):
     seen = []
 
     def parse(ctx, file: dict):
@@ -240,7 +240,7 @@ async def test_7_a_keys_override_obeys_the_patterns(state):  # noqa: F811
     assert seen == ["a/1"] and set(await rows_of(engine, project, "samples")) == {"a/1"}
 
 
-async def test_8_a_renamed_asset_keeps_its_failures(state):  # noqa: F811
+async def test_8_a_renamed_asset_keeps_its_failures(state):
     calls = []
 
     @asset(outputs=Output("files", keyed=True))
@@ -273,7 +273,7 @@ async def test_8_a_renamed_asset_keeps_its_failures(state):  # noqa: F811
     assert calls == [1, 1] and engine.m.partition("parsed", "")["failures"]["counts"] == {}
 
 
-async def test_a_full_run_reads_every_key_once_in_batches(state):  # noqa: F811
+async def test_a_full_run_reads_every_key_once_in_batches(state):
     """The inherited blocker: a `full` run resets once, then resumes its pass."""
 
     seen, plain = [], []

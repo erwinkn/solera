@@ -8,10 +8,10 @@ from solera.sdk import Incremental, Output, Project, asset
 from solera.stores import FileStore, Patch
 
 from ..conftest import whole
-from .test_engine import drive, make_engine, state, status_of  # noqa: F401
+from .engines import drive, make_engine, status_of
 
 
-async def test_a_keyed_output_moved_to_another_store_stays_readable(state, tmp_path):  # noqa: F811
+async def test_a_keyed_output_moved_to_another_store_stays_readable(state, tmp_path):
     """An output moved to another store keeps its key index; the next write
     resolved against it stores only the keys that changed, so a key it did
     not change must still read back — from the store the head now names."""
@@ -48,7 +48,7 @@ def _ref(head):
     return Ref.from_json(head["ref"])
 
 
-async def test_a_removed_assets_last_attempt_ends_its_run(state, monkeypatch):  # noqa: F811
+async def test_a_removed_assets_last_attempt_ends_its_run(state, monkeypatch):
     """§11: an attempt launched before its asset was removed settles under
     the contract it was launched with. When it commits a batch and asks for
     more, the asset is gone: its task cannot run again, and its run must
@@ -92,7 +92,7 @@ async def test_a_removed_assets_last_attempt_ends_its_run(state, monkeypatch):  
     assert not state.model.partition("batches", "").get("bookmarks")  # its pass ends with it
 
 
-async def test_an_attempt_launched_before_a_rename_settles(state, monkeypatch):  # noqa: F811
+async def test_an_attempt_launched_before_a_rename_settles(state, monkeypatch):
     """docs/object-store-state.md §2: a rename moves heads, indexes and
     outcomes to the new name; an attempt launched under the old name still
     settles — its run ends and the partition is free for the next one."""
@@ -139,7 +139,7 @@ async def test_an_attempt_launched_before_a_rename_settles(state, monkeypatch): 
     assert status_of(await drive(engine, await engine.submit(["new"], mode="full"))) == "succeeded"
 
 
-async def test_a_change_made_during_a_full_pass_reaches_downstream(state):  # noqa: F811
+async def test_a_change_made_during_a_full_pass_reaches_downstream(state):
     """§6, §9: a full keyed pass begun at commit 0 delivers what changed
     meanwhile afterwards, as a delta. Interrupted after its first batch, then
     the upstream changes: the firing for that change resumes the pass —
@@ -232,7 +232,7 @@ async def test_a_slow_new_engine_never_opens_without_acknowledged_events(tmp_pat
         await a.flush()
 
 
-async def test_an_unkeyed_upstream_reset_right_after_a_pass_is_delivered_in_full(state):  # noqa: F811
+async def test_an_unkeyed_upstream_reset_right_after_a_pass_is_delivered_in_full(state):
     """§6: a `full` run starts an unkeyed incremental output over at a new
     `base`; a consumer that read commits before it must be told (`full`),
     or it keeps rows the upstream let go — also when the reset commit is
@@ -265,7 +265,7 @@ async def test_an_unkeyed_upstream_reset_right_after_a_pass_is_delivered_in_full
     assert state.model.partition("tally", "")["cursor"] == 1
 
 
-async def test_a_full_pass_that_takes_no_key_still_starts_over(state):  # noqa: F811
+async def test_a_full_pass_that_takes_no_key_still_starts_over(state):
     """F10, architecture.md §5: a full pass starts its consumer over, so it
     reaches the producer even when the input's patterns take none of the
     upstream's keys: one empty batch, `full`, `first` and `final`. Keys the
@@ -297,7 +297,7 @@ async def test_a_full_pass_that_takes_no_key_still_starts_over(state):  # noqa: 
     assert rows == []
 
 
-async def test_a_full_pass_over_an_empty_upstream_reaches_its_producer(state):  # noqa: F811
+async def test_a_full_pass_over_an_empty_upstream_reaches_its_producer(state):
     """F10: an upstream that holds no key any more still starts its
     consumer over on a full pass: the producer sees one empty batch, `full`,
     `first` and `final`, and what the consumer held from before goes."""
@@ -324,7 +324,7 @@ async def test_a_full_pass_over_an_empty_upstream_reaches_its_producer(state):  
     assert state.model.index("mirror", "").count == 0
 
 
-async def test_an_each_full_pass_that_takes_no_key_drops_its_keys(state):  # noqa: F811
+async def test_an_each_full_pass_that_takes_no_key_drops_its_keys(state):
     """F10 for `Each`: the producer is written for one key, so a full pass
     taking none is not called; the cleanup after the pass drops the keys the
     asset holds that its input no longer has."""
@@ -351,7 +351,7 @@ async def test_an_each_full_pass_that_takes_no_key_drops_its_keys(state):  # noq
     assert state.model.index("out", "").count == 0
 
 
-async def test_a_name_removed_and_added_back_starts_over(state):  # noqa: F811
+async def test_a_name_removed_and_added_back_starts_over(state):
     """F12: a name the project no longer declares holds no live state. `copy`
     renamed to `mirror` and back without an alias left `mirror`'s first life
     in place, and the next rename onto `mirror` kept it — under a bookmark
@@ -395,7 +395,7 @@ async def test_a_name_removed_and_added_back_starts_over(state):  # noqa: F811
     assert m.heads[("mirror", "")]["ref"]["generation"] == copied  # copy's state, not the first life
 
 
-async def test_a_key_a_moved_output_dropped_leaves_its_consumer(state, tmp_path, monkeypatch):  # noqa: F811
+async def test_a_key_a_moved_output_dropped_leaves_its_consumer(state, tmp_path, monkeypatch):
     """F9, under the reset rule: a move makes `items` a new output, so its
     consumer starts over on it. `copy`'s attempt, launched before the move,
     is refused when it settles — its upstream was reset since — and its
@@ -452,7 +452,7 @@ async def test_a_key_a_moved_output_dropped_leaves_its_consumer(state, tmp_path,
 
 @pytest.mark.parametrize("ends", ["succeeds", "fails", "lost"])
 @pytest.mark.parametrize("when", ["before", "during"])
-async def test_an_attempt_of_a_removed_and_readded_asset_stays_in_its_life(state, monkeypatch, ends, when):  # noqa: F811
+async def test_an_attempt_of_a_removed_and_readded_asset_stays_in_its_life(state, monkeypatch, ends, when):
     """Execution spec review: an asset removed and added back under its name
     starts a new life (F12), and an attempt of its first life, launched
     before the removal, ends after the re-add — committing, failing or
@@ -465,7 +465,7 @@ async def test_an_attempt_of_a_removed_and_readded_asset_stays_in_its_life(state
     await _first_life_across_a_readd(state, monkeypatch, ends, when)
 
 
-async def test_a_name_removed_while_its_attempt_runs_and_added_back_starts_over(state, monkeypatch):  # noqa: F811
+async def test_a_name_removed_while_its_attempt_runs_and_added_back_starts_over(state, monkeypatch):
     """F19, F12's rule across a live attempt: removing `copy` resets it at
     that deploy, though its attempt still runs — nothing waits for it, as it
     can commit nothing — so adding it back starts it over: no head, no
@@ -474,7 +474,7 @@ async def test_a_name_removed_while_its_attempt_runs_and_added_back_starts_over(
     await _first_life_across_a_readd(state, monkeypatch, "fails", "before", fresh=True)
 
 
-async def _first_life_across_a_readd(state, monkeypatch, ends: str, when: str, fresh: bool = False):  # noqa: F811
+async def _first_life_across_a_readd(state, monkeypatch, ends: str, when: str, fresh: bool = False):
     from solera_server import attempts
     from solera_server.executors.inline import InlinePlacement
 
@@ -567,7 +567,7 @@ def _moving(tmp_path, rows: dict, seen: list):
     return project
 
 
-async def test_a_move_and_back_with_no_write_between_resets(state, tmp_path):  # noqa: F811
+async def test_a_move_and_back_with_no_write_between_resets(state, tmp_path):
     """K10: each move makes a new output, so `items` moved away and back with
     nothing written in between is reset all the same: its head and index go
     at the deploy, with `copy`'s bookmark on it, and both start over."""
@@ -590,7 +590,7 @@ async def test_a_move_and_back_with_no_write_between_resets(state, tmp_path):  #
     assert sorted((await engine.list_keys("copy"))["keys"]) == ["a"]
 
 
-async def test_an_attempt_launched_before_its_output_moved_commits_nothing(state, tmp_path, monkeypatch):  # noqa: F811
+async def test_an_attempt_launched_before_its_output_moved_commits_nothing(state, tmp_path, monkeypatch):
     """K10: an attempt launched before its output moved commits nothing —
     also on a partition with no head yet, which the stale-head check alone
     would let through. Its retry writes into the new store."""
@@ -627,7 +627,7 @@ async def test_an_attempt_launched_before_its_output_moved_commits_nothing(state
     assert head["attempt"] != held and head["ref"]["store"] == "other"
 
 
-async def test_a_keys_run_after_a_move_reads_a_whole_full_pass(state, tmp_path):  # noqa: F811
+async def test_a_keys_run_after_a_move_reads_a_whole_full_pass(state, tmp_path):
     """K10, the review's example: `copy` holds {a, b}, moves, and runs
     keys=(a). A move takes its bookmarks, so the run reads a full pass —
     every batch of it before it succeeds — not the one key: the new store
@@ -659,7 +659,7 @@ async def test_a_keys_run_after_a_move_reads_a_whole_full_pass(state, tmp_path):
     assert "reset" not in state.model.partition("copy", "")
 
 
-async def test_an_earlier_lifes_objects_are_never_read(state, tmp_path):  # noqa: F811
+async def test_an_earlier_lifes_objects_are_never_read(state, tmp_path):
     """K10 with FileStore, which keeps a name's objects in one place: `log`'s
     first life commits 0–9; it moves away and back; its third life commits
     0–2 in the same place. Reads are bounded by the head, and generations
@@ -700,7 +700,7 @@ async def test_an_earlier_lifes_objects_are_never_read(state, tmp_path):  # noqa
     assert sorted((await engine.list_keys("keys"))["keys"]) == ["k0"]
 
 
-async def test_the_retry_clock_waits_for_an_input_with_no_head(state, tmp_path):  # noqa: F811
+async def test_the_retry_clock_waits_for_an_input_with_no_head(state, tmp_path):
     """F20: `checks` (Each, automated) owes a forced retry while a move left
     `items` with no head. The retry clock submitted a run that could not plan
     on every tick, forever — runs and the journal grew without bound. A
@@ -742,7 +742,7 @@ async def test_the_retry_clock_waits_for_an_input_with_no_head(state, tmp_path):
     assert [r for r in submitted if r is not None] == []
 
 
-async def test_a_reset_output_is_due_for_a_rebuild(state, tmp_path):  # noqa: F811
+async def test_a_reset_output_is_due_for_a_rebuild(state, tmp_path):
     """K10: a reset leaves an automated output due for a rebuild. `items`
     (OnChange on `feed`) moves to another store, and `feed` does not change:
     the move alone fires `items` again, so it does not stay empty — and its
@@ -788,7 +788,7 @@ async def test_a_reset_output_is_due_for_a_rebuild(state, tmp_path):  # noqa: F8
     assert head is not None and head["ref"]["store"] == "other", "items stays empty until feed changes"
 
 
-async def test_a_job_added_back_does_not_take_its_first_lifes_commit(state, monkeypatch):  # noqa: F811
+async def test_a_job_added_back_does_not_take_its_first_lifes_commit(state, monkeypatch):
     """F19 for a job: `seen` has no output, so no output's reset covers it.
     Removed while its attempt runs and added back before that attempt
     succeeds, it must not take that attempt's commit — its cursor and
@@ -838,7 +838,7 @@ async def test_a_job_added_back_does_not_take_its_first_lifes_commit(state, monk
     assert cursor is None or cursor["life"] == "2", f"the second life took the first's commit: {cursor}"
 
 
-async def test_a_job_removed_while_its_attempt_runs_and_added_back_starts_over(state, monkeypatch):  # noqa: F811
+async def test_a_job_removed_while_its_attempt_runs_and_added_back_starts_over(state, monkeypatch):
     """F21: the reset rule for an asset with no output. Job `seen` reads
     `items` incrementally; its cursor is what it saw. Removed while its
     attempt runs, and added back (version 2), it starts over: its partition

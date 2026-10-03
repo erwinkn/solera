@@ -14,17 +14,9 @@ from solera.executors import Pool
 from solera.sdk import Project, Retry, asset
 from solera_server.engine import Engine
 from solera_server.executors import PlacementContext
-from solera_server.state import State
 from solera_worker.worker import run_attempt
 
 from tests.server.test_fence import Gated
-
-
-@pytest.fixture
-async def state(tmp_path):
-    opened = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
-    yield opened
-    await opened.close()
 
 
 def make_engine(state, project, placements=None, **kw):

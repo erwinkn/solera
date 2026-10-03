@@ -122,7 +122,7 @@ async def test_the_engine_warns_when_a_worker_computed_its_revision_another_way(
     from solera.sdk import Project, asset
     from solera_server.state import State
 
-    from tests.server.test_engine import make_engine
+    from tests.server.engines import make_engine
 
     @asset
     def numbers():
@@ -147,7 +147,7 @@ async def test_the_engine_warns_a_sensor_host_once(tmp_path, caplog):
     from solera.sdk import Project, asset
     from solera_server.state import State
 
-    from tests.server.test_engine import make_engine
+    from tests.server.engines import make_engine
 
     @asset
     def numbers():

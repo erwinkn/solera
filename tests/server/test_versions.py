@@ -8,11 +8,11 @@ from solera.sdk import Each, Incremental, Output, Project, Ref, asset
 from solera.stores import Patch
 
 from ..conftest import whole
-from .test_engine import drive, make_engine, state, status_of  # noqa: F401
+from .engines import drive, make_engine, status_of
 from .test_fence import LiveStore
 
 
-async def test_a_delta_pass_over_batches_says_the_generation_it_read(state):  # noqa: F811
+async def test_a_delta_pass_over_batches_says_the_generation_it_read(state):
     """Review finding 3: a delta pass delivered over batches reads the index
     as of its start. The upstream writes `b` again (g3) after the pass's
     first batch; its second batch reads `b` as of g2 — the object it was
@@ -62,7 +62,7 @@ async def test_a_delta_pass_over_batches_says_the_generation_it_read(state):  # 
     assert sorted((r["id"], r["v"]) for r in rows) == [("a", 2), ("b", 3)]
 
 
-async def test_a_failure_record_lives_in_its_entry_across_a_restart(state, tmp_path):  # noqa: F811
+async def test_a_failure_record_lives_in_its_entry_across_a_restart(state, tmp_path):
     """Review finding 2: the failed keys's entry carries the key's record —
     its outcome, tries, retry deadline and the upstream generation it failed
     at — as its payload. After a restart, the replayed engine reads it back
@@ -124,7 +124,7 @@ async def test_a_failure_record_lives_in_its_entry_across_a_restart(state, tmp_p
     await again.close()
 
 
-async def _dead_write(state, landed: bool):  # noqa: F811
+async def _dead_write(state, landed: bool):
     """`k` is not in the index. Attempt g12 patches it into a fenced store and
     dies after its gate — its insert landed, or not — leaving its intent;
     the next attempt, g15, patches `x` alone. Returns the engine's index of
@@ -157,7 +157,7 @@ async def _dead_write(state, landed: bool):  # noqa: F811
     return engine, live
 
 
-async def test_a_repair_keeps_a_dead_writers_key_it_finds(state):  # noqa: F811
+async def test_a_repair_keeps_a_dead_writers_key_it_finds(state):
     """docs/versions.md §5, landed: the store holds `k`, so it takes the
     repairing attempt's generation, as `x` does; the index and the store
     agree."""
@@ -168,7 +168,7 @@ async def test_a_repair_keeps_a_dead_writers_key_it_finds(state):  # noqa: F811
     assert keys["k"] == keys["x"] == g15 and sorted(keys) == sorted(live.rows) == ["a", "k", "x"]
 
 
-async def test_a_repair_drops_a_dead_writers_key_it_does_not_find(state):  # noqa: F811
+async def test_a_repair_drops_a_dead_writers_key_it_does_not_find(state):
     """docs/versions.md §5, not landed: the store lacks `k` and the index
     never held it: nothing — the index lists no key without rows."""
 

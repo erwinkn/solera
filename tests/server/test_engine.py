@@ -27,9 +27,9 @@ from solera.sdk import (
     job,
 )
 from solera.stores import FileStore, Patch
-from solera_server.engine import Engine
 from solera_server.executors.inline import InlinePlacement
-from solera_server.state import State
+
+from .engines import drive, make_engine, status_of, task_statuses
 
 
 class Fake(Executor):
@@ -66,19 +66,8 @@ class FakePlacement:
         self.script.setdefault(handle["id"], {})["canceled"] = True
 
 
-def inline(project, **env_kw):
-    return {"Local": lambda s, c: InlinePlacement(c, project)}
-
-
 def fake(project, **env_kw):
     return {"Fake": lambda s, c: FakePlacement(c)}
-
-
-@pytest.fixture
-async def state(tmp_path):
-    opened = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
-    yield opened
-    await opened.close()
 
 
 def head(state, output, partition=""):
@@ -90,30 +79,6 @@ async def spec_of(state, output, partition=""):
 
     h = head(state, output, partition)
     return await state.attempt_spec(h["run"], h["attempt"])
-
-
-def make_engine(state, project, placements=None, **kw):
-    kw.setdefault("eval_interval", 0.05)
-    kw.setdefault("clock", state.clock)
-    return Engine(
-        state,
-        project.manifest,
-        placements=placements or inline(project),
-        **kw,
-    )
-
-
-async def drive(engine, run, timeout=30):
-    detail = await engine.run_until(run["id"], timeout)
-    return detail
-
-
-def status_of(detail):
-    return detail["request"]["status"]
-
-
-def task_statuses(detail):
-    return {t["asset"]: t["status"] for t in detail["tasks"]}
 
 
 async def test_bare_return_and_commit(state):

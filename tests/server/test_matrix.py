@@ -22,12 +22,12 @@ from solera.sdk import (
 from solera.stores import Patch
 from solera_server.planning import select_partitions
 
-from .test_engine import drive, make_engine, state, status_of, task_statuses  # noqa: F401
+from .engines import drive, make_engine, status_of, task_statuses
 
 # -- full rewrite × equal payload -------------------------------------------------------
 
 
-async def test_an_identical_full_rewrite_stays_readable(state):  # noqa: F811
+async def test_an_identical_full_rewrite_stays_readable(state):
     seen = []
 
     @asset(outputs=Output("log", incremental=True))
@@ -48,7 +48,7 @@ async def test_an_identical_full_rewrite_stays_readable(state):  # noqa: F811
     assert seen == [[{"n": 1}]]
 
 
-async def test_a_full_run_after_a_rename_stays_readable(state):  # noqa: F811
+async def test_a_full_run_after_a_rename_stays_readable(state):
     """Worker/stores review round 4 #1: `old` wrote {a, b}; renamed `new`,
     a full run writes {a: 2, b: 1}. Only `a` is written again: `b` stays
     where `old` put it, so the new head must still say its content is
@@ -83,7 +83,7 @@ async def test_a_full_run_after_a_rename_stays_readable(state):  # noqa: F811
 # -- AllPartitions × zero free dimensions -----------------------------------------------
 
 
-async def test_all_partitions_with_nothing_to_collapse(state):  # noqa: F811
+async def test_all_partitions_with_nothing_to_collapse(state):
     """Unpartitioned on both sides, or every dimension shared: one complete
     head, read under the key `""`."""
     seen = {}
@@ -120,7 +120,7 @@ async def test_all_partitions_with_nothing_to_collapse(state):  # noqa: F811
 # -- registration × queued work ---------------------------------------------------------
 
 
-async def test_a_removed_asset_takes_its_queued_work_with_it(state):  # noqa: F811
+async def test_a_removed_asset_takes_its_queued_work_with_it(state):
     """A queued or waiting task of an asset the new project drops is
     canceled, saying why, and its run rolls up; one of a renamed asset runs
     under the new name; unrelated work dispatches."""
@@ -174,7 +174,7 @@ async def test_a_removed_asset_takes_its_queued_work_with_it(state):  # noqa: F8
 # -- OnChange × work queued in another run ----------------------------------------------
 
 
-async def test_a_change_waits_for_work_already_queued(state):  # noqa: F811
+async def test_a_change_waits_for_work_already_queued(state):
     """The firing would drop a partition another run has queued, and run what
     reads it against old data: the change waits while any owed partition is
     claimed or queued, then fires and orders after it."""
@@ -215,7 +215,7 @@ async def test_a_change_waits_for_work_already_queued(state):  # noqa: F811
 # -- OnChange × a pass under way ----------------------------------------------------
 
 
-async def test_a_change_is_kept_until_its_delivery_completes(state):  # noqa: F811
+async def test_a_change_is_kept_until_its_delivery_completes(state):
     """An AllPartitions read excludes a partition whose pass is under way: a
     change made by its first batch waits until the last batch drains it — even
     when that batch writes nothing — then fires once, over complete data."""
@@ -270,7 +270,7 @@ def test_an_explicit_selection_is_linear():
 # -- registration × pass obligations ------------------------------------------------
 
 
-async def test_a_removed_consumer_lets_go_of_its_upstreams_log(state):  # noqa: F811
+async def test_a_removed_consumer_lets_go_of_its_upstreams_log(state):
     """Review round 5, engine #3 and system #2: `gone` and `keep` read
     `feed` incrementally. `gone` is removed: its bookmark goes with it, so
     the log of `feed`'s later commits is kept only as long as `keep` needs
@@ -308,7 +308,7 @@ async def test_a_removed_consumer_lets_go_of_its_upstreams_log(state):  # noqa: 
 # -- a rewrite × interpretation ----------------------------------------------------------
 
 
-async def test_a_value_written_again_is_a_new_version_its_readers_reread(state):  # noqa: F811
+async def test_a_value_written_again_is_a_new_version_its_readers_reread(state):
     """docs/versions.md §7, identical rewrites: `settings` is written again
     with the same content — a new version, at a new generation. A reader of
     `feed` that also reads it reads under another interpretation, so its
@@ -344,7 +344,7 @@ async def test_a_value_written_again_is_a_new_version_its_readers_reread(state):
 # -- OnChange × an interrupted pass, for Each -----------------------------------------
 
 
-async def test_an_each_delivery_resumed_by_a_firing_takes_its_change(state):  # noqa: F811
+async def test_an_each_delivery_resumed_by_a_firing_takes_its_change(state):
     """As test_sim_found's keyed case, for an Each input: a full pass cut
     short after its first key, the upstream changing, the firing resuming it
     — the change is delivered, and only then is the partition drained."""

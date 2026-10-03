@@ -30,7 +30,7 @@ from solera_server.planning import (
     size,
 )
 
-from .test_engine import drive, make_engine, state  # noqa: F401
+from .engines import drive, make_engine
 
 UTC = dt.UTC
 
@@ -101,7 +101,7 @@ def test_membership_and_size_agree_with_the_enumeration():
     assert size(big, now, partitions) == 1_000_000 > MAX_PARTITIONS  # counted, not listed
 
 
-async def test_a_fan_in_reads_the_heads_that_exist(state):  # noqa: F811
+async def test_a_fan_in_reads_the_heads_that_exist(state):
     """Engine review round 2 #7: an AllPartitions read over a million-partition
     domain pins the heads that exist and agree with the consumer's shared keys
     — it never lists the domain. Building upstream does, and is refused."""
@@ -216,7 +216,7 @@ def test_an_empty_fan_in_is_missing():
     assert planned("rollup", skip_missing_inputs=True) == ["d1"]
 
 
-async def test_a_fan_in_reads_only_current_partitions(state):  # noqa: F811
+async def test_a_fan_in_reads_only_current_partitions(state):
     """Review round 3 (engine B2, system B2): a retired partition's head is
     kept for inspection but no fan-in reads it — not AllPartitions, not a
     dep across the dimension, not a missing-input check."""
@@ -280,7 +280,7 @@ def test_latest_and_changes_are_counted_before_they_are_listed():
     assert len(planner.plan_run(["daily"])["tasks"]) == 400  # the latest day, every `a`
 
 
-async def test_an_onchange_firing_is_one_run_in_order(state):  # noqa: F811
+async def test_an_onchange_firing_is_one_run_in_order(state):
     """Review round 3 (engine B1): a firing is one run over every target, so
     a target that reads another waits for it; an automation that names
     `partitions` runs those, not the change's projection."""
@@ -352,7 +352,7 @@ def test_linking_a_run_is_linear():
     assert cooked_7["deps"] == [f"{run['id']}/raw:k=k00007,site=east", f"{run['id']}/raw:k=k00007,site=west"]
 
 
-async def test_a_source_change_fans_out_over_a_partitioned_consumer(state):  # noqa: F811
+async def test_a_source_change_fans_out_over_a_partitioned_consumer(state):
     @asset(
         partitions={"site": StaticPartitions(["a", "b"])},
         deps=["prices"],
@@ -372,7 +372,7 @@ async def test_a_source_change_fans_out_over_a_partitioned_consumer(state):  # n
     assert partitions == ["a", "b"] and not state.model.automations["report.onchange.0"]["pending"]
 
 
-async def test_a_change_during_a_run_is_kept_for_after_it(state):  # noqa: F811
+async def test_a_change_during_a_run_is_kept_for_after_it(state):
     from solera_server.executors.inline import InlinePlacement
 
     release, calls = asyncio.Event(), []
@@ -405,7 +405,7 @@ async def test_a_change_during_a_run_is_kept_for_after_it(state):  # noqa: F811
     assert len(calls) == 2  # v2 was processed
 
 
-async def test_unkeyed_source_commits_over_http(state):  # noqa: F811
+async def test_unkeyed_source_commits_over_http(state):
     @asset(deps=["matrix"])
     def report():
         return [1]

@@ -13,7 +13,7 @@ from solera.sdk import Each, Output, Project, Ref, RegistrationError, Result, Re
 from solera.stores import Patch
 
 from ..conftest import whole
-from .test_engine import drive, make_engine, state, status_of, task_statuses  # noqa: F401
+from .engines import drive, make_engine, status_of, task_statuses
 
 
 class Unprocessable(Rejected):
@@ -56,7 +56,7 @@ def files_project(content, fn, *, written=None, **input):
     return Project(assets=[files, parse])
 
 
-async def test_one_call_per_key_many_rows_one_write(state):  # noqa: F811
+async def test_one_call_per_key_many_rows_one_write(state):
     """Each key's call returns its rows; the store takes every key's group
     in one write. A file that parses to nothing has no key in the output —
     a key with no rows does not exist — while its outcome says it was
@@ -84,7 +84,7 @@ async def test_one_call_per_key_many_rows_one_write(state):  # noqa: F811
     assert attempt["keys"] == {"ok": 3}
 
 
-async def test_failures_are_recorded_and_never_block(state):  # noqa: F811
+async def test_failures_are_recorded_and_never_block(state):
     content = {
         "good.csv": {"text": "1"},
         "empty.csv": {"text": "reject"},
@@ -137,7 +137,7 @@ async def test_failures_are_recorded_and_never_block(state):  # noqa: F811
     assert engine.m.partition("parse", "")["failures"]["counts"] == {"retrying": 1}
 
 
-async def test_removed_keys_lose_their_rows(state):  # noqa: F811
+async def test_removed_keys_lose_their_rows(state):
     content = {"a": {"text": "1"}, "b": {"text": "2"}}
 
     def parse(file: dict):
@@ -152,7 +152,7 @@ async def test_removed_keys_lose_their_rows(state):  # noqa: F811
     assert set(await rows_of(engine, project, "samples")) == {"b"}
 
 
-async def test_transient_key_retried_when_due(state):  # noqa: F811
+async def test_transient_key_retried_when_due(state):
     """A transient key is retried once its `retry_after` has passed — on the
     engine's clock, which the test moves instead of waiting on the wall."""
 
@@ -181,7 +181,7 @@ async def test_transient_key_retried_when_due(state):  # noqa: F811
     assert record["passes"] == 1
 
 
-async def test_failed_keys_get_one_try_per_deploy(state):  # noqa: F811
+async def test_failed_keys_get_one_try_per_deploy(state):
     tries = {"n": 0}
 
     def parse(file: dict):
@@ -205,7 +205,7 @@ async def test_failed_keys_get_one_try_per_deploy(state):  # noqa: F811
     assert (await records(engine, "parse"))["a"].tries == 2
 
 
-async def test_forced_retry_takes_each_key_once(state):  # noqa: F811
+async def test_forced_retry_takes_each_key_once(state):
     tries = {"n": 0}
 
     def parse(file: dict):
@@ -236,7 +236,7 @@ async def test_forced_retry_takes_each_key_once(state):  # noqa: F811
     assert tries["n"] == 3 and engine.m.partition("parse", "")["failures"]["counts"] == {}
 
 
-async def test_abort_fails_the_attempt_and_commits_nothing(state):  # noqa: F811
+async def test_abort_fails_the_attempt_and_commits_nothing(state):
     def parse(file: dict):
         if file["text"] == "x":
             raise Abort("credentials expired")
@@ -257,7 +257,7 @@ async def test_abort_fails_the_attempt_and_commits_nothing(state):  # noqa: F811
     assert ("samples", "") not in engine.m.heads and "failures" not in engine.m.partition("parse", "")
 
 
-async def test_concurrency_and_batches(state):  # noqa: F811
+async def test_concurrency_and_batches(state):
     live = {"now": 0, "max": 0}
     batches = []
 
@@ -279,7 +279,7 @@ async def test_concurrency_and_batches(state):  # noqa: F811
     assert len(await rows_of(engine, project, "samples")) == 7
 
 
-async def test_multi_output_result_and_keyed_values(state):  # noqa: F811
+async def test_multi_output_result_and_keyed_values(state):
     @asset(outputs=Output("files", keyed=True))
     def files():
         return {"a": 1, "b": 2}
@@ -379,7 +379,7 @@ async def test_a_user_cancel_commits_finished_keys_and_leaves_the_rest_dormant(t
     await opened.close()
 
 
-async def test_a_retry_pass_spans_batches_and_accumulates_its_bounds(state):  # noqa: F811
+async def test_a_retry_pass_spans_batches_and_accumulates_its_bounds(state):
     """Retry batches walk the failed keys `batch_size` keys at a time,
     alternating with change batches; the pass's accumulators become the exact
     bounds when it completes (§9)."""
@@ -415,7 +415,7 @@ async def test_a_retry_pass_spans_batches_and_accumulates_its_bounds(state):  # 
     assert len(await rows_of(engine, project, "samples")) == 6
 
 
-async def test_the_retry_clock_runs_automated_assets(state):  # noqa: F811
+async def test_the_retry_clock_runs_automated_assets(state):
     from solera.sdk import Automation, Every
 
     tries = {"n": 0}
@@ -486,7 +486,7 @@ async def test_a_timeout_drain_counts_a_try_and_comes_due(tmp_path):
     await opened.close()
 
 
-async def test_patterns_select_keys_and_a_batch_of_none_is_skipped(state):  # noqa: F811
+async def test_patterns_select_keys_and_a_batch_of_none_is_skipped(state):
     from solera import Incremental
 
     content = {"ICP/a.csv": {"n": 1}, "ICP/archive/b.csv": {"n": 2}, "XRF/c.csv": {"n": 3}}
@@ -530,7 +530,7 @@ async def test_patterns_select_keys_and_a_batch_of_none_is_skipped(state):  # no
     assert calls == [["XRF/c.csv"]] and task_statuses(detail)["plain"] == "skipped"
 
 
-async def test_a_pattern_change_cuts_over(state):  # noqa: F811
+async def test_a_pattern_change_cuts_over(state):
     """§11: changes up to the pattern change finish under the old patterns — so a
     pending deletion of a newly excluded key still removes its rows — then
     membership is diffed against the snapshot at the pattern change, then deltas
@@ -582,7 +582,7 @@ async def test_a_pattern_change_cuts_over(state):  # noqa: F811
     assert seen == ["b/5.csv"]
 
 
-async def test_a_rescope_pins_its_snapshot_between_attempts(state):  # noqa: F811
+async def test_a_rescope_pins_its_snapshot_between_attempts(state):
     """The snapshot a pattern change diffs is read across attempts: index files it
     names stay until the transition ends, even with no attempt running."""
 
@@ -611,7 +611,7 @@ async def test_a_rescope_pins_its_snapshot_between_attempts(state):  # noqa: F81
     assert await state.get_object(path) is None
 
 
-async def test_none_is_no_change_and_removal_is_explicit(state):  # noqa: F811
+async def test_none_is_no_change_and_removal_is_explicit(state):
     """D7: an output an Each call returns as None (or omits) keeps its
     previous content for that key; `Patch(None, remove=[ctx.key])` removes
     the key; a Patch for anything else fails the call."""
@@ -644,7 +644,7 @@ async def test_none_is_no_change_and_removal_is_explicit(state):  # noqa: F811
     assert (await records(engine, "parse"))["c"].outcome == FAILED
 
 
-async def test_a_last_batch_that_writes_nothing_still_completes_the_partition(state):  # noqa: F811
+async def test_a_last_batch_that_writes_nothing_still_completes_the_partition(state):
     """Review round 3 (system B1): one key a batch, `a` writes rows, `b`
     fails — so the last batch writes no output. The pass drained all the
     same: the partition is complete, kept out of `missing`, and its head is
