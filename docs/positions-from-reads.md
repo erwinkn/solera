@@ -1,12 +1,11 @@
 # Positions from what was read (design note, K43, K45)
 
 Status: **approved** by Erwin (K43, amended by K45 and its read-ahead
-entries, K46), and **built**: the plain incremental read-ahead and the full
-pass across runs, staleness as three predicates. On hold: `each=True`
-per-key records (Positions.tla found K45's snapshot plus read-ahead as
-precise in a 1:1 chain). Waiting: exact presence at the position (K44's
-added and updated, a net "behind"), for a design study. It supersedes
-K36–K42 and K40's wording.
+entries, K46, K47), and **built**: one record for every asset, `each=True`
+included (a position and read-ahead entries, no per-key payloads), the
+full pass across runs, staleness as three predicates. Waiting: exact
+presence at the position (K44's added and updated, a net "behind"), for
+the key-index redesign. It supersedes K36–K42 and K40's wording.
 
 ## Units
 
@@ -49,7 +48,7 @@ for incremental reads: not a second source of truth.
 
 | Input unit | Record | Where | Exists today? |
 |---|---|---|---|
-| upstream key (`each=True`) | the generation of the input key the output key was built from | the output key index entry's payload (v3 has one) | no: the one new datum |
+| upstream key (`each=True`) | nothing of its own: derived from the position and the read-ahead (K47) | — | — |
 | upstream partition, incremental input | the position: `next`, the pass under way, the patterns | partition record | yes, but moved by the plan (below) |
 | upstream partition, incremental input, keys read ahead | the read-ahead: `[commit, run, attempt]` per `keys=` run since the last pass (K45) | the position, capped at 10,000 entries | yes |
 | upstream partition, whole or dep input | the head generation read (a digest of the refs, for a fan-in) | partition record | folded into the fingerprint's digest today |
@@ -113,40 +112,46 @@ locates the spec), and stores no per-key version. The record is snapshot
   batch planned under the old patterns commits a position that names them,
   so the next plan finds the change and diffs.
 
-`each=True` keeps per-key records in its output's key index instead, with
-no cap.
+**One record for every asset** (K47). `each=True` keeps the same record:
+its `keys=` runs are read-ahead entries, counted by the cap, and its stale
+keys are derived from it key by key (below). Positions.tla found the
+snapshot plus read-ahead exactly as precise as per-key records in a 1:1
+chain, so the key index stores no consumer payload. A retry pass (an
+`each` asset's failed keys) whose last batch finds nothing past the
+snapshot undelivered, read ahead or read by that batch, collapses the
+record as a default run does. As built it seldom has to: a `keys=` run
+that leaves nothing uncovered collapses the record itself, so entries stay
+only while some changed key is undelivered, which a retry pass, reading
+failed keys at their failed version, does not read.
 
-An `each=True` key's shared whole or dep inputs need no payload: they
-are pinned at the claim, and the key's own generation `g` is the event
-counter at its claim, so the key read every shared head committed before
-`g`, and is stale exactly for a head committed after it.
-
-Why a per-key payload, and not the output key's own generation: an
-upstream key can change between a run's read and its commit. Its version
-is then older than the output key's generation, yet the run never read
-it, so comparing the two generations would miss the change.
+A full pass records the claim generation that `began` it. Entries
+recorded before a start-over stay in the record, but count toward the
+pass only from `began` on: a start-over owes every key again, while an
+older entry still says what a key was read at, which keeps a key read
+under the old definition from looking never delivered. An entry also
+stops counting once a whole or dep input it read commits again (it read
+the old one). Within a full pass, a `keys=` run skips a named key the
+pass already delivered at its current version, read ahead or walked:
+nothing twice. For `each=True`, it covers (and collapses the record)
+only if the output and its failed keys hold no key the pass's reconcile
+would remove, except keys the run names: it removes those itself (R2).
 
 ## Runs target only what input units allow
 
 - `partitions=` always: a partition is an output unit or holds them.
-- `keys=` on any keyed incremental input: per key for `each=True`; for a
-  plain input, through the read-ahead above (K45 replaced K43's refusal).
+- `keys=` on any keyed incremental input, `each=True` included, through
+  the read-ahead above (K45 replaced K43's refusal; K47, one record).
 
 ## How runs update records, and positions follow
 
 Position at 56, upstream head at 60. Commits 56–60 touched `k1`, `k2`,
 `k3`.
 
-- **`each=True`, `keys=("k1","k2")`.** The run reads both at 60. `k1`'s
-  and `k2`'s payloads now hold the generations read, so they are not
-  stale; `k3` still is. The position is the first commit past which some
-  key under the patterns is newer than its record, so it stays at 56. A
-  later `keys=("k3",)` covers the rest: at its commit, every key the
-  delta log holds past 56 is current, and the position moves to 61. The
-  check reads only the delta past the position. After a reset there is
-  no position, and the check reads the whole upstream index once, so it
-  is bounded: tried only when the selection is as large as the index's
-  key count.
+- **`each=True`, `keys=("k1","k2")`.** The same record as any asset: the
+  run is delivered both as of 60, and the position becomes snapshot 56
+  plus `[60, run, attempt]`; `k3` is stale, `k1` and `k2` are not. A later
+  `keys=("k3",)` leaves nothing past 56 undelivered, and the record
+  collapses to snapshot 61.
 - **Not `each`, `partitions=("P1",)`.** A partition rerun reads its input
   unit whole, so P1's records update as any default run's do, and P1 is
   current. Today already works this way.
@@ -208,11 +213,19 @@ What can be stale is what was built since its outputs' last reset: a
 head, or a commit (a `keys=` run that took no key included). Never built,
 or reset since, it is missing.
 
-- **key** (`each=True`): its input key's current generation differs from
-  its payload (or the key is missing, or removed upstream); or a shared
-  whole or dep head was committed after the key's generation; or its
-  asset changed after it was written.
-- **partition**: one of its keys is stale (`each=True`). Otherwise a key
+- **key** (`each=True`), from the one record: with a snapshot, a key the
+  patterns take changed past `next`, read by no entry at or after its
+  change (removed: only if the output holds it); with a full pass due or
+  under way (no position, an upstream reset no pass has delivered yet,
+  its definition changed, a whole or dep input moved), every key under
+  the patterns the pass has not delivered at its current version, and
+  every key the output holds the upstream has not; and along an each
+  chain, the keys whose upstream key is stale. Its reasons are its
+  keys': `definition changed` while the output holds a key, present
+  upstream, whose generation (its writer's claim) is before the change;
+  `input changed` while a key is stale as if the definition had not
+  changed: a pass the change made due reads as the snapshot it left.
+- **partition**: the reasons above (`each=True` alike). A key
   under the patterns changed, appeared or disappeared upstream past the
   position (K39); or a whole or dep head differs from its record; or
   `caught_up_at` is before `changed_at`. A keyed output that is not
@@ -255,8 +268,8 @@ comparison: the work it would do is exactly the stale part.
 - **Pattern changes.** A pattern change is an asset change, so every unit
   is stale until it reads again under the new patterns. The position's
   diff pass keeps its old/new split.
-- **Retry passes.** An `each` key that failed was read, so its payload
-  holds what it read. Its failure record keeps it due: failing, not
-  stale.
+- **Retry passes.** An `each` key that failed was read, so its entry, or
+  the pass it failed in, covers it. Its failure record keeps it due:
+  failing, not stale.
 - **Repairs after a writer died.** A dead attempt committed nothing, so
   its reads update no record. A repair moves no record. Unchanged.

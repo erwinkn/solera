@@ -760,14 +760,17 @@ class Engine(Attempts, Sensors, Staleness, Views):
         `keys=` runs read and the latest upstream generation one read it at:
         the entries name the attempts, whose immutable specs list the keys.
         Read only when there are entries, the specs together; a spec gone is
-        an entry lost, whose keys the next pass delivers again."""
+        an entry lost, whose keys the next pass delivers again. With a full
+        pass under way, only the entries claimed since it began: it owes
+        every key again."""
 
-        entries = {
-            param: position["ahead"]
-            for param in (self.manifest["assets"][task["asset"]].get("inputs") or {})
-            if (position := self.m.position(task["asset"], param, task["partition"]))
-            and position.get("ahead")
-        }
+        entries, began = {}, {}
+        for param in self.manifest["assets"][task["asset"]].get("inputs") or {}:
+            position = self.m.position(task["asset"], param, task["partition"])
+            if position and position.get("ahead"):
+                entries[param] = position["ahead"]
+                if (position.get("pass") or {}).get("mode") == "full":
+                    began[param] = int(position["pass"].get("began") or 0)
         if not entries:
             return {}
         listed = sorted({(run, attempt) for ahead in entries.values() for _, run, attempt in ahead})
@@ -780,10 +783,13 @@ class Engine(Attempts, Sensors, Staleness, Views):
         for param, ahead in entries.items():
             read = out[param] = {}
             for _, run, attempt in ahead:
-                pin = ((specs[(run, attempt)] or {}).get("inputs") or {}).get(param)
+                spec = specs[(run, attempt)] or {}
+                pin = (spec.get("inputs") or {}).get(param)
                 if pin is None:
                     log.warning("%s: the spec of read-ahead attempt %s is gone", task["asset"], attempt)
                     continue
+                if int(spec.get("generation") or 0) < began.get(param, 0):
+                    continue  # read before the pass under way began
                 generation = int(pin["ref"].get("generation") or 0)
                 for key in pin["batch"]["keys"]:
                     read[key] = max(read.get(key, -1), generation)
@@ -877,7 +883,16 @@ class Engine(Attempts, Sensors, Staleness, Views):
                 plan.update(run=run["id"], attempt=attempt)
             if input.spec.get("each") is not None:
                 pin, plan, empty = self._each_plan(
-                    task, asset, param, input.spec, ref, upstream_partition, pin, plan, empty
+                    task,
+                    asset,
+                    param,
+                    input.spec,
+                    ref,
+                    upstream_partition,
+                    pin,
+                    plan,
+                    empty,
+                    (ahead or {}).get(param),
                 )
                 each_page = pin["each"]
             pins[param] = pin
@@ -1077,17 +1092,19 @@ class Engine(Attempts, Sensors, Staleness, Views):
             )
         return {input.key(s): h["ref"] for s, h in planner.fan_in(input, materialized=True).items()}
 
-    def _selection(self, task, input, ref, upstream_partition, fingerprint, run, position, override, ahead):
+    def _selection(
+        self, task, input, ref, upstream_partition, fingerprint, run, position, override, ahead, began
+    ):
         """A keys= selection of a keyed incremental input (K43, K45): the pin
         for the spec, the plan its commit `advance`s by, and whether it has
         nothing to deliver. The input's patterns still decide what it takes
         (§11), and it moves no `next` but by collapsing its read-ahead.
 
-        - `each`: the named keys as of the head, written or removed where the
-          upstream has none (R2); its output's keys record what they read.
-        - A plain input with a fresh snapshot: the named keys' changes past
+        Every input alike, `each` ones too: one record, position and read-ahead (K47).
+
+        - A fresh snapshot: the named keys' changes past
           `next` its read-ahead lacks, recorded in the read-ahead.
-        - A plain input with a full pass due (no position, an asset change or
+        - A full pass due (no position, an asset change or
           reset, a log that no longer holds the delta) or under way: it starts
           that pass over with the named keys, or continues it; recorded like
           any read-ahead entry, with the pass as its base.
@@ -1104,9 +1121,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
         pin = {"ref": ref, "batch": {"keys": keys, "full": False}, "index": index.slice().to_json()}
         if input.get("patterns") is not None:
             pin["patterns"] = input["patterns"]
-        plan = {"kind": "selection", "output": output, "position": None, "head": head_commit, "per_key": each}
-        if each:
-            return pin, plan, not keys
+        plan = {"kind": "selection", "output": output, "position": None, "head": head_commit}
         fresh = (
             position is not None
             and position.get("fingerprint") == fingerprint
@@ -1121,7 +1136,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
             return pin, plan, not keys  # a pattern change decides membership first: merged, recorded nowhere
         if position is not None and len(position.get("ahead", ())) >= self.read_ahead_cap:
             raise NonRetryable(f"{task['asset']}: {self.READ_AHEAD_FULL}")
-        if ahead:
+        if ahead and fresh:  # a start-over owes every key again: what was read before is not of it
             pin["ahead"] = ahead
         if fresh and pass_.get("mode") != "full":
             lo = int(position["next"])
@@ -1140,14 +1155,27 @@ class Engine(Attempts, Sensors, Staleness, Views):
                 "upstream_partition": upstream_partition,
                 "fingerprint": fingerprint,
                 "reset_by": run["id"],
-                "next": head_commit + 1,
-                "pass": {"mode": "full", "from": head_commit + 1, "at": None, "batch": 0},
+                "next": int(position["next"]) if position is not None else head_commit + 1,
+                "pass": {"mode": "full", "from": head_commit + 1, "at": None, "batch": 0, "began": began},
             }
+            if (position or {}).get("ahead"):  # kept: what keys were read, if under another definition
+                base["ahead"] = position["ahead"]
             base["pass"]["batches"] = _batches(index.count, limit)
+            if each:  # an Each output may hold keys the pass will not name: cleaned up after (§11)
+                held = [o["name"] for o in self.manifest["assets"][task["asset"]]["outputs"]]
+                base["pass"]["reconcile"] = any(self.m.index(n, task["partition"]).count for n in held)
             if input.get("patterns") is not None:
                 base["patterns"] = input["patterns"]
         d = base["pass"]
         pin["batch"].update({"full": True, "scan": True, "index": d["batch"], "count": d.get("batches", 1)})
+        if each:  # an Each output keeps its keys through a start-over: a named key gone upstream goes (R2)
+            pin["batch"]["removes"] = True
+            if d.get("reconcile"):  # what its reconcile would walk: the pass covers only once none is left
+                names = [o["name"] for o in self.manifest["assets"][task["asset"]]["outputs"]] + [
+                    f"@{task['asset']}"
+                ]
+                held = [self.m.index(n, task["partition"]) for n in names]
+                pin["batch"]["held"] = [i.slice().to_json() for i in held if i.count or i.files]
         if d.get("at") is not None:  # what the pass's own batches delivered, and as of when
             pin["batch"]["walked"] = {"at": d["at"], "generation": d.get("read_from", 0)}
         plan["position"] = base
@@ -1196,9 +1224,10 @@ class Engine(Attempts, Sensors, Staleness, Views):
         override = (run.get("keys") or {}).get(output)
         position = self.m.position(task["asset"], param, task["partition"])
         each = input.get("each") is not None
+        began = claim_generation if claim_generation is not None else self.m.event_counter
         if isinstance(override, dict) and "keys" in override:
             return self._selection(
-                task, input, ref, upstream_partition, fingerprint, run, position, override, ahead
+                task, input, ref, upstream_partition, fingerprint, run, position, override, ahead, began
             )
         first = int(head.get("base", 0))
         # A `full` run or a keys="full" override starts one pass per run, which the
@@ -1218,7 +1247,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
             "fingerprint": fingerprint,
             "reset_by": run["id"] if reset else position.get("reset_by"),
         }
-        if not reset and position.get("ahead"):
+        if position is not None and position.get("ahead"):  # a start-over keeps them too, before `began`
             carried["ahead"] = position["ahead"]
         current = None if reset else position.get("pass")
 
@@ -1257,7 +1286,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
                 "at": head_commit,
                 "generation": latest_generation,
                 "snapshot": index.slice().to_json(),
-                "pin": claim_generation if claim_generation is not None else self.m.event_counter,
+                "pin": began,
             }
         if pattern_change is not None:
             carried["patterns"], carried["pattern_change"] = pattern_change["old"], pattern_change
@@ -1286,7 +1315,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
         if current is None and reset:
             # A full pass of an Each input ends with a cleanup of the keys it no
             # longer names — needed only if the asset held keys when it began (§11).
-            current = {"mode": "full", "from": head_commit + 1, "at": None}
+            current = {"mode": "full", "from": head_commit + 1, "at": None, "began": began}
             if each:
                 current["reconcile"] = any(self.m.index(name, task["partition"]).count for name in held)
             # A full pass starts its consumer over, keys or none: a plain producer is
@@ -1308,6 +1337,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
                 "mode": "full",
                 "from": head_commit + 1,
                 "at": None,
+                "began": began,
                 **({"reconcile": True} if each else {}),
             }
             empty = False
@@ -1334,7 +1364,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
         batch = {**span, "limit": limit, "index": current["batch"], "count": current["batches"]}
         read = current["generation"] if not whole else latest_generation  # a full pass reads the head
         pin = {"ref": {**ref, "generation": read}, "index": pinned.to_json(), "batch": batch}
-        if ahead:  # what keys= runs read ahead, past `next` or within this pass: skipped (K45)
+        if ahead and not reset:  # what keys= runs read ahead, past `next` or within this pass: skipped (K45)
             pin["ahead"] = ahead
         if whole and "read_from" not in current:  # the pass's own batches read at or after this
             current["read_from"] = latest_generation
@@ -1366,7 +1396,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
             or self._forced_at(record) > int(record.get("done_forced") or 0)
         )
 
-    def _each_plan(self, task, asset, param, input, ref, upstream_partition, pin, plan, empty):
+    def _each_plan(self, task, asset, param, input, ref, upstream_partition, pin, plan, empty, ahead=None):
         """An Each input's batch: the changes of its pass, or the keys its
         failed keys has due again. When both are pending they alternate —
         neither starves, and there is no fraction to tune (§9). A full
@@ -1378,13 +1408,14 @@ class Engine(Attempts, Sensors, Staleness, Views):
         position = self.m.position(task["asset"], param, task["partition"])
         whole = plan["kind"] == "keys" and plan["pass"]["mode"] == "full"
         # After a full pass, the output's keys it no longer names go first (§11).
-        reconcile = None if whole else (position or {}).get("reconcile")
+        selecting = plan["kind"] == "selection"  # a keys= run: changes, never a retry or a cleanup
+        reconcile = None if whole or selecting else (position or {}).get("reconcile")
         # A full pass reprocesses every key, a pattern change and its cleanup
         # decide which keys are the input's: retries wait for them to end.
         transition = (
             whole or "pattern_change" in ((plan or {}).get("position") or {}) or reconcile is not None
         )
-        retries = not transition and self._has_retries(record)
+        retries = not transition and not selecting and self._has_retries(record)
         if reconcile is not None:
             kind = "reconcile"
         elif changes and retries:
@@ -1447,6 +1478,22 @@ class Engine(Attempts, Sensors, Staleness, Views):
                 "position": position,
                 "each": {"kind": "retry", "pass": retry, "changes": changes},
             }
+            latest = int(
+                (self.m.heads.get((input["output"], upstream_partition)) or {}).get("commit_number", -1)
+            )
+            if position is not None and position.get("ahead") and "pass" not in position:
+                # The pass's last batch says whether, its keys read, nothing past the snapshot
+                # is left undelivered: then the record collapses, as after a default run (K47).
+                lo = int(position["next"])
+                index = self.m.index(input["output"], upstream_partition)
+                if lo <= latest and index.covers(lo, latest):
+                    pin["cover"] = {
+                        "from": lo,
+                        "to": latest,
+                        "index": index.slice(lo, latest).to_json(),
+                        "ahead": ahead or {},
+                    }
+                    plan["head"] = latest
             return pin, plan, False
         pin = {**pin, "each": each}
         batch = {"kind": "changes", "retries": retries, "pass": retry}
@@ -1651,6 +1698,11 @@ class Engine(Attempts, Sensors, Staleness, Views):
             if plan["kind"] == "selection":  # whether it left anything undelivered (K45)
                 covered[param] = bool((delivered.get(param) or {}).get("covers"))
                 plan = {**plan, "covers": covered[param]}
+            elif plan["kind"] == "held" and "head" in plan and (delivered.get(param) or {}).get("covers"):
+                # A retry pass that left nothing past the snapshot undelivered collapses the
+                # record, as a default run does (K47).
+                done = {k: v for k, v in plan["position"].items() if k != "ahead"}
+                plan = {**plan, "position": {**done, "next": max(int(done["next"]), int(plan["head"]) + 1)}}
             if plan["kind"] == "keys":  # a key batch reports where it stopped
                 if param not in delivered:
                     raise Conflict(f"input {param}: the result reports nothing delivered", retryable=False)

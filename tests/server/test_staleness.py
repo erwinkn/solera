@@ -306,7 +306,6 @@ Staleness.TestCase.settings = settings(
 )
 
 
-@per_key
 def test_staleness_matches_the_reference_over_any_history():
     Staleness.TestCase().runTest()
 
@@ -329,7 +328,6 @@ async def _built(state, tmp_path, keys, **decl):
     return engine, outside
 
 
-@per_key
 async def test_keys_runs_after_an_upstream_reset_merge_and_together_catch_up(state, tmp_path):
     """The coordinator's example (R2, R4): `items` is reset; `checks` holds
     k1, k2, k3. keys=(k1, k2) updates those two, leaves k3 untouched and
@@ -359,7 +357,6 @@ async def test_keys_runs_after_an_upstream_reset_merge_and_together_catch_up(sta
     assert await index_entries(state, "checks", "") == settled, "the next default run writes nothing"
 
 
-@per_key
 async def test_a_reset_output_holds_only_what_keys_runs_wrote_until_a_default_run(state, tmp_path):
     """R6: `checks` itself reset (moved) starts empty; keys=(k1) leaves k1
     alone in it, stale keys {k2, k3} (missing); a default run converges."""
@@ -394,7 +391,6 @@ async def test_an_unkeyed_partition_stays_stale_until_it_reruns(state, tmp_path)
     assert not await staleness.asset_stale(engine, "count")
 
 
-@per_key
 async def test_a_commit_of_excluded_keys_alone_leaves_their_consumers_fresh(state, tmp_path):
     """K39's calibration: `items` commits only `x1`, which `checks` and `copy`
     exclude: neither is stale (the plain "position behind" rule says both
@@ -416,7 +412,6 @@ async def test_a_commit_of_excluded_keys_alone_leaves_their_consumers_fresh(stat
     assert await staleness.partition_stale(engine, "copy")
 
 
-@per_key
 async def test_a_shared_input_change_makes_every_key_stale(state, tmp_path):
     """`knob`, a dep every key of `checks` shares, changes: every key is
     stale, though no upstream key changed; keys= runs covering them all
@@ -574,7 +569,6 @@ async def test_a_full_pass_after_an_asset_change_may_take_several_runs(state, tm
     assert await run() == (set(), False)
 
 
-@per_key
 async def test_staleness_is_transitive_down_a_chain(state, tmp_path):
     """K46, three levels: `feed` commits k2 and `items` has not rerun.
     `items` is stale ("input changed"); `copy`, `count` and every key of

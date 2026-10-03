@@ -158,10 +158,27 @@ async def read_batch(pin: dict, keys_io) -> Batch:
         upserted = {key_str(k): generation for k, (generation, _) in found.items()}
         # A named key the upstream has not is removed (R2) — but not within a full pass,
         # whose consumer holds only what the pass delivered: never there, never removed.
-        gone = [] if ch.get("scan") else [k for k in named if k not in upserted and taken(k)]
-        batch = Batch({k: e for k, e in upserted.items() if taken(k)}, gone, None, len(named))
+        gone = (
+            []
+            if ch.get("scan") and not ch.get("removes")
+            else [k for k in named if k not in upserted and taken(k)]
+        )
+        upserted = {k: g for k, g in upserted.items() if taken(k)}
+        if ch.get("scan"):  # within a full pass: a key it delivered at this version is not delivered twice
+            walked = ch.get("walked")
+            upserted = {
+                k: g
+                for k, g in upserted.items()
+                if ahead.get(k, -1) < g and not (walked and k <= walked["at"] and g <= walked["generation"])
+            }
+        batch = Batch(upserted, gone, None, len(named))
         if ch.get("scan"):  # a full pass's delivery: whether it leaves any key undelivered (K45)
             batch.covers = await _covers(index, taken, set(named), ahead, ch.get("walked"))
+            for held in ch.get("held") or ():  # and leaves nothing its reconcile would remove
+                if not batch.covers:
+                    break
+                held = KeyIndex(keys_io, None, IndexState.from_json(held))
+                batch.covers = await _holds_only(held, index, taken, set(named))
         return batch
 
     def kind(entry):
@@ -191,6 +208,23 @@ async def _covers(index, taken, named: set[str], ahead: dict, walked: dict | Non
                 continue
             if walked is not None and key <= walked["at"] and generation <= walked["generation"]:
                 continue
+            return False
+        if after is None:
+            return True
+
+
+async def _holds_only(held, index, taken, named: set[str]) -> bool:
+    """Whether an Each output (or its failed keys) holds no key its reconcile
+    would remove — gone upstream or left out by the patterns — but those
+    this run names, which it removes itself (R2)."""
+
+    after = None
+    while True:
+        keys, _, _, after = await held.page(after, 1000)
+        rest = [k for k in keys if key_str(k) not in named]
+        if any(not taken(key_str(k)) for k in rest):
+            return False
+        if rest and len(await index.lookup(rest)) < len(rest):
             return False
         if after is None:
             return True
@@ -245,7 +279,7 @@ async def read_each_batch(spec: dict, pin: dict, keys_io) -> Batch:
         elif entry[0] == walked[key].upstream:
             upserted[key] = entry[0]
         # else: its upstream was written since — the delta pass brings it, at its new generation
-    return Batch(
+    batch = Batch(
         upserted,
         deleted,
         end,
@@ -254,6 +288,31 @@ async def read_each_batch(spec: dict, pin: dict, keys_io) -> Batch:
         walked=walked,
         priors={k: walked[k] for k in due},
     )
+    if end is None and pin.get("cover"):  # the pass's last batch: is anything past the snapshot left?
+        batch.covers = await _retry_covers(pin["cover"], taken, upserted, set(deleted), keys_io)
+    return batch
+
+
+async def _retry_covers(cover: dict, taken, upserted: dict, deleted: set, keys_io) -> bool:
+    """Whether every key the patterns take changed past the snapshot has been
+    delivered: read ahead at or after its change, or read by this batch
+    (K47: a retry pass that leaves nothing uncovered collapses the record)."""
+
+    ahead = cover.get("ahead") or {}
+    index = KeyIndex(keys_io, None, IndexState.from_json(cover["index"]))
+    pages = index.pending_pages(int(cover["from"]), int(cover["to"]), None, 1000)
+    try:
+        async for keys, generations, gone, _ in pages:
+            for k, generation, removed in zip(keys, generations, gone, strict=True):
+                key = key_str(k)
+                if not taken(key) or ahead.get(key, -1) >= generation:
+                    continue
+                if (removed and key in deleted) or (not removed and upserted.get(key, -1) >= generation):
+                    continue
+                return False
+        return True
+    finally:
+        await pages.aclose()
 
 
 async def _reconcile_batch(spec: dict, pin: dict, keys_io, failures: KeyIndex) -> Batch:
@@ -485,6 +544,8 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
         "upserted": sorted(batch.upserted),
         "deleted": [*batch.deleted, *batch.unmatched],
     }
+    if batch.covers:  # nothing it did not take is left undelivered: the record collapses (K45, K47)
+        delivered["covers"] = True
     return {
         "values": values,
         "delivered": delivered,

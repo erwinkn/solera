@@ -722,7 +722,7 @@ class Model:
                 del self.partitions[key]
                 continue
             if key[0] in producers:  # a new life: never built, so missing, not stale
-                for field in ("caught_up", "caught_up_at", "seen"):
+                for field in ("caught_up", "caught_up_at", "built_at", "seen"):
                     self.partitions[key].pop(field, None)
             positions = self.partitions[key].get("positions")
             if not positions:
@@ -1073,6 +1073,7 @@ class Model:
                     self.garbage.extend([index.path(f["name"]), self.event_counter] for f in intent["files"])
         record = self._partition(asset, partition)
         record.setdefault("caught_up", False)  # built, though maybe not caught up (a keys= run)
+        record.setdefault("built_at", self.event_counter)  # its first commit since its last reset
         if "caught_up" in commit:
             record["caught_up"] = bool(commit["caught_up"])
             if record["caught_up"]:

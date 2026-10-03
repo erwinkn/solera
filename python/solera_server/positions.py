@@ -16,6 +16,7 @@ Each (asset, input, partition) keeps a **position**:
         "batch": int, "batches": int,  # the next batch's index, and how many are planned
         "pin": int,                 # a delta pass's reader pin (lifecycle.md §9.8)
         "reconcile": bool,          # a full Each pass owes a reconcile after (§11)
+        "began": int,               # a full pass: the claim generation that started it
       },
       "patterns": ...,              # keys: the patterns it delivers under (per-key §11)
       "pattern_change": {"old", "new", "at", "snapshot", "pin"},
@@ -41,12 +42,12 @@ batch); or a `selection`, a run's `keys=` selection, which reads the keys it
 names as of one upstream commit and moves neither `next` nor the
 partition's progress.
 
-**The read-ahead** (docs/positions-from-reads.md, K45). A selection of a
-plain incremental input adds `[commit, run, attempt]` to `ahead`: it read
-every key the attempt's spec names as of upstream commit `commit`. The
-next pass skips a changed key some entry read at or after its last change,
-and the entries a new `next` passes collapse into the snapshot. An `Each`
-input keeps per-key records in its output's key index instead.
+**The read-ahead** (docs/positions-from-reads.md, K45, K47). A selection
+adds `[commit, run, attempt]` to `ahead`: it read every key the attempt's
+spec names as of upstream commit `commit`. The next pass skips a changed
+key some entry read at or after its last change, and the entries a new
+`next` passes collapse into the snapshot. An `Each` input keeps the same
+record: no per-key one.
 """
 
 from __future__ import annotations
@@ -59,7 +60,7 @@ def advance(plan: dict, after: str | None = None) -> dict | None:
 
     if plan["kind"] == "selection":
         position = plan.get("position")
-        if position is None or plan.get("per_key"):  # no snapshot to be ahead of, or per-key records
+        if position is None:  # no snapshot to be ahead of
             return None
         if plan.get("covers"):  # nothing is left undelivered: the record collapses to a new snapshot
             done = {k: v for k, v in position.items() if k not in ("pass", "ahead")}
