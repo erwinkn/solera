@@ -318,6 +318,8 @@ class Reference:
                     self.checks.held[k] = (self.up[k], t)
                 else:
                     self.checks.held.pop(k, None)
+            if not self.direct_stale_keys():  # nothing left uncovered: the record collapses
+                self.checks.entries = 0
             return None
         o = self.others[name]
         if len(o.entries) >= self.cap:
@@ -325,8 +327,11 @@ class Reference:
         delivered = keys & self.pending(name)
         start_over = self._deliver(o, delivered)
         o.entries.append((self.last_commit, frozenset(keys)))
-        if o.snapshot is None and not self.pending(name):  # the pass is complete
-            self._complete(o, self.last_commit)
+        if not self.pending(name):  # nothing past the snapshot uncovered: the record collapses
+            if o.snapshot is None:
+                self._complete(o, self.last_commit)
+            else:
+                o.snapshot, o.entries = self.last_commit, []
         return delivered, start_over
 
     def run_default(self, name: str):

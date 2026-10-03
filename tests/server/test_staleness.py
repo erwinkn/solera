@@ -486,18 +486,21 @@ async def test_keys_runs_past_the_read_ahead_cap_are_refused_until_a_default_run
 @per_key
 async def test_keys_runs_on_an_each_asset_count_toward_the_cap_too(state, tmp_path):
     """K47: an each=True asset keeps the same record, so its keys= runs are
-    read-ahead entries and the cap (2 here) counts them; a default run
-    collapses the record, and keys= runs are taken again."""
+    read-ahead entries, and the cap (2 here) counts the ones that leave
+    something uncovered: k1, k2, k3 change; keys=(k1), keys=(k2) leave k3,
+    and a third keys= run is refused until a default run collapses the
+    record."""
 
     outside = External()
     engine = staleness.engine_with_read_ahead_cap(state, project(tmp_path, outside), cap=2)
     await engine.initialize()
-    await boot(engine, outside, {"k1": "1", "k2": "1"})
+    await boot(engine, outside, {"k1": "1", "k2": "1", "k3": "1"})
     await drive(engine, await engine.submit(["checks"]))
+    await _change(engine, outside, upserts=["k1", "k2", "k3"])
     for key in ("k1", "k2"):
         await drive(engine, await engine.submit(["checks"], keys={"items": {"keys": [key]}}))
     with pytest.raises(ValueError, match="run the partition first"):
-        await engine.submit(["checks"], keys={"items": {"keys": ["k1"]}})
+        await engine.submit(["checks"], keys={"items": {"keys": ["k3"]}})
     await drive(engine, await engine.submit(["checks"]))
     await drive(engine, await engine.submit(["checks"], keys={"items": {"keys": ["k1"]}}))
 
@@ -715,9 +718,10 @@ def test_the_reference_reads_the_worked_examples():
     assert ref.run_default("copy") == ({"k3"}, False)  # never k2 again
     ref.commit({"k2", "k3"}, set())
     assert ref.run_keys({"k2", "x1"}, "copy") == ({"k2"}, False)
+    assert len(ref.others["copy"].entries) == 1  # k3 still uncovered
     assert ref.run_keys({"k3"}, "copy") == ({"k3"}, False) and not ref.stale("copy")  # covered
-    assert len(ref.others["copy"].entries) == 2
-    assert ref.run_default("copy") == (set(), False) and ref.others["copy"].entries == []  # collapsed
+    assert ref.others["copy"].entries == []  # nothing left uncovered: collapsed
+    assert ref.run_default("copy") == (set(), False)
     ref.commit({"k2"}, set())  # an entry covers a key only up to the commit it read at
     assert ref.run_keys({"k2"}, "copy")[0] == {"k2"}
     ref.commit({"k2"}, set())
@@ -769,18 +773,20 @@ def test_the_reference_reads_the_worked_examples():
     both.change_asset("count")  # due only to the asset change
     assert both.reasons("count") == {DEF}
 
-    capped = staleness.Reference(takes=taken, cap=2)  # the cap counts keys= runs
-    capped.commit({"k1"}, set())
+    capped = staleness.Reference(takes=taken, cap=2)  # the cap counts keys= runs that leave something
+    capped.change_knob()
+    capped.commit({"k1": "1", "k2": "1", "k3": "1"}, set())
+    for name in ("checks", "copy"):
+        capped.run_default(name)
+    capped.commit({"k1": "2", "k2": "2", "k3": "2"}, set())
+    assert capped.run_keys({"k1"}, "copy") == ({"k1"}, False)
+    assert capped.run_keys({"k2"}, "copy") == ({"k2"}, False)
+    assert capped.run_keys({"k3"}, "copy") == "refused"
     capped.run_default("copy")
     assert capped.run_keys({"k1"}, "copy") == (set(), False)
-    assert capped.run_keys({"k1", "k2"}, "copy") == (set(), False)
-    assert capped.run_keys({"k1"}, "copy") == "refused"
-    capped.run_default("copy")
-    assert capped.run_keys({"k1"}, "copy") == (set(), False)
-    capped.run_default("checks")  # K47: each=True keeps the same record, capped alike
-    capped.run_keys({"k1"})
-    capped.run_keys({"k1"})
-    assert capped.run_keys({"k1"}) == "refused"
+    capped.run_keys({"k1"})  # K47: each=True keeps the same record, capped alike
+    capped.run_keys({"k2"})
+    assert capped.run_keys({"k3"}) == "refused"
     capped.run_default("checks")
     assert capped.run_keys({"k1"}) is None
 
