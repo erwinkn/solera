@@ -1016,7 +1016,6 @@ async def test_an_asset_change_is_built_by_its_automation_or_marked_stale(state,
     assert await status(engine, name) == ["materialized"]  # the marker clears
 
 
-@pytest.mark.xfail(strict=True, reason="F26: open")
 async def test_a_pool_attempt_is_offered_only_once_its_launch_is_durable(state, monkeypatch):
     """F26: a pool attempt was offered to pool workers from the model, where
     `AttemptLaunched` is applied before it is durable. An engine replaced in

@@ -177,6 +177,7 @@ class Live:
     cancel: Cancel | None = None  # the latched cancel record (§2.2)
     finished: bool = False  # the worker said its result is written
     offered_at: float | None = None  # a pool attempt: when discovery first offered it
+    launching: bool = False  # its launch is recorded, not yet durable: no one outside sees it
     lines: deque = field(default_factory=lambda: deque(maxlen=LIVE_LINES))
     log_offset: int = 0
     fresh: bool = False  # launched by this engine process: its first `start` binds unread
@@ -408,7 +409,7 @@ class Attempts:
             found = []
             for record in sorted(self.m.pool.values(), key=lambda r: r["created_at"]):
                 live = self.live.get(record["attempt"])
-                if record["pool"] != pool or (live is not None and live.started):
+                if record["pool"] != pool or (live is not None and (live.started or live.launching)):
                     continue
                 if (self.m.task(record["task"]) or {}).get("status") == "canceled":
                     continue  # being ended
@@ -484,9 +485,13 @@ class Attempts:
         if execution["kind"] == "Pool":
             needs = {k: v for k in ("cpu", "memory", "gpu") if (v := execution["options"].get(k)) is not None}
             event["pool"] = {"name": execution["executor"], "needs": needs}
+        # Launch only what a restarted engine would adopt, never an orphan: until the
+        # launch is durable, pool discovery does not offer it either (F26). If it never
+        # is (this engine was replaced), it never is offered.
+        live.launching = True
         self.state.record(event)
-        # Launch only what a restarted engine would adopt, never an orphan.
         await self.state.durable()
+        live.launching = False
         if execution["kind"] == "Pool":
             self._pool_wake()
         return {"attempt": attempt, "run": task["run"], "objects": self.state.objects_url}
