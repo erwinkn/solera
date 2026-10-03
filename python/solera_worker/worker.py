@@ -920,7 +920,10 @@ class ControlFile:
         attempt, `lost` if another worker does, `ended` if the engine ended
         it or the file is gone."""
 
-        found = await lifecycle.read_control(self.objects, self.run, self.attempt)
+        try:
+            found = await lifecycle.read_control(self.objects, self.run, self.attempt)
+        except lifecycle.Malformed:  # not a file this worker can own: write nothing
+            return lifecycle.ENDED
         while True:
             if found is None or found[0]["state"] == lifecycle.ENDED:
                 return lifecycle.ENDED
@@ -931,7 +934,10 @@ class ControlFile:
                 self.etag = await swap(self.objects, self.path, body, found[1])
                 return lifecycle.OWNED
             except Conflict:  # another worker, or the engine, came first: see which
-                found = await lifecycle.read_control(self.objects, self.run, self.attempt)
+                try:
+                    found = await lifecycle.read_control(self.objects, self.run, self.attempt)
+                except lifecycle.Malformed:
+                    return lifecycle.ENDED
 
     async def move(self, state: str, **fields) -> bool:
         """Swap to `state` from the version this worker last wrote: `False`
@@ -1080,7 +1086,10 @@ async def _await_owner(objects, run: str, attempt: str, poll: float, channel=Non
     `ended` (`not_owner` is no news)."""
 
     while True:
-        found = await lifecycle.read_control(objects, run, attempt)
+        try:
+            found = await lifecycle.read_control(objects, run, attempt)
+        except lifecycle.Malformed:  # nothing an owner of this version wrote: no reason to wait
+            return
         if found is None or found[0]["state"] in lifecycle.FINAL:
             return
         if channel is not None:

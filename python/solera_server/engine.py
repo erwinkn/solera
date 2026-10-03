@@ -140,6 +140,8 @@ class Engine(Attempts, Sensors, Staleness, Views):
         self.registry = registry or Registry(ctx, extra=placements)
         # attempt id -> (run id, asyncio task): attempts this process is driving.
         self.inflight: dict[str, tuple[str, asyncio.Task]] = {}
+        # Attempts whose end failed: (times, not adopted again before this monotonic time).
+        self._crashes: dict[str, tuple[int, float]] = {}
         # attempt id -> set when its run is controlled, so its watcher looks at once.
         self._stirred: dict[str, asyncio.Event] = {}
         # Attempts consuming a local execution slot. Pool attempts only poll
@@ -622,9 +624,12 @@ class Engine(Attempts, Sensors, Staleness, Views):
         """Wait again for attempts launched before a restart (§8): their
         claims are durable, but nothing in this process waits on them yet."""
 
+        now = asyncio.get_running_loop().time()
         for task_id, claim in list(self.m.claims.items()):
             attempt = claim["attempt"]
             if not claim.get("launched") or attempt in self.inflight:
+                continue
+            if self._crashes.get(attempt, (0, 0.0))[1] > now:  # its end failed: backing off
                 continue
             task = self.m.task(task_id)
             launched = task["launched"]
@@ -726,16 +731,27 @@ class Engine(Attempts, Sensors, Staleness, Views):
         task = self.m.task(task_id)
         if claim is None or task is None:
             return
-        with contextlib.suppress(Exception):
+        try:
             if claim.get("launched"):
                 # A sealed result that could not be settled fails with its own evidence:
-                # settling it again would fail again.
-                result = await self.state.attempt_result(task["run"], attempt)
+                # settling it again would fail again. A malformed file has none.
+                try:
+                    result = await self.state.attempt_result(task["run"], attempt)
+                except lifecycle.Malformed:
+                    result = None
                 await self._fail(
                     task_id, attempt, f"engine: {error}", retryable=True, reason="engine", result=result
                 )
             else:
                 self._finish(task, claim, "failed", error=f"engine: {error}", retryable=True, reason="engine")
+            self._crashes.pop(attempt, None)
+        except Exception:
+            # It could not be ended either (its store unreachable, say): adopted again,
+            # but after a back-off, never in a loop (F30; F20's lesson).
+            times, _ = self._crashes.get(attempt, (0, 0.0))
+            wait = min(60.0, 0.5 * 2**times)
+            self._crashes[attempt] = (times + 1, asyncio.get_running_loop().time() + wait)
+            log.exception("attempt %s: ending it failed; adopted again in %.1fs", attempt, wait)
 
     # -- input resolution + Incremental plans (§5, §6, §8) --------------------------
 

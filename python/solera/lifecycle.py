@@ -54,11 +54,43 @@ def control(state: str, **fields) -> bytes:
     return json.dumps({"state": state, **fields}, sort_keys=True, allow_nan=False).encode()
 
 
+class Malformed(ValueError):
+    """A control file no writer of this version would write: its version
+    (`etag`) is kept, so the engine can still end it."""
+
+    def __init__(self, reason: str, etag: str):
+        super().__init__(f"malformed control file: {reason}")
+        self.etag = etag
+
+
+def check_control(data: bytes, etag: str) -> dict:
+    """A control file's body, or `Malformed`: a JSON object in a known state,
+    with what that state adds."""
+
+    try:
+        body = json.loads(data)
+    except (ValueError, UnicodeDecodeError):
+        raise Malformed("not JSON", etag) from None
+    if not isinstance(body, dict):
+        raise Malformed("not an object", etag)
+    state = body.get("state")
+    if state not in (OPEN, OWNED, WRITING, SEALED, ENDED):
+        raise Malformed(f"unknown state {state!r}", etag)
+    if state in (OWNED, WRITING, SEALED) and not isinstance(body.get("worker_id"), str):
+        raise Malformed(f"{state} names no worker", etag)
+    if state == WRITING and not isinstance(body.get("intents", {}), dict):
+        raise Malformed("writing with intents that are not an object", etag)
+    if state == SEALED and not isinstance(body.get("result"), dict):
+        raise Malformed("sealed with no result", etag)
+    return body
+
+
 async def read_control(store, run: str, attempt: str) -> tuple[dict, str] | None:
-    """The attempt's control file and its version, or `None` if there is none."""
+    """The attempt's control file and its version, or `None` if there is
+    none. Raises `Malformed` for one no writer of this version would write."""
 
     found = await read(store, f"{base(run, attempt)}{CONTROL}")
-    return (json.loads(found[0]), found[1]) if found is not None else None
+    return (check_control(*found), found[1]) if found is not None else None
 
 
 # -- the cancel record (§2.2) --------------------------------------------------------

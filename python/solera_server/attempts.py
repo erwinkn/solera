@@ -232,7 +232,7 @@ class Attempts:
     async def _owner(self, run_id: str, attempt: str) -> str | None:
         """The worker that owns the attempt, as its control file says (§2.4)."""
 
-        found = await lifecycle.read_control(self.state.objects, run_id, attempt)
+        found = await self._control_file(run_id, attempt)
         return found[0].get("worker_id") if found is not None else None
 
     async def _bind(self, attempt: str, live: Live, worker_id: str, start: bool = False) -> None:
@@ -545,6 +545,17 @@ class Attempts:
             live.heard(now, "worker")
 
     async def _watch(self, task_id: str, attempt: str, placement, handle, adopted=False):
+        """Follow a launched attempt to its end (`_follow`). A control file no
+        writer of this version would write fails it, retryably, as lost: the
+        engine ends the file on its version, so no worker writes after (F30)."""
+
+        try:
+            return await self._follow(task_id, attempt, placement, handle, adopted)
+        except lifecycle.Malformed as error:
+            log.warning("attempt %s: %s", attempt, error)
+            await self._fail(task_id, attempt, str(error), retryable=True, end="lost", reason="malformed")
+
+    async def _follow(self, task_id: str, attempt: str, placement, handle, adopted=False):
         """Wait for a launched attempt to end, then settle it (§7).
 
         Evidence comes from the worker's reports — over the channel, else
@@ -807,12 +818,14 @@ class Attempts:
         path = f"{lifecycle.base(run_id, attempt)}{lifecycle.CONTROL}"
         for retry in range(6):
             try:
-                found = await lifecycle.read_control(self.state.objects, run_id, attempt)
+                found = await self._control_file(run_id, attempt)
                 while found is not None and found[0]["state"] not in lifecycle.FINAL:
                     body, version = found
                     end = {"engine": self.state.journal.engine, "write": lifecycle.NONE}
                     if body["state"] == lifecycle.WRITING:
                         end.update(write=lifecycle.WRITING, intents=body.get("intents") or {})
+                    elif body["state"] is None:  # malformed: whether it took the gate is unknown
+                        end.update(write=lifecycle.WRITING)
                     self._authority()
                     try:
                         await swap(
@@ -820,7 +833,7 @@ class Attempts:
                         )
                         return {"state": lifecycle.ENDED, **end}
                     except Conflict:  # the worker moved on, or another engine ended it
-                        found = await lifecycle.read_control(self.state.objects, run_id, attempt)
+                        found = await self._control_file(run_id, attempt)
                 return found[0] if found is not None else None
             except LostOwnership:
                 raise
@@ -828,6 +841,15 @@ class Attempts:
                 if retry == 5:
                     raise
                 await asyncio.sleep(0.2 * 2**retry)
+
+    async def _control_file(self, run_id: str, attempt: str) -> tuple[dict, str] | None:
+        """The control file and its version; a malformed one as state None,
+        at its version, so that it can still be ended."""
+
+        try:
+            return await lifecycle.read_control(self.state.objects, run_id, attempt)
+        except lifecycle.Malformed as error:
+            return {"state": None, "malformed": str(error)}, error.etag
 
     async def _fail(
         self,

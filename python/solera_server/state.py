@@ -238,7 +238,13 @@ class State:
         return found[0]["result"] if found is not None and found[0]["state"] == lifecycle.SEALED else None
 
     async def attempt_finished(self, run_id: str, attempt: str) -> bool:
-        return await self.attempt_result(run_id, attempt) is not None
+        """Whether its worker is done with it: a sealed result, or a control file
+        no worker of this version writes — which the engine fails, on reading it."""
+
+        try:
+            return await self.attempt_result(run_id, attempt) is not None
+        except lifecycle.Malformed:
+            return True
 
     async def attempt_log(self, run_id: str, attempt: str, tail: int | None = None) -> bytes:
         """An attempt's log as JSON lines: from the chunks its result lists

@@ -175,3 +175,56 @@ async def test_an_engine_fenced_before_its_launch_is_durable_tells_no_worker(tmp
     assert attempt not in successor["state"].model.attempts
     await engine.stop()
     await successor["state"].close()
+
+
+@pytest.mark.parametrize(
+    "body", [b'{"engine": "e"}', b'{"state": "sealed", "worker_id": "w"}', b"", b"not json"]
+)
+async def test_a_malformed_control_file_fails_its_attempt_and_is_ended(tmp_path, body):
+    """F30: a control file no writer of this version would write — no state,
+    sealed with no result, empty, not JSON — fails its attempt, retryably,
+    ended as lost, with the reason in its error. The engine ends the file on
+    its version, so no worker writes after; the partition runs again."""
+
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = engine_for(state, REMOTE, heartbeat_seconds=0.1)
+    await engine.initialize()
+    run, attempt = await launched(engine, ["remote"])
+    await state.put_object(f"{state.attempt_path(run['id'], attempt)}{lifecycle.CONTROL}", body)
+    await until(engine, lambda: state.model.claimed(attempt) is None)
+    [first, *_] = (await engine.history.attempts(run["id"]))[
+        state.model.attempts.get(attempt) or next(iter(state.model.runs[run["id"]]["tasks"]))
+    ]
+    assert first["id"] == attempt and first["outcome"] == "failed"
+    assert "malformed control file" in first["error"]
+    assert await fence(state, run["id"], attempt) == ("ended", "writing")
+    await engine.stop()
+    await state.close()
+
+
+async def test_an_attempt_that_cannot_be_ended_is_adopted_again_after_a_back_off(tmp_path, monkeypatch):
+    """F30, F20's lesson: a watcher that raises, and whose end fails too, is
+    not restarted in a tight loop: adopted again after a growing back-off."""
+
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = engine_for(state, REMOTE)
+    await engine.initialize()
+    run, attempt = await launched(engine, ["remote"])
+    watched = []
+
+    async def broken(task_id, attempt, placement, handle, adopted=False):
+        watched.append(attempt)
+        raise RuntimeError("a watcher that cannot follow")
+
+    async def unreachable(run_id, attempt):
+        raise OSError("the store does not answer")
+
+    monkeypatch.setattr(engine, "_follow", broken)
+    monkeypatch.setattr(engine, "_end", unreachable)
+    engine.inflight.pop(attempt)[1].cancel()  # its first watcher goes: the next tick adopts it
+    for _ in range(50):  # a second of ticks
+        await engine.tick()
+        await asyncio.sleep(0.02)
+    assert 1 <= len(watched) <= 3 and state.model.claimed(attempt) is not None
+    await engine.stop()
+    await state.close()
