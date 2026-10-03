@@ -6,8 +6,12 @@ against the code: the bug TLC finds without the rule cannot happen."""
 
 import asyncio
 import contextlib
+import json
+import os
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 from solera import lifecycle
 from solera.objects import Conflict, swap
 from solera.sdk import Project, Retry, asset
@@ -16,7 +20,19 @@ from solera_server import attempts
 from solera_server.state import State, Unavailable
 from solera_worker.worker import ENDED, run_attempt
 
-from .test_fence import REMOTE, Fake, Gated, Remote, as_worker, engine_for, fence, launched, own, until
+from .test_fence import (
+    REMOTE,
+    Fake,
+    Gated,
+    Remote,
+    as_worker,
+    engine_for,
+    fence,
+    finish_as_worker,
+    launched,
+    own,
+    until,
+)
 
 
 def writes_to(monkeypatch) -> list[str]:
@@ -228,3 +244,93 @@ async def test_an_attempt_that_cannot_be_ended_is_adopted_again_after_a_back_off
     assert 1 <= len(watched) <= 3 and state.model.claimed(attempt) is not None
     await engine.stop()
     await state.close()
+
+
+async def _with_control_file(tmp_path, body: bytes):
+    """Launch an attempt, put `body` where its control file is (a worker of
+    another version, or a hostile one), and see the run end; then a next
+    run of the asset must still work."""
+
+    import obstore
+
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = engine_for(state, REMOTE, provision_seconds=0.5, heartbeat_seconds=0.1)
+    await engine.initialize()
+    try:
+        run, attempt = await launched(engine, ["remote"])
+        await obstore.put_async(
+            state.objects, f"{state.attempt_path(run['id'], attempt)}{lifecycle.CONTROL}", body
+        )
+        detail = await engine.run_until(run["id"], 10)
+        assert detail["request"]["status"] in ("failed", "succeeded")
+        assert not state.poisoned
+        again, attempt = await launched(engine, ["remote"])
+        await finish_as_worker(state, again["id"], attempt, "remote")
+        assert (await engine.run_until(again["id"], 10))["request"]["status"] == "succeeded"
+    finally:
+        await engine.stop()
+        await state.close()
+
+
+@pytest.mark.xfail(strict=True, raises=(TimeoutError, AssertionError), reason="F32: open")
+async def test_an_open_control_file_naming_a_worker_fails_its_attempt(tmp_path):
+    """F32 (the control-file fuzzer, after F30's fix): an `open` file that
+    names a worker, which no writer writes (a worker swaps to `owned`),
+    left the attempt waiting on that worker past any provisioning deadline:
+    the run never ended and its partition never ran again."""
+
+    await _with_control_file(tmp_path, b'{"state": "open", "worker_id": "w"}')
+
+
+json_values = st.recursive(
+    st.one_of(st.none(), st.booleans(), st.integers(), st.text(max_size=8)),
+    lambda inner: st.one_of(
+        st.lists(inner, max_size=3), st.dictionaries(st.text(max_size=8), inner, max_size=3)
+    ),
+    max_leaves=8,
+)
+control_bodies = st.one_of(
+    st.binary(max_size=40),
+    json_values.map(lambda v: json.dumps(v).encode()),
+    st.fixed_dictionaries(
+        {
+            "state": st.sampled_from(
+                [
+                    lifecycle.OPEN,
+                    lifecycle.OWNED,
+                    lifecycle.WRITING,
+                    lifecycle.SEALED,
+                    lifecycle.ENDED,
+                    "other",
+                    5,
+                ]
+            )
+        },
+        optional={
+            "worker_id": json_values,
+            "write": json_values,
+            "intents": json_values,
+            "result": json_values,
+        },
+    ).map(lambda v: json.dumps(v).encode()),
+)
+
+
+@pytest.mark.skipif(
+    not os.environ.get("SOLERA_FUZZ_EXAMPLES"), reason="a fuzzing campaign: SOLERA_FUZZ_EXAMPLES=N"
+)
+def test_any_control_file_fails_its_attempt_not_the_engine(tmp_path):
+    """Any bytes in a control file, near misses of its shapes included:
+    the run ends, the engine is not poisoned, and the next run works.
+    Seconds per example, so a campaign only (docs/verification.md, "Fuzzing")."""
+
+    import tempfile
+    from pathlib import Path
+
+    @settings(max_examples=int(os.environ.get("SOLERA_FUZZ_EXAMPLES", "0") or 1), deadline=None)
+    @given(body=control_bodies)
+    def check(body):
+        with tempfile.TemporaryDirectory(dir=tmp_path) as d:
+            asyncio.run(_with_control_file(Path(d), body))
+
+    check()
