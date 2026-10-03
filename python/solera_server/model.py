@@ -162,6 +162,7 @@ class Model:
                 "repairs": _nest(self.repairs, 2),
                 "cleanups": _nest(self.cleanups, 2),
                 "reset_at": self.reset_at,
+                "changed_at": self.changed_at,
                 "automations": self.automations,
                 "sensors": self.sensors,
                 "runs": self.runs,
@@ -207,6 +208,10 @@ class Model:
         # (an output) moved to another store. An attempt launched under an earlier
         # one commits nothing of it.
         self.reset_at: dict[str, int] = snap.get("reset_at") or {}
+        # asset -> the event counter of its last change: added (again), renamed,
+        # its declaration changed, or reset. A partition caught up before it is
+        # stale (`stale`), and the deploy owes its OnChange automations a firing.
+        self.changed_at: dict[str, int] = snap.get("changed_at") or {}
         self.automations: dict[str, dict] = snap.get("automations") or {}
         # sensor -> {cursor, accepted}: the last tick that changed something (docs/lifecycle.md §11.4)
         self.sensors: dict[str, dict] = snap.get("sensors") or {}
@@ -523,15 +528,21 @@ class Model:
             self.deploy_number += 1
         previous = (self.manifest or {}).get("outputs") or {}
         assets_before = set((self.manifest or {}).get("assets") or ())
+        declared_before = {a: _declared(self.manifest, a) for a in assets_before}
         self.deploy, self.manifest, self.project = e["deploy"], manifest, e.get("project")
         self._consumed = self._consumed_outputs(manifest)
         renamed, output_map = self._apply_aliases(manifest)
         self._reconcile_tasks(manifest, renamed, output_map, e["at"])
         carried = {old for olds in renamed.values() for old in olds}  # by an alias: not removed
-        lost = self._reset(
+        reset = self._reset(
             {output_map.get(name, name): o.get("store") for name, o in previous.items()},
             assets_before - carried,
         )
+        for asset in manifest["assets"]:
+            olds = [a for a in renamed.get(asset, ()) if a in declared_before]  # renamed by this deploy
+            before = declared_before.get(asset, declared_before.get(olds[0]) if olds else None)
+            if before is None or olds or before != _declared(manifest, asset) or asset in reset:
+                self.changed_at[asset] = self.event_counter
         self._unsubscribe()
         automations = {}
         for name, auto in manifest["automations"].items():
@@ -550,13 +561,6 @@ class Model:
                         record[field] = existing.get(field, record[field])
             automations[name] = record
         self.automations = automations
-        # What a reset took is due again, as a change of its own asset: OnChange
-        # rebuilds it now, not when its upstream next changes — its consumers wait.
-        for asset, partition in sorted(lost):
-            for auto in automations.values():
-                onchange = auto["trigger"]["kind"] == "onchange" and auto["enabled"]
-                if onchange and asset in auto["targets"] and [asset, partition] not in auto["pending"]:
-                    auto["pending"].append([asset, partition])
         self.sensors = {n: s for n, s in self.sensors.items() if n in (manifest.get("sensors") or {})}
         for name, source in manifest["sources"].items():
             if (name, "") not in self.heads:
@@ -653,7 +657,7 @@ class Model:
             if not marks:
                 del self.partitions[key]["bookmarks"]
 
-    def _reset(self, stores: dict[str, str], assets_before: set[str]) -> set[tuple[str, str]]:
+    def _reset(self, stores: dict[str, str], assets_before: set[str]) -> set[str]:
         """A deploy that removes an asset, or removes an output or declares it
         on another store than `stores` says it was on, resets it: what comes
         back under that name, or what the new store holds, is a new one (K10).
@@ -666,8 +670,8 @@ class Model:
         before the reset commits nothing of it (`Engine.commit_attempt`), so
         nothing waits for one in flight. History keeps the records, and
         pending cleanups stay: their objects are still owed (F12, F13, F17,
-        F19, F21). Returns the (asset, partition) pairs that lost a head, due
-        for a rebuild."""
+        F19, F21). Returns the assets whose outputs were reset: changed, so
+        the deploy owes their OnChange automations a firing (`FiringsOwed`)."""
 
         manifest = self.manifest or {}
         outputs, assets = manifest.get("outputs") or {}, manifest.get("assets") or {}
@@ -688,7 +692,6 @@ class Model:
                 return key[0][1:] not in assets
             return key[0] in reset
 
-        lost = {(head.get("asset"), key[1]) for key, head in self.heads.items() if gone(key)}
         for key in [k for k in self.heads if gone(k)]:
             del self.heads[key]
         for key in [k for k in self.repairs if gone(k)]:  # what dead attempts meant to write
@@ -712,7 +715,8 @@ class Model:
                 self.partitions[key]["reset"] = True  # until a full pass catches it up
             if not marks:
                 del self.partitions[key]["bookmarks"]
-        return {(asset, partition) for asset, partition in lost if asset in assets}
+        return producers
+        return producers
 
     def _apply_aliases(self, manifest) -> tuple[dict[str, list[str]], dict[str, str]]:
         """Move everything held under an asset's former names to its current
@@ -1049,6 +1053,7 @@ class Model:
         if "caught_up" in commit:
             record["caught_up"] = bool(commit["caught_up"])
             if record["caught_up"]:
+                record["caught_up_at"] = self.event_counter  # against its asset's `changed_at`: `stale`
                 record.pop("reset", None)
         if "cursor" in commit:
             if commit["cursor"] is None:
@@ -1129,6 +1134,16 @@ class Model:
             watched = set(auto.get("watched") or trigger.get("outputs") or [])
             if watched & set(changed):
                 entry = [asset, partition]
+                if entry not in auto["pending"]:
+                    auto["pending"].append(entry)
+
+    def _on_FiringsOwed(self, e):
+        """What a deploy left each `OnChange` automation owing: a firing per
+        (asset, partition), as a change of the asset's own (`Engine._owed_firings`)."""
+
+        for name, due in e["owed"].items():
+            auto = self.automations.get(name)
+            for entry in due if auto is not None else ():
                 if entry not in auto["pending"]:
                     auto["pending"].append(entry)
 
@@ -1475,3 +1490,26 @@ class Model:
     def _on_RunsPurged(self, e):
         gone = set(e["runs"])
         self.deleted = [r for r in self.deleted if r not in gone]
+
+
+def _declared(manifest: dict | None, asset: str) -> str:
+    """What of an asset's declaration its outputs depend on, as one string:
+    its version and deps, its inputs (upstream, kind, patterns, batch
+    size), its outputs with their store's version, not its name — which
+    store holds an output is the reset rule's (§2). A difference makes the
+    deploy an asset change; its docs, automations, placement, retries,
+    timeout, tags or retention do not."""
+
+    import json
+
+    entry = (manifest or {})["assets"][asset]
+    stores = manifest["stores"]
+    outputs = [
+        {**{k: v for k, v in o.items() if k != "store"}, "store_version": stores[o["store"]]["version"]}
+        for o in entry["outputs"]
+    ]
+    inputs = {p: {k: v for k, v in i.items() if k != "meta"} for p, i in entry["inputs"].items()}
+    return json.dumps(
+        {"version": entry["version"], "deps": entry["deps"], "inputs": inputs, "outputs": outputs},
+        sort_keys=True,
+    )

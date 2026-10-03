@@ -447,6 +447,16 @@ over one or more attempts:
 A pass that ends behind the head goes on to it.
 *Was:* delivery, window, delta window, change window, pending window.
 
+**asset change**. A deploy that adds an asset (new, or added back),
+renames it, changes its declaration (version, deps, inputs and patterns,
+outputs and their stores' versions) or resets it. Its automations decide
+what follows: `OnChange` fires once for every partition whose inputs have
+heads, a schedule waits for its next time, no automation runs nothing.
+*Why a word:* "the deploy that changed it" is what decides a rebuild and
+what `stale` is measured against, whichever of four things changed.
+*Example:* `items` moved to another store, so its `OnChange` builds it in
+the new one at once (object-store-state.md §2).
+
 **batch** `ctx.batch[input]`. What one attempt reads from an incremental
 input: up to `batch_size` keys, or up to `batch_size` upstream commits.
 It may be one upstream commit, part of one, or several. One batch per
@@ -457,6 +467,14 @@ the planned `count` (possibly an estimate), `first`, `final`, `full`, and
 its `upserted` and `removed` keys. *Example:* `file_index` reads four
 files per site in two batches of `batch_size=2`. *Was:* page (`Changes`,
 `ctx.batch`, `page_size`, `page`, `pages`).
+
+**stale**. A partition materialized, but caught up before its asset's
+last asset change: built by the old declaration, so due a rebuild. A
+partition status beside `materialized`, `missing`, `failed`, `running`,
+`removed`. *Edge case:* an asset with no automation, renamed or with a new
+version, keeps its old content until someone runs it: `stale` says so,
+where `materialized` would hide it. A run that catches it up clears it,
+a skip included. *Not:* `missing` (no head at all).
 
 **fingerprint**. The digest of an asset's declaration that its outputs
 depend on: its version, its stores' versions, its outputs' migrations.

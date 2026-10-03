@@ -201,6 +201,52 @@ class Engine(Attempts, Sensors, Views):
                     "at": self.clock(),
                 }
             )
+            if owed := self._owed_firings():
+                self.state.record({"type": "FiringsOwed", "owed": owed, "at": self.clock()})
+
+    def _owed_firings(self) -> dict[str, list[list[str]]]:
+        """What the deploy just registered leaves each `OnChange` automation
+        owing, once: for each target it changed — added (again), renamed,
+        its declaration changed, or reset (`Model.changed_at`) — every
+        current partition whose inputs have heads, so it is built now, not
+        when its upstream next changes (F22). Decided at the deploy and
+        recorded, never re-checked by a tick: a run of it that fails is not
+        resubmitted on every tick (F20). Schedules, OnDeploy and sensors keep
+        their own criteria."""
+
+        planner, owed = self.planner(), {}
+        changed = {a for a, n in self.m.changed_at.items() if n == self.m.event_counter}
+        for name, auto in self.m.automations.items():
+            if auto["trigger"]["kind"] != "onchange" or not auto["enabled"]:
+                continue
+            due = []
+            for target in sorted(changed & set(auto["targets"])):
+                try:
+                    partitions = planner.partitions(target, "all")
+                except ValueError:  # too many to list: its upstream's next changes reach them
+                    continue
+                due += [[target, s] for s in partitions if self._inputs_written(planner, target, s)]
+            if due:
+                owed[name] = due
+        return owed
+
+    @staticmethod
+    def _inputs_written(planner, asset: str, partition: str) -> bool:
+        """Whether every input of (asset, partition) has something to read: a
+        head, or — across partitions (`AllPartitions`, a fan-in) — at least one
+        materialized upstream partition."""
+
+        try:
+            inputs = planner.inputs(asset, partition)
+        except planning.UpstreamOnly:
+            return False
+        for input in inputs:
+            if input.kind == "all_partitions" or input.fan_in:
+                if not planner.fan_in(input, materialized=True):
+                    return False
+            elif planner.head(input.output, input.partition) is None:
+                return False
+        return True
 
     async def _load_secret(self) -> bytes:
         """The secret attempt tokens are signed with: created once, kept in

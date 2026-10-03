@@ -206,7 +206,7 @@ export interface AssetStatus {
   updated_at: number | null;
 }
 
-export type PartitionStatus = "materialized" | "missing" | "failed" | "running" | "removed";
+export type PartitionStatus = "materialized" | "stale" | "missing" | "failed" | "running" | "removed";
 
 export interface PartitionOutcome {
   last_outcome: string;

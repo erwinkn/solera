@@ -14,6 +14,7 @@ const TONES: Record<string, Tone> = {
   succeeded: "ok",
   committed: "ok",
   materialized: "ok",
+  stale: "warn",
   running: "run",
   launched: "run",
   claimed: "run",

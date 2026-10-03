@@ -119,6 +119,7 @@ async def test_assets_status_rolls_up_every_asset(world):
     assert parse["partitions"] == {
         "total": 1,
         "materialized": 1,
+        "stale": 0,
         "missing": 0,
         "failed": 0,
         "running": 0,
@@ -372,6 +373,7 @@ async def test_a_domain_too_big_to_list_still_rolls_up(tmp_path):
             assert response.json()["assets"][name]["partitions"] == {
                 "total": 1_000_000,
                 "materialized": 1,
+                "stale": 0,
                 "missing": 999_999,
                 "failed": 0,
                 "running": 0,

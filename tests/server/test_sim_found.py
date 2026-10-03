@@ -887,3 +887,129 @@ async def test_a_job_removed_while_its_attempt_runs_and_added_back_starts_over(s
     await drive(engine, old, timeout=10)  # refused, and carried on by the new life's code
     record = state.model.partition("seen", "")
     assert record["cursor"] == {"life": "2"} and record["last"]["attempt"] != held, record
+
+
+async def test_an_onchange_asset_added_back_is_built(state):  # noqa: F811
+    """F22: `copy` (OnChange on `items`) removed and added back was not built
+    until `items` next changed: its automation came back with nothing
+    pending. A deploy leaves each OnChange automation owing a firing for
+    every partition with no head whose inputs have heads — once, at the
+    deploy, never re-checked by a tick (F20)."""
+
+    from solera.sdk import AutoRefresh
+
+    @asset(outputs=Output("feed", key="id"), automations=AutoRefresh())
+    def feed():
+        return [{"id": "a"}]
+
+    @asset(inputs={"feed": Incremental()}, outputs=Output("items", key="id"), automations=AutoRefresh())
+    def items(feed: list):
+        return feed
+
+    @asset(inputs={"items": Incremental()}, outputs=Output("copy", key="id"), automations=AutoRefresh())
+    def copy(items: list):
+        return items
+
+    async def quiet(engine):
+        for _ in range(200):
+            await engine.tick()
+            busy = any(
+                r["status"] not in ("succeeded", "failed", "canceled") for r in state.model.runs.values()
+            )
+            if not busy and not any(a["pending"] for a in state.model.automations.values()):
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError("never quiet")
+
+    engine = make_engine(state, Project(assets=[feed, items, copy]))
+    await engine.initialize()
+    await drive(engine, await engine.submit(["copy"], upstream=True))  # built
+    await quiet(engine)
+    await engine.stop()
+    for assets in ([feed, items], [feed, items, copy]):  # without copy; with it again
+        engine = make_engine(state, Project(assets=assets))
+        await engine.initialize()
+        await quiet(engine)
+        await engine.stop()
+    assert ("copy", "") in state.model.heads
+
+
+def _changing(tmp_path, kind: str, automation: str, after: bool, calls: list):
+    """`feed` and `items` (reading it incrementally), before or `after` an
+    asset change of `kind` to `items`, under `automation`."""
+
+    from solera.sdk import Automation, AutoRefresh, Cron
+
+    @asset(outputs=Output("feed", key="id"))
+    def feed():
+        return [{"id": "a"}]
+
+    if kind == "added" and not after:
+        return Project(assets=[feed]), "items"
+    name = "renamed" if kind == "renamed" and after else "items"
+    automations = {
+        "onchange": AutoRefresh(),
+        "schedule": Automation(trigger=Cron("0 7 1 1 *")),  # yearly: not due in the test
+        "none": [],
+    }[automation]
+
+    def body(feed: list):
+        calls.append(after)
+        return feed
+
+    body.__name__ = name
+    items = asset(
+        inputs={"feed": Incremental(batch_size=2 if kind == "changed" and after else 100)},
+        outputs=Output(name, key="id", store="other" if kind == "reset" and after else None),
+        automations=automations,
+        aliases=["items"] if name == "renamed" else [],
+    )(body)
+    return Project(assets=[feed, items], stores={"other": FileStore(tmp_path / "other")}), name
+
+
+@pytest.mark.parametrize("automation", ["onchange", "schedule", "none"])
+@pytest.mark.parametrize("kind", ["added", "renamed", "changed", "reset"])
+async def test_an_asset_change_is_built_by_its_automation_or_marked_stale(state, tmp_path, kind, automation):  # noqa: F811
+    """Erwin's asset-change rule: a deploy that adds an asset (again),
+    renames it, changes its declaration or resets it leaves its OnChange
+    automation owing a firing, once, per partition whose inputs have heads:
+    it is built at once. A schedule waits for its next tick and no
+    automation runs nothing: the partition shows `stale` (or `missing`) until
+    a run catches it up, and then `materialized`."""
+
+    async def quiet(engine):
+        for _ in range(100):
+            await engine.tick()
+            busy = any(
+                r["status"] not in ("succeeded", "failed", "canceled") for r in state.model.runs.values()
+            )
+            if not busy and not any(a["pending"] for a in state.model.automations.values()):
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError("never quiet")
+
+    async def status(engine, name):
+        return [row["status"] for row in (await engine.partition_statuses([name]))[name]]
+
+    calls = []
+    project, name = _changing(tmp_path, kind, automation, after=False, calls=calls)
+    engine = make_engine(state, project)
+    await engine.initialize()
+    await drive(engine, await engine.submit(["feed" if kind == "added" else name], upstream=True))
+    await quiet(engine)
+    await engine.stop()
+    project, name = _changing(tmp_path, kind, automation, after=True, calls=calls)
+    engine = make_engine(state, project)
+    await engine.initialize()
+    await quiet(engine)
+    if automation == "onchange" or (automation == "schedule" and kind == "added"):
+        # built at once: by the firing the deploy owes OnChange, or by a new
+        # schedule's own criterion — never having fired, it is due now
+        assert await status(engine, name) == ["materialized"]
+        if kind == "renamed":  # its state carried over: the firing is a skip, no call
+            assert True not in calls
+        return
+    expected = "missing" if kind in ("added", "reset") else "stale"
+    assert await status(engine, name) == [expected]  # nothing ran: shown, for a run by hand
+    assert status_of(await drive(engine, await engine.submit([name]))) == "succeeded"
+    assert await status(engine, name) == ["materialized"]  # the marker clears

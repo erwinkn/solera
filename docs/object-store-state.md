@@ -144,12 +144,7 @@ store holds, is a new one (K10). At that deploy, not later:
   bookmarks this way reads that full pass too, to its last batch, before
   it succeeds;
 - a removed asset loses its partition records — cursor, bookmarks, failed
-  keys — a job's too, which has no output (F21);
-- what lost a head is due for a rebuild: each `OnChange` automation of its
-  asset owes it a firing, as for a change of its own, so it is written
-  again at once — not when its upstream next changes, with every consumer
-  waiting meanwhile. An asset with no such automation waits for its next
-  run.
+  keys — a job's too, which has no output (F21).
 
 An attempt launched before the reset commits nothing of it: one of a
 reset asset, or that writes a reset output or reads one incrementally, is
@@ -171,6 +166,26 @@ holds. Findings this closes: F12 (`copy` renamed to `mirror` and back kept
 `mirror`'s first life), F13 (a key removed after a move stayed
 downstream), F17 (moved away and back, an output lost keys), F19 (removed
 while its attempt ran and added back, an asset resumed its first life), F21 (the same, for a job).
+
+**An asset change leaves the asset due.** A deploy that adds an asset
+(new, or added back), renames it, changes its declaration (its version,
+deps, inputs and their patterns, outputs and their stores' versions) or
+resets it is an **asset change** (`changed_at` in the model, by asset).
+Its automations then decide, each by its own criterion:
+
+- `OnChange` owes one firing, as for a change of the asset's own, per
+  current partition whose inputs have heads (for `AllPartitions` or a
+  fan-in, a materialized upstream partition): built at once, not when its
+  upstream next changes (F22). The engine works this out once, right after
+  recording the deploy (`FiringsOwed`); no tick checks it again, so a run
+  of it that fails is not submitted on every tick (F20). After a rename the
+  firing is a skip: the state carried over is caught up.
+- A schedule fires at its next time (a new one has never fired: at once);
+  `OnDeploy` and sensors keep their criteria.
+- With no automation nothing runs. The partition shows `stale` —
+  materialized, but caught up (`caught_up_at`) before its asset's last
+  change — until a run catches it up: the console and CLI show it, for a
+  run by hand.
 
 ## 3. Journal
 
@@ -232,7 +247,8 @@ status are derived inside `apply`; they are not events.
 
 | Event | Fields | Effect |
 |---|---|---|
-| `ProjectRegistered` | `deploy`, `manifest` | replaces the manifest; applies aliases; retires removed names (§2); reconciles automation state |
+| `ProjectRegistered` | `deploy`, `manifest` | replaces the manifest; applies aliases; resets removed assets and removed or moved outputs (§2); reconciles automation state |
+| `FiringsOwed` | `owed` {automation: [[asset, partition]]} | what the deploy's asset changes leave each `OnChange` automation owing, once (§2): appended to its pending changes |
 | `RunSubmitted` | `run` (id, request, tasks) | adds an active run |
 | `RunControlled` | `run`, `action` (`cancel` \| `pause` \| `resume`) | |
 | `AttemptLaunched` | `run`, `task`, `attempt`, `started_at`, `pin`, `at`, `execution`, `prepared`, `pool?` | the attempt file exists and a placement is about to start it: its claim becomes durable (§8) |
@@ -279,7 +295,7 @@ State
 | Type | Fields | Bounded by |
 |---|---|---|
 | `Head` | `ref` (from the store), `run`, `attempt` (may point at a deleted run), `commit_number` (incremental outputs: the last commit that changed it, −1 before any), `base` (the first commit after the last reset of an unkeyed incremental output), `count` (keyed: live keys), `elements?` (dynamic partitions and set dimensions), `complete`, `version` (declared asset version), `asset`, `at` | outputs × partitions |
-| `PartitionRecord` | `cursor?` (json), `last?` (`Outcome`: its last terminal result), `caught_up?` (whether its last commit finished the pass it was on — the partition's completeness, whatever its outputs wrote), `bookmarks?` {input: `Bookmark`}, `reset?` (a reset took its bookmarks: `keys=` runs read a full pass until one catches it up), `failures?` (`Failures`: an Each asset's failing keys, per-key-processing.md §9). Registration moves it whole under a rename, drops the bookmarks of inputs the project no longer declares, and those a reset takes (§2). | assets × partitions |
+| `PartitionRecord` | `cursor?` (json), `last?` (`Outcome`: its last terminal result), `caught_up?` (whether its last commit finished the pass it was on — the partition's completeness, whatever its outputs wrote), `caught_up_at?` (the event counter of the commit that last caught it up: before its asset's `changed_at`, it is `stale`), `bookmarks?` {input: `Bookmark`}, `reset?` (a reset took its bookmarks: `keys=` runs read a full pass until one catches it up), `failures?` (`Failures`: an Each asset's failing keys, per-key-processing.md §9). Registration moves it whole under a rename, drops the bookmarks of inputs the project no longer declares, and those a reset takes (§2). | assets × partitions |
 | `Failures` | `commit_number` (the record's last commit), `counts` {outcome: keys}, `due` and `deploy_min` (lower bounds), `retry?` {`pass`, `deploy`, `forced_pos`, `after`, `due_acc`, `deploy_acc`}, `passes`, `done_forced`, `last` (`changes` or `retry`), `forced` {class: position} — its index is `indexes["@asset"][partition]` (per-key-processing.md §9) | Each assets × partitions |
 | `KeyIndex` | `prefix` (where its files live — kept across renames), `count`, `inexact` (commits since the last recount whose count came from filters; the count is exact at 0), `files` [{`name`, `level`, `min`, `max`, `entries`, `size`, `tail`, `index`}], `log` [[`batch`, [file]], …] — see §6 | a few dozen files per index |
 | `Bookmark` | `kind` (`keys` or `commits`), `next` (the first upstream commit not yet delivered), `pass` (one under way: its `mode` — `full`, `delta`, or a pattern change's `diff` — its boundary `from`..`to`, its position `at` — the last key delivered, or the next batch — its `page` of `pages`, a delta pass's reader `pin`; a full keyed pass's `from` is the head's commit number + 1 when it began, so changes made meanwhile arrive afterwards as deltas), `fingerprint`, `output` and `up` (the upstream index it reads), and per-key `patterns`, `pattern change`, `reconcile` (`python/solera_server/bookmarks.py`) | inputs × partitions |

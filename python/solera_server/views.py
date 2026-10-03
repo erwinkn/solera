@@ -24,15 +24,17 @@ class Views:
     # -- partitions and assets (§7, §8) -------------------------------------------------
 
     async def partition_statuses(self, assets: list[str], *, every: bool = True) -> dict[str, list[dict]]:
-        """Each partition of each asset, by status: `complete` (its head is),
-        `running` (a task is pending), `failed` (its last outcome failed, was
-        canceled or blocked), `missing`, or `retired` (no longer a current
-        key). A job has no head: it is complete when its last outcome
-        succeeded. `every` lists every current partition, enumerated — refused
-        past `MAX_SCOPES`; else only the partitions with a record (a head, an
-        outcome or a pending task), the domain never enumerated. From heads,
-        partition outcomes and the pending index, one pass over each — never a
-        task scan."""
+        """Each partition of each asset, by status: `materialized` (its head is),
+        `stale` (materialized, but caught up before its asset last changed —
+        added again, renamed, its declaration changed or reset: built by the
+        old declaration, so due a rebuild), `running` (a task is pending),
+        `failed` (its last outcome failed, was canceled or blocked), `missing`,
+        or `removed` (no longer a current key). A job has no head: it is
+        materialized when its last outcome succeeded. `every` lists every
+        current partition, enumerated — refused past `MAX_PARTITIONS`; else
+        only the partitions with a record (a head, an outcome or a pending
+        task), the domain never enumerated. From heads, partition records and
+        the pending index, one pass over each — never a task scan."""
 
         heads: dict[str, dict] = {}
         for (output, partition), head in self.m.heads.items():
@@ -47,7 +49,9 @@ class Views:
             scoped: dict[str, dict] = {}
             for output in outputs:  # a partition's head: its last declared output's, among those it has
                 scoped.update(heads.get(output["name"]) or {})
-            recorded = {s: r["last"] for s, r in self.m.partitions.of(asset).items() if "last" in r}
+            records = self.m.partitions.of(asset)
+            recorded = {s: r["last"] for s, r in records.items() if "last" in r}
+            changed = self.m.changed_at.get(asset, 0)
             pending = running.get(asset) or set()
             partitions = set(scoped) | set(recorded) | pending
             if every:
@@ -60,10 +64,11 @@ class Views:
                 head, record = scoped.get(partition), recorded.get(partition)
                 last = (record or {}).get("outcome")
                 done = planner.materialized(asset, partition)
+                stale = (records.get(partition) or {}).get("caught_up_at", 0) < changed
                 status = (
                     "removed"
                     if not current(partition)
-                    else "materialized"
+                    else ("stale" if stale else "materialized")
                     if done
                     else "running"
                     if partition in pending
@@ -99,12 +104,12 @@ class Views:
         for name in names:
             counts = Counter(row["status"] for row in statuses[name])
             total = planning.size(planner.dims(name), planner.time, planner.dynamic_partitions)
-            missing = total - counts["materialized"] - counts["failed"] - counts["running"]
+            missing = total - sum(counts[s] for s in ("materialized", "stale", "failed", "running"))
             out[name] = {
                 "partitions": {
                     "total": total,
                     "missing": missing,
-                    **{s: counts[s] for s in ("materialized", "failed", "running", "removed")},
+                    **{s: counts[s] for s in ("materialized", "stale", "failed", "running", "removed")},
                 },
                 "partitioned": bool(planner.dims(name)),
                 "last": None,
