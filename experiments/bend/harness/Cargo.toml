@@ -1,0 +1,12 @@
+[package]
+name = "bend-harness"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+solera-native = { path = "../../../native" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
