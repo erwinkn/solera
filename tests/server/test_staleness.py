@@ -1,4 +1,4 @@
-"""Staleness at every level (K43; tests/staleness.py states the rules):
+"""Staleness at every level (K43, K45; tests/staleness.py states the rules):
 the engine's stale keys, partition and asset statuses against a reference
 model, over random histories; worked examples and calibrations; and R2 on
 every built-in store. Strict xfails until W22 builds the rules
@@ -9,7 +9,7 @@ import asyncio
 import pytest
 from hypothesis import HealthCheck, Phase, settings
 from hypothesis import strategies as st
-from hypothesis.stateful import RuleBasedStateMachine, initialize, invariant, rule
+from hypothesis.stateful import RuleBasedStateMachine, initialize, invariant, precondition, rule
 from solera.sdk import Each, Incremental, Output, Project, Source, asset
 from solera.stores import FileStore
 from solera_server.state import State
@@ -25,7 +25,7 @@ pending = pytest.mark.xfail(
     not staleness.LANDED,
     strict=True,
     raises=(staleness.NotBuilt, AssertionError, pytest.fail.Exception),
-    reason="K43: not built",
+    reason="K43, K45: not built",
 )
 
 
@@ -67,14 +67,26 @@ def project(
         version=copy_v,
     )
     def copy(ctx, items: list):
-        return rebuild(ctx.batch["items"], [{"id": r["id"], "v": r["v"]} for r in items])
+        changes = ctx.batch["items"]
+        outside.delivered |= {r["id"] for r in items} | set(changes.removed)  # what reached it
+        return rebuild(changes, [{"id": r["id"], "v": r["v"]} for r in items])
 
     @asset(inputs={"items": Incremental()}, outputs=Output("count"), version=count_v)
     def count(ctx, items: list):
         return {"rows": len(items)}
 
+    @asset(inputs={"items": Incremental()}, outputs=Output("tally"))
+    def tally(ctx, items: list):
+        """K44's example: the count of `items`, kept from what each batch
+        added and removed (a full pass's first batch starts over)."""
+
+        changes = ctx.batch["items"]
+        before = 0 if changes.full and changes.first else (ctx.load() or {"rows": 0})["rows"]
+        return {"rows": before + len(changes.added) - len(changes.removed)}
+
+    outside.delivered = getattr(outside, "delivered", set())
     return Project(
-        assets=[items, checks, copy, count],
+        assets=[items, checks, copy, count, tally],
         sources=[Source("feed", key="id", store="ext"), Source("knob")],
         stores={
             "ext": SourceStore(root / "ext", outside),
@@ -187,24 +199,24 @@ class Staleness(RuleBasedStateMachine):
         self._submit(["checks"], keys={"items": {"keys": sorted(keys)}})
         self.ref.run_keys(keys)
 
+    @precondition(lambda self: self.ref.others["copy"].built)
     @rule(keys=st.sets(st.sampled_from(KEYS), min_size=1))
-    def keys_on_a_non_each_asset(self, keys):
-        """Refused, and nothing changes."""
+    def run_keys_on_copy(self, keys):
+        """K45: copy (plain incremental) is delivered the named keys' changes
+        its record lacks, and nothing else."""
 
-        async def go():
-            try:
-                await self.engine.submit(["copy"], keys={"items": {"keys": sorted(keys)}})
-            except ValueError as error:
-                assert "each=True" in str(error), error
-            else:
-                raise AssertionError("a keys= run of copy (not each=True) was accepted")
-
-        self._run(go())
+        self.outside.delivered.clear()
+        self._submit(["copy"], keys={"items": {"keys": sorted(keys)}})
+        want = self.ref.run_keys(keys, "copy")
+        assert self.outside.delivered == want, f"copy was delivered {self.outside.delivered}, not {want}"
 
     @rule(name=st.sampled_from(["checks", "copy", "count"]))
     def run_default(self, name):
+        self.outside.delivered.clear()
         self._submit([name])
-        self.ref.run_default(name)
+        want = self.ref.run_default(name)
+        if name == "copy" and want is not None:  # nothing delivered twice
+            assert self.outside.delivered == want, f"copy was delivered {self.outside.delivered}, not {want}"
 
     # -- what the engine says ----------------------------------------------------------
 
@@ -374,18 +386,76 @@ async def test_a_shared_input_change_makes_every_key_stale(state, tmp_path):
     assert not await staleness.partition_stale(engine, "checks")
 
 
+async def _change(engine, outside, upserts=(), removes=()):
+    outside.feed.update(dict.fromkeys(upserts, "2"))
+    for k in removes:
+        outside.feed.pop(k, None)
+    await engine.commit_source("feed", upsert=sorted(upserts), remove=sorted(removes))
+    await drive(engine, await engine.submit(["items"]))
+
+
 @pending
-async def test_keys_on_an_asset_that_is_not_each_are_refused(state, tmp_path):
-    """K43: a keys= run targets input units; only an each=True input has one
-    per key. On `copy` (keyed, incremental) and `count` (unkeyed) it is
-    refused with what to do instead, and nothing is submitted."""
+@pytest.mark.parametrize("then", ["default", "keys"])
+async def test_a_keys_run_on_an_incremental_asset_delivers_each_change_once(state, tmp_path, then):
+    """K45: `copy` (plain incremental) built from k1, k2, k3; k1 and k2
+    change. keys=(k1) delivers k1 alone, and `copy` stays stale (k2). Then
+    a default run delivers k2 alone, never k1 again; or keys=(k2) covers the
+    rest, and the partition's record collapses: `copy` is fresh either way."""
+
+    engine, outside = await _built(state, tmp_path, {"k1": "1", "k2": "1", "k3": "1"})
+    await _change(engine, outside, upserts=["k1", "k2"])
+    outside.delivered.clear()
+    await drive(engine, await engine.submit(["copy"], keys={"items": {"keys": ["k1"]}}))
+    assert outside.delivered == {"k1"}
+    assert await staleness.partition_stale(engine, "copy"), "k2 is not read yet"
+    outside.delivered.clear()
+    keys = None if then == "default" else {"items": {"keys": ["k2"]}}
+    await drive(engine, await engine.submit(["copy"], keys=keys))
+    assert outside.delivered == {"k2"}, "k1 was delivered twice"
+    assert not await staleness.partition_stale(engine, "copy")
+    outside.delivered.clear()
+    await drive(engine, await engine.submit(["copy"]))
+    assert outside.delivered == set(), "the next default run has nothing new"
+
+
+@pending
+async def test_too_many_explicit_keys_for_an_incremental_asset_are_refused(state, tmp_path):
+    """K45's bound: a partition's read-ahead holds at most 10,000 keys; a
+    keys= run past it is refused and nothing is submitted. each=True assets
+    have no such cap."""
 
     engine, _ = await _built(state, tmp_path, {"k1": "1"})
     runs = len(state.model.runs)
-    for name in ("copy", "count"):
-        with pytest.raises(ValueError, match="keys= needs an each=True input; rerun the partition"):
-            await engine.submit([name], keys={"items": {"keys": ["k1"]}})
+    many = [f"k{i:05d}" for i in range(10_001)]
+    with pytest.raises(
+        ValueError, match="too many explicit keys for an incremental asset; rerun the partition"
+    ):
+        await engine.submit(["copy"], keys={"items": {"keys": many}})
     assert len(state.model.runs) == runs
+    await engine.submit(["checks"], keys={"items": {"keys": many}})  # each=True: accepted
+
+
+@pending
+async def test_a_count_kept_from_its_batches_stays_exact_through_a_keys_run(state, tmp_path):
+    """K44's example through a keys= run (K45): `tally` = what it held +
+    added - removed. k4 added and k1 removed; keys=(k4) delivers k4 as added;
+    the next default run delivers k1's removal alone, never k4 again: the
+    tally equals `items`' count after each run."""
+
+    engine, outside = await _built(state, tmp_path, {"k1": "1", "k2": "1", "k3": "1"})
+    p = project(tmp_path, outside)
+
+    async def tally(keys=None):
+        from tests.sim.oracle import value_content
+
+        detail = await drive(engine, await engine.submit(["tally"], keys=keys))
+        assert detail["request"]["status"] == "succeeded", detail["request"]
+        return (await value_content(engine, p, "tally"))["rows"]
+
+    assert await tally() == 3
+    await _change(engine, outside, upserts=["k4"], removes=["k1"])
+    assert await tally({"items": {"keys": ["k4"]}}) == 4  # k1's removal not read yet
+    assert await tally() == 3 == len(outside.feed)
 
 
 @pending
@@ -447,8 +517,16 @@ def test_the_reference_reads_the_worked_examples():
     ref.change_knob()
     assert ref.stale_keys() == {"k1"}
     assert ref.stale_keys_of("copy") == {"k1"}  # copy holds k1 alone: k1 changed
-    ref.run_default("copy")
+    assert ref.run_default("copy") == {"k1"}
     assert not ref.stale("copy") and ref.stale_keys_of("copy") == set()
+
+    ref.commit({"k2", "k3"}, set())  # K45: a keys= run, then the rest
+    assert ref.run_keys({"k2"}, "copy") == {"k2"} and ref.stale("copy")
+    assert ref.run_default("copy") == {"k3"}  # never k2 again
+    ref.commit({"k2", "k3"}, set())
+    assert ref.run_keys({"k2", "x1"}, "copy") == {"k2"}
+    assert ref.run_keys({"k3"}, "copy") == {"k3"} and not ref.stale("copy")  # collapsed
+    assert ref.others["copy"].ahead == {} and ref.run_default("copy") == set()
 
 
 # -- the keyed merge on every built-in store (R2) ----------------------------------------

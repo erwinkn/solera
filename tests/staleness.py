@@ -18,10 +18,20 @@ that use this module are strict xfails or off):
   key the upstream has under the patterns and the output does not, or one
   the output holds and the upstream removed. Roll-ups use "any": key ->
   partition -> asset.
-- Runs target what input units allow: `partitions=` always; `keys=` only on
-  each=True assets, refused elsewhere ("keys= needs an each=True input;
-  rerun the partition"). A `keys=` run makes each named key its patterns
-  take match its upstream, and never touches a key it does not name (R2).
+- Runs (K45, amending K43): `keys=` on an each=True asset makes each named
+  key its patterns take match its upstream, and never touches a key it
+  does not name (R2). On a plain incremental input it delivers the changes
+  past the snapshot, filtered to the named keys; the partition then records
+  "snapshot at N, plus these keys at the versions read" (the read-ahead,
+  at most 10,000 keys: more is refused with "too many explicit keys for an
+  incremental asset; rerun the partition"). A default run delivers only
+  what that record does not cover: nothing is delivered twice. Once the
+  read-ahead covers every change past the snapshot under the patterns, it
+  collapses into a new snapshot.
+- A plain incremental partition is stale while some change past its
+  snapshot, under the patterns, is not in its read-ahead at its current
+  version, or its asset changed (cleared by a default run); its keys share
+  the partition's answer.
 - An output reset itself starts empty: a `keys=` run leaves just its keys;
   the next default run converges (R6).
 - Positions are derived from what each attempt read; nothing here asserts one.
@@ -107,12 +117,18 @@ class EachAsset:
 
 @dataclass
 class ByPartition:
-    """Any other output: the counter of its last catch-up (None: never
-    built), its asset's last change, the keys its input's patterns take,
-    and, keyed, the keys it holds: they go stale together."""
+    """A plain incremental output: whether it has a head; its record, a
+    snapshot (the counter through which it read every change; None after a
+    reset or an asset change: the next default run reads a full pass) and
+    the read-ahead (key -> the version a `keys=` run read); its last
+    catch-up by a default run and its asset's last change; the keys its
+    input's patterns take, and, keyed, the keys it holds."""
 
     takes: Callable[[str], bool] = everything
-    caught_up_at: int | None = None
+    built: bool = False
+    snapshot: int | None = None
+    ahead: dict[str, int] = field(default_factory=dict)
+    caught_up_at: int = 0
     changed_at: int = 0
     keys: set[str] = field(default_factory=set)
 
@@ -120,7 +136,7 @@ class ByPartition:
 class Reference:
     """One keyed upstream (`items`) and one shared input (`knob`); `checks`,
     each=True over `items` with `knob` a dep; `copy`, a keyed incremental
-    consumer of `items`; `count`, an unkeyed one. What K36–K41 say each is
+    consumer of `items`; `count`, an unkeyed one. What K43 and K45 say each is
     after any history of upstream commits, upstream resets, shared-input
     changes, the each=True output's own resets, asset changes, `keys=` runs
     and default runs."""
@@ -128,7 +144,8 @@ class Reference:
     def __init__(self, takes: Callable[[str], bool] = everything):
         self.now = 0
         self.up: dict[str, int] = {}  # key -> the counter of its last write
-        self.commits: list[tuple[int, frozenset[str]]] = []  # every change of `items`: when, which keys
+        self.changed: dict[str, int] = {}  # key -> the counter of its last change, a removal too
+        self.last_commit = 0
         self.knob = 0  # the counter of the shared input's last change
         self.checks = EachAsset(takes=takes)
         self.others = {"copy": ByPartition(takes=takes), "count": ByPartition()}
@@ -146,15 +163,20 @@ class Reference:
             self.up[k] = t
         for k in removes:
             del self.up[k]
+        for k in upserts | removes:
+            self.changed[k] = t
         if upserts or removes:
-            self.commits.append((t, frozenset(upserts | removes)))
+            self.last_commit = t
 
     def reset_upstream(self) -> None:
         """`items` moved and rebuilt: the same keys at new versions."""
 
         t = self._tick()
         self.up = dict.fromkeys(self.up, t)
-        self.commits.append((t, frozenset(self.up)))
+        self.changed.update(dict.fromkeys(self.up, t))
+        self.last_commit = t
+        for o in self.others.values():
+            o.snapshot, o.ahead = None, {}
 
     def change_knob(self) -> None:
         self.knob = self._tick()
@@ -167,34 +189,55 @@ class Reference:
 
     def change_asset(self, name: str) -> None:
         t = self._tick()
-        (self.checks if name == "checks" else self.others[name]).changed_at = t
+        if name == "checks":
+            self.checks.changed_at = t
+        else:
+            o = self.others[name]
+            o.changed_at, o.snapshot, o.ahead = t, None, {}
 
-    def run_keys(self, keys: set[str]) -> None:
-        """R2 on `checks`, the each=True asset: the named keys its patterns
-        take are fresh after. (Elsewhere a keys= run is refused.)"""
+    def run_keys(self, keys: set[str], name: str = "checks") -> set[str] | None:
+        """A keys= run. On `checks` (each=True), R2: the named keys its
+        patterns take are fresh after. On a plain incremental asset: what it
+        delivers, the named keys among the changes its record lacks; they
+        join the read-ahead, which collapses once it covers them all."""
 
         t = self._tick()
-        self.checks.built = True
-        for k in keys:
-            if not self.checks.takes(k):
-                continue
-            if k in self.up:
-                self.checks.held[k] = (self.up[k], t)
-            else:
-                self.checks.held.pop(k, None)
+        if name == "checks":
+            self.checks.built = True
+            for k in keys:
+                if not self.checks.takes(k):
+                    continue
+                if k in self.up:
+                    self.checks.held[k] = (self.up[k], t)
+                else:
+                    self.checks.held.pop(k, None)
+            return None
+        o = self.others[name]
+        delivered = keys & self.pending(name)
+        o.built = True
+        for k in delivered:
+            o.ahead[k] = self.changed[k]
+            (o.keys.add if k in self.up else o.keys.discard)(k)
+        if not self.pending(name):
+            o.snapshot, o.ahead = self.last_commit, {}
+        return delivered
 
-    def run_default(self, name: str) -> None:
-        """A default run, caught up at its end."""
+    def run_default(self, name: str) -> set[str] | None:
+        """A default run, caught up at its end. On a plain incremental
+        asset: what it delivers, the changes its record lacks (None for a
+        full pass, which has no position to start from)."""
 
         t = self._tick()
         if name == "checks":
             c = self.checks
             c.built = True
             c.held = {k: (v, t) for k, v in self.up.items() if c.takes(k)}
-        else:
-            o = self.others[name]
-            o.caught_up_at = t
-            o.keys = {k for k in self.up if o.takes(k)} if name == "copy" else set()
+            return None
+        o = self.others[name]
+        delivered = None if o.snapshot is None else self.pending(name)
+        o.built, o.snapshot, o.ahead, o.caught_up_at = True, self.last_commit, {}, t
+        o.keys = {k for k in self.up if o.takes(k)} if name == "copy" else set()
+        return delivered
 
     # answers
 
@@ -219,11 +262,19 @@ class Reference:
             return self.stale_keys()
         return set(self.others[name].keys) if self.stale(name) else set()
 
+    def pending(self, name: str) -> set[str]:
+        """The changes a plain incremental asset's record lacks: past its
+        snapshot (all of them without one), under its patterns, not in its
+        read-ahead at their current version."""
+
+        o = self.others[name]
+        since = -1 if o.snapshot is None else o.snapshot
+        return {k for k, t in self.changed.items() if t > since and o.takes(k) and o.ahead.get(k) != t}
+
     def stale(self, name: str) -> bool:
         if name == "checks":
             return self.checks.built and bool(self.stale_keys())
         o = self.others[name]
-        if o.caught_up_at is None:
+        if not o.built:
             return False  # never built: `missing`, not `stale`
-        seen = any(t > o.caught_up_at and any(o.takes(k) for k in keys) for t, keys in self.commits)
-        return seen or o.caught_up_at < o.changed_at
+        return bool(self.pending(name)) or o.caught_up_at < o.changed_at
