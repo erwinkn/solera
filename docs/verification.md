@@ -176,6 +176,12 @@ which order. A finding is then reduced to an engine-level test, without the
 simulation, in `tests/server/test_sim_found.py`: a strict `xfail` until it is
 fixed, an ordinary test after.
 
+When Hypothesis gives up shrinking a long run (it stops after five minutes
+of slow progress), `uv run python -m tests.sim.shrink replay.py "<signature>"`
+shrinks the printed case by delta debugging: each candidate in a capped process
+of its own, keeping a step's invariant calls with it, until no step can go
+(`replay_min.py`). An F16 run of 55 steps went to 8 this way.
+
 Determinism has one limit: Python randomizes string hashing per process, so a
 set iterated by product code may order differently in another process. A
 replay in the same process is exact; across processes it is the same run with
