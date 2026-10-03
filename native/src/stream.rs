@@ -441,6 +441,20 @@ impl Merge {
         self.runs[self.cur.0].block().payload(self.cur.1)
     }
 
+    /// Prototype (docs/presence-at-position.md): the current key's generation
+    /// before the oldest of its entries the merge holds, None if it was not
+    /// live. Every writer names the predecessor of a key it read live,
+    /// tombstones included; a range file carries its oldest entry's.
+    pub fn predecessor(&self) -> Option<u64> {
+        let (r, i) = self.shadowed.last().copied().unwrap_or(self.cur);
+        self.runs[r].block().predecessor(i)
+    }
+
+    /// Prototype: whether the current key was live before its oldest entry.
+    pub fn existed(&self) -> bool {
+        self.predecessor().is_some()
+    }
+
     /// The older entries of the current key the merge passed over, newest
     /// first: `(deleted, generation)`. Readable until the next call.
     pub fn shadowed(&self) -> impl Iterator<Item = (bool, u64)> + '_ {

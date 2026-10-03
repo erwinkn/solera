@@ -80,6 +80,7 @@ class Tiling:
         self.floors = floors
         self.k0 = 1000
         self.monotone = True
+        self.balance: float | None = 4.0
         self.runs: list[Run] = [Run(-1, -1, 1.0, 0.0)]  # the base first, then oldest first
         self.written = self.read = self.committed = 0.0
         self.base_merges = 0
@@ -113,7 +114,12 @@ class Tiling:
                 seg = self.runs[start:i]
                 floor, rest = seg[0], seg[1:]
                 size = sum(r.entries(n) for r in rest)
-                if rest and (self.floors or start == 0) and size * self.base_ratio >= floor.entries(n):
+                if (
+                    rest
+                    and (self.floors or start == 0)
+                    and size * self.base_ratio >= floor.entries(n)
+                    and self.balanced(seg)
+                ):
                     # The newer runs of a segment join its oldest (the base: N live entries, no tombstones).
                     out = Run(-1, seg[-1].b, 1.0, 0.0) if start == 0 else self.merged(seg)
                     self.read += floor.entries(n) + size
@@ -135,6 +141,15 @@ class Tiling:
                     break
                 start = i
 
+    def balanced(self, rs: list[Run]) -> bool:
+        """Whether a merge may take `rs`: its largest input holds at most
+        `balance` times the others combined (None: always)."""
+
+        if self.balance is None:
+            return True
+        sizes = [r.entries(self.n) for r in rs]
+        return max(sizes) <= self.balance * (sum(sizes) - max(sizes))
+
     def tier(self, r: Run) -> int:
         return int(math.log(max(r.entries(self.n), self.k0) / self.k0, self.way))
 
@@ -148,7 +163,13 @@ class Tiling:
         if self.monotone:  # a run older than a bigger one (left by a boundary that went away) joins it
             for j in range(len(rs) - 1):
                 if tiers[j] < tiers[j + 1]:
-                    return j, 2
+                    if self.balance is None:
+                        return j, 2
+                    # The shortest balanced window around it; none yet: it waits for its peers.
+                    for w in range(2, len(rs) + 1):
+                        for lo in range(max(0, j + 2 - w), min(j, len(rs) - w) + 1):
+                            if self.balanced(rs[lo : lo + w]):
+                                return lo, w
         for j in range(len(rs) - w, -1, -1):
             if len(set(tiers[j : j + w])) == 1:
                 return j, w
@@ -181,7 +202,7 @@ def simulate(n, commits, k, periods, way, cap, base_ratio, cap_ratio, floors=Tru
         # Consumers due read through the head (c) and move to c + 1.
         for x in consumers:
             if x.position is not None and t.cap_ratio < math.inf:
-                if sum(r.entries(n) for r in t.after(x.position)) > t.cap_ratio * n and x.position > 0:
+                if sum(r.entries(n) for r in t.after(x.position)) > t.cap_ratio * n:
                     x.position, x.dropped = None, x.dropped + 1
             if (c - x.phase) % x.period == 0:
                 if x.position is None:

@@ -413,6 +413,62 @@ fn merge_page<'py>(
     })
 }
 
+/// Prototype (docs/presence-at-position.md): `format::merge_ranges`, the
+/// runs (newest first) merged into one range file's bytes (split past
+/// `max_file_bytes`).
+#[pyfunction]
+#[pyo3(signature = (runs, codecs, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864))]
+#[allow(clippy::too_many_arguments)]
+fn merge_ranges<'py>(
+    py: Python<'py>,
+    runs: Vec<Vec<PyBackedBytes>>,
+    codecs: Vec<u8>,
+    block_size: usize,
+    level: u32,
+    bits_per_item: u64,
+    k: u8,
+    codec: u8,
+    max_file_bytes: usize,
+) -> PyResult<Bound<'py, PyList>> {
+    guard(|| {
+        let o = options(block_size, level, bits_per_item, k, codec);
+        let files = py
+            .detach(|| {
+                let runs: Vec<Vec<&[u8]>> = runs.iter().map(|r| slices(r)).collect();
+                format::merge_ranges(&runs, &codecs, o, max_file_bytes)
+            })
+            .map_err(to_py)?;
+        list_of_bytes(py, &files)
+    })
+}
+
+/// Prototype (docs/presence-at-position.md): `format::presence` over the
+/// delta log's runs, newest first: counts `[added, updated, removed,
+/// neither]`, and with `with_keys` the keys and their classes.
+#[pyfunction]
+#[pyo3(signature = (runs, codecs, with_keys=false))]
+#[allow(clippy::type_complexity)]
+fn presence<'py>(
+    py: Python<'py>,
+    runs: Vec<Vec<PyBackedBytes>>,
+    codecs: Vec<u8>,
+    with_keys: bool,
+) -> PyResult<(Vec<u64>, Bound<'py, PyList>, Bound<'py, PyBytes>)> {
+    guard(|| {
+        let (counts, keys, classes) = py
+            .detach(|| {
+                let runs: Vec<Vec<&[u8]>> = runs.iter().map(|r| slices(r)).collect();
+                format::presence(&runs, &codecs, with_keys)
+            })
+            .map_err(to_py)?;
+        Ok((
+            counts.to_vec(),
+            list_of_bytes(py, &keys)?,
+            PyBytes::new(py, &classes),
+        ))
+    })
+}
+
 /// Every entry of a garbage file (docs/key-index-format.md § Garbage files):
 /// keys, generations.
 #[pyfunction]
@@ -1771,6 +1827,8 @@ fn solera_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bloom_check_tombstones, m)?)?;
     m.add_function(wrap_pyfunction!(lookup, m)?)?;
     m.add_function(wrap_pyfunction!(merge_range, m)?)?;
+    m.add_function(wrap_pyfunction!(presence, m)?)?;
+    m.add_function(wrap_pyfunction!(merge_ranges, m)?)?;
     m.add_function(wrap_pyfunction!(merge_page, m)?)?;
     m.add_function(wrap_pyfunction!(filter_nbits, m)?)?;
     m.add_function(wrap_pyfunction!(_panic, m)?)?;
