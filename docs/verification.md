@@ -188,6 +188,25 @@ TestMyStore = stateful(lambda: Harness(MyStore(dsn), fresh_output)).TestCase
 the example SQL store, S3Store and the simulation's table store (30 runs
 each; ten times that with `--slow`).
 
+## Property tests
+
+Pieces with a simple model of their own are checked against it directly,
+with Hypothesis drawing the inputs (in CI, a few seconds each):
+
+- **The key index format** (`tests/sdk/test_keys_properties.py`): files
+  the native extension or the Python reference wrote, the other reads back;
+  lookups, range merges and compactions are newest-wins over a dict; a
+  resolve writes exactly the keys a write changes, with their prior
+  generations (`native/src/delta.rs`); sorted entries round-trip. Inputs
+  reach the edges: empty, 600-byte and shared-prefix keys, generations up
+  to 2⁶⁴ − 1, empty payloads, one-byte blocks. A resolve request's framing
+  is fuzzed: any body is either read with exact payload bounds or
+  `Malformed`.
+- **Key patterns** (`tests/sdk/test_patterns.py`): every glob matches as
+  an independent reference matcher does (`**/` takes whole directories or
+  none, `*` and `?` stay within one, `[`, `\` and newlines are literal),
+  and `include`/`exclude` combine as documented.
+
 ## Formal model: execution semantics (`spec/tla/Execution.tla`)
 
 The simulation samples interleavings of the real code; the model checker
