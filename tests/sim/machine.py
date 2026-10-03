@@ -69,19 +69,9 @@ STORES = ["file", "table"] + (["pg"] if postgres.DSN else [])  # where `items` l
 # runs are left out until it is fixed (tests/server/test_sim_found.py);
 # SOLERA_SIM_KNOWN=1 puts them back.
 KNOWN: dict[str, str] = {
-    "seen": "F19: an asset added back resumes its first life (the reset rule)",
+    "seen": "F21: a job added back takes its first life's commit",
 }
 CHANGES = sorted(set(VARIANTS) - (set() if os.environ.get("SOLERA_SIM_KNOWN") else set(KNOWN)))
-# Rules whose findings wait for the reset rule (W22): off until it lands;
-# SOLERA_SIM_KNOWN=1 turns them on.
-AWAITING = {
-    "round_trip": "F13, F17: an output moved away and back",
-    "readd_live": "F19: an asset added back while its attempt runs",
-}
-
-
-def _on(rule: str) -> bool:
-    return rule not in AWAITING or bool(os.environ.get("SOLERA_SIM_KNOWN"))
 
 
 fates = st.one_of(
@@ -129,7 +119,6 @@ class Simulation(RuleBasedStateMachine):
         self.knob = "0"
         self.runs: list[str] = []
         self.serial = 0
-        self.moves = 0
         self._ensure_engine()
         world.start_pool_hosts(POOL, 2)
 
@@ -344,7 +333,6 @@ class Simulation(RuleBasedStateMachine):
         self.trace.append(f"cache_trouble({kind!r})")
         self.world.cache_trouble(kind)
 
-    @precondition(lambda self: _on("round_trip"))
     @rule(between=st.sampled_from(["nothing", "keys", "write"]), clean=st.booleans())
     def round_trip(self, between, clean):
         """`items` moves to its other store and back (st1 -> st2 -> st1):
@@ -361,7 +349,7 @@ class Simulation(RuleBasedStateMachine):
             self.wait(45.0)
         self.redeploy("table", clean)
 
-    @precondition(lambda self: _on("readd_live") and self.variant.seen)
+    @precondition(lambda self: self.variant.seen)
     @rule(clean=st.booleans(), ends=st.sampled_from(["succeeds", "dies"]))
     def readd_live(self, clean, ends):
         """`seen` has an attempt in flight, its worker paused before its
@@ -449,10 +437,8 @@ class Simulation(RuleBasedStateMachine):
     def _change(self, change: str) -> None:
         """The project moves to another variant (`VARIANTS`)."""
 
-        before = self.variant.items_store
         self.variant = VARIANTS[change](self.variant)
         self.project = self._build()
-        self.moves += self.variant.items_store != before  # how often `items` changed store
 
     @rule(change=st.sampled_from(CHANGES), clean=st.booleans())
     def redeploy(self, change, clean):
@@ -537,10 +523,12 @@ class Simulation(RuleBasedStateMachine):
     def a_life_is_its_own(self):
         """F12's rule: an asset removed and added back starts over; no
         attempt launched in its first life installs a commit into the
-        second. While F19 is open, a crossing sets the run aside."""
+        second (F19)."""
 
         if self.world is not None and (crossed := self.journal.a_life_crossed()):
-            self._known("F19", crossed)
+            if crossed.split(" committed into ", 1)[1].split(" ", 1)[0] == "seen":  # a job: F21
+                self._known("F21", crossed)
+            raise Violation(f"a first life's attempt committed into the second: {crossed}")
 
     @invariant()
     def one_attempt_per_partition(self):
@@ -797,24 +785,17 @@ class Simulation(RuleBasedStateMachine):
         async def check():
             items = await keyed_content(engine, project, "items", whole=True)
             want = expected_items(self.feed, variant)
-            if set(want) - set(items) and self.moves >= 2:
-                self._known(
-                    "F17", f"items lacks {sorted(set(want) - set(items))} after {self.moves} store moves"
-                )
             if items != want:
                 raise Violation(f"items {stage}: {items} != {want} (feed {self.feed})")
             copy = await keyed_content(engine, project, variant.copy_name, whole=True)
-            self._moved_upstream_kept(variant.copy_name, copy, expected_copy(want, variant))
             if copy != expected_copy(want, variant):
                 raise Violation(f"{variant.copy_name} {stage}: {copy} != {expected_copy(want, variant)}")
             for output, want_split in zip(("odd", "even"), expected_split(want), strict=True):
                 got = await keyed_content(engine, project, output, whole=True)
-                self._moved_upstream_kept(output, got, want_split)
                 if got != want_split:
                     raise Violation(f"{output} {stage}: {got} != {want_split}")
             if variant.seen:
                 seen = engine.m.partition("seen", "").get("cursor") or {}
-                self._moved_upstream_kept("seen", seen, want)
                 if seen != want:
                     raise Violation(f"the job seen's cursor {stage}: {seen} != {want}")
             checks = await keyed_content(engine, project, "checks", whole=True, column="w")
@@ -846,13 +827,6 @@ class Simulation(RuleBasedStateMachine):
                     raise Violation(f"tally {stage}: {tally} for {len(rows)} rows of log")
 
         self._run(check())
-
-    def _moved_upstream_kept(self, output: str, got: dict, want: dict) -> None:
-        """F13's signature: an incremental consumer of `items` keeps keys
-        `items` let go of, in a run where `items` changed store."""
-
-        if set(got) - set(want) and self.moves:
-            self._known("F13", f"{output} keeps {sorted(set(got) - set(want))} after `items` moved store")
 
     def _check_replay(self) -> None:
         """The journal alone rebuilds the engine's state."""

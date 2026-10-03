@@ -84,8 +84,8 @@ arguments, up to 40 per run.
 | `flaky(keys, error)` | `flaky(['k2'], 'failed')` | `Each` keys failing by error class: `Transient` (retried on its backoff), `Failed` (once per deploy), `Rejected` (when the input changes), `Abort` (the whole attempt, per `retries=`) |
 | `retry_keys(classes)` | `retry_keys(['rejected'])` | a forced retry of failing keys, as `solera keys retry` asks for one |
 | `submit(asset, mode, upstream, partitions, keys)` | `submit('checks', mode='incremental', upstream=False, partitions='all', keys=('k1', 'k10'))` | manual runs; `keys=` makes the target's keyed input read a full pass (`'full'`) or the keys named |
-| `round_trip(between, clean)` | `round_trip('keys', clean=True)` | `items` moved to its other store and back, with nothing, a `keys=` run or a feed change in between; off until the reset rule (F13, F17) |
-| `readd_live(clean, ends)` | `readd_live(clean=False, ends='succeeds')` | the job `seen` removed and added back while its attempt runs, which then succeeds or dies; off until the reset rule (F19) |
+| `round_trip(between, clean)` | `round_trip('keys', clean=True)` | `items` moved to its other store and back, with nothing, a `keys=` run or a feed change in between (F13, F17) |
+| `readd_live(clean, ends)` | `readd_live(clean=False, ends='succeeds')` | the job `seen` removed and added back while its attempt runs, which then succeeds or dies (F19) |
 | `break_watch(broken)` | `break_watch(True)` | the sensor raising on every tick (the host posts the error), then working again |
 | `pool_hosts(hosts)` | `pool_hosts(2)` | how many pool hosts poll `split`'s `Pool`: none (its attempts wait for one), one, or two racing to own each attempt (`lifecycle.md` §10) |
 | `cancel(newest)` | | a user cancel of a live run |
@@ -109,7 +109,7 @@ Checked after every step:
 | **Reads say what they read.** A PostgresStore read reports the generation that wrote the rows it loaded, the newest committed before its snapshot — never one that only acquired the partition. | an attempt that acquired and died surfacing as the read generation |
 | **Committed keys are readable.** Every key an immutable store's head lists loads back at its indexed generation, from an object a committed attempt wrote. | a stale writer's object referenced by the index |
 | **A fenced partition at rest holds its index.** A fenced store's partition that no attempt holds and no dead writer left owing a repair holds exactly the keys its index lists, and, in Postgres, reads as written by its head's generation (`versions.md` §5, §9). | a repair that marks a key live with no rows, or leaves a dead attempt's generation as the partition's |
-| **A life is its own.** No attempt launched before its asset was added back (no alias carrying it) installs a commit after (F12's rule). While F19 is open, a crossing sets the run aside. | `seen`'s first life's attempt committing its cursor into the `seen` a deploy added back |
+| **A life is its own.** No attempt launched before its asset was added back (no alias carrying it) installs a commit after (F12's rule, F19). | `seen`'s first life's attempt committing its cursor into the `seen` a deploy added back |
 | **One attempt per asset partition.** No attempt launches on an asset partition another launched attempt holds — in the journal, in order, and in the serving engine's claims. A task follows its asset through a rename (an alias); `mirror` renamed back to `copy` without one is another asset. | the hourly run and a manual run both launching `copy` before either ends |
 | **A tick's runs are submitted once.** Each run a sensor tick requests is submitted at most once, however late, often, or across restarts the tick's outcome is posted. | a retried post of tick `T` submitting its `per_site` run a second time |
 | **A fenced write holds its gate.** Every write a worker makes to a fenced store (the table store, Postgres) comes after its attempt's gate was created `writing` with that worker's id (`lifecycle.md` §2.4, §3). | a worker paused before its gate, whose attempt the engine closed meanwhile, writing `items` when it wakes; the twin of a `twice` worker writing beside the owner |
@@ -144,15 +144,12 @@ ones on every worker and reports throughput, e.g. `simulation: 400 runs,
 
 **Open findings are set aside.** A run that trips a finding still open (its
 signature is recognized in `machine.py`, `_known`) is set aside rather than
-failed, and counted, so the simulation keeps looking for new bugs.
-Signatures today: F13 (a consumer of `items` keeps extra keys in a run where
-`items` moved store), F16 (overlapping index levels), F17 (`items` lacks a
-key after two store moves), F19 (a commit crossing into a re-added asset's
-new life). Rules and re-registrations that would trip an open finding on
-almost every run are off until its fix: `AWAITING` (`round_trip`,
-`readd_live`) and `KNOWN` (removing `seen`). A signature is coarser than its
-bug and can hide another; each goes with its fix. `SOLERA_SIM_KNOWN=1` puts
-all of it back.
+failed, and counted, so the simulation keeps looking for new bugs; a
+re-registration that would trip one on almost every run is left out until
+its fix (`KNOWN`). Today: F21 (a commit crossing into the job `seen`'s new life); `KNOWN`
+leaves out removing `seen` until F21's fix.
+A signature is coarser than its bug and can hide another; each goes with its
+fix. `SOLERA_SIM_KNOWN=1` puts all of it back.
 
 ## Reading a failure
 
@@ -973,3 +970,5 @@ attempt.
 | F17 | An output moved to another store and back loses keys when nothing moved its bookmark in between: `items` commits `k10` on FileStore; a takeover moves it to the table store, where only a `keys=('k1', 'k10')` run writes (a fresh index there; a selection moves no bookmark, which keeps FileStore's fingerprint); a takeover moves it back; the feed adds `k3`: the fingerprint matches, so `items` reads a delta, and the move starts its index over with `k3` alone — `k10` is gone. A move that starts the index over has to make the asset read a full pass | P1 | fixed by the reset rule (object-store-state.md §2): each move resets the output and takes its asset's bookmarks, so it reads full passes — `tests/sim/test_replays.py::test_f17_an_output_moved_away_and_back_keeps_its_keys`, `tests/server/test_sim_found.py::test_a_move_and_back_with_no_write_between_resets` |
 | F18 | PostgresStore's migration ledger (`public.solera_migrations`) is keyed by output name, not by the table a migration changes: two projects (or a staging and a production namespace) on one database each write `orders` in a schema of their own; migration `note` adds a column to the first's table; the second's `migrate` finds the ledger row, skips it and reports it applied — its table never gets the column | P2 | fixed: the ledger (`solera_migration_ledger`) and its lock are keyed by the schema-qualified table — `tests/sdk/test_postgres.py::test_a_migration_applies_to_each_schemas_table_of_one_name` |
 | F19 | An asset removed while its attempt runs and added back before that attempt ends resumes its first life (F12's rule, across a live attempt): `copy` (version 1) has an attempt running; a deploy removes `copy`, which defers retiring its head and bookmarks until the attempt settles; a deploy adds `copy` back (version 2) — its first life's head and bookmarks are still there; the old attempt then succeeds and its commit installs into the new `copy`: rows written by version 1's code become version 2's head, under version 1's bookmark (found by the execution spec's review; a failed or lost attempt installs nothing, and its run carries on with a fresh attempt of the new code) | P2 | fixed by the reset rule (object-store-state.md §2): a removal resets at its deploy, and an attempt launched before commits nothing — `tests/server/test_sim_found.py::test_a_name_removed_while_its_attempt_runs_and_added_back_starts_over`, `test_an_attempt_of_a_removed_and_readded_asset_stays_in_its_life` |
+| F20 | The retry clock resubmits a retry run that cannot plan, at every tick: `checks` (`Each` over `items`, automated) has an operator's forced retry outstanding; `items` has no head (a store move reset it); the clock submits a retry run, which fails planning ("input 'items' has no head"), so the request is never done; the run's events wake the loop, which ticks again at once and submits it again — a hot loop, the journal and run history growing as fast as they can be written (in the simulation, at one virtual instant, until memory ran out) | P1 | fixed in b6d9968 (the retry clock waits for inputs with no head) — `tests/server/test_sim_found.py::test_the_retry_clock_waits_for_an_input_with_no_head` |
+| F21 | A job added back takes its first life's commit (F19's case, for an asset with no output: the reset rule resets outputs, and a job has none): the job `seen` has an attempt running; a deploy removes `seen`, another adds it back; the attempt succeeds and its cursor and bookmarks install into the new `seen` | P2 | open — `tests/server/test_sim_found.py::test_a_job_added_back_does_not_take_its_first_lifes_commit`; randomized runs where it crosses into `seen` are set aside (sweep Z921, seed 921) |

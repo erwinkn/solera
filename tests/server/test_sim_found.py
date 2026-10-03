@@ -784,3 +784,54 @@ async def test_a_reset_output_is_due_for_a_rebuild(state, tmp_path):  # noqa: F8
             break
         await asyncio.sleep(0.01)
     assert head is not None and head["ref"]["store"] == "other", "items stays empty until feed changes"
+
+
+@pytest.mark.xfail(strict=True, reason="F21: a job added back takes its first life's commit")
+async def test_a_job_added_back_does_not_take_its_first_lifes_commit(state, monkeypatch):  # noqa: F811
+    """F19 for a job: `seen` has no output, so no output's reset covers it.
+    Removed while its attempt runs and added back before that attempt
+    succeeds, it must not take that attempt's commit — its cursor and
+    bookmarks belong to the first life."""
+
+    from solera.sdk import Result, job
+    from solera_server import attempts
+
+    monkeypatch.setattr(attempts, "AFTER_COMMIT_WAIT", 0.2)  # the stopped engine's answer to `finished`
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    @asset(outputs=Output("items", key="id"))
+    def items():
+        return [{"id": "a"}, {"id": "b"}]
+
+    def project(life):
+        if life is None:
+            return Project(assets=[items])
+
+        @job(inputs={"items": Incremental()}, version=life)
+        async def seen(ctx, items: list):
+            if life == "1":
+                entered.set()
+                await release.wait()
+            return Result(outputs={}, cursor={"life": life, "keys": sorted(r["id"] for r in items)})
+
+        return Project(assets=[items, seen])
+
+    engine = make_engine(state, project("1"))
+    await engine.initialize()
+    await drive(engine, await engine.submit(["items"]))
+    old = await engine.submit(["seen"])
+    while not entered.is_set():
+        await engine.tick()
+        await asyncio.sleep(0.01)
+    await engine.stop()
+
+    engine = make_engine(state, project(None))  # `seen` removed
+    await engine.initialize()
+    await engine.stop()
+
+    engine = make_engine(state, project("2"))  # and added back
+    await engine.initialize()
+    release.set()
+    await drive(engine, old, timeout=10)
+    cursor = state.model.partition("seen", "").get("cursor")
+    assert cursor is None or cursor["life"] == "2", f"the second life took the first's commit: {cursor}"
