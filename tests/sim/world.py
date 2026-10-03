@@ -355,7 +355,7 @@ class World:
         if self.pg is not None:
             from . import postgres
 
-            patches += postgres.patches(self.pg, actor.get)
+            patches += postgres.patches(self.pg, actor.get, self.now)
         patches += [
             (worker_mod, "Reporter", reporter),
             (engine_mod, "KeyService", keys),

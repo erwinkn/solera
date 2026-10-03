@@ -11,11 +11,8 @@ from __future__ import annotations
 
 import itertools
 import os
-import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-
-from .core import EPOCH
 
 DSN = os.environ.get("SOLERA_TEST_DATABASE_URL")
 _schemas = itertools.count()
@@ -63,7 +60,7 @@ def _pairs(value) -> list[tuple[str, str]]:
     return sorted((str(r["id"]), str(r["v"])) for r in rows)
 
 
-def patches(ledger: Ledger, current_actor) -> list[tuple]:
+def patches(ledger: Ledger, current_actor, now) -> list[tuple]:
     """(owner, name, value) patches recording into `ledger`."""
 
     from solera.stores import Keys
@@ -76,7 +73,7 @@ def patches(ledger: Ledger, current_actor) -> list[tuple]:
         return table
 
     def _store(self, write, prior, context):
-        at = time.time() - EPOCH  # virtual: the loop waits for this thread
+        at = now()  # the loop's clock: it waits for this thread
         written = store_real(self, write, prior, context)
         ref = written.ref
         table = (ref.handle or {}).get("table") or table_of(self, context.output, prior)
