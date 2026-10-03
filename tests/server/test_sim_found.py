@@ -696,3 +696,45 @@ async def test_an_earlier_lifes_objects_are_never_read(state, tmp_path):  # noqa
     assert await FileStore().load(ref, list[dict], None) == [{"life": "3"}] * 3
     assert await FileStore().load(ref, list[dict], Commits(0, 9)) == [{"life": "3"}] * 3
     assert sorted((await engine.list_keys("keys"))["keys"]) == ["k0"]
+
+
+async def test_the_retry_clock_waits_for_an_input_with_no_head(state, tmp_path):  # noqa: F811
+    """F20: `checks` (Each, automated) owes a forced retry while a move left
+    `items` with no head. The retry clock submitted a run that could not plan
+    on every tick, forever — runs and the journal grew without bound. A
+    partition whose inputs have no head now waits for them; a run by hand
+    still says why it cannot run."""
+
+    from solera.sdk import AutoRefresh, Each
+
+    def project(store):
+        @asset(outputs=Output("items", key="id", store=store))
+        def items():
+            return [{"id": "a"}]
+
+        @asset(inputs={"item": Each("items")}, outputs=Output("checks", key="id"), automations=AutoRefresh())
+        def checks(ctx, item: list):
+            raise RuntimeError("bad")
+
+        return Project(assets=[items, checks], stores={"other": FileStore(tmp_path / "other")})
+
+    engine = make_engine(state, project(None))
+    await engine.initialize()
+    await drive(engine, await engine.submit(["checks"], upstream=True))
+    engine.retry_keys("checks", ["failed"])
+    await engine.stop()
+    engine = make_engine(state, project("other"))  # `items` moves: no head until it writes
+    await engine.initialize()
+    assert ("items", "") not in state.model.heads
+    submitted, submit = [], engine.submit
+
+    async def counted(*args, **kwargs):
+        run = await submit(*args, **kwargs)
+        submitted.append(run)
+        return run
+
+    engine.submit = counted
+    for _ in range(30):
+        await engine.tick()
+        await asyncio.sleep(0.01)
+    assert [r for r in submitted if r is not None] == []

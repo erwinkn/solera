@@ -1775,7 +1775,8 @@ class Engine(Attempts, Sensors, Views):
         """The retry clock (docs/per-key-processing.md §9): an automated Each
         asset whose failed keys has keys due again runs for that partition, even
         when nothing upstream changed. An asset run by hand picks them up on
-        its next run."""
+        its next run. A partition whose inputs have no head waits for them: its
+        run could not plan, and would be submitted again every tick (F20)."""
 
         automated = {t for auto in self.m.automations.values() if auto["enabled"] for t in auto["targets"]}
         for (asset, partition), state in list(self.m.partitions.items()):
@@ -1784,9 +1785,11 @@ class Engine(Attempts, Sensors, Views):
             if self._partition_active(asset, partition) or self.m.is_pending(asset, partition):
                 continue
             if self._has_retries(state["failures"]):
-                await self.submit_retries(asset, [partition], "retry clock")
+                await self.submit_retries(asset, [partition], "retry clock", skip_missing_inputs=True)
 
-    async def submit_retries(self, asset: str, partitions, by: str | None) -> list[dict]:
+    async def submit_retries(
+        self, asset: str, partitions, by: str | None, skip_missing_inputs: bool = False
+    ) -> list[dict]:
         """Runs for an Each asset's partitions that have keys to retry, each under
         the configuration its partition last ran with (kept on its failure record):
         a retry under another configuration would read other inputs, and its
@@ -1800,7 +1803,12 @@ class Engine(Attempts, Sensors, Views):
         runs = []
         for config, group in sorted(by_config.items()):
             run = await self.submit(
-                [asset], partitions=sorted(group), config=json.loads(config), skip_active=True, by=by
+                [asset],
+                partitions=sorted(group),
+                config=json.loads(config),
+                skip_active=True,
+                skip_missing_inputs=skip_missing_inputs,
+                by=by,
             )
             if run is not None:
                 runs.append(run)
