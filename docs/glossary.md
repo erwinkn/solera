@@ -435,7 +435,9 @@ A pass that ends behind the head goes on to it.
 **batch** `ctx.batch[input]`. What one attempt reads from an incremental
 input: up to `batch_size` keys, or up to `batch_size` upstream commits.
 It may be one upstream commit, part of one, or several. One batch per
-attempt and commit. It knows its `index` in the pass (0-based, exact),
+attempt and commit. Never empty, but for one case: a full pass whose
+input takes no key reaches a plain producer as one empty batch, since
+starting over must happen (an `Each` asset's cleanup does it instead). It knows its `index` in the pass (0-based, exact),
 the planned `count` (possibly an estimate), `first`, `final`, `full`, and
 its `upserted` and `removed` keys. *Example:* `file_index` reads four
 files per site in two batches of `batch_size=2`. *Was:* page (`Changes`,

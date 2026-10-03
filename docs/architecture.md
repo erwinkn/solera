@@ -367,7 +367,12 @@ read ahead past the others, so `final` is on a real batch — unless a
 batch had to examine more than 100,000 keys to fill itself or to prove
 it is the last: it then goes as it is, not final, and the rest, if the
 patterns take nothing from it, completes the pass without calling the
-producer. `upstream` carries facts about the upstream: its `output`,
+producer. One exception: a full pass always reaches its consumer, keys or
+none, because starting over must happen. A plain producer whose full
+pass takes no key is called once with an empty batch — `full`, `first`
+and `final` — and returns its new, empty content; an `Each` producer,
+written for one key, is not called, and the cleanup after the full pass
+drops the keys its asset holds that the input no longer has. `upstream` carries facts about the upstream: its `output`,
 and for an unkeyed incremental upstream the range of `commits` the batch
 covers. The pass's plan is kept on the input's bookmark while it
 continues, for keyed and unkeyed upstreams, delta passes and full passes

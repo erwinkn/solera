@@ -379,7 +379,8 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
             # The batch — a keys= override, inlined by the engine, or read from the
             # pinned index — filtered by the input's patterns (per-key §11).
             read = await each.read_batch(pin, keys_io)
-            reads.append(read)
+            if not (full and int(ch.get("index") or 0) == 0):
+                reads.append(read)  # a full pass's first batch starts its consumer over, keys or none
             upserted, deleted, after = read.upserted, (*read.deleted, *read.unmatched), read.after
             args[param] = await observed.load(store, ref, t, Keys(upserted))
             batch[param] = Batch(
@@ -401,7 +402,7 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
             args[param] = await _load_whole(observed.load, store, ref, t, keys_io, pin.get("index"))
             timeline.add("loaded", param, _rows(args[param]))
     # Every keyed batch held keys, and the inputs' patterns took none of them: nothing
-    # to call the producer with.
+    # to call the producer with — unless one starts a full pass (architecture.md §5).
     filtered = bool(reads) and all(not r.upserted and not r.deleted and not r.unmatched for r in reads)
     delivered["*filtered"] = filtered and any(r.read for r in reads)
     return args, batch, delivered

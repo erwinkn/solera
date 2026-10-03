@@ -466,7 +466,7 @@ async def test_renamed_asset_keeps_its_state(state):
     assert {r["id"]: r["v"] for r in loaded} == {"a": 1, "b": 2}
 
 
-async def test_small_writes_resolve_in_the_engine_and_pages_come_with_start(state, monkeypatch):
+async def test_small_writes_resolve_in_the_engine_and_batches_come_with_start(state, monkeypatch):
     """docs/resolved-commits.md §4, §7: once the engine's cache holds an index,
     a small patch's delta comes from the engine — the worker reads no index
     file — and a consumer's pending batch comes with its start reply."""

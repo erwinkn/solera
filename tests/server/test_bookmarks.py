@@ -23,7 +23,7 @@ def test_a_batch_delivery_keeps_its_mode_to_its_boundary():
     assert done == {"kind": "commits", **CARRIED, "next": 3} and not continues(last, None, done)
 
 
-def test_a_key_delivery_pages_by_key_then_moves_next():
+def test_a_keyed_pass_goes_by_key_then_moves_next():
     wm0 = {"kind": "keys", **CARRIED, "next": 5}
     full = {"mode": "full", "from": 8, "at": None, "batch": 0, "batches": 2, "reconcile": True}
     plan = {"kind": "keys", "bookmark": wm0, "pass": full}
@@ -48,7 +48,7 @@ def test_a_pattern_transition_ends_on_the_new_patterns():
     assert done == {"kind": "keys", **CARRIED, "next": 5, "patterns": ["b/**"]} and pins(done) == []
 
 
-def test_a_held_page_moves_no_watermark():
+def test_a_held_batch_moves_no_bookmark():
     kept = {"kind": "keys", **CARRIED, "next": 3}
     assert advance({"kind": "held", "bookmark": kept}) == kept
     assert advance({"kind": "held", "bookmark": None}) is None

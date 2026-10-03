@@ -1078,7 +1078,9 @@ class Engine(Attempts, Sensors, Views):
             current = {"mode": "full", "from": head_commit + 1, "at": None}
             if each:
                 current["reconcile"] = any(self.m.index(name, task["partition"]).count for name in held)
-            empty = index.count == 0 and not index.files
+            # A full pass starts its consumer over, keys or none: a plain producer is
+            # called with one empty batch, an Each asset's cleanup drops its keys (§5).
+            empty = each and not current["reconcile"] and index.count == 0 and not index.files
         elif current is None:
             current = {
                 "mode": "delta",

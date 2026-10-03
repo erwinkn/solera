@@ -1097,7 +1097,10 @@ Where the implementation (`solera/errors.py`, `solera/build.py`,
   are formed from the keys they take, read ahead past the others until a
   batch holds `batch_size` keys or the pass runs out, so no batch is
   empty; a pass they take nothing from does not call the producer
-  and ends `skipped`. The read-ahead is bounded: the index is read a batch's
+  and ends `skipped` — but for a full pass, which starts its consumer
+  over all the same: a plain producer gets one empty batch (`full`,
+  `first`, `final`), and an `Each` asset's cleanup after the pass drops
+  the keys the input no longer has (`architecture.md` §5). The read-ahead is bounded: the index is read a batch's
   worth and one more at a time, never only what the batch still lacks, and
   a batch examines at most 100,000 entries (`LOOKAHEAD` in
   `solera_worker/each.py`) — past that it goes as it is,

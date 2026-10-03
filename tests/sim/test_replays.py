@@ -324,9 +324,6 @@ def test_f12_a_rename_back_and_forth_over_rolling_deploys_keeps_up():
     state.teardown()
 
 
-@pytest.mark.xfail(
-    strict=True, reason="F13: a key removed after its upstream moved store (across a crash) stays downstream"
-)
 def test_f13_a_key_removed_after_a_store_move_leaves_its_consumers():
     """`items` on the table store holds `k11`; a clean redeploy, then a crash
     redeploy moving `items` to FileStore; the feed then removes `k11`.
@@ -411,7 +408,6 @@ def test_f16_a_compaction_landing_after_a_commit_keeps_the_newest_entry():
     state.teardown()
 
 
-@pytest.mark.xfail(strict=True, reason="F13: a key removed after its upstream moved store stays downstream")
 def test_f13_a_key_removed_after_a_takeover_moved_its_upstream_leaves_its_consumers():
     """F13 by another route, no crash: `k0`, `k11` committed; a takeover
     moves `items` from FileStore to the table store; the feed removes both.

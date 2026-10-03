@@ -12,7 +12,7 @@ from .test_engine import drive, make_engine, state, status_of  # noqa: F401
 from .test_fence import LiveStore
 
 
-async def test_a_paged_delta_window_says_the_generation_it_read(state):  # noqa: F811
+async def test_a_delta_pass_over_batches_says_the_generation_it_read(state):  # noqa: F811
     """Review finding 3: a delta pass delivered over batches reads the index
     as of its start. The upstream writes `b` again (g3) after the pass's
     first batch; its second batch reads `b` as of g2 — the object it was

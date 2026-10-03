@@ -472,7 +472,9 @@ class Batch:
       running out, never from `count`. Batches are formed from the keys the
       input's patterns take, so every batch holds some: `final` is always
       on a real batch, and a pass that takes no key at all does not call
-      the producer;
+      the producer — but for a full pass, which always reaches it, as one
+      empty batch that is `full`, `first` and `final`: starting over must
+      happen;
     - `upstream`: facts about the upstream (`Upstream`).
 
     A consumer that rebuilds starts over when `full and first`, appends every

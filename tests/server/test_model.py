@@ -389,7 +389,7 @@ async def test_a_value_the_journal_cannot_hold_changes_nothing(state, clock):
     json.dumps(state.model.snapshot(), allow_nan=False)
 
 
-async def test_a_paged_task_keeps_no_list_of_its_pages(state, clock):
+async def test_a_task_over_many_batches_keeps_no_list_of_them(state, clock):
     """Engine review #6 (D4): a task paging through a backlog holds counts
     and its last attempt, not one summary per batch; every attempt's row is
     in the history as it ends, and the run's detail lists them all."""

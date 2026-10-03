@@ -439,7 +439,7 @@ async def test_a_selection_reads_its_keys_and_moves_nothing(state):
         await engine.submit(["consumer"], mode="full", keys={"files": {"keys": ["a"]}})
 
 
-async def test_a_paged_full_override_resumes_its_pass(state):
+async def test_a_full_override_resumes_its_pass_batch_by_batch(state):
     """Engine review round 2 #2: `keys={"files": "full"}` starts one pass per
     run and its later batches resume it — the first batch is not served again."""
     seen = []
@@ -1229,7 +1229,7 @@ async def test_ondeploy_two_registrations_fire_latest_once(state):
     assert auto["last_deploy"] == project_b.manifest["deploy"]
 
 
-async def test_a_delivery_says_where_each_page_sits(state):
+async def test_a_batch_says_where_it_sits_in_its_pass(state):
     """A pass spans batches of `batch_size`: `index` is the batch's index,
     `count` the plan, `first` is batch 0, `final` the pass running out,
     and `full` holds on every batch of a full pass — for keyed full
@@ -1294,7 +1294,7 @@ async def test_a_delivery_says_where_each_page_sits(state):
     assert batch_pages == [(0, 1, True, True, [3], False)]  # then a delta
 
 
-async def test_the_page_plan_is_an_estimate_but_final_is_not(state):
+async def test_the_batch_plan_is_an_estimate_but_final_is_not(state):
     """Patterns filter keys after the plan is made: batches are formed from the
     keys they take, read ahead past the rest, so the pass takes the batches
     it takes, none is empty, and `final` is on the last real one (§5)."""
@@ -1321,9 +1321,10 @@ async def test_the_page_plan_is_an_estimate_but_final_is_not(state):
     ]
 
 
-async def test_pages_read_ahead_past_keys_the_patterns_leave_out(state):
+async def test_batches_read_ahead_past_keys_the_patterns_leave_out(state):
     """Every batch holds `batch_size` taken keys, however sparse they are in the
-    upstream; a pass that takes none never calls the producer."""
+    upstream; a delta pass that takes none never calls the producer. A full
+    pass does, once, with an empty batch: it starts its consumer over."""
 
     calls = []
 
@@ -1346,11 +1347,14 @@ async def test_pages_read_ahead_past_keys_the_patterns_leave_out(state):
     await engine.initialize()
     await drive(engine, await engine.submit(["sparse"], upstream=True))
     assert calls == [(0, ["k03", "k04"], False), (1, ["k17", "k18"], False), (2, ["k29"], True)]
-    detail = await drive(engine, await engine.submit(["none"]))
-    assert "none" not in calls and task_statuses(detail)["none"] == "skipped"
+    await drive(engine, await engine.submit(["none"]))  # its first pass: a full one
+    assert calls.count("none") == 1
+    await drive(engine, await engine.submit(["files"], mode="full"))  # every key changes: v=1 rewritten
+    detail = await drive(engine, await engine.submit(["none"]))  # a delta pass taking none
+    assert calls.count("none") == 1 and task_statuses(detail)["none"] == "skipped"
 
 
-async def test_a_page_looks_ahead_a_bounded_way(state, monkeypatch):
+async def test_a_batch_looks_ahead_a_bounded_way(state, monkeypatch):
     """Review round 5 (system #5): a batch reads the index in chunks, whatever
     it still lacks, and examines at most `LOOKAHEAD` entries — past them it
     goes as it is, not final; a batch left with nothing is skipped without

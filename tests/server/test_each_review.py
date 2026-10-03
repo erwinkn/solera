@@ -273,7 +273,7 @@ async def test_8_a_renamed_asset_keeps_its_failures(state):  # noqa: F811
     assert calls == [1, 1] and engine.m.partition("parsed", "")["failures"]["counts"] == {}
 
 
-async def test_a_full_run_pages_through_every_key_once(state):  # noqa: F811
+async def test_a_full_run_reads_every_key_once_in_batches(state):  # noqa: F811
     """The inherited blocker: a `full` run resets once, then resumes its pass."""
 
     seen, plain = [], []

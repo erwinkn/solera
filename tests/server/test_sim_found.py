@@ -139,7 +139,7 @@ async def test_an_attempt_launched_before_a_rename_settles(state, monkeypatch): 
     assert status_of(await drive(engine, await engine.submit(["new"], mode="full"))) == "succeeded"
 
 
-async def test_a_change_made_during_a_full_delivery_reaches_downstream(state):  # noqa: F811
+async def test_a_change_made_during_a_full_pass_reaches_downstream(state):  # noqa: F811
     """§6, §9: a full keyed pass begun at commit 0 delivers what changed
     meanwhile afterwards, as a delta. Interrupted after its first batch, then
     the upstream changes: the firing for that change resumes the pass —
@@ -230,7 +230,7 @@ async def test_a_slow_new_writer_never_fences_into_a_deleted_segment(tmp_path):
         await add(a, sa, "x", 1)
 
 
-async def test_a_batch_upstream_reset_right_after_a_delivery_is_delivered_in_full(state):  # noqa: F811
+async def test_an_unkeyed_upstream_reset_right_after_a_pass_is_delivered_in_full(state):  # noqa: F811
     """§6: a `full` run starts an unkeyed incremental output over at a new
     `base`; a consumer that read commits before it must be told (`full`),
     or it keeps rows the upstream let go — also when the reset commit is
@@ -263,15 +263,11 @@ async def test_a_batch_upstream_reset_right_after_a_delivery_is_delivered_in_ful
     assert state.model.partition("tally", "")["cursor"] == 1
 
 
-@pytest.mark.xfail(
-    strict=True, reason="sim finding F10: a reset delivery its patterns take nothing from is skipped"
-)
-async def test_a_full_delivery_that_takes_no_key_still_starts_over(state):  # noqa: F811
-    """§5, §8: a full run makes the output equal to exactly its write, and a
-    full pass starts its consumer over. When the input's patterns take
-    none of the upstream's keys, the pass is skipped without calling
-    the producer — so nothing starts over, and keys the consumer holds from
-    before stay, though its upstream holds them no longer."""
+async def test_a_full_pass_that_takes_no_key_still_starts_over(state):  # noqa: F811
+    """F10, architecture.md §5: a full pass starts its consumer over, so it
+    reaches the producer even when the input's patterns take none of the
+    upstream's keys: one empty batch, `full`, `first` and `final`. Keys the
+    consumer held from before go, as its upstream no longer holds them."""
 
     from solera.stores import Patch
 
@@ -297,6 +293,60 @@ async def test_a_full_delivery_that_takes_no_key_still_starts_over(state):  # no
         _ref(state.model.heads[("mirror", "")]), list[dict], await whole(state, "mirror")
     )
     assert rows == []
+
+
+async def test_a_full_pass_over_an_empty_upstream_reaches_its_producer(state):  # noqa: F811
+    """F10: an upstream that holds no key any more still starts its
+    consumer over on a full pass: the producer sees one empty batch, `full`,
+    `first` and `final`, and what the consumer held from before goes."""
+
+    content, seen = {"rows": [{"id": "a", "v": "1"}]}, []
+
+    @asset(outputs=Output("items", key="id"))
+    def items():
+        return content["rows"]
+
+    @asset(inputs={"items": Incremental()}, outputs=Output("mirror", key="id"))
+    def mirror(ctx, items: list):
+        b = ctx.batch["items"]
+        seen.append((b.full, b.first, b.final, len(items)))
+        return [{"id": r["id"], "v": r["v"]} for r in items]
+
+    engine = make_engine(state, Project(assets=[items, mirror]))
+    await engine.initialize()
+    await drive(engine, await engine.submit(["mirror"], upstream=True))  # mirror holds a
+    content["rows"] = []
+    await drive(engine, await engine.submit(["items"], mode="full"))  # the upstream holds nothing
+    await drive(engine, await engine.submit(["mirror"], mode="full"))
+    assert seen[-1] == (True, True, True, 0)
+    assert state.model.index("mirror", "").count == 0
+
+
+async def test_an_each_full_pass_that_takes_no_key_drops_its_keys(state):  # noqa: F811
+    """F10 for `Each`: the producer is written for one key, so a full pass
+    taking none is not called; the cleanup after the pass drops the keys the
+    asset holds that its input no longer has."""
+
+    from solera.sdk import Each
+
+    content = {"rows": [{"id": "a", "v": "1"}]}
+
+    @asset(outputs=Output("items", key="id"))
+    def items():
+        return content["rows"]
+
+    @asset(inputs={"item": Each("items", exclude=["k*"])}, outputs=Output("out", key="id"))
+    def out(ctx, item: list):
+        return [{"v": item[0]["v"]}]
+
+    engine = make_engine(state, Project(assets=[items, out]))
+    await engine.initialize()
+    await drive(engine, await engine.submit(["out"], upstream=True))
+    assert state.model.index("out", "").count == 1
+    content["rows"] = [{"id": "k1", "v": "1"}]  # a is gone; k1 is excluded
+    await drive(engine, await engine.submit(["items"]))
+    await drive(engine, await engine.submit(["out"], mode="full"))
+    assert state.model.index("out", "").count == 0
 
 
 async def test_a_name_removed_and_added_back_starts_over(state):  # noqa: F811

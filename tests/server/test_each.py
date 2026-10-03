@@ -379,7 +379,7 @@ async def test_a_user_cancel_commits_finished_keys_and_leaves_the_rest_dormant(t
     await opened.close()
 
 
-async def test_a_retry_pass_spans_pages_and_accumulates_its_bounds(state):  # noqa: F811
+async def test_a_retry_pass_spans_batches_and_accumulates_its_bounds(state):  # noqa: F811
     """Retry batches walk the failed keys `batch_size` keys at a time,
     alternating with change batches; the pass's accumulators become the exact
     bounds when it completes (§9)."""
@@ -486,7 +486,7 @@ async def test_a_timeout_drain_counts_a_try_and_comes_due(tmp_path):
     await opened.close()
 
 
-async def test_patterns_select_keys_and_a_page_of_none_is_skipped(state):  # noqa: F811
+async def test_patterns_select_keys_and_a_batch_of_none_is_skipped(state):  # noqa: F811
     from solera import Incremental
 
     content = {"ICP/a.csv": {"n": 1}, "ICP/archive/b.csv": {"n": 2}, "XRF/c.csv": {"n": 3}}
@@ -644,7 +644,7 @@ async def test_none_is_no_change_and_removal_is_explicit(state):  # noqa: F811
     assert (await records(engine, "parse"))["c"].outcome == FAILED
 
 
-async def test_a_last_page_that_writes_nothing_still_completes_the_scope(state):  # noqa: F811
+async def test_a_last_batch_that_writes_nothing_still_completes_the_partition(state):  # noqa: F811
     """Review round 3 (system B1): one key a batch, `a` writes rows, `b`
     fails — so the last batch writes no output. The pass drained all the
     same: the partition is complete, kept out of `missing`, and its head is
