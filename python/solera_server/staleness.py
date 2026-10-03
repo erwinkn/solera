@@ -161,15 +161,17 @@ class Staleness:
         behind = False
         with self.m.reading(state.prefix):
             index = KeyIndex(self._key_io(), None, state.slice(lo, hi), self.key_options)
-            after = None
-            while not behind:
-                keys, generations, _, _, after = await index.pending(lo, hi, after, BEHIND_PAGE)
-                behind = any(
-                    taken(key_str(k)) and read.get(key_str(k), -1) < g
-                    for k, g in zip(keys, generations, strict=True)
-                )
-                if after is None:
-                    break
+            pages = index.pending_pages(lo, hi, None, BEHIND_PAGE)  # one merge of the commits
+            try:
+                async for keys, generations, _, _ in pages:
+                    behind = any(
+                        taken(key_str(k)) and read.get(key_str(k), -1) < g
+                        for k, g in zip(keys, generations, strict=True)
+                    )
+                    if behind:
+                        break
+            finally:
+                await pages.aclose()
         if len(cache) > 10_000:
             cache.clear()
         cache[memo_key] = behind

@@ -1336,3 +1336,29 @@ def test_under_any_budget_and_any_trouble_the_engine_resolves_as_a_cold_reader(
         await asyncio.gather(*resolver._fills, return_exceptions=True)
 
     asyncio.run(run())
+
+
+async def test_pending_pages_stream_what_pending_pages(io):
+    """`pending_pages` reads the commits' files once, through one merge, and
+    yields every entry `pending` gives a page at a time, from any cursor, in
+    pages of any size: deletions, payloads and the newest generation alike."""
+
+    state = await logged_index(io, seed=5)
+    rng = random.Random(6)
+    for _ in range(12):
+        after = rng.choice([None, key(rng.randrange(2100))])
+        limit = rng.choice([1, 7, 100, 5000])
+        lo = rng.randrange(10)
+        hi = rng.randrange(lo, 10)
+        index = KeyIndex(io, None, state, OPTS)
+        paged, cursor = [], after
+        while True:
+            *entries, cursor = await index.pending(lo, hi, cursor, limit)
+            paged += list(zip(*entries, strict=True))
+            if cursor is None:
+                break
+        streamed = []
+        async for page in KeyIndex(io, None, state, OPTS).pending_pages(lo, hi, after, limit):
+            assert len(page[0]) <= limit
+            streamed += list(zip(*page, strict=True))
+        assert streamed == paged

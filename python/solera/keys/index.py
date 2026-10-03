@@ -846,6 +846,47 @@ class KeyIndex:
         args = (first_commit, last_commit, after, limit)
         return await self._read("pending", args, levels, local, store)
 
+    async def pending_pages(
+        self, first_commit: int, last_commit: int, after: bytes | None = None, limit=100_000
+    ):
+        """Every page of `pending` from `after`, through one merge of the
+        commits' files, each read once: paging with `pending` starts that
+        merge over for every page, which far behind a long log costs the
+        whole merge per page. Yields `(keys, generations, deleted flags,
+        payloads)`. Where reads are served or the files are local copies,
+        `pending` itself pages, as recorded reads are page by page."""
+
+        logged = dict(self.state.log)
+        missing = [b for b in range(first_commit, last_commit + 1) if b not in logged]
+        if missing:
+            raise LookupError(f"delta log no longer holds commits {missing[:5]}")
+        levels = [sorted(logged[b], key=lambda f: f.min) for b in range(last_commit, first_commit - 1, -1)]
+        if getattr(self.io, "served", None) is not None or self._snapshot(levels) is not None:
+            while True:
+                keys, generations, deleted, payloads, after = await self.pending(
+                    first_commit, last_commit, after, limit
+                )
+                yield keys, generations, deleted, payloads
+                if after is None:
+                    return
+        from .jobs import _Run
+
+        job = Merge.scan(len(levels), after=after, limit=limit)
+        readers = [_Run(self.io, self.path, files) for files in levels]
+        try:
+            while (step := await in_thread(job.step)) is not None:
+                kind, x = step
+                if kind == "run":
+                    segment = await readers[x].next()
+                    if segment is None:
+                        job.end(x)
+                    else:
+                        job.feed(x, *segment)
+                else:
+                    yield x
+        finally:
+            await asyncio.gather(*(r.close() for r in readers))
+
     async def recount(self) -> int:
         """Count live keys exactly: one streaming pass over the whole index,
         over the `io`'s local copies when they hold it (`_run`)."""

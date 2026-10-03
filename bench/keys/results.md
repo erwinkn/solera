@@ -1224,3 +1224,24 @@ one, at every size: it reads level 0's files and writes the merged file
 writes, and a few MB, to a compaction that was free. It happens only when
 level 1 is empty: an index's first compaction, or one after a replacement
 by nothing. Peak memory is about 170 bytes per output entry in both cases.
+
+## A pass far behind: `pending` against `pending_pages` (`pending.py`)
+
+A full read of a delta log of 1K-key commits over 1M keys (90% updates, 5%
+removes, 5% inserts), in 100K-key pages, on the bench's store model (30 ms
+a request, 80 MB/s a connection), capped at 1.5 cores. `pending` starts its
+merge of every commit's file over for each page; `pending_pages` keeps one
+merge across pages (a native `Merge.scan` job). Reads are the same: each
+commit's file once.
+
+| commits behind | entries | how | wall | CPU | GETs | MB |
+|---:|---:|---|---:|---:|---:|---:|
+| 1,000 | 642,761 | `pending`, page by page | 3.1 s | 2.7 s | 1,000 | 6.8 |
+| 1,000 | 642,761 | `pending_pages`, one merge | 1.3 s | 1.0 s | 1,000 | 6.8 |
+| 10,000 | 1,281,690 | `pending`, page by page | 101.0 s | 95.5 s | 10,000 | 68.4 |
+| 10,000 | 1,281,690 | `pending_pages`, one merge | 21.5 s | 17.8 s | 10,000 | 68.4 |
+
+The time was the merge, restarted per page: the 10,000-way merge for each
+of 13 pages. Staleness's check of a position reads through `pending_pages`;
+a worker's batches still page with `pending` (small, and the engine may
+answer them page by page from its record, docs/resolved-commits.md §7).

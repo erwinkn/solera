@@ -32,7 +32,7 @@ use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::{PyBool, PyBytes, PyCapsule, PyDict, PyInt, PyList, PyString};
 
 use format::{Error, Options};
-use jobs::{Compact, Count, Join, Step};
+use jobs::{Compact, Count, Join, Scan, Step};
 use rayon::prelude::*;
 use rows::{Arena, Constant, Cursor, Overlay, Payloads, Source, Stream, Table};
 use stream::Segment;
@@ -1187,6 +1187,7 @@ enum Kind {
     Join(Box<Join>),
     Compact(Box<Compact>),
     Count(Count),
+    Scan(Scan),
 }
 
 /// A streaming job over an index's runs (see the module documentation).
@@ -1208,6 +1209,7 @@ fn merge_of(kind: &mut Kind) -> &mut stream::Merge {
         Kind::Join(j) => &mut j.merge,
         Kind::Compact(j) => &mut j.merge,
         Kind::Count(j) => &mut j.merge,
+        Kind::Scan(j) => &mut j.merge,
     }
 }
 
@@ -1351,6 +1353,20 @@ impl Merge {
         })
     }
 
+    /// Every merged entry of `runs` (newest first) past `after`, newest
+    /// winning, deleted ones included: `step` returns `("page", (keys,
+    /// generations, deleted, payloads))` every `limit` entries, and once for
+    /// what is left at the end.
+    #[staticmethod]
+    #[pyo3(signature = (runs, *, after=None, limit=100000))]
+    fn scan(runs: usize, after: Option<Vec<u8>>, limit: usize) -> PyResult<Merge> {
+        Ok(Merge {
+            key: None,
+            local: None,
+            kind: Kind::Scan(Scan::new(runs, after, limit)),
+        })
+    }
+
     /// Counts the live keys of `runs` (newest first).
     #[staticmethod]
     fn count(runs: usize) -> PyResult<Merge> {
@@ -1441,6 +1457,7 @@ impl Merge {
                             Kind::Join(j) => j.step()?,
                             Kind::Compact(j) => j.step()?,
                             Kind::Count(j) => j.step()?,
+                            Kind::Scan(j) => j.step()?,
                         };
                         match (step, local.as_mut()) {
                             (Step::Run(r), Some((snap, feed))) => {
@@ -1465,6 +1482,30 @@ impl Merge {
                 Step::Rows => Some(("rows", py.None().into_bound(py))),
                 Step::File => Some(("file", PyBytes::new(py, &file.unwrap()).into_any())),
                 Step::Garbage => Some(("garbage", PyBytes::new(py, &file.unwrap()).into_any())),
+                Step::Page => {
+                    let page = match &mut self.kind {
+                        Kind::Scan(j) => std::mem::take(&mut j.page),
+                        _ => Vec::new(),
+                    };
+                    let (keys, generations, deleted, payloads) = (
+                        PyList::empty(py),
+                        PyList::empty(py),
+                        PyList::empty(py),
+                        PyList::empty(py),
+                    );
+                    for (key, generation, gone, payload) in page {
+                        keys.append(PyBytes::new(py, &key))?;
+                        generations.append(generation)?;
+                        deleted.append(gone)?;
+                        payloads.append(payload.map(|p| PyBytes::new(py, &p)))?;
+                    }
+                    Some((
+                        "page",
+                        (keys, generations, deleted, payloads)
+                            .into_pyobject(py)?
+                            .into_any(),
+                    ))
+                }
                 Step::Done => None,
             })
         })

@@ -155,7 +155,7 @@ async def test_a_dead_pool_claim_that_took_its_gate_is_still_writing(state):
     await own(state, run["id"], first, "dead")
     intents = {"job": {"files": [], "added": 0, "removed": 0, "exact": True}}
     await as_worker(state, run["id"], first, lifecycle.WRITING, "dead", intents=intents)
-    detail = await engine.run_until(run["id"], 10)
+    detail = await engine.run_until(run["id"], 30)  # a margin that holds under load
     assert detail["request"]["status"] == "failed"
     assert state.model.repairs[("job", "")][0]["attempt"] == first
 

@@ -99,7 +99,7 @@ fn main() {
                 files += 1;
             }
             Step::Garbage => unreachable!("no garbage asked for"),
-            Step::Rows => unreachable!(),
+            Step::Rows | Step::Page => unreachable!(),
             Step::Done => break,
         }
     }

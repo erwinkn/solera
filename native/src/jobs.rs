@@ -20,6 +20,8 @@ pub enum Step {
     File,
     /// A garbage file is ready: `Compact::garbage`'s `files`.
     Garbage,
+    /// A page of entries is ready: `Scan::page`.
+    Page,
     Done,
 }
 
@@ -188,6 +190,53 @@ impl Compact {
                     }
                     self.done = true;
                 }
+            }
+        }
+    }
+}
+
+/// The merged entries of the runs past `after`, newest winning, deleted ones
+/// included, `limit` at a time: one merge read once across pages, where a
+/// page-by-page read starts the merge over for each (`KeyIndex.pending_pages`).
+pub struct Scan {
+    pub merge: Merge,
+    after: Option<Vec<u8>>,
+    limit: usize,
+    pub page: Vec<(Vec<u8>, u64, bool, Option<Vec<u8>>)>,
+}
+
+impl Scan {
+    pub fn new(runs: usize, after: Option<Vec<u8>>, limit: usize) -> Scan {
+        Scan {
+            merge: Merge::new(runs),
+            after,
+            limit: limit.max(1),
+            page: Vec::new(),
+        }
+    }
+
+    pub fn step(&mut self) -> Result<Step> {
+        loop {
+            match self.merge.next_key()? {
+                Next::Entry => {
+                    let key = self.merge.key();
+                    if self.after.as_deref().is_some_and(|after| key <= after) {
+                        continue;
+                    }
+                    let entry = (
+                        key.to_vec(),
+                        self.merge.generation(),
+                        self.merge.deleted(),
+                        self.merge.payload().map(<[u8]>::to_vec),
+                    );
+                    self.page.push(entry);
+                    if self.page.len() >= self.limit {
+                        return Ok(Step::Page);
+                    }
+                }
+                Next::Need(r) => return Ok(Step::Run(r)),
+                Next::End if self.page.is_empty() => return Ok(Step::Done),
+                Next::End => return Ok(Step::Page),
             }
         }
     }
