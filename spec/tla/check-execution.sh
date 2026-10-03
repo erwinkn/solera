@@ -2,7 +2,7 @@
 # Model-check the execution spec (docs/verification.md, "Execution spec").
 #
 #   spec/tla/check-execution.sh             the smoke model and the calibrations (CI)
-#   spec/tla/check-execution.sh design      the design with liveness: store moves, patterns and versions, removal (minutes)
+#   spec/tla/check-execution.sh design      the design with liveness: store moves, patterns and versions, removal, a zombie (minutes)
 #   spec/tla/check-execution.sh big         every deploy kind, every fault kind, each=True: too large to finish yet
 #   spec/tla/check-execution.sh safety      every kind at once, two deploys and two faults: random behaviours (SAFETY_TRACES)
 #   spec/tla/check-execution.sh calibrate   each fix put back out: TLC must find its bug
@@ -54,8 +54,9 @@ check() {  # check NAME [TLC options]: the model must pass
 calibrate() {  # calibrate NAME EXPECTED: the model with its fix out must violate EXPECTED
     local log="$work/$1.log"
     tlc "Execution-$1.cfg" "$log"
-    # TLC names a violated invariant, not a temporal property: Quiesces is the only one checked.
-    if grep -qE "Invariant $2 is violated" "$log" ||
+    # TLC names a violated invariant or action property, not a temporal
+    # property: Quiesces is the only one checked.
+    if grep -qE "(Invariant|Action property) $2 is violated" "$log" ||
         { [ "$2" = Quiesces ] && grep -q "Temporal properties were violated" "$log"; }; then
         printf '   %-4s %s violated in %s steps\n' "$1" "$2" "$(grep -cE '^State [0-9]+:' "$log")"
     else
@@ -71,14 +72,15 @@ calibration() {
     calibrate F10 BookmarkHonest   # a full pass its patterns take nothing from never reaches B
     calibrate F13 BookmarkHonest   # a store move leaves the fingerprint: the moved write starts over with one batch
     calibrate F17 BookmarkHonest   # moved and back with a keys= run between: the old fingerprint matches, the index started over
+    calibrate selection RunsEndCaughtUp  # a keys= run made a full pass ends after its first batch
 }
 
 case "${1:-ci}" in
     ci) check smoke; calibration ;;
-    design) for m in store shape remove; do check $m; done ;;
+    design) for m in store shape remove zombie; do check $m; done ;;
     big) for m in deploys faults each; do check $m; done ;;
     safety) check safety -simulate "num=${SAFETY_TRACES:-100000}" -depth 150 ;;
     calibrate) calibration ;;
-    all) check smoke; calibration; for m in store shape remove; do check $m; done; check safety -simulate "num=${SAFETY_TRACES:-100000}" -depth 150 ;;
+    all) check smoke; calibration; for m in store shape remove zombie; do check $m; done; check safety -simulate "num=${SAFETY_TRACES:-100000}" -depth 150 ;;
     *) echo "usage: $0 [ci|design|big|safety|calibrate|all]" >&2; exit 2 ;;
 esac

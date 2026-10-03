@@ -8,8 +8,9 @@
 (* crash, restart and takeover; worker crashes, timeouts, user cancels.    *)
 (* docs/verification.md, "Formal model", says what is abstracted and why.  *)
 (*                                                                         *)
-(* FixF6, FixF9, FixF10, FixF13 select each rule as designed (TRUE) or as  *)
-(* it was before its fix (FALSE): the model must find each known bug.      *)
+(* FixF6, FixF9, FixF10, FixF13, FixF17, FixSelection select each rule as  *)
+(* designed (TRUE) or as it was before its fix (FALSE): the model must find *)
+(* each known bug.                                                          *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
@@ -26,7 +27,8 @@ CONSTANTS
     WithB,       \* B is declared at the start (else the chain is S and A, unless B is added)
     Deploys,     \* the deploy kinds explored: subset of {"move","pattern","bump","remove"}
     Faults,      \* the fault kinds explored: subset of {"worker","crash","takeover","timeout","cancel","zombie"}
-    FixF6, FixF9, FixF10, FixF13, FixF17
+    FixF6, FixF9, FixF10, FixF13, FixF17,
+    FixSelection \* a keys= run made a full pass (F17's fix) reads it to the end
 
 Keys == 1..NK
 Assets == {"A", "B"}
@@ -47,7 +49,7 @@ VARIABLES
     nRun,
     pending,  \* [Assets -> BOOLEAN]: an OnChange automation owes a firing
     man,      \* the manifest served
-    eng,      \* [serving: BOOLEAN, zombie: BOOLEAN]
+    eng,      \* [serving: BOOLEAN, zombie: BOOLEAN, knew: the attempts the zombie created]
     used      \* environment budgets spent: [src, deploy, fault]
 
 vars == <<log, bm, store, fence, hst, owes, att, nAtt, runs, nRun, pending, man, eng, used>>
@@ -166,7 +168,7 @@ Init ==
     /\ nRun = 0
     /\ pending = [c \in Assets |-> c = "A"]
     /\ man = [storeA |-> "st1", ver |-> [c \in Assets |-> 1], pat |-> Keys, hasB |-> WithB, lifeB |-> 0]
-    /\ eng = [serving |-> TRUE, zombie |-> FALSE]
+    /\ eng = [serving |-> TRUE, zombie |-> FALSE, knew |-> 0]
     /\ used = [src |-> 0, deploy |-> 0, fault |-> 0, keys |-> 0]
 
 
@@ -180,7 +182,9 @@ Tidy(a) == IF a.status \in {"prep", "launched", "settled", "dropped"} /\ Gone(a)
            ELSE a
 TidyAtt(f) == [i \in DOMAIN f |-> Tidy(f[i])]
 TidyRuns(f) == [r \in DOMAIN f |-> IF f[r].st \in {"succeeded", "failed", "canceled"}
-                                   THEN [st |-> "ended", tgt |-> f[r].tgt, tries |-> 0, keys |-> 0] ELSE f[r]]
+                                   THEN [st |-> "ended", tgt |-> f[r].tgt, tries |-> 0, keys |-> 0,
+                                         ok |-> f[r].st = "succeeded"]
+                                   ELSE f[r]]
 
 -----------------------------------------------------------------------------
 (* The engine (the serving one; its decisions are journal events) *)
@@ -197,10 +201,13 @@ Fire(c) ==
     /\ UNCHANGED <<log, bm, store, fence, hst, owes, att, nAtt, man, eng, used>>
 
 \* Claim the asset partition, pin, plan the batch; nothing to do ends the task.
+\* A keys= run on an output that must start over reads a full pass instead
+\* (F17's fix), and from then on is a run of the whole asset: it goes on
+\* until the pass ends (FixSelection; without it, it ends after one batch).
 Prepare(r) ==
-    \* (A keys= run on an output that must start over reads a full pass instead: F17's fix.)
     LET c == runs[r].tgt
-        p == IF runs[r].keys > 0 /\ ~(FixF17 /\ Moved(c)) THEN KeysPlan(c, runs[r].keys) ELSE Plan(c)
+        whole == FixF17 /\ Moved(c)
+        p == IF runs[r].keys > 0 /\ ~whole THEN KeysPlan(c, runs[r].keys) ELSE Plan(c)
     IN
     /\ eng.serving /\ runs[r].st = "active" /\ Present(c) /\ ~Claimed(c)
     /\ IF p.act = "none"
@@ -214,7 +221,8 @@ Prepare(r) ==
                          fullEnd |-> p.fullEnd, owed |-> owes[c], w |-> "none", gate |-> "none",
                          rep |-> {}, cancel |-> FALSE]])
               /\ nAtt' = nAtt + 1
-              /\ UNCHANGED runs
+              /\ runs' = IF runs[r].keys > 0 /\ whole /\ FixSelection
+                         THEN [runs EXCEPT ![r].keys = 0] ELSE runs
     /\ UNCHANGED <<log, bm, store, fence, hst, owes, nRun, pending, man, eng, used>>
 
 Launch(i) ==
@@ -414,16 +422,18 @@ Restart ==
     /\ UNCHANGED <<log, bm, store, fence, hst, owes, att, nAtt, runs, nRun, pending, man, used>>
 
 \* A new engine fences the serving one, which runs on as a zombie: its
-\* journal writes fail, but it may still take gates.
+\* journal writes fail, but it may still take the gates of the attempts it
+\* created (with "zombie" among the faults explored).
 Takeover ==
     /\ Fault("takeover") /\ eng.serving /\ ~eng.zombie
-    /\ eng' = [eng EXCEPT !.zombie = TRUE]
+    /\ eng' = [eng EXCEPT !.zombie = TRUE, !.knew = nAtt]
     /\ DropPrepared
     /\ SpendFault
     /\ UNCHANGED <<log, bm, store, fence, hst, owes, nAtt, runs, nRun, pending, man>>
 
 ZombieAbort(i) ==
-    /\ eng.zombie /\ att[i].status = "launched" /\ att[i].gate = "none"
+    /\ "zombie" \in Faults /\ eng.zombie /\ i <= eng.knew
+    /\ att[i].status = "launched" /\ att[i].gate = "none"
     /\ att' = TidyAtt([att EXCEPT ![i].gate = "aborted"])
     /\ UNCHANGED <<log, bm, store, fence, hst, owes, nAtt, runs, nRun, pending, man, eng, used>>
 
@@ -516,5 +526,19 @@ Converged ==
 Converges == <>[]Converged
 \* Both, as one property (one tableau for TLC).
 Quiesces == <>[](NoActiveRun /\ Converged)
+
+\* A run that succeeds leaves its asset caught up: no pass under way, its
+\* bookmark at the upstream's head, and its output what the upstream holds
+\* under its patterns. This binds every run of a whole asset, and a keys=
+\* run that moved the bookmark (one made a full pass). Checked as the run
+\* succeeds, so no later change is needed to see one that ended halfway.
+RunsEndCaughtUp ==
+    [][\A r \in 1..MaxRuns :
+         LET c == runs[r].tgt IN
+         (/\ runs[r].st = "active" /\ runs'[r].st = "ended" /\ runs'[r].ok /\ Present(c)
+          /\ runs[r].keys = 0 \/ bm'[c] # bm[c])
+         => /\ bm'[c].pass.kind = "none"
+            /\ bm'[c].next = Len(log'[Up(c)])
+            /\ Fold(log'[c]) = Fold(log'[Up(c)]) \cap (IF c = "A" THEN Keys ELSE man'.pat)]_vars
 
 =============================================================================

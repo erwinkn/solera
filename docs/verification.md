@@ -330,7 +330,11 @@ drained cancel; or lost: take the gate, owe a repair). Workers: start and
 acquire the fence (reading back owed repairs), take the gate (or drain a
 requested cancel), write (checking the fence), seal. A worker runs on
 after the engine gave up on it. A zombie engine can only take gates
-(`aborted`): its journal writes are fenced. Everything but the last
+(`aborted`), and only of the attempts it created before it was fenced
+(with `zombie` among the faults explored): its journal writes are fenced.
+A `keys=` run whose write starts the output over reads a full pass, and
+from then on is a run of the whole asset: it goes on until the pass
+ends. Everything but the last
 commit to `S` happens before it, so "after quiescence" is a state the
 model reaches.
 
@@ -341,6 +345,7 @@ model reaches.
 | `OneAttemptPerPartition` | safety | at most one prepared or launched attempt per asset partition |
 | `BookmarkHonest` | safety | with no pass under way, every key no later commit touched is in the output exactly when it was in the upstream at the bookmark, under its patterns: a bookmark never passes a change it did not deliver |
 | `StoreMatchesJournal` | safety | with no attempt in flight, no repair owed and no stale writer at its gate, a store holds exactly its output's committed content |
+| `RunsEndCaughtUp` | action | a run that succeeds leaves its asset caught up: no pass under way, the bookmark at the upstream's head, the output what the upstream holds under its patterns. It binds every run of a whole asset, and a `keys=` run that moved the bookmark; checked as the run succeeds, so no later change is needed to see one that ended halfway |
 | `Quiesces` | liveness | eventually and forever, no run is active (every run ends) and `A` holds `S`'s keys, `B` holds `A`'s under its patterns (convergence) |
 
 Liveness assumes weak fairness of all engine and worker steps together
@@ -379,23 +384,36 @@ and TLC must find it (`check-execution.sh calibrate`):
 | `FixF9` | a reset upstream commit makes its consumers read a full pass | (needed by the others; F9's own bug is the simulation's) |
 | `FixF10` | a full pass reaches the consumer even when its patterns take no key; `each` reconciles at its end | `B` holds 1 and 2; `B` excludes key 2 and its version is bumped; `S` drops key 1, so `A` holds 2 alone; `B`'s full pass takes no key and is skipped: `B` keeps 1 (`BookmarkHonest`, 41 steps) |
 | `FixF13` | moving a store changes the asset's fingerprint, so its inputs read a full pass | `A`'s full pass commits key 1 into store 1; `A` moves to store 2; the pass's next batch, key 2, starts store 2 over: `A` holds 2 alone, its bookmark says 1 and 2 (`BookmarkHonest`, 17 steps) |
+| `FixSelection` | a `keys=` run made a full pass (`FixF17`) reads the pass to its end | `A`'s first run is `keys=(1)`; its write starts the output over, so it reads a full pass, but ends after the first batch: `A` holds key 1 alone, a pass under way, and no run to finish it (`RunsEndCaughtUp`, 9 steps). Found by the spec's review (finding 1): the older properties needed a later source change to see it |
 | `FixF17` | a write that starts the output over (into a store the head is not in) reads a full pass, also for a `keys=` run | `A` holds 1 and 2 in store 1; `A` moves to store 2; a `keys=` run for key 1 starts store 2 over with key 1 alone and moves no bookmark (still store 1's fingerprint): `A` lacks 2 though nothing removed it (`BookmarkHonest`, 25 steps). Moving back makes it permanent: the fingerprint matches again, so nothing reads a full pass (the simulation's F17) |
 
-**Results.** With every fix on (TLC 1.7.4, 8 workers, shared machine):
+**Results.** With every fix on (TLC 1.7.4; the first four rows and
+`zombie` re-run after the review's fixes with 3 workers, the others as
+as first run, with 8 workers; a shared machine):
 
 | Configuration | What varies | States (distinct) | Time | Verdict |
 |---|---|---|---|---|
-| `smoke` | nothing: the plain pipeline | 10,852 | 2 s | passes, liveness included |
-| `store` | `A` moves away and back, a `keys=` run between (`B` left out) | 16,666 | 5 s | passes |
-| `shape` | two pattern changes or version bumps of `B` | 398,934 | 95 s | passes |
-| `remove` | `B` removed and re-added, twice | 191,388 | 55 s | passes |
+| `smoke` | nothing: the plain pipeline | 10,852 | 5 s | passes, liveness included |
+| `store` | `A` moves away and back, a `keys=` run between (`B` left out) | 36,810 | 13 s | passes |
+| `shape` | two pattern changes or version bumps of `B` | 398,934 | 3 min 39 s | passes |
+| `remove` | `B` removed and re-added, twice | 217,957 | 1 min 57 s | passes |
+| `zombie` | a takeover, the zombie taking gates (`B` left out) | 1,368 | 2 s | passes; with the zombie free to take any attempt's gate, `Quiesces` fails (the review's finding 2) |
 | `deploys` | one deploy of every kind and a `keys=` run | over 4.5 million | capped at 25 min | no invariant violated in what was explored; liveness not reached |
 | `faults` | two faults of every kind | over 2.8 million | capped at 25 min | no invariant violated in what was explored; liveness not reached |
 | `each` | `B` is `each=True`; one deploy and one fault of most kinds | over 2.3 million | capped at 25 min | no invariant violated in what was explored; liveness not reached |
 | `safety` | every kind at once, two of each: random behaviours | 100,000 behaviours of up to 150 steps | minutes | (`check-execution.sh safety`; 2,000 behaviours pass in 7 s) |
 
-No design bug found so far; one modeling error was (a fingerprint change
-during a full pass must start the pass over, as the engine does).
+No design bug found so far. Modeling errors found: a fingerprint change
+during a full pass must start the pass over, as the engine does; and,
+from an independent review of the spec, a promoted `keys=` run ended after one batch
+(finding 1, now `FixSelection` and `RunsEndCaughtUp`) and a zombie could
+abort attempts its successor created, exhausting their retries (finding
+2). Still open from the review: `FixF13` restores a synthetic store-move
+bug rather than F13's real mechanism (3), `Each` applies to `A` as well as
+`B` (4), a move back and forth without a write restores the old state
+where K10 makes each move a new output (5), the results table's budgets
+are shared across kinds (6), and the fairness argument must be redone
+once attempts are swaps on a control file, whose retries are loops.
 
 **Store moves, as decided.** A store move is a full reset: the output is
 new under the same name, its index starts empty, it reads every input in a
