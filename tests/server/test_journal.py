@@ -306,7 +306,9 @@ async def test_a_fence_a_newer_engine_moved_past_stays(tmp_path):
     reads that fence, fences at 3 and checkpoints at 3. B takes checkpoint
     3 for a sign that its fence landed in a hole cleanup left, deletes it
     and opens again. A's next append lands at 2 and is acknowledged, but
-    every later replay starts from checkpoint 3, which holds B's fence at 2."""
+    every later replay starts from checkpoint 3, which holds B's fence at 2.
+    Fixed, B keeps its fence and A's append is refused: what is
+    acknowledged is what a replay finds."""
 
     store = LocalStore(str(tmp_path), mkdir=True)
     a, sa, _ = await open_journal(store)
@@ -325,11 +327,15 @@ async def test_a_fence_a_newer_engine_moved_past_stays(tmp_path):
     await c.close()  # a checkpoint at 3, holding B's fence at 2
     go.set()
     await opening
-    await add(a, sa, "x")  # acknowledged
+    try:
+        await add(a, sa, "x")
+        acknowledged = 1
+    except Fenced:
+        acknowledged = 0
     d, again, _ = await open_journal(store)
     for j in (a, b, d):
         await j.close()
-    assert again.counts.get("x") == 1
+    assert again.counts.get("x", 0) == acknowledged
 
 
 @pytest.mark.xfail(strict=True, reason="journal spec F15: an opener replays a fence made in a hole")
