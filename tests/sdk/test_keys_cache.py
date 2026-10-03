@@ -9,6 +9,8 @@ import struct
 import zlib
 
 import pytest
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
 from obstore.store import MemoryStore
 from solera import _native
 from solera.keys import FOOTER_SIZE, SortedEntries, _python
@@ -1240,3 +1242,94 @@ async def test_start_reads_are_admitted_and_hold_their_room(io, tmp_path, monkey
     finally:
         go.set()
         await service.stop()
+
+
+_step = st.one_of(
+    st.tuples(st.just("commit"), st.integers(0, 2), st.integers(1, 300)),
+    st.tuples(st.just("resolve"), st.integers(0, 2), st.integers(1, 60)),
+    st.tuples(st.just("fills"), st.just(0), st.just(0)),
+    st.tuples(st.sampled_from(["wipe", "corrupt", "restart"]), st.just(0), st.just(0)),
+)
+
+
+@settings(max_examples=40, deadline=None, suppress_health_check=list(HealthCheck))
+@given(
+    disk=st.sampled_from([4_000, 40_000, 400_000, 16 * 2**30]),
+    steps=st.lists(_step, max_size=25),
+    seed=st.integers(0, 99),
+)
+def test_under_any_budget_and_any_trouble_the_engine_resolves_as_a_cold_reader(
+    tmp_path_factory, disk, steps, seed
+):
+    """Three indexes grow by commits while one engine cache, its disk budget
+    from a few files' worth to plenty, serves resolves; its files are
+    deleted (a temporary-files cleaner) or corrupted under it, or the cache
+    restarts on its directory. Every answer it gives is the cold reader's,
+    and it never holds more than its budget."""
+
+    root = str(tmp_path_factory.mktemp("cache"))
+
+    async def run():
+        rng = random.Random(seed)
+        io = ObjectIO(MemoryStore())
+        states = [IndexState(prefix=f"keys/out{i}/_/") for i in range(3)]
+        cache = EngineCache(root, disk=disk, candidates=disk // 4)
+        resolver = Resolver(cache, io, OPTS)
+        commit = 0
+        for op, i, n in steps:
+            if op == "commit":
+                ks = sorted({key(rng.randrange(2000)) for _ in range(n)})
+                rm = sorted({key(rng.randrange(2000)) for _ in range(n // 10)} - set(ks))
+                files, _ = await KeyIndex(io, None, states[i], OPTS).resolve(
+                    SortedEntries.of(ks, [rng.randbytes(4) for _ in ks], rm),
+                    commit_number=commit,
+                    attempt=f"w{commit}",
+                    generation=commit + 1,
+                )
+                states[i] = states[i].committed(commit, files, keep_log=False)
+                while (out := await KeyIndex(io, None, states[i], OPTS).compact()) is not None:
+                    states[i] = states[i].compacted(*out[:2])
+                commit += 1
+            elif op == "resolve" and states[i].files:
+                ks = sorted({key(rng.randrange(2000)) for _ in range(n)})
+                rm = sorted({key(rng.randrange(2000)) for _ in range(n // 5)} - set(ks))
+                vs = [rng.randbytes(4) for _ in ks]
+                a = Ask("out", "", "patch", 99, 100, states[i].prefix, 98, SortedEntries.of(ks, vs, rm))
+                p = prepared(states[i])
+                for _ in range(2):  # declined cold: the fill runs, and the worker asks again
+                    body = await resolver.resolve("att", request("inv", [a]), lambda _, p=p: p, lambda: True)
+                    answer, delta = answers(body)["out"]
+                    if answer.get("reason") != "cold":
+                        break
+                    await asyncio.gather(*resolver._fills, return_exceptions=True)
+                if answer["result"] in ("delta", "empty"):
+                    files, _ = await KeyIndex(io, None, states[i], OPTS).resolve(
+                        SortedEntries.of(ks, vs, rm),
+                        commit_number=99,
+                        attempt=f"cold{rng.getrandbits(32)}",
+                        generation=100,
+                        exact=True,
+                    )
+                    cold = decoded([await io.read_whole(states[i].path(f.name), f.size) for f in files.files])
+                    assert (decoded([delta]) if delta else []) == cold
+            elif op == "fills":
+                await asyncio.gather(*resolver._fills, return_exceptions=True)
+            elif op in ("wipe", "corrupt"):
+                for name in os.listdir(root):
+                    path = os.path.join(root, name)
+                    if op == "wipe":
+                        os.unlink(path)
+                    elif os.path.getsize(path):
+                        with open(path, "r+b") as f:
+                            f.seek(os.path.getsize(path) // 2)
+                            byte = f.read(1)
+                            f.seek(-1, 1)
+                            f.write(bytes([byte[0] ^ 0xFF]))
+            elif op == "restart":
+                await asyncio.gather(*resolver._fills, return_exceptions=True)
+                cache = EngineCache(root, disk=disk, candidates=disk // 4)
+                resolver = Resolver(cache, io, OPTS)
+            assert cache.used <= cache.disk, (cache.used, cache.disk)
+        await asyncio.gather(*resolver._fills, return_exceptions=True)
+
+    asyncio.run(run())

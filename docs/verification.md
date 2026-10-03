@@ -219,6 +219,11 @@ with Hypothesis drawing the inputs (in CI, a few seconds each):
   to 2⁶⁴ − 1, empty payloads, one-byte blocks. A resolve request's framing
   is fuzzed: any body is either read with exact payload bounds or
   `Malformed`.
+- **The engine's key cache** (`tests/sdk/test_keys_cache.py`): three
+  indexes grow while one cache, its disk budget from a few files' worth to
+  plenty, serves resolves; its files are deleted or corrupted under it, or
+  it restarts on its directory. Every answer is the cold reader's, and it
+  never holds more than its budget (1,500 runs once, 40 in CI).
 - **Key patterns** (`tests/sdk/test_patterns.py`): every glob matches as
   an independent reference matcher does (`**/` takes whole directories or
   none, `*` and `?` stay within one, `[`, `\` and newlines are literal),
