@@ -29,9 +29,18 @@ that use this module are strict xfails or off):
   twice. At most a configured number of entries (10,000) per partition: a
   keys= run past it is refused with "run the partition first"; one run may
   name any number of keys.
+- A full pass (after an asset change or a reset) may take several runs:
+  its first delivery, keys= or default, starts over (first batch full and
+  first); later keys= runs continue it with their keys; a default run
+  delivers what the pass has not, and finishes it. Once every key under
+  the patterns has been delivered in the pass at its current version, the
+  asset is fresh, and the record collapses to a snapshot.
 - A plain incremental partition is stale while some change past its
-  snapshot, under the patterns, is covered by no entry, or its asset
-  changed (cleared by a default run); its keys share the partition's answer.
+  snapshot, under the patterns, is covered by no entry, or while a full
+  pass is due and unfinished; its keys share the partition's answer.
+- Staleness is transitive (K46): a unit is also stale when an upstream unit
+  it depends on is. Each stale status says why: "input changed", "upstream
+  stale", "definition changed", one or more.
 - An output reset itself starts empty: a `keys=` run leaves just its keys;
   the next default run converges (R6).
 - Positions are derived from what each attempt read; nothing here asserts one.
@@ -45,7 +54,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-LANDED = False  # W22's K43 build; True turns the tests on
+LANDED = False  # W22's K43/K45/K46 build; True turns the tests on
 
 
 class NotBuilt(NotImplementedError):
@@ -86,6 +95,20 @@ async def stale_partitions(engine, asset: str) -> set[str]:
     return {r["partition"] for r in rows if r["status"] == "stale"}
 
 
+async def stale_reasons(engine, asset: str, partition: str = "") -> set[str]:
+    """Why the partition statuses report it `stale` (K46); empty if not."""
+
+    rows = (await engine.partition_statuses([asset], every=False))[asset]
+    for row in rows:
+        if row["partition"] == partition:
+            if row["status"] != "stale":
+                return set()
+            if "reasons" not in row:
+                raise NotBuilt("partition_statuses rows' `reasons` (K46)")
+            return set(row["reasons"])
+    return set()
+
+
 async def asset_stale(engine, asset: str) -> bool:
     """The asset rollup's own flag (asset_statuses, the console's graph)."""
 
@@ -112,6 +135,8 @@ def engine_with_read_ahead_cap(state, project, cap: int):
 
 # -- the reference -------------------------------------------------------------------
 
+INPUT, UPSTREAM, DEFINITION = "input changed", "upstream stale", "definition changed"
+
 
 def everything(key: str) -> bool:
     return True
@@ -132,37 +157,40 @@ class EachAsset:
 
 @dataclass
 class ByPartition:
-    """A plain incremental output: whether it has a head; its record, a
-    snapshot (the counter through which it read every change; None after a
-    reset or an asset change: the next default run reads a full pass) and
-    one entry per keys= run since (the commit it read at, the keys it
-    named); its last default run and its asset's last change; the keys its
-    input's patterns take, and, keyed, the keys it holds."""
+    """A plain incremental output. Its record: a snapshot (the counter
+    through which it read every change of `items`) and an entry per keys=
+    run since (the commit it read at, the keys it named); or, while a full
+    pass is due (`snapshot` None), why (`due`), whether the pass has started,
+    and what it delivered (key -> the version delivered). Also: whether it
+    has a head, the keys its patterns take and, keyed, the keys it holds."""
 
     takes: Callable[[str], bool] = everything
     built: bool = False
     snapshot: int | None = None
+    due: str = INPUT
+    started: bool = False
+    passed: dict[str, int] = field(default_factory=dict)
     entries: list[tuple[int, frozenset[str]]] = field(default_factory=list)
-    caught_up_at: int = 0
-    changed_at: int = 0
     keys: set[str] = field(default_factory=set)
 
 
 class Reference:
-    """One keyed upstream (`items`) and one shared input (`knob`); `checks`,
-    each=True over `items` with `knob` a dep; `copy`, a keyed incremental
-    consumer of `items`; `count`, an unkeyed one. What K43 and K45 say each is
-    after any history of upstream commits, upstream resets, shared-input
-    changes, the each=True output's own resets, asset changes, `keys=` runs
-    and default runs."""
+    """`feed` (a keyed source) -> `items` (plain incremental, run by hand) ->
+    `checks` (each=True, with the source `knob` a dep), `copy` (plain
+    incremental, keyed) and `count` (plain incremental, unkeyed). What
+    K43–K46 say of each after any history of feed commits, runs of `items`,
+    its resets, `knob` changes, `checks`' own resets, asset changes, keys=
+    runs and default runs: what each run delivers, and what is stale, why."""
 
     def __init__(self, takes: Callable[[str], bool] = everything, cap: int = 10_000):
         self.cap = cap  # keys= runs a plain incremental partition takes between default runs
         self.now = 0
-        self.up: dict[str, int] = {}  # key -> the counter of its last write
-        self.changed: dict[str, int] = {}  # key -> the counter of its last change, a removal too
-        self.last_commit = 0
-        self.knob = 0  # the counter of the shared input's last change
+        self.feed: dict[str, int] = {}
+        self.unread: set[str] = set()  # feed keys changed since `items` last ran
+        self.up: dict[str, int] = {}  # `items`: key -> the counter of its write
+        self.changed: dict[str, int] = {}  # `items` key -> the counter of its last change, a removal too
+        self.last_commit = 0  # `items`' newest commit
+        self.knob = 0
         self.checks = EachAsset(takes=takes)
         self.others = {"copy": ByPartition(takes=takes), "count": ByPartition()}
 
@@ -172,27 +200,52 @@ class Reference:
 
     # history
 
-    def commit(self, upserts: set[str], removes: set[str]) -> None:
+    def commit_feed(self, upserts: set[str], removes: set[str]) -> None:
         t = self._tick()
-        removes = {k for k in removes - upserts if k in self.up}
+        removes = {k for k in removes - upserts if k in self.feed}
         for k in upserts:
-            self.up[k] = t
+            self.feed[k] = t
         for k in removes:
-            del self.up[k]
-        for k in upserts | removes:
+            del self.feed[k]
+        self.unread |= upserts | removes
+
+    def run_items(self) -> None:
+        """`items` reads what `feed` changed, and commits it."""
+
+        t = self._tick()
+        for k in self.unread:
+            if k in self.feed:
+                self.up[k] = t
+            elif k in self.up:
+                del self.up[k]
+            else:
+                continue
             self.changed[k] = t
-        if upserts or removes:
             self.last_commit = t
+        self.unread = set()
+
+    def commit(self, upserts: set[str], removes: set[str]) -> None:
+        """A feed commit, and the run of `items` that takes it."""
+
+        self.commit_feed(upserts, removes)
+        self.run_items()
 
     def reset_upstream(self) -> None:
-        """`items` moved and rebuilt: the same keys at new versions."""
+        """`items` moved, and rebuilt from `feed`: every key at a new version;
+        its consumers owe a full pass."""
 
         t = self._tick()
-        self.up = dict.fromkeys(self.up, t)
+        for k in set(self.up) - set(self.feed):
+            self.changed[k] = t
+        self.up = dict.fromkeys(self.feed, t)
         self.changed.update(dict.fromkeys(self.up, t))
-        self.last_commit = t
+        self.last_commit, self.unread = t, set()
         for o in self.others.values():
-            o.snapshot, o.entries = None, []
+            self._owe_a_pass(o, INPUT)
+
+    @staticmethod
+    def _owe_a_pass(o: ByPartition, why: str) -> None:
+        o.snapshot, o.due, o.started, o.passed, o.entries = None, why, False, {}, []
 
     def change_knob(self) -> None:
         self.knob = self._tick()
@@ -208,14 +261,13 @@ class Reference:
         if name == "checks":
             self.checks.changed_at = t
         else:
-            o = self.others[name]
-            o.changed_at, o.snapshot, o.entries = t, None, []
+            self._owe_a_pass(self.others[name], DEFINITION)
 
-    def run_keys(self, keys: set[str], name: str = "checks") -> set[str] | str | None:
+    def run_keys(self, keys: set[str], name: str = "checks"):
         """A keys= run. On `checks` (each=True), R2: the named keys its
-        patterns take are fresh after. On a plain incremental asset: what it
-        delivers, the named keys among the changes its record lacks, read as
-        of the newest commit, and an entry for it; "refused" past the cap."""
+        patterns take are fresh after; returns None. On a plain incremental
+        asset: (what it delivers, whether it starts over), or "refused" past
+        the cap."""
 
         t = self._tick()
         if name == "checks":
@@ -232,16 +284,16 @@ class Reference:
         if len(o.entries) >= self.cap:
             return "refused"
         delivered = keys & self.pending(name)
-        o.built = True
+        start_over = self._deliver(o, delivered)
         o.entries.append((self.last_commit, frozenset(keys)))
-        for k in delivered:
-            (o.keys.add if k in self.up else o.keys.discard)(k)
-        return delivered
+        if o.snapshot is None and not self.pending(name):  # the pass is complete
+            o.snapshot, o.entries, o.passed, o.started = self.last_commit, [], {}, False
+        return delivered, start_over
 
-    def run_default(self, name: str) -> set[str] | None:
-        """A default run, caught up at its end. On a plain incremental
-        asset: what it delivers, the changes its record lacks (None for a
-        full pass, which has no position to start from)."""
+    def run_default(self, name: str):
+        """A default run: (what it delivers, whether it starts over) on a
+        plain incremental asset; it finishes any pass due, and collapses the
+        record into its snapshot."""
 
         t = self._tick()
         if name == "checks":
@@ -250,25 +302,72 @@ class Reference:
             c.held = {k: (v, t) for k, v in self.up.items() if c.takes(k)}
             return None
         o = self.others[name]
-        delivered = None if o.snapshot is None else self.pending(name)
-        o.built, o.snapshot, o.entries, o.caught_up_at = True, self.last_commit, [], t
-        o.keys = {k for k in self.up if o.takes(k)} if name == "copy" else set()
-        return delivered
+        delivered = self.pending(name)
+        start_over = self._deliver(o, delivered)
+        o.snapshot, o.entries, o.passed, o.started = self.last_commit, [], {}, False
+        return delivered, start_over
+
+    def _deliver(self, o: ByPartition, delivered: set[str]) -> bool:
+        start_over = o.snapshot is None and not o.started
+        if start_over:
+            o.keys, o.started = set(), True  # the consumer rebuilds
+        o.built = True
+        for k in delivered:
+            (o.keys.add if k in self.up else o.keys.discard)(k)
+            if o.snapshot is None:
+                o.passed[k] = self.changed[k]
+        return start_over
 
     # answers
 
-    def stale_keys(self) -> set[str]:
-        """`checks`' stale keys."""
+    def pending(self, name: str) -> set[str]:
+        """What a plain incremental asset's record lacks. In a full pass:
+        the keys under its patterns not delivered in it at their current
+        version, and the ones it delivered that were removed since. Else:
+        the changes past its snapshot, under its patterns, named by no entry
+        read at or after the change."""
 
-        c, out = self.checks, set()
+        o = self.others[name]
+        if o.snapshot is None:
+            present = {k for k in self.up if o.takes(k) and o.passed.get(k) != self.changed[k]}
+            gone = {k for k, v in o.passed.items() if k not in self.up and v != self.changed[k]}
+            return present | gone
+        return {
+            k
+            for k, t in self.changed.items()
+            if t > o.snapshot and o.takes(k) and not any(k in named and at >= t for at, named in o.entries)
+        }
+
+    def items_stale(self) -> bool:
+        return bool(self.unread)
+
+    def direct_stale_keys(self) -> dict[str, set[str]]:
+        """`checks`' stale keys by its own inputs, with why."""
+
+        c, out = self.checks, {}
         for k in {k for k in self.up if c.takes(k)} | set(c.held):
+            why = set()
             if k not in c.held or k not in self.up:
-                out.add(k)
-                continue
-            read, written = c.held[k]
-            if self.up[k] > read or written < c.changed_at or written < self.knob:
-                out.add(k)
+                why.add(INPUT)
+            else:
+                read, written = c.held[k]
+                if self.up[k] > read or written < self.knob:
+                    why.add(INPUT)
+                if written < c.changed_at:
+                    why.add(DEFINITION)
+            if why:
+                out[k] = why
         return out
+
+    def stale_keys(self) -> set[str]:
+        """`checks`' stale keys: its own, and, while `items` is stale, every
+        key whose upstream key is (all of them: `items` is stale by partition)."""
+
+        c = self.checks
+        direct = set(self.direct_stale_keys())
+        if self.items_stale():
+            return direct | {k for k in self.up if c.takes(k)} | set(c.held)
+        return direct
 
     def stale_keys_of(self, name: str) -> set[str]:
         """The stale keys of a keyed asset: per key for `checks`; for `copy`
@@ -278,23 +377,21 @@ class Reference:
             return self.stale_keys()
         return set(self.others[name].keys) if self.stale(name) else set()
 
-    def pending(self, name: str) -> set[str]:
-        """The changes a plain incremental asset's record lacks: past its
-        snapshot (all of them without one), under its patterns, named by no
-        entry read at or after the change."""
+    def reasons(self, name: str) -> set[str]:
+        """Why `name` is stale (K46): empty if it is not."""
 
-        o = self.others[name]
-        since = -1 if o.snapshot is None else o.snapshot
-        return {
-            k
-            for k, t in self.changed.items()
-            if t > since and o.takes(k) and not any(k in named and at >= t for at, named in o.entries)
-        }
+        if name == "items":
+            return {INPUT} if self.items_stale() else set()
+        if name == "checks":
+            if not self.checks.built:
+                return set()  # never built: `missing`, not `stale`
+            why = set().union(*self.direct_stale_keys().values())
+        else:
+            o = self.others[name]
+            if not o.built:
+                return set()
+            why = {o.due} if o.snapshot is None else ({INPUT} if self.pending(name) else set())
+        return why | ({UPSTREAM} if self.items_stale() else set())
 
     def stale(self, name: str) -> bool:
-        if name == "checks":
-            return self.checks.built and bool(self.stale_keys())
-        o = self.others[name]
-        if not o.built:
-            return False  # never built: `missing`, not `stale`
-        return bool(self.pending(name)) or o.caught_up_at < o.changed_at
+        return bool(self.reasons(name))
