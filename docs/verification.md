@@ -84,6 +84,8 @@ arguments, up to 40 per run.
 | `flaky(keys, error)` | `flaky(['k2'], 'failed')` | `Each` keys failing by error class: `Transient` (retried on its backoff), `Failed` (once per deploy), `Rejected` (when the input changes), `Abort` (the whole attempt, per `retries=`) |
 | `retry_keys(classes)` | `retry_keys(['rejected'])` | a forced retry of failing keys, as `solera keys retry` asks for one |
 | `submit(asset, mode, upstream, partitions, keys)` | `submit('checks', mode='incremental', upstream=False, partitions='all', keys=('k1', 'k10'))` | manual runs; `keys=` makes the target's keyed input read a full pass (`'full'`) or the keys named |
+| `round_trip(between, clean)` | `round_trip('keys', clean=True)` | `items` moved to its other store and back, with nothing, a `keys=` run or a feed change in between; off until the reset rule (F13, F17) |
+| `readd_live(clean, ends)` | `readd_live(clean=False, ends='succeeds')` | the job `seen` removed and added back while its attempt runs, which then succeeds or dies; off until the reset rule (F19) |
 | `break_watch(broken)` | `break_watch(True)` | the sensor raising on every tick (the host posts the error), then working again |
 | `pool_hosts(hosts)` | `pool_hosts(2)` | how many pool hosts poll `split`'s `Pool`: none (its attempts wait for one), one, or two racing for each claim (`lifecycle.md` §10) |
 | `cancel(newest)` | | a user cancel of a live run |
@@ -107,6 +109,7 @@ Checked after every step:
 | **Reads say what they read.** A PostgresStore read reports the generation that wrote the rows it loaded, the newest committed before its snapshot — never one that only acquired the partition. | an attempt that acquired and died surfacing as the read generation |
 | **Committed keys are readable.** Every key an immutable store's head lists loads back at its indexed generation, from an object a committed attempt wrote. | a stale writer's object referenced by the index |
 | **A fenced partition at rest holds its index.** A fenced store's partition that no attempt holds and no dead writer left owing a repair holds exactly the keys its index lists, and, in Postgres, reads as written by its head's generation (`versions.md` §5, §9). | a repair that marks a key live with no rows, or leaves a dead attempt's generation as the partition's |
+| **A life is its own.** No attempt launched before its asset was added back (no alias carrying it) installs a commit after (F12's rule). While F19 is open, a crossing sets the run aside. | `seen`'s first life's attempt committing its cursor into the `seen` a deploy added back |
 | **One attempt per asset partition.** No attempt launches on an asset partition another launched attempt holds — in the journal, in order, and in the serving engine's claims. A task follows its asset through a rename (an alias); `mirror` renamed back to `copy` without one is another asset. | the hourly run and a manual run both launching `copy` before either ends |
 | **A tick's runs are submitted once.** Each run a sensor tick requests is submitted at most once, however late, often, or across restarts the tick's outcome is posted. | a retried post of tick `T` submitting its `per_site` run a second time |
 | **A fenced write holds its gate.** Every write a worker makes to a fenced store (the table store, Postgres) comes after its attempt's gate was created `writing` with that worker's id (`lifecycle.md` §2.4, §3). | a worker paused before its gate, whose attempt the engine closed meanwhile, writing `items` when it wakes; the twin of a `twice` worker writing beside the owner |
@@ -140,14 +143,16 @@ ones on every worker and reports throughput, e.g. `simulation: 400 runs,
 15,880 steps, 61.2 h virtual in 8.5 min (112,000 steps/hour)`.
 
 **Open findings are set aside.** A run that trips a finding still open (its
-signature is recognized in `machine.py`, `_known`) is cleaned up rather than
-failed, and counted, so the simulation keeps looking for new bugs; a
-re-registration that trips one on almost every run is left out (`KNOWN`,
-empty since F10's fix brought `copy`'s `exclude` back). Signatures today: F13 (a consumer of `items` keeps
-extra keys in a run where `items` moved store), F16 (overlapping index
-levels), F17 (`items` lacks a key after two store moves). A signature is
-coarser than its bug and can hide another; each goes with its fix.
-`SOLERA_SIM_KNOWN=1` puts all of it back.
+signature is recognized in `machine.py`, `_known`) is set aside rather than
+failed, and counted, so the simulation keeps looking for new bugs.
+Signatures today: F13 (a consumer of `items` keeps extra keys in a run where
+`items` moved store), F16 (overlapping index levels), F17 (`items` lacks a
+key after two store moves), F19 (a commit crossing into a re-added asset's
+new life). Rules and re-registrations that would trip an open finding on
+almost every run are off until its fix: `AWAITING` (`round_trip`,
+`readd_live`) and `KNOWN` (removing `seen`). A signature is coarser than its
+bug and can hide another; each goes with its fix. `SOLERA_SIM_KNOWN=1` puts
+all of it back.
 
 ## Reading a failure
 

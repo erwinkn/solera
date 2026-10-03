@@ -93,6 +93,46 @@ class Journal:
                 seen[key] = seen.get(key, 0) + 1
         return [f"tick {t} request {c}: {n} runs" for (t, c), n in seen.items() if n > 1]
 
+    def a_life_crossed(self) -> str | None:
+        """The first commit an attempt installed into an asset added back
+        after it was launched (F12's rule: a name that comes back starts
+        over), or None. A rename (an alias) continues a life."""
+
+        declared: set[str] | None = None
+        born: dict[str, int] = {}  # asset -> seq of the deploy that added it back
+        launched: dict[str, tuple[int, str]] = {}  # attempt -> (seq, asset)
+        asset_of: dict[str, str] = {}  # task -> its asset now
+        for seq, event in self.events():
+            kind = event["type"]
+            if kind == "ProjectRegistered":
+                assets = event["manifest"]["assets"]
+                renamed = {
+                    old: new
+                    for new, a in assets.items()
+                    for old in a.get("aliases") or ()
+                    if old not in assets
+                }
+                if declared is not None:
+                    for name, a in assets.items():
+                        if name not in declared and not set(a.get("aliases") or ()) & declared:
+                            born[name] = seq
+                asset_of = {t: renamed.get(a, a) for t, a in asset_of.items()}
+                declared = set(assets)
+            elif kind == "RunSubmitted":
+                asset_of.update({t: task["asset"] for t, task in event["run"]["tasks"].items()})
+            elif kind == "AttemptLaunched":
+                task = event["task"]
+                launched[event["attempt"]] = (seq, asset_of.get(task, task.split("/", 1)[1].split(":", 1)[0]))
+            elif kind == "AttemptFinished" and event.get("commit") and event["attempt"] in launched:
+                at, asset = launched[event["attempt"]]
+                asset = asset_of.get(event["task"], asset)
+                if born.get(asset, -1) > at:
+                    return (
+                        f"{event['attempt']}, launched at seq {at}, committed into {asset} "
+                        f"at seq {seq}, after a deploy added {asset} back at seq {born[asset]}"
+                    )
+        return None
+
     def two_attempts_at_once(self) -> str | None:
         """The first durable launch of an attempt on an asset partition
         another launched attempt still holds, or None. A task follows its

@@ -68,8 +68,21 @@ STORES = ["file", "table"] + (["pg"] if postgres.DSN else [])  # where `items` l
 # Re-registrations the rules make. Those that trip an open finding on most
 # runs are left out until it is fixed (tests/server/test_sim_found.py);
 # SOLERA_SIM_KNOWN=1 puts them back.
-KNOWN: dict[str, str] = {}
+KNOWN: dict[str, str] = {
+    "seen": "F19: an asset added back resumes its first life (the reset rule)",
+}
 CHANGES = sorted(set(VARIANTS) - (set() if os.environ.get("SOLERA_SIM_KNOWN") else set(KNOWN)))
+# Rules whose findings wait for the reset rule (W22): off until it lands;
+# SOLERA_SIM_KNOWN=1 turns them on.
+AWAITING = {
+    "round_trip": "F13, F17: an output moved away and back",
+    "readd_live": "F19: an asset added back while its attempt runs",
+}
+
+
+def _on(rule: str) -> bool:
+    return rule not in AWAITING or bool(os.environ.get("SOLERA_SIM_KNOWN"))
+
 
 fates = st.one_of(
     st.builds(
@@ -331,6 +344,38 @@ class Simulation(RuleBasedStateMachine):
         self.trace.append(f"cache_trouble({kind!r})")
         self.world.cache_trouble(kind)
 
+    @precondition(lambda self: _on("round_trip"))
+    @rule(between=st.sampled_from(["nothing", "keys", "write"]), clean=st.booleans())
+    def round_trip(self, between, clean):
+        """`items` moves to its other store and back (st1 -> st2 -> st1):
+        with nothing written on st2, only a `keys=` run (which moves no
+        bookmark, F17), or a feed change its automation writes. Its steps
+        are rules of their own: the trace replays them."""
+
+        self.redeploy("table", clean)
+        if between == "keys":
+            self.submit("items", "incremental", False, "latest", ("k1", "k10"))
+        elif between == "write":
+            self.commit_feed("upsert", {"k2"}, str(self.serial % 3 + 1))
+        if between != "nothing":
+            self.wait(45.0)
+        self.redeploy("table", clean)
+
+    @precondition(lambda self: _on("readd_live") and self.variant.seen)
+    @rule(clean=st.booleans(), ends=st.sampled_from(["succeeds", "dies"]))
+    def readd_live(self, clean, ends):
+        """`seen` has an attempt in flight, its worker paused before its
+        result (20 s: not yet silent); a deploy removes `seen`, another adds
+        it back; then the worker goes on, or dies. Its commit must not land
+        in the new life (`a_life_is_its_own`)."""
+
+        self.doom_next_worker(Fate("pause" if ends == "succeeds" else "die", "result", "before", 20.0))
+        self.submit("seen", "full", False, "latest")  # the next worker launched
+        self.wait(2.0)
+        self.redeploy("seen", clean)
+        self.redeploy("seen", clean)
+        self.wait(45.0)
+
     @rule(broken=st.booleans())
     def break_watch(self, broken):
         """`watch` raises on every tick from now on, or works again."""
@@ -487,6 +532,15 @@ class Simulation(RuleBasedStateMachine):
         if world is None or world.pg is None:
             return
         self._pg_checked = postgres.check(world.pg, self._pg_checked)
+
+    @invariant()
+    def a_life_is_its_own(self):
+        """F12's rule: an asset removed and added back starts over; no
+        attempt launched in its first life installs a commit into the
+        second. While F19 is open, a crossing sets the run aside."""
+
+        if self.world is not None and (crossed := self.journal.a_life_crossed()):
+            self._known("F19", crossed)
 
     @invariant()
     def one_attempt_per_partition(self):
@@ -723,13 +777,14 @@ class Simulation(RuleBasedStateMachine):
         self._check_content(automated=False)
         self._check_replay()
         self.one_attempt_per_partition()  # convergence ran no invariant
+        self.a_life_is_its_own()
         self.a_ticks_runs_are_submitted_once()
         self.fenced_writes_hold_their_gate()
 
     def _asset(self, target: str) -> str | None:
         if target == "copy":
             return self.variant.copy_name
-        if target == "summary" and not self.variant.summary:
+        if (target == "summary" and not self.variant.summary) or (target == "seen" and not self.variant.seen):
             return None
         return target
 
@@ -756,10 +811,11 @@ class Simulation(RuleBasedStateMachine):
                 self._moved_upstream_kept(output, got, want_split)
                 if got != want_split:
                     raise Violation(f"{output} {stage}: {got} != {want_split}")
-            seen = engine.m.partition("seen", "").get("cursor") or {}
-            self._moved_upstream_kept("seen", seen, want)
-            if seen != want:
-                raise Violation(f"the job seen's cursor {stage}: {seen} != {want}")
+            if variant.seen:
+                seen = engine.m.partition("seen", "").get("cursor") or {}
+                self._moved_upstream_kept("seen", seen, want)
+                if seen != want:
+                    raise Violation(f"the job seen's cursor {stage}: {seen} != {want}")
             checks = await keyed_content(engine, project, "checks", whole=True, column="w")
             if checks != expected_checks(want):
                 raise Violation(f"checks {stage}: {checks} != {expected_checks(want)}")

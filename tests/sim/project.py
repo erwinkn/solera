@@ -56,11 +56,13 @@ class Variant:
     copy_name: str = "copy"  # "copy" | "mirror" (renamed, aliases=["copy"])
     summary: bool = True
     exclude: str | None = None  # copy's input: keys it leaves out
+    seen: bool = True  # the job `seen` is declared
 
     def label(self) -> str:
         return (
             f"items@{self.items_store}/v{self.items_version} {self.copy_name}"
             f"{' -' + self.exclude if self.exclude else ''}{'' if self.summary else ' no-summary'}"
+            f"{'' if self.seen else ' no-seen'}"
         )
 
 
@@ -70,6 +72,7 @@ VARIANTS = {
     "rename": lambda v: replace(v, copy_name="mirror" if v.copy_name == "copy" else "copy"),
     "summary": lambda v: replace(v, summary=not v.summary),
     "exclude": lambda v: replace(v, exclude=None if v.exclude else "k1*"),
+    "seen": lambda v: replace(v, seen=not v.seen),
 }
 
 
@@ -237,7 +240,7 @@ def build(variant: Variant, data_root, db: Database, outside: External, pg: str 
             }
         )
 
-    assets = [items, copy, per_site, log, tally, checks, split, seen]
+    assets = [items, copy, per_site, log, tally, checks, split] + ([seen] if variant.seen else [])
     if variant.summary:
 
         @asset(inputs={"per_site": AllPartitions()}, automations=AutoRefresh())
