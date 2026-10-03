@@ -29,14 +29,18 @@ tlc() {  # tlc CONFIG LOG
 }
 
 # configure NAME BASE [CONSTANT=VALUE | -PROPERTY ...]: BASE's model, changed.
+# edit EXPRESSION: apply a sed -E expression to $cfg in place (no sed -i,
+# whose syntax differs between GNU and BSD sed).
+edit() { sed -E "$1" "$cfg" > "$cfg.tmp" && mv "$cfg.tmp" "$cfg"; }
+
 configure() {
     local cfg="$work/$1.cfg" change
     cp "Attempt-$2.cfg" "$cfg"
     shift 2
     for change in "$@"; do
         case $change in
-            -*) sed -i -E "s/^PROPERTY ${change#-} *$//" "$cfg" ;;
-            *) sed -i -E "s/^( +${change%%=*}) = .*/\1 = ${change#*=}/" "$cfg" ;;
+            -*) edit "s/^PROPERTY ${change#-} *$//" ;;
+            *) edit "s/^( +${change%%=*}) = .*/\1 = ${change#*=}/" ;;
         esac
     done
 }

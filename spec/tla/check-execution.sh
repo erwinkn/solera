@@ -28,7 +28,7 @@ tlc() {  # tlc CONFIG LOG [TLC options]
     shift 2
     local args=(-XX:+UseParallelGC "-Xmx${TLC_HEAP:-4g}" -cp "$jar" tlc2.TLC -workers "${TLC_WORKERS:-2}" -deadlock -lncheck final
                 -metadir "$work/states" "$@" -config "$cfg" Execution.tla)
-    if command -v java >/dev/null; then
+    if java -version >/dev/null 2>&1; then  # not just on PATH: macOS has a /usr/bin/java stub
         java "${args[@]}" > "$log" 2>&1 || true
     else
         docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/w -v "$work":"$work" -w /w \
