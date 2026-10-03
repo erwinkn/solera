@@ -20,6 +20,8 @@ from hypothesis import strategies as st
 from solera_server.api import create_app
 from solera_server.state import State
 
+from tests.conftest import worker_finished
+
 from .engines import make_engine
 from .test_api import build_project
 
@@ -120,16 +122,16 @@ async def _exchange(root: Path, sent: list[tuple[str, object]]) -> None:
                     f"{route} {content[:200]}: {answer.status_code} {answer.text[:300]}"
                 )
         await engine.tick()
-        await state.durable()
-        live = _normal(state.model)
-        replayed = await State.open(root.as_uri(), "test", writer=False)
-        assert _normal(replayed.model) == live, "the journal replays to another state"
     finally:
         await engine.stop()
-    closing = _normal(state.model)
+    await worker_finished()  # nothing records past here: the model is what was accepted
+    await state.durable()
+    live = _normal(state.model)
+    replayed = await State.open(root.as_uri(), "test", writer=False)
+    assert _normal(replayed.model) == live, "the journal replays to another state"
     await state.close()  # a final checkpoint of everything accepted
     again = await State.open(root.as_uri(), "test", writer=False)
-    assert _normal(again.model) == closing, "the checkpoint reopens to another state"
+    assert _normal(again.model) == live, "the checkpoint reopens to another state"
 
 
 @settings(
