@@ -146,8 +146,7 @@ ones on every worker and reports throughput, e.g. `simulation: 400 runs,
 signature is recognized in `machine.py`, `_known`) is set aside rather than
 failed, and counted, so the simulation keeps looking for new bugs; a
 re-registration that would trip one on almost every run is left out until
-its fix (`KNOWN`). Today: F21 (a commit crossing into the job `seen`'s new life); `KNOWN`
-leaves out removing `seen` until F21's fix.
+its fix (`KNOWN`). None today.
 A signature is coarser than its bug and can hide another; each goes with its
 fix. `SOLERA_SIM_KNOWN=1` puts all of it back.
 
@@ -287,6 +286,7 @@ rules, not invariant checks. `pg`: `items` may also live in Postgres.
 | Y1–Y3 | the reset rule's rules (off), `a_life_is_its_own` | 911–913 | 682 runs, 37,174 steps | default ×2, pg | green; F19 set aside once (rules off: a rename back without an alias) |
 | Z1 | the reset rule's rules on (b7d8ae7) | 921 | 637 runs, 9,635 steps | default | F21; F20 set aside 9 times (since fixed) |
 | Z2–Z3 | F16, F20 fixed; F21 set aside | 931–932 | 435 runs, 24,486 steps | default, pg | green; F21 set aside 28 times |
+| Z4 | F21 fixed (b8bf1a4), nothing set aside | 941 | 203 runs, 14,284 steps, 61 h | default | green |
 
 ## Formal model: execution semantics (`spec/tla/Execution.tla`)
 

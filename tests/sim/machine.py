@@ -68,9 +68,7 @@ STORES = ["file", "table"] + (["pg"] if postgres.DSN else [])  # where `items` l
 # Re-registrations the rules make. Those that trip an open finding on most
 # runs are left out until it is fixed (tests/server/test_sim_found.py);
 # SOLERA_SIM_KNOWN=1 puts them back.
-KNOWN: dict[str, str] = {
-    "seen": "F21: a job added back takes its first life's commit",
-}
+KNOWN: dict[str, str] = {}
 CHANGES = sorted(set(VARIANTS) - (set() if os.environ.get("SOLERA_SIM_KNOWN") else set(KNOWN)))
 
 
@@ -526,8 +524,6 @@ class Simulation(RuleBasedStateMachine):
         second (F19)."""
 
         if self.world is not None and (crossed := self.journal.a_life_crossed()):
-            if crossed.split(" committed into ", 1)[1].split(" ", 1)[0] == "seen":  # a job: F21
-                self._known("F21", crossed)
             raise Violation(f"a first life's attempt committed into the second: {crossed}")
 
     @invariant()
