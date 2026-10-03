@@ -280,3 +280,35 @@ async def test_the_encoding_is_deterministic():
     state = {"b": [1, 2.5, None, "x"], "a": {"z": True, "y": {"k": -(2**62)}}}
     assert journal_module._dumps(state) == journal_module._dumps(json.loads(json.dumps(state)))
     assert journal_module._dumps(state).startswith(b'{"a":{"y"')
+
+
+@pytest.mark.parametrize("landed", [True, False])
+async def test_a_checkpoints_move_that_errors_is_written_again(store, monkeypatch, landed):
+    """F24: the swap that moves the journal to a new checkpoint fails with an
+    error that is no conflict — its answer lost after it landed, or not
+    landed at all. The move stays pending and is written again, the very
+    same body, before anything else: a lone engine is not fenced, and no
+    event is lost."""
+
+    j, s, _ = await open_journal(store, min_checkpoint=1)
+    real, failed = journal_module.swap, []
+
+    async def move_fails_once(st, path, data, etag):
+        if b'"events":[]' in data and not failed:
+            failed.append(1)
+            if landed:
+                await real(st, path, data, etag)
+            raise ConnectionError("the move's answer was lost")
+        return await real(st, path, data, etag)
+
+    monkeypatch.setattr(journal_module, "swap", move_fails_once)
+    record(j, s, "a")
+    with pytest.raises(ConnectionError):
+        await j.flush()  # the event lands; its checkpoint's move fails
+    assert failed and not j.fenced
+    record(j, s, "b")
+    await j.flush()  # the move first, again, then the event
+    assert not j.fenced and (await journal_of(store))["checkpoint"] == j.checkpoint is not None
+    await j.close(checkpoint=False)
+    _, s2, _ = await open_journal(store)
+    assert s2.counts == {"a": 1, "b": 1}

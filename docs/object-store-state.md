@@ -92,7 +92,7 @@ current content.
 {root}/{namespace}/
   control/
     journal.json                             ← the engine id, the checkpoint, the events since
-    checkpoints/7f3a9c0e-000012.json ← the checkpoint the journal names
+    checkpoints/7f3a9c0e5b21d846-000012.json ← the checkpoint the journal names
   keys/
     site_files/alpha/000000000057.kx         ← delta file of commit 57
     site_files/alpha/c01J8ZE2….kx            ← compacted file
@@ -221,8 +221,8 @@ retention (§11).
 
 ```json
 {
-  "checkpoint": "7f3a9c0e-000012",
-  "engine": "7f3a9c0e",
+  "checkpoint": "7f3a9c0e5b21d846-000012",
+  "engine": "7f3a9c0e5b21d846",
   "events": [
     "…every event since checkpoint 000012, then:",
     {"type": "AttemptFinished", "run": "01J8ZC7Q…", "task": "site_feed:alpha",
@@ -967,6 +967,9 @@ shutdown. It takes these steps, under the flusher's lock:
    checkpoint with the rest.
 4. Move the journal: swap in `{engine, the new checkpoint, no events}`.
    A `Conflict` means the engine was fenced: it stops and deletes nothing.
+   Any other error leaves the move pending: the next flush writes its very
+   same body before anything else, and `swap` takes its own bytes for a
+   move that landed unheard.
 5. Once the move has landed, `DELETE` every checkpoint that step 1 listed.
 
 Besides the engine id, three rules make this safe. Break any one and

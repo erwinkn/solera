@@ -121,6 +121,7 @@ class Journal:
         self._waiters: list[tuple[int, asyncio.Future]] = []  # (events appended, waiter)
         self._urgent = False  # someone waits on `durable()`
         self._sealed: tuple | None = None  # (body, events, count, snapshot): written next, as is
+        self._move: tuple | None = None  # (name, size, listed): a checkpoint's move, landed or not
         self._flushing = asyncio.Lock()
         self._wake = asyncio.Event()
         self._task: asyncio.Task | None = None
@@ -176,7 +177,7 @@ class Journal:
             if not writer:
                 self.fenced = True  # read-only: every append fails
                 return OpenResult(engine=None, replayed=replayed, checkpoint=checkpoint)
-            engine = secrets.token_hex(4)
+            engine = secrets.token_hex(8)  # no two processes share one (§10)
             try:
                 self._etag = await swap(
                     self.store,
@@ -256,6 +257,8 @@ class Journal:
         byte for byte."""
 
         async with self._flushing:
+            if self._move is not None and not self.fenced:
+                await self._finish_move()  # pending since an error: before anything else
             while self._sealed is not None or self._buffer:
                 if self.fenced:
                     self._fail(Fenced("this engine was replaced"))
@@ -322,13 +325,25 @@ class Journal:
         if back != data:
             log.warning("checkpoint %s reads back other bytes; keeping the journal", name)
             return
+        self._move = (name, len(data), listed)
+        await self._finish_move()
+
+    async def _finish_move(self) -> None:
+        """Move the journal to the checkpoint written, then delete what was
+        listed before. An error but a conflict leaves the move pending: it is
+        written again, the very same body, before anything else — `swap`
+        takes its own bytes for a move that landed unheard."""
+
+        name, size, listed = self._move
         try:
             self._etag = await swap(self.store, self._journal, self._body(self.engine, name, []), self._etag)
         except Conflict:
+            self._move = None
             self._fail(Fenced("another engine wrote the journal"))
             return  # fenced: deletes nothing
+        self._move = None
         self.checkpoint, self._events, self._events_bytes = name, [], 0
-        self._last_checkpoint_size = len(data)
+        self._last_checkpoint_size = size
         for i in range(0, len(listed), 1000):
             with contextlib.suppress(NotFoundError, FileNotFoundError):
                 await obstore.delete_async(self.store, listed[i : i + 1000])
@@ -350,7 +365,7 @@ class Journal:
         loop = asyncio.get_running_loop()
         while not self.fenced:
             self._wake.clear()
-            if self._sealed is None:
+            if self._sealed is None and self._move is None:
                 if self._first_buffered is None:
                     await self._wake.wait()
                     continue
