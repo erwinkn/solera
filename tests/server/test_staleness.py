@@ -34,7 +34,7 @@ def pending(why: str):
 per_key = pending("each=True per-key records: not built (W22: next)")
 net_delta = pending("the net delta: over-reports until K44's range scan (W22)")
 k44 = pending("K44: added/updated/removed and ctx.load(): not built")
-ruling = pending("reasons during a full pass after an asset change: awaiting a ruling")
+ruling = pending("a full pass due only to an asset change reports definition changed alone (ruling; W22)")
 
 
 def taken(key: str) -> bool:
@@ -635,6 +635,25 @@ async def test_a_key_updated_and_reverted_changes_nothing(state, tmp_path):
     assert await index_entries(state, "items", "") == before
 
 
+async def test_a_reset_upstream_and_a_new_version_give_both_reasons(state, tmp_path):
+    """The ruling: `items` reset (its content replaced) and then `count`'s
+    version bumped: `count` is stale for both, ["input changed",
+    "definition changed"]; one full pass under the new version, reading the
+    new `items`, clears both."""
+
+    engine, outside = await _built(state, tmp_path, {"k1": "1"})
+    await engine.stop()
+    engine = make_engine(state, project(tmp_path, outside, items_store="b"))  # items reset
+    await engine.initialize()
+    await drive(engine, await engine.submit(["items"]))
+    await engine.stop()
+    engine = make_engine(state, project(tmp_path, outside, items_store="b", count_v="2"))
+    await engine.initialize()
+    assert await staleness.stale_reasons(engine, "count") == {staleness.INPUT, staleness.DEFINITION}
+    await drive(engine, await engine.submit(["count"]))
+    assert await staleness.stale_reasons(engine, "count") == set()
+
+
 def test_the_reference_reads_the_worked_examples():
     """The reference itself on the examples above: what the tests hold the
     engine to."""
@@ -709,8 +728,8 @@ def test_the_reference_reads_the_worked_examples():
     assert ref.stale_keys() == {"k1", "k2", "k3"}  # every key of checks, upstream stale
     ref.change_asset("copy")
     assert ref.reasons("copy") == {DEF, UP}
-    ref.run_items()
-    assert ref.reasons("copy") == {DEF} and ref.reasons("count") == {IN}
+    ref.run_items()  # items moved after copy's pass began: its input changed too
+    assert ref.reasons("copy") == {DEF, IN} and ref.reasons("count") == {IN}
 
     net = staleness.Reference(takes=taken)  # the net delta
     net.change_knob()
@@ -727,6 +746,17 @@ def test_the_reference_reads_the_worked_examples():
     assert not net.stale("items") and not net.stale("fchecks")
     net.commit_feed({"k1": "2"}, set())
     assert net.reasons("items") == {IN} and net.fchecks_stale_keys() == {"k1"}
+
+    both = staleness.Reference(takes=taken)  # the ruling: every reason that holds
+    both.commit({"k1": "1"}, set())
+    both.run_default("count")
+    both.reset_upstream()
+    both.change_asset("count")
+    assert both.reasons("count") == {IN, DEF}
+    both.run_default("count")  # one pass under the new version, reading the new upstream
+    assert both.reasons("count") == set()
+    both.change_asset("count")  # due only to the asset change
+    assert both.reasons("count") == {DEF}
 
     capped = staleness.Reference(takes=taken, cap=2)  # the cap counts keys= runs
     capped.commit({"k1"}, set())

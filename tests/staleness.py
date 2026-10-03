@@ -156,14 +156,17 @@ class ByPartition:
     """A plain incremental output. Its record: a snapshot (the counter
     through which it read every change of `items`) and an entry per keys=
     run since (the commit it read at, the keys it named); or, while a full
-    pass is due (`snapshot` None), why (`due`), whether the pass has started,
+    pass is due (`snapshot` None), whether it has started,
     and what it delivered (key -> the version delivered). Also: whether it
     has a head, the keys its patterns take and, keyed, the keys it holds."""
 
     takes: Callable[[str], bool] = everything
     built: bool = False
     snapshot: int | None = None
-    due: str = INPUT
+    input_reset: bool = False  # its upstream was replaced; no completed pass has read it since
+    changed_at: int = 0  # its asset's last change
+    definition_seen: int = 0  # the asset change its last completed pass ran under
+    pass_base: int = 0  # `items`' newest commit when the pass due began
     started: bool = False
     passed: dict[str, int] = field(default_factory=dict)
     entries: list[tuple[int, frozenset[str]]] = field(default_factory=list)
@@ -253,11 +256,21 @@ class Reference:
             self._write(k, t if k in self.feed else None, t)
         self.feed_read = dict(self.feed)
         for o in self.others.values():
-            self._owe_a_pass(o, INPUT)
+            self._owe_a_pass(o)
+            o.input_reset = True
+
+    def _owe_a_pass(self, o: ByPartition) -> None:
+        if o.snapshot is not None:
+            o.pass_base = self.last_commit
+        o.snapshot, o.started, o.passed, o.entries = None, False, {}, []
 
     @staticmethod
-    def _owe_a_pass(o: ByPartition, why: str) -> None:
-        o.snapshot, o.due, o.started, o.passed, o.entries = None, why, False, {}, []
+    def _complete(o: ByPartition, snapshot: int) -> None:
+        """A pass is complete: it read the upstream as it is, under the asset's
+        current definition."""
+
+        o.snapshot, o.entries, o.passed, o.started = snapshot, [], {}, False
+        o.input_reset, o.definition_seen = False, o.changed_at
 
     def change_knob(self) -> None:
         self.knob = self._tick()
@@ -273,7 +286,9 @@ class Reference:
         if name == "checks":
             self.checks.changed_at = t
         else:
-            self._owe_a_pass(self.others[name], DEFINITION)
+            o = self.others[name]
+            o.changed_at = t
+            self._owe_a_pass(o)
 
     def run_keys(self, keys: set[str], name: str = "checks"):
         """A keys= run. On `checks` (each=True), R2: the named keys its
@@ -299,7 +314,7 @@ class Reference:
         start_over = self._deliver(o, delivered)
         o.entries.append((self.last_commit, frozenset(keys)))
         if o.snapshot is None and not self.pending(name):  # the pass is complete
-            o.snapshot, o.entries, o.passed, o.started = self.last_commit, [], {}, False
+            self._complete(o, self.last_commit)
         return delivered, start_over
 
     def run_default(self, name: str):
@@ -316,7 +331,10 @@ class Reference:
         o = self.others[name]
         delivered = self.pending(name)
         start_over = self._deliver(o, delivered)
-        o.snapshot, o.entries, o.passed, o.started = self.last_commit, [], {}, False
+        if o.snapshot is None:
+            self._complete(o, self.last_commit)
+        else:
+            o.snapshot, o.entries = self.last_commit, []
         return delivered, start_over
 
     def _deliver(self, o: ByPartition, delivered: set[str]) -> bool:
@@ -410,8 +428,25 @@ class Reference:
             return self.stale_keys()
         return set(self.others[name].keys) if self.stale(name) else set()
 
+    # each reason its own predicate over the records (Erwin's ruling): those that
+    # hold are reported, and nothing remembers why a unit went stale
+
+    def input_changed(self, name: str) -> bool:
+        o = self.others[name]
+        if o.snapshot is not None:
+            return bool(self.pending(name))
+        moved = {k for k, t in self.changed.items() if t > o.pass_base}  # since the pass began
+        return o.input_reset or bool(self.pending(name) & moved)
+
+    def definition_changed(self, name: str) -> bool:
+        o = self.others[name]
+        return o.changed_at > o.definition_seen
+
+    def upstream_stale(self) -> bool:
+        return self.items_stale()
+
     def reasons(self, name: str) -> set[str]:
-        """Why `name` is stale (K46): empty if it is not."""
+        """Why `name` is stale (K46): the reasons whose predicate holds."""
 
         if name == "items":
             return {INPUT} if self.items_stale() else set()
@@ -422,11 +457,11 @@ class Reference:
                 return set()  # never built: `missing`, not `stale`
             why = set().union(*self.direct_stale_keys().values())
         else:
-            o = self.others[name]
-            if not o.built:
+            if not self.others[name].built:
                 return set()
-            why = {o.due} if o.snapshot is None else ({INPUT} if self.pending(name) else set())
-        return why | ({UPSTREAM} if self.items_stale() else set())
+            why = {INPUT} if self.input_changed(name) else set()
+            why |= {DEFINITION} if self.definition_changed(name) else set()
+        return why | ({UPSTREAM} if self.upstream_stale() else set())
 
     def stale(self, name: str) -> bool:
         return bool(self.reasons(name))
