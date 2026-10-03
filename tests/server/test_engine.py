@@ -734,11 +734,11 @@ async def test_cancel_run(state):
     """§8: cancel fences running attempts (LostOwnership on next renew) and
     drops queued tasks."""
 
-    @asset(partitions=StaticPartitions(["a", "b"]))
+    @asset(partitions=StaticPartitions(["a", "b"]), executor=Fake("fake")())
     def slowish(ctx):
         return [{"p": ctx.partition}]
 
-    project = Project(assets=[slowish])
+    project = Project(assets=[slowish], executors=[Fake("fake")])
     engine = make_engine(state, project, placements=fake(project))
     FakePlacement.script.clear()
     await engine.initialize()
