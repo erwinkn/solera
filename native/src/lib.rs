@@ -26,7 +26,7 @@ use std::sync::Arc;
 use arrow_array::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow_array::RecordBatch;
 use pyo3::create_exception;
-use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::{PyBool, PyBytes, PyCapsule, PyDict, PyInt, PyList, PyString};
@@ -55,6 +55,22 @@ create_exception!(
     PyValueError,
     "Well-formed input over a limit: more entries or bytes than the caller takes."
 );
+
+/// Runs a binding's body, turning a panic into a `RuntimeError`. Unguarded,
+/// pyo3 raises `PanicException`, a `BaseException` that every `except
+/// Exception` in the engine and the worker lets through.
+fn guard<T>(body: impl FnOnce() -> PyResult<T>) -> PyResult<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).unwrap_or_else(|payload| {
+        let what = payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "a panic with no message".into());
+        Err(PyRuntimeError::new_err(format!(
+            "solera._native panicked: {what}"
+        )))
+    })
+}
 
 fn to_py(e: Error) -> PyErr {
     match e {
@@ -153,22 +169,24 @@ fn encode_file<'py>(
     k: u8,
     codec: u8,
 ) -> PyResult<Bound<'py, PyBytes>> {
-    let o = options(block_size, level, bits_per_item, k, codec);
-    let (payloads, predecessors) = extra(keys.len(), payloads, predecessors)?;
-    let out = py
-        .detach(|| {
-            let payloads: Vec<Option<&[u8]>> = payloads.iter().map(opt).collect();
-            format::encode_file(
-                &slices(&keys),
-                &generations,
-                &deleted,
-                &payloads,
-                &predecessors,
-                o,
-            )
-        })
-        .map_err(to_py)?;
-    Ok(PyBytes::new(py, &out))
+    guard(|| {
+        let o = options(block_size, level, bits_per_item, k, codec);
+        let (payloads, predecessors) = extra(keys.len(), payloads, predecessors)?;
+        let out = py
+            .detach(|| {
+                let payloads: Vec<Option<&[u8]>> = payloads.iter().map(opt).collect();
+                format::encode_file(
+                    &slices(&keys),
+                    &generations,
+                    &deleted,
+                    &payloads,
+                    &predecessors,
+                    o,
+                )
+            })
+            .map_err(to_py)?;
+        Ok(PyBytes::new(py, &out))
+    })
 }
 
 /// Entries (sorted, unique keys) as files of about `max_file_bytes` each.
@@ -189,30 +207,32 @@ fn write_files<'py>(
     codec: u8,
     max_file_bytes: usize,
 ) -> PyResult<Bound<'py, PyList>> {
-    if generations.len() != keys.len() || deleted.len() != keys.len() {
-        return Err(PyValueError::new_err(
-            "keys, generations and deleted must have the same length",
-        ));
-    }
-    let (payloads, predecessors) = extra(keys.len(), payloads, predecessors)?;
-    let o = options(block_size, level, bits_per_item, k, codec);
-    let files = py
-        .detach(|| {
-            let mut w = stream::Writer::new(o, max_file_bytes);
-            for i in 0..keys.len() {
-                w.push(
-                    &keys[i],
-                    generations[i],
-                    deleted[i] != 0,
-                    opt(&payloads[i]),
-                    predecessors[i],
-                )?;
-            }
-            w.finish(false)?;
-            Ok(w.files.into_iter().collect::<Vec<_>>())
-        })
-        .map_err(to_py)?;
-    list_of_bytes(py, &files)
+    guard(|| {
+        if generations.len() != keys.len() || deleted.len() != keys.len() {
+            return Err(PyValueError::new_err(
+                "keys, generations and deleted must have the same length",
+            ));
+        }
+        let (payloads, predecessors) = extra(keys.len(), payloads, predecessors)?;
+        let o = options(block_size, level, bits_per_item, k, codec);
+        let files = py
+            .detach(|| {
+                let mut w = stream::Writer::new(o, max_file_bytes);
+                for i in 0..keys.len() {
+                    w.push(
+                        &keys[i],
+                        generations[i],
+                        deleted[i] != 0,
+                        opt(&payloads[i]),
+                        predecessors[i],
+                    )?;
+                }
+                w.finish(false)?;
+                Ok(w.files.into_iter().collect::<Vec<_>>())
+            })
+            .map_err(to_py)?;
+        list_of_bytes(py, &files)
+    })
 }
 
 type Block5<'py> = (
@@ -227,15 +247,17 @@ type Block5<'py> = (
 /// predecessor generation or None.
 #[pyfunction]
 fn decode_block<'py>(py: Python<'py>, data: PyBackedBytes, codec: u8) -> PyResult<Block5<'py>> {
-    let ((keys, generations, flags, payloads), predecessors) =
-        format::decode_block(&data, codec).map_err(to_py)?;
-    Ok((
-        list_of_bytes(py, &keys)?,
-        generations,
-        PyBytes::new(py, &flags),
-        payload_list(py, payloads.iter().map(Option::as_deref))?,
-        predecessors,
-    ))
+    guard(|| {
+        let ((keys, generations, flags, payloads), predecessors) =
+            format::decode_block(&data, codec).map_err(to_py)?;
+        Ok((
+            list_of_bytes(py, &keys)?,
+            generations,
+            PyBytes::new(py, &flags),
+            payload_list(py, payloads.iter().map(Option::as_deref))?,
+            predecessors,
+        ))
+    })
 }
 
 #[pyfunction]
@@ -245,11 +267,15 @@ fn bloom_check_keys<'py>(
     nbits: u64,
     k: u8,
     keys: Vec<PyBackedBytes>,
-) -> Bound<'py, PyBytes> {
-    PyBytes::new(
-        py,
-        &format::bloom_check_keys(&bits, nbits, k, &slices(&keys)),
-    )
+) -> PyResult<Bound<'py, PyBytes>> {
+    guard(|| {
+        Ok({
+            PyBytes::new(
+                py,
+                &format::bloom_check_keys(&bits, nbits, k, &slices(&keys)),
+            )
+        })
+    })
 }
 
 #[pyfunction]
@@ -259,11 +285,15 @@ fn bloom_check_tombstones<'py>(
     nbits: u64,
     k: u8,
     keys: Vec<PyBackedBytes>,
-) -> Bound<'py, PyBytes> {
-    PyBytes::new(
-        py,
-        &format::bloom_check_tombstones(&bits, nbits, k, &slices(&keys)),
-    )
+) -> PyResult<Bound<'py, PyBytes>> {
+    guard(|| {
+        Ok({
+            PyBytes::new(
+                py,
+                &format::bloom_check_tombstones(&bits, nbits, k, &slices(&keys)),
+            )
+        })
+    })
 }
 
 type Found<'py> = (
@@ -281,14 +311,16 @@ fn lookup<'py>(
     codec: u8,
     keys: Vec<PyBackedBytes>,
 ) -> PyResult<Found<'py>> {
-    let (found, generations, deleted, payloads) =
-        format::lookup(&slices(&blocks), codec, &slices(&keys)).map_err(to_py)?;
-    Ok((
-        PyBytes::new(py, &found),
-        generations,
-        PyBytes::new(py, &deleted),
-        payload_list(py, payloads.iter().map(Option::as_deref))?,
-    ))
+    guard(|| {
+        let (found, generations, deleted, payloads) =
+            format::lookup(&slices(&blocks), codec, &slices(&keys)).map_err(to_py)?;
+        Ok((
+            PyBytes::new(py, &found),
+            generations,
+            PyBytes::new(py, &deleted),
+            payload_list(py, payloads.iter().map(Option::as_deref))?,
+        ))
+    })
 }
 
 type Merged<'py> = (
@@ -319,16 +351,18 @@ fn merge_range<'py>(
     upto: Option<PyBackedBytes>,
     drop_deleted: bool,
 ) -> PyResult<Merged<'py>> {
-    let runs: Vec<Vec<&[u8]>> = runs.iter().map(|r| slices(r)).collect();
-    let m = format::merge_range(
-        &runs,
-        &codecs,
-        after.as_ref().map(|a| a.as_ref()),
-        upto.as_ref().map(|u| u.as_ref()),
-        drop_deleted,
-    )
-    .map_err(to_py)?;
-    merged(py, m)
+    guard(|| {
+        let runs: Vec<Vec<&[u8]>> = runs.iter().map(|r| slices(r)).collect();
+        let m = format::merge_range(
+            &runs,
+            &codecs,
+            after.as_ref().map(|a| a.as_ref()),
+            upto.as_ref().map(|u| u.as_ref()),
+            drop_deleted,
+        )
+        .map_err(to_py)?;
+        merged(py, m)
+    })
 }
 
 /// A bounded page of the merged view (`format::merge_page`): keys,
@@ -353,36 +387,40 @@ fn merge_page<'py>(
     Option<Bound<'py, PyBytes>>,
     bool,
 )> {
-    let page = py
-        .detach(|| {
-            let runs: Vec<Vec<&[u8]>> = runs.iter().map(|r| slices(r)).collect();
-            format::merge_page(
-                &runs,
-                &codecs,
-                after.as_deref(),
-                bound.as_deref(),
-                limit,
-                drop_deleted,
-            )
-        })
-        .map_err(to_py)?;
-    let (k, g, f, p) = merged(py, page.entries)?;
-    Ok((
-        k,
-        g,
-        f,
-        p,
-        page.last.map(|k| PyBytes::new(py, &k)),
-        page.more,
-    ))
+    guard(|| {
+        let page = py
+            .detach(|| {
+                let runs: Vec<Vec<&[u8]>> = runs.iter().map(|r| slices(r)).collect();
+                format::merge_page(
+                    &runs,
+                    &codecs,
+                    after.as_deref(),
+                    bound.as_deref(),
+                    limit,
+                    drop_deleted,
+                )
+            })
+            .map_err(to_py)?;
+        let (k, g, f, p) = merged(py, page.entries)?;
+        Ok((
+            k,
+            g,
+            f,
+            p,
+            page.last.map(|k| PyBytes::new(py, &k)),
+            page.more,
+        ))
+    })
 }
 
 /// Every entry of a garbage file (docs/key-index-format.md § Garbage files):
 /// keys, generations.
 #[pyfunction]
 fn decode_garbage<'py>(py: Python<'py>, data: &[u8]) -> PyResult<(Bound<'py, PyList>, Vec<u64>)> {
-    let (k, g) = garbage::decode(data).map_err(to_py)?;
-    Ok((list_of_bytes(py, &k)?, g))
+    guard(|| {
+        let (k, g) = garbage::decode(data).map_err(to_py)?;
+        Ok((list_of_bytes(py, &k)?, g))
+    })
 }
 
 // -- tails ----------------------------------------------------------------------------
@@ -406,42 +444,48 @@ fn footer_dict<'py>(py: Python<'py>, f: &format::Footer) -> PyResult<Bound<'py, 
 
 #[pyfunction]
 fn parse_footer<'py>(py: Python<'py>, footer: &[u8]) -> PyResult<Bound<'py, PyDict>> {
-    footer_dict(py, &format::parse_footer(footer).map_err(to_py)?)
+    guard(|| footer_dict(py, &format::parse_footer(footer).map_err(to_py)?))
 }
 
 /// A file's block index from its last bytes (`part` ends at `file_size`).
 #[pyfunction]
 fn parse_index<'py>(py: Python<'py>, part: &[u8], file_size: u64) -> PyResult<Bound<'py, PyDict>> {
-    let t = format::parse_index(part, file_size).map_err(to_py)?;
-    let d = footer_dict(py, &t.footer)?;
-    d.set_item("size", file_size)?;
-    d.set_item("min_key", PyBytes::new(py, &t.min_key))?;
-    d.set_item("max_key", PyBytes::new(py, &t.max_key))?;
-    let blocks = PyList::empty(py);
-    for (first, off, size, n, crc) in &t.blocks {
-        blocks.append((PyBytes::new(py, first), off, size, n, crc))?;
-    }
-    d.set_item("blocks", blocks)?;
-    Ok(d)
+    guard(|| {
+        let t = format::parse_index(part, file_size).map_err(to_py)?;
+        let d = footer_dict(py, &t.footer)?;
+        d.set_item("size", file_size)?;
+        d.set_item("min_key", PyBytes::new(py, &t.min_key))?;
+        d.set_item("max_key", PyBytes::new(py, &t.max_key))?;
+        let blocks = PyList::empty(py);
+        for (first, off, size, n, crc) in &t.blocks {
+            blocks.append((PyBytes::new(py, first), off, size, n, crc))?;
+        }
+        d.set_item("blocks", blocks)?;
+        Ok(d)
+    })
 }
 
 /// A file's tail — filters, index and footer (`tail` ends at `file_size`).
 #[pyfunction]
 fn parse_tail<'py>(py: Python<'py>, tail: &[u8], file_size: u64) -> PyResult<Bound<'py, PyDict>> {
-    let d = parse_index(py, tail, file_size)?;
-    let filters = format::parse_filters(tail, file_size).map_err(to_py)?;
-    for (name, (nbits, k, bits)) in ["key_filter", "tomb_filter"].into_iter().zip(filters) {
-        d.set_item(name, (nbits, k, PyBytes::new(py, bits)))?;
-    }
-    Ok(d)
+    guard(|| {
+        let d = parse_index(py, tail, file_size)?;
+        let filters = format::parse_filters(tail, file_size).map_err(to_py)?;
+        for (name, (nbits, k, bits)) in ["key_filter", "tomb_filter"].into_iter().zip(filters) {
+            d.set_item(name, (nbits, k, PyBytes::new(py, bits)))?;
+        }
+        Ok(d)
+    })
 }
 
 #[pyfunction]
 fn check_block(data: &[u8], crc: u32) -> PyResult<()> {
-    if crc32fast::hash(data) != crc {
-        return Err(FormatError::new_err("block checksum mismatch"));
-    }
-    Ok(())
+    guard(|| {
+        if crc32fast::hash(data) != crc {
+            return Err(FormatError::new_err("block checksum mismatch"));
+        }
+        Ok(())
+    })
 }
 
 // -- written content ------------------------------------------------------------------
@@ -604,13 +648,15 @@ impl Pages {
     }
 
     fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Entries<'py>>> {
-        let (keys, payloads) = (PyList::empty(py), PyList::empty(py));
-        while keys.len() < self.size && self.cursor.read().map_err(to_py)? {
-            let (k, p) = self.cursor.entry();
-            keys.append(PyBytes::new(py, k))?;
-            payloads.append(p.map(|p| PyBytes::new(py, p)))?;
-        }
-        Ok((!keys.is_empty()).then_some((keys, payloads)))
+        guard(|| {
+            let (keys, payloads) = (PyList::empty(py), PyList::empty(py));
+            while keys.len() < self.size && self.cursor.read().map_err(to_py)? {
+                let (k, p) = self.cursor.entry();
+                keys.append(PyBytes::new(py, k))?;
+                payloads.append(p.map(|p| PyBytes::new(py, p)))?;
+            }
+            Ok((!keys.is_empty()).then_some((keys, payloads)))
+        })
     }
 }
 
@@ -649,8 +695,10 @@ impl Rows {
     /// Rows as mappings: the key is `row[key]`, a `str` or an `int`.
     #[staticmethod]
     fn records(py: Python<'_>, rows: Bound<'_, PyList>, key: &str) -> PyResult<Rows> {
-        let keys = record_keys(py, rows.as_any(), key)?;
-        Ok(Rows::new(py, Box::new(keys), None))
+        guard(|| {
+            let keys = record_keys(py, rows.as_any(), key)?;
+            Ok(Rows::new(py, Box::new(keys), None))
+        })
     }
 
     /// Rows read a column at a time — a DataFrame through pandas alone, no
@@ -662,69 +710,79 @@ impl Rows {
         columns: Vec<Bound<'_, PyList>>,
         key: &str,
     ) -> PyResult<Rows> {
-        if names.len() != columns.len() {
-            return Err(PyValueError::new_err("a name for every column"));
-        }
-        let mut sorted: Vec<&String> = names.iter().collect();
-        sorted.sort();
-        if let Some(w) = sorted.windows(2).find(|w| w[0] == w[1]) {
-            return Err(PyValueError::new_err(format!(
-                "column {:?} appears twice",
-                w[0]
-            )));
-        }
-        let n = columns.first().map_or(0, |c| c.len());
-        if columns.iter().any(|c| c.len() != n) {
-            return Err(PyValueError::new_err("columns of different lengths"));
-        }
-        let k = names
-            .iter()
-            .position(|c| c == key)
-            .ok_or_else(|| PyKeyError::new_err(key.to_string()))?;
-        let mut keys = Arena::default();
-        keys.ends.reserve(n);
-        for i in 0..n {
-            row_key(&columns[k].get_item(i)?, &mut keys.data)?;
-            keys.ends.push(keys.data.len());
-            if i % 65536 == 65535 {
-                py.detach(|| ()); // let other threads run: this loop holds the GIL
+        guard(|| {
+            if names.len() != columns.len() {
+                return Err(PyValueError::new_err("a name for every column"));
             }
-        }
-        Ok(Rows::new(py, Box::new(keys), None))
+            let mut sorted: Vec<&String> = names.iter().collect();
+            sorted.sort();
+            if let Some(w) = sorted.windows(2).find(|w| w[0] == w[1]) {
+                return Err(PyValueError::new_err(format!(
+                    "column {:?} appears twice",
+                    w[0]
+                )));
+            }
+            let n = columns.first().map_or(0, |c| c.len());
+            if columns.iter().any(|c| c.len() != n) {
+                return Err(PyValueError::new_err("columns of different lengths"));
+            }
+            let k = names
+                .iter()
+                .position(|c| c == key)
+                .ok_or_else(|| PyKeyError::new_err(key.to_string()))?;
+            let mut keys = Arena::default();
+            keys.ends.reserve(n);
+            for i in 0..n {
+                row_key(&columns[k].get_item(i)?, &mut keys.data)?;
+                keys.ends.push(keys.data.len());
+                if i % 65536 == 65535 {
+                    py.detach(|| ()); // let other threads run: this loop holds the GIL
+                }
+            }
+            Ok(Rows::new(py, Box::new(keys), None))
+        })
     }
 
     /// `(key, value)` pairs (a `keyed=True` output).
     #[staticmethod]
     fn values(py: Python<'_>, items: Bound<'_, PyList>) -> PyResult<Rows> {
-        let keys = pack(py, &items, |item| item.get_item(0))?;
-        Ok(Rows::new(py, Box::new(keys), None))
+        guard(|| {
+            let keys = pack(py, &items, |item| item.get_item(0))?;
+            Ok(Rows::new(py, Box::new(keys), None))
+        })
     }
 
     /// A source's `(key, version)` pairs: the version `str` or `bytes`, or
     /// None for none.
     #[staticmethod]
     fn pairs(py: Python<'_>, items: Bound<'_, PyList>) -> PyResult<Rows> {
-        let keys = pack(py, &items, |item| item.get_item(0))?;
-        let versions: Box<dyn Payloads> = Box::new(Versions(items.unbind()));
-        Ok(Rows::new(py, Box::new(keys), Some(versions)))
+        guard(|| {
+            let keys = pack(py, &items, |item| item.get_item(0))?;
+            let versions: Box<dyn Payloads> = Box::new(Versions(items.unbind()));
+            Ok(Rows::new(py, Box::new(keys), Some(versions)))
+        })
     }
 
     /// Keys, each with `payload` if given (a partition set's elements: empty).
     #[staticmethod]
     #[pyo3(signature = (keys, payload=None))]
     fn keys(py: Python<'_>, keys: Bound<'_, PyList>, payload: Option<&[u8]>) -> PyResult<Rows> {
-        let packed = pack(py, &keys, |k| Ok(k.clone()))?;
-        let payloads = payload.map(|p| Box::new(Constant(p.to_vec())) as Box<dyn Payloads>);
-        Ok(Rows::new(py, Box::new(packed), payloads))
+        guard(|| {
+            let packed = pack(py, &keys, |k| Ok(k.clone()))?;
+            let payloads = payload.map(|p| Box::new(Constant(p.to_vec())) as Box<dyn Payloads>);
+            Ok(Rows::new(py, Box::new(packed), payloads))
+        })
     }
 
     /// Arrow data (any object with `__arrow_c_stream__`), its `key` column
     /// read in place.
     #[staticmethod]
     fn arrow(py: Python<'_>, data: Bound<'_, PyAny>, key: &str) -> PyResult<Rows> {
-        let batches = arrow_batches(py, &data)?;
-        let keys = arrow::keys(&batches, key, false).map_err(to_py)?;
-        Ok(Rows::new(py, keys, None))
+        guard(|| {
+            let batches = arrow_batches(py, &data)?;
+            let keys = arrow::keys(&batches, key, false).map_err(to_py)?;
+            Ok(Rows::new(py, keys, None))
+        })
     }
 
     /// Rows, not keys.
@@ -740,24 +798,28 @@ impl Rows {
 
     /// Every key and its payload (None for none), in key order.
     fn entries<'py>(&self, py: Python<'py>) -> PyResult<Entries<'py>> {
-        let mut c = Cursor::new(self.table.clone());
-        let (keys, payloads) = (PyList::empty(py), PyList::empty(py));
-        while c.read().map_err(to_py)? {
-            let (k, p) = c.entry();
-            keys.append(PyBytes::new(py, k))?;
-            payloads.append(p.map(|p| PyBytes::new(py, p)))?;
-        }
-        Ok((keys, payloads))
+        guard(|| {
+            let mut c = Cursor::new(self.table.clone());
+            let (keys, payloads) = (PyList::empty(py), PyList::empty(py));
+            while c.read().map_err(to_py)? {
+                let (k, p) = c.entry();
+                keys.append(PyBytes::new(py, k))?;
+                payloads.append(p.map(|p| PyBytes::new(py, p)))?;
+            }
+            Ok((keys, payloads))
+        })
     }
 
     /// Every key and its payload, in key order, `size` at a time.
     fn pages(&self, size: usize) -> PyResult<Pages> {
-        if size == 0 {
-            return Err(PyValueError::new_err("a page holds at least one key"));
-        }
-        Ok(Pages {
-            cursor: Cursor::new(self.table.clone()),
-            size,
+        guard(|| {
+            if size == 0 {
+                return Err(PyValueError::new_err("a page holds at least one key"));
+            }
+            Ok(Pages {
+                cursor: Cursor::new(self.table.clone()),
+                size,
+            })
         })
     }
 
@@ -770,34 +832,38 @@ impl Rows {
         py: Python<'py>,
         keys: Vec<Bound<'py, PyAny>>,
     ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyList>)> {
-        let packed = packed_keys(&keys)?;
-        let table = self.table.clone();
-        let found: Vec<Option<Vec<u32>>> = py.detach(|| {
-            (0..packed.len())
-                .into_par_iter()
-                .map(|i| table.find(packed.get(i)))
-                .collect()
-        });
-        let (rows, ends) = (PyList::empty(py), PyList::empty(py));
-        let mut n = 0usize;
-        for (i, f) in found.into_iter().enumerate() {
-            let Some(f) = f else {
-                return Err(PyKeyError::new_err(keys[i].clone().unbind()));
-            };
-            n += f.len();
-            for r in f {
-                rows.append(r)?;
+        guard(|| {
+            let packed = packed_keys(&keys)?;
+            let table = self.table.clone();
+            let found: Vec<Option<Vec<u32>>> = py.detach(|| {
+                (0..packed.len())
+                    .into_par_iter()
+                    .map(|i| table.find(packed.get(i)))
+                    .collect()
+            });
+            let (rows, ends) = (PyList::empty(py), PyList::empty(py));
+            let mut n = 0usize;
+            for (i, f) in found.into_iter().enumerate() {
+                let Some(f) = f else {
+                    return Err(PyKeyError::new_err(keys[i].clone().unbind()));
+                };
+                n += f.len();
+                for r in f {
+                    rows.append(r)?;
+                }
+                ends.append(n)?;
             }
-            ends.append(n)?;
-        }
-        Ok((rows, ends))
+            Ok((rows, ends))
+        })
     }
 
     /// Whether the write holds `key`.
     fn __contains__(&self, key: Bound<'_, PyAny>) -> PyResult<bool> {
-        let mut k = Vec::new();
-        row_key(&key, &mut k)?;
-        Ok(self.table.find(&k).is_some())
+        guard(|| {
+            let mut k = Vec::new();
+            row_key(&key, &mut k)?;
+            Ok(self.table.find(&k).is_some())
+        })
     }
 }
 
@@ -862,11 +928,13 @@ impl SortedRun {
         payloads: Option<Vec<Option<PyBackedBytes>>>,
         removes: Vec<PyBackedBytes>,
     ) -> PyResult<SortedRun> {
-        sorted_run(py.detach(|| {
-            let payloads: Option<Vec<Option<&[u8]>>> =
-                payloads.as_ref().map(|p| p.iter().map(opt).collect());
-            run::SortedRun::of(&slices(&keys), payloads.as_deref(), &slices(&removes))
-        }))
+        guard(|| {
+            sorted_run(py.detach(|| {
+                let payloads: Option<Vec<Option<&[u8]>>> =
+                    payloads.as_ref().map(|p| p.iter().map(opt).collect());
+                run::SortedRun::of(&slices(&keys), payloads.as_deref(), &slices(&removes))
+            }))
+        })
     }
 
     /// Every key of `rows`, with its payload, in key order, and the removes
@@ -878,8 +946,10 @@ impl SortedRun {
         rows: PyRef<'_, Rows>,
         removes: Vec<PyBackedBytes>,
     ) -> PyResult<SortedRun> {
-        let mut src = Source::Table(Box::new(Cursor::new(rows.table.clone())));
-        sorted_run(py.detach(|| run::SortedRun::from_source(&mut src, &slices(&removes))))
+        guard(|| {
+            let mut src = Source::Table(Box::new(Cursor::new(rows.table.clone())));
+            sorted_run(py.detach(|| run::SortedRun::from_source(&mut src, &slices(&removes))))
+        })
     }
 
     /// A run from its transport form, a `.kx` file, every fact checked
@@ -893,7 +963,7 @@ impl SortedRun {
         max_entries: u64,
         max_bytes: u64,
     ) -> PyResult<SortedRun> {
-        sorted_run(py.detach(|| run::SortedRun::decode(&data, max_entries, max_bytes)))
+        guard(|| sorted_run(py.detach(|| run::SortedRun::decode(&data, max_entries, max_bytes))))
     }
 
     /// The transport form: one `.kx` file.
@@ -907,9 +977,11 @@ impl SortedRun {
         k: u8,
         codec: u8,
     ) -> PyResult<Bound<'py, PyBytes>> {
-        let o = options(block_size, level, bits_per_item, k, codec);
-        let out = py.detach(|| self.inner.encode(o)).map_err(to_py)?;
-        Ok(PyBytes::new(py, &out))
+        guard(|| {
+            let o = options(block_size, level, bits_per_item, k, codec);
+            let out = py.detach(|| self.inner.encode(o)).map_err(to_py)?;
+            Ok(PyBytes::new(py, &out))
+        })
     }
 
     fn __len__(&self) -> usize {
@@ -933,19 +1005,21 @@ impl SortedRun {
     }
 
     fn keys<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        arena_list(py, &self.inner.keys)
+        guard(|| arena_list(py, &self.inner.keys))
     }
 
     /// Keys, generations, deleted flags, payloads (None for none).
     fn entries<'py>(&self, py: Python<'py>) -> PyResult<Merged<'py>> {
-        let r = &self.inner;
-        let flags: Vec<u8> = r.deleted.iter().map(|&d| d as u8).collect();
-        Ok((
-            arena_list(py, &r.keys)?,
-            r.generations.clone(),
-            PyBytes::new(py, &flags),
-            payload_list(py, (0..r.len()).map(|i| r.payload(i)))?,
-        ))
+        guard(|| {
+            let r = &self.inner;
+            let flags: Vec<u8> = r.deleted.iter().map(|&d| d as u8).collect();
+            Ok((
+                arena_list(py, &r.keys)?,
+                r.generations.clone(),
+                PyBytes::new(py, &flags),
+                payload_list(py, (0..r.len()).map(|i| r.payload(i)))?,
+            ))
+        })
     }
 }
 
@@ -963,10 +1037,14 @@ fn filter_of(f: &(u64, u8, PyBackedBytes)) -> sparse::Filter<'_> {
 #[pymethods]
 impl Sparse {
     #[new]
-    fn new(run: PyRef<'_, SortedRun>) -> Sparse {
-        Sparse {
-            inner: sparse::Sparse::new(run.inner.clone()),
-        }
+    fn new(run: PyRef<'_, SortedRun>) -> PyResult<Sparse> {
+        guard(|| {
+            Ok({
+                Sparse {
+                    inner: sparse::Sparse::new(run.inner.clone()),
+                }
+            })
+        })
     }
 
     /// Entries still undecided.
@@ -988,8 +1066,8 @@ impl Sparse {
     }
 
     /// The positions `[lo, hi)` of the run's keys in `[min, max]`.
-    fn span(&self, min: &[u8], max: &[u8]) -> (usize, usize) {
-        self.inner.span(min, max)
+    fn span(&self, min: &[u8], max: &[u8]) -> PyResult<(usize, usize)> {
+        guard(|| Ok(self.inner.span(min, max)))
     }
 
     /// The blocks a read of one file needs, by its blocks' first keys: with
@@ -1002,8 +1080,8 @@ impl Sparse {
         file: Option<usize>,
         lo: usize,
         hi: usize,
-    ) -> Vec<usize> {
-        self.inner.blocks(&slices(&firsts), file, lo, hi)
+    ) -> PyResult<Vec<usize>> {
+        guard(|| Ok(self.inner.blocks(&slices(&firsts), file, lo, hi)))
     }
 
     /// Reads those entries in one file's fetched `blocks`, `(index, bytes)`.
@@ -1019,13 +1097,15 @@ impl Sparse {
         lo: usize,
         hi: usize,
     ) -> PyResult<()> {
-        let inner = &mut self.inner;
-        py.detach(|| {
-            let blocks: Vec<(usize, &[u8])> =
-                blocks.iter().map(|(i, b)| (*i, b.as_ref())).collect();
-            inner.read(&blocks, codec, &slices(&firsts), file, lo, hi)
+        guard(|| {
+            let inner = &mut self.inner;
+            py.detach(|| {
+                let blocks: Vec<(usize, &[u8])> =
+                    blocks.iter().map(|(i, b)| (*i, b.as_ref())).collect();
+                inner.read(&blocks, codec, &slices(&firsts), file, lo, hi)
+            })
+            .map_err(to_py)
         })
-        .map_err(to_py)
     }
 
     /// Runs one file's filters — `(nbits, k, bits)` each, as its tail holds
@@ -1037,27 +1117,35 @@ impl Sparse {
         hi: usize,
         keys: (u64, u8, PyBackedBytes),
         tombs: (u64, u8, PyBackedBytes),
-    ) {
-        self.inner
-            .filter(file, lo, hi, filter_of(&keys), filter_of(&tombs));
+    ) -> PyResult<()> {
+        guard(|| {
+            self.inner
+                .filter(file, lo, hi, filter_of(&keys), filter_of(&tombs));
+            Ok(())
+        })
     }
 
     /// Decides what the filters can (`exact`: no change from filters alone).
-    fn classify(&mut self, exact: bool) {
-        self.inner.classify(exact);
+    fn classify(&mut self, exact: bool) -> PyResult<()> {
+        guard(|| {
+            self.inner.classify(exact);
+            Ok(())
+        })
     }
 
     /// Each live entry read: `{key: (generation, payload)}`, the payload
     /// None for none.
     fn live<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let out = PyDict::new(py);
-        for (p, g, payload) in self.inner.live() {
-            out.set_item(
-                PyBytes::new(py, self.inner.run.key(p)),
-                (g, payload.map(|b| PyBytes::new(py, b))),
-            )?;
-        }
-        Ok(out)
+        guard(|| {
+            let out = PyDict::new(py);
+            for (p, g, payload) in self.inner.live() {
+                out.set_item(
+                    PyBytes::new(py, self.inner.run.key(p)),
+                    (g, payload.map(|b| PyBytes::new(py, b))),
+                )?;
+            }
+            Ok(out)
+        })
     }
 
     /// The run's delta over what was read: `.kx` files with added, removed
@@ -1076,12 +1164,14 @@ impl Sparse {
         codec: u8,
         max_file_bytes: usize,
     ) -> PyResult<(Resolved<'py>, Option<Changed<'py>>)> {
-        let o = options(block_size, level, bits_per_item, k, codec);
-        let inner = &self.inner;
-        let d = py
-            .detach(|| inner.delta(o, max_file_bytes, collect, generation))
-            .map_err(to_py)?;
-        Ok((delta_files(py, &d), changed(py, &d.collected)?))
+        guard(|| {
+            let o = options(block_size, level, bits_per_item, k, codec);
+            let inner = &self.inner;
+            let d = py
+                .detach(|| inner.delta(o, max_file_bytes, collect, generation))
+                .map_err(to_py)?;
+            Ok((delta_files(py, &d), changed(py, &d.collected)?))
+        })
     }
 }
 
@@ -1162,26 +1252,28 @@ impl Job {
         generation: u64,
         overlay: Option<PyRef<'_, SortedRun>>,
     ) -> PyResult<Job> {
-        let src = match (rows, overlay) {
-            (Some(r), None) => Source::Table(Box::new(Cursor::new(r.table.clone()))),
-            (None, None) => Source::Stream(Stream::default()),
-            (None, Some(run)) => {
-                Source::Overlay(Box::new(Overlay::new(Stream::default(), run.inner.clone())))
-            }
-            (Some(_), Some(_)) => {
-                return Err(PyValueError::new_err(
-                    "an overlay goes over a streamed replacement",
-                ))
-            }
-        };
-        let o = options(block_size, level, bits_per_item, k, codec);
-        Ok(Job {
-            kind: Kind::Join(Box::new(
-                Join::new(src, true, runs, o, max_file_bytes, collect, generation)
-                    .map_err(to_py)?,
-            )),
-            key,
-            local: None,
+        guard(|| {
+            let src = match (rows, overlay) {
+                (Some(r), None) => Source::Table(Box::new(Cursor::new(r.table.clone()))),
+                (None, None) => Source::Stream(Stream::default()),
+                (None, Some(run)) => {
+                    Source::Overlay(Box::new(Overlay::new(Stream::default(), run.inner.clone())))
+                }
+                (Some(_), Some(_)) => {
+                    return Err(PyValueError::new_err(
+                        "an overlay goes over a streamed replacement",
+                    ))
+                }
+            };
+            let o = options(block_size, level, bits_per_item, k, codec);
+            Ok(Job {
+                kind: Kind::Join(Box::new(
+                    Join::new(src, true, runs, o, max_file_bytes, collect, generation)
+                        .map_err(to_py)?,
+                )),
+                key,
+                local: None,
+            })
         })
     }
 
@@ -1205,14 +1297,16 @@ impl Job {
         collect: usize,
         generation: u64,
     ) -> PyResult<Job> {
-        let o = options(block_size, level, bits_per_item, k, codec);
-        let src = Source::Run(run.inner.clone(), 0);
-        let job =
-            Join::new(src, replace, runs, o, max_file_bytes, collect, generation).map_err(to_py)?;
-        Ok(Job {
-            key: None,
-            local: None,
-            kind: Kind::Join(Box::new(job)),
+        guard(|| {
+            let o = options(block_size, level, bits_per_item, k, codec);
+            let src = Source::Run(run.inner.clone(), 0);
+            let job = Join::new(src, replace, runs, o, max_file_bytes, collect, generation)
+                .map_err(to_py)?;
+            Ok(Job {
+                key: None,
+                local: None,
+                kind: Kind::Join(Box::new(job)),
+            })
         })
     }
 
@@ -1232,111 +1326,141 @@ impl Job {
         k: u8,
         codec: u8,
         max_file_bytes: usize,
-    ) -> Job {
-        let o = options(block_size, level, bits_per_item, k, codec);
-        Job {
-            key: None,
-            local: None,
-            kind: Kind::Compact(Box::new(Compact::new(
-                runs,
-                drop_deleted,
-                garbage,
-                o,
-                max_file_bytes,
-            ))),
-        }
+    ) -> PyResult<Job> {
+        guard(|| {
+            Ok({
+                let o = options(block_size, level, bits_per_item, k, codec);
+                Job {
+                    key: None,
+                    local: None,
+                    kind: Kind::Compact(Box::new(Compact::new(
+                        runs,
+                        drop_deleted,
+                        garbage,
+                        o,
+                        max_file_bytes,
+                    ))),
+                }
+            })
+        })
     }
 
     /// Counts the live keys of `runs` (newest first).
     #[staticmethod]
-    fn count(runs: usize) -> Job {
-        Job {
-            key: None,
-            local: None,
-            kind: Kind::Count(Count::new(runs)),
-        }
+    fn count(runs: usize) -> PyResult<Job> {
+        guard(|| {
+            Ok({
+                Job {
+                    key: None,
+                    local: None,
+                    kind: Kind::Count(Count::new(runs)),
+                }
+            })
+        })
     }
 
     /// The next consecutive blocks of run `r`: `data` holds them, `blocks`
     /// gives each one's offset in `data`, compressed size and CRC.
-    fn feed(&mut self, r: usize, data: PyBackedBytes, blocks: Vec<(usize, usize, u32)>, codec: u8) {
-        self.merge().runs[r].feed(Segment {
-            data: Arc::new(data),
-            blocks,
-            codec,
-        });
+    fn feed(
+        &mut self,
+        r: usize,
+        data: PyBackedBytes,
+        blocks: Vec<(usize, usize, u32)>,
+        codec: u8,
+    ) -> PyResult<()> {
+        guard(|| {
+            self.merge().runs[r].feed(Segment {
+                data: Arc::new(data),
+                blocks,
+                codec,
+            });
+            Ok(())
+        })
     }
 
-    fn end(&mut self, r: usize) {
-        self.merge().runs[r].end();
+    fn end(&mut self, r: usize) -> PyResult<()> {
+        guard(|| {
+            self.merge().runs[r].end();
+            Ok(())
+        })
     }
 
     /// Reads the existing runs from local files (`LocalFile`s, newest run
     /// first, each in key order) instead of asking for segments: `step`
     /// then never returns `("run", r)`.
     fn local(&mut self, runs: Vec<Vec<PyRef<'_, LocalFile>>>) -> PyResult<()> {
-        if runs.len() != self.merge().runs.len() {
-            return Err(PyValueError::new_err("a local run per run"));
-        }
-        let snap = local::Snapshot::new(
-            runs.iter()
-                .map(|r| r.iter().map(|f| f.inner.clone()).collect())
-                .collect(),
-        );
-        self.local = Some((snap, local::Feed::new(runs.len())));
-        Ok(())
+        guard(|| {
+            if runs.len() != self.merge().runs.len() {
+                return Err(PyValueError::new_err("a local run per run"));
+            }
+            let snap = local::Snapshot::new(
+                runs.iter()
+                    .map(|r| r.iter().map(|f| f.inner.clone()).collect())
+                    .collect(),
+            );
+            self.local = Some((snap, local::Feed::new(runs.len())));
+            Ok(())
+        })
     }
 
     fn feed_rows(&mut self, py: Python<'_>, rows: Bound<'_, PyAny>) -> PyResult<()> {
-        let keys = chunk(py, &rows, self.key.as_deref())?;
-        match self.join()?.src.stream() {
-            Some(s) => s.feed(keys).map_err(to_py),
-            None => Err(PyTypeError::new_err("not a streamed replacement")),
-        }
+        guard(|| {
+            let keys = chunk(py, &rows, self.key.as_deref())?;
+            match self.join()?.src.stream() {
+                Some(s) => s.feed(keys).map_err(to_py),
+                None => Err(PyTypeError::new_err("not a streamed replacement")),
+            }
+        })
     }
 
     fn end_rows(&mut self) -> PyResult<()> {
-        if let Some(s) = self.join()?.src.stream() {
-            s.end();
-        }
-        Ok(())
+        guard(|| {
+            if let Some(s) = self.join()?.src.stream() {
+                s.end();
+            }
+            Ok(())
+        })
     }
 
     fn step<'py>(
         &mut self,
         py: Python<'py>,
     ) -> PyResult<Option<(&'static str, Bound<'py, PyAny>)>> {
-        let (kind, local) = (&mut self.kind, &mut self.local);
-        let (step, file) = py
-            .detach(|| {
-                let step = loop {
-                    let step = match kind {
-                        Kind::Join(j) => j.step()?,
-                        Kind::Compact(j) => j.step()?,
-                        Kind::Count(j) => j.step()?,
+        guard(|| {
+            let (kind, local) = (&mut self.kind, &mut self.local);
+            let (step, file) = py
+                .detach(|| {
+                    let step = loop {
+                        let step = match kind {
+                            Kind::Join(j) => j.step()?,
+                            Kind::Compact(j) => j.step()?,
+                            Kind::Count(j) => j.step()?,
+                        };
+                        match (step, local.as_mut()) {
+                            (Step::Run(r), Some((snap, feed))) => {
+                                feed.feed(snap, merge_of(kind), r)?
+                            }
+                            (step, _) => break step,
+                        }
                     };
-                    match (step, local.as_mut()) {
-                        (Step::Run(r), Some((snap, feed))) => feed.feed(snap, merge_of(kind), r)?,
-                        (step, _) => break step,
-                    }
-                };
-                let file = match (&step, kind) {
-                    (Step::File, Kind::Join(j)) => j.delta.writer.files.pop_front(),
-                    (Step::File, Kind::Compact(j)) => j.writer.files.pop_front(),
-                    (Step::Garbage, Kind::Compact(j)) => {
-                        j.garbage.as_mut().and_then(|g| g.files.pop_front())
-                    }
-                    _ => None,
-                };
-                Ok((step, file))
+                    let file = match (&step, kind) {
+                        (Step::File, Kind::Join(j)) => j.delta.writer.files.pop_front(),
+                        (Step::File, Kind::Compact(j)) => j.writer.files.pop_front(),
+                        (Step::Garbage, Kind::Compact(j)) => {
+                            j.garbage.as_mut().and_then(|g| g.files.pop_front())
+                        }
+                        _ => None,
+                    };
+                    Ok((step, file))
+                })
+                .map_err(to_py)?;
+            Ok(match step {
+                Step::Run(r) => Some(("run", r.into_pyobject(py)?.into_any())),
+                Step::Rows => Some(("rows", py.None().into_bound(py))),
+                Step::File => Some(("file", PyBytes::new(py, &file.unwrap()).into_any())),
+                Step::Garbage => Some(("garbage", PyBytes::new(py, &file.unwrap()).into_any())),
+                Step::Done => None,
             })
-            .map_err(to_py)?;
-        Ok(match step {
-            Step::Run(r) => Some(("run", r.into_pyobject(py)?.into_any())),
-            Step::Rows => Some(("rows", py.None().into_bound(py))),
-            Step::File => Some(("file", PyBytes::new(py, &file.unwrap()).into_any())),
-            Step::Garbage => Some(("garbage", PyBytes::new(py, &file.unwrap()).into_any())),
-            Step::Done => None,
         })
     }
 
@@ -1344,41 +1468,41 @@ impl Job {
     /// keys written again.
     #[getter]
     fn added(&self) -> PyResult<u64> {
-        Ok(self.delta()?.added)
+        guard(|| Ok(self.delta()?.added))
     }
 
     #[getter]
     fn removed(&self) -> PyResult<u64> {
-        Ok(self.delta()?.removed)
+        guard(|| Ok(self.delta()?.removed))
     }
 
     #[getter]
     fn changed(&self) -> PyResult<u64> {
-        Ok(self.delta()?.changed)
+        guard(|| Ok(self.delta()?.changed))
     }
 
     /// Entries a compaction wrote to garbage files.
     #[getter]
     fn garbage(&self) -> PyResult<u64> {
-        match &self.kind {
+        guard(|| match &self.kind {
             Kind::Compact(j) => Ok(j.garbage.as_ref().map_or(0, |g| g.total)),
             _ => Err(PyTypeError::new_err("not a compaction")),
-        }
+        })
     }
 
     /// A count's live keys.
     #[getter]
     fn live(&self) -> PyResult<u64> {
-        match &self.kind {
+        guard(|| match &self.kind {
             Kind::Count(j) => Ok(j.live),
             _ => Err(PyTypeError::new_err("not a count")),
-        }
+        })
     }
 
     /// A replacement's or a patch's written keys and its deleted keys, or
     /// None past `collect`.
     fn collected<'py>(&self, py: Python<'py>) -> PyResult<Option<Changed<'py>>> {
-        changed(py, &self.delta()?.collected)
+        guard(|| changed(py, &self.delta()?.collected))
     }
 }
 
@@ -1386,9 +1510,13 @@ impl Job {
 
 /// A file's content digest: XXH3-128, as hex.
 #[pyfunction]
-fn content_digest(py: Python<'_>, data: PyBackedBytes) -> String {
-    let h = py.detach(|| xxhash_rust::xxh3::xxh3_128(&data));
-    format!("{h:032x}")
+fn content_digest(py: Python<'_>, data: PyBackedBytes) -> PyResult<String> {
+    guard(|| {
+        Ok({
+            let h = py.detach(|| xxhash_rust::xxh3::xxh3_128(&data));
+            format!("{h:032x}")
+        })
+    })
 }
 
 /// Writes the local form of a `.kx` file (`source`, content digest
@@ -1403,16 +1531,18 @@ fn build_local(
     path: String,
     max_bytes: u64,
 ) -> PyResult<u64> {
-    py.detach(|| {
-        local::build(
-            &data,
-            &source,
-            &digest,
-            std::path::Path::new(&path),
-            max_bytes,
-        )
+    guard(|| {
+        py.detach(|| {
+            local::build(
+                &data,
+                &source,
+                &digest,
+                std::path::Path::new(&path),
+                max_bytes,
+            )
+        })
+        .map_err(to_py)
     })
-    .map_err(to_py)
 }
 
 /// A local file, open, its directory verified and held in memory.
@@ -1425,11 +1555,13 @@ struct LocalFile {
 impl LocalFile {
     #[new]
     fn open(py: Python<'_>, path: String) -> PyResult<LocalFile> {
-        let inner = py
-            .detach(|| local::Local::open(std::path::Path::new(&path)))
-            .map_err(to_py)?;
-        Ok(LocalFile {
-            inner: Arc::new(inner),
+        guard(|| {
+            let inner = py
+                .detach(|| local::Local::open(std::path::Path::new(&path)))
+                .map_err(to_py)?;
+            Ok(LocalFile {
+                inner: Arc::new(inner),
+            })
         })
     }
 
@@ -1454,13 +1586,13 @@ impl LocalFile {
     }
 
     #[getter]
-    fn blocks(&self) -> usize {
-        self.inner.blocks()
+    fn blocks(&self) -> PyResult<usize> {
+        guard(|| Ok(self.inner.blocks()))
     }
 
     #[getter]
-    fn digest<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, &self.inner.digest)
+    fn digest<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        guard(|| Ok(PyBytes::new(py, &self.inner.digest)))
     }
 }
 
@@ -1494,14 +1626,18 @@ struct Snapshot {
 #[pymethods]
 impl Snapshot {
     #[new]
-    fn new(runs: Vec<Vec<PyRef<'_, LocalFile>>>) -> Snapshot {
-        Snapshot {
-            inner: local::Snapshot::new(
-                runs.iter()
-                    .map(|r| r.iter().map(|f| f.inner.clone()).collect())
-                    .collect(),
-            ),
-        }
+    fn new(runs: Vec<Vec<PyRef<'_, LocalFile>>>) -> PyResult<Snapshot> {
+        guard(|| {
+            Ok({
+                Snapshot {
+                    inner: local::Snapshot::new(
+                        runs.iter()
+                            .map(|r| r.iter().map(|f| f.inner.clone()).collect())
+                            .collect(),
+                    ),
+                }
+            })
+        })
     }
 
     #[getter]
@@ -1526,12 +1662,14 @@ impl Snapshot {
         codec: u8,
         max_file_bytes: usize,
     ) -> PyResult<Resolved<'py>> {
-        let o = options(block_size, level, bits_per_item, k, codec);
-        let (inner, run) = (&mut self.inner, run.inner.clone());
-        let d = py
-            .detach(|| inner.resolve(&run, replace, generation, o, max_file_bytes))
-            .map_err(to_py)?;
-        Ok(delta_files(py, &d))
+        guard(|| {
+            let o = options(block_size, level, bits_per_item, k, codec);
+            let (inner, run) = (&mut self.inner, run.inner.clone());
+            let d = py
+                .detach(|| inner.resolve(&run, replace, generation, o, max_file_bytes))
+                .map_err(to_py)?;
+            Ok(delta_files(py, &d))
+        })
     }
 
     /// Up to `limit` entries of the merged snapshot past `after` — deletions
@@ -1547,16 +1685,18 @@ impl Snapshot {
         drop_deleted: bool,
         max_bytes: u64,
     ) -> PyResult<(SortedRun, Option<Bound<'py, PyBytes>>)> {
-        let inner = &self.inner;
-        let (page, next) = py
-            .detach(|| inner.scan(after.as_deref(), limit, drop_deleted, max_bytes))
-            .map_err(to_py)?;
-        Ok((
-            SortedRun {
-                inner: Arc::new(page),
-            },
-            next.map(|n| PyBytes::new(py, &n)),
-        ))
+        guard(|| {
+            let inner = &self.inner;
+            let (page, next) = py
+                .detach(|| inner.scan(after.as_deref(), limit, drop_deleted, max_bytes))
+                .map_err(to_py)?;
+            Ok((
+                SortedRun {
+                    inner: Arc::new(page),
+                },
+                next.map(|n| PyBytes::new(py, &n)),
+            ))
+        })
     }
 
     /// The newest entry of each key — `(generation, deleted, payload)` — or None.
@@ -1566,24 +1706,45 @@ impl Snapshot {
         py: Python<'py>,
         keys: Vec<PyBackedBytes>,
     ) -> PyResult<Vec<Option<(u64, bool, Option<Bound<'py, PyBytes>>)>>> {
-        let inner = &mut self.inner;
-        let hits = py
-            .detach(|| {
-                keys.iter()
-                    .map(|k| inner.get(k))
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .map_err(to_py)?;
-        Ok(hits
-            .into_iter()
-            .map(|h| {
-                h.map(|h| {
-                    let payload = h.payload.as_deref().map(|p| PyBytes::new(py, p));
-                    (h.generation, h.deleted, payload)
+        guard(|| {
+            let inner = &mut self.inner;
+            let hits = py
+                .detach(|| {
+                    keys.iter()
+                        .map(|k| inner.get(k))
+                        .collect::<Result<Vec<_>, _>>()
                 })
-            })
-            .collect())
+                .map_err(to_py)?;
+            Ok(hits
+                .into_iter()
+                .map(|h| {
+                    h.map(|h| {
+                        let payload = h.payload.as_deref().map(|p| PyBytes::new(py, p));
+                        (h.generation, h.deleted, payload)
+                    })
+                })
+                .collect())
+        })
     }
+}
+
+/// Panics through the guard, on this thread or a rayon worker's: what the
+/// guard's test (tests/sdk/test_native_guard.py) needs, no bug at hand.
+#[pyfunction]
+#[pyo3(signature = (message, parallel=false))]
+fn _panic(py: Python<'_>, message: &str, parallel: bool) -> PyResult<()> {
+    guard(|| {
+        py.detach(|| {
+            if parallel {
+                (0..4)
+                    .into_par_iter()
+                    .for_each(|i| assert!(i < 3, "{message}"));
+            } else {
+                panic!("{message}");
+            }
+        });
+        Ok(())
+    })
 }
 
 #[pymodule]
@@ -1606,6 +1767,7 @@ fn solera_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(merge_range, m)?)?;
     m.add_function(wrap_pyfunction!(merge_page, m)?)?;
     m.add_function(wrap_pyfunction!(filter_nbits, m)?)?;
+    m.add_function(wrap_pyfunction!(_panic, m)?)?;
     m.add_function(wrap_pyfunction!(parse_footer, m)?)?;
     m.add_function(wrap_pyfunction!(parse_index, m)?)?;
     m.add_function(wrap_pyfunction!(parse_tail, m)?)?;
