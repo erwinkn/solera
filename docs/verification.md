@@ -235,6 +235,76 @@ with Hypothesis drawing the inputs (in CI, a few seconds each):
   an independent reference matcher does (`**/` takes whole directories or
   none, `*` and `?` stay within one, `[`, `\` and newlines are literal),
   and `include`/`exclude` combine as documented.
+- **Staleness** (`tests/server/test_staleness.py`, the rules in
+  `tests/staleness.py`): random histories of upstream commits and resets,
+  shared-input changes, an output's own reset, asset changes, `keys=` and
+  default runs; after each step the engine's stale keys and its partition
+  and asset statuses must equal a reference model's (K43). Strict xfails
+  until the design is built. One part runs now: on FileStore, PostgresStore
+  and S3Store, a `keys=` run never touches a key it does not name.
+
+## Kani: bounded proofs on the native readers
+
+`native/kani` holds Kani proofs on the `.kx` readers: for every input
+within a bound, not a sample of them. Run `cargo kani -Z stubbing` there
+(Kani 0.68, CBMC 6.11): four harnesses, about 40 s, a few hundred MB.
+
+| Harness | What it proves | Time |
+|---|---|---|
+| `a_varint_read_stays_in_bounds` | any 12 bytes, any start: an error, or a read of at most 10 bytes inside them | 7 s |
+| `a_varint_round_trips` | every `u64` written reads back, using exactly its bytes | 7 s |
+| `a_varint_read_loses_no_bits` | a varint the reader accepts is its bytes' exact LEB128 value. On the code before F23's fix (ab0c346^) it fails in 11 s with F23's counterexample | 4 s |
+| `any_filters_parse_or_err` | 16 bytes of filters and a footer with any offsets, lengths and file size: an error, or filters of exactly `nbits / 8` bytes, nothing read outside | 19 s |
+
+What it could not do, on the M5 Max with a 16 GB cap:
+
+- **Block decoding** (`Block::decode`), even at 6 bytes: CBMC passed 16 GB
+  in 5 minutes. The decoder grows two vectors by symbolic amounts.
+- **The block index** (`parse_index_at_most`, 16 bytes) and **garbage
+  files** (12-byte body): no answer in 10 minutes (8–10 GB).
+- **A footer with any version**: the error message formats the version,
+  and Rust's formatting machinery on a symbolic value did not finish in 25
+  minutes. The other harnesses fix magic, version and codec for this reason.
+- **zlib** (codec 1), and **the writer, merges and compactions**: they run
+  on rayon's threads, which Kani does not model, so file round trips and
+  merge invariants are out of reach without restructuring the code.
+
+CRC-32 is stubbed: its SIMD path is out of Kani's reach, and a hostile
+file carries a matching checksum anyway.
+
+**Verdict.** Kani adds proof for all inputs where the property tests and
+fuzzers sample, and it is cheap where it works: 40 s, one small crate. It
+found F23 in seconds on the old code, but only once someone wrote the
+property ("no bits lost"). The same property as a differential test,
+native against the reference on arbitrary bytes, would likely have found
+it too. Where the risk is (block, index, merge), CBMC runs out of memory or
+time at a few bytes, so the fuzzers carry that. Keep the four harnesses as
+a check to run when `format.rs`'s varints or filters change. Write a new
+one only for small, allocation-free parsing functions.
+
+## Fuzzing: bytes that may be corrupt or hostile
+
+Each target, what ran on 2026-10-03 (M5 Max, one core each, libFuzzer's
+RSS limit 2 GB), and the verdict. The native targets are in `native/fuzz`:
+`uv run python native/fuzz/seeds.py` writes seed corpora (real files from
+the writers), then `cargo +nightly fuzz run -O <target> corpus/<target> --
+-max_total_time=1200`.
+
+| Target | Reads | Ran | Verdict |
+|---|---|---|---|
+| `kx-file` | any bytes as a `.kx` file: footer, filters, index, sorted entries, each block, lookups. Each input runs twice: as it is, and with its index and filter CRCs made to match, as a hostile file's would | 10.0 M inputs in 20 min, 1,322 edges | clean. Keep it: the checksums stop random corruption, so this is the only thing exercising the parsers behind them |
+| `kx-merge` | up to three runs of up to four arbitrary blocks, any codec, merged as a range and as pages | 3.9 M, 1,794 edges | clean |
+| `kx-round-trip` | any entries (keys, generations, deletions, payloads, predecessors), any block size, both codecs: encoded, then decoded back equal | 2.0 M, 2,660 edges | clean |
+| `kg-file` | any bytes as a garbage file | 8.9 M, 632 edges | clean |
+| API request bodies (`tests/server/test_api_bodies.py`) | every route that records: runs, source commits, retries, prunes, cleanups; near misses of valid bodies and any JSON (NaN, infinities, integers of any size, deep nesting). A body taken must replay from the journal and survive a checkpoint, and nothing answers 500 | 60 examples in CI; 2,000 with `SOLERA_FUZZ_EXAMPLES=2000` (9 min), clean after the fixes | found F27 (P1) and F28 (P3) on its first runs. Keep it in CI |
+| Resolve requests | already fuzzed (property tests, above) | — | — |
+| The journal object and checkpoints | — | not fuzzed | not worth a target: a body that does not parse, or applies badly, fails the open loudly, and nothing catches it; what reaches the journal is the API's to check (above) |
+| Control files | — | — | not built yet |
+
+One observation, no finding: `lookup` and the merges decode zlib blocks
+without a size limit (`Block::decode`). An 8 KB input expands at most about
+1,000 times, so the fuzzers cannot show it. A hostile block of 64 MB could
+ask for gigabytes, but writing one takes write access to the bucket.
 
 ## What is not exercised yet
 
