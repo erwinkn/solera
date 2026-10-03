@@ -205,14 +205,14 @@ async def test_compaction_truncation_and_garbage(state):
     def items():
         return Patch(pending["rows"], remove=pending["remove"])
 
-    @asset(inputs={"items": Incremental(page_size=7)})
+    @asset(inputs={"items": Incremental(batch_size=7)})
     def mirror(ctx, items: list):
-        changes = ctx.changes["items"]
+        changes = ctx.batch["items"]
         if changes.full and changes.first:
             seen.clear()
         for row in items:
             seen[row["id"]] = row["v"]
-        for key in changes.deleted:
+        for key in changes.removed:
             seen.pop(key, None)
         return [{"n": len(items)}]
 
@@ -244,9 +244,9 @@ async def test_compaction_truncation_and_garbage(state):
     assert index.count == len(truth) and index.count_exact
     assert len(index.level(0)) < 3 and index.depth >= 1  # compacted
     head_commit = state.model.heads[("items", "")]["commit_number"]
-    watermark = state.model.watermark("mirror", "items", "")
-    assert watermark["next"] == head_commit + 1
-    assert all(commit_number >= watermark["next"] for commit_number, _ in index.log)  # truncated behind it
+    bookmark = state.model.bookmark("mirror", "items", "")
+    assert bookmark["next"] == head_commit + 1
+    assert all(commit_number >= bookmark["next"] for commit_number, _ in index.log)  # truncated behind it
     read = state.model.cleanup_reads()  # kept for the discards still pending (docs/lifecycle.md §9.8)
     assert {path for path, _ in state.model.garbage} <= read
     assert on_disk(state, index) == {index.path(n) for n in index.referenced()} | read
@@ -335,7 +335,7 @@ async def test_a_consumer_without_a_log_starts_over(state):
 
     @asset(inputs={"items": Incremental()})
     def mirror(ctx, items: list):
-        deliveries.append((ctx.changes["items"].full, sorted(r["id"] for r in items)))
+        deliveries.append((ctx.batch["items"].full, sorted(r["id"] for r in items)))
         return []
 
     project = Project(assets=[items, mirror])
@@ -343,8 +343,8 @@ async def test_a_consumer_without_a_log_starts_over(state):
     await engine.initialize()
     await run(engine, ["mirror"], upstream=True)
     engine.upkeep.truncate()
-    wm = state.model.watermark("mirror", "items", "")
-    state.model.partition("mirror", "")["watermarks"]["items"] = {**wm, "next": 0}  # behind the (empty) log
+    wm = state.model.bookmark("mirror", "items", "")
+    state.model.partition("mirror", "")["bookmarks"]["items"] = {**wm, "next": 0}  # behind the (empty) log
     await run(engine, ["mirror"])
     assert deliveries == [(True, ["a", "b"]), (True, ["a", "b"])]
 
@@ -358,7 +358,7 @@ async def test_keyed_source_commits_go_through_the_index(state):
 
     @asset(inputs={"uploads": Incremental()})
     def ingest(ctx, uploads: list):
-        got.append((sorted(ctx.changes["uploads"].upserted), sorted(ctx.changes["uploads"].deleted)))
+        got.append((sorted(ctx.batch["uploads"].upserted), sorted(ctx.batch["uploads"].removed)))
         return []
 
     class External(FileStore):
@@ -424,7 +424,7 @@ async def test_renamed_asset_keeps_its_state(state):
     rows = {"v": [{"id": "a", "v": 1}, {"id": "b", "v": 1}]}
 
     def mirror(ctx, feed: list):
-        delivered.append((ctx.changes["feed"].full, sorted(r["id"] for r in feed)))
+        delivered.append((ctx.batch["feed"].full, sorted(r["id"] for r in feed)))
         return []
 
     def feed():
@@ -456,7 +456,7 @@ async def test_renamed_asset_keeps_its_state(state):
     assert ("feed", "") not in m.heads and m.heads[("source_feed", "")]["ref"] == before["ref"]
     assert m.heads[("source_feed", "")]["asset"] == "source_feed"
     assert m.indexes[("source_feed", "")].prefix == "keys/feed/_/"  # files stay where they are
-    assert m.watermark("mirror", "feed", "")["output"] == "source_feed"
+    assert m.bookmark("mirror", "feed", "")["output"] == "source_feed"
     rows["v"] = Patch([{"id": "b", "v": 2}])
     await run(engine, ["mirror"], upstream=True)
     assert m.heads[("source_feed", "")]["commit_number"] == 1
@@ -480,11 +480,11 @@ async def test_small_writes_resolve_in_the_engine_and_pages_come_with_start(stat
     def items():
         return Patch(pending["rows"])
 
-    @asset(inputs={"items": Incremental(page_size=100)})
+    @asset(inputs={"items": Incremental(batch_size=100)})
     def mirror(ctx, items: list):
         for row in items:
             seen[row["id"]] = row["v"]
-        for key in ctx.changes["items"].deleted:
+        for key in ctx.batch["items"].removed:
             seen.pop(key, None)
         return [{"n": len(items)}]
 
@@ -501,7 +501,7 @@ async def test_small_writes_resolve_in_the_engine_and_pages_come_with_start(stat
 
     async def reads_(self, spec, *args):
         out = await real_reads(self, spec, *args)
-        if any("changes" in pin for pin in spec["inputs"].values()):  # a consumer's start
+        if any("batch" in pin for pin in spec["inputs"].values()):  # a consumer's start
             served.append(out is not None)
         return out
 
@@ -550,12 +550,12 @@ async def test_input_reads_come_from_the_engine_once_warm(state, monkeypatch):
         def fn(ctx, items: list):
             for row in items:
                 seen[name][row["id"]] = row["v"]
-            for key in ctx.changes["items"].deleted:
+            for key in ctx.batch["items"].removed:
                 seen[name].pop(key, None)
             return [{"n": len(items)}]
 
         fn.__name__ = name
-        return asset(inputs={"items": Incremental(page_size=100)})(fn)
+        return asset(inputs={"items": Incremental(batch_size=100)})(fn)
 
     served, real_reads = [], KeyService.reads
 

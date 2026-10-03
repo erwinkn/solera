@@ -53,7 +53,7 @@ from solera.objects import create
 from solera.sdk import (
     UNSET,
     Asset,
-    Changes,
+    Batch,
     Output,
     Project,
     Ref,
@@ -205,7 +205,7 @@ class Ctx:
         asset: Asset,
         project: Project,
         objects,
-        changes,
+        batch,
         shipper,
         timeline,
         keys_io=None,
@@ -229,7 +229,7 @@ class Ctx:
         )
         self.partition_window = self._window(project, asset)
         self.cursor = spec.get("cursor")
-        self.changes = changes
+        self.batch = batch
         self.run_id = spec["run"]["id"]
         self.config = spec["run"].get("config") or {}
         self.execution = spec.get("execution") or {
@@ -324,7 +324,7 @@ class Ctx:
 
 
 async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Observed):
-    """Load each pin by annotation; build call args + ctx.changes (§5, §10).
+    """Load each pin by annotation; build call args + ctx.batch (§5, §10).
 
     An Incremental edge over a keyed upstream reads its page from the pinned
     key index — the pending deltas in `[from, to]`, or the whole index for a
@@ -335,7 +335,7 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
     manifest_asset = project.manifest["assets"][asset.name]
     inputs = manifest_asset["inputs"]
     hints = project.hints[asset.name]  # resolved once, at registration
-    args, changes, delivered = {}, {}, {}
+    args, batch, delivered = {}, {}, {}
     windows = []
     for name, pin in spec["inputs"].items():
         input = inputs.get(name)
@@ -360,17 +360,17 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
             continue
         ref = Ref.from_json(pin["ref"])
         store = project.stores[ref.store]
-        if "changes" in pin:  # Incremental: selection + ctx.changes (§5.1)
-            ch = pin["changes"]
+        if "batch" in pin:  # Incremental: selection + ctx.batch (§5.1)
+            ch = pin["batch"]
             full = bool(ch.get("full"))
             if "commits" in ch:
                 lo, hi = (int(v) for v in ch["commits"])
                 args[param] = await observed.load(store, ref, t, Commits(lo, hi))
-                changes[param] = Changes(
+                batch[param] = Batch(
                     rows=args[param],
                     full=full,
-                    page=int(ch.get("page") or 0),
-                    pages=int(ch.get("pages") or 1),
+                    index=int(ch.get("index") or 0),
+                    count=int(ch.get("count") or 1),
                     final=not ch.get("more"),
                     upstream=Upstream(ref.output, range(lo, hi + 1)),
                 )
@@ -382,14 +382,14 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
             windows.append(window)
             upserted, deleted, after = window.upserted, window.deleted, window.after
             args[param] = await observed.load(store, ref, t, Keys(upserted))
-            changes[param] = Changes(
+            batch[param] = Batch(
                 rows=args[param],
-                deleted=deleted,
+                removed=deleted,
                 full=full,
                 upserted=tuple(sorted(upserted)),
-                page=int(ch.get("page") or 0),
-                pages=int(ch.get("pages") or 1),
-                final=after is None,  # the delivery ran out: never inferred from `pages`
+                index=int(ch.get("index") or 0),
+                count=int(ch.get("count") or 1),
+                final=after is None,  # the pass ran out: never inferred from `count`
                 upstream=Upstream(ref.output),
             )
             delivered[param] = {"after": after, "upserted": sorted(upserted), "deleted": list(deleted)}
@@ -404,7 +404,7 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
     # to call the producer with.
     filtered = bool(windows) and all(not w.upserted and not w.deleted for w in windows)
     delivered["*filtered"] = filtered and any(w.read for w in windows)
-    return args, changes, delivered
+    return args, batch, delivered
 
 
 async def _unobserved(store, ref, t, selection):
@@ -1153,9 +1153,9 @@ async def _execute(
         # Index files straight from the store, but for the reads the engine answered at
         # `start` (docs/resolved-commits.md §7); small writes are the engine's too.
         keys_io = ObjectIO(objects, served=control.get("reads"))
-        args, changes, delivered = await _resolve_inputs(spec, project, asset, keys_io, timeline, observed)
+        args, batch, delivered = await _resolve_inputs(spec, project, asset, keys_io, timeline, observed)
         filtered = delivered.pop("*filtered", False)
-        ctx = Ctx(spec, asset, project, objects, changes, shipper, timeline, keys_io, observed)
+        ctx = Ctx(spec, asset, project, objects, batch, shipper, timeline, keys_io, observed)
         signature = inspect.signature(asset.fn)
         if "ctx" in signature.parameters:
             args["ctx"] = ctx

@@ -316,7 +316,7 @@ class KeyService:
                 try:
                     if "each" in pin:
                         await each.read_page(spec, pin, io)
-                    elif "changes" in pin:
+                    elif "batch" in pin:
                         await each.read_window(pin, io)
                     elif pin.get("load") == "data":  # a whole read: its locators, a page at a time
                         for js in [pin["index"]] if pin.get("index") else (pin.get("indexes") or {}).values():

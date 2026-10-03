@@ -205,7 +205,7 @@ async def test_rename_and_meta_edges(state):
 
 async def test_incremental_filters_input_and_changes(state):
     """§5/§6: under Incremental the parameter arrives filtered to upserted
-    keys and ctx.changes carries upserted + deleted."""
+    keys and ctx.batch carries upserted + deleted."""
     seen = {}
     content = {"rows": [{"id": "a", "v": 1}, {"id": "b", "v": 1}, {"id": "c", "v": 1}]}
 
@@ -216,8 +216,8 @@ async def test_incremental_filters_input_and_changes(state):
     @asset(inputs={"files": Incremental()})
     def consumer(ctx, files: list):
         seen["rows"] = list(files)
-        seen["upserted"] = list(ctx.changes["files"].upserted)
-        seen["deleted"] = list(ctx.changes["files"].deleted)
+        seen["upserted"] = list(ctx.batch["files"].upserted)
+        seen["deleted"] = list(ctx.batch["files"].removed)
         return [{"n": len(files)}]
 
     project = Project(assets=[files, consumer])
@@ -239,7 +239,7 @@ async def test_incremental_filters_input_and_changes(state):
     assert seen["upserted"] == ["b"]
     assert [r["id"] for r in seen["rows"]] == ["b"]
 
-    # A deletion arrives via ctx.changes (§5: what a selection cannot carry).
+    # A deletion arrives via ctx.batch (§5: what a selection cannot carry).
     seen.clear()
     content["rows"] = Patch([], remove=["b"])
     await drive(engine, await engine.submit(["consumer"], upstream=True))
@@ -258,7 +258,7 @@ async def test_config_change_reprocesses_everything(state):
     @asset(inputs={"files": Incremental()})
     def consumer(ctx, files: list):
         seen.setdefault("commits", []).append([r["id"] for r in files])
-        seen.setdefault("full", []).append(ctx.changes["files"].full)
+        seen.setdefault("full", []).append(ctx.batch["files"].full)
         return []
 
     project = Project(assets=[files, consumer])
@@ -281,14 +281,14 @@ async def test_full_run_resets_watermark(state):
 
     @asset(inputs={"files": Incremental()})
     def consumer(ctx, files: list):
-        seen.append((sorted(r["id"] for r in files), ctx.changes["files"].full))
+        seen.append((sorted(r["id"] for r in files), ctx.batch["files"].full))
         return [{"n": len(files)}]
 
     project = Project(assets=[files, consumer])
     engine = make_engine(state, project)
     await engine.initialize()
     await drive(engine, await engine.submit(["consumer"], upstream=True))
-    first = state.model.watermark("consumer", "files", "")
+    first = state.model.bookmark("consumer", "files", "")
     assert first == {
         "kind": "keys",
         "next": 1,  # the head's next batch: nothing under way
@@ -299,7 +299,7 @@ async def test_full_run_resets_watermark(state):
     }
     detail = await drive(engine, await engine.submit(["consumer"], mode="full"))
     assert task_statuses(detail)["consumer"] == "succeeded"  # never skipped on full
-    second = state.model.watermark("consumer", "files", "")
+    second = state.model.bookmark("consumer", "files", "")
     assert second == {**first, "reset_by": detail["request"]["id"]}  # back at head+1, nothing left mid-way
     # Both deliveries were full-head reads.
     assert seen == [(["a", "b"], True), (["a", "b"], True)]
@@ -355,7 +355,7 @@ async def test_incremental_batching_and_more(state):
     def files():
         return [{"id": f"k{i}", "v": 1} for i in range(5)]
 
-    @asset(inputs={"files": Incremental(page_size=2)})
+    @asset(inputs={"files": Incremental(batch_size=2)})
     def consumer(ctx, files: list):
         commits.append([r["id"] for r in files])
         return []
@@ -407,9 +407,9 @@ async def test_a_selection_reads_its_keys_and_moves_nothing(state):
     def files():
         return [{"id": k, "v": 1} for k in "abc"]
 
-    @asset(inputs={"files": Incremental(page_size=1)}, retries=Retry(n=0))
+    @asset(inputs={"files": Incremental(batch_size=1)}, retries=Retry(n=0))
     def consumer(ctx, files: list):
-        if ctx.changes["files"].page == broken["page"]:
+        if ctx.batch["files"].index == broken["page"]:
             raise RuntimeError("stopped half-way")
         calls.append(sorted(r["id"] for r in files))
         return []
@@ -420,16 +420,16 @@ async def test_a_selection_reads_its_keys_and_moves_nothing(state):
     await drive(engine, await engine.submit(["files"]))
     detail = await drive(engine, await engine.submit(["consumer"], keys={"files": {"keys": ["b"]}}))
     assert status_of(detail) == "succeeded" and calls == [["b"]]  # the selection, and nothing else
-    assert state.model.watermark("consumer", "files", "") is None
+    assert state.model.bookmark("consumer", "files", "") is None
     assert "drained" not in state.model.partition("consumer", "")
     calls.clear()
     await drive(engine, await engine.submit(["consumer"]))  # a full delivery, stopped after `a`
-    stopped = state.model.watermark("consumer", "files", "")
-    assert calls == [["a"]] and stopped["delivery"]["at"] == "a"
+    stopped = state.model.bookmark("consumer", "files", "")
+    assert calls == [["a"]] and stopped["pass"]["at"] == "a"
     assert state.model.partition("consumer", "")["drained"] is False
     calls.clear()
     await drive(engine, await engine.submit(["consumer"], keys={"files": {"keys": ["c"]}}))
-    assert calls == [["c"]] and state.model.watermark("consumer", "files", "") == stopped
+    assert calls == [["c"]] and state.model.bookmark("consumer", "files", "") == stopped
     assert state.model.partition("consumer", "")["drained"] is False  # `b` is still owed
     broken["page"] = None
     calls.clear()
@@ -448,10 +448,10 @@ async def test_a_paged_full_override_resumes_its_pass(state):
     def files():
         return [{"id": k, "v": 1} for k in "abc"]
 
-    @asset(inputs={"files": Incremental(page_size=2)})
+    @asset(inputs={"files": Incremental(batch_size=2)})
     def consumer(ctx, files: list):
-        changes = ctx.changes["files"]
-        seen.append((sorted(r["id"] for r in files), changes.full, changes.page))
+        changes = ctx.batch["files"]
+        seen.append((sorted(r["id"] for r in files), changes.full, changes.index))
         return []
 
     project = Project(assets=[files, consumer])
@@ -1246,10 +1246,10 @@ async def test_a_delivery_says_where_each_page_sits(state):
     def files():
         return Patch([{"id": k, "v": content[k]} for k in written["keys"]])
 
-    @asset(inputs={"files": Incremental(page_size=3)})
+    @asset(inputs={"files": Incremental(batch_size=3)})
     def consumer(ctx, files: list):
-        ch = ctx.changes["files"]
-        pages.append((ch.page, ch.pages, ch.first, ch.final, ch.full))
+        ch = ctx.batch["files"]
+        pages.append((ch.index, ch.count, ch.first, ch.final, ch.full))
         if ch.full and ch.first:
             rebuilt["keys"] = []
         rebuilt["keys"] += [r["id"] for r in files]
@@ -1261,10 +1261,10 @@ async def test_a_delivery_says_where_each_page_sits(state):
 
     batch_pages = []
 
-    @asset(inputs={"log": Incremental(page_size=1)})
+    @asset(inputs={"log": Incremental(batch_size=1)})
     def tail(ctx, log: list):
-        ch = ctx.changes["log"]
-        batch_pages.append((ch.page, ch.pages, ch.first, ch.final, list(ch.upstream.commits), ch.full))
+        ch = ctx.batch["log"]
+        batch_pages.append((ch.index, ch.count, ch.first, ch.final, list(ch.upstream.commits), ch.full))
         return [{"n": len(log)}]
 
     project = Project(assets=[files, consumer, log, tail])
@@ -1305,10 +1305,10 @@ async def test_the_page_plan_is_an_estimate_but_final_is_not(state):
     def files():
         return [{"id": f"k{i}", "v": 1} for i in range(7)]
 
-    @asset(inputs={"files": Incremental(page_size=3, include=["k0", "k1", "k2", "k3"])})
+    @asset(inputs={"files": Incremental(batch_size=3, include=["k0", "k1", "k2", "k3"])})
     def consumer(ctx, files: list):
-        ch = ctx.changes["files"]
-        pages.append((ch.page, ch.pages, ch.final, sorted(r["id"] for r in files)))
+        ch = ctx.batch["files"]
+        pages.append((ch.index, ch.count, ch.final, sorted(r["id"] for r in files)))
         return [{"n": len(files)}]
 
     project = Project(assets=[files, consumer])
@@ -1331,12 +1331,12 @@ async def test_pages_read_ahead_past_keys_the_patterns_leave_out(state):
     def files():
         return [{"id": f"k{i:02d}", "v": 1} for i in range(30)]
 
-    @asset(inputs={"files": Incremental(page_size=2, include=["k03", "k04", "k17", "k18", "k29"])})
+    @asset(inputs={"files": Incremental(batch_size=2, include=["k03", "k04", "k17", "k18", "k29"])})
     def sparse(ctx, files: list):
-        calls.append((ctx.changes["files"].page, sorted(r["id"] for r in files), ctx.changes["files"].final))
+        calls.append((ctx.batch["files"].index, sorted(r["id"] for r in files), ctx.batch["files"].final))
         return [{"n": len(files)}]
 
-    @asset(inputs={"files": Incremental(page_size=2, include="nothing/**")})
+    @asset(inputs={"files": Incremental(batch_size=2, include="nothing/**")})
     def none(files: list):
         calls.append("none")
         return []
@@ -1380,9 +1380,9 @@ async def test_a_page_looks_ahead_a_bounded_way(state, monkeypatch):
     def files():
         return [{"id": f"k{i:02d}", "v": 1} for i in range(20)]
 
-    @asset(inputs={"files": Incremental(page_size=100, include="k0*")})
+    @asset(inputs={"files": Incremental(batch_size=100, include="k0*")})
     def sparse(ctx, files: list):
-        calls.append((sorted(r["id"] for r in files), ctx.changes["files"].final))
+        calls.append((sorted(r["id"] for r in files), ctx.batch["files"].final))
         return [{"n": len(files)}]
 
     monkeypatch.setattr(each, "LOOKAHEAD", 5)

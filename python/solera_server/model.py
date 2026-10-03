@@ -32,7 +32,7 @@ import math
 
 from solera.keys.index import DeltaFiles, FileInfo, IndexState, index_prefix
 
-from . import delivery, history
+from . import bookmarks, history
 from .lake import LakeState
 
 TERMINAL_TASK = frozenset({"succeeded", "skipped", "failed", "blocked", "canceled"})
@@ -317,14 +317,14 @@ class Model:
 
         return self.partitions.get((asset, partition)) or {}
 
-    def watermark(self, asset: str, input: str, partition: str) -> dict | None:
-        return (self.partition(asset, partition).get("watermarks") or {}).get(input)
+    def bookmark(self, asset: str, input: str, partition: str) -> dict | None:
+        return (self.partition(asset, partition).get("bookmarks") or {}).get(input)
 
-    def watermarks(self):
+    def bookmarks(self):
         """Every Incremental edge's watermark, of every scope."""
 
         for record in self.partitions.values():
-            yield from (record.get("watermarks") or {}).values()
+            yield from (record.get("bookmarks") or {}).values()
 
     def _partition(self, asset: str, partition: str) -> dict:
         """An asset scope's record, to change: made if it has none."""
@@ -382,9 +382,9 @@ class Model:
         out = [
             (c["pin"], c.get("domains")) for c in self.claims.values() if c["attempt"] != but and "pin" in c
         ]
-        for wm in self.watermarks():
+        for wm in self.bookmarks():
             upstream = (self.index(wm["output"], wm["upstream_partition"]).prefix,)
-            out += [(pin, upstream) for pin in delivery.pins(wm)]
+            out += [(pin, upstream) for pin in bookmarks.pins(wm)]
         for tick in self.ticks.values():
             out.append(
                 (tick["pin"], tuple(self.index(source, "").prefix for source in tick.get("snapshot") or ()))
@@ -454,7 +454,7 @@ class Model:
             "pin": launched["pin"],
             "status": status,
             "launched": True,
-            "reads": delivery.reads(launched["prepared"].get("plans") or {}),
+            "reads": bookmarks.reads(launched["prepared"].get("plans") or {}),
             "domains": tuple(launched["prepared"].get("domains") or ()),
             "cleanups": _delta_files(
                 d
@@ -622,13 +622,13 @@ class Model:
         live = {(t["asset"], t["partition"]) for tid in self.claims if (t := self.task(tid)) is not None}
         keys = list(self.partitions) if asset is None else [(asset, partition)]
         for key in keys:
-            marks = self.partitions.get(key, {}).get("watermarks")
+            marks = self.partitions.get(key, {}).get("bookmarks")
             if not marks or key in live:
                 continue
             for input in [input for input, wm in marks.items() if not self._subscribed(key[0], input, wm)]:
                 del marks[input]
             if not marks:
-                del self.partitions[key]["watermarks"]
+                del self.partitions[key]["bookmarks"]
 
     def _retire_removed(self) -> None:
         """Live state of names the project no longer declares goes: heads,
@@ -706,7 +706,7 @@ class Model:
         for head in self.heads.values():
             if head.get("asset") in asset_map:
                 head["asset"] = asset_map[head["asset"]]
-        for wm in self.watermarks():
+        for wm in self.bookmarks():
             if wm.get("output") in output_map:
                 wm["output"] = output_map[wm["output"]]
         for auto in self.automations.values():
@@ -998,9 +998,9 @@ class Model:
                 record.pop("cursor", None)
             else:
                 record["cursor"] = commit["cursor"]
-        for input, wm in commit.get("watermarks", {}).items():
+        for input, wm in commit.get("bookmarks", {}).items():
             if self._subscribed(asset, input, wm):  # an edge removed while it ran keeps no delivery
-                record.setdefault("watermarks", {})[input] = wm
+                record.setdefault("bookmarks", {})[input] = wm
         if "failures" in commit:
             self._failures(asset, partition, commit["failures"])
         for row in commit.get("key_outcomes") or ():

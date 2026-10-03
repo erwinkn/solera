@@ -124,7 +124,7 @@ async def test_compaction_garbage_is_collected(tmp_path, data):
     def items():
         return Patch(pending["rows"])
 
-    @asset(inputs={"items": Incremental(page_size=5)})
+    @asset(inputs={"items": Incremental(batch_size=5)})
     def mirror(items: list):
         return []
 
@@ -174,13 +174,13 @@ async def test_a_reader_pin_holds_collection_back(tmp_path):
     m.claims["reader"] = {"attempt": "r", "pin": 9, "started_at": 0, "status": "running"}
     assert engine._due_cleanups("scores", "", "me") == []
     m.claims["reader"]["pin"] = 10
-    m._partition("c", "")["watermarks"] = {
+    m._partition("c", "")["bookmarks"] = {
         "e": {
             "kind": "keys",
             "output": "scores",
             "upstream_partition": "",
             "next": 0,
-            "delivery": {"mode": "delta", "from": 0, "to": 1, "at": "k", "page": 1, "pages": 2, "pin": 8},
+            "pass": {"mode": "delta", "from": 0, "to": 1, "at": "k", "page": 1, "pages": 2, "pin": 8},
         }
     }
     assert engine._due_cleanups("scores", "", "me") == []

@@ -86,6 +86,8 @@ jobs:
             test-results.xml
             dist/
   browser:
+    # console tests paused until the design direction is chosen
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

@@ -269,7 +269,7 @@ async def test_concurrency_and_batches(state):  # noqa: F811
         pages.append(ctx.attempt if hasattr(ctx, "attempt") else ctx.run_id)
         return [{"value": file["n"]}]
 
-    project = files_project({f"k{i}": {"n": i} for i in range(7)}, parse, page_size=3, concurrency=2)
+    project = files_project({f"k{i}": {"n": i} for i in range(7)}, parse, batch_size=3, concurrency=2)
     engine = make_engine(state, project)
     await engine.initialize()
     detail = await drive(engine, await engine.submit(["parse"], upstream=True))
@@ -364,7 +364,7 @@ async def test_a_user_cancel_commits_finished_keys_and_leaves_the_rest_dormant(t
     assert set(await rows_of(engine, project, "rows")) == {"a"}
     found = await records(engine, "parse")
     assert {k: r.outcome for k, r in found.items()} == {"b": CANCELED, "c": CANCELED}
-    assert "delivery" not in engine.m.watermark("parse", "file", "")  # past the whole page
+    assert "pass" not in engine.m.bookmark("parse", "file", "")  # past the whole page
     # Dormant: a later run finds nothing to do.
     release.set()
     detail = await engine.run_until((await engine.submit(["parse"]))["id"], 10)
@@ -392,7 +392,7 @@ async def test_a_retry_pass_spans_pages_and_accumulates_its_bounds(state):  # no
             raise ValueError("bug")
         return [{"n": file["n"]}]
 
-    project = files_project(content, parse, page_size=2)
+    project = files_project(content, parse, batch_size=2)
     engine = make_engine(state, project)
     await engine.initialize()
     await drive(engine, await engine.submit(["parse"], upstream=True))
@@ -544,7 +544,7 @@ async def test_a_pattern_change_cuts_over(state):  # noqa: F811
         return [{"n": file["n"]}]
 
     written = {}
-    old = files_project(content, parse, include=["a/**", "archive/**"], page_size=1, written=written)
+    old = files_project(content, parse, include=["a/**", "archive/**"], batch_size=1, written=written)
     engine = make_engine(state, old)
     await engine.initialize()
     await drive(engine, await engine.submit(["parse"], upstream=True))
@@ -559,7 +559,7 @@ async def test_a_pattern_change_cuts_over(state):  # noqa: F811
         parse,
         include=["a/**", "b/**"],
         exclude={"archive": "archive/**"},
-        page_size=1,
+        batch_size=1,
         written=written,
     )
     engine = make_engine(state, new)
@@ -569,9 +569,9 @@ async def test_a_pattern_change_cuts_over(state):  # noqa: F811
     assert status_of(detail) == "succeeded"
     assert set(await rows_of(engine, new, "samples")) == {"a/1.csv", "b/3.csv", "b/4.csv"}
     assert sorted(seen) == ["b/3.csv", "b/4.csv"]  # a/1.csv matched both times: not reprocessed
-    wm = engine.m.watermark("parse", "file", "")
+    wm = engine.m.bookmark("parse", "file", "")
     assert (
-        "rescope" not in wm
+        "pattern_change" not in wm
         and wm["patterns"] == new.manifest["assets"]["parse"]["inputs"]["file"]["patterns"]
     )
     # From here on, deltas under the new patterns.
@@ -594,19 +594,19 @@ async def test_a_rescope_pins_its_snapshot_between_attempts(state):  # noqa: F81
     path = "keys/files/_/old.kx"
     await state.put_object(path, b"x")
     engine.m.garbage.append([path, engine.m.applied + 5])  # let go of after the pin below
-    engine.m._partition("parse", "")["watermarks"] = {
+    engine.m._partition("parse", "")["bookmarks"] = {
         "file": {
             "kind": "keys",
             "output": "files",
             "upstream_partition": "",
             "next": 3,
-            "rescope": {"pin": engine.m.applied, "cutover": 2},
-            "delivery": {"mode": "diff", "at": "k", "page": 1, "pages": 2},
+            "pattern_change": {"pin": engine.m.applied, "at": 2},
+            "pass": {"mode": "diff", "at": "k", "page": 1, "pages": 2},
         }
     }
     await engine.upkeep.collect()
     assert await state.get_object(path) is not None
-    del engine.m.partitions[("parse", "")]["watermarks"]
+    del engine.m.partitions[("parse", "")]["bookmarks"]
     await engine.upkeep.collect()
     assert await state.get_object(path) is None
 
@@ -655,7 +655,7 @@ async def test_a_last_page_that_writes_nothing_still_completes_the_scope(state):
             raise ValueError("unparseable")
         return [{"value": 1}]
 
-    project = files_project({"a.csv": {"text": "1"}, "b.csv": {"text": "2"}}, parse, page_size=1)
+    project = files_project({"a.csv": {"text": "1"}, "b.csv": {"text": "2"}}, parse, batch_size=1)
     engine = make_engine(state, project)
     await engine.initialize()
     detail = await drive(engine, await engine.submit(["parse"], upstream=True))

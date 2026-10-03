@@ -29,7 +29,7 @@ export interface InputDecl {
   kind: "in" | "incremental" | "all_partitions";
   output: string;
   meta: Json;
-  page_size?: number;
+  batch_size?: number;
   each?: { concurrency: number } | null;
   patterns?: Patterns | null;
 }
@@ -218,7 +218,7 @@ export interface AssetDetail {
   asset: AssetDecl;
   heads: Record<string, [string, Head][]>;
   cursor: Json;
-  watermarks: Record<string, Watermark | null>;
+  bookmarks: Record<string, Bookmark | null>;
   current_keys: string[][];
   repairs: Record<string, string[]>;
   partitions: Record<string, PartitionOutcome>;
@@ -333,20 +333,20 @@ export interface Explain {
   verdict: "ok" | "failing" | "excluded" | "not_matched" | "pending" | "removed" | "absent";
 }
 
-export type InputState = "never" | "caught_up" | "behind" | "paging" | "full" | "rescope" | "reconcile";
+export type InputState = "never" | "caught_up" | "behind" | "paging" | "full" | "pattern_change" | "reconcile";
 
-/** An input's delivery progress (python/solera_server/delivery.py): `next`,
- * the first upstream commit not yet delivered; `delivery`, one under way —
+/** An input's bookmark (python/solera_server/bookmarks.py): `next`,
+ * the first upstream commit not yet delivered; `pass`, one under way —
  * its mode, boundary (`from`..`to`) and position (`at`: the last key
  * delivered, or the next commit). */
-export interface Watermark {
+export interface Bookmark {
   kind: "keys" | "commits";
   output: string;
   up: string;
   fingerprint: string;
   reset_by?: string | null;
   next: number;
-  delivery?: {
+  pass?: {
     mode: "full" | "delta" | "diff";
     from?: number;
     to?: number;
@@ -357,14 +357,14 @@ export interface Watermark {
     reconcile?: boolean;
   };
   patterns?: Json;
-  rescope?: { old: Json; new: Json; cutover: number; pin: number };
+  pattern_change?: { old: Json; new: Json; at: number; pin: number };
   reconcile?: { after: string | null };
 }
 
 export interface InputPartition {
   partition: string;
   upstream_partition: string;
-  watermark: Watermark | null;
+  bookmark: Bookmark | null;
   head_commit: number | null;
   lag: number | null;
   state: InputState;
@@ -376,7 +376,7 @@ export interface Input {
   output: string;
   upstream_asset: string | null;
   source: boolean;
-  page_size: number | null;
+  batch_size: number | null;
   concurrency: number | null;
   patterns: Patterns | null;
   partitions: InputPartition[];

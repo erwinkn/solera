@@ -30,7 +30,7 @@ async def icp(ctx, files: list[dict], sharepoint: SharePointClient):
         except Exception as e:
             ctx.log.warning(f"skipping {f['path']}: {e}")   # swallowed: the file is never retried
     frames = await asyncio.gather(*(one(f) for f in files))
-    return Patch(pd.concat([f for f in frames if f is not None]), remove=ctx.changes["files"].deleted)
+    return Patch(pd.concat([f for f in frames if f is not None]), remove=ctx.batch["files"].deleted)
 ```
 
 Three things in Solera force that shape:

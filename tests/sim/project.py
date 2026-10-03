@@ -120,7 +120,7 @@ def rebuild(changes, rows: list[dict]):
 
     if changes.full and changes.first:
         return rows
-    return Patch(rows, remove=list(changes.deleted))
+    return Patch(rows, remove=list(changes.removed))
 
 
 def f_items(v: str, version: str) -> str:
@@ -147,18 +147,18 @@ def build(variant: Variant, data_root, db: Database, outside: External, pg: str 
     )
     def items(ctx, feed: list):
         rows = [{"id": r["id"], "v": f_items(r["v"], variant.items_version)} for r in feed]
-        return rebuild(ctx.changes["feed"], rows)
+        return rebuild(ctx.batch["feed"], rows)
 
     copy_kw = {"aliases": ["copy"]} if variant.copy_name == "mirror" else {}
 
     def copy_fn(ctx, items: list):
-        return rebuild(ctx.changes["items"], [{"id": r["id"], "v": r["v"]} for r in items])
+        return rebuild(ctx.batch["items"], [{"id": r["id"], "v": r["v"]} for r in items])
 
     copy_fn.__name__ = variant.copy_name
     copy = asset(
         copy_fn,
         outputs=Output(key="id"),
-        inputs={"items": Incremental(page_size=2, exclude=[variant.exclude] if variant.exclude else None)},
+        inputs={"items": Incremental(batch_size=2, exclude=[variant.exclude] if variant.exclude else None)},
         automations=AutoRefresh(),
         retries=Retry(3, delay=1.0),
         timeout=300,
@@ -179,13 +179,13 @@ def build(variant: Variant, data_root, db: Database, outside: External, pg: str 
 
     @asset(inputs={"log": Incremental()})
     def tally(ctx, log: list):
-        changes = ctx.changes["log"]
+        changes = ctx.batch["log"]
         base = 0 if (changes.full and changes.first) or ctx.cursor is None else ctx.cursor
         total = base + len(log)
         return Result(outputs={"tally": {"rows": total}}, cursor=total)
 
     @asset(
-        inputs={"item": Each("items", page_size=2, concurrency=2)},
+        inputs={"item": Each("items", batch_size=2, concurrency=2)},
         outputs=Output("checks", key="id"),
         automations=AutoRefresh(),
         retries=Retry(3, delay=1.0),
@@ -198,7 +198,7 @@ def build(variant: Variant, data_root, db: Database, outside: External, pg: str 
 
     @asset(
         outputs=[Output("odd", key="id", store="db"), Output("even", key="id")],
-        inputs={"items": Incremental(page_size=2)},
+        inputs={"items": Incremental(batch_size=2)},
         automations=AutoRefresh(),
         retries=Retry(3, delay=1.0),
         timeout=300,
@@ -209,12 +209,12 @@ def build(variant: Variant, data_root, db: Database, outside: External, pg: str 
         version flips moves from one output to the other in one commit, one
         output fenced, the other immutable. Its attempts run on a pool."""
 
-        changes = ctx.changes["items"]
+        changes = ctx.batch["items"]
         odd = [r for r in items if is_odd(r["v"])]
         even = [r for r in items if not is_odd(r["v"])]
         if changes.full and changes.first:
             return Result(outputs={"odd": odd, "even": even})
-        gone = list(changes.deleted)
+        gone = list(changes.removed)
         return Result(
             outputs={
                 "odd": Patch(odd, remove=[r["id"] for r in even] + gone),

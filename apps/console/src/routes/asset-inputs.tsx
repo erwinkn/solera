@@ -22,7 +22,7 @@ const KIND: Record<Input["kind"], { name: string; means: string }> = {
   },
   incremental: {
     name: "Incremental",
-    means: "Only what changed since this asset's watermark, a page at a time.",
+    means: "Only what changed since this asset's bookmark, a batch at a time.",
   },
   each: {
     name: "Each",
@@ -44,7 +44,7 @@ const STATE_HINT: Record<InputState, string> = {
   behind: "Batches committed upstream wait to be delivered.",
   paging: "A window is being delivered over several attempts.",
   full: "A full delivery (a reset or a full run) is in progress.",
-  rescope: "The input's patterns changed: finishing old deltas, then diffing membership.",
+  pattern_change: "The input's patterns changed: finishing old deltas, then diffing membership.",
   reconcile: "After a full delivery: removing keys the upstream no longer names.",
 };
 
@@ -105,7 +105,7 @@ function EdgeCard({ input, partition }: { input: Input; partition?: string }) {
         description={kind.means}
         actions={
           <div className="flex flex-wrap items-center gap-2 text-xs text-fg-muted">
-            {input.page_size != null && <span>{input.page_size} keys a page</span>}
+            {input.batch_size != null && <span>{input.batch_size} keys a batch</span>}
             {input.concurrency != null && <span>· {input.concurrency} at a time</span>}
             {input.partitions.length > 0 && <span>· {behind ? `${behind} behind` : "all caught up"}</span>}
           </div>
@@ -142,12 +142,12 @@ function EdgeCard({ input, partition }: { input: Input; partition?: string }) {
 }
 
 function PartitionRow({ s }: { s: InputPartition }) {
-  const wm = s.watermark;
+  const wm = s.bookmark;
   const delivered = wm ? wm.next - 1 : null;
   const lag = s.lag ?? 0;
   const head = s.head_commit ?? 0;
   const done = head + 1 - lag;
-  const d = wm?.delivery;
+  const d = wm?.pass;
   const at =
     typeof d?.at === "string" ? `after ${d.at}` : typeof d?.at === "number" ? `commit ${count(d.at)}` : null;
   const position = d ? [d.mode, at, `page ${d.page + 1} of ${d.pages}`].filter(Boolean).join(" · ") : null;

@@ -384,7 +384,7 @@ class Incremental(In):
     def __init__(
         self,
         output: str | None = None,
-        page_size: int = 100,
+        batch_size: int = 100,
         meta: dict | None = None,
         *,
         include=None,
@@ -393,16 +393,16 @@ class Incremental(In):
         from . import patterns
 
         super().__init__(output, meta=meta)
-        if page_size < 1:
+        if batch_size < 1:
             raise RegistrationError("Incremental page_size must be positive")
-        self.page_size = page_size
+        self.batch_size = batch_size
         try:
             self.patterns = patterns.spec(include, exclude)
         except (ValueError, TypeError) as error:
             raise RegistrationError(str(error)) from None
 
     def spec(self, param: str) -> dict:
-        spec = {**super().spec(param), "page_size": self.page_size}
+        spec = {**super().spec(param), "batch_size": self.batch_size}
         if self.patterns is not None:
             spec["patterns"] = self.patterns
         return spec
@@ -420,13 +420,13 @@ class Each(Incremental):
         self,
         output: str | None = None,
         *,
-        page_size: int = 100,
+        batch_size: int = 100,
         concurrency: int = 16,
         meta: dict | None = None,
         include=None,
         exclude=None,
     ):
-        super().__init__(output, page_size=page_size, meta=meta, include=include, exclude=exclude)
+        super().__init__(output, batch_size=batch_size, meta=meta, include=include, exclude=exclude)
         if concurrency < 1:
             raise RegistrationError("Each concurrency must be positive")
         self.concurrency = concurrency
@@ -452,44 +452,44 @@ class Upstream:
 
 
 @dataclass(frozen=True)
-class Changes:
-    """What an `Incremental` edge delivered to a parameter (§5.1). The rows
-    arrive as the parameter; `ctx.changes[name]` says what they are and
-    where they sit in their delivery:
+class Batch:
+    """What an `Incremental` input delivered to a parameter (§5.1). The rows
+    arrive as the parameter; `ctx.batch[name]` says what they are and where
+    they sit in their pass:
 
     - `rows`: the delivered rows (the object the parameter received);
-      `upserted` and `deleted`: the keys delivered and removed (keyed
+      `upserted` and `removed`: the keys delivered and removed (keyed
       upstreams);
-    - `full`: the page is part of a full delivery — the whole head after a
+    - `full`: the batch is part of a full pass — the whole head after a
       reset, not a delta;
-    - `page`: this page's 0-based index in its delivery, exact;
-    - `pages`: how many pages the delivery was planned to take when it
-      started, by `page_size`. Exact when the edge has no patterns and the
-      upstream's key count is exact; otherwise an estimate, and the
-      delivery may take fewer pages, or more;
-    - `first`: `page == 0` — on a full delivery, the moment to start over;
-    - `final`: no page of this delivery follows, known from the delivery
-      itself running out, never from `pages`. Pages are formed from the
-      keys the edge's patterns take, so every page holds some: `final` is
-      always on a real page, and a delivery that takes no key at all does
-      not call the producer;
+    - `index`: this batch's 0-based index in its pass, exact;
+    - `count`: how many batches the pass was planned to take when it
+      started, by `batch_size`. Exact when the input has no patterns and the
+      upstream's key count is exact; otherwise an estimate, and the pass
+      may take fewer batches, or more;
+    - `first`: `index == 0` — on a full pass, the moment to start over;
+    - `final`: no batch of this pass follows, known from the pass itself
+      running out, never from `count`. Batches are formed from the keys the
+      input's patterns take, so every batch holds some: `final` is always
+      on a real batch, and a pass that takes no key at all does not call
+      the producer;
     - `upstream`: facts about the upstream (`Upstream`).
 
     A consumer that rebuilds starts over when `full and first`, appends every
-    page, and swaps or finalizes on `final`."""
+    batch, and swaps or finalizes on `final`."""
 
     rows: Any = ()
-    deleted: tuple = ()
+    removed: tuple = ()
     upserted: tuple = ()
     full: bool = False
-    page: int = 0
-    pages: int = 1
+    index: int = 0
+    count: int = 1
     final: bool = True
     upstream: Upstream = field(default_factory=Upstream)
 
     @property
     def first(self) -> bool:
-        return self.page == 0
+        return self.index == 0
 
 
 # ---------------------------------------------------------------------------

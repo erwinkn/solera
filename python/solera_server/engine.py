@@ -48,7 +48,7 @@ from solera.keys.index import (
 from solera.keys.io import ObjectIO
 from solera.sdk import digest
 
-from . import delivery, history, planning
+from . import bookmarks, history, planning
 from .attempts import POOL_OFFERED_GRACE, Attempts, Live, current_names, moved, worker_report
 from .history import MAX_METADATA, History, RunFilter
 from .keyservice import KeyService, cache_root
@@ -599,11 +599,11 @@ class Engine(Attempts, Sensors, Views):
                 return
             if prepared.get("skip"):
                 advanced = {
-                    param: delivery.advance(plan) for param, plan in prepared["plans"].items() if plan
+                    param: bookmarks.advance(plan) for param, plan in prepared["plans"].items() if plan
                 }
-                watermarks = {param: wm for param, wm in advanced.items() if wm is not None}
-                commit = {"watermarks": watermarks}
-                if not delivery.selects(prepared["plans"]):
+                marks = {param: wm for param, wm in advanced.items() if wm is not None}
+                commit = {"bookmarks": marks}
+                if not bookmarks.selects(prepared["plans"]):
                     commit["drained"] = True
                 self._finish(task, claim, "skipped", commit=commit)
                 return
@@ -739,7 +739,7 @@ class Engine(Attempts, Sensors, Views):
         if full and run["mode"] == "full" and incremental:
             # This run's reset began the pass every edge is on: resume it, page by page.
             started = [
-                (self.m.watermark(task["asset"], e.param, partition) or {}).get("reset_by")
+                (self.m.bookmark(task["asset"], e.param, partition) or {}).get("reset_by")
                 for e in incremental
             ]
             if all(s == run["id"] for s in started):
@@ -769,13 +769,13 @@ class Engine(Attempts, Sensors, Views):
             pins[param] = pin
             plans[param] = plan
             all_empty = all_empty and empty
-        if full and delivery.selects(plans):
+        if full and bookmarks.selects(plans):
             raise NonRetryable(f"{task['asset']}: a keys= selection cannot run while a full run is due")
         claim = self.m.claimed(attempt) if attempt is not None else None
         if claim is not None:
             # Keep the delta log this attempt reads until it finishes (§6).
-            claim["reads"] = delivery.reads(plans)
-        more = any(p["kind"] == "commits" and delivery.continues(p, None, None) for p in plans.values() if p)
+            claim["reads"] = bookmarks.reads(plans)
+        more = any(p["kind"] == "commits" and bookmarks.continues(p, None, None) for p in plans.values() if p)
         skip = bool(incremental) and all_empty and not more and not full
         # An Each asset whose keys all failed so far has no head yet: nothing to wait for.
         if skip and each_page is None and not planner.complete(task["asset"], partition):
@@ -961,7 +961,7 @@ class Engine(Attempts, Sensors, Views):
 
         output = input["output"]
         keyed = self.manifest["outputs"][output].get("key") is not None
-        limit = int(input.get("page_size") or 100)
+        limit = int(input.get("batch_size") or 100)
         # The generation of the head a page is planned against. A delivery that
         # reads a fixed snapshot over its pages — a delta window, a rescope's
         # diff, a range of batches — keeps the one it started at: what its
@@ -972,13 +972,13 @@ class Engine(Attempts, Sensors, Views):
             head.get("commit_number", -1)
         )  # `latest`: the head this page is planned against
         override = (run.get("keys") or {}).get(output)
-        wm = self.m.watermark(task["asset"], param, task["partition"])
+        wm = self.m.bookmark(task["asset"], param, task["partition"])
         if isinstance(override, dict) and "keys" in override:
             # A keys= selection reads the keys it names, whatever the watermark — none
             # yet, a delivery under way, a reset due — and moves neither it nor the
             # scope's progress. The edge's patterns still decide which it takes (§11).
             keys = sorted({str(k) for k in override["keys"]})
-            pin = {"ref": ref, "changes": {"keys": keys, "full": False}}
+            pin = {"ref": ref, "batch": {"keys": keys, "full": False}}
             pin["index"] = self.m.index(output, upstream_partition).pinned().to_json()  # the keys' locators
             if input.get("patterns") is not None:
                 pin["patterns"] = input["patterns"]
@@ -992,13 +992,13 @@ class Engine(Attempts, Sensors, Views):
         again = override == "full" and (wm or {}).get("reset_by") != run["id"]
         reset = full or wm is None or wm.get("fingerprint") != fingerprint or again
         if not reset and not keyed:
-            under_way = wm.get("delivery")
+            under_way = wm.get("pass")
             reset = int(under_way["from"]) < first if under_way else int(wm["next"]) <= first
         elif not reset and first:
             # A keyed upstream that moved store started its index over at `base`, the
             # move's batch, whose delta holds only upserts: a delivery begun at or
             # before it — planned against the old index — starts over (F9).
-            under_way = wm.get("delivery") or {}
+            under_way = wm.get("pass") or {}
             start = under_way.get("from", wm.get("next"))
             reset = start is not None and int(start) <= first
         carried = {
@@ -1008,7 +1008,7 @@ class Engine(Attempts, Sensors, Views):
             "fingerprint": fingerprint,
             "reset_by": run["id"] if reset else wm.get("reset_by"),
         }
-        current = None if reset else wm.get("delivery")
+        current = None if reset else wm.get("pass")
 
         if not keyed:
             if current is None:
@@ -1023,52 +1023,52 @@ class Engine(Attempts, Sensors, Views):
                 "commits": [lo, hi],
                 "full": current["mode"] == "full",
                 "more": hi < current["to"],
-                "page": current["page"],
-                "pages": current["pages"],
+                "index": current["page"],
+                "count": current["pages"],
             }
             carried["next"] = current["from"] if reset else int(wm["next"])
-            plan = {"kind": "commits", "watermark": carried, "delivery": current, "hi": hi, "head": latest}
-            return {"ref": {**ref, "generation": current["generation"]}, "changes": changes}, plan, hi < lo
+            plan = {"kind": "commits", "bookmark": carried, "pass": current, "hi": hi, "head": latest}
+            return {"ref": {**ref, "generation": current["generation"]}, "batch": changes}, plan, hi < lo
 
         index = self.m.index(output, upstream_partition)
         patterns = input.get("patterns")
         carried["next"] = None if reset else int(wm["next"])
         carried["patterns"] = patterns
-        rescope = None if reset else wm.get("rescope")
-        if not reset and rescope is None and wm.get("patterns") != patterns:
+        pattern_change = None if reset else wm.get("pattern_change")
+        if not reset and pattern_change is None and wm.get("patterns") != patterns:
             # The edge's patterns changed: cut over at the upstream's head (per-key §11).
             # Changes up to it finish under the old patterns, then membership is
             # diffed against the index as of the cutover, pinned until the diff ends.
-            rescope = {
+            pattern_change = {
                 "old": wm.get("patterns"),
                 "new": patterns,
-                "cutover": head_commit,
+                "at": head_commit,
                 "generation": latest_generation,
                 "snapshot": index.pinned().to_json(),
                 "pin": claim_pin if claim_pin is not None else self.m.applied,
             }
-        if rescope is not None:
-            carried["patterns"], carried["rescope"] = rescope["old"], rescope
-            if (current is None or current["mode"] == "diff") and carried["next"] > rescope["cutover"]:
+        if pattern_change is not None:
+            carried["patterns"], carried["pattern_change"] = pattern_change["old"], pattern_change
+            if (current is None or current["mode"] == "diff") and carried["next"] > pattern_change["at"]:
                 if current is None:
-                    count = IndexState.from_json(rescope["snapshot"]).count
+                    count = IndexState.from_json(pattern_change["snapshot"]).count
                     current = {"mode": "diff", "at": None, "page": 0, "pages": _pages(count, limit)}
                 pin = {
-                    "ref": {**ref, "generation": rescope["generation"]},
-                    "index": rescope["snapshot"],
-                    "changes": {
-                        "rescope": {"from": rescope["old"], "to": rescope["new"]},
+                    "ref": {**ref, "generation": pattern_change["generation"]},
+                    "index": pattern_change["snapshot"],
+                    "batch": {
+                        "pattern_change": {"from": pattern_change["old"], "to": pattern_change["new"]},
                         "after": current["at"],
                         "limit": limit,
-                        "page": current["page"],
-                        "pages": current["pages"],
+                        "index": current["page"],
+                        "count": current["pages"],
                     },
                 }
                 if carried["patterns"] is None:
                     carried.pop("patterns")
-                return pin, {"kind": "keys", "watermark": carried, "delivery": current, "head": latest}, False
-            if head_commit > rescope["cutover"]:  # finish: under the old patterns, up to the cutover
-                head_commit, latest_generation = rescope["cutover"], rescope["generation"]
+                return pin, {"kind": "keys", "bookmark": carried, "pass": current, "head": latest}, False
+            if head_commit > pattern_change["at"]:  # finish: under the old patterns, up to the cutover
+                head_commit, latest_generation = pattern_change["at"], pattern_change["generation"]
         each = input.get("each") is not None
         held = [o["name"] for o in self.manifest["assets"][task["asset"]]["outputs"]] + [f"@{task['asset']}"]
         empty = False
@@ -1098,10 +1098,10 @@ class Engine(Attempts, Sensors, Views):
                 **({"reconcile": True} if each else {}),
             }
             empty = False
-            if rescope is not None:  # a full delivery is under the new patterns: no diff left
-                carried.pop("rescope")
+            if pattern_change is not None:  # a full delivery is under the new patterns: no diff left
+                carried.pop("pattern_change")
                 carried["patterns"] = patterns
-        if carried.get("rescope") is not None:
+        if carried.get("pattern_change") is not None:
             empty = False  # the transition has its diff still to do
         if carried["next"] is None:
             carried["next"] = current["from"]
@@ -1118,14 +1118,14 @@ class Engine(Attempts, Sensors, Views):
         window = {"full": whole, "from": current["from"], "after": current["at"]}
         if not whole:
             window["to"] = current["to"]
-        changes = {**window, "limit": limit, "page": current["page"], "pages": current["pages"]}
+        changes = {**window, "limit": limit, "index": current["page"], "count": current["pages"]}
         read = current["generation"] if not whole else latest_generation  # a full delivery reads the head
-        pin = {"ref": {**ref, "generation": read}, "index": pinned.to_json(), "changes": changes}
+        pin = {"ref": {**ref, "generation": read}, "index": pinned.to_json(), "batch": changes}
         if carried["patterns"] is not None:
             pin["patterns"] = carried["patterns"]  # the worker filters the page
         else:
             carried.pop("patterns")
-        return pin, {"kind": "keys", "watermark": carried, "delivery": current, "head": latest}, empty
+        return pin, {"kind": "keys", "bookmark": carried, "pass": current, "head": latest}, empty
 
     # -- Each pages (docs/per-key-processing.md §5, §9) ------------------------------
 
@@ -1158,13 +1158,13 @@ class Engine(Attempts, Sensors, Views):
         record = self.m.partition(task["asset"], task["partition"]).get("failures") or {}
         failures = self.m.index(f"@{task['asset']}", task["partition"])
         changes = not empty
-        wm = self.m.watermark(task["asset"], param, task["partition"])
-        whole = plan["kind"] == "keys" and plan["delivery"]["mode"] == "full"
+        wm = self.m.bookmark(task["asset"], param, task["partition"])
+        whole = plan["kind"] == "keys" and plan["pass"]["mode"] == "full"
         # After a full delivery, the output's keys it no longer names go first (§11).
         reconcile = None if whole else (wm or {}).get("reconcile")
         # A full delivery reprocesses every key, a pattern transition and its cleanup
         # decide which keys are the edge's: retries wait for them to end.
-        transition = whole or "rescope" in (plan or {}).get("watermark", {}) or reconcile is not None
+        transition = whole or "pattern_change" in (plan or {}).get("bookmark", {}) or reconcile is not None
         retries = not transition and self._has_retries(record)
         if reconcile is not None:
             kind = "reconcile"
@@ -1189,19 +1189,19 @@ class Engine(Attempts, Sensors, Views):
             "commit_number": int(record.get("commit_number", -1)) + 1,
             "pass_after": (retry or {}).get("after"),
         }
-        limit = int(input.get("page_size") or 100)
+        limit = int(input.get("batch_size") or 100)
         if kind == "reconcile":
             pin = {
                 "ref": ref,
                 "index": self.m.index(input["output"], upstream_partition).pinned().to_json(),
-                "changes": {"reconcile": {"after": reconcile["after"]}, "limit": limit},
+                "batch": {"reconcile": {"after": reconcile["after"]}, "limit": limit},
                 "each": each,
             }
             if wm.get("patterns") is not None:
                 pin["patterns"] = wm["patterns"]
             return (
                 pin,
-                {"kind": "held", "watermark": wm, "each": {"kind": "reconcile", "changes": changes}},
+                {"kind": "held", "bookmark": wm, "each": {"kind": "reconcile", "batch": changes}},
                 False,
             )
         if kind == "retry":
@@ -1218,15 +1218,15 @@ class Engine(Attempts, Sensors, Views):
             pin = {
                 "ref": ref,
                 "index": self.m.index(input["output"], upstream_partition).pinned().to_json(),
-                "changes": {"retry": {"after": retry["after"]}, "limit": limit},
+                "batch": {"retry": {"after": retry["after"]}, "limit": limit},
                 "each": each,
             }
             if (wm or {}).get("patterns") is not None:
                 pin["patterns"] = wm["patterns"]  # a due key the edge no longer takes goes
             plan = {
                 "kind": "held",
-                "watermark": wm,
-                "each": {"kind": "retry", "pass": retry, "changes": changes},
+                "bookmark": wm,
+                "each": {"kind": "retry", "pass": retry, "batch": changes},
             }
             return pin, plan, False
         pin = {**pin, "each": each}
@@ -1262,7 +1262,7 @@ class Engine(Attempts, Sensors, Views):
             # The configuration the scope runs under, for the runs retries start (§9).
             "config": run.get("config") or {},
         }
-        retry, more, watermark = page.get("pass"), False, None
+        retry, more, bookmark = page.get("pass"), False, None
         delivered = (result.get("delivered") or {}).get(plan.get("param") or "", {})
         # A forced request newer than the pass in progress, or than the last one done,
         # is owed a pass: this run takes it rather than waiting for unrelated activity.
@@ -1271,12 +1271,12 @@ class Engine(Attempts, Sensors, Views):
         )
         if page["kind"] == "reconcile":
             after = delivered.get("after")
-            wm = dict(delivery.advance(plan))
+            wm = dict(bookmarks.advance(plan))
             if after is None:
                 wm.pop("reconcile", None)
             else:
                 wm["reconcile"] = {"after": after}
-            watermark = wm
+            bookmark = wm
             more = after is not None or bool(page.get("changes")) or forced_after
         elif page["kind"] == "retry":
             walked = report.get("range") or {}
@@ -1308,7 +1308,7 @@ class Engine(Attempts, Sensors, Views):
                 or forced_after
             )
         commit.update({"due": due, "deploy_min": deploy_min})
-        return commit, more, watermark
+        return commit, more, bookmark
 
     def _due_cleanups(self, output: str, partition: str, attempt: str | None) -> list[dict]:
         """The data garbage of an immutable output's scope that no reader can
@@ -1392,7 +1392,7 @@ class Engine(Attempts, Sensors, Views):
         declared = {name: info["contract"] for name, info in (prepared.get("outputs") or {}).items()}
         # Where each keyed Incremental page ended decides the next watermark.
         delivered = result.get("delivered") or {}
-        watermarks, more = {}, bool(prepared.get("more"))
+        marks, more = {}, bool(prepared.get("more"))
         failures = None
         for param, plan in (prepared.get("plans") or {}).items():
             if plan is None:
@@ -1401,16 +1401,16 @@ class Engine(Attempts, Sensors, Views):
                 failures, each_more, reconciled = self._each_commit(task, {**plan, "param": param}, result)
                 more = more or each_more
                 if reconciled is not None:
-                    watermarks[param] = reconciled
+                    marks[param] = reconciled
                     continue
             after = None
             if plan["kind"] == "keys":  # a key page reports where it stopped
                 if param not in delivered:
                     raise Conflict(f"input {param}: the result reports no delivery", retryable=False)
                 after = delivered[param].get("after")
-            if (wm := delivery.advance(plan, after)) is not None:
-                watermarks[param] = wm
-            more = more or delivery.continues(plan, after, wm)
+            if (wm := bookmarks.advance(plan, after)) is not None:
+                marks[param] = wm
+            more = more or bookmarks.continues(plan, after, wm)
         heads, keys = {}, {}
         for name, entry in outputs.items():
             if name not in declared:
@@ -1459,16 +1459,16 @@ class Engine(Attempts, Sensors, Views):
             # nor does a page whose keys the edge's patterns all left out.
             if prepared["outputs"][name]["head"] is None and failures is None and not result.get("skipped"):
                 raise Conflict(f"omitted output {name} has no head to keep (§2)", retryable=False)
-        commit = {"heads": heads, "watermarks": watermarks}
-        if not delivery.selects(prepared.get("plans") or {}):
+        commit = {"heads": heads, "bookmarks": marks}
+        if not bookmarks.selects(prepared.get("plans") or {}):
             # Whether the delivery is done is the scope's, not its outputs' — a last page
             # may write none of them (§7) — and every edge's: one still delivering, its
             # watermark untouched by this attempt, keeps the scope from draining.
             after = [
-                watermarks.get(p) or self.m.watermark(task["asset"], p, task["partition"])
+                marks.get(p) or self.m.bookmark(task["asset"], p, task["partition"])
                 for p in prepared.get("plans") or {}
             ]
-            commit["drained"] = not more and not any(delivery.outstanding(wm) for wm in after if wm)
+            commit["drained"] = not more and not any(bookmarks.outstanding(wm) for wm in after if wm)
         if failures is not None:
             commit["failures"] = failures
             if result.get("key_outcomes"):
@@ -2158,8 +2158,8 @@ class Engine(Attempts, Sensors, Views):
             o["name"]: [(s, self.head_view(h)) for s, h in self.m.heads_of(o["name"])]
             for o in info["outputs"]
         }
-        watermarks = {
-            param: self.m.watermark(asset, param, partition)
+        marks = {
+            param: self.m.bookmark(asset, param, partition)
             for param, input in info["inputs"].items()
             if input["kind"] == "incremental"
         }
@@ -2168,7 +2168,7 @@ class Engine(Attempts, Sensors, Views):
             "asset": info,
             "heads": heads,
             "cursor": self.m.partition(asset, partition).get("cursor"),
-            "watermarks": watermarks,
+            "bookmarks": marks,
             "current_keys": self.planner().dim_keys(dims) if dims else [],
             "repairs": {
                 o["name"]: sorted(s for (n, s) in self.m.repairs if n == o["name"]) for o in info["outputs"]

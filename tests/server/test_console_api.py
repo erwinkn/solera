@@ -62,7 +62,7 @@ def build_project(content, parts):
     def parted(ctx):
         return dict(parts[ctx.partition])
 
-    @asset(inputs={"parts": Incremental(page_size=1)}, partitions={"day": days}, deps=["files"])
+    @asset(inputs={"parts": Incremental(batch_size=1)}, partitions={"day": days}, deps=["files"])
     def consume(parts: dict):
         return {"n": len(parts)}
 
@@ -315,15 +315,15 @@ async def test_edges_report_every_scope_and_its_lag(world):
     assert found["asset"] == "consume"
     inputs = {e["param"]: e for e in found["inputs"]}
     assert (inputs["parts"]["kind"], inputs["files"]["kind"]) == ("incremental", "dep")
-    assert inputs["parts"]["upstream_asset"] == "parted" and inputs["parts"]["page_size"] == 1
+    assert inputs["parts"]["upstream_asset"] == "parted" and inputs["parts"]["batch_size"] == 1
     assert inputs["files"]["partitions"] == [] and inputs["files"]["source"] is False
     partitions = {s["partition"]: s for s in inputs["parts"]["partitions"]}
     assert partitions["x"]["state"] == "caught_up" and partitions["x"]["lag"] == 0
-    assert partitions["x"]["watermark"]["next"] == partitions["x"]["head_commit"] + 1
+    assert partitions["x"]["bookmark"]["next"] == partitions["x"]["head_commit"] + 1
     assert partitions["y"] == {
         "partition": "y",
         "upstream_partition": "y",
-        "watermark": None,
+        "bookmark": None,
         "head_commit": 0,
         "lag": 1,
         "state": "never",

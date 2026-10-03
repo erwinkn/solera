@@ -148,7 +148,7 @@ async def test_4_a_rescope_without_its_log_still_removes_left_out_and_deleted_ke
     detail = await drive(engine, await engine.submit(["parse"]))
     assert detail["request"]["status"] == "succeeded"
     assert set(await rows_of(engine, new, "samples")) == {"a/1"}
-    assert "reconcile" not in engine.m.watermark("parse", "file", "")
+    assert "reconcile" not in engine.m.bookmark("parse", "file", "")
 
 
 async def test_5_a_user_cancel_during_a_timeout_drain_makes_its_keys_canceled(tmp_path, monkeypatch):
@@ -282,9 +282,9 @@ async def test_a_full_run_pages_through_every_key_once(state):  # noqa: F811
         seen.append(ctx.key)
         return [{"n": file["n"]}]
 
-    project = files_project({"a": {"n": 1}, "b": {"n": 2}, "c": {"n": 3}}, parse, page_size=1)
+    project = files_project({"a": {"n": 1}, "b": {"n": 2}, "c": {"n": 3}}, parse, batch_size=1)
 
-    @asset(inputs={"f": Incremental("files", page_size=1)})
+    @asset(inputs={"f": Incremental("files", batch_size=1)})
     def consumer(f: dict):
         plain.extend(f)
         return [{"n": len(f)}]

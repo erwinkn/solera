@@ -63,7 +63,7 @@ async def test_a_removed_assets_last_attempt_ends_its_run(state, monkeypatch):  
     def files():
         return [{"id": "a"}, {"id": "b"}]
 
-    @asset(inputs={"files": Incremental(page_size=1)})
+    @asset(inputs={"files": Incremental(batch_size=1)})
     async def pages(files: list):
         entered.set()
         await release.wait()
@@ -89,7 +89,7 @@ async def test_a_removed_assets_last_attempt_ends_its_run(state, monkeypatch):  
         tasks = state.model.runs[run["id"]]["tasks"].values()
         raise AssertionError(f"the run never ends: {[(t['status'], t.get('held')) for t in tasks]}") from None
     assert status_of(detail) in {"succeeded", "failed", "canceled"}
-    assert not state.model.partition("pages", "").get("watermarks")  # its delivery ends with it
+    assert not state.model.partition("pages", "").get("bookmarks")  # its delivery ends with it
 
 
 async def test_an_attempt_launched_before_a_rename_settles(state, monkeypatch):  # noqa: F811
@@ -155,12 +155,12 @@ async def test_a_change_made_during_a_full_delivery_reaches_downstream(state):  
         return [{"id": k, "v": v} for k, v in content.items()]
 
     @asset(
-        inputs={"items": Incremental(page_size=1)},
+        inputs={"items": Incremental(batch_size=1)},
         outputs=Output("out", key="id"),
         automations=AutoRefresh(),
     )
     def out(ctx, items: list):
-        return Patch([{"id": r["id"], "v": r["v"]} for r in items], remove=list(ctx.changes["items"].deleted))
+        return Patch([{"id": r["id"], "v": r["v"]} for r in items], remove=list(ctx.batch["items"].removed))
 
     project = Project(assets=[items, out])
     engine = make_engine(state, project)
@@ -168,7 +168,7 @@ async def test_a_change_made_during_a_full_delivery_reaches_downstream(state):  
     await engine.set_automation("out.onchange.0", False)
     await drive(engine, await engine.submit(["items"]))
     run = await engine.submit(["out"])
-    while (state.model.watermark("out", "items", "") or {}).get("delivery", {}).get("page") != 1:
+    while (state.model.bookmark("out", "items", "") or {}).get("pass", {}).get("page") != 1:
         await engine.tick()
         await asyncio.sleep(0.01)
     await engine.cancel(run["id"])  # after its first page: `a` delivered at 1
@@ -247,7 +247,7 @@ async def test_a_batch_upstream_reset_right_after_a_delivery_is_delivered_in_ful
 
     @asset(inputs={"log": Incremental()})
     def tally(ctx, log: list):
-        changes = ctx.changes["log"]
+        changes = ctx.batch["log"]
         seen.append((changes.full, len(log)))
         base = 0 if (changes.full and changes.first) or ctx.cursor is None else ctx.cursor
         return Result(outputs={"tally": {"rows": base + len(log)}}, cursor=base + len(log))
@@ -283,9 +283,9 @@ async def test_a_full_delivery_that_takes_no_key_still_starts_over(state):  # no
 
     @asset(inputs={"items": Incremental(exclude=["k*"])}, outputs=Output("mirror", key="id", deploy="v"))
     def mirror(ctx, items: list):
-        changes = ctx.changes["items"]
+        changes = ctx.batch["items"]
         rows = [{"id": r["id"], "v": r["v"]} for r in items]
-        return rows if changes.full and changes.first else Patch(rows, remove=list(changes.deleted))
+        return rows if changes.full and changes.first else Patch(rows, remove=list(changes.removed))
 
     engine = make_engine(state, Project(assets=[items, mirror]))
     await engine.initialize()
@@ -363,8 +363,8 @@ async def test_a_key_a_moved_output_dropped_leaves_its_consumer(state, tmp_path)
             if store is not None and not entered.is_set():  # hold until the move landed
                 entered.set()
                 await release.wait()
-            changes = ctx.changes["items"]
-            return items if changes.full else Patch(items, remove=changes.deleted)
+            changes = ctx.batch["items"]
+            return items if changes.full else Patch(items, remove=changes.removed)
 
         return Project(assets=[items, copy], stores={"other": FileStore(tmp_path / "other")})
 

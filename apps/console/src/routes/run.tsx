@@ -676,7 +676,7 @@ function SpecTab({ run, attempt }: { run: string; attempt: Attempt }) {
     string,
     {
       ref?: { output: string; generation: number; partition: string };
-      changes?: Record<string, Json>;
+      batch?: Record<string, Json>;
       refs?: Record<string, Json>;
     }
   >;
@@ -701,7 +701,7 @@ function SpecTab({ run, attempt }: { run: string; attempt: Attempt }) {
                     {plural(Object.keys(pin.refs).length, "partition")} (all partitions)
                   </span>
                 )}
-                {pin.changes && <span className="text-fg-subtle">{windowOf(pin.changes)}</span>}
+                {pin.batch && <span className="text-fg-subtle">{windowOf(pin.batch)}</span>}
               </li>
             ))}
           </ul>
@@ -715,18 +715,18 @@ function SpecTab({ run, attempt }: { run: string; attempt: Attempt }) {
 /** What an incremental pin delivers, in the spec's own terms: pages of keys, or a commit range. */
 function windowOf(changes: Record<string, Json>): string {
   const page =
-    typeof changes.page === "number"
-      ? `page ${changes.page + 1}${typeof changes.pages === "number" ? ` of ${changes.pages}` : ""}`
+    typeof changes.index === "number"
+      ? `batch ${changes.index + 1}${typeof changes.count === "number" ? ` of ${changes.count}` : ""}`
       : null;
   const parts: string[] = [];
-  if (changes.full) parts.push("full delivery");
+  if (changes.full) parts.push("full pass");
   else if (changes.retry) parts.push("retry page");
   else if (changes.reconcile) parts.push("cleanup page");
   else if (changes.keys) parts.push("explicit keys");
   else if (Array.isArray(changes.commits)) parts.push(`commits ${changes.commits.join("–")}`);
   else if (changes.from !== undefined) parts.push(`commits ${String(changes.from)}–${String(changes.to)}`);
   if (page) parts.push(page);
-  if (typeof changes.limit === "number") parts.push(`${changes.limit} keys a page`);
+  if (typeof changes.limit === "number") parts.push(`${changes.limit} keys a batch`);
   return parts.join(" · ");
 }
 

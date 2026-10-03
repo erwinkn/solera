@@ -918,9 +918,7 @@ async def test_a_corrupt_copy_recovers_through_start_reads(io, tmp_path):
     from solera_server.keyservice import KeyService
 
     state = await built_index(io, commits=1)
-    spec = {
-        "inputs": {"x": {"index": state.to_json(), "changes": {"full": True, "after": None, "limit": 50}}}
-    }
+    spec = {"inputs": {"x": {"index": state.to_json(), "batch": {"full": True, "after": None, "limit": 50}}}}
     service = KeyService(io.store, str(tmp_path))
     service.start()
     try:
@@ -1055,7 +1053,7 @@ async def test_a_page_reads_one_entry_past_itself(io, tmp_path):
     assert await cache.fill(io, state)
     with cache.held(state) as pin:
         reads = Reads(recording=True, max_entries=10**6, max_bytes=2**24)
-        spec_pin = {"index": state.to_json(), "changes": {"full": True, "after": None, "limit": 100}}
+        spec_pin = {"index": state.to_json(), "batch": {"full": True, "after": None, "limit": 100}}
         window = await each.read_window(spec_pin, ObjectIO(None, local=pin.handles, served=reads))
     assert len(window.upserted) == 100 and window.after is not None
     assert reads.entries == 101
@@ -1226,7 +1224,7 @@ async def test_start_reads_are_admitted_and_hold_their_room(io, tmp_path, monkey
     try:
         assert await asyncio.wrap_future(service._submit(service.cache.fill(service.io, state)))
         spec = {
-            "inputs": {"x": {"index": state.to_json(), "changes": {"full": True, "after": None, "limit": 50}}}
+            "inputs": {"x": {"index": state.to_json(), "batch": {"full": True, "after": None, "limit": 50}}}
         }
         outs = await asyncio.gather(*(service.reads(spec, 0) for _ in range(16)))
         assert outs == [None] * 16  # timed out, or turned away

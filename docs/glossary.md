@@ -434,7 +434,7 @@ attempt and commit. It knows its `index` in the pass (0-based, exact),
 the planned `count` (possibly an estimate), `first`, `final`, `full`, and
 its `upserted` and `removed` keys. *Example:* `file_index` reads four
 files per site in two batches of `batch_size=2`. *Was:* page (`Changes`,
-`ctx.changes`, `page_size`, `page`, `pages`).
+`ctx.batch`, `page_size`, `page`, `pages`).
 
 **fingerprint**. The digest of an asset's declaration that its outputs
 depend on: its version, its stores' versions, its outputs' migrations.
@@ -730,7 +730,7 @@ shown as a version": that line goes).
 | 2.12 | `GET /holds`, `holds_view`, console `Holds` | `GET /repairs` and `GET /cleanups`, two views, two types | `api.py`, `views.py`, console `queries.ts`, `health.tsx`, `overview.tsx` | yes |
 | 2.13 | watermark (`Model.watermark(s)`, `scopes[*].watermarks`, console `Watermark`); `delivery` (the watermark's field, module `delivery.py`) | `bookmark(s)`; `pass`, module `bookmarks.py` | `delivery.py`, `model.py`, `engine.py`, `planning.py`, `views.py`, `each.py`, console, `object-store-state.md` §5 | yes (API) |
 | 2.14 | `rescope {old, new, cutover, snapshot, pin}`; `EdgeState "rescope"`; changes `rescope` | `pattern_change {old, new, at, snapshot, pin}`; `"pattern_change"` | `delivery.py`, `engine.py`, `model.py`, `views.py`, `each.py`, console `Watermark`, `lib/status.ts` | yes (API) |
-| 2.15 | `Changes`, `ctx.changes[input]`, `page_size`, `Changes.page`, `.pages`, `.deleted`, spec `changes`; `delivered[*].deleted` | `Batch`, `ctx.batch[input]`, `batch_size`, `Batch.index`, `.count`, `.removed`, `batch`; `removed` | `sdk.py`, `__init__.py`, `worker.py`, `each.py`, `engine.py`, docs, demo, example, tests | yes |
+| 2.15 | `Changes`, `ctx.batch[input]`, `page_size`, `Changes.page`, `.pages`, `.deleted`, spec `changes`; `delivered[*].deleted` | `Batch`, `ctx.batch[input]`, `batch_size`, `Batch.index`, `.count`, `.removed`, `batch`; `removed` | `sdk.py`, `__init__.py`, `worker.py`, `each.py`, `engine.py`, docs, demo, example, tests | yes |
 | 2.16 | `Each(…)` | `Incremental(…, each=True)` (until model change 2 lands, an alias) | `sdk.py`, demo, example, docs | yes |
 | 2.17 | `KeyedWrite.whole` | `KeyedWrite.reset` | `stores/__init__.py`, stores, `stores.md` | yes (store authors) |
 | 2.18 | `AttemptLaunched.pin`, `launched.pin`, claim `pin` | `generation` | `model.py`, `engine.py`, `attempts.py` | no |

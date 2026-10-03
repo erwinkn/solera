@@ -453,14 +453,14 @@
       "doc": "One changed workbook of this site: its samples. Solera runs it for every\nfile_id written since, eight at a time, writes all of them in one\nstore write, and removes the samples of deleted workbooks; the store\nstamps `file_id` and `site`. A workbook that raises is recorded as a\nfailing key, and the others still commit.",
       "inputs": {
         "workbook": {
+          "batch_size": 100,
           "each": {
             "concurrency": 8
           },
           "kind": "incremental",
           "load": "data",
           "meta": null,
-          "output": "qaqc_files",
-          "page_size": 100
+          "output": "qaqc_files"
         }
       },
       "on_version_change": "fail",
@@ -1015,7 +1015,7 @@
     "id": "snapshot",
     "source": "explicit"
   },
-  "deploy": "6c420b090b5047e8967b016d469ed00bbb24f3282446b4cd694f3ea9db3e6fa2",
+  "deploy": "052a43eec69a8aeb7eafb135303c347bac0f5413b918f4ed16ee9d8208705059",
   "errors": [],
   "executors": {
     "ingest": {

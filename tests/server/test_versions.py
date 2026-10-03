@@ -26,15 +26,15 @@ async def test_a_paged_delta_window_says_the_generation_it_read(state):  # noqa:
     def items():
         return Patch(content["rows"])
 
-    @asset(inputs={"items": Incremental(page_size=1)}, outputs=Output("copy", key="id"))
+    @asset(inputs={"items": Incremental(batch_size=1)}, outputs=Output("copy", key="id"))
     async def copy(ctx, items: list):
-        changes = ctx.changes["items"]
+        changes = ctx.batch["items"]
         seen.append((changes.full, [(r["id"], r["v"]) for r in items]))
         if not changes.full and changes.first and not moved["done"]:
             moved["done"] = True  # the upstream moves while the window is half delivered
             content["rows"] = [{"id": "b", "v": 3}]
             assert status_of(await drive(engine, await engine.submit(["items"]))) == "succeeded"
-        return Patch(items, remove=list(changes.deleted))
+        return Patch(items, remove=list(changes.removed))
 
     project = Project(assets=[items, copy])
     engine = make_engine(state, project)

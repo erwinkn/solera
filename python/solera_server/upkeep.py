@@ -26,7 +26,7 @@ from solera.keys import LocalError
 from solera.keys.index import IndexState, KeyIndex, Options
 from solera.keys.io import ObjectIO
 
-from . import delivery, history
+from . import bookmarks, history
 
 log = logging.getLogger(__name__)
 
@@ -114,9 +114,9 @@ class Upkeep:
         in progress still reads."""
 
         needed: dict[tuple, int] = {}
-        for wm in self.m.watermarks():
+        for wm in self.m.bookmarks():
             key = (wm["output"], wm["upstream_partition"])
-            needed[key] = min(needed.get(key, math.inf), delivery.needs(wm))
+            needed[key] = min(needed.get(key, math.inf), bookmarks.needs(wm))
         for claim in self.m.claims.values():
             for output, up, first in claim.get("reads") or ():
                 needed[(output, up)] = min(needed.get((output, up), math.inf), int(first))

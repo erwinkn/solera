@@ -225,9 +225,9 @@ async def test_a_change_is_kept_until_its_delivery_completes(state):  # noqa: F8
     def files():
         return [{"id": "a"}, {"id": "b"}]
 
-    @asset(inputs={"files": Incremental(page_size=1)})
+    @asset(inputs={"files": Incremental(batch_size=1)})
     def mid(ctx, files: list):
-        return [{"n": 1}] if ctx.changes["files"].first else Result(outputs={})
+        return [{"n": 1}] if ctx.batch["files"].first else Result(outputs={})
 
     @asset(inputs={"mid": AllPartitions()}, automations=Automation(trigger=OnChange("mid")))
     def agg(mid: dict[str, list]):
@@ -297,7 +297,7 @@ async def test_a_removed_consumer_lets_go_of_its_upstreams_log(state):  # noqa: 
 
     engine = make_engine(state, Project(assets=[feed, keep]))
     await engine.initialize()
-    assert sorted(a for (a, _), r in state.model.partitions.items() if r.get("watermarks")) == ["keep"]
+    assert sorted(a for (a, _), r in state.model.partitions.items() if r.get("bookmarks")) == ["keep"]
     for key in ("b", "c", "d"):
         rows.append({"id": key})
         await drive(engine, await engine.submit(["keep"], upstream=True))
@@ -357,7 +357,7 @@ async def test_an_each_delivery_resumed_by_a_firing_takes_its_change(state):  # 
         return [{"id": k, "v": v} for k, v in content.items()]
 
     @asset(
-        inputs={"item": Each("items", page_size=1)},
+        inputs={"item": Each("items", batch_size=1)},
         outputs=Output("out", key="id"),
         automations=AutoRefresh(),
     )
@@ -371,7 +371,7 @@ async def test_an_each_delivery_resumed_by_a_firing_takes_its_change(state):  # 
     await engine.set_automation("out.onchange.0", False)
     await drive(engine, await engine.submit(["items"]))
     run = await engine.submit(["out"])
-    while (state.model.watermark("out", "item", "") or {}).get("delivery", {}).get("page") != 1:
+    while (state.model.bookmark("out", "item", "") or {}).get("pass", {}).get("page") != 1:
         await engine.tick()
         await asyncio.sleep(0.01)
     await engine.cancel(run["id"])

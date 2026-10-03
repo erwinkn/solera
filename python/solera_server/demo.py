@@ -225,18 +225,18 @@ def site_feed(ctx, feed: FeedClient):
         migrations=postgres_migrations("file_index"),
     ),
     partitions={"site": sites},
-    inputs={"site_files": Incremental(page_size=2)},
+    inputs={"site_files": Incremental(batch_size=2)},
     version="2",
     automations=AutoRefresh(),
 )
 def file_index(ctx, site_files: list[dict]):
     """Index the files written since the last commit (§6)."""
-    changes = ctx.changes["site_files"]
-    ctx.log("indexing", upserted=len(changes.upserted), deleted=len(changes.deleted))
+    changes = ctx.batch["site_files"]
+    ctx.log("indexing", upserted=len(changes.upserted), deleted=len(changes.removed))
     rows = [
         {"file_id": f["file_id"], "site": ctx.partition, "indexed_version": f["version"]} for f in site_files
     ]
-    return Patch(rows, remove=changes.deleted)
+    return Patch(rows, remove=changes.removed)
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +261,7 @@ class Unreadable(Rejected):
         migrations=postgres_migrations("file_checks"),
     ),
     partitions={"site": sites},
-    inputs={"file": Each("site_files", page_size=4, concurrency=4, exclude={"drafts": "*-file-2"})},
+    inputs={"file": Each("site_files", batch_size=4, concurrency=4, exclude={"drafts": "*-file-2"})},
     automations=AutoRefresh(),
 )
 async def file_checks(ctx, file: list[dict]):

@@ -424,7 +424,7 @@ function Declaration({ asset, manifest }: { asset: AssetDecl; manifest: Manifest
                   {input.output}
                   <span className="text-fg-subtle">)</span>
                 </span>
-                {input.page_size != null && <Tag>{input.page_size} keys a page</Tag>}
+                {input.batch_size != null && <Tag>{input.batch_size} keys a batch</Tag>}
                 {input.each && <Tag>{input.each.concurrency} at a time</Tag>}
                 {input.patterns && <PatternList patterns={input.patterns} />}
               </Row>

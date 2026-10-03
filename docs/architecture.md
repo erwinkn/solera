@@ -354,7 +354,7 @@ partition and `dict[str, TableRef]` hands over refs. An `Incremental` edge canno
 be ref-annotated.
 
 **The parameter is the selection.** Under `Incremental` the value arrives
-filtered to the delivered keys or batches; `ctx.changes[name]` carries the
+filtered to the delivered keys or batches; `ctx.batch[name]` carries the
 rest. A delivery comes in **pages** of `page_size` keys (or upstream
 batches); "batch" always means an upstream commit. Top-level fields
 describe the delivery: `upserted` and `deleted` keys, `full` on every page

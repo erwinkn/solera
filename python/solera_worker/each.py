@@ -106,7 +106,7 @@ async def read_window(pin: dict, keys_io) -> Window:
     through `KeyIndex.page`, `pending` and `lookup` only, so the engine can
     run it on its own copies to serve the same page."""
 
-    ch = pin["changes"]
+    ch = pin["batch"]
     index = KeyIndex(keys_io, None, IndexState.from_json(pin["index"]))
     limit = int(ch.get("limit") or 1)
     start = key_bytes(ch["after"]) if ch.get("after") is not None else None
@@ -119,8 +119,8 @@ async def read_window(pin: dict, keys_io) -> Window:
         keys, generations, flags, _, nxt = await index.pending(int(ch["from"]), int(ch["to"]), after, n)
         return list(zip(keys, generations, flags, strict=True)), nxt
 
-    if "rescope" in ch:
-        old, new = Matcher(ch["rescope"]["from"]), Matcher(ch["rescope"]["to"])
+    if "pattern_change" in ch:
+        old, new = Matcher(ch["pattern_change"]["from"]), Matcher(ch["pattern_change"]["to"])
 
         def changed(entry):
             key = key_str(entry[0])
@@ -165,8 +165,8 @@ async def read_page(spec: dict, pin: dict, keys_io) -> Page:
         )
     # A retry page: walk the failure index from the pass's position, taking the
     # keys that are due, `limit` at most (§9).
-    limit = int(pin["changes"]["limit"])
-    after = pin["changes"]["retry"].get("after")
+    limit = int(pin["batch"]["limit"])
+    after = pin["batch"]["retry"].get("after")
     cursor = key_bytes(after) if after is not None else None
     walked: dict[str, Record] = {}
     due: list[str] = []
@@ -217,8 +217,8 @@ async def _reconcile_page(spec: dict, pin: dict, keys_io, failures: KeyIndex) ->
     failure index hold, and which of them the edge no longer has — gone
     upstream, or left out by its patterns. Those go (§11); the rest stay."""
 
-    limit = int(pin["changes"]["limit"])
-    after = pin["changes"]["reconcile"].get("after")
+    limit = int(pin["batch"]["limit"])
+    after = pin["batch"]["reconcile"].get("after")
     start = key_bytes(after) if after is not None else None
     indexes = [
         KeyIndex(keys_io, None, IndexState.from_json(info["index"]))

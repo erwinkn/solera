@@ -267,7 +267,7 @@ class Views:
         cleanup after a full Each delivery), `paging` (a delta delivered over
         several attempts), `behind` (lag), else `caught_up`."""
 
-        wm = self.m.watermark(asset, param, partition)
+        wm = self.m.bookmark(asset, param, partition)
         upstream_partition = (wm or {}).get("upstream_partition")
         if upstream_partition is None:
             try:
@@ -286,11 +286,11 @@ class Views:
         if head_commit is not None:
             first = int(head.get("base", 0))
             lag = max(0, head_commit + 1 - max(int(wm["next"]) if wm else first, first))
-        mode = ((wm or {}).get("delivery") or {}).get("mode")
+        mode = ((wm or {}).get("pass") or {}).get("mode")
         if wm is None:
             state = "never"
-        elif wm.get("rescope"):
-            state = "rescope"
+        elif wm.get("pattern_change"):
+            state = "pattern_change"
         elif mode == "full":
             state = "full"
         elif wm.get("reconcile") is not None:
@@ -302,12 +302,12 @@ class Views:
         view = None
         if wm is not None:  # less the rescope's snapshot: an index state, too big to show
             view = dict(wm)
-            if wm.get("rescope"):
-                view["rescope"] = {k: v for k, v in wm["rescope"].items() if k != "snapshot"}
+            if wm.get("pattern_change"):
+                view["pattern_change"] = {k: v for k, v in wm["pattern_change"].items() if k != "snapshot"}
         return {
             "partition": partition,
             "upstream_partition": upstream_partition,
-            "watermark": view,
+            "bookmark": view,
             "head_commit": head_commit,
             "lag": lag,
             "state": state,
@@ -323,7 +323,7 @@ class Views:
         current = set(self.planner().partitions(asset, "all"))
         marked: dict[str, set] = {}
         for partition, record in self.m.partitions.of(asset).items():
-            for param in record.get("watermarks") or ():
+            for param in record.get("bookmarks") or ():
                 marked.setdefault(param, set()).add(partition)
         out = []
         for param, input in inputs:
@@ -339,7 +339,7 @@ class Views:
                     "output": output,
                     "upstream_asset": self.manifest["outputs"][output].get("asset"),
                     "source": output in self.manifest["sources"],
-                    "page_size": input.get("page_size"),
+                    "batch_size": input.get("batch_size"),
                     "concurrency": (input.get("each") or {}).get("concurrency"),
                     "patterns": input.get("patterns"),
                     "partitions": partitions,
@@ -408,7 +408,7 @@ class Views:
         spec, is_each = keyed[input], keyed[input].get("each") is not None
         if (
             partition not in self.planner().partitions(asset, [partition])
-            and self.m.watermark(asset, input, partition) is None
+            and self.m.bookmark(asset, input, partition) is None
         ):
             raise KeyError(f"{asset}/{partition}")
         output = spec["output"]
@@ -434,7 +434,7 @@ class Views:
                 kept = last_ok = settled
             elif settled is not None:
                 last_ok = await self._newest_outcome(asset, partition, key, [OK])
-        wm = self.m.watermark(asset, input, partition)
+        wm = self.m.bookmark(asset, input, partition)
         served = wm.get("patterns") if wm is not None else spec.get("patterns")
         matcher = Matcher(served)
         included, excluded_by = matcher.included(key), matcher.excluded_by(key)

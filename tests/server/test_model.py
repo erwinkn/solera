@@ -113,7 +113,7 @@ async def test_commit_installs_heads_cursor_watermarks_and_pends_onchange(state,
     m = state.model
     assert m.heads[("files", "")]["run"] == detail["request"]["id"]
     assert m.partition("consumer", "")["drained"] is True
-    assert m.watermark("consumer", "files", "")["next"] == 1
+    assert m.bookmark("consumer", "files", "")["next"] == 1
     # files changed and consumer watches it: the change pended, and the next tick
     # (run_until ticks) fired the OnChange automation and consumed it — without a
     # new run, since this run's consumer task was still pending (§9).
@@ -297,7 +297,7 @@ def test_finishing_a_task_touches_only_its_dependents():
             "outcome": "succeeded",
             "started_at": 1,
             "finished_at": 2,
-            "commit": {"heads": {}, "watermarks": {}},
+            "commit": {"heads": {}, "bookmarks": {}},
         }
     )
     assert Counting.scans == 0
@@ -400,7 +400,7 @@ async def test_a_paged_task_keeps_no_list_of_its_pages(state, clock):
     def uploads():
         return Patch(commit_number)
 
-    @asset(inputs={"uploads": Incremental(page_size=1)})
+    @asset(inputs={"uploads": Incremental(batch_size=1)})
     def each_page(uploads: dict):
         return [{"n": len(uploads)}]
 
@@ -499,7 +499,7 @@ def test_a_rename_moves_a_scopes_record_whole():
         "cursor": "c1",
         "last": {"outcome": "failed", "run": "r", "attempt": "a", "at": 1.0},
         "drained": True,
-        "watermarks": {"feed": wm, "gone": {**wm, "output": "elsewhere"}},
+        "bookmarks": {"feed": wm, "gone": {**wm, "output": "elsewhere"}},
         "failures": {"commit_number": 0, "forced": {}, "counts": {"failed": 1}},
     }
     m = Model()
@@ -514,7 +514,7 @@ def test_a_rename_moves_a_scopes_record_whole():
         "automations": {},
     }
     m.apply({"type": "ProjectRegistered", "deploy": "r2", "manifest": manifest, "at": 3.0})
-    assert m.partition("new", "x") == {**whole, "watermarks": {"feed": wm}}
+    assert m.partition("new", "x") == {**whole, "bookmarks": {"feed": wm}}
     assert m.partition("new", "y") == {
         "last": {"outcome": "succeeded", "run": "r", "attempt": "b", "at": 2.0}
     }

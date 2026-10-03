@@ -49,7 +49,7 @@ const TONES: Record<string, Tone> = {
   behind: "warn",
   paging: "run",
   full: "run",
-  rescope: "wait",
+  pattern_change: "wait",
   reconcile: "wait",
   never: "idle",
   pending: "wait",
