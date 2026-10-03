@@ -14,7 +14,7 @@ import pytest
 from obstore.store import LocalStore, MemoryStore
 from solera import objects
 from solera_server import journal as journal_module
-from solera_server.journal import Fenced, Journal, encode
+from solera_server.journal import Fenced, Journal, Stopped, encode
 
 
 class Counter:
@@ -139,7 +139,7 @@ async def test_a_new_engine_fences_the_old_one(store):
     record(a, sa, "x", 1)
     with pytest.raises(Fenced):
         await a.durable()
-    assert a.fenced
+    assert isinstance(a.stopped, Fenced)
     with pytest.raises(Fenced):
         record(a, sa, "y")
     record(b, sb, "z")
@@ -156,7 +156,7 @@ async def test_a_read_only_open_does_not_fence(store):
     r = Journal(store, "control")
     reader = Counter()
     result = await r.open(reader.restore, reader.apply, reader.snapshot, writer=False)
-    assert reader.counts == {"x": 1} and result.engine is None and r.fenced
+    assert reader.counts == {"x": 1} and result.engine is None and r.stopped
     record(a, sa, "x")
     await a.durable()  # still the writer
     await a.close()
@@ -179,7 +179,7 @@ async def test_a_lost_answer_is_settled_by_reading_back_its_own_bytes(store, mon
     monkeypatch.setattr(objects, "_conditional_put", landed_unheard)
     record(j, s, "a")
     await j.durable()
-    assert lost and not j.fenced
+    assert lost and not j.stopped
     record(j, s, "b")
     await j.durable()
     await j.close(checkpoint=False)
@@ -234,7 +234,7 @@ async def test_cleanup_deletes_only_what_it_listed_before_its_move(store, monkey
     b_checkpoint = b.checkpoint
     snap = journal_module._dumps({"at": 0, "engine": a.engine, "state": sa.snapshot()})
     await a._take_checkpoint(snap)  # listed, wrote, read back; its move meets B's body
-    assert a.fenced and f"{b_checkpoint}.json" in checkpoints(store)
+    assert isinstance(a.stopped, Fenced) and f"{b_checkpoint}.json" in checkpoints(store)
     await b.close(checkpoint=False)
     _, sc, _ = await open_journal(store)
     assert sc.counts == {"x": 1, "y": 1}
@@ -305,10 +305,45 @@ async def test_a_checkpoints_move_that_errors_is_written_again(store, monkeypatc
     record(j, s, "a")
     with pytest.raises(ConnectionError):
         await j.flush()  # the event lands; its checkpoint's move fails
-    assert failed and not j.fenced
+    assert failed and not j.stopped
     record(j, s, "b")
     await j.flush()  # the move first, again, then the event
-    assert not j.fenced and (await journal_of(store))["checkpoint"] == j.checkpoint is not None
+    assert not j.stopped and (await journal_of(store))["checkpoint"] == j.checkpoint is not None
     await j.close(checkpoint=False)
     _, s2, _ = await open_journal(store)
     assert s2.counts == {"a": 1, "b": 1}
+
+
+@pytest.mark.parametrize("value", [2**64, -(2**63) - 1, float("nan"), float("inf")])
+def test_an_event_no_checkpoint_can_hold_is_refused(value):
+    """F27: what an event brings into the model, a checkpoint holds. An
+    integer past 64 bits (orjson refuses it) or a nan (orjson would write
+    null) is refused as the event is recorded, not at the next checkpoint."""
+
+    with pytest.raises(ValueError):
+        encode({"type": "Add", "key": "a", "n": value})
+    assert orjson.loads(encode({"type": "Add", "key": "a", "n": 2**64 - 1}))["n"] == 2**64 - 1
+
+
+async def test_a_state_no_checkpoint_can_hold_stops_the_journal(store):
+    """F27: a snapshot that cannot be encoded fails every checkpoint alike,
+    so the journal stops with the reason — waiters and later appends get
+    it — rather than retrying forever. The seal takes nothing from the
+    buffer first."""
+
+    class Unwritable(Counter):
+        def snapshot(self):
+            return {"counts": self.counts, "huge": 2**70}
+
+    j, s, _ = await open_journal(store, Unwritable(), min_checkpoint=0)
+    record(j, s, "a")
+    with pytest.raises(orjson.JSONEncodeError):
+        j._seal()
+    assert len(j._buffer) == 1 and j._sealed is None
+    with pytest.raises(Stopped, match="cannot be written"):
+        await j.durable()
+    with pytest.raises(Stopped, match="cannot be written"):
+        record(j, s, "b")
+    await j._task
+    assert (await journal_of(store))["events"] == [] and checkpoints(store) == []
+    await j.close()

@@ -5,6 +5,7 @@ import asyncio
 import copy
 import json
 
+import orjson
 import pytest
 from solera.sdk import Automation, Every, Incremental, OnChange, Output, Project, asset
 from solera.stores import Patch
@@ -377,18 +378,20 @@ async def test_the_journal_alone_reproduces_the_live_model(tmp_path, clock):
     await state.close()
 
 
-async def test_a_value_the_journal_cannot_hold_changes_nothing(state, clock):
-    """Engine review #1: `config={"x": 1e400}` is refused before the run
-    reaches the model; the journal and its checkpoints go on."""
+@pytest.mark.parametrize("value", [float("inf"), 2**70, -(2**63) - 1])
+async def test_a_value_the_journal_cannot_hold_changes_nothing(state, clock, value):
+    """Engine review #1, F27: `config={"x": 1e400}`, or an integer past 64
+    bits, is refused before the run reaches the model; the journal and its
+    checkpoints go on."""
 
     engine = engine_on(state, clock)
     await engine.initialize()
     runs = dict(state.model.runs)
     with pytest.raises(ValueError):
-        await engine.submit(["polled"], config={"x": float("inf")})
+        await engine.submit(["polled"], config={"x": value})
     assert state.model.runs == runs
     await state.durable()
-    json.dumps(state.model.snapshot(), allow_nan=False)
+    orjson.dumps(state.model.snapshot(), option=orjson.OPT_SORT_KEYS)
 
 
 async def test_a_task_over_many_batches_keeps_no_list_of_them(state, clock):

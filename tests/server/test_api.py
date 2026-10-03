@@ -175,6 +175,16 @@ async def test_run_validation_conflict(client, base):
     assert bad_keys.status_code == 400
 
 
+async def test_a_value_no_checkpoint_can_hold_is_a_400(client, base, engine):
+    """F27: one request with an integer past 64 bits is refused as it is
+    recorded; the engine goes on writing, checkpoints included."""
+
+    huge = await client.post(f"{base}/runs", json={"targets": ["daily"], "config": {"n": 2**70}})
+    assert huge.status_code == 400 and "64-bit" in huge.json()["detail"]
+    ok = await client.post(f"{base}/runs", json={"targets": ["daily"], "config": {"n": 2**63}})
+    assert ok.status_code == 201 and not engine.state.poisoned
+
+
 async def test_heads_keys_and_partitions(client, base, engine):
     """Heads expose ref/version/key_count/complete; keys pages the folded
     delta map; partitions report current/missing/retired status (§2, §7)."""

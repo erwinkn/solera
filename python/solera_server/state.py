@@ -35,7 +35,7 @@ from obstore.store import LocalStore, MemoryStore
 from solera import lifecycle
 from solera.objects import create
 
-from .journal import Fenced, Journal, encode
+from .journal import Journal, Stopped, encode
 from .model import Model
 
 log = logging.getLogger(__name__)
@@ -141,7 +141,7 @@ class State:
 
     @property
     def poisoned(self) -> bool:
-        return self.journal.fenced or self.broken is not None
+        return self.journal.stopped is not None or self.broken is not None
 
     def record(self, *events: dict, lazy: bool = False) -> None:
         """Apply events to the model now, and make them durable in the
@@ -153,8 +153,8 @@ class State:
         copies. Neither the caller's events nor the model's objects are
         ever the journal's: what is replayed is what was recorded."""
 
-        if self.journal.fenced:
-            raise Unavailable("This writer was replaced; restart required")
+        if self.journal.stopped:
+            raise Unavailable(f"This engine writes no more ({self.journal.stopped}); restart required")
         if self.broken is not None:
             raise Unavailable(
                 f"State failed applying an event ({self.broken}); restart to replay the journal"
@@ -206,8 +206,8 @@ class State:
 
         try:
             await self.journal.durable()
-        except Fenced as error:
-            raise Unavailable("This writer was replaced; restart required") from error
+        except Stopped as error:
+            raise Unavailable(f"This engine writes no more ({error}); restart required") from error
 
     async def close(self) -> None:
         await self.journal.close()

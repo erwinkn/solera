@@ -35,8 +35,7 @@ def _normal(model) -> dict:
 scalars = st.one_of(
     st.none(),
     st.booleans(),
-    # Integers past 64 bits are left out while F27 is open: its own test has them.
-    st.integers(min_value=-(2**63), max_value=2**63 - 1),
+    st.integers(),
     st.floats(allow_nan=True, allow_infinity=True),
     st.text(max_size=12),
     st.sampled_from(
@@ -147,7 +146,6 @@ def test_any_body_the_api_takes_survives_replay_and_checkpoint(sent, tmp_path):
         asyncio.run(_exchange(Path(d), sent))
 
 
-@pytest.mark.xfail(strict=True, reason="F27: open")
 @pytest.mark.parametrize(
     "route,body",
     [

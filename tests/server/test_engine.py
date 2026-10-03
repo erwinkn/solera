@@ -127,6 +127,21 @@ async def test_result_cursor_and_omitted_output(state):
     assert state.model.partition("pair", "").get("cursor") is None  # full clears the cursor
 
 
+async def test_a_cursor_the_journal_cannot_hold_fails_its_attempt(state):
+    """F27: a worker's result is recorded as any event is: an integer past
+    64 bits fails the attempt that returned it, and the engine goes on."""
+
+    @asset
+    def huge():
+        return Result(outputs={"huge": {"a": 1}}, cursor={"n": 2**70})
+
+    engine = make_engine(state, Project(assets=[huge]))
+    await engine.initialize()
+    detail = await drive(engine, await engine.submit(["huge"]))
+    assert status_of(detail) == "failed" and "64-bit" in detail["tasks"][0]["error"]
+    assert not state.poisoned and state.model.partition("huge", "").get("cursor") is None
+
+
 async def test_omitted_output_without_head_fails(state):
     """§2/§8: an omitted output with no prior head is a commit error."""
 

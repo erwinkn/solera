@@ -18,7 +18,8 @@ on meanwhile: read again.
 **Fencing.** Every write is a swap on the ETag of this engine's last one,
 and no body repeats — each names its engine and adds events or a newer
 checkpoint — so once another engine has written, the next swap raises
-`Conflict`: the journal is `fenced`, and every later append fails.
+`Conflict`: the journal is `stopped` (`Fenced`), and every later append
+fails. So is a state no checkpoint can hold: no retry would write it.
 
 **Durability.** `append` applies nothing; the caller applies an event to
 memory and appends it, and a background flusher swaps in the journal with
@@ -35,10 +36,10 @@ it back byte for byte, move the journal to it (no events), and only then
 delete what was listed. Listing after the move could delete a newer engine's checkpoint,
 not yet named; one not read back could be named and unreadable.
 
-The journal and checkpoints are encoded with orjson, keys sorted: the same
-state gives the same bytes. Events are encoded with the standard library,
-which refuses what JSON cannot hold exactly (`inf`, `nan`) before anything
-is applied.
+The journal, its events and checkpoints are encoded with orjson, keys
+sorted: the same state gives the same bytes. An event is encoded before
+anything is applied, so one the encoding cannot hold exactly is refused
+then, not at the next checkpoint.
 """
 
 from __future__ import annotations
@@ -60,8 +61,12 @@ from solera.objects import Conflict, create, read, swap
 log = logging.getLogger(__name__)
 
 
-class Fenced(RuntimeError):
-    """Another engine took over this namespace; this one must stop."""
+class Stopped(RuntimeError):
+    """This journal writes no more; its engine must stop."""
+
+
+class Fenced(Stopped):
+    """Another engine took over this namespace."""
 
 
 class JournalCorrupt(RuntimeError):
@@ -69,11 +74,18 @@ class JournalCorrupt(RuntimeError):
 
 
 def encode(event: dict) -> bytes:
-    """An event as the journal keeps it. Raises `ValueError` for what JSON
-    cannot hold exactly (`inf`, `nan`) and `TypeError` for what it cannot
-    hold at all — before anything was applied."""
+    """An event as the journal keeps it, encoded as checkpoints are: what an
+    event brings into the model, a checkpoint holds. Raises `TypeError` for
+    what JSON cannot hold at all, and `ValueError` for what the encoding
+    cannot hold exactly — `inf` and `nan` (orjson writes them as null),
+    integers past 64 bits, keys that are not strings — before anything was
+    applied."""
 
-    return json.dumps(event, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    json.dumps(event, allow_nan=False)  # TypeError; ValueError for inf and nan
+    try:
+        return _dumps(event)
+    except orjson.JSONEncodeError as error:
+        raise ValueError(f"the journal cannot hold this event: {error}") from None
 
 
 def _dumps(value) -> bytes:
@@ -110,7 +122,7 @@ class Journal:
 
         self.engine: str | None = None
         self.checkpoint: str | None = None  # the checkpoint the journal names
-        self.fenced = False
+        self.stopped: Stopped | None = None  # why this journal writes no more
         self._etag: str | None = None  # of this engine's last write
         self._events: list[bytes] = []  # encoded, every event since `checkpoint`: the journal's
         self._events_bytes = 0
@@ -175,7 +187,7 @@ class Journal:
             self._events_bytes = sum(len(e) for e in self._events)
             replayed = len(self._events)
             if not writer:
-                self.fenced = True  # read-only: every append fails
+                self.stopped = Stopped("opened read-only")
                 return OpenResult(engine=None, replayed=replayed, checkpoint=checkpoint)
             engine = secrets.token_hex(8)  # no two processes share one (§10)
             try:
@@ -216,8 +228,8 @@ class Journal:
         does not start the flush clock: it is written with whatever comes
         next, or by `durable()` (docs/lifecycle.md §13)."""
 
-        if self.fenced:
-            raise Fenced("this engine was replaced")
+        if self.stopped:
+            raise self._stop()
         for event in events:
             self._buffer.append(event)
             self._buffer_bytes += len(event)
@@ -239,8 +251,8 @@ class Journal:
         target = self.appended
         if self.written >= target:
             return
-        if self.fenced:
-            raise Fenced("this engine was replaced")
+        if self.stopped:
+            raise self._stop()
         if self._task is None:  # closed: nothing flushes in the background
             await self.flush()
             return
@@ -257,14 +269,19 @@ class Journal:
         byte for byte."""
 
         async with self._flushing:
-            if self._move is not None and not self.fenced:
+            if self._move is not None and not self.stopped:
                 await self._finish_move()  # pending since an error: before anything else
             while self._sealed is not None or self._buffer:
-                if self.fenced:
-                    self._fail(Fenced("this engine was replaced"))
+                if self.stopped:
+                    self._fail(self._stop())
                     return
                 if self._sealed is None:
-                    self._seal()
+                    try:
+                        self._seal()
+                    except Exception as error:  # the state cannot be encoded: no retry changes that
+                        stopped = Stopped(f"the state cannot be written ({error})")
+                        self._fail(stopped)
+                        raise stopped from error
                 body, events, count, snap = self._sealed
                 try:
                     self._etag = await swap(self.store, self._journal, body, self._etag)
@@ -287,17 +304,21 @@ class Journal:
                     await self._take_checkpoint(snap)
 
     def _seal(self) -> None:
+        """Seal what is buffered, and the state as of it if a checkpoint is
+        due. Everything is encoded before the buffer is taken: one that
+        fails leaves the buffer as it was."""
+
         new = self._buffer
-        self._buffer, self._buffer_bytes, self._first_buffered, self._urgent = [], 0, None, False
         events = self._events + new
-        body = self._body(self.engine, self.checkpoint, events)
-        # Sealed: memory now reflects exactly these events, so a snapshot taken
-        # here is the state as of this flush — before any later event is applied.
+        # Memory now reflects exactly these events, so a snapshot taken here is
+        # the state as of this flush — before any later event is applied.
         size = sum(len(e) for e in events)
         due = self._snapshot is not None and size >= max(
             self.min_checkpoint, self._last_checkpoint_size // 16
         )
         snap = _dumps({"at": self.clock(), "engine": self.engine, "state": self._snapshot()}) if due else None
+        body = self._body(self.engine, self.checkpoint, events)
+        self._buffer, self._buffer_bytes, self._first_buffered, self._urgent = [], 0, None, False
         self._sealed = (body, events, len(new), snap)
 
     async def _take_checkpoint(self, data: bytes) -> None:
@@ -340,7 +361,7 @@ class Journal:
         except Conflict:
             self._move = None
             self._fail(Fenced("another engine wrote the journal"))
-            return  # fenced: deletes nothing
+            return  # stopped: deletes nothing
         self._move = None
         self.checkpoint, self._events, self._events_bytes = name, [], 0
         self._last_checkpoint_size = size
@@ -348,8 +369,13 @@ class Journal:
             with contextlib.suppress(NotFoundError, FileNotFoundError):
                 await obstore.delete_async(self.store, listed[i : i + 1000])
 
-    def _fail(self, error: BaseException) -> None:
-        self.fenced = True
+    def _stop(self) -> Stopped:
+        """A fresh error for why this journal stopped, to raise."""
+
+        return type(self.stopped)(*self.stopped.args)
+
+    def _fail(self, error: Stopped) -> None:
+        self.stopped = error
         for _, waiter in self._waiters:
             if not waiter.done():
                 waiter.set_exception(error)
@@ -363,7 +389,7 @@ class Journal:
         failed write is retried after `flush_interval`."""
 
         loop = asyncio.get_running_loop()
-        while not self.fenced:
+        while not self.stopped:
             self._wake.clear()
             if self._sealed is None and self._move is None:
                 if self._first_buffered is None:
@@ -376,8 +402,8 @@ class Journal:
                     continue
             try:
                 await self.flush()
-            except Fenced:
-                log.error("journal fenced: another engine took over; stopping")
+            except Stopped as error:
+                log.critical("journal stopped: %s", error)
                 return
             except Exception as error:
                 log.error("journal flush failed, retrying: %s", error)
@@ -393,10 +419,10 @@ class Journal:
             except (asyncio.CancelledError, Exception):
                 pass
             self._task = None
-        if self.fenced or self.engine is None:
+        if self.stopped or self.engine is None:
             return
         await self.flush()
-        if checkpoint and self._snapshot is not None and self._events and not self.fenced:
+        if checkpoint and self._snapshot is not None and self._events and not self.stopped:
             async with self._flushing:
                 state = self._snapshot()
                 await self._take_checkpoint(
