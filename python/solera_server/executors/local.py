@@ -1,4 +1,4 @@
-"""Local placement (§10): the harness runs as a subprocess on the engine host.
+"""Local placement (§10): the worker runs as a subprocess on the engine host.
 
 Handles carry `{launch, pid, started_at, ticks, host}`. `launch` names this
 launch: only a handle this engine process launched finds its child in the

@@ -199,7 +199,7 @@ class EngineCache:
 
     def _local(self, path: str) -> str:
         """A local file's name: a fixed-length hash of its object's path, whatever
-        the path's length (a scope is domain data); the file names its source."""
+        the path's length (a partition is domain data); the file names its source."""
 
         return os.path.join(self.root, hashlib.sha256(path.encode()).hexdigest()[:32] + ".kxl")
 

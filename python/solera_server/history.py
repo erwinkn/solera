@@ -123,7 +123,7 @@ TABLES = {
             "duration": "DOUBLE",
             # seconds in each phase: from its first event to the next phase's
             "preparing": "DOUBLE",  # claimed: inputs pinned, the spec written
-            "provisioning": "DOUBLE",  # launched: a machine found, the harness started
+            "provisioning": "DOUBLE",  # launched: a machine found, the worker started
             "importing": "DOUBLE",  # booted: the project imported
             "loading": "DOUBLE",  # imported: the inputs loaded
             "computing": "DOUBLE",  # computing: the asset's function ran
@@ -176,7 +176,7 @@ TABLES = {
             "at": "DOUBLE",
             "input": "VARCHAR",
             "input_partition": "VARCHAR",
-            "input_generation": "BIGINT",  # what was pinned: the head, or the delivery's snapshot
+            "input_generation": "BIGINT",  # what was pinned: the head, or the pass's snapshot
             "param": "VARCHAR",
             # What a read of a store that reads the current rows saw (docs/stores.md,
             # "What a read sees"): the generation whose write it found. Null for a
@@ -486,7 +486,7 @@ def commit_row(
     """The row of an output version a commit installed: `head` is the head
     as installed, `keys` the commit's key delta for the output, `listed` a
     source commit's record, which lists the keys it changed; `complete`
-    whether the commit drained its partition's delivery."""
+    whether the commit drained its partition's pass."""
 
     listed = listed or {}
 
@@ -521,7 +521,7 @@ def _edge(row, nodes) -> dict:
 
     i, i_s, read, o, s, g, param, run, pinned, read_generation, committed, writer, writer_run, writer_at = row
     source = {"output": i, "partition": i_s, "generation": read}
-    if committed or writer is None:  # its materialization says who made it
+    if committed or writer is None:  # its commit says who made it
         made = nodes.get((i, i_s, read)) or {}
         source |= {"run": made.get("run"), "attempt": made.get("attempt"), "at": made.get("at")}
     else:

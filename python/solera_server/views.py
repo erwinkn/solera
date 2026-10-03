@@ -1,6 +1,6 @@
 """The console's read models (§8, §10): per-asset rollups, an `Each` asset's
-failure index and `explain`, every scope of every edge, and what holds
-scopes back. Reads only: they record nothing, and never scan a run's tasks.
+failed keys and `explain`, every partition of every edge, and what holds
+partitions back. Reads only: they record nothing, and never scan a run's tasks.
 A mixin of the engine, as `Attempts` and `Sensors` are."""
 
 from __future__ import annotations
@@ -17,21 +17,21 @@ from . import planning
 from .model import BAD_OUTCOME
 
 SCAN = 100  # a failure listing reads at most this many entries per key it returns
-PAGE = 1000  # entries read from a failure index at a time
+PAGE = 1000  # entries read from a failed keys at a time
 
 
 class Views:
     # -- partitions and assets (§7, §8) -------------------------------------------------
 
     async def partition_statuses(self, assets: list[str], *, every: bool = True) -> dict[str, list[dict]]:
-        """Each scope of each asset, by status: `complete` (its head is),
+        """Each partition of each asset, by status: `complete` (its head is),
         `running` (a task is pending), `failed` (its last outcome failed, was
         canceled or blocked), `missing`, or `retired` (no longer a current
         key). A job has no head: it is complete when its last outcome
-        succeeded. `every` lists every current scope, enumerated — refused
-        past `MAX_SCOPES`; else only the scopes with a record (a head, an
+        succeeded. `every` lists every current partition, enumerated — refused
+        past `MAX_SCOPES`; else only the partitions with a record (a head, an
         outcome or a pending task), the domain never enumerated. From heads,
-        scope outcomes and the pending index, one pass over each — never a
+        partition outcomes and the pending index, one pass over each — never a
         task scan."""
 
         heads: dict[str, dict] = {}
@@ -45,7 +45,7 @@ class Views:
         for asset in assets:
             outputs = self.manifest["assets"][asset]["outputs"]
             scoped: dict[str, dict] = {}
-            for output in outputs:  # a scope's head: its last declared output's, among those it has
+            for output in outputs:  # a partition's head: its last declared output's, among those it has
                 scoped.update(heads.get(output["name"]) or {})
             recorded = {s: r["last"] for s, r in self.m.partitions.of(asset).items() if "last" in r}
             pending = running.get(asset) or set()
@@ -83,13 +83,13 @@ class Views:
         return out
 
     async def asset_statuses(self) -> dict[str, dict]:
-        """One rollup per asset, for the console's graph and list: its scopes
+        """One rollup per asset, for the console's graph and list: its partitions
         by status — `total` counts the current ones, `removed` those past
         them — its newest outcome, an `Each` asset's failing keys by class
-        (null for any other), its held scopes, the scopes of its outputs a
-        dead writer left unsettled, and when an output last changed. Counted
-        from the dimensions and the scopes with a record, so a domain too big
-        to list still rolls up: `missing` is every current scope not
+        (null for any other), its held partitions, the partitions of its outputs a
+        dead writer left owing a repair, and when an output last changed. Counted
+        from the dimensions and the partitions with a record, so a domain too big
+        to list still rolls up: `missing` is every current partition not
         otherwise counted."""
 
         names = list(self.manifest["assets"])
@@ -161,8 +161,8 @@ class Views:
         }
 
     async def _failure_entries(self, asset: str, partitions: list[str], start: list | None):
-        """`(scope, key, record)` of an asset's failure index in scope and key
-        order, from just past `start` (`[scope, key]`)."""
+        """`(partition, key, record)` of an asset's failed keys in partition and key
+        order, from just past `start` (`[partition, key]`)."""
 
         for partition in partitions:
             if start is not None and partition < start[0]:
@@ -189,10 +189,10 @@ class Views:
         after: str | None = None,
         limit: int = 100,
     ) -> dict:
-        """An `Each` asset's failure index (§9): the record of every scope
-        with one, or of `scope`, and a page of its failing keys in scope and
+        """An `Each` asset's failed keys (§9): the record of every partition
+        with one, or of `partition`, and a page of its failing keys in partition and
         key order, of the classes in `outcomes` if any. `after` is the
-        previous page's `next`: `[scope, key]` as JSON. A page reads at most
+        previous page's `next`: `[partition, key]` as JSON. A page reads at most
         `SCAN` entries per key it may return, so a rare class can come back
         as a short page with a `next`."""
 
@@ -250,21 +250,21 @@ class Views:
     # -- edges (§6; per-key-processing.md §11) -----------------------------------------------
 
     def _input_partition(self, asset: str, param: str, input: dict, partition: str) -> dict:
-        """One scope of an Incremental edge: its watermark and how far it is
+        """One partition of an Incremental edge: its bookmark and how far it is
         behind the upstream head.
 
-        `watermark.next` is the first upstream batch the edge has not yet
-        delivered (`delivery`, a delivery under way, keeps its boundary and
-        position until its last page — see `delivery`). So `lag` = head
+        `bookmark.next` is the first upstream batch the edge has not yet
+        delivered (`pass`, a pass under way, keeps its boundary and
+        position until its last page — see `pass`). So `lag` = head
         batch + 1 − `next`: the upstream batches committed and not yet
         delivered in full — counted from the head's `base` for an unkeyed
-        upstream, which starts over there; every batch without a watermark.
+        upstream, which starts over there; every batch without a bookmark.
         A change of fingerprint (the asset's version, its run config, a
         pinned input) resets the edge at its next run: not shown here.
 
-        `state`: `never` (no watermark), `rescope` (a pattern transition,
-        per-key §11), `full` (a full delivery under way), `reconcile` (the
-        cleanup after a full Each delivery), `paging` (a delta delivered over
+        `state`: `never` (no bookmark), `pattern change` (a pattern change,
+        per-key §11), `full` (a full pass under way), `reconcile` (the
+        cleanup after a full Each pass), `paging` (a delta delivered over
         several attempts), `behind` (lag), else `caught_up`."""
 
         wm = self.m.bookmark(asset, param, partition)
@@ -300,7 +300,7 @@ class Views:
         else:
             state = "behind" if lag else "caught_up"
         view = None
-        if wm is not None:  # less the rescope's snapshot: an index state, too big to show
+        if wm is not None:  # less the pattern change's snapshot: an index state, too big to show
             view = dict(wm)
             if wm.get("pattern_change"):
                 view["pattern_change"] = {k: v for k, v in wm["pattern_change"].items() if k != "snapshot"}
@@ -315,8 +315,8 @@ class Views:
 
     async def asset_inputs(self, asset: str) -> dict:
         """Every input edge of an asset, deps included (kind `dep`); for an
-        Incremental or Each edge, each scope's watermark and lag — the
-        asset's current scopes and every scope with a watermark."""
+        Incremental or Each edge, each partition's bookmark and lag — the
+        asset's current partitions and every partition with a bookmark."""
 
         info = self.manifest["assets"][asset]
         inputs = [*info["inputs"].items(), *((d, {"kind": "dep", "output": d}) for d in info["deps"])]
@@ -375,7 +375,7 @@ class Views:
 
         - `not_matched`: no `include` pattern of the edge matches it;
         - `excluded`: an `exclude` pattern does (`patterns.excluded_by`);
-        - `failing`: the asset's failure index holds it (`failure`);
+        - `failing`: the asset's failed keys holds it (`failure`);
         - `removed`: the upstream no longer holds it, and it was processed
           once or an output still does (its removal may be undelivered);
         - `absent`: the upstream does not hold it, and nothing shows it did;
@@ -386,7 +386,7 @@ class Views:
         - `pending`: the upstream holds a write of it the edge has not
           delivered yet.
 
-        The patterns are those the edge delivers under — its watermark's,
+        The patterns are those the edge delivers under — its bookmark's,
         else the manifest's; `pending` the manifest's, when a transition to
         them has yet to run."""
 

@@ -18,7 +18,7 @@ write-safety rules — that `object-store-state.md` §8 and `architecture.md`
 D2–D4, and D1 as Erwin decided it after the review: heartbeats are evidence
 only, and every store is exact: `immutable` or `fenced` (round-2
 decision 2 dropped the `overwrite` kind, its grace and its holds).
-Observations are sensors (§11), which are not attempts at all.
+Ticks are sensors (§11), which are not attempts at all.
 
 It assumes what is built: fence segments kept for good and carrying a
 writer nonce, create-only writes that recognize their own bytes
@@ -29,7 +29,7 @@ worker's first report.
 
 Its companions: `resolved-commits.md` (the resolver on this channel, and
 the write phases of a keyed output), `per-key-processing.md` (pages,
-failure indexes, sensors' sources).
+failed keys, sensors' sources).
 
 **This doc is the authority for four records the others use:** the cancel
 record (§2.2), write-completion evidence (§2.3), the sensor snapshot
@@ -53,7 +53,7 @@ guarantee (§9).
 
 ```
 engine                                   object store                         worker
-  claim scope, choose generation, pin
+  claim partition, choose generation, pin
   PUT .spec  ──────────────────────────▶ runs/R/A.spec
   AttemptLaunched, durable
   placement.launch(A); AttemptPlaced ──────────────────────────────────────▶ boots, GET .spec
@@ -76,26 +76,26 @@ engine                                   object store                         wo
 ### 2.1 Attempt objects
 
 All under `runs/{run}/`, all named after the attempt. Only the claim's
-winner writes anything but the spec (§4), so no name needs the invocation
+winner writes anything but the spec (§4), so no name needs the worker
 token.
 
 | Object | Written by | Mode | Meaning |
 |---|---|---|---|
 | `{attempt}.spec` | engine, before `AttemptLaunched` | create-only, immutable | what to run: today's `spec`, plus `engine` (HTTPS URL), `token` (§5.2), `generation` (§9.7) |
-| `{attempt}.worker` | the invocation that claims it | created once; then overwritten only by its owner, only while HTTP fails (§6) | the claim `{"invocation", "host", "pid", "at"}`; later also `{"seq", "timeline", "usage"}` |
-| `{attempt}.writing` | worker before its first store write, or engine to abort or close | create-only | the gate: `writing` (with `invocation` and intents), `aborted` or `closed`; only for attempts with outputs on `fenced` stores (§9.6). Outlives its run (§2.4) |
+| `{attempt}.worker` | the worker that claims it | created once; then overwritten only by its owner, only while HTTP fails (§6) | the claim `{"worker", "host", "pid", "at"}`; later also `{"seq", "timeline", "usage"}` |
+| `{attempt}.writing` | worker before its first store write, or engine to abort or close | create-only | the gate: `writing` (with `worker_id` and intents), `aborted` or `closed`; only for attempts with outputs on `fenced` stores (§9.6). Outlives its run (§2.4) |
 | `{attempt}.log.{n:06d}` | worker | create-only, immutable | a gzip member of the log, flushed every 30 s or 1 MB; a short log has none (§13) |
 | `{attempt}.result` | worker | create-only, immutable, sealed bytes | the outcome; its existence means the worker is done |
 
 Gone: the two-write `{attempt}.json`, `.beat` and its done marker, the
 joined `.log`, chunk deletion, `AttemptClaimed`.
 
-**The result** carries today's result, plus the invocation, the timeline,
+**The result** carries today's result, plus the worker, the timeline,
 usage, the log index, and what is known of the attempt's writes:
 
 ```json
 {
-  "invocation": "k3v9q2",
+  "worker": "k3v9q2",
   "status": "succeeded",
   "writes": "complete",
   "outputs": {"orders": {"ref": {"…": "…"}, "keys": {"files": [{"name": "000000000012-01J9…"}], "added": 3, "removed": 0, "exact": true}}},
@@ -133,15 +133,15 @@ What the engine decided to stop, latched, and what the worker acts on:
   a drain result is no longer accepted). It only advances.
 - `reason`: `user` (an explicit cancel of the run), `timeout` (the
   attempt's timeout) or `provisioning` (no first report in time; no worker
-  is running, so there is nothing to drain). The failure index records
+  is running, so there is nothing to drain). The failed keys records
   interrupted keys by it (`per-key-processing.md` §5): `user` keys are
   dormant, `timeout` keys count a try and come due.
 - **Precedence**: `user` over `timeout` over `provisioning`. A user cancel
   arriving during a timeout's drain changes the reason; a timeout during a
   user cancel's drain changes nothing.
-- `since`: the event position at which the engine latched it, so a
+- `since`: the event counter at which the engine latched it, so a
   restarted engine's re-derived cancel (§12) can be told from the first.
-- **Delivery**: every beat answer carries the current record (or `null`);
+- **Pass**: every beat answer carries the current record (or `null`);
   the worker latches the strongest it has seen (§5.3).
 - **In the result**: the worker copies the record it sealed with into
   `.result`. That record decides how its failure delta treats interrupted
@@ -196,8 +196,8 @@ claim more.
 Example: `orders:alpha` writes a three-key `Patch` to PostgresStore, on
 ECS, engine up throughout.
 
-1. **Claim the scope** (memory) and pin inputs, as today. The claim's
-   event position becomes the attempt's **generation** (§9.7): chosen now,
+1. **Claim the partition** (memory) and pin inputs, as today. The claim's
+   event counter becomes the attempt's **generation** (§9.7): chosen now,
    before the spec.
 2. **Write the spec**: `PUT runs/R/A.spec` create-only.
 3. **Authorize**: record `AttemptLaunched`, await `durable()`. A replaced
@@ -205,14 +205,14 @@ ECS, engine up throughout.
    authorization every later step rests on.
 4. **Launch**: `placement.launch(stage)` with the provider's name for `A`
    (ECS `clientToken`, Kubernetes job name); record `AttemptPlaced`.
-5. **Claim**: the worker boots, reads the spec, generates an invocation
+5. **Claim**: the worker boots, reads the spec, generates an worker
    token (`k3v9q2`) and creates `A.worker`. If it finds another token
    there, it lost: §4.
-6. **Start**: `POST attempts/A/start`. The engine binds the invocation
+6. **Start**: `POST attempts/A/start`. The engine binds the worker
    (§5.3). The attempt now runs: its `timeout` starts (§8).
 7. **Compute**, beating every 10 s. Logs go live over HTTP and durably as
    chunks.
-8. **Acquire** (fenced stores): `Store.acquire(scope)` takes generation
+8. **Acquire** (fenced stores): `Store.acquire(context)` takes generation
    `g` for the output's write domain (§9.7) — after computing, before any
    repair read or mutation.
 9. **Plan** each keyed output (`resolved-commits.md` §3): repair reads
@@ -223,16 +223,16 @@ ECS, engine up throughout.
 11. **Write**: the store's transactions check generation `g` (§9.7).
 12. **Seal**: build the result once, `PUT A.result` create-only, retried
     with the same bytes; `POST attempts/A/finished` as a hint; exit.
-13. **Settle**: the engine reads `A.result`, checks its invocation against
+13. **Settle**: the engine reads `A.result`, checks its worker against
     the bound one, validates it, records `AttemptFinished` and makes it
     durable. One journal decision installs the output deltas, the failure
     index delta (`per-key-processing.md` §9), the cursor and the
-    watermarks together.
+    bookmarks together.
 
 A failed attempt follows the same path with `status: failed`. Canceling
 and timing out are §7.
 
-## 4. Invocations and duplicates
+## 4. Workers and duplicates
 
 A placement may run one attempt twice: Kubernetes may start a second pod
 for a Job even with `parallelism: 1`, and an engine restart can `resume`
@@ -244,10 +244,10 @@ claim decides:
   or uploading anything.
 - **An ambiguous create** (response lost) is resolved by reading the claim
   back: its own token is its own claim.
-- **The engine binds one invocation per attempt** (§5.3) and accepts
+- **The engine binds one worker per attempt** (§5.3) and accepts
   beats, resolves and results only from it.
 
-**A losing invocation must not end the attempt by exiting.** If it exited
+**A losing worker must not end the attempt by exiting.** If it exited
 at once with code 0, the engine would follow the handle it relaunched,
 see the exit, find no result, and fail the attempt while the owner is
 still computing; and a Kubernetes Job is complete as soon as one pod
@@ -261,10 +261,10 @@ succeeds. So:
   writes anything, not even a log.
 - **The engine treats a provider exit as the owner's only if the owner has
   also fallen silent.** On an exit without a result, the engine checks the
-  bound invocation's last report: one within three beat intervals means
-  the exit was another invocation's, so the engine keeps waiting on the
+  bound worker's last report: one within three beat intervals means
+  the exit was another worker's, so the engine keeps waiting on the
   owner's reports (and drops the handle, which named a duplicate). With no
-  invocation bound yet, it reads `.worker` first. (Built: only reports
+  worker bound yet, it reads `.worker` first. (Built: only reports
   received over the channel count here — a `.worker` read now may have been
   written before the exit — so a worker reporting only through `.worker`
   has its duplicate's exit taken for its own; its gate then stops it.)
@@ -279,14 +279,14 @@ All under `/api/projects/{p}/`, over HTTPS.
 
 | Route | Body → answer | From |
 |---|---|---|
-| `POST attempts/{a}/start` | `{invocation, host, pid}` → `{cancel}` · `409 {reason}` | the claim's winner, once |
-| `POST attempts/{a}/beat` | `{invocation, seq, events[], usage, progress?}` → `{cancel}` · `409` | worker, every 10 s |
-| `POST attempts/{a}/logs` | `{invocation, offset, lines[]}` → `{offset}` | worker, every 1 s while it logs |
+| `POST attempts/{a}/start` | `{worker, host, pid}` → `{cancel}` · `409 {reason}` | the claim's winner, once |
+| `POST attempts/{a}/beat` | `{worker, seq, events[], usage, progress?}` → `{cancel}` · `409` | worker, every 10 s |
+| `POST attempts/{a}/logs` | `{worker, offset, lines[]}` → `{offset}` | worker, every 1 s while it logs |
 | `POST attempts/{a}/resolve` | binary, versioned: `resolved-commits.md` §4 | worker, small keyed writes |
-| `POST attempts/{a}/finished` | `{invocation}` → `204` | worker, after `.result` |
+| `POST attempts/{a}/finished` | `{worker}` → `204` | worker, after `.result` |
 | `GET pools/{pool}/work?wait=30` | capacity → `[stage]` | pool workers (§10) |
-| `GET sensors/next?wait=30` | revision → `[{tick, sensor, cursor, snapshot}]` | sensor hosts (§11) |
-| `POST sensors/{s}/ticks/{t}` | the tick's outcome (§11.4); key maps in the resolver's framing → `{runs}` · `409` | sensor hosts |
+| `GET sensors/next?wait=30` | deploy → `[{tick, sensor, cursor, snapshot}]` | sensor workers (§11) |
+| `POST sensors/{s}/ticks/{t}` | the tick's outcome (§11.4); key maps in the resolver's framing → `{runs}` · `409` | sensor workers |
 
 `cancel` is `null` or the cancel record (§2.2). `events` are timeline
 events (`loaded`, `mark`, per-key outcomes); `progress` is free-form for
@@ -301,7 +301,7 @@ Gone: `POST /api/workers/register`, `/api/tasks/claim`,
 - **Bootstrap.** A placement hands the worker the stage — `attempt`, `run`,
   `objects` — as today. The worker reads the spec with the environment's
   own object-store credentials; the spec gives it the engine's URL and its
-  token. Pool workers get the stage from discovery (§10). Sensor hosts
+  token. Pool workers get the stage from discovery (§10). Sensor workers
   need no spec: a remote host is configured with its pool token, and the
   local host gets a token for the engine's own pool in its environment
   when the engine starts it (§11).
@@ -326,14 +326,14 @@ Gone: `POST /api/workers/register`, `/api/tasks/claim`,
 Every route is idempotent and safe to retry, and nothing the worker sends
 over HTTP is the only copy of a fact:
 
-1. **Binding.** The first `start` binds its invocation: only the claim's
+1. **Binding.** The first `start` binds its worker: only the claim's
    winner sends `start`, since a loser knows it lost (§4). A request from
    any other token makes the engine read `.worker` (one GET), and the
    claim's token wins; the other gets `409 not_owner`. The binding lives
    in memory; after a restart the engine rebuilds it from `.worker` on the
    first request, never from the request itself.
 2. **Sequence numbers.** Beats carry `seq`, logs carry the line `offset`
-   of their first line; the engine keeps the highest per invocation and
+   of their first line; the engine keeps the highest per worker and
    drops what it has seen. A retried log batch is not shown twice; a gap
    (a batch lost for good) is accepted, since the chunks hold every line.
 3. **Cancel is latched.** Once the engine has answered a cancel record
@@ -412,7 +412,7 @@ happens to the work left undone.
    - work that finished is written and published — for a per-key page, the
      finished keys' outputs plus the interrupted holes in its failure
      index — as one result with `status: canceled`, which the engine
-     commits as one journal decision (outputs, failure delta, watermark
+     commits as one journal decision (outputs, failure delta, bookmark
      past the whole page);
    - a plain asset that had not reached its writes publishes `canceled`
      with no outputs and `writes: none`; one that had taken the gate
@@ -483,14 +483,14 @@ check them are in `stores.md`.
 ### 9.1 The hazard
 
 An attempt W1 is believed finished (failed, timed out, canceled, lost),
-its scope is released, and W2 commits. Then a write of W1's lands.
+its partition is released, and W2 commits. Then a write of W1's lands.
 
 | Store | W1's late write | Damage |
 |---|---|---|
 | keyed, one object or row per key | key `k` as W1 wrote it | `k` regresses: the index says W2 wrote it, the store holds W1's rows |
 | keyed, W1 removes `k` | deletes W2's `k` | a key the index lists is missing |
 | a value | the whole value | regresses to W1's |
-| unkeyed incremental | batch `n`, which W2 also wrote (retries reuse batch numbers) | W2's batch replaced by W1's |
+| unkeyed incremental | commit `n`, which W2 also wrote (retries reuse commit numbers) | W2's commit replaced by W1's |
 
 Only a write landing after a newer commit does damage, and only on a
 store that writes in place — which is why such a store must be `fenced`.
@@ -499,7 +499,7 @@ How W1 can still write after the engine gave up on it: it lost contact but
 runs on; it paused (GC, VM migration); a request it issued is still in
 flight or queued at the backend (a `COMMIT` waiting on a lock); a store
 call raised on the client while the backend completed it (a timeout); a
-duplicate invocation (§4, §9.5); user code writing outside the store
+duplicate worker (§4, §9.5); user code writing outside the store
 contract.
 
 ### 9.2 What others do
@@ -544,7 +544,7 @@ Not a ladder of safety levels: each is a different contract.
 | Contract | What it guarantees | Chosen for |
 |---|---|---|
 | Detect and retry | at-least-once execution; late writes possible | **dropped**: a write in flight past any wait can still land after the next commit |
-| Hold on uncertainty | no late write can follow a release, at the price of scopes blocked until completion is established | **dropped** with it: an approximation of what a store can guarantee itself |
+| Hold on uncertainty | no late write can follow a release, at the price of partitions blocked until completion is established | **dropped** with it: an approximation of what a store can guarantee itself |
 | Self-fencing leases | risk reduction under timing and authority assumptions | **rejected**: the review showed it fails without exceeding its own margins (a superseded engine still granting renewals; a failed result bypassing the drain; renewals by `.worker` defeating cancel) |
 | Generation checked by the store | exact exclusion of older writers, when acquisition precedes reads | PostgresStore (§9.7); user stores declaring `fenced` |
 | Immutable outputs | stale writes are unreferenced garbage; pinned reads | FileStore, S3Store (§9.8); user stores declaring `immutable` |
@@ -552,10 +552,10 @@ Not a ladder of safety levels: each is a different contract.
 ### 9.4 The decision in one paragraph
 
 A store declares how it writes: `immutable` or `fenced`; registration
-refuses anything else, and a store that does not implement `discard` or
+refuses anything else, and a store that does not implement `cleanup` or
 `acquire`, respectively. FileStore and S3Store are `immutable`,
 PostgresStore is `fenced`, and a SQL store gets fencing in one line
-(`solera.fencing.fence`). Scopes are released as soon as the engine ends
+(`solera.fencing.fence`). Partitions are released as soon as the engine ends
 an attempt, whatever happened to its worker, and workers keep writing
 through an engine outage: a writer the engine gave up on can no longer
 change what a newer one committed.
@@ -577,11 +577,11 @@ silence.
 
 ```python
 class MyStore(Store):
-    writes = "immutable"   # writes only names nothing committed references; implements discard()
+    writes = "immutable"   # writes only names nothing committed references; implements cleanup()
     writes = "fenced"      # implements acquire() and keys(); every write checks the generation atomically
 ```
 
-| Kind | Gate and intents | Repair | Scope released when the engine ends the attempt | A read sees |
+| Kind | Gate and intents | Repair | Partition released when the engine ends the attempt | A read sees |
 |---|---|---|---|---|
 | `immutable` | none | none: abandoned writes are unreferenced | at once | the pinned generation, exactly |
 | `fenced` | gate with intents (repair, and the unknown-writes intent of `Sql`, below) | after `acquire`, by presence (`versions.md` §5) | at once: the next attempt's acquisition fences the old writer | current rows |
@@ -592,7 +592,7 @@ a key present takes the repairing attempt's generation, so it counts as
 changed; one absent and live in the index gets a tombstone; one absent
 and not live, nothing. A key the repairing attempt writes or removes
 itself ends as it says. The repair always runs its write transaction,
-even with no rows of its own, so the slice reads as written by the
+even with no rows of its own, so the partition reads as written by the
 repair, not by the dead writer no commit has (`versions.md` §5).
 
 ```
@@ -616,10 +616,10 @@ gate, the next attempt cannot repair by reading named keys — there are
 none. For example, the statement deletes `a` and inserts `b`, commits, and
 the worker dies before reporting its map; the next attempt patches `c`.
 So, after acquisition (§9.7), an unknown-writes intent is settled only by
-reading **every key the scope holds** (`keys(ref, None)`) and replacing
+reading **every key the partition holds** (`keys(ref, None)`) and replacing
 the index with them, the attempt's own patch laid over: every key the
 store holds is written at the new generation, and live keys it lacks are
-deleted. Consumers take everything again. A full replacement may instead rewrite the whole scope,
+deleted. Consumers take everything again. A full replacement may instead rewrite the whole partition,
 which settles it too. `resolved-commits.md` §3 carries the same branch for
 the resolver's write phases.
 
@@ -627,41 +627,41 @@ the resolver's write phases.
 `resolved-commits.md` §14.4). Intents name store writes a dead attempt may
 have half-done, so that the next attempt can read them back. A failure
 delta is a key-index file, engine metadata: it takes effect only through
-the commit that names it, and an uncommitted one is discarded with the
+the commit that names it, and an uncommitted one is cleaned up with the
 attempt like any delta file. There is nothing to repair.
 
 ### 9.7 PostgresStore: generation fencing
 
 Internal to the store; the engine supplies one number.
 
-- **The generation** is the event position (`applied`) of the attempt's
+- **The generation** is the event counter (`applied`) of the attempt's
   claim, carried on `AttemptLaunched` as `pin` today and written into the
   spec. It is chosen before the spec and needs no allocation. A
   generation reaches the database only once its `AttemptLaunched` is
   durable, and that event itself moves `applied` past it: every later
-  claim on the scope — by this engine, or a restarted one replaying the
+  claim on the partition — by this engine, or a restarted one replaying the
   event — gets a larger one. (A claim dropped before launch may share its
   number with the next claim; it never wrote.)
-- **The write domain** is the output's table and the scope's partition,
+- **The write domain** is the output's table and the partition,
   keyed by the table's OID, which survives `ALTER TABLE … RENAME`: an
   output renamed under an alias keeps its fence.
-- **Bound to the invocation.** One table per database:
+- **Bound to the worker.** One table per database:
 
   ```sql
-  CREATE TABLE solera_generations (relid oid, part text, generation bigint, invocation text,
+  CREATE TABLE solera_generations (relid oid, part text, generation bigint, worker text,
                                    PRIMARY KEY (relid, part));
   ```
 
-- **`Store.acquire(scope)`** runs after the producer computed and before
+- **`Store.acquire(context)`** runs after the producer computed and before
   any repair read or mutation (`resolved-commits.md` §3), in a transaction
   of its own:
 
   ```sql
   INSERT INTO solera_generations VALUES ($relid, $part, $g, $inv)
-  ON CONFLICT (relid, part) DO UPDATE SET generation = $g, invocation = $inv
+  ON CONFLICT (relid, part) DO UPDATE SET generation = $g, worker = $inv
     WHERE solera_generations.generation < $g
-       OR (solera_generations.generation = $g AND solera_generations.invocation = $inv)
-  RETURNING invocation;               -- no row: a newer generation, or another invocation of this one
+       OR (solera_generations.generation = $g AND solera_generations.worker = $inv)
+  RETURNING worker;               -- no row: a newer generation, or another worker of this one
   ```
 
   Postgres locks the conflicting row even when the `WHERE` refuses, so the
@@ -669,9 +669,9 @@ Internal to the store; the engine supplies one number.
   every later transaction of the older writer is refused. (Checked on
   Postgres 17.)
 - **Every write transaction** starts by locking the row and checking that
-  it still holds `(g, invocation)`; otherwise it raises before changing
+  it still holds `(g, worker)`; otherwise it raises before changing
   anything (a store exception after the gate: `uncertain`, §2.3).
-- **Equal generation, other invocation** is refused, so a duplicate of the
+- **Equal generation, other worker** is refused, so a duplicate of the
   newest attempt cannot write. An attempt the engine ended before it
   acquired is stopped by its retained gate (§2.4), not by the database,
   which never saw its generation.
@@ -689,13 +689,13 @@ Internal to the store; the engine supplies one number.
   domain shared (a transaction-level advisory lock); a migration takes it
   exclusively, so it waits for every open write transaction and holds off
   new ones, of partitions with a fence row or not. Before it changes
-  anything, it takes the attempt's own slice: an older attempt's migration
+  anything, it takes the attempt's own partition: an older attempt's migration
   is refused. One that **replaces the relation** (create, copy, drop,
   rename) gives the table a new OID; it moves the fence rows to the new OID
   in the same transaction, so the write domain keeps its generations. An
   operator's `solera migrate` has no generation: it only takes its turn.
-- **Only a migration may replace the relation, or touch another slice.**
-  A `Sql` write is a query the store materializes into its own slice,
+- **Only a migration may replace the relation, or touch another partition.**
+  A `Sql` write is a query the store materializes into its own partition,
   never a statement: one that would update, delete or replace anything is
   refused before it runs (architecture.md, "Writes").
 - **Cost**: one indexed upsert per acquisition and one row lock per write
@@ -707,23 +707,23 @@ Internal to the store; the engine supplies one number.
 attempt will ever write, so deleting one can never hit something current.
 
 **Names.** The physical name carries the attempt's **generation** (§9.7:
-the claim's event position, in the spec), which is also the key's version
+the claim's event counter, in the spec), which is also the key's version
 (`versions.md`):
 
 ```
 site_files/alpha/f-1/184467.json                 a key, as generation 184467 wrote it
 site_status/alpha@184467.json                    a value
-site_events/alpha/000000000042/184467.json       batch 42 of an append output, by generation 184467
+site_events/alpha/000000000042/184467.json       commit 42 of an append output, by generation 184467
 ```
 
 Writes are create-only. Two writers of one name are the same attempt (a
 delayed duplicate of itself), so they write the same bytes: an attempt
 writes a key at most once.
 
-**Why the generation, not the batch.** A retry reuses its predecessor's
-batch number: W1 (batch 57) dies having written `f-1/57`, and its retry
-W2, also batch 57, may write that very name and commit it. W1's leftovers
-could then be judged only once batch 57 is committed, and only by diffing
+**Why the generation, not the commit number.** A retry reuses its predecessor's
+commit number: W1 (commit 57) dies having written `f-1/57`, and its retry
+W2, also commit 57, may write that very name and commit it. W1's leftovers
+could then be judged only once commit 57 is committed, and only by diffing
 them against the committing delta. A generation is never reused, so an
 attempt that ends without committing leaves objects nobody else names:
 they can go at once. It costs the same one integer per index entry.
@@ -744,11 +744,11 @@ they can go at once. It costs the same one integer per index entry.
 
 **How loads find names.** A keyed load computes every name from `Keys` and
 needs no LIST. A full load of a keyed input becomes a `Keys` selection the
-harness pages from the pinned index (the spec pins the index of every
+worker pages from the pinned index (the spec pins the index of every
 keyed input, as it does for incremental ones); stores never read an index.
 A value's name is in its head's ref. An append output's range load lists
-the batches' prefix and keeps, per batch, the file with the highest
-generation: the attempts that used batch `n` all ran between the commits
+the commits' prefix and keeps, per commit number, the file with the highest
+generation: the attempts that used commit `n` all ran between the commits
 of `n − 1` and `n`, one at a time, and the one that committed `n` was the
 last of them.
 
@@ -762,48 +762,48 @@ chooses two triggers, and this section's collection follows them:
 - **At compaction, for the rest.** A key the filters counted live has no
   named predecessor, but its old entry is still in the index, shadowed.
   Every merge that drops an entry (shadowed, or under a bottom-level
-  tombstone) emits it as data garbage, named before or not: names are
-  never reused, so discarding one twice is a no-op.
+  tombstone) emits it as cleanup, named before or not: names are
+  never reused, so cleaning up one twice is a no-op.
 
 So the cold path keeps its cost, and collection is prompt wherever the old
 entry was read, deferred to compaction elsewhere.
 
 **Reader pins.** An object or index file may go only when no reader can
-still need it. The pins, all by event position (`object-store-state.md`
+still need it. The pins, all by event counter (`object-store-state.md`
 §6):
 
 - every live claim (as today);
 - **durable multi-attempt reads**, recorded with their pin in the
-  watermark state, so the pin holds in the gaps between attempts and
+  bookmark state, so the pin holds in the gaps between attempts and
   across engine restarts, until the read ends:
-  - a **paged delta window**: an `Incremental` edge delivering one pinned
+  - a **paged delta pass**: an `Incremental` input delivering one pinned
     window `from…to` over several attempts (`after` set). A later commit
     may supersede a key inside the window, and an attempt launched after
     that commit would not otherwise cover the version the window still
     delivers;
-  - a **rescope drain** and a **retry pass** (`per-key-processing.md`),
+  - a **pattern change drain** and a **retry pass** (`per-key-processing.md`),
     each reading one pinned snapshot across many attempts.
 
 **Collection.** Only from durable decisions; never from what a listing
 shows.
 
 - **Superseded versions, named at resolution.** A commit records one
-  data-garbage entry for its delta file at its event position. Once no
-  pin predates it, the engine calls `store.discard(output, scope, names)`
+  data-garbage entry for its delta file at its event counter. Once no
+  pin predates it, the engine calls `store.cleanup(context, prior, names)`
   with the delta's predecessors, in batches of 1,000; then the entry goes.
   A superseded value is one name from the previous head's ref.
 - **Entries dropped by compaction.** An `IndexCompacted` records, at its
-  event position, one data-garbage entry naming the dropped entries (in a
+  event counter, one data-garbage entry naming the dropped entries (in a
   sidecar file the compaction writes, not in the event); they are
-  discarded under the same pin rule. A name already discarded through a
-  predecessor is discarded again, harmlessly.
+  cleaned up under the same pin rule. A name already cleaned up through a
+  predecessor is cleaned up again, harmlessly.
 - **Attempts that ended without committing.** Their names carry their own
   generation, which no other attempt uses, and their `AttemptFinished`
-  without a commit is durable: the engine discards the names in their
-  uploaded delta file, their value and their batch file.
+  without a commit is durable: the engine cleanups the names in their
+  uploaded delta file, their value and their commit's file.
 - **The sweep**, occasional, for what a worker still running after its
   attempt ended (given up on, or a duplicate) wrote later. It lists a
-  scope and deletes a name only if its generation belongs to an attempt
+  partition and deletes a name only if its generation belongs to an attempt
   with a durable end and no commit (the history records each attempt's
   generation). A name with any other generation — committed, in flight,
   unknown — is never swept: "not current in the index" is not garbage (an
@@ -811,44 +811,44 @@ shows.
   a pinned reader needs superseded ones).
 
 **As built.** The engine holds no store credentials and runs no user
-code, so workers discard, twice over:
+code, so workers clean up, twice over:
 
 - **Right after a commit** (D8). The worker's `finished` waits until the
   engine settled the attempt and made its commit durable; the answer
-  names the entries now due in its scope — what the commit let go of that
+  names the entries now due in its partition — what the commit let go of that
   no reader pins, and what was waiting — with each output's head. The
-  worker calls `store.discard` with them and acknowledges by entry id
-  (`POST attempts/{a}/discarded`, recorded as `DiscardsDone`). So a
+  worker calls `store.cleanup` with them and acknowledges by entry id
+  (`POST attempts/{a}/cleaned up`, recorded as `CleanupsDone`). So a
   partition that never runs again keeps no garbage.
-- **By the scope's next attempt**, the fallback for whatever the first
+- **By the partition's next attempt**, the fallback for whatever the first
   missed: the engine unreachable, the worker gone before it
   acknowledged, a reader still pinned. The engine puts the due entries (at
   most 64) in the spec's output info, and the worker, after its own store
-  call succeeds, discards them and reports which in its result;
+  call succeeds, cleanups them and reports which in its result;
   `AttemptFinished` then removes them.
 
 Deleting a name twice is no harm, and only the index files an
 acknowledged entry names become garbage. Due means no reader pin that
-may read the entry's output scope predates it: pins are per output scope,
-each named by its index prefix. An attempt's claim names the scopes it
-reads and writes (every scope, while it is still preparing); a paged
-window or a rescope drain its upstream; a sensor tick its sources; an
+may read the entry's output partition predates it: pins are per output partition,
+each named by its index prefix. An attempt's claim names the partitions it
+reads and writes (every partition, while it is still preparing); a paged
+window or a pattern change drain its upstream; a sensor tick its sources; an
 engine reader what it reads (`history/` for a history query). Index and
 history files are collected by the same rule, by their paths, so one slow
 reader holds back only what it reads. A delta file
 a pending entry reads is kept, even once the index let go of it, until the
 entry is done — and while an attempt whose spec holds the entry runs, even
-if another acknowledged it meanwhile (the previous attempt's own discards
+if another acknowledged it meanwhile (the previous attempt's own cleanups
 after its commit can). An entry whose files cannot be read stays pending; after
 three such attempts it is `stuck`: no longer handed out, listed in
-`/api/diagnostics` and on its scope's head record, until an operator runs
-`solera scopes discards OUTPUT [SCOPE] --clear` (its objects stay). An
+`/api/diagnostics` and on its partition's head record, until an operator runs
+`solera cleanups OUTPUT [Partition] --clear` (its objects stay). An
 abandoned attempt's keyed names come from listing its own delta files
-(`{batch:012d}-{attempt}*` under the index prefix, complete because
+(`{commit_number:012d}-{attempt}*` under the index prefix, complete because
 deltas are uploaded before data), not from a sweep; those delta files and
 consumed compaction sidecars then go through the ordinary index garbage.
-A rescope drain's snapshot pin (`watermark.rescope.pin`) holds both
-index-file garbage and data discards, as a live claim does; a retry pass
+A pattern change drain's snapshot pin (`bookmark.pattern change.pin`) holds both
+index-file garbage and data cleanups, as a live claim does; a retry pass
 needs none, since each of its pages reads the state of its own prepare
 (`per-key-processing.md` §20). Not built: the sweep, so a worker that
 writes after its attempt ended leaves orphans.
@@ -874,7 +874,7 @@ reader pin). `solera data get OUTPUT KEY` resolves the current one.
 ```
 engine   AttemptLaunched (pool: ingest, needs: {cpu: 4}), durable — no placement call
 worker   GET pools/ingest/work?wait=30 (capacity: cpu 8)   → [{attempt: A, run: R, objects}]
-worker   create runs/R/A.worker {invocation}                 → wins, or loses and polls again
+worker   create runs/R/A.worker {worker}                 → wins, or loses and polls again
 worker   POST attempts/A/start                               → runs as any attempt
 ```
 
@@ -924,7 +924,7 @@ result is published, or once it cannot be: Local, ECS and Kubernetes
 workers as much as pool children. A thread the attempt gave up on — a
 synchronous `Each` call canceled mid-flight, say — would otherwise keep
 the process, and its placement, alive until it returned. (Modal runs the
-harness as a function in a container of its own: not this exit.)
+worker as a function in a container of its own: not this exit.)
 
 ## 11. Sensors
 
@@ -969,20 +969,20 @@ that source.
 
 ### 11.2 Where ticks run
 
-In a **sensor host**: a long-lived process with the project loaded, like
+In a **sensor worker**: a long-lived process with the project loaded, like
 Dagster's code server, so a tick costs a function call, not a process
 start and an import.
 
 - **Local (default).** When the project declares sensors, the engine
-  keeps one sensor host subprocess alive beside it, restarted with backoff
-  if it exits and replaced when a new revision is served.
+  keeps one sensor worker subprocess alive beside it, restarted with backoff
+  if it exits and replaced when a new deploy is served.
 - **Pool.** `solera_worker sensors --pool NAME` on any machine: the same
   host, remote, for sensors that need a network the engine cannot reach or
   that should not run beside it. `executor=` on the sensor picks.
 
 A host long-polls `GET sensors/next?wait=30` with its pool token and its
-project revision; the engine answers with due ticks for sensors on that
-executor and revision: `{tick, sensor, cursor, snapshot}` (§11.3). The
+deploy; the engine answers with due ticks for sensors on that
+executor and deploy: `{tick, sensor, cursor, snapshot}` (§11.3). The
 host runs the body (up to `concurrency` ticks at once, each within the
 sensor's `timeout`, 60 s by default) and posts the outcome to
 `POST sensors/{sensor}/ticks/{tick}`.
@@ -996,7 +996,7 @@ What a tick observed against, sent with it, per declared source:
 ```
 
 - **`head`** is an opaque, monotonic identity of the source's current
-  head: the event position at which that head was installed (by
+  head: the event counter at which that head was installed (by
   registration, an API commit or a sensor). Every source kind has one,
   including unkeyed sources whose version is a string: a tick that saw
   `v1` while an API client committed `v2` meanwhile carries a stale `head`
@@ -1042,7 +1042,7 @@ synchronous.
 6. **Prepare without publishing**: source commits through the commit
    API's preparation (an identical version or map is no change), then run
    requests through submission's, planned against the heads those
-   commits will install (a partition set's new elements), never touching
+   commits will install (a dynamic partitions's new elements), never touching
    the model. The sources' heads are checked again after.
 7. **Record everything at once**: the source commits, the run submissions
    (`command = {tick}/{n}`, so the run receipts deduplicate them too),
@@ -1062,7 +1062,7 @@ engine resolves it in-process against the snapshot's index, as it does for
 API commits. A bigger one is resolved by the host — the streaming
 merge-join over the snapshot's `index` — which uploads the delta file
 under a name that includes the tick, and posts a **delta reference**
-`{files, batch}`. Installed, it is the source's delta like any other. A
+`{files, commit_number}`. Installed, it is the source's delta like any other. A
 refused or dropped tick's file is **not deleted on the spot**: a retry of
 an accepted tick may name it (step 1 answers that one), so the decision
 queues it as garbage only if the source's index does not reference it,
@@ -1092,26 +1092,26 @@ replacement every five minutes.
 
 ### 11.6 What this removes
 
-Compared with the spec-less observation attempt of the previous draft:
+Compared with the spec-less tick attempt of the previous draft:
 
 - no launch path without a spec, and no attempt that is not journaled;
-- no per-launch bootstrap credential, no in-memory invocation claim per
-  observation, no observation result route;
+- no per-launch bootstrap credential, no in-memory worker claim per
+  tick, no tick result route;
 - no process start per check: a 300-second sensor on `Local` cost a
   subprocess and an import every tick;
 - no `skipped` runs, attempts and `kind: observe` retention class: checks
   that found nothing are tick rows, not runs;
-- no resolve route validated against an observation claim: small maps
+- no resolve route validated against an tick claim: small maps
   resolve in the engine, big ones on the host.
 
-What it adds: the sensor host (one long-lived process kind, which Pool
+What it adds: the sensor worker (one long-lived process kind, which Pool
 workers resemble), two routes, a cursor per sensor in the engine's state,
 and the `ticks` table.
 
 **Risks.** User code in a long-lived process can leak memory or state
 between ticks, and a body that hangs holds a host thread: hosts are
 restarted when ticks overrun or after `host_max_ticks` (10,000). A host
-on an old revision gets no ticks.
+on an old deploy gets no ticks.
 
 ### 11.7 As built
 
@@ -1213,12 +1213,12 @@ sources).
 |---|---|
 | `{attempt}.json`: spec, then overwritten with spec + result + log index | `.spec` and `.result`, both immutable |
 | `.beat` every 30 s with a fence GET, then a done beat | HTTP beat every 10 s; `.worker` only while HTTP fails; `.result` means done |
-| no invocation identity; duplicates overwrite each other (R3) | `.worker` claim; losers write nothing and wait for the owner |
+| no worker identity; duplicates overwrite each other (R3) | `.worker` claim; losers write nothing and wait for the owner |
 | log chunks joined at the end, chunks deleted | immutable chunks every 30 s / 1 MB, indexed from the result; live lines over HTTP |
 | Pool: register, claim, renew, complete; in-memory leases; `AttemptClaimed` | long-poll discovery; `.worker` claim; four states; claim expiry into a new attempt |
 | cancel read from the fence by every beat; engine aborts at once | two-phase cancel: requested and drained, then forced |
-| any presumed death releases the scope (R1) | every store is `immutable` or `fenced`: released at once, the older writer unable to write |
-| a failed result releases the scope | a failure after the gate is uncertain completion; an attempt without a result is classified from its gate (§2.3) |
+| any presumed death releases the partition (R1) | every store is `immutable` or `fenced`: released at once, the older writer unable to write |
+| a failed result releases the partition | a failure after the gate is uncertain completion; an attempt without a result is classified from its gate (§2.3) |
 | gates deleted with their run | gates retained `gate_days` beyond it as tombstones; an attempt that took none gets a `closed` one (§2.4) |
 | cancel and timeout indistinguishable to the worker | a latched cancel record with phase and reason, carried into the result (§2.2) |
 | repair before the store is fenced | `Store.acquire` before repair, for fenced stores |

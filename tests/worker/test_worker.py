@@ -58,7 +58,7 @@ project = Project(assets=[feed, consumer])
 
     task = [t for t in detail["tasks"] if t["asset"] == "consumer"][0]
     attempt = detail["attempts"][task["id"]][0]["id"]
-    # the harness wrote the batch's delta file into the output's key index
+    # the worker wrote the batch's delta file into the output's key index
     head = state.model.heads[("feed", "")]
     assert head["count"] == 2 and head["commit_number"] == 0
     index = state.model.indexes[("feed", "")]
@@ -116,7 +116,7 @@ project = Project(assets=[job])
 
 
 async def test_killed_harness_retries(state, tmp_path, monkeypatch):
-    """§10: a harness that dies leaves no result; the engine fails the attempt
+    """§10: a worker that dies leaves no result; the engine fails the attempt
     retryably and the retry commits."""
     flag = tmp_path / "slept.flag"
     monkeypatch.setenv("KILL_FLAG", str(flag))

@@ -357,7 +357,14 @@ whole. *Example:* `RunSubmitted`, `AttemptLaunched`, `AttemptFinished`
 
 **event counter**. How many events the engine has applied: its clock, the
 same in every engine that replays the journal. Generations and pins are
-values of it. *Was:* event position, `applied` (code), `seq` in places.
+values of it. *Was:* event position, `applied` (code). *Not:* the
+**segment number**.
+
+**segment number** `seq`. The number of a journal segment, the object
+one flush writes: `journal/{seq:020d}.json`, and a checkpoint is named
+by the last segment it covers. A segment holds many events, so it is no
+event counter. `seq` stays as its name in storage and in the journal's
+TLA+ spec. *Example:* segment 1042 is engine 1042's fence.
 
 **commit**. The atomic install of new heads, all in one event: an
 attempt's result (heads, key-index deltas, cursor, bookmarks, failed keys),
@@ -662,6 +669,12 @@ Each line: what goes, what replaces it, and why it does not earn a name.
   running somewhere, from writing.
 
 ## Rename plan
+
+*Applied* (phases 0-4, 2026-10-03), but for two rows: 2.16 (`Each` as
+an `Incremental` alias) gives way to model change 2, which makes `each`
+a flag for real; and 2.28's `KeyService.hold`/`release` stay, since
+`KeyService` already names its engine-cache pins `pin`/`unpin`. The
+journal's `seq` stays as the segment number's storage name.
 
 Order matters: phase 1 frees names that phase 2 reuses. Each row is one
 codemod: rename `from` to `to` in the listed places, word-bounded. "User"

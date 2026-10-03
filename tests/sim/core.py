@@ -11,7 +11,7 @@ Determinism comes from three rules:
   synchronously (obstore's blocking calls against a real `file://` store)
   and work handed to a thread runs to completion while the loop waits, so
   the loop's FIFO order is the only order there is.
-- **Randomness is seeded.** ULIDs, invocation tokens and writer nonces come
+- **Randomness is seeded.** ULIDs, worker id and writer nonces come
   from the example's RNG; faults and delays from the fault plan's.
 
 A request the engine or a worker makes can fail before it reaches the store
@@ -48,7 +48,7 @@ class Killed(BaseException):
     SIGKILL."""
 
 
-# Who is acting: ("engine", n) or ("worker", attempt, invocation n), or None
+# Who is acting: ("engine", n) or ("worker", attempt, worker n), or None
 # for the simulation itself. Tasks inherit it from whoever created them.
 actor: contextvars.ContextVar[tuple | None] = contextvars.ContextVar("sim_actor", default=None)
 

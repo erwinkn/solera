@@ -1,7 +1,7 @@
-"""Delivery progress (§5, §6; per-key §11): where an Incremental edge is in
+"""Pass progress (§5, §6; per-key §11): where an Incremental edge is in
 delivering its upstream, and the one transition a delivered page makes.
 
-Each (asset, edge, scope) keeps a **watermark**:
+Each (asset, edge, partition) keeps a **bookmark**:
 
     {
       "kind": "keys" | "batches",   # a keyed upstream, read by key; or batch by batch
@@ -9,17 +9,17 @@ Each (asset, edge, scope) keeps a **watermark**:
       "fingerprint",                # the interpretation it was delivered under (§6)
       "reset_by": run id,           # the run whose reset began the current pass
       "next": int,                  # the first upstream batch not yet delivered
-      "pass": {                 # a delivery under way, paged over attempts
+      "pass": {                 # a pass under way, paged over attempts
         "mode": "full" | "delta" | "diff",
         "from": int, "to": int,     # its boundary, decided when it starts
         "at": key | batch | None,   # its position: the last key delivered, the next batch
         "page": int, "pages": int,  # where the next page sits in its plan
-        "pin": int,                 # a delta window's reader pin (lifecycle.md §9.8)
-        "reconcile": bool,          # a full Each delivery owes a reconcile after (§11)
+        "pin": int,                 # a delta pass's reader pin (lifecycle.md §9.8)
+        "reconcile": bool,          # a full Each pass owes a reconcile after (§11)
       },
       "patterns": ...,              # keys: the patterns it delivers under (per-key §11)
-      "rescope": {"old", "new", "at", "snapshot", "pin"},  # a pattern transition
-      "reconcile": {"after": key},  # an Each output's cleanup after a full delivery
+      "pattern change": {"old", "new", "at", "snapshot", "pin"},  # a pattern change
+      "reconcile": {"after": key},  # an Each output's cleanup after a full pass
     }
 
 The modes:
@@ -27,17 +27,17 @@ The modes:
 - `full`: everything — a keyed upstream's whole index, which resumes as
   deltas from `from` (the head's next batch when it started); a batch
   upstream's batches from its reset's `base` to `to`.
-- `delta`: the batches `from`..`to` past the last delivery.
-- `diff`: a pattern transition's membership diff over the index as of its
-  cutover (keys).
+- `delta`: the batches `from`..`to` past the last pass.
+- `diff`: a pattern change's membership diff over the index as of its
+  pattern change (keys).
 
-A delivery's mode, boundary and page plan are decided when it starts and
+A pass's mode, boundary and page plan are decided when it starts and
 kept until its last page; `next` then moves past it. An attempt is given a
-**plan** — `kind`, the `watermark` it carries forward, and the `delivery`
+**plan** — `kind`, the `bookmark` it carries forward, and the `pass`
 its page is on (`hi`, for batches: the page's last batch); a `held` plan,
-a page that moves no watermark of its own (an Each retry or reconcile
+a page that moves no bookmark of its own (an Each retry or reconcile
 page); or a `selection`, a run's `keys=` selection, which reads the keys it
-names and moves neither the watermark nor the scope's progress, whatever
+names and moves neither the bookmark nor the partition's progress, whatever
 they are.
 """
 
@@ -45,8 +45,8 @@ from __future__ import annotations
 
 
 def advance(plan: dict, after: str | None = None) -> dict | None:
-    """The watermark after a page of `plan` was delivered — `after`, a key
-    page's last key (`None`: the delivery is done) — or `None` if it moves
+    """The bookmark after a page of `plan` was delivered — `after`, a key
+    page's last key (`None`: the pass is done) — or `None` if it moves
     none."""
 
     if plan["kind"] == "selection":
@@ -61,11 +61,11 @@ def advance(plan: dict, after: str | None = None) -> dict | None:
             wm.pop("pass", None)
             wm["next"] = max(int(d["at"]), d["to"] + 1)
         return wm
-    if after is not None:  # the delivery continues from the next key
+    if after is not None:  # the pass continues from the next key
         wm["pass"] = {**d, "at": after, "page": d["page"] + 1}
         return wm
     wm.pop("pass", None)
-    if d["mode"] == "diff":  # the transition is done: the new patterns from the cutover on
+    if d["mode"] == "diff":  # the transition is done: the new patterns from the pattern change on
         pattern_change = wm.pop("pattern_change")
         wm.pop("patterns", None)
         if pattern_change["new"] is not None:
@@ -73,7 +73,7 @@ def advance(plan: dict, after: str | None = None) -> dict | None:
     elif d["mode"] == "full":
         wm["next"] = d["from"]
         if d.get("reconcile"):
-            # An Each output may hold keys the delivery no longer names — gone
+            # An Each output may hold keys the pass no longer names — gone
             # upstream, or left out by the patterns: reconcile them next (§11).
             wm["reconcile"] = {"after": None}
     else:
@@ -82,16 +82,16 @@ def advance(plan: dict, after: str | None = None) -> dict | None:
 
 
 def continues(plan: dict, after: str | None, wm: dict | None) -> bool:
-    """Whether the task has more to deliver after this page: a delivery not
-    done, a pattern transition's diff still owed, a cleanup begun — or a
-    delivery done behind the upstream `head` the page was planned against.
-    A delivery's boundary is fixed when it starts, so one resumed after the
-    upstream moved (a full delivery interrupted, then a change it was fired
+    """Whether the task has more to deliver after this page: a pass not
+    done, a pattern change's diff still owed, a cleanup begun — or a
+    pass done behind the upstream `head` the page was planned against.
+    A pass's boundary is fixed when it starts, so one resumed after the
+    upstream moved (a full pass interrupted, then a change it was fired
     for) ends short of that change: the task goes on to it, as a delta."""
 
     if plan["kind"] in ("held", "selection"):
         return False
-    # Behind: known only once the page's watermark is (`wm`, after `advance`).
+    # Behind: known only once the page's bookmark is (`wm`, after `advance`).
     behind = wm is not None and "pass" not in wm and int(wm["next"]) <= int(plan.get("head", -1))
     wm = wm or {}
     if plan["kind"] == "commits":
@@ -101,14 +101,14 @@ def continues(plan: dict, after: str | None, wm: dict | None) -> bool:
 
 def selects(plans: dict) -> bool:
     """Whether an attempt reads a `keys=` selection: it then leaves the
-    scope's progress as it was."""
+    partition's progress as it was."""
 
     return any(p and p["kind"] == "selection" for p in plans.values())
 
 
 def outstanding(wm: dict) -> bool:
-    """Whether an edge still owes its scope delivery: one under way, a
-    pattern transition's diff, an Each cleanup."""
+    """Whether an edge still owes its partition pass: one under way, a
+    pattern change's diff, an Each cleanup."""
 
     return "pass" in wm or "pattern_change" in wm or "reconcile" in wm
 
@@ -121,8 +121,8 @@ def needs(wm: dict) -> int:
 
 
 def pins(wm: dict) -> list[int]:
-    """The reader pins an edge holds: a delta window paged over attempts
-    reads versions as of its first page; a pattern transition, its cutover's
+    """The reader pins an edge holds: a delta pass paged over attempts
+    reads versions as of its first page; a pattern change, its pattern change's
     index (lifecycle.md §9.8)."""
 
     out = []
@@ -134,7 +134,7 @@ def pins(wm: dict) -> list[int]:
 
 
 def reads(plans: dict) -> list[tuple]:
-    """The delta logs an attempt's plans read: `(output, scope, first batch)`
+    """The delta logs an attempt's plans read: `(output, partition, first batch)`
     — kept until its claim goes (§6)."""
 
     return [

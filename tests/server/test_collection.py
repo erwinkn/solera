@@ -1,6 +1,6 @@
 """Collection of immutable stores' data (docs/lifecycle.md §9.8): what a
-commit, a compaction or an abandoned attempt let go of is discarded by the
-scope's next attempt, once no reader can still need it."""
+commit, a compaction or an abandoned attempt let go of is cleaned up by the
+partition's next attempt, once no reader can still need it."""
 
 import asyncio
 import random
@@ -21,7 +21,7 @@ def engine_for(state, project, **kw):
 
 
 async def run(engine, targets):
-    """A run settled, and its workers done: their discards after the commit too."""
+    """A run settled, and its workers done: their cleanups after the commit too."""
 
     detail = await engine.run_until((await engine.submit(targets))["id"], 20)
     assert detail["request"]["status"] == "succeeded", [t.get("error") for t in detail["tasks"]]
@@ -76,7 +76,7 @@ async def test_superseded_versions_go_right_after_the_commit(tmp_path, data):
 async def test_an_abandoned_attempts_objects_go(tmp_path, data, monkeypatch):
     """An attempt dies after its first object landed: everything it wrote
     carries its generation, and its delta file names it all. The retry, the
-    scope's next attempt, discards it and its delta file."""
+    partition's next attempt, cleanups it and its delta file."""
 
     values = [{"a": 1, "b": 1}, {"a": 2, "c": 1}, {"a": 2, "c": 1}, {"a": 2, "c": 1}]
 
@@ -152,14 +152,14 @@ async def test_compaction_garbage_is_collected(tmp_path, data):
     sidecars = [
         p for p in await state.list_objects(state.model.indexes[("items", "")].prefix) if p.endswith(".kg")
     ]
-    assert sidecars == []  # each went once its entries were discarded
+    assert sidecars == []  # each went once its entries were cleaned up
     await engine.stop()
     await state.close()
 
 
 async def test_a_reader_pin_holds_collection_back(tmp_path):
-    """Data garbage is due only once every reader pin has passed it: the
-    claims of attempts in flight, and a delta window paged over attempts."""
+    """Cleanup is due only once every reader pin has passed it: the
+    claims of attempts in flight, and a delta pass paged over attempts."""
 
     @asset(outputs=Output("scores", keyed=True))
     def scores():
@@ -225,7 +225,7 @@ async def test_a_delta_a_pending_discard_reads_outlives_its_index(tmp_path, data
 async def test_an_entry_whose_names_cannot_be_read_gets_stuck_and_is_shown(tmp_path):
     """After three attempts that could not read an entry's names, it is
     stuck: no longer handed out, so it takes no attempt's slot; shown in
-    diagnostics and on the scope's head, until an operator clears it."""
+    diagnostics and on the partition's head, until an operator clears it."""
 
     import httpx
     from solera_server.api import create_app
@@ -268,7 +268,7 @@ async def test_an_entry_whose_names_cannot_be_read_gets_stuck_and_is_shown(tmp_p
 
 async def test_entries_of_one_event_are_acknowledged_one_by_one(tmp_path):
     """Astra review 2, P2-5: one commit lets go of several entries at one
-    event position, and the delivery limit can split them. Acknowledging
+    event counter, and the pass limit can split them. Acknowledging
     the delivered ones leaves the others queued; and a resolved sibling's
     acknowledgment does not erase an unresolved one's miss."""
 
@@ -321,7 +321,7 @@ def scores_project():
 async def test_without_the_channel_the_next_attempt_discards(tmp_path, data, monkeypatch):
     """D8's fallbacks: the engine unreachable when the worker says it
     finished, or the worker gone before it acknowledges, leave the entries
-    queued; the scope's next attempt discards them (a second delete of the
+    queued; the partition's next attempt cleanups them (a second delete of the
     same names is no harm)."""
 
     from solera_worker.channel import LocalChannel
@@ -338,7 +338,7 @@ async def test_without_the_channel_the_next_attempt_discards(tmp_path, data, mon
         raise OSError("connection reset")  # its answer is lost
 
     monkeypatch.setattr(LocalChannel, "finished", unreachable)
-    await run(engine, ["scores"])  # supersedes `a`, cannot discard
+    await run(engine, ["scores"])  # supersedes `a`, cannot clean up
     assert objects(data, "scores") != await named(state, "scores") and state.model.cleanups
     monkeypatch.setattr(LocalChannel, "finished", finished)
 
@@ -346,7 +346,7 @@ async def test_without_the_channel_the_next_attempt_discards(tmp_path, data, mon
         raise OSError("the worker died before it acknowledged")
 
     monkeypatch.setattr(LocalChannel, "cleaned_up", gone)
-    await run(engine, ["scores"])  # supersedes `a` again: discards it, cannot acknowledge
+    await run(engine, ["scores"])  # supersedes `a` again: cleanups it, cannot acknowledge
     assert objects(data, "scores") == await named(state, "scores") and state.model.cleanups
     monkeypatch.undo()
     await run(engine, ["scores"])  # deletes them again, harmlessly, and acknowledges
@@ -357,7 +357,7 @@ async def test_without_the_channel_the_next_attempt_discards(tmp_path, data, mon
 
 async def test_a_reader_pin_at_commit_keeps_the_garbage_queued(tmp_path, data):
     """D8: a reader still pinned before the commit may read what it let go
-    of: nothing is discarded after the commit; the entry stays queued."""
+    of: nothing is cleaned up after the commit; the entry stays queued."""
 
     project = scores_project()
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
@@ -375,8 +375,8 @@ async def test_a_reader_pin_at_commit_keeps_the_garbage_queued(tmp_path, data):
 
 
 async def test_a_run_is_settled_before_its_worker_has_cleaned_up(tmp_path, data, monkeypatch):
-    """Review round 3, S2: the worker discards after its commit, so a run
-    reads settled while its discards are still under way; tests wait for
+    """Review round 3, S2: the worker cleanups after its commit, so a run
+    reads settled while its cleanups are still under way; tests wait for
     the worker, never for a while."""
 
     cleanup, go = FileStore.cleanup, asyncio.Event()
@@ -396,14 +396,14 @@ async def test_a_run_is_settled_before_its_worker_has_cleaned_up(tmp_path, data,
     go.clear()
     settled = await engine.run_until((await engine.submit(["scores"]))["id"], 20)
     assert settled["request"]["status"] == "succeeded"
-    assert objects(data, "scores") != await named(state, "scores")  # the worker is still discarding
+    assert objects(data, "scores") != await named(state, "scores")  # the worker is still cleaning up
     go.set()
     await worker_finished()
     assert objects(data, "scores") == await named(state, "scores")
 
 
 async def test_a_slow_reader_holds_back_only_what_it_reads(tmp_path):
-    """Review round 2, system #6 and engine #8: pins are per output scope.
+    """Review round 2, system #6 and engine #8: pins are per output partition.
     An attempt reading `scores` holds back `scores`' garbage only, not
     another output's nor the history's; a claim still preparing holds
     back everything; a history query holds back only history files."""
@@ -440,7 +440,7 @@ async def test_a_slow_reader_holds_back_only_what_it_reads(tmp_path):
 
 async def test_collection_reduces_the_pins_once_per_pass(tmp_path, monkeypatch):
     """Review round 4, engine #6: a pass costs garbage + pins, not garbage ×
-    pins. 40 output scopes, each with a garbage file and a reader; the even
+    pins. 40 output partitions, each with a garbage file and a reader; the even
     ones' readers pinned before their file was let go of. The pins are
     walked once, and each odd file goes."""
 

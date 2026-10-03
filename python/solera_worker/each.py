@@ -2,7 +2,7 @@
 (docs/per-key-processing.md §5, §9).
 
 A page is either the changes of the edge's window (`changes`) or the
-failure index's keys that are due again (`retry`). Each key is one call,
+failed keys's keys that are due again (`retry`). Each key is one call,
 `concurrency` at a time; its outcome is classified (`solera.errors`), the
 outputs of the keys that succeeded become one `Patch({key: value})` per
 output, and every key's outcome moves its failure record (`solera.failed_keys`)
@@ -53,7 +53,7 @@ class Window:
     """An Incremental page of a keyed upstream, its keys filtered by the
     edge's patterns: `read` says how many keys the page held before, and
     `unmatched` that its deletions are keys that stopped matching (a
-    rescope's diff) rather than keys gone upstream."""
+    pattern change's diff) rather than keys gone upstream."""
 
     upserted: dict[str, int]  # key -> generation
     deleted: tuple
@@ -68,7 +68,7 @@ async def _fill(chunk, start: bytes | None, limit: int, kind) -> tuple[list, str
     entries as `(key, generation, deleted)` in key order past `after`,
     and where to go on (None: exhausted). Past a full page it looks on for
     one more entry it takes, so that a page is `final` exactly when nothing
-    follows and no delivery ends on an empty page (§5).
+    follows and no pass ends on an empty page (§5).
 
     Entries are read a page's worth and one more at a time — never just what
     the page still lacks, so a sparse pattern costs scans in proportion to
@@ -98,10 +98,10 @@ async def _fill(chunk, start: bytes | None, limit: int, kind) -> tuple[list, str
 
 async def read_window(pin: dict, keys_io) -> Window:
     """An Incremental page of a keyed upstream, as the spec pins it: the
-    keys= override, a full delivery's page, a window of pending deltas — all
+    keys= override, a full pass's page, a window of pending deltas — all
     filtered by the edge's patterns (per-key §11), read ahead past keys they
-    leave out until the page holds `page_size` keys or the delivery runs
-    out — or a rescope's diff of the index as of its cutover: the keys whose
+    leave out until the page holds `batch_size` keys or the pass runs
+    out — or a pattern change's diff of the index as of its pattern change: the keys whose
     membership changed. A pure function of the pin: it reads the index
     through `KeyIndex.page`, `pending` and `lookup` only, so the engine can
     run it on its own copies to serve the same page."""
@@ -163,7 +163,7 @@ async def read_page(spec: dict, pin: dict, keys_io) -> Page:
             unmatched=list(window.deleted) if window.unmatched else [],
             priors={key_str(k): Record.decode(p) for k, (_, p) in priors.items()},
         )
-    # A retry page: walk the failure index from the pass's position, taking the
+    # A retry page: walk the failed keys from the pass's position, taking the
     # keys that are due, `limit` at most (§9).
     limit = int(pin["batch"]["limit"])
     after = pin["batch"]["retry"].get("after")
@@ -200,7 +200,7 @@ async def read_page(spec: dict, pin: dict, keys_io) -> Page:
             deleted.append(key)  # gone upstream: its outputs and its record go
         elif entry[0] == walked[key].upstream:
             upserted[key] = entry[0]
-        # else: its upstream was written since — the change window brings it, at its new generation
+        # else: its upstream was written since — the delta pass brings it, at its new generation
     return Page(
         "retry",
         upserted,
@@ -213,8 +213,8 @@ async def read_page(spec: dict, pin: dict, keys_io) -> Page:
 
 
 async def _reconcile_page(spec: dict, pin: dict, keys_io, failures: KeyIndex) -> Page:
-    """After a full delivery: the next `limit` keys the asset's outputs or its
-    failure index hold, and which of them the edge no longer has — gone
+    """After a full pass: the next `limit` keys the asset's outputs or its
+    failed keys hold, and which of them the edge no longer has — gone
     upstream, or left out by its patterns. Those go (§11); the rest stay."""
 
     limit = int(pin["batch"]["limit"])
@@ -384,7 +384,7 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
     if abort:
         return {"abort": abort[0]}
     for key, generation in page.upserted.items():
-        # Every key of the page has an outcome before its watermark moves past it.
+        # Every key of the page has an outcome before its bookmark moves past it.
         outcomes.setdefault(key, Outcome(INTERRUPTED, generation))
     for key in page.deleted:
         outcomes[key] = Outcome(REMOVED)
@@ -450,7 +450,7 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
 
 async def _failures(spec, each: dict, page: Page, outcomes: dict, keys_io) -> dict:
     """Move each touched key's record (§9's transition table), write the
-    failure index's delta, and report the outcome counts' transitions and
+    failed keys's delta, and report the outcome counts' transitions and
     the bounds the commit lowers or accumulates."""
 
     deploy, forced = int(each["deploy"]), int(each.get("forced_pos") or 0)

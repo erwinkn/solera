@@ -1,4 +1,4 @@
-"""Object-store writes the harness and the engine both decide by.
+"""Object-store writes the worker and the engine both decide by.
 
 A create-only PUT decides who owns a name. Its outcome can be ambiguous:
 the object lands but the response is lost, and the retry — obstore's or

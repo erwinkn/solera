@@ -1,7 +1,7 @@
 """The simulated deployment: engines that start, crash, restart and take
-over from each other; workers that run the real harness in process and
+over from each other; workers that run the real worker in process and
 can die, pause or run twice at any step of an attempt's lifecycle; a
-sensor host; and the clients that call the API — all on one `SimLoop`.
+sensor worker; and the clients that call the API — all on one `SimLoop`.
 
 Every actor runs in a context naming it (`core.actor`), so the object
 store knows who asks, the world can kill an actor's every task at once,
@@ -42,7 +42,7 @@ POINTS = ("claim", "start", "delta", "gate", "store", "result", "finished")
 class Fate:
     """What befalls the next worker launched: `die` or `pause` (for
     `seconds`) `before` or `after` its first request at `point`; `mute`
-    (its channel never reaches the engine); `twice` (a second invocation
+    (its channel never reaches the engine); `twice` (a second worker
     starts `seconds` later)."""
 
     kind: str
@@ -255,7 +255,7 @@ def sim_key_service_class():
 
 
 class SimPlacement:
-    """`Local`, in process: each launch starts the real harness as a task
+    """`Local`, in process: each launch starts the real worker as a task
     of its own actor; handles survive engines, as a process outlives the
     engine that started it."""
 

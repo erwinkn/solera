@@ -117,7 +117,7 @@ METHODS = {
 
 def method_note(served: dict | None, reported: dict | None) -> str | None:
     """Why two revisions differ when it is the method, not the code: the
-    engine serves a revision computed one way and a worker or sensor host
+    engine serves a revision computed one way and a worker or sensor worker
     computed its own another way — a build with `.git` against an image
     without it — so they never agree. `None` when the methods match."""
 

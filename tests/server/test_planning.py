@@ -1,5 +1,5 @@
 """Planning (engine review thr_e77mqir977 #2, #4, #5; system review
-thr_t6wbrkikak #3, #4; review round 3): which scopes a request or a change
+thr_t6wbrkikak #3, #4; review round 3): which partitions a request or a change
 selects, what each reads, and the order a run's tasks take."""
 
 import asyncio
@@ -67,7 +67,7 @@ def test_one_explicit_scope_never_enumerates_the_domain():
         select_partitions(
             dims, ["a=a7,b=b9", "a=nope,b=b9"], now=now, partitions=lambda o: None, missing=lambda s: True
         )
-    assert time.perf_counter() - start < 1.0  # 1,000,000 possible scopes, none listed
+    assert time.perf_counter() - start < 1.0  # 1,000,000 possible partitions, none listed
     assert len(pick) == 1
     with pytest.raises(ValueError, match=f"more than {MAX_PARTITIONS}"):
         select_partitions(dims, "all", now=now, partitions=lambda o: None, missing=lambda s: True)
@@ -102,7 +102,7 @@ def test_membership_and_size_agree_with_the_enumeration():
 
 
 async def test_a_fan_in_reads_the_heads_that_exist(state):  # noqa: F811
-    """Engine review round 2 #7: an AllPartitions read over a million-scope
+    """Engine review round 2 #7: an AllPartitions read over a million-partition
     domain pins the heads that exist and agree with the consumer's shared keys
     — it never lists the domain. Building upstream does, and is refused."""
     seen = {}
@@ -169,7 +169,7 @@ def test_the_planner_takes_its_view_as_arguments():
 def test_an_empty_fan_in_is_missing():
     """A fan-in — `AllPartitions`, or a dep across a dimension the consumer
     lacks — with no upstream head at all counts as missing: under
-    `skip_missing_inputs` its scope waits for the first one. Otherwise it
+    `skip_missing_inputs` its partition waits for the first one. Otherwise it
     runs over nothing, as before."""
     day, site = StaticPartitions(["d1", "d2"]), StaticPartitions(["east", "west"])
 
@@ -209,7 +209,7 @@ def test_an_empty_fan_in_is_missing():
         assert planned(target) == ["d1", "d2"]  # unchanged without the flag
         assert planned(target, skip_missing_inputs=True, upstream=True) == ["d1", "d2"]  # the run builds them
     heads[("readings", "day=d1,site=west")] = {"asset": "readings"}
-    drained[("readings", "day=d1,site=west")] = False  # a delivery under way
+    drained[("readings", "day=d1,site=west")] = False  # a pass under way
     assert planned("report", skip_missing_inputs=True) == ["d1"]  # one head of its day is enough
     assert planned("rollup", skip_missing_inputs=True) is None  # AllPartitions reads complete heads
     drained[("readings", "day=d1,site=west")] = True
@@ -254,8 +254,8 @@ async def test_a_fan_in_reads_only_current_partitions(state):  # noqa: F811
 def test_latest_and_changes_are_counted_before_they_are_listed():
     """Review round 3 (system B3, engine P2): `latest` holds time dimensions
     at their latest window but lists the others in full, and a change
-    reaches every scope it does not pin — both refused past `MAX_SCOPES`, as
-    `all` is, before a scope is built."""
+    reaches every partition it does not pin — both refused past `MAX_SCOPES`, as
+    `all` is, before a partition is built."""
     big = StaticPartitions([f"k{i}" for i in range(400)])
 
     @asset(partitions={"a": big, "b": big})
@@ -274,7 +274,7 @@ def test_latest_and_changes_are_counted_before_they_are_listed():
         with pytest.raises(ValueError, match=f"160000 partitions, more than {MAX_PARTITIONS}"):
             planner.plan_run(["grid"], partitions=selection)
     with pytest.raises(ValueError, match=f"more than {MAX_PARTITIONS}"):
-        planner.reach(None, "", "grid")  # a source change reaches every scope
+        planner.reach(None, "", "grid")  # a source change reaches every partition
     assert time.perf_counter() - start < 1.0  # refused before listing
     assert len(planner.reach("grid", "a=k1,b=k2", "daily")) == 31  # `a` pinned, every day listed
     assert len(planner.plan_run(["daily"])["tasks"]) == 400  # the latest day, every `a`
@@ -321,7 +321,7 @@ async def test_an_onchange_firing_is_one_run_in_order(state):  # noqa: F811
 def test_linking_a_run_is_linear():
     """Review round 3 (P1): a one-to-one edge links each task by lookup, a
     fan-in through one grouping per edge shape — not by scanning every
-    upstream scope for every task."""
+    upstream partition for every task."""
     keys = StaticPartitions([f"k{i:05d}" for i in range(4000)])
     sites = StaticPartitions(["east", "west"])
 

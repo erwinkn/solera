@@ -145,7 +145,7 @@ class Journal:
 
 
 async def index_entries(state, output: str, partition: str) -> dict[str, tuple[int, bytes | None]]:
-    """Every live entry of an output scope's key index: key -> (generation, payload)."""
+    """Every live entry of an output partition's key index: key -> (generation, payload)."""
 
     index = KeyIndex(ObjectIO(state.objects), None, state.model.index(output, partition).pinned())
     entries, after = {}, None
@@ -164,7 +164,7 @@ async def keyed_content(
     holds (docs/versions.md) — no key missing, none read twice, none the
     index does not list. `whole` also checks a store that reads current
     rows holds no row the index does not list (only true when no writer is
-    unsettled). Returns each key's `column`, None without one."""
+    owing a repair). Returns each key's `column`, None without one."""
 
     m = engine.state.model
     head = m.heads.get((output, partition))

@@ -44,14 +44,14 @@ class FileStore:
         {root}/site_events/alpha/000000000042/184467.json
                                                 an unkeyed incremental output: one per batch
 
-    A name carries the writing attempt's generation (`Scope.generation`) —
+    A name carries the writing attempt's generation (`WriteContext.generation`) —
     a key's version (docs/versions.md) — and a write is create-only: a dead
     writer only ever leaves objects nothing references, and a reader gets
     exactly what it was pinned to. A keyed read names its objects from the
     generations the key index holds (`Keys`); a range of batches keeps, per
     batch, the highest generation, which committed it — listed batch by
     batch, so reading one never lists the others. Superseded objects
-    are deleted by `discard`, once nothing can read them.
+    are deleted by `cleanup`, once nothing can read them.
 
     Content is JSON when it round-trips exactly, pickle otherwise. `path`
     defaults to `$SOLERA_DATA`, else `.solera/data` next to the project
@@ -120,7 +120,7 @@ class FileStore:
         return Written(self._ref(context, {"mode": "value", "path": name, "base": base}))
 
     async def _store_set(self, write: KeyedWrite, prior, context, base, generation) -> Written:
-        """A partition set: its element list, as one value."""
+        """A dynamic partitions: its element list, as one value."""
 
         partitions = write.prepared.take(None)
         if not write.reset and prior is not None:
@@ -135,7 +135,7 @@ class FileStore:
         writes, each named by the generation the key index will hold, so no
         object goes unnamed — only their groups are read from the write.
         Removed keys need no write: the index stops naming them, and
-        `discard` deletes what nothing reads."""
+        `cleanup` deletes what nothing reads."""
 
         async def put(entry) -> None:
             key, group = entry
@@ -148,7 +148,7 @@ class FileStore:
     async def _store_commit(self, write: Patch, prior, context, base, generation) -> Written:
         """An unkeyed incremental write: its items, as one object per batch.
         With no prior (a first write, or a reset) the output starts over at
-        this batch; earlier ones are no longer read, and go with `discard`."""
+        this batch; earlier ones are no longer read, and go with `cleanup`."""
 
         output = context.output
         if write.remove:
@@ -177,8 +177,8 @@ class FileStore:
         """Delete objects nothing reads any more (docs/lifecycle.md §9.8):
         superseded ones, and what attempts that never committed wrote.
         `items` name them: `("key", key, generation)`,
-        `("path", path)`, `("value", generation)`, `("batch", n, generation)`,
-        or `("batches", lo, hi)` — every object of batches lo..hi. Names are
+        `("path", path)`, `("value", generation)`, `("commit_number", n, generation)`,
+        or `("commits", lo, hi)` — every object of commits lo..hi. Names are
         never reused, so deleting one twice is no harm."""
 
         base = self._base(context.output, context, prior)
@@ -305,7 +305,7 @@ class FileStore:
 
     @staticmethod
     def _base(output, context, prior) -> str:
-        """Where the scope's content lives: the prior's place, so a renamed
+        """Where the partition's content lives: the prior's place, so a renamed
         output keeps its objects where they are (§2)."""
 
         handle = (prior.handle or {}) if prior is not None else {}
@@ -382,7 +382,7 @@ def _commit_of(base: str, path: str) -> tuple[int, int] | None:
 class S3Store(FileStore):
     """FileStore's layout and behavior in a bucket: `S3Store("s3://bucket/prefix")`.
     `options` go to obstore (`region`, `endpoint`, credentials, …); `env:NAME`
-    values are resolved in the harness. A PUT is atomic, so there is nothing
+    values are resolved in the worker. A PUT is atomic, so there is nothing
     to rename."""
 
     def __init__(self, url: str, **options: Any):

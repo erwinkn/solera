@@ -1,5 +1,5 @@
 """Server-side placements (§10): a placement is lifecycle only — start the
-harness somewhere, report when it stopped. It never reads a spec or a result.
+worker somewhere, report when it stopped. It never reads a spec or a result.
 
     Stage    = {"attempt": str, "run": str, "objects": str}
     AttemptHandle = JSON dict, recorded (`AttemptPlaced`) for whichever engine follows the attempt

@@ -1,4 +1,4 @@
-"""Sensors (docs/lifecycle.md §11): checks a sensor host runs every
+"""Sensors (docs/lifecycle.md §11): checks a sensor worker runs every
 interval, which may or may not lead to a change. A tick is not an attempt:
 no attempt objects, no run of its own, no journal event unless it changes
 something. The engine dispatches a due tick with the sensor's cursor and a
@@ -50,7 +50,7 @@ class Sensors:
         }
 
     def _head_id(self, source: str) -> str:
-        """A source head's identity (§11.3): the event position that
+        """A source head's identity (§11.3): the event counter that
         installed it."""
 
         return f"h:{(self.m.heads.get((source, '')) or {}).get('n', 0)}"
@@ -234,7 +234,7 @@ class Sensors:
                 if event is not None:
                     prepared.append(event)
             # The runs are planned against the heads the commits will install —
-            # a partition set's new elements — never the model's until recorded.
+            # a dynamic partitions's new elements — never the model's until recorded.
             projected = {(e["source"], ""): e["head"] for e in prepared}
             for n, request in enumerate(runs):
                 run = self._plan_run(

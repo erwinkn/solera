@@ -6,7 +6,7 @@ looks for the sequences they do not spell out. It needs Hypothesis:
 
     from solera.testing.storemachine import stateful
 
-    TestMyStore = stateful(lambda: Harness(MyStore(dsn), fresh_output)).TestCase
+    TestMyStore = stateful(lambda: Worker(MyStore(dsn), fresh_output)).TestCase
 
 One run is one output — `Harness.output` gives a fresh one per run — and
 the machine plays the engine for it:
@@ -18,13 +18,13 @@ the machine plays the engine for it:
   write commits or is abandoned (its worker died, its answer was lost). An
   attempt makes one write, which may be retried: a name carries its
   generation, so it never writes a key twice with other content. An earlier
-  attempt may write late (a stale writer) and a second invocation of the
+  attempt may write late (a stale writer) and a second worker of the
   current one may try (a duplicate).
 - **readers.** A reader pins the committed content and reads it later;
   a by-key reader loads `dict[str, T]` under `Keys`, as `Each` does.
 - **collection** (immutable stores). The names no committed index and no
   pinned reader references — superseded, abandoned, or never written —
-  are discarded, twice over.
+  are cleaned up, twice over.
 - **batches.** An unkeyed incremental output appends engine-numbered
   batches, retries one, starts over, and a stale writer rewrites one.
 
@@ -54,7 +54,7 @@ class Attempt:
     generation: int
     worker_id: str
     last: tuple | None = None  # its write call, to retry: (keyed write, prior, written ref)
-    fenced: bool = False  # it holds the slice: acquired once the slice existed, or wrote
+    fenced: bool = False  # it holds the partition: acquired once the partition existed, or wrote
 
 
 @dataclass
@@ -74,7 +74,7 @@ class CommitModel:
 
 def stateful(make_harness: Callable[[], Harness]):
     """A Hypothesis `RuleBasedStateMachine` class over the store
-    `make_harness()` gives, one harness per run."""
+    `make_harness()` gives, one worker per run."""
 
     from hypothesis import strategies as st
     from hypothesis.stateful import RuleBasedStateMachine, invariant, precondition, rule
@@ -94,8 +94,8 @@ def stateful(make_harness: Callable[[], Harness]):
             self.current: Attempt | None = None
             self.stale: list[Attempt] = []
             self.dirty: set[str] = set()  # keys a dead writer may have changed in place (fenced)
-            self.exists = False  # the slice exists in the store: something wrote it
-            self.fence = 0  # the newest generation holding the slice (fenced)
+            self.exists = False  # the partition exists in the store: something wrote it
+            self.fence = 0  # the newest generation holding the partition (fenced)
             self.written: set[tuple[str, int]] = set()  # (key, generation) names ever written
             self.pins: list[Pin] = []
             self.commits_out = None
@@ -111,7 +111,7 @@ def stateful(make_harness: Callable[[], Harness]):
 
         @rule()
         def begin(self):
-            """The engine starts the next attempt on the scope."""
+            """The engine starts the next attempt on the partition."""
 
             if self.current is not None:
                 self.stale.append(self.current)
@@ -119,7 +119,7 @@ def stateful(make_harness: Callable[[], Harness]):
             self.current = Attempt(self.generation, f"i{self.generation}")
             if self.kind == "fenced":
                 self.run(self.store.acquire(self._context(self.current), self.head))
-                if self.exists:  # a slice not written yet is acquired by its first write
+                if self.exists:  # a partition not written yet is acquired by its first write
                     self.current.fenced, self.fence = True, self.generation
 
         @precondition(lambda self: self.current is not None and self.current.last is None)
@@ -179,8 +179,8 @@ def stateful(make_harness: Callable[[], Harness]):
         def stale_write(self, which, version, patch):
             """An attempt the engine gave up on writes late — its one write, or
             that write once more: a fenced store refuses it once a newer
-            attempt holds the slice, an immutable one lets it write names
-            nobody reads. (Before the slice exists nothing may hold it: the
+            attempt holds the partition, an immutable one lets it write names
+            nobody reads. (Before the partition exists nothing may hold it: the
             stale write may land, uncommitted, and the next commit, a first
             write, replaces it whole.)"""
 
@@ -197,7 +197,7 @@ def stateful(make_harness: Callable[[], Harness]):
                     with _refused("a stale writer"):
                         self.run(self.store.store(keyed, self.head, self._context(attempt)))
                     return
-                try:  # nothing holds the slice yet: refusing early is as good
+                try:  # nothing holds the partition yet: refusing early is as good
                     self.run(self.store.store(keyed, self.head, self._context(attempt)))
                 except StoreError:
                     return
@@ -210,8 +210,8 @@ def stateful(make_harness: Callable[[], Harness]):
         @precondition(lambda self: self.kind == "fenced" and self.current is not None and self.current.fenced)
         @rule()
         def duplicate(self):
-            """A second invocation of the current attempt: refused, both to
-            acquire and to write, once the attempt holds the slice."""
+            """A second worker of the current attempt: refused, both to
+            acquire and to write, once the attempt holds the partition."""
 
             twin = Attempt(self.current.generation, self.current.worker_id + "-twin")
             with _refused("a duplicate invocation's acquire"):
@@ -239,7 +239,7 @@ def stateful(make_harness: Callable[[], Harness]):
         @rule(take=st.integers(0, 2**16), twice=st.booleans())
         def cleanup(self, take, twice):
             """Collection: names no index and no pinned reader references —
-            superseded, abandoned or never written — are discarded."""
+            superseded, abandoned or never written — are cleaned up."""
 
             live = set(self.ledger.entries.items())
             for pin in self.pins:

@@ -110,7 +110,7 @@ class Upkeep:
     # -- key indexes (§6) --------------------------------------------------------------
 
     def truncate(self) -> None:
-        """Drop the delta log batches no consumer's watermark and no attempt
+        """Drop the delta log batches no consumer's bookmark and no attempt
         in progress still reads."""
 
         needed: dict[tuple, int] = {}
@@ -167,7 +167,7 @@ class Upkeep:
 
         options, objects, service = self.key_options, self.state.objects, self.keys
         # An immutable store's compaction lists what its merge dropped: those
-        # entries name objects that collection then discards (docs/lifecycle.md §9.8).
+        # entries name objects that collection then cleanups (docs/lifecycle.md §9.8).
         garbage = self.m.immutable(key[0])
 
         def work():
@@ -235,7 +235,7 @@ class Upkeep:
             event["garbage"] = [g.to_json() for g in dropped]
         self.state.record(event)
         if self.keys is not None:  # published: no new snapshot reads its inputs
-            # ...but a delta still in the log stays for change windows, until collected.
+            # ...but a delta still in the log stays for delta passes, until collected.
             kept = {f.name for f in added} | (self.m.indexes.get(key) or current).referenced()
             self.keys.retired([index.path(n) for n in removed if n not in kept])
 
@@ -243,14 +243,14 @@ class Upkeep:
 
     async def collect(self) -> None:
         """Delete the files nothing references, once no reader pinned before
-        they were let go of — an attempt, a paged delta window, a sensor
+        they were let go of — an attempt, a paged delta pass, a sensor
         tick — still reads. Both are positions in the model's event order,
         never wall clocks: two engines' clocks may disagree, the order they
         replay may not."""
 
         if not self.m.garbage:
             return
-        floors, read = self.m.floors(), self.m.cleanup_reads()  # pending discards still read them
+        floors, read = self.m.floors(), self.m.cleanup_reads()  # pending cleanups still read them
         # The engine's own fills and fetches of index files hold back index files only.
         cache = self.keys.floor() if self.keys is not None else math.inf
 

@@ -48,7 +48,7 @@ class Unavailable(RuntimeError):
 
 
 class LostOwnership(Exception):
-    """The attempt no longer owns its scope (fencing, §8)."""
+    """The attempt no longer owns its partition (fencing, §8)."""
 
 
 class Conflict(Exception):

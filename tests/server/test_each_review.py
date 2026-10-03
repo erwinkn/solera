@@ -1,5 +1,5 @@
 """Regression tests for the per-key v1 review (thr_9ezn6cyar5): the
-boundaries between Each, cancellation, full deliveries, retries,
+boundaries between Each, cancellation, full passes, retries,
 configuration, patterns and aliases."""
 
 import asyncio
@@ -218,7 +218,7 @@ async def test_6_a_forced_retry_during_the_last_retry_page_is_taken(state):  # n
         await engine.tick()
         await asyncio.sleep(0.02)
     engine.retry_keys("parse", ["rejected"])  # arrives while the pass's last page runs
-    assert await engine.submit_retries("parse", [""], "test") == []  # the scope is active
+    assert await engine.submit_retries("parse", [""], "test") == []  # the partition is active
     gate["event"].set()
     await engine.run_until(run["id"], 10)
     assert calls == ["a", "a", "a"]  # the newer request was taken in the same run

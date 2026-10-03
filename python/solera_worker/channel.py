@@ -5,7 +5,7 @@ back to its `.worker` object (§6).
 
 A channel answers `start` and `beat` with `{"cancel": record | None}`,
 raises `Ended` when the engine says the attempt is over for this
-invocation, and any other exception when it cannot be reached."""
+worker, and any other exception when it cannot be reached."""
 
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ class HttpChannel:
         return await asyncio.to_thread(self._post, "logs", body)
 
     async def finished(self, body: dict) -> dict:
-        # The answer waits for the commit, to name what is due for discarding.
+        # The answer waits for the commit, to name what is due for cleaning up.
         return await asyncio.to_thread(self._post, "finished", body, 30.0)
 
     async def cleaned_up(self, body: dict) -> None:

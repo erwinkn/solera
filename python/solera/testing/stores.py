@@ -1,20 +1,20 @@
 """Conformance scenarios for a store (docs/stores.md, "Scenarios"): the
-sequences of writes, loads, acquisitions and discards a store of each kind
+sequences of writes, loads, acquisitions and cleanups a store of each kind
 must answer exactly as stated. Each scenario is an async function of a
-`Harness` that raises `AssertionError` when the store answers otherwise;
+`Worker` that raises `AssertionError` when the store answers otherwise;
 the kit needs no test framework. With pytest:
 
-    from solera.testing.stores import Harness, scenarios
+    from solera.testing.stores import Worker, scenarios
 
     @pytest.fixture
-    def harness():
-        return Harness(MyStore(dsn), lambda **decl: Output(f"t_{uuid.uuid4().hex[:12]}", store="mine", **decl))
+    def worker():
+        return Worker(MyStore(dsn), lambda **decl: Output(f"t_{uuid.uuid4().hex[:12]}", store="mine", **decl))
 
     @pytest.mark.parametrize("scenario", scenarios(MyStore), ids=lambda s: s.__name__)
-    async def test_conformance(harness, scenario):
-        await scenario(harness)
+    async def test_conformance(worker, scenario):
+        await scenario(worker)
 
-The kit drives the store as the harness does: keyed writes arrive as a
+The kit drives the store as the worker does: keyed writes arrive as a
 `KeyedWrite`, resolved against what the engine's key index would hold
 (the kit keeps that `Ledger` itself), keyed loads name their keys, and an
 unkeyed output's value arrives as it is, a plain list."""
@@ -36,9 +36,9 @@ class Harness:
     """What a scenario needs of the store under test. `output(**decl)` makes
     a fresh `Output` on it — a new name each call, so scenarios never share
     data — with the declaration given (`key="id"`, `incremental=True`, or
-    none). `hold(scope)`, which a fenced store's
-    harness must give, is an async context manager that opens a write
-    transaction of `scope` holding its fence until the block ends, then
+    none). `hold(partition)`, which a fenced store's
+    worker must give, is an async context manager that opens a write
+    transaction of `partition` holding its fence until the block ends, then
     commits it: a newer writer waits for it."""
 
     store: Any
@@ -52,7 +52,7 @@ class Harness:
 
 @dataclass
 class Ledger:
-    """What the engine's key index would hold for one output scope: each
+    """What the engine's key index would hold for one output partition: each
     live key's version — the generation that wrote it."""
 
     entries: dict[str, int] = field(default_factory=dict)
@@ -94,7 +94,7 @@ async def write(
     worker_id: str = "i",
     partition: str = "",
 ) -> Ref:
-    """Write `rows` to a keyed output as the harness would — the scope's whole
+    """Write `rows` to a keyed output as the worker would — the partition's whole
     content, or (`patch`) its keys and `remove` — and record in `ledger`
     what the index then holds: every key written, at `generation`. With
     `changed`, a replacement is resolved against the ledger as the worker
@@ -137,7 +137,7 @@ async def rows(h: Harness, ref: Ref, selection) -> list[tuple[str, str]]:
 
 
 async def now(h: Harness, ref: Ref, ledger: Ledger) -> list[tuple[str, str]]:
-    """The scope's content as a reader of `ref` gets it: an immutable store's
+    """The partition's content as a reader of `ref` gets it: an immutable store's
     through the keys the index names; a fenced store's whole, as it is."""
 
     return await rows(h, ref, ledger.keys() if h.store.writes == "immutable" else None)
@@ -151,7 +151,7 @@ def keyed(h: Harness) -> Output:
 
 
 async def a_replacement_is_the_scopes_whole_content(h: Harness) -> None:
-    """Write {a, b}, then replace it with {b, c}: the scope holds b and c; a
+    """Write {a, b}, then replace it with {b, c}: the partition holds b and c; a
     replacement drops the keys it does not name."""
 
     out, ledger = keyed(h), Ledger()
@@ -175,7 +175,7 @@ async def a_patch_changes_only_its_keys(h: Harness) -> None:
 
 
 async def an_empty_replacement_holds_no_key(h: Harness) -> None:
-    """{a}, then a replacement with zero rows: the scope holds nothing."""
+    """{a}, then a replacement with zero rows: the partition holds nothing."""
 
     out, ledger = keyed(h), Ledger()
     first = await write(h, out, [{"id": "a", "v": "1"}], 1, ledger)
@@ -184,7 +184,7 @@ async def an_empty_replacement_holds_no_key(h: Harness) -> None:
 
 
 async def a_write_repeated_by_its_attempt_lands_once(h: Harness) -> None:
-    """The same attempt — one generation, one invocation — writes the same
+    """The same attempt — one generation, one worker — writes the same
     content twice (a retried call): the same ref, the same content."""
 
     out, ledger = keyed(h), Ledger()
@@ -288,7 +288,7 @@ async def a_pinned_read_returns_its_version(h: Harness) -> None:
 
 async def discarding_never_takes_what_is_read(h: Harness) -> None:
     """a at 1 is superseded by a at 2, and an abandoned attempt (generation
-    7) wrote b. Discarding the superseded and the abandoned names — twice,
+    7) wrote b. Cleaning up the superseded and the abandoned names — twice,
     and names never written — leaves the current content whole."""
 
     out, ledger = keyed(h), Ledger()
@@ -319,7 +319,7 @@ async def a_stale_writer_is_refused(h: Harness) -> None:
 
 
 async def one_generation_admits_one_invocation(h: Harness) -> None:
-    """Generation 9 acquired by invocation x: invocation y of the same
+    """Generation 9 acquired by worker x: worker y of the same
     generation (a duplicate) can neither acquire nor write; x acquiring
     again is its own retry."""
 
@@ -336,7 +336,7 @@ async def one_generation_admits_one_invocation(h: Harness) -> None:
 
 
 async def a_first_write_acquires(h: Harness) -> None:
-    """Acquiring a slice that holds nothing yet succeeds; the first write (3)
+    """Acquiring a partition that holds nothing yet succeeds; the first write (3)
     takes it, and an older writer (2) is refused after."""
 
     out, ledger = keyed(h), Ledger()
@@ -349,7 +349,7 @@ async def a_first_write_acquires(h: Harness) -> None:
 
 async def the_next_attempt_replaces_what_a_dead_writer_left(h: Harness) -> None:
     """Writer 5 died after its write of c landed, uncommitted. Writer 9
-    acquires and writes the scope's content, {a, b}: c is gone, and writer
+    acquires and writes the partition's content, {a, b}: c is gone, and writer
     5 can write nothing more."""
 
     out, ledger = keyed(h), Ledger()
@@ -363,9 +363,9 @@ async def the_next_attempt_replaces_what_a_dead_writer_left(h: Harness) -> None:
 
 
 async def a_scope_says_which_keys_it_holds(h: Harness) -> None:
-    """`keys(ref, among)`: the keys the scope holds, sorted by their bytes —
+    """`keys(ref, among)`: the keys the partition holds, sorted by their bytes —
     among those given, or all of them — never a value (docs/versions.md
-    §5). Writer 5's patch of c landed and it died: the scope holds c."""
+    §5). Writer 5's patch of c landed and it died: the partition holds c."""
 
     out, ledger = keyed(h), Ledger()
     first = await write(h, out, [{"id": k, "v": "1"} for k in ("b", "a", "é", "B")], 1, ledger)

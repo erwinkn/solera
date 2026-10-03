@@ -36,7 +36,7 @@ def test_minute_keys():
 
 
 def test_cron_every():
-    """§7: a cron 'every' makes calendar slices; format is required."""
+    """§7: a cron 'every' makes calendar partitions; format is required."""
 
     # Mondays at 00:00 UTC: windows close at the next fire, so by Sep 19
     # (a Saturday) the Sep 14 window is still open.

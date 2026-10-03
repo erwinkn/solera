@@ -224,7 +224,7 @@ async def test_incremental_filters_input_and_changes(state):
     engine = make_engine(state, project)
     await engine.initialize()
     await drive(engine, await engine.submit(["consumer"], upstream=True))
-    assert seen["upserted"] == ["a", "b", "c"]  # §6: first delivery upserts everything
+    assert seen["upserted"] == ["a", "b", "c"]  # §6: first pass upserts everything
     assert {r["id"] for r in seen["rows"]} == {"a", "b", "c"}
 
     # Second run, nothing written since → skipped, nothing loaded.
@@ -247,7 +247,7 @@ async def test_incremental_filters_input_and_changes(state):
 
 
 async def test_config_change_reprocesses_everything(state):
-    """§6/§2.2: run config is part of the interpretation fingerprint —
+    """§6/§2.2: run config is part of the fingerprint —
     changing it forces full=True on the edge and reprocesses every key."""
     seen = {}
 
@@ -267,12 +267,12 @@ async def test_config_change_reprocesses_everything(state):
     await drive(engine, await engine.submit(["consumer"], upstream=True))
     await drive(engine, await engine.submit(["consumer"], upstream=True, config={"threshold": 2}))
     assert seen["commits"] == [["a"], ["a"]]
-    assert seen["full"] == [True, True]  # first delivery + fingerprint reset
+    assert seen["full"] == [True, True]  # first pass + fingerprint reset
 
 
 async def test_full_run_resets_watermark(state):
-    """§2.2: a `full` run resets the edge watermark — the consumer re-reads
-    the whole head (not a diff) and the watermark lands past the head batch."""
+    """§2.2: a `full` run resets the edge bookmark — the consumer re-reads
+    the whole head (not a diff) and the bookmark lands past the head batch."""
     seen = []
 
     @asset(outputs=Output("files", key="id"))
@@ -295,20 +295,20 @@ async def test_full_run_resets_watermark(state):
         "fingerprint": first["fingerprint"],
         "output": "files",
         "upstream_partition": "",
-        "reset_by": first["reset_by"],  # the run whose reset began the delivery
+        "reset_by": first["reset_by"],  # the run whose reset began the pass
     }
     detail = await drive(engine, await engine.submit(["consumer"], mode="full"))
     assert task_statuses(detail)["consumer"] == "succeeded"  # never skipped on full
     second = state.model.bookmark("consumer", "files", "")
     assert second == {**first, "reset_by": detail["request"]["id"]}  # back at head+1, nothing left mid-way
-    # Both deliveries were full-head reads.
+    # Both passes were full-head reads.
     assert seen == [(["a", "b"], True), (["a", "b"], True)]
 
 
 async def test_version_bump_fails_then_full_recovers(state):
     """§6: a version mismatch between committed and declared fails an
     incremental attempt non-retryably; on_version_change='full' turns the
-    next attempt of the scope into a full run."""
+    next attempt of the partition into a full run."""
     count = {"n": 0}
 
     @asset(version="1")
@@ -347,7 +347,7 @@ async def test_version_bump_fails_then_full_recovers(state):
 
 
 async def test_incremental_batching_and_more(state):
-    """§6: work is batched by page_size; `more` re-queues the task;
+    """§6: work is batched by batch_size; `more` re-queues the task;
     scope_complete lands on the head only with the last batch."""
     commits = []
 
@@ -373,7 +373,7 @@ async def test_incremental_batching_and_more(state):
 
 async def test_run_keys_override(state):
     """§8: `keys=` explicit list is a one-off selection that never moves the
-    watermark; 'full' drains the folded key map as a reset."""
+    bookmark; 'full' drains the folded key map as a reset."""
     seen = []
 
     @asset(outputs=Output("files", key="id"))
@@ -398,9 +398,9 @@ async def test_run_keys_override(state):
 
 async def test_a_selection_reads_its_keys_and_moves_nothing(state):
     """Review round 5 (system #3, engine #2): a keys= selection reads the keys
-    it names — on a consumer never run, or one whose full delivery stopped
-    half-way — and moves neither its watermark nor its scope's progress: the
-    interrupted delivery still owes `b`, and resumes."""
+    it names — on a consumer never run, or one whose full pass stopped
+    half-way — and moves neither its bookmark nor its partition's progress: the
+    interrupted pass still owes `b`, and resumes."""
     calls, broken = [], {"page": 1}
 
     @asset(outputs=Output("files", key="id"))
@@ -423,7 +423,7 @@ async def test_a_selection_reads_its_keys_and_moves_nothing(state):
     assert state.model.bookmark("consumer", "files", "") is None
     assert "caught_up" not in state.model.partition("consumer", "")
     calls.clear()
-    await drive(engine, await engine.submit(["consumer"]))  # a full delivery, stopped after `a`
+    await drive(engine, await engine.submit(["consumer"]))  # a full pass, stopped after `a`
     stopped = state.model.bookmark("consumer", "files", "")
     assert calls == [["a"]] and stopped["pass"]["at"] == "a"
     assert state.model.partition("consumer", "")["caught_up"] is False
@@ -528,7 +528,7 @@ async def test_all_partitions_values(state, data):
     project = Project(assets=[sites, per_site, rollup])
     engine = make_engine(state, project)
     await engine.initialize()
-    # The key set must be committed before fan-out planning can see it (§7).
+    # The dynamic partitions must be committed before fan-out planning can see it (§7).
     await drive(engine, await engine.submit(["sites"]))
     detail = await drive(engine, await engine.submit(["rollup"], upstream=True))
     assert status_of(detail) == "succeeded"
@@ -538,7 +538,7 @@ async def test_all_partitions_values(state, data):
 
 async def test_partition_selections(state):
     """§7/§8: 'latest', 'missing', 'all' and explicit lists select from the
-    current key set."""
+    current dynamic partitions."""
     ran = []
 
     @asset(partitions=StaticPartitions(["a", "b", "c"]))
@@ -563,7 +563,7 @@ async def test_partition_selections(state):
 
 
 async def test_external_partition_set_via_commit(state):
-    """§5/§7: an external PartitionSet is patched through the commit API; new
+    """§5/§7: an external DynamicPartitions is patched through the commit API; new
     keys surface through partitions='missing'."""
     ran = []
 
@@ -619,7 +619,7 @@ async def test_two_dimension_broadcast_and_collapse(state):
     project = Project(assets=[sites, config, site_data, broadcast, collapsed])
     engine = make_engine(state, project)
     await engine.initialize()
-    await drive(engine, await engine.submit(["sites"]))  # commit the key set
+    await drive(engine, await engine.submit(["sites"]))  # commit the dynamic partitions
     detail = await drive(engine, await engine.submit(["broadcast"], upstream=True))
     assert status_of(detail) == "succeeded"
     assert sorted(seen) == [("s1", 5), ("s2", 5)]
@@ -677,8 +677,8 @@ async def test_upstream_false_never_replans(state):
 
 
 async def test_fencing_concurrent_claim(state):
-    """§8: a second task for a claimed scope requeues instead of dispatching;
-    only one attempt owns the scope."""
+    """§8: a second task for a claimed partition requeues instead of dispatching;
+    only one attempt owns the partition."""
 
     class Hold(InlinePlacement):
         async def launch(self, stage):
@@ -780,7 +780,7 @@ async def test_every_and_cron_fire(state):
 
 async def test_onchange_fans_out_by_projection(state):
     """§9: OnChange pends in the commit transaction and fans out to the target
-    scopes by the projection rule."""
+    partitions by the projection rule."""
     seen = []
 
     @asset(outputs=DynamicPartitions("sites"))
@@ -849,7 +849,7 @@ async def test_an_automation_can_skip_until_its_inputs_are_written(state):
 
 
 async def test_every_skips_active_scope(state):
-    """§9: a tick is skipped for any scope still running."""
+    """§9: a tick is skipped for any partition still running."""
     calls = {"n": 0}
 
     @asset(automations=Every(1))
@@ -864,13 +864,13 @@ async def test_every_skips_active_scope(state):
     await engine.tick()  # fires, dispatches into forever-wait
     await asyncio.sleep(0.1)
     state.model.automations["polled.every.0"]["last_fired"] = 0  # make the interval due on the next tick
-    await engine.tick()  # would fire again but the scope is active
+    await engine.tick()  # would fire again but the partition is active
     runs = (await engine.list_runs(limit=10))["runs"]
     assert len([r for r in runs if r.get("automation") == "polled.every.0"]) == 1
 
 
 async def test_every_skips_queued_scope(state):
-    """§9: a tick is skipped for a scope that is queued but not yet running —
+    """§9: a tick is skipped for a partition that is queued but not yet running —
     otherwise repeated fires pile duplicate tasks onto the dispatch queue."""
 
     @asset(automations=Every(1))
@@ -956,7 +956,7 @@ async def test_timeout_fails_retryably(state):
 
 
 async def test_harness_exit_without_result_fails_retryably(state):
-    """§10: a harness that exits without writing a result is a retryable
+    """§10: a worker that exits without writing a result is a retryable
     failure."""
 
     class NoResult(FakePlacement):
@@ -1102,7 +1102,7 @@ class MigratingStore(FileStore):
 
 async def test_migration_changes_fingerprint_and_marks_handle(state):
     """§6/§4: adding a migration to an asset's output changes the
-    interpretation fingerprint so every key reprocesses, and the new head's
+    fingerprint so every key reprocesses, and the new head's
     handle carries the last applied migration as `schema`."""
     from solera.sdk import Migration
 
@@ -1230,10 +1230,10 @@ async def test_ondeploy_two_registrations_fire_latest_once(state):
 
 
 async def test_a_delivery_says_where_each_page_sits(state):
-    """A delivery spans pages of `page_size`: `page` is the page's index,
-    `pages` the plan, `first` is page 0, `final` the delivery running out,
-    and `full` holds on every page of a full delivery — for keyed full
-    deliveries, delta windows and batch-mode upstreams (§5; review round 3,
+    """A pass spans pages of `batch_size`: `page` is the page's index,
+    `pages` the plan, `first` is page 0, `final` the pass running out,
+    and `full` holds on every page of a full pass — for keyed full
+    passes, delta passes and batch-mode upstreams (§5; review round 3,
     system B5)."""
 
     from solera.stores import Patch
@@ -1273,7 +1273,7 @@ async def test_a_delivery_says_where_each_page_sits(state):
     await drive(engine, await engine.submit(["consumer"], upstream=True))
     assert pages == [(0, 3, True, False, True), (1, 3, False, False, True), (2, 3, False, True, True)]
     assert sorted(rebuilt["keys"]) == [f"k{i}" for i in range(7)]
-    # A delta window of four changed keys: two pages.
+    # A delta pass of four changed keys: two pages.
     pages.clear()
     for key in ("k0", "k2", "k4", "k6"):
         content[key] = 2
@@ -1296,7 +1296,7 @@ async def test_a_delivery_says_where_each_page_sits(state):
 
 async def test_the_page_plan_is_an_estimate_but_final_is_not(state):
     """Patterns filter keys after the plan is made: pages are formed from the
-    keys they take, read ahead past the rest, so the delivery takes the pages
+    keys they take, read ahead past the rest, so the pass takes the pages
     it takes, none is empty, and `final` is on the last real one (§5)."""
 
     pages = []
@@ -1322,8 +1322,8 @@ async def test_the_page_plan_is_an_estimate_but_final_is_not(state):
 
 
 async def test_pages_read_ahead_past_keys_the_patterns_leave_out(state):
-    """Every page holds `page_size` taken keys, however sparse they are in the
-    upstream; a delivery that takes none never calls the producer."""
+    """Every page holds `batch_size` taken keys, however sparse they are in the
+    upstream; a pass that takes none never calls the producer."""
 
     calls = []
 
@@ -1354,7 +1354,7 @@ async def test_a_page_looks_ahead_a_bounded_way(state, monkeypatch):
     """Review round 5 (system #5): a page reads the index in chunks, whatever
     it still lacks, and examines at most `LOOKAHEAD` entries — past them it
     goes as it is, not final; a page left with nothing is skipped without
-    calling the producer, and the delivery still completes."""
+    calling the producer, and the pass still completes."""
     from solera.keys.index import key_bytes
     from solera_worker import each
 

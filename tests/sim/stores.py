@@ -1,7 +1,7 @@
 """A fenced store for the simulation: a table per output in an in-memory
 database that outlives engines and workers, written in transactions that
-take the slice's fence first — `examples/json_table_store.py`, without
-Postgres. A transaction holds its slice's lock from its fence check to its
+take the partition's fence first — `examples/json_table_store.py`, without
+Postgres. A transaction holds its partition's lock from its fence check to its
 commit, so a newer `acquire` waits behind an open older one (docs/stores.md,
 invariant 8), and the simulation can hold a transaction open (`delay`) or
 lose its answer after it committed (`lost`)."""
@@ -31,7 +31,7 @@ class Database:
     commits: int = 0
     # Every committed store transaction: (began at, actor, generation, worker id)
     writes: list[tuple] = field(default_factory=list)
-    # (kind, scope) -> None | "error" | "lost", plus a delay: the simulation's say over one transaction
+    # (kind, partition) -> None | "error" | "lost", plus a delay: the simulation's say over one transaction
     fault: Callable[[str, object], tuple[str | None, float]] | None = None
 
     def lock(self, domain: str, part: str) -> asyncio.Lock:
@@ -73,7 +73,7 @@ class TableStore:
         return mine
 
     async def _transaction(self, kind: str, context, prior, body: Callable[[dict], object]):
-        """Lock the slice, fence, apply `body` to a copy of its rows, commit."""
+        """Lock the partition, fence, apply `body` to a copy of its rows, commit."""
 
         table = self._table(context.output, prior)
         fate, delay = self.db.fault(kind, context) if self.db.fault is not None else (None, 0.0)
@@ -138,7 +138,7 @@ class TableStore:
         return await self._transaction("store", context, prior, body)
 
     def keys(self, ref, among=None):
-        """The keys the slice holds — among `among`, or all — sorted by their
+        """The keys the partition holds — among `among`, or all — sorted by their
         bytes: a repair's question, never a value."""
 
         table = (ref.handle or {}).get("table") or f"rows_{ref.output}"

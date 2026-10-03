@@ -10,9 +10,9 @@ index reads — its input pages — are answered from the same cache at
 It depends on two other designs, and says where:
 
 - `lifecycle.md` — the worker → engine HTTPS channel (§5), the `.worker`
-  claim that admits one invocation (§4), and the store kinds `immutable`
+  claim that admits one worker (§4), and the store kinds `immutable`
   and `fenced` (§9.6, `stores.md`), which decide the repair rules of §3.
-- `per-key-processing.md` — the failure index, whose one v1 reader here
+- `per-key-processing.md` — the failed keys, whose one v1 reader here
   (retry pages, read at `start`) follows that doc's eligibility predicate and
   transition table (§8). Its own semantics (rescoping, cancellation, retry
   pacing, sensors) belong to that doc.
@@ -71,7 +71,7 @@ A delta that is empty does not mean the store has nothing to write:
 
 ```
 committed           a=1
-attempt 1           writes a=2 to the store, dies before committing    → unsettled intent {a}
+attempt 1           writes a=2 to the store, dies before committing    → repair intent {a}
 attempt 2 returns   a=1
 delta vs the index  empty: the index still says a=1
 the store           still holds a=2 — it must be overwritten
@@ -83,14 +83,14 @@ the first:
 1. **What changes in the index?** The delta: entries whose version differs
    from the pinned snapshot, deletions of live keys the write removes, and
    `added` / `removed`. This is what the resolver computes, and what
-   becomes the batch's delta file.
+   becomes the commit's delta file.
 2. **What must the store write?** Decided by the worker, by the store's
    kind (`lifecycle.md` §9.6).
 
 **`immutable` stores** (FileStore, S3Store) write each key under a name
 carrying the writer's generation, `{key}/{generation}` (`lifecycle.md`
 §9.8), and never overwrite. A dead attempt leaves only unreferenced
-objects, so there are no unsettled intents and no repair: the store writes
+objects, so there are no repair intents and no repair: the store writes
 the delta's upserts, and the commit records the delta. The generation is
 the delta entry's own (`versions.md`); superseded objects are collected
 through their predecessors' generations (§6).
@@ -98,7 +98,7 @@ through their predecessors' generations (§6).
 **`fenced` stores** keep intents and repair, in this order:
 
 ```
-1. acquire       fenced: the store's generation for (output, scope), before reading anything
+1. acquire       fenced: the store's generation for (output, partition), before reading anything
                  (an older writer's open transaction finishes first; its later ones are refused)
 2. repair read   named intents: keys dead attempts meant to change and this patch does
                  not mention, read back from the store and folded into the run;
@@ -112,18 +112,18 @@ through their predecessors' generations (§6).
 Repair reads before acquisition — what `_store_outputs` does today — would
 read `k=1` while an older transaction is about to commit `k=2`, and the new
 commit would then clear the intents with the index still saying `k=1`.
-Acquisition is a new store phase (`Store.acquire(scope)`, a no-op for
+Acquisition is a new store phase (`Store.acquire(context)`, a no-op for
 other kinds); the `generation` is the lifecycle's.
 
 What those stores write:
 
-| Write | Unsettled intents | Store writes |
+| Write | Repair intents | Store writes |
 |---|---|---|
 | Patch | none | the delta's upserts and removes |
 | Patch | named | the delta, plus the patch's own keys an intent touched (`own ∩ intended`), even when unchanged in the index; step 2 already folded in the intents' other keys |
-| Patch | unknown writes | step 2 reads the store's whole key map and reconciles it (below); then as for named intents, with every key of the scope as `intended` |
-| Replacement | none | the delta's upserts and removes; the whole scope if the delta's key list was not collected |
-| Replacement | named or unknown | the whole scope, overwritten. Step 2 does not run: it would keep stray rows the replacement means to remove |
+| Patch | unknown writes | step 2 reads the store's whole key map and reconciles it (below); then as for named intents, with every key of the partition as `intended` |
+| Replacement | none | the delta's upserts and removes; the whole partition if the delta's key list was not collected |
+| Replacement | named or unknown | the whole partition, overwritten. Step 2 does not run: it would keep stray rows the replacement means to remove |
 | `Sql` | — | the query, materialized; the store reports its rows afterwards, resolved as a replacement |
 
 **Unknown writes.** A `Sql` write's intent names no keys: the query
@@ -138,18 +138,18 @@ next attempt        a patch of c
 ```
 
 So after acquisition (step 1), a **patch** against an unknown-writes
-intent reads the store's full key map for the scope — the same extraction
+intent reads the store's full key map for the partition — the same extraction
 a `Sql` write reports with — and reconciles it with the pinned index:
 every key whose store version differs from the index's, that the store
 holds and the index does not, or that the index holds live and the store
 does not (here `a` deleted and `b` inserted), joins the run as a repair
 entry before resolution. Only then can the commit clear the intent. A
-**replacement** needs no read: it overwrites the whole scope, as with any
-unsettled intent.
+**replacement** needs no read: it overwrites the whole partition, as with any
+repair intent.
 
-An output is **unchanged** — no store write, no new batch, head kept —
+An output is **unchanged** — no store write, no new commit, head kept —
 only when the delta is empty, the output exists, and no intent is
-unsettled. An empty delta with unsettled intents is still a commit: no
+owing a repair. An empty delta with repair intents is still a commit: no
 delta file, but the repair writes and the settlement that clears the
 intents.
 
@@ -163,7 +163,7 @@ Content-Type: application/vnd.solera.resolve; version=1
 Authorization: Bearer {attempt token}
 ```
 
-The token, invocation rule and retries are `lifecycle.md`'s (§4, §5.2,
+The token, worker rule and retries are `lifecycle.md`'s (§4, §5.2,
 §5.3); the framing, limits and validation below are this doc's, and
 `lifecycle.md` §5.1 points here. One request per attempt that has something to
 resolve, covering every output the worker wants resolved; outputs it
@@ -179,9 +179,9 @@ resolves locally; a frame whose bounds do not hold gets `400`.
 **Request.**
 
 ```json
-{"invocation": "k3f…", "outputs": [
-  {"name": "orders", "scope": "", "kind": "patch", "batch": 12, "generation": 184467,
-   "base": {"prefix": "keys/orders/_/", "head_batch": 11},
+{"worker": "k3f…", "outputs": [
+  {"name": "orders", "partition": "", "kind": "patch", "commit_number": 12, "generation": 184467,
+   "base": {"prefix": "keys/orders/_/", "head_commit": 11},
    "keys": 1000, "offset": 0, "size": 41250, "digest": "9e07…"}
 ]}
 ```
@@ -196,21 +196,21 @@ resolves locally; a frame whose bounds do not hold gets `400`.
   (`{a: 1}` against `{a: 1, b: 1}` is empty as a patch and deletes `b` as
   a replacement).
 - `base` names the snapshot the worker resolved against: the index (its
-  prefix, which survives renames) and the head's batch, as pinned in its
-  spec. `batch` is the batch the delta will carry.
+  prefix, which survives renames) and the head's commit number, as pinned in its
+  spec. `commit_number` is the commit the delta will carry.
 - `digest` is the payload's XXH3-128.
 
 **Validation.** The engine trusts nothing in the header it can check
 against the attempt's preparation, which it holds in memory for every
 live attempt (and rebuilds from `.spec` on adoption):
 
-- the invocation is the one the engine admitted (`lifecycle.md` §4: the
+- the worker is the one the engine admitted (`lifecycle.md` §4: the
   `start`ed one, or after a restart the one in `.worker`); any other gets
   `409` and resolves nothing — it should not be running;
-- the attempt is live and holds the scope lock for `(name, scope)`;
-- `name`, `scope`, `batch`, `generation` and `base.prefix` are the ones
+- the attempt is live and holds the claim for `(name, partition)`;
+- `name`, `partition`, `commit_number`, `generation` and `base.prefix` are the ones
   prepared for that output, the run's entries are at that generation, and
-  `base.head_batch` is the head's batch now;
+  `base.head_commit` is the head's commit number now;
 - `kind` is allowed for the output (a `replace` of an output whose write
   can only be a patch is refused);
 - the payload is what the header says, from its own bytes: its digest is
@@ -228,7 +228,7 @@ a guess.
 when their whole semantic input matches:
 
 ```
-(attempt, invocation, name, scope, kind, batch, generation, base.prefix, base.head_batch, digest)
+(attempt, worker, name, partition, kind, commit_number, generation, base.prefix, base.head_commit, digest)
 ```
 
 The answer is a pure function of that tuple and the snapshot content,
@@ -248,7 +248,7 @@ freeze, no response to recover and no engine-written file to clean up.
 ```
 
 - `delta`: the payload is the delta as a complete `.kx` file, ready to
-  upload under the worker's own name `{batch:012d}-{attempt}`. Its entries
+  upload under the worker's own name `{commit_number:012d}-{attempt}`. Its entries
   are `(key, generation, deleted, payload?)`, and every changed or deleted
   key that had a live entry carries that entry's **predecessor**
   generation — always, since the engine reads full entries; for an
@@ -276,10 +276,10 @@ freeze, no response to recover and no engine-written file to clean up.
 filters, so `added` and `removed` are exact and an engine-resolved commit
 never increments `inexact`.
 
-**Which snapshot.** While an attempt is live it holds its scope lock: no
+**Which snapshot.** While an attempt is live it holds its claim: no
 other commit can change that index, and compaction and recounts change its
 files and count fields but not its content. The engine therefore resolves
-against the file set it currently holds for that scope, once validation
+against the file set it currently holds for that partition, once validation
 passed, and pins that file set before any asynchronous work (§5); the
 content is the pinned snapshot's even if compaction swapped files since
 prepare.
@@ -318,9 +318,9 @@ the engine checks again.
 - **Sensor ticks** (`lifecycle.md` §11) post a small key map in this
   framing to their tick route, and the engine resolves it in-process as it
   does for source commits; a map over `sensor_map_max` is resolved on the
-  sensor host, which commits a reference to its delta file. Neither uses
+  sensor worker, which commits a reference to its delta file. Neither uses
   this route or an attempt's validation.
-- **Failure indexes** are not resolve targets: failure deltas are resolved
+- **Failed keys** are not resolve targets: failure deltas are resolved
   by the worker, with exact lookups of prior records
   (`per-key-processing.md` §9).
 
@@ -329,11 +329,11 @@ the engine checks again.
 | Case | Outcome |
 |---|---|
 | Engine unreachable, restarting, or slow | Local resolve after the timeout; same delta, possibly an inexact count (§6) |
-| Worker dies after the response, before the gate | Nothing to clean on the engine; the uploaded delta is the worker's and is discarded at attempt end as today |
-| Worker dies after the gate | Unsettled intents and repair (fenced); nothing for immutable stores |
+| Worker dies after the response, before the gate | Nothing to clean on the engine; the uploaded delta is the worker's and is cleaned up at attempt end as today |
+| Worker dies after the gate | Repair intents and repair (fenced); nothing for immutable stores |
 | Attempt canceled while a resolve runs | By the cancel record (`lifecycle.md` §2.2): a draining attempt still resolves; once the record is `forced`, or the attempt ended, a resolve checks that when it starts and between chunks, and stops, releasing its pins |
 | Compaction commits during a resolve | The resolve keeps the file set it pinned; garbage collection waits for the pin |
-| A second invocation of the attempt | `409`: the engine admits one invocation (lifecycle §4) |
+| A second worker of the attempt | `409`: the engine admits one worker (lifecycle §4) |
 | Local copy corrupt | Dropped, refetched from S3 and rebuilt; the request is declined `cold` meanwhile |
 
 ## 5. The engine cache
@@ -360,7 +360,7 @@ The cache checks a fill against it, and candidates (below) are matched by
 it.
 
 **Local form.** On disk, each file becomes `{hash of its path}.kxl` — a
-fixed-length name whatever the scope's length; the file names its source —
+fixed-length name whatever the partition's length; the file names its source —
 (byte layout in `native/src/local.rs`):
 
 ```
@@ -413,7 +413,7 @@ read fails with `corrupt`.
 
 **Pins.** A reader pins the file set it reads; eviction skips pinned
 files. A reader that fetches from S3 is also a reader pin in the garbage
-order of `object-store-state.md` (pins and deletions by event position),
+order of `object-store-state.md` (pins and deletions by event counter),
 so compaction cannot delete a file under a fill.
 
 **Reservations.** Every operation that adds bytes reserves them first,
@@ -540,10 +540,10 @@ cannot: for a write of `k` it knows that `k` is live, not whether it was
   named predecessor, but its old entry is still in the index, shadowed.
   Every merge that drops a shadowed entry — or the entry under a
   tombstone at the bottom level — emits that entry's `(key, generation)`
-  as data garbage at the compaction's event position, under the
+  as cleanup at the compaction's event counter, under the
   same reader-pin rule. Compaction emits every entry it drops, named
-  before or not: names are never reused, so discarding a name twice is a
-  no-op (`discard` ignores missing names), and no "already collected" bit
+  before or not: names are never reused, so cleaning up a name twice is a
+  no-op (`cleanup` ignores missing names), and no "already collected" bit
   has to survive compaction.
 
 The alternatives, priced at 100M keys, 1K random changes per commit:
@@ -605,7 +605,7 @@ of magnitude fewer:
 ## 7. Engine-served reads
 
 Everything an attempt reads from an index before it computes — a full
-delivery's page, a change window, a rescope's diff, a `keys=` selection,
+pass's page, a delta pass, a pattern change's diff, a `keys=` selection,
 an `Each` page's failure records and retry walk, an immutable store's
 generations for a whole read — a worker alone pages from the store, cold: at
 100M keys, 20 to 37 GETs a page (`bench/keys/results.md`). The engine holds those indexes warm. So, mirroring
@@ -632,7 +632,7 @@ request per step: `start` for reads, `resolve` before writing.
   second page. Work cancelled by a timeout keeps what it holds — its
   semaphore, reservation and pins — until its thread ends.
 - **Bound to the attempt and its pins.** The record rides the reply to the
-  `start` of the attempt's admitted invocation (`lifecycle.md` §5), and an
+  `start` of the attempt's admitted worker (`lifecycle.md` §5), and an
   entry names its index by the digest of the pinned state in the spec —
   the files and log the spec pins, never the engine's current index.
 - **Bounded, the work as well as the reply.** At most `reads_max_entries`
@@ -659,7 +659,7 @@ request per step: `start` for reads, `resolve` before writing.
   nothing, and a window is answered at `start` when its index is warm —
   an index refused admission is read from the store, small windows
   included.
-- **Delta files stay while logged.** A change window reads delta files
+- **Delta files stay while logged.** A delta pass reads delta files
   that compaction has merged out of the levels; the cache retires a delta
   only when collection deletes it, so a warm index answers its windows
   locally, and a fill fetches its logged deltas too.
@@ -676,15 +676,15 @@ identity. This doc implements none of that differently; it calls the same
 SDK predicate.
 
 In v1 the cache's per-key reader is the start read (§7): an `Each`
-attempt's retry page — the walk of its failure index from the pass
+attempt's retry page — the walk of its failed keys from the pass
 position, keeping the keys `eligible` says are due, then their upstream
 entries — is the worker's own read code, recorded over local copies like
-any input read, and bound the same way to the failure index the spec
-pins. Without a record, the worker walks the failure index itself.
+any input read, and bound the same way to the failed keys the spec
+pins. Without a record, the worker walks the failed keys itself.
 
 Failure deltas are not resolved here: the worker resolves them locally,
 with exact lookups of prior records (per-key doc §9) — answered at
-`start` too, when the failure index is warm.
+`start` too, when the failed keys are warm.
 
 Not in v1, and not to be built from this doc: engine-side pattern skip
 hints (pattern match counts per committed delta), and coalesced
@@ -725,8 +725,8 @@ to re-estimate, not this one's.
 - **Generations and predecessors.** A varint generation per entry, and a
   predecessor generation per changed key in deltas until compaction drops
   it: 8 B per entry in all at 10M random ids without payloads, 26 B with
-  16-byte versions (`bench/keys/results.md`). Discards are DELETEs, free on S3, batched
-  by 1,000; keys collected at commit are discarded a second time, as a
+  16-byte versions (`bench/keys/results.md`). Cleanups are DELETEs, free on S3, batched
+  by 1,000; keys collected at commit are cleaned up a second time, as a
   no-op, when compaction drops their old entry.
 - **Network.** Requests and responses are ~40 KB and ~27 KB per 1K-key
   commit. Within one availability zone that is free; across zones EC2
@@ -760,12 +760,12 @@ reports both.
   off by at most the keys it decided). Over random patches, removes,
   replacements, repairs and compactions between prepare and resolve.
 - **Repair.** The `a=1 → a=2 → a=1` sequence rewrites the store with an
-  empty delta; a replacement with unsettled intents rewrites the scope;
+  empty delta; a replacement with repair intents rewrites the partition;
   "unchanged" only without intents; for a fenced store, an older writer's
   pending `k=2` lands before the repair read; immutable stores skip repair.
 - **Protocol.** Requests differing only in `kind` are not deduplicated;
-  identical ones are; a header naming another scope, batch or prefix is
-  declined; a second invocation gets `409`; each decline reason falls back
+  identical ones are; a header naming another partition, commit number or prefix is
+  declined; a second worker gets `409`; each decline reason falls back
   locally; a timeout falls back and the late response is dropped; an
   unknown protocol version gets `415`; mixed attempts commit together.
 - **Cache.** The alternating-indexes case stays warm for one and cold for
@@ -778,14 +778,14 @@ reports both.
   pinned files survive eviction and garbage collection.
 - **Generations.** Resolver deltas, cold deltas, recorded reads and `Keys`
   carry generations; every superseded object of an immutable output is
-  discarded — by its commit when the old entry was read, by the
+  cleaned up — by its commit when the old entry was read, by the
   compaction that drops it otherwise, including keys the filters counted
   live and keys deleted at the bottom level — and none while a reader
-  pins it; a second discard is a no-op.
+  pins it; a second cleanup is a no-op.
 - **Unknown writes.** A dead `Sql` writer that deleted `a` and inserted
   `b`: the next patch acquires, reads the store's key map, reconciles both
   keys and only then clears the intent; a replacement overwrites instead.
-- **Retry pages.** Recorded against the pinned failure index only;
+- **Retry pages.** Recorded against the pinned failed keys only;
   canceled keys are never selected by themselves (the per-key predicate).
 - **Start reads.** Local pages, windows and lookups equal the store's from
   any cursor; a record answers only its own calls on its own pinned
@@ -815,7 +815,7 @@ The follow-up review agrees with all three.
   decides nothing, so a retried request needs no stored answer: it is
   recomputed, or deduplicated while in flight.
 - **Resolve against the current file set, not the pinned manifest.**
-  Under the scope lock they have the same content, and the current files
+  Under the claim they have the same content, and the current files
   are the warm ones; validation and pinning before any asynchronous work
   make a moved head a `stale` decline rather than a wrong answer.
 - **Filters and recounts stay.** The sparse reader's pair-filter shortcut

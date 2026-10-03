@@ -9,7 +9,7 @@ thread of their own: nothing here runs on the engine's event loop.
   worker's own read code over local copies, recorded.
 
 Whatever here reads index files from the object store holds a reader pin
-(`hold`) at the event position it read the index at, until its reads are
+(`hold`) at the event counter it read the index at, until its reads are
 done: collection (`floor`) deletes nothing a pinned reader may still read.
 """
 
@@ -73,7 +73,7 @@ class KeyService:
         self.loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._stopped = False
-        self._holds: dict[int, float] = {}  # token -> event position: readers of index files
+        self._holds: dict[int, float] = {}  # token -> event counter: readers of index files
         self._hold_lock = threading.Lock()
         self._tokens = itertools.count()
         self._owners: set[asyncio.Task] = set()  # operations running on the loop
@@ -295,7 +295,7 @@ class KeyService:
         from solera_worker import each
         from solera_worker.worker import REPAIR_PAGE
 
-        states = {}  # what the reads may touch: inputs, failure indexes, outputs (reconcile pages)
+        states = {}  # what the reads may touch: inputs, failed keys, outputs (reconcile pages)
         for pin in (spec.get("inputs") or {}).values():
             for js in (
                 pin.get("index"),

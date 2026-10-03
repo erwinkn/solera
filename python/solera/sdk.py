@@ -69,8 +69,8 @@ _REF_KINDS: dict[str, type[Ref]] = {}
 class Ref:
     """A self-contained pointer into a store (§3), and its version: the
     `generation` of the write that made it (docs/versions.md) — the attempt's
-    generation, or a source commit's event position. A store builds a ref
-    without it; the harness sets it."""
+    generation, or a source commit's event counter. A store builds a ref
+    without it; the worker sets it."""
 
     output: str
     store: str
@@ -114,7 +114,7 @@ class Ref:
 
 @dataclass(frozen=True)
 class ObjectRef(Ref):
-    """A FileStore or S3Store ref: where the scope's objects live."""
+    """A FileStore or S3Store ref: where the partition's objects live."""
 
     kind: ClassVar[str | None] = "object"
 
@@ -125,7 +125,7 @@ class ObjectRef(Ref):
 
 @dataclass(frozen=True)
 class TableRef(Ref):
-    """A Postgres ref: a table plus the slice and key columns (§3)."""
+    """A Postgres ref: a table plus the partition and key columns (§3)."""
 
     kind: ClassVar[str | None] = "table"
 
@@ -375,7 +375,7 @@ class In:
 
 
 class Incremental(In):
-    """Delta edge: the watermark-planned changes since last delivery (§5, §6).
+    """Delta edge: the bookmark-planned changes since last pass (§5, §6).
     On a keyed upstream, `include` and `exclude` select the keys it takes
     by name (`solera.patterns`, docs/per-key-processing.md §11)."""
 
@@ -412,7 +412,7 @@ class Each(Incremental):
     """An asset written for one key, run over every changed key of a keyed
     upstream (docs/per-key-processing.md §5): the parameter receives one
     key's value, `ctx.key` names it, and every output is keyed by it.
-    `page_size` keys make one attempt and one commit; `concurrency` of them
+    `batch_size` keys make one attempt and one commit; `concurrency` of them
     run at once. A key whose call raises is recorded in the asset's failure
     index and retried by its class (§8, §9); it never blocks the others."""
 
@@ -761,7 +761,7 @@ class OnDeploy:
 
 class Automation:
     """When `trigger` fires, submit this run in §8 vocabulary.
-    `skip_missing_inputs`: skip a scope whose inputs have never been written
+    `skip_missing_inputs`: skip a partition whose inputs have never been written
     (and that the run doesn't build), rather than run it to fail."""
 
     def __init__(
@@ -894,7 +894,7 @@ def _observed(source: str, value: Any) -> Tick | None:
 
 
 class Sensor:
-    """A check run every `every` on a sensor host: `fn(ctx, …resources)`
+    """A check run every `every` on a sensor worker: `fn(ctx, …resources)`
     returns a `Tick` or `None`. `commits` names every source it may commit
     to; `executor` is the host: the engine's own (`Local`, the default) or a
     `Pool` of `solera_worker sensors` hosts."""
@@ -965,7 +965,7 @@ class Retention:
 
     `days`: runs older than that go. `runs`: keep the runs of the newest
     `runs` commits. Both: whichever keeps more. `forever=True` keeps everything, overriding a project default.
-    Current state — heads, key indexes, cursors, watermarks, and the data
+    Current state — heads, key indexes, cursors, bookmarks, and the data
     in stores — never expires, and neither does a run still in progress."""
 
     days: float | None = None
@@ -1103,7 +1103,7 @@ def type_name(t: Any) -> Any:
 def hints(name: str, fn: Callable) -> dict[str, Any]:
     """A producer's annotations, resolved once, at registration: one that
     does not resolve (a type never imported) is a registration error, not
-    the first run's. `Project.hints` keeps them for the harness."""
+    the first run's. `Project.hints` keeps them for the worker."""
 
     try:
         return typing.get_type_hints(fn)
@@ -1271,7 +1271,7 @@ class Project:
                 output.name = output.name or default
                 if not NAME.fullmatch(output.name):
                     # Names are letters, digits, `_.-`: never `@asset`, the namespace of
-                    # failure indexes (docs/per-key-processing.md §9), nor a path.
+                    # failed keys (docs/per-key-processing.md §9), nor a path.
                     raise RegistrationError(f"{asset.name}: invalid output name {output.name!r}")
                 if output.name in table or output.name in seen:
                     raise RegistrationError(f"Duplicate output name: {output.name}")
@@ -1654,7 +1654,7 @@ class Project:
             # How a store keeps a writer the engine gave up on from writing over a
             # newer one (docs/stores.md): it writes only names no one else uses, or
             # every write checks the attempt's generation — and says which keys a
-            # slice holds, for a repair (docs/versions.md §5).
+            # partition holds, for a repair (docs/versions.md §5).
             writes = getattr(store, "writes", None)
             needs = {"immutable": ("cleanup",), "fenced": ("acquire", "keys")}.get(writes)
             if needs is None:

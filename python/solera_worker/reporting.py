@@ -34,7 +34,7 @@ class Reporter:
 
     `on_cancel(record)` runs, from this thread, each time the latched cancel
     record gets stronger; `on_ended()` once the engine says the attempt is
-    over for this invocation."""
+    over for this worker."""
 
     def __init__(self, objects, base, worker_id, channel, interval, timeline, on_cancel, on_ended):
         self.objects, self.base, self.worker_id = objects, base, worker_id

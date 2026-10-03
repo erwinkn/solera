@@ -1,5 +1,5 @@
 """The attempt lifecycle's races (docs/lifecycle.md §2–§7): duplicate
-invocations, a duplicate's exit, the two-phase cancel and its record, the
+workers, a duplicate's exit, the two-phase cancel and its record, the
 binding rebuilt after a restart, and logs as chunks plus a tail."""
 
 import asyncio
@@ -17,7 +17,7 @@ from .test_fence import REMOTE, Fake, Remote, engine_for, finish_as_worker, laun
 
 
 async def test_a_duplicate_invocation_waits_for_the_owner_and_writes_nothing(tmp_path):
-    """Two invocations of one attempt: the first claim wins. The loser
+    """Two workers of one attempt: the first claim wins. The loser
     touches nothing and exits only once the owner's result exists, so its
     exit never reads as the attempt's (§4)."""
 
@@ -128,7 +128,7 @@ class Duplicate(Remote):
 
 async def test_a_duplicates_exit_does_not_end_the_owners_attempt(tmp_path):
     """The provider reports an exit while the claim's owner still beats over
-    the channel: the exit was another invocation's. The engine drops the
+    the channel: the exit was another worker's. The engine drops the
     handle, follows the owner, and commits its result (§4)."""
 
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
@@ -216,7 +216,7 @@ async def test_a_timeout_drain_is_retryable(tmp_path):
 
 async def test_a_restarted_engine_binds_the_claims_owner(tmp_path):
     """After a restart the binding lives in `.worker`, never in a request:
-    the owner's next beat binds; any other invocation gets `not_owner`."""
+    the owner's next beat binds; any other worker gets `not_owner`."""
 
     url = tmp_path.as_uri()
     state = await State.open(url, "test", flush_interval=0.001)
@@ -314,8 +314,8 @@ async def test_a_fenced_store_runs_its_retry_at_once(tmp_path):
 
 
 async def test_a_renamed_asset_keeps_what_its_scope_owes(tmp_path):
-    """Review P1-3: renaming an asset (`aliases=`) moves its unsettled
-    intents and its pending discards with it: a new name never lets a dead
+    """Review P1-3: renaming an asset (`aliases=`) moves its owing a repair
+    intents and its pending cleanups with it: a new name never lets a dead
     writer's keys go unrepaired, nor its garbage go uncollected."""
 
     @asset(outputs=Output("items", key="id"))

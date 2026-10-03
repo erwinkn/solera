@@ -104,10 +104,10 @@ class Prepared:
     partition: str
     commit_number: int
     generation: int
-    index: IndexState  # the index the engine holds for the scope now
+    index: IndexState  # the index the engine holds for the partition now
     head_commit: int
     replace: bool  # whether a replacement is allowed
-    position: float = math.inf  # the event position the index was read at: a fill's reader pin
+    position: float = math.inf  # the event counter the index was read at: a fill's reader pin
 
 
 @dataclass

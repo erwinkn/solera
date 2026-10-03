@@ -557,7 +557,7 @@ async def test_level_0_merges_in_itself_until_it_is_a_tenth_of_level_1():
 
 async def test_generations_and_predecessors():
     """Entries carry the generation that wrote them; delta entries carry the
-    generation the key had before, for an immutable store to discard the
+    generation the key had before, for an immutable store to clean up the
     object it superseded (lifecycle.md §9.8). Compaction keeps generations
     and payloads only."""
 

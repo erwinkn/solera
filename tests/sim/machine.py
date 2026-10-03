@@ -293,7 +293,7 @@ class Simulation(RuleBasedStateMachine):
 
     @rule(delay=st.sampled_from([0.0, 20.0, 90.0]), twice=st.booleans())
     def sensor_round(self, delay, twice):
-        """The sensor host asks for due ticks, runs them, posts what they found
+        """The sensor worker asks for due ticks, runs them, posts what they found
         (`delay` later; `twice`: the post is retried)."""
 
         self.trace.append(f"sensor_round(delay={delay}, twice={twice})")
@@ -576,8 +576,8 @@ class Simulation(RuleBasedStateMachine):
 
     @invariant()
     def a_fenced_scope_at_rest_holds_its_index_keys(self):
-        """docs/versions.md §9: a fenced store's scope that no attempt holds
-        and no dead writer left unsettled holds exactly the keys its index
+        """docs/versions.md §9: a fenced store's partition that no attempt holds
+        and no dead writer left owing a repair holds exactly the keys its index
         lists — a repair by presence leaves no key without rows, and no row
         without its key — and, in Postgres, reads as written by its head's
         generation: a repair always writes, so a dead attempt's generation,
@@ -741,7 +741,7 @@ class Simulation(RuleBasedStateMachine):
             checks = await keyed_content(engine, project, "checks", whole=True, column="w")
             if checks != expected_checks(want):
                 raise Violation(f"checks {stage}: {checks} != {expected_checks(want)}")
-            outside = {  # each key at the version its last observation gave it
+            outside = {  # each key at the version its last tick gave it
                 k: p.decode() for k, (_, p) in (await index_entries(engine.state, "outside", "")).items()
             }
             if outside != self.outside.keys:

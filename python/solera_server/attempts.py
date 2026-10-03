@@ -27,7 +27,7 @@ from .state import LostOwnership, Unavailable
 log = logging.getLogger(__name__)
 
 LIVE_LINES = 10_000  # live log lines kept per attempt for the console
-AFTER_COMMIT_WAIT = 10.0  # seconds a worker's `finished` waits for its commit, for its discards
+AFTER_COMMIT_WAIT = 10.0  # seconds a worker's `finished` waits for its commit, for its cleanups
 POOL_OFFERED_GRACE = 10.0  # an offered pool attempt not started this long: look for its claim
 POOL_PAGE = 8  # attempts one discovery answer offers
 
@@ -59,8 +59,8 @@ def _names(value) -> dict[str, list[str]]:
 
 
 def cleanup_report(body) -> dict:
-    """A worker's discard acknowledgement as the model applies it: its
-    `scope`, and by output the entry ids it discarded (`discarded`) or
+    """A worker's clean up acknowledgement as the model applies it: its
+    `partition`, and by output the entry ids it cleaned up (`cleaned up`) or
     could not read the names of (`discard_unresolved`), and the index files
     it deleted (`discarded_files`)."""
 
@@ -113,7 +113,7 @@ def current_names(prepared: dict, by_output: dict) -> dict:
 def worker_report(worker: dict | None) -> dict:
     """What a worker's result or report may put in an event, as values the
     model applies with no parsing (review round 3, B5): its timeline
-    events, its usage, the data garbage it discarded, and its keys by
+    events, its usage, the cleanup it cleaned up, and its keys by
     outcome. A malformed part is left out; a worker cannot make a reducer
     fail half-way."""
 
@@ -156,8 +156,8 @@ def worker_report(worker: dict | None) -> dict:
 
 
 def _read(entry) -> dict | None:
-    """One slice a worker's read saw (`solera_worker.observed`): its output
-    and scope, and the generation whose write it saw (None: no fenced write
+    """One partition a worker's read saw (`solera_worker.observed`): its output
+    and partition, and the generation whose write it saw (None: no fenced write
     says, as for an external table)."""
 
     if not isinstance(entry, dict) or not isinstance(entry.get("output"), str):
@@ -175,7 +175,7 @@ class Live:
     """What the engine knows of a launched attempt's worker, in memory only:
     rebuilt from `.worker` after a restart (§5.3)."""
 
-    worker_id: str | None = None  # the bound invocation: the claim's owner
+    worker_id: str | None = None  # the bound worker: the claim's owner
     started: bool = False  # it reported: the runtime clock runs
     started_at: float = 0.0  # monotonic
     reported: float | None = None  # when it last reported (monotonic)
@@ -244,7 +244,7 @@ class Attempts:
 
     async def _bind(self, attempt: str, live: Live, worker_id: str, start: bool = False) -> None:
         """The first `start` of an attempt this engine launched binds its
-        invocation: only the claim's winner sends one. Any other token, or
+        worker: only the claim's winner sends one. Any other token, or
         any request after a restart, is checked against the claim itself
         (§5.3)."""
 
@@ -311,10 +311,10 @@ class Attempts:
 
     async def _due_after(self, attempt: str, task_id: str | None) -> dict:
         """Once the attempt is settled and its commit durable, the data
-        garbage due in its scope — what its commit let go of that no reader
-        pins, and what was waiting — for its worker to discard at once
+        garbage due in its partition — what its commit let go of that no reader
+        pins, and what was waiting — for its worker to clean up at once
         (docs/lifecycle.md §9.8). Nothing if settling takes longer: the
-        scope's next attempt discards it, as ever."""
+        partition's next attempt cleanups it, as ever."""
 
         task = self.m.task(task_id or "")
         loop = asyncio.get_running_loop()
@@ -334,7 +334,7 @@ class Attempts:
         return {"cleanup": due, "partition": task["partition"]} if due else {}
 
     async def attempt_cleaned_up(self, attempt: str, body) -> None:
-        """A worker's acknowledgement of what it discarded after its commit,
+        """A worker's acknowledgement of what it cleaned up after its commit,
         checked whole before anything is recorded: one that is malformed is
         refused (`ValueError`), and no reducer ever sees it."""
 
@@ -686,7 +686,7 @@ class Attempts:
         status = result.get("status")
         if status == "canceled" and "failures" in result:
             # A drained Each page (docs/lifecycle.md §7): what finished commits, as one
-            # decision with its interrupted keys and its watermark.
+            # decision with its interrupted keys and its bookmark.
             reason = (result.get("cancel") or {}).get("reason") or "user"
             user = reason == "user"
             try:
@@ -772,7 +772,7 @@ class Attempts:
         )
 
     def partition_cleanups(self, output: str, partition: str) -> dict:
-        """An output scope's data garbage awaiting its next attempt (§9.8):
+        """An output partition's cleanup awaiting its next attempt (§9.8):
         how much is pending, and the entries stuck — their names could not
         be read three times — for an operator to see and clear."""
 
@@ -790,7 +790,7 @@ class Attempts:
         }
 
     def clear_cleanups(self, output: str, partition: str, by: str) -> dict:
-        """An operator's `solera scopes discards --clear`: forget the stuck
+        """An operator's `solera cleanups --clear`: forget the stuck
         entries. Their objects stay where they are."""
 
         stuck = [e["id"] for e in self.m.cleanups.get((output, partition)) or [] if e.get("stuck")]
@@ -839,7 +839,7 @@ class Attempts:
         """End a launched attempt without a commit. Its gate is taken as
         `aborted` first, so it can never write after this, and the gate
         found says what it may have written (§2.3). If it had begun writing,
-        the keyed outputs it meant to change stay unsettled until a later
+        the keyed outputs it meant to change stay owing a repair until a later
         commit takes in what landed; their intent files are kept for that.
         `result` is the worker's, when it published one."""
 
@@ -880,7 +880,7 @@ class Attempts:
 
     async def _cleanup(self, attempt: str, prepared: dict, keep=()):
         """Delete the delta files an attempt wrote but never committed, except
-        the intents of outputs it left unsettled. They are named after the
+        the intents of outputs it left owing a repair. They are named after the
         attempt, so nothing else can hold them (§6)."""
 
         for name, info in (prepared.get("outputs") or {}).items():

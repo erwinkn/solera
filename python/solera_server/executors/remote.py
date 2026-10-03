@@ -2,7 +2,7 @@
 
 Each lazily imports its SDK so the server runs without the optional extras
 installed; a missing SDK raises at `launch`, which the engine records as a
-retryable attempt failure. `launch` hands the harness the stage strings —
+retryable attempt failure. `launch` hands the worker the stage strings —
 `attempt`, `run` and `objects` — via container override, argv, or function
 argument.
 
@@ -198,7 +198,7 @@ class K8sJob:
 
 
 class Modal:
-    """`Modal(app)(gpu)` — spawns the harness as a Modal function call."""
+    """`Modal(app)(gpu)` — spawns the worker as a Modal function call."""
 
     max_concurrent = None
 

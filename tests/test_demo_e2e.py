@@ -109,7 +109,7 @@ def test_demo_end_to_end(demo, pool_worker):
     for auto in client.get(f"{base}/automations").json()["automations"]:
         client.post(f"{base}/automations/{auto['name']}/disable")
 
-    # The external `uploads` partition set is fed from outside (§5) — this
+    # The external `uploads` dynamic partitions is fed from outside (§5) — this
     # commit is what the README does with `solera commit uploads`.
     committed = client.post(f"{base}/sources/uploads/commit", json={"keys": {"u-1": "v1", "u-2": "v1"}})
     assert committed.status_code == 200 and committed.json()["ref"]["generation"]
@@ -117,8 +117,8 @@ def test_demo_end_to_end(demo, pool_worker):
     # `manual_ingest` is placed on Pool("ingest"): only an external worker
     # can complete it — `pool_worker`, `solera worker pool ingest` in the README.
 
-    # The partition set grows one site per run and caps at four. Saturate it
-    # first so every downstream run plans the same site scopes.
+    # The dynamic partitions grows one site per run and caps at four. Saturate it
+    # first so every downstream run plans the same site partitions.
     last = set()
     for _ in range(5):
         response = client.get(f"{base}/outputs/sites/keys")
@@ -132,7 +132,7 @@ def test_demo_end_to_end(demo, pool_worker):
     assert len(sites) == 4
 
     # Submit the whole graph. upstream=True pulls producers (and the sites
-    # partition set) into each run; the rollup fans in over all sites.
+    # dynamic partitions) into each run; the rollup fans in over all sites.
     submitted = [
         submit(["site_digest"]),  # site × day — needs sites + site_feed
         submit(["fleet_index"]),  # AllPartitions rollup over file_index
@@ -143,7 +143,7 @@ def test_demo_end_to_end(demo, pool_worker):
     assert wait(lambda: all(run_done(r) for r in submitted))
     assert all(run_status(r) == "succeeded" for r in submitted)
 
-    # Every output has a complete head for every planned scope.
+    # Every output has a complete head for every planned partition.
     def all_complete():
         all_heads = {o: heads(o) for o in OUTPUTS}
         return all(hs and all(h["materialized"] for h in hs) for hs in all_heads.values())
@@ -165,8 +165,8 @@ def test_demo_end_to_end(demo, pool_worker):
     # version and never changes.)
     #
     # The concurrent runs above commit site_files deltas that can land after
-    # a sibling run's last file_index drain — real work the watermark must
-    # not skip. Drain the log first so every watermark sits at head.
+    # a sibling run's last file_index drain — real work the bookmark must
+    # not skip. Drain the log first so every bookmark sits at head.
     drain = submit(["file_index"], partitions="all", upstream=False)
     assert wait(lambda: run_done(drain)) and run_status(drain) == "succeeded"
     site_files = {h["partition"]: h["ref"]["generation"] for h in heads("site_files")}
@@ -181,7 +181,7 @@ def test_demo_end_to_end(demo, pool_worker):
     assert {h["partition"]: h["ref"]["generation"] for h in heads("site_files")} == site_files
 
     # The Incremental consumer over unchanged upstream state skips every
-    # scope — the delta log holds nothing past its watermark.
+    # partition — the delta log holds nothing past its bookmark.
     again = submit(["file_index"], partitions=sorted(site_files), upstream=False)
     assert wait(lambda: run_done(again)) and run_status(again) == "succeeded"
     detail = client.get(f"{base}/runs/{again}").json()
@@ -195,7 +195,7 @@ def test_demo_end_to_end(demo, pool_worker):
     # -- the changed-keys pass (§6, Incremental) -----------------------------
     # Once the tick advances every file's revision bumps; the consumer must
     # process exactly the changed keys (and any deletions), in batches of
-    # page_size=2 — four files per site means `more` continuation.
+    # batch_size=2 — four files per site means `more` continuation.
     def site_file_keys():
         out = {}
         for h in heads("site_files"):
@@ -322,8 +322,8 @@ def test_demo_postgres_migrations_and_ondeploy(tmp_path):
 
         assert wait(deploy_fired, timeout=30), "the OnDeploy job did not fire on boot"
 
-        # Populate the sites partition set first so downstream runs plan
-        # real scopes, then drive file_index (pulls sites + site_feed via
+        # Populate the sites dynamic partitions first so downstream runs plan
+        # real partitions, then drive file_index (pulls sites + site_feed via
         # upstream). Each head's ref carries the last applied migration as
         # schema (§4).
         def run_done(run_id):

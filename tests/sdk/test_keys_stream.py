@@ -46,7 +46,7 @@ def replace(rows, runs, max_file_bytes=4096, collect=10**6, stream=(), key=None)
 
 def scenario(seed=0, n=3000):
     """An index of two runs — an old level and a newer delta — of a source
-    whose keys carry versions, and its next observation: most keys at the
+    whose keys carry versions, and its next tick: most keys at the
     version they have, some at another, some written again with none,
     deleted keys back, new keys."""
 
@@ -112,7 +112,7 @@ def test_every_write_of_a_key_without_a_version_is_a_change():
 
 
 def test_a_set_relisted_changes_nothing():
-    """A partition set's elements carry an empty version: listing them again
+    """A dynamic partitions's elements carry an empty version: listing them again
     is no change (docs/versions.md §2)."""
 
     written = [b"%05d" % i for i in range(2000)]

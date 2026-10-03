@@ -89,13 +89,13 @@ async def test_a_removed_assets_last_attempt_ends_its_run(state, monkeypatch):  
         tasks = state.model.runs[run["id"]]["tasks"].values()
         raise AssertionError(f"the run never ends: {[(t['status'], t.get('held')) for t in tasks]}") from None
     assert status_of(detail) in {"succeeded", "failed", "canceled"}
-    assert not state.model.partition("pages", "").get("bookmarks")  # its delivery ends with it
+    assert not state.model.partition("pages", "").get("bookmarks")  # its pass ends with it
 
 
 async def test_an_attempt_launched_before_a_rename_settles(state, monkeypatch):  # noqa: F811
     """docs/object-store-state.md §2: a rename moves heads, indexes and
     outcomes to the new name; an attempt launched under the old name still
-    settles — its run ends and the scope is free for the next one."""
+    settles — its run ends and the partition is free for the next one."""
 
     from solera_server import attempts
 
@@ -140,9 +140,9 @@ async def test_an_attempt_launched_before_a_rename_settles(state, monkeypatch): 
 
 
 async def test_a_change_made_during_a_full_delivery_reaches_downstream(state):  # noqa: F811
-    """§6, §9: a full keyed delivery begun at batch 0 delivers what changed
+    """§6, §9: a full keyed pass begun at batch 0 delivers what changed
     meanwhile afterwards, as a delta. Interrupted after its first page, then
-    the upstream changes: the firing for that change resumes the delivery —
+    the upstream changes: the firing for that change resumes the pass —
     and must also deliver the change, since nothing else will fire for it."""
 
     from solera.sdk import AutoRefresh
@@ -268,8 +268,8 @@ async def test_a_batch_upstream_reset_right_after_a_delivery_is_delivered_in_ful
 )
 async def test_a_full_delivery_that_takes_no_key_still_starts_over(state):  # noqa: F811
     """§5, §8: a full run makes the output equal to exactly its write, and a
-    full delivery starts its consumer over. When the edge's patterns take
-    none of the upstream's keys, the delivery is skipped without calling
+    full pass starts its consumer over. When the edge's patterns take
+    none of the upstream's keys, the pass is skipped without calling
     the producer — so nothing starts over, and keys the consumer holds from
     before stay, though its upstream holds them no longer."""
 
@@ -302,8 +302,8 @@ async def test_a_full_delivery_that_takes_no_key_still_starts_over(state):  # no
 async def test_a_name_removed_and_added_back_starts_over(state):  # noqa: F811
     """F12: a name the project no longer declares holds no live state. `copy`
     renamed to `mirror` and back without an alias left `mirror`'s first life
-    in place, and the next rename onto `mirror` kept it — under a watermark
-    already past a deletion. Removed, a name's head, index and scope go (its
+    in place, and the next rename onto `mirror` kept it — under a bookmark
+    already past a deletion. Removed, a name's head, index and partition go (its
     index files to collection); renamed onto, it takes the old name's state."""
 
     @asset(outputs=Output("items", key="id"))
@@ -346,8 +346,8 @@ async def test_a_name_removed_and_added_back_starts_over(state):  # noqa: F811
 async def test_a_key_a_moved_output_dropped_leaves_its_consumer(state, tmp_path):  # noqa: F811
     """F9: a keyed output moved to another store starts its index over, and
     the move's first write holds only upserts. `copy`, planned under the new
-    project but against the old index, commits its delivery after the move
-    landed: its watermark then reaches the move's batch, and the move must
+    project but against the old index, commits its pass after the move
+    landed: its bookmark then reaches the move's batch, and the move must
     not be read as a plain delta — `k11`, which the move dropped, goes."""
 
     rows = {"items": [{"id": "k10"}, {"id": "k11"}]}

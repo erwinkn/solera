@@ -19,9 +19,9 @@ here.
 
 A key is identified by `(output, partition, key)`. **Its version is the
 generation of the write that last wrote it.** The generation is what
-`lifecycle.md` §9.7 already defines: the event position of the writing
+`lifecycle.md` §9.7 already defines: the event counter of the writing
 attempt's claim, carried in its spec, larger for every later attempt on a
-scope. The index already stores it as each entry's locator, the name an
+partition. The index already stores it as each entry's locator, the name an
 immutable store gives the key's object, so the version adds nothing new.
 
 **Change detection is "was it written".** Any write of a key is a change
@@ -39,7 +39,7 @@ reprocess everything. That is accepted: to avoid it, the producer returns
 a `Patch` of the keys that changed, or leaves an output out of its
 `Result`, which writes nothing.
 
-The same holds for a whole output scope: its version is the generation of
+The same holds for a whole output partition: its version is the generation of
 the last commit that changed it. A ref carries its `generation` (one
 concept, not two); a store builds refs without it and the worker stamps
 the attempt's.
@@ -48,7 +48,7 @@ the attempt's.
 
 A source is fed from outside, so no attempt wrote its keys and no
 generation says when they changed. A source commit takes the engine's
-event position as its generation, like an attempt's claim, and then:
+event counter as its generation, like an attempt's claim, and then:
 
 - **A version per key** (an etag, a ctag, an `updated_at`) may come with
   the commit: `observe()` returning `{key: version}`, `solera commit
@@ -60,7 +60,7 @@ event position as its generation, like an attempt's claim, and then:
   *Edge case:* a sensor that lists a 1M-file folder every five minutes
   must not mark 1M files changed every five minutes when two moved.
 - **No version:** every key the commit names is changed. A full
-  observation without versions therefore marks every key changed, by
+  tick without versions therefore marks every key changed, by
   convention.
 - **A source that already knows its changes** (`Observed(upsert, remove)`,
   a delta feed, `--upsert '["a.csv"]'`) needs no versions: the keys it
@@ -76,7 +76,7 @@ observe → {a.csv: "c7", b.csv: "c4", d.csv: "c1"}            a full map
 delta:    b.csv@g210 (changed)  d.csv@g210 (added)            a.csv unchanged
 ```
 
-**Partition sets** reuse the version: an element's version is empty,
+**Dynamic partitions** reuse the version: an element's version is empty,
 since membership is all an element holds, so listing it again changes
 nothing.
 *Edge case:* the demo's `sites` re-lists every site on every cron run;
@@ -95,13 +95,13 @@ v3       (key, generation, deleted, payload?)    + predecessor generation
 - `version` and `locator` merge into `generation`. *Why:* they were two
   fields for one fact once versions stopped being digests.
 - `payload` is one optional opaque field the index's kind interprets: a
-  source key's version, or a failure index's failure record
+  source key's version, or a failed keys's failure record
   (`per-key-processing.md` §9). A flag bit, then length and bytes; an
   upsert carrying a payload equal to the live entry's is unchanged.
-  *Edge case:* §2's full observations; and one field, not two, for the
-  failure index, which needed one of its own.
+  *Edge case:* §2's full ticks; and one field, not two, for the
+  failed keys, which needed one of its own.
 - The predecessor is the generation the change superseded. *Edge case:*
-  an immutable store discards the superseded object by name,
+  an immutable store cleanups the superseded object by name,
   `{key}/{generation}`.
 - **Filters: keys and tombstones; the pair filter went.** It answered "is
   `(key, version)` live?", which no write asks any more: a written key is
@@ -125,15 +125,15 @@ grouped by key (`Rows`). Nothing else of a row reaches native code.
 
 A store still:
 
-1. writes each upsert's rows, deletes each remove, clears the scope for a
+1. writes each upsert's rows, deletes each remove, clears the partition for a
    whole write;
 2. is `immutable` or `fenced` (`stores.md`);
 3. if immutable, names a key's object `{output}/{partition}/{key}/{generation}`
-   and discards by `("key", key, generation)`;
+   and cleanups by `("key", key, generation)`;
 4. if fenced, keeps the fence row's `written` generation and offers
    `reads()`;
 5. if fenced, answers **`keys(ref, among)`**: the keys present in the
-   scope, sorted, among the given ones or all of them, never a value.
+   partition, sorted, among the given ones or all of them, never a value.
    *Edge case:* repair, §5;
 6. for a `Sql` write, reports the keys it wrote, sorted.
 
@@ -161,7 +161,7 @@ immutable; the conformance kit holds stores to it.
 
 Only fenced stores repair: an immutable store's dead writer leaves only
 names no entry points at. An attempt that took its gate and died leaves
-its intents, the keys it meant to change. The next attempt on the scope
+its intents, the keys it meant to change. The next attempt on the partition
 acquires the fence, so the dead writer can write nothing more, then:
 
 - a key it writes or removes itself ends as it says;
@@ -178,12 +178,12 @@ attempt g15   k present → k@g15         k absent → nothing
 
 *Edge case for the presence check:* without it, g15 would mark `k` live
 whether or not the insert landed, and the index would list a key with no
-rows, counted, and handed to every full delivery. It reads keys, never
+rows, counted, and handed to every full pass. It reads keys, never
 values.
 
 **Unknown writes.** A `Sql` write's gate names no keys. If it dies, its
 next write must cover every key: a replacement or `Sql` write rewrites
-the scope, and every key it writes is at its generation anyway; a patch
+the partition, and every key it writes is at its generation anyway; a patch
 first reads every present key (`keys(ref, None)`), gives each the new
 generation and tombstones live keys the store lacks. Either way consumers
 take everything again.
@@ -194,30 +194,30 @@ transaction even when its own write is empty, so the fence row's
 
 ## 6. Lineage
 
-Lineage records **the generation read**, per input slice:
+Lineage records **the generation read**, per input partition:
 
 - an immutable store's read is the pinned generation, exactly;
 - a fenced store's read is the fence row's `written` at the reader's
   snapshot (`reads()`);
-- `uncommitted` when no commit of the slice has that generation;
+- `uncommitted` when no commit of the partition has that generation;
   *Edge case:* a reader saw a dead attempt's write;
-- a fixed paged delivery (a delta window, a rescope) records the
-  generation the delivery was cut at, persisted with the delivery, not
+- a fixed paged pass (a delta pass, a pattern change) records the
+  generation the pass was cut at, persisted with the pass, not
   the head's when a later page is read. *Edge case:* a window cut at g2
   whose second page is read after g3 committed read g2's content;
 - an external source, read current with no fence, records the generation
-  of the observation the attempt was pinned to. No new marker: external
+  of the tick the attempt was pinned to. No new marker: external
   sources are read current by definition.
 
 `ctx.load` reads are not lineage edges: they read no input of the
-attempt's. One moment reads a slice once, so the first read of a slice is
+attempt's. One moment reads a partition once, so the first read of a partition is
 what lineage records; there is no "mixed" marker. The per-key versions a
 current read used to report, computed by hashing what it loaded, are
 gone. The pin stays internal: the engine uses it to deliver, and lineage
 shows it only as debugging detail.
 
 ```
-B pins A@g10 and reads A's slice in Postgres while A's attempt g12 writes it
+B pins A@g10 and reads A's partition in Postgres while A's attempt g12 writes it
 lineage:  B ← A, generation 12                    (g12 committed)
           B ← A, generation 12, uncommitted        (g12 died; the repair is g15)
 ```
@@ -228,15 +228,15 @@ lineage:  B ← A, generation 12                    (g12 committed)
 |---|---|---|
 | A rewrites `k` while B reads it | Immutable: B reads the pinned object, then `k` again with A's delta. Fenced: B may read A's new rows and records generation 12; A's commit, or the repair of its dead attempt, puts `k` in a delta B receives later, and B rereads | yes |
 | Identical rewrites | Every key rewritten is a change; consumers reprocess. A whole input rewritten identically changes its ref's generation, so it resets its consumers' incremental edges (the fingerprint holds input refs): a full redelivery | accepted |
-| `version=` bump | The fingerprint changes, the asset's edges reset, every key is reprocessed and written at a new generation, so consumers reprocess too. (Revision outputs used to hide this; they are gone.) A cursor producer with no inputs reprocesses nothing, as today | yes |
+| `version=` bump | The fingerprint changes, the asset's inputs reset, every key is reprocessed and written at a new generation, so consumers reprocess too. (Revision outputs used to hide this; they are gone.) A cursor producer with no inputs reprocesses nothing, as today | yes |
 | Deploys | The epoch moves; only failed `Each` keys get their one try, and those that succeed are written at a new generation | yes |
-| Retries | A new attempt has a new generation; an uncommitted attempt's delta files and objects are discarded. A store call retried inside one attempt rewrites the same names with the same bytes | yes |
+| Retries | A new attempt has a new generation; an uncommitted attempt's delta files and objects are cleaned up. A store call retried inside one attempt rewrites the same names with the same bytes | yes |
 | `Each` full redelivery (truncated log, reset) | Every key is processed and written again; its consumers reprocess everything | accepted |
-| Rescope | Newly matched keys are delivered at their generation; unmatched ones removed | yes |
+| Pattern change | Newly matched keys are delivered at their generation; unmatched ones removed | yes |
 | Unknown `Sql` writes | §5: a rewrite, or a key scan before a patch | yes |
 | Store move | The moved output starts over (`59812c4`): a fresh index, a whole first write, every key at a new generation, consumers take everything | yes |
 | Rename | Index entries, generations and object names stay | yes |
-| Failure index retry, upstream changed | The failure record's upstream generation differs from the key's in the pinned input, so the key comes with the change window instead (`per-key-processing.md` §9) | yes |
+| Failed keys retry, upstream changed | The failure record's upstream generation differs from the key's in the pinned input, so the key comes with the delta pass instead (`per-key-processing.md` §9) | yes |
 
 **Breaks with the model as Erwin stated it.** One:
 
@@ -246,7 +246,7 @@ lineage:  B ← A, generation 12                    (g12 committed)
    ```
    attempt g12   writes k to Postgres (written = 12), dies after its gate
    attempt g15   patches nothing of its own; repairs k → k@g15 in the index, writes no rows
-   reader C      reads the slice later: written = 12 → "generation 12, uncommitted"
+   reader C      reads the partition later: written = 12 → "generation 12, uncommitted"
    ```
 
    C read content that g15 committed, and lineage says nobody did, until
@@ -281,13 +281,13 @@ revision.
   write is a change; a retried store call in one attempt gives the same
   delta bytes; source versions: equal unchanged, different changed, absent
   changed; set elements re-listed unchanged; immutable names and
-  discards by generation; `keys(ref, among)` in the store conformance
+  cleanups by generation; `keys(ref, among)` in the store conformance
   kit; the repair example of §5 both ways; a dead `Sql` writer then a
   replacement, then a patch.
 - **The simulation** (`tests/sim`, `verification.md`). Its invariant
   "Reads say what they read" drops the per-key part: a read reports the
-  generation that wrote the slice. Add one invariant and one check:
-  - after every step, for a fenced scope with nothing unsettled, the
+  generation that wrote the partition. Add one invariant and one check:
+  - after every step, for a fenced partition with nothing owing a repair, the
     index's live keys are exactly the store's present keys;
   - at convergence, every lineage generation that some commit settled is
     not reported `uncommitted` (break 1).
@@ -316,10 +316,10 @@ One implementation worker, in this order, merged when `tests/` and
    upstream `generation`); the simulation's invariants.
 
 Tests for the review's four sequences, `tests/server/test_versions.py`
-and `test_lineage_reads.py`: a paged delta window's lineage across a
+and `test_lineage_reads.py`: a paged delta pass's lineage across a
 later commit; a failure record across an engine restart with a skewed
 clock; repair keeping or dropping a dead writer's key; an external
-table's lineage at its observation. Postgres key identity:
+table's lineage at its tick. Postgres key identity:
 `tests/sdk/test_postgres.py`.
 
 Then the docs: delete `row-digest.md`; update `architecture.md` §3,

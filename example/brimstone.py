@@ -1,7 +1,7 @@
 """End-to-end project: every pattern in the architecture, in one file.
 
 Brimstone-flavored: SharePoint sites polled through Microsoft Graph delta
-feeds, a keyed output used as the site partition set, an externally fed
+feeds, a keyed output used as the site dynamic partitions, an externally fed
 upload set, per-file Excel ingestion keyed by file_id (an `Each` edge: one
 call per changed workbook, its failures kept per key), Postgres and blob
 outputs, multi-dimensional partitions, sized executors, a job, and both
@@ -43,7 +43,7 @@ from solera_postgres import PostgresStore
 
 # ---------------------------------------------------------------------------
 # Resources: ordinary client objects, injected by parameter name. `env:`
-# indirection resolves in the harness, like store config.
+# indirection resolves in the worker, like store config.
 # ---------------------------------------------------------------------------
 
 
@@ -86,7 +86,7 @@ ingest = Pool("ingest")
 
 
 # ---------------------------------------------------------------------------
-# A partition set is an output. `sites` is an ordinary asset whose value is a
+# A dynamic partitions is an output. `sites` is an ordinary asset whose value is a
 # key list; its key map is the set every consumer pins.
 # ---------------------------------------------------------------------------
 
@@ -128,7 +128,7 @@ uploads = DynamicPartitions("uploads")
     automations=Automation(trigger=Every(30)),
 )
 def graph_delta(ctx, graph: GraphClient):
-    """Poll a site's Graph delta feed; the delta token is the cursor."""
+    """Poll a site's Graph delta feed; the feed's cursor is the cursor."""
     events, token = graph.delta(site=ctx.partition, since=ctx.cursor)
     workbooks = [
         {"file_id": e["file_id"], "version": e["version"], "path": e["path"]}
@@ -166,7 +166,7 @@ class Unprocessable(Rejected):
         partition_column="site",
         # Schema owned by the output: the store applies pending ones before
         # its first write, keeps the ledger in Postgres, and a new entry
-        # reprocesses every key (it enters the interpretation fingerprint).
+        # reprocesses every key (it enters the fingerprint).
         migrations=[
             Migration("0001_analyst", "ALTER TABLE qaqc.qaqc_samples ADD COLUMN IF NOT EXISTS analyst text"),
             Migration(
@@ -266,7 +266,7 @@ def leach(
     automations=AutoRefresh(),
 )
 def site_health(ctx, change_events: TableRef) -> Sql:
-    """In-database: a TableRef in, a query out; no row enters the harness.
+    """In-database: a TableRef in, a query out; no row enters the worker.
     The store materializes the SELECT into ops.site_health for this site."""
     return Sql(
         f"SELECT status, count(*) AS n FROM {change_events.table} WHERE {change_events.where_sql()} GROUP BY status"
@@ -364,7 +364,7 @@ project = Project(
         Source("xrf", store="postgres", schema="datasmart"),
         # Lineage only: read via a resource, referenced in deps=.
         Source("usgs_3dep_tiles"),
-        # PartitionSet fed through the commit API.
+        # DynamicPartitions fed through the commit API.
         uploads,
     ],
     stores={

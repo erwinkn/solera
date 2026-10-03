@@ -1,14 +1,14 @@
 """PostgresStore: shared mutable tables (§3, §4). Reads are not pinned: a
-ref names a table slice, and a load reads what it holds now.
+ref names a table partition, and a load reads what it holds now.
 
 A `fenced` store (docs/lifecycle.md §9.7): each attempt takes its generation
-for the slice it writes — keyed by the table's OID, which survives renames,
+for the partition it writes — keyed by the table's OID, which survives renames,
 and the partition — before it reads anything, and every write transaction
 checks it under the row's lock. A newer attempt's acquisition waits for an
 older writer's open transaction, after which that writer can change nothing.
 
 `psycopg` is imported lazily so project files can declare the store without a
-driver installed; only `store`/`load` need it (in the harness).
+driver installed; only `store`/`load` need it (in the worker).
 """
 
 from __future__ import annotations
@@ -112,7 +112,7 @@ class PostgresStore:
 
     def can_store(self, t, output) -> bool:
         if output.is_dynamic_partitions or output.key == KEYS:
-            return False  # partition sets and dict outputs live on the default store
+            return False  # dynamic partitions and dict outputs live on the default store
         return t is Sql or takes(t, output, frames=True, values=False)  # rows, DataFrames, Arrow
 
     # -- plumbing -----------------------------------------------------------
@@ -239,7 +239,7 @@ class PostgresStore:
     # -- generations (docs/lifecycle.md §9.7) -------------------------------------
 
     def _fence_table(self, cur) -> None:
-        """The fence rows: per slice, the generation that holds it, and the one
+        """The fence rows: per partition, the generation that holds it, and the one
         whose write transaction last changed it (`written`), which a read
         reports (`reads`)."""
 
@@ -256,11 +256,11 @@ class PostgresStore:
         )
 
     def _take(self, cur, relid: int, context: WriteContext, write: bool = False) -> None:
-        """Take `scope`'s generation for (relid, partition), holding the row's
+        """Take `partition`'s generation for (relid, partition), holding the row's
         lock until the transaction ends. Postgres locks the conflicting row
         even when the `WHERE` refuses the update, so a newer acquisition waits
         for an older writer's open transaction. A `write` transaction also
-        marks the slice written by its generation, as it commits."""
+        marks the partition written by its generation, as it commits."""
 
         written = ", written = EXCLUDED.written" if write else ""
         taken = cur.execute(
@@ -297,9 +297,9 @@ class PostgresStore:
         return cur.execute("SELECT to_regclass(%s)::oid AS relid", (table,)).fetchone()["relid"]
 
     def _fence(self, cur, table: str, context: WriteContext | None) -> None:
-        """In a write transaction, before it changes anything: the slice must
+        """In a write transaction, before it changes anything: the partition must
         still be this attempt's (`_take` is a no-op for its own generation
-        and invocation). A slice it never acquired — a table this
+        and worker). A partition it never acquired — a table this
         transaction created, a new partition — is acquired here."""
 
         if context is None or context.generation is None:
@@ -308,7 +308,7 @@ class PostgresStore:
         self._take(cur, self._relid(cur, table), context, write=True)
 
     async def acquire(self, context: WriteContext, prior: Ref | None = None) -> None:
-        """Take the attempt's generation for the slice it writes — in the
+        """Take the attempt's generation for the partition it writes — in the
         table `prior`, the committed head, names — in a transaction of its
         own, before any read of the store: from here on no older attempt can
         change it. A table that does not exist yet is acquired when the
@@ -491,11 +491,11 @@ class PostgresStore:
 
     def _apply_keyed(self, cur, output, write: KeyedWrite, context, table, slice_where) -> None:
         """Every key is the group of rows that carry it. A whole write is the
-        slice's content: cleared, then written; otherwise only the keys it
+        partition's content: cleared, then written; otherwise only the keys it
         writes change — their rows replaced by their groups, a page at a
         time — and its removes go, every other row untouched. A write of
-        nothing still runs, fencing the slice: the harness gives one only
-        to a repair, whose generation the slice must then read as written
+        nothing still runs, fencing the partition: the worker gives one only
+        to a repair, whose generation the partition must then read as written
         (docs/versions.md §5)."""
 
         self._ensure(
@@ -555,13 +555,13 @@ class PostgresStore:
         )
 
     def _apply_sql(self, cur, output, write: Sql, context, table, slice_where) -> None:
-        """Materialize a query into the slice. The query is never a statement
+        """Materialize a query into the partition. The query is never a statement
         of its own: the store embeds it in one, `INSERT INTO t SELECT … FROM
         (<query>) _src`, prepared (the extended protocol), so UPDATE, DELETE,
         DDL and data-modifying CTEs do not parse, and a second statement is
         refused. What remains is a function the query calls, which must not
-        write; `sql_read_only` makes sure. The harness never sees these rows:
-        a keyed output reports the slice's keys (§6, §9)."""
+        write; `sql_read_only` makes sure. The worker never sees these rows:
+        a keyed output reports the partition's keys (§6, §9)."""
 
         import psycopg
         from psycopg import sql
@@ -623,7 +623,7 @@ class PostgresStore:
         return frames.prepare(write, output)
 
     def keys(self, ref: Ref, among: list[str] | None = None):
-        """The keys `ref`'s slice holds — among `among`, or all of them —
+        """The keys `ref`'s partition holds — among `among`, or all of them —
         sorted by their bytes, a chunk at a time: never a value
         (docs/versions.md §5)."""
 
@@ -631,7 +631,7 @@ class PostgresStore:
         return self._keys(handle["table"], handle["key"], dict(handle.get("where") or {}), among)
 
     def _keys(self, table, key_column: str, where: dict, among: list[str] | None):
-        """The slice's keys (as text) sorted by their bytes, a chunk at a time
+        """The partition's keys (as text) sorted by their bytes, a chunk at a time
         from a server-side cursor, read once the iteration starts — after a
         write has committed."""
 
@@ -671,8 +671,8 @@ class PostgresStore:
         domain exclusively (`_domain`): it waits for every partition's open
         write transaction, a partition's first included, and holds off new
         ones until it commits. Before it changes anything it takes the
-        attempt's own slice, so an older attempt's migration is refused
-        (docs/lifecycle.md §9.7). An operator's migration (no scope) only
+        attempt's own partition, so an older attempt's migration is refused
+        (docs/lifecycle.md §9.7). An operator's migration (no partition) only
         takes its turn. The table is the committed head's (`prior`), else the
         declaration's."""
 
@@ -713,7 +713,7 @@ class PostgresStore:
                     )
                 after = self._relid(cur, table)
                 if before is not None and after is not None and after != before:
-                    # The migration replaced the relation: its slices keep their generations.
+                    # The migration replaced the relation: its partitions keep their generations.
                     self._fence_table(cur)
                     cur.execute(f"UPDATE {FENCE_TABLE} SET relid = %s WHERE relid = %s", (after, before))
                 cur.execute(
@@ -735,7 +735,7 @@ class PostgresStore:
         """An attempt's reads of this store, at one moment (docs/stores.md,
         "What a read sees"): every load of the reader runs in one REPEATABLE
         READ, READ ONLY transaction, and returns with the generation whose
-        write last changed its slice, read in the same snapshot."""
+        write last changed its partition, read in the same snapshot."""
 
         import psycopg
 
@@ -747,7 +747,7 @@ class PostgresStore:
             await asyncio.to_thread(conn.close)
 
     def _written(self, cur, ref: Ref) -> int | None:
-        """The generation whose write transaction last changed `ref`'s slice,
+        """The generation whose write transaction last changed `ref`'s partition,
         as the transaction's snapshot sees it; None if none was fenced."""
 
         if not cur.execute("SELECT to_regclass(%s) IS NOT NULL AS ok", (FENCE_TABLE,)).fetchone()["ok"]:

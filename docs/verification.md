@@ -1,10 +1,10 @@
 # Verification: the deterministic simulation
 
 Solera's bugs live where two features meet: a rename while an attempt is in
-flight, a cancel in the middle of a paged delivery, a new engine opening while
+flight, a cancel in the middle of a paged pass, a new engine opening while
 the old one still writes. Hand-written tests check one feature at a time; the
 simulation in `tests/sim` checks them together. It runs the real engine and the
-real worker harness against a real `file://` object store, lets
+real worker against a real `file://` object store, lets
 [Hypothesis](https://hypothesis.readthedocs.io/en/latest/stateful.html) choose
 long random sequences of things that happen to a deployment, checks invariants
 after every step, and shrinks a failure to its shortest sequence. Like
@@ -18,12 +18,12 @@ seed replays the same run, request for request.
 | Part | In the simulation | As in production |
 |---|---|---|
 | Engine | `Engine` on a `State`, started, stopped, crashed (every task killed, nothing buffered written) and replaced while still running (a *zombie* until the platform kills it) | the server process |
-| Workers | `run_attempt` in process, one task per invocation, through `SimPlacement` (`Local`), or started by a pool host for an attempt discovery offered it (`Pool`); handles outlive engines | a subprocess, container or job; `solera worker pool` |
+| Workers | `run_attempt` in process, one task per worker, through `SimPlacement` (`Local`), or started by a pool host for an attempt discovery offered it (`Pool`); handles outlive engines | a subprocess, container or job; `solera worker pool` |
 | Channel | `SimChannel`: each call runs as a request of whichever engine serves now, answered once durable (the API middleware's rule) | HTTPS to a stable engine URL |
 | Heartbeats | the worker's `Reporter`, beating from a task instead of a thread | a thread |
 | Key cache | the engine's `KeyService` on the simulation's loop instead of its own thread | a thread with its own loop |
-| Stores | FileStore (`immutable`); `TableStore` (`fenced`, `tests/sim/stores.py`): an in-memory database whose transactions take the slice's fence and can stay open or lose their answer; and, with `SOLERA_TEST_DATABASE_URL`, a real PostgresStore in a schema of its own per run, every transaction and read recorded (`tests/sim/postgres.py`) | FileStore, S3Store, PostgresStore |
-| Sensor host | a rule that polls `sensor_next` and posts each tick's outcome, late or twice | `solera_worker sensors` |
+| Stores | FileStore (`immutable`); `TableStore` (`fenced`, `tests/sim/stores.py`): an in-memory database whose transactions take the partition's fence and can stay open or lose their answer; and, with `SOLERA_TEST_DATABASE_URL`, a real PostgresStore in a schema of its own per run, every transaction and read recorded (`tests/sim/postgres.py`) | FileStore, S3Store, PostgresStore |
+| Sensor worker | a rule that polls `sensor_next` and posts each tick's outcome, late or twice | `solera_worker sensors` |
 | Clients | rules calling the engine's API; a failed call is an unknown outcome | the API, the CLI |
 
 **Time is virtual** (`tests/sim/core.py`). `SimLoop` is an asyncio event loop
@@ -31,7 +31,7 @@ whose clock jumps to the next timer whenever nothing is ready, so ten minutes of
 heartbeats, retries and timeouts cost a few milliseconds, and `time.time()`
 reads the same clock. Nothing runs beside the loop: object requests are
 answered synchronously through obstore's blocking client, and work handed to a
-thread runs to its end while the loop waits. Attempt ids, invocation tokens and
+thread runs to its end while the loop waits. Attempt ids, worker id and
 writer nonces come from the run's seed.
 
 **The fault plan.** Every object request an actor makes goes through
@@ -47,7 +47,7 @@ lost answer, or held open (with the fence row locked) for a while. A killed
 actor can make no request at all: a crashed engine's tasks and a dead worker's
 stop where they are, and their `finally` blocks find the store gone.
 
-**The project** (`tests/sim/project.py`) is small and covers every edge kind:
+**The project** (`tests/sim/project.py`) is small and covers every input kind:
 
 ```
 feed (keyed source) ──Incremental──▶ items ──Incremental(page 2)──▶ copy
@@ -67,7 +67,7 @@ two outputs on two kinds of store in one commit), `tally` counts `log`'s
 rows, and so on.
 Re-registration moves between *variants*: `items` on either store, its declared
 version bumped, `copy` renamed to `mirror` (with an alias), `summary` removed,
-`copy`'s edge excluding `k1*`.
+`copy`'s input excluding `k1*`.
 
 ## Rules
 
@@ -77,8 +77,8 @@ arguments, up to 40 per run.
 | Rule | Example | What it exercises |
 |---|---|---|
 | `commit_feed(op, keys, version)` | `commit_feed('replace', ['k1', 'k3'], '2')` | keyed source commits, each key at a version: patch, remove, full map |
-| `commit_sites(op, site)` | `commit_sites('upsert', 'west')` | a partition set growing and shrinking |
-| `commit_knob()` | | an unkeyed source's new version: `OnChange` over every scope |
+| `commit_sites(op, site)` | `commit_sites('upsert', 'west')` | a dynamic partitions growing and shrinking |
+| `commit_knob()` | | an unkeyed source's new version: `OnChange` over every partition |
 | `change_outside(keys)` / `sensor_round(delay, twice)` | `sensor_round(delay=90, twice=True)` | a sensor tick posted late, or twice; its commit, and the run of `per_site` it requests when what it sees changed |
 | `flaky(keys, error)` | `flaky(['k2'], 'failed')` | `Each` keys failing by error class: `Transient` (retried on its backoff), `Failed` (once per deploy), `Rejected` (when the input changes), `Abort` (the whole attempt, per `retries=`) |
 | `retry_keys(classes)` | `retry_keys(['rejected'])` | a forced retry of failing keys, as `solera keys retry` asks for one |
@@ -102,10 +102,10 @@ Checked after every step:
 |---|---|
 | **No state breaks.** No engine's `State` fails applying an event (which would exit the process with code 70). | a reducer raising on a replayed event |
 | **One end per attempt.** The journal holds at most one `AttemptFinished` per attempt, and no segment lands twice with different bytes and stays (an opener whose fence lands in a hole cleanup left deletes it and opens again, by design). | a zombie engine and its successor both ending attempt `A` |
-| **Nothing is read after collection.** No live attempt or serving engine finds an index file or data object gone because garbage collection deleted it. | a delta window's reader pin not holding its files |
-| **Reads say what they read.** A PostgresStore read reports the generation that wrote the rows it loaded, the newest committed before its snapshot — never one that only acquired the slice. | an attempt that acquired and died surfacing as the read generation |
+| **Nothing is read after collection.** No live attempt or serving engine finds an index file or data object gone because garbage collection deleted it. | a delta pass's reader pin not holding its files |
+| **Reads say what they read.** A PostgresStore read reports the generation that wrote the rows it loaded, the newest committed before its snapshot — never one that only acquired the partition. | an attempt that acquired and died surfacing as the read generation |
 | **Committed keys are readable.** Every key an immutable store's head lists loads back at its indexed generation, from an object a committed attempt wrote. | a stale writer's object referenced by the index |
-| **A fenced scope at rest holds its index.** A fenced store's scope that no attempt holds and no dead writer left unsettled holds exactly the keys its index lists, and, in Postgres, reads as written by its head's generation (`versions.md` §5, §9). | a repair that marks a key live with no rows, or leaves a dead attempt's generation as the slice's |
+| **A fenced partition at rest holds its index.** A fenced store's partition that no attempt holds and no dead writer left owing a repair holds exactly the keys its index lists, and, in Postgres, reads as written by its head's generation (`versions.md` §5, §9). | a repair that marks a key live with no rows, or leaves a dead attempt's generation as the partition's |
 | **One attempt per asset partition.** No attempt launches on an asset partition another launched attempt holds — in the journal, in order, and in the serving engine's claims. A task follows its asset through a rename (an alias); `mirror` renamed back to `copy` without one is another asset. | the hourly run and a manual run both launching `copy` before either ends |
 | **A tick's runs are submitted once.** Each run a sensor tick requests is submitted at most once, however late, often, or across restarts the tick's outcome is posted. | a retried post of tick `T` submitting its `per_site` run a second time |
 | **A fenced write holds its gate.** Every write a worker makes to a fenced store (the table store, Postgres) comes after its attempt's gate was created `writing` with that worker's id (`lifecycle.md` §2.4, §3). | a worker paused before its gate, whose attempt the engine closed meanwhile, writing `items` when it wakes; the twin of a `twice` worker writing beside the owner |
@@ -119,7 +119,7 @@ then:
 |---|---|
 | **Quiet.** Within four virtual hours: no run in progress, no claim, no worker alive, no automation pending. | a task held forever |
 | **Automations converge.** With no manual run, every automated output equals what the oracle computes from its sources — no change stuck, none silently consumed. | `copy` missing a key `items` has |
-| **A catch-up run converges.** After a run of every asset with `upstream=True`, every output, `tally` included, equals the oracle's. | a watermark past rows never delivered |
+| **A catch-up run converges.** After a run of every asset with `upstream=True`, every output, `tally` included, equals the oracle's. | a bookmark past rows never delivered |
 | **Stores hold what was committed.** A fenced store holds exactly the rows its index lists, no stale writer's rows besides. | a dead writer's patch surviving |
 | **The journal alone rebuilds the state.** A read-only `State` replayed from storage equals the live model. | an event applied differently on replay |
 
@@ -135,11 +135,11 @@ SOLERA_SIM_TRACE=1 uv run pytest tests/sim -q -s # print every run's trace
 ```
 
 The CI budget is derandomized: the same runs every time. `--slow` draws new
-ones on every invocation and reports throughput, e.g. `simulation: 400 runs,
+ones on every worker and reports throughput, e.g. `simulation: 400 runs,
 15,880 steps, 61.2 h virtual in 8.5 min (112,000 steps/hour)`.
 
 **Open findings are set aside.** A run that trips a finding still open (its
-signature is recognized in `machine.py`, `_known`) is discarded rather than
+signature is recognized in `machine.py`, `_known`) is cleaned up rather than
 failed, and counted, so the simulation keeps looking for new bugs; a
 re-registration that trips one on almost every run is left out (`KNOWN`:
 `copy`'s `exclude`, F10). Signatures today: F13 (a consumer of `items` keeps
@@ -186,13 +186,13 @@ readable spec of a store; `solera.testing.storemachine` is its generated
 counterpart, for store authors as much as for Solera's own stores. It plays
 the engine for one output per run: attempts with growing generations
 (acquiring first on a fenced store), writes that commit or are abandoned,
-calls retried, stale writers and duplicate invocations, readers that pin and
-read later, by-key loads as `Each` does them, discards of what nothing
+calls retried, stale writers and duplicate workers, readers that pin and
+read later, by-key loads as `Each` does them, cleanups of what nothing
 references, and an incremental output's batches — appended, retried, reset,
 rewritten by a stale writer. After every step the committed content, every
 pinned read and every batch range must read back as the engine's key index
 says. Example: `begin; write(commits=False); begin; stale_write` — the
-second attempt holds the slice, so a fenced store must refuse the first.
+second attempt holds the partition, so a fenced store must refuse the first.
 
 ```python
 from solera.testing.storemachine import stateful
@@ -214,7 +214,7 @@ with Hypothesis drawing the inputs (in CI, a few seconds each):
   lookups, range merges and compactions are newest-wins over a dict; a
   resolve writes exactly the keys a write changes, with their prior
   generations (`native/src/delta.rs`); sorted entries round-trip. Inputs
-  reach the edges: empty, 600-byte and shared-prefix keys, generations up
+  reach the inputs: empty, 600-byte and shared-prefix keys, generations up
   to 2⁶⁴ − 1, empty payloads, one-byte blocks. A resolve request's framing
   is fuzzed: any body is either read with exact payload bounds or
   `Malformed`.
@@ -339,7 +339,7 @@ restarting after a crash, and of the final commit to `S`.
 
 - *One partition per asset:* claims, bookmarks and passes are per asset
   partition and do not interact; fan-in reads committed heads only.
-- *Key sets, not versions:* the properties are about which keys an output
+- *Dynamic partitions, not versions:* the properties are about which keys an output
   holds; a re-upsert of a present key changes nothing here.
 - *One key per full-pass batch, one batch per delta or diff pass:* enough
   to interrupt a full pass between batches (F6) and to pin a delta.
@@ -635,13 +635,13 @@ CI's `journal-spec` job runs `ci`: about ten minutes on a GitHub runner.
 | F3 | `Each` loads its upstream as `dict[str, T]`; the store contract, the conformance kit and `examples/json_table_store.py` do not say or do so, and `Each` over such a store fails every key | P2 | doc and example fixed in 217c8f4; by-key loads checked by the store machine (`read_by_key`) |
 | F4 | A removed asset's launched attempt that asks for more pages, or fails retryably, re-queues a task no manifest can place: its run never ends | P1 | fixed in 59812c4 — `test_a_removed_assets_last_attempt_ends_its_run` |
 | F5 | An attempt launched before a rename settles into a head that moved and an output the manifest no longer names: its claim is never released, its run never ends | P1 | fixed in 59812c4 — `test_an_attempt_launched_before_a_rename_settles` |
-| F6 | A run that finishes an interrupted full delivery ends there though the upstream moved: the `OnChange` firing it ran for delivers nothing of its change | P1 | fixed in 1cad0bd — `test_a_change_made_during_a_full_delivery_reaches_downstream` |
+| F6 | A run that finishes an interrupted full pass ends there though the upstream moved: the `OnChange` firing it ran for delivers nothing of its change | P1 | fixed in 1cad0bd — `test_a_change_made_during_a_full_delivery_reaches_downstream` |
 | F7 | Journal cleanup deletes segments a writer still opening has not read; its fence lands in the hole and it serves a state without acknowledged events | P1 | fixed in 3c23397 — `test_a_slow_new_writer_never_fences_into_a_deleted_segment` |
 | F8 | A `full` run resets an unkeyed incremental output at a new `base`; a consumer whose next batch is exactly that base gets the reset as a delta and keeps the rows the upstream let go (`next < base`, not `<=`) | P1 | fixed in 2af00fc — `test_a_batch_upstream_reset_right_after_a_delivery_is_delivered_in_full` |
-| F9 | A keyed output moved to another store starts over with an index of its own; a consumer then keeps a key the move's first write dropped (seen when the consumer's first delivery and the moved write run together) | P1 | fixed: a move sets the head's `base`, and a delivery begun at or before it starts over — `test_f9_a_key_dropped_by_a_moved_output_leaves_its_consumers`, `test_a_key_a_moved_output_dropped_leaves_its_consumer` |
-| F10 | A full delivery (a reset) whose patterns take none of the upstream's keys is skipped without calling the producer, so the consumer never starts over: keys it held stay, though the upstream dropped them — also after a `full` run | P1 | open — `test_a_full_delivery_that_takes_no_key_still_starts_over` |
-| F11 | A delta file a pending discard entry reads is deleted while an attempt that was handed the entry runs: the attempt cannot read it, the superseded objects it names leak, and the entry ends `stuck` | P2 | fixed in ffe6921 — `test_f11_a_discard_entrys_delta_outlives_the_attempt_reading_it`, `test_a_discard_entrys_delta_outlives_the_attempt_holding_it` |
-| F12 | `copy` renamed to `mirror` and back over rolling deploys (engines overlapping): `mirror` ends holding a key `items` deleted while `mirror` was not served — its old index survives under a watermark already past the deletion | P2 | fixed: a name the manifest no longer declares holds no live state — `test_f12_a_rename_back_and_forth_over_rolling_deploys_keeps_up`, `test_a_name_removed_and_added_back_starts_over` |
+| F9 | A keyed output moved to another store starts over with an index of its own; a consumer then keeps a key the move's first write dropped (seen when the consumer's first pass and the moved write run together) | P1 | fixed: a move sets the head's `base`, and a pass begun at or before it starts over — `test_f9_a_key_dropped_by_a_moved_output_leaves_its_consumers`, `test_a_key_a_moved_output_dropped_leaves_its_consumer` |
+| F10 | A full pass (a reset) whose patterns take none of the upstream's keys is skipped without calling the producer, so the consumer never starts over: keys it held stay, though the upstream dropped them — also after a `full` run | P1 | open — `test_a_full_delivery_that_takes_no_key_still_starts_over` |
+| F11 | A delta file a pending cleanup entry reads is deleted while an attempt that was handed the entry runs: the attempt cannot read it, the superseded objects it names leak, and the entry ends `stuck` | P2 | fixed in ffe6921 — `test_f11_a_discard_entrys_delta_outlives_the_attempt_reading_it`, `test_a_discard_entrys_delta_outlives_the_attempt_holding_it` |
+| F12 | `copy` renamed to `mirror` and back over rolling deploys (engines overlapping): `mirror` ends holding a key `items` deleted while `mirror` was not served — its old index survives under a bookmark already past the deletion | P2 | fixed: a name the manifest no longer declares holds no live state — `test_f12_a_rename_back_and_forth_over_rolling_deploys_keeps_up`, `test_a_name_removed_and_added_back_starts_over` |
 | F13 | `items` moved from the table store to FileStore by a crash redeploy; the feed then removes `k11`: `copy` keeps it (F9's territory, the deletion after the move). Also with no crash: `k0`, `k11` committed; a takeover moves `items` from FileStore to the table store; the feed removes both; `copy` and `split`'s `odd` keep them, `checks` drops them | P1 | open — `tests/sim/test_replays.py::test_f13_a_key_removed_after_a_store_move_leaves_its_consumers`, `test_f13_a_key_removed_after_a_takeover_moved_its_upstream_leaves_its_consumers`; runs where `items` moved and a consumer keeps extra keys are set aside |
 | F14 | An engine that created its fence finds a checkpoint at or past it and deletes the fence as a hole's, but a newer engine had read it and checkpointed past it: the old engine's next append lands in the freed slot, is acknowledged, and no replay sees it (journal spec; trace and fix under "Formal model: the journal"; three engines, or two with an unreadable checkpoint) | P1 | fixed: the hole test (`object-store-state.md` §10), run by the engine that created the fence — `tests/server/test_journal.py::test_a_fence_a_newer_engine_moved_past_stays` |
 | F15 | A fence created in a hole stays readable until its engine deletes it: another opener replays it in place of the event cleanup deleted, and serves without that acknowledged event (journal spec; trace and fix under "Formal model: the journal"; three engines) | P1 | fixed: the hole test (`object-store-state.md` §10), run by every opener that reads a fence — `tests/server/test_journal.py::test_an_opener_never_replays_a_fence_created_in_a_hole` |

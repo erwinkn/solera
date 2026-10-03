@@ -1,5 +1,5 @@
 """Launched attempts outlive the engine (docs/object-store-state.md §8): the
-write fence, adoption after a restart, heartbeats, and unsettled outputs."""
+write fence, adoption after a restart, heartbeats, and outputs owing a repair."""
 
 import asyncio
 import contextlib
@@ -334,7 +334,7 @@ async def test_a_cancel_waits_for_a_worker_that_is_writing(tmp_path):
 async def test_a_drain_that_outlives_its_grace_is_forced_and_uncertain(tmp_path):
     """A worker that took the gate and does not finish within the grace is
     forced: its gate is found `writing`, so its writes are uncertain (§2.3)
-    and its intents stay unsettled for the next attempt to repair."""
+    and its intents stay owing a repair for the next attempt to repair."""
 
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = engine_for(state, REMOTE, cancel_grace=0.3)
@@ -482,7 +482,7 @@ async def test_a_worker_that_dies_writing_leaves_its_output_unsettled_and_the_re
     detail = await engine.run_until((await engine.submit(["items"]))["id"], 20)
     watcher.cancel()
     assert detail["request"]["status"] == "succeeded", detail
-    assert seen == [{("items", ""): 1}]  # the dead attempt left `items` unsettled
+    assert seen == [{("items", ""): 1}]  # the dead attempt left `items` owing a repair
     assert state.model.repairs == {}  # the retry's commit settled it
     assert live.rows == {"a": {"id": "a", "v": 2}, "b": {"id": "b", "v": 1}, "c": {"id": "c", "v": 1}}
     assert state.model.heads[("items", "")]["count"] == 3
@@ -526,7 +526,7 @@ async def test_an_aborted_worker_writes_nothing(tmp_path):
 async def test_a_dead_immutable_write_leaves_nothing_to_repair(tmp_path, data, monkeypatch):
     """FileStore is immutable (§9.8): a worker that dies after its first
     object landed leaves an object nothing references, under its own
-    generation. There is no gate, no unsettled intent and no hold: the
+    generation. There is no gate, no repair intent and no hold: the
     retry runs at once, and reads see exactly the committed versions."""
 
     values = [{"a": 1, "b": 1}, {"a": 2, "c": 1}, {"a": 1, "b": 1}]
@@ -840,7 +840,7 @@ async def test_a_malformed_worker_result_is_settled_without_its_bad_parts(tmp_pa
     ],
 )
 async def test_a_malformed_discard_report_is_refused(tmp_path, world, body):
-    """Review round 5, engine #4: a worker's discard acknowledgement is
+    """Review round 5, engine #4: a worker's clean up acknowledgement is
     checked whole at the boundary. A malformed one is refused, and the
     state is neither broken nor changed; it used to reach the reducer,
     which broke the state and ended the process."""
@@ -943,8 +943,8 @@ async def failed_writing(state, run_id, attempt, intents):
 async def test_an_adopted_attempt_fails_under_the_contract_it_was_launched_with(tmp_path, change):
     """Review round 4, engine #3: launched writing `remote` on a fenced
     store, failed after a restart that serves `remote` removed, or on an
-    immutable store. Its failure is still a fenced one: the scope is
-    released, and the intents its gate lists stay unsettled for repair —
+    immutable store. Its failure is still a fenced one: the partition is
+    released, and the intents its gate lists stay owing a repair for repair —
     unless `remote` is gone: settled, a removed name holds no state, and
     if it comes back its first write is whole, clearing what this left (F12)."""
 
@@ -978,7 +978,7 @@ async def test_an_adopted_attempt_fails_under_the_contract_it_was_launched_with(
 
 async def test_a_rename_moves_a_launched_attempt_with_its_scope(tmp_path):
     """Review round 5, engine #1 and system #1: `remote` is launched, then
-    renamed `renamed` and submitted again. One writer owns the scope: the
+    renamed `renamed` and submitted again. One writer owns the partition: the
     new attempt waits for the one in flight, which commits — under its
     launched name, as its worker knows it — into `renamed`'s head."""
 
@@ -1003,7 +1003,7 @@ async def test_a_rename_moves_a_launched_attempt_with_its_scope(tmp_path):
     assert (await engine.run_until(run["id"], 10))["request"]["status"] == "succeeded"
     assert list(state.model.heads) == [("renamed", "")]
     assert state.model.heads[("renamed", "")]["attempt"] == attempt
-    await until(engine, lambda: len(Remote.launches) == 2)  # the scope is free: the new one runs
+    await until(engine, lambda: len(Remote.launches) == 2)  # the partition is free: the new one runs
     await finish_as_worker(state, again["id"], Remote.launches[1], "renamed")
     assert (await engine.run_until(again["id"], 10))["request"]["status"] == "succeeded"
     await engine.stop()

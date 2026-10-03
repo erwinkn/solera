@@ -505,7 +505,7 @@ class Migrating(FileStore):
 
 def test_output_names_are_names():
     """An output is named like everything else — never `@asset`, the
-    namespace of Each failure indexes, which would share its key files."""
+    namespace of Each failed keys, which would share its key files."""
 
     def parse():
         return {}
@@ -518,7 +518,7 @@ def test_output_names_are_names():
 def test_an_annotation_that_does_not_resolve_fails_registration():
     """Review round 5 #5: annotations resolve once, at registration — one
     naming a type never imported fails there, not in the first run's
-    worker; the project keeps the resolved ones for the harness."""
+    worker; the project keeps the resolved ones for the worker."""
 
     def produce() -> "MissingPayloadType":  # noqa: F821
         return 1

@@ -6,7 +6,7 @@ as `Each` reads a page. The committed head names the table, so a renamed
 output keeps it. `fence()` at the top of every write transaction, and as
 `acquire`, is all the fencing it needs; `reads`
 reads an attempt's inputs at one moment, each with the generation that
-wrote what it read (`written()`); `keys` says which keys a scope holds,
+wrote what it read (`written()`); `keys` says which keys a partition holds,
 for the repair after a writer died. Each call's transaction runs on a
 thread, off the worker's event loop. The conformance kit
 (`solera.testing.stores`) checks it like any store."""
@@ -100,7 +100,7 @@ class JsonTableStore:
                     Ref(out.name, "", {**handle, "commit_number": context.commit_number}, context.partition)
                 )
             write = KeyedWrite.of(self, write, out, prior)
-            if write.reset:  # the scope's whole content: clear it first
+            if write.reset:  # the partition's whole content: clear it first
                 cur.execute(f"DELETE FROM {table} WHERE part = %s", (context.partition,))
             for chunk in write.iter_chunks():  # the keys to write: (key, rows)
                 keys = [k for k, _ in chunk]
@@ -120,7 +120,7 @@ class JsonTableStore:
             return Written(Ref(out.name, "", handle, context.partition))
 
     def keys(self, ref, among=None):
-        """The keys `ref`'s scope holds — among `among`, or all — sorted by
+        """The keys `ref`'s partition holds — among `among`, or all — sorted by
         their bytes, in chunks: never a value."""
 
         sql, params = (

@@ -1,11 +1,11 @@
-"""Planning (§7, §8): which scopes a request selects, what each scope reads
+"""Planning (§7, §8): which partitions a request selects, what each partition reads
 upstream, and the run a request becomes — synchronous domain code over an
 explicit view: the manifest, the heads (with any heads a sensor's commits
 are about to install over them) and the time. No engine state, no I/O,
 nothing awaited.
 
 A selection is answered without enumerating the partition domain unless it
-asks for the whole of it: one explicit scope checks each of its parts'
+asks for the whole of it: one explicit partition checks each of its parts'
 membership. Any other is counted before it is listed — `latest` holds each
 time dimension at its latest window and lists the rest — and refused past
 `MAX_SCOPES` rather than silently truncated.
@@ -22,7 +22,7 @@ from itertools import product
 from solera.ids import ulid
 from solera.sdk import MAX_PARTITION_KEYS, TimePartitions, canonical_partition, split_partition
 
-MAX_PARTITIONS = 100_000  # scopes a request may enumerate
+MAX_PARTITIONS = 100_000  # partitions a request may enumerate
 
 
 def time_partitions(dim: dict) -> TimePartitions:
@@ -61,7 +61,7 @@ def _size(dim: dict, now: dt.datetime, partitions) -> int:
 
 
 def size(dims: dict, now: dt.datetime, partitions) -> int:
-    """How many scopes `dims` spans, counted per dimension — never enumerated.
+    """How many partitions `dims` spans, counted per dimension — never enumerated.
     A cron time dimension is counted only to just past `MAX_SCOPES`."""
 
     total = 1
@@ -73,7 +73,7 @@ def size(dims: dict, now: dt.datetime, partitions) -> int:
 def enumerate_partitions(
     dims: dict, now: dt.datetime, partitions, *, pinned: Mapping[str, str] | None = None, what: str = ""
 ) -> list[str]:
-    """Every scope of `dims` — those in `pinned` held at one key each — in
+    """Every partition of `dims` — those in `pinned` held at one key each — in
     dimension order: counted first, refused past `MAX_SCOPES`."""
 
     if not dims:
@@ -94,10 +94,10 @@ def enumerate_partitions(
 
 
 def membership(dims: dict, now: dt.datetime, partitions) -> Callable[[str], bool]:
-    """Whether a scope is one `enumerate_scopes` would list: canonical, each
+    """Whether a partition is one `enumerate_scopes` would list: canonical, each
     of its parts a member of its dimension — checked part by part, never by
     enumeration. Each dimension's members are read once, for any number of
-    scopes."""
+    partitions."""
 
     if not dims:
         return lambda partition: partition == ""
@@ -131,9 +131,9 @@ def select_partitions(
     missing: Callable[[str], bool],
     what: str = "",
 ) -> list[str]:
-    """The scopes `selection` names: `"all"` (or None), `"latest"`,
+    """The partitions `selection` names: `"all"` (or None), `"latest"`,
     `"missing"`, or explicit keys. `elements(output)` gives a set
-    dimension's members; `missing(scope)` whether a scope lacks a complete
+    dimension's members; `missing(partition)` whether a partition lacks a complete
     head."""
 
     if selection is None or selection == "all":
@@ -157,7 +157,7 @@ def select_partitions(
             partition = canonical(dims, key)
         except (ValueError, KeyError):
             continue
-        if partition not in seen and member(partition):  # two spellings may name one scope
+        if partition not in seen and member(partition):  # two spellings may name one partition
             seen.add(partition)
             out.append(partition)
     return out
@@ -187,12 +187,12 @@ COLLAPSING = frozenset({"all_partitions", "dep"})  # edge kinds that may read ac
 
 @dataclass(frozen=True)
 class Input:
-    """One read of a scope (§5, §7): an input, a dep, or the dep a
+    """One read of a partition (§5, §7): an input, a dep, or the dep a
     partition-set dimension implies (`set_dim`: lineage, never the
     fingerprint). Of the owner's dimensions `dims`, the consumer shares
-    `pinned` — at its scope's keys — and lacks `free`. A fan-in (an
+    `pinned` — at its partition's keys — and lacks `free`. A fan-in (an
     `AllPartitions` or a dep with free dimensions) reads the heads that
-    exist across them; any other edge reads its one projected `scope`."""
+    exist across them; any other edge reads its one projected `partition`."""
 
     param: str
     kind: str
@@ -210,7 +210,7 @@ class Input:
 
     @property
     def partition(self) -> str | None:
-        """The one upstream scope it reads; None for a fan-in."""
+        """The one upstream partition it reads; None for a fan-in."""
 
         return None if self.free else canonical_partition(self.dims, self.pinned) if self.dims else ""
 
@@ -222,10 +222,10 @@ class Input:
 
 
 class Planner:
-    """Planning over one view: `manifest`; `head(output, scope)` and
+    """Planning over one view: `manifest`; `head(output, partition)` and
     `heads_of(output)` — the committed heads, with `projected` heads (what a
-    sensor's commits will install) over them; `drained(asset, scope)`,
-    whether a scope's last commit finished its delivery; and `now` (epoch seconds). The view is read as
+    sensor's commits will install) over them; `drained(asset, partition)`,
+    whether a partition's last commit finished its pass; and `now` (epoch seconds). The view is read as
     of each call; what a call derives from it (heads by output, set members)
     is kept for the planner's life — one operation's."""
 
@@ -251,20 +251,20 @@ class Planner:
         return found if found is not None else self._head(output, partition)
 
     def heads_of(self, output: str) -> dict[str, dict]:
-        """Every head of `output`, by scope: what exists, never the domain."""
+        """Every head of `output`, by partition: what exists, never the domain."""
 
         heads = dict(self._heads_of(output))
         heads.update({partition: h for (o, partition), h in self.projected.items() if o == output})
         return heads
 
     def caught_up(self, asset: str, partition: str) -> bool:
-        """Whether the scope's last commit finished its delivery."""
+        """Whether the partition's last commit finished its pass."""
 
         return self._caught_up(asset, partition)
 
     def materialized(self, asset: str, partition: str) -> bool:
-        """Whether a scope is complete (§7): each of its outputs has a head,
-        and its delivery drained — however many of them its last pages wrote.
+        """Whether a partition is complete (§7): each of its outputs has a head,
+        and its pass drained — however many of them its last pages wrote.
         A job, which has no output, once a run of it succeeded. The one answer
         for selection, fan-in and the views."""
 
@@ -274,7 +274,7 @@ class Planner:
         )
 
     def head_materialized(self, output: str, partition: str) -> bool:
-        """Whether an output's head at `scope` is of a complete delivery: a
+        """Whether an output's head at `partition` is of a complete pass: a
         source's always is."""
 
         owner = self.owner(output)
@@ -301,7 +301,7 @@ class Planner:
 
     def shared(self, consumer: dict, consumer_partition: str, upstream_dims: dict) -> tuple[dict, dict]:
         """`(pinned, free)`: the upstream dimensions the consumer shares, at its
-        scope's keys, and those it lacks."""
+        partition's keys, and those it lacks."""
 
         c_dims = dims_of(consumer)
         parts = split_partition(c_dims, consumer_partition) if c_dims else {}
@@ -315,7 +315,7 @@ class Planner:
         return pinned, free
 
     def project_downstream(self, producer: str | None, partition: str, target: str) -> dict[str, str]:
-        """Shared dims pinned by a changed scope of `producer`; the target's
+        """Shared dims pinned by a changed partition of `producer`; the target's
         others are left for the caller to expand (§7, §9). A source (`None`)
         pins none."""
 
@@ -332,9 +332,9 @@ class Planner:
         return pinned
 
     def visible(self, producer: str | None, partition: str, target: str) -> bool:
-        """Whether `target` can read a change of `producer` at `scope` yet:
-        `AllPartitions` reads complete deliveries only, so a change made by a
-        delivery still under way is not, until that delivery drains."""
+        """Whether `target` can read a change of `producer` at `partition` yet:
+        `AllPartitions` reads complete passes only, so a change made by a
+        pass still under way is not, until that pass drains."""
 
         if producer is None:
             return True
@@ -343,7 +343,7 @@ class Planner:
         return not whole or self.caught_up(producer, partition)
 
     def reach(self, producer: str | None, partition: str, target: str) -> list[str]:
-        """The target scopes a change of `producer` at `scope` reaches (§7,
+        """The target partitions a change of `producer` at `partition` reaches (§7,
         §9): the dimensions it shares pinned, the others — every one, for a
         source — over their current keys. Bounded by `MAX_SCOPES`."""
 
@@ -359,7 +359,7 @@ class Planner:
     # -- edges -------------------------------------------------------------------
 
     def inputs(self, asset: str, partition: str) -> list[Input]:
-        """What (asset, scope) reads: its inputs, its deps, then the partition
+        """What (asset, partition) reads: its inputs, its deps, then the partition
         sets its dimensions are bound to. An edge that is no fan-in may not
         lack an upstream dimension (`UpstreamOnly`)."""
 
@@ -394,7 +394,7 @@ class Planner:
         return out
 
     def fan_in(self, input: Input, *, materialized: bool) -> dict[str, dict]:
-        """The heads a fan-in reads, by upstream scope: among those that exist,
+        """The heads a fan-in reads, by upstream partition: among those that exist,
         the current partitions — a retired one's head is kept, never read —
         that agree with its shared keys (`complete` ones only, for
         `AllPartitions`). Never by expanding the domain: the owner's heads are
@@ -413,7 +413,7 @@ class Planner:
         return {s: h for s, h in heads.items() if not materialized or self.head_materialized(input.output, s)}
 
     def spread(self, input: Input) -> list[str]:
-        """Every upstream scope an edge could read: for a fan-in, the domain
+        """Every upstream partition an edge could read: for a fan-in, the domain
         across its free dimensions, enumerated — only to build upstream work,
         and bounded by `MAX_SCOPES`."""
 
@@ -424,7 +424,7 @@ class Planner:
         )
 
     def missing(self, asset: str, partition: str, planned: Mapping[str, Collection[str]]) -> bool:
-        """Whether (asset, scope) reads an input never written that the run
+        """Whether (asset, partition) reads an input never written that the run
         doesn't build — preparing it would fail. A fan-in reads what there is,
         so it is missing only when there is nothing: no current upstream head
         agrees with its shared keys (a complete one, for `AllPartitions`)."""
@@ -487,8 +487,8 @@ class Planner:
         retry_of=None,
     ) -> dict | None:
         """The run a request becomes, without submitting it; `None` if the
-        skips leave nothing. `partitions` selects every target's scopes, or —
-        a map — each one's own. `active(asset, scope)` says whether a scope is
+        skips leave nothing. `partitions` selects every target's partitions, or —
+        a map — each one's own. `active(asset, partition)` says whether a partition is
         in flight, for `skip_active`. A run is at most `MAX_SCOPES` tasks."""
 
         if isinstance(targets, str):
@@ -553,7 +553,7 @@ class Planner:
                 for name, partition in dropped:
                     assets[name].discard(partition)
         if (skip_active or skip_missing_inputs) and not any(assets.values()):
-            return None  # §9: every scope is in flight, or can't run until its inputs are written
+            return None  # §9: every partition is in flight, or can't run until its inputs are written
         if sum(len(held) for held in assets.values()) > MAX_PARTITIONS:
             raise ValueError(f"the run spans more than {MAX_PARTITIONS} tasks: select fewer partitions")
         run_id = ulid(self.now)
@@ -597,8 +597,8 @@ class Planner:
         }
 
     def _order(self, tasks: dict, assets: Mapping[str, set[str]]) -> None:
-        """A task waits for the run's tasks it reads: the one scope an edge
-        projects to, looked up; or — a fan-in — the owner's scopes in this run
+        """A task waits for the run's tasks it reads: the one partition an edge
+        projects to, looked up; or — a fan-in — the owner's partitions in this run
         that agree with its shared keys, grouped by them once per owner and
         set of shared dimensions. Linear in tasks plus links."""
 

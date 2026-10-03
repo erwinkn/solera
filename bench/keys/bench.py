@@ -596,7 +596,7 @@ async def _run_size(n: int, prefix: str, args) -> dict:
                 await measure("100K random keys changed", io, lambda io=io: changes(io, pick(100_000)))
             )
 
-        # A full-delivery page and a pending read.
+        # A full-pass page and a pending read.
         io = cold()
         after = key_of(sample[len(sample) // 3][0])
         rows.append(

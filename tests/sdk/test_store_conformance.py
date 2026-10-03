@@ -139,7 +139,7 @@ async def test_the_kit_catches_a_store_that_forgets_its_fence():
 
 
 def test_a_fenced_stores_harness_holds_a_transaction():
-    """The waiting scenario needs `Harness.hold`: a fenced store's harness
+    """The waiting scenario needs `Worker.hold`: a fenced store's worker
     without one is refused, rather than a scenario passing untested."""
 
     with pytest.raises(ValueError, match="needs hold"):

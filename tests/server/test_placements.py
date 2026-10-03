@@ -113,7 +113,7 @@ async def test_a_dead_pool_claim_expires_into_a_new_attempt(state):
 async def test_a_dead_pool_claim_that_took_its_gate_is_uncertain(state):
     """The claimant took its gate and entered a store call before it could
     report again: the engine finds `writing`, so the writes are uncertain
-    and the intents stay unsettled — whatever `.worker` showed."""
+    and the intents stay owing a repair — whatever `.worker` showed."""
 
     from solera import lifecycle
 
@@ -332,7 +332,7 @@ def modal_exceptions():
 
 
 async def test_modal_reports_only_what_modal_says_of_the_call(state, monkeypatch):
-    """§10: Modal spawns the harness function with the stage. A call that
+    """§10: Modal spawns the worker function with the stage. A call that
     returned exits with its code; one that raised or timed out fails; one
     Modal does not know is lost. Modal's own client and service errors say
     nothing of the call: wait raises, so the engine keeps the handle."""

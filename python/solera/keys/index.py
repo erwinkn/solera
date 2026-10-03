@@ -74,8 +74,8 @@ def delta_keys(data: bytes) -> tuple[list[bytes], list[bytes]]:
 
 
 def index_prefix(output: str, partition: str) -> str:
-    """Where a new index's files go: `keys/{output}/{scope}/` (`_` for the
-    unpartitioned scope). An index keeps its prefix when its output is renamed."""
+    """Where a new index's files go: `keys/{output}/{partition}/` (`_` for the
+    unpartitioned partition). An index keeps its prefix when its output is renamed."""
 
     return f"keys/{output}/{quote(partition or '_', safe='')}/"
 
@@ -278,7 +278,7 @@ class Delta:
 class DeltaKeys:
     """The keys a commit's delta files write — not those they delete — read a
     page at a time in key order: a store's selection when there are too many
-    to list (`solera.stores.Scope`)."""
+    to list (`solera.stores.Partition`)."""
 
     io: ObjectIO
     prefix: str
@@ -345,7 +345,7 @@ class Options:
 @dataclass(frozen=True)
 class GarbageFile:
     """A compaction's garbage file (docs/key-index-format.md § Garbage files):
-    the entries it dropped, for an immutable store to discard."""
+    the entries it dropped, for an immutable store to clean up."""
 
     name: str
     entries: int
@@ -530,7 +530,7 @@ class KeyIndex:
         """Exactly, the live `(generation, payload)` of each of `keys` the
         index holds — the newest entry wins, and a deleted key is absent:
         for selections named outright (a run's `keys=`), immutable stores'
-        reads (docs/lifecycle.md §9.8) and failure indexes' prior records.
+        reads (docs/lifecycle.md §9.8) and failed keys' prior records.
         Every level at once; the filters only skip files that cannot hold a
         key."""
 
@@ -751,7 +751,7 @@ class KeyIndex:
         )
         return DeltaFiles(files, delta.added, delta.removed, delta.exact)
 
-    # -- scans: full delivery and pending deltas ----------------------------------------------
+    # -- scans: full pass and pending deltas ----------------------------------------------
 
     async def _scan(self, levels: list[list[FileInfo]], after: bytes | None, limit: int, drop_deleted: bool):
         """Up to `limit` entries of the merged view with keys > `after`, and the
@@ -809,7 +809,7 @@ class KeyIndex:
         return keys, generations, deleted, payloads, cursor if bound is not None else None
 
     async def page(self, after: bytes | None, limit: int):
-        """One page of the full delivery: live keys > `after`, their
+        """One page of the full pass: live keys > `after`, their
         generations and payloads, and the next cursor (`None` when done)."""
 
         levels = self.state.newest_first()
@@ -898,7 +898,7 @@ class KeyIndex:
         """Run one compaction; returns the added files and removed names for
         `IndexState.compacted`, and with `garbage` the garbage files listing
         every entry the merge dropped that names an object — what an
-        immutable store discards (docs/key-index-format.md § Garbage files).
+        immutable store cleanups (docs/key-index-format.md § Garbage files).
         Its inputs are read from the `io`'s local copies when they hold them."""
 
         plan = plan or self.plan_compaction()

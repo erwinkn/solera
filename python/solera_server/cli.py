@@ -289,7 +289,7 @@ async def _dispatch(args, parser):
 
 
 async def _migrate(args, parser):
-    """Apply declared migrations through the local harness path (§4): load the
+    """Apply declared migrations through the local worker path (§4): load the
     project, bind its stores to the namespace's object store, migrate."""
 
     from solera_worker.worker import load_project

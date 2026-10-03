@@ -1,5 +1,5 @@
 """The console's read models over the API (§8, §10): asset rollups, an Each
-asset's failing keys, key outcomes, explain, edges with their watermarks,
+asset's failing keys, key outcomes, explain, edges with their bookmarks,
 holds, and when schedules next fire."""
 
 import json
@@ -348,7 +348,7 @@ async def test_edges_report_every_scope_and_its_lag(world):
 
 
 async def test_a_domain_too_big_to_list_still_rolls_up(tmp_path):
-    grid = {d: StaticPartitions([f"{d}{i}" for i in range(1000)]) for d in "ab"}  # 1,000,000 scopes
+    grid = {d: StaticPartitions([f"{d}{i}" for i in range(1000)]) for d in "ab"}  # 1,000,000 partitions
 
     @asset(outputs=Output("rows", keyed=True), partitions=grid)
     def rows(ctx):
@@ -382,11 +382,11 @@ async def test_a_domain_too_big_to_list_still_rolls_up(tmp_path):
         )
         assert explained.status_code == 200, explained.text
         assert explained.json()["verdict"] == "ok"
-        other = {"key": "k1", "partition": "a=a8,b=b9"}  # a current scope, never run
+        other = {"key": "k1", "partition": "a=a8,b=b9"}  # a current partition, never run
         assert (await client.get(f"{base}/assets/cells/explain", params=other)).json()["verdict"] == "absent"
         ghost = {"key": "k1", "partition": "a=a7,b=b1000"}
         assert (await client.get(f"{base}/assets/cells/explain", params=ghost)).status_code == 404
-        # Listing every scope stays bounded: refused, as an `all` run would be.
+        # Listing every partition stays bounded: refused, as an `all` run would be.
         assert (await client.get(f"{base}/partitions/rows")).status_code == 400
     await state.close()
 

@@ -1,6 +1,6 @@
 """Versions are generations (docs/versions.md): the sequences its review
 asked for, end to end through the engine — provenance of a paged
-delivery, a failure record kept in its entry across a restart, and repair
+pass, a failure record kept in its entry across a restart, and repair
 by presence after a writer died."""
 
 from solera import Transient
@@ -13,7 +13,7 @@ from .test_fence import LiveStore
 
 
 async def test_a_paged_delta_window_says_the_generation_it_read(state):  # noqa: F811
-    """Review finding 3: a delta window delivered over pages reads the index
+    """Review finding 3: a delta pass delivered over pages reads the index
     as of its start. The upstream writes `b` again (g3) after the window's
     first page; its second page reads `b` as of g2 — the object it was
     pinned to — and lineage says g2, not the head's g3. The change then
@@ -63,7 +63,7 @@ async def test_a_paged_delta_window_says_the_generation_it_read(state):  # noqa:
 
 
 async def test_a_failure_record_lives_in_its_entry_across_a_restart(state, tmp_path):  # noqa: F811
-    """Review finding 2: the failure index's entry carries the key's record —
+    """Review finding 2: the failed keys's entry carries the key's record —
     its outcome, tries, retry deadline and the upstream generation it failed
     at — as its payload. After a restart, the replayed engine reads it back
     whole, and a retry takes the key at the upstream generation it failed at."""

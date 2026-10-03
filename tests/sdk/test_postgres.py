@@ -1,4 +1,4 @@
-"""§3/§4: PostgresStore — Patch, batch snapshots, partition slices,
+"""§3/§4: PostgresStore — Patch, batch snapshots, partition partitions,
 Sql writes. Skips unless SOLERA_TEST_DATABASE_URL points at a scratch database."""
 
 import os
@@ -31,18 +31,18 @@ def output(name=None, **config):
 
 
 async def test_bare_replace(store):
-    """§3: a bare write replaces the scope: the table keeps its place."""
+    """§3: a bare write replaces the partition: the table keeps its place."""
 
     out = output(key="id")
     first = await store.store([{"id": "a", "v": "1"}, {"id": "b", "v": "1"}], None, context(out))
     second = await store.store([{"id": "a", "v": "2"}], first.ref, context(out))
-    assert second.ref == first.ref  # the same table and slice: its generation is the harness's
+    assert second.ref == first.ref  # the same table and partition: its generation is the worker's
     assert await store.load(second.ref, list[dict], None) == [{"id": "a", "v": "2"}]
 
 
 async def test_patch_upsert_and_remove(store):
     """§3/§4: Patch upserts keys and removes others; with no prior it is the
-    whole content. The store reports no keys: the harness derives them."""
+    whole content. The store reports no keys: the worker derives them."""
 
     out = output(key="id", primary_key=["id"])
     first = await store.store(Patch([{"id": "a", "v": "1"}, {"id": "b", "v": "1"}]), None, context(out))
@@ -88,7 +88,7 @@ async def test_patch_replaces_each_keys_rows(store):
 async def test_a_lost_commit_does_not_stick_the_slice(store):
     """§8: an attempt whose write landed but whose commit was lost leaves the
     table ahead of the head. The next write, from the older prior, goes
-    through; reads get what the slice holds now."""
+    through; reads get what the partition holds now."""
 
     out = output(key="id", primary_key=["id"])
     first = await store.store([{"id": "a", "v": "1"}], None, context(out))
@@ -99,7 +99,7 @@ async def test_a_lost_commit_does_not_stick_the_slice(store):
 
 
 async def test_partition_column_stamping(store):
-    """§4: partition_column is stamped from the scope; disagreeing rows are rejected."""
+    """§4: partition_column is stamped from the partition; disagreeing rows are rejected."""
 
     out = output(key="id", primary_key=["id"], partition_column="site")
     with pytest.raises(WriteError):
@@ -125,8 +125,8 @@ async def test_sql_materializes_select(store):
 
 
 async def test_keyed_sql_reports_its_keys(store):
-    """§6/§9: the harness never sees rows a Sql write materializes, so the
-    store reports the keys the slice holds, sorted, each once."""
+    """§6/§9: the worker never sees rows a Sql write materializes, so the
+    store reports the keys the partition holds, sorted, each once."""
 
     source = output(key="id")
     rows = [{"id": "b", "v": "2"}, {"id": "a", "v": "1"}, {"id": "b", "v": "3"}]
@@ -315,9 +315,9 @@ def fenced(out, generation, worker_id="i", partition=""):
 
 
 async def test_a_newer_generation_fences_older_writers(store):
-    """docs/lifecycle.md §9.7: once a newer attempt acquired a slice, an older
-    one can change nothing; another invocation of the same generation can't
-    either, while the same invocation acquiring again is its own retry."""
+    """docs/lifecycle.md §9.7: once a newer attempt acquired a partition, an older
+    one can change nothing; another worker of the same generation can't
+    either, while the same worker acquiring again is its own retry."""
 
     out = output(key="id")
     first = await store.store([{"id": "a", "v": "1"}], None, fenced(out, 5))
@@ -333,7 +333,7 @@ async def test_a_newer_generation_fences_older_writers(store):
 
 async def test_a_repair_writing_no_rows_still_marks_the_slice_written(store):
     """docs/versions.md §5, break 1: the store is given an empty write only by
-    a repair, which must still run its transaction — the slice then reads as
+    a repair, which must still run its transaction — the partition then reads as
     written by the repairing generation, not by the dead attempt it repaired,
     which no commit has."""
 
@@ -348,7 +348,7 @@ async def test_a_repair_writing_no_rows_still_marks_the_slice_written(store):
 
 
 async def test_a_takeover_waits_for_an_older_writers_transaction(store):
-    """The older writer's transaction is open, holding the slice: the newer
+    """The older writer's transaction is open, holding the partition: the newer
     acquisition waits for it to end, and from then on the older writer's
     next transaction is refused."""
 
@@ -412,7 +412,7 @@ async def test_a_migration_that_replaces_the_table_keeps_its_fence(store):
 
 
 async def test_a_patch_refuses_requested_keys_it_does_not_hold(store):
-    """A key the harness asks the store to write must be in the write: a
+    """A key the worker asks the store to write must be in the write: a
     missing one is an error, never a silent skip."""
 
     out = output(key="id")
@@ -424,7 +424,7 @@ async def test_a_patch_refuses_requested_keys_it_does_not_hold(store):
 
 async def test_reconciliation_streams_the_slice_s_keys(store, monkeypatch):
     """docs/versions.md §5: after a dead `Sql` writer, a patch reconciles the
-    whole slice — the keys it holds read back through `keys` a chunk at a
+    whole partition — the keys it holds read back through `keys` a chunk at a
     time, never a value — at the patch's generation, with its own keys and
     removes laid over them; a live key the store lacks is removed. A by-key
     patch reconciles like any: a key it gives no rows is removed."""
@@ -533,7 +533,7 @@ async def test_a_migration_runs_between_acquisitions_never_under_one(store):
 
 
 async def test_an_older_attempts_migration_is_refused(store):
-    """Once attempt 9 holds the slice, attempt 5's migration changes nothing
+    """Once attempt 9 holds the partition, attempt 5's migration changes nothing
     and records nothing."""
 
     from solera.sdk import Migration
@@ -552,7 +552,7 @@ async def test_an_older_attempts_migration_is_refused(store):
 
 async def test_a_migration_waits_for_every_slices_open_writer(store):
     """A migration changes every partition's rows: it waits for an open
-    write transaction of another partition's slice, not just its own."""
+    write transaction of another partition's partition, not just its own."""
 
     from solera.sdk import Migration
 
@@ -625,7 +625,7 @@ async def test_a_read_only_sql_store_refuses_a_query_whose_function_writes():
     """A function the query calls is the one way left for it to write;
     `sql_read_only` reads the query in a READ ONLY transaction of its own,
     which no function can turn back (not even through `SET ROLE`), and
-    streams its rows into the slice."""
+    streams its rows into the partition."""
 
     if not DSN:
         pytest.skip("SOLERA_TEST_DATABASE_URL is not set")
@@ -751,7 +751,7 @@ async def test_a_missing_grant_role_is_skipped_without_aborting_the_write(store)
 
 async def test_a_replacement_writes_only_the_keys_it_is_asked_to(store):
     """§4: with a selection, a replacement changes only the selected keys —
-    content and key events never disagree; with none, it is the whole slice."""
+    content and key events never disagree; with none, it is the whole partition."""
 
     out = output(key="id")
     first = await store.store(

@@ -15,12 +15,12 @@ One distribution, `solera`, built with maturin: four Python packages under
 `python/` and a Rust extension.
 
 - `python/solera` — the asset SDK project files import
-  (`@asset`, `Output`, `Patch`, `Sql`, `PartitionSet`, `Incremental`,
+  (`@asset`, `Output`, `Patch`, `Sql`, `DynamicPartitions`, `Incremental`,
   `AllPartitions`, `TimePartitions`, triggers, placements), and the key
   index (`solera.keys`). `solera_postgres` ships `PostgresStore`.
 - `python/solera_server` — the control plane (state layer, engine,
   FastAPI, CLI) and the built console under `solera_server/web`.
-- `python/solera_worker` — the task harness that executes attempts in
+- `python/solera_worker` — the task worker that executes attempts in
   subprocesses and pool workers.
 - `native` — the Rust crate built into `solera._native`: the key index's
   per-key work (encoding, decoding, sorting, merging).
@@ -62,12 +62,12 @@ The default project is designed to make every architecture feature visible:
 
 | asset | shows |
 | --- | --- |
-| `sites` | a `PartitionSet` on a `Cron` — the site list grows one site per run (cursor-driven) and caps at four |
-| `uploads` | an external `PartitionSet` source fed by `solera commit` |
+| `sites` | a `DynamicPartitions` on a `Cron` — the site list grows one site per run (cursor-driven) and caps at four |
+| `uploads` | an external `DynamicPartitions` source fed by `solera commit` |
 | `upload_drop` | a sensor on `Every(15)` committing to `uploads`: a new upload a minute, three at most — its tick history shows committed and skipped ticks |
 | `site_feed` | per-site cursor asset on `Every(10)`: `site_events` (unkeyed incremental) + `site_files` (keyed inventory), `Patch` both ways |
 | `file_index` | `Incremental(batch_size=2)` consumer — watch `more` continuation; declared `version="2"` |
-| `file_checks` | an `Each` edge: one call per changed file, four at a time; the fourth file is rejected on odd feed ticks (the failure index), and `exclude={"drafts": "*-file-2"}` leaves the third out |
+| `file_checks` | an `Each` input: one call per changed file, four at a time; the fourth file is rejected on odd feed ticks (the failed keys), and `exclude={"drafts": "*-file-2"}` leaves the third out |
 | `site_digest` | `site × day` two-dimensional asset (`TimePartitions`), `deps=` on the `roadmap` source, a `bytes` output (pickled by FileStore) |
 | `fleet_index` | `AllPartitions` fan-in: `dict[str, list[dict]]` on FileStore, `dict[str, TableRef]` on Postgres |
 | `site_status` | `Sql` asset over a `TableRef` (Postgres); on FileStore it logs that it skipped |
@@ -93,7 +93,7 @@ same commands drive an in-process engine against `SOLERA_STATE_URL`.
 export SOLERA_SERVER_URL=http://127.0.0.1:8000
 ```
 
-### 1. The growing partition set
+### 1. The growing dynamic partitions
 
 ```bash
 uv run solera run sites        # run it a few times — one site appears per run
@@ -121,11 +121,11 @@ committing is enough once a pool worker is running.
 uv run solera run site_feed --partitions all --upstream
 ```
 
-Each site scope writes a `site_events` incremental batch and a `site_files` keyed
-patch, and stores the feed token as its cursor. **Runs** shows the run; click a
+Each site partition writes a `site_events` incremental batch and a `site_files` keyed
+patch, and stores the feed's cursor as its cursor. **Runs** shows the run; click a
 task to see its attempt spec — `inputs.site_files` carries the pinned ref, the
 pinned key index and the window to read (a delta-log range, or the whole index
-for a first delivery); the attempt's result records the keys it delivered.
+for a first pass); the attempt's result records the keys it delivered.
 
 Run it again inside the same feed tick: the cursor is already there, the feed
 returns no events, the empty patch writes nothing, and `file_index` is not
@@ -154,7 +154,7 @@ uv run solera run site_digest --partitions all --upstream
 ```
 
 `site_digest` is partitioned by `site` and a daily `TimePartitions` dim, so
-its scopes look like `day=2026-09-01,site=alpha` (explicit multi-dim keys use
+its partitions look like `day=2026-09-01,site=alpha` (explicit multi-dim keys use
 that canonical comma form with `--partition`). Its `deps=["roadmap"]` pins the
 plain source in lineage without loading it. The output is bytes, which
 FileStore pickles — check the head's ref on the asset page.
@@ -173,8 +173,8 @@ the values are `list[dict]`; with Postgres they are `TableRef`s.
 
 With `DATABASE_URL` set (next section), `site_status` materializes
 `SELECT status, count(*) ... GROUP BY status` into `ops.site_status` and
-`fleet_status` unions a per-site count across `site_events` slices — neither
-row set enters the harness. Without Postgres, `site_status` still runs and
+`fleet_status` unions a per-site count across `site_events` partitions — neither
+row set enters the worker. Without Postgres, `site_status` still runs and
 logs `DATABASE_URL unset — site_status skipped (needs Postgres)` — visible in
 the attempt log.
 
@@ -249,7 +249,7 @@ each pending migration plus its ledger row in one transaction under an
 advisory lock keyed on the output, so concurrent workers apply each exactly
 once. A table that already exists must match the declaration —
 drift fails non-retryably instead of triggering a silent `ALTER`. The
-harness migrates before the first write in an attempt, and the output's
+worker migrates before the first write in an attempt, and the output's
 head carries the last applied name as `schema`.
 
 Apply pending migrations without running the pipeline:
@@ -293,7 +293,7 @@ through the server instead.
 solera serve [--project SPEC] [--insecure]   API + console (default project: the demo)
 solera manifest --project SPEC               print the project manifest
 solera run TARGET... [--partitions latest|all|missing] [--partition KEY]
-           [--upstream] [--full] [--keys EDGE=k1,k2] [--config JSON] [--tag NAME=VALUE]
+           [--upstream] [--full] [--keys INPUT=k1,k2] [--config JSON] [--tag NAME=VALUE]
 solera runs [--status S] [--asset A] [--tag NAME=VALUE] [-q TEXT] [--before RUN_ID] [--limit N]
 solera run-show RUN_ID / logs RUN_ID ATTEMPT_ID [--tail N]
 solera runs delete RUN_ID                    delete a finished run
@@ -317,10 +317,10 @@ attempts can load the project.
 ## Authoring
 
 ```python
-from solera.sdk import Output, PartitionSet, Project, TimePartitions, asset
+from solera.sdk import Output, DynamicPartitions, Project, TimePartitions, asset
 from solera.stores import Patch
 
-sites = PartitionSet("sites")
+sites = DynamicPartitions("sites")
 
 
 @asset(outputs=Output("files", key="file_id"), partitions={"site": sites})

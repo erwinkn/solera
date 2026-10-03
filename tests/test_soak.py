@@ -8,7 +8,7 @@ for >= 500 batches per site, and nothing may grow faster than the work does.
 - finished runs leave memory and land under `runs/`;
 - `keys/` — the key indexes — stays bounded by live keys plus the delta log
   a consumer still needs: compaction folds delta files together, the log is
-  truncated behind the consumer's watermark, and unreferenced files are
+  truncated behind the consumer's bookmark, and unreferenced files are
   deleted.
 
 The real engine, FileStore and LocalStore all run in-process; `time.time` is
@@ -98,7 +98,7 @@ async def test_soak(tmp_path, monkeypatch):
         await engine.set_automation(name, False)
     root = tmp_path / "state" / "soak"
 
-    # Saturate the site partition set (one new site per run, caps at 4).
+    # Saturate the site dynamic partitions (one new site per run, caps at 4).
     for _ in range(4):
         run = await engine.submit(["sites"])
         detail = await engine.run_until(run["id"], timeout=1e9)
@@ -116,7 +116,7 @@ async def test_soak(tmp_path, monkeypatch):
         assert detail["request"]["status"] == "succeeded", detail["request"]["id"]
         if (i + 1) % 100 == 50:
             # Keep a live incremental consumer: file_index drains site_files
-            # per site and advances its watermarks.
+            # per site and advances its bookmarks.
             run = await engine.submit(["file_index"], partitions="all")
             detail = await engine.run_until(run["id"], timeout=1e9)
             submitted += 1
@@ -175,7 +175,7 @@ async def test_soak(tmp_path, monkeypatch):
         referenced = {index.path(n) for n in index.referenced()}
         referenced |= {
             p for p in state.model.cleanup_reads() if p.startswith(index.prefix)
-        }  # pending discards
+        }  # pending cleanups
         on_disk = {str(p.relative_to(root)) for p in (root / index.prefix).glob("*.kx")}
         assert on_disk == referenced, (output, partition, sorted(on_disk - referenced)[:5])
     assert _count(root, "deltas") == 0, "delta files live in the key index (§6)"

@@ -1,5 +1,5 @@
-"""Delivery progress (review round 3, system S1): one transition, `advance`,
-over an explicit watermark — a delivery keeps its mode, boundary and page
+"""Pass progress (review round 3, system S1): one transition, `advance`,
+over an explicit bookmark — a pass keeps its mode, boundary and page
 plan until its last page, then `next` moves past it."""
 
 from solera_server.bookmarks import advance, continues, needs, pins
@@ -29,7 +29,7 @@ def test_a_key_delivery_pages_by_key_then_moves_next():
     plan = {"kind": "keys", "bookmark": wm0, "pass": full}
     wm = advance(plan, "k9")
     assert wm == {**wm0, "pass": {**full, "at": "k9", "page": 1}} and continues(plan, "k9", wm)
-    assert needs(wm) == 8  # a full delivery resumes as deltas from its `from`
+    assert needs(wm) == 8  # a full pass resumes as deltas from its `from`
     done = advance({**plan, "pass": wm["pass"]}, None)
     assert done == {**wm0, "next": 8, "reconcile": {"after": None}}  # an Each cleanup owed
 

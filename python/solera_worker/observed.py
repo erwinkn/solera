@@ -29,7 +29,7 @@ class Observed:
         if reader is None:
             reader = self._readers[ref.store] = await self._stack.enter_async_context(store.reads())
         value, generation = await reader.load(ref, t, selection)
-        # One moment reads a slice once: the first read of it is what lineage records.
+        # One moment reads a partition once: the first read of it is what lineage records.
         self.read.setdefault(
             (ref.output, ref.partition or ""),
             {"output": ref.output, "partition": ref.partition or "", "generation": generation},
@@ -45,6 +45,6 @@ class Observed:
         await stack.aclose()
 
     def report(self) -> list[dict]:
-        """For the result: per slice read, the generation it saw."""
+        """For the result: per partition read, the generation it saw."""
 
         return list(self.read.values())

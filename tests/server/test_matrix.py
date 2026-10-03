@@ -175,8 +175,8 @@ async def test_a_removed_asset_takes_its_queued_work_with_it(state):  # noqa: F8
 
 
 async def test_a_change_waits_for_work_already_queued(state):  # noqa: F811
-    """The firing would drop a scope another run has queued, and run what
-    reads it against old data: the change waits while any owed scope is
+    """The firing would drop a partition another run has queued, and run what
+    reads it against old data: the change waits while any owed partition is
     claimed or queued, then fires and orders after it."""
     value, reads = {"v": 1}, []
 
@@ -212,11 +212,11 @@ async def test_a_change_waits_for_work_already_queued(state):  # noqa: F811
     assert reads[-1] == [2]
 
 
-# -- OnChange × a delivery under way ----------------------------------------------------
+# -- OnChange × a pass under way ----------------------------------------------------
 
 
 async def test_a_change_is_kept_until_its_delivery_completes(state):  # noqa: F811
-    """An AllPartitions read excludes a scope whose delivery is under way: a
+    """An AllPartitions read excludes a partition whose pass is under way: a
     change made by its first page waits until the last page drains it — even
     when that page writes nothing — then fires once, over complete data."""
     observed = []
@@ -251,7 +251,7 @@ async def test_a_change_is_kept_until_its_delivery_completes(state):  # noqa: F8
 
 
 def test_an_explicit_selection_is_linear():
-    """A request may name up to `MAX_SCOPES` scopes: each is checked once."""
+    """A request may name up to `MAX_SCOPES` partitions: each is checked once."""
     import datetime as dt
 
     keys = [f"k{i}" for i in range(80_000)]
@@ -267,12 +267,12 @@ def test_an_explicit_selection_is_linear():
     assert len(picked) == 80_000 and time.perf_counter() - start < 3.0  # ~25 s when quadratic
 
 
-# -- registration × delivery obligations ------------------------------------------------
+# -- registration × pass obligations ------------------------------------------------
 
 
 async def test_a_removed_consumer_lets_go_of_its_upstreams_log(state):  # noqa: F811
     """Review round 5, engine #3 and system #2: `gone` and `keep` read
-    `feed` incrementally. `gone` is removed: its watermark goes with it, so
+    `feed` incrementally. `gone` is removed: its bookmark goes with it, so
     the log of `feed`'s later batches is kept only as long as `keep` needs
     it."""
 
@@ -341,13 +341,13 @@ async def test_a_value_written_again_is_a_new_version_its_readers_reread(state):
     assert calls == [1, 1, 1]
 
 
-# -- OnChange × an interrupted delivery, for Each -----------------------------------------
+# -- OnChange × an interrupted pass, for Each -----------------------------------------
 
 
 async def test_an_each_delivery_resumed_by_a_firing_takes_its_change(state):  # noqa: F811
-    """As test_sim_found's keyed case, for an Each edge: a full delivery cut
+    """As test_sim_found's keyed case, for an Each edge: a full pass cut
     short after its first key, the upstream changing, the firing resuming it
-    — the change is delivered, and only then is the scope drained."""
+    — the change is delivered, and only then is the partition drained."""
     from solera.sdk import AutoRefresh, Each
 
     content, calls = {"a": "1", "b": "1"}, []

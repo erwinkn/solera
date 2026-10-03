@@ -211,7 +211,7 @@ async def test_a_moved_input_still_commits(state, clock):
 
 async def test_restart_keeps_launched_claims(tmp_path, clock):
     """A launched attempt is durable (§8): after a restart its task still
-    holds its claim and scope lock, and is not queued again."""
+    holds its claim and claim, and is not queued again."""
 
     state = await State.open(tmp_path.as_uri(), "test", clock=clock, flush_interval=0.001)
     engine = engine_on(state, clock, placement="hold")
@@ -491,10 +491,10 @@ def test_one_outputs_heads_are_found_without_looking_at_the_others():
 
 
 def test_a_rename_moves_a_scopes_record_whole():
-    """§2, §5: a scope's cursor, outcome, completeness, watermarks and
+    """§2, §5: a partition's cursor, outcome, completeness, bookmarks and
     failing keys are one record, and `aliases=` moves it as one. A name
     that already has a record keeps its own: two assets' states never mix.
-    A watermark of an edge the project no longer declares goes."""
+    A bookmark of an edge the project no longer declares goes."""
 
     wm = {"kind": "keys", "output": "feed", "upstream_partition": "", "next": 3}
     whole = {
@@ -525,7 +525,7 @@ def test_a_rename_moves_a_scopes_record_whole():
 
 def test_a_discard_entrys_delta_outlives_the_attempt_holding_it():
     """docs/lifecycle.md §9.8, simulation finding F11: an attempt's spec hands
-    it a discard entry; the previous attempt's own discards (D8) acknowledge
+    it a clean up entry; the previous attempt's own cleanups (D8) acknowledge
     that entry meanwhile. The delta file the entry reads stays readable until
     the attempt holding it ends, not only while the entry is pending."""
 

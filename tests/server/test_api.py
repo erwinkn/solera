@@ -289,7 +289,7 @@ async def test_executors_and_workers(client, base):
 async def test_worker_pull_path_and_channel(engine, monkeypatch):
     """docs/lifecycle.md §5, §10: a pool worker discovers work that fits it
     (pool token), claims it by creating `.worker`, and reports on the
-    attempt's routes with the attempt's own token; another invocation, or
+    attempt's routes with the attempt's own token; another worker, or
     another attempt's token, gets nothing."""
 
     import json
@@ -378,7 +378,7 @@ async def test_worker_pull_path_and_channel(engine, monkeypatch):
 
         monkeypatch.setattr(attempts, "AFTER_COMMIT_WAIT", 0.1)  # nothing settles it here
         finished = await client.post(f"{routes}/finished", json={"worker_id": "mine"}, headers=token)
-        assert finished.status_code == 200  # what is due for discarding once committed: here nothing
+        assert finished.status_code == 200  # what is due for cleaning up once committed: here nothing
 
 
 async def test_console_shell_served(client):
@@ -400,7 +400,7 @@ async def test_console_shell_served(client):
 
 async def test_partitions_read_scope_records_not_task_history(client, base, engine, monkeypatch):
     """§8: the partitions endpoint answers complete, missing, running,
-    failed and retired from heads + scope outcomes + the pending index —
+    failed and retired from heads + partition outcomes + the pending index —
     in memory, never reading a run's tasks or an archived run."""
 
     reads = []
@@ -410,9 +410,9 @@ async def test_partitions_read_scope_records_not_task_history(client, base, engi
         reads.append(args)
         return await original(*args, **kwargs)
 
-    # complete (a succeeded scope) and missing (a key never run)
+    # complete (a succeeded partition) and missing (a key never run)
     await engine.run_until((await engine.submit(["daily"], partitions=["2026-09-18"]))["id"])
-    # failed: a scope whose task finished failed
+    # failed: a partition whose task finished failed
     detail = await engine.run_until(
         (await engine.submit(["flaky"], partitions=["2026-09-18"], config={"fail": True}))["id"]
     )
@@ -449,8 +449,8 @@ async def test_partitions_read_scope_records_not_task_history(client, base, engi
 
 
 async def test_failed_scope_reports_complete_after_success(client, base, engine):
-    """§8: a scope that failed and later succeeded reports complete — the
-    scope record is the last outcome, not a task-history scan."""
+    """§8: a partition that failed and later succeeded reports complete — the
+    partition record is the last outcome, not a task-history scan."""
 
     await engine.run_until(
         (await engine.submit(["flaky"], partitions=["2026-09-19"], config={"fail": True}))["id"]

@@ -20,10 +20,10 @@ a byte string, `generation` the generation of the write that last wrote
 the key — its version, and what an immutable store names the key's object
 by (`versions.md`, `lifecycle.md` §9.8) — `deleted` a flag, and `payload`
 optional bytes the index's kind interprets: a source key's version
-(`versions.md` §2; empty for a partition set's element), or a failure
+(`versions.md` §2; empty for a dynamic partitions's element), or a failure
 index's failure record (`per-key-processing.md` §9). An entry of a delta
 file may also hold its key's **predecessor** generation: what the commit
-superseded, for the store to discard. Compaction drops predecessors.
+superseded, for the store to clean up. Compaction drops predecessors.
 Entries are strictly increasing by `key` (byte-wise comparison); a file
 never holds the same key twice.
 

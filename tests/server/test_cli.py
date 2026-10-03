@@ -38,7 +38,7 @@ def state_url(tmp_path):
 
 
 def cli(monkeypatch, capsys, *argv):
-    """Run the CLI as a subprocess-free invocation; returns parsed stdout."""
+    """Run the CLI as a subprocess-free worker; returns parsed stdout."""
 
     from solera_server.cli import main
 

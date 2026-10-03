@@ -130,7 +130,7 @@ ingest = Pool("ingest")
 
 
 # ---------------------------------------------------------------------------
-# Partition sets: `sites` refreshes on a cron and grows; `uploads` is fed from
+# Dynamic partitions: `sites` refreshes on a cron and grows; `uploads` is fed from
 # outside — `solera commit uploads --upsert ...`, or the `upload_drop` sensor
 # below (§5, §7).
 # ---------------------------------------------------------------------------
@@ -138,7 +138,7 @@ ingest = Pool("ingest")
 
 @asset(outputs=DynamicPartitions(), automations=Automation(trigger=Cron("* * * * *")))
 def sites(ctx, registry: SiteRegistry):
-    """The site list is a partition set; each run may surface a new site.
+    """The site list is a dynamic partitions; each run may surface a new site.
 
     The cursor keeps the simulated count, so the list grows on every run —
     a new key arrives as missing work downstream (§7)."""
@@ -167,7 +167,7 @@ def upload_drop(ctx) -> Tick | None:
 
 # ---------------------------------------------------------------------------
 # Per-site cursor asset: an unkeyed incremental event log and a keyed file
-# inventory, patched both ways; the delta token is the cursor (§2, §5, §6).
+# inventory, patched both ways; the feed's cursor is the cursor (§2, §5, §6).
 # ---------------------------------------------------------------------------
 
 
@@ -192,7 +192,7 @@ def upload_drop(ctx) -> Tick | None:
     automations=Automation(trigger=Every(10)),
 )
 def site_feed(ctx, feed: FeedClient):
-    """Poll one site's feed; the delta token persists as ctx.cursor."""
+    """Poll one site's feed; the feed's cursor persists as ctx.cursor."""
     events, token = feed.delta(
         ctx.partition, ctx.cursor, tick_seconds=float(ctx.config.get("feed_tick_seconds", 5))
     )
@@ -242,7 +242,7 @@ def file_index(ctx, site_files: list[dict]):
 # ---------------------------------------------------------------------------
 # Per-file processing: an Each edge runs one call per changed file, four at a
 # time; every file's rows go to the store in one write per page, and a file
-# that raises is kept in the asset's failure index, per key, while the others
+# that raises is kept in the asset's failed keys, per key, while the others
 # commit (docs/per-key-processing.md §5, §9). The edge's patterns leave each
 # site's third file — a draft — out entirely (§11).
 # ---------------------------------------------------------------------------
@@ -339,7 +339,7 @@ if DATABASE:
     )
     def fleet_status(ctx, site_events: dict[str, TableRef]):
         """AllPartitions over TableRefs: the pins stay refs, the SELECT runs
-        inside Postgres against each site's slice (§4, §7)."""
+        inside Postgres against each site's partition (§4, §7)."""
         union = " UNION ALL ".join(
             f"SELECT '{ref.where.get('site', site)}' AS site, count(*)::int AS events "
             f"FROM {ref.table} WHERE {ref.where_sql()}"
@@ -367,7 +367,7 @@ if DATABASE:
         automations=AutoRefresh(),
     )
     def site_status(ctx, site_events: TableRef) -> Sql:
-        """A SELECT materialized inside Postgres; no row enters the harness."""
+        """A SELECT materialized inside Postgres; no row enters the worker."""
         return Sql(
             f"SELECT status, count(*) AS n FROM {site_events.table} WHERE {site_events.where_sql()} GROUP BY status"
         )
@@ -437,7 +437,7 @@ project = Project(
     ],
     sources=[
         Source("roadmap"),  # lineage-only: read via resources, pinned via deps=
-        uploads,  # external PartitionSet, fed by the commit API and `upload_drop`
+        uploads,  # external DynamicPartitions, fed by the commit API and `upload_drop`
     ],
     sensors=[upload_drop],
     stores={

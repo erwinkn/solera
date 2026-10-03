@@ -1,4 +1,4 @@
-"""Inline placement for tests: runs the real worker harness in-process against
+"""Inline placement for tests: runs the real worker in-process against
 the real object store."""
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ class InlinePlacement:
 
     def release(self, run: dict) -> None:
         """Settled: the worker's task goes once it ends (it may still be
-        discarding after its commit, docs/lifecycle.md §9.8)."""
+        cleaning up after its commit, docs/lifecycle.md §9.8)."""
 
         task = self._tasks.get(run["id"])
         if task is not None:

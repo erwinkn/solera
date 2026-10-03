@@ -1,4 +1,4 @@
-"""A sensor host (docs/lifecycle.md §11.2): a long-lived process with the
+"""A sensor worker (docs/lifecycle.md §11.2): a long-lived process with the
 project loaded, so a tick costs a function call. It long-polls the engine
 for due ticks, runs each body on a thread of its own within the sensor's
 timeout, and posts the outcome. A host whose tick overran, or that ran

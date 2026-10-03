@@ -27,7 +27,7 @@ def test_f9_a_key_dropped_by_a_moved_output_leaves_its_consumers():
 
 
 def test_f11_a_discard_entrys_delta_outlives_the_attempt_reading_it():
-    """F11: a `copy` attempt's spec hands it discard entry `delta` naming a
+    """F11: a `copy` attempt's spec hands it clean up entry `delta` naming a
     delta file compaction let go of before the attempt was claimed; the
     entry is acknowledged meanwhile, and collection deleted that file while
     the attempt ran. The file is kept while an attempt holds the entry
@@ -234,7 +234,7 @@ def test_f12_a_rename_back_and_forth_over_rolling_deploys_keeps_up():
     engine runs on a minute): `mirror` ends holding `k1`, which `items`
     deleted while the name `mirror` was not served — the move of `copy`'s
     state onto a name that held state before keeps the old index under a
-    watermark already past the deletion. Timing-sensitive: keep the steps."""
+    bookmark already past the deletion. Timing-sensitive: keep the steps."""
 
     state = Simulation()
     state.boot(store="file", seed=14094)

@@ -62,7 +62,7 @@ class Cancel:
 
     phase: str
     reason: str
-    since: int  # the event position at which the engine latched it
+    since: int  # the event counter at which the engine latched it
 
     def __post_init__(self):
         if self.phase not in PHASES or self.reason not in REASONS:
@@ -106,8 +106,8 @@ def valid(secret: bytes, attempt: str, presented: str) -> bool:
 
 
 class Ended(Exception):
-    """The engine says this attempt is over for this invocation (`409`):
-    it ended, or another invocation owns it. Write nothing more."""
+    """The engine says this attempt is over for this worker (`409`):
+    it ended, or another worker owns it. Write nothing more."""
 
     def __init__(self, reason: str = "ended"):
         super().__init__(reason)

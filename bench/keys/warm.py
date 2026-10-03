@@ -139,7 +139,7 @@ async def run_size(n: int, args) -> list[dict]:
             state = state.committed(b + 1, files, keep_log=False)
             current.update((i, (100 + b, v)) for (i, _), v in zip(items, vers, strict=True))
         window = None
-        if args.reads:  # a consumer behind by 20 commits of 5K keys: its change window
+        if args.reads:  # a consumer behind by 20 commits of 5K keys: its delta pass
             for b in range(8, 28):
                 items = sorted((i, v) for i, (_, v) in rng.sample(list(current.items()), 5000))
                 vers = [rng.randbytes(16) for _ in items]

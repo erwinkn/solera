@@ -620,7 +620,7 @@ async def test_an_answer_waits_for_its_decision_to_be_durable(tmp_path, monkeypa
 
 
 async def test_requested_runs_see_the_ticks_own_commits(tmp_path):
-    """Astra review 2, P1-4: a tick replaces a partition set `[old]` with
+    """Astra review 2, P1-4: a tick replaces a dynamic partitions `[old]` with
     `[new]` and requests a run over all partitions: the run's tasks are for
     `new`, planned against the set the tick installs."""
 

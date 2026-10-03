@@ -2,17 +2,17 @@
 call inside a write's own transaction makes a store `fenced`.
 
     with conn.transaction(), conn.cursor() as cur:
-        fence(cur, scope, "public.events")   # before the write changes anything
+        fence(cur, partition, "public.events")   # before the write changes anything
         cur.execute("INSERT INTO public.events ...")
 
 The fence table holds, per write domain (a table, say) and partition, the
-newest generation that took it, that generation's invocation, and the
+newest generation that took it, that generation's worker, and the
 generation whose write last changed it (`written`), which a read reports
 (`written()`, in the read's own snapshot). `fence`
-takes the row for `scope`'s generation — inserting it, or raising an older
+takes the row for `partition`'s generation — inserting it, or raising an older
 one — and keeps its lock until the transaction ends; it raises
 `StoreError`, changing nothing, when a newer generation or another
-invocation of this one holds it. So a newer attempt's `fence` (its
+worker of this one holds it. So a newer attempt's `fence` (its
 `acquire`) waits behind an older writer's open transaction, and from then
 on every transaction of the older writer is refused.
 
@@ -49,10 +49,10 @@ def fence(
     table: str = FENCE_TABLE,
     param: str = "%s",
 ) -> None:
-    """Take `(domain, scope.partition)` for `scope`'s generation and
-    invocation, in the caller's transaction, until it ends; raise
-    `StoreError` if a newer generation, or another invocation of this one,
-    holds it. A `write` transaction — one that changes the slice, not an
+    """Take `(domain, partition.partition)` for `partition`'s generation and
+    worker, in the caller's transaction, until it ends; raise
+    `StoreError` if a newer generation, or another worker of this one,
+    holds it. A `write` transaction — one that changes the partition, not an
     `acquire` — also marks it written by its generation. Outside an attempt
     (no generation) there is nothing to check."""
 

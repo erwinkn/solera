@@ -1,4 +1,4 @@
-"""Store protocol and the built-in stores (§3, §4). Runs in the harness."""
+"""Store protocol and the built-in stores (§3, §4). Runs in the worker."""
 
 from __future__ import annotations
 
@@ -65,7 +65,7 @@ class Commits:
 
 @dataclass(frozen=True)
 class WriteContext:
-    """A write scope (§9): `batch` is the engine-assigned batch number for
+    """A write partition (§9): `batch` is the engine-assigned batch number for
     incremental outputs, `attempt` the writing attempt's id. `reset` says the write starts the content over
     (a full run): `prior` still says where the content is, but nothing of
     it is kept — a store's batches start over at `batch`. What a keyed write
@@ -76,7 +76,7 @@ class WriteContext:
     commit_number: int | None = None
     attempt: str | None = None
     reset: bool = False
-    # The attempt's generation and invocation, for a `fenced` store to check
+    # The attempt's generation and worker, for a `fenced` store to check
     # (docs/lifecycle.md §9.7); `None` outside an attempt.
     generation: int | None = None
     worker_id: str | None = None
@@ -84,12 +84,12 @@ class WriteContext:
 
 @dataclass(frozen=True)
 class Written:
-    """What a store wrote: a ref to the new content, which the harness gives
-    the attempt's generation. `keys` is only for writes the harness never
-    sees as rows (`Sql` materialized inside Postgres): the keys the scope
+    """What a store wrote: a ref to the new content, which the worker gives
+    the attempt's generation. `keys` is only for writes the worker never
+    sees as rows (`Sql` materialized inside Postgres): the keys the partition
     holds now, sorted by their UTF-8 bytes, in chunks — lists of keys — the
-    harness pulls one at a time after `store` returned. For every other
-    write the harness reads the keys itself (§6, §9)."""
+    worker pulls one at a time after `store` returned. For every other
+    write the worker reads the keys itself (§6, §9)."""
 
     ref: Ref
     keys: Iterable | None = None
@@ -107,9 +107,9 @@ class Store(Protocol):
     `writes` says how a writer the engine gave up on is kept from writing
     over a newer one — every store declares one (docs/stores.md):
     `"immutable"`, it writes only names no other attempt uses, and
-    implements `discard`; or `"fenced"`, it implements `acquire`, every
+    implements `cleanup`; or `"fenced"`, it implements `acquire`, every
     write checks the attempt's generation atomically (`solera.fencing`),
-    and `keys(ref, among)` says which keys the scope holds — for a repair
+    and `keys(ref, among)` says which keys the partition holds — for a repair
     after a writer died (docs/versions.md §5).
 
     It also says what a load sees (docs/stores.md): an immutable store
@@ -127,12 +127,12 @@ class Store(Protocol):
     async def load(self, ref: Ref, t: type, selection: Keys | Commits | None) -> Any: ...
 
     # immutable: async def cleanup(self, context: WriteContext, prior: Ref | None, items: list) -> None
-    # fenced:    async def acquire(self, scope: Scope, prior: Ref | None) -> None
+    # fenced:    async def acquire(self, partition: Partition, prior: Ref | None) -> None
     #            def keys(self, ref: Ref, among: list[str] | None) -> Iterable[list[str]]
 
 
 def resolve_env(value: Any) -> Any:
-    """`env:NAME` indirection for store/resource config, resolved in the harness.
+    """`env:NAME` indirection for store/resource config, resolved in the worker.
     Dicts and lists are walked; anything else passes through."""
 
     if isinstance(value, str) and value.startswith("env:"):
@@ -166,7 +166,7 @@ def takes(t: Any, output: Output, *, frames: bool = False, values: bool = True) 
     forms the framework defines, once, for a store's `can_store` (which
     registration asks). A `keyed=True` output takes a dict of values; a
     keyed rows output rows — a list of mappings — or rows by key, a dict of
-    lists of them; a partition set its elements, a list or a set; an
+    lists of them; a dynamic partitions its elements, a list or a set; an
     unkeyed incremental output a batch of rows, a list; any other output a
     value, anything — unless not `values`, for a store of rows only.
     `frames`: a DataFrame or an Arrow table wherever rows go. Unannotated
@@ -250,7 +250,7 @@ class Prepared:
     (`solera.keys.Rows`): only the key of a row is read (docs/versions.md).
     `take(indices)` gives the write's rows at those
     indices — every row for None — as the store persists them: mappings for
-    a rows output, `(key, value)` items for `keyed=True`, a partition set's
+    a rows output, `(key, value)` items for `keyed=True`, a dynamic partitions's
     elements; a store reading types of its own gives its own. A `Patch` also
     names the keys it `removes`, none of them written. `kinds`, when the
     reader knows them, are its columns' value kinds (`frames.KINDS`), for a
@@ -265,7 +265,7 @@ class Prepared:
 
     def groups(self, keys: Sequence[str]) -> list:
         """Each key's group, as its store writes it: the list of its rows, a
-        `keyed=True` output's value, or a partition set's element."""
+        `keyed=True` output's value, or a dynamic partitions's element."""
 
         try:
             rows, ends = self.rows.find(list(keys))
@@ -353,7 +353,7 @@ def prepare(write: Any, output: Output, read: Callable | None = None) -> Prepare
     """A keyed write — the whole content, or a `Patch` — read once
     (`Prepared`). The default reads plain Python: a list of mappings, a
     by-key mapping (`{key: rows}`), a `keyed=True` output's dict, a
-    partition set's elements. A store taking other types passes `read`:
+    dynamic partitions's elements. A store taking other types passes `read`:
     `read(content, output)` gives `(rows, take, empty, kinds)` for content
     it reads, or None to leave it to the default
     (`solera.stores.frames.read` reads DataFrames and Arrow). A partition

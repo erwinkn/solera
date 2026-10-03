@@ -116,7 +116,7 @@ class SourceStore(FileStore):
 
 
 def rebuild(changes, rows: list[dict]):
-    """A keyed consumer's write for one page: a full delivery (a reset) starts
+    """A keyed consumer's write for one page: a full pass (a reset) starts
     the output over on its first page (architecture.md §5), then patches."""
 
     if changes.full and changes.first:

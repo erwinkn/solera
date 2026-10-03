@@ -143,9 +143,9 @@ async def test_lineage_says_what_a_current_read_saw(state):
 async def test_an_external_tables_lineage_is_its_observation(state):
     """docs/versions.md §6, review finding 4: a source's table is written
     outside Solera — no fence says which write a read saw. Lineage records
-    the generation of the observation the read came from, and flags
+    the generation of the tick the read came from, and flags
     nothing: an external source is read as it is now, so what a reader
-    loads may be newer than the observation."""
+    loads may be newer than the tick."""
 
     if not DSN:
         pytest.skip("SOLERA_TEST_DATABASE_URL is not set")

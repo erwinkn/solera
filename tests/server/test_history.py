@@ -405,7 +405,7 @@ async def test_stats(state, clock):
     assert by["revenue"]["failed"] == 1
     assert by["orders"]["p50"] is not None and by["orders"]["hours"] >= 0
     assert [row["executor"] for row in stats["executors"]] == ["local"]
-    # Unpartitioned tasks have the empty scope; a partition narrows to its own.
+    # Unpartitioned tasks have the empty partition; a partition narrows to its own.
     assert (await engine.history.stats(asset="orders", partition=""))["assets"] == [by["orders"]]
     assert (await engine.history.stats(asset="orders", partition="2026-01-01"))["assets"] == []
 
@@ -413,7 +413,7 @@ async def test_stats(state, clock):
 async def test_a_retry_asks_for_the_work_it_selects(state, clock):
     """Review round 3 (system B4): a retry's request is built from the tasks
     it reruns — a key override for an edge none of them reads is left out,
-    and each asset's scopes are kept as a map, live and in the history."""
+    and each asset's partitions are kept as a map, live and in the history."""
     from solera.sdk import Incremental, StaticPartitions
 
     @asset(outputs=Output("log", key="id"))

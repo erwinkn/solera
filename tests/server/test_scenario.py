@@ -1,7 +1,7 @@
 """One short run across every boundary that rewrites state: journal
 flushes and checkpoints, history flushes, key-index compaction, log
 truncation behind a consumer, garbage collection and run retirement. Then
-the journal alone reproduces the live model, every delivery was exact, and
+the journal alone reproduces the live model, every pass was exact, and
 `keys/` holds what is referenced. (The long growth soaks: `--slow`.)"""
 
 import json

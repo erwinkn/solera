@@ -328,8 +328,8 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
 
     An Incremental edge over a keyed upstream reads its page from the pinned
     key index — the pending deltas in `[from, to]`, or the whole index for a
-    full delivery — and loads just those keys. `delivered` reports where the
-    page ended, for the engine's watermark (§6). Each input loaded is a
+    full pass — and loads just those keys. `delivered` reports where the
+    page ended, for the engine's bookmark (§6). Each input loaded is a
     `loaded` event; `observed` records what each read saw."""
 
     manifest_asset = project.manifest["assets"][asset.name]
@@ -470,7 +470,7 @@ async def _store_outputs(
     (all but `immutable` ones), it takes the attempt's gate first, listing
     their delta files — the keys this attempt is about to change — and only
     then do the stores write. An engine that finds the fence taken by a worker that then
-    died keeps the outputs unsettled, and their intents, for the next attempt
+    died keeps the outputs owing a repair, and their intents, for the next attempt
     to repair (`_repair`). Returns `{name: entry}` and the cursor."""
 
     manifest_asset = project.manifest["assets"][asset.name]
@@ -513,10 +513,10 @@ async def _store_outputs(
         if o.index is None:
             continue
         if o.sql:
-            # Rows the harness never sees: the store reports the whole new key
+            # Rows the worker never sees: the store reports the whole new key
             # map once it wrote, so its delta comes after — and needs no repair.
             # Unknown writes: if this attempt dies after its gate, no key list says what landed
-            # (docs/lifecycle.md §9.6): the next attempt reconciles the whole slice.
+            # (docs/lifecycle.md §9.6): the next attempt reconciles the whole partition.
             intents[name] = {**DeltaFiles([], 0, 0, True).to_json(), "unknown": True}
             continue
         if o.files is None:
@@ -539,7 +539,7 @@ async def _store_outputs(
         if outs:  # only by a worker about to write; a gate only for stores that take one (§2.4, §9.6)
             await fence({n: i for n, i in intents.items() if n in gated}, bool(gated))
     except Aborted:
-        # The engine has discarded this attempt's delta files; these came after.
+        # The engine has cleaned up this attempt's delta files; these came after.
         import obstore
 
         paths = [outs[n].index.path(f["name"]) for n, files in intents.items() for f in files["files"]]
@@ -605,7 +605,7 @@ async def _store_outputs(
 
 
 REPAIR_PAGE = 100_000
-LISTED = 1_000_000  # changed keys a replacement lists for its store; past it, the store rewrites the scope
+LISTED = 1_000_000  # changed keys a replacement lists for its store; past it, the store rewrites it
 RESOLVE_KEYS = 100_000  # a write the engine resolves: its keys (docs/resolved-commits.md §4)...
 RESOLVE_ENTRIES = 2_000_000  # ...and for a replacement, its keys plus the live ones
 RESOLVE_TIMEOUT = 5.0  # seconds the worker waits for the engine before resolving itself
@@ -776,7 +776,7 @@ def _keyed_write(o: _Out, keys_io) -> KeyedWrite:
         return KeyedWrite(p, upserted, deleted, reset=o.replace)
     if o.reset or (o.replace and (changed is None or o.repairs)):
         # A first write, or a replacement with more changes than it lists, or with
-        # dead attempts': the scope rewritten.
+        # dead attempts': the partition rewritten.
         return KeyedWrite(p, reset=True)
     if o.replace:
         return KeyedWrite(p, upserted, deleted)
@@ -830,7 +830,7 @@ async def _upload(index: KeyIndex, commit_number: int, attempt: str, answer) -> 
 
 
 async def _intended(info, keys_io, repairs) -> list[str]:
-    """The keys dead attempts meant to change (§8): each unsettled intent
+    """The keys dead attempts meant to change (§8): each repair intent
     lists the delta files of an attempt that died while writing, and any of
     those writes may have landed."""
 
@@ -909,7 +909,7 @@ class _Stop(Exception):
 
 
 ENDED = ABORTED = 3  # the exit code of an attempt the engine ended: no result was published
-LOSER_POLL = 30.0  # how often an invocation that lost the claim looks for the owner's result
+LOSER_POLL = 30.0  # how often an worker that lost the claim looks for the owner's result
 
 
 async def run_attempt(
@@ -927,7 +927,7 @@ async def run_attempt(
     """Run one attempt (docs/lifecycle.md §3): read its spec, claim it, run
     it, seal its result.
 
-    The claim is the first write: an invocation that loses it touches
+    The claim is the first write: an worker that loses it touches
     nothing and, unless it is a pool worker (`pool`), waits for the owner's
     result before exiting, so its exit never reads as the attempt's. The
     engine is reached through `channel`, or over HTTPS at `engine_url` (else
@@ -1031,7 +1031,7 @@ async def run_attempt(
 
 
 async def _await_owner(objects, base: str, poll: float, channel=None, worker_id: str = "") -> None:
-    """A losing invocation: wait until the attempt is over before exiting —
+    """A losing worker: wait until the attempt is over before exiting —
     the owner's result exists, the engine closed or aborted its gate, the
     engine says `ended` (`not_owner` is no news), or its objects are gone."""
 
@@ -1136,7 +1136,7 @@ async def _execute(
 
     try:
         project = entrypoint if isinstance(entrypoint, Project) else load_project(entrypoint)
-        control["project"] = project  # for the discards after its commit
+        control["project"] = project  # for the cleanups after its commit
     except Exception as error:
         return _failed(error, False)
     timeline.add("imported")
@@ -1161,7 +1161,7 @@ async def _execute(
             args["ctx"] = ctx
         for name, resource in project.resources.items():
             if name in signature.parameters:
-                args[name] = resolve_env(resource)  # env: secrets resolve in the harness (§5)
+                args[name] = resolve_env(resource)  # env: secrets resolve in the worker (§5)
         page = next(((p, pin) for p, pin in spec["inputs"].items() if "each" in pin), None)
         if page is not None:
             control["drain"] = asyncio.Event()
@@ -1173,7 +1173,7 @@ async def _execute(
             delivered[page[0]] = ran["delivered"]
         elif filtered:
             # The edges' patterns took none of the page's keys: the producer has
-            # nothing to see, and the page commits only its watermark (per-key §11).
+            # nothing to see, and the page commits only its bookmark (per-key §11).
             return {"status": "succeeded", "skipped": True, "outputs": {}, "delivered": delivered}
         else:
             await observed.close()  # the inputs' moment ends: a long producer holds no snapshot
@@ -1231,9 +1231,9 @@ async def _execute(
 
 
 async def _cleanup_after(answer, spec, project, objects, channel, worker_id) -> None:
-    """Discard what the engine says is due in this attempt's scope now that
+    """Clean up what the engine says is due in this attempt's partition now that
     its commit is durable (docs/lifecycle.md §9.8), and say so. Anything
-    that fails here leaves the entries queued for the scope's next attempt:
+    that fails here leaves the entries queued for the partition's next attempt:
     deleting a name twice is no harm."""
 
     if not (answer or {}).get("cleanup") or project is None:
@@ -1258,10 +1258,10 @@ def _file_entries(data: bytes):
 
 
 async def _cleanup_due(spec, project, asset, objects, writes) -> dict:
-    """Discard the data garbage the engine handed this attempt (docs/
+    """Clean up the cleanup the engine handed this attempt (docs/
     lifecycle.md §9.8): the objects a commit or a compaction let go of, and
     what attempts that never committed wrote — all past every reader pin.
-    The engine runs no store code; the scope's next attempt, which has its
+    The engine runs no store code; the partition's next attempt, which has its
     store, deletes for it. Returns what was done, for the result."""
 
     import obstore

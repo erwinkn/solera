@@ -70,7 +70,7 @@
         "graph_delta.every.0"
       ],
       "deps": [],
-      "doc": "Poll a site's Graph delta feed; the delta token is the cursor.",
+      "doc": "Poll a site's Graph delta feed; the feed's cursor is the cursor.",
       "inputs": {},
       "on_version_change": "fail",
       "outputs": [
@@ -608,7 +608,7 @@
         "site_health.onchange.0"
       ],
       "deps": [],
-      "doc": "In-database: a TableRef in, a query out; no row enters the harness.\nThe store materializes the SELECT into ops.site_health for this site.",
+      "doc": "In-database: a TableRef in, a query out; no row enters the worker.\nThe store materializes the SELECT into ops.site_health for this site.",
       "inputs": {
         "change_events": {
           "kind": "in",
@@ -1015,7 +1015,7 @@
     "id": "snapshot",
     "source": "explicit"
   },
-  "deploy": "c389e7dc92d447355a9f1fbdd33766f8be020a794a961c4f79ff83b4e6750e29",
+  "deploy": "430d481a8780d17aa5bf5403421b8986cf69fda8d51d8fafcc5368dea6825c42",
   "errors": [],
   "executors": {
     "ingest": {

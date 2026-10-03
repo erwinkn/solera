@@ -660,7 +660,7 @@ async def logged_index(io, seed=3):
 
 
 async def test_local_reads_are_the_stores(io, tmp_path):
-    """Pages, pending windows and lookups over the cache's local copies equal
+    """Pages, delta passes and lookups over the cache's local copies equal
     the store's, from any cursor."""
 
     from solera.keys.reads import Cold, Reads
@@ -773,7 +773,7 @@ async def test_a_build_stops_at_the_room_it_holds(io, tmp_path):
 
 async def test_long_paths_make_short_local_names(io, tmp_path):
     """Round 2, finding 3: a local file is named by a hash of its object's
-    path, so a long scope fills like any other."""
+    path, so a long partition fills like any other."""
 
     state = IndexState(prefix=f"keys/out/{'s' * 180}/")
     files, _ = await KeyIndex(io, None, state, OPTS).resolve(

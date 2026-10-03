@@ -1,5 +1,5 @@
 """A real PostgresStore in the simulation, watched: every write transaction
-it commits (the slice, its generation, the slice's rows after it), every
+it commits (the partition, its generation, the partition's rows after it), every
 acquisition, and every read through `reads()` (the reader's snapshot, the
 generation it reported, the rows it loaded). The machine checks what
 lineage says against this record (docs/stores.md, "What a read sees").
@@ -139,7 +139,7 @@ def patches(ledger: Ledger, current_actor, now) -> list[tuple]:
 
 def check(ledger: Ledger, start: int) -> int:
     """Every read since `start`: the generation it reports committed a write
-    to its slice — the newest before its snapshot — and the rows it loaded
+    to its partition — the newest before its snapshot — and the rows it loaded
     are that write's rows (of the keys it asked for). Returns where it stopped."""
 
     from .oracle import Violation

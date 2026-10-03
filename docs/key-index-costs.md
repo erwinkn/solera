@@ -92,7 +92,7 @@ levels filled the way steady-state random writes leave them.
 | 1K new keys inserted | — | 29 GETs, 0.5 s | |
 | 100K random keys changed | 845 GETs, 1.6 s | 376 GETs, 1.3 s | |
 | 1K random, engine cache warm | 10 GETs | 0 GETs, 57 ms, the delta uploaded | |
-| Full-delivery page of 10K keys | 12 GETs | 2 GETs, 0.3 MB, 0.1 s | 14 GETs, 1.4 MB, 0.1 s |
+| Full-pass page of 10K keys | 12 GETs | 2 GETs, 0.3 MB, 0.1 s | 14 GETs, 1.4 MB, 0.1 s |
 | Full scan (recount), 100K-key pages | ~150 GETs (§6) | 1,077 GETs, 122 s | 3,029 GETs, 242 s |
 
 Scenario E (1K random changes every 10 s into 100M keys, cold) is about
@@ -231,10 +231,10 @@ index; that is inherent, and cheap in requests.
 | read time | 30 ms | 30 ms | 34 ms | 70 ms | 430 ms | 4.1 s |
 | compare, native | 0 ms | 0 ms | 3 ms | 33 ms | 333 ms | 3.3 s |
 
-### Full delivery to a consumer
+### Full pass to a consumer
 
 A consumer re-reads everything (new consumer, version bump, `full` run),
-one attempt per page of `page_size` keys. Only the key index side is
+one attempt per page of `batch_size` keys. Only the key index side is
 counted here; loading the rows is the store's cost.
 
 Pages of 10K keys:
@@ -267,7 +267,7 @@ the attempts costs regardless. Filters on, cold workers.
 | A. Reference table, 1K keys, full replace hourly (1% changed) | 720 | $0.0042 | $0.02 | <$0.0001 | $0.02 | 30 ms |  |
 | B. SharePoint inventory, 100K keys, 100 random changes every 10 s | 259,200 | $1.92 | $6.69 | <$0.0001 | $8.61 | 34 ms |  |
 | C. Event table, 10M keys, 10K clustered changes every minute | 43,200 | $0.41 | $1.11 | $0.0059 | $1.53 | 75 ms |  |
-| D. Large dimension, 100M keys, 1M random changes daily | 30 | $0.04 | $0.0008 | $0.06 | $0.10 | 4.6 s | + one full delivery to a new consumer (100K pages) |
+| D. Large dimension, 100M keys, 1M random changes daily | 30 | $0.04 | $0.0008 | $0.06 | $0.10 | 4.6 s | + one full pass to a new consumer (100K pages) |
 | E. Worst case, 100M keys, 1K random changes every 10 s | 259,200 | $6.92 | $6.69 | $0.06 | $13.67 | 815 ms |  |
 | F. Big full replacement, 100M keys daily (1% changed) | 30 | $0.0021 | $0.0008 | $0.06 | $0.06 | 4.1 s |  |
 

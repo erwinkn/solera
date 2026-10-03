@@ -72,7 +72,7 @@ async def world(monkeypatch):
 
 
 async def worker_finished() -> None:
-    """Every in-process worker done — past its commit, its discards too
+    """Every in-process worker done — past its commit, its cleanups too
     (docs/lifecycle.md §9.8): a run is settled before its worker ends."""
 
     from solera_server.executors.inline import InlinePlacement
@@ -118,7 +118,7 @@ def context(output: Output, partition: str = "", commit_number=None, **kw) -> Wr
 
 
 async def whole(state, output: str, partition: str = ""):
-    """A whole keyed read's selection, as the harness builds it for an
+    """A whole keyed read's selection, as the worker builds it for an
     immutable store: every live entry of the output's key index, with the
     generation that wrote it (docs/lifecycle.md §9.8)."""
 

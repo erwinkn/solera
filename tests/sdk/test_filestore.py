@@ -1,9 +1,9 @@
 """§4: FileStore and S3Store — one object per value, key or batch, each
 written once under a name that carries the writing attempt's generation
 (docs/lifecycle.md §9.8, docs/versions.md); JSON when it round-trips,
-pickle otherwise. The store never works out what changed; the harness
+pickle otherwise. The store never works out what changed; the worker
 does, against the key index (tests/worker), and says so in the write's
-scope. A keyed read names its objects from the generations the index
+partition. A keyed read names its objects from the generations the index
 holds."""
 
 import os
@@ -129,7 +129,7 @@ async def test_a_keyed_write_touches_only_what_the_harness_says(store):
     prepared = prepare(content, out)
     only = KeyedWrite(prepared, frozenset({"b"}), frozenset({"a"}))
     await store.store(only, None, context(out, generation=3))
-    # `c` is in the write but not in upserts: the harness knows it is there already.
+    # `c` is in the write but not in upserts: the worker knows it is there already.
     assert await paths(store) == ["uploads/b/3.json"]
     # A requested key the write does not hold is an error, never a silent skip.
     with pytest.raises(StoreError, match="zzz"):
@@ -301,7 +301,7 @@ async def test_many_objects_are_never_many_tasks_at_once(store):
 
 
 async def test_a_prepared_write_is_read_once_and_only_its_selection_taken(store, monkeypatch):
-    """§4, §6: the harness reads a keyed write once (`Prepared`); the store
+    """§4, §6: the worker reads a keyed write once (`Prepared`); the store
     reads no more of it than the groups of the keys it is asked to write —
     a DataFrame of many keys with one changed is one group, not every row."""
 

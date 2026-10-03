@@ -1,4 +1,4 @@
-"""Key indexes in the engine (docs/object-store-state.md §6): the harness works
+"""Key indexes in the engine (docs/object-store-state.md §6): the worker works
 out each commit's delta against the output's index, consumers read the delta
 log, the engine truncates the log behind consumers, compacts, recounts, and
 deletes files nothing references — and renames carry all of it along (§2)."""
@@ -193,8 +193,8 @@ async def test_a_patch_reconciles_what_a_dead_sql_writer_left(state, arrow):
 
 async def test_compaction_truncation_and_garbage(state):
     """§6: level 0 is compacted once it holds `l0_max_files` files; the delta
-    log keeps only what the consumer's watermark still needs; files nothing
-    references are deleted — and every delivery stays exact throughout."""
+    log keeps only what the consumer's bookmark still needs; files nothing
+    references are deleted — and every pass stays exact throughout."""
 
     rng = random.Random(7)
     truth: dict[str, int] = {}
@@ -247,7 +247,7 @@ async def test_compaction_truncation_and_garbage(state):
     bookmark = state.model.bookmark("mirror", "items", "")
     assert bookmark["next"] == head_commit + 1
     assert all(commit_number >= bookmark["next"] for commit_number, _ in index.log)  # truncated behind it
-    read = state.model.cleanup_reads()  # kept for the discards still pending (docs/lifecycle.md §9.8)
+    read = state.model.cleanup_reads()  # kept for the cleanups still pending (docs/lifecycle.md §9.8)
     assert {path for path, _ in state.model.garbage} <= read
     assert on_disk(state, index) == {index.path(n) for n in index.referenced()} | read
     assert sorted((await engine.list_keys("items"))["keys"]) == sorted(truth)
@@ -325,7 +325,7 @@ def test_a_recount_stays_inexact_if_a_later_commit_was():
 
 
 async def test_a_consumer_without_a_log_starts_over(state):
-    """§6: a watermark whose window the log no longer holds gets a full delivery."""
+    """§6: a bookmark whose window the log no longer holds gets a full pass."""
 
     @asset(outputs=Output("items", key="id"))
     def items():
@@ -417,7 +417,7 @@ async def test_only_the_engine_caches_index_files(state, tmp_path):
 
 
 async def test_renamed_asset_keeps_its_state(state):
-    """§2: `aliases=` moves heads, key indexes, cursors, watermarks and
+    """§2: `aliases=` moves heads, key indexes, cursors, bookmarks and
     automation state to the new name; a consumer continues incrementally."""
 
     delivered = []
@@ -533,7 +533,7 @@ async def test_small_writes_resolve_in_the_engine_and_pages_come_with_start(stat
 
 async def test_input_reads_come_from_the_engine_once_warm(state, monkeypatch):
     """docs/resolved-commits.md §7: once the engine's cache holds an index, a
-    consumer's pages — a full delivery, change windows — come with its start
+    consumer's pages — a full pass, delta passes — come with its start
     reply, and its worker reads no index file to find
     them; what it delivers is what the store's pages would have."""
 
@@ -584,7 +584,7 @@ async def test_input_reads_come_from_the_engine_once_warm(state, monkeypatch):
         await warm()
         monkeypatch.setattr(IO, "read", read)
         served.clear()
-        await run(engine, ["mirror"] if n < 2 else ["mirror", "copy"])  # copy: a full delivery
+        await run(engine, ["mirror"] if n < 2 else ["mirror", "copy"])  # copy: a full pass
         monkeypatch.setattr(IO, "read", real_read)
         assert served and all(served)
         truth = await _stored(engine, state)

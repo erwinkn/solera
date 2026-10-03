@@ -1,7 +1,7 @@
 """The generated conformance kit (`solera.testing.storemachine`) against the
 shipped stores, the guide's example store and the simulation's in-memory
 fenced store: random sequences of attempts, stale writers, duplicates,
-retries, pinned readers, discards and batches, checked after every step."""
+retries, pinned readers, cleanups and batches, checked after every step."""
 
 import os
 import tempfile
@@ -27,7 +27,7 @@ def table_harness(_tmp):
 
     @contextlib.asynccontextmanager
     async def hold(partition):
-        """The older writer's transaction, open: the slice's lock held, its fence taken."""
+        """The older writer's transaction, open: the partition's lock held, its fence taken."""
 
         table = store._table(partition.output, None)
         async with store.db.lock(table, partition.partition):

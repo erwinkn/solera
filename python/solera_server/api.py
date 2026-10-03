@@ -112,7 +112,7 @@ def create_app(
             return secret is not None and lifecycle.valid(secret, match.group(1), presented)
         if POOL_ROUTE.match(path) and pool_token:
             return hmac.compare_digest(presented.encode(), pool_token.encode())
-        if SENSOR_ROUTE.match(path):  # sensor hosts: the pool token, or the local host's own
+        if SENSOR_ROUTE.match(path):  # sensor workers: the pool token, or the local host's own
             if pool_token and hmac.compare_digest(presented.encode(), pool_token.encode()):
                 return True
             secret = request.app.state.engine.secret
@@ -206,7 +206,7 @@ def create_app(
             "active_runs": sum(1 for r in runtime.m.runs.values() if r["status"] not in TERMINAL_RUN),
             "postgres": bool(os.environ.get("DATABASE_URL")),
             "last_error": runtime.failing,
-            # data garbage whose names could not be read: see and clear with `solera cleanups`
+            # cleanup whose names could not be read: see and clear with `solera cleanups`
             "stuck_cleanups": [
                 {"output": output, "partition": partition, "id": e["id"]}
                 for (output, partition), entries in runtime.m.cleanups.items()

@@ -1,5 +1,5 @@
 """`Each` edges (docs/per-key-processing.md §5–§10): one call per key, by-key
-writes, the failure index, retry passes, forced retries, key outcomes."""
+writes, the failed keys, retry passes, forced retries, key outcomes."""
 
 import asyncio
 import copy
@@ -128,7 +128,7 @@ async def test_failures_are_recorded_and_never_block(state):  # noqa: F811
         ("slow.csv", "retrying"),
     ]
 
-    # A changed or removed key comes back through the change window: its record goes.
+    # A changed or removed key comes back through the delta pass: its record goes.
     content["empty.csv"] = {"text": "2"}
     del content["bug.csv"]
     detail = await drive(engine, await engine.submit(["parse"], upstream=True))
@@ -327,7 +327,7 @@ def test_registration():
 async def test_a_user_cancel_commits_finished_keys_and_leaves_the_rest_dormant(tmp_path):
     """Cancel requested: no key starts, the calls in flight are cancelled, the
     keys that finished commit with the interrupted ones' records and the
-    watermark past the whole page (§5); canceled keys never come due by
+    bookmark past the whole page (§5); canceled keys never come due by
     themselves (§9)."""
 
     from solera.failed_keys import CANCELED
@@ -380,7 +380,7 @@ async def test_a_user_cancel_commits_finished_keys_and_leaves_the_rest_dormant(t
 
 
 async def test_a_retry_pass_spans_pages_and_accumulates_its_bounds(state):  # noqa: F811
-    """Retry pages walk the failure index `page_size` keys at a time,
+    """Retry pages walk the failed keys `batch_size` keys at a time,
     alternating with change pages; the pass's accumulators become the exact
     bounds when it completes (§9)."""
 
@@ -531,9 +531,9 @@ async def test_patterns_select_keys_and_a_page_of_none_is_skipped(state):  # noq
 
 
 async def test_a_pattern_change_cuts_over(state):  # noqa: F811
-    """§11: changes up to the cutover finish under the old patterns — so a
+    """§11: changes up to the pattern change finish under the old patterns — so a
     pending deletion of a newly excluded key still removes its rows — then
-    membership is diffed against the snapshot at the cutover, then deltas
+    membership is diffed against the snapshot at the pattern change, then deltas
     continue under the new patterns."""
 
     content = {"a/1.csv": {"n": 1}, "archive/2.csv": {"n": 2}, "b/3.csv": {"n": 3}}
@@ -583,7 +583,7 @@ async def test_a_pattern_change_cuts_over(state):  # noqa: F811
 
 
 async def test_a_rescope_pins_its_snapshot_between_attempts(state):  # noqa: F811
-    """The snapshot a rescope diffs is read across attempts: index files it
+    """The snapshot a pattern change diffs is read across attempts: index files it
     names stay until the transition ends, even with no attempt running."""
 
     def parse(file: dict):
@@ -646,8 +646,8 @@ async def test_none_is_no_change_and_removal_is_explicit(state):  # noqa: F811
 
 async def test_a_last_page_that_writes_nothing_still_completes_the_scope(state):  # noqa: F811
     """Review round 3 (system B1): one key a page, `a` writes rows, `b`
-    fails — so the last page writes no output. The delivery drained all the
-    same: the scope is complete, kept out of `missing`, and its head is
+    fails — so the last page writes no output. The pass drained all the
+    same: the partition is complete, kept out of `missing`, and its head is
     unchanged — the version and provenance `a`'s page installed."""
 
     def parse(ctx, file: dict):

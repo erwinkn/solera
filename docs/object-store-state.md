@@ -39,15 +39,15 @@ Everything lives under `{root}/{namespace}/`.
 |---|---|---|---|---|
 | Journal segment | `control/journal/{seq:020d}.json` | engine | create-only | the checkpoint before the newest covers it; a writer's fence segment never |
 | Checkpoint | `control/checkpoints/{seq:020d}.json` | engine | create-only | two newer checkpoints exist |
-| Key index file | `keys/{output}/{scope}/{name}.kx` | harness (delta files), compaction | create-only | no longer in the index and no consumer needs it (§6) |
+| Key index file | `keys/{output}/{partition}/{name}.kx` | worker (delta files), compaction | create-only | no longer in the index and no consumer needs it (§6) |
 | History file | `history/{table}/{ulid}.parquet` | engine | create-only | merged into a bigger file, or rewritten without deleted runs (§7) |
 | Spec | `runs/{run}/{attempt}.spec` | engine, before `AttemptLaunched` | create-only, immutable | with its run |
-| Claim | `runs/{run}/{attempt}.worker` | the invocation that claims the attempt; then its reports while its channel fails | created once, then overwritten by its owner only | with its run |
+| Claim | `runs/{run}/{attempt}.worker` | the worker that claims the attempt; then its reports while its channel fails | created once, then overwritten by its owner only | with its run |
 | Result | `runs/{run}/{attempt}.result` | the claim's owner, once | create-only, immutable, sealed bytes | with its run |
 | Gate | `runs/{run}/{attempt}.writing` | the worker about to write, or the engine ending the attempt — whichever is first | create-only | `gate_days` (30) after its run (§8) |
 | Engine heartbeat | `engine/alive.json` | engine, every 30 s while runs are live | overwritten | never (one object) |
 | Attempt log | chunks `runs/{run}/{attempt}.log.{n:06d}`, every 30 s or 1 MB; the end inside the result | worker | create-only, never joined | with its run |
-| Output data | store-defined (FileStore: `{output}/{partition}/{key}/{generation}.json` under `.solera/data`, §9) | the store, inside the harness | FileStore / S3Store: created once, never overwritten; others: store-defined | FileStore / S3Store: superseded or abandoned objects, by the scope's next attempt once no reader pin predates them (§9); never expired |
+| Output data | store-defined (FileStore: `{output}/{partition}/{key}/{generation}.json` under `.solera/data`, §9) | the store, inside the worker | FileStore / S3Store: created once, never overwritten; others: store-defined | FileStore / S3Store: superseded or abandoned objects, by the partition's next attempt once no reader pin predates them (§9); never expired |
 
 **Growth.** `control/` is bounded: at most two checkpoints plus the
 journal since the older one — and one fence segment per writer that ever
@@ -67,13 +67,13 @@ current content.
     checkpoints/00000000000000000990.json    ← previous (kept for recovery)
     checkpoints/00000000000000001040.json    ← newest
   keys/
-    site_files/alpha/000000000057.kx         ← delta file of batch 57
+    site_files/alpha/000000000057.kx         ← delta file of commit 57
     site_files/alpha/c01J8ZE2….kx            ← compacted file
     uploads/_/000000000003.kx                ← external source
   history/
     runs/01J9A2….parquet                     ← merged: 4,000 runs
     runs/01J9C7….parquet                     ← one flush
-    tasks/…  attempts/…  materializations/…  lineage/…
+    tasks/…  attempts/…  commits/…  lineage/…
   runs/
     01J8ZB3K…/01J8ZB3M….spec                 ← what to run, immutable
     01J8ZB3K…/01J8ZB3M….worker               ← the claim
@@ -90,17 +90,17 @@ Output data lives wherever its store puts it: FileStore under
 | Id | Form | Notes |
 |---|---|---|
 | run | `{ulid}` | sorts by time and embeds its creation time; carries no names, so renames never orphan history |
-| task | `{asset}:{scope}` | unique within its run |
+| task | `{asset}:{partition}` | unique within its run |
 | attempt | `{ulid}` | globally unique; names delta files and attempt files |
 | commit | `(run, attempt)` | no separate commit id or record |
-| batch | integer per (output, scope) | engine-assigned, starts at 0 |
+| commit number | integer per (output, partition) | engine-assigned, starts at 0 |
 | seq | integer per namespace | journal position |
 | writer | the `seq` of that writer's fence segment | no separate epoch object |
 
 **Renames.** `@asset(aliases=["old_name"])`. On registration the engine
-moves everything held under an alias to the current name: its scope
-records (cursor, outcome, completeness, watermarks, failing keys — one
-record per scope, moved whole), heads, key indexes, automation state
+moves everything held under an alias to the current name: its partition
+records (cursor, outcome, completeness, bookmarks, failing keys — one
+record per partition, moved whole), heads, key indexes, automation state
 (attached automations are named after their asset), retention lists. Outputs named after the
 asset follow. Stores never rename anything: the committed head's ref
 says where the content is (a FileStore directory, a Postgres table), so
@@ -109,14 +109,14 @@ the declaration names the storage only of a first write.
 
 **Removals.** A name the project no longer declares, as an asset or an
 output, and that no alias carries over, holds no live state: on
-registration its heads, key indexes (their files go to collection), scope
-records and unsettled intents go — those of an asset with an attempt in
+registration its heads, key indexes (their files go to collection), partition
+records and repair intents go — those of an asset with an attempt in
 flight once that attempt settles. History keeps its records, and its
-pending discards stay, still owed. A name that comes back, added again or
+pending cleanups stay, still owed. A name that comes back, added again or
 the target of a rename, starts over: it never resumes an earlier life
 (simulation finding F12: `copy` renamed to `mirror` and back without an
 alias left `mirror`'s first life, which the next rename onto `mirror`
-kept, under a watermark already past a deletion).
+kept, under a bookmark already past a deletion).
 
 ## 3. Journal segment
 
@@ -157,11 +157,11 @@ retention (§11).
      "attempt": "01J8ZC7R…", "outcome": "succeeded", "started_at": 1790074865.2, "finished_at": 1790074866.0,
      "commit": {
        "heads": {"site_events": {"…": "Head, §5"}, "site_files": {"…": "Head, §5"}},
-       "keys": {"site_files": {"batch": 57, "added": 0, "removed": 0, "exact": true,
+       "keys": {"site_files": {"commit_number": 57, "added": 0, "removed": 0, "exact": true,
                                "files": [{"name": "000000000057-01J8ZC7R…", "level": 0, "entries": 2,
                                           "min": "alpha-file-1", "max": "alpha-file-3", "…": "…"}]}},
        "cursor": "5921",
-       "watermarks": {}
+       "bookmarks": {}
      }},
     {"type": "AutomationFired", "name": "site_feed.every.0", "at": 1790074866.1, "run": "01J8ZC7S…"}
   ]
@@ -176,17 +176,17 @@ status are derived inside `apply`; they are not events.
 | Event | Fields | Effect |
 |---|---|---|
 | `EngineStarted` | `writer`, `nonce` | first event of every writer; its segment's `seq` becomes the writer id; `nonce` is random, so no two writers' fences have the same bytes |
-| `ProjectRegistered` | `revision`, `manifest` | replaces the manifest; applies aliases; retires removed names (§2); reconciles automation state |
+| `ProjectRegistered` | `deploy`, `manifest` | replaces the manifest; applies aliases; retires removed names (§2); reconciles automation state |
 | `RunSubmitted` | `run` (id, request, tasks) | adds an active run |
 | `RunControlled` | `run`, `action` (`cancel` \| `pause` \| `resume`) | |
-| `AttemptLaunched` | `run`, `task`, `attempt`, `started_at`, `pin`, `at`, `execution`, `prepared`, `pool?` | the attempt file exists and a placement is about to start it: its claim and scope lock become durable (§8) |
+| `AttemptLaunched` | `run`, `task`, `attempt`, `started_at`, `pin`, `at`, `execution`, `prepared`, `pool?` | the attempt file exists and a placement is about to start it: its claim and claim become durable (§8) |
 | `AttemptPlaced` | `attempt`, `handle` | the placement started it: where it runs, for whichever engine follows it (§8) |
-| `AttemptFinished` | `run`, `task`, `attempt`, `outcome` (`succeeded` \| `failed` \| `skipped` \| `canceled`), `started_at`, `finished_at`, `error?`, `retryable?`, `commit?`, `unsettled?`, `writes?` | records the attempt; on commit, installs heads, the scope's record (cursor, watermarks, completeness), and each keyed output's new delta file; `unsettled` keeps the intents of a writer that died (§8) |
+| `AttemptFinished` | `run`, `task`, `attempt`, `outcome` (`succeeded` \| `failed` \| `skipped` \| `canceled`), `started_at`, `finished_at`, `error?`, `retryable?`, `commit?`, `owing a repair?`, `writes?` | records the attempt; on commit, installs heads, the partition's record (cursor, bookmarks, completeness), and each keyed output's new delta file; `repairs` keeps the intents of a writer that died (§8) |
 | `SourceCommitted` | `source`, `head`, `keys?`, `at`, `run?` | installs a source head and its delta file; a commit that changed something records `run` in the history (§7) |
-| `IndexCompacted` | `output`, `scope`, `added` [file], `removed` [name], `at` | swaps compacted files into a key index |
-| `IndexRecounted` | `output`, `scope`, `live`, `pinned_count`, `pinned_inexact` | a recount found `live` keys where the state it scanned said `pinned_count`: the count becomes `live` plus what commits since added, and `inexact` drops by `pinned_inexact` (§6) |
-| `IndexTruncated` | `output`, `scope`, `below`, `at` | drops delta log entries below `below` |
-| `GarbageDeleted` | `paths` | forgets index files that were deleted |
+| `IndexCompacted` | `output`, `partition`, `added` [file], `removed` [name], `at` | swaps compacted files into a key index |
+| `IndexRecounted` | `output`, `partition`, `live`, `pinned_count`, `pinned_inexact` | a recount found `live` keys where the state it scanned said `pinned_count`: the count becomes `live` plus what commits since added, and `inexact` drops by `pinned_inexact` (§6) |
+| `IndexTruncated` | `output`, `partition`, `below`, `at` | drops delta log entries below `below` |
+| `FilesCleanedUp` | `paths` | forgets index files that were deleted |
 | `AutomationChanged` | `name`, `enabled` | |
 | `AutomationFired` | `name`, `at`, `run` | clears its pending set |
 | `RunArchived` | `run`, `at` | drops a finished run from memory; its rows join the pending history (§7) |
@@ -208,33 +208,33 @@ than joined string keys, because partition keys may contain `/`.
 
 ```
 State
-  seq, writer, applied, revision, manifest         # applied: events applied so far, the model's clock
-  heads        {output: {scope: Head}}             # assets and external sources
-  indexes      {output: {scope: KeyIndex}}         # keyed outputs and keyed sources (§6)
-  scopes       {asset: {scope: Scope}}             # each asset scope's committed lifecycle
+  seq, engine, event_counter, deploy, deploy_number, manifest   # event_counter: events applied so far, the model's clock
+  heads        {output: {partition: Head}}             # assets and external sources
+  indexes      {output: {partition: KeyIndex}}         # keyed outputs and keyed sources (§6)
+  partitions   {asset: {partition: PartitionRecord}}   # each asset partition's committed lifecycle
   automations  {name: AutomationState}
   runs         {run: Run}                          # active, or finished and not yet archived
   history      {files: {table: [File]}, rows: {table: [[seq, row], …]}, seq, imported}   # §7
-  unsettled    {output: {scope: [Intent, …]}}      # keyed outputs a dead writer may have half-written (§8)
+  repairs    {output: {partition: [Intent, …]}}      # keyed outputs a dead writer may have half-written (§8)
   garbage      [[path, n], …]                      # index and history files nothing references since event n
   retired      [run, …]                            # deleted runs whose directories are still to delete (§11)
 ```
 
 | Type | Fields | Bounded by |
 |---|---|---|
-| `Head` | `ref` (from the store), `run`, `attempt` (may point at a deleted run), `batch` (incremental outputs: the last batch that changed it, −1 before any), `base` (the first batch after the last reset of an unkeyed incremental output, or a keyed output's move to another store, which starts its index over), `count` (keyed: live keys), `elements?` (partition sets and set dimensions), `complete`, `version` (declared asset version), `asset`, `at` | outputs × partitions |
-| `Scope` | `cursor?` (json), `last?` (`Outcome`: its last terminal result), `drained?` (whether its last commit finished the delivery it was on — the scope's completeness, whatever its outputs wrote), `watermarks?` {edge: `Watermark`}, `failures?` (`Failures`: an Each asset's failing keys, per-key-processing.md §9). Registration moves it whole under a rename and drops the watermarks of edges the project no longer declares. | assets × partitions |
-| `Failures` | `batch` (the failure index's last batch), `counts` {outcome: keys}, `due` and `epoch_min` (lower bounds), `retry?` {`pass`, `epoch`, `forced_pos`, `after`, `due_acc`, `epoch_acc`}, `passes`, `done_forced`, `last` (`changes` or `retry`), `forced` {class: position} — its index is `indexes["@asset"][scope]` (per-key-processing.md §9) | Each assets × partitions |
+| `Head` | `ref` (from the store), `run`, `attempt` (may point at a deleted run), `commit_number` (incremental outputs: the last commit that changed it, −1 before any), `base` (the first batch after the last reset of an unkeyed incremental output, or a keyed output's move to another store, which starts its index over), `count` (keyed: live keys), `elements?` (dynamic partitions and set dimensions), `complete`, `version` (declared asset version), `asset`, `at` | outputs × partitions |
+| `PartitionRecord` | `cursor?` (json), `last?` (`Outcome`: its last terminal result), `drained?` (whether its last commit finished the pass it was on — the partition's completeness, whatever its outputs wrote), `bookmarks?` {input: `Bookmark`}, `failures?` (`Failures`: an Each asset's failing keys, per-key-processing.md §9). Registration moves it whole under a rename and drops the bookmarks of inputs the project no longer declares. | assets × partitions |
+| `Failures` | `batch` (the failed keys's last batch), `counts` {outcome: keys}, `due` and `epoch_min` (lower bounds), `retry?` {`pass`, `epoch`, `forced_pos`, `after`, `due_acc`, `epoch_acc`}, `passes`, `done_forced`, `last` (`changes` or `retry`), `forced` {class: position} — its index is `indexes["@asset"][partition]` (per-key-processing.md §9) | Each assets × partitions |
 | `KeyIndex` | `prefix` (where its files live — kept across renames), `count`, `inexact` (commits since the last recount whose count came from filters; the count is exact at 0), `files` [{`name`, `level`, `min`, `max`, `entries`, `size`, `tail`, `index`}], `log` [[`batch`, [file]], …] — see §6 | a few dozen files per index |
-| `Watermark` | `kind` (`keys` or `batches`), `next` (the first upstream batch not yet delivered), `delivery` (one under way: its `mode` — `full`, `delta`, or a pattern transition's `diff` — its boundary `from`..`to`, its position `at` — the last key delivered, or the next batch — its `page` of `pages`, a delta window's reader `pin`; a full keyed delivery's `from` is the head's batch + 1 when it began, so changes made meanwhile arrive afterwards as deltas), `fingerprint`, `output` and `up` (the upstream index it reads), and per-key `patterns`, `rescope`, `reconcile` (`python/solera_server/delivery.py`) | edges × partitions |
+| `Bookmark` | `kind` (`keys` or `commits`), `next` (the first upstream commit not yet delivered), `pass` (one under way: its `mode` — `full`, `delta`, or a pattern change's `diff` — its boundary `from`..`to`, its position `at` — the last key delivered, or the next batch — its `page` of `pages`, a delta pass's reader `pin`; a full keyed pass's `from` is the head's commit number + 1 when it began, so changes made meanwhile arrive afterwards as deltas), `fingerprint`, `output` and `up` (the upstream index it reads), and per-key `patterns`, `pattern change`, `reconcile` (`python/solera_server/bookmarks.py`) | edges × partitions |
 | `Outcome` | `outcome`, `run`, `attempt`, `at` | assets × partitions |
-| `AutomationState` | `enabled`, `last_fired`, `last_run`, `last_revision`, `pending` (set of `[asset, scope]` for OnChange) | automations × partitions |
+| `AutomationState` | `enabled`, `last_fired`, `last_run`, `last_revision`, `pending` (set of `[asset, partition]` for OnChange) | automations × partitions |
 | `Run` | `id`, `request` {targets, partitions, mode, config, keys, automation, tags}, `status`, `paused`, `created_at`, `events` (how many it has recorded), `tasks` {task: `Task`} | in-flight work |
 | `Task` | `status`, `deps`, `ready_at` (now, or a retry's due time), `wait` (seconds counted so far), `queued_at` (when the wait clock last started; null while stopped), `held?` [reason, name] (why the dispatcher last passed it over), `max_attempts`, what its ended attempts add up to — `tries`, `outcomes` {outcome: count}, `duration`, `first_at`, `last_at`, `last` (the latest attempt's `id`, `outcome`, `error?`, `outputs?`), `error?`, `executor?` — never a list of them (each one's row is in the history as it ends), `launched?` {`attempt`, `started_at`, `pin` (`applied` when it was claimed), `at`, `execution`, `prepared`, `handle?`, `pool?`, `worker?`, `claimed_at?`} | |
 | `File` | `path`, `rows`, `bytes`, `at` [lo, hi] (time column), `runs` [first, last], `deleted?` [run] (hidden until rewritten), `deleted_at?` | files per table: ~log(rows) after merging |
 | `Intent` | `added`, `removed`, `exact`, `files` (the dead attempt's delta files), `run`, `attempt` | writers that died mid-write, until the next commit of that output |
 
-**Derived, rebuilt at start:** the claims and scope locks of launched
+**Derived, rebuilt at start:** the claims and claims of launched
 attempts (from `Task.launched`), the pool queue, the ready queue and the
 dependents index.
 
@@ -247,22 +247,22 @@ Example (abridged):
 
 ```json
 {
-  "seq": 1040, "engine": 1001, "revision": "c0ffee…", "manifest": {"…": "…"},
+  "seq": 1040, "engine": 1001, "deploy": "c0ffee…", "manifest": {"…": "…"},
   "heads": {"site_files": {"alpha": {
     "ref": {"output": "site_files", "store": "default", "partition": "alpha", "generation": 184467,
             "handle": {"mode": "keyed", "path": "site_files/alpha", "key": "path"}},
     "run": "01J8ZC7Q…", "attempt": "01J8ZC7R…",
-    "batch": 57, "count": 4, "complete": true, "version": "1", "at": 1790074866.0}}},
+    "commit_number": 57, "count": 4, "complete": true, "version": "1", "at": 1790074866.0}}},
   "indexes": {"site_files": {"alpha": {
     "prefix": "keys/site_files/alpha/", "count": 4, "inexact": 0,
     "files": [{"name": "c01J8ZE2…-0000", "level": 1, "min": "alpha-file-0", "max": "alpha-file-3", "entries": 4, "size": 212, "…": "…"},
               {"name": "000000000057-01J8ZC7R…", "level": 0, "min": "alpha-file-1", "max": "alpha-file-3", "entries": 2, "size": 140, "…": "…"}],
     "log": [[56, [{"name": "000000000056-01J8ZB…", "…": "…"}]], [57, [{"name": "000000000057-01J8ZC7R…", "…": "…"}]]]}}},
-  "scopes": {"site_feed": {"alpha": {"cursor": "5921", "drained": true}},
+  "partitions": {"site_feed": {"alpha": {"cursor": "5921", "drained": true}},
              "file_index": {"alpha": {
                "last": {"outcome": "succeeded", "run": "01J8ZB3K…", "attempt": "01J8ZB3M…", "at": 1790074800.0},
                "drained": true,
-               "watermarks": {"site_files": {"kind": "keys", "next": 56, "fingerprint": "8d46…",
+               "bookmarks": {"site_files": {"kind": "keys", "next": 56, "fingerprint": "8d46…",
                                              "output": "site_files", "up": "alpha"}}}}},
   "automations": {"site_feed.every.0": {"enabled": true, "last_fired": 1790074866.1,
                   "last_run": "01J8ZC7S…", "last_revision": "c0ffee…", "pending": []}},
@@ -276,7 +276,7 @@ Example (abridged):
 ## 6. Key index
 
 One per keyed output (or keyed external source) and partition. The format
-and operations live in an SDK library (`solera.keys`) used by the harness,
+and operations live in an SDK library (`solera.keys`) used by the worker,
 by compaction, and by the server for key listings. The engine itself only
 holds each index's `KeyIndex` record.
 
@@ -284,19 +284,19 @@ holds each index's `KeyIndex` record.
 holds `(key, generation, deleted, payload?)` entries sorted by key — the
 generation that last wrote the key, its version, and what an immutable
 store names its object by (`versions.md`, `lifecycle.md` §9.8); the
-optional payload is a source key's version or a failure index's record —
+optional payload is a source key's version or a failed keys's record —
 and a delta's entries also the predecessor generation of the key they
 change or delete, which compaction drops.
 
-- **Level 0** holds delta files, one per commit, named by batch, and files
+- **Level 0** holds delta files, one per commit, named by commit number, and files
   merged from them. Their key ranges overlap; a file is as recent as the
-  newest batch it holds, which leads its name.
+  newest commit it holds, which leads its name.
 - **Levels 1+** hold compacted files with non-overlapping key ranges, each
   up to ~64 MB, each level ~10× the previous.
 - **Newest wins:** a key's current entry is its entry in the newest file
   containing it; a `deleted` entry hides older ones.
-- **`log`** lists the delta files by batch, from the lowest consumer
-  watermark to the head. A delta file stays readable while it is in the
+- **`log`** lists the delta files by commit number, from the lowest consumer
+  bookmark to the head. A delta file stays readable while it is in the
   log, even after compaction has merged it out of the levels.
 
 **File layout.** `[data blocks][filters][block index][footer]`, byte
@@ -337,7 +337,7 @@ Deltas themselves are always exact; only the count is approximate.
 offered to the engine over the attempt's channel: it answers from a cache
 of the index files on its local disk — exact, no requests — or declines,
 and the worker resolves the write itself as below. The same cache answers
-an attempt's input reads — its pages of a full delivery or a pending
+an attempt's input reads — its pages of a full pass or a pending
 window — with its `start` reply, so a consumer reads no index file when
 the index is warm.
 
@@ -351,7 +351,7 @@ the written keys and runs the filters, and reads blocks only for the keys
 they cannot clear, in the files whose key filter matched, all levels at
 once, each key taking its newest entry. If those block reads would number
 more than 16 per streamed segment, it streams instead. An `exact` read
-(failure indexes) reads every live key's entry, counting nothing from the
+(failed keys) reads every live key's entry, counting nothing from the
 filters.
 
 **Full replacement.** A bare return of every row must compare every live
@@ -382,15 +382,15 @@ None)`), and the replacement streams them, so nothing is sorted or held.
 
 | Operation | Who | How |
 |---|---|---|
-| Compute a delta | harness, at write time | Read the write's keys once (`Prepared`, `per-key-processing.md` §7), against the index **as pinned in the spec**. A patch is checked with the filters and the read strategy above: every key it writes, at the attempt's generation, plus `deleted` entries for removed keys that may exist. A full replacement is the streaming merge-join above. Either way the result is the batch's delta files, split at ~64 MB. |
-| Commit | engine | Add the delta file to level 0 and to `log`; `count += added − removed`, and `inexact += 1` if the count change came from filters. The scope lock — one attempt per (asset, scope) from launch to settlement — guarantees the index didn't change underneath. |
-| Deliver pending deltas | harness, for an `Incremental` edge | Read the `log` files from the watermark to the head; chunk by `page_size` in key order; ask the upstream store for those rows with `Keys(…)`. |
-| Full delivery | harness | Page through the merged view of all levels from `after`, `page_size` keys at a time, and ask the store for them with `Keys(…)`. Per level, only the files covering the page are opened, and only their index parts are read — or the whole file, once, when it is small (below one request's latency worth of transfer, ~2.4 MB). A multi-page scan keeps each file's last fetched blocks for the next page, so it reads every block once. |
+| Compute a delta | worker, at write time | Read the write's keys once (`Prepared`, `per-key-processing.md` §7), against the index **as pinned in the spec**. A patch is checked with the filters and the read strategy above: every key it writes, at the attempt's generation, plus `deleted` entries for removed keys that may exist. A full replacement is the streaming merge-join above. Either way the result is the batch's delta files, split at ~64 MB. |
+| Commit | engine | Add the delta file to level 0 and to `log`; `count += added − removed`, and `inexact += 1` if the count change came from filters. The claim — one attempt per (asset, partition) from launch to settlement — guarantees the index didn't change underneath. |
+| Deliver pending deltas | worker, for an `Incremental` input | Read the `log` files from the bookmark to the head; chunk by `batch_size` in key order; ask the upstream store for those rows with `Keys(…)`. |
+| Full pass | worker | Page through the merged view of all levels from `after`, `batch_size` keys at a time, and ask the store for them with `Keys(…)`. Per level, only the files covering the page are opened, and only their index parts are read — or the whole file, once, when it is small (below one request's latency worth of transfer, ~2.4 MB). A multi-page scan keeps each file's last fetched blocks for the next page, so it reads every block once. |
 | Compaction | the engine's machine by default (§6, *Engine work*) | Once level 0 holds ~8 files, merge them into one level-0 file — or, once level 0 holds a tenth of level 1's bytes, into level 1 with the level-1 files it overlaps (all of them, for random keys). A level over its target pushes one file down, merging it with the files it overlaps there. A merge streams, a few segments per input and one output file at a time. Commit with `IndexCompacted`. Each merge into a level rewrites about ten times the bytes it brings: ~20–30× over an entry's life with random keys (`bench/keys/amplification.py`). |
-| Truncate the log | engine | Drop `log` entries below the lowest consumer watermark and below every window an in-flight attempt was given (`IndexTruncated`); an output with no `Incremental` consumers keeps none. A consumer whose window the log no longer holds gets a full delivery. |
-| Delete files | engine | A file in neither `files` nor `log` joins `garbage`, and is deleted once every attempt that could have pinned it has finished (`GarbageDeleted`): every attempt claimed before the event that let go of it. Both are positions in event order (`applied`), the same in every engine that replays the journal — never wall clocks, which two engines may disagree on. A delta file of an attempt that never committed is deleted when the attempt ends, unless it is an unsettled intent (§8). |
+| Truncate the log | engine | Drop `log` entries below the lowest consumer bookmark and below every window an in-flight attempt was given (`IndexTruncated`); an output with no `Incremental` consumers keeps none. A consumer whose window the log no longer holds gets a full pass. |
+| Delete files | engine | A file in neither `files` nor `log` joins `garbage`, and is deleted once every attempt that could have pinned it has finished (`FilesCleanedUp`): every attempt claimed before the event that let go of it. Both are positions in event order (`applied`), the same in every engine that replays the journal — never wall clocks, which two engines may disagree on. A delta file of an attempt that never committed is deleted when the attempt ends, unless it is an repair intent (§8). |
 
-Writes that never pass through the harness as rows — `Sql` materialized
+Writes that never pass through the worker as rows — `Sql` materialized
 inside Postgres — are the one case where the store must report the keys it holds once it
 wrote, sorted (above); only stores supporting such writes need to.
 
@@ -414,7 +414,7 @@ never stale. The one cache of them is the engine's (`resolved-commits.md`
 §5): it answers small writes from local copies before a worker reads
 anything, and answers attempts' input reads at `start`. Workers keep
 no cache: what they read — a write the engine declines or that is too big
-for it, a full delivery's pages, `Each`'s lookups — comes from the store
+for it, a full pass's pages, `Each`'s lookups — comes from the store
 (the costs are in `bench/keys/results.md`, "Without a worker cache").
 
 **Implementation.** The file format is ours (no Parquet). The per-key
@@ -441,12 +441,12 @@ input versions built this version of `revenue`".
 | Table | One row per | Notable columns |
 |---|---|---|
 | `runs` | finished run or source commit | `status` (`succeeded`, `failed`, `canceled`, `skipped`), `trigger` (`manual`, `automation`, `sensor`, `commit`), `automation`, `by`, `retry_of` (the run a retry ran again), `source`, `targets`, `assets`, `committed`, `tags` (map), `task_count`, `failed_count`, `error`, `config` and `keys` (JSON, as submitted) |
-| `tasks` | task of a finished run | `asset`, `scope`, `status`, `started_at`, `finished_at`, `attempts`, `duration`, `wait` (seconds it could have run but didn't), `deps`, `max_attempts`, `retry_delay`, `retry_backoff`, `executor` (of its last attempt) |
+| `tasks` | task of a finished run | `asset`, `partition`, `status`, `started_at`, `finished_at`, `attempts`, `duration`, `wait` (seconds it could have run but didn't), `deps`, `max_attempts`, `retry_delay`, `retry_backoff`, `executor` (of its last attempt) |
 | `attempts` | attempt | `task`, `n`, `generation` (the one its writes carried), `outcome`, `started_at`, `finished_at`, `duration`, `preparing`, `provisioning`, `importing`, `loading`, `computing`, `writing`, `settling` (seconds per phase, below), `peak_memory` (bytes; only in a process of its own), `cpu_seconds`, `error`, `executor`, `cpu`, `memory`, `gpu` (requested; all null if it never launched), `options` (map: its other placement options, e.g. `image`), `outputs` (the outputs it committed, each at its `generation`), `keys` (map: an `Each` attempt's keys by outcome) |
-| `run_events` | moment of a run | `n` (its order in the run), `at`, `type`, `task` and `attempt` (null for the run's own events), `by`, `name`, `reason`, `until`, `rows` — the timeline, below |
-| `materializations` | output version a commit installed | `output`, `scope`, `generation` (its version: the writing attempt's, or a source commit's), `run`, `attempt`, `at`, `batch`, `added`, `removed`, `added_keys`, `removed_keys` (a source commit's keys, up to 1,000), `rows`, `metadata` (JSON; an unkeyed source commit's `version`) |
-| `lineage` | input version an output version was read from, and what a current read saw (stores.md, "What a read sees") | `output`, `scope`, `generation`, `input`, `input_scope`, `input_generation` (what was pinned: the head, or a fixed delivery's generation), `param`, `read_generation` (what a read of current rows saw; null for a snapshot store's read, which is the pin, and for an external source's, which is its observation — `versions.md` §6) |
-| `key_outcomes` | key an `Each` attempt processed | `run`, `attempt` (`attempts.id`), `asset`, `scope`, `key`, `generation` (the upstream key's it processed), `outcome` (`ok`, `removed`, `unmatched`, `rejected`, `failed`, `retrying`, `canceled`, `timed_out`), `error`, `duration`, `at` — per-key-processing.md §10 |
+| `run_timeline` | moment of a run | `n` (its order in the run), `at`, `type`, `task` and `attempt` (null for the run's own events), `by`, `name`, `reason`, `until`, `rows` — the timeline, below |
+| `commits` | output version a commit installed | `output`, `partition`, `generation` (its version: the writing attempt's, or a source commit's), `run`, `attempt`, `at`, `batch`, `added`, `removed`, `added_keys`, `removed_keys` (a source commit's keys, up to 1,000), `rows`, `metadata` (JSON; an unkeyed source commit's `version`) |
+| `lineage` | input version an output version was read from, and what a current read saw (stores.md, "What a read sees") | `output`, `partition`, `generation`, `input`, `input_scope`, `input_generation` (what was pinned: the head, or a fixed pass's generation), `param`, `read_generation` (what a read of current rows saw; null for a snapshot store's read, which is the pin, and for an external source's, which is its tick — `versions.md` §6) |
+| `key_outcomes` | key an `Each` attempt processed | `run`, `attempt` (`attempts.id`), `asset`, `partition`, `key`, `generation` (the upstream key's it processed), `outcome` (`ok`, `removed`, `unmatched`, `rejected`, `failed`, `retrying`, `canceled`, `timed_out`), `error`, `duration`, `at` — per-key-processing.md §10 |
 
 A run where every task was skipped — it launched nothing and wrote
 nothing — is recorded with status `skipped`. Listings hide skipped runs
@@ -454,18 +454,18 @@ unless the filter asks for that status, so a 10-second poller that
 usually finds nothing new does not bury the runs that did something.
 
 A source commit that changed something is a `runs` row with trigger
-`commit`, plus the `materializations` row of the version it made, which
+`commit`, plus the `commits` row of the version it made, which
 lists the keys it changed (up to 1,000; past that, only counted). The
 source's head points at it (`head.run`).
 
 **No run documents.** The tables are the record: a finished run's detail
 — is rebuilt from its `runs`, `tasks` and
-`attempts` rows (a source commit's from its `runs` and `materializations`
+`attempts` rows (a source commit's from its `runs` and `commits`
 rows), and reads the same as it did while the run was live. Only what has
 no shape of its own stays JSON: a run's `config` and `keys`, and output
 metadata.
 
-**The timeline — `run_events`.** Everything that happened to a run, in
+**The timeline — `run_timeline`.** Everything that happened to a run, in
 order: the engine's decisions and what the worker reports. The summary
 columns of the other tables are computed from it. For example, one
 attempt of `revenue`:
@@ -529,7 +529,7 @@ Run events are appended as they happen, not when the run finishes: a live
 run's timeline is queryable.
 
 **A finished run never changes.** Retrying it (`POST runs/{run}/retry`)
-submits a new run of its failed and canceled tasks' scopes, and of those
+submits a new run of its failed and canceled tasks' partitions, and of those
 it blocked, with `retry_of` naming it; a run in progress cannot be
 retried. Retries inside a running task are its attempts.
 
@@ -538,9 +538,9 @@ that finish things: `AttemptFinished` yields the attempt's `attempts` row
 (a task paging through a backlog holds counts, not one summary per page);
 `RunArchived` yields a run's `runs` and `tasks` rows; `AttemptFinished`
 with a commit also yields a
-`materializations` row per changed output, plus `lineage` rows from the
+`commits` row per changed output, plus `lineage` rows from the
 input versions pinned in the attempt's spec; `SourceCommitted` yields a
-`runs` row and a `materializations` row. From there, they are the **lake's**
+`runs` row and a `commits` row. From there, they are the **lake's**
 business.
 
 **The lake** (`lake.py`) is the storage layer under the history: a set of
@@ -570,7 +570,7 @@ adds the runs to the `hidden` list of every file whose key range covers
 them; queries filter them out (`WHERE run NOT IN (…)`). A file is
 rewritten without them after an hour, or as soon as it hides 1,000 runs,
 and the old file becomes garbage. A flush or merge that raced a deletion
-is discarded rather than installed, so a deleted run never comes back.
+is cleaned up rather than installed, so a deleted run never comes back.
 
 **Queries.** A query runs on a worker thread, with one view per table
 over three parts:
@@ -627,15 +627,15 @@ count of a keyed output, else the length of a returned list.
 | value counts per filter field | `GET /runs:facets?…` → `{status: [{value, count}], asset, tag, trigger, automation, by, source}` | |
 | runs over time, per status | `GET /runs:histogram?…&bars=60` → `{bucket, since, until, bars: [{t, counts}]}` | |
 | finished tasks | `GET /tasks?asset=&status=&run=&since=&before=` | |
-| p50/p95 duration and wait, failure counts, compute hours, per asset and per executor | `GET /stats?since=&asset=&scope=` | |
-| an asset's versions and their metadata | `GET /assets/{name}/history?output=&scope=&before=` | |
-| what a version was built from, or what was built from it | `GET /outputs/{name}/lineage?scope=&generation=&direction=upstream\|downstream&depth=5` | each edge's `from` is what was read: its `generation` and the writer's `run`, `attempt` and `at`. Flag: `uncommitted` (`{attempt, run}`: a write no attempt committed). `detail` keeps the pin (`pinned_generation`) for debugging |
-| every asset at a glance: scopes by status, newest outcome, failing keys, unsettled scopes | `GET /assets:status` → `{assets: {name: {partitions, partitioned, last, failures, unsettled, updated_at}}}` | |
-| an `Each` asset's failing keys, and each scope's failure record | `GET /assets/{name}/failures?scope=&outcome=&after=&limit=100` → `{scopes, keys, epoch, now, next}` | |
-| what an `Each` asset's keys came to, newest first | `GET /assets/{name}/key-outcomes?scope=&key=&q=&outcome=&run=&before=&limit=100` → `{outcomes, next}` | |
-| why a key is, or is not, in an asset's output (per-key-processing.md §10) | `GET /assets/{name}/explain?key=&scope=&edge=` → `{verdict, patterns, failure, last, last_ok, …}` | |
-| an asset's input edges, with every scope's watermark, lag and state | `GET /assets/{name}/edges` | |
-| unsettled outputs, stuck discards (lifecycle.md §9.6, §9.8) | `GET /holds` | `solera scopes discards` |
+| p50/p95 duration and wait, failure counts, compute hours, per asset and per executor | `GET /stats?since=&asset=&partition=` | |
+| an asset's versions and their metadata | `GET /assets/{name}/history?output=&partition=&before=` | |
+| what a version was built from, or what was built from it | `GET /outputs/{name}/lineage?partition=&generation=&direction=upstream\|downstream&depth=5` | each edge's `from` is what was read: its `generation` and the writer's `run`, `attempt` and `at`. Flag: `uncommitted` (`{attempt, run}`: a write no attempt committed). `detail` keeps the pin (`pinned_generation`) for debugging |
+| every asset at a glance: partitions by status, newest outcome, failing keys, partitions owing a repair | `GET /assets:status` → `{assets: {name: {partitions, partitioned, last, failures, owing a repair, updated_at}}}` | |
+| an `Each` asset's failing keys, and each partition's failure record | `GET /assets/{name}/failures?partition=&outcome=&after=&limit=100` → `{partitions, keys, epoch, now, next}` | |
+| what an `Each` asset's keys came to, newest first | `GET /assets/{name}/key-outcomes?partition=&key=&q=&outcome=&run=&before=&limit=100` → `{outcomes, next}` | |
+| why a key is, or is not, in an asset's output (per-key-processing.md §10) | `GET /assets/{name}/explain?key=&partition=&input=` → `{verdict, patterns, failure, last, last_ok, …}` | |
+| an asset's input inputs, with every partition's bookmark, lag and state | `GET /assets/{name}/inputs` | |
+| outputs owing a repair, stuck cleanups (lifecycle.md §9.6, §9.8) | `GET /repairs`, `GET /cleanups` | `solera cleanups` |
 
 Filter fields combine with AND; repeating one field (`status=failed&status=canceled`)
 matches any of its values. A facet counts its values with every *other*
@@ -651,8 +651,8 @@ the records the engine and the worker share are `solera/lifecycle.py`.
 
 **Spec, claim, result.** The engine writes `{attempt}.spec` — immutable,
 before `AttemptLaunched`. A worker reads it and claims the attempt by
-creating `{attempt}.worker` with a random invocation token; the first
-create wins. An invocation that loses writes nothing and, unless it is a
+creating `{attempt}.worker` with a random worker id; the first
+create wins. An worker that loses writes nothing and, unless it is a
 pool worker, waits for the owner's result before exiting, so its exit is
 never taken for the attempt's. The owner seals its outcome once into
 `{attempt}.result`, create-only, retried with the same bytes: its existence
@@ -661,23 +661,23 @@ result, as if it had died.
 
 `spec` is everything the worker needs and the lineage record of what the
 attempt read, including the key indexes as pinned, plus the engine's URL,
-the attempt's token and its generation (the claim's event position).
+the attempt's token and its generation (the claim's event counter).
 
 ```json
 {
-  "attempt": "01J8ZB3M…", "run": {"id": "01J8ZB3K…", "config": {}}, "revision": "c0ffee…",
+  "attempt": "01J8ZB3M…", "run": {"id": "01J8ZB3K…", "config": {}}, "deploy": "c0ffee…",
   "project": "brimstone", "asset": "file_index", "partition": "alpha", "execution": {"kind": "Local"},
   "inputs": {"site_files": {"ref": {"…": "…"}, "index": {"…": "KeyIndex: levels + log[56..57]"},
              "changes": {"from": 56, "to": 57, "after": null, "full": false, "limit": 2}}},
   "outputs": {"file_index": {"before": {"…": "ref"}, "reset": false, "contract": {"…": "store, writes, key"},
-                             "batch": 12, "index": {"…": "KeyIndex: levels only"}}},
+                             "commit_number": 12, "index": {"…": "KeyIndex: levels only"}}},
   "heartbeat": 10, "engine": "https://solera.example.com", "token": "…", "generation": 184467
 }
 ```
 
 ```json
 {
-  "invocation": "k3v9q2", "status": "succeeded", "writes": "complete",
+  "worker": "k3v9q2", "status": "succeeded", "writes": "complete",
   "outputs": {"file_index": {"ref": {"…": "…"},
               "keys": {"added": 0, "removed": 0, "exact": true, "files": [{"name": "000000000012-01J8ZB3M…", "…": "…"}]}}},
   "delivered": {"site_files": {"after": null, "upserted": ["alpha-file-2"], "deleted": []}},
@@ -689,7 +689,7 @@ the attempt's token and its generation (the claim's event position).
 **Launch and adoption.** The engine writes the spec, then
 `AttemptLaunched`, durable, then starts the placement and records its
 handle as `AttemptPlaced` — lazily, riding the next journal segment. From
-`AttemptLaunched` on, the attempt's claim and its scope lock are durable:
+`AttemptLaunched` on, the attempt's claim and its claim are durable:
 an engine that restarts adopts it — follows its handle, or finds it again
 by name (ECS `clientToken`, the Kubernetes job `solera-{attempt}`), or
 follows its worker's reports — and settles it as the first engine would
@@ -727,7 +727,7 @@ or at once for a worker that never reported, the record becomes `forced`:
 the engine takes the gate and ends the attempt; a late result is refused.
 
 **The gate — `{attempt}.writing`.** A worker about to write creates it,
-`{"state": "writing", "invocation", "intents"}`, listing the delta files
+`{"state": "writing", "worker", "intents"}`, listing the delta files
 of the keys it will change; finding one already there — `aborted` or
 `closed` — it writes nothing. The engine ending an attempt without a
 result creates it `aborted`, and what it finds is the attempt's
@@ -742,13 +742,13 @@ resumes after its run was deleted must still find its gate: retention
 deletes a run's objects except its gates, notes them under
 `control/gates/{day}/`, and deletes them `gate_days` (30) later.
 
-**Unsettled outputs.** An attempt that ends with its gate `writing` may
+**Outputs owing a repair.** An attempt that ends with its gate `writing` may
 have written part of its keyed outputs. The engine fails it with the
-gate's intents (`AttemptFinished.unsettled`) and keeps their delta files.
-The next attempt on that scope reads the intended keys back from the store
+gate's intents (`AttemptFinished.intents`) and keeps their delta files.
+The next attempt on that partition reads the intended keys back from the store
 and folds what landed into its own delta, and its commit settles the
 output. Unkeyed outputs need no repair: the next attempt writes the same
-value or batch again.
+value or commit again.
 
 **The attempt log** is gzip-compressed JSON lines, one per `ctx.log(…)`:
 `{"at", "level", "message", "fields"}`. Lines go live to the engine within
@@ -766,21 +766,21 @@ Past 100 MB compressed a truncation marker is written and shipping stops.
 class Store(Protocol):
     def can_store(self, t, output) -> bool                  # checked at registration
     def can_load(self, t, selection) -> bool
-    async def store(self, write, prior, scope) -> Written   # Written(ref, keys?)
-    async def load(self, ref, t, selection) -> Any          # selection: None | Keys | Batches
+    async def store(self, write, prior, context) -> Written   # Written(ref, keys?)
+    async def load(self, ref, t, selection) -> Any          # selection: None | Keys | Commits
     writes: str                                             # "immutable" or "fenced" (stores.md)
 ```
 
-- `Scope` carries the engine-assigned `batch`, whether the write is a
+- `WriteContext` carries the engine-assigned `commit_number`, whether the write is a
   `reset`, the `attempt` id, its
-  `generation` and `invocation` (`lifecycle.md` §9.7–9.8). A keyed output's write reaches the store as a
+  `generation` and `worker_id` (`lifecycle.md` §9.7–9.8). A keyed output's write reaches the store as a
   `KeyedWrite`: read once (`prepared`), and what it changes against the
   key index — `upserts` to write, `removes` to delete — or `whole`, a first write or a reset (a `full`
   run): the store then writes everything and deletes whatever else
   it holds. A patch that changes 3 keys of 100,000 reaches the store as 3
   upserts, and the store reads only their groups.
-- `Written.keys` is only for writes the harness never sees as rows
-  (§6); for everything else the harness computes keys itself.
+- `Written.keys` is only for writes the worker never sees as rows
+  (§6); for everything else the worker computes keys itself.
 - **What a read sees depends on the store's kind** (`architecture.md` §3,
   `lifecycle.md` §9.6). FileStore and S3Store (`immutable`) never
   overwrite, so a load reads exactly the generation its consumer pinned; a
@@ -794,7 +794,7 @@ class Store(Protocol):
 
 **FileStore**, the default, writes what an asset returns as files under
 `.solera/data` next to the project file (or `FileStore(path)`, or
-`$SOLERA_DATA`) — one object per value, partition, key or batch:
+`$SOLERA_DATA`) — one object per value, partition, key or commit:
 
 ```
 rollup@184467.json                a value, by generation 184467
@@ -802,21 +802,21 @@ site_status/alpha@184467.json     a value, partition alpha
 uploads/u-7/184467.pkl            a keyed output: one object per key and generation
 site_files/alpha/f-1/184467.json  keyed and partitioned
 site_events/alpha/000000000042/184467.json
-                                  an unkeyed incremental output: one object per batch
+                                  an unkeyed incremental output: one object per commit
 ```
 
 Every name carries the **generation** of the attempt that wrote it (its
-claim's event position), so no two attempts write one name and objects
+claim's event counter), so no two attempts write one name and objects
 are created once, never overwritten (`lifecycle.md` §9.8). A keyed load
 names its objects from the index's generations; a whole keyed
 read is paged from the pinned index. Content is JSON when it round-trips
 exactly, pickle (`.pkl`) otherwise. Keyed outputs are declared
 `Output(keyed=True)` and return `dict[str, Any]`, or rows with
 `key="id"`. A superseded or removed key's object, a value's previous
-object and an abandoned attempt's objects are deleted by the scope's next
-attempt (`store.discard`) once no reader pin predates them. Batches of an
+object and an abandoned attempt's objects are deleted by the partition's next
+attempt (`store.cleanup`) once no reader pin predates them. Commits of an
 unkeyed incremental output accumulate until a `full` run starts the
-output over; a batch's committed object is its highest generation. **S3Store(url)** is the same layout in a
+output over; a commit's object is its highest generation. **S3Store(url)** is the same layout in a
 bucket; `Project(default_store=S3Store("s3://…"))` makes it the default.
 
 **PostgresStore** keeps one table per output, shared by its partitions,
@@ -939,7 +939,7 @@ Project(retention=Retention(days=30))          # default, including source commi
 Retention(forever=True)
 ```
 
-**Current state never depends on runs.** Heads, cursors, watermarks and
+**Current state never depends on runs.** Heads, cursors, bookmarks and
 key indexes stand on their own; a head keeps its `run` and `attempt`
 references even after that run is deleted ("produced 45 days ago, run
 expired"). The only runs that cannot be deleted are active ones.
@@ -970,7 +970,7 @@ committed to `file_index`.
 
 **Bounding data.** Stores keep only current content, so a keyed output is
 bounded by its live keys, and a value by its size. What grows is an
-append-only output — FileStore batches, a Postgres event table. Bound it
+append-only output — FileStore's commits, a Postgres event table. Bound it
 with a scheduled job, or a periodic `full` run:
 
 ```python
