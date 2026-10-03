@@ -130,7 +130,7 @@ class Staleness(RuleBasedStateMachine):
     def __init__(self):
         super().__init__()
         self.loop = asyncio.new_event_loop()
-        self.ref = staleness.Reference(takes=taken)
+        self.ref = staleness.Reference(takes=taken, net=staleness.NET)
         self.outside = External()
         self.decl = {"items_store": "a", "checks_store": "a", "checks_v": "1", "copy_v": "1", "count_v": "1"}
         self.serial = 0
@@ -772,6 +772,17 @@ def test_the_reference_reads_the_worked_examples():
     assert both.reasons("count") == set()
     both.change_asset("count")  # due only to the asset change
     assert both.reasons("count") == {DEF}
+
+    built = staleness.Reference(takes=taken, net=False)  # the build until K44: a revert counts
+    built.change_knob()
+    built.commit({"k2": "1"}, set())
+    built.run_default("checks")
+    built.run_fchecks()
+    built.commit_feed({"k2": "2"}, set())
+    built.commit_feed({"k2": "1"}, set())  # W22's minimal case
+    assert built.stale("items") and built.fchecks_stale_keys() == {"k2"}
+    built.run_items()  # items writes k2 again, at a new generation
+    assert built.stale_keys() == {"k2"} and not built.stale("items")
 
     capped = staleness.Reference(takes=taken, cap=2)  # the cap counts keys= runs that leave something
     capped.change_knob()
