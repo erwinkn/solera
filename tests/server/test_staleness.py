@@ -332,7 +332,6 @@ async def test_a_reset_output_holds_only_what_keys_runs_wrote_until_a_default_ru
     assert not await staleness.partition_stale(engine, "checks")
 
 
-@pending
 async def test_an_unkeyed_partition_stays_stale_until_it_reruns(state, tmp_path):
     """K38's calibration: `count` (unkeyed) built, then `items` changes:
     `count` is stale, through any number of ticks, until a run of it."""
@@ -394,7 +393,6 @@ async def _change(engine, outside, upserts=(), removes=()):
     await drive(engine, await engine.submit(["items"]))
 
 
-@pending
 @pytest.mark.parametrize("then", ["default", "keys"])
 async def test_a_keys_run_on_an_incremental_asset_delivers_each_change_once(state, tmp_path, then):
     """K45: `copy` (plain incremental) built from k1, k2, k3; k1 and k2
@@ -466,7 +464,6 @@ async def test_a_count_kept_from_its_batches_stays_exact_through_a_keys_run(stat
     assert await tally() == 3 == len(outside.feed)
 
 
-@pending
 async def test_a_non_each_keyed_outputs_keys_go_stale_together(state, tmp_path):
     """K43: every key of `copy` depends on the whole of `items` under its
     patterns, so a change of `k1` alone makes `k1`, `k2` and `k3` stale; a

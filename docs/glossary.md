@@ -491,13 +491,19 @@ its `upserted` and `removed` keys. *Example:* `file_index` reads four
 files per site in two batches of `batch_size=2`. *Was:* page (`Changes`,
 `ctx.batch`, `page_size`, `page`, `pages`).
 
-**stale**. A partition materialized, but caught up before its asset's
-last asset change: built by the old declaration, so due a rebuild. A
-partition status beside `materialized`, `missing`, `failed`, `running`,
-`removed`. *Edge case:* an asset with no automation, renamed or with a new
-version, keeps its old content until someone runs it: `stale` says so,
-where `materialized` would hide it. A run that catches it up clears it,
-a skip included. *Not:* `missing` (no head at all).
+**stale**. A materialized output unit due a rebuild, and why, one or more
+of: **input changed** (an input unit it depends on changed since it read
+it), **upstream stale** (a partition it reads is itself stale, to any
+depth: rerun upstream first, or with `upstream=True`), **definition
+changed** (its asset changed since it was written: version,
+configuration, patterns, rename, added or reset). A partition status
+beside `materialized`, `missing`, `failed`, `running`, `removed`, with
+its reasons; an asset is stale if any partition is, a partition if any of
+its keys is. Computed on demand, never stored. *Edge case:* feed → items
+→ copy, feed commits: copy is stale (upstream stale) though items has not
+moved; it becomes input changed once items reruns. *Not:* `missing` (no
+head at all). *Example:* `copy` after its version bump: definition
+changed, until a run delivers every key under the new definition.
 
 **fingerprint**. The digest of what an asset's incremental reads depend
 on: its version, its stores' versions, its outputs' migrations, the run's

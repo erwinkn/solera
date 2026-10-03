@@ -25,9 +25,9 @@ class Views:
 
     async def partition_statuses(self, assets: list[str], *, every: bool = True) -> dict[str, list[dict]]:
         """Each partition of each asset, by status: `materialized` (its head is),
-        `stale` (materialized, but caught up before its asset last changed —
-        added again, renamed, its declaration changed or reset: built by the
-        old declaration, so due a rebuild), `running` (a task is pending),
+        `stale` (materialized, but due a rebuild: its `reasons` say why — an
+        input changed since it read it, an upstream it reads is itself stale,
+        or its definition changed; `staleness.py`), `running` (a task is pending),
         `failed` (its last outcome failed, was canceled or blocked), `missing`,
         or `removed` (no longer a current key). A job has no head: it is
         materialized when its last outcome succeeded. `every` lists every
@@ -43,7 +43,7 @@ class Views:
         for (asset, partition), ids in self.m.pending.items():
             if ids:
                 running.setdefault(asset, set()).add(partition)
-        planner, out = self.planner(), {}
+        planner, out, memo = self.planner(), {}, {}
         for asset in assets:
             outputs = self.manifest["assets"][asset]["outputs"]
             scoped: dict[str, dict] = {}
@@ -51,7 +51,6 @@ class Views:
                 scoped.update(heads.get(output["name"]) or {})
             records = self.m.partitions.of(asset)
             recorded = {s: r["last"] for s, r in records.items() if "last" in r}
-            changed = self.m.changed_at.get(asset, 0)
             pending = running.get(asset) or set()
             partitions = set(scoped) | set(recorded) | pending
             if every:
@@ -64,7 +63,10 @@ class Views:
                 head, record = scoped.get(partition), recorded.get(partition)
                 last = (record or {}).get("outcome")
                 done = planner.materialized(asset, partition)
-                stale = (records.get(partition) or {}).get("caught_up_at", 0) < changed
+                reasons = (
+                    await self.stale_reasons(asset, partition, memo) if done and current(partition) else []
+                )
+                stale = bool(reasons)
                 status = (
                     "removed"
                     if not current(partition)
@@ -77,14 +79,15 @@ class Views:
                     else "missing"
                 )
                 view = self.outcome_view(record) if record else {}
-                rows.append(
-                    {
-                        "partition": partition,
-                        "status": status,
-                        "last_outcome": view.get("last_outcome"),
-                        "last_attempt": view.get("last_attempt"),
-                    }
-                )
+                row = {
+                    "partition": partition,
+                    "status": status,
+                    "last_outcome": view.get("last_outcome"),
+                    "last_attempt": view.get("last_attempt"),
+                }
+                if status == "stale":
+                    row["reasons"] = reasons
+                rows.append(row)
         return out
 
     async def asset_statuses(self) -> dict[str, dict]:
@@ -112,6 +115,7 @@ class Views:
                     **{s: counts[s] for s in ("materialized", "stale", "failed", "running", "removed")},
                 },
                 "partitioned": bool(planner.dims(name)),
+                "stale": counts["stale"] > 0,  # any of its partitions (K38, K46)
                 "last": None,
                 "failures": {} if self._each_input(name) else None,
                 "repairs": 0,

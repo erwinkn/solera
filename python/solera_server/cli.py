@@ -32,6 +32,23 @@ async def _remote_project(client):
     return response.json()["project"]
 
 
+async def _stale_pages(page) -> dict:
+    """Every page of an asset partition's stale keys, put together."""
+
+    first = await page(None)
+    keys, after = list(first["keys"]), first.get("next")
+    while after is not None:
+        more = await page(after)
+        keys.extend(more["keys"])
+        after = more.get("next")
+    return {
+        "stale": bool(first["reasons"]),
+        "reasons": first["reasons"],
+        "tracked": first["tracked"],
+        "keys": keys,
+    }
+
+
 def _reads(args) -> bool:
     """Commands that only read: they open the namespace as a reader, and
     leave a running engine its writer."""
@@ -43,7 +60,7 @@ def _reads(args) -> bool:
         return not args.clear
     if command == "automations":
         return not args.action
-    return command in ("run-show", "logs")
+    return command in ("run-show", "logs", "stale")
 
 
 async def _local_reader(args):
@@ -163,6 +180,12 @@ def _main():
     cleanups.add_argument("output")
     cleanups.add_argument("partition", nargs="?", default="")
     cleanups.add_argument("--clear", action="store_true", help="Forget the stuck entries; their objects stay")
+
+    stale = commands.add_parser(
+        "stale", help="Whether an asset's partition is stale, why, and its stale keys", parents=[common]
+    )
+    stale.add_argument("asset")
+    stale.add_argument("partition", nargs="?", default="", help="Its partition; none when unpartitioned")
 
     keys = commands.add_parser(
         "keys", help="An Each asset's failing keys (per-key-processing.md §9)", parents=[common]
@@ -421,6 +444,15 @@ async def _remote(args, parser):
             response.raise_for_status()
             heads = [h for h in response.json()["heads"] if h["partition"] == args.partition]
             print(json.dumps(heads[0]["cleanups"] if heads else None, indent=2))
+        elif args.command == "stale":
+
+            async def page(after):
+                params = {"partition": args.partition, **({"after": after} if after else {})}
+                response = await client.get(f"{base}/assets/{args.asset}/stale-keys", params=params)
+                response.raise_for_status()
+                return response.json()
+
+            print(json.dumps(await _stale_pages(page), indent=2))
         elif args.command == "keys":
             body = {"classes": _key_classes(args), "partition": args.partition, "by": "cli"}
             response = await client.post(f"{base}/assets/{args.asset}/keys:retry", json=body)
@@ -491,6 +523,12 @@ async def _local(args, parser):
             print(json.dumps(detail, indent=2))
             if detail["request"]["status"] != "succeeded":
                 raise SystemExit(1)
+        elif args.command == "stale":
+
+            async def page(after):
+                return await runtime.stale_keys(args.asset, args.partition, after=after)
+
+            print(json.dumps(await _stale_pages(page), indent=2))
         elif args.command == "cleanups":
             done = runtime.clear_cleanups if args.clear else None
             view = (

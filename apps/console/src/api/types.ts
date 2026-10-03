@@ -195,6 +195,7 @@ export interface CatalogAsset extends AssetDecl {
 export interface AssetStatus {
   partitions: Record<PartitionStatus, number> & { total: number };
   partitioned: boolean;
+  stale: boolean; // one of its partitions is
   last: {
     partition: string;
     outcome: string;
@@ -207,6 +208,19 @@ export interface AssetStatus {
 }
 
 export type PartitionStatus = "materialized" | "stale" | "missing" | "failed" | "running" | "removed";
+
+/** Why a partition is stale (docs/positions-from-reads.md): an input it read
+ * changed, an upstream it reads is itself stale, or its asset changed. */
+export type StaleReason = "input changed" | "upstream stale" | "definition changed";
+
+/** A page of an asset partition's stale keys: all of them or none for a
+ * keyed output that is not `each`; `tracked` false for an unkeyed one. */
+export interface StaleKeys {
+  tracked: boolean;
+  keys: string[];
+  next: string | null;
+  reasons: StaleReason[];
+}
 
 export interface PartitionOutcome {
   last_outcome: string;
@@ -230,6 +244,7 @@ export interface PartitionRow {
   status: PartitionStatus;
   last_outcome: string | null;
   last_attempt: string | null;
+  reasons?: StaleReason[]; // when `stale`
 }
 
 export interface OutputHead {

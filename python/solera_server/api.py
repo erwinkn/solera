@@ -274,6 +274,21 @@ def create_app(
         outcomes = [v for v in request.query_params.getlist("outcome") if v]
         return await runtime.key_failures(name, partition, outcomes=outcomes, after=after, limit=limit)
 
+    @app.get("/api/projects/{p}/assets/{name}/stale-keys")
+    async def asset_stale_keys(
+        p: str,
+        name: str,
+        request: Request,
+        partition: str = "",
+        after: str | None = None,
+        limit: int = Query(default=1000, ge=1, le=10000),
+    ):
+        """A page of a keyed asset's stale keys in `partition` (unpartitioned:
+        none), and why it is stale (docs/positions-from-reads.md)."""
+
+        runtime = await asset_engine(request, p, name)
+        return await runtime.stale_keys(name, partition, after=after, limit=limit)
+
     @app.get("/api/projects/{p}/assets/{name}/key-outcomes")
     async def asset_key_outcomes(
         p: str,

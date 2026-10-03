@@ -55,6 +55,7 @@ from .keyservice import KeyService, cache_root
 from .model import TERMINAL_RUN, commit_of
 from .positions import advance, continues, outstanding, reads, selects
 from .sensors import Sensors
+from .staleness import Staleness
 from .state import Conflict, LostOwnership, State
 from .upkeep import ALIVE, Upkeep
 from .views import Views
@@ -86,7 +87,7 @@ def _batches(keys: int, limit: int) -> int:
     return max(1, -(-int(keys) // max(1, int(limit))))
 
 
-class Engine(Attempts, Sensors, Views):
+class Engine(Attempts, Sensors, Staleness, Views):
     Conflict = Conflict
     GRACE_SECONDS = GRACE_SECONDS
     READ_AHEAD_FULL = "too many keys= runs since its last run: run the partition first"
@@ -927,6 +928,9 @@ class Engine(Attempts, Sensors, Views):
         return {
             "version": asset["version"],
             "deploy_number": self.m.deploy_number,
+            # The version of each whole or dep input read: a catch-up records it, and a
+            # partition whose inputs moved since is stale (docs/positions-from-reads.md).
+            "seen": {i.param: self._input_version(planner, i) for i in inputs if self._versioned(i)},
             "prefixes": self._prefixes(pins, outputs, task),
             "inputs": pins,
             "lineage": lineage,
@@ -989,6 +993,7 @@ class Engine(Attempts, Sensors, Views):
             for k in (
                 "version",
                 "deploy_number",
+                "seen",
                 "prefixes",
                 "plans",
                 "more",
@@ -1023,6 +1028,28 @@ class Engine(Attempts, Sensors, Views):
         ):
             return None
         return self.m.index(output, ref.get("partition") or "").slice().to_json()
+
+    @staticmethod
+    def _versioned(input: planning.Input) -> bool:
+        """Whether staleness follows an input's version: a whole input or a dep,
+        but not a partition set's implied dep (adding a key changes nothing
+        already built), nor an incremental one, which its position follows."""
+
+        return input.kind != "incremental" and not input.set_dim
+
+    def _input_version(self, planner: planning.Planner, input: planning.Input) -> list:
+        """A whole or dep input's version: the generation of each head it reads."""
+
+        if input.kind == "all_partitions":
+            refs = self._all_partitions(planner, input)
+        elif input.fan_in:
+            refs = {k: h["ref"] for k, h in planner.fan_in(input, materialized=False).items()}
+        else:
+            try:
+                refs = {input.partition: self._pin_at(input.output, input.partition)}
+            except Retryable:
+                refs = {}
+        return sorted([key, (ref or {}).get("generation")] for key, ref in refs.items())
 
     @staticmethod
     def _all_partitions(planner: planning.Planner, input: planning.Input) -> dict:
@@ -1663,6 +1690,8 @@ class Engine(Attempts, Sensors, Views):
             commit["caught_up"] = not more and not any(
                 outstanding(position) for position in after if position
             )
+            if commit["caught_up"] and prepared.get("seen") is not None:
+                commit["seen"] = prepared["seen"]  # the whole and dep inputs it caught up to
         if failures is not None:
             commit["failures"] = failures
             if result.get("key_outcomes"):

@@ -144,6 +144,31 @@ Position at 56, upstream head at 60. Commits 56–60 touched `k1`, `k2`,
 
 ## Staleness at every level
 
+Staleness is **transitive and says why** (K46). A stale status carries
+one or more reasons:
+
+- **input changed**: an input unit it depends on changed since it read
+  it; rerunning it helps;
+- **upstream stale**: an upstream it depends on is itself stale, to any
+  depth; rerun the upstream first, or run with `upstream=True`;
+- **definition changed**: its asset changed (version, configuration,
+  patterns, rename, added or reset) since it was written.
+
+It is computed on demand, never stored as a flag: a project's statuses are
+one walk up the lineage, memoized, each partition's direct checks or any
+partition it reads being stale (`python/solera_server/staleness.py`).
+*Example:* feed → items → copy. feed commits and items has not rerun:
+items is stale (input changed), and so is copy (upstream stale), though
+items has not moved. Automations are unchanged: `OnChange` fires on real
+commits, and copy's input changes once items reruns.
+
+As built, an incremental input is behind when a key its patterns take
+changed past `next` and is not read ahead at or after its change, or when
+there is no position or a pass under way; a whole or dep input, when its
+version differs from the one recorded at the last catch-up (`seen`). One
+case over-reports until the range scan of K44 lands: a key added and
+removed past `next` counts, though it nets out.
+
 - **key** (`each=True`): its input key's current generation differs from
   its payload (or the key is missing, or removed upstream); or a shared
   whole or dep head was committed after the key's generation; or its
@@ -152,8 +177,10 @@ Position at 56, upstream head at 60. Commits 56–60 touched `k1`, `k2`,
   under the patterns changed, appeared or disappeared upstream past the
   position (K39); or a whole or dep head differs from its record; or
   `caught_up_at` is before `changed_at`. A keyed output that is not
-  `each` has its keys share the partition's answer: its stale-keys
-  listing says so ("not tracked per key").
+  `each` has its keys share the partition's answer: all its keys are
+  stale, or none. An unkeyed output has no keys (`tracked: false`).
+  `GET /assets/{name}/stale-keys?partition=&after=`, `solera stale ASSET
+  [PARTITION]`.
 - **asset**: one of its partitions is stale.
 
 No other state is needed. A default run's dry plan is the same

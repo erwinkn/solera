@@ -100,6 +100,9 @@ def test_local_run_and_reads(project_file, state_url, capsys, monkeypatch):
     autos = cli(monkeypatch, capsys, "--state-url", state_url, "automations")
     assert isinstance(autos, list)
 
+    fresh = cli(monkeypatch, capsys, "--state-url", state_url, "stale", "feed")
+    assert fresh == {"stale": False, "reasons": [], "tracked": True, "keys": []}
+
     committed = cli(
         monkeypatch,
         capsys,
@@ -189,6 +192,9 @@ def test_remote_run_and_reads(server, project_file, capsys, monkeypatch):
 
     autos = cli(monkeypatch, capsys, "automations")
     assert isinstance(autos, list)
+
+    unkeyed = cli(monkeypatch, capsys, "stale", "total")  # never run: missing, and it has no keys
+    assert unkeyed == {"stale": False, "reasons": [], "tracked": False, "keys": []}
 
 
 def test_serve_insecure_guard(capsys, monkeypatch):

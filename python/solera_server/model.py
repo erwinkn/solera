@@ -1072,6 +1072,8 @@ class Model:
             record["caught_up"] = bool(commit["caught_up"])
             if record["caught_up"]:
                 record["caught_up_at"] = self.event_counter  # against its asset's `changed_at`: `stale`
+                if "seen" in commit:  # its whole and dep inputs' versions: moved since, it is stale
+                    record["seen"] = commit["seen"]
         if "cursor" in commit:
             if commit["cursor"] is None:
                 record.pop("cursor", None)
