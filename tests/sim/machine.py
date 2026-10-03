@@ -25,7 +25,16 @@ from solera.sdk import Ref
 from . import postgres
 from .core import EPOCH, Killed
 from .oracle import Journal, Violation, commit_rows, index_entries, keyed_content, value_content
-from .project import VARIANTS, External, Variant, build, expected_checks, expected_copy, expected_items
+from .project import (
+    FLAKY,
+    VARIANTS,
+    External,
+    Variant,
+    build,
+    expected_checks,
+    expected_copy,
+    expected_items,
+)
 from .stores import Database
 from .world import POINTS, Fate, World
 
@@ -197,12 +206,30 @@ class Simulation(RuleBasedStateMachine):
         self.trace.append(f"change_outside({keys})")
         self.outside.keys = dict(keys)
 
-    @rule(keys=st.sets(st.sampled_from(KEYS), max_size=2))
-    def flaky(self, keys):
-        """`checks` fails on these keys until the next change of mind."""
+    @rule(keys=st.sets(st.sampled_from(KEYS), max_size=2), error=st.sampled_from(sorted(FLAKY)))
+    def flaky(self, keys, error="transient"):
+        """`checks` fails on these keys, raising `error`'s class, until the
+        next change of mind."""
 
-        self.trace.append(f"flaky({sorted(keys)})")
-        self.outside.flaky = set(keys)
+        self.trace.append(f"flaky({sorted(keys)}, {error!r})")
+        self.outside.flaky = dict.fromkeys(keys, error)
+
+    @rule(classes=st.sampled_from([["failed"], ["rejected"], ["canceled"], ["all"]]))
+    def retry_keys(self, classes):
+        """`solera keys retry checks`: a forced retry of its failing keys of
+        `classes`, and the run that takes it."""
+
+        self.trace.append(f"retry_keys({classes})")
+        self._retry(classes)
+
+    def _retry(self, classes) -> dict | None:
+        async def retry(e):
+            found = e.retry_keys("checks", classes, by="sim")
+            if found["scopes"]:
+                await e.submit_retries("checks", found["scopes"], "sim")
+            return found
+
+        return self._request(retry, "retry")
 
     @rule(
         asset=st.sampled_from(TARGETS),
@@ -581,7 +608,7 @@ class Simulation(RuleBasedStateMachine):
         self.trace.append("# converge")
         world.plan.enabled = False
         world.fates.clear()
-        self.outside.flaky = set()
+        self.outside.flaky = {}
         for slot in world.slots:
             if slot is not world.slot and not slot.dead:
                 self._run(world.crash(slot))
@@ -601,6 +628,10 @@ class Simulation(RuleBasedStateMachine):
         for _ in range(4):  # the sensor brings `outside` in line with the world
             self.sensor_round(0.0, False)
             self._run(asyncio.sleep(31.0))
+        # Keys failed, rejected or canceled are retried only on request (or a
+        # new deploy, or a change of their input): ask, as an operator would.
+        if self._retry(["canceled", "failed", "rejected"]) is None:
+            raise Violation("a forced retry failed with the store healthy")
         self._settle()
         self._check_content(automated=True)
         names = [n for n in (self._asset(t) for t in TARGETS) if n]

@@ -6,7 +6,7 @@ output from the sources alone.
     feed (keyed source) ──Incremental──▶ items ──Incremental(page 2)──▶ copy
     knob (version) ──dep──▶ per_site[site ∈ sites] ──AllPartitions──▶ summary
     knob ──dep──▶ log (batches) ──Incremental──▶ tally
-    items ──Each(page 2)──▶ checks (fails while a key is flaky)
+    items ──Each(page 2)──▶ checks (fails while a key is flaky, by error class)
     outside (keyed source) ◀── watch (a sensor over an external map)
 
 Variants (`Variant`): `items` on a FileStore or the simulation's fenced
@@ -19,7 +19,7 @@ from __future__ import annotations
 import fnmatch
 from dataclasses import dataclass, replace
 
-from solera.errors import Transient
+from solera.errors import Abort, Failed, Rejected, Transient
 from solera.sdk import (
     AllPartitions,
     Automation,
@@ -71,12 +71,23 @@ VARIANTS = {
 class External:
     """The world outside: the `feed` its clients write, what the `watch`
     sensor observes (`keys`), and which keys `checks` currently fails on (a
-    flaky API)."""
+    flaky API), with the error class it raises (`FLAKY`)."""
 
     def __init__(self):
         self.feed: dict[str, str] = {}
         self.keys: dict[str, str] = {}
-        self.flaky: set[str] = set()
+        self.flaky: dict[str, str] = {}
+
+
+# How `checks` fails on a flaky key, by error class (docs/per-key-processing.md):
+# retried on its own backoff, once per deploy, when its input changes, or the
+# whole attempt per `retries=`.
+FLAKY = {
+    "transient": lambda key: Transient(f"{key} is flaky", retry_after=5),
+    "failed": lambda key: Failed(f"{key} is broken"),
+    "rejected": lambda key: Rejected(f"{key} is refused"),
+    "abort": lambda key: Abort(f"the API is down at {key}"),
+}
 
 
 class SourceStore(FileStore):
@@ -175,7 +186,7 @@ def build(variant: Variant, data_root, db: Database, outside: External, pg: str 
     )
     async def checks(ctx, item: list):
         if ctx.key in outside.flaky:
-            raise Transient(f"{ctx.key} is flaky", retry_after=5)
+            raise FLAKY[outside.flaky[ctx.key]](ctx.key)
         return [{"w": f"x{item[0]['v']}"}]
 
     assets = [items, copy, per_site, log, tally, checks]
