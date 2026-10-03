@@ -102,6 +102,10 @@ class Simulation(RuleBasedStateMachine):
         self.journal = Journal(now=world.now)
         world.objects.tap = self.journal.landed
         world.on_record = self.journal.recorded
+        self.requests: list[dict] = []
+        # SOLERA_SIM_REQUESTS: a directory for each example's requests (spec/tla/check-trace.py)
+        if os.environ.get("SOLERA_SIM_REQUESTS"):
+            world.objects.trace = self._traced
         self.db, self.outside = Database(), External()
         self.db.fault = self._db_fault
         self.data_root = self.tmp / "data"
@@ -122,6 +126,14 @@ class Simulation(RuleBasedStateMachine):
 
     def _build(self):
         return build(self.variant, self.data_root, self.db, self.outside, self.schema)
+
+    def _traced(self, who, kind, path, outcome, listed):
+        root = str(self.tmp.resolve())
+        line = {"at": self.world.now(), "who": list(who) if who else None, "kind": kind}
+        line |= {"path": path.removeprefix(root), "outcome": outcome}
+        if listed is not None:
+            line["listed"] = [p.removeprefix(root) for p in listed]
+        self.requests.append(line)
 
     def _db_fault(self, kind, partition):
         if not self.world.plan.enabled:
@@ -682,7 +694,20 @@ class Simulation(RuleBasedStateMachine):
                 self.world.close()
             if os.environ.get("SOLERA_SIM_TRACE"):
                 print("\n".join(self.trace), flush=True)
+            if os.environ.get("SOLERA_SIM_REQUESTS") and self.world is not None:
+                self._write_requests(Path(os.environ["SOLERA_SIM_REQUESTS"]))
             shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write_requests(self, out: Path) -> None:
+        """This example's object requests as JSONL, after its steps (`{"step": …}`)."""
+
+        out.mkdir(parents=True, exist_ok=True)
+        n = STATS["examples"]
+        with open(out / f"{n:05d}.jsonl", "w") as f:
+            for step in self.trace:
+                f.write(json.dumps({"step": step}) + "\n")
+            for line in self.requests:
+                f.write(json.dumps(line) + "\n")
 
     def _quiet(self) -> str | None:
         """Why the system is not quiet yet, or None."""
@@ -830,6 +855,8 @@ class Simulation(RuleBasedStateMachine):
 
         async def check():
             await world.request(lambda e: e.state.durable())
+            if world.objects.trace is not None:
+                self.requests.append({"reader": True})  # the requests with no actor that follow are its
             replayed = await State.open(world.url, "sim", writer=False, clock=world.wall)
             live = _normal(engine.state.model.snapshot())
             again = _normal(replayed.model.snapshot())

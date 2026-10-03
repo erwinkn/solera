@@ -303,7 +303,7 @@ not the code: where they differ, the code is the suspect.
 
 ```bash
 spec/tla/check-execution.sh            # smoke and calibrations (CI): about a minute
-spec/tla/check-execution.sh design     # store moves (with and without B), patterns and versions, removal, a zombie: ~15 min, liveness included
+spec/tla/check-execution.sh design     # store moves (with and without B), patterns and versions, removal, a zombie: ~30 min at 6 workers, liveness included
 spec/tla/check-execution.sh big        # every deploy kind, every fault kind, each=True: too large to finish yet
 spec/tla/check-execution.sh all
 ```
@@ -353,9 +353,14 @@ of its output, or of the output it reads, is refused at commit and its
 run carries on; what it wrote is owed a repair unless its own output was
 reset. A `keys=` run of a partition a reset took bookmarks from reads a
 full pass, and from then on is a run of the whole asset: it goes on until
-the pass ends. Everything but the last
-commit to `S` happens before it, so "after quiescence" is a state the
-model reaches.
+the pass ends. An asset change (K34, aa0e7dd: `B` added back, its
+patterns or version changed, `A` moved) leaves the asset due: its
+`OnChange` automation owes a firing, if its input has a head
+(`FiringsOwed`; for `AllPartitions` or a fan-in, a materialized upstream
+partition, which one partition per asset does not reach). Deploys and faults may come after the last
+commit to `S`, so the system must converge without a later change; only a
+user cancel comes before it, since a canceled run's change waits for the
+next one.
 
 **Properties.**
 
@@ -365,11 +370,11 @@ model reaches.
 | `BookmarkHonest` | safety | with no pass under way, every key no later commit touched is in the output exactly when it was in the upstream at the bookmark, under its patterns: a bookmark never passes a change it did not deliver |
 | `StoreMatchesJournal` | safety | with no attempt in flight, no repair owed and no stale writer at its gate, a store holds exactly its output's committed content |
 | `RunsEndCaughtUp` | action | a run that succeeds leaves its asset caught up: no pass under way, the bookmark at the upstream's head, the output what the upstream holds under its patterns. It binds every run of a whole asset, and a `keys=` run that moved the bookmark; checked as the run succeeds, so no later change is needed to see one that ended halfway |
-| `Quiesces` | liveness | eventually and forever, no run is active (every run ends) and `A` holds `S`'s keys, `B` holds `A`'s under its patterns (convergence) |
+| `Quiesces` | liveness | eventually and forever, no run is active (every run ends) and `A` holds `S`'s keys, `B` holds `A`'s under its patterns, each read under its current fingerprint (convergence) |
 
 Liveness assumes weak fairness of all engine and worker steps together
 (each behaviour takes finitely many: everything is bounded), of an engine
-restarting after a crash, and of the final commit to `S`.
+restarting after a crash, and of the commits to `S`.
 
 **Abstracted, and why.**
 
@@ -399,25 +404,28 @@ and TLC must find it (`check-execution.sh calibrate`):
 
 | Switch | Rule as designed | Counterexample with it off |
 |---|---|---|
-| `FixF6` | a pass that ends behind the head goes on to it | `A` reads keys 1 and 2 in a full pass; key 1 commits; a cancel stops the run; `S` drops key 1; the firing resumes the pass, delivers key 2, and the task ends behind the head: `A` keeps 1 for good (`Quiesces`, 36 steps) |
+| `FixF6` | a pass that ends behind the head goes on to it | `A` reads keys 1 and 2 in a full pass; key 1 commits; a cancel stops the run; `S` drops key 1; the firing resumes the pass, delivers key 2, and the task ends behind the head: `A` keeps 1 for good (`Quiesces`, 36 to 37 steps) |
 | `FixF9` | a reset upstream commit makes its consumers read a full pass | (needed by the others; F9's own bug is the simulation's) |
-| `FixF10` | a full pass reaches the consumer even when its patterns take no key; `each` reconciles at its end | `B` holds 1 and 2; `B` excludes key 2 and its version is bumped; `S` drops key 1, so `A` holds 2 alone; `B`'s full pass takes no key and is skipped: `B` keeps 1 (`BookmarkHonest`, 41 steps) |
+| `FixF10` | a full pass reaches the consumer even when its patterns take no key; `each` reconciles at its end | `S` drops key 1, so `A` and `B` hold 2 alone; `B` excludes key 2 and its version is bumped; `B`'s full pass takes no key and is skipped: `B` keeps 2, which its patterns exclude (`BookmarkHonest`, 27 steps) |
 | `ResetOnMove` (with `FixF17`: calibration `move`) | a move resets the output at the deploy (K10; b7d8ae7). With both off, a move only changes where `A`'s next write goes, and that write starts the store over without a full pass | `A`'s full pass commits key 1 into store 1; `A` moves to store 2; the pass's next batch, key 2, starts store 2 over: `A` holds 2 alone, its bookmark says 1 and 2 (`BookmarkHonest`, 17 steps). F13's mechanism as W15 described it; F13's replays turned out to take F10's route |
 | `FixSelection` | a `keys=` run made a full pass (`FixF17`) reads the pass to its end | `A`'s first run is `keys=(1)`; its write starts the output over, so it reads a full pass, but ends after the first batch: `A` holds key 1 alone, a pass under way, and no run to finish it (`RunsEndCaughtUp`, 9 to 11 steps). Found by the spec's review (finding 1): the older properties needed a later source change to see it |
+| `FixF22` | an asset change leaves its asset due, if its input has a head (K34, aa0e7dd; before it, d6585fb for a move): `A` moved, `B` added back, `B`'s patterns or version changed. Calibrations `F22-move`, `F22-shape`, `F22-add`, each with no commit to `S` after the first | `A` is built; `A` moves, which resets it; nothing fires `A`, and `S` never changes again: `A` stays empty (`Quiesces`, 18 steps). `B`'s patterns or version change: `B` keeps what it read under its old declaration (34 steps). `B` is removed and added back: `B` stays empty (19 steps). Before this change the model's last commit to `S` came after every deploy and fired `A`, which hid the first (as it hid finding 1) |
 | `FixF17` | a `keys=` run of a partition a reset took bookmarks from reads that full pass (without `ResetOnMove`: a write that starts the output over reads a full pass) | `A` moves, which resets it; a `keys=` run for key 1 writes key 1 alone into the new, empty output and succeeds: `A` lacks key 2, though nothing removed it (`RunsEndCaughtUp`, 10 steps). Before the reset rule, moving back made it permanent (the simulation's F17) |
 
 **Results.** With every fix on (TLC 1.7.4; the first six rows re-run
-after the review's fixes and the reset rule, with 2 workers under a 5 GB,
-1.5-CPU cap; the others as first run, with 8 workers; a shared machine):
+after the asset-change rule (K34), deploys and faults free to come after
+the last commit to `S`, with 6 workers and a 24 GB heap on a MacBook Pro;
+the others as first run, before the review's fixes, with 8 workers on a
+shared machine):
 
 | Configuration | What varies | States (distinct) | Time | Verdict |
 |---|---|---|---|---|
-| `smoke` | nothing: the plain pipeline | 10,852 | 9 s | passes, liveness included |
-| `store` | `A` moves away and back, a `keys=` run between (`B` left out) | 45,983 | 24 s | passes |
-| `reset` | `A` moved once while `B` reads it | 395,549 | 5 min 2 s | passes; without the repair a refused `B` attempt owes, `StoreMatchesJournal` fails |
-| `shape` | two pattern changes or version bumps of `B`, in any mix | 398,934 | 5 min 20 s | passes |
-| `remove` | `B` removed and re-added (two deploys: one pair) | 243,354 | 3 min 25 s | passes |
-| `zombie` | a takeover, the zombie taking gates (`B` left out) | 1,368 | 3 s | passes; with the zombie free to take any attempt's gate, `Quiesces` fails (the review's finding 2) |
+| `smoke` | nothing: the plain pipeline | 10,852 | 2 s | passes, liveness included |
+| `store` | `A` moves away and back, a `keys=` run between (`B` left out) | 145,872 | 21 s | passes |
+| `reset` | `A` moved once while `B` reads it | 2,993,830 | 10 min 4 s | passes; without the repair a refused `B` attempt owes, `StoreMatchesJournal` fails |
+| `shape` | two pattern changes or version bumps of `B`, in any mix | 3,490,004 | 15 min 47 s | passes |
+| `remove` | `B` removed and re-added (two deploys: one pair) | 228,033 | 1 min 40 s | passes |
+| `zombie` | a takeover, the zombie taking gates (`B` left out) | 1,808 | 1 s | passes; with the zombie free to take any attempt's gate, `Quiesces` fails (the review's finding 2) |
 | `deploys` | one deploy, of any one kind, and a `keys=` run | over 4.5 million | capped at 25 min | no invariant violated in what was explored; liveness not reached (before the review's fixes) |
 | `faults` | two faults in all, of any kinds | over 2.8 million | capped at 25 min | the same (before the review's fixes) |
 | `each` | `B` is `each=True`; one deploy of any kind and one fault of any of four kinds | over 2.3 million | capped at 25 min | the same (before the review's fixes; then `A` was `each=True` too, finding 4) |
@@ -465,6 +473,9 @@ the name is new (K10). In the model, at the move:
   bookmark marked `reset` claims nothing (`BookmarkHonest`) until a full
   pass catches it up.
 - A move away and back is two resets.
+- `A` is due for a rebuild: its `OnChange` automation owes a firing
+  (an asset change, K34), so it is written again at once, not when `S`
+  next changes.
 
 Every attempt records which reset of its output, and of the output it
 reads, it launched under. One launched before a later reset is refused at
@@ -510,8 +521,8 @@ it read 1 and 2.
   write lands whole or not at all (no half-written batch); immutable
   stores, renames, fan-in, `Each`'s failed keys and retry passes, and
   time partitions are not modelled; runs have one target (no `upstream=`
-  run graph); a deploy of `B`'s version makes it read a full pass only
-  when it next runs (no `OnDeploy`).
+  run graph); automations are `OnChange` only (an asset with a schedule,
+  or none, waits for its next run after an asset change).
 - *What I would do next:* a run graph (`upstream=True`, a task waiting on
   another) for "every run ends" across tasks; a half-written batch with
   repair; and an immutable store beside the fenced one.
@@ -701,6 +712,58 @@ its attempts can carry the file's states and the end as a read and a
 swap, with this model as the reference for the protocol. Its fairness
 argument then needs the bound above: finitely many file changes per
 attempt.
+
+## Trace validation: simulation runs against the specs
+
+The specs check the design; the simulation runs the code. Trace
+validation joins them: it checks that what the code did in a simulation
+run is a behaviour of the spec, request by request. A run that is not
+shows either code doing what the design does not allow, or a step the
+spec misses.
+
+```bash
+uv run python spec/tla/check-trace.py SPEC              # run the simulation, check each run
+uv run python spec/tla/check-trace.py SPEC RUN.jsonl…   # check runs exported before
+```
+
+- **Export.** With `SOLERA_SIM_REQUESTS=DIR`, the simulation writes each
+  run's object requests to `DIR/NNNNN.jsonl`: the actor (an engine, a
+  worker, or a read-only open), the request, the path, and how it ended
+  (`ok`, `missing`, `exists`, `refused`, `lost`, `error`), with what a
+  LIST returned (`Objects.trace` in `tests/sim/core.py`). It only reads:
+  the simulation runs the same with it on.
+- **Check.** `check-trace.py` keeps the requests on the objects a spec
+  describes and writes them as a TLA+ sequence. The spec's trace module
+  (`{Spec}Trace.tla`) extends the spec: each request is a step of its
+  actor that makes it and sees what the code saw, or a check without a
+  step for a request the spec folds into another (a read-back after a
+  create). Before each request its actor may take the steps that make no
+  request. TLC searches for a behaviour that explains every request, one
+  worker, and reports the run valid, or the first request no behaviour
+  explains, with that actor's requests before it.
+
+**First target: the segment journal** (`Journal.tla`, retired with its
+code in cfdc723). Of a batch of 24 simulation runs
+(8 to 673 journal requests each), the first three, of 125, 125 and 437
+requests, were explained in full; the fourth, of 588, had 458 explained
+when it was stopped at 5 minutes (the search's cost, not a request the
+spec could not make), and the spec was not worth making faster. Mapping the code's requests onto the spec
+found three steps the spec lacked (added for the check, not kept, since
+the spec retired): the engine
+whose fence create succeeded LISTs checkpoints twice (`_behind`, then the
+hole test), and never serves under a fence a checkpoint covered; a failed
+checkpoint create or cleanup DELETE drops the rest of the cleanup; a
+checkpoint create is not retried, so one whose answer is lost lands
+unknown to its writer. The cost was in the invariants, checked on every
+state of a trace with a dozen engines and hundreds of segments, and in
+branches the search keeps open (a run of 437 requests: 36 s and 298,493
+states with `NotDone` alone, minutes with every invariant). The journal
+object's trace module should settle each choice at the request that
+reveals it.
+
+**Next:** the journal object (`JournalObject.tla`), then the attempt
+control file (`Attempt.tla`), as their code lands. `Execution.tla` needs an
+abstraction map (key sets, one partition per asset) and comes last.
 
 ## Findings
 

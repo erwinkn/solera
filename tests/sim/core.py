@@ -33,7 +33,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import obstore
-from obstore.exceptions import GenericError, NotFoundError, PreconditionError
+from obstore.exceptions import AlreadyExistsError, GenericError, NotFoundError, PreconditionError
 
 EPOCH = 1_790_000_000.0  # virtual 0 is 2026-09-21: wall time is EPOCH + loop time
 
@@ -262,6 +262,11 @@ class Objects:
         self.dead: set[tuple] = set()  # actors that can make no request any more
         self.hook: Callable | None = None
         self.tap: Callable | None = None  # (full path, bytes) of every write that landed
+        # (who, kind, full path, outcome, listed): every request and how it ended
+        # (ok, missing, exists, refused, lost, error, or another exception's
+        # name), for trace validation (spec/tla/check-trace.py). `listed`: what a
+        # list returned.
+        self.trace: Callable | None = None
         self.log: list[Op] = []
         self.deleted: dict[str, tuple] = {}  # full path -> (when, by whom) it was deleted
         self.requests = 0
@@ -311,6 +316,10 @@ class Objects:
 
     # -- helpers ----------------------------------------------------------------------
 
+    def _traced(self, who, kind: str, full: str, outcome: str, listed: list[str] | None = None) -> None:
+        if self.trace is not None:
+            self.trace(who, kind, full, outcome, listed)
+
     @staticmethod
     def full(store, path: str) -> str:
         root = str(getattr(store, "prefix", "") or "")
@@ -342,6 +351,7 @@ class Objects:
         if kind in ("create", "put", "swap", "delete") or op.gone is not None:
             self.log.append(op)
         if fate == "error":
+            self._traced(who, kind, full, "error")
             raise GenericError(f"injected: 503 Slow Down ({kind} {path})")
         try:
             value = do()
@@ -349,7 +359,20 @@ class Objects:
             op.found = False
             if kind == "delete":
                 self.deleted[full] = (self.loop._now, who)
+            else:  # a delete traces each of its paths
+                self._traced(who, kind, full, "missing")
             raise
+        except AlreadyExistsError:
+            self._traced(who, kind, full, "exists")
+            raise
+        except PreconditionError:  # a swap refused: the object is not what it read
+            self._traced(who, kind, full, "refused")
+            raise
+        except Exception as error:
+            self._traced(who, kind, full, type(error).__name__)
+            raise
+        if kind != "delete":
+            self._traced(who, kind, full, "lost" if fate == "lost" else "ok")
         if kind == "delete":
             self.deleted[full] = (self.loop._now, who)
         elif kind in ("create", "put", "swap"):
@@ -424,6 +447,8 @@ class Objects:
                     real(store, p)
                 except (NotFoundError, FileNotFoundError):
                     missing.append(p)
+            for p in many:
+                self._traced(actor.get(), "delete", self.full(store, p), "missing" if p in missing else "ok")
             for p in many[1:]:
                 full = self.full(store, p)
                 self.deleted[full] = (self.loop._now, actor.get())
@@ -441,11 +466,15 @@ class Objects:
         fate, _ = self.plan.decide() if self._on_loop() and who is not None else (None, 0.0)
         self.requests += 1
         if fate == "error":
+            self._traced(who, "list", self.full(store, prefix or ""), "error")
             raise GenericError(f"injected: 503 Slow Down (list {prefix})")
         args = {"prefix": prefix} if prefix is not None else {}
         if offset is not None:
             args["offset"] = offset
         commits = [list(b) for b in real(store, **args)]
+        if self.trace is not None:
+            listed = [self.full(store, m["path"]) for b in commits for m in b]
+            self._traced(who, "list", self.full(store, prefix or ""), "ok", listed)
         return _Listing(commits)
 
     def put(self, store, path, data, **kw):

@@ -73,6 +73,9 @@ calibration() {
     calibrate move BookmarkHonest  # synthetic: a store move that changes neither the fingerprint nor the plan
     calibrate F17 RunsEndCaughtUp  # after a move resets A, a keys= run reads only its key into the new output, and succeeds
     calibrate selection RunsEndCaughtUp  # a keys= run made a full pass ends after its first batch
+    calibrate F22-move Quiesces    # d6585fb: a move resets A, and nothing fires A until S changes
+    calibrate F22-shape Quiesces   # K34: B's patterns or version change, and nothing fires B
+    calibrate F22-add Quiesces     # K34: B is removed and added back, and nothing fires B
 }
 
 case "${1:-ci}" in

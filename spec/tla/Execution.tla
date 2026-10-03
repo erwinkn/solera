@@ -8,9 +8,9 @@
 (* crash, restart and takeover; worker crashes, timeouts, user cancels.    *)
 (* docs/verification.md, "Formal model", says what is abstracted and why.  *)
 (*                                                                         *)
-(* FixF6, FixF9, FixF10, FixF17, FixSelection and ResetOnMove select each *)
-(* rule as designed (TRUE) or as it was before its fix (FALSE): the model  *)
-(* must find each known bug.                                                *)
+(* FixF6, FixF9, FixF10, FixF17, FixF22, FixSelection and ResetOnMove    *)
+(* select each rule as designed (TRUE) or as it was before its fix         *)
+(* (FALSE): the model must find each known bug.                            *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
@@ -29,8 +29,11 @@ CONSTANTS
     Faults,      \* the fault kinds explored: subset of {"worker","crash","takeover","timeout","cancel","zombie"}
     FixF6, FixF9, FixF10, FixF17,
     FixSelection, \* a keys= run made a full pass (F17's fix) reads it to the end
-    ResetOnMove   \* a move resets A's output at the deploy (K10; F13, F17); else
+    ResetOnMove,  \* a move resets A's output at the deploy (K10; F13, F17); else
                   \* it only changes where A's next write goes
+    FixF22        \* an asset change (K34, aa0e7dd: added, its fingerprint or
+                  \* patterns changed, or reset) leaves the asset due: its
+                  \* OnChange automation owes a firing, if its input has a head
 
 Keys == 1..NK
 Assets == {"A", "B"}
@@ -76,6 +79,9 @@ Present(c) == c = "A" \/ man.hasB
 \* of B (F12) makes the output new under the same name. An attempt reading
 \* A (B's) depends on A's life too.
 Life(c) == man.life[c]
+\* An asset change (K34): the asset is due, if its input has something to
+\* read (aa0e7dd's FiringsOwed; with one partition, a head).
+Due(c) == FixF22 /\ log[Up(c)] # <<>>
 UpLife(c) == IF c = "B" THEN Life("A") ELSE 0
 EachOf(c) == Each /\ c = "B"
 
@@ -352,18 +358,21 @@ WSeal(i) ==
     /\ UNCHANGED <<log, bm, store, fence, hst, owes, nAtt, runs, nRun, pending, man, eng, used>>
 
 -----------------------------------------------------------------------------
-(* The environment. Everything but commits to S happens before the final *)
-(* one, so that the system then has to converge.                         *)
+(* The environment. Deploys and faults may come after the final commit to *)
+(* S, and the system must converge without a later change, but for a user *)
+(* cancel: its run's change stays unconsumed until the next one, so a     *)
+(* cancel comes before it.                                                *)
 
 Early == used.src < MaxSrc   \* the final change to S is not made yet
-Fault(kind) == kind \in Faults /\ used.fault < MaxFault /\ Early
-Deploy(kind) == kind \in Deploys /\ used.deploy < MaxDeploy /\ Early
+Anytime(kind) == Early \/ kind # "cancel"
+Fault(kind) == kind \in Faults /\ used.fault < MaxFault /\ Anytime(kind)
+Deploy(kind) == kind \in Deploys /\ used.deploy < MaxDeploy /\ Anytime(kind)
 SpendFault == used' = [used EXCEPT !.fault = @ + 1]
 SpendDeploy == used' = [used EXCEPT !.deploy = @ + 1]
 
-\* A user runs A for one key with keys= (before the final change).
+\* A user runs A for one key with keys=.
 KeysRun(k) ==
-    /\ used.keys < MaxKeysRuns /\ Early /\ eng.serving /\ nRun < MaxRuns
+    /\ used.keys < MaxKeysRuns /\ eng.serving /\ nRun < MaxRuns
     /\ nRun' = nRun + 1
     /\ runs' = [runs EXCEPT ![nRun + 1] = [st |-> "active", tgt |-> "A", tries |-> 0, keys |-> k]]
     /\ used' = [used EXCEPT !.keys = @ + 1]
@@ -382,8 +391,9 @@ SrcCommit(k) ==
 \* (K10), whatever the stores compare to: its head and repair intents go,
 \* and so do its own bookmarks and B's on it (marked `reset`), so A reads S
 \* in a full pass and B re-reads A from scratch; an attempt launched before
-\* commits nothing (Valid). Without ResetOnMove, the move only changes
-\* where A's next write goes.
+\* commits nothing (Valid); and A is due for a rebuild (FixF22). Without
+\* ResetOnMove, the move only changes where A's next
+\* write goes.
 MoveA ==
     /\ Deploy("move")
     /\ IF ResetOnMove
@@ -392,26 +402,31 @@ MoveA ==
             /\ log' = [log EXCEPT !["A"] = <<>>]
             /\ owes' = [owes EXCEPT !["A"] = {}]
             /\ bm' = [c \in Assets |-> [InitBm EXCEPT !.reset = TRUE]]
+            /\ pending' = [pending EXCEPT !["A"] = @ \/ Due("A")]
        ELSE /\ man' = [man EXCEPT !.storeA = IF @ = "st1" THEN "st2" ELSE "st1"]
-            /\ UNCHANGED <<log, owes, bm>>
+            /\ UNCHANGED <<log, owes, bm, pending>>
     /\ SpendDeploy
-    /\ UNCHANGED <<store, fence, hst, att, nAtt, runs, nRun, pending, eng>>
+    /\ UNCHANGED <<store, fence, hst, att, nAtt, runs, nRun, eng>>
 
+\* A change of B's patterns or version: B is due (FixF22).
 PatternB ==
     /\ Deploy("pattern") /\ man.hasB
     /\ man' = [man EXCEPT !.pat = IF @ = Keys THEN Keys \ {NK} ELSE Keys]
+    /\ pending' = [pending EXCEPT !["B"] = @ \/ Due("B")]
     /\ SpendDeploy
-    /\ UNCHANGED <<log, bm, store, fence, hst, owes, att, nAtt, runs, nRun, pending, eng>>
+    /\ UNCHANGED <<log, bm, store, fence, hst, owes, att, nAtt, runs, nRun, eng>>
 
 BumpB ==
     /\ Deploy("bump") /\ man.hasB
     /\ man' = [man EXCEPT !.ver["B"] = @ + 1]
+    /\ pending' = [pending EXCEPT !["B"] = @ \/ Due("B")]
     /\ SpendDeploy
-    /\ UNCHANGED <<log, bm, store, fence, hst, owes, att, nAtt, runs, nRun, pending, eng>>
+    /\ UNCHANGED <<log, bm, store, fence, hst, owes, att, nAtt, runs, nRun, eng>>
 
 \* Removing B cancels its queued work; a launched attempt settles, its commit
 \* dropped. Re-adding B starts it fresh: a name no longer declared holds no
-\* state (F12's fix), so its first write starts the store over.
+\* state (F12's fix), so its first write starts the store over; with no
+\* head, it is due for a build (FixF22).
 RemoveB ==
     /\ Deploy("remove") /\ man.hasB
     /\ man' = [man EXCEPT !.hasB = FALSE]
@@ -430,7 +445,7 @@ AddB ==
     /\ log' = [log EXCEPT !["B"] = <<>>]
     /\ bm' = [bm EXCEPT !["B"] = InitBm]
     /\ owes' = [owes EXCEPT !["B"] = {}]
-    /\ pending' = [pending EXCEPT !["B"] = TRUE]
+    /\ pending' = [pending EXCEPT !["B"] = Due("B")]
     /\ SpendDeploy
     /\ UNCHANGED <<store, fence, hst, att, nAtt, runs, nRun, eng>>
 
@@ -520,7 +535,7 @@ Next == Engine \/ Worker \/ Env
 \* Every engine and worker step is bounded (attempts, runs, batches), so
 \* each behaviour takes finitely many of them: weak fairness on all of them
 \* together forces the system on until nothing is enabled. The environment
-\* is not forced, but for the final change to S (and an engine restarting).
+\* is not forced, but for the commits to S (and an engine restarting).
 Fairness == WF_vars(Engine \/ Worker \/ Restart \/ \E k \in Keys : SrcCommit(k))
 
 Spec == Init /\ [][Next]_vars /\ Fairness
@@ -557,9 +572,12 @@ WithinBudget == nAtt < MaxAtt /\ nRun < MaxRuns
 NoActiveRun == \A r \in 1..nRun : runs[r].st # "active"
 EveryRunEnds == <>[]NoActiveRun
 
+\* Every asset holds its upstream's keys under its patterns, read under its
+\* current fingerprint.
 Converged ==
     /\ Content("A") = Content("S")
     /\ man.hasB => Content("B") = Content("A") \cap man.pat
+    /\ \A c \in Assets : Present(c) => bm[c].fp = FP(c)
 Converges == <>[]Converged
 \* Both, as one property (one tableau for TLC).
 Quiesces == <>[](NoActiveRun /\ Converged)
