@@ -377,6 +377,10 @@ class Model:
         self.claims[task_id] = {
             "attempt": attempt,
             "started_at": now,
+            # Not durable until its launch is: an engine replaced before then leaves
+            # the number to the next one, which may hand it out again. Harmless only
+            # because nothing outside learns of an attempt before its launch is
+            # durable (F26), so no write was made under it.
             "generation": self.event_counter,
             "status": "running",
         }

@@ -52,9 +52,11 @@ const p = (project: string) => `/projects/${encodeURIComponent(project)}`;
 const enc = encodeURIComponent;
 
 export const ACTIVE_RUN = new Set(["queued", "running", "waiting"]);
-/** An attempt that can still change: preparing, launched, waiting for a pool worker, running. */
+/** An attempt that can still change: preparing, launching (its launch not yet
+ * durable), launched, waiting for a pool worker, running. */
 export const ACTIVE_ATTEMPT = new Set([
   "preparing",
+  "launching",
   "launched",
   "provisioning",
   "claimable",

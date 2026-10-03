@@ -2141,12 +2141,13 @@ class Engine(Attempts, Sensors, Views):
             out.append(view)
         claim = self.m.claims.get(task["id"]) if live else None
         if claim:
+            launching = getattr(self.live.get(claim["attempt"]), "launching", False)  # not durable yet (F26)
             out.append(
                 {
                     "id": claim["attempt"],
                     "task": task["id"],
                     "generation": len(out) + 1,
-                    "outcome": claim["status"],
+                    "outcome": "launching" if launching else claim["status"],
                     "started_at": claim["started_at"],
                     **(history.execution(task["launched"]["execution"]) if claim.get("launched") else {}),
                 }

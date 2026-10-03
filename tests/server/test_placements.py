@@ -69,6 +69,40 @@ async def test_pool_workers_race_for_a_claim(state):
     assert await engine.pool_work("ingest", {"cpu": 4}, "w1", 0) == []  # ended: no longer offered
 
 
+async def test_an_attempt_whose_launch_is_in_flight_shows_as_launching(state):
+    """F26: an operator may see an attempt before its launch is durable, marked
+    `launching`; once the launch lands it is what its claim says."""
+
+    @asset(executor=Pool("ingest")())
+    def job():
+        return [{"ok": True}]
+
+    engine = make_engine(state, Project(assets=[job]), heartbeat_seconds=0.3)
+    await engine.initialize()
+    run = await engine.submit(["job"])
+    lands, durable = asyncio.Event(), state.durable
+
+    async def slow_launch():  # the launch's write is under way until `lands`
+        if any(live.launching for live in engine.live.values()):
+            await lands.wait()
+        await durable()
+
+    state.durable = slow_launch
+    await pool_attempt(engine, state)
+
+    async def outcome():
+        [attempts] = (await engine.run_detail(run["id"]))["attempts"].values()
+        return attempts[-1]["outcome"]
+
+    assert await outcome() == "launching"
+    lands.set()
+    for _ in range(100):
+        if await outcome() != "launching":
+            break
+        await asyncio.sleep(0.01)
+    assert await outcome() == "claimable"
+
+
 async def test_a_dead_pool_claim_expires_into_a_new_attempt(state):
     """A worker claims, then dies before it says anything. The engine finds
     the claim, waits for a report, and ends the attempt lost; its writes are
