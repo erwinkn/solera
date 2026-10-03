@@ -7,8 +7,10 @@
 (* move, pattern change, version bump, removal and re-adding); engine      *)
 (* crash, restart and takeover; worker crashes, timeouts, user cancels.    *)
 (* docs/verification.md, "Formal model", says what is abstracted and why.  *)
+(* Runs are default runs: keys= runs, positions from what was read and     *)
+(* staleness are Positions.tla's.                                          *)
 (*                                                                         *)
-(* FixF6, FixF10, FixF17, FixF22, FixSelection and ResetOnMove           *)
+(* FixF6, FixF10, FixF17, FixF22 and ResetOnMove                          *)
 (* select each rule as designed (TRUE) or as it was before its fix         *)
 (* (FALSE): the model must find each known bug.                            *)
 (***************************************************************************)
@@ -22,13 +24,11 @@ CONSTANTS
     MaxAtt,      \* attempts, over the whole behaviour
     MaxRuns,     \* runs, over the whole behaviour
     MaxTries,    \* attempts a run's task may fail before it fails
-    MaxKeysRuns, \* manual runs of A with keys= (one key, read as given; no position moves)
     Each,        \* B is an each=True asset (reconciled at the end of a full pass); A is not
     WithB,       \* B is declared at the start (else the chain is S and A, unless B is added)
     Deploys,     \* the deploy kinds explored: subset of {"move","pattern","bump","remove"}
     Faults,      \* the fault kinds explored: subset of {"worker","crash","takeover","timeout","cancel","zombie"}
     FixF6, FixF10, FixF17,
-    FixSelection, \* a keys= run made a full pass (F17's fix) reads it to the end
     ResetOnMove,  \* a move resets A's output at the deploy (K10; F13, F17); else
                   \* it only changes where A's next write goes
     FixF22        \* an asset change (K34, aa0e7dd: added, its fingerprint or
@@ -88,10 +88,9 @@ EachOf(c) == Each /\ c = "B"
 NoPass == [kind |-> "none", at |-> 0, from |-> 0, first |-> FALSE]
 \* The fingerprint is a digest of the declaration: the asset's version (not
 \* its output's store: a move resets the output instead). 0 is never one.
-\* `reset`: a reset took this position, and no full pass has caught it up
-\* since; a keys= run reads that full pass.
+\* No position (fp 0): a reset took it, or the input never read.
 FP(c) == man.ver[c]
-NoPosition == [next |-> 0, fp |-> 0, pat |-> Keys, pass |-> NoPass, reset |-> FALSE]
+NoPosition == [next |-> 0, fp |-> 0, pat |-> Keys, pass |-> NoPass]
 
 -----------------------------------------------------------------------------
 (* Planning one batch (the engine, at an attempt's claim) *)
@@ -105,7 +104,7 @@ Batch(up, rm, reset, newpos, fullEnd) ==
 FullStep(c, ps, b0) ==
     LET u == Up(c)  P == b0.pat
         avail == {k \in Content(u) \cap P : k > ps.at}
-        ended == [b0 EXCEPT !.next = ps.from, !.pass = NoPass, !.reset = FALSE]
+        ended == [b0 EXCEPT !.next = ps.from, !.pass = NoPass]
     IN IF avail # {} THEN
           LET k == Min(avail)
               last == {j \in Content(u) \cap P : j > k} = {}
@@ -142,10 +141,6 @@ NeedsFull(c) ==
     \/ b.fp # FP(c)
     \/ FixF17 /\ Moved(c)
     \/ \E i \in (seen + 1)..Len(log[Up(c)]) : log[Up(c)][i].reset
-
-\* A keys= run reads one key as given, writes it, and moves no position.
-KeysPlan(c, k) ==
-    LET cur == Content(Up(c)) IN Batch({k} \cap cur, {k} \ cur, FALSE, pos[c], FALSE)
 
 Plan(c) ==
     LET b == pos[c]  h == Len(log[Up(c)])  P == Pat(c) IN
@@ -187,7 +182,7 @@ Init ==
     /\ man = [storeA |-> "st1", ver |-> [c \in Assets |-> 1], pat |-> Keys, hasB |-> WithB,
               life |-> [c \in Assets |-> 0]]
     /\ eng = [serving |-> TRUE, zombie |-> FALSE, knew |-> 0]
-    /\ used = [src |-> 0, deploy |-> 0, fault |-> 0, keys |-> 0]
+    /\ used = [src |-> 0, deploy |-> 0, fault |-> 0]
 
 
 \* What is left of a finished attempt (settled, its worker done; or dropped)
@@ -200,7 +195,7 @@ Tidy(a) == IF a.status \in {"prep", "launched", "settled", "dropped"} /\ Gone(a)
            ELSE a
 TidyAtt(f) == [i \in DOMAIN f |-> Tidy(f[i])]
 TidyRuns(f) == [r \in DOMAIN f |-> IF f[r].st \in {"succeeded", "failed", "canceled"}
-                                   THEN [st |-> "ended", tgt |-> f[r].tgt, tries |-> 0, keys |-> 0,
+                                   THEN [st |-> "ended", tgt |-> f[r].tgt, tries |-> 0,
                                          ok |-> f[r].st = "succeeded"]
                                    ELSE f[r]]
 
@@ -214,21 +209,13 @@ ActiveRun(c) == \E r \in 1..nRun : runs[r].st = "active" /\ runs[r].tgt = c
 Fire(c) ==
     /\ eng.serving /\ pending[c] /\ Present(c) /\ ~ActiveRun(c) /\ nRun < MaxRuns
     /\ nRun' = nRun + 1
-    /\ runs' = TidyRuns([runs EXCEPT ![nRun + 1] = [st |-> "active", tgt |-> c, tries |-> 0, keys |-> 0]])
+    /\ runs' = TidyRuns([runs EXCEPT ![nRun + 1] = [st |-> "active", tgt |-> c, tries |-> 0]])
     /\ pending' = [pending EXCEPT ![c] = FALSE]
     /\ UNCHANGED <<log, pos, store, fence, hst, owes, att, nAtt, man, eng, used>>
 
 \* Claim the asset partition, pin, plan the batch; nothing to do ends the task.
-\* A keys= run of a partition a reset took positions from reads that full
-\* pass instead (F17's fix; without ResetOnMove, of any output that must
-\* start over), and from then on is a run of the whole asset: it goes on
-\* until the pass ends (FixSelection; without it, it ends after one batch).
-\* A never-run consumer's keys= run reads only its keys.
 Prepare(r) ==
-    LET c == runs[r].tgt
-        whole == FixF17 /\ IF ResetOnMove THEN pos[c].reset ELSE Moved(c)
-        p == IF runs[r].keys > 0 /\ ~whole THEN KeysPlan(c, runs[r].keys) ELSE Plan(c)
-    IN
+    LET c == runs[r].tgt  p == Plan(c) IN
     /\ eng.serving /\ runs[r].st = "active" /\ Present(c) /\ ~Claimed(c)
     /\ IF p.act = "none"
          THEN /\ runs' = TidyRuns([runs EXCEPT ![r].st = "succeeded"])
@@ -242,8 +229,7 @@ Prepare(r) ==
                          fullEnd |-> p.fullEnd, owed |-> owes[c], w |-> "none", gate |-> "none",
                          rep |-> {}, cancel |-> FALSE]])
               /\ nAtt' = nAtt + 1
-              /\ runs' = IF runs[r].keys > 0 /\ whole /\ FixSelection
-                         THEN [runs EXCEPT ![r].keys = 0] ELSE runs
+              /\ UNCHANGED runs
     /\ UNCHANGED <<log, pos, store, fence, hst, owes, nRun, pending, man, eng, used>>
 
 Launch(i) ==
@@ -280,7 +266,7 @@ SettleOk(i) ==
               /\ hst' = [hst EXCEPT ![c] = a.st]
               /\ pending' = IF c = "A" /\ change THEN [pending EXCEPT !["B"] = TRUE] ELSE pending
               /\ runs' = TidyRuns(IF runs[r].st # "active" THEN runs
-                         ELSE IF runs[r].keys = 0 /\ MoreAfter(c, a.newpos, a.fullEnd) THEN runs
+                         ELSE IF MoreAfter(c, a.newpos, a.fullEnd) THEN runs
                          ELSE [runs EXCEPT ![r].st = "succeeded"])
          \* Refused at commit: it installs nothing, and its run carries on (a
          \* fresh attempt, planned anew), or, its asset removed, is canceled.
@@ -371,14 +357,6 @@ Deploy(kind) == kind \in Deploys /\ used.deploy < MaxDeploy /\ Anytime(kind)
 SpendFault == used' = [used EXCEPT !.fault = @ + 1]
 SpendDeploy == used' = [used EXCEPT !.deploy = @ + 1]
 
-\* A user runs A for one key with keys=.
-KeysRun(k) ==
-    /\ used.keys < MaxKeysRuns /\ eng.serving /\ nRun < MaxRuns
-    /\ nRun' = nRun + 1
-    /\ runs' = [runs EXCEPT ![nRun + 1] = [st |-> "active", tgt |-> "A", tries |-> 0, keys |-> k]]
-    /\ used' = [used EXCEPT !.keys = @ + 1]
-    /\ UNCHANGED <<log, pos, store, fence, hst, owes, att, nAtt, pending, man, eng>>
-
 SrcCommit(k) ==
     /\ used.src < MaxSrc
     /\ LET e == IF k \in Content("S") THEN [up |-> {}, rm |-> {k}, reset |-> FALSE]
@@ -390,7 +368,7 @@ SrcCommit(k) ==
 
 \* Deploys: a new manifest. Moving A's store resets its output at the deploy
 \* (K10), whatever the stores compare to: its head and repair intents go,
-\* and so do its own positions and B's on it (marked `reset`), so A reads S
+\* and so do its own positions and B's on it, so A reads S
 \* in a full pass and B re-reads A from scratch; an attempt launched before
 \* commits nothing (Valid); and A is due for a rebuild (FixF22). Without
 \* ResetOnMove, the move only changes where A's next
@@ -402,7 +380,7 @@ MoveA ==
                                   !.life["A"] = @ + 1]
             /\ log' = [log EXCEPT !["A"] = <<>>]
             /\ owes' = [owes EXCEPT !["A"] = {}]
-            /\ pos' = [c \in Assets |-> [NoPosition EXCEPT !.reset = TRUE]]
+            /\ pos' = [c \in Assets |-> NoPosition]
             /\ pending' = [pending EXCEPT !["A"] = @ \/ Due("A")]
        ELSE /\ man' = [man EXCEPT !.storeA = IF @ = "st1" THEN "st2" ELSE "st1"]
             /\ UNCHANGED <<log, owes, pos, pending>>
@@ -525,7 +503,7 @@ Engine ==
 Worker == \E i \in 1..MaxAtt : i <= nAtt /\ (WAcquire(i) \/ WGate(i) \/ WWrite(i) \/ WSeal(i))
 
 Env ==
-    \/ \E k \in Keys : SrcCommit(k) \/ KeysRun(k)
+    \/ \E k \in Keys : SrcCommit(k)
     \/ MoveA \/ PatternB \/ BumpB \/ RemoveB \/ AddB
     \/ \E i \in 1..MaxAtt : i <= nAtt /\ (WorkerCrash(i) \/ Timeout(i) \/ ZombieAbort(i))
     \/ \E r \in 1..MaxRuns : r <= nRun /\ Cancel(r)
@@ -550,11 +528,11 @@ OneAttemptPerPartition ==
 
 \* A position never passes a change it did not deliver: with no pass under
 \* way, every key no later commit touched is in the output exactly when it
-\* was in the upstream at the position, under the patterns it reads. A
-\* position a reset took claims nothing until a full pass catches it up.
+\* was in the upstream at the position, under the patterns it reads. No
+\* position (a reset took it) claims nothing.
 PositionHonest ==
     \A c \in Assets :
-        (Present(c) /\ pos[c].pass.kind = "none" /\ ~pos[c].reset) =>
+        (Present(c) /\ pos[c].pass.kind = "none" /\ pos[c].fp # 0) =>
             LET u == Up(c)  b == pos[c]  quiet == Keys \ Touched(u, b.next, Len(log[u])) IN
             \A k \in quiet : (k \in Content(c)) <=> (k \in UpTo(u, b.next) \cap b.pat)
 
@@ -585,15 +563,12 @@ Quiesces == <>[](NoActiveRun /\ Converged)
 
 \* A run that succeeds leaves its asset caught up: no pass under way, its
 \* position at the upstream's head, and its output what the upstream holds
-\* under its patterns. This binds every run of a whole asset, a keys= run
-\* that moved the position (one made a full pass), and a keys= run of a
-\* partition a reset took positions from. Checked as the run succeeds, so
-\* no later change is needed to see one that ended halfway.
+\* under its patterns. Checked as the run succeeds, so no later change is
+\* needed to see one that ended halfway.
 RunsEndCaughtUp ==
     [][\A r \in 1..MaxRuns :
          LET c == runs[r].tgt IN
-         (/\ runs[r].st = "active" /\ runs'[r].st = "ended" /\ runs'[r].ok /\ Present(c)
-          /\ runs[r].keys = 0 \/ pos'[c] # pos[c] \/ pos[c].reset)
+         (runs[r].st = "active" /\ runs'[r].st = "ended" /\ runs'[r].ok /\ Present(c))
          => /\ pos'[c].pass.kind = "none"
             /\ pos'[c].next = Len(log'[Up(c)])
             /\ Fold(log'[c]) = Fold(log'[Up(c)]) \cap (IF c = "A" THEN Keys ELSE man'.pat)]_vars

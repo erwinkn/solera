@@ -374,8 +374,8 @@ spec/tla/check.sh execution all
 - Per output, two **fenced stores** (`A` can move between them) holding
   rows, a **fence** generation per store, the store the head is in, and
   the **repair** intents owed.
-- **Runs** of one target (as an automation submits them, or a user with
-  `keys=`), **attempts** with their **generation**, planned **batch**,
+- **Runs** of one target, as an automation submits them (default runs:
+  `keys=` runs are `Positions.tla`'s), **attempts** with their **generation**, planned **batch**,
   worker progress, **gate** (`none`, `writing`, `aborted`) and **cancel**
   request. Claims are the attempts `prep`ared or launched.
 - The **manifest** (`A`'s store, versions, `B`'s patterns, whether `B` is
@@ -385,8 +385,7 @@ spec/tla/check.sh execution all
   possibly a zombie (a rolling deploy).
 
 **Actions.** The environment: commits to `S`; deploys (move `A`'s store,
-change `B`'s patterns, bump `B`'s version, remove and re-add `B`); `keys=`
-runs of `A`; worker crashes; engine crash, restart and takeover; timeouts;
+change `B`'s patterns, bump `B`'s version, remove and re-add `B`); worker crashes; engine crash, restart and takeover; timeouts;
 user cancels. The engine: automations firing (`OnChange`), preparing an
 attempt (claim, pin, plan the batch), launching, settling (commit; a
 drained cancel; or lost: take the gate, owe a repair). Workers: start and
@@ -399,9 +398,7 @@ A move resets `A` at the deploy: its head and repair intents go, and so
 do its own positions and `B`'s on it. An attempt launched before a reset
 of its output, or of the output it reads, is refused at commit and its
 run carries on; what it wrote is owed a repair unless its own output was
-reset. A `keys=` run of a partition a reset took positions from reads a
-full pass, and from then on is a run of the whole asset: it goes on until
-the pass ends. An asset change (K34, aa0e7dd: `B` added back, its
+reset. An asset change (K34, aa0e7dd: `B` added back, its
 patterns or version changed, `A` moved) leaves the asset due: its
 `OnChange` automation owes a firing, if its input has a head
 (`FiringsOwed`; for `AllPartitions` or a fan-in, a materialized upstream
@@ -417,7 +414,7 @@ next one.
 | `OneAttemptPerPartition` | safety | at most one prepared or launched attempt per asset partition |
 | `PositionHonest` | safety | with no pass under way, every key no later commit touched is in the output exactly when it was in the upstream at the position, under its patterns: a position never passes a change it did not deliver |
 | `StoreMatchesJournal` | safety | with no attempt in flight, no repair owed and no stale writer at its gate, a store holds exactly its output's committed content |
-| `RunsEndCaughtUp` | action | a run that succeeds leaves its asset caught up: no pass under way, the position at the upstream's head, the output what the upstream holds under its patterns. It binds every run of a whole asset, and a `keys=` run that moved the position; checked as the run succeeds, so no later change is needed to see one that ended halfway |
+| `RunsEndCaughtUp` | action | a run that succeeds leaves its asset caught up: no pass under way, the position at the upstream's head, the output what the upstream holds under its patterns. Checked as the run succeeds, so no later change is needed to see one that ended halfway |
 | `Quiesces` | liveness | eventually and forever, no run is active (every run ends) and `A` holds `S`'s keys, `B` holds `A`'s under its patterns, each read under its current fingerprint (convergence) |
 
 Liveness assumes weak fairness of all engine and worker steps together
@@ -455,9 +452,7 @@ and TLC must find it (`check.sh execution calibrate`):
 | `FixF6` | a pass that ends behind the head goes on to it | `A` reads keys 1 and 2 in a full pass; key 1 commits; a cancel stops the run; `S` drops key 1; the firing resumes the pass, delivers key 2, and the task ends behind the head: `A` keeps 1 for good (`Quiesces`, 36 to 37 steps) |
 | `FixF10` | a full pass reaches the consumer even when its patterns take no key; `each` reconciles at its end | `S` drops key 1, so `A` and `B` hold 2 alone; `B` excludes key 2 and its version is bumped; `B`'s full pass takes no key and is skipped: `B` keeps 2, which its patterns exclude (`PositionHonest`, 27 steps) |
 | `ResetOnMove` (with `FixF17`: calibration `move`) | a move resets the output at the deploy (K10; b7d8ae7). With both off, a move only changes where `A`'s next write goes, and that write starts the store over without a full pass | `A`'s full pass commits key 1 into store 1; `A` moves to store 2; the pass's next batch, key 2, starts store 2 over: `A` holds 2 alone, its position says 1 and 2 (`PositionHonest`, 17 steps). F13's mechanism as W15 described it; F13's replays turned out to take F10's route |
-| `FixSelection` | a `keys=` run made a full pass (`FixF17`) reads the pass to its end | `A`'s first run is `keys=(1)`; its write starts the output over, so it reads a full pass, but ends after the first batch: `A` holds key 1 alone, a pass under way, and no run to finish it (`RunsEndCaughtUp`, 9 to 11 steps). Found by the spec's review (finding 1): the older properties needed a later source change to see it |
 | `FixF22` | an asset change leaves its asset due, if its input has a head (K34, aa0e7dd; before it, d6585fb for a move): `A` moved, `B` added back, `B`'s patterns or version changed. Calibrations `F22-move`, `F22-shape`, `F22-add`, each with no commit to `S` after the first | `A` is built; `A` moves, which resets it; nothing fires `A`, and `S` never changes again: `A` stays empty (`Quiesces`, 18 steps). `B`'s patterns or version change: `B` keeps what it read under its old declaration (34 steps). `B` is removed and added back: `B` stays empty (19 steps). Before this change the model's last commit to `S` came after every deploy and fired `A`, which hid the first (as it hid finding 1) |
-| `FixF17` | a `keys=` run of a partition a reset took positions from reads that full pass (without `ResetOnMove`: a write that starts the output over reads a full pass) | `A` moves, which resets it; a `keys=` run for key 1 writes key 1 alone into the new, empty output and succeeds: `A` lacks key 2, though nothing removed it (`RunsEndCaughtUp`, 10 steps). Before the reset rule, moving back made it permanent (the simulation's F17) |
 
 **Results.** With every fix on (TLC 1.7.4; the first six rows re-run
 after the asset-change rule (K34), deploys and faults free to come after
@@ -468,38 +463,38 @@ shared machine):
 | Configuration | What varies | States (distinct) | Time | Verdict |
 |---|---|---|---|---|
 | `smoke` | nothing: the plain pipeline | 10,852 | 2 s | passes, liveness included |
-| `store` | `A` moves away and back, a `keys=` run between (`B` left out) | 145,872 | 21 s | passes |
+| `store` | `A` moves away and back (`B` left out) | 6,404 | 1 s | passes |
 | `reset` | `A` moved once while `B` reads it | 2,993,830 | 10 min 4 s | passes; without the repair a refused `B` attempt owes, `StoreMatchesJournal` fails |
 | `shape` | two pattern changes or version bumps of `B`, in any mix | 3,490,004 | 15 min 47 s | passes |
 | `remove` | `B` removed and re-added (two deploys: one pair) | 228,033 | 1 min 40 s | passes |
 | `zombie` | a takeover, the zombie taking gates (`B` left out) | 1,808 | 1 s | passes; with the zombie free to take any attempt's gate, `Quiesces` fails (the review's finding 2) |
-| `deploys` | one deploy, of any one kind, and a `keys=` run | over 4.5 million | capped at 25 min | no invariant violated in what was explored; liveness not reached (before the review's fixes) |
+| `deploys` | one deploy, of any one kind | over 4.5 million | capped at 25 min | no invariant violated in what was explored; liveness not reached (before the review's fixes) |
 | `faults` | two faults in all, of any kinds | over 2.8 million | capped at 25 min | the same (before the review's fixes) |
 | `each` | `B` is `each=True`; one deploy of any kind and one fault of any of four kinds | over 2.3 million | capped at 25 min | the same (before the review's fixes; then `A` was `each=True` too, finding 4) |
-| `safety` | two deploys and two faults in all, of any kinds, and a `keys=` run: random behaviours | configured: 100,000 behaviours of up to 150 steps; run so far: 2,000 | 7 s for the 2,000 | passed what ran (`check.sh execution safety` runs the configured target) |
+| `safety` | two deploys and two faults in all, of any kinds: random behaviours | configured: 100,000 behaviours of up to 150 steps; run so far: 2,000 | 7 s for the 2,000 | passed what ran (`check.sh execution safety` runs the configured target) |
 
 The budgets are shared across kinds: `MaxDeploy` and `MaxFault` count
 deploys and faults of any kind, so a configuration listing every kind
 explores every *choice* of them within the budget, not every kind at
 once. The bounds, exactly:
 
-| Configuration | Keys | Source commits after the first | Deploys (budget: kinds) | Faults (budget: kinds) | `keys=` runs | `B` | `each` | Attempts, runs, tries |
-|---|---|---|---|---|---|---|---|---|
-| `smoke` | 2 | 1 | 0 | 0 | 0 | declared | — | 12, 10, 3 |
-| `store` | 2 | 1 | 2: move | 0 | 1 | left out | — | 12, 10, 3 |
-| `reset` | 2 | 1 | 1: move | 0 | 0 | declared | — | 12, 10, 3 |
-| `shape` | 2 | 1 | 2: pattern, bump | 0 | 0 | declared | — | 12, 10, 3 |
-| `remove` | 2 | 1 | 2: remove (a removal and a re-adding each spend one) | 0 | 0 | declared | — | 12, 10, 3 |
-| `zombie` | 2 | 1 | 0 | 1: takeover (the zombie's aborts spend none) | 0 | left out | — | 12, 10, 3 |
-| `deploys` | 2 | 1 | 1: move, pattern, bump, remove | 0 | 1 | declared | — | 12, 10, 3 |
-| `faults` | 2 | 1 | 0 | 2: worker, crash, takeover, timeout, cancel, zombie | 0 | declared | — | 12, 10, 3 |
-| `each` | 2 | 1 | 1: move, pattern, bump, remove | 1: worker, crash, timeout, cancel | 0 | declared | `B` | 12, 10, 3 |
-| `safety` | 2 | 1 | 2: move, pattern, bump, remove | 2: worker, crash, takeover, timeout, cancel, zombie | 1 | declared | — | 14, 10, 4 |
+| Configuration | Keys | Source commits after the first | Deploys (budget: kinds) | Faults (budget: kinds) | `B` | `each` | Attempts, runs, tries |
+|---|---|---|---|---|---|---|---|
+| `smoke` | 2 | 1 | 0 | 0 | declared | — | 12, 10, 3 |
+| `store` | 2 | 1 | 2: move | 0 | left out | — | 12, 10, 3 |
+| `reset` | 2 | 1 | 1: move | 0 | declared | — | 12, 10, 3 |
+| `shape` | 2 | 1 | 2: pattern, bump | 0 | declared | — | 12, 10, 3 |
+| `remove` | 2 | 1 | 2: remove (a removal and a re-adding each spend one) | 0 | declared | — | 12, 10, 3 |
+| `zombie` | 2 | 1 | 0 | 1: takeover (the zombie's aborts spend none) | left out | — | 12, 10, 3 |
+| `deploys` | 2 | 1 | 1: move, pattern, bump, remove | 0 | declared | — | 12, 10, 3 |
+| `faults` | 2 | 1 | 0 | 2: worker, crash, takeover, timeout, cancel, zombie | declared | — | 12, 10, 3 |
+| `each` | 2 | 1 | 1: move, pattern, bump, remove | 1: worker, crash, timeout, cancel | declared | `B` | 12, 10, 3 |
+| `safety` | 2 | 1 | 2: move, pattern, bump, remove | 2: worker, crash, takeover, timeout, cancel, zombie | declared | — | 14, 10, 4 |
 
 No design bug found so far. Modeling errors found: a fingerprint change
 during a full pass must start the pass over, as the engine does; and,
 from an independent review of the spec, a promoted `keys=` run ended after one batch
-(finding 1, now `FixSelection` and `RunsEndCaughtUp`) and a zombie could
+(finding 1, which gave `RunsEndCaughtUp`; `keys=` runs are now `Positions.tla`'s) and a zombie could
 abort attempts its successor created, exhausting their retries (finding
 2). The review's other findings are addressed. `FixF13` (the store in
 the fingerprint) was not F13's mechanism; the store is out of the
@@ -515,10 +510,9 @@ in "Formal model: the attempt control file".
 deploy that moves an output, or removes it, resets it: the output under
 the name is new (K10). In the model, at the move:
 - `A`'s head and repair intents go;
-- `A`'s own positions and `B`'s position on `A` go, marked `reset`.
-  `A` reads `S` in a full pass, and `B` re-reads `A` from scratch. A
-  position marked `reset` claims nothing (`PositionHonest`) until a full
-  pass catches it up.
+- `A`'s own positions and `B`'s position on `A` go: `A` reads `S` in a
+  full pass, and `B` re-reads `A` from scratch. No position claims
+  nothing (`PositionHonest`) until a full pass catches it up.
 - A move away and back is two resets.
 - `A` is due for a rebuild: its `OnChange` automation owes a firing
   (an asset change, K34), so it is written again at once, not when `S`
@@ -533,10 +527,8 @@ the need for that repair: without it, `B`'s refused attempt leaves rows in
 `B`'s store that no commit records (`StoreMatchesJournal`, check `reset`).
 The code does record it (`_fail` takes a refused result's gate intents).
 The first write after a reset is a reset commit (its index starts
-empty), planned as a full pass, also for a `keys=` run of a partition the
-reset took positions from (`FixF17`), which then runs to the pass's end
-(`FixSelection`); a reset upstream commit makes every consumer read a
-full pass (F9).
+empty), planned as a full pass; a reset upstream commit makes every
+consumer read a full pass (F9).
 
 **F13, in plain words** (the store-move mechanism the decision removes;
 the two F13 replays turned out to take F10's route, and pass since F10's
@@ -573,6 +565,89 @@ it read 1 and 2.
 - *What I would do next:* a run graph (`upstream=True`, a task waiting on
   another) for "every run ends" across tasks; a half-written batch with
   repair; and an immutable store beside the fenced one.
+
+## Formal model: positions and staleness (`spec/tla/Positions.tla`)
+
+*The design of `positions-from-reads.md` (K43; K45 and its amendment; the
+full pass completed across runs; K46), not built yet.* What a run reads,
+what the partition record keeps of it, and whether the status derived
+from that record tells the truth. `Execution.tla` keeps the engine,
+faults and resets with default runs; this model leaves them out to reach
+three keys.
+
+```bash
+spec/tla/check.sh positions          # base, each, the calibrations: ~1 min
+spec/tla/check.sh positions three    # three keys: the note's k1, k2, k3
+```
+
+**State.** A chain `S -> A -> B` of keyed outputs, one partition each.
+`A` copies `S`; `B` copies `A` under its patterns, `each=True` or not.
+Every commit has a fresh id, and a key's version is the id of the commit
+that last wrote it (0: absent). A run plans one batch when it claims the
+partition and commits it later; the upstream may commit in between. The
+record of an incremental input: a snapshot (the upstream commit read
+through); the read-ahead, the keys `keys=` runs read past it with the
+version read (K45: the amendment's `(commit, attempt)` entries say the
+same), at most `MaxEntries` of them; the full pass due after a reset or
+an asset change, with the keys it delivered; for `each=True`, the
+version each key was read at; and the definition the last finished pass
+was under. A ghost records, per output key, the input version and the
+definition it was produced from: the truth the record is checked
+against.
+
+**Runs.** A `keys=` run in a pass delivers its key into the pass, the
+first delivery starting the output over; outside one, it reads its key
+ahead if it is behind. A default run in a pass delivers the keys not yet
+delivered at their version and finishes the pass; outside one, what is
+behind. A keys= commit that leaves nothing behind finishes the pass or
+collapses the read-ahead. An attempt planned before a reset of its
+output or its input, or before an asset change, or against a record that
+moved since, commits nothing.
+
+**Properties.**
+
+| Property | Says |
+|---|---|
+| `StatusExact` | with no attempt in flight, the status the record gives equals the truth: the output holds exactly its input's keys under its patterns, each produced from the input's current version under its current definition, and, for `B`, so does `A` (K46: stale if its upstream is) |
+| `DeliveredOnce` | no key is delivered again at the input version, under the definition, it was produced from (K45, and the pass completed across runs) |
+
+**Calibration.**
+
+| Rule off | TLC finds |
+|---|---|
+| `FixNet`: "behind" is the net delta (K39) | `StatusExact`, 4 steps: a key added and removed past the position counts as behind, though a rerun changes nothing |
+| `FixTransitive`: stale if an upstream is (K46) | `StatusExact`, 3 steps: `S` commits; `B` looks fresh to its own check while `A` is stale |
+| `FixSkip`: a default run skips a key a `keys=` run read at its version | `DeliveredOnce`, 8 steps |
+| `FixContinue`: a default run continues a pass `keys=` runs began | `DeliveredOnce`, 6 steps: it starts the pass over and delivers their keys again |
+| `FixCollapse`: a `keys=` commit collapses the record only once nothing is behind | `StatusExact`, 4 steps |
+
+**Results.**
+
+| Model | Keys | Distinct states | Time |
+|---|---|---|---|
+| `base`: `B` not `each`; two commits to `S`, two `keys=` runs, one deploy, one read-ahead entry | 2 | 1,857,464 | 14 s |
+| `each`: `B` is `each=True` | 2 | 1,857,464 | 14 s |
+| `three` | 3 | 7,388,487 | 1 min 10 s |
+
+`each` reaches the same states as `base`: in this chain, which copies
+keys one to one, the snapshot and its read-ahead answer exactly as the
+per-key records do.
+
+**What the model found** (design points, sent to W22):
+- *A key read ahead, then removed upstream.* `A`'s snapshot is at `N`;
+  `S` adds key 1, a `keys=(1)` run reads it, `S` removes it. The net
+  delta past `N` is empty (key 1 absent at both ends), so neither the
+  status nor the next default run looks at it, and `A` keeps key 1 for
+  good. The rule: a key's last read version is the read-ahead's, else the
+  snapshot's; a read-ahead key whose version changed since is behind.
+- *The latest read wins.* Two reads of one key, in a pass or ahead, keep
+  only the later; the higher version is not the later one (a removal is
+  0).
+- *An asset change invalidates attempts in flight.* A batch planned
+  under the old definition must not finish the pass due under the new
+  one: the model refuses its commit, as for a reset. The note does not
+  say yet; W22 to confirm.
+- *A start-over drops the records of the keys it does not deliver.*
 
 ## Formal model: the journal object (`spec/tla/JournalObject.tla`)
 

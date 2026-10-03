@@ -10,6 +10,7 @@
 #   journal    ci: small, fixed, live and the calibrations; big: three engines, six writes
 #   attempt    ci: small, dup, live and the calibrations; big: two attempts with a
 #              duplicate worker each (too large to finish)
+#   positions  ci: base, each and the calibrations; three: three keys
 #   every spec: calibrate (each rule switched off: TLC must find its bug), all
 #
 # A model is its spec's base config ({Spec}.cfg) with changes (`model` below):
@@ -40,23 +41,21 @@ model() {
     case $1/$2 in
         # Execution.tla: the plain pipeline, keys 1 and 2, B declared.
         execution/smoke) changes=() ;;
-        execution/store) changes=(MaxDeploy=2 "$move" MaxKeysRuns=1 WithB=FALSE) ;;
+        execution/store) changes=(MaxDeploy=2 "$move" WithB=FALSE) ;;
         execution/reset) changes=(MaxDeploy=1 "$move") ;;
         execution/shape) changes=(MaxDeploy=2 'Deploys={"pattern", "bump"}') ;;
         execution/remove) changes=(MaxDeploy=2 'Deploys={"remove"}') ;;
         execution/zombie) changes=(MaxFault=1 'Faults={"takeover", "zombie"}' WithB=FALSE) ;;
-        execution/deploys) changes=(MaxDeploy=1 "$every_deploy" MaxKeysRuns=1) ;;
+        execution/deploys) changes=(MaxDeploy=1 "$every_deploy") ;;
         execution/faults) changes=(MaxFault=2 'Faults={"worker", "crash", "takeover", "timeout", "cancel", "zombie"}') ;;
         execution/each)
             changes=(MaxDeploy=1 "$every_deploy" MaxFault=1 'Faults={"worker", "crash", "timeout", "cancel"}' Each=TRUE) ;;
         execution/safety)
-            changes=(MaxDeploy=2 "$every_deploy" MaxFault=2 MaxKeysRuns=1 MaxAtt=14 MaxTries=4
+            changes=(MaxDeploy=2 "$every_deploy" MaxFault=2 MaxAtt=14 MaxTries=4
                      'Faults={"worker", "crash", "takeover", "timeout", "cancel", "zombie"}' -Quiesces) ;;
         execution/F6) changes=(MaxFault=1 'Faults={"cancel"}' FixF6=FALSE -RunsEndCaughtUp) ;;
         execution/F10) changes=(MaxDeploy=2 'Deploys={"pattern", "bump"}' FixF10=FALSE -RunsEndCaughtUp) ;;
         execution/move) changes=(MaxDeploy=1 "$move" ResetOnMove=FALSE FixF17=FALSE -RunsEndCaughtUp) ;;
-        execution/F17) changes=(MaxDeploy=2 "$move" MaxKeysRuns=1 FixF17=FALSE -Quiesces) ;;
-        execution/selection) changes=(MaxDeploy=2 "$move" MaxKeysRuns=1 WithB=FALSE FixSelection=FALSE -Quiesces) ;;
         execution/F22-move) changes=(MaxSrc=0 MaxDeploy=1 "$move" WithB=FALSE FixF22=FALSE -RunsEndCaughtUp) ;;
         execution/F22-shape) changes=(MaxSrc=0 MaxDeploy=1 'Deploys={"pattern", "bump"}' FixF22=FALSE -RunsEndCaughtUp) ;;
         execution/F22-add) changes=(MaxSrc=0 MaxDeploy=2 'Deploys={"remove"}' FixF22=FALSE -RunsEndCaughtUp) ;;
@@ -84,6 +83,15 @@ model() {
         attempt/engine-swaps) changes=(EngineSwaps=FALSE -OneOutcome) ;;
         attempt/classify) changes=(Classify=FALSE) ;;
         attempt/offer) changes=(OfferDurable=FALSE) ;;
+        # Positions.tla: keys 1 and 2, B not each=True, every rule as designed.
+        positions/base) changes=() ;;
+        positions/each) changes=(Each=TRUE) ;;
+        positions/three) changes=(NK=3 MaxSrc=2 MaxKeysRuns=2) ;;
+        positions/net) changes=(FixNet=FALSE) ;;
+        positions/transitive) changes=(FixTransitive=FALSE) ;;
+        positions/skip) changes=(FixSkip=FALSE) ;;
+        positions/continue) changes=(FixContinue=FALSE) ;;
+        positions/collapse) changes=(FixCollapse=FALSE) ;;
         *) echo "no model $2 of $1" >&2; exit 2 ;;
     esac
 }
@@ -97,8 +105,6 @@ calibration() {
             calibrate F6 Quiesces           # 1cad0bd: a pass that ends behind the head ends the task
             calibrate F10 PositionHonest    # a full pass its patterns take nothing from never reaches B
             calibrate move PositionHonest   # synthetic: a store move that changes neither the fingerprint nor the plan
-            calibrate F17 RunsEndCaughtUp   # after a move resets A, a keys= run reads only its key into the new output, and succeeds
-            calibrate selection RunsEndCaughtUp  # a keys= run made a full pass ends after its first batch
             calibrate F22-move Quiesces     # d6585fb: a move resets A, and nothing fires A until S changes
             calibrate F22-shape Quiesces    # K34: B's patterns or version change, and nothing fires B
             calibrate F22-add Quiesces      # K34: B is removed and added back, and nothing fires B
@@ -117,6 +123,21 @@ calibration() {
             # Cleanup that LISTs after its move deletes a newer engine's
             # checkpoint before that engine's move names it: the state is lost.
             calibrate list-first NoAckedLoss
+            ;;
+        positions)
+            # K39 with the net rule: a key added and removed past the position
+            # counted as behind, though nothing would be delivered.
+            calibrate net StatusExact
+            # K46: B looks fresh to its own check while A, its input, is stale.
+            calibrate transitive StatusExact
+            # K45: a default run delivers again a key a keys= run already read
+            # at its version.
+            calibrate skip DeliveredOnce
+            # The correction: a default run starts over a pass keys= runs
+            # began, delivering their keys again.
+            calibrate continue DeliveredOnce
+            # K45: a keys= commit collapses the record while a key is behind.
+            calibrate collapse StatusExact
             ;;
         attempt)
             # A create-if-absent gate with nothing retained: a worker that read its
@@ -211,7 +232,8 @@ run() {  # run SPEC GROUP
         execution) module=Execution ;;
         journal) module=JournalObject ;;
         attempt) module=Attempt ;;
-        *) echo "usage: $0 [ci | execution|journal|attempt [GROUP|MODEL]]" >&2; exit 2 ;;
+        positions) module=Positions ;;
+        *) echo "usage: $0 [ci | execution|journal|attempt|positions [GROUP|MODEL]]" >&2; exit 2 ;;
     esac
     case $spec/$2 in
         execution/ci) check smoke; calibration execution ;;
@@ -222,6 +244,8 @@ run() {  # run SPEC GROUP
         journal/ci) check small; check fixed; check live; check failures; calibration journal ;;
         journal/all) run journal ci; check big ;;
         attempt/ci) check small; check dup; check live; calibration attempt ;;
+        positions/ci) check base; check each; calibration positions ;;
+        positions/all) run positions ci; check three ;;
         attempt/all) run attempt ci; check big ;;
         */calibrate) calibration "$spec" ;;
         *) check "$2" ;;
@@ -229,6 +253,6 @@ run() {  # run SPEC GROUP
 }
 
 case ${1:-ci} in
-    ci) for s in execution journal attempt; do echo "# $s"; run $s ci; done ;;
+    ci) for s in execution journal attempt positions; do echo "# $s"; run $s ci; done ;;
     *) run "$1" "${2:-ci}" ;;
 esac
