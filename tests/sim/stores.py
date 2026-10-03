@@ -29,7 +29,7 @@ class Database:
     fences: dict[tuple[str, str], tuple[int, str]] = field(default_factory=dict)
     locks: dict[tuple[str, str], asyncio.Lock] = field(default_factory=dict)
     commits: int = 0
-    # Every committed store transaction: (began at, actor, generation, invocation)
+    # Every committed store transaction: (began at, actor, generation, worker id)
     writes: list[tuple] = field(default_factory=list)
     # (kind, scope) -> None | "error" | "lost", plus a delay: the simulation's say over one transaction
     fault: Callable[[str, object], tuple[str | None, float]] | None = None

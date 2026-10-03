@@ -481,9 +481,9 @@ class Simulation(RuleBasedStateMachine):
     @invariant()
     def fenced_writes_hold_their_gate(self):
         """docs/lifecycle.md §2.4, §3: a worker writes to a fenced store only
-        after it took its attempt's gate (`writing`, its own invocation): an
+        after it took its attempt's gate (`writing`, its own worker id): an
         attempt the engine ended (`aborted`, `closed`), or a duplicate
-        invocation, writes nothing."""
+        worker, writes nothing."""
 
         if self.world is None:
             return
@@ -500,7 +500,7 @@ class Simulation(RuleBasedStateMachine):
             gate = self.journal.gates.get(who[1])
             if gate is None or gate[0] != "writing" or gate[1] != worker_id or gate[2] > at:
                 raise Violation(
-                    f"{who} wrote to a fenced store at t={at:g} (invocation {worker_id}); "
+                    f"{who} wrote to a fenced store at t={at:g} (worker {worker_id}); "
                     f"its gate: {gate and gate[:2]}{f' from t={gate[2]:g}' if gate else ''}"
                 )
 

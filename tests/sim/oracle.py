@@ -35,7 +35,7 @@ class Journal:
     )  # (seq, path, when): segments that landed again, other bytes
     now: object = None  # the world's clock
     applied_commits: set = field(default_factory=set)  # attempts some engine committed in memory
-    gates: dict[str, tuple] = field(default_factory=dict)  # attempt -> (state, invocation, landed at)
+    gates: dict[str, tuple] = field(default_factory=dict)  # attempt -> (state, worker id, landed at)
 
     def landed(self, path: str, data: bytes) -> None:
         if path.endswith(lifecycle.GATE):
