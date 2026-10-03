@@ -265,6 +265,11 @@ rules, not invariant checks. `pg`: `items` may also live in Postgres.
 | Q1–Q3 | `split` on a `Pool` | 301–303 | 542 runs, 23,897 steps | default ×2, pg | a pool host never took an attempt again after its worker died before the claim (a simulation bug, fixed); F16 set aside twice |
 | R1–R3 | `Pool` (fixed), `watch` requests runs | 511–513 | 503 runs, 23,744 steps | default ×2, pg | F17; F13 by a takeover; F16 set aside once |
 | S1–S3 | cb3367b (F13, F17 set aside) | 521–523 | 572 runs, 26,112 steps, 121 h | default ×2, pg | green; F13 set aside 3 times |
+| L1 | a780a55 (main) | 601 | 1,059 runs, 73,668 steps, 323 h virtual | default | green; F16 set aside 6 times |
+| L2 | a780a55 | 602 | 616 runs × up to 120 steps, 67,036 steps, 260 h | default | green; F13 set aside 4 times |
+| L3 | a780a55 | 603 | 527 runs, 29,798 steps, 161 h | pg | green; F13 set aside 10 times |
+| L4 | a780a55 | 604 | 435 runs × up to 80 steps, 31,285 steps, 187 h | pg | green; F13 set aside 8 times |
+| T1 | `break_watch` | 701 | 158 runs, 7,293 steps | default | green |
 
 ## Formal model: execution semantics (`spec/tla/Execution.tla`)
 
