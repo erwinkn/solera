@@ -693,6 +693,9 @@ pub fn merge_ranges(
     Ok(w.files.into_iter().collect())
 }
 
+/// Counts per class, and the keys and their classes when asked.
+pub type Classed = ([u64; 4], Vec<Vec<u8>>, Vec<u8>);
+
 /// Prototype (docs/presence-at-position.md): the delta log's runs (newest
 /// first) merged, each key classed by its state before the oldest run and
 /// after the newest: 0 added, 1 updated, 2 removed, 3 neither (added and
@@ -702,7 +705,7 @@ pub fn presence(
     runs: &[Vec<&[u8]>],
     codecs: &[u8],
     with_keys: bool,
-) -> Result<([u64; 4], Vec<Vec<u8>>, Vec<u8>)> {
+) -> Result<Classed> {
     let mut m = fed(runs, codecs)?;
     let (mut counts, mut keys, mut classes) = ([0u64; 4], Vec::new(), Vec::new());
     loop {
