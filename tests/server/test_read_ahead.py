@@ -169,3 +169,36 @@ async def test_a_full_pass_due_runs_across_keys_runs(state, tmp_path, then):
     position = engine.m.position("copy", "feed", "")
     assert "pass" not in position and "ahead" not in position, "the record collapsed to a snapshot"
     assert engine.m.partition("copy", "")["caught_up"] is True
+
+
+async def test_a_key_read_ahead_then_removed_upstream_is_behind(state, tmp_path):
+    """Positions.tla, point 1: k4 is added past the snapshot and read ahead
+    by keys=(k4); then the upstream removes it. Absent at both ends, the net
+    delta past the snapshot omits it, but its read-ahead entry read it: it is
+    behind, and the next pass delivers its removal."""
+
+    engine, commit, seen = await built(state, tmp_path)
+    await commit(k4="1", k1="2")
+    await drive(engine, await engine.submit(["copy"], keys={"feed": {"keys": ["k4"]}}))
+    assert seen == [(["k4"], [])] and len(ahead(engine)) == 1
+    await commit(k4=None)
+    assert await engine.stale_reasons("copy", "") == ["input changed"]
+    await drive(engine, await engine.submit(["copy"]))
+    assert seen[1:] == [(["k1"], ["k4"])]
+    assert "k4" not in (await engine.list_keys("copy"))["keys"]
+
+
+async def test_the_latest_read_of_a_key_wins(state, tmp_path):
+    """Positions.tla, point 2: keys=(k1) reads k1, the upstream removes it,
+    keys=(k1) reads its removal. The latest read wins (a removal is no
+    version, not the lowest): the next pass delivers k2 alone."""
+
+    engine, commit, seen = await built(state, tmp_path)
+    await commit(k1="2", k2="2")
+    await drive(engine, await engine.submit(["copy"], keys={"feed": {"keys": ["k1"]}}))
+    await commit(k1=None)
+    await drive(engine, await engine.submit(["copy"], keys={"feed": {"keys": ["k1"]}}))
+    assert seen == [(["k1"], []), ([], ["k1"])]
+    await drive(engine, await engine.submit(["copy"]))
+    assert seen[2:] == [(["k2"], [])]
+    assert await engine.stale_reasons("copy", "") == []

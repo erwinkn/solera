@@ -1,8 +1,12 @@
 # Positions from what was read (design note, K43, K45)
 
 Status: **approved** by Erwin (K43, amended by K45 and its read-ahead
-entries). The plain incremental read-ahead is built; per-key records and
-staleness are being built. It supersedes K36–K42 and K40's wording.
+entries, K46), and **built**: the plain incremental read-ahead and the full
+pass across runs, staleness as three predicates. On hold: `each=True`
+per-key records (Positions.tla found K45's snapshot plus read-ahead as
+precise in a 1:1 chain). Waiting: exact presence at the position (K44's
+added and updated, a net "behind"), for a design study. It supersedes
+K36–K42 and K40's wording.
 
 ## Units
 
@@ -92,6 +96,13 @@ locates the spec), and stores no per-key version. The record is snapshot
   is bumped. keys=(k1) starts over with k1; keys=(k2, k3) continues, and
   `copy` is fresh. Or, after keys=(k1), a default run delivers k2 and k3
   and finishes.
+- **A batch planned before an asset change does not commit** (Positions.tla,
+  approved): its commit is refused, as for a reset, when the declaration
+  the fingerprint takes (version, store versions, migrations) changed since
+  its claim. What it built is the old definition's, so it cannot finish the
+  full pass the change makes due; the run goes on with a fresh attempt. A
+  rename changes no definition: an attempt in flight commits under the new
+  name.
 - **A pattern change under way** decides membership first: a `keys=` run
   meanwhile merges the keys it names and records nothing.
 
@@ -162,12 +173,33 @@ items is stale (input changed), and so is copy (upstream stale), though
 items has not moved. Automations are unchanged: `OnChange` fires on real
 commits, and copy's input changes once items reruns.
 
-As built, an incremental input is behind when a key its patterns take
-changed past `next` and is not read ahead at or after its change, or when
-there is no position or a pass under way; a whole or dep input, when its
-version differs from the one recorded at the last catch-up (`seen`). One
-case over-reports until the range scan of K44 lands: a key added and
-removed past `next` counts, though it nets out.
+Each reason is its own predicate, a function of the records, and the
+reported reasons are exactly those that hold (Erwin's ruling); nothing is
+kept of earlier causes, and each clears on its own condition:
+
+- `definition_changed`: the asset changed since the partition last caught
+  up. A pass under the new definition clears it.
+- `input_changed`: an upstream reset replaced its input's content since it
+  caught up (the model records when it dropped the position); or an
+  incremental input has a key its patterns take changed past `next`, not
+  read ahead at or after its change; or a whole or dep input is at another
+  version than the one recorded at the last catch-up (`seen`). A missing
+  position, or a pass under way, counts only when the asset's own change
+  did not make that pass due: a full pass due only to an asset change is
+  `definition changed` alone, until commits land past its base. A pass
+  that reads the new upstream clears it.
+- `upstream_stale`: a partition it reads is itself stale.
+
+So an upstream reset followed by the asset's own change reports both.
+A key's last read is its read-ahead entry's, else the snapshot's, and the
+latest read wins: a key read ahead and then removed upstream is behind,
+whatever a net delta past the snapshot says (Positions.tla). One case
+over-reports until exact presence lands: a key added and removed past
+`next` counts, though it nets out.
+
+What can be stale is what was built since its outputs' last reset: a
+head, or a commit (a `keys=` run that took no key included). Never built,
+or reset since, it is missing.
 
 - **key** (`each=True`): its input key's current generation differs from
   its payload (or the key is missing, or removed upstream); or a shared

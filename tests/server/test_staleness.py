@@ -34,7 +34,6 @@ def pending(why: str):
 per_key = pending("each=True per-key records: not built (W22: next)")
 net_delta = pending("the net delta: over-reports until K44's range scan (W22)")
 k44 = pending("K44: added/updated/removed and ctx.load(): not built")
-ruling = pending("a full pass due only to an asset change reports definition changed alone (ruling; W22)")
 
 
 def taken(key: str) -> bool:
@@ -526,7 +525,6 @@ async def test_a_non_each_keyed_outputs_keys_go_stale_together(state, tmp_path):
     assert not await staleness.partition_stale(engine, "copy")
 
 
-@ruling
 @pytest.mark.parametrize("then", ["keys", "default"])
 async def test_a_full_pass_after_an_asset_change_may_take_several_runs(state, tmp_path, then):
     """The full pass (Erwin's correction to K45): `copy` holds k1, k2, k3;

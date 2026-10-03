@@ -721,6 +721,9 @@ class Model:
             if key[0] not in assets:
                 del self.partitions[key]
                 continue
+            if key[0] in producers:  # a new life: never built, so missing, not stale
+                for field in ("caught_up", "caught_up_at", "seen"):
+                    self.partitions[key].pop(field, None)
             positions = self.partitions[key].get("positions")
             if not positions:
                 continue
@@ -731,9 +734,10 @@ class Model:
             ]
             for input in dropped:
                 del positions[input]
+            if dropped and key[0] not in producers:  # its input's content replaced: a fact staleness reads
+                self.partitions[key]["input_reset_at"] = self.event_counter
             if not positions:
                 del self.partitions[key]["positions"]
-        return producers
         return producers
 
     def _apply_aliases(self, manifest) -> tuple[dict[str, list[str]], dict[str, str]]:
@@ -1068,6 +1072,7 @@ class Model:
                 for intent in self.repairs.pop((name, partition), ()):
                     self.garbage.extend([index.path(f["name"]), self.event_counter] for f in intent["files"])
         record = self._partition(asset, partition)
+        record.setdefault("caught_up", False)  # built, though maybe not caught up (a keys= run)
         if "caught_up" in commit:
             record["caught_up"] = bool(commit["caught_up"])
             if record["caught_up"]:

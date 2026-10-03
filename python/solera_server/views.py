@@ -63,14 +63,13 @@ class Views:
                 head, record = scoped.get(partition), recorded.get(partition)
                 last = (record or {}).get("outcome")
                 done = planner.materialized(asset, partition)
-                reasons = (
-                    await self.stale_reasons(asset, partition, memo) if done and current(partition) else []
-                )
-                stale = bool(reasons)
+                reasons = await self.stale_reasons(asset, partition, memo) if current(partition) else []
                 status = (
                     "removed"
                     if not current(partition)
-                    else ("stale" if stale else "materialized")
+                    else "stale"
+                    if reasons
+                    else "materialized"
                     if done
                     else "running"
                     if partition in pending

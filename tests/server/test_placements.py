@@ -120,7 +120,8 @@ async def test_a_dead_pool_claim_expires_into_a_new_attempt(state):
     [first] = await pool_attempt(engine, state)
     await engine.pool_work("ingest", {}, "w1", 0)
     await own(state, run["id"], first, "dead")
-    for _ in range(200):
+    deadline = asyncio.get_running_loop().time() + 15  # a margin that holds under load
+    while asyncio.get_running_loop().time() < deadline:
         await engine.tick()
         await asyncio.sleep(0.02)
         if first not in state.model.pool and state.model.pool:

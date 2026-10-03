@@ -939,6 +939,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
             # The version of each whole or dep input read: a catch-up records it, and a
             # partition whose inputs moved since is stale (docs/positions-from-reads.md).
             "seen": {i.param: self._input_version(planner, i) for i in inputs if self._versioned(i)},
+            "declaration": digest(self._declaration(asset)),
             "prefixes": self._prefixes(pins, outputs, task),
             "inputs": pins,
             "lineage": lineage,
@@ -1002,6 +1003,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
                 "version",
                 "deploy_number",
                 "seen",
+                "declaration",
                 "prefixes",
                 "plans",
                 "more",
@@ -1556,17 +1558,22 @@ class Engine(Attempts, Sensors, Staleness, Views):
         position that reads it or is its asset's (`Model._reset`); a rename
         keeps everything."""
 
+        return digest({**self._declaration(asset), "config": run.get("config") or {}, "refs": pinned})
+
+    def _declaration(self, asset: dict) -> dict:
+        """What of an asset's declaration its outputs are built under: its
+        version, the versions of the stores it writes and reads, its
+        migrations. A change makes a full pass due: an attempt claimed
+        before it does not commit (Positions.tla; docs/positions-from-reads.md).
+        Not its name: a rename keeps everything."""
+
         names = {o["name"] for o in asset["outputs"]} | {i["output"] for i in asset["inputs"].values()}
         outputs, stores = self.manifest["outputs"], self.manifest["stores"]
-        return digest(
-            {
-                "version": asset["version"],
-                "stores": sorted(stores[outputs[n]["store"]]["version"] for n in names | set(asset["deps"])),
-                "migrations": {o["name"]: o["migrations"] for o in asset["outputs"] if o.get("migrations")},
-                "config": run.get("config") or {},
-                "refs": pinned,
-            }
-        )
+        return {
+            "version": asset["version"],
+            "stores": sorted(stores[outputs[n]["store"]]["version"] for n in names | set(asset["deps"])),
+            "migrations": {o["name"]: o["migrations"] for o in asset["outputs"] if o.get("migrations")},
+        }
 
     # -- the placement loop (§10) ---------------------------------------------------
 
@@ -1615,6 +1622,14 @@ class Engine(Attempts, Sensors, Staleness, Views):
         for kind, name in reset:
             if self.m.reset_at.get((kind, name), 0) > prepared["deploy_number"]:
                 raise Conflict(f"{kind} {name} was reset since this attempt launched")
+        # Nor does a batch planned before an asset change finish the full pass due
+        # after it: what it built is the old definition's (Positions.tla).
+        current = self.manifest["assets"].get(task["asset"])
+        if current is not None and prepared.get("declaration") not in (
+            None,
+            digest(self._declaration(current)),
+        ):
+            raise Conflict(f"asset {task['asset']} changed since this attempt launched")
         outputs = current_names(prepared, result.get("outputs") or {})
         # Settled under the contract it was launched with, not today's manifest.
         declared = {name: info["contract"] for name, info in (prepared.get("outputs") or {}).items()}

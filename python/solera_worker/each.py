@@ -156,7 +156,9 @@ async def read_batch(pin: dict, keys_io) -> Batch:
         named = sorted({str(k) for k in ch["keys"]})
         found = await index.lookup([key_bytes(k) for k in named])
         upserted = {key_str(k): generation for k, (generation, _) in found.items()}
-        gone = [k for k in named if k not in upserted and taken(k)]
+        # A named key the upstream has not is removed (R2) — but not within a full pass,
+        # whose consumer holds only what the pass delivered: never there, never removed.
+        gone = [] if ch.get("scan") else [k for k in named if k not in upserted and taken(k)]
         batch = Batch({k: e for k, e in upserted.items() if taken(k)}, gone, None, len(named))
         if ch.get("scan"):  # a full pass's delivery: whether it leaves any key undelivered (K45)
             batch.covers = await _covers(index, taken, set(named), ahead, ch.get("walked"))
