@@ -234,7 +234,7 @@ lineage:  B ← A, generation 12                    (g12 committed)
 | `Each` full redelivery (truncated log, reset) | Every key is processed and written again; its consumers reprocess everything | accepted |
 | Pattern change | Newly matched keys are delivered at their generation; unmatched ones removed | yes |
 | Unknown `Sql` writes | §5: a rewrite, or a key scan before a patch | yes |
-| Store move | The moved output starts over (`59812c4`): a fresh index, a whole first write, every key at a new generation, consumers take everything | yes |
+| Store move | A reset: the moved output is a new one (object-store-state.md §2) — no head, a fresh index, a whole first write, every key at a new generation; its consumers and its own inputs start over | yes |
 | Rename | Index entries, generations and object names stay | yes |
 | Failed keys retry, upstream changed | The failure record's upstream generation differs from the key's in the pinned input, so the key comes with the delta pass instead (`per-key-processing.md` §9) | yes |
 

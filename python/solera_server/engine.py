@@ -49,7 +49,7 @@ from solera.keys.io import ObjectIO
 from solera.sdk import digest
 
 from . import bookmarks, history, planning
-from .attempts import POOL_OFFERED_GRACE, Attempts, Live, current_names, moved, worker_report
+from .attempts import POOL_OFFERED_GRACE, Attempts, Live, current_names, worker_report
 from .executors import PlacementContext, Registry
 from .history import MAX_METADATA, History, RunFilter
 from .keyservice import KeyService, cache_root
@@ -799,18 +799,12 @@ class Engine(Attempts, Sensors, Views):
                     "incremental": output.get("incremental"),
                 },
             }
-            # Whether the write starts the content over: a first write, a full run,
-            # or one in a store the head is not in (`moved`), which holds none of it.
-            elsewhere = moved(info)
-            info["reset"] = reset or head is None or elsewhere
+            # Whether the write starts the content over: a first write (an output
+            # reset by a move holds no head), or a full run.
+            info["reset"] = reset or head is None
             if output.get("incremental"):
                 info["commit_number"] = int((head or {}).get("commit_number", -1)) + 1
-            if output.get("key") is not None and elsewhere:
-                # Its key index names the old store's objects: it starts over too, at
-                # a prefix of its own, and the commit replaces it (`Model._commit_keys`).
-                current = self.m.index(name, partition)
-                info["index"] = IndexState(prefix=f"{current.prefix}{info['commit_number']:012d}/").to_json()
-            elif output.get("key") is not None:
+            if output.get("key") is not None:
                 info["index"] = self.m.index(name, partition).slice().to_json()
                 if (name, partition) in self.m.repairs:
                     info["repairs"] = self.m.repairs[(name, partition)]
@@ -829,6 +823,7 @@ class Engine(Attempts, Sensors, Views):
                 lineage.append([input.output, ref.get("partition") or "", ref.get("generation"), input.param])
         return {
             "version": asset["version"],
+            "deploy_number": self.m.deploy_number,
             "prefixes": self._prefixes(pins, outputs, task),
             "inputs": pins,
             "lineage": lineage,
@@ -890,6 +885,7 @@ class Engine(Attempts, Sensors, Views):
             k: prepared.get(k)
             for k in (
                 "version",
+                "deploy_number",
                 "prefixes",
                 "plans",
                 "more",
@@ -973,10 +969,16 @@ class Engine(Attempts, Sensors, Views):
         )  # `latest`: the head this batch is planned against
         override = (run.get("keys") or {}).get(output)
         wm = self.m.bookmark(task["asset"], param, task["partition"])
-        if isinstance(override, dict) and "keys" in override:
-            # A keys= selection reads the keys it names, whatever the bookmark — none
-            # yet, a pass under way, a reset due — and moves neither it nor the
-            # partition's progress. The input's patterns still decide which it takes (§11).
+        # A partition whose bookmarks a reset took — its upstream's, or its own
+        # outputs' — has no position to keep: a keys= run reads a full pass, to its
+        # last batch before the run succeeds, as any other run does (K10).
+        starts_over = self.m.partition(task["asset"], task["partition"]).get("reset") and (
+            wm is None or (wm.get("reset_by") == run["id"] and "pass" in wm)
+        )
+        if isinstance(override, dict) and "keys" in override and not starts_over:
+            # A keys= selection reads the keys it names, whatever the bookmark — a
+            # pass under way, a reset due — and moves neither it nor the partition's
+            # progress. The input's patterns still decide which it takes (§11).
             keys = sorted({str(k) for k in override["keys"]})
             pin = {"ref": ref, "batch": {"keys": keys, "full": False}}
             pin["index"] = self.m.index(output, upstream_partition).slice().to_json()  # the keys' locators
@@ -994,13 +996,6 @@ class Engine(Attempts, Sensors, Views):
         if not reset and not keyed:
             under_way = wm.get("pass")
             reset = int(under_way["from"]) < first if under_way else int(wm["next"]) <= first
-        elif not reset and first:
-            # A keyed upstream that moved store started its index over at `base`, the
-            # move's commit, whose delta holds only upserts: a pass begun at or
-            # before it — planned against the old index — starts over (F9).
-            under_way = wm.get("pass") or {}
-            start = under_way.get("from", wm.get("next"))
-            reset = start is not None and int(start) <= first
         carried = {
             "kind": "keys" if keyed else "commits",
             "output": output,
@@ -1333,22 +1328,20 @@ class Engine(Attempts, Sensors, Views):
         return [output, ref.get("partition") or "", ref.get("generation")]
 
     def _fingerprint(self, asset, run, pinned):
-        """H(version, store versions of input+output stores, run config,
-        the non-Incremental inputs and deps, as `_logical` sees them) —
-        per-key interpretation state; a change resets the input's bookmark
-        (§2.2, §6)."""
+        """H(version, the store version of each output it writes and reads,
+        run config, the non-Incremental inputs and deps, as `_logical` sees
+        them) — per-key interpretation state; a change resets the input's
+        bookmark (§2.2, §6). Neither which store holds an output nor its name
+        is in it, only the versions: a move resets the output, and every
+        bookmark that reads it or is its asset's (`Model._reset`); a rename
+        keeps everything."""
 
-        stores = set()
-        for output in asset["outputs"]:
-            stores.add(output["store"])
-        for input in asset["inputs"].values():
-            stores.add(self.manifest["outputs"][input["output"]]["store"])
-        for dep in asset["deps"]:
-            stores.add(self.manifest["outputs"][dep]["store"])
+        names = {o["name"] for o in asset["outputs"]} | {i["output"] for i in asset["inputs"].values()}
+        outputs, stores = self.manifest["outputs"], self.manifest["stores"]
         return digest(
             {
                 "version": asset["version"],
-                "stores": sorted(f"{name}@{self.manifest['stores'][name]['version']}" for name in stores),
+                "stores": sorted(stores[outputs[n]["store"]]["version"] for n in names | set(asset["deps"])),
                 "migrations": {o["name"]: o["migrations"] for o in asset["outputs"] if o.get("migrations")},
                 "config": run.get("config") or {},
                 "refs": pinned,
@@ -1385,10 +1378,18 @@ class Engine(Attempts, Sensors, Views):
         # cover only the batch it was given, and a moved input changes the
         # next attempt's fingerprint. Refusing here would only strand a write
         # a shared-table store has already made.
-        # Output heads must be unchanged since the claim.
+        # Output heads must be unchanged since the claim, and no output it writes or
+        # reads incrementally reset since it launched (removed, or moved to another
+        # store): what it built belongs to the output's earlier life.
         for output, info in (prepared.get("outputs") or {}).items():
             if commit_of(self.m.heads.get((output, task["partition"]))) != commit_of(info["head"]):
                 raise Conflict(f"output {output} head changed since this attempt was claimed")
+        upstreams = [
+            p["bookmark"]["output"] for p in (prepared.get("plans") or {}).values() if p and "bookmark" in p
+        ]
+        for output in [*(prepared.get("outputs") or {}), *upstreams]:
+            if self.m.reset_at.get(output, 0) > prepared["deploy_number"]:
+                raise Conflict(f"output {output} was reset since this attempt launched")
         outputs = current_names(prepared, result.get("outputs") or {})
         # Settled under the contract it was launched with, not today's manifest.
         declared = {name: info["contract"] for name, info in (prepared.get("outputs") or {}).items()}
@@ -1434,15 +1435,9 @@ class Engine(Attempts, Sensors, Views):
                     raise Conflict(f"keyed output {name}: the result carries no key delta", retryable=False)
                 head["commit_number"] = int((before or {}).get("commit_number", -1))
                 if delta is not None:
-                    if delta["files"] or moved(info):
+                    if delta["files"]:
                         head["commit_number"] = int(info["commit_number"])
                     keys[name] = {**delta, "commit_number": head["commit_number"]}
-                # A move starts the index over at its commit, as a reset starts an
-                # unkeyed output over: no pass begun before it reads it as a delta (F9).
-                if moved(info):
-                    head["base"] = head["commit_number"]
-                elif (before or {}).get("base"):
-                    head["base"] = before["base"]
                 if "partitions" in info:
                     head["partitions"] = entry.get("partitions", info["partitions"])
             elif decl.get("incremental"):

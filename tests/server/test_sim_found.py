@@ -393,15 +393,19 @@ async def test_a_name_removed_and_added_back_starts_over(state):  # noqa: F811
     assert m.heads[("mirror", "")]["ref"]["generation"] == copied  # copy's state, not the first life
 
 
-async def test_a_key_a_moved_output_dropped_leaves_its_consumer(state, tmp_path):  # noqa: F811
-    """F9: a keyed output moved to another store starts its index over, and
-    the move's first write holds only upserts. `copy`, planned under the new
-    project but against the old index, commits its pass after the move
-    landed: its bookmark then reaches the move's commit, and the move must
-    not be read as a plain delta — `k11`, which the move dropped, goes."""
+async def test_a_key_a_moved_output_dropped_leaves_its_consumer(state, tmp_path, monkeypatch):  # noqa: F811
+    """F9, under the reset rule: a move makes `items` a new output, so its
+    consumer starts over on it. `copy`'s attempt, launched before the move,
+    is refused when it settles — its upstream was reset since — and its
+    retry reads the new `items` in a full pass: `k11`, which the move's first
+    write left out, goes."""
 
+    from solera_server import attempts
+
+    monkeypatch.setattr(attempts, "AFTER_COMMIT_WAIT", 0.2)  # the stopped engine's answer to `finished`
     rows = {"items": [{"id": "k10"}, {"id": "k11"}]}
     entered, release = asyncio.Event(), asyncio.Event()
+    calls = []
 
     def project(store):
         @asset(outputs=Output("items", key="id", store=store))
@@ -410,7 +414,8 @@ async def test_a_key_a_moved_output_dropped_leaves_its_consumer(state, tmp_path)
 
         @asset(outputs=Output("copy", key="id"), inputs={"items": Incremental()})
         async def copy(ctx, items: list):
-            if store is not None and not entered.is_set():  # hold until the move landed
+            calls.append(1)
+            if len(calls) == 2:  # the second attempt is in flight across the move
                 entered.set()
                 await release.wait()
             changes = ctx.batch["items"]
@@ -423,27 +428,27 @@ async def test_a_key_a_moved_output_dropped_leaves_its_consumer(state, tmp_path)
     assert status_of(await drive(engine, await engine.submit(["copy"], upstream=True))) == "succeeded"
     rows["items"] = [{"id": "k10"}, {"id": "k11"}, {"id": "k12"}]
     assert status_of(await drive(engine, await engine.submit(["items"]))) == "succeeded"
+    held = await engine.submit(["copy"])  # launched before the move
+    while not entered.is_set():
+        await engine.tick()
+        await asyncio.sleep(0.01)
     await engine.stop()
 
     engine = make_engine(state, project("other"))
     await engine.initialize()
-    held = await engine.submit(["copy"])  # planned against the old index
-    while not entered.is_set():
-        await engine.tick()
-        await asyncio.sleep(0.01)
-    rows["items"] = [{"id": "k10"}, {"id": "k12"}]  # the move drops k11
+    assert ("items", "") not in state.model.heads and not state.model.bookmark("copy", "items", "")
+    rows["items"] = [{"id": "k10"}, {"id": "k12"}]  # the move's first write drops k11
     assert status_of(await drive(engine, await engine.submit(["items"]))) == "succeeded"
     assert state.model.heads[("items", "")]["ref"]["store"] == "other"
     release.set()
-    assert status_of(await drive(engine, held)) == "succeeded"
-    assert status_of(await drive(engine, await engine.submit(["copy"]))) == "succeeded"
+    detail = await drive(engine, held, timeout=10)
+    assert status_of(detail) == "succeeded"
+    outcomes = [a["outcome"] for attempts_ in detail["attempts"].values() for a in attempts_]
+    assert outcomes[0] == "failed" and outcomes[-1] == "succeeded", outcomes  # refused, then retried
     assert sorted((await engine.list_keys("copy"))["keys"]) == ["k10", "k12"]
 
 
-F19 = pytest.mark.xfail(strict=True, reason="F19: an asset added back resumes its first life")
-
-
-@pytest.mark.parametrize("ends", [pytest.param("succeeds", marks=F19), "fails", "lost"])
+@pytest.mark.parametrize("ends", ["succeeds", "fails", "lost"])
 @pytest.mark.parametrize("when", ["before", "during"])
 async def test_an_attempt_of_a_removed_and_readded_asset_stays_in_its_life(state, monkeypatch, ends, when):  # noqa: F811
     """Execution spec review: an asset removed and added back under its name
@@ -458,11 +463,10 @@ async def test_an_attempt_of_a_removed_and_readded_asset_stays_in_its_life(state
     await _first_life_across_a_readd(state, monkeypatch, ends, when)
 
 
-@F19
 async def test_a_name_removed_while_its_attempt_runs_and_added_back_starts_over(state, monkeypatch):  # noqa: F811
-    """F19, F12's rule across a live attempt: removing `copy` while its
-    attempt runs defers retiring its state until the attempt settles;
-    adding it back before then must still start it over — no head, no
+    """F19, F12's rule across a live attempt: removing `copy` resets it at
+    that deploy, though its attempt still runs — nothing waits for it, as it
+    can commit nothing — so adding it back starts it over: no head, no
     bookmarks of the first life."""
 
     await _first_life_across_a_readd(state, monkeypatch, "fails", "before", fresh=True)
@@ -540,3 +544,155 @@ async def _first_life_across_a_readd(state, monkeypatch, ends: str, when: str, f
     assert not state.model.claims
     commits = (await engine.history.commits(outputs=["copy"]))["commits"]
     assert held not in {c["attempt"] for c in commits}, "the first life's attempt committed into the second"
+
+
+def _moving(tmp_path, rows: dict, seen: list):
+    """`items` (keyed) on `store`, and `copy` reading it incrementally."""
+
+    def project(store):
+        @asset(outputs=Output("items", key="id", store=store))
+        def items():
+            return rows["items"]
+
+        @asset(outputs=Output("copy", key="id"), inputs={"items": Incremental()})
+        def copy(ctx, items: list):
+            b = ctx.batch["items"]
+            seen.append((b.full, sorted(r["id"] for r in items)))
+            return items if b.full and b.first else Patch(items, remove=list(b.removed))
+
+        return Project(assets=[items, copy], stores={"other": FileStore(tmp_path / "other")})
+
+    return project
+
+
+async def test_a_move_and_back_with_no_write_between_resets(state, tmp_path):  # noqa: F811
+    """K10: each move makes a new output, so `items` moved away and back with
+    nothing written in between is reset all the same: its head and index go
+    at the deploy, with `copy`'s bookmark on it, and both start over."""
+
+    rows, seen = {"items": [{"id": "a"}, {"id": "b"}]}, []
+    project = _moving(tmp_path, rows, seen)
+    m = state.model
+    engine = make_engine(state, project(None))
+    await engine.initialize()
+    assert status_of(await drive(engine, await engine.submit(["copy"], upstream=True))) == "succeeded"
+    for store in ("other", None):  # away, and back: no run in between
+        await engine.stop()
+        engine = make_engine(state, project(store))
+        await engine.initialize()
+    assert ("items", "") not in m.heads and ("items", "") not in m.indexes
+    assert m.reset_at["items"] == m.deploy_number and not m.bookmark("copy", "items", "")
+    rows["items"] = [{"id": "a"}]  # the new `items` holds no `b`
+    assert status_of(await drive(engine, await engine.submit(["copy"], upstream=True))) == "succeeded"
+    assert seen[-1] == (True, ["a"])
+    assert sorted((await engine.list_keys("copy"))["keys"]) == ["a"]
+
+
+async def test_an_attempt_launched_before_its_output_moved_commits_nothing(state, tmp_path, monkeypatch):  # noqa: F811
+    """K10: an attempt launched before its output moved commits nothing —
+    also on a partition with no head yet, which the stale-head check alone
+    would let through. Its retry writes into the new store."""
+
+    from solera_server import attempts
+
+    monkeypatch.setattr(attempts, "AFTER_COMMIT_WAIT", 0.2)  # the stopped engine's answer to `finished`
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    def project(store):
+        @asset(outputs=Output("items", key="id", store=store))
+        async def items():
+            if not entered.is_set():  # the first attempt is held across the move
+                entered.set()
+                await release.wait()
+            return [{"id": "a"}]
+
+        return Project(assets=[items], stores={"other": FileStore(tmp_path / "other")})
+
+    engine = make_engine(state, project(None))
+    await engine.initialize()
+    run = await engine.submit(["items"])
+    while not entered.is_set():
+        await engine.tick()
+        await asyncio.sleep(0.01)
+    (held,) = [c["attempt"] for c in state.model.claims.values()]
+    await engine.stop()
+    engine = make_engine(state, project("other"))
+    await engine.initialize()
+    release.set()
+    detail = await drive(engine, run, timeout=10)
+    assert status_of(detail) == "succeeded"
+    head = state.model.heads[("items", "")]
+    assert head["attempt"] != held and head["ref"]["store"] == "other"
+
+
+async def test_a_keys_run_after_a_move_reads_a_whole_full_pass(state, tmp_path):  # noqa: F811
+    """K10, the review's example: `copy` holds {a, b}, moves, and runs
+    keys=(a). A move takes its bookmarks, so the run reads a full pass —
+    every batch of it before it succeeds — not the one key: the new store
+    holds {a, b}, and no pass is left half way."""
+
+    @asset(outputs=Output("items", key="id"))
+    def items():
+        return [{"id": "a"}, {"id": "b"}]
+
+    def project(store):
+        @asset(outputs=Output("copy", key="id", store=store), inputs={"items": Incremental(batch_size=1)})
+        def copy(ctx, items: list):
+            b = ctx.batch["items"]
+            return items if b.full and b.first else Patch(items, remove=list(b.removed))
+
+        return Project(assets=[items, copy], stores={"other": FileStore(tmp_path / "other")})
+
+    engine = make_engine(state, project(None))
+    await engine.initialize()
+    assert status_of(await drive(engine, await engine.submit(["copy"], upstream=True))) == "succeeded"
+    await engine.stop()
+    engine = make_engine(state, project("other"))
+    await engine.initialize()
+    detail = await drive(engine, await engine.submit(["copy"], keys={"items": {"keys": ["a"]}}))
+    assert status_of(detail) == "succeeded"
+    assert sorted((await engine.list_keys("copy"))["keys"]) == ["a", "b"]
+    assert state.model.heads[("copy", "")]["ref"]["store"] == "other"
+    assert "pass" not in state.model.bookmark("copy", "items", "")
+    assert "reset" not in state.model.partition("copy", "")
+
+
+async def test_an_earlier_lifes_objects_are_never_read(state, tmp_path):  # noqa: F811
+    """K10 with FileStore, which keeps a name's objects in one place: `log`'s
+    first life commits 0–9; it moves away and back; its third life commits
+    0–2 in the same place. Reads are bounded by the head, and generations
+    only grow: an unkeyed read lists only the head's commits first..last and
+    takes each one's highest generation, so commits 3–9 of the first life
+    are never read, whole or by range; and a keyed read names only what its
+    fresh key index holds, so the first life's keys are gone."""
+
+    from solera.sdk import Result
+    from solera.stores import Commits
+
+    life = {"n": "1"}
+
+    def project(store):
+        @asset(outputs=[Output("log", incremental=True, store=store), Output("keys", key="id", store=store)])
+        def log():
+            keys = [{"id": f"k{i}"} for i in range(10)] if life["n"] == "1" else [{"id": "k0"}]
+            return Result(outputs={"log": Patch([{"life": life["n"]}]), "keys": keys})
+
+        return Project(assets=[log], stores={"other": FileStore(tmp_path / "other")})
+
+    engine = make_engine(state, project(None))
+    await engine.initialize()
+    for _ in range(10):
+        assert status_of(await drive(engine, await engine.submit(["log"]))) == "succeeded"
+    assert state.model.heads[("log", "")]["commit_number"] == 9
+    for store in ("other", None):
+        await engine.stop()
+        engine = make_engine(state, project(store))
+        await engine.initialize()
+    life["n"] = "3"
+    for _ in range(3):
+        assert status_of(await drive(engine, await engine.submit(["log"]))) == "succeeded"
+    ref = _ref(state.model.heads[("log", "")])
+    assert ref.handle["commits"] == [0, 2]
+    assert await FileStore().load(ref, list[dict], None) == [{"life": "3"}] * 3
+    assert await FileStore().load(ref, list[dict], Commits(0, 9)) == [{"life": "3"}] * 3
+    assert sorted((await engine.list_keys("keys"))["keys"]) == ["k0"]

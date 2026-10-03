@@ -84,20 +84,11 @@ def cleanup_report(body) -> dict:
     return out
 
 
-def moved(info: dict) -> bool:
-    """Whether an output's committed head is in another store than the one
-    it is launched on: nothing of that store's is the new one's."""
-
-    head = info["head"]
-    return head is not None and head["ref"].get("store") != info["contract"]["store"]
-
-
 def worker_output(info: dict) -> dict:
     """An output's launch record as its worker sees it: the committed head
-    only as its ref (`before`), where the content is — none for an output
-    moved to another store, where it writes as if for the first time."""
+    only as its ref (`before`), where the content is."""
 
-    head = None if moved(info) else info["head"]
+    head = info["head"]
     return {**{k: v for k, v in info.items() if k != "head"}, "before": head["ref"] if head else None}
 
 

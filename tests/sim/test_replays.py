@@ -442,9 +442,6 @@ def test_f13_a_key_removed_after_a_takeover_moved_its_upstream_leaves_its_consum
     state.teardown()
 
 
-@pytest.mark.xfail(
-    strict=True, reason="F17: an output moved away and back loses the keys its last write lacked"
-)
 def test_f17_an_output_moved_away_and_back_keeps_its_keys():
     """F17: `items` holds `k10` on FileStore; a takeover moves it to the
     table store, where only a `keys=` run writes (a fresh index, the

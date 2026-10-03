@@ -161,6 +161,7 @@ class Model:
                 "partitions": _nest(self.partitions, 2),
                 "repairs": _nest(self.repairs, 2),
                 "cleanups": _nest(self.cleanups, 2),
+                "reset_at": self.reset_at,
                 "automations": self.automations,
                 "sensors": self.sensors,
                 "runs": self.runs,
@@ -189,9 +190,10 @@ class Model:
         # deleted runs whose directories are still to be deleted (§11)
         self.deleted: list[str] = snap.get("deleted") or []
         # (asset, partition) -> the partition's record (§5): its `cursor`; `last`, its last
-        # terminal outcome; `drained`, whether its last commit finished the pass
+        # terminal outcome; `caught_up`, whether its last commit finished the pass
         # it was on — its completeness, whatever its outputs wrote; `bookmarks`
-        # {input: Bookmark}; and an Each asset's `failures` record
+        # {input: Bookmark}; `reset`, set when a reset took bookmarks, until a full
+        # pass catches it up (keys= runs read one meanwhile); and an Each asset's `failures` record
         # (docs/per-key-processing.md §9), whose index lives in `indexes` under
         # ("@asset", partition). A rename moves it, retirement trims it: one record.
         self.partitions = Grouped(_flatten(snap.get("partitions"), 2))
@@ -201,6 +203,9 @@ class Model:
         # event counter that let go of it: for the partition's next attempt to clean up
         # once no reader pins it (docs/lifecycle.md §9.8)
         self.cleanups: dict[tuple, list] = _flatten(snap.get("cleanups"), 2)
+        # output -> the deploy number that last reset it: removed, or moved to
+        # another store. An attempt launched under an earlier one commits nothing.
+        self.reset_at: dict[str, int] = snap.get("reset_at") or {}
         self.automations: dict[str, dict] = snap.get("automations") or {}
         # sensor -> {cursor, accepted}: the last tick that changed something (docs/lifecycle.md §11.4)
         self.sensors: dict[str, dict] = snap.get("sensors") or {}
@@ -515,11 +520,12 @@ class Model:
         manifest = e["manifest"]
         if e["deploy"] != self.deploy:
             self.deploy_number += 1
+        previous = (self.manifest or {}).get("outputs") or {}
         self.deploy, self.manifest, self.project = e["deploy"], manifest, e.get("project")
         self._consumed = self._consumed_outputs(manifest)
         renamed, output_map = self._apply_aliases(manifest)
         self._reconcile_tasks(manifest, renamed, output_map, e["at"])
-        self._retire_removed()
+        self._reset({output_map.get(name, name): o.get("store") for name, o in previous.items()})
         self._unsubscribe()
         automations = {}
         for name, auto in manifest["automations"].items():
@@ -634,39 +640,59 @@ class Model:
             if not marks:
                 del self.partitions[key]["bookmarks"]
 
-    def _retire_removed(self) -> None:
-        """Live state of names the project no longer declares goes: heads,
-        key indexes (their files become garbage), partition records and owing a repair
-        intents. A name that comes back — added again, or the target of a
-        rename — starts over and never resumes an earlier life (F12: a rename
-        back without an alias left `mirror`'s first life in place, and the
-        next rename onto it kept that). History keeps the records, and pending
-        cleanups stay: their objects are still owed. An asset with an attempt
-        in flight keeps its state until that attempt settles."""
+    def _reset(self, stores: dict[str, str]) -> None:
+        """A deploy that removes an output, or declares it on another store
+        than `stores` says it was on, resets it: the output that comes back
+        under that name, or that the new store holds, is a new one (K10). Its
+        heads, key indexes (their files become garbage) and repair intents go
+        now, with the bookmarks that read it or are its asset's: every
+        consumer and its producer start over, with full passes. The same for
+        an asset the project no longer declares: its partition records go.
+        An attempt launched before the reset commits nothing
+        (`Engine.commit_attempt`), so nothing waits for one in flight. History
+        keeps the records, and pending cleanups stay: their objects are still
+        owed (F12, F13, F17, F19)."""
 
         manifest = self.manifest or {}
-        outputs, assets = set(manifest.get("outputs") or ()), set(manifest.get("assets") or ())
-        busy = {t["asset"] for tid in self.claims if (t := self.task(tid)) is not None}
+        outputs, assets = manifest.get("outputs") or {}, manifest.get("assets") or {}
+        reset = {
+            name
+            for name, store in stores.items()
+            if name not in outputs or outputs[name].get("store") != store
+        }
+        for name in reset:
+            self.reset_at[name] = self.deploy_number
+        reset |= {k[0] for k in self.heads} - set(outputs)  # any other name no longer declared
+        producers = {outputs[name].get("asset") for name in reset if name in outputs} - {None}
 
-        def gone(asset) -> bool:
-            return asset not in assets and asset not in busy
-
-        owner = {key: head.get("asset") for key, head in self.heads.items()}
-
-        def removed(key) -> bool:
+        def gone(key) -> bool:
             if key[0].startswith("@"):  # an Each asset's failed keys
-                return gone(key[0][1:])
-            return key[0] not in outputs and gone(owner.get(key))
+                return key[0][1:] not in assets
+            return key[0] in reset
 
-        for key in [k for k in self.heads if removed(k)]:
+        for key in [k for k in self.heads if gone(k)]:
             del self.heads[key]
-        for key in [k for k in self.indexes if removed(k)]:
+        for key in [k for k in self.repairs if gone(k)]:  # what dead attempts meant to write
+            index = self.index(*key)
+            for intent in self.repairs.pop(key):
+                self.garbage.extend([index.path(f["name"]), self.event_counter] for f in intent["files"])
+        for key in [k for k in self.indexes if gone(k)]:
             index = self.indexes.pop(key)
             self.garbage.extend([index.path(name), self.event_counter] for name in sorted(index.referenced()))
-        for key in [k for k in self.repairs if removed(k)]:
-            del self.repairs[key]
-        for key in [k for k in self.partitions if gone(k[0])]:
-            del self.partitions[key]
+        for key in list(self.partitions):
+            if key[0] not in assets:
+                del self.partitions[key]
+                continue
+            marks = self.partitions[key].get("bookmarks")
+            if not marks:
+                continue
+            lost = [i for i, wm in marks.items() if key[0] in producers or wm.get("output") in reset]
+            for input in lost:
+                del marks[input]
+            if lost:
+                self.partitions[key]["reset"] = True  # until a full pass catches it up
+            if not marks:
+                del self.partitions[key]["bookmarks"]
 
     def _apply_aliases(self, manifest) -> tuple[dict[str, list[str]], dict[str, str]]:
         """Move everything held under an asset's former names to its current
@@ -826,9 +852,7 @@ class Model:
             launched["handle"] = e["handle"]
 
     def _on_AttemptFinished(self, e):
-        task = self._attempt_finished(e)
-        if task is not None and task["asset"] not in ((self.manifest or {}).get("assets") or {}):
-            self._retire_removed()  # an asset removed while this attempt ran: settled now
+        self._attempt_finished(e)
 
     def _attempt_finished(self, e) -> dict | None:
         run = self.runs.get(e["run"])
@@ -854,6 +878,13 @@ class Model:
             self._claimed(run, task, e["attempt"], e["started_at"])
         times = self._attempt_events(run, task, e, launched)
         for output, intent in (e.get("intents") or {}).items():
+            if self.reset_at.get(output, 0) > prepared.get("deploy_number", self.deploy_number):
+                # Reset since it launched: what it meant to write was the old output's,
+                # which owes no repair. Its files go, from where it wrote them.
+                prefix = ((prepared.get("outputs") or {}).get(output) or {}).get("prefix")
+                index = IndexState(prefix=prefix) if prefix else self.index(output, task["partition"])
+                self.garbage.extend([index.path(f["name"]), self.event_counter] for f in intent["files"])
+                continue
             intents = self.repairs.setdefault((output, task["partition"]), [])
             intents.append({**intent, "run": e["run"], "attempt": e["attempt"]})
         self._cleaned_up(task["partition"], e)
@@ -997,6 +1028,8 @@ class Model:
         record = self._partition(asset, partition)
         if "caught_up" in commit:
             record["caught_up"] = bool(commit["caught_up"])
+            if record["caught_up"]:
+                record.pop("reset", None)
         if "cursor" in commit:
             if commit["cursor"] is None:
                 record.pop("cursor", None)
@@ -1161,27 +1194,19 @@ class Model:
         else:
             run["status"] = "running"
 
-    def _commit_keys(self, output: str, partition: str, keys: dict | None, prefix: str | None = None) -> None:
+    def _commit_keys(self, output: str, partition: str, keys: dict | None, prefix: str | None) -> None:
         """Add a commit's delta files to the output's key index (§6): into the
         levels, and into the delta log if anything reads it incrementally.
-        The head carries the index's live key count."""
+        An output's first index starts where its attempt wrote them, `prefix`
+        — under the name it launched with, when a rename came since. The head
+        carries the index's live key count."""
 
         if keys is not None:
             index, delta = self.index(output, partition), DeltaFiles.from_json(keys)
-            keep_log = output in self._consumed
-            if prefix is not None and prefix != index.prefix:
-                # Delta files under a prefix of their own: the output moved to another
-                # store, and its index starts over there. Every file of the old one —
-                # and the intents of what dead attempts meant to write in the old
-                # store — goes once no reader pins it.
-                fresh = IndexState(prefix=prefix).committed(keys["commit_number"], delta, keep_log=keep_log)
-                if (output, partition) in self.indexes:
-                    self._replace_index((output, partition), fresh)
-                for intent in self.repairs.pop((output, partition), ()):
-                    self.garbage.extend([index.path(f["name"]), self.event_counter] for f in intent["files"])
-                index = fresh
-            elif keys["files"]:
-                index = index.committed(keys["commit_number"], delta, keep_log=keep_log)
+            if (output, partition) not in self.indexes and prefix is not None:
+                index = IndexState(prefix=prefix)
+            if keys["files"]:
+                index = index.committed(keys["commit_number"], delta, keep_log=output in self._consumed)
             self.indexes[(output, partition)] = index
         index = self.indexes.get((output, partition))
         if index is not None:
@@ -1342,7 +1367,7 @@ class Model:
         before = self.heads.get((e["source"], ""))
         head = e["head"]
         self.heads[(e["source"], "")] = {**head, "at": e["at"], "n": self.event_counter}
-        self._commit_keys(e["source"], "", e.get("keys"))
+        self._commit_keys(e["source"], "", e.get("keys"), None)
         run = e.get("run")
         if run is not None:
             self._record("runs", history.source_run_row(run, e["at"]))

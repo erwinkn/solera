@@ -452,8 +452,8 @@ generation)` files (object-store-state.md §6): the worker resolves each
 write against it, skips the store entirely when the write changes nothing
 (an empty patch, a set listed again), and otherwise writes the keys it
 writes and removes, at the attempt's generation, as the commit's delta file. An unkeyed output's commits
-are its store's; `head.base` is the first commit after its last reset (for a
-keyed output, its last move to another store, which starts its index over). The
+are its store's; `head.base` is the first commit after its last reset. A move to another
+store resets the output altogether (object-store-state.md §2). The
 engine keeps a per-input **bookmark** — the consumer's position: `next`,
 the first upstream commit not yet delivered, and while a pass is under
 way, `pass` `{mode, from, to, at, batch, batches}`: `full` or `delta`, its
@@ -469,7 +469,7 @@ pass's boundary is fixed when it starts, so one that ends behind the
 head its last batch was planned against — interrupted, then resumed after
 the upstream moved — goes on in the same task to what was committed
 meanwhile: the partition drains only once it has caught up. Whether the pass drained is the partition's
-(`drained := not more` on its progress), not its outputs': a last batch may
+(`caught_up := not more` on its record), not its outputs': a last batch may
 write none of them, and the partition is complete all the same. A partition is
 **complete** when each of its outputs has a head and its pass drained —
 a job, once a run of it succeeded. Selection (`"missing"`), `AllPartitions`

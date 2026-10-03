@@ -209,7 +209,11 @@ materializes all the data of each partition again. Its writes **reset**
 each output partition (the store keeps nothing of the prior content), no
 cursor is passed, and every incremental input reads its upstream in a
 full pass. *Why reset is a word:* an unkeyed output appends one commit at
-a time; only a reset tells the store to drop the earlier ones.
+a time; only a reset tells the store to drop the earlier ones. A deploy
+that removes an output or moves it to another store resets it too, as a
+whole: the output under that name is a new one, its heads, index and the
+bookmarks on it go at that deploy, and an attempt launched before commits
+nothing (object-store-state.md §2).
 *Not:* a full pass of one input (`keys={"x": "full"}`), which rewrites
 nothing by itself. *Was:* `KeyedWrite.whole`.
 
