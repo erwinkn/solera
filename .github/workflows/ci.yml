@@ -123,7 +123,7 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
-      - run: spec/tla/check-journal.sh ci
+      - run: spec/tla/check.sh journal
   execution-spec:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -133,7 +133,7 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
-      - run: spec/tla/check-execution.sh
+      - run: spec/tla/check.sh execution
   attempt-spec:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -143,4 +143,4 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
-      - run: spec/tla/check-attempt.sh
+      - run: spec/tla/check.sh attempt

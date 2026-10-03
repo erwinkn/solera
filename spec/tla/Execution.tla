@@ -3,12 +3,12 @@
 (* Solera's execution semantics, as designed (docs/glossary.md), at small  *)
 (* bounds: a source S, an asset A reading it incrementally, an asset B     *)
 (* reading A incrementally; runs, claims, attempts, passes and batches,    *)
-(* bookmarks; fenced stores with gates, fences and repairs; deploys (store *)
+(* positions; fenced stores with gates, fences and repairs; deploys (store *)
 (* move, pattern change, version bump, removal and re-adding); engine      *)
 (* crash, restart and takeover; worker crashes, timeouts, user cancels.    *)
 (* docs/verification.md, "Formal model", says what is abstracted and why.  *)
 (*                                                                         *)
-(* FixF6, FixF9, FixF10, FixF17, FixF22, FixSelection and ResetOnMove    *)
+(* FixF6, FixF10, FixF17, FixF22, FixSelection and ResetOnMove           *)
 (* select each rule as designed (TRUE) or as it was before its fix         *)
 (* (FALSE): the model must find each known bug.                            *)
 (***************************************************************************)
@@ -22,12 +22,12 @@ CONSTANTS
     MaxAtt,      \* attempts, over the whole behaviour
     MaxRuns,     \* runs, over the whole behaviour
     MaxTries,    \* attempts a run's task may fail before it fails
-    MaxKeysRuns, \* manual runs of A with keys= (one key, read as given; no bookmark moves)
+    MaxKeysRuns, \* manual runs of A with keys= (one key, read as given; no position moves)
     Each,        \* B is an each=True asset (reconciled at the end of a full pass); A is not
     WithB,       \* B is declared at the start (else the chain is S and A, unless B is added)
     Deploys,     \* the deploy kinds explored: subset of {"move","pattern","bump","remove"}
     Faults,      \* the fault kinds explored: subset of {"worker","crash","takeover","timeout","cancel","zombie"}
-    FixF6, FixF9, FixF10, FixF17,
+    FixF6, FixF10, FixF17,
     FixSelection, \* a keys= run made a full pass (F17's fix) reads it to the end
     ResetOnMove,  \* a move resets A's output at the deploy (K10; F13, F17); else
                   \* it only changes where A's next write goes
@@ -43,7 +43,7 @@ Up(c) == IF c = "A" THEN "S" ELSE "A"
 
 VARIABLES
     log,      \* [Outputs -> Seq([up, rm, reset])]: each output partition's commits (the journal)
-    bm,       \* [Assets -> bookmark]: what each incremental input has read
+    pos,       \* [Assets -> position]: what each incremental input has read
     store,    \* [Assets -> [Stores -> SUBSET Keys]]: the rows each store holds
     fence,    \* [Assets -> [Stores -> Nat]]: the newest generation that acquired
     hst,      \* [Assets -> <<store, life>>]: the store the head is in, and the life it was written in
@@ -57,7 +57,7 @@ VARIABLES
     eng,      \* [serving: BOOLEAN, zombie: BOOLEAN, knew: the attempts the zombie created]
     used      \* environment budgets spent: [src, deploy, fault]
 
-vars == <<log, bm, store, fence, hst, owes, att, nAtt, runs, nRun, pending, man, eng, used>>
+vars == <<log, pos, store, fence, hst, owes, att, nAtt, runs, nRun, pending, man, eng, used>>
 
 -----------------------------------------------------------------------------
 (* Content *)
@@ -88,17 +88,17 @@ EachOf(c) == Each /\ c = "B"
 NoPass == [kind |-> "none", at |-> 0, from |-> 0, first |-> FALSE]
 \* The fingerprint is a digest of the declaration: the asset's version (not
 \* its output's store: a move resets the output instead). 0 is never one.
-\* `reset`: a reset took this bookmark, and no full pass has caught it up
+\* `reset`: a reset took this position, and no full pass has caught it up
 \* since; a keys= run reads that full pass.
 FP(c) == man.ver[c]
-InitBm == [next |-> 0, fp |-> 0, pat |-> Keys, pass |-> NoPass, reset |-> FALSE]
+NoPosition == [next |-> 0, fp |-> 0, pat |-> Keys, pass |-> NoPass, reset |-> FALSE]
 
 -----------------------------------------------------------------------------
 (* Planning one batch (the engine, at an attempt's claim) *)
 
 NoWork == [act |-> "none"]
-Batch(up, rm, reset, newbm, fullEnd) ==
-    [act |-> "batch", up |-> up, rm |-> rm, reset |-> reset, newbm |-> newbm, fullEnd |-> fullEnd]
+Batch(up, rm, reset, newpos, fullEnd) ==
+    [act |-> "batch", up |-> up, rm |-> rm, reset |-> reset, newpos |-> newpos, fullEnd |-> fullEnd]
 
 \* A full pass reads the current head a key at a time, past the last key it
 \* delivered; deltas resume from `from`, the head when it began.
@@ -133,21 +133,22 @@ DiffStep(c, b, P) ==
 StoreOf(c) == IF c = "A" THEN man.storeA ELSE "st1"
 Moved(c) == log[c] = <<>> \/ hst[c] # StoreOf(c)
 
-\* A fingerprint change, (F17's fix) a write that starts the output over, or (F9's fix) a reset upstream commit past what the
-\* input has read (or, during a full pass, past the head it began at),
-\* starts a full pass: one under way starts over.
+\* A fingerprint change, (F17's fix) a write that starts the output over, or
+\* a reset upstream commit past what the input has read (or, during a full
+\* pass, past the head it began at; F9) starts a full pass: one under way
+\* starts over.
 NeedsFull(c) ==
-    LET b == bm[c]  seen == IF b.pass.kind = "full" THEN b.pass.from ELSE b.next IN
+    LET b == pos[c]  seen == IF b.pass.kind = "full" THEN b.pass.from ELSE b.next IN
     \/ b.fp # FP(c)
     \/ FixF17 /\ Moved(c)
-    \/ FixF9 /\ \E i \in (seen + 1)..Len(log[Up(c)]) : log[Up(c)][i].reset
+    \/ \E i \in (seen + 1)..Len(log[Up(c)]) : log[Up(c)][i].reset
 
-\* A keys= run reads one key as given, writes it, and moves no bookmark.
+\* A keys= run reads one key as given, writes it, and moves no position.
 KeysPlan(c, k) ==
-    LET cur == Content(Up(c)) IN Batch({k} \cap cur, {k} \ cur, FALSE, bm[c], FALSE)
+    LET cur == Content(Up(c)) IN Batch({k} \cap cur, {k} \ cur, FALSE, pos[c], FALSE)
 
 Plan(c) ==
-    LET b == bm[c]  h == Len(log[Up(c)])  P == Pat(c) IN
+    LET b == pos[c]  h == Len(log[Up(c)])  P == Pat(c) IN
     IF NeedsFull(c)
       THEN FullStep(c, [kind |-> "full", at |-> 0, from |-> h, first |-> TRUE],
                     [b EXCEPT !.fp = FP(c), !.pat = P])
@@ -173,7 +174,7 @@ MoreAfter(c, nb, fullEnd) ==
 
 Init ==
     /\ log = [o \in Outputs |-> IF o = "S" THEN <<[up |-> Keys, rm |-> {}, reset |-> TRUE]>> ELSE <<>>]
-    /\ bm = [c \in Assets |-> InitBm]
+    /\ pos = [c \in Assets |-> NoPosition]
     /\ store = [c \in Assets |-> [s \in Stores |-> {}]]
     /\ fence = [c \in Assets |-> [s \in Stores |-> 0]]
     /\ hst = [c \in Assets |-> "st1"]
@@ -215,17 +216,17 @@ Fire(c) ==
     /\ nRun' = nRun + 1
     /\ runs' = TidyRuns([runs EXCEPT ![nRun + 1] = [st |-> "active", tgt |-> c, tries |-> 0, keys |-> 0]])
     /\ pending' = [pending EXCEPT ![c] = FALSE]
-    /\ UNCHANGED <<log, bm, store, fence, hst, owes, att, nAtt, man, eng, used>>
+    /\ UNCHANGED <<log, pos, store, fence, hst, owes, att, nAtt, man, eng, used>>
 
 \* Claim the asset partition, pin, plan the batch; nothing to do ends the task.
-\* A keys= run of a partition a reset took bookmarks from reads that full
+\* A keys= run of a partition a reset took positions from reads that full
 \* pass instead (F17's fix; without ResetOnMove, of any output that must
 \* start over), and from then on is a run of the whole asset: it goes on
 \* until the pass ends (FixSelection; without it, it ends after one batch).
 \* A never-run consumer's keys= run reads only its keys.
 Prepare(r) ==
     LET c == runs[r].tgt
-        whole == FixF17 /\ IF ResetOnMove THEN bm[c].reset ELSE Moved(c)
+        whole == FixF17 /\ IF ResetOnMove THEN pos[c].reset ELSE Moved(c)
         p == IF runs[r].keys > 0 /\ ~whole THEN KeysPlan(c, runs[r].keys) ELSE Plan(c)
     IN
     /\ eng.serving /\ runs[r].st = "active" /\ Present(c) /\ ~Claimed(c)
@@ -237,20 +238,20 @@ Prepare(r) ==
                  att' = TidyAtt([att EXCEPT ![nAtt + 1] =
                         [status |-> "prep", asset |-> c, run |-> r, life |-> Life(c),
                          uplife |-> UpLife(c), st |-> st,
-                         up |-> p.up, rm |-> p.rm, reset |-> p.reset \/ moved, newbm |-> p.newbm,
+                         up |-> p.up, rm |-> p.rm, reset |-> p.reset \/ moved, newpos |-> p.newpos,
                          fullEnd |-> p.fullEnd, owed |-> owes[c], w |-> "none", gate |-> "none",
                          rep |-> {}, cancel |-> FALSE]])
               /\ nAtt' = nAtt + 1
               /\ runs' = IF runs[r].keys > 0 /\ whole /\ FixSelection
                          THEN [runs EXCEPT ![r].keys = 0] ELSE runs
-    /\ UNCHANGED <<log, bm, store, fence, hst, owes, nRun, pending, man, eng, used>>
+    /\ UNCHANGED <<log, pos, store, fence, hst, owes, nRun, pending, man, eng, used>>
 
 Launch(i) ==
     /\ eng.serving /\ att[i].status = "prep"
     /\ att' = TidyAtt([att EXCEPT ![i].status = "launched"])
-    /\ UNCHANGED <<log, bm, store, fence, hst, owes, nAtt, runs, nRun, pending, man, eng, used>>
+    /\ UNCHANGED <<log, pos, store, fence, hst, owes, nAtt, runs, nRun, pending, man, eng, used>>
 
-\* Its result: the commit (heads, bookmark, repair) in one event.
+\* Its result: the commit (heads, position, repair) in one event.
 \* Whether a result installs: not if a reset (a removal, or a move) took its
 \* output, or the output it reads, since it launched. Like a stale head,
 \* it is refused at commit, and its run carries on (F12, F13, F17, F19).
@@ -274,12 +275,12 @@ SettleOk(i) ==
     /\ att' = TidyAtt([att EXCEPT ![i].status = "settled"])
     /\ IF Valid(i)
          THEN /\ log' = [log EXCEPT ![c] = IF change THEN Append(@, entry) ELSE @]
-              /\ bm' = [bm EXCEPT ![c] = a.newbm]
+              /\ pos' = [pos EXCEPT ![c] = a.newpos]
               /\ owes' = [owes EXCEPT ![c] = {}]
               /\ hst' = [hst EXCEPT ![c] = a.st]
               /\ pending' = IF c = "A" /\ change THEN [pending EXCEPT !["B"] = TRUE] ELSE pending
               /\ runs' = TidyRuns(IF runs[r].st # "active" THEN runs
-                         ELSE IF runs[r].keys = 0 /\ MoreAfter(c, a.newbm, a.fullEnd) THEN runs
+                         ELSE IF runs[r].keys = 0 /\ MoreAfter(c, a.newpos, a.fullEnd) THEN runs
                          ELSE [runs EXCEPT ![r].st = "succeeded"])
          \* Refused at commit: it installs nothing, and its run carries on (a
          \* fresh attempt, planned anew), or, its asset removed, is canceled.
@@ -287,14 +288,14 @@ SettleOk(i) ==
          ELSE /\ runs' = TidyRuns(IF runs[r].st = "active" /\ ~Present(c)
                                   THEN [runs EXCEPT ![r].st = "canceled"] ELSE runs)
               /\ owes' = IF OwnLife(i) THEN [owes EXCEPT ![c] = @ \cup Intents(a)] ELSE owes
-              /\ UNCHANGED <<log, bm, hst, pending>>
+              /\ UNCHANGED <<log, pos, hst, pending>>
     /\ UNCHANGED <<store, fence, nAtt, nRun, man, eng, used>>
 
 \* A worker that drained a requested cancel before its gate: nothing written.
 SettleDrained(i) ==
     /\ eng.serving /\ att[i].status = "launched" /\ att[i].w = "drained"
     /\ att' = TidyAtt([att EXCEPT ![i].status = "settled"])
-    /\ UNCHANGED <<log, bm, store, fence, hst, owes, nAtt, runs, nRun, pending, man, eng, used>>
+    /\ UNCHANGED <<log, pos, store, fence, hst, owes, nAtt, runs, nRun, pending, man, eng, used>>
 
 \* An attempt ended without a result: the engine takes the gate. Winning it,
 \* nothing was written; finding `writing`, the writer's intents are owed a repair.
@@ -312,7 +313,7 @@ EndLost(i) ==
 SettleLost(i) ==
     /\ eng.serving /\ att[i].status = "launched" /\ att[i].w \in {"dead", "quit"}
     /\ EndLost(i)
-    /\ UNCHANGED <<log, bm, store, fence, hst, nAtt, nRun, pending, man, eng, used>>
+    /\ UNCHANGED <<log, pos, store, fence, hst, nAtt, nRun, pending, man, eng, used>>
 
 -----------------------------------------------------------------------------
 (* Workers: they run on whatever the engine decided, even after it settled *)
@@ -330,7 +331,7 @@ WAcquire(i) ==
               /\ UNCHANGED fence
          ELSE /\ fence' = [fence EXCEPT ![a.asset][a.st] = i]
               /\ att' = TidyAtt([att EXCEPT ![i].w = "acq", ![i].rep = a.owed \cap store[a.asset][a.st]])
-    /\ UNCHANGED <<log, bm, store, hst, owes, nAtt, runs, nRun, pending, man, eng, used>>
+    /\ UNCHANGED <<log, pos, store, hst, owes, nAtt, runs, nRun, pending, man, eng, used>>
 
 \* The gate: a requested cancel drains first; the engine's `aborted` stops it.
 WGate(i) ==
@@ -339,7 +340,7 @@ WGate(i) ==
     /\ att' = TidyAtt([att EXCEPT ![i].w = IF a.cancel /\ a.gate = "none" THEN "drained"
                                     ELSE IF a.gate = "none" THEN "gated" ELSE "quit",
                           ![i].gate = IF ~a.cancel /\ a.gate = "none" THEN "writing" ELSE @])
-    /\ UNCHANGED <<log, bm, store, fence, hst, owes, nAtt, runs, nRun, pending, man, eng, used>>
+    /\ UNCHANGED <<log, pos, store, fence, hst, owes, nAtt, runs, nRun, pending, man, eng, used>>
 
 \* Every write transaction checks the fence (a fenced store).
 WWrite(i) ==
@@ -350,12 +351,12 @@ WWrite(i) ==
               /\ att' = TidyAtt([att EXCEPT ![i].w = "wrote"])
          ELSE /\ att' = TidyAtt([att EXCEPT ![i].w = "quit"])
               /\ UNCHANGED store
-    /\ UNCHANGED <<log, bm, fence, hst, owes, nAtt, runs, nRun, pending, man, eng, used>>
+    /\ UNCHANGED <<log, pos, fence, hst, owes, nAtt, runs, nRun, pending, man, eng, used>>
 
 WSeal(i) ==
     /\ Running(i) /\ att[i].w = "wrote"
     /\ att' = TidyAtt([att EXCEPT ![i].w = "sealed"])
-    /\ UNCHANGED <<log, bm, store, fence, hst, owes, nAtt, runs, nRun, pending, man, eng, used>>
+    /\ UNCHANGED <<log, pos, store, fence, hst, owes, nAtt, runs, nRun, pending, man, eng, used>>
 
 -----------------------------------------------------------------------------
 (* The environment. Deploys and faults may come after the final commit to *)
@@ -376,7 +377,7 @@ KeysRun(k) ==
     /\ nRun' = nRun + 1
     /\ runs' = [runs EXCEPT ![nRun + 1] = [st |-> "active", tgt |-> "A", tries |-> 0, keys |-> k]]
     /\ used' = [used EXCEPT !.keys = @ + 1]
-    /\ UNCHANGED <<log, bm, store, fence, hst, owes, att, nAtt, pending, man, eng>>
+    /\ UNCHANGED <<log, pos, store, fence, hst, owes, att, nAtt, pending, man, eng>>
 
 SrcCommit(k) ==
     /\ used.src < MaxSrc
@@ -385,11 +386,11 @@ SrcCommit(k) ==
        IN log' = [log EXCEPT !["S"] = Append(@, e)]
     /\ pending' = [pending EXCEPT !["A"] = TRUE]
     /\ used' = [used EXCEPT !.src = @ + 1]
-    /\ UNCHANGED <<bm, store, fence, hst, owes, att, nAtt, runs, nRun, man, eng>>
+    /\ UNCHANGED <<pos, store, fence, hst, owes, att, nAtt, runs, nRun, man, eng>>
 
 \* Deploys: a new manifest. Moving A's store resets its output at the deploy
 \* (K10), whatever the stores compare to: its head and repair intents go,
-\* and so do its own bookmarks and B's on it (marked `reset`), so A reads S
+\* and so do its own positions and B's on it (marked `reset`), so A reads S
 \* in a full pass and B re-reads A from scratch; an attempt launched before
 \* commits nothing (Valid); and A is due for a rebuild (FixF22). Without
 \* ResetOnMove, the move only changes where A's next
@@ -401,10 +402,10 @@ MoveA ==
                                   !.life["A"] = @ + 1]
             /\ log' = [log EXCEPT !["A"] = <<>>]
             /\ owes' = [owes EXCEPT !["A"] = {}]
-            /\ bm' = [c \in Assets |-> [InitBm EXCEPT !.reset = TRUE]]
+            /\ pos' = [c \in Assets |-> [NoPosition EXCEPT !.reset = TRUE]]
             /\ pending' = [pending EXCEPT !["A"] = @ \/ Due("A")]
        ELSE /\ man' = [man EXCEPT !.storeA = IF @ = "st1" THEN "st2" ELSE "st1"]
-            /\ UNCHANGED <<log, owes, bm, pending>>
+            /\ UNCHANGED <<log, owes, pos, pending>>
     /\ SpendDeploy
     /\ UNCHANGED <<store, fence, hst, att, nAtt, runs, nRun, eng>>
 
@@ -414,14 +415,14 @@ PatternB ==
     /\ man' = [man EXCEPT !.pat = IF @ = Keys THEN Keys \ {NK} ELSE Keys]
     /\ pending' = [pending EXCEPT !["B"] = @ \/ Due("B")]
     /\ SpendDeploy
-    /\ UNCHANGED <<log, bm, store, fence, hst, owes, att, nAtt, runs, nRun, eng>>
+    /\ UNCHANGED <<log, pos, store, fence, hst, owes, att, nAtt, runs, nRun, eng>>
 
 BumpB ==
     /\ Deploy("bump") /\ man.hasB
     /\ man' = [man EXCEPT !.ver["B"] = @ + 1]
     /\ pending' = [pending EXCEPT !["B"] = @ \/ Due("B")]
     /\ SpendDeploy
-    /\ UNCHANGED <<log, bm, store, fence, hst, owes, att, nAtt, runs, nRun, eng>>
+    /\ UNCHANGED <<log, pos, store, fence, hst, owes, att, nAtt, runs, nRun, eng>>
 
 \* Removing B cancels its queued work; a launched attempt settles, its commit
 \* dropped. Re-adding B starts it fresh: a name no longer declared holds no
@@ -437,13 +438,13 @@ RemoveB ==
                      /\ ~\E i \in 1..nAtt : att[i].run = r /\ att[i].status = "launched"
                   THEN [runs[r] EXCEPT !.st = "canceled"] ELSE runs[r]])
     /\ SpendDeploy
-    /\ UNCHANGED <<log, bm, store, fence, hst, owes, nAtt, nRun, pending, eng>>
+    /\ UNCHANGED <<log, pos, store, fence, hst, owes, nAtt, nRun, pending, eng>>
 
 AddB ==
     /\ Deploy("remove") /\ ~man.hasB
     /\ man' = [man EXCEPT !.hasB = TRUE, !.life["B"] = @ + 1]
     /\ log' = [log EXCEPT !["B"] = <<>>]
-    /\ bm' = [bm EXCEPT !["B"] = InitBm]
+    /\ pos' = [pos EXCEPT !["B"] = NoPosition]
     /\ owes' = [owes EXCEPT !["B"] = {}]
     /\ pending' = [pending EXCEPT !["B"] = Due("B")]
     /\ SpendDeploy
@@ -457,7 +458,7 @@ WorkerCrash(i) ==
     /\ Fault("worker") /\ Running(i) /\ att[i].w \in {"none", "acq", "gated", "wrote"}
     /\ att' = TidyAtt([att EXCEPT ![i].w = "dead"])
     /\ SpendFault
-    /\ UNCHANGED <<log, bm, store, fence, hst, owes, nAtt, runs, nRun, pending, man, eng>>
+    /\ UNCHANGED <<log, pos, store, fence, hst, owes, nAtt, runs, nRun, pending, man, eng>>
 
 \* The serving engine dies: what it held in memory (prepared attempts) goes.
 EngineCrash ==
@@ -465,12 +466,12 @@ EngineCrash ==
     /\ eng' = [eng EXCEPT !.serving = FALSE]
     /\ DropPrepared
     /\ SpendFault
-    /\ UNCHANGED <<log, bm, store, fence, hst, owes, nAtt, runs, nRun, pending, man>>
+    /\ UNCHANGED <<log, pos, store, fence, hst, owes, nAtt, runs, nRun, pending, man>>
 
 Restart ==
     /\ ~eng.serving
     /\ eng' = [eng EXCEPT !.serving = TRUE]
-    /\ UNCHANGED <<log, bm, store, fence, hst, owes, att, nAtt, runs, nRun, pending, man, used>>
+    /\ UNCHANGED <<log, pos, store, fence, hst, owes, att, nAtt, runs, nRun, pending, man, used>>
 
 \* A new engine fences the serving one, which runs on as a zombie: its
 \* journal writes fail, but it may still take the gates of the attempts it
@@ -480,18 +481,18 @@ Takeover ==
     /\ eng' = [eng EXCEPT !.zombie = TRUE, !.knew = nAtt]
     /\ DropPrepared
     /\ SpendFault
-    /\ UNCHANGED <<log, bm, store, fence, hst, owes, nAtt, runs, nRun, pending, man>>
+    /\ UNCHANGED <<log, pos, store, fence, hst, owes, nAtt, runs, nRun, pending, man>>
 
 ZombieAbort(i) ==
     /\ "zombie" \in Faults /\ eng.zombie /\ i <= eng.knew
     /\ att[i].status = "launched" /\ att[i].gate = "none"
     /\ att' = TidyAtt([att EXCEPT ![i].gate = "aborted"])
-    /\ UNCHANGED <<log, bm, store, fence, hst, owes, nAtt, runs, nRun, pending, man, eng, used>>
+    /\ UNCHANGED <<log, pos, store, fence, hst, owes, nAtt, runs, nRun, pending, man, eng, used>>
 
 KillZombie ==
     /\ eng.zombie
     /\ eng' = [eng EXCEPT !.zombie = FALSE]
-    /\ UNCHANGED <<log, bm, store, fence, hst, owes, att, nAtt, runs, nRun, pending, man, used>>
+    /\ UNCHANGED <<log, pos, store, fence, hst, owes, att, nAtt, runs, nRun, pending, man, used>>
 
 \* A timeout (or a forced cancel): the engine ends a running attempt; its
 \* worker runs on, stale.
@@ -500,7 +501,7 @@ Timeout(i) ==
     /\ att[i].w \in {"none", "acq", "gated", "wrote"}
     /\ EndLost(i)
     /\ SpendFault
-    /\ UNCHANGED <<log, bm, store, fence, hst, nAtt, nRun, pending, man, eng>>
+    /\ UNCHANGED <<log, pos, store, fence, hst, nAtt, nRun, pending, man, eng>>
 
 \* A user cancels a run: queued work goes; a launched attempt is asked to
 \* stop, and drains (before its gate) or completes (past it).
@@ -512,7 +513,7 @@ Cancel(r) ==
                  ELSE IF i <= nAtt /\ att[i].run = r /\ att[i].status = "launched" THEN [att[i] EXCEPT !.cancel = TRUE]
                  ELSE att[i]])
     /\ SpendFault
-    /\ UNCHANGED <<log, bm, store, fence, hst, owes, nAtt, nRun, pending, man, eng>>
+    /\ UNCHANGED <<log, pos, store, fence, hst, owes, nAtt, nRun, pending, man, eng>>
 
 -----------------------------------------------------------------------------
 
@@ -547,14 +548,14 @@ Spec == Init /\ [][Next]_vars /\ Fairness
 OneAttemptPerPartition ==
     \A c \in Assets : Cardinality({i \in 1..nAtt : att[i].asset = c /\ att[i].status \in {"prep", "launched"}}) <= 1
 
-\* A bookmark never passes a change it did not deliver: with no pass under
+\* A position never passes a change it did not deliver: with no pass under
 \* way, every key no later commit touched is in the output exactly when it
-\* was in the upstream at the bookmark, under the patterns it reads. A
-\* bookmark a reset took claims nothing until a full pass catches it up.
-BookmarkHonest ==
+\* was in the upstream at the position, under the patterns it reads. A
+\* position a reset took claims nothing until a full pass catches it up.
+PositionHonest ==
     \A c \in Assets :
-        (Present(c) /\ bm[c].pass.kind = "none" /\ ~bm[c].reset) =>
-            LET u == Up(c)  b == bm[c]  quiet == Keys \ Touched(u, b.next, Len(log[u])) IN
+        (Present(c) /\ pos[c].pass.kind = "none" /\ ~pos[c].reset) =>
+            LET u == Up(c)  b == pos[c]  quiet == Keys \ Touched(u, b.next, Len(log[u])) IN
             \A k \in quiet : (k \in Content(c)) <=> (k \in UpTo(u, b.next) \cap b.pat)
 
 \* With nothing in flight, nothing owed and no stale writer at its gate, a
@@ -577,24 +578,24 @@ EveryRunEnds == <>[]NoActiveRun
 Converged ==
     /\ Content("A") = Content("S")
     /\ man.hasB => Content("B") = Content("A") \cap man.pat
-    /\ \A c \in Assets : Present(c) => bm[c].fp = FP(c)
+    /\ \A c \in Assets : Present(c) => pos[c].fp = FP(c)
 Converges == <>[]Converged
 \* Both, as one property (one tableau for TLC).
 Quiesces == <>[](NoActiveRun /\ Converged)
 
 \* A run that succeeds leaves its asset caught up: no pass under way, its
-\* bookmark at the upstream's head, and its output what the upstream holds
+\* position at the upstream's head, and its output what the upstream holds
 \* under its patterns. This binds every run of a whole asset, a keys= run
-\* that moved the bookmark (one made a full pass), and a keys= run of a
-\* partition a reset took bookmarks from. Checked as the run succeeds, so
+\* that moved the position (one made a full pass), and a keys= run of a
+\* partition a reset took positions from. Checked as the run succeeds, so
 \* no later change is needed to see one that ended halfway.
 RunsEndCaughtUp ==
     [][\A r \in 1..MaxRuns :
          LET c == runs[r].tgt IN
          (/\ runs[r].st = "active" /\ runs'[r].st = "ended" /\ runs'[r].ok /\ Present(c)
-          /\ runs[r].keys = 0 \/ bm'[c] # bm[c] \/ bm[c].reset)
-         => /\ bm'[c].pass.kind = "none"
-            /\ bm'[c].next = Len(log'[Up(c)])
+          /\ runs[r].keys = 0 \/ pos'[c] # pos[c] \/ pos[c].reset)
+         => /\ pos'[c].pass.kind = "none"
+            /\ pos'[c].next = Len(log'[Up(c)])
             /\ Fold(log'[c]) = Fold(log'[Up(c)]) \cap (IF c = "A" THEN Keys ELSE man'.pat)]_vars
 
 =============================================================================

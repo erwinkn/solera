@@ -123,7 +123,7 @@ then:
 |---|---|
 | **Quiet.** Within four virtual hours: no run in progress, no claim, no worker alive, no automation pending. | a task held forever |
 | **Automations converge.** With no manual run, every automated output equals what the oracle computes from its sources — no change stuck, none silently consumed. | `copy` missing a key `items` has |
-| **A catch-up run converges.** After a run of every asset with `upstream=True`, every output, `tally` included, equals the oracle's. | a bookmark past rows never delivered |
+| **A catch-up run converges.** After a run of every asset with `upstream=True`, every output, `tally` included, equals the oracle's. | a position past rows never delivered |
 | **Stores hold what was committed.** A fenced store holds exactly the rows its index lists, no stale writer's rows besides. | a dead writer's patch surviving |
 | **The journal alone rebuilds the state.** A read-only `State` replayed from storage equals the live model. | an event applied differently on replay |
 
@@ -288,10 +288,10 @@ model is the design as decided (`glossary.md`, with its model changes),
 not the code: where they differ, the code is the suspect.
 
 ```bash
-spec/tla/check-execution.sh            # smoke and calibrations (CI): about a minute
-spec/tla/check-execution.sh design     # store moves (with and without B), patterns and versions, removal, a zombie: ~30 min at 6 workers, liveness included
-spec/tla/check-execution.sh big        # every deploy kind, every fault kind, each=True: too large to finish yet
-spec/tla/check-execution.sh all
+spec/tla/check.sh execution            # smoke and calibrations (CI): about a minute
+spec/tla/check.sh execution design     # store moves (with and without B), patterns and versions, removal, a zombie: ~30 min at 6 workers, liveness included
+spec/tla/check.sh execution big        # every deploy kind, every fault kind, each=True: too large to finish yet
+spec/tla/check.sh execution all
 ```
 
 **State.**
@@ -301,8 +301,8 @@ spec/tla/check-execution.sh all
   reading `A` incrementally (with patterns; `B` is `each=True` in one
   configuration, `A` never). Each has a **commit log**, `[up, rm, reset]` per commit
   over a set of keys: its content is the log's fold, and a prefix's fold
-  is what a bookmark at that commit number has read.
-- Per incremental input, a **bookmark**: `next`, the **pass** under way (a
+  is what a position at that commit number has read.
+- Per incremental input, a **position**: `next`, the **pass** under way (a
   `full` pass's position and the head it resumes deltas from; `delta` and
   `diff` passes are one batch each), and the **fingerprint** and
   **patterns** it reads under, and whether a **reset** took it (no full
@@ -334,10 +334,10 @@ after the engine gave up on it. A zombie engine can only take gates
 (`aborted`), and only of the attempts it created before it was fenced
 (with `zombie` among the faults explored): its journal writes are fenced.
 A move resets `A` at the deploy: its head and repair intents go, and so
-do its own bookmarks and `B`'s on it. An attempt launched before a reset
+do its own positions and `B`'s on it. An attempt launched before a reset
 of its output, or of the output it reads, is refused at commit and its
 run carries on; what it wrote is owed a repair unless its own output was
-reset. A `keys=` run of a partition a reset took bookmarks from reads a
+reset. A `keys=` run of a partition a reset took positions from reads a
 full pass, and from then on is a run of the whole asset: it goes on until
 the pass ends. An asset change (K34, aa0e7dd: `B` added back, its
 patterns or version changed, `A` moved) leaves the asset due: its
@@ -353,9 +353,9 @@ next one.
 | Property | Kind | Says |
 |---|---|---|
 | `OneAttemptPerPartition` | safety | at most one prepared or launched attempt per asset partition |
-| `BookmarkHonest` | safety | with no pass under way, every key no later commit touched is in the output exactly when it was in the upstream at the bookmark, under its patterns: a bookmark never passes a change it did not deliver |
+| `PositionHonest` | safety | with no pass under way, every key no later commit touched is in the output exactly when it was in the upstream at the position, under its patterns: a position never passes a change it did not deliver |
 | `StoreMatchesJournal` | safety | with no attempt in flight, no repair owed and no stale writer at its gate, a store holds exactly its output's committed content |
-| `RunsEndCaughtUp` | action | a run that succeeds leaves its asset caught up: no pass under way, the bookmark at the upstream's head, the output what the upstream holds under its patterns. It binds every run of a whole asset, and a `keys=` run that moved the bookmark; checked as the run succeeds, so no later change is needed to see one that ended halfway |
+| `RunsEndCaughtUp` | action | a run that succeeds leaves its asset caught up: no pass under way, the position at the upstream's head, the output what the upstream holds under its patterns. It binds every run of a whole asset, and a `keys=` run that moved the position; checked as the run succeeds, so no later change is needed to see one that ended halfway |
 | `Quiesces` | liveness | eventually and forever, no run is active (every run ends) and `A` holds `S`'s keys, `B` holds `A`'s under its patterns, each read under its current fingerprint (convergence) |
 
 Liveness assumes weak fairness of all engine and worker steps together
@@ -364,7 +364,7 @@ restarting after a crash, and of the commits to `S`.
 
 **Abstracted, and why.**
 
-- *One partition per asset:* claims, bookmarks and passes are per asset
+- *One partition per asset:* claims, positions and passes are per asset
   partition and do not interact; fan-in reads committed heads only.
 - *Dynamic partitions, not versions:* the properties are about which keys an output
   holds; a re-upsert of a present key changes nothing here.
@@ -386,17 +386,16 @@ restarting after a crash, and of the commits to `S`.
   histories differing only there are one state.
 
 **Calibration.** Each known bug is a switch restoring its pre-fix rule,
-and TLC must find it (`check-execution.sh calibrate`):
+and TLC must find it (`check.sh execution calibrate`):
 
 | Switch | Rule as designed | Counterexample with it off |
 |---|---|---|
 | `FixF6` | a pass that ends behind the head goes on to it | `A` reads keys 1 and 2 in a full pass; key 1 commits; a cancel stops the run; `S` drops key 1; the firing resumes the pass, delivers key 2, and the task ends behind the head: `A` keeps 1 for good (`Quiesces`, 36 to 37 steps) |
-| `FixF9` | a reset upstream commit makes its consumers read a full pass | (needed by the others; F9's own bug is the simulation's) |
-| `FixF10` | a full pass reaches the consumer even when its patterns take no key; `each` reconciles at its end | `S` drops key 1, so `A` and `B` hold 2 alone; `B` excludes key 2 and its version is bumped; `B`'s full pass takes no key and is skipped: `B` keeps 2, which its patterns exclude (`BookmarkHonest`, 27 steps) |
-| `ResetOnMove` (with `FixF17`: calibration `move`) | a move resets the output at the deploy (K10; b7d8ae7). With both off, a move only changes where `A`'s next write goes, and that write starts the store over without a full pass | `A`'s full pass commits key 1 into store 1; `A` moves to store 2; the pass's next batch, key 2, starts store 2 over: `A` holds 2 alone, its bookmark says 1 and 2 (`BookmarkHonest`, 17 steps). F13's mechanism as W15 described it; F13's replays turned out to take F10's route |
+| `FixF10` | a full pass reaches the consumer even when its patterns take no key; `each` reconciles at its end | `S` drops key 1, so `A` and `B` hold 2 alone; `B` excludes key 2 and its version is bumped; `B`'s full pass takes no key and is skipped: `B` keeps 2, which its patterns exclude (`PositionHonest`, 27 steps) |
+| `ResetOnMove` (with `FixF17`: calibration `move`) | a move resets the output at the deploy (K10; b7d8ae7). With both off, a move only changes where `A`'s next write goes, and that write starts the store over without a full pass | `A`'s full pass commits key 1 into store 1; `A` moves to store 2; the pass's next batch, key 2, starts store 2 over: `A` holds 2 alone, its position says 1 and 2 (`PositionHonest`, 17 steps). F13's mechanism as W15 described it; F13's replays turned out to take F10's route |
 | `FixSelection` | a `keys=` run made a full pass (`FixF17`) reads the pass to its end | `A`'s first run is `keys=(1)`; its write starts the output over, so it reads a full pass, but ends after the first batch: `A` holds key 1 alone, a pass under way, and no run to finish it (`RunsEndCaughtUp`, 9 to 11 steps). Found by the spec's review (finding 1): the older properties needed a later source change to see it |
 | `FixF22` | an asset change leaves its asset due, if its input has a head (K34, aa0e7dd; before it, d6585fb for a move): `A` moved, `B` added back, `B`'s patterns or version changed. Calibrations `F22-move`, `F22-shape`, `F22-add`, each with no commit to `S` after the first | `A` is built; `A` moves, which resets it; nothing fires `A`, and `S` never changes again: `A` stays empty (`Quiesces`, 18 steps). `B`'s patterns or version change: `B` keeps what it read under its old declaration (34 steps). `B` is removed and added back: `B` stays empty (19 steps). Before this change the model's last commit to `S` came after every deploy and fired `A`, which hid the first (as it hid finding 1) |
-| `FixF17` | a `keys=` run of a partition a reset took bookmarks from reads that full pass (without `ResetOnMove`: a write that starts the output over reads a full pass) | `A` moves, which resets it; a `keys=` run for key 1 writes key 1 alone into the new, empty output and succeeds: `A` lacks key 2, though nothing removed it (`RunsEndCaughtUp`, 10 steps). Before the reset rule, moving back made it permanent (the simulation's F17) |
+| `FixF17` | a `keys=` run of a partition a reset took positions from reads that full pass (without `ResetOnMove`: a write that starts the output over reads a full pass) | `A` moves, which resets it; a `keys=` run for key 1 writes key 1 alone into the new, empty output and succeeds: `A` lacks key 2, though nothing removed it (`RunsEndCaughtUp`, 10 steps). Before the reset rule, moving back made it permanent (the simulation's F17) |
 
 **Results.** With every fix on (TLC 1.7.4; the first six rows re-run
 after the asset-change rule (K34), deploys and faults free to come after
@@ -415,7 +414,7 @@ shared machine):
 | `deploys` | one deploy, of any one kind, and a `keys=` run | over 4.5 million | capped at 25 min | no invariant violated in what was explored; liveness not reached (before the review's fixes) |
 | `faults` | two faults in all, of any kinds | over 2.8 million | capped at 25 min | the same (before the review's fixes) |
 | `each` | `B` is `each=True`; one deploy of any kind and one fault of any of four kinds | over 2.3 million | capped at 25 min | the same (before the review's fixes; then `A` was `each=True` too, finding 4) |
-| `safety` | two deploys and two faults in all, of any kinds, and a `keys=` run: random behaviours | configured: 100,000 behaviours of up to 150 steps; run so far: 2,000 | 7 s for the 2,000 | passed what ran (`check-execution.sh safety` runs the configured target) |
+| `safety` | two deploys and two faults in all, of any kinds, and a `keys=` run: random behaviours | configured: 100,000 behaviours of up to 150 steps; run so far: 2,000 | 7 s for the 2,000 | passed what ran (`check.sh execution safety` runs the configured target) |
 
 The budgets are shared across kinds: `MaxDeploy` and `MaxFault` count
 deploys and faults of any kind, so a configuration listing every kind
@@ -424,7 +423,7 @@ once. The bounds, exactly:
 
 | Configuration | Keys | Source commits after the first | Deploys (budget: kinds) | Faults (budget: kinds) | `keys=` runs | `B` | `each` | Attempts, runs, tries |
 |---|---|---|---|---|---|---|---|---|
-| `smoke` | 2 | 1 | 0 | 0 | 0 | declared | — | 8, 6, 2 |
+| `smoke` | 2 | 1 | 0 | 0 | 0 | declared | — | 12, 10, 3 |
 | `store` | 2 | 1 | 2: move | 0 | 1 | left out | — | 12, 10, 3 |
 | `reset` | 2 | 1 | 1: move | 0 | 0 | declared | — | 12, 10, 3 |
 | `shape` | 2 | 1 | 2: pattern, bump | 0 | 0 | declared | — | 12, 10, 3 |
@@ -454,9 +453,9 @@ in "Formal model: the attempt control file".
 deploy that moves an output, or removes it, resets it: the output under
 the name is new (K10). In the model, at the move:
 - `A`'s head and repair intents go;
-- `A`'s own bookmarks and `B`'s bookmark on `A` go, marked `reset`.
+- `A`'s own positions and `B`'s position on `A` go, marked `reset`.
   `A` reads `S` in a full pass, and `B` re-reads `A` from scratch. A
-  bookmark marked `reset` claims nothing (`BookmarkHonest`) until a full
+  position marked `reset` claims nothing (`PositionHonest`) until a full
   pass catches it up.
 - A move away and back is two resets.
 - `A` is due for a rebuild: its `OnChange` automation owes a firing
@@ -473,9 +472,9 @@ the need for that repair: without it, `B`'s refused attempt leaves rows in
 The code does record it (`_fail` takes a refused result's gate intents).
 The first write after a reset is a reset commit (its index starts
 empty), planned as a full pass, also for a `keys=` run of a partition the
-reset took bookmarks from (`FixF17`), which then runs to the pass's end
+reset took positions from (`FixF17`), which then runs to the pass's end
 (`FixSelection`); a reset upstream commit makes every consumer read a
-full pass (`FixF9`).
+full pass (F9).
 
 **F13, in plain words** (the store-move mechanism the decision removes;
 the two F13 replays turned out to take F10's route, and pass since F10's
@@ -488,12 +487,12 @@ delta, and `k10` and `k11` are gone though the feed still has them. A key
 the feed later removes is then removed from nothing, so `copy`, which read
 the reset as an ordinary commit, keeps it. In the model (17 steps): `A`'s
 full pass commits key 1 into store 1; `A` moves; the pass's next batch,
-key 2, starts store 2 over: `A` holds key 2 alone, while its bookmark says
+key 2, starts store 2 over: `A` holds key 2 alone, while its position says
 it read 1 and 2.
 
 **Next** (open choices, what is too big):
 
-- *Too big to exhaust* (`check-execution.sh big`): every deploy kind
+- *Too big to exhaust* (`check.sh execution big`): every deploy kind
   together (`deploys`, over 4.5 million states unfinished), every fault
   kind (`faults`, over 2.8 million), `each=True` with deploys and faults
   (over 2.3 million), and every deploy and fault kind together (over 22
@@ -502,7 +501,7 @@ it read 1 and 2.
   safety on random behaviours (`safety`). TLC's `-simulate` with liveness
   is not sound; liveness needs the exhaustive splits.
 - *Open modeling choices:* a pattern change's diff pass runs once the
-  bookmark reaches the head (the design says "commits up to the change
+  position reaches the head (the design says "commits up to the change
   finish under the old patterns"; the cutover point is simplified); a
   write lands whole or not at all (no half-written batch); immutable
   stores, renames, fan-in, `Each`'s failed keys and retry passes, and
@@ -544,7 +543,7 @@ checkpoint and the events since that checkpoint.
   answer.
 
 **Calibration.** Each rule of the design is a switch. With it off, TLC
-must find the bug it prevents (`check-journal.sh calibrate`):
+must find the bug it prevents (`check.sh journal calibrate`):
 
 | Rule off | TLC finds | Trace |
 |---|---|---|
@@ -559,10 +558,10 @@ must find the bug it prevents (`check-journal.sh calibrate`):
 
 | Model | Engines | Journal writes | Distinct states | Depth | Time |
 |---|---|---|---|---|---|
-| `JournalObject-small.cfg` | 2 | 7 | 766,771 | 53 | 26 s |
-| `fixed` (`JournalObject-big.cfg`, five writes) | 3 | 5 | 4,663,723 | 46 | 2 min 52 s |
-| `JournalObject-big.cfg` | 3 | 6 | 23,642,632 | 53 | 8 min 52 s |
-| `JournalObject-live.cfg`: one engine at a time, no 409s | 3 | 7 | 1,075,329 | 47 | 1 min 57 s |
+| `small` | 2 | 7 | 766,771 | 53 | 26 s |
+| `fixed` | 3 | 5 | 4,663,723 | 46 | 2 min 52 s |
+| `big` | 3 | 6 | 23,642,632 | 53 | 8 min 52 s |
+| `live`: one engine at a time, no 409s | 3 | 7 | 1,075,329 | 47 | 1 min 57 s |
 
 Liveness leaves out 409s. A store that refuses every conditional write
 forever is an outage, not a fault the journal can outlast.
@@ -572,8 +571,8 @@ forever is an outage, not a fault the journal can outlast.
 (`journal-object.md`, "The checkpoint's cost, measured").
 
 ```bash
-spec/tla/check-journal.sh ci    # two engines, three, liveness, calibration: ~6 min
-spec/tla/check-journal.sh big   # three engines, six writes: ~9 min
+spec/tla/check.sh journal       # two engines, three, liveness, calibration: ~6 min
+spec/tla/check.sh journal big   # three engines, six writes: ~9 min
 ```
 
 ## Formal model: the attempt control file (`spec/tla/Attempt.tla`)
@@ -663,7 +662,7 @@ a real one: an engine that keeps crashing ends nothing.
   result but not who may write.
 
 **Calibration.** Each rule is a switch, and with it off TLC must find the
-bug (`check-attempt.sh`; with several TLC workers, a trace's length varies
+bug (`check.sh attempt calibrate`; with several TLC workers, a trace's length varies
 by a step between runs):
 
 | Rule off | TLC finds | Trace |
@@ -678,18 +677,18 @@ one engine restart, the zombie, lost answers):
 
 | Model | Attempts | Workers each | Distinct states | Depth | Time |
 |---|---|---|---|---|---|
-| `Attempt-small.cfg` | 2 | 1 | 1,948,128 | 30 | 42 s |
-| `Attempt-dup.cfg`: a duplicate worker | 1 | 2 | 41,018 | 19 | 2 s |
-| `Attempt-live.cfg`: liveness, the engine fair | 2 | 1 | 1,948,128 | 30 | 3 min 59 s |
+| `small` | 2 | 1 | 1,948,128 | 30 | 42 s |
+| `dup`: a duplicate worker | 1 | 2 | 41,018 | 19 | 2 s |
+| `live`: liveness, the engine fair | 2 | 1 | 1,948,128 | 30 | 3 min 59 s |
 
-Two attempts with a duplicate worker each (`check-attempt.sh big`) is
+Two attempts with a duplicate worker each (`check.sh attempt big`) is
 too large to finish here. An earlier version, without draining, passed
 68 million states before it was stopped. The duplicate (`dup`) and the
 sequence of attempts (`small`) are each covered whole.
 
 ```bash
-spec/tla/check-attempt.sh        # small, dup, live, calibration: ~5 min
-spec/tla/check-attempt.sh big    # two attempts with a duplicate worker each: too large to finish
+spec/tla/check.sh attempt        # small, dup, live, calibration: ~5 min
+spec/tla/check.sh attempt big    # two attempts with a duplicate worker each: too large to finish
 ```
 
 **Into `Execution.tla`.** That model has attempts end atomically
@@ -766,15 +765,15 @@ abstraction map (key sets, one partition per asset) and comes last.
 | F9 | A keyed output moved to another store starts over with an index of its own; a consumer then keeps a key the move's first write dropped (seen when the consumer's first pass and the moved write run together) | P1 | fixed: a move sets the head's `base`, and a pass begun at or before it starts over — `test_f9_a_key_dropped_by_a_moved_output_leaves_its_consumers`, `test_a_key_a_moved_output_dropped_leaves_its_consumer` |
 | F10 | A full pass (a reset) whose patterns take none of the upstream's keys is skipped without calling the producer, so the consumer never starts over: keys it held stay, though the upstream dropped them — also after a `full` run | P1 | fixed: a full pass always reaches the consumer (`architecture.md` §5) — `test_a_full_pass_that_takes_no_key_still_starts_over`, and the simulation's `exclude` change is back in its rules |
 | F11 | A delta file a pending cleanup entry reads is deleted while an attempt that was handed the entry runs: the attempt cannot read it, the superseded objects it names leak, and the entry ends `stuck` | P2 | fixed in ffe6921 — `test_f11_a_discard_entrys_delta_outlives_the_attempt_reading_it`, `test_a_discard_entrys_delta_outlives_the_attempt_holding_it` |
-| F12 | `copy` renamed to `mirror` and back over rolling deploys (engines overlapping): `mirror` ends holding a key `items` deleted while `mirror` was not served — its old index survives under a bookmark already past the deletion | P2 | fixed: a name the manifest no longer declares holds no live state — `test_f12_a_rename_back_and_forth_over_rolling_deploys_keeps_up`, `test_a_name_removed_and_added_back_starts_over` |
+| F12 | `copy` renamed to `mirror` and back over rolling deploys (engines overlapping): `mirror` ends holding a key `items` deleted while `mirror` was not served — its old index survives under a position already past the deletion | P2 | fixed: a name the manifest no longer declares holds no live state — `test_f12_a_rename_back_and_forth_over_rolling_deploys_keeps_up`, `test_a_name_removed_and_added_back_starts_over` |
 | F13 | `items` moved from the table store to FileStore by a crash redeploy; the feed then removes `k11`: `copy` keeps it (F9's territory, the deletion after the move). Also with no crash: `k0`, `k11` committed; a takeover moves `items` from FileStore to the table store; the feed removes both; `copy` and `split`'s `odd` keep them, `checks` drops them | P1 | fixed by the reset rule (object-store-state.md §2): a move resets the output, its consumers re-read it from scratch — `tests/sim/test_replays.py::test_f13_a_key_removed_after_a_store_move_leaves_its_consumers`, `test_f13_a_key_removed_after_a_takeover_moved_its_upstream_leaves_its_consumers`, `tests/server/test_sim_found.py::test_a_key_a_moved_output_dropped_leaves_its_consumer` |
-| F14 | An engine that created its fence finds a checkpoint at or past it and deletes the fence as a hole's, but a newer engine had read it and checkpointed past it: the old engine's next append lands in the freed slot, is acknowledged, and no replay sees it (journal spec; trace and fix under "Formal model: the journal"; three engines, or two with an unreadable checkpoint) | P1 | fixed: the hole test (`object-store-state.md` §10), run by the engine that created the fence — `tests/server/test_journal.py::test_a_fence_a_newer_engine_moved_past_stays` |
-| F15 | A fence created in a hole stays readable until its engine deletes it: another opener replays it in place of the event cleanup deleted, and serves without that acknowledged event (journal spec; trace and fix under "Formal model: the journal"; three engines) | P1 | fixed: the hole test (`object-store-state.md` §10), run by every opener that reads a fence — `tests/server/test_journal.py::test_an_opener_never_replays_a_fence_created_in_a_hole` |
+| F14 | An engine that created its fence finds a checkpoint at or past it and deletes the fence as a hole's, but a newer engine had read it and checkpointed past it: the old engine's next append lands in the freed slot, is acknowledged, and no replay sees it (the segment journal's spec, retired in cfdc723 with its code; three engines, or two with an unreadable checkpoint) | P1 | fixed: the hole test (`object-store-state.md` §10), run by the engine that created the fence — `tests/server/test_journal.py::test_a_fence_a_newer_engine_moved_past_stays` |
+| F15 | A fence created in a hole stays readable until its engine deletes it: another opener replays it in place of the event cleanup deleted, and serves without that acknowledged event (the segment journal's spec, retired in cfdc723 with its code; three engines) | P1 | fixed: the hole test (`object-store-state.md` §10), run by every opener that reads a fence — `tests/server/test_journal.py::test_an_opener_never_replays_a_fence_created_in_a_hole` |
 | F16 | A key index compaction moves level-0 files into an empty level 1 without merging them, so level 1 holds overlapping files and a read takes an older entry: `k0` written (level 1); rewritten (level 0); the output replaced by nothing (a level-0 tombstone); a background compaction that empties the index lands only after `k0`, `k1` are written again (level 0, level 1 now empty); `k1` removed (level 0); the next compaction "moves the deepest level down whole" — level 1 holds `{k0, k1}` and `{k1 removed}` — and `k1` reads live. In the simulation `items` kept a key the feed dropped, kept `k3` at an old value, or named an object already collected (`KeyIndex.compact`: `out_level > depth` also holds for level 0 at depth 0) | P1 | fixed: level 0 is always merged, never moved down whole (its files overlap) — `tests/sdk/test_keys_index.py::test_any_workload_of_a_few_keys_matches_a_dict`, `tests/sim/test_replays.py::test_f16_*` |
-| F17 | An output moved to another store and back loses keys when nothing moved its bookmark in between: `items` commits `k10` on FileStore; a takeover moves it to the table store, where only a `keys=('k1', 'k10')` run writes (a fresh index there; a selection moves no bookmark, which keeps FileStore's fingerprint); a takeover moves it back; the feed adds `k3`: the fingerprint matches, so `items` reads a delta, and the move starts its index over with `k3` alone — `k10` is gone. A move that starts the index over has to make the asset read a full pass | P1 | fixed by the reset rule (object-store-state.md §2): each move resets the output and takes its asset's bookmarks, so it reads full passes — `tests/sim/test_replays.py::test_f17_an_output_moved_away_and_back_keeps_its_keys`, `tests/server/test_sim_found.py::test_a_move_and_back_with_no_write_between_resets` |
+| F17 | An output moved to another store and back loses keys when nothing moved its position in between: `items` commits `k10` on FileStore; a takeover moves it to the table store, where only a `keys=('k1', 'k10')` run writes (a fresh index there; a selection moves no position, which keeps FileStore's fingerprint); a takeover moves it back; the feed adds `k3`: the fingerprint matches, so `items` reads a delta, and the move starts its index over with `k3` alone — `k10` is gone. A move that starts the index over has to make the asset read a full pass | P1 | fixed by the reset rule (object-store-state.md §2): each move resets the output and takes its asset's positions, so it reads full passes — `tests/sim/test_replays.py::test_f17_an_output_moved_away_and_back_keeps_its_keys`, `tests/server/test_sim_found.py::test_a_move_and_back_with_no_write_between_resets` |
 | F18 | PostgresStore's migration ledger (`public.solera_migrations`) is keyed by output name, not by the table a migration changes: two projects (or a staging and a production namespace) on one database each write `orders` in a schema of their own; migration `note` adds a column to the first's table; the second's `migrate` finds the ledger row, skips it and reports it applied — its table never gets the column | P2 | fixed: the ledger (`solera_migration_ledger`) and its lock are keyed by the schema-qualified table — `tests/sdk/test_postgres.py::test_a_migration_applies_to_each_schemas_table_of_one_name` |
-| F19 | An asset removed while its attempt runs and added back before that attempt ends resumes its first life (F12's rule, across a live attempt): `copy` (version 1) has an attempt running; a deploy removes `copy`, which defers retiring its head and bookmarks until the attempt settles; a deploy adds `copy` back (version 2) — its first life's head and bookmarks are still there; the old attempt then succeeds and its commit installs into the new `copy`: rows written by version 1's code become version 2's head, under version 1's bookmark (found by the execution spec's review; a failed or lost attempt installs nothing, and its run carries on with a fresh attempt of the new code) | P2 | fixed by the reset rule (object-store-state.md §2): a removal resets at its deploy, and an attempt launched before commits nothing — `tests/server/test_sim_found.py::test_a_name_removed_while_its_attempt_runs_and_added_back_starts_over`, `test_an_attempt_of_a_removed_and_readded_asset_stays_in_its_life` |
+| F19 | An asset removed while its attempt runs and added back before that attempt ends resumes its first life (F12's rule, across a live attempt): `copy` (version 1) has an attempt running; a deploy removes `copy`, which defers retiring its head and positions until the attempt settles; a deploy adds `copy` back (version 2) — its first life's head and positions are still there; the old attempt then succeeds and its commit installs into the new `copy`: rows written by version 1's code become version 2's head, under version 1's position (found by the execution spec's review; a failed or lost attempt installs nothing, and its run carries on with a fresh attempt of the new code) | P2 | fixed by the reset rule (object-store-state.md §2): a removal resets at its deploy, and an attempt launched before commits nothing — `tests/server/test_sim_found.py::test_a_name_removed_while_its_attempt_runs_and_added_back_starts_over`, `test_an_attempt_of_a_removed_and_readded_asset_stays_in_its_life` |
 | F20 | The retry clock resubmits a retry run that cannot plan, at every tick: `checks` (`Each` over `items`, automated) has an operator's forced retry outstanding; `items` has no head (a store move reset it); the clock submits a retry run, which fails planning ("input 'items' has no head"), so the request is never done; the run's events wake the loop, which ticks again at once and submits it again — a hot loop, the journal and run history growing as fast as they can be written (in the simulation, at one virtual instant, until memory ran out) | P1 | fixed in b6d9968 (the retry clock waits for inputs with no head) — `tests/server/test_sim_found.py::test_the_retry_clock_waits_for_an_input_with_no_head` |
-| F21 | A job added back takes its first life's commit (F19's case, for an asset with no output: the reset rule resets outputs, and a job has none): the job `seen` has an attempt running; a deploy removes `seen`, another adds it back; the attempt succeeds and its cursor and bookmarks install into the new `seen` | P2 | fixed: removing an asset resets it, and an attempt launched before commits nothing of it (`reset_at` by asset) — `tests/server/test_sim_found.py::test_a_job_added_back_does_not_take_its_first_lifes_commit`, `test_a_job_removed_while_its_attempt_runs_and_added_back_starts_over` |
+| F21 | A job added back takes its first life's commit (F19's case, for an asset with no output: the reset rule resets outputs, and a job has none): the job `seen` has an attempt running; a deploy removes `seen`, another adds it back; the attempt succeeds and its cursor and positions install into the new `seen` | P2 | fixed: removing an asset resets it, and an attempt launched before commits nothing of it (`reset_at` by asset) — `tests/server/test_sim_found.py::test_a_job_added_back_does_not_take_its_first_lifes_commit`, `test_a_job_removed_while_its_attempt_runs_and_added_back_starts_over` |
 | F22 | An `OnChange` asset added back, or newly declared, is not built until its upstream next changes: `copy` (OnChange on `items`) is removed and added back; its automation comes back with nothing pending, so `copy` stays empty while `items` holds keys | P2 | fixed in aa0e7dd: any asset change (added, renamed, declaration changed, reset) leaves the asset due, and OnChange owes one firing per partition whose inputs have heads, decided once at the deploy — `tests/server/test_sim_found.py::test_an_onchange_asset_added_back_is_built` |
 | F23 | The native `.kx` reader accepts a 10-byte varint with bits past 2^64 and drops them: a block entry whose generation is `ff` × 9, `7f` reads as 2^64 − 1 natively and as 2^70 − 1 in the Python reference. Only bytes no writer produces reach it (a hostile or corrupt file whose checksums match), but the two readers then disagree on a file both accept | P3 | fixed in ab0c346: a tenth byte above `0x01` is refused, natively and by the reference — `tests/sdk/test_keys_format.py::test_a_varint_past_64_bits_is_refused` |

@@ -172,7 +172,7 @@ def main() -> int:
     if len(sys.argv) < 2 or sys.argv[1] not in SPECS:
         raise SystemExit(f"usage: check-trace.py {{{','.join(SPECS)}}} [RUN.jsonl ...]")
     if not JAR.exists():
-        raise SystemExit(f"{JAR} is missing: run spec/tla/check-journal.sh once to download it")
+        raise SystemExit(f"{JAR} is missing: run spec/tla/check.sh once to download it")
     spec = SPECS[sys.argv[1]]
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
