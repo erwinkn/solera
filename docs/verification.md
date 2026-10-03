@@ -285,6 +285,8 @@ rules, not invariant checks. `pg`: `items` may also live in Postgres.
 | J1–J3 | the job `seen` | 811–813 | 668 runs, 33,179 steps | default ×2, pg | green; F13 set aside once |
 | X1–X3 | 33fa183 (F10 fixed, `exclude` back) | 901–903 | 853 runs, 46,600 steps | default ×2, pg | green |
 | Y1–Y3 | the reset rule's rules (off), `a_life_is_its_own` | 911–913 | 682 runs, 37,174 steps | default ×2, pg | green; F19 set aside once (rules off: a rename back without an alias) |
+| Z1 | the reset rule's rules on (b7d8ae7) | 921 | 637 runs, 9,635 steps | default | F21; F20 set aside 9 times (since fixed) |
+| Z2–Z3 | F16, F20 fixed; F21 set aside | 931–932 | 435 runs, 24,486 steps | default, pg | green; F21 set aside 28 times |
 
 ## Formal model: execution semantics (`spec/tla/Execution.tla`)
 
