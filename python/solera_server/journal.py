@@ -1,44 +1,44 @@
-"""The engine's durable state on an object store alone (docs/object-store-state.md §3, §10).
+"""The engine's durable state on an object store alone
+(docs/object-store-state.md §0, §10; docs/journal-object.md).
 
-Current state lives in memory. Every change to it is an event; the journal
-appends events to create-only segment objects and periodically writes the
-whole state as a checkpoint. A writer starting up loads the newest
-checkpoint and replays the segments after it.
+Current state lives in memory. Every change to it is an event. The journal
+is one object, swapped with `If-Match` on every write (`solera.objects.swap`):
+the id of the engine that writes it, the checkpoint it extends, and every
+event since that checkpoint. A checkpoint is the whole state, written now
+and then under a fresh name.
 
-    {prefix}/journal/{seq:020d}.json      {"seq", "engine", "at", "events": [...]}
-    {prefix}/checkpoints/{seq:020d}.json  {"seq", "engine", "at", "fences", "state": {...}}
+    {prefix}/journal.json                    {"checkpoint", "engine", "events": [...]}
+    {prefix}/checkpoints/{engine}-{n:06d}.json   {"at", "engine", "state": {...}}
 
-Only create-only puts and LIST are needed — no compare-and-swap, which
-obstore's local filesystem backend does not implement.
+**Opening.** Read the journal, load the checkpoint it names and apply its
+events; then fence: swap in the same journal under this engine's own id, on
+the ETag read. A checkpoint gone, or a conflict, means another engine moved
+on meanwhile: read again.
 
-**Fencing.** A writer's first segment is its fence (`EngineStarted`); the
-segment's seq is the writer id. The fence carries a random nonce: a create
-that finds its segment's exact bytes takes them for its own earlier try,
-and without the nonce two writers fencing at one seq could seal the same
-bytes. Every later segment is created at `seq+1`.
-A replaced writer's next create collides with a segment it did not write
-and the journal becomes `fenced`: every later append fails. That segment is
-its successor's fence, so fence segments are never deleted: were cleanup to
-remove one, the replaced writer's next create would succeed in its slot, and
-what it appended would be acknowledged yet never replayed. Each checkpoint
-lists them (`fences`) so cleanup can skip them: one small object per writer.
+**Fencing.** Every write is a swap on the ETag of this engine's last one,
+and no body repeats — each names its engine and adds events or a newer
+checkpoint — so once another engine has written, the next swap raises
+`Conflict`: the journal is `fenced`, and every later append fails.
 
 **Durability.** `append` applies nothing; the caller applies an event to
-memory and appends it, and a background flusher writes what is buffered
-once `flush_interval` has passed or `max_buffer` bytes are buffered. Only
-what acts on the outside world on the strength of an event — launching an
-attempt, deleting what the event made garbage, answering an API call —
-awaits `durable()`, which flushes at once. A failed write is retried with
-the very same segment.
+memory and appends it, and a background flusher swaps in the journal with
+what is buffered once `flush_interval` has passed or `max_buffer` bytes are
+buffered. What acts on the outside world on the strength of an event awaits
+`durable()`, which flushes at once. A flush is sealed before it is written:
+a failed one is retried with the very same bytes, which `swap` takes for
+its own if an earlier try landed unheard.
 
-**Checkpoints.** After a flush, once the journal written since the last
-checkpoint reaches that checkpoint's size (and at least `min_checkpoint`
-bytes), the state is snapshotted — at the moment the flushed batch was
-sealed, so it matches the segment's seq exactly — and written. Then
-checkpoints older than the previous one are deleted, and so are segments
-at or below the previous checkpoint's seq but fences: the previous checkpoint and the
-journal after it are kept, so a newest checkpoint that turns out
-unreadable can be recovered from.
+**Checkpoints.** Once the journal's events reach max(`min_checkpoint`, a
+sixteenth of the last checkpoint's size), and on a clean close: list the
+checkpoints, write the state as of the last flush under a fresh name, read
+it back, move the journal to it (no events), and only then delete what was
+listed. Listing after the move could delete a newer engine's checkpoint,
+not yet named; one not read back could be named and unreadable.
+
+The journal and checkpoints are encoded with orjson, keys sorted: the same
+state gives the same bytes. Events are encoded with the standard library,
+which refuses what JSON cannot hold exactly (`inf`, `nan`) before anything
+is applied.
 """
 
 from __future__ import annotations
@@ -53,27 +53,19 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import obstore
-from obstore.exceptions import AlreadyExistsError, NotFoundError
-from solera.objects import create
+import orjson
+from obstore.exceptions import NotFoundError
+from solera.objects import Conflict, create, read, swap
 
 log = logging.getLogger(__name__)
 
 
-class _Behind(Exception):
-    """The writer checkpointed past what an opener had read, and cleaned up
-    segments it had yet to read: it opens again, from the newer checkpoint."""
-
-
 class Fenced(RuntimeError):
-    """Another writer took over this namespace; this one must stop."""
+    """Another engine took over this namespace; this one must stop."""
 
 
 class JournalCorrupt(RuntimeError):
-    """The journal has a gap or an unreadable segment."""
-
-
-def _dumps(value) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    """The journal, or the checkpoint it names, cannot be read."""
 
 
 def encode(event: dict) -> bytes:
@@ -81,14 +73,21 @@ def encode(event: dict) -> bytes:
     cannot hold exactly (`inf`, `nan`) and `TypeError` for what it cannot
     hold at all — before anything was applied."""
 
-    return _dumps(event)
+    return json.dumps(event, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+
+
+def _dumps(value) -> bytes:
+    """The journal's and the checkpoints' encoding: keys sorted, so a state
+    encodes to the same bytes every time (`swap` reads back by bytes)."""
+
+    return orjson.dumps(value, option=orjson.OPT_SORT_KEYS)
 
 
 @dataclass
 class OpenResult:
-    seq: int  # the writer's fence segment — its writer id
-    replayed: int  # segments applied after the checkpoint
-    checkpoint: int | None  # the checkpoint loaded, if any
+    engine: str | None  # this engine's id: None when read-only
+    replayed: int  # events applied on top of the checkpoint
+    checkpoint: str | None  # the checkpoint loaded, if any
 
 
 class Journal:
@@ -99,7 +98,7 @@ class Journal:
         *,
         flush_interval: float = 1.0,
         max_buffer: int = 1 << 20,
-        min_checkpoint: int = 256 << 10,
+        min_checkpoint: int = 64 << 10,
         clock: Callable[[], float] = time.time,
     ):
         self.store = store
@@ -109,53 +108,33 @@ class Journal:
         self.min_checkpoint = min_checkpoint
         self.clock = clock
 
-        self.seq = 0  # last segment written (by anyone) and applied
-        self.engine: int | None = None
-        # This writer's own: two writers fencing at one seq in the same instant
-        # would otherwise seal the same bytes, each taking the other's for its own.
-        self.nonce = secrets.token_hex(8)
+        self.engine: str | None = None
+        self.checkpoint: str | None = None  # the checkpoint the journal names
         self.fenced = False
-        self._buffer: list[bytes] = []  # encoded events: what was recorded, never what the model became
+        self._etag: str | None = None  # of this engine's last write
+        self._events: list[bytes] = []  # encoded, every event since `checkpoint`: the journal's
+        self._events_bytes = 0
+        self._buffer: list[bytes] = []  # encoded events not yet written
         self._buffer_bytes = 0
         self._first_buffered: float | None = None
-        self.appended = self.written = 0  # events this writer appended, and wrote
+        self.appended = self.written = 0  # events this engine appended, and wrote
         self._waiters: list[tuple[int, asyncio.Future]] = []  # (events appended, waiter)
         self._urgent = False  # someone waits on `durable()`
-        self._sealed: tuple | None = None  # (seq, data, events, checkpoint): written next, as is
-        self._flushing: asyncio.Lock = asyncio.Lock()
+        self._sealed: tuple | None = None  # (body, events, count, snapshot): written next, as is
+        self._flushing = asyncio.Lock()
         self._wake = asyncio.Event()
         self._task: asyncio.Task | None = None
         self._snapshot: Callable[[], dict] | None = None
-        self._since_checkpoint = 0
         self._last_checkpoint_size = 0
-        self._checkpoints: list[int] = []
-        self.fences: list[int] = []  # every writer's fence segment: never deleted
+        self._checkpoints = 0  # this engine's, for their names
 
-    # -- paths ----------------------------------------------------------------------
+    @property
+    def _journal(self) -> str:
+        return f"{self.prefix}/journal.json"
 
-    def _segment(self, seq: int) -> str:
-        return f"{self.prefix}/journal/{seq:020d}.json"
-
-    def _checkpoint(self, seq: int) -> str:
-        return f"{self.prefix}/checkpoints/{seq:020d}.json"
-
-    async def _list(self, kind: str, after: int | None = None) -> list[int]:
-        prefix = f"{self.prefix}/{kind}/"
-        offset = f"{prefix}{after:020d}.json" if after is not None else None
-        out = []
-        stream = (
-            obstore.list(self.store, prefix, offset=offset) if offset else obstore.list(self.store, prefix)
-        )
-        async for batch in stream:
-            for meta in batch:
-                name = meta["path"].rsplit("/", 1)[-1]
-                if name.endswith(".json") and name[:-5].isdigit():
-                    out.append(int(name[:-5]))
-        return sorted(out)
-
-    async def _get_json(self, path: str):
-        data = await obstore.get_async(self.store, path)
-        return json.loads(bytes(await data.bytes_async()))
+    def _body(self, engine: str | None, checkpoint: str | None, events: list[bytes]) -> bytes:
+        head = _dumps({"checkpoint": checkpoint, "engine": engine})  # sorts before "events"
+        return head[:-1] + b',"events":[' + b",".join(events) + b"]}"
 
     # -- opening ----------------------------------------------------------------------
 
@@ -167,155 +146,67 @@ class Journal:
         *,
         writer: bool = True,
     ) -> OpenResult:
-        """Load the newest readable checkpoint, replay the segments after it,
-        then fence: from here on this process is the only writer. A writer
-        still running may checkpoint and clean up meanwhile, deleting
-        segments not yet read: then everything starts again, from its newer
-        checkpoint.
-
-        `writer=False` opens read-only: nothing is fenced and appends fail —
-        for tools that inspect a namespace a server may be writing."""
+        """Read the journal, load its checkpoint and apply its events, then
+        fence: from here on this process is the only writer. `writer=False`
+        opens read-only: nothing is fenced and appends fail — for tools that
+        inspect a namespace a server may be writing."""
 
         self._snapshot = snapshot
         while True:
+            found = await read(self.store, self._journal)
             try:
-                loaded = await self._load(restore)
-                replayed = await self._replay(apply)
-                if not writer:
-                    self.fenced = True  # read-only: every append fails
-                    return OpenResult(seq=None, replayed=replayed, checkpoint=loaded)
-                await self._fence(apply)
-                break
-            except _Behind:
-                log.warning("the journal was cleaned up past what this writer had read; opening again")
-        self._task = asyncio.create_task(self._run())
-        return OpenResult(seq=self.engine, replayed=replayed, checkpoint=loaded)
-
-    async def _load(self, restore) -> int | None:
-        """Restore the newest readable checkpoint; its seq, or None."""
-
-        self._checkpoints = await self._list("checkpoints")
-        self.fences, self._since_checkpoint, self._last_checkpoint_size = [], 0, 0
-        loaded = None
-        for seq in reversed(self._checkpoints):
+                body = orjson.loads(found[0]) if found is not None else {"checkpoint": None, "events": []}
+            except orjson.JSONDecodeError as error:
+                raise JournalCorrupt(f"{self._journal}: {error}") from None
+            checkpoint = body["checkpoint"]
             try:
-                body = await self._get_json(self._checkpoint(seq))
-                restore(body["state"])
-                self.fences = list(body["fences"])
-                loaded = seq
-                self._last_checkpoint_size = len(_dumps(body))
-                break
-            except (NotFoundError, ValueError, KeyError) as error:
-                log.warning("checkpoint %s unreadable (%s); trying the previous one", seq, error)
-        if loaded is None:
-            restore(None)
-        self.seq = loaded or 0
-        return loaded
-
-    async def _replay(self, apply) -> int:
-        count = 0
-        for seq in await self._list("journal", after=self.seq):
-            if seq != self.seq + 1:
-                await self._behind(self.seq + 1)
-                raise JournalCorrupt(f"journal gap: expected segment {self.seq + 1}, found {seq}")
-            body = await self._read_segment(seq)
-            await self._apply_read(seq, body, apply)
-            self._since_checkpoint += len(_dumps(body))
-            count += 1
-        return count
-
-    async def _read_segment(self, seq: int) -> dict:
-        try:
-            return await self._get_json(self._segment(seq))
-        except NotFoundError:  # listed, or found taken, then cleaned up
-            await self._behind(seq)
-            raise
-
-    async def _behind(self, seq: int) -> None:
-        """Raise `_Behind` if segment `seq` is missing because a checkpoint
-        covers it: cleanup deletes a segment only once two checkpoints at or
-        past it exist, so one there means it was written, then deleted."""
-
-        if any(c >= seq for c in await self._list("checkpoints")):
-            raise _Behind(seq)
-
-    async def _hole(self, seq: int) -> bool | None:
-        """The hole test for a fence segment at `seq` (docs/object-store-state.md
-        §10, "Fences in holes"): True if it was created in a hole cleanup left,
-        False if it is real, None if every listed checkpoint at or past it is
-        unreadable. Cleanup deletes a segment only once two checkpoints at or
-        past it exist and never deletes a fence, and every checkpoint written
-        after a real fence lists it: so fewer than two means real, and any one
-        readable checkpoint at or past `seq` decides. Never one below it."""
-
-        while True:
-            covering = [c for c in await self._list("checkpoints") if c >= seq]
-            if len(covering) < 2:
-                return False
-            gone = False
-            for c in reversed(covering):
-                try:
-                    fences = (await self._get_json(self._checkpoint(c)))["fences"]
-                except (NotFoundError, FileNotFoundError):  # cleaned up since the LIST: list again
-                    gone = True
-                    break
-                except (ValueError, KeyError, TypeError) as error:
-                    log.warning("checkpoint %s unreadable (%s); trying another for the hole test", c, error)
-                    continue
-                return seq not in fences
-            if not gone:
-                return None
-
-    async def _apply_read(self, seq: int, body: dict, apply) -> None:
-        """Apply a segment read from the journal — unless it is a fence created
-        in a hole: then this opener is behind, and opens again (F15)."""
-
-        if any(e["type"] == "EngineStarted" for e in body["events"]) and await self._hole(seq) is not False:
-            raise _Behind(seq)
-        self._apply_segment(seq, body, apply)
-
-    async def _fence(self, apply) -> None:
-        while True:
-            seq = self.seq + 1
-            fence = {"type": "EngineStarted", "engine": seq, "nonce": self.nonce}
-            body = {"seq": seq, "engine": seq, "at": self.clock(), "events": [fence]}
-            try:
-                await create(self.store, self._segment(seq), _dumps(body))
-            except AlreadyExistsError:
-                # Another writer appended since we listed: apply it and try the next seq.
-                await self._apply_read(seq, await self._read_segment(seq), apply)
-                continue
+                state = await self._load(checkpoint) if checkpoint is not None else None
             except (NotFoundError, FileNotFoundError):
-                # The create's read-back found the slot emptied by cleanup: behind.
-                raise _Behind(seq) from None
+                log.warning("checkpoint %s is gone: the journal moved on; reading it again", checkpoint)
+                continue
+            # Encoded before the model applies them: it keeps what it applies, and later
+            # events change it — the journal must keep what was recorded.
+            events = [encode(e) for e in body["events"]]
+            restore(state)
+            for event in body["events"]:
+                apply(event)
+            self.checkpoint, self._events = checkpoint, events
+            self._events_bytes = sum(len(e) for e in self._events)
+            replayed = len(self._events)
+            if not writer:
+                self.fenced = True  # read-only: every append fails
+                return OpenResult(engine=None, replayed=replayed, checkpoint=checkpoint)
+            engine = secrets.token_hex(4)
             try:
-                # A checkpoint at or past the fence: a newer writer replayed it (it
-                # stays, and this one opens again behind it, F14), or it landed in a
-                # hole cleanup left (it goes). Neither when that cannot be told.
-                await self._behind(seq)
-            except _Behind:
-                if await self._hole(seq):
-                    with contextlib.suppress(NotFoundError):
-                        await obstore.delete_async(self.store, self._segment(seq))
-                raise
-            apply(fence)
-            self.seq = seq
-            self.engine = seq
-            self.fences.append(seq)
-            return
+                self._etag = await swap(
+                    self.store,
+                    self._journal,
+                    self._body(engine, checkpoint, self._events),
+                    found and found[1],
+                )
+            except Conflict:
+                log.warning("another engine wrote the journal while this one opened; reading it again")
+                continue
+            self.engine = engine
+            break
+        self._task = asyncio.create_task(self._run())
+        return OpenResult(engine=self.engine, replayed=replayed, checkpoint=checkpoint)
 
-    def _apply_segment(self, seq: int, body: dict, apply) -> None:
-        for event in body["events"]:
-            apply(event)
-            if event["type"] == "EngineStarted":
-                self.fences.append(seq)
-        self.seq = seq
+    async def _load(self, name: str) -> dict:
+        got = await obstore.get_async(self.store, f"{self.prefix}/checkpoints/{name}.json")
+        data = bytes(await got.bytes_async())
+        try:
+            body = orjson.loads(data)
+        except orjson.JSONDecodeError as error:
+            raise JournalCorrupt(f"checkpoint {name}: {error}") from None
+        self._last_checkpoint_size = len(data)
+        return body["state"]
 
     # -- appending ----------------------------------------------------------------------
 
     def stop_checkpoints(self) -> None:
         """Take no checkpoint from now on: the state it would snapshot is no
-        longer the fold of these segments."""
+        longer the fold of the journal."""
 
         self._snapshot = None
 
@@ -325,7 +216,7 @@ class Journal:
         next, or by `durable()` (docs/lifecycle.md §13)."""
 
         if self.fenced:
-            raise Fenced("this writer was replaced")
+            raise Fenced("this engine was replaced")
         for event in events:
             self._buffer.append(event)
             self._buffer_bytes += len(event)
@@ -348,7 +239,7 @@ class Journal:
         if self.written >= target:
             return
         if self.fenced:
-            raise Fenced("this writer was replaced")
+            raise Fenced("this engine was replaced")
         if self._task is None:  # closed: nothing flushes in the background
             await self.flush()
             return
@@ -359,28 +250,29 @@ class Journal:
         await waiter
 
     async def flush(self) -> None:
-        """Write everything buffered, as one segment (and a checkpoint if one
-        is due). A segment is sealed before it is written: if the write fails
-        or is interrupted, the next flush writes it again, byte for byte."""
+        """Swap in the journal with everything buffered (and take a
+        checkpoint if one is due). A flush is sealed before it is written: if
+        the write fails or is interrupted, the next flush writes it again,
+        byte for byte."""
 
         async with self._flushing:
             while self._sealed is not None or self._buffer:
                 if self.fenced:
-                    self._fail(Fenced("this writer was replaced"))
+                    self._fail(Fenced("this engine was replaced"))
                     return
                 if self._sealed is None:
                     self._seal()
-                seq, data, count, snap = self._sealed
+                body, events, count, snap = self._sealed
                 try:
-                    await self._put_segment(seq, data)
-                except Fenced as error:
+                    self._etag = await swap(self.store, self._journal, body, self._etag)
+                except Conflict:
                     self._sealed = None
+                    error = Fenced("another engine wrote the journal")
                     self._fail(error)
-                    raise
+                    raise error from None
                 self._sealed = None
-                self.seq = seq
+                self._events, self._events_bytes = events, sum(len(e) for e in events)
                 self.written += count
-                self._since_checkpoint += len(data)
                 waiting = []
                 for target, waiter in self._waiters:
                     if target > self.written:
@@ -389,71 +281,59 @@ class Journal:
                         waiter.set_result(None)
                 self._waiters = waiting
                 if snap is not None:
-                    await self._write_checkpoint(seq, snap)
+                    await self._take_checkpoint(snap)
 
     def _seal(self) -> None:
-        events = self._buffer
+        new = self._buffer
         self._buffer, self._buffer_bytes, self._first_buffered, self._urgent = [], 0, None, False
-        seq = self.seq + 1
-        head = {"at": self.clock(), "seq": seq, "engine": self.engine}
-        data = b'{"events":[' + b",".join(events) + b"]," + _dumps(head)[1:]
-        # Sealed: memory now reflects exactly segments 1..seq, so a snapshot
-        # taken here matches `seq` — before any later event is applied.
-        due = self._snapshot is not None and self._since_checkpoint + len(data) >= max(
-            self.min_checkpoint, self._last_checkpoint_size
+        events = self._events + new
+        body = self._body(self.engine, self.checkpoint, events)
+        # Sealed: memory now reflects exactly these events, so a snapshot taken
+        # here is the state as of this flush — before any later event is applied.
+        size = sum(len(e) for e in events)
+        due = self._snapshot is not None and size >= max(
+            self.min_checkpoint, self._last_checkpoint_size // 16
         )
-        snap = _dumps(self._checkpoint_body(seq)) if due else None
-        self._sealed = (seq, data, len(events), snap)
+        snap = _dumps({"at": self.clock(), "engine": self.engine, "state": self._snapshot()}) if due else None
+        self._sealed = (body, events, len(new), snap)
 
-    def _checkpoint_body(self, seq: int) -> dict:
-        at, fences = self.clock(), list(self.fences)
-        return {"seq": seq, "engine": self.engine, "at": at, "fences": fences, "state": self._snapshot()}
+    async def _take_checkpoint(self, data: bytes) -> None:
+        """List, write, read back, move the journal, then delete what was
+        listed — in that order (docs/object-store-state.md §10)."""
 
-    async def _put_segment(self, seq: int, data: bytes) -> None:
-        for attempt in range(5):
-            try:
-                await create(self.store, self._segment(seq), data)  # or finds our own earlier try
-                return
-            except AlreadyExistsError:
-                self.fenced = True
-                raise Fenced(f"segment {seq} was written by another writer") from None
-            except (OSError, TimeoutError, ConnectionError) as error:
-                if attempt == 4:
-                    raise
-                log.warning("segment %s put failed (%s); retrying", seq, error)
-                await asyncio.sleep(0.2 * 2**attempt)
-
-    async def _write_checkpoint(self, seq: int, data: bytes) -> None:
+        listed = [
+            meta["path"]
+            for batch in obstore.list(self.store, prefix=f"{self.prefix}/checkpoints/")
+            for meta in batch
+            if meta["path"].endswith(".json")
+        ]
+        self._checkpoints += 1
+        name = f"{self.engine}-{self._checkpoints:06d}"
+        path = f"{self.prefix}/checkpoints/{name}.json"
+        await create(self.store, path, data)  # a fresh name; a retry finds its own bytes
         try:
-            await create(self.store, self._checkpoint(seq), data)
-        except AlreadyExistsError:
+            got = await obstore.get_async(self.store, path)
+            orjson.loads(bytes(await got.bytes_async()))
+        except Exception as error:  # the journal stays: the next due point tries again
+            log.warning("checkpoint %s does not read back (%s); keeping the journal", name, error)
             return
-        self._checkpoints.append(seq)
-        self._since_checkpoint = 0
+        try:
+            self._etag = await swap(self.store, self._journal, self._body(self.engine, name, []), self._etag)
+        except Conflict:
+            self._fail(Fenced("another engine wrote the journal"))
+            return  # fenced: deletes nothing
+        self.checkpoint, self._events, self._events_bytes = name, [], 0
         self._last_checkpoint_size = len(data)
-        await self._collect()
-
-    async def _collect(self) -> None:
-        """Keep the newest checkpoint, the one before it, the journal after
-        that, and every fence."""
-
-        if len(self._checkpoints) < 2:
-            return
-        previous = self._checkpoints[-2]
-        old = [c for c in self._checkpoints if c < previous]
-        fences = set(self.fences)
-        segments = [s for s in await self._list("journal") if s <= previous and s not in fences]
-        paths = [self._checkpoint(c) for c in old] + [self._segment(s) for s in segments]
-        for i in range(0, len(paths), 1000):
-            await obstore.delete_async(self.store, paths[i : i + 1000])
-        self._checkpoints = [c for c in self._checkpoints if c >= previous]
+        for i in range(0, len(listed), 1000):
+            with contextlib.suppress(NotFoundError, FileNotFoundError):
+                await obstore.delete_async(self.store, listed[i : i + 1000])
 
     def _fail(self, error: BaseException) -> None:
         self.fenced = True
         for _, waiter in self._waiters:
             if not waiter.done():
                 waiter.set_exception(error)
-        self._waiters, self._buffer, self._buffer_bytes = [], [], 0
+        self._waiters, self._buffer, self._buffer_bytes, self._first_buffered = [], [], 0, None
 
     # -- the flusher ----------------------------------------------------------------------
 
@@ -463,7 +343,7 @@ class Journal:
         failed write is retried after `flush_interval`."""
 
         loop = asyncio.get_running_loop()
-        while True:
+        while not self.fenced:
             self._wake.clear()
             if self._sealed is None:
                 if self._first_buffered is None:
@@ -477,14 +357,14 @@ class Journal:
             try:
                 await self.flush()
             except Fenced:
-                log.error("journal fenced: another writer took over; stopping")
+                log.error("journal fenced: another engine took over; stopping")
                 return
             except Exception as error:
                 log.error("journal flush failed, retrying: %s", error)
                 await asyncio.sleep(self.flush_interval)
 
     async def close(self, *, checkpoint: bool = True) -> None:
-        """Flush what is buffered, write a final checkpoint, stop the flusher."""
+        """Flush what is buffered, take a final checkpoint, stop the flusher."""
 
         if self._task is not None:
             self._task.cancel()
@@ -496,5 +376,9 @@ class Journal:
         if self.fenced or self.engine is None:
             return
         await self.flush()
-        if checkpoint and self._snapshot is not None and self._since_checkpoint:
-            await self._write_checkpoint(self.seq, _dumps(self._checkpoint_body(self.seq)))
+        if checkpoint and self._snapshot is not None and self._events and not self.fenced:
+            async with self._flushing:
+                state = self._snapshot()
+                await self._take_checkpoint(
+                    _dumps({"at": self.clock(), "engine": self.engine, "state": state})
+                )

@@ -466,15 +466,11 @@ class Simulation(RuleBasedStateMachine):
             return
         if self.journal.problems:
             raise Violation("; ".join(self.journal.problems))
-        if overwritten := self.journal.overwritten(self.world.objects.deleted, self.world.now()):
-            raise Violation(
-                f"journal segments {overwritten} landed twice with different bytes, both readable"
-            )
         for attempt, ends in self.journal.finished.items():
             if len(ends) > 1:
                 raise Violation(
                     f"attempt {attempt} ended {len(ends)} times: "
-                    + ", ".join(f"seq {s}: {e['outcome']}" for s, e in ends)
+                    + ", ".join(f"event {s}: {e['outcome']}" for s, e in ends)
                 )
 
     @invariant()

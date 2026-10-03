@@ -92,7 +92,7 @@ current content.
 {root}/{namespace}/
   control/
     journal.json                             ← the engine id, the checkpoint, the events since
-    checkpoints/7f3a9c0e5b21d846-000012.json ← the checkpoint the journal names
+    checkpoints/7f3a9c0e-000012.json ← the checkpoint the journal names
   keys/
     site_files/alpha/000000000057.kx         ← delta file of commit 57
     site_files/alpha/c01J8ZE2….kx            ← compacted file
@@ -220,9 +220,8 @@ retention (§11).
 
 ```json
 {
-  "engine": "7f3a9c0e5b21d846",
-  "checkpoint": "7f3a9c0e5b21d846-000012",
-  "at": 1790074866.1,
+  "checkpoint": "7f3a9c0e-000012",
+  "engine": "7f3a9c0e",
   "events": [
     "…every event since checkpoint 000012, then:",
     {"type": "AttemptFinished", "run": "01J8ZC7Q…", "task": "site_feed:alpha",

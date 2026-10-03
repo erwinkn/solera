@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
-# Model-check the journal spec (docs/verification.md, "Formal model: the journal").
+# Model-check the journal spec, the journal as one object swapped with
+# If-Match (JournalObject.tla; docs/verification.md, "Formal model: the
+# journal object").
 #
-#   spec/tla/check-journal.sh              the small model: two engines, as built
-#   spec/tla/check-journal.sh fixed        three engines, four segments
-#   spec/tla/check-journal.sh big          the same, five segments
+#   spec/tla/check-journal.sh              the small model: two engines
+#   spec/tla/check-journal.sh fixed        three engines, five writes
+#   spec/tla/check-journal.sh big          three engines, six writes
 #   spec/tla/check-journal.sh live         liveness, engines one at a time
-#   spec/tla/check-journal.sh calibrate    each fix put back out: TLC must find its bug
+#   spec/tla/check-journal.sh calibrate    each rule switched off: TLC must find its bug
 #   spec/tla/check-journal.sh ci           small, fixed, live and calibrate
 #   spec/tla/check-journal.sh all          ci and big
-#   spec/tla/check-journal.sh object       the journal as one object (JournalObject.tla):
-#                                          two engines, three, liveness, calibration
-#   spec/tla/check-journal.sh object-big   the same, three engines, six writes
 #
 # TLC_WORKERS (2) and TLC_HEAP (4g) bound what a run takes of a shared
 # machine. Needs Java 11+. Downloads tla2tools.jar into spec/tla/.tools (gitignored).
@@ -23,7 +22,7 @@ if [ ! -f "$jar" ]; then
     mkdir -p .tools
     curl -fsSL -o "$jar" "https://github.com/tlaplus/tlaplus/releases/download/v$version/tla2tools.jar"
 fi
-module=Journal  # the spec checked: Journal, or JournalObject
+module=JournalObject
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
@@ -88,47 +87,9 @@ calibrate() {
     fi
 }
 
-# Every journal fix switched off in turn, on the rule with the F14 and F15
-# fixes (Journal-big.cfg): TLC must find each bug again.
+# Each of the journal's rules switched off in turn: TLC must find its bug.
 calibration() {
     echo "== calibrate"
-    # 3c23397, F7: an opener whose fence lands in a hole serves under it,
-    # without the events cleanup deleted; one whose GET finds the segment
-    # gone fails.
-    calibrate f7 big OneWriter FixF7=FALSE -OpensNeverFail
-    calibrate f7-gap big OpensNeverFail FixF7=FALSE
-    # 0b3e226: cleanup deletes a fence; the old engine appends into its slot.
-    calibrate 0b3e226 big NoAckedLoss KeepFences=FALSE -FencesStay -OneWriter
-    # f300500: two engines fence at one seq with the same bytes; both serve.
-    calibrate f300500 big OneWriter FenceNonce=FALSE
-    # F14, F15: each half of the hole test off, then both (before 1367919). Without
-    # FixF14 an opener deletes real fences, so HolesTwiceCovered, a lemma of
-    # the fixed rule, fails first: it is left out to reach the lost event.
-    calibrate f14 big NoAckedLoss FixF14=FALSE Unreadable=FALSE -HolesTwiceCovered
-    calibrate f15 big StatesArePrefixes FixF15=FALSE
-    calibrate f15-writer big FencedSeesAcked FixF15=FALSE -StatesArePrefixes
-    calibrate pre-1367919 big NoAckedLoss FixF14=FALSE FixF15=FALSE Unreadable=FALSE -HolesTwiceCovered
-    # Before 1367919, F14 needed only two engines once a checkpoint could be
-    # unreadable: an opener deleted its fence after its successor read it.
-    calibrate f14-two small CleanupCovered FixF14=FALSE FixF15=FALSE -HolesTwiceCovered
-    # A create that does not know its own bytes fences out a lone engine.
-    calibrate own-bytes live AppendsAlone OwnBytes=FALSE -OpensAlone
-    # The design does not keep a segment an opener listed until it reads it.
-    calibrate listed-stay small ListedStayUntilRead +ListedStayUntilRead
-}
-
-live() {
-    check live live
-}
-
-# The journal as one object (docs/verification.md, "Formal model: the
-# journal object"): its models, then each of its rules switched off in turn.
-object() {
-    module=JournalObject
-    check object-small small
-    check object-fixed big MaxWrites=5
-    check object-live live
-    echo "== calibrate the journal object"
     # Without the engine id in the journal, a fence can leave its bytes, so
     # its ETag, unchanged: the old engine's If-Match still holds.
     calibrate engine-id small OneWriter EngineId=FALSE
@@ -143,18 +104,15 @@ object() {
     # Cleanup that LISTs after its move deletes a newer engine's checkpoint
     # before that engine's move names it: the state is lost.
     calibrate list-first small NoAckedLoss ListFirst=FALSE
-    module=Journal
 }
 
 case ${1:-small} in
     small) check small small ;;
-    fixed) check fixed big MaxSeq=4 ;;
+    fixed) check fixed big MaxWrites=5 ;;
     big) check big big ;;
-    live) live ;;
+    live) check live live ;;
     calibrate) calibration ;;
-    ci) check small small; check fixed big MaxSeq=4; live; calibration ;;
-    all) check small small; check fixed big MaxSeq=4; live; calibration; check big big ;;
-    object) object ;;
-    object-big) module=JournalObject; check object-big big ;;
-    *) echo "usage: $0 [small|fixed|big|live|calibrate|ci|all|object|object-big]" >&2; exit 2 ;;
+    ci) check small small; check fixed big MaxWrites=5; check live live; calibration ;;
+    all) check small small; check fixed big MaxWrites=5; check live live; calibration; check big big ;;
+    *) echo "usage: $0 [small|fixed|big|live|calibrate|ci|all]" >&2; exit 2 ;;
 esac

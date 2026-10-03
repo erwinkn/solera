@@ -345,7 +345,6 @@ async def test_replay_reproduces_the_live_model(tmp_path, clock):
     )
     assert finished >= 6
     replayed = durable(again.model)
-    live.pop("engine"), replayed.pop("engine")
     assert replayed == live
 
 
@@ -370,7 +369,6 @@ async def test_the_journal_alone_reproduces_the_live_model(tmp_path, clock):
     await state.durable()
     again = await State.open(tmp_path.as_uri(), "test", clock=clock, writer=False)
     live, replayed = durable(state.model), durable(again.model)
-    live.pop("engine"), replayed.pop("engine")
     assert replayed == live
     await state.close()
 

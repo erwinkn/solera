@@ -188,46 +188,48 @@ async def test_a_change_made_during_a_full_pass_reaches_downstream(state):  # no
     assert sorted((r["id"], r["v"]) for r in rows) == [("a", "2"), ("b", "2")]
 
 
-async def test_a_slow_new_writer_never_fences_into_a_deleted_segment(tmp_path):
-    """docs/object-store-state.md §10: a new writer replays the journal after
-    the checkpoint it loaded, then fences at the next free seq. Meanwhile the
-    old writer may append, checkpoint and clean up the segments the new one
-    has not read yet. The fence must not land in such a hole: the new writer
-    then holds a state without acknowledged events, and the old writer's
-    later segments follow a fence that never saw what they build on."""
+async def test_a_slow_new_engine_never_opens_without_acknowledged_events(tmp_path, monkeypatch):
+    """docs/object-store-state.md §10 (F7, F14, F15 under the journal head):
+    a new engine reads the journal and loads its checkpoint, then is slow
+    to fence. Meanwhile the old engine appends, checkpoints and cleans up.
+    The new engine's fence is a swap on the ETag it read, so it fails and
+    the engine reads again: it never holds a state without acknowledged
+    events, and the old engine is fenced once it has opened."""
 
     from obstore.store import LocalStore
+    from solera_server import journal as journal_module
     from solera_server.journal import Fenced, Journal
 
-    from .test_journal import Counter, add, open_journal
+    from .test_journal import Counter, open_journal, record
 
     store = LocalStore(str(tmp_path), mkdir=True)
     a, sa, _ = await open_journal(store, min_checkpoint=50)
-    await add(a, sa, "x", 1)
+    record(a, sa, "x")
+    await a.flush()
 
     b, sb = Journal(store, "control", flush_interval=0.01), Counter()
-    fence, opened, go = b._fence, asyncio.Event(), asyncio.Event()
+    real_swap, opened, go = journal_module.swap, asyncio.Event(), asyncio.Event()
 
-    async def slow(apply):  # replayed what it listed; slow before fencing
-        opened.set()
-        await go.wait()
-        return await fence(apply)
+    async def slow(st, path, data, etag):  # read and replayed; slow before fencing
+        if asyncio.current_task() is opening and not go.is_set():
+            opened.set()
+            await go.wait()
+        return await real_swap(st, path, data, etag)
 
-    b._fence = slow
+    monkeypatch.setattr(journal_module, "swap", slow)
     opening = asyncio.create_task(b.open(sb.restore, sb.apply, sb.snapshot))
     await opened.wait()
     acknowledged = 1
-    for _ in range(12):  # the old writer appends, checkpoints and cleans up meanwhile
-        await add(a, sa, "x", 1)
+    for _ in range(12):  # the old engine appends, checkpoints and cleans up meanwhile
+        record(a, sa, "x")
+        await a.flush()
         acknowledged += 1
     go.set()
-    try:
-        await opening
-    except Exception:
-        return  # refusing to open is safe
-    assert sb.counts.get("x") == acknowledged, "the new writer lost acknowledged events"
+    await opening
+    assert sb.counts.get("x") == acknowledged, "the new engine lost acknowledged events"
+    record(a, sa, "x")
     with pytest.raises(Fenced):
-        await add(a, sa, "x", 1)
+        await a.flush()
 
 
 async def test_an_unkeyed_upstream_reset_right_after_a_pass_is_delivered_in_full(state):  # noqa: F811

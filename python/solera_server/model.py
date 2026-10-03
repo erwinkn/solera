@@ -145,37 +145,39 @@ class Model:
 
     # -- snapshot / restore ---------------------------------------------------------------
 
-    def snapshot(self) -> dict:
-        return copy.deepcopy(
-            {
-                "event_counter": self.event_counter,
-                "engine": self.engine,
-                "deploy": self.deploy,
-                "deploy_number": self.deploy_number,
-                "manifest": self.manifest,
-                "project": self.project,
-                "heads": _nest(self.heads, 2),
-                "indexes": _nest({k: v.to_json() for k, v in self.indexes.items()}, 2),
-                "garbage": self.garbage,
-                "deleted": self.deleted,
-                "partitions": _nest(self.partitions, 2),
-                "repairs": _nest(self.repairs, 2),
-                "cleanups": _nest(self.cleanups, 2),
-                "reset_at": self.reset_at,
-                "changed_at": self.changed_at,
-                "automations": self.automations,
-                "sensors": self.sensors,
-                "runs": self.runs,
-                "receipts": list(self.receipts.items()),
-                "history": self.history.to_json(),
-            }
-        )
+    def snapshot(self, *, copied: bool = True) -> dict:
+        """The state, as a checkpoint holds it. `copied=False` hands out the
+        model's own structures — for a caller that encodes them at once, before
+        any later event changes them (the journal's checkpoint: no deep copy
+        under its lock)."""
+
+        data = {
+            "event_counter": self.event_counter,
+            "deploy": self.deploy,
+            "deploy_number": self.deploy_number,
+            "manifest": self.manifest,
+            "project": self.project,
+            "heads": _nest(self.heads, 2),
+            "indexes": _nest({k: v.to_json() for k, v in self.indexes.items()}, 2),
+            "garbage": self.garbage,
+            "deleted": self.deleted,
+            "partitions": _nest(self.partitions, 2),
+            "repairs": _nest(self.repairs, 2),
+            "cleanups": _nest(self.cleanups, 2),
+            "reset_at": self.reset_at,
+            "changed_at": self.changed_at,
+            "automations": self.automations,
+            "sensors": self.sensors,
+            "runs": self.runs,
+            "receipts": list(self.receipts.items()),
+            "history": self.history.to_json(),
+        }
+        return copy.deepcopy(data) if copied else data
 
     def restore(self, snap: dict | None) -> None:
         snap = copy.deepcopy(snap) if snap else {}
         # durable
         self.event_counter: int = snap.get("event_counter") or 0
-        self.engine = snap.get("engine")
         self.deploy = snap.get("deploy")
         # how many deploys this namespace has served: what gives failed keys
         # one try per deploy (per-key §13)
@@ -518,9 +520,6 @@ class Model:
     def apply(self, event: dict) -> None:
         self.event_counter += 1
         getattr(self, f"_on_{event['type']}")(event)
-
-    def _on_EngineStarted(self, e):
-        self.engine = e.get("engine")
 
     def _on_ProjectRegistered(self, e):
         manifest = e["manifest"]

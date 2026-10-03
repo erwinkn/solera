@@ -874,7 +874,7 @@ async def test_an_event_its_reducer_cannot_apply_ends_the_process(tmp_path, worl
         state.record({"type": "NoSuchEvent"})  # no reducer applies it
     assert state.poisoned
     with pytest.raises(Unavailable):
-        state.record({"type": "EngineStarted", "engine": "x"})
+        state.record({"type": "AutomationChanged", "name": "after", "enabled": True})
     for _ in range(100):
         if world.exits:
             break

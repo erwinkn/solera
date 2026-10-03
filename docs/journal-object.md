@@ -1,7 +1,7 @@
 # The journal as one object: why, and what it costs
 
-Status: **decided** (K18), not built yet. The rule to build is in
-`object-store-state.md` §10 (and `swap` in §0). It is checked in TLA+:
+Status: **built** (K18): `solera_server/journal.py`, on `solera.objects.swap`.
+The rule is in `object-store-state.md` §10 (and `swap` in §0). It is checked in TLA+:
 `spec/tla/JournalObject.tla`, described in `verification.md`, "Formal
 model: the journal object". This file records why the numbered segments
 went, what replaced them, and what it costs.
@@ -75,7 +75,7 @@ cadence is `max(64 KB, checkpoint size / 16)`:
 | State | Written per flush (mean) | A checkpoint every | Snapshot cost |
 |---|---|---|---|
 | 150 KB (the soak) | 32 KB, plus 4 KB of checkpoint amortized | 38 flushes | small |
-| 10 MB (estimate) | 320 KB, about 1.3 ms of upload | 640 KB of journal: 16× the old rate | `json.dumps` of 10 MB takes 215 ms, and parsing it back takes 200 ms (which can run off the event loop) |
+| 10 MB (measured below) | 320 KB, about 1.3 ms of upload | 640 KB of journal: 16× the old rate | about 100 ms under the flusher's lock |
 
 A request costs 12 ms on Railway (a PUT, p50), and the bandwidth is about
 250 MB/s. So the bytes cost little. What costs is the snapshot rate, and the
@@ -88,11 +88,31 @@ most a sixteenth of the state, and that only becomes slow (more than
 another request's worth, about 3 MB a flush) at around 100 MB of state,
 far beyond any estimate.
 
-**A known cost.** The checkpoint is written under the flusher's lock, as
-before. For a 10 MB state, `durable()` therefore waits about 0.3 s (the
-PUT, the read-back and the parse) once per checkpoint. If that matters,
-let flushes continue during steps 2 and 3, and have the move carry the
-events flushed since the snapshot. That variant is not modeled.
+**The checkpoint's cost, measured.** The engine encodes the journal and the
+checkpoints with orjson (keys sorted, so a state always gives the same
+bytes); events stay on the standard library, which refuses `inf` and
+`nan`. Every state the test suite and the simulation encode (3,124 of
+them) holds only string keys, ints within 64 bits and finite floats, and
+decodes from orjson exactly as from `json`. On a 10.7 MB state shaped like
+the model's (heads, partition records, runs; a local filesystem, median of
+five):
+
+| | `json` | orjson |
+|---|---|---|
+| encode | 84 ms | 26 ms |
+| parse | 83 ms | 57 ms |
+| the checkpoint under the flusher's lock, with `Model.snapshot`'s deep copy (278 ms) | 429 ms | 416 ms |
+| the same, encoding the model's own structures at once (no copy) | — | 100 ms |
+
+The deep copy was most of the hold, and it is not needed: the snapshot is
+encoded on the spot, before any later event changes the model
+(`Model.snapshot(copied=False)`). What remains, about 100 ms per checkpoint
+for `durable()` to wait at 10 MB, is mostly the read-back's parse (57 ms);
+on S3 the PUT and GET of 10 MB add about 80 ms at 250 MB/s. Comparing the
+bytes read back with the bytes written, instead of parsing them, would
+check the same thing for a fraction of it. If the hold still matters, the
+variant that lets flushes continue during the checkpoint — the move then
+carrying the events flushed since the snapshot — is not modeled yet.
 
 ## Rejected alternatives
 

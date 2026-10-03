@@ -104,7 +104,7 @@ Checked after every step:
 | Invariant | Example of a violation |
 |---|---|
 | **No state breaks.** No engine's `State` fails applying an event (which would exit the process with code 70). | a reducer raising on a replayed event |
-| **One end per attempt.** The journal holds at most one `AttemptFinished` per attempt, and no segment lands twice with different bytes and stays (an opener whose fence lands in a hole cleanup left deletes it and opens again, by design). | a zombie engine and its successor both ending attempt `A` |
+| **One end per attempt.** The journal holds at most one `AttemptFinished` per attempt, and every body that lands extends the events the last one held, or starts over at a newer checkpoint: no swap drops an event. | a zombie engine and its successor both ending attempt `A` |
 | **Nothing is read after collection.** No live attempt or serving engine finds an index file or data object gone because garbage collection deleted it. | a delta pass's reader pin not holding its files |
 | **Reads say what they read.** A PostgresStore read reports the generation that wrote the rows it loaded, the newest committed before its snapshot — never one that only acquired the partition. | an attempt that acquired and died surfacing as the read generation |
 | **Committed keys are readable.** Every key an immutable store's head lists loads back at its indexed generation, from an object a committed attempt wrote. | a stale writer's object referenced by the index |
@@ -516,264 +516,15 @@ it read 1 and 2.
   another) for "every run ends" across tasks; a half-written batch with
   repair; and an immutable store beside the fenced one.
 
-## Formal model: the journal (`spec/tla/Journal.tla`)
-
-*Decided (K18): the journal becomes one object ("Formal model: the
-journal object", below). This section describes the numbered segments,
-which `journal.py` implements until that is built.*
-
-The journal (`object-store-state.md` §3, §10; `python/solera_server/journal.py`)
-is a protocol between engines that share nothing but the object store: an
-old engine still appending, checkpointing and cleaning up while new ones
-open. TLC checks it in every interleaving of a few engines. Most steps are
-one object request; the exceptions are listed under "Abstracted". The
-model follows the code; where the design doc says otherwise, that is listed
-below.
-
-**State.**
-
-- The object store: two maps, `journal` (seq → segment) and `checkpoints`
-  (seq → the state it holds), and which checkpoint, if any, cannot be
-  parsed (at most one). A segment is the engine that wrote it and whether
-  it is a fence.
-- Per engine: where it is (opening, serving, cleaning up, closing,
-  stopped); its state, as the segments folded into it; what its last LIST
-  returned; the checkpoints it knows of (`_checkpoints`); its fence; what
-  its cleanup has yet to delete.
-- History, for the properties only: the first segment that landed at each
-  seq, the appends whose create an engine saw succeed (acknowledged), and
-  the fences engines serve under.
-
-**Actions.** An engine starts at any time, also while others still run (a
-rolling deploy, a zombie). Opening, it LISTs checkpoints, GETs the newest
-listed one still there (or starts from nothing), LISTs the journal after
-it and GETs each segment in order, then creates its fence at the next seq,
-reading any segment found in the way and trying the seq after. A missing
-segment, or a fence create that succeeds, where a checkpoint at or past it
-exists sends it back to the start (the F7 fix), after deleting a fence it
-created there; with the F14 and F15 fix, a fence it created or read first
-goes through the hole test (below). A read-only open ends before the fence.
-Serving, it creates
-its next segment at seq + 1: success acknowledges the event; another
-engine's segment there means it was fenced, and it stops. After an append
-a checkpoint may be due; after a checkpoint, cleanup LISTs the journal and
-DELETEs, one request each in any order, the checkpoints older than the
-previous one and the segments at or below it but the fences its state
-holds. A clean shutdown writes a last checkpoint and cleans up. A create
-can land with its answer lost; the retry finds its own bytes. One
-checkpoint may be written unparseable, which every reader skips. Any engine
-crashes between any two steps; a restart is the next engine starting.
-
-**Properties.** Invariants, except the last three.
-
-| Property | Says |
-|---|---|
-| `NoAckedLoss` | Every acknowledged event is in what an engine opening now recovers: the newest readable checkpoint, then the segments after it. |
-| `OneWriter` | At most one engine appends successfully at a time: every acknowledged segment lies past its engine's fence and below every newer engine's fence. |
-| `FencedSeesAcked` | An engine that opened and fenced holds every event acknowledged below its fence. |
-| `StatesArePrefixes` | The segments folded into every state an engine acts on (once it has fenced, or what a read-only open returns), and into every checkpoint, are a prefix of one history of landed segments. It says nothing of events an engine has applied and not yet flushed, which may differ between engines. |
-| `CountersDense` | Nothing lands at seq n before n − 1 has. |
-| `CleanupCovered` | A segment that landed and is gone is covered by a readable checkpoint still there, which holds it (`StatesArePrefixes`). |
-| `HolesTwiceCovered` | A segment that landed and is gone is covered by two checkpoints still there. The hole test relies on it; before the F14 and F15 fix (1367919), F14 broke it. |
-| `FencesStay` | A fence an engine serves under is never deleted. |
-| `OpensNeverFail` | No opener gives up on the journal (before F7's fix, a gap was "journal corrupt"). |
-| `Monotonic` | Once an engine serves, its state only grows, and the newest checkpoint only moves forward. |
-| `OpensAlone` | Liveness, engines one at a time: an engine that starts opens, unless it crashes. |
-| `AppendsAlone` | Liveness, engines one at a time: an append an engine begins succeeds, unless it crashes. |
-
-Liveness assumes weak fairness for each engine's own steps (`Progress`),
-none for starting, appending, closing, crashing or losing an answer.
-
-What holds of cleanup and openers is this: **an opener that finds a
-segment missing restarts from a checkpoint covering it** (`CleanupCovered`,
-`OpensNeverFail`). Cleanup cannot know about openers (there is no
-compare-and-swap and no registry of openers), so it does delete segments
-an opener listed and has yet to read: `ListedStayUntilRead` fails in 20
-steps.
-
-**The object store's consistency, as relied on.** Each request is atomic
-and sees every request completed before it:
-
-- a create-only PUT (`If-None-Match: *`) is atomic: of two creates of one
-  name, one lands and the other fails;
-- GET, LIST and DELETE are strongly consistent with every completed PUT
-  and DELETE (S3 since December 2020; any `file://` store);
-- a DELETE is atomic per object; a batch delete is neither atomic nor
-  ordered.
-
-Nothing relies on a conditional overwrite (`If-Match`, compare-and-swap:
-obstore's `file://` backend has none), on versioning, or on ordering
-between objects beyond the above.
-
-**Abstracted, and why.**
-
-- *One event per segment, no buffer.* An append is one event, created as
-  one segment. So the model checks segments, not events: it does not
-  check how many events a segment holds, the event counter's value inside
-  a batch, the buffer, the flush timer, or `durable()` and its waiters. Its
-  liveness is "an append begun completes", not "a recorded event is
-  eventually flushed".
-- *A state is the list of segments folded into it.* A fold is a function
-  of that list; what events mean is not the journal's business (650bea8
-  and 1cc87d8 fixed the fold, not the log).
-- *Steps of more than one request.* A LIST is one snapshot, though S3
-  pages a long listing. A create and its read-back are one step (if the
-  object is deleted in between, the read-back raises: divergence 2 below,
-  a crash here). Loading tries the listed checkpoints newest first until
-  one reads; the model takes the newest readable one still there, in one
-  step.
-- *Why a torn listing is safe (argued, not checked).* Each page is a
-  snapshot of its key range at its own time, and keys only grow from page
-  to page. A segment created after its page was read is missed, as by a
-  stale listing, which the model has. A segment deleted after its page was
-  read is found missing by its GET, which the model has. A later page
-  cannot show a gap that did not exist at its own time, and nothing past
-  the newest checkpoint is ever deleted, so a torn listing yields no
-  false gap.
-- *Checkpoint creates never lose their answer:* a retry finds its own
-  bytes, so a lost answer is a delay, and a crash after landing is a crash
-  after success.
-
-**Bounds and cost** (TLC 2.19 from tla2tools 1.7.4, 8 workers on a shared
-8-core VM):
-
-| Model | Engines | Segments | Distinct states | Depth | Time |
-|---|---|---|---|---|---|
-| `Journal-small.cfg`: as built (with 1367919's fix), one checkpoint possibly unreadable | 2 | 6 | 665,146 | 55 | 21 s |
-| `fixed` (`Journal-big.cfg`, four segments): the same | 3 | 4 | 2,044,229 | 55 | 53 s |
-| `Journal-big.cfg`: the same, five segments (5 GB heap) | 3 | 5 | 23,314,158 | 62 | 23 min 39 s |
-| `Journal-live.cfg`: as built, one engine at a time | 3 | 5 | 284,784 | 44 | 53 s |
-
-Two engines (an old one and its successor, as in the simulation's
-takeovers) are enough for F7 and every earlier journal bug. F14 needs
-three, or two once a checkpoint can be unreadable; F15 needs three.
-
-**Calibration.** Each journal fix in the history is a switch. Turning one
-off, in the bigger model with the F14 and F15 fix on, restores the pre-fix
-rule, and TLC must find the bug again. Traces as TLC prints them, shortest
-first, in plain words (A is the old engine):
-
-| Switch off | Fix | TLC finds | Trace |
-|---|---|---|---|
-| `FixF7` | 3c23397 | `OneWriter`, 24 steps | B replays segment 1. A appends 2 and 3, checkpointing at both, and cleanup deletes 2. B's fence create at 2 lands in the hole: B serves under it without A's acknowledged 2 and 3, and A's next append, at 4, succeeds too. |
-| `FixF7` | 3c23397 | `OpensNeverFail`, 23 steps | The same, but B listed 1 to 3 before the cleanup: its GET of 2 finds nothing, and opening fails. |
-| `KeepFences` | 0b3e226 | `NoAckedLoss`, 26 steps | B fences at 2. B appends 3 and 4, checkpointing at both; cleanup deletes 2, B's fence. A appends at 2: acknowledged, but checkpoint 4 holds B's fence there. |
-| `FenceNonce` | f300500 | `OneWriter`, 15 steps | A and B both fence at 1 with the same bytes; each takes the other's for its own, and both serve. |
-| `OwnBytes` | none: `_put_segment` always compared bytes | `AppendsAlone`, 15 to 21 steps (a liveness trace varies between runs) | A lone engine's create lands with its answer lost; the retry takes the segment for another engine's, and the engine stops. |
-| `FixF14` | F14's half of the hole test | `NoAckedLoss`, 30 steps (checkpoints readable) | F14 (below). |
-| `FixF15` | F15's half of the hole test | `StatesArePrefixes`, 29 steps; `FencedSeesAcked`, 31 | F15 (below): a read-only open, then a serving engine. |
-| `FixF14`, `FixF15` | before 1367919 | `NoAckedLoss`, 27 steps (checkpoints readable) | F14. |
-| `FixF14`, `FixF15` | before 1367919, two engines | `CleanupCovered`, 17 steps | B fences at 1; C reads it, fences at 2 and checkpoints at 2, unreadable; B deletes its fence as a hole's. Segment 1 is now covered by no readable checkpoint: every later opener finds it missing, loads nothing, and opens again forever. |
-
-With every switch on, the design as built since 1367919, every model
-passes. `spec/tla/check-journal.sh calibrate` runs all of the above and fails
-unless each named property is the one violated.
-
-**F14 and F15** (Findings, below). Both come from one wrong inference in
-the F7 fix: "a checkpoint at or past my fence exists, so my fence landed in
-a hole cleanup left". F14: the checkpoint can be a newer engine's that read
-the fence and moved past it.
-
-1. A serves; its fence is segment 1.
-2. B opens: reads 1, creates its fence at 2. A is fenced.
-3. C opens: reads 1 and 2 (B's fence), fences at 3, and checkpoints at 3
-   (a clean shutdown, or enough appends).
-4. B, still checking for a hole, finds checkpoint 3, deletes segment 2 and
-   opens again.
-5. A appends: its create at 2 succeeds and the event is acknowledged. No
-   replay sees it: every opener starts from checkpoint 3, which holds B's
-   fence at 2.
-
-F15: a fence created in a hole is readable until its engine deletes it
-(forever, if that engine crashes first).
-
-1. A serves (fence 1). B and C start opening; there is no checkpoint yet.
-   B lists the journal: 1.
-2. A appends 2, 3 and 4, checkpointing at 2 and 4; cleanup deletes 2.
-3. B creates its fence at 2: the create succeeds in the hole.
-4. C lists the journal (1, 2, 3, 4) and replays it, B's fence in place of
-   A's event 2.
-5. C fences at 5, finds no checkpoint at or past it, and serves without
-   A's acknowledged event 2; its next checkpoint makes that permanent. A
-   read-only open can return the same state.
-
-**The checked rule for F14 and F15** is the hole test, written as the
-rule to build in `object-store-state.md` §10, "Fences in holes".
-`FixF14` (the writer that created a fence runs it) and `FixF15` (every
-opener that reads a fence runs it) model it request by request: the LIST
-(`HoleList`, or `FenceCheck` for one's own fence), then, with two or more
-checkpoints at or past the fence, a GET of any of them (`HoleGet`, a
-nondeterministic choice, so every choice policy is checked). Cleanup may
-delete that checkpoint in between (then: LIST again), and one checkpoint
-may be unparseable (then: GET another). With the rule, every property
-above holds, liveness included, and switching off any older fix still
-fails.
-
-A first version of the rule decided "unknown, open again" whenever the
-checkpoints at or past the fence were all unreadable. TLC found that a
-lone engine then reopens forever: B fences at 1 and closes with an
-unreadable checkpoint at 1; the next engine reads fence 1, finds only that
-checkpoint, and loops. Step 1's "fewer than two: real" removes the case:
-a hole always has two covering checkpoints (`HolesTwiceCovered`).
-
-Not checked: two unreadable checkpoints, and an opener that keeps
-reopening while an old engine keeps checkpointing (bounded seqs end it).
-
-**Where the docs and the code differ.**
-
-1. Fixed in 1367919: §10 reasoned that "a fence create that succeeds
-   where a checkpoint at or past it exists" landed in a hole (F14), and
-   `_fence` let the `NotFoundError` of `create`'s read-back end the open
-   instead of opening again.
-2. `journal.py` as of 1367919 (`_hole`, `_apply_read`, `_fence`) follows
-   the modeled hole test request by request, with three differences, none
-   unsafe. The engine whose fence create succeeded LISTs twice (`_behind`,
-   then `_hole`), where the model uses the first listing: `_hole` is a
-   fresh test, which the model has as its "LIST again" path. If that
-   second listing shows fewer than two covering checkpoints, the code
-   keeps the fence and opens again, where the model would serve: opening
-   again is always safe. And `_hole` returns "undecidable" when every
-   covering checkpoint listed is unreadable; the model has that outcome
-   but never reaches it, since it allows one unreadable checkpoint and
-   the test only reads with two or more covering. With two unreadable
-   covering checkpoints, beyond what the design survives, a lone engine
-   reopens forever, the loop the first version of the rule had. Usually
-   the journal is lost then anyway: the two newest checkpoints are
-   unreadable, and cleanup removed what lies below the previous one. Only
-   if cleanup did not run after them (a crash) does an older checkpoint
-   and the journal after it remain, and the loop blocks a recovery the
-   code before 1367919 would have made. Applying an undecidable fence
-   instead would bring F15 back, so the code is right to refuse it; the
-   way out is an operator, or a newer readable checkpoint.
-3. `glossary.md` lists `seq` among the old names of the event counter.
-   In `object-store-state.md` and `journal.py`, `seq` numbers segments, and
-   a segment holds many events, so the two are different counters. The
-   glossary has no name for a segment's number.
-
-**Running it.** Java 11 or later; the script downloads `tla2tools.jar`
-1.7.4 into `spec/tla/.tools/` (gitignored).
-
-```bash
-spec/tla/check-journal.sh              # the small model, two engines: ~20 s
-spec/tla/check-journal.sh fixed        # three engines, four segments: ~1 min
-spec/tla/check-journal.sh big          # the same, five segments: ~25 min
-spec/tla/check-journal.sh live         # liveness: ~1 min
-spec/tla/check-journal.sh calibrate    # every fix switched off in turn: ~2 min
-spec/tla/check-journal.sh ci           # small, fixed, live and calibrate
-```
-
-CI's `journal-spec` job runs `ci`: about ten minutes on a GitHub runner.
-
 ## Formal model: the journal object (`spec/tla/JournalObject.tla`)
 
-Decided (K18), not built yet: the journal becomes one object,
-`control/journal.json`, swapped with `If-Match` (`object-store-state.md`
-§0 and §10; why, and what it costs: `journal-object.md`). The object holds
-the engine id of its writer, the name of the current checkpoint and the
-events since that checkpoint. Until it is built, `Journal.tla` (above)
-describes `journal.py`.
+Built (K18): the journal is one object, `control/journal.json`, swapped
+with `If-Match` (`object-store-state.md` §0 and §10; why, and what it costs:
+`journal-object.md`; the code: `journal.py` on `solera.objects.swap`). The
+object holds the engine id of its writer, the name of the current
+checkpoint and the events since that checkpoint.
 
-**What differs from `Journal.tla`.**
+**What the model abstracts.**
 
 - The store is the journal (a body, or nothing yet), the checkpoints by
   unique name, and at most one unparseable checkpoint. An ETag is a
@@ -782,25 +533,21 @@ describes `journal.py`.
   `file://`'s SHA-256 under its lock) gives at least that.
 - Journal writes are numbered (`writes`), for the properties only. A
   fence or an acknowledgment records the number of the write that carried
-  it. `OneWriter` and `FencedSeesAcked` order by these numbers where
-  `Journal.tla` uses a segment's `seq`. `MaxWrites` bounds the model, as
-  `MaxSeq` does there.
+  it. `OneWriter` and `FencedSeesAcked` order by these numbers.
+  `MaxWrites` bounds the model.
 - Faults: crashes between any two requests, overlapping and zombie
   engines, lost answers, 409s (a conditional write refused without
   landing), one unparseable checkpoint, and cleanup at any time. A
   checkpoint is due at any point after an append: the cadence does not
   matter to safety.
-- `JournalResolves` replaces `CleanupCovered`: the journal names a
-  checkpoint that is there and readable. `CountersDense`,
-  `HolesTwiceCovered` and `FencesStay` have no counterpart, since there
-  are no slots and no fences to keep.
-- One step is one request, as in `Journal.tla`. Abstracted the same way:
-  one event per append, a state as the list of events folded into it, a
+- `JournalResolves`: the journal names a checkpoint that is there and
+  readable.
+- One step is one request. Abstracted: one event per append, a state as the list of events folded into it, a
   LIST as one snapshot, and checkpoint creates that never lose their
   answer.
 
 **Calibration.** Each rule of the design is a switch. With it off, TLC
-must find the bug it prevents (`check-journal.sh object`):
+must find the bug it prevents (`check-journal.sh calibrate`):
 
 | Rule off | TLC finds | Trace |
 |---|---|---|
@@ -825,11 +572,11 @@ forever is an outage, not a fault the journal can outlast.
 
 **Not modeled.** The `file://` lock, which gives one machine the same
 `If-Match`. Flushes that run while a checkpoint is written
-(`journal-object.md`, "A known cost").
+(`journal-object.md`, "The checkpoint's cost, measured").
 
 ```bash
-spec/tla/check-journal.sh object       # two engines, three, liveness, calibration: ~6 min
-spec/tla/check-journal.sh object-big   # three engines, six writes: ~9 min
+spec/tla/check-journal.sh ci    # two engines, three, liveness, calibration: ~6 min
+spec/tla/check-journal.sh big   # three engines, six writes: ~9 min
 ```
 
 ## Formal model: the attempt control file (`spec/tla/Attempt.tla`)

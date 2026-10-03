@@ -90,7 +90,7 @@ async def test_every_boundary_once(tmp_path):
     assert any(f["rows"] for f in m.history.files.get("runs", ()))  # history flushed
     kept = await engine.list_runs(None, limit=1000)
     assert kept["total"] <= 2 * 3 + 2  # of 20: retired behind `runs=3` per asset
-    assert state.journal._checkpoints and state.journal._checkpoints[-1] > 1  # checkpointed on the way
+    assert state.journal.checkpoint is not None  # checkpointed on the way
     index = m.indexes[("items", "")]
     root = Path(state.objects_url.removeprefix("file://"))
     on_disk = {str(p.relative_to(root)) for p in (root / index.prefix).glob("*.kx")}
@@ -100,7 +100,6 @@ async def test_every_boundary_once(tmp_path):
     await state.durable()
     again = await State.open(url, "test", clock=clock, writer=False)
     live, replayed = json.loads(json.dumps(m.snapshot())), json.loads(json.dumps(again.model.snapshot()))
-    live.pop("engine"), replayed.pop("engine")
     assert replayed == live
     await engine.stop()
     await state.close()

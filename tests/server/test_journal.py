@@ -1,37 +1,37 @@
-"""The journal (docs/object-store-state.md §3, §10): replay, checkpoints,
-cleanup, and fencing between writers — on the local filesystem, in memory,
-and on an S3-compatible server when SOLERA_TEST_S3 is set."""
+"""The journal (docs/object-store-state.md §0, §10): one object swapped with
+`If-Match`, and checkpoints — replay, fencing between engines, the
+checkpoint's order (list, write, read back, move, delete) — on the local
+filesystem, in memory, and on an S3-compatible server when SOLERA_TEST_S3 is
+set."""
 
-import asyncio
 import json
 import os
-import random
 import uuid
 
 import obstore
+import orjson
 import pytest
 from obstore.store import LocalStore, MemoryStore
-from solera_server.journal import Fenced, Journal, JournalCorrupt, encode
+from solera import objects
+from solera_server import journal as journal_module
+from solera_server.journal import Fenced, Journal, encode
 
 
 class Counter:
-    """A toy state: counts per key, plus which writers started."""
+    """A toy state: counts per key."""
 
     def __init__(self):
-        self.counts, self.writers = {}, []
+        self.counts = {}
 
     def restore(self, snap):
         self.counts = dict(snap["counts"]) if snap else {}
-        self.writers = list(snap["writers"]) if snap else []
 
     def apply(self, event):
-        if event["type"] == "EngineStarted":
-            self.writers.append(event.get("engine"))
-        elif event["type"] == "Add":
+        if event["type"] == "Add":
             self.counts[event["key"]] = self.counts.get(event["key"], 0) + event["n"]
 
     def snapshot(self):
-        return {"counts": dict(self.counts), "writers": list(self.writers)}
+        return {"counts": dict(self.counts)}
 
 
 # An S3-compatible server to also run against, e.g. http://user:secret@127.0.0.1:9100/bucket
@@ -51,9 +51,8 @@ def store(request, tmp_path):
     from obstore.store import S3Store
 
     u = urlsplit(S3_URL)
-    bucket = u.path.strip("/")
     return S3Store(
-        bucket,
+        u.path.strip("/"),
         prefix=f"journal-test-{uuid.uuid4().hex}",
         endpoint=f"{u.scheme}://{u.netloc.rpartition('@')[2]}",
         access_key_id=unquote(u.username),
@@ -70,390 +69,214 @@ async def open_journal(store, state=None, **kw):
     return j, state, result
 
 
-async def add(j, state, key, n=1):
+def record(j, state, key, n=1):
     event = {"type": "Add", "key": key, "n": n}
     state.apply(event)
     j.append(encode(event))
-    await j.durable()
 
 
-def names(store, kind):
+async def journal_of(store) -> dict:
+    got = await objects.read(store, "control/journal.json")
+    return orjson.loads(got[0])
+
+
+def checkpoints(store) -> list[str]:
     return sorted(
-        m["path"].rsplit("/", 1)[-1]
-        for commit_number in obstore.list(store, f"control/{kind}/")
-        for m in commit_number
+        m["path"].rsplit("/", 1)[1] for b in obstore.list(store, prefix="control/checkpoints/") for m in b
     )
 
 
 async def test_replay_restores_state(store):
-    j, state, result = await open_journal(store)
-    assert result.seq == 1 and result.checkpoint is None
-    for i in range(20):
-        await add(j, state, f"k{i % 3}", i)
+    j, s, result = await open_journal(store)
+    assert result.checkpoint is None and result.replayed == 0
+    for key in "abca":
+        record(j, s, key)
+    await j.durable()
     await j.close(checkpoint=False)
-    j2, again, result = await open_journal(store)
-    assert again.counts == state.counts
-    assert again.writers == [1, result.seq]
+    j2, s2, result = await open_journal(store)
+    assert s2.counts == {"a": 2, "b": 1, "c": 1} and result.replayed == 4
     await j2.close()
 
 
-async def test_events_group_into_segments(store):
-    j, state, _ = await open_journal(store, flush_interval=0.2)
-    events = [{"type": "Add", "key": "a", "n": 1} for _ in range(50)]
-    for e in events:
-        state.apply(e)
-    j.append(*map(encode, events))
-    await asyncio.sleep(0.3)  # the flush interval passes
+async def test_a_checkpoint_moves_the_journal_and_keeps_one(store):
+    """Once the events reach the threshold, the state is written, read back
+    and named by the journal, whose events start over; the checkpoint before
+    goes. A replay from it equals the full fold."""
+
+    j, s, _ = await open_journal(store, min_checkpoint=200)
+    for i in range(40):
+        record(j, s, f"k{i % 7}")
+        await j.flush()
+    assert len(checkpoints(store)) == 1
+    body = await journal_of(store)
+    assert body["checkpoint"] == j.checkpoint and len(body["events"]) < 40
     await j.close(checkpoint=False)
-    # The fence, then one segment holding all 50 events.
-    assert len(names(store, "journal")) == 2
+    j2, s2, result = await open_journal(store)
+    assert s2.counts == s.counts and result.checkpoint == j.checkpoint
+    await j2.close()
 
 
-async def test_checkpoints_match_full_replay_and_cleanup_keeps_two(store):
-    rng = random.Random(3)
-    j, state, _ = await open_journal(store, min_checkpoint=200)
-    for step in range(200):
-        await add(j, state, f"k{rng.randrange(10)}", rng.randrange(100))
-        if step % 17 == 0:
-            await j.flush()
-    await j.close(checkpoint=False)
-    checkpoints = names(store, "checkpoints")
-    assert len(checkpoints) == 2  # the newest and the previous
-    oldest_kept = int(checkpoints[0][:-5])
-    kept = [int(s[:-5]) for s in names(store, "journal")]
-    assert [s for s in kept if s <= oldest_kept] == [1]  # but the writer's fence
-    _, again, result = await open_journal(store)
-    assert result.checkpoint == int(checkpoints[-1][:-5])
-    assert again.counts == state.counts
+async def test_close_takes_a_final_checkpoint(store):
+    j, s, _ = await open_journal(store)
+    record(j, s, "a", 3)
+    await j.close()
+    body = await journal_of(store)
+    assert body["events"] == [] and checkpoints(store) == [f"{body['checkpoint']}.json"]
+    j2, s2, result = await open_journal(store)
+    assert s2.counts == {"a": 3} and result.replayed == 0
+    await j2.close()
 
 
-async def test_a_new_writer_fences_the_old_one(store):
+async def test_a_new_engine_fences_the_old_one(store):
+    """B's fence swaps in A's journal under its own id: A's next swap meets
+    B's body and fails, and nothing A had acknowledged is lost."""
+
     a, sa, _ = await open_journal(store)
-    await add(a, sa, "x", 5)
+    record(a, sa, "x", 5)
+    await a.durable()
     b, sb, result = await open_journal(store)
-    assert sb.counts == {"x": 5} and result.seq == 3
+    assert sb.counts == {"x": 5} and result.engine != a.engine
+    record(a, sa, "x", 1)
     with pytest.raises(Fenced):
-        await add(a, sa, "x", 1)  # a's next segment collides with b's fence
+        await a.durable()
     assert a.fenced
     with pytest.raises(Fenced):
-        a.append(encode({"type": "Add", "key": "x", "n": 1}))
-    await add(b, sb, "y", 2)
-    await b.close()
+        record(a, sa, "y")
+    record(b, sb, "z")
+    await b.durable()
+    await b.close(checkpoint=False)
     _, sc, _ = await open_journal(store)
-    assert sc.counts == {"x": 5, "y": 2}  # a's rejected event is not there
+    assert sc.counts == {"x": 5, "z": 1}
 
 
-async def test_fence_converges_past_a_segment_it_did_not_list(store, monkeypatch):
-    """A writer whose listing missed the newest segment collides on fencing,
-    applies that segment, and fences one further."""
-
+async def test_a_read_only_open_does_not_fence(store):
     a, sa, _ = await open_journal(store)
-    await add(a, sa, "x", 1)
-    j = Journal(store, "control", flush_interval=0.01)
-    real = j._list
-
-    async def stale(kind, after=None):
-        seqs = await real(kind, after)
-        return seqs[:-1] if kind == "journal" and seqs else seqs
-
-    monkeypatch.setattr(j, "_list", stale)
-    state = Counter()
-    result = await j.open(state.restore, state.apply, state.snapshot)
-    assert state.counts == {"x": 1}  # the hidden segment was applied on collision
-    assert result.seq == 3
-    await j.close()
-
-
-async def test_an_unconfirmed_write_is_recognized_on_retry(store, monkeypatch):
-    j, state, _ = await open_journal(store)
-    real = obstore.put_async
-    calls = {"n": 0}
-
-    async def lossy(store_, path, data, **kw):
-        await real(store_, path, data, **kw)
-        calls["n"] += 1
-        if calls["n"] == 1:
-            raise TimeoutError("the response was lost")
-
-    monkeypatch.setattr(obstore, "put_async", lossy)
-    await add(j, state, "x", 7)  # retried, found identical: success, not fenced
-    assert not j.fenced
-    monkeypatch.setattr(obstore, "put_async", real)
-    await j.close()
-    _, again, _ = await open_journal(store)
-    assert again.counts == {"x": 7}
-
-
-async def test_an_unreadable_newest_checkpoint_falls_back(store):
-    j, state, _ = await open_journal(store, min_checkpoint=50)
-    for i in range(60):
-        await add(j, state, f"k{i % 4}", i)
-    await j.close()
-    newest = names(store, "checkpoints")[-1]
-    await obstore.put_async(store, f"control/checkpoints/{newest}", b"not json")
-    _, again, result = await open_journal(store)
-    assert result.checkpoint == int(names(store, "checkpoints")[-2][:-5])
-    assert again.counts == state.counts
-
-
-async def test_a_gap_in_the_journal_is_an_error(store):
-    j, state, _ = await open_journal(store)
-    for i in range(3):
-        await add(j, state, "x", i)
-    await j.close(checkpoint=False)
-    await obstore.delete_async(store, ["control/journal/00000000000000000002.json"])
-    with pytest.raises(JournalCorrupt):
-        await open_journal(store)
-
-
-async def test_close_writes_a_final_checkpoint(store):
-    j, state, _ = await open_journal(store, min_checkpoint=1 << 30)
-    await add(j, state, "x", 3)
-    await j.close()
-    [only] = names(store, "checkpoints")
-    body = json.loads(bytes(obstore.get(store, f"control/checkpoints/{only}").bytes()))
-    assert body["state"]["counts"] == {"x": 3}
-    _, again, result = await open_journal(store)
-    assert result.replayed == 0 and again.counts == {"x": 3}
-
-
-async def test_a_replaced_writer_stays_fenced_after_cleanup(store):
-    """The new writer's fence outlives cleanup: however far it has moved on,
-    the old writer's next segment collides with that fence and nothing it
-    appends is acknowledged."""
-
-    a, sa, _ = await open_journal(store)
-    await add(a, sa, "x", 1)
-    b, sb, result = await open_journal(store, min_checkpoint=50)
-    for i in range(40):  # checkpoints come and go, and so does the journal under them
-        await add(b, sb, "y", i)
-    assert len(names(store, "checkpoints")) == 2
-    assert f"{result.seq:020d}.json" in names(store, "journal")  # b's fence is kept
-    with pytest.raises(Fenced):
-        await add(a, sa, "x", 100)
-    await b.close()
-    _, again, _ = await open_journal(store)
-    assert again.counts == sb.counts and "x" in again.counts and again.counts["x"] == 1
-
-
-async def test_two_writers_never_take_the_same_fence(store):
-    """Two writers starting at the same seq at the same instant would seal
-    identical fence segments, and each would take the other's for its own
-    unconfirmed write. Each writer's fence carries a nonce of its own, so
-    the second collides, and the first is fenced at its next write."""
-
-    a, sa, first = await open_journal(store, clock=lambda: 1790000000.0)
-    b = Journal(store, "control", flush_interval=0.01, clock=lambda: 1790000000.0)
-    real = b._list
-
-    async def raced(kind, after=None):  # b listed before a's fence landed
-        return [] if kind == "journal" else await real(kind, after)
-
-    b._list = raced
-    sb = Counter()
-    second = await b.open(sb.restore, sb.apply, sb.snapshot)
-    b._list = real
-    assert (first.seq, second.seq) == (1, 2)
-    with pytest.raises(Fenced):
-        await add(a, sa, "x", 1)
-    await add(b, sb, "y", 1)
-    await b.close()
-    _, again, _ = await open_journal(store)
-    assert again.counts == {"y": 1}
-
-
-async def test_an_opener_whose_segments_were_cleaned_up_opens_again(tmp_path):
-    """Simulation finding F7: a new writer loads a checkpoint, and before it
-    lists the segments after it, the old writer appends, checkpoints and
-    cleans those segments up. The gap is not corruption: the new writer
-    opens again from the newer checkpoint, with every acknowledged event,
-    and fences the old one."""
-
-    store = LocalStore(str(tmp_path), mkdir=True)
-    a, sa, _ = await open_journal(store, min_checkpoint=50)
-    await add(a, sa, "x")
-    b, sb = Journal(store, "control", flush_interval=0.01), Counter()
-    replay, loaded, go = b._replay, asyncio.Event(), asyncio.Event()
-
-    async def slow(apply):  # loaded its checkpoint; slow to list what follows
-        if not loaded.is_set():
-            loaded.set()
-            await go.wait()
-        return await replay(apply)
-
-    b._replay = slow
-    opening = asyncio.create_task(b.open(sb.restore, sb.apply, sb.snapshot))
-    await loaded.wait()
-    for _ in range(12):
-        await add(a, sa, "x")
-    assert names(store, "journal")[0] != "00000000000000000002.json"  # cleaned up past it
-    go.set()
-    await opening
-    assert sb.counts["x"] == 13
-    with pytest.raises(Fenced):
-        await add(a, sa, "x")
-    await b.close()
-
-
-def segment(seq):
-    return f"{seq:020d}.json"
-
-
-async def test_a_fence_a_newer_engine_moved_past_stays(tmp_path):
-    """Journal spec finding F14 (docs/verification.md, "Journal spec"): B
-    creates its fence at 2, which fences A. Before B checks for a hole, C
-    reads that fence, fences at 3 and checkpoints at 3. B takes checkpoint
-    3 for a sign that its fence landed in a hole cleanup left, deletes it
-    and opens again. A's next append lands at 2 and is acknowledged, but
-    every later replay starts from checkpoint 3, which holds B's fence at 2.
-    Fixed, B keeps its fence and A's append is refused: what is
-    acknowledged is what a replay finds."""
-
-    store = LocalStore(str(tmp_path), mkdir=True)
-    a, sa, _ = await open_journal(store)
-    b, sb = Journal(store, "control", flush_interval=0.01), Counter()
-    behind, created, go = b._behind, asyncio.Event(), asyncio.Event()
-
-    async def slow(seq):  # created its fence; slow to check for a hole
-        created.set()
-        await go.wait()
-        return await behind(seq)
-
-    b._behind = slow
-    opening = asyncio.create_task(b.open(sb.restore, sb.apply, sb.snapshot))
-    await created.wait()
-    c, _, _ = await open_journal(store)
-    await c.close()  # a checkpoint at 3, holding B's fence at 2
-    go.set()
-    await opening
-    try:
-        await add(a, sa, "x")
-        acknowledged = 1
-    except Fenced:
-        acknowledged = 0
-    d, again, _ = await open_journal(store)
-    for j in (a, b, d):
-        await j.close()
-    assert again.counts.get("x", 0) == acknowledged
-
-
-async def test_an_opener_never_replays_a_fence_created_in_a_hole(tmp_path):
-    """Journal spec finding F15 (docs/verification.md, "Journal spec"): B
-    replays segment 1 and is slow to fence; C loads no checkpoint and is
-    slow to list the journal. A appends 2, 3 and 4, checkpointing at 2 and
-    4, so cleanup deletes 2. B's fence create at 2 lands in the hole. C
-    lists the journal, replays B's fence where A's event 2 was, fences at 5
-    and serves without that acknowledged event. B finds the hole and
-    deletes its fence only afterwards."""
-
-    store = LocalStore(str(tmp_path), mkdir=True)
-    a, sa, _ = await open_journal(store, min_checkpoint=1)
-    b, sb = Journal(store, "control", flush_interval=0.01), Counter()
-    c, sc = Journal(store, "control", flush_interval=0.01), Counter()
-    b_replay, b_behind, c_replay = b._replay, b._behind, c._replay
-    b_listed, b_go, b_created, b_check, c_loaded, c_go = (asyncio.Event() for _ in range(6))
-
-    async def b_slow_replay(apply):  # replayed segment 1; slow to fence
-        count = await b_replay(apply)
-        b_listed.set()
-        await b_go.wait()
-        return count
-
-    async def b_slow_behind(seq):  # created its fence; slow to check for a hole
-        b_created.set()
-        await b_check.wait()
-        return await b_behind(seq)
-
-    async def c_slow_replay(apply):  # loaded no checkpoint; slow to list the journal
-        if not c_loaded.is_set():
-            c_loaded.set()
-            await c_go.wait()
-        return await c_replay(apply)
-
-    b._replay, b._behind, c._replay = b_slow_replay, b_slow_behind, c_slow_replay
-    b_opening = asyncio.create_task(b.open(sb.restore, sb.apply, sb.snapshot))
-    c_opening = asyncio.create_task(c.open(sc.restore, sc.apply, sc.snapshot))
-    await b_listed.wait()
-    await c_loaded.wait()
-    for _ in range(3):  # segments 2, 3 and 4; checkpoints at 2 and 4
-        await add(a, sa, "x")
-    while segment(2) in names(store, "journal"):  # cleanup runs after the flush
-        await asyncio.sleep(0.01)
-    assert segment(3) in names(store, "journal")
-    b_go.set()
-    await b_created.wait()  # B's fence, at 2
-    c_go.set()
-    await c_opening
-    b_check.set()
-    await b_opening
-    for j in (b, c):
-        await j.close()
-    assert sc.counts.get("x") == sa.counts["x"]
-
-
-def put_checkpoint(store, seq, fences, data=None):
-    body = {"seq": seq, "engine": 1, "at": 0, "fences": fences, "state": {}}
-    obstore.put(store, f"control/checkpoints/{seq:020d}.json", data or json.dumps(body).encode())
-
-
-async def test_the_hole_test_lists_again_when_its_checkpoint_is_gone(tmp_path):
-    """docs/object-store-state.md §10, step 3: the checkpoint the LIST showed
-    is cleaned up before its GET. The test lists again and decides from what
-    is there now — never from a checkpoint that is gone."""
-
-    store = LocalStore(str(tmp_path), mkdir=True)
-    put_checkpoint(store, 4, [1])
-    put_checkpoint(store, 5, [1])
-    j = Journal(store, "control")
-    get, calls = j._get_json, []
-
-    async def racing(path):
-        calls.append(path)
-        if len(calls) == 1:  # a newer checkpoint lands and cleanup deletes the one asked for
-            put_checkpoint(store, 6, [1])
-            obstore.delete(store, path)
-        return await get(path)
-
-    j._get_json = racing
-    assert await j._hole(3) is True  # 4 and 6 cover 3, and 6 does not list it
-    assert len(calls) == 2 and calls[1].endswith(f"{6:020d}.json")
-
-
-async def test_the_hole_test_reads_past_an_unreadable_checkpoint(tmp_path):
-    """§10, step 3: a checkpoint that cannot be parsed is passed over for
-    another at or past the fence; with none readable the test decides
-    nothing, so the fence is neither applied nor deleted."""
-
-    store = LocalStore(str(tmp_path), mkdir=True)
-    put_checkpoint(store, 4, [1, 3])
-    put_checkpoint(store, 5, [], data=b"not json")
-    j = Journal(store, "control")
-    assert await j._hole(3) is False  # 4 lists the fence at 3: real
-    put_checkpoint(store, 4, [], data=b"{")
-    assert await j._hole(3) is None
-    put_checkpoint(store, 2, [])  # below the fence: never asked
-    assert await j._hole(3) is None
-
-
-async def test_a_fence_whose_read_back_finds_nothing_opens_again(tmp_path, monkeypatch):
-    """create()'s read-back may find the slot it collided in deleted by
-    cleanup: the opener is behind, and opens again rather than failing."""
-
-    from solera_server import journal as module
-
-    store = LocalStore(str(tmp_path), mkdir=True)
-    a, sa, _ = await open_journal(store)
-    await add(a, sa, "x")
+    record(a, sa, "x")
+    await a.durable()
+    r = Journal(store, "control")
+    reader = Counter()
+    result = await r.open(reader.restore, reader.apply, reader.snapshot, writer=False)
+    assert reader.counts == {"x": 1} and result.engine is None and r.fenced
+    record(a, sa, "x")
+    await a.durable()  # still the writer
     await a.close()
-    real, tries = module.create, []
 
-    async def flaky(*args, **kw):
-        tries.append(1)
-        if len(tries) == 1:
-            raise obstore.exceptions.NotFoundError("read back: gone")
-        return await real(*args, **kw)
 
-    monkeypatch.setattr(module, "create", flaky)
-    b, sb, _ = await open_journal(store)
-    await b.close()
-    assert sb.counts["x"] == 1 and len(tries) >= 2
+async def test_a_lost_answer_is_settled_by_reading_back_its_own_bytes(store, monkeypatch):
+    """A flush lands but its answer is lost: `swap` reads back exactly the
+    sealed bytes, so the flush succeeded — no conflict, no fence."""
+
+    j, s, _ = await open_journal(store)
+    real, lost = objects._conditional_put, []
+
+    async def landed_unheard(st, path, data, etag):
+        tag = await real(st, path, data, etag)
+        if not lost:
+            lost.append(path)
+            raise ConnectionError("reset after the request landed")
+        return tag
+
+    monkeypatch.setattr(objects, "_conditional_put", landed_unheard)
+    record(j, s, "a")
+    await j.durable()
+    assert lost and not j.fenced
+    record(j, s, "b")
+    await j.durable()
+    await j.close(checkpoint=False)
+    _, s2, _ = await open_journal(store)
+    assert s2.counts == {"a": 1, "b": 1}
+
+
+async def test_an_opener_whose_checkpoint_is_gone_reads_the_journal_again(store, monkeypatch):
+    """B reads the journal naming checkpoint 1; A checkpoints again and
+    deletes it before B loads it; B finds it gone and reads the journal
+    again, now naming checkpoint 2."""
+
+    a, sa, _ = await open_journal(store, min_checkpoint=1)
+    record(a, sa, "x")
+    await a.flush()  # checkpoint 1
+    real_read, moved = journal_module.read, []
+
+    async def read_then_a_moves(st, path):
+        found = await real_read(st, path)
+        if not moved:
+            moved.append(1)
+            record(a, sa, "y")
+            await a.flush()  # checkpoint 2, and checkpoint 1 deleted
+        return found
+
+    monkeypatch.setattr(journal_module, "read", read_then_a_moves)
+    b, sb, result = await open_journal(store)
+    assert moved and sb.counts == {"x": 1, "y": 1} and result.checkpoint == a.checkpoint
+    await b.close(checkpoint=False)
+
+
+async def test_cleanup_deletes_only_what_it_listed_before_its_move(store, monkeypatch):
+    """The journal spec's case (NoAckedLoss): A lists the checkpoints, then B
+    fences A, appends and writes a checkpoint of its own; A's move fails, so A
+    deletes nothing — B's checkpoint survives, and with it every event B
+    acknowledged."""
+
+    a, sa, _ = await open_journal(store, min_checkpoint=1 << 30)
+    record(a, sa, "x")
+    await a.durable()
+    real_list, others = obstore.list, {}
+
+    def list_then_b_takes_over(st, prefix=None, **kw):
+        listed = list(real_list(st, prefix=prefix, **kw))
+        others["listed"] = listed
+        return listed
+
+    monkeypatch.setattr(obstore, "list", list_then_b_takes_over)
+    b, sb, _ = await open_journal(store, min_checkpoint=1)
+    record(b, sb, "y")
+    await b.flush()  # B's own checkpoint
+    b_checkpoint = b.checkpoint
+    snap = journal_module._dumps({"at": 0, "engine": a.engine, "state": sa.snapshot()})
+    await a._take_checkpoint(snap)  # listed, wrote, read back; its move meets B's body
+    assert a.fenced and f"{b_checkpoint}.json" in checkpoints(store)
+    await b.close(checkpoint=False)
+    _, sc, _ = await open_journal(store)
+    assert sc.counts == {"x": 1, "y": 1}
+
+
+async def test_no_checkpoint_is_named_before_it_reads_back(store, monkeypatch):
+    """A checkpoint that does not read back is never named: the journal stays
+    as it is, and the next due point tries again."""
+
+    j, s, _ = await open_journal(store, min_checkpoint=1)
+    real_get, broken = obstore.get_async, []
+
+    async def garbled_once(st, path, **kw):
+        got = await real_get(st, path, **kw)
+        if "/checkpoints/" in path and not broken:
+            broken.append(path)
+
+            class Garbled:
+                meta = got.meta
+
+                async def bytes_async(self):
+                    return b"{not json"
+
+            return Garbled()
+        return got
+
+    monkeypatch.setattr(obstore, "get_async", garbled_once)
+    record(j, s, "a")
+    await j.flush()
+    assert broken and (await journal_of(store))["checkpoint"] is None
+    record(j, s, "b")
+    await j.flush()  # due again: written, read back, named
+    assert (await journal_of(store))["checkpoint"] == j.checkpoint is not None
+    await j.close(checkpoint=False)
+    _, s2, _ = await open_journal(store)
+    assert s2.counts == {"a": 1, "b": 1}
+
+
+async def test_the_encoding_is_deterministic():
+    """The same state encodes to the same bytes, keys sorted: `swap` reads a
+    lost answer back by bytes."""
+
+    state = {"b": [1, 2.5, None, "x"], "a": {"z": True, "y": {"k": -(2**62)}}}
+    assert journal_module._dumps(state) == journal_module._dumps(json.loads(json.dumps(state)))
+    assert journal_module._dumps(state).startswith(b'{"a":{"y"')

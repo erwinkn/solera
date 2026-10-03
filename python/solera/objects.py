@@ -30,6 +30,7 @@ from obstore.exceptions import (
     NotFoundError,
     NotSupportedError,
     PermissionDeniedError,
+    PreconditionError,
     UnauthenticatedError,
 )
 
@@ -71,14 +72,10 @@ async def swap(store, path: str, data: bytes, etag: str | None) -> str:
     back: holding exactly `data`, it landed; still at `etag`, it is written
     again; anything else is a conflict."""
 
-    if _local(store):
-        return await asyncio.to_thread(_swap_file, _file(store, path), data, etag)
     error: BaseException | None = None
     for _ in range(ATTEMPTS):
-        mode = "create" if etag is None else {"e_tag": etag}
         try:
-            put = await obstore.put_async(store, path, data, mode=mode, use_multipart=False)
-            return put["e_tag"]
+            return await _conditional_put(store, path, data, etag)
         except _FINAL:
             raise
         except Exception as e:  # refused (412, 409, exists), or the answer lost: read back
@@ -90,6 +87,16 @@ async def swap(store, path: str, data: bytes, etag: str | None) -> str:
             raise Conflict(f"{path}: another writer's write is there") from error
         # still at `etag`: nothing landed (409: a concurrent conditional write lost), so again
     raise error  # type: ignore[misc]
+
+
+async def _conditional_put(store, path: str, data: bytes, etag: str | None) -> str:
+    """One conditional write: the new ETag, or an exception — refused, or
+    unanswered — for `swap` to settle by reading back."""
+
+    if _local(store):
+        return await asyncio.to_thread(_put_file_if, _file(store, path), data, etag)
+    mode = "create" if etag is None else {"e_tag": etag}
+    return (await obstore.put_async(store, path, data, mode=mode, use_multipart=False))["e_tag"]
 
 
 def _local(store) -> bool:
@@ -105,10 +112,11 @@ def _digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _swap_file(full: str, data: bytes, etag: str | None) -> str:
-    """`swap` on a local file: under an `flock` on `{full}.lock`, which the
-    kernel drops if the process dies, compare the file's digest with
-    `etag`, then write a temporary file, fsync it and replace the object."""
+def _put_file_if(full: str, data: bytes, etag: str | None) -> str:
+    """A conditional write of a local file: under an `flock` on
+    `{full}.lock`, which the kernel drops if the process dies, compare the
+    file's digest with `etag`, then write a temporary file, fsync it and
+    replace the object. Refused (`PreconditionError`) if the digest differs."""
 
     os.makedirs(os.path.dirname(full), exist_ok=True)
     with open(f"{full}.lock", "a") as lock:
@@ -116,13 +124,11 @@ def _swap_file(full: str, data: bytes, etag: str | None) -> str:
         try:
             try:
                 with open(full, "rb") as f:
-                    current = f.read()
+                    current = _digest(f.read())
             except FileNotFoundError:
                 current = None
-            if current == data:
-                return _digest(data)  # an earlier try of this write
-            if (_digest(current) if current is not None else None) != etag:
-                raise Conflict(f"{full}: another writer's write is there")
+            if current != etag:
+                raise PreconditionError(f"{full}: its digest is not {etag}")
             tmp = f"{full}.{uuid.uuid4().hex}.tmp"
             with open(tmp, "wb") as f:
                 f.write(data)

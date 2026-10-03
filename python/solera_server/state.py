@@ -111,7 +111,7 @@ class State:
         *,
         clock=None,
         flush_interval: float = 1.0,
-        min_checkpoint: int = 256 << 10,
+        min_checkpoint: int = 64 << 10,
         writer: bool = True,
     ) -> State:
         """Load the newest checkpoint, replay the journal, and fence out any
@@ -124,7 +124,8 @@ class State:
         journal = Journal(
             store, "control", flush_interval=flush_interval, min_checkpoint=min_checkpoint, clock=clock
         )
-        await journal.open(model.restore, model.apply, model.snapshot, writer=writer)
+        # Encoded at once, under the flusher's lock: no copy needed (docs/journal-object.md).
+        await journal.open(model.restore, model.apply, lambda: model.snapshot(copied=False), writer=writer)
         return cls(
             store,
             url=url,

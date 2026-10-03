@@ -1,7 +1,7 @@
 """What must hold, checked against the system as it is.
 
-`Journal` taps every segment that lands in the object store, so the
-history of decisions is known even after checkpoints delete segments.
+`Journal` taps every journal body that lands in the object store, so the
+history of decisions is known even after checkpoints fold the journal.
 `Checks` reads the engine's state and the stores the way a reader would
 and raises `Violation` with what it found."""
 
@@ -24,15 +24,14 @@ class Violation(AssertionError):
 
 @dataclass
 class Journal:
-    """Every journal segment that landed, by seq: events in order."""
+    """Every event the journal object held, in order: each body that landed
+    extends the last one's events, or starts over at a newer checkpoint."""
 
-    segments: dict[int, dict] = field(default_factory=dict)
+    history: list[dict] = field(default_factory=list)
     finished: dict[str, list[tuple[int, dict]]] = field(default_factory=lambda: defaultdict(list))
     launched: dict[str, dict] = field(default_factory=dict)  # attempt -> AttemptLaunched
     problems: list[str] = field(default_factory=list)
-    twice: list[tuple] = field(
-        default_factory=list
-    )  # (seq, path, when): segments that landed again, other bytes
+    body: tuple = (None, [])  # the last landed (checkpoint, events)
     now: object = None  # the world's clock
     applied_commits: set = field(default_factory=set)  # attempts some engine committed in memory
     gates: dict[str, tuple] = field(default_factory=dict)  # attempt -> (state, worker id, landed at)
@@ -43,27 +42,25 @@ class Journal:
             attempt = path.rsplit("/", 1)[-1].removesuffix(lifecycle.GATE)
             self.gates.setdefault(attempt, (gate["state"], gate.get("worker_id"), self.now()))
             return
-        if "/control/journal/" not in path:
+        if not path.endswith("/control/journal.json"):
             return
         body = json.loads(data)
-        seq = body["seq"]
-        if seq in self.segments:
-            if self.segments[seq] != body:
-                self.twice.append((seq, path, self.now()))
-            return
-        self.segments[seq] = body
-        for event in body["events"]:
+        checkpoint, events = body["checkpoint"], body["events"]
+        known_checkpoint, known = self.body
+        if checkpoint == known_checkpoint:
+            if events[: len(known)] != known:  # a swap dropped what the journal held: acknowledged loss
+                self.problems.append(f"the journal at {checkpoint} lost events it held")
+                return
+            new = events[len(known) :]
+        else:  # moved to a newer checkpoint, which holds every event before it
+            new = events
+        self.body = (checkpoint, events)
+        for event in new:
+            self.history.append(event)
             if event["type"] == "AttemptFinished":
-                self.finished[event["attempt"]].append((seq, event))
+                self.finished[event["attempt"]].append((len(self.history), event))
             elif event["type"] == "AttemptLaunched":
                 self.launched[event["attempt"]] = event
-
-    def overwritten(self, deleted: dict, now: float) -> list[int]:
-        """Segments that landed twice with different bytes, the second still
-        there a minute later. (An opener whose fence lands in a hole cleanup
-        left deletes it at once and opens again: transient, by design.)"""
-
-        return [seq for seq, path, at in self.twice if path not in deleted and now - at > 60.0]
 
     def recorded(self, events) -> None:
         """Events an engine applied (durable or not yet): what its model knows."""
@@ -79,9 +76,7 @@ class Journal:
                 self.launched.setdefault(event["attempt"], event)
 
     def events(self):
-        for seq in sorted(self.segments):
-            for event in self.segments[seq]["events"]:
-                yield seq, event
+        yield from enumerate(self.history, 1)
 
     def ticks_submitted_twice(self) -> list[str]:
         """Run requests of one sensor tick submitted more than once."""

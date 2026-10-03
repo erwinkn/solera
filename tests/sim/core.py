@@ -33,7 +33,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import obstore
-from obstore.exceptions import GenericError, NotFoundError
+from obstore.exceptions import GenericError, NotFoundError, PreconditionError
 
 EPOCH = 1_790_000_000.0  # virtual 0 is 2026-09-21: wall time is EPOCH + loop time
 
@@ -283,6 +283,10 @@ class Objects:
     # -- install ----------------------------------------------------------------------
 
     def __enter__(self):
+        from solera import objects
+
+        self._saved_put_if = objects._conditional_put
+        objects._conditional_put = self.conditional_put  # a swap's write: faults, hooks, tap
         patched = {
             "put_async": self.put_async,
             "get_async": self.get_async,
@@ -298,6 +302,9 @@ class Objects:
         return self
 
     def __exit__(self, *exc):
+        from solera import objects
+
+        objects._conditional_put = self._saved_put_if
         while self._saved:
             name, fn = self._saved.pop()
             setattr(obstore, name, fn)
@@ -332,7 +339,7 @@ class Objects:
                 raise Killed(f"{who} is dead")
         self.requests += 1
         op = Op(self.loop._now, kind, full, who, fate, gone=self.deleted.get(full))
-        if kind in ("create", "put", "delete") or op.gone is not None:
+        if kind in ("create", "put", "swap", "delete") or op.gone is not None:
             self.log.append(op)
         if fate == "error":
             raise GenericError(f"injected: 503 Slow Down ({kind} {path})")
@@ -345,7 +352,7 @@ class Objects:
             raise
         if kind == "delete":
             self.deleted[full] = (self.loop._now, who)
-        elif kind in ("create", "put"):
+        elif kind in ("create", "put", "swap"):
             self.deleted.pop(full, None)
             if self.tap is not None:
                 self.tap(full, data)
@@ -362,6 +369,31 @@ class Objects:
         body = bytes(data) if not isinstance(data, bytes) else data
         real = self._real["put"]
         return await self._request(kind, store, path, lambda: real(store, path, body, mode=mode), body)
+
+    async def conditional_put(self, store, path, data, etag):
+        """One conditional write of `solera.objects.swap`, as the real store
+        answers it — on a local file its ETag is the content's digest, the
+        loop running one request at a time — with the fault plan applied:
+        `swap` settles an error or a lost answer by reading back."""
+
+        from solera import objects
+
+        real_get, real_put = self._real["get"], self._real["put"]
+
+        def do():
+            if not objects._local(store):
+                mode = "create" if etag is None else {"e_tag": etag}
+                return real_put(store, path, data, mode=mode)["e_tag"]
+            try:
+                current = objects._digest(bytes(real_get(store, path).bytes()))
+            except (NotFoundError, FileNotFoundError):
+                current = None
+            if current != etag:
+                raise PreconditionError(f"{path}: its digest is not {etag}")
+            real_put(store, path, data)
+            return objects._digest(data)
+
+        return await self._request("swap", store, path, do, data)
 
     async def get_async(self, store, path, **kw):
         real = self._real["get"]
