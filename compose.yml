@@ -19,7 +19,8 @@ services:
     ports: ['127.0.0.1:8000:8000']
     environment:
       SOLERA_STATE_URL: file:///home/app/state
-      SOLERA_API_TOKEN: ${SOLERA_API_TOKEN:?Set a local API token before starting Compose}
+      # Required: without it the server refuses to start (`docker compose up postgres` needs none).
+      SOLERA_API_TOKEN: ${SOLERA_API_TOKEN:-}
       DATABASE_URL: postgresql://solera:solera@postgres:5432/solera
     volumes:
       - objects:/home/app/state

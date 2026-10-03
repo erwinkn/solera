@@ -232,6 +232,8 @@ SOLERA_API_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))'
   docker compose up --build
 ```
 
+Without `SOLERA_API_TOKEN` the `solera` service exits at once (the server
+serves no unauthenticated API); `docker compose up postgres` needs none.
 It wires `DATABASE_URL` to the compose Postgres and keeps object state and
 asset data on named volumes — swap `SOLERA_STATE_URL` for `s3://…` in `compose.yml` to run the
 same stack on S3.
