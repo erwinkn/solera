@@ -55,7 +55,7 @@ items ──Each(page 2)──▶ checks              (fails while a key is "fla
 items ──Incremental(page 2)──▶ split ──▶ odd (table store), even (FileStore); on a pool
 knob (version) ──dep──▶ per_site[site ∈ sites] ──AllPartitions──▶ summary
 knob ──dep──▶ log (batches) ──Incremental──▶ tally
-outside (keyed source) ◀── watch (a sensor over an external map)
+outside (keyed source) ◀── watch (a sensor over an external map; runs per_site when it changed)
 ```
 
 Every producer is a pure function of its inputs, so the oracle computes what
@@ -79,7 +79,7 @@ arguments, up to 40 per run.
 | `commit_feed(op, keys, version)` | `commit_feed('replace', ['k1', 'k3'], '2')` | keyed source commits, each key at a version: patch, remove, full map |
 | `commit_sites(op, site)` | `commit_sites('upsert', 'west')` | a partition set growing and shrinking |
 | `commit_knob()` | | an unkeyed source's new version: `OnChange` over every scope |
-| `change_outside(keys)` / `sensor_round(delay, twice)` | `sensor_round(delay=90, twice=True)` | a sensor tick posted late, or twice |
+| `change_outside(keys)` / `sensor_round(delay, twice)` | `sensor_round(delay=90, twice=True)` | a sensor tick posted late, or twice; its commit, and the run of `per_site` it requests when what it sees changed |
 | `flaky(keys, error)` | `flaky(['k2'], 'failed')` | `Each` keys failing by error class: `Transient` (retried on its backoff), `Failed` (once per deploy), `Rejected` (when the input changes), `Abort` (the whole attempt, per `retries=`) |
 | `retry_keys(classes)` | `retry_keys(['rejected'])` | a forced retry of failing keys, as `solera keys retry` asks for one |
 | `submit(asset, mode, upstream, partitions, keys)` | `submit('checks', mode='incremental', upstream=False, partitions='all', keys=('k1', 'k10'))` | manual runs; `keys=` makes the target's keyed input read a full pass (`'full'`) or the keys named |
@@ -106,6 +106,7 @@ Checked after every step:
 | **Committed keys are readable.** Every key an immutable store's head lists loads back at its indexed generation, from an object a committed attempt wrote. | a stale writer's object referenced by the index |
 | **A fenced scope at rest holds its index.** A fenced store's scope that no attempt holds and no dead writer left unsettled holds exactly the keys its index lists, and, in Postgres, reads as written by its head's generation (`versions.md` §5, §9). | a repair that marks a key live with no rows, or leaves a dead attempt's generation as the slice's |
 | **One attempt per asset partition.** No attempt launches on an asset partition another launched attempt holds — in the journal, in order, and in the serving engine's claims. A task follows its asset through a rename (an alias); `mirror` renamed back to `copy` without one is another asset. | the hourly run and a manual run both launching `copy` before either ends |
+| **A tick's runs are submitted once.** Each run a sensor tick requests is submitted at most once, however late, often, or across restarts the tick's outcome is posted. | a retried post of tick `T` submitting its `per_site` run a second time |
 | **A fenced write holds its gate.** Every write a worker makes to a fenced store (the table store, Postgres) comes after its attempt's gate was created `writing` with that worker's id (`lifecycle.md` §2.4, §3). | a worker paused before its gate, whose attempt the engine closed meanwhile, writing `items` when it wakes; the twin of a `twice` worker writing beside the owner |
 
 Checked once the system is quiet, at the end of every run (`_converge`): faults
@@ -226,7 +227,7 @@ Known gaps, most valuable first; each says what would close it.
   dimensions, windows and `all_partitions=` are untested together. Waits
   for the input kinds of the model changes (`glossary.md`), then a
   `day × site` asset in the project.
-- **Sensors that request runs**, and failing ticks: `watch` only commits.
+- **Failing sensor ticks**: `watch` never raises.
 - **Jobs** (assets with no output) and **migrations**.
 - **Retention past `gate_days`**: virtual runs last hours, so a gate is
   never old enough to go.
@@ -238,7 +239,8 @@ resolves against a dict (property tests, and F16); glob patterns; resolve
 framing; claims (one attempt per asset partition); the gate under worker
 death, pause and duplicates; rolling deploys with three or more engines;
 `Each` errors by class and forced retries; runs with `keys=`; an asset
-with two outputs on two kinds of store; a `Pool` with racing hosts.
+with two outputs on two kinds of store; a `Pool` with racing hosts; a
+sensor that requests runs.
 
 ## Sweeps
 

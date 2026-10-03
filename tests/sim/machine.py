@@ -490,6 +490,15 @@ class Simulation(RuleBasedStateMachine):
             held[partition] = claim["attempt"]
 
     @invariant()
+    def a_ticks_runs_are_submitted_once(self):
+        """A sensor tick's outcome is applied all or nothing, once: posted
+        late, twice, or to an engine that restarted, its run requests are
+        submitted at most once each."""
+
+        if self.world is not None and (twice := self.journal.ticks_submitted_twice()):
+            raise Violation("; ".join(twice))
+
+    @invariant()
     def fenced_writes_hold_their_gate(self):
         """docs/lifecycle.md §2.4, §3: a worker writes to a fenced store only
         after it took its attempt's gate (`writing`, its own worker id): an
@@ -694,6 +703,7 @@ class Simulation(RuleBasedStateMachine):
         self._check_content(automated=False)
         self._check_replay()
         self.one_attempt_per_partition()  # convergence ran no invariant
+        self.a_ticks_runs_are_submitted_once()
         self.fenced_writes_hold_their_gate()
 
     def _asset(self, target: str) -> str | None:

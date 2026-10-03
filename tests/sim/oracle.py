@@ -83,6 +83,16 @@ class Journal:
             for event in self.segments[seq]["events"]:
                 yield seq, event
 
+    def ticks_submitted_twice(self) -> list[str]:
+        """Run requests of one sensor tick submitted more than once."""
+
+        seen: dict[tuple, int] = {}
+        for _, event in self.events():
+            if event["type"] == "RunSubmitted" and (tick := (event["run"].get("tags") or {}).get("tick")):
+                key = (tick, event.get("command"))
+                seen[key] = seen.get(key, 0) + 1
+        return [f"tick {t} request {c}: {n} runs" for (t, c), n in seen.items() if n > 1]
+
     def two_attempts_at_once(self) -> str | None:
         """The first durable launch of an attempt on an asset partition
         another launched attempt still holds, or None. A task follows its

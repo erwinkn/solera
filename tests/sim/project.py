@@ -8,7 +8,7 @@ output from the sources alone.
     knob ──dep──▶ log (batches) ──Incremental──▶ tally
     items ──Each(page 2)──▶ checks (fails while a key is flaky, by error class)
     items ──Incremental(page 2)──▶ split ──▶ odd (table store), even (FileStore); on a pool
-    outside (keyed source) ◀── watch (a sensor over an external map)
+    outside (keyed source) ◀── watch (a sensor over an external map; runs per_site when it changed)
 
 Variants (`Variant`): `items` on a FileStore or the simulation's fenced
 table store; its declared version; `copy` renamed to `mirror` (with an
@@ -35,6 +35,7 @@ from solera.sdk import (
     Project,
     Result,
     Retry,
+    RunRequest,
     Source,
     Tick,
     asset,
@@ -82,6 +83,7 @@ class External:
         self.feed: dict[str, str] = {}
         self.keys: dict[str, str] = {}
         self.flaky: dict[str, str] = {}
+        self.seen: dict[str, str] | None = None  # what `watch` saw on its last tick
 
 
 # How `checks` fails on a flaky key, by error class (docs/per-key-processing.md):
@@ -231,7 +233,12 @@ def build(variant: Variant, data_root, db: Database, outside: External, pg: str 
 
     @sensor(every=30, commits=["outside"])
     def watch(ctx):
-        return Tick(commits=[Commit("outside", keys=dict(outside.keys))])
+        """Commits what it sees; when that changed since its last tick, also
+        asks for a run of every `per_site` partition."""
+
+        seen, outside.seen = outside.seen, dict(outside.keys)
+        runs = [RunRequest("per_site", partitions="all")] if seen != outside.keys else []
+        return Tick(commits=[Commit("outside", keys=dict(outside.keys))], runs=runs)
 
     return Project(
         assets=assets,
