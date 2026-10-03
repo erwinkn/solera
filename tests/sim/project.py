@@ -84,6 +84,7 @@ class External:
         self.keys: dict[str, str] = {}
         self.flaky: dict[str, str] = {}
         self.seen: dict[str, str] | None = None  # what `watch` saw on its last tick
+        self.broken = False  # `watch` raises
 
 
 # How `checks` fails on a flaky key, by error class (docs/per-key-processing.md):
@@ -236,6 +237,8 @@ def build(variant: Variant, data_root, db: Database, outside: External, pg: str 
         """Commits what it sees; when that changed since its last tick, also
         asks for a run of every `per_site` partition."""
 
+        if outside.broken:
+            raise ConnectionError("the outside cannot be reached")
         seen, outside.seen = outside.seen, dict(outside.keys)
         runs = [RunRequest("per_site", partitions="all")] if seen != outside.keys else []
         return Tick(commits=[Commit("outside", keys=dict(outside.keys))], runs=runs)

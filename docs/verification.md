@@ -83,6 +83,7 @@ arguments, up to 40 per run.
 | `flaky(keys, error)` | `flaky(['k2'], 'failed')` | `Each` keys failing by error class: `Transient` (retried on its backoff), `Failed` (once per deploy), `Rejected` (when the input changes), `Abort` (the whole attempt, per `retries=`) |
 | `retry_keys(classes)` | `retry_keys(['rejected'])` | a forced retry of failing keys, as `solera keys retry` asks for one |
 | `submit(asset, mode, upstream, partitions, keys)` | `submit('checks', mode='incremental', upstream=False, partitions='all', keys=('k1', 'k10'))` | manual runs; `keys=` makes the target's keyed input read a full pass (`'full'`) or the keys named |
+| `break_watch(broken)` | `break_watch(True)` | the sensor raising on every tick (the host posts the error), then working again |
 | `pool_hosts(hosts)` | `pool_hosts(2)` | how many pool hosts poll `split`'s `Pool`: none (its attempts wait for one), one, or two racing for each claim (`lifecycle.md` §10) |
 | `cancel(newest)` | | a user cancel of a live run |
 | `wait(seconds)` | `wait(700)` | time passing: retries, timeouts, schedules |
@@ -231,7 +232,6 @@ Known gaps, most valuable first; each says what would close it.
   dimensions, windows and `all_partitions=` are untested together. Waits
   for the input kinds of the model changes (`glossary.md`), then a
   `day × site` asset in the project.
-- **Failing sensor ticks**: `watch` never raises.
 - **Jobs** (assets with no output) and **migrations**.
 - **Retention past `gate_days`**: virtual runs last hours, so a gate is
   never old enough to go.
@@ -244,7 +244,7 @@ framing; claims (one attempt per asset partition); the gate under worker
 death, pause and duplicates; rolling deploys with three or more engines;
 `Each` errors by class and forced retries; runs with `keys=`; an asset
 with two outputs on two kinds of store; a `Pool` with racing hosts; a
-sensor that requests runs.
+sensor that requests runs, and one that fails.
 
 ## Sweeps
 

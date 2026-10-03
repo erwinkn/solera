@@ -14,6 +14,7 @@ import logging
 import os
 import shutil
 import tempfile
+import traceback
 from pathlib import Path
 
 from hypothesis import assume
@@ -299,8 +300,11 @@ class Simulation(RuleBasedStateMachine):
         world, deploy = self.world, self.project.manifest["deploy"]
         answer = self._request(lambda e: e.sensor_next("local", deploy, "sim-host", 4, 0.0), "sensor poll")
         for tick in (answer or {}).get("ticks", []):
-            value = self.project.sensors[tick["sensor"]].fn(None)
-            outcome = value.to_json() if value is not None else {}
+            try:
+                value = self.project.sensors[tick["sensor"]].fn(None)
+                outcome = value.to_json() if value is not None else {}
+            except Exception as error:  # posted as the host does (solera_worker.sensors)
+                outcome = {"error": "".join(traceback.format_exception_only(error)).strip()}
             if delay:
                 self._run(asyncio.sleep(delay))
             for _ in range(2 if twice else 1):
@@ -308,6 +312,13 @@ class Simulation(RuleBasedStateMachine):
                     lambda e, t=tick, o=outcome: e.sensor_post(t["sensor"], t["tick"], o), "sensor post"
                 )
         del world
+
+    @rule(broken=st.booleans())
+    def break_watch(self, broken):
+        """`watch` raises on every tick from now on, or works again."""
+
+        self.trace.append(f"break_watch({broken})")
+        self.outside.broken = broken
 
     @rule(hosts=st.sampled_from([0, 1, 2]))
     def pool_hosts(self, hosts):
@@ -659,7 +670,7 @@ class Simulation(RuleBasedStateMachine):
         self.trace.append("# converge")
         world.plan.enabled = False
         world.fates.clear()
-        self.outside.flaky = {}
+        self.outside.flaky, self.outside.broken = {}, False
         world.pool_hosts = max(world.pool_hosts, 1)
         for slot in world.slots:
             if slot is not world.slot and not slot.dead:
