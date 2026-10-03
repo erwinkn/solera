@@ -29,6 +29,12 @@ that use this module are strict xfails or off):
   twice. At most a configured number of entries (10,000) per partition: a
   keys= run past it is refused with "run the partition first"; one run may
   name any number of keys.
+- One record for every asset, each=True included (K47): a position and
+  read-ahead entries (the keys from the attempt's spec, the versions from
+  the commit), no per-key payloads. An each=True asset's stale keys are
+  derived from it, exact per key, and its keys= runs count toward the cap.
+  A retry pass that leaves nothing uncovered collapses the record, as a
+  default run does.
 - A full pass (after an asset change or a reset) may take several runs:
   its first delivery, keys= or default, starts over (first batch full and
   first); later keys= runs continue it with their keys; a default run
@@ -143,12 +149,15 @@ class EachAsset:
     """An each=True output: whether it has a head (without one it is
     `missing`, never `stale`); for each key it holds, the upstream version
     it read and the counter of its write; its asset's last change; the
-    keys its `Each` input's patterns take."""
+    keys its `Each` input's patterns take. (The engine keeps no such per-key
+    record: K47 derives the same answers from the position and the
+    read-ahead entries; this is the model of what they mean.)"""
 
     takes: Callable[[str], bool] = everything
     built: bool = False
     held: dict[str, tuple[int, int]] = field(default_factory=dict)
     changed_at: int = 0
+    entries: int = 0  # keys= runs since the last default run: the cap counts them (K47)
 
 
 @dataclass
@@ -298,6 +307,9 @@ class Reference:
 
         t = self._tick()
         if name == "checks":
+            if self.checks.entries >= self.cap:
+                return "refused"
+            self.checks.entries += 1
             self.checks.built = True
             for k in keys:
                 if not self.checks.takes(k):
@@ -325,7 +337,7 @@ class Reference:
         t = self._tick()
         if name == "checks":
             c = self.checks
-            c.built = True
+            c.built, c.entries = True, 0
             c.held = {k: (v, t) for k, v in self.up.items() if c.takes(k)}
             return None
         o = self.others[name]

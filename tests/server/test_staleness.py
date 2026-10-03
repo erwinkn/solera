@@ -31,7 +31,7 @@ def pending(why: str):
     )
 
 
-per_key = pending("each=True per-key records: not built (W22: next)")
+per_key = pending("each=True staleness from the one record, position + read-ahead (K47): W22's next step")
 net_delta = pending("the net delta: over-reports until K44's range scan (W22)")
 k44 = pending("K44: added/updated/removed and ctx.load(): not built")
 
@@ -465,7 +465,7 @@ async def test_keys_runs_past_the_read_ahead_cap_are_refused_until_a_default_run
     """K45's bound, at a cap of 2: a plain incremental partition takes two
     keys= runs, of any number of keys; a third is refused ("run the
     partition first") and nothing is submitted; a default run collapses the
-    record, and keys= runs are taken again. each=True assets have no cap."""
+    record, and keys= runs are taken again."""
 
     outside = External()
     engine = staleness.engine_with_read_ahead_cap(state, project(tmp_path, outside), cap=2)
@@ -479,10 +479,27 @@ async def test_keys_runs_past_the_read_ahead_cap_are_refused_until_a_default_run
     with pytest.raises(ValueError, match="run the partition first"):
         await engine.submit(["copy"], keys={"items": {"keys": ["k1"]}})
     assert len(state.model.runs) == runs
-    for _ in range(3):
-        await drive(engine, await engine.submit(["checks"], keys=many))  # each=True: no cap
     await drive(engine, await engine.submit(["copy"]))
     await drive(engine, await engine.submit(["copy"], keys={"items": {"keys": ["k1"]}}))
+
+
+@per_key
+async def test_keys_runs_on_an_each_asset_count_toward_the_cap_too(state, tmp_path):
+    """K47: an each=True asset keeps the same record, so its keys= runs are
+    read-ahead entries and the cap (2 here) counts them; a default run
+    collapses the record, and keys= runs are taken again."""
+
+    outside = External()
+    engine = staleness.engine_with_read_ahead_cap(state, project(tmp_path, outside), cap=2)
+    await engine.initialize()
+    await boot(engine, outside, {"k1": "1", "k2": "1"})
+    await drive(engine, await engine.submit(["checks"]))
+    for key in ("k1", "k2"):
+        await drive(engine, await engine.submit(["checks"], keys={"items": {"keys": [key]}}))
+    with pytest.raises(ValueError, match="run the partition first"):
+        await engine.submit(["checks"], keys={"items": {"keys": ["k1"]}})
+    await drive(engine, await engine.submit(["checks"]))
+    await drive(engine, await engine.submit(["checks"], keys={"items": {"keys": ["k1"]}}))
 
 
 @k44
@@ -760,6 +777,12 @@ def test_the_reference_reads_the_worked_examples():
     assert capped.run_keys({"k1"}, "copy") == "refused"
     capped.run_default("copy")
     assert capped.run_keys({"k1"}, "copy") == (set(), False)
+    capped.run_default("checks")  # K47: each=True keeps the same record, capped alike
+    capped.run_keys({"k1"})
+    capped.run_keys({"k1"})
+    assert capped.run_keys({"k1"}) == "refused"
+    capped.run_default("checks")
+    assert capped.run_keys({"k1"}) is None
 
 
 # -- the keyed merge on every built-in store (R2) ----------------------------------------
