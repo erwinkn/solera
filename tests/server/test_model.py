@@ -13,6 +13,8 @@ from solera_server.executors.inline import InlinePlacement
 from solera_server.model import Model
 from solera_server.state import Conflict, LostOwnership, State
 
+from tests.conftest import worker_finished
+
 
 class Clock:
     def __init__(self):
@@ -362,13 +364,15 @@ async def test_the_journal_alone_reproduces_the_live_model(tmp_path, clock):
     for _ in range(3):
         await settle(engine, (await engine.submit(["consumer"], upstream=True))["id"])
         clock.now += 61
+    await worker_finished()  # its cleanups recorded too: nothing lands after the snapshot
     await engine.tick()  # archive what finished
     run = await engine.submit(["polled"])
     await state.durable()
     await engine.pause(run["id"])  # after RunSubmitted was flushed: it must not change it
     await state.durable()
+    live = durable(state.model)
     again = await State.open(tmp_path.as_uri(), "test", clock=clock, writer=False)
-    live, replayed = durable(state.model), durable(again.model)
+    replayed = durable(again.model)
     assert replayed == live
     await state.close()
 

@@ -141,7 +141,8 @@ def test_demo_end_to_end(demo, pool_worker):
         submit(["weekly_digest"]),  # job: no outputs, just a clean run
     ]
     assert wait(lambda: all(run_done(r) for r in submitted))
-    assert all(run_status(r) == "succeeded" for r in submitted)
+    failed = {r: client.get(f"{base}/runs/{r}").json() for r in submitted if run_status(r) != "succeeded"}
+    assert not failed, failed
 
     # Every output has a complete head for every planned partition.
     def all_complete():
@@ -356,7 +357,7 @@ def test_demo_postgres_migrations_and_ondeploy(tmp_path, own_database):
         run_id = submit(["file_index"], partitions="all")
         assert wait(lambda: run_done(run_id))
         status = client.get(f"{base}/runs/{run_id}").json()["request"]["status"]
-        assert status == "succeeded"
+        assert status == "succeeded", client.get(f"{base}/runs/{run_id}").json()
         for output in ("site_events", "site_files", "file_index"):
             heads = client.get(f"{base}/outputs/{output}/heads").json()["heads"]
             assert heads, output
