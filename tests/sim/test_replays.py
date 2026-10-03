@@ -322,3 +322,20 @@ def test_f12_a_rename_back_and_forth_over_rolling_deploys_keeps_up():
     state.one_end_per_attempt()
     state.reads_say_what_they_read()
     state.teardown()
+
+
+@pytest.mark.xfail(
+    strict=True, reason="F13: a key removed after its upstream moved store (across a crash) stays downstream"
+)
+def test_f13_a_key_removed_after_a_store_move_leaves_its_consumers():
+    """`items` on the table store holds `k11`; a clean redeploy, then a crash
+    redeploy moving `items` to FileStore; the feed then removes `k11`.
+    `copy` keeps `k11` (F9's territory: the deletion comes after the move)."""
+
+    state = Simulation()
+    state.boot(seed=225, store="table")
+    state.commit_feed(keys={"k11"}, op="upsert", version="1")
+    state.redeploy(change="summary", clean=True)
+    state.redeploy(change="table", clean=False)
+    state.commit_feed(keys={"k11", "k3"}, op="remove", version="1")
+    state.teardown()
