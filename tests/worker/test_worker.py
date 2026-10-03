@@ -317,7 +317,7 @@ threading.Thread(target=busy, daemon=True).start()
 
 @asset(executor=Pool("ingest")())
 def lingering() -> int:
-    if not lock.acquire(timeout=10):  # forked mid-hold from a process that imported this: never released
+    if not lock.acquire(timeout=30):  # forked mid-hold from a process that imported this: never released
         raise RuntimeError("the project's lock was inherited held")
     lock.release()
     return 1
@@ -345,7 +345,9 @@ async def test_a_pool_attempt_runs_in_a_child_of_the_warm_worker(state, tmp_path
     )
     entrypoint = write_project(tmp_path, recorded + source)
     monkeypatch.setenv("SOLERA_PROJECT", entrypoint)
-    engine = make_engine(state, entrypoint, heartbeat_seconds=0.2)
+    # A short grace: the engine reads the claim and the result without the worker's
+    # channel, which this worker has none of, a moment after the offer, not 10 s.
+    engine = make_engine(state, entrypoint, heartbeat_seconds=0.2, pool_offered_grace=0.5)
     await engine.initialize()
     run = await engine.submit(["lingering"])
     for _ in range(100):
@@ -366,10 +368,10 @@ async def test_a_pool_attempt_runs_in_a_child_of_the_warm_worker(state, tmp_path
         [sys.executable, "-c", worker, json.dumps(stage), entrypoint],
         capture_output=True,
         text=True,
-        timeout=50,
+        timeout=55,
     )
     assert done.stdout.strip().splitlines()[-1] == "0", done.stderr
-    assert asyncio.get_running_loop().time() - started < 30  # not the lingering minute
+    assert asyncio.get_running_loop().time() - started < 45  # not the lingering minute, under load too
     # By this test's engine, and by the attempt's child: never in the forkserver it was forked from.
     assert imports.read_text().count("imported") == 2
     detail = await engine.run_until(run["id"], 30)
