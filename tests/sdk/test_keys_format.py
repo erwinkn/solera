@@ -293,12 +293,11 @@ def test_rejects_the_previous_format_version(impl):
         impl.parse_footer(bytes(data[-48:]))
 
 
-@pytest.mark.xfail(strict=True, reason="F23: open")
 @pytest.mark.parametrize("impl", IMPLS)
 def test_a_varint_past_64_bits_is_refused(impl):
     """F23: a block entry whose generation is a 10-byte varint with bits
     past 2^64 (`ff` x 9, `7f`). The native reader dropped those bits and
-    read 2^64 - 1; the Python reference read 2^70 - 1. Both must refuse it."""
+    read 2^64 - 1; the Python reference read 2^70 - 1. Both refuse it."""
 
     entry = b"\x00" + b"\x01a" + b"\x00" + b"\xff" * 9 + b"\x7f"  # shared, suffix, flags, generation
     with pytest.raises(impl.FormatError, match="varint"):

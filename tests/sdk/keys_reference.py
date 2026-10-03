@@ -45,7 +45,7 @@ def get_varint(buf, pos: int) -> tuple[int, int]:
         b = buf[pos]
         pos += 1
         if shift >= 64 or (shift == 63 and b > 0x01):  # past a u64: as native refuses it
-            raise ValueError("varint too long")
+            raise FormatError("varint too long")
         n |= (b & 0x7F) << shift
         if b < 0x80:
             return n, pos
