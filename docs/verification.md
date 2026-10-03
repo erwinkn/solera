@@ -243,8 +243,8 @@ Known gaps, most valuable first; each says what would close it.
   dimensions, windows and `all_partitions=` are untested together. Waits
   for the input kinds of the model changes (`glossary.md`), then a
   `day × site` asset in the project.
-- **Migrations** in the simulation: waits for F18's fix, since every run's
-  `items` would share one ledger row.
+- **Migrations** in the simulation: no rule runs `migrate` yet. Nothing
+  blocks one since F18's fix; it would run on `pg`.
 - **A worker that resumes after its run was purged**: with the control
   file (`lifecycle.md` §2.4, decided, not built) it finds the file gone
   and stops, however long it paused; `Attempt.tla` checks it ("Formal
@@ -262,34 +262,22 @@ under tight budgets and with its files deleted or corrupted under it.
 
 ## Sweeps
 
-Long runs (`--slow`, new seeds each) and what they found. Steps count
-rules, not invariant checks. `pg`: `items` may also live in Postgres.
+Long runs (`--slow`, new seeds each). Steps count rules, not invariant
+checks; `pg` means `items` may also live in Postgres.
+
+Up to 6a941c9, 24 sweeps (seeds 101–941) made about 11,000 runs and 600,000
+steps, a third of them `pg`, some of 80 or 120 steps per run. Every new
+rule or invariant got one sweep on default stores and one on `pg`. They
+found F13, F16, F17 and F21. They also found four bugs in the simulation
+(a Postgres clock in the gate invariant, the claims invariant twice, a pool
+host idle forever after its worker died before owning an attempt) and one
+in the environment (a reused database's fence table of an older shape,
+which the simulation now drops at boot).
+
+New sweeps since that summary:
 
 | Run | Code | Seed | Runs × steps | Stores | Result |
 |---|---|---|---|---|---|
-| A | fa12f01 | 101 | 720 runs, 38,382 steps, 244 h virtual | default | F16 (`items` keeps a key the feed dropped) |
-| E | `flaky` by class, `retry_keys` | 105 | 415 runs, 23,065 steps, 138 h | default | green |
-| F | as E | 106 | 151 runs, 2,450 steps | pg | the gate invariant's Postgres clock (a simulation bug, fixed in 2808bbc) |
-| G | `submit(keys=)` | 107 | 322 runs, 13,700 steps | default | the claims invariant equated `mirror` with `copy` (a simulation bug, fixed) |
-| H | e39ead9 | 108 | 106 runs, 4,379 steps | pg | every `items` write refused: the database's fence table predated the `worker_id` rename (an environment bug: the simulation now drops a fence table of another shape at boot) |
-| I | e39ead9 | 109 | 399 runs, 21,474 steps, 122 h | default | the claims invariant again; F16 |
-| P1 | a6dcc0e (F16 set aside) | 201 | 157 runs, 6,312 steps | default | green |
-| P2 | a6dcc0e | 202 | 158 runs, 6,177 steps | default | green |
-| P3 | a6dcc0e | 203 | 106 runs, 4,060 steps | pg | green |
-| Q1–Q3 | `split` on a `Pool` | 301–303 | 542 runs, 23,897 steps | default ×2, pg | a pool host never took an attempt again after its worker died before owning it (a simulation bug, fixed); F16 set aside twice |
-| R1–R3 | `Pool` (fixed), `watch` requests runs | 511–513 | 503 runs, 23,744 steps | default ×2, pg | F17; F13 by a takeover; F16 set aside once |
-| S1–S3 | cb3367b (F13, F17 set aside) | 521–523 | 572 runs, 26,112 steps, 121 h | default ×2, pg | green; F13 set aside 3 times |
-| L1 | a780a55 (main) | 601 | 1,059 runs, 73,668 steps, 323 h virtual | default | green; F16 set aside 6 times |
-| L2 | a780a55 | 602 | 616 runs × up to 120 steps, 67,036 steps, 260 h | default | green; F13 set aside 4 times |
-| L3 | a780a55 | 603 | 527 runs, 29,798 steps, 161 h | pg | green; F13 set aside 10 times |
-| L4 | a780a55 | 604 | 435 runs × up to 80 steps, 31,285 steps, 187 h | pg | green; F13 set aside 8 times |
-| T1 | `break_watch` | 701 | 158 runs, 7,293 steps | default | green |
-| C1–C3 | the key cache under pressure | 801–803 | 702 runs, 32,147 steps | default ×2, pg | green; F13 set aside 3 times |
-| J1–J3 | the job `seen` | 811–813 | 668 runs, 33,179 steps | default ×2, pg | green; F13 set aside once |
-| X1–X3 | 33fa183 (F10 fixed, `exclude` back) | 901–903 | 853 runs, 46,600 steps | default ×2, pg | green |
-| Y1–Y3 | the reset rule's rules (off), `a_life_is_its_own` | 911–913 | 682 runs, 37,174 steps | default ×2, pg | green; F19 set aside once (rules off: a rename back without an alias) |
-| Z1 | the reset rule's rules on (b7d8ae7) | 921 | 637 runs, 9,635 steps | default | F21; F20 set aside 9 times (since fixed) |
-| Z2–Z3 | F16, F20 fixed; F21 set aside | 931–932 | 435 runs, 24,486 steps | default, pg | green; F21 set aside 28 times |
 | Z4 | F21 fixed (b8bf1a4), nothing set aside | 941 | 203 runs, 14,284 steps, 61 h | default | green |
 
 ## Formal model: execution semantics (`spec/tla/Execution.tla`)
