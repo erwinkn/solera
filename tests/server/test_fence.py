@@ -251,7 +251,9 @@ async def test_an_attempt_whose_launch_was_cut_short_is_resumed(tmp_path):
     await engine.initialize()
     Named.hang, Named.started = True, set()
     run = await engine.submit(["remote"])
-    await until(engine, lambda: any(c.get("launched") for c in state.model.claims.values()))
+    # The first launch is in the provider, hanging: its record is durable before it
+    # gets there, so a restart in between would leave the hang to the second engine.
+    await until(engine, lambda: not Named.hang)
     [attempt] = [c["attempt"] for c in state.model.claims.values()]
     state, engine = await restart(state, engine, url, REMOTE, worker=Named)
     assert "handle" not in state.model.task(state.model.attempts[attempt])["launched"]
