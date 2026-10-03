@@ -1194,3 +1194,33 @@ are 1.75 B per entry at 14 bits per item, 0.35% false positives measured.
 `cpu.py 1000000` (path-like keys): native encode 2.38M entries/s, decode
 5.79M/s, merge 5.73M/s without payloads (1.85M, 3.81M and 3.80M with 16
 bytes).
+
+## F16's cost: level 0 merged into an empty level 1 (2026-10-03)
+
+Before F16's fix, level 0 compacting into an empty level 1 was a relabel:
+no bytes read or written. It is now a merge (level-0 files overlap). This
+compares that merge with the same compaction into a level 1 holding every
+key. Level 0: 8 files of `n` changed keys each, drawn from `10n`; level 1
+empty, or all `10n` keys. Local file:// store, no injected latency (wall
+time is CPU and local disk), Apple M5 Max, native, zlib level 1. Bytes are
+everything through `ObjectIO`; peak RSS is the compaction's own (a fresh
+process, measured above its resident memory just before); wall time the
+best of three.
+
+    uv run python bench/keys/f16.py --sizes 1e3,1e4,1e5
+
+| Keys per level-0 file | Level 1 | Wall | Read | Written | Peak RSS | Out entries |
+|---|---|---|---|---|---|---|
+| 1,000 | empty | 5 ms | 37 kB | 24 kB | 4.4 MB | 5,662 |
+| 1,000 | all 10,000 keys | 6 ms | 56 kB | 37 kB | 5.3 MB | 10,000 |
+| 10,000 | empty | 12 ms | 0.3 MB | 0.2 MB | 13.9 MB | 57,106 |
+| 10,000 | all 100,000 keys | 20 ms | 0.5 MB | 0.4 MB | 24.5 MB | 100,000 |
+| 100,000 | empty | 75 ms | 3.4 MB | 2.3 MB | 96.8 MB | 569,612 |
+| 100,000 | all 1,000,000 keys | 141 ms | 5.2 MB | 3.7 MB | 164.6 MB | 1,000,000 |
+
+The merge into an empty level 1 costs about half the merge into a full
+one, at every size: it reads level 0's files and writes the merged file
+(overlapping keys once). On S3 that adds a round trip of reads and one of
+writes, and a few MB, to a compaction that was free. It happens only when
+level 1 is empty: an index's first compaction, or one after a replacement
+by nothing. Peak memory is about 170 bytes per output entry in both cases.
