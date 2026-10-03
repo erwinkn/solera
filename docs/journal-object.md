@@ -103,16 +103,17 @@ five):
 | parse | 83 ms | 57 ms |
 | the checkpoint under the flusher's lock, with `Model.snapshot`'s deep copy (278 ms) | 429 ms | 416 ms |
 | the same, encoding the model's own structures at once (no copy) | — | 100 ms |
+| the same, the read-back compared by bytes, not parsed | — | 43 ms |
 
 The deep copy was most of the hold, and it is not needed: the snapshot is
 encoded on the spot, before any later event changes the model
-(`Model.snapshot(copied=False)`). What remains, about 100 ms per checkpoint
-for `durable()` to wait at 10 MB, is mostly the read-back's parse (57 ms);
-on S3 the PUT and GET of 10 MB add about 80 ms at 250 MB/s. Comparing the
-bytes read back with the bytes written, instead of parsing them, would
-check the same thing for a fraction of it. If the hold still matters, the
-variant that lets flushes continue during the checkpoint — the move then
-carrying the events flushed since the snapshot — is not modeled yet.
+(`Model.snapshot(copied=False)`). Most of what remained was the
+read-back's parse (57 ms). The read-back now compares bytes instead: the
+encoding is deterministic and came from a valid state, so the bytes
+written, read back unchanged, are a checkpoint that parses. That leaves
+43 ms per checkpoint locally for `durable()` to wait at 10 MB, and on
+S3 the PUT and GET of 10 MB add about 80 ms at 250 MB/s — acceptable, so
+flushes do not continue during a checkpoint.
 
 ## Rejected alternatives
 

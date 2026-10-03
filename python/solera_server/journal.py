@@ -31,8 +31,8 @@ its own if an earlier try landed unheard.
 **Checkpoints.** Once the journal's events reach max(`min_checkpoint`, a
 sixteenth of the last checkpoint's size), and on a clean close: list the
 checkpoints, write the state as of the last flush under a fresh name, read
-it back, move the journal to it (no events), and only then delete what was
-listed. Listing after the move could delete a newer engine's checkpoint,
+it back byte for byte, move the journal to it (no events), and only then
+delete what was listed. Listing after the move could delete a newer engine's checkpoint,
 not yet named; one not read back could be named and unreadable.
 
 The journal and checkpoints are encoded with orjson, keys sorted: the same
@@ -311,11 +311,16 @@ class Journal:
         name = f"{self.engine}-{self._checkpoints:06d}"
         path = f"{self.prefix}/checkpoints/{name}.json"
         await create(self.store, path, data)  # a fresh name; a retry finds its own bytes
+        # Read back byte for byte: the encoding is deterministic and came from a
+        # valid state, so the same bytes are a checkpoint that parses.
         try:
             got = await obstore.get_async(self.store, path)
-            orjson.loads(bytes(await got.bytes_async()))
+            back = bytes(await got.bytes_async())
         except Exception as error:  # the journal stays: the next due point tries again
             log.warning("checkpoint %s does not read back (%s); keeping the journal", name, error)
+            return
+        if back != data:
+            log.warning("checkpoint %s reads back other bytes; keeping the journal", name)
             return
         try:
             self._etag = await swap(self.store, self._journal, self._body(self.engine, name, []), self._etag)
