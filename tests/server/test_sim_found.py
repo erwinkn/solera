@@ -738,3 +738,49 @@ async def test_the_retry_clock_waits_for_an_input_with_no_head(state, tmp_path):
         await engine.tick()
         await asyncio.sleep(0.01)
     assert [r for r in submitted if r is not None] == []
+
+
+async def test_a_reset_output_is_due_for_a_rebuild(state, tmp_path):  # noqa: F811
+    """K10: a reset leaves an automated output due for a rebuild. `items`
+    (OnChange on `feed`) moves to another store, and `feed` does not change:
+    the move alone fires `items` again, so it does not stay empty — and its
+    consumers waiting — until `feed` next changes."""
+
+    from solera.sdk import AutoRefresh
+
+    @asset(outputs=Output("feed", key="id"))
+    def feed():
+        return [{"id": "a"}]
+
+    def project(store):
+        @asset(
+            inputs={"feed": Incremental()},
+            outputs=Output("items", key="id", store=store),
+            automations=AutoRefresh(),
+        )
+        def items(ctx, feed: list):
+            return feed
+
+        return Project(assets=[feed, items], stores={"other": FileStore(tmp_path / "other")})
+
+    engine = make_engine(state, project(None))
+    await engine.initialize()
+    await drive(engine, await engine.submit(["items"], upstream=True))
+    for _ in range(100):  # the firing `feed`'s commit owes: settled before the move
+        await engine.tick()
+        busy = any(r["status"] not in ("succeeded", "failed", "canceled") for r in state.model.runs.values())
+        if not busy and not state.model.automations["items.onchange.0"]["pending"]:
+            break
+        await asyncio.sleep(0.01)
+    await engine.stop()
+    engine = make_engine(state, project("other"))
+    await engine.initialize()
+    assert ("items", "") not in state.model.heads
+    assert state.model.automations["items.onchange.0"]["pending"] == [["items", ""]]  # the reset's alone
+    for _ in range(100):
+        await engine.tick()
+        head = state.model.heads.get(("items", ""))
+        if head is not None:
+            break
+        await asyncio.sleep(0.01)
+    assert head is not None and head["ref"]["store"] == "other", "items stays empty until feed changes"

@@ -143,7 +143,12 @@ is a new output (K10). At that deploy, not later:
   each of its inputs in a full pass. A `keys=` run of a partition that lost
   bookmarks this way reads that full pass too, to its last batch, before
   it succeeds;
-- an asset the project no longer declares loses its partition records.
+- an asset the project no longer declares loses its partition records;
+- what lost a head is due for a rebuild: each `OnChange` automation of its
+  asset owes it a firing, as for a change of its own, so it is written
+  again at once — not when its upstream next changes, with every consumer
+  waiting meanwhile. An asset with no such automation waits for its next
+  run.
 
 An attempt launched before the reset commits nothing: one that writes a
 reset output or reads one incrementally is refused at commit, as a

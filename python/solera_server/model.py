@@ -525,7 +525,7 @@ class Model:
         self._consumed = self._consumed_outputs(manifest)
         renamed, output_map = self._apply_aliases(manifest)
         self._reconcile_tasks(manifest, renamed, output_map, e["at"])
-        self._reset({output_map.get(name, name): o.get("store") for name, o in previous.items()})
+        lost = self._reset({output_map.get(name, name): o.get("store") for name, o in previous.items()})
         self._unsubscribe()
         automations = {}
         for name, auto in manifest["automations"].items():
@@ -544,6 +544,13 @@ class Model:
                         record[field] = existing.get(field, record[field])
             automations[name] = record
         self.automations = automations
+        # What a reset took is due again, as a change of its own asset: OnChange
+        # rebuilds it now, not when its upstream next changes — its consumers wait.
+        for asset, partition in sorted(lost):
+            for auto in automations.values():
+                onchange = auto["trigger"]["kind"] == "onchange" and auto["enabled"]
+                if onchange and asset in auto["targets"] and [asset, partition] not in auto["pending"]:
+                    auto["pending"].append([asset, partition])
         self.sensors = {n: s for n, s in self.sensors.items() if n in (manifest.get("sensors") or {})}
         for name, source in manifest["sources"].items():
             if (name, "") not in self.heads:
@@ -640,7 +647,7 @@ class Model:
             if not marks:
                 del self.partitions[key]["bookmarks"]
 
-    def _reset(self, stores: dict[str, str]) -> None:
+    def _reset(self, stores: dict[str, str]) -> set[tuple[str, str]]:
         """A deploy that removes an output, or declares it on another store
         than `stores` says it was on, resets it: the output that comes back
         under that name, or that the new store holds, is a new one (K10). Its
@@ -651,7 +658,8 @@ class Model:
         An attempt launched before the reset commits nothing
         (`Engine.commit_attempt`), so nothing waits for one in flight. History
         keeps the records, and pending cleanups stay: their objects are still
-        owed (F12, F13, F17, F19)."""
+        owed (F12, F13, F17, F19). Returns the (asset, partition) pairs that
+        lost a head, due for a rebuild."""
 
         manifest = self.manifest or {}
         outputs, assets = manifest.get("outputs") or {}, manifest.get("assets") or {}
@@ -670,6 +678,7 @@ class Model:
                 return key[0][1:] not in assets
             return key[0] in reset
 
+        lost = {(head.get("asset"), key[1]) for key, head in self.heads.items() if gone(key)}
         for key in [k for k in self.heads if gone(k)]:
             del self.heads[key]
         for key in [k for k in self.repairs if gone(k)]:  # what dead attempts meant to write
@@ -686,13 +695,14 @@ class Model:
             marks = self.partitions[key].get("bookmarks")
             if not marks:
                 continue
-            lost = [i for i, wm in marks.items() if key[0] in producers or wm.get("output") in reset]
-            for input in lost:
+            dropped = [i for i, wm in marks.items() if key[0] in producers or wm.get("output") in reset]
+            for input in dropped:
                 del marks[input]
-            if lost:
+            if dropped:
                 self.partitions[key]["reset"] = True  # until a full pass catches it up
             if not marks:
                 del self.partitions[key]["bookmarks"]
+        return {(asset, partition) for asset, partition in lost if asset in assets}
 
     def _apply_aliases(self, manifest) -> tuple[dict[str, list[str]], dict[str, str]]:
         """Move everything held under an asset's former names to its current
