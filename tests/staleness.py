@@ -1,34 +1,30 @@
-"""Staleness at every level (K36–K41), for the simulation and the property
-tests: the engine's answers, behind placeholder names, and a reference
-model of what they must be.
+"""Staleness at every level (K43, the approved design; docs/positions-from-reads.md),
+for the simulation and the property tests: the engine's answers, behind
+placeholder names, and a reference model of what they must be.
 
-The rules (W22 builds them after the journal head; until then the tests
+The rules (W22 builds them after the control file; until then the tests
 that use this module are strict xfails or off):
 
-- Two kinds of asset (K40). An `each=True` asset (one `Each` input; any
-  others whole or deps, shared by every key) has exact per-key staleness.
-  Every other asset, keyed or not, is stale by partition only, and its
-  stale-key listing answers "not tracked per key".
-- Its keys (K39, K40). An each=True asset's keys are its `Each` input's
-  upstream keys under that input's patterns; nothing else counts.
-- A key of an each=True asset is stale if its upstream key changed after
-  it read it, if it is missing (the upstream has it under the patterns and
-  the output does not), if the output holds it and the upstream removed
-  it, if it predates its asset's last change, or if a shared input changed
-  after it was written. Its partition is stale exactly when a key is:
-  `keys=` runs that leave no stale key leave it fresh.
-- Any other partition is stale when it has not seen each input at its
-  latest version since its last catch-up, or its asset changed since; for
-  an incremental input with patterns, only commits holding a key they take
-  count (K39). A `keys=` run never clears it; a default run does.
-- A `keys=` run makes each named key its patterns take match its upstream:
-  written, removed, or left alone if neither side has it. Never a reset
-  write: every key not named keeps its value (R2).
+- Output unit: a key within a partition if the output is keyed, else the
+  partition. Input unit, per input: one upstream key for an each=True
+  input; otherwise the upstream partition(s) it reads.
+- Dependency: with each=True, output key k depends on input key k (and on
+  every shared whole or dep input). Otherwise every output unit of a
+  partition depends on its whole input units: a keyed non-each output's
+  keys go stale together.
+- An output unit is stale iff an input unit it depends on changed after
+  it was written (for an input with patterns, only keys they take count:
+  K39), or its asset changed since. Missing keys count for each=True: a
+  key the upstream has under the patterns and the output does not, or one
+  the output holds and the upstream removed. Roll-ups use "any": key ->
+  partition -> asset.
+- Runs target what input units allow: `partitions=` always; `keys=` only on
+  each=True assets, refused elsewhere ("keys= needs an each=True input;
+  rerun the partition"). A `keys=` run makes each named key its patterns
+  take match its upstream, and never touches a key it does not name (R2).
 - An output reset itself starts empty: a `keys=` run leaves just its keys;
   the next default run converges (R6).
-- An asset is stale exactly when one of its partitions is (K38).
-- Positions follow what an attempt read (K41): nothing here says when one
-  moves, only what is stale.
+- Positions are derived from what each attempt read; nothing here asserts one.
 
 Every engine call the tests make about staleness is in this module, so
 adapting to the names W22 picks is one edit here.
@@ -39,7 +35,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-LANDED = False  # W22's K36–K41 build; True turns the tests on
+LANDED = False  # W22's K43 build; True turns the tests on
 
 
 class NotBuilt(NotImplementedError):
@@ -50,8 +46,9 @@ class NotBuilt(NotImplementedError):
 
 
 async def stale_keys(engine, asset: str, partition: str = "") -> set[str] | None:
-    """The exact stale keys of a per-key asset's partition, every page of
-    them; None where staleness is not tracked per key."""
+    """The stale keys of a keyed asset's partition, every page of them
+    (a non-each output's are all its keys, or none); None for an unkeyed
+    output, which has no keys."""
 
     listing = getattr(engine, "stale_keys", None)
     if listing is None:
@@ -111,11 +108,13 @@ class EachAsset:
 @dataclass
 class ByPartition:
     """Any other output: the counter of its last catch-up (None: never
-    built), and its asset's last change; the keys its input's patterns take."""
+    built), its asset's last change, the keys its input's patterns take,
+    and, keyed, the keys it holds: they go stale together."""
 
     takes: Callable[[str], bool] = everything
     caught_up_at: int | None = None
     changed_at: int = 0
+    keys: set[str] = field(default_factory=set)
 
 
 class Reference:
@@ -170,13 +169,11 @@ class Reference:
         t = self._tick()
         (self.checks if name == "checks" else self.others[name]).changed_at = t
 
-    def run_keys(self, name: str, keys: set[str]) -> None:
-        """R2. On `checks`, the named keys its patterns take are fresh after;
-        on any other asset nothing about staleness changes."""
+    def run_keys(self, keys: set[str]) -> None:
+        """R2 on `checks`, the each=True asset: the named keys its patterns
+        take are fresh after. (Elsewhere a keys= run is refused.)"""
 
         t = self._tick()
-        if name != "checks":
-            return
         self.checks.built = True
         for k in keys:
             if not self.checks.takes(k):
@@ -195,7 +192,9 @@ class Reference:
             c.built = True
             c.held = {k: (v, t) for k, v in self.up.items() if c.takes(k)}
         else:
-            self.others[name].caught_up_at = t
+            o = self.others[name]
+            o.caught_up_at = t
+            o.keys = {k for k in self.up if o.takes(k)} if name == "copy" else set()
 
     # answers
 
@@ -211,6 +210,14 @@ class Reference:
             if self.up[k] > read or written < c.changed_at or written < self.knob:
                 out.add(k)
         return out
+
+    def stale_keys_of(self, name: str) -> set[str]:
+        """The stale keys of a keyed asset: per key for `checks`; for `copy`
+        all its keys, or none."""
+
+        if name == "checks":
+            return self.stale_keys()
+        return set(self.others[name].keys) if self.stale(name) else set()
 
     def stale(self, name: str) -> bool:
         if name == "checks":
