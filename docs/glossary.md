@@ -291,8 +291,9 @@ waits for the first's attempt to commit, then reads what it wrote.
 computes, writes, seals the result), or, long-lived, a `Pool`'s attempts
 or an executor's sensor ticks (`solera worker pool NAME`, `solera worker
 sensors NAME`). A placement may start two workers for one attempt (a
-Kubernetes Job's second pod): the first to create `{attempt}.worker`
-**owns** the attempt; the other waits for it to end and writes nothing.
+Kubernetes Job's second pod): the first to swap the control file from
+`open` to `owned` **owns** the attempt; the other waits for it to end and
+writes nothing.
 *Was:* harness; invocation (one worker of an attempt), invocation token
 (worker id); sensor host.
 
@@ -312,13 +313,23 @@ options. `ctx.placement` is the resolved one. *Was:* `ctx.execution`.
 attempt: what to run, its pinned inputs, its batch, its generation, its
 deploy. Written before launch; what a worker reads first.
 
+**control file** `{attempt}.control`. The one object that decides an
+attempt's life between the worker and the engine: who owns it, whether
+it began writing (the gate) and with which intents, its sealed result,
+or the engine's end. The engine creates it `open` before the launch;
+after that it is only swapped (`If-Match`): `open` → `owned` → `writing`
+→ `sealed` by the owner, or → `ended` by the engine, and exactly one of a
+seal and an end lands. A worker that finds it gone stops and never
+creates it (`lifecycle.md` §2.4). *Was:* `{attempt}.worker` (the claim),
+`{attempt}.writing` (the gate) and `{attempt}.result`, until K18.
+
 **attempt handle**. An executor's identifier for the worker it started
 (an ECS task ARN, a pod name), recorded so a restarted engine can follow
 or cancel it. *Was:* `RunHandle`, the protocol's `run` parameter.
 
 **result**. What an attempt produced: per output its ref and delta, the
-batches it read, its cursor, or an error; sealed once into
-`{attempt}.result`. `Result(outputs=…, cursor=…)` is the producer's side
+batches it read, its cursor, or an error; sealed once into the control
+file. `Result(outputs=…, cursor=…)` is the producer's side
 of the same thing.
 
 **step**. One moment in a run's life, recorded on its run timeline.
@@ -334,7 +345,7 @@ commits its result or fails it). The worker's: `booted`, `imported`,
 its usage. Evidence that it lives, never permission to write.
 
 **cancel**. Two phases: **requested** (stop starting work; what finished
-still commits) then **forced** (the engine takes the gate and ends the attempt).
+still commits) then **forced** (the engine swaps the control file to `ended`).
 Reasons: `user`, `timeout`, `provisioning`.
 
 ## State, commits and the key index
@@ -466,18 +477,19 @@ remove=["K2"])`. *Was:* cleanup (the pass's flag).
 
 ## Safety
 
-**gate** `{attempt}.writing`. The one-time race between an attempt's
-worker and the engine over whether it may write: the worker creates it
-(`writing`, with its **intents**: the keys it is about to write) before
-its first store write; the engine creates it (`aborted`, or `closed`)
-when it ends the attempt first. The file is create-only, so whoever comes
-first wins, for good. *Not a lock:* nothing waits on it, nothing releases
+**gate**. The one-time race between an attempt's worker and the engine
+over whether it may write, held in the control file: the worker swaps it
+to `writing` (with its **intents**: the keys it is about to write) before
+its first store write; the engine swaps it to `ended` when it ends the
+attempt first. Both swap the same version, so whoever comes first wins,
+for good. *Not a lock:* nothing waits on it, nothing releases
 it, and it concerns one attempt; ordering attempts is the fence's job.
 *Example:* a 10-minute timeout fires as the worker finishes computing: if
-the engine's `aborted` lands first, the worker writes nothing and the
+the engine's `ended` lands first, the worker writes nothing and the
 retry starts clean; if the worker's `writing` lands first, the writes may
 be half done, and the next attempt repairs its intents. Only attempts with
-outputs on fenced stores take one. *Was:* write fence (prose).
+outputs on fenced stores take one. *Was:* write fence (prose); the
+create-only object `{attempt}.writing`, until K18.
 
 **repair**. What the next attempt on an output partition does after a
 worker died past its gate: acquire the fence, ask the store which intended

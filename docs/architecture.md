@@ -754,27 +754,31 @@ class Placement(Protocol):
 | `cancel` | Best-effort, idempotent, never raises for a finished run. |
 
 Object keys are conventional under `objects`: `runs/{run}/{attempt}.spec`,
-the claim `.worker`, the gate `.writing`, log chunks `.log.{n:06d}` and the
-result `.result`; see object-store-state.md §8 and `lifecycle.md`.
+the control file `.control` (the owner, the gate, the sealed result),
+`.beat` while the channel fails, and log chunks `.log.{n:06d}`; see
+object-store-state.md §8 and `lifecycle.md` §2.4.
 
 **Engine loop**, per attempt:
 
 ```python
 await objects.create(f"runs/{run_id}/{attempt}.spec", spec)
+await objects.swap(f"runs/{run_id}/{attempt}.control", OPEN, None)   # create-only
 record(AttemptLaunched(...))                  # from here on, a restart adopts it
 await durable()                               # never launch what a restart wouldn't adopt
 run = await placement.launch(Stage(attempt, run_id, objects_url))
 record(AttemptPlaced(attempt, run), lazy=True)   # a restart follows it through this handle
 while not finished:                           # the worker's `finished`, the provider's exit,
     ...                                       # or the worker silent: settle
-    # reports (channel, else `.worker`) are evidence, never permission
+    # reports (channel, else `.beat`) are evidence, never permission
     if canceled or past_timeout or not reported and past_provisioning:
         cancel = latch(requested, reason)     # answered to the worker's next beat
         if not reported or past(cancel_grace):
-            writes = await take_gate(attempt, "aborted")   # none, or `writing` if it finds the gate taken
+            control = await end(attempt)          # swap to `ended`: none, or `writing` with its intents;
+            if control.state == "sealed":         # a result sealed first stands
+                return commit_or_fail(control.result)
             await placement.cancel(run)
-            return fail(reason, writes)
-result = await objects.get(f"runs/{run_id}/{attempt}.result")
+            return fail(reason, control.write)
+result = (await objects.read(f"runs/{run_id}/{attempt}.control")).result   # sealed, or none
 if result is None:
     return fail(f"the worker exited without a result: {exit}", retryable=True)
 commit_or_fail(result)
@@ -853,15 +857,17 @@ they were pinned do not void the commit: the attempt delivered the batch
 it was given.
 
 **Worker** (`python -m solera_worker run --objects URL --attempt ID`; the
-project entrypoint comes from the environment): fetch `.spec` → claim
-`.worker` (a loser writes nothing and waits for the owner's result) →
+project entrypoint comes from the environment): fetch `.spec` → swap
+`.control` from `open` to `owned` (a loser writes nothing and waits for
+the owner's end; a file `ended` or gone stops it) →
 `start` on the channel → refuse on deploy mismatch (a failed result, not
 a crash) → resolve `env:` → load inputs per annotation (keyed Incremental
 inputs through the upstream key index) → build `ctx` → run the producer →
 compare each keyed output with its key index and write the delta file (an
-output where nothing changed is not stored) → take the gate, if anything
-is to be written (write nothing if the engine holds it) → `store()` each
-output → seal the result once into `.result`, retried as it is: a failed
+output where nothing changed is not stored) → take the gate (swap
+`.control` to `writing`), if anything is to be written to a fenced store
+(write nothing if the engine ended it) → `store()` each output → seal the
+result once into `.control`, retried as it is: a failed
 upload never changes the outcome. Throughout, a thread beats every 10 s,
 logs go live and as chunks, and a requested cancel stops the work before
 the gate. `manifest` mode runs through `Local` only, at server start.
@@ -880,10 +886,10 @@ the gate. `manifest` mode runs through `Local` only, at server start.
 processes (`solera worker pool NAME`): they long-poll `GET
 /api/projects/{p}/pools/{pool}/work` with their capacity and get launched
 attempts that fit and have not started, oldest first; they race for each
-attempt's claim by creating its `.worker`, and the winner runs it like any
-attempt. No registration, no leases: a pool worker's liveness is its
-attempt's heartbeat. A claim whose worker never reports is ended, classified
-from its gate, and retried under a new attempt id.
+attempt by swapping its control file to `owned`, and the winner runs it
+like any attempt. No registration, no leases: a pool worker's liveness is
+its attempt's heartbeat. An owner that never reports is ended, classified
+from its control file, and retried under a new attempt id.
 
 ## 11. Registration
 

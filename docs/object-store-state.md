@@ -73,9 +73,8 @@ Everything lives under `{root}/{namespace}/`.
 | Key index file | `keys/{output}/{partition}/{name}.kx` | worker (delta files), compaction | create-only | no longer in the index and no consumer needs it (§6) |
 | History file | `history/{table}/{ulid}.parquet` | engine | create-only | merged into a bigger file, or rewritten without deleted runs (§7) |
 | Spec | `runs/{run}/{attempt}.spec` | engine, before `AttemptLaunched` | create-only, immutable | with its run |
-| Claim | `runs/{run}/{attempt}.worker` | the worker that claims the attempt; then its reports while its channel fails | created once, then overwritten by its owner only | with its run |
-| Result | `runs/{run}/{attempt}.result` | the claim's owner, once | create-only, immutable, sealed bytes | with its run |
-| Gate | `runs/{run}/{attempt}.writing` | the worker about to write, or the engine ending the attempt — whichever is first | create-only | `gate_days` (30) after its run (§8) |
+| Control file | `runs/{run}/{attempt}.control` | the engine creates it `open` before the launch; then the owner (`owned`, `writing`, `sealed` with its result) or the engine (`ended`) | created once, then only swapped (`If-Match`) | with its run |
+| Beat | `runs/{run}/{attempt}.beat` | the owner, while its channel fails | overwritten | with its run |
 | Engine heartbeat | `engine/alive.json` | engine, every 30 s while runs are live | overwritten | never (one object) |
 | Attempt log | chunks `runs/{run}/{attempt}.log.{n:06d}`, every 30 s or 1 MB; the end inside the result | worker | create-only, never joined | with its run |
 | Output data | store-defined (FileStore: `{output}/{partition}/{key}/{generation}.json` under `.solera/data`, §9) | the store, inside the worker | FileStore / S3Store: created once, never overwritten; others: store-defined | FileStore / S3Store: superseded or abandoned objects, by the partition's next attempt once no reader pin predates them (§9); never expired |
@@ -104,10 +103,8 @@ current content.
     tasks/…  attempts/…  commits/…  lineage/…
   runs/
     01J8ZB3K…/01J8ZB3M….spec                 ← what to run, immutable
-    01J8ZB3K…/01J8ZB3M….worker               ← the claim
-    01J8ZB3K…/01J8ZB3M….writing              ← the gate
+    01J8ZB3K…/01J8ZB3M….control              ← the owner, the gate, the sealed result
     01J8ZB3K…/01J8ZB3M….log.000000           ← log chunks
-    01J8ZB3K…/01J8ZB3M….result               ← the outcome, immutable
 ```
 
 Output data lives wherever its store puts it: FileStore under
@@ -269,7 +266,8 @@ dependents index.
 
 **Memory only:** the claim of an attempt still preparing (a restart
 dispatches its task again), what each launched attempt's worker reported
-(rebuilt from `.worker` after a restart), a cache of key index blocks, and
+(rebuilt from the control file and `.beat` after a restart), a cache of
+key index blocks, and
 a local copy of the history files (§7).
 
 Example (abridged):
@@ -675,18 +673,25 @@ requested number of bars. `next` is a cursor: the last run id of the page.
 
 ## 8. Attempt objects — `runs/{run}/{attempt}.*`
 
-The protocol is `lifecycle.md`'s, which this section summarizes as built;
-the records the engine and the worker share are `solera/lifecycle.py`.
+The protocol is `lifecycle.md`'s, which this section summarizes; the
+records the engine and the worker share are `solera/lifecycle.py`. The
+control file is decided (K18) and not built yet: as built, the claim is
+`{attempt}.worker` (create-only), the gate `{attempt}.writing`
+(create-only, retained `gate_days` past its run) and the result
+`{attempt}.result` (create-only).
 
-**Spec, claim, result.** The engine writes `{attempt}.spec` — immutable,
-before `AttemptLaunched`. A worker reads it and claims the attempt by
-creating `{attempt}.worker` with a random worker id; the first
-create wins. An worker that loses writes nothing and, unless it is a
-pool worker, waits for the owner's result before exiting, so its exit is
-never taken for the attempt's. The owner seals its outcome once into
-`{attempt}.result`, create-only, retried with the same bytes: its existence
-means the worker is done. A worker that cannot publish exits without a
-result, as if it had died.
+**Spec and control file.** The engine writes `{attempt}.spec`, immutable,
+then creates `{attempt}.control` `open`, both before `AttemptLaunched`.
+Every later change to the control file is a swap (`If-Match`, §0), and
+each body names its writer. A worker reads the spec and takes the
+attempt by swapping the control file from `open` to `owned`, with a
+random worker id; the first swap wins. A worker that loses writes nothing
+and, unless it is a pool worker, waits for the owner's end before exiting,
+so its exit is never taken for the attempt's. The owner seals its outcome
+once, swapping the file to `sealed` with the result; a refused retry that
+reads its own body back landed. A worker that cannot publish exits
+without a result, as if it had died. A worker that finds the file `ended`
+or gone stops, and never creates it (`lifecycle.md` §2.4).
 
 `spec` is everything the worker needs and the lineage record of what the
 attempt read, including the key indexes as pinned, plus the engine's URL,
@@ -729,16 +734,17 @@ the run, cannot tell for now.
 over its channel (HTTPS, `lifecycle.md` §5): `start` once, a beat every 10
 s, live log lines with their offsets, `finished`. Each answer carries the
 cancel record, if any. After two failed beats — or with no engine to
-reach, as under the CLI — it reports by overwriting `.worker` every two
-beats instead, and reads its gate each time: an `aborted` or `closed` gate
-stops it. The engine reads `.worker` only while the channel is quiet. A
-worker is silent after three beats without a report over the channel, or
-six through `.worker`; a provider's exit ends an attempt unless its owner
+reach, as under the CLI — it reports by overwriting `.beat` every two
+beats instead, and reads its control file each time: `ended` stops it.
+The engine reads `.beat` only while the channel is quiet. A worker is
+silent after three beats without a report over the channel, or six
+through `.beat`; a provider's exit ends an attempt unless its owner
 still reports over the channel (then it was a duplicate's). None of this
-decides whether the attempt's writes may still land: that is the gate's.
+decides whether the attempt's writes may still land: that is the control
+file's.
 
 **Provisioning and deadlines.** Until its first report — `start`, a beat,
-or its claim seen — a worker is provisioning, under a deadline of its own
+or `owned` seen — a worker is provisioning, under a deadline of its own
 (`provision_seconds`, 10 min; none for a pool). Its `timeout` runs from the
 first report. The engine times attempts on its own monotonic clock; an
 adopted attempt still provisioning keeps what the launching engine's clock
@@ -753,27 +759,27 @@ what finished — a plain asset, `canceled` with nothing written, unless it
 had already taken its gate, in which case it completes its writes and the
 commit stands. Its result carries the record it acted on. After the grace,
 or at once for a worker that never reported, the record becomes `forced`:
-the engine takes the gate and ends the attempt; a late result is refused.
+the engine swaps the control file to `ended`; a result sealed before
+that stands, and a later one is refused (its swap fails).
 
-**The gate — `{attempt}.writing`.** A worker about to write creates it,
-`{"state": "writing", "worker", "intents"}`, listing the delta files
-of the keys it will change; finding one already there — `aborted` or
-`closed` — it writes nothing. The engine ending an attempt without a
-result creates it `aborted`, and what it finds is the attempt's
-write-completion evidence: winning means `none`; finding `writing` means
-`writing`. A result says its own: `none` (no store call), `complete`
-(every store call returned) or `writing` (one raised, or was
-abandoned). An attempt that ends with nothing written and no gate gets one
-`closed`.
+**The gate: the control file's `writing`.** A worker about to write to a
+`fenced` store swaps the file from `owned` to `writing`, with its
+intents: the delta files of the keys it will change. Refused, with `ended`
+or no file there, it writes nothing. The engine ending an attempt without
+a result swaps the file to `ended`, and what it swapped from is the
+attempt's write-completion evidence: from `open` or `owned`, `none`;
+from `writing`, `writing`, with the intents. A result says its own:
+`none` (no store call), `complete` (every store call returned) or
+`writing` (one raised, or was abandoned).
 
-**Gates outlive their runs.** A worker that read its spec, paused, and
-resumes after its run was deleted must still find its gate: retention
-deletes a run's objects except its gates, notes them under
-`control/gates/{day}/`, and deletes them `gate_days` (30) later.
+**Nothing outlives its run.** Retention deletes a run's directory whole.
+A worker that read its spec, paused, and resumes after that finds its
+control file gone, so its swap is refused and it stops: it never creates
+the file, so it never takes a gate the engine did not leave open.
 
-**Outputs owing a repair.** An attempt that ends with its gate `writing` may
-have written part of its keyed outputs. The engine fails it with the
-gate's intents (`AttemptFinished.intents`) and keeps their delta files.
+**Outputs owing a repair.** An attempt that ends with its control file
+`writing` may have written part of its keyed outputs. The engine fails it
+with the intents (`AttemptFinished.intents`) and keeps their delta files.
 The next attempt on that partition reads the intended keys back from the store
 and folds what landed into its own delta, and its commit settles the
 output. Unkeyed outputs need no repair: the next attempt writes the same
@@ -954,11 +960,13 @@ platform restarts it, and the replay recovers exactly the journal's state.
 `HistoryFlushed` · merge → `HistoryCompacted` · retention →
 `RunsDeleted`, durable → `DELETE runs/{run}/` → `RunsPurged`.
 
-**Attempt lifecycle.** claim (memory) → pin and write the spec →
-`AttemptLaunched` → launch → `AttemptPlaced` → the worker claims
-(`.worker`), starts, takes the gate, writes, and seals its result → the
-engine commits it (`AttemptFinished`). A cancel or timeout is requested,
-drained, then forced: the engine takes the gate and ends the attempt with
+**Attempt lifecycle.** claim (memory) → pin, write the spec and the
+control file →
+`AttemptLaunched` → launch → `AttemptPlaced` → the worker takes the
+control file (`owned`), starts, takes the gate (`writing`), writes, and
+seals its result → the engine commits it (`AttemptFinished`). A cancel or
+timeout is requested, drained, then forced: the engine swaps the control
+file to `ended` and ends the attempt with
 `AttemptFinished` (`canceled`, or `failed` and retryable) (§8).
 
 ## 11. Retention

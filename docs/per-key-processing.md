@@ -12,9 +12,9 @@ per-key outcomes with user-classified errors, key patterns on inputs, and
 observable sources. It builds on the engine cache, the HTTP resolver,
 engine-served reads of `resolved-commits.md`, the versions of
 `versions.md`, and on the worker → engine HTTP channel and attempt
-objects of `lifecycle.md` (being written): `{attempt}.spec`, the
-`{attempt}.worker` worker claim, `{attempt}.result`, and the
-`{attempt}.writing` fence.
+objects of `lifecycle.md`: `{attempt}.spec` and the control file
+`{attempt}.control`, which holds the owner, the gate and the sealed
+result.
 
 ## 1. Why
 
@@ -216,7 +216,7 @@ two-phase cancel (`lifecycle.md` §7); for a per-key batch the phases are:
    the keys that finished — one store write per output, as for a whole
    batch — records the keys it did not finish as **interrupted** in the
    failure delta by the record's `reason` (table below), and publishes
-   all of it as one `.result` with `status: canceled`, carrying the record
+   all of it as one result with `status: canceled`, carrying the record
    as §2.2 says. The engine commits outputs, failure delta and bookmark
    as one journal decision.
 2. **Forced abort,** after `cancel_grace` without a result: the record's
@@ -235,7 +235,7 @@ failed keys instead.
 ```
 batch: a b c d e(deleted)   cancel requested while b, d are in flight
 store.store(Patch({a: …, c: …}, remove=[e]))
-.result status: canceled → one commit: bookmark past e · failed keys +b, +d interrupted
+result status: canceled → one commit: bookmark past e · failed keys +b, +d interrupted
 ```
 
 What happens to the holes depends on the record's `reason`:
@@ -640,7 +640,7 @@ processed:
 | `duration` | seconds in the call |
 | `at` | |
 
-The rows travel in the attempt's `.result` (at most `batch_size` of them) and
+The rows travel in the attempt's result (at most `batch_size` of them) and
 the engine appends them at settlement. They are filed by `run`, so
 retention drops them with their run; the failed keys are state and never
 expires. The table counts no rows: how many rows a key produced is the
@@ -807,7 +807,7 @@ an import. By default the engine keeps one host subprocess beside it;
 host instead, for sources the engine's machine cannot reach. The engine
 holds the clock and no user code: a host long-polls for due ticks, runs
 the body, and posts the outcome. A tick is not an attempt — no `.spec`,
-`.worker`, `.result`, fence or run of its own.
+control file or run of its own.
 
 **How a tick lands.** Observable sources follow the lifecycle's
 source-head identity and snapshot contract for sensors (`lifecycle.md`
@@ -959,7 +959,7 @@ is below the current one.
 | Key index (`object-store-state.md` §6) | No format change. A new kind of index (`keys/@{asset}/{partition}/`, the failed keys) compacted like the others; `Rows` groups every key (§6), read once as the prepared write (§7); patches build `Rows`. |
 | Engine cache (`resolved-commits.md`) | New readers: retry batches, read at `start`, in v1; pattern counts at commit and failure-summary recomputation later. No new cached content beyond failed keys. |
 | HTTP resolver (`resolved-commits.md`) | Each batches' output deltas are small resolves when the index is admitted; failure deltas are resolved locally, not by the resolver (§9 here is authoritative for the record, transitions, eligibility, pass state and forced-request identity; the engine's start reads run the same SDK functions, and its v1 has no pattern hints or summary recomputation); the worker uploads both. A sensor's full key map is resolved in-process (small) or on the host (big), not through an attempt's resolve. |
-| Attempt lifecycle (`lifecycle.md`) | The cancel record (§2.2) and write-completion evidence (§2.3), authoritative there; the two-phase cancel of §7, which §5 follows; live per-key events and key-tagged logs; per-key outcomes in `.result`. Sensors (§11) carry observable sources: `Source.observe` declares one. |
+| Attempt lifecycle (`lifecycle.md`) | The cancel record (§2.2) and write-completion evidence (§2.3), authoritative there; the two-phase cancel of §7, which §5 follows; live per-key events and key-tagged logs; per-key outcomes in the sealed result. Sensors (§11) carry observable sources: `Source.observe` declares one. |
 
 ## 17. What changes in the code
 

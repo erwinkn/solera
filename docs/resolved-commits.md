@@ -9,8 +9,8 @@ index reads — its input batches — are answered from the same cache at
 
 It depends on two other designs, and says where:
 
-- `lifecycle.md` — the worker → engine HTTPS channel (§5), the `.worker`
-  claim that admits one worker (§4), and the store kinds `immutable`
+- `lifecycle.md` — the worker → engine HTTPS channel (§5), the control
+  file whose `owned` admits one worker (§2.4, §4), and the store kinds `immutable`
   and `fenced` (§9.6, `stores.md`), which decide the repair rules of §3.
 - `per-key-processing.md` — the failed keys, whose one v1 reader here
   (retry batches, read at `start`) follows that doc's eligibility predicate and
@@ -105,7 +105,7 @@ through their predecessors' generations (§6).
                  an unknown-writes intent: the store's whole key map, reconciled (below)
 3. resolve       the repaired run — by the engine or locally
 4. upload        the delta file, create-only
-5. gate          the attempt's `.writing` gate with its intents (lifecycle §9.6)
+5. gate          the control file swapped to `writing`, with its intents (lifecycle §2.4, §9.6)
 6. write         under the store's checks: fenced, every transaction checks the generation
 ```
 
@@ -205,7 +205,7 @@ against the attempt's preparation, which it holds in memory for every
 live attempt (and rebuilds from `.spec` on adoption):
 
 - the worker is the one the engine admitted (`lifecycle.md` §4: the
-  `start`ed one, or after a restart the one in `.worker`); any other gets
+  `start`ed one, or after a restart the owner its control file names); any other gets
   `409` and resolves nothing — it should not be running;
 - the attempt is live and holds the claim for `(name, partition)`;
 - `name`, `partition`, `commit_number`, `generation` and `base.prefix` are the ones

@@ -240,11 +240,11 @@ Known gaps, most valuable first; each says what would close it.
   `day × site` asset in the project.
 - **Migrations** in the simulation: waits for F18's fix, since every run's
   `items` would share one ledger row.
-- **Retention past `gate_days`**, left out on purpose: past it, a stale
-  worker is stopped by its store's fence alone, which `lifecycle.md` §2.4
-  says and claims no more. Expiring gates within the simulation's hours
-  would mostly replay that concession; the fence itself is what the store
-  kit's stale writers check, against every fenced store.
+- **A worker that resumes after its run was purged**: with the control
+  file (`lifecycle.md` §2.4, decided, not built) it finds the file gone
+  and stops, however long it paused; `Attempt.tla` checks it ("Formal
+  model: the attempt control file"). Once built, the simulation can purge
+  runs within its hours and resume stale workers after.
 
 Closed in this round: the key index format, merges, compactions and
 resolves against a dict (property tests, and F16); glob patterns; resolve
@@ -776,6 +776,128 @@ forever is an outage, not a fault the journal can outlast.
 spec/tla/check-journal.sh object       # two engines, three, liveness, calibration: ~6 min
 spec/tla/check-journal.sh object-big   # three engines, six writes: ~9 min
 ```
+
+## Formal model: the attempt control file (`spec/tla/Attempt.tla`)
+
+Decided (K18), not built yet: one control file per attempt, swapped with
+`If-Match`, replaces the claim (`.worker`), the gate (`.writing`) and the
+result (`.result`) (`lifecycle.md` §2.4). The model is the protocol at the
+level of requests. The durable state is apart from each actor's view of
+it: the object store (the control files, the fenced store's generation
+and rows) and the journal (`AttemptLaunched`, `AttemptFinished`) on one
+side, and what each engine and worker last read on the other.
+
+**State.** One output partition on a fenced store. Its attempts run one
+after another (the claim), and each attempt's number is its generation.
+Each attempt has:
+- one or two worker processes, a duplicate being the second;
+- its control file: missing, or a body naming its state, its writer and
+  its write evidence;
+- whether retention purged it.
+
+The engine keeps what it last read of each file. Each worker keeps where
+it is, the body it last read or wrote (its `If-Match`), and what it knows
+of its own write. For the properties only, the model also records which
+attempts' store writes landed, and in what order.
+
+**Actions.**
+- *The engine:*
+  - launches the next attempt once the last one has ended, creating its
+    file `open` first;
+  - asks a worker to cancel (it drains);
+  - reads a file, then ends the attempt on what it read: a swap to
+    `ended`, recording `none` from `open` or `owned` and `writing` from
+    `writing`;
+  - settles from a final file (`sealed` or `ended`) with a durable
+    `AttemptFinished`;
+  - restarts, forgetting what it read.
+- *A zombie engine* ends any live file.
+- *Retention* deletes a settled attempt's files at any time.
+- *A worker* boots (stopping if its spec is gone), reads the file, swaps
+  it to `owned`, acquires its generation at the store, swaps it to
+  `writing`, writes (the transaction checks the generation), and swaps it
+  to `sealed`. A requested cancel lets it drain before `writing`. Its
+  swaps can land with the answer lost; its retry, refused, reads back its
+  own body. A refused swap that finds `ended`, another worker's body, or
+  no file stops it. Workers pause anywhere and crash anywhere.
+
+**Properties.**
+
+| Property | Kind | Says |
+|---|---|---|
+| `NoWriteAfterNone` | safety | an attempt whose `AttemptFinished` says it wrote nothing has no store write that landed, before or after the decision: no write after an abort is decided |
+| `CompleteLanded` | safety | a result that calls its writes complete did land them |
+| `WritesInOrder` | safety | store writes land in generation order: one attempt writes the partition at a time, and an older attempt never writes over a newer one |
+| `OneOutcome` | action | a final file (`sealed` or `ended`) never changes, only goes with its run; a decision is made once. So the worker's seal and the engine's end, racing on one version, cannot both land |
+| `EveryAttemptEnds` | liveness | every attempt launched gets its `AttemptFinished` |
+
+**Fairness.** The review of `Execution.tla` asked for this argument to be
+redone, since swap retries are loops. Liveness assumes weak fairness of
+each of the engine's steps (read, end, settle) for each attempt, and
+nothing of workers: a worker may stop anywhere, forever, and the engine
+must still end its attempt. The engine's retry loop is a read, then an
+end that is refused, then another read. Each refusal needs the file to
+have changed in between, and only these can change it:
+- a worker, whose steps are bounded (each lands one state further on);
+- the zombie, which ends a live file at most once;
+- retention, which runs only after the decision.
+
+Engine restarts are bounded too (`MaxRestarts`). So every behaviour
+changes each file finitely often, an end that is weakly fair eventually
+lands or finds a final file, and settling follows. TLC checks this
+(`live`). An unbounded restart loop is the one way to starve it, and it is
+a real one: an engine that keeps crashing ends nothing.
+
+**Abstracted, and why.**
+- One partition: attempts of different partitions share nothing here.
+- A fenced store only. An immutable store takes no gate, and its stale
+  writes are unreferenced by construction.
+- The HTTP channel, `.beat` and clocks: they are evidence, deciding *when*
+  the engine ends an attempt, which here is any time.
+- The engine's end is atomic: a read, then a swap on what was read. A
+  lost answer to it is a crash between the swap and the settle, after
+  which a later read finds the file final. The zombie's end is one step:
+  a refused swap changes nothing.
+- A crash between the engine's create and `AttemptLaunched` leaves an
+  `open` file that no worker is launched for: one step here.
+- The cancel record's content (reasons, precedence), which shapes the
+  result but not who may write.
+
+**Calibration.** Each rule is a switch, and with it off TLC must find the
+bug (`check-attempt.sh`):
+
+| Rule off | TLC finds | Trace |
+|---|---|---|
+| `PreCreate`: the engine creates the file before the launch, and nobody else creates it | `NoWriteAfterNone`, 12 steps | The create-if-absent gate with nothing retained, the case the old design kept gates `gate_days` for. The engine ends A before its worker reports, creating the file `ended` (`none`), and settles. A's worker boots and reads its spec, and retention deletes A's files. The worker finds no file, creates it `owned`, acquires (no later attempt has), marks `writing` and writes. |
+| `TakeWriting`: the worker marks `writing` before its first write | `NoWriteAfterNone`, 10 steps | The worker owns A and acquires; the engine ends A from `owned` (`none`); the worker writes anyway |
+| `EngineSwaps`: the engine ends with `If-Match`, not a blind PUT | `NoWriteAfterNone`, 11 to 12 steps | The engine reads `open`. The worker owns A, acquires and marks `writing`. The engine's blind PUT replaces `writing` with `ended` (`none`, from the `open` it read), and the worker's write lands. With `OneOutcome` also checked, TLC finds that first (5 steps): a blind end overwrites the zombie's. |
+| `Classify`: ended from `writing`, the evidence is `writing` | `NoWriteAfterNone`, 10 steps | The worker marks `writing` and writes; the engine ends from `writing` but records `none` |
+
+**Bounds and cost** (TLC 2.19; 3 workers, 6 GB, on a shared 8-core VM;
+one engine restart, the zombie, lost answers):
+
+| Model | Attempts | Workers each | Distinct states | Depth | Time |
+|---|---|---|---|---|---|
+| `Attempt-small.cfg` | 2 | 1 | 1,948,128 | 30 | 42 s |
+| `Attempt-dup.cfg`: a duplicate worker | 1 | 2 | 41,018 | 19 | 2 s |
+| `Attempt-live.cfg`: liveness, the engine fair | 2 | 1 | 1,948,128 | 30 | 3 min 59 s |
+
+Two attempts with a duplicate worker each (`check-attempt.sh big`) is
+too large to finish here. An earlier version, without draining, passed
+68 million states before it was stopped. The duplicate (`dup`) and the
+sequence of attempts (`small`) are each covered whole.
+
+```bash
+spec/tla/check-attempt.sh        # small, dup, live, calibration: ~5 min
+spec/tla/check-attempt.sh big    # two attempts with a duplicate worker each: too large to finish
+```
+
+**Into `Execution.tla`.** That model has attempts end atomically
+(`EndLost`) and its gate as one field. Once the control file is built,
+its attempts can carry the file's states and the end as a read and a
+swap, with this model as the reference for the protocol. Its fairness
+argument then needs the bound above: finitely many file changes per
+attempt.
 
 ## Findings
 
