@@ -636,16 +636,8 @@ pub fn merge_page(
     }
 }
 
-/// Prototype (docs/presence-at-position.md): the delta log's runs (newest
-/// first) merged, each key classed by its state before the oldest run and
-/// after the newest: 0 added, 1 updated, 2 removed, 3 neither (added and
-/// removed within the range). Returns the counts, and the keys and classes
-/// with `with_keys`.
-pub fn presence(
-    runs: &[Vec<&[u8]>],
-    codecs: &[u8],
-    with_keys: bool,
-) -> Result<([u64; 4], Vec<Vec<u8>>, Vec<u8>)> {
+/// A merge over whole runs (newest first), each a file's blocks.
+fn fed(runs: &[Vec<&[u8]>], codecs: &[u8]) -> Result<Merge> {
     if codecs.len() != runs.len() {
         return Err(Error::Value("a codec per run".into()));
     }
@@ -667,6 +659,51 @@ pub fn presence(
         }
         m.runs[r].end();
     }
+    Ok(m)
+}
+
+/// Prototype (docs/presence-at-position.md, range files): adjacent ranges
+/// of the delta log (newest first) merged into one range file. Per key: the
+/// newest entry (generation, deleted, payload), and the oldest entry's
+/// predecessor, the key's generation before the range. Nothing is dropped:
+/// a key added and removed within it stays, a tombstone naming no
+/// predecessor. Associative: newest and oldest of a sequence.
+pub fn merge_ranges(
+    runs: &[Vec<&[u8]>],
+    codecs: &[u8],
+    o: Options,
+    max_file_bytes: usize,
+) -> Result<Vec<Vec<u8>>> {
+    let mut m = fed(runs, codecs)?;
+    let mut w = Writer::new(o, max_file_bytes);
+    loop {
+        match m.next_key()? {
+            Next::Entry => w.push(
+                m.key(),
+                m.generation(),
+                m.deleted(),
+                m.payload(),
+                m.predecessor(),
+            )?,
+            Next::Need(_) => unreachable!("every run is fed whole"),
+            Next::End => break,
+        }
+    }
+    w.finish(false)?;
+    Ok(w.files.into_iter().collect())
+}
+
+/// Prototype (docs/presence-at-position.md): the delta log's runs (newest
+/// first) merged, each key classed by its state before the oldest run and
+/// after the newest: 0 added, 1 updated, 2 removed, 3 neither (added and
+/// removed within the range). Returns the counts, and the keys and classes
+/// with `with_keys`.
+pub fn presence(
+    runs: &[Vec<&[u8]>],
+    codecs: &[u8],
+    with_keys: bool,
+) -> Result<([u64; 4], Vec<Vec<u8>>, Vec<u8>)> {
+    let mut m = fed(runs, codecs)?;
     let (mut counts, mut keys, mut classes) = ([0u64; 4], Vec::new(), Vec::new());
     loop {
         match m.next_key()? {

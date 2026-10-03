@@ -441,14 +441,18 @@ impl Merge {
         self.runs[self.cur.0].block().payload(self.cur.1)
     }
 
-    /// Prototype (docs/presence-at-position.md): whether the current key was
-    /// live before the oldest of its entries the merge holds. A tombstone is
-    /// written only over a live key, an upsert names its predecessor when
-    /// the key was live: exact when every writer resolves exactly.
-    pub fn existed(&self) -> bool {
+    /// Prototype (docs/presence-at-position.md): the current key's generation
+    /// before the oldest of its entries the merge holds, None if it was not
+    /// live. Every writer names the predecessor of a key it read live,
+    /// tombstones included; a range file carries its oldest entry's.
+    pub fn predecessor(&self) -> Option<u64> {
         let (r, i) = self.shadowed.last().copied().unwrap_or(self.cur);
-        let b = self.runs[r].block();
-        b.deleted(i) || b.predecessor(i).is_some()
+        self.runs[r].block().predecessor(i)
+    }
+
+    /// Prototype: whether the current key was live before its oldest entry.
+    pub fn existed(&self) -> bool {
+        self.predecessor().is_some()
     }
 
     /// The older entries of the current key the merge passed over, newest

@@ -158,12 +158,12 @@ What changes:
   `resolve(exact=)`, and the "within the filters' false-positive rate"
   caveats in `Batch.count` and `key-index-costs.md`.
 
-**Optional: Erwin's horizon, applied to the log.** If the log since a
+**Superseded: Erwin's horizon, applied to the log.** If the log since a
 position holds more entries than the index has live keys, the next pass is
-full. It reuses an existing rule (a log that no longer holds the delta
-means a full pass). It caps the log at about the index's size in entries,
-and at 1M keys it replaces the 18 s merge above with a 9 MB read. A full
-pass restarts K44's count from 0, which stays correct.
+full. It caps the log at about the index's size in entries, and at 1M keys
+it replaces the 18 s merge above with a 9 MB read. The follow-up,
+`delta-log-ranges.md`, makes the far-behind catch-up cheap instead (range
+files merged over commits), and drops this rule.
 
 Correctness under the usual suspects:
 
