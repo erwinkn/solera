@@ -216,6 +216,46 @@ with Hypothesis drawing the inputs (in CI, a few seconds each):
   none, `*` and `?` stay within one, `[`, `\` and newlines are literal),
   and `include`/`exclude` combine as documented.
 
+## What is not exercised yet
+
+Known gaps, most valuable first; each says what would close it.
+
+- **Time partitions and several dimensions.** The project has one dynamic
+  dimension (`sites`): broadcast, fan-in over an upstream's extra
+  dimensions, windows and `all_partitions=` are untested together. Waits
+  for the input kinds of the model changes (`glossary.md`), then a
+  `day × site` asset in the project.
+- **Sensors that request runs**, and failing ticks: `watch` only commits.
+- **Jobs** (assets with no output) and **migrations**.
+- **Retention past `gate_days`**: virtual runs last hours, so a gate is
+  never old enough to go.
+- **The key cache under pressure**: its disk budget and evictions run at
+  their defaults, far from their limits.
+
+Closed in this round: the key index format, merges, compactions and
+resolves against a dict (property tests, and F16); glob patterns; resolve
+framing; claims (one attempt per asset partition); the gate under worker
+death, pause and duplicates; rolling deploys with three or more engines;
+`Each` errors by class and forced retries; runs with `keys=`; an asset
+with two outputs on two kinds of store; a `Pool` with racing hosts.
+
+## Sweeps
+
+Long runs (`--slow`, new seeds each) and what they found. Steps count
+rules, not invariant checks. `pg`: `items` may also live in Postgres.
+
+| Run | Code | Seed | Runs × steps | Stores | Result |
+|---|---|---|---|---|---|
+| A | fa12f01 | 101 | 720 runs, 38,382 steps, 244 h virtual | default | F16 (`items` keeps a key the feed dropped) |
+| E | `flaky` by class, `retry_keys` | 105 | 415 runs, 23,065 steps, 138 h | default | green |
+| F | as E | 106 | 151 runs, 2,450 steps | pg | the gate invariant's Postgres clock (a simulation bug, fixed in 2808bbc) |
+| G | `submit(keys=)` | 107 | 322 runs, 13,700 steps | default | the claims invariant equated `mirror` with `copy` (a simulation bug, fixed) |
+| H | e39ead9 | 108 | 106 runs, 4,379 steps | pg | every `items` write refused: the database's fence table predated the `worker_id` rename (an environment bug: the simulation now drops a fence table of another shape at boot) |
+| I | e39ead9 | 109 | 399 runs, 21,474 steps, 122 h | default | the claims invariant again; F16 |
+| P1 | a6dcc0e (F16 set aside) | 201 | 157 runs, 6,312 steps | default | green |
+| P2 | a6dcc0e | 202 | 158 runs, 6,177 steps | default | green |
+| P3 | a6dcc0e | 203 | 106 runs, 4,060 steps | pg | green |
+
 ## Formal model: execution semantics (`spec/tla/Execution.tla`)
 
 The simulation samples interleavings of the real code; the model checker
