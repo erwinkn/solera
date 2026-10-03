@@ -31,7 +31,9 @@ CONSTANTS
     Overlap,          \* an engine may start while another still runs
     LostAnswers,      \* a journal write may land with its answer lost
     Conflicts,        \* a journal write may fail without landing (S3's 409)
-    Unreadable,       \* one checkpoint may be written that cannot be parsed
+    Unreadable,       \* one checkpoint may be written that does not read back as written
+    Failures,         \* a request may fail: of a checkpoint or its cleanup (GiveUp),
+                      \* or the GET that settles a swap (AskFails)
     \* The design has every switch below TRUE. Each one off removes a rule,
     \* to check that the model finds what the rule is for.
     EngineId,         \* the journal names its writer: a random id per process
@@ -44,7 +46,7 @@ VARIABLES
     \* The object store.
     journal,      \* the journal's body, or None
     checkpoints,  \* name -> the state it holds
-    torn,         \* the checkpoints that cannot be parsed (at most one)
+    torn,         \* the checkpoints that do not read back as written (at most one)
     \* Each engine.
     pc,           \* where it is
     state,        \* its state: the events folded into it, in order
@@ -228,7 +230,9 @@ Swap(e) ==
             Refused(e) /\ UNCHANGED <<journal, ghost>>
     /\ UNCHANGED <<checkpoints, torn>>
 
-\* The same write, landing with its answer lost: the engine tries again.
+\* The same write, landing with its answer lost: the engine GETs the journal
+\* to learn what happened (`swap`'s read-back); without AskJournal it tries
+\* the write again.
 SwapUnheard(e) ==
     /\ LostAnswers
     /\ pc[e] \in Writing
@@ -236,7 +240,8 @@ SwapUnheard(e) ==
     /\ journal = seen[e]
     /\ Land(e)
     /\ mine' = [mine EXCEPT ![e] = Pending(e)]
-    /\ UNCHANGED <<checkpoints, torn, pc, state, seen, made, listed, doomed, fence, closing,
+    /\ IF AskJournal THEN Goto(e, Asking[pc[e]]) ELSE UNCHANGED pc
+    /\ UNCHANGED <<checkpoints, torn, state, seen, made, listed, doomed, fence, closing,
                    acked, took>>
 
 \* The same write, refused without landing although the journal matched:
@@ -267,6 +272,14 @@ AskStep(e) ==
               /\ UNCHANGED <<state, seen, mine, made, listed, doomed, fence, closing, acked, took>>
          [] OTHER -> Halt(e, "stopped") /\ UNCHANGED <<acked, took>>
     /\ UNCHANGED <<store, writes, history>>
+
+\* That GET fails too (with Failures): the engine writes again, and a
+\* refusal sends it back to GET the journal.
+AskFails(e) ==
+    /\ Failures
+    /\ pc[e] \in {Asking[k] : k \in Writing}
+    /\ Goto(e, KindOf(pc[e]))
+    /\ UNCHANGED <<store, state, seen, mine, made, listed, doomed, fence, closing, ghost>>
 
 -----------------------------------------------------------------------------
 (* Serving.                                                               *)
@@ -302,8 +315,8 @@ List(e) ==
     /\ UNCHANGED <<store, state, seen, mine, made, doomed, fence, closing, ghost>>
 
 \* PUT the checkpoint under a fresh name: the state as of the journal this
-\* engine last wrote. With Unreadable, the first checkpoint written may turn
-\* out unparseable to every reader (a bug in the snapshot, say).
+\* engine last wrote. With Unreadable, the first checkpoint written may not
+\* read back as written (a torn or corrupted write, say), for every reader.
 CreateCheckpoint(e) ==
     /\ pc[e] = "create"
     /\ checkpoints' = Put(checkpoints, NextCp(e), state[e])
@@ -313,8 +326,9 @@ CreateCheckpoint(e) ==
     /\ Goto(e, "verify")
     /\ UNCHANGED <<journal, state, seen, mine, listed, doomed, fence, closing, ghost>>
 
-\* GET it back and parse it. Unreadable (or gone: a newer engine's cleanup
-\* took it, so this one is fenced): no move; cleanup deletes it later.
+\* GET it back and compare it with what was written (the code compares
+\* bytes). Not as written (or gone: a newer engine's cleanup took it, so
+\* this one is fenced): no move; cleanup deletes it later.
 VerifyCheckpoint(e) ==
     /\ pc[e] = "verify"
     /\ Goto(e, IF Verify /\ LastCp(e) \notin Readable THEN AfterCleanup(e) ELSE "move")
@@ -343,6 +357,22 @@ Delete(e) ==
               /\ UNCHANGED pc
     /\ UNCHANGED <<journal, torn, state, seen, mine, made, listed, fence, closing, ghost>>
 
+\* A request of the checkpoint or its cleanup fails (the LIST, the create,
+\* the read-back, a DELETE), or a clean shutdown cancels the flusher between
+\* two of them: the engine drops what is left and serves on (or stops).
+\* What landed stays: the journal still names the checkpoint it named, and
+\* the next cleanup's LIST finds what this one left. The move may be dropped
+\* before its request, not after: a move whose outcome is unknown is
+\* settled first (AskStep). A create that fails still uses up its name.
+GiveUp(e) ==
+    /\ Failures
+    /\ pc[e] \in {"list", "create", "verify", "move", "delete"}
+    /\ Goto(e, AfterCleanup(e))
+    /\ made' = [made EXCEPT ![e] = IF pc[e] = "create" THEN @ + 1 ELSE @]
+    /\ listed' = [listed EXCEPT ![e] = {}]
+    /\ doomed' = [doomed EXCEPT ![e] = {}]
+    /\ UNCHANGED <<store, state, seen, mine, fence, closing, ghost>>
+
 \* The process dies between two requests: what landed stays.
 Crash(e) ==
     /\ pc[e] \notin {"idle"} \cup Terminal
@@ -352,21 +382,25 @@ Crash(e) ==
 -----------------------------------------------------------------------------
 \* The steps an engine takes on its own once it has started; fairness
 \* applies to these only. Nothing forces a start, an append, a checkpoint,
-\* a close, a crash, a lost answer or a conflict.
+\* a close, a failed request, a crash, a lost answer or a conflict.
 Progress(e) ==
     \/ GetJournal(e) \/ GetCheckpoint(e) \/ Swap(e) \/ AskStep(e)
     \/ List(e) \/ CreateCheckpoint(e) \/ VerifyCheckpoint(e) \/ GC(e) \/ Delete(e)
 
 Step(e) ==
     \/ Start(e) \/ Progress(e)
-    \/ ReadOnly(e) \/ SwapUnheard(e) \/ SwapConflict(e)
-    \/ BeginAppend(e) \/ BeginCheckpoint(e) \/ Close(e) \/ Crash(e)
+    \/ ReadOnly(e) \/ SwapUnheard(e) \/ SwapConflict(e) \/ AskFails(e)
+    \/ BeginAppend(e) \/ BeginCheckpoint(e) \/ Close(e) \/ GiveUp(e) \/ Crash(e)
 
 Spec == Init /\ [][\E e \in Engines : Step(e)]_vars
 
 FairSpec == Spec /\ \A e \in Engines : WF_vars(Progress(e))
 
 Symmetry == Permutations(Engines)
+
+\* With Failures, an engine may give up on checkpoints without writing the
+\* journal, so MaxWrites no longer bounds them: a state constraint does.
+Bounded == \A e \in Engines : made[e] <= MaxWrites \div 2
 
 -----------------------------------------------------------------------------
 (* Properties: Journal.tla's, restated for one object.                   *)

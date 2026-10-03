@@ -962,9 +962,11 @@ shutdown. It takes these steps, under the flusher's lock:
 2. `PUT` the state, as of the last flush, under a fresh name:
    `checkpoints/{engine}-{n:06d}.json`, where `n` counts this engine's
    checkpoints.
-3. `GET` it back and parse it. If that fails, leave the journal as it
-   is: the next due point tries again, and cleanup deletes the bad
-   checkpoint with the rest.
+3. `GET` it back and compare its bytes with what was written. The
+   encoding is deterministic and came from a valid state, so the same
+   bytes are a checkpoint that parses. If the GET fails or the bytes
+   differ, leave the journal as it is: the next due point tries again, and
+   cleanup deletes the bad checkpoint with the rest.
 4. Move the journal: swap in `{engine, the new checkpoint, no events}`.
    A `Conflict` means the engine was fenced: it stops and deletes nothing.
    Any other error leaves the move pending: the next flush writes its very
@@ -980,7 +982,8 @@ first, a lost acknowledged event for the other two.
   Cleanup only deletes checkpoints the journal no longer names, so the
   journal has moved past it.
 - **No checkpoint is named before it is read back.** Only one checkpoint
-  is kept, so the journal must never name one that nobody can parse.
+  is kept, so the journal must never name one that does not read back as
+  written.
 - **Cleanup deletes only what it listed before its move.** A checkpoint
   exists before the journal names it, and listing after the move would
   catch it in that window. For example: A moves to `a7f3-000005`. B fences

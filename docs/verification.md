@@ -596,7 +596,8 @@ checkpoint and the events since that checkpoint.
 **What the model abstracts.**
 
 - The store is the journal (a body, or nothing yet), the checkpoints by
-  unique name, and at most one unparseable checkpoint. An ETag is a
+  unique name, and at most one checkpoint that does not read back as
+  written (the code compares the bytes it reads back). An ETag is a
   function of the body, as on S3 and R2 (an MD5), so `If-Match` compares
   bodies. A store whose ETag is a version counter (GCS, `MemoryStore`, or
   `file://`'s SHA-256 under its lock) gives at least that.
@@ -606,9 +607,19 @@ checkpoint and the events since that checkpoint.
   `MaxWrites` bounds the model.
 - Faults: crashes between any two requests, overlapping and zombie
   engines, lost answers, 409s (a conditional write refused without
-  landing), one unparseable checkpoint, and cleanup at any time. A
+  landing), one checkpoint that does not read back, and cleanup at any time. A
   checkpoint is due at any point after an append: the cadence does not
-  matter to safety.
+  matter to safety. A write whose answer was lost GETs the journal at
+  once, as `swap` does. With `Failures` (the `failures` model), a request
+  may fail: one of a checkpoint or its cleanup, and the engine drops the
+  rest and serves on (`GiveUp`), as `journal.py` does, a checkpoint left
+  behind being deleted by the next cleanup's LIST; or the GET settling a
+  swap, and the engine writes again (`AskFails`). Not the move: a move
+  whose outcome is unknown is settled before the engine serves again
+  (`AskStep`; the code does not yet, F24). Giving up without writing the
+  journal could repeat forever, so that model bounds each engine's
+  checkpoints (`Bounded`, a state constraint). Liveness leaves failures
+  out: a store that fails every read forever is an outage.
 - `JournalResolves`: the journal names a checkpoint that is there and
   readable.
 - One step is one request. Abstracted: one event per append, a state as the list of events folded into it, a
@@ -621,9 +632,9 @@ must find the bug it prevents (`check.sh journal calibrate`):
 | Rule off | TLC finds | Trace |
 |---|---|---|
 | `EngineId`: the journal names its writer | `OneWriter`, 9 steps | A fences, then begins an append. B reads the journal and fences, but without an id its body is A's byte for byte, so the ETag does not change. A's append still matches, and it is acknowledged after B's fence. |
-| `AskJournal`: a refused write reads the journal | `AppendsAlone`, 13 to 15 steps (a liveness trace varies between runs) | A lone engine's append lands, but its answer is lost. The retry is refused, because its own write changed the ETag. The engine takes that for a newer engine's write and stops. |
+| `AskJournal`: a refused write reads the journal | `AppendsAlone`, 12 to 18 steps (a liveness trace varies between runs) | A lone engine's append lands, but its answer is lost. The retry is refused, because its own write changed the ETag. The engine takes that for a newer engine's write and stops. |
 | `ReGet`: a gone checkpoint sends the opener back to the journal | `OpensNeverFail`, 25 steps | B reads the journal, which names `cp-A-1`. A moves to `cp-A-2`, and its cleanup deletes `cp-A-1`. B's GET of `cp-A-1` finds nothing, and B gives up. |
-| `Verify`: a checkpoint is read back before the move | `NoAckedLoss`, 11 steps | A appends, writes a checkpoint nobody can parse, and moves the journal to it. An opener can no longer load A's acknowledged event. |
+| `Verify`: a checkpoint is read back before the move | `NoAckedLoss`, 11 steps | A appends, writes a checkpoint that does not read back as written, and moves the journal to it. An opener can no longer load A's acknowledged event. |
 | `ListFirst`: cleanup deletes only what it listed before its move | `NoAckedLoss`, 24 steps | A moves to `cp-A-1`. B opens, fences, appends and writes `cp-B-1`. A, now a zombie, LISTs for its cleanup and deletes every checkpoint except `cp-A-1`, so `cp-B-1` goes too. B's move then lands, and the journal names a deleted checkpoint. |
 
 **Bounds and cost** (TLC 2.19; `-workers 3`, `-Xmx6g`, on a shared
@@ -631,10 +642,16 @@ must find the bug it prevents (`check.sh journal calibrate`):
 
 | Model | Engines | Journal writes | Distinct states | Depth | Time |
 |---|---|---|---|---|---|
-| `small` | 2 | 7 | 766,771 | 53 | 26 s |
-| `fixed` | 3 | 5 | 4,663,723 | 46 | 2 min 52 s |
-| `big` | 3 | 6 | 23,642,632 | 53 | 8 min 52 s |
-| `live`: one engine at a time, no 409s | 3 | 7 | 1,075,329 | 47 | 1 min 57 s |
+| `small` | 2 | 7 | 734,754 | 53 | 26 s |
+| `fixed` | 3 | 5 | 4,464,794 | 46 | 2 min 52 s |
+| `big` (before the steps below) | 3 | 6 | 23,642,632 | 53 | 8 min 52 s |
+| `live`: one engine at a time, no 409s, no failed requests | 3 | 7 | 914,709 | 47 | 1 min 57 s |
+| `failures`: a checkpoint, its cleanup or the read settling a swap may fail | 2 | 5 | 1,767,521 | 38 | 15 s |
+
+The counts are of the model since trace validation: a lost answer reads
+the journal at once, and requests may fail (`failures`). The times are of
+the model before, on the VM; on a MacBook Pro with 5 workers, `ci` takes
+about 6 minutes.
 
 Liveness leaves out 409s. A store that refuses every conditional write
 forever is an outage, not a fault the journal can outlast.
@@ -825,9 +842,35 @@ states with `NotDone` alone, minutes with every invariant). The journal
 object's trace module should settle each choice at the request that
 reveals it.
 
-**Next:** the journal object (`JournalObject.tla`), then the attempt
-control file (`Attempt.tla`), as their code lands. `Execution.tla` needs an
-abstraction map (key sets, one partition per asset) and comes last.
+**The journal object** (`JournalObject.tla`, `JournalObjectTrace.tla`;
+`check-trace.py journal`). The code's requests map onto the spec's steps
+almost one to one: a GET of the journal is an open's read or the read that
+settles a refused or unanswered swap; a swap is a fence, an append or a
+move; a GET of a checkpoint is a load or the read-back before the move.
+The code names a checkpoint `{engine id}-{n}`, with an id new on every
+open, and the spec `<<engine, n>>`: the translation maps each id to the
+engine that creates a checkpoint under it. A write of the journal is
+logged with the checkpoint its body names, so a move and an append, both
+swaps, are told apart: without it, a checkpoint dropped just before its
+move kept two readings of every later swap alive, and the search doubled
+at each checkpoint.
+
+Of a batch of 21 simulation runs (53 to 603 journal requests each), 19
+were explained in full; two, of 515 and 290 requests, were stopped at
+10 minutes with no request found unexplained (the first has 21 engines
+overlapping; the search's cost, not yet looked into further). The
+first batches found three steps the spec lacked, now in it: a write whose
+answer was lost GETs the journal at once (`swap`'s read-back), where the
+spec wrote again first; that GET can fail too, and the engine writes again
+(`AskFails`); and a checkpoint or its cleanup can be given up midway, on a
+failed request or because a clean shutdown cancels the flusher, also just
+before the move (`GiveUp`). Checking the code against the spec by hand
+found the move whose outcome is never settled (F24) and the 32-bit engine
+id (F25).
+
+**Next:** the attempt control file (`Attempt.tla`), as its code lands.
+`Execution.tla` needs an abstraction map (key sets, one partition per
+asset) and comes last.
 
 ## Findings
 

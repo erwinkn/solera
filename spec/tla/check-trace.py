@@ -10,7 +10,7 @@ each run's object requests, tagged by actor (`tests/sim/core.py`,
 TLA+ module, `{Spec}TraceLog`, holding `Trace`, a sequence of
 
     [e |-> actor, req |-> "list" | "get" | "readback" | "create" | "delete",
-     obj |-> the object's kind, n |-> its number, out |-> how it ended,
+     obj |-> the object's kind, n |-> its name, out |-> how it ended,
      listed |-> what a list returned]
 
 and TLC searches the spec's trace module (`{Spec}Trace.tla`) for a
@@ -34,6 +34,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -45,14 +46,66 @@ JAR = HERE / ".tools" / "tla2tools-1.7.4.jar"
 @dataclass
 class Spec:
     module: str  # the spec; its trace module is f"{module}Trace"
-    path: re.Pattern  # an object it describes: groups (kind, number or None)
+    # (request, actor, names) -> (kind, name) of the object a request is on,
+    # if the spec describes it, else None; `names` is the run's own memory,
+    # for names the spec gives otherwise.
+    parse: Callable[[dict, str, dict], tuple | None]
     config: str  # the trace module's TLC config
 
 
+CHECKPOINT = re.compile(r"/control/checkpoints/([0-9a-f]+-\d+)\.json$")
+
+
+def journal_object(request: dict, actor: str, names: dict) -> tuple | None:
+    """`control/journal.json`, and `control/checkpoints/{engine id}-{k}.json`
+    as the spec names it, <<engine, k>>: the engine id is new on every open,
+    so it is mapped to the engine that first creates a checkpoint under it.
+    A write of the journal is named by the checkpoint its body names: a move
+    names a new one, an append the one it extends."""
+
+    def checkpoint(name: str) -> tuple:
+        engine_id, k = name.rsplit("-", 1)
+        return names.setdefault(engine_id, actor), int(k)
+
+    path = request["path"]
+    if path.endswith("/control/journal.json"):
+        named = request.get("names")
+        return "journal", checkpoint(named) if named else ()
+    if path.endswith("/control/checkpoints/"):
+        return "checkpoints", ()
+    m = CHECKPOINT.search(path)
+    return ("checkpoints", checkpoint(m.group(1))) if m else None
+
+
 # The specs checked against simulation runs. The first, the segment journal
-# (Journal.tla), retired with its code (docs/verification.md); the journal
-# object (JournalObject.tla) is next.
-SPECS: dict[str, Spec] = {}
+# (Journal.tla), retired with its code (docs/verification.md).
+SPECS = {
+    "journal": Spec(
+        "JournalObject",
+        journal_object,
+        """\
+INIT TInit
+NEXT TNext
+CONSTANTS
+    Engines <- TraceActors
+    MaxWrites <- TraceMaxN
+    None = None
+    Nobody = Nobody
+    Overlap = TRUE
+    LostAnswers = TRUE
+    Conflicts = TRUE
+    Unreadable = FALSE
+    Failures = TRUE
+    EngineId = TRUE
+    AskJournal = TRUE
+    ReGet = TRUE
+    Verify = TRUE
+    ListFirst = TRUE
+INVARIANT NotDone TypeOK NoAckedLoss OneWriter FencedSeesAcked StatesArePrefixes JournalResolves OpensNeverFail
+CHECK_DEADLOCK FALSE
+""",
+    ),
+}
 
 
 def requests(spec: Spec, path: Path) -> list[dict]:
@@ -60,22 +113,25 @@ def requests(spec: Spec, path: Path) -> list[dict]:
 
     out: list[dict] = []
     readers = 0
+    names: dict = {}
     last: dict[str, dict] = {}  # each actor's previous request
     for line in path.read_text().splitlines():
         r = json.loads(line)
         if r.get("reader"):
             readers += 1
             continue
-        m = spec.path.search(r.get("path", ""))
-        if "kind" not in r or m is None:
+        if "kind" not in r:
             continue
         who = r["who"]
-        e = f"e{who[1]}" if who and who[0] == "engine" else f"r{readers}" if who is None and readers else None
-        if e is None:
+        e = f"e{who[1]}" if who and who[0] == "engine" else f"r{readers}" if who is None and readers else ""
+        obj = spec.parse(r, e, names)
+        if obj is None:
+            continue
+        if not e:
             raise SystemExit(f"{path}: a request by {who}: {r}")
-        ev = {"e": e, "req": r["kind"], "obj": m.group(1), "n": int(m.group(2) or 0), "out": r["outcome"]}
-        found = (spec.path.search(p) for p in r.get("listed") or [])
-        ev["listed"] = sorted(int(f.group(2)) for f in found if f and f.group(2))
+        ev = {"e": e, "req": r["kind"], "obj": obj[0], "n": obj[1], "out": r["outcome"]}
+        found = (spec.parse({"path": p}, e, names) for p in r.get("listed") or [])
+        ev["listed"] = sorted(f[1] for f in found if f and f[1])
         before = last.get(e) or {}
         found = ("create", "exists", ev["obj"], ev["n"])  # a create found something in its way
         if ev["req"] == "get" and tuple(before.get(k) for k in ("req", "out", "obj", "n")) == found:
@@ -90,19 +146,20 @@ def tla(value) -> str:
         return json.dumps(value)
     if isinstance(value, list):
         return "{" + ", ".join(tla(v) for v in value) + "}"
+    if isinstance(value, tuple):
+        return "<<" + ", ".join(tla(v) for v in value) + ">>"
     return str(value)
 
 
 def log_module(spec: Spec, events: list[dict]) -> str:
     actors = sorted({ev["e"] for ev in events})
-    top = max([ev["n"] for ev in events] + [n for ev in events for n in ev["listed"]] + [1])
     records = ",\n    ".join(
         "[" + ", ".join(f"{k} |-> {tla(ev[k])}" for k in ("e", "req", "obj", "n", "out", "listed")) + "]"
         for ev in events
     )
     return (
         f"---- MODULE {spec.module}TraceLog ----\nEXTENDS Sequences\n"
-        f"TraceActors == {tla(actors)}\nTraceMaxN == {top + 1}\n"
+        f"TraceActors == {tla(actors)}\nTraceMaxN == {len(events) + 1}\n"
         f"Trace == <<\n    {records}\n    >>\n====\n"
     )
 
@@ -149,7 +206,7 @@ def check(spec: Spec, path: Path, work: Path) -> bool:
 
 def fmt(ev: dict) -> str:
     listed = f" -> {ev['listed']}" if ev["req"] == "list" else ""
-    return f"{ev['e']:4s} {ev['req']:8s} {ev['obj']:11s} {ev['n'] or '':>4} {ev['out']}{listed}"
+    return f"{ev['e']:4s} {ev['req']:8s} {ev['obj']:11s} {str(ev['n'] or ''):>12} {ev['out']}{listed}"
 
 
 def simulate(out: Path) -> list[Path]:

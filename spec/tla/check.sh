@@ -14,8 +14,8 @@
 #
 # A model is its spec's base config ({Spec}.cfg) with changes (`model` below):
 #   CONSTANT=VALUE   a constant's value
-#   KEYWORD=...      the whole SPECIFICATION, INVARIANT, PROPERTY or SYMMETRY line
-#                    (nothing after `=`: no such line)
+#   KEYWORD=...      the whole SPECIFICATION, INVARIANT, PROPERTY, SYMMETRY or
+#                    CONSTRAINT line (nothing after `=`: no such line)
 #   -NAME            NAME left out of the invariants and properties
 #
 # TLC_WORKERS (2) and TLC_HEAP (4g) bound what a run takes of a shared machine;
@@ -67,6 +67,8 @@ model() {
         journal/live)  # engines one at a time, each step fair; no 409s
             changes=('Engines={e1, e2, e3}' Overlap=FALSE Conflicts=FALSE SPECIFICATION=FairSpec SYMMETRY=
                      'PROPERTY=OpensAlone AppendsAlone') ;;
+        journal/failures)  # a checkpoint or its cleanup may fail midway; fewer writes
+            changes=(Failures=TRUE MaxWrites=5 CONSTRAINT=Bounded) ;;
         journal/engine-id) changes=(EngineId=FALSE) ;;
         journal/ask) model journal live; changes+=(AskJournal=FALSE -OpensAlone) ;;
         journal/re-get) changes=(ReGet=FALSE) ;;
@@ -145,8 +147,9 @@ configure() {
         key=${change%%=*}
         case $change in
             -*) edit "s/ ${change#-}( |$)/\1/" ;;
-            SPECIFICATION=* | INVARIANT=* | PROPERTY=* | SYMMETRY=*)
-                if [ -n "${change#*=}" ]; then edit "s/^$key .*/$key ${change#*=}/"; else edit "/^$key /d"; fi ;;
+            SPECIFICATION=* | INVARIANT=* | PROPERTY=* | SYMMETRY=* | CONSTRAINT=*)
+                edit "/^$key /d"
+                if [ -n "${change#*=}" ]; then echo "$key ${change#*=}" >> "$cfg"; fi ;;
             *) edit "s/^( +$key) = .*/\1 = ${change#*=}/" ;;
         esac
     done
@@ -216,7 +219,7 @@ run() {  # run SPEC GROUP
         execution/big) for m in deploys faults each; do check $m; done ;;
         execution/safety) check safety -simulate "num=${SAFETY_TRACES:-100000}" -depth 150 ;;
         execution/all) run execution ci; run execution design; run execution safety ;;
-        journal/ci) check small; check fixed; check live; calibration journal ;;
+        journal/ci) check small; check fixed; check live; check failures; calibration journal ;;
         journal/all) run journal ci; check big ;;
         attempt/ci) check small; check dup; check live; calibration attempt ;;
         attempt/all) run attempt ci; check big ;;

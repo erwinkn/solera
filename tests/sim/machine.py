@@ -126,12 +126,14 @@ class Simulation(RuleBasedStateMachine):
     def _build(self):
         return build(self.variant, self.data_root, self.db, self.outside, self.schema)
 
-    def _traced(self, who, kind, path, outcome, listed):
+    def _traced(self, who, kind, path, outcome, listed, data):
         root = str(self.tmp.resolve())
         line = {"at": self.world.now(), "who": list(who) if who else None, "kind": kind}
         line |= {"path": path.removeprefix(root), "outcome": outcome}
         if listed is not None:
             line["listed"] = [p.removeprefix(root) for p in listed]
+        if data is not None and path.endswith("/control/journal.json"):
+            line["names"] = json.loads(data)["checkpoint"]  # a move names a new one; an append keeps it
         self.requests.append(line)
 
     def _db_fault(self, kind, partition):

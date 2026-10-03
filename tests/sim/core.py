@@ -262,10 +262,10 @@ class Objects:
         self.dead: set[tuple] = set()  # actors that can make no request any more
         self.hook: Callable | None = None
         self.tap: Callable | None = None  # (full path, bytes) of every write that landed
-        # (who, kind, full path, outcome, listed): every request and how it ended
+        # (who, kind, full path, outcome, listed, data): every request and how it ended
         # (ok, missing, exists, refused, lost, error, or another exception's
         # name), for trace validation (spec/tla/check-trace.py). `listed`: what a
-        # list returned.
+        # list returned; `data`: what a write wrote.
         self.trace: Callable | None = None
         self.log: list[Op] = []
         self.deleted: dict[str, tuple] = {}  # full path -> (when, by whom) it was deleted
@@ -316,9 +316,9 @@ class Objects:
 
     # -- helpers ----------------------------------------------------------------------
 
-    def _traced(self, who, kind: str, full: str, outcome: str, listed: list[str] | None = None) -> None:
+    def _traced(self, who, kind: str, full: str, outcome: str, listed=None, data=None) -> None:
         if self.trace is not None:
-            self.trace(who, kind, full, outcome, listed)
+            self.trace(who, kind, full, outcome, listed, data)
 
     @staticmethod
     def full(store, path: str) -> str:
@@ -351,7 +351,7 @@ class Objects:
         if kind in ("create", "put", "swap", "delete") or op.gone is not None:
             self.log.append(op)
         if fate == "error":
-            self._traced(who, kind, full, "error")
+            self._traced(who, kind, full, "error", data=data)
             raise GenericError(f"injected: 503 Slow Down ({kind} {path})")
         try:
             value = do()
@@ -360,19 +360,19 @@ class Objects:
             if kind == "delete":
                 self.deleted[full] = (self.loop._now, who)
             else:  # a delete traces each of its paths
-                self._traced(who, kind, full, "missing")
+                self._traced(who, kind, full, "missing", data=data)
             raise
         except AlreadyExistsError:
-            self._traced(who, kind, full, "exists")
+            self._traced(who, kind, full, "exists", data=data)
             raise
         except PreconditionError:  # a swap refused: the object is not what it read
-            self._traced(who, kind, full, "refused")
+            self._traced(who, kind, full, "refused", data=data)
             raise
         except Exception as error:
-            self._traced(who, kind, full, type(error).__name__)
+            self._traced(who, kind, full, type(error).__name__, data=data)
             raise
         if kind != "delete":
-            self._traced(who, kind, full, "lost" if fate == "lost" else "ok")
+            self._traced(who, kind, full, "lost" if fate == "lost" else "ok", data=data)
         if kind == "delete":
             self.deleted[full] = (self.loop._now, who)
         elif kind in ("create", "put", "swap"):
