@@ -18,7 +18,7 @@ seed replays the same run, request for request.
 | Part | In the simulation | As in production |
 |---|---|---|
 | Engine | `Engine` on a `State`, started, stopped, crashed (every task killed, nothing buffered written) and replaced while still running (a *zombie* until the platform kills it) | the server process |
-| Workers | `run_attempt` in process, one task per invocation, through `SimPlacement` (`Local`); handles outlive engines | a subprocess, container or job |
+| Workers | `run_attempt` in process, one task per invocation, through `SimPlacement` (`Local`), or started by a pool host for an attempt discovery offered it (`Pool`); handles outlive engines | a subprocess, container or job; `solera worker pool` |
 | Channel | `SimChannel`: each call runs as a request of whichever engine serves now, answered once durable (the API middleware's rule) | HTTPS to a stable engine URL |
 | Heartbeats | the worker's `Reporter`, beating from a task instead of a thread | a thread |
 | Key cache | the engine's `KeyService` on the simulation's loop instead of its own thread | a thread with its own loop |
@@ -52,7 +52,7 @@ stop where they are, and their `finally` blocks find the store gone.
 ```
 feed (keyed source) ──Incremental──▶ items ──Incremental(page 2)──▶ copy
 items ──Each(page 2)──▶ checks              (fails while a key is "flaky")
-items ──Incremental(page 2)──▶ split ──▶ odd (table store), even (FileStore)
+items ──Incremental(page 2)──▶ split ──▶ odd (table store), even (FileStore); on a pool
 knob (version) ──dep──▶ per_site[site ∈ sites] ──AllPartitions──▶ summary
 knob ──dep──▶ log (batches) ──Incremental──▶ tally
 outside (keyed source) ◀── watch (a sensor over an external map)
@@ -83,6 +83,7 @@ arguments, up to 40 per run.
 | `flaky(keys, error)` | `flaky(['k2'], 'failed')` | `Each` keys failing by error class: `Transient` (retried on its backoff), `Failed` (once per deploy), `Rejected` (when the input changes), `Abort` (the whole attempt, per `retries=`) |
 | `retry_keys(classes)` | `retry_keys(['rejected'])` | a forced retry of failing keys, as `solera keys retry` asks for one |
 | `submit(asset, mode, upstream, partitions, keys)` | `submit('checks', mode='incremental', upstream=False, partitions='all', keys=('k1', 'k10'))` | manual runs; `keys=` makes the target's keyed input read a full pass (`'full'`) or the keys named |
+| `pool_hosts(hosts)` | `pool_hosts(2)` | how many pool hosts poll `split`'s `Pool`: none (its attempts wait for one), one, or two racing for each claim (`lifecycle.md` §10) |
 | `cancel(newest)` | | a user cancel of a live run |
 | `wait(seconds)` | `wait(700)` | time passing: retries, timeouts, schedules |
 | `doom_next_worker(fate)` | `doom_next_worker(Fate('die', 'gate', 'after'))` | the next launched worker dies or pauses before or after its claim, start, delta upload, gate, store write, result or `finished`; is muted (cannot reach the engine); or is started twice |

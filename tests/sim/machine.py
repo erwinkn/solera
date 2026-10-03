@@ -27,6 +27,7 @@ from .core import EPOCH, Killed
 from .oracle import Journal, Violation, commit_rows, index_entries, keyed_content, value_content
 from .project import (
     FLAKY,
+    POOL,
     VARIANTS,
     External,
     Variant,
@@ -112,6 +113,7 @@ class Simulation(RuleBasedStateMachine):
         self.runs: list[str] = []
         self.serial = 0
         self._ensure_engine()
+        world.start_pool_hosts(POOL, 2)
 
     def _build(self):
         return build(self.variant, self.data_root, self.db, self.outside, self.schema)
@@ -305,6 +307,14 @@ class Simulation(RuleBasedStateMachine):
                     lambda e, t=tick, o=outcome: e.sensor_post(t["sensor"], t["tick"], o), "sensor post"
                 )
         del world
+
+    @rule(hosts=st.sampled_from([0, 1, 2]))
+    def pool_hosts(self, hosts):
+        """How many hosts poll `split`'s pool: none (its attempts wait),
+        one, or two (racing for each claim)."""
+
+        self.trace.append(f"pool_hosts({hosts})")
+        self.world.pool_hosts = hosts
 
     # -- time and bad luck --------------------------------------------------------------------
 
@@ -650,6 +660,7 @@ class Simulation(RuleBasedStateMachine):
         world.plan.enabled = False
         world.fates.clear()
         self.outside.flaky = {}
+        world.pool_hosts = max(world.pool_hosts, 1)
         for slot in world.slots:
             if slot is not world.slot and not slot.dead:
                 self._run(world.crash(slot))

@@ -7,7 +7,7 @@ output from the sources alone.
     knob (version) ──dep──▶ per_site[site ∈ sites] ──AllPartitions──▶ summary
     knob ──dep──▶ log (batches) ──Incremental──▶ tally
     items ──Each(page 2)──▶ checks (fails while a key is flaky, by error class)
-    items ──Incremental(page 2)──▶ split ──▶ odd (table store), even (FileStore)
+    items ──Incremental(page 2)──▶ split ──▶ odd (table store), even (FileStore); on a pool
     outside (keyed source) ◀── watch (a sensor over an external map)
 
 Variants (`Variant`): `items` on a FileStore or the simulation's fenced
@@ -21,6 +21,7 @@ import fnmatch
 from dataclasses import dataclass, replace
 
 from solera.errors import Abort, Failed, Rejected, Transient
+from solera.executors import Pool
 from solera.sdk import (
     AllPartitions,
     Automation,
@@ -67,6 +68,9 @@ VARIANTS = {
     "summary": lambda v: replace(v, summary=not v.summary),
     "exclude": lambda v: replace(v, exclude=None if v.exclude else "k1*"),
 }
+
+
+POOL = "pool"  # the executor `split` runs on: workers pull its attempts
 
 
 class External:
@@ -196,11 +200,12 @@ def build(variant: Variant, data_root, db: Database, outside: External, pg: str 
         automations=AutoRefresh(),
         retries=Retry(3, delay=1.0),
         timeout=300,
+        executor=Pool(POOL)(cpu=2),
     )
     def split(ctx, items: list):
         """Each key in `odd` or `even` by its feed version: a key whose
         version flips moves from one output to the other in one commit, one
-        output fenced, the other immutable."""
+        output fenced, the other immutable. Its attempts run on a pool."""
 
         changes = ctx.changes["items"]
         odd = [r for r in items if is_odd(r["v"])]

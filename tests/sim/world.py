@@ -327,6 +327,7 @@ class World:
         self._saved: list = []
         self.on_record: Callable | None = None  # events an engine applied, as it applies them
         self.pg = None  # a postgres.Ledger, when the project writes to Postgres
+        self.pool_hosts = 1  # how many pool hosts poll (`start_pool_hosts`)
 
     # -- running ------------------------------------------------------------------------
 
@@ -545,7 +546,12 @@ class World:
 
     # -- workers ------------------------------------------------------------------------
 
-    def launch(self, stage: dict, *, fate: Fate | None = None, twin: bool = False) -> Worker:
+    def launch(
+        self, stage: dict, *, fate: Fate | None = None, twin: bool = False, pool: bool = False
+    ) -> Worker:
+        """A worker for `stage`: launched by a placement, or (`pool`) one a
+        pool host took from discovery."""
+
         from solera_worker.worker import run_attempt
 
         attempt = stage["attempt"]
@@ -555,13 +561,11 @@ class World:
         who = ("worker", attempt, self.launched)
         project = self.slot.project if self.slot is not None else None
         channel = SimChannel(self, attempt, who, muted=fate is not None and fate.kind == "mute")
-        coro = run_attempt(stage["objects"], attempt, project, run=stage["run"], channel=channel)
+        coro = run_attempt(stage["objects"], attempt, project, run=stage["run"], channel=channel, pool=pool)
         task = self._spawn(who, coro)
         worker = Worker(who, attempt, stage["run"], task, fate if not twin else None)
         self.workers[who] = worker
         self.by_attempt.setdefault(attempt, []).append(worker)
-        if fate is not None and fate.kind == "twin" and not twin:
-            pass
         if fate is not None and fate.kind == "twice" and not twin:
 
             async def second():
@@ -570,6 +574,31 @@ class World:
 
             self._spawn(None, second())
         return worker
+
+    def start_pool_hosts(self, pool: str, count: int, every: float = 10.0) -> None:
+        """`count` hosts of `pool` (`solera worker pool`): each polls the
+        serving engine for work every `every` seconds while it is one of the
+        first `pool_hosts`, and starts a worker for each attempt offered.
+        Discovery is a hint: hosts offered the same attempt race for its claim."""
+
+        async def host(n: int):
+            mine: dict[str, Worker] = {}  # the worker this host started for each attempt
+            while True:
+                await asyncio.sleep(every)
+                if n >= self.pool_hosts:
+                    continue
+                try:
+                    stages = await self.request(lambda e: e.pool_work(pool, {"cpu": 4.0}, f"host-{n}", 0.0))
+                except (Exception, Killed):
+                    continue
+                for stage in stages:  # still offered: never claimed, or its worker died first
+                    worker = mine.get(stage["attempt"])
+                    if worker is None or worker.task.done():
+                        twin = stage["attempt"] in self.by_attempt
+                        mine[stage["attempt"]] = self.launch(stage, twin=twin, pool=True)
+
+        for n in range(count):
+            self._spawn(("pool", n), host(n))
 
     async def _strike(self, worker: Worker) -> None:
         fate = worker.fate
