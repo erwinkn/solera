@@ -293,3 +293,95 @@ async def test_an_opener_whose_segments_were_cleaned_up_opens_again(tmp_path):
     with pytest.raises(Fenced):
         await add(a, sa, "x")
     await b.close()
+
+
+def segment(seq):
+    return f"{seq:020d}.json"
+
+
+@pytest.mark.xfail(strict=True, reason="journal spec F14: an opener deletes a fence a newer engine read")
+async def test_a_fence_a_newer_engine_moved_past_stays(tmp_path):
+    """Journal spec finding F14 (docs/verification.md, "Journal spec"): B
+    creates its fence at 2, which fences A. Before B checks for a hole, C
+    reads that fence, fences at 3 and checkpoints at 3. B takes checkpoint
+    3 for a sign that its fence landed in a hole cleanup left, deletes it
+    and opens again. A's next append lands at 2 and is acknowledged, but
+    every later replay starts from checkpoint 3, which holds B's fence at 2."""
+
+    store = LocalStore(str(tmp_path), mkdir=True)
+    a, sa, _ = await open_journal(store)
+    b, sb = Journal(store, "control", flush_interval=0.01), Counter()
+    behind, created, go = b._behind, asyncio.Event(), asyncio.Event()
+
+    async def slow(seq):  # created its fence; slow to check for a hole
+        created.set()
+        await go.wait()
+        return await behind(seq)
+
+    b._behind = slow
+    opening = asyncio.create_task(b.open(sb.restore, sb.apply, sb.snapshot))
+    await created.wait()
+    c, _, _ = await open_journal(store)
+    await c.close()  # a checkpoint at 3, holding B's fence at 2
+    go.set()
+    await opening
+    await add(a, sa, "x")  # acknowledged
+    d, again, _ = await open_journal(store)
+    for j in (a, b, d):
+        await j.close()
+    assert again.counts.get("x") == 1
+
+
+@pytest.mark.xfail(strict=True, reason="journal spec F15: an opener replays a fence made in a hole")
+async def test_an_opener_never_replays_a_fence_created_in_a_hole(tmp_path):
+    """Journal spec finding F15 (docs/verification.md, "Journal spec"): B
+    replays segment 1 and is slow to fence; C loads no checkpoint and is
+    slow to list the journal. A appends 2, 3 and 4, checkpointing at 2 and
+    4, so cleanup deletes 2. B's fence create at 2 lands in the hole. C
+    lists the journal, replays B's fence where A's event 2 was, fences at 5
+    and serves without that acknowledged event. B finds the hole and
+    deletes its fence only afterwards."""
+
+    store = LocalStore(str(tmp_path), mkdir=True)
+    a, sa, _ = await open_journal(store, min_checkpoint=1)
+    b, sb = Journal(store, "control", flush_interval=0.01), Counter()
+    c, sc = Journal(store, "control", flush_interval=0.01), Counter()
+    b_replay, b_behind, c_replay = b._replay, b._behind, c._replay
+    b_listed, b_go, b_created, b_check, c_loaded, c_go = (asyncio.Event() for _ in range(6))
+
+    async def b_slow_replay(apply):  # replayed segment 1; slow to fence
+        count = await b_replay(apply)
+        b_listed.set()
+        await b_go.wait()
+        return count
+
+    async def b_slow_behind(seq):  # created its fence; slow to check for a hole
+        b_created.set()
+        await b_check.wait()
+        return await b_behind(seq)
+
+    async def c_slow_replay(apply):  # loaded no checkpoint; slow to list the journal
+        if not c_loaded.is_set():
+            c_loaded.set()
+            await c_go.wait()
+        return await c_replay(apply)
+
+    b._replay, b._behind, c._replay = b_slow_replay, b_slow_behind, c_slow_replay
+    b_opening = asyncio.create_task(b.open(sb.restore, sb.apply, sb.snapshot))
+    c_opening = asyncio.create_task(c.open(sc.restore, sc.apply, sc.snapshot))
+    await b_listed.wait()
+    await c_loaded.wait()
+    for _ in range(3):  # segments 2, 3 and 4; checkpoints at 2 and 4
+        await add(a, sa, "x")
+    while segment(2) in names(store, "journal"):  # cleanup runs after the flush
+        await asyncio.sleep(0.01)
+    assert segment(3) in names(store, "journal")
+    b_go.set()
+    await b_created.wait()  # B's fence, at 2
+    c_go.set()
+    await c_opening
+    b_check.set()
+    await b_opening
+    for j in (b, c):
+        await j.close()
+    assert sc.counts.get("x") == sa.counts["x"]
