@@ -234,8 +234,33 @@ def test_demo_end_to_end(demo, pool_worker):
         assert upserted or deleted
 
 
+@pytest.fixture
+def own_database():
+    """A database of the test's own on SOLERA_TEST_DATABASE_URL's server: the
+    demo writes fixed table names, which another suite on that database
+    would drop under it."""
+
+    import os
+    import uuid
+
+    dsn = os.environ.get("SOLERA_TEST_DATABASE_URL")
+    if not dsn:
+        pytest.skip("SOLERA_TEST_DATABASE_URL is not set")
+    import psycopg
+    from psycopg.conninfo import make_conninfo
+
+    name = f"solera_e2e_{uuid.uuid4().hex[:12]}"
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(f'CREATE DATABASE "{name}"')
+    try:
+        yield make_conninfo(dsn, dbname=name)
+    finally:
+        with psycopg.connect(dsn, autocommit=True) as conn:
+            conn.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+
+
 @pytest.mark.postgres
-def test_demo_postgres_migrations_and_ondeploy(tmp_path):
+def test_demo_postgres_migrations_and_ondeploy(tmp_path, own_database):
     """§8 gate: with DATABASE_URL the demo's relational outputs land in
     PostgresStore — each declares one migration, `solera migrate` applies
     them into the solera_migration_ledger, written heads carry the applied
@@ -249,25 +274,11 @@ def test_demo_postgres_migrations_and_ondeploy(tmp_path):
     import shutil
     import subprocess
 
-    dsn = os.environ.get("SOLERA_TEST_DATABASE_URL")
-    if not dsn:
-        pytest.skip("SOLERA_TEST_DATABASE_URL is not set")
     import psycopg
 
+    dsn = own_database
     solera = shutil.which("solera")
     assert solera, "the solera console script is not on PATH"
-
-    # Clean slate: drop every table the demo owns plus the store ledgers.
-    with psycopg.connect(dsn, autocommit=True) as conn:
-        conn.execute("DROP SCHEMA IF EXISTS ops CASCADE")
-        for name in (
-            "site_events",
-            "site_files",
-            "file_index",
-            "demo_migrations",
-            "solera_migration_ledger",
-        ):
-            conn.execute(f'DROP TABLE IF EXISTS "{name}"')
 
     state_url = (tmp_path / "state").as_uri()
     env = {
