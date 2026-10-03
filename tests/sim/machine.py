@@ -50,6 +50,7 @@ STATS = {
 KEYS = ["k0", "k1", "k2", "k3", "k10", "k11"]
 SITES = ["east", "west", "north"]
 TARGETS = ["items", "copy", "per_site", "log", "tally", "summary", "checks"]
+KEYED_INPUT = {"items": "feed", "copy": "items", "checks": "items"}  # what a run's `keys=` overrides
 TERMINAL = {"succeeded", "failed", "canceled", "skipped"}
 STORES = ["file", "table"] + (["pg"] if postgres.DSN else [])  # where `items` lives
 # Re-registrations the rules make. Those that trip an open finding on most
@@ -236,17 +237,29 @@ class Simulation(RuleBasedStateMachine):
         mode=st.sampled_from(["incremental", "incremental", "full"]),
         upstream=st.booleans(),
         partitions=st.sampled_from(["latest", "all", "missing"]),
+        keys=st.sampled_from([None, None, "full", ("k1", "k10"), ("k2",)]),
     )
-    def submit(self, asset, mode, upstream, partitions):
+    def submit(self, asset, mode, upstream, partitions, keys=None):
+        """A manual run; `keys` overrides what the target's keyed input
+        reads: a full pass of it, or the keys named (`KEYED_INPUT`)."""
+
         name = self._asset(asset)
         if name is None:
             return
         self.serial += 1
         command = f"c{self.serial}"
-        self.trace.append(f"submit({asset!r}, mode={mode!r}, upstream={upstream}, partitions={partitions!r})")
+        upstream_output = KEYED_INPUT.get(asset)
+        keys = None if upstream_output is None else keys
+        self.trace.append(
+            f"submit({asset!r}, mode={mode!r}, upstream={upstream}, partitions={partitions!r}"
+            + (f", keys={keys!r})" if keys else ")")
+        )
+        override = None
+        if keys:
+            override = {upstream_output: keys if keys == "full" else {"keys": list(keys)}}
         run = self._request(
             lambda e: e.submit(
-                [name], partitions=partitions, mode=mode, upstream=upstream, command_id=command
+                [name], partitions=partitions, mode=mode, upstream=upstream, keys=override, command_id=command
             ),
             "submit",
         )
