@@ -142,3 +142,34 @@ Wall-clock times (CEST, 2026-10-04), each check is one `bend PROOF.bend` run
   times (1,285 involuntary context switches in one run). Switched to CPU
   time (`clock()` on both sides), best of 5, Bend `--threads 1` (it
   defaults to every core).
+
+## Lean comparison (01:20 to 01:30)
+
+Same definitions and laws in Lean 4.34 (core, no Mathlib), `lean/Delta.lean`,
+273 lines with the definitions.
+
+- merge_assoc: 3 rounds. 1: `by_cases` on six comparisons + `simp_all` +
+  `omega` left goals where `if ky < kz` was not decided from `kz < ky`.
+  2: `rcases Nat.lt_trichotomy` three times, `subst_vars`, `simp_all [merge,
+  comb, Nat.lt_irrefl, Nat.lt_asymm]`: checks. The 27 cases are one tactic
+  line; Bend needed the `Imp` table, `tri`, 5 step lemmas and 27 written
+  cases.
+- Everything else in one file, then 3 rounds: `rfl` does not unfold `merge`
+  (well-founded recursion, not definitional: the mirror image of Bend's
+  stuck multi-scrutinee match); `subst` needs a variable side; `Consistent
+  snil d` does not reduce for a variable `d` (same pattern-compilation
+  effect as in Bend), fixed with `cases d`.
+- Compiled with `lake build` (Lean also emits C), driven on the harness's
+  inputs (`Bench.lean`); checksums equal Bend's on all three shapes.
+
+## The design thread's answer (thr_xvgqnrw2kr, 01:22)
+
+Asked at Erwin's request whether this algebra survives the span rework
+(docs/key-index-design.md on main, cc54fcc). Yes: a span is this delta with
+"before" widened to the span, its merge is this merge, changes(P->N) is (c),
+the base merge and count are (d); (c)'s precondition is the design's "exact
+writes". Predecessor generation instead of a bit: faithful as Maybe<G>, older
+kept. Next laws it wants, in order: tiling bookkeeping; read-ahead with
+increasing generations (and the counterexample when "neither" entries are
+dropped); a write-amplification bound for the balance-guarded merge policy
+that survives dedup (open); newest-first lookup equals the fold.

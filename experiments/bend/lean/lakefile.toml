@@ -1,0 +1,9 @@
+name = "delta"
+defaultTargets = ["bench"]
+
+[[lean_lib]]
+name = "Delta"
+
+[[lean_exe]]
+name = "bench"
+root = "Bench"
