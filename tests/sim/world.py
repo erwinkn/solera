@@ -226,7 +226,7 @@ def sim_key_service_class():
             budget = SimKeyService.world.cache_budget if SimKeyService.world is not None else None
             disk, candidates = budget or (self.disk, self.candidates)
             self.cache = EngineCache(self.root, disk=disk, candidates=candidates, window=self.window)
-            self.resolver = Resolver(self.cache, self.io, self.options, self.limits, holds=self)
+            self.resolver = Resolver(self.cache, self.io, self.options, self.limits, pins=self)
             self.loop = SimKeyService.loop_of
 
         async def stop(self):
@@ -244,10 +244,10 @@ def sim_key_service_class():
                 t.cancel()
             await asyncio.gather(*owners, return_exceptions=True)
 
-        def pinned(self, state):  # from a compaction's thread, while the loop waits for it
+        def _open(self, state):  # from a compaction's thread, while the loop waits for it
             if not self._running():
                 return None
-            return self.cache.pin(state)
+            return self.cache.open(state)
 
     return SimKeyService
 

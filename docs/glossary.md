@@ -668,10 +668,9 @@ Each line: what goes, what replaces it, and why it does not earn a name.
 
 ## Rename plan
 
-*Applied* (phases 0-4, 2026-10-03), but for two rows: 2.16 (`Each` as
+*Applied* (phases 0-4, 2026-10-03), but for one row: 2.16 (`Each` as
 an `Incremental` alias) gives way to model change 2, which makes `each`
-a flag for real; and 2.28's `KeyService.hold`/`release` stay, since
-`KeyService` already names its engine-cache pins `pin`/`unpin`. The
+a flag for real. The
 journal's `seq` stayed as the segment number's storage name until the
 journal became one object (K18).
 
@@ -755,7 +754,7 @@ shown as a version": that line goes).
 | 2.25 | automation view `last_at` | `last_fired` | `engine.py` (`automation_view`), console `Automation.last_at` | yes (API) |
 | 2.26 | run detail attempt `status` | `outcome` | `engine.py` (`run_detail`), console `Attempt.status` | yes (API) |
 | 2.27 | `Model.retired` (runs) | `deleted` | `model.py`, `upkeep.py`, `object-store-state.md` §5, §11 | no |
-| 2.28 | reader pin `domains`; `KeyService.hold`/`release` | `prefixes`; `pin`/`unpin` | `model.py`, `keyservice.py`, `engine.py` | no |
+| 2.28 | reader pin `domains`; `KeyService.hold`/`release`; the engine cache's file pins: `EngineCache.pin`/`held`, `Pin`, `KeyService.pinned`/`unpin`; `IndexState.pinned(log_from, log_to)` | `prefixes`; `pin`/`unpin` (the reader pin, for collection's floor); no noun: `with cache.open(state) as files` (`open_present` for what is local), `OpenFiles`, `with KeyService.open(state)` — open files are not evicted, a cache property; `IndexState.slice(first, last)`, the part of the index one reader needs | `model.py`, `keyservice.py`, `engine.py`, `keys/cache.py`, `keys/resolver.py`, `keys/index.py`, `upkeep.py` | no |
 | 2.29 | `Model.applied` | `Model.event_counter` | `model.py`, `engine.py`, `state.py`, `upkeep.py`, `keyservice.py`, tests/sim | no |
 | 2.30 | `Planner.complete`, `head_complete`, `drained`; statuses `complete`, `retired`; `Model.progress` | `materialized`, `head_materialized`, `caught_up`; `materialized`, `removed`; folded into the partition's `last` record as `caught_up` | `planning.py`, `views.py`, `engine.py`, `model.py`, console `lib/status.ts`, routes | yes |
 | 2.31 | failure index (`failures.py` names, `GET …/failures`, console `Failures`) | failed keys (`failed_keys`, `GET …/failed-keys`, `FailedKeys`) | `failures.py`, `api.py`, `views.py`, `each.py`, console | yes |

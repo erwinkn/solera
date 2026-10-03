@@ -9,7 +9,7 @@ thread of their own: nothing here runs on the engine's event loop.
   worker's own read code over local copies, recorded.
 
 Whatever here reads index files from the object store holds a reader pin
-(`hold`) at the event counter it read the index at, until its reads are
+(`pin`) at the event counter it read the index at, until its reads are
 done: collection (`floor`) deletes nothing a pinned reader may still read.
 """
 
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import hashlib
 import itertools
 import json
@@ -73,29 +74,29 @@ class KeyService:
         self.loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._stopped = False
-        self._holds: dict[int, float] = {}  # token -> event counter: readers of index files
-        self._hold_lock = threading.Lock()
+        self._pins: dict[int, float] = {}  # token -> event counter: readers of index files
+        self._lock = threading.Lock()
         self._tokens = itertools.count()
         self._owners: set[asyncio.Task] = set()  # operations running on the loop
         self._installing = 0  # bytes of `installed` files waiting
 
     # -- reader pins ----------------------------------------------------------------------
 
-    def hold(self, position: float) -> int:
-        with self._hold_lock:
+    def pin(self, position: float) -> int:
+        with self._lock:
             token = next(self._tokens)
-            self._holds[token] = position
+            self._pins[token] = position
             return token
 
-    def release(self, token: int) -> None:
-        with self._hold_lock:
-            self._holds.pop(token, None)
+    def unpin(self, token: int) -> None:
+        with self._lock:
+            self._pins.pop(token, None)
 
     def floor(self) -> float:
         """The oldest position a reader here holds: for collection's `pin_floor`."""
 
-        with self._hold_lock:
-            return min(self._holds.values(), default=math.inf)
+        with self._lock:
+            return min(self._pins.values(), default=math.inf)
 
     # -- the thread -----------------------------------------------------------------------
 
@@ -116,7 +117,7 @@ class KeyService:
                 self.cache = EngineCache(
                     self.root, disk=self.disk, candidates=self.candidates, window=self.window
                 )
-                self.resolver = Resolver(self.cache, self.io, self.options, self.limits, holds=self)
+                self.resolver = Resolver(self.cache, self.io, self.options, self.limits, pins=self)
             except BaseException as e:
                 loop.close()
                 started.set_exception(e)
@@ -195,13 +196,13 @@ class KeyService:
 
         if not self._running():
             return None
-        token = self.hold(position)
+        token = self.pin(position)
         try:
             return await asyncio.wrap_future(
                 self._submit(self.resolver.resolve(attempt, body, prepared, live))
             )
         finally:
-            self.release(token)
+            self.unpin(token)
 
     async def direct(
         self,
@@ -220,33 +221,45 @@ class KeyService:
         if not self._running():
             return {"result": "declined", "reason": "busy"}, None
         p = Prepared("", commit_number, generation, index, commit_number - 1, True, position)
-        token = self.hold(position)
+        token = self.pin(position)
         try:
             return await asyncio.wrap_future(self._submit(self.resolver.compute(p, kind, run, path)))
         finally:
-            self.release(token)
+            self.unpin(token)
 
     def committed(self, prefix: str, path, files: list[FileInfo], position: float) -> None:
         """A commit at `position` installed `files` (a commit's delta) into the index at `prefix`."""
 
         if not self._running():
             return
-        token = self.hold(position)
+        token = self.pin(position)
         fut = self._submit(self._committed(prefix, path, files))
         fut.add_done_callback(_logged)
-        fut.add_done_callback(lambda _f: self.release(token))
+        fut.add_done_callback(lambda _f: self.unpin(token))
 
-    def pinned(self, state: IndexState):
-        """The engine cache's copies of `state`'s files, pinned — a `Pin`,
-        its `handles` by path — when it holds them all, else None. From any
-        thread but this service's; `unpin` when done."""
+    @contextlib.contextmanager
+    def open(self, state: IndexState):
+        """The engine cache's copies of `state`'s files, open — `OpenFiles`,
+        its `handles` by path — when it holds them all, else None; closed on
+        exit. From any thread but this service's."""
 
+        files = self._open(state)
+        try:
+            yield files
+        finally:
+            if files is not None:
+                self._fire(lambda: self._close(files))
+
+    def _open(self, state: IndexState):
         if not self._running():
             return None
-        return self._submit(self._pin(state)).result()
+        return self._submit(self._open_here(state)).result()
 
-    async def _pin(self, state: IndexState):
-        return self.cache.pin(state)
+    async def _open_here(self, state: IndexState):
+        return self.cache.open(state)
+
+    async def _close(self, files) -> None:
+        files.close()
 
     def corrupt(self, path: str) -> None:
         """A local file failed a check while read: it goes."""
@@ -255,12 +268,6 @@ class KeyService:
 
     async def _corrupt(self, path: str) -> None:
         self.cache.corrupt(path)
-
-    def unpin(self, pin) -> None:
-        self._fire(lambda: self._unpin(pin))
-
-    async def _unpin(self, pin) -> None:
-        pin.__exit__(None, None, None)
 
     async def reads(self, spec: dict, position: float) -> dict | None:
         """The input reads of the attempt `spec` describes, answered from
@@ -271,7 +278,7 @@ class KeyService:
 
         if not self._running():
             return None
-        token = self.hold(position)
+        token = self.pin(position)
         try:
             fut = self._submit(self._admitted(spec, position))
             try:
@@ -282,7 +289,7 @@ class KeyService:
                 log.warning("key cache reads: %s", e)
             return None
         finally:
-            self.release(token)
+            self.unpin(token)
 
     async def _admitted(self, spec: dict, position: float) -> dict | None:
         """`_reads` under the resolver's admission (`Resolver.admitted`), holding
@@ -307,9 +314,9 @@ class KeyService:
         for info in (spec.get("outputs") or {}).values():
             if info.get("index"):
                 states[json.dumps(info["index"], sort_keys=True)] = IndexState.from_json(info["index"])
-        pins = [self.cache.held(st) for st in states.values()]
+        opened = [self.cache.open_present(st) for st in states.values()]
         reads = Reads(recording=True, max_entries=READS_MAX_ENTRIES, max_bytes=READS_MAX_BYTES)
-        io = ObjectIO(None, local={p: h for pin in pins for p, h in pin.handles.items()}, served=reads)
+        io = ObjectIO(None, local={p: h for files in opened for p, h in files.handles.items()}, served=reads)
         cold = False
         try:
             for pin in (spec.get("inputs") or {}).values():
@@ -333,8 +340,8 @@ class KeyService:
         except Full:
             pass  # the rest go to the store
         finally:
-            for pin in pins:
-                pin.__exit__(None, None, None)
+            for files in opened:
+                files.close()
         if cold:
             for st in states.values():
                 if st.files:
@@ -348,7 +355,7 @@ class KeyService:
 
         if not self._running():
             return
-        with self._hold_lock:
+        with self._lock:
             take = self._installing + len(data) <= INSTALL_QUEUE
             if take:
                 self._installing += len(data)
@@ -360,7 +367,7 @@ class KeyService:
         fut.add_done_callback(lambda _f: self._installed(len(data)))
 
     def _installed(self, n: int) -> None:
-        with self._hold_lock:
+        with self._lock:
             self._installing -= n
 
     async def _demote(self, prefix: str) -> None:

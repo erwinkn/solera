@@ -108,7 +108,7 @@ async def test_a_failure_record_lives_in_its_entry_across_a_restart(state, tmp_p
     again = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = make_engine(again, project, clock=clock)
     await engine.initialize()
-    index = KeyIndex(ObjectIO(again.objects), None, again.model.index("@parse", "").pinned())
+    index = KeyIndex(ObjectIO(again.objects), None, again.model.index("@parse", "").slice())
     found = await index.lookup([b"a.csv"])
     from solera.failed_keys import Record
 
@@ -148,7 +148,7 @@ async def _dead_write(state, landed: bool):  # noqa: F811
     from solera.keys.io import ObjectIO
 
     index = state.model.index("items", "")
-    files, _ = await KeyIndex(ObjectIO(state.objects), None, index.pinned()).resolve(
+    files, _ = await KeyIndex(ObjectIO(state.objects), None, index.slice()).resolve(
         SortedEntries.of([b"k"]), commit_number=1, attempt="dead", generation=12
     )
     state.model.repairs[("items", "")] = [{**files.to_json(), "run": "r", "attempt": "dead"}]

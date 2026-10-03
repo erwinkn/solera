@@ -126,7 +126,7 @@ async def whole(state, output: str, partition: str = ""):
     from solera.keys.io import ObjectIO
     from solera.stores import Keys
 
-    index = KeyIndex(ObjectIO(state.objects), None, state.model.index(output, partition).pinned())
+    index = KeyIndex(ObjectIO(state.objects), None, state.model.index(output, partition).slice())
     entries, after = {}, None
     while True:
         keys, generations, _, after = await index.page(after, 100_000)

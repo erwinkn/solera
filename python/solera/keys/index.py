@@ -178,14 +178,14 @@ class IndexState:
     def path(self, name: str) -> str:
         return f"{self.prefix}{name}.kx"
 
-    def pinned(self, log_from: int | None = None, log_to: int | None = None) -> IndexState:
+    def slice(self, first: int | None = None, last: int | None = None) -> IndexState:
         """The part of the index one reader needs: the levels, and the log
-        entries in `[log_from, log_to]` (none when `log_from` is None)."""
+        entries in `[first, last]` (none when `first` is None)."""
 
-        if log_from is None:
+        if first is None:
             return replace(self, log=())
-        hi = log_to if log_to is not None else math.inf
-        return replace(self, log=tuple(e for e in self.log if log_from <= e[0] <= hi))
+        hi = last if last is not None else math.inf
+        return replace(self, log=tuple(e for e in self.log if first <= e[0] <= hi))
 
     def covers(self, first: int, last: int) -> bool:
         """Whether the log still holds every commit in `[first, last]`."""

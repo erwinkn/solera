@@ -76,7 +76,7 @@ async def served_reads(n, state, cache, sample, window, opts, cold) -> list[dict
 
     middle = bench.key_of(sorted(sample)[len(sample) // 2][0])
     lo, hi = window
-    pinned = state.pinned(lo, hi)
+    pinned = state.slice(lo, hi)
     calls = [
         ("full pass: first batch, 10K keys", state, lambda ix: ix.page(None, 10_000)),
         ("full pass: a batch of 100K keys, mid-index", state, lambda ix: ix.page(middle, 100_000)),
@@ -87,7 +87,7 @@ async def served_reads(n, state, cache, sample, window, opts, cold) -> list[dict
         ),
     ]
     rows = []
-    with cache.held(state) as pin:
+    with cache.open_present(state) as opened:
         for label, st, call in calls:
             row = {"n": n, "op": label}
             io = cold()
@@ -96,7 +96,7 @@ async def served_reads(n, state, cache, sample, window, opts, cold) -> list[dict
 
             async def served(st=st, call=call):
                 reads = Reads(recording=True, max_entries=READS_MAX_ENTRIES, max_bytes=READS_MAX_BYTES)
-                await call(KeyIndex(ObjectIO(None, local=pin.handles, served=reads), None, st, opts))
+                await call(KeyIndex(ObjectIO(None, local=opened.handles, served=reads), None, st, opts))
                 body = json.dumps(reads.to_json())
                 wio = cold()
                 wio.served = Reads.from_json(json.loads(body))
@@ -182,8 +182,8 @@ async def run_size(n: int, args) -> list[dict]:
             live, wall, cpu = await timed(lambda io=io: KeyIndex(io, None, state, opts).recount())
             row["store"] = (wall, cpu, io.metrics.gets, io.metrics.bytes_in / 1e6)
             io = cold()
-            with cache.pin(state) as pin:
-                io.local = pin.handles
+            with cache.open(state) as opened:
+                io.local = opened.handles
                 again, wall, cpu = await timed(lambda io=io: KeyIndex(io, None, state, opts).recount())
             assert again == live, (again, live)
             row["local"] = (wall, cpu, io.metrics.gets, io.metrics.bytes_in / 1e6)

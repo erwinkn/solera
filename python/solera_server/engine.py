@@ -811,7 +811,7 @@ class Engine(Attempts, Sensors, Views):
                 current = self.m.index(name, partition)
                 info["index"] = IndexState(prefix=f"{current.prefix}{info['commit_number']:012d}/").to_json()
             elif output.get("key") is not None:
-                info["index"] = self.m.index(name, partition).pinned().to_json()
+                info["index"] = self.m.index(name, partition).slice().to_json()
                 if (name, partition) in self.m.repairs:
                     info["repairs"] = self.m.repairs[(name, partition)]
                 if output.get("dynamic_partitions") or name in self._dynamic_dims:
@@ -923,7 +923,7 @@ class Engine(Attempts, Sensors, Views):
             or store.get("writes") != "immutable"
         ):
             return None
-        return self.m.index(output, ref.get("partition") or "").pinned().to_json()
+        return self.m.index(output, ref.get("partition") or "").slice().to_json()
 
     @staticmethod
     def _all_partitions(planner: planning.Planner, input: planning.Input) -> dict:
@@ -979,7 +979,7 @@ class Engine(Attempts, Sensors, Views):
             # partition's progress. The input's patterns still decide which it takes (§11).
             keys = sorted({str(k) for k in override["keys"]})
             pin = {"ref": ref, "batch": {"keys": keys, "full": False}}
-            pin["index"] = self.m.index(output, upstream_partition).pinned().to_json()  # the keys' locators
+            pin["index"] = self.m.index(output, upstream_partition).slice().to_json()  # the keys' locators
             if input.get("patterns") is not None:
                 pin["patterns"] = input["patterns"]
             return pin, {"kind": "selection"}, not keys
@@ -1044,7 +1044,7 @@ class Engine(Attempts, Sensors, Views):
                 "new": patterns,
                 "at": head_commit,
                 "generation": latest_generation,
-                "snapshot": index.pinned().to_json(),
+                "snapshot": index.slice().to_json(),
                 "pin": claim_generation if claim_generation is not None else self.m.event_counter,
             }
         if pattern_change is not None:
@@ -1106,7 +1106,7 @@ class Engine(Attempts, Sensors, Views):
         if carried["next"] is None:
             carried["next"] = current["from"]
         whole = current["mode"] == "full"
-        pinned = index.pinned() if whole else index.pinned(current["from"], current["to"])
+        pinned = index.slice() if whole else index.slice(current["from"], current["to"])
         if "batch" not in current:
             # Where each batch sits in the pass (§5), planned when it starts: the keys
             # in the whole index or in the delta's files, by `batch_size` — an
@@ -1185,7 +1185,7 @@ class Engine(Attempts, Sensors, Views):
             "forced_pos": current,
             "now": self.clock(),
             "retries": asset.get("retries", {}).get("n", 0),
-            "failures": failures.pinned().to_json(),
+            "failures": failures.slice().to_json(),
             "commit_number": int(record.get("commit_number", -1)) + 1,
             "pass_after": (retry or {}).get("after"),
         }
@@ -1193,7 +1193,7 @@ class Engine(Attempts, Sensors, Views):
         if kind == "reconcile":
             pin = {
                 "ref": ref,
-                "index": self.m.index(input["output"], upstream_partition).pinned().to_json(),
+                "index": self.m.index(input["output"], upstream_partition).slice().to_json(),
                 "batch": {"reconcile": {"after": reconcile["after"]}, "limit": limit},
                 "each": each,
             }
@@ -1217,7 +1217,7 @@ class Engine(Attempts, Sensors, Views):
             each["pass_after"] = retry["after"]
             pin = {
                 "ref": ref,
-                "index": self.m.index(input["output"], upstream_partition).pinned().to_json(),
+                "index": self.m.index(input["output"], upstream_partition).slice().to_json(),
                 "batch": {"retry": {"after": retry["after"]}, "limit": limit},
                 "each": each,
             }
@@ -1603,7 +1603,7 @@ class Engine(Attempts, Sensors, Views):
                 [key_bytes(k) for k in new], list(new.values()), [key_bytes(k) for k in removes]
             )
             with self.m.reading(self.m.index(name, "").prefix):  # outlives compaction meanwhile
-                pinned = self.m.index(name, "").pinned()
+                pinned = self.m.index(name, "").slice()
                 index = KeyIndex(self._key_io(), None, pinned, self.key_options)
                 files = await self._resolve_source(
                     index, pinned, sorted_run, replace, commit_number, attempt, generation
@@ -1661,7 +1661,7 @@ class Engine(Attempts, Sensors, Views):
         for event in events:
             if "keys" in event:
                 index = KeyIndex(
-                    self._key_io(), None, self.m.index(event["source"], "").pinned(), self.key_options
+                    self._key_io(), None, self.m.index(event["source"], "").slice(), self.key_options
                 )
                 paths += [index.path(f["name"]) for f in event["keys"]["files"]]
         if paths:
@@ -1713,7 +1713,7 @@ class Engine(Attempts, Sensors, Views):
             return {"total": 0, "exact": True, "keys": {}, "next": None}
         start = key_bytes(after) if after is not None else None
         with self.m.reading(state.prefix):  # its files outlive compaction until the page is read
-            index = KeyIndex(self._key_io(), None, state.pinned(), self.key_options)
+            index = KeyIndex(self._key_io(), None, state.slice(), self.key_options)
             keys, generations, _, nxt = await index.page(start, offset + limit)
         return {
             "total": state.count,

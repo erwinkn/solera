@@ -5,7 +5,7 @@ only evicted. Each file is kept on local disk in its local form
 (`solera._native.build_local`: blocks decompressed, with restart points, a
 checksummed directory), opened with its directory in memory. An index is
 **warm** when every file of a snapshot is present; resolves only ever read
-warm snapshots, and pin the files they read.
+warm snapshots, and keep the files they read open.
 
 Budgets:
 - disk: local files, candidates, temporary files and reservations. Every
@@ -23,7 +23,7 @@ Admission is by index, with hysteresis: an index is admitted when its
 snapshot, plus a compaction's overlap, fits beside the indexes active in
 the last `window` seconds; eviction takes retired files (inputs of a
 published compaction), then files of inactive or demoted indexes, never
-pinned files or an active index's. A file's local size is estimated from
+open files or an active index's. A file's local size is estimated from
 its source until one is built; from then on the size it built to counts,
 so an index shown not to fit is not fetched again until room changes.
 
@@ -63,7 +63,7 @@ class _File:
     used: float
     source_size: int
     digest: str  # of the source, hex
-    pins: int = 0
+    readers: int = 0  # open for reading: not evicted
     retired: bool = False  # a published compaction let go of it
 
 
@@ -130,8 +130,9 @@ def verify(f: FileInfo, path: str, data: bytes) -> None:
         raise Corrupt(f"{path}: {len(data)} bytes that do not match its size and digest")
 
 
-class Pin:
-    """Files held for one reader; released on exit."""
+class OpenFiles:
+    """Files open for one reader: the cache evicts none of them until it
+    closes them (on exit)."""
 
     def __init__(self, cache: EngineCache, files: list[_File], runs: list[list[object]]):
         self.cache, self.files, self.runs = cache, files, runs
@@ -141,9 +142,12 @@ class Pin:
         return self
 
     def __exit__(self, *exc):
+        self.close()
+
+    def close(self) -> None:
         for f in self.files:
-            f.pins -= 1
-            if f.retired and f.pins == 0:
+            f.readers -= 1
+            if f.retired and f.readers == 0:
                 self.cache._drop(f.path)
         self.files = []
 
@@ -216,7 +220,7 @@ class EngineCache:
     def _evict(self, need: int, keep: str | None = None) -> bool:
         """Make `need` bytes free: candidates past their budget, then retired
         files, then files of inactive or demoted indexes, least recently used.
-        Never pinned files or an active index's."""
+        Never open files or an active index's."""
 
         now = self.clock()
         while self.candidates and self.candidates.bytes > self.candidate_budget:
@@ -228,7 +232,7 @@ class EngineCache:
             (
                 f
                 for f in self.files.values()
-                if f.pins == 0 and (f.retired or (f.prefix not in active and f.prefix != keep))
+                if f.readers == 0 and (f.retired or (f.prefix not in active and f.prefix != keep))
             ),
             key=lambda f: (not f.retired, f.used),
         )
@@ -272,7 +276,7 @@ class EngineCache:
             return None
         if local.source_size == f.size and local.digest == f.digest:
             return local
-        if local.pins == 0:
+        if local.readers == 0:
             self._drop(path)
         return None
 
@@ -327,25 +331,25 @@ class EngineCache:
             f = self.files.get(path)
             if f is not None:
                 f.retired = True
-                if f.pins == 0:
+                if f.readers == 0:
                     self._drop(path)
 
-    def held(self, state: IndexState) -> Pin:
+    def open_present(self, state: IndexState) -> OpenFiles:
         """Whatever of the snapshot's files and logged deltas the cache holds,
-        pinned: a reader that takes what is local and does without the rest."""
+        open: for a reader that takes what is local and does without the rest."""
 
         self.admit(state)  # a read: the index is active, and a recovered one is admitted again
         now, files = self.clock(), []
         for f in {**{f.name: f for f in _logged(state)}, **{f.name: f for f in state.files}}.values():
             local = self._present(state.path(f.name), f)
             if local is not None:
-                local.pins += 1
+                local.readers += 1
                 local.used = now
                 files.append(local)
-        return Pin(self, files, [])
+        return OpenFiles(self, files, [])
 
-    def pin(self, state: IndexState) -> Pin | None:
-        """The snapshot's local files, newest run first, pinned; None unless warm."""
+    def open(self, state: IndexState) -> OpenFiles | None:
+        """The snapshot's local files, newest run first, open; None unless warm."""
 
         if not self.warm(state):
             return None
@@ -356,12 +360,12 @@ class EngineCache:
             run = []
             for f in level:
                 local = self.files[state.path(f.name)]
-                local.pins += 1
+                local.readers += 1
                 local.used = now
                 held.append(local)
                 run.append(local.handle)
             runs.append(run)
-        return Pin(self, held, runs)
+        return OpenFiles(self, held, runs)
 
     # -- filling ------------------------------------------------------------------------
 

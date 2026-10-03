@@ -179,15 +179,12 @@ class Upkeep:
 
             # One warm copy serves every engine reader: an index the engine's cache
             # holds is read from its local files, the store otherwise.
-            pin = service.pinned(index) if service is not None else None
-            if pin is None:
-                return asyncio.run(go(None))
-            try:
-                return asyncio.run(go(pin.handles))
-            except LocalError as e:
-                service.corrupt(e.path)  # dropped, fetched again by a fill; this run reads the store
-            finally:
-                service.unpin(pin)
+            with service.open(index) if service is not None else contextlib.nullcontext() as local:
+                if local is not None:
+                    try:
+                        return asyncio.run(go(local.handles))
+                    except LocalError as e:
+                        service.corrupt(e.path)  # dropped, fetched again by a fill; this run reads the store
             return asyncio.run(go(None))
 
         try:

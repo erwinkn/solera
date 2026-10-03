@@ -509,7 +509,7 @@ async def test_a_canceled_fill_keeps_its_room_until_the_build_ends(io, tmp_path,
 
 async def test_a_reader_does_not_evict_what_compaction_wrote(io, tmp_path):
     """Review 7: a compaction's output, installed before the compaction is
-    published, stays while readers still pin the snapshot it replaces; the
+    published, stays while readers still have the snapshot it replaces open; the
     inputs go once the compaction is published and no reader holds them."""
 
     state = await built_index(io, commits=3)
@@ -522,7 +522,7 @@ async def test_a_reader_does_not_evict_what_compaction_wrote(io, tmp_path):
     added, removed, _ = await idx.compact(plan)
     for path, f, data in written:
         assert await cache.install(state.prefix, f, path, data)
-    with cache.pin(state):
+    with cache.open(state):
         assert all(path in cache.files for path, _, _ in written)
         cache.retire([state.path(n) for n in removed])
         assert all(state.path(n) in cache.files for n in removed)  # still read
@@ -613,27 +613,26 @@ async def test_maintenance_reads_the_engine_caches_copies(io, tmp_path):
     service.start()
     try:
         assert await asyncio.wrap_future(service._submit(service.cache.fill(service.io, state)))
-        pin = await asyncio.to_thread(service.pinned, state)
-        assert pin is not None
-        cold = await KeyIndex(io, None, state, OPTS).recount()
-        gets = io.metrics.gets
-        held = ObjectIO(io.store, metrics=io.metrics, local=pin.handles)
-        idx = KeyIndex(held, None, state, OPTS)
-        assert await idx.recount() == cold and idx.local_reads and io.metrics.gets == gets
-        plan = (state.level(0) + state.level(1), 1) if state.level(0) else (state.level(1), 2)
-        local = KeyIndex(held, None, state, OPTS)
-        added, _, _ = await local.compact(plan, garbage=True)
-        assert local.local_reads and io.metrics.gets == gets
-        stored, _, _ = await KeyIndex(io, None, state, OPTS).compact(plan, garbage=True)
+        with service.open(state) as local_files:
+            assert local_files is not None
+            cold = await KeyIndex(io, None, state, OPTS).recount()
+            gets = io.metrics.gets
+            held = ObjectIO(io.store, metrics=io.metrics, local=local_files.handles)
+            idx = KeyIndex(held, None, state, OPTS)
+            assert await idx.recount() == cold and idx.local_reads and io.metrics.gets == gets
+            plan = (state.level(0) + state.level(1), 1) if state.level(0) else (state.level(1), 2)
+            local = KeyIndex(held, None, state, OPTS)
+            added, _, _ = await local.compact(plan, garbage=True)
+            assert local.local_reads and io.metrics.gets == gets
+            stored, _, _ = await KeyIndex(io, None, state, OPTS).compact(plan, garbage=True)
 
-        async def read(files):
-            return decoded([await io.read_whole(state.path(f.name), f.size) for f in files])
+            async def read(files):
+                return decoded([await io.read_whole(state.path(f.name), f.size) for f in files])
 
-        assert await read(added) == await read(stored)
-        partial = ObjectIO(io.store, local=dict(list(pin.handles.items())[1:]))
-        idx = KeyIndex(partial, None, state, OPTS)
-        assert await idx.recount() == cold and not idx.local_reads
-        service.unpin(pin)
+            assert await read(added) == await read(stored)
+            partial = ObjectIO(io.store, local=dict(list(local_files.handles.items())[1:]))
+            idx = KeyIndex(partial, None, state, OPTS)
+            assert await idx.recount() == cold and not idx.local_reads
     finally:
         await service.stop()
 
@@ -671,9 +670,9 @@ async def test_local_reads_are_the_stores(io, tmp_path):
     assert state.depth >= 1 and len(state.log) == 10
     cache = EngineCache(str(tmp_path))
     assert await cache.fill(io, state)
-    pin = cache.held(state)
-    assert len(pin.handles) == len(state.referenced())  # the logged deltas too
-    local = ObjectIO(None, local=pin.handles)
+    opened = cache.open_present(state)
+    assert len(opened.handles) == len(state.referenced())  # the logged deltas too
+    local = ObjectIO(None, local=opened.handles)
     rng = random.Random(4)
 
     async def walk(read, after, limit):
@@ -702,11 +701,11 @@ async def test_local_reads_are_the_stores(io, tmp_path):
         assert await warm.lookup(probe) == await cold.lookup(probe)
     # Recording reads only local copies: one it does not hold is `Cold`.
     gone = state.path(state.files[0].name)  # a file a page reads, not one only the log holds
-    held = {p: h for p, h in pin.handles.items() if p != gone}
+    held = {p: h for p, h in opened.handles.items() if p != gone}
     partial = ObjectIO(None, local=held, served=Reads(recording=True))
     with pytest.raises(Cold):
         await KeyIndex(partial, None, state, OPTS).page(None, 10)
-    pin.__exit__(None, None, None)
+    opened.close()
 
 
 async def test_a_record_answers_its_calls_and_nothing_else(io, tmp_path):
@@ -719,9 +718,9 @@ async def test_a_record_answers_its_calls_and_nothing_else(io, tmp_path):
     state = await logged_index(io)
     cache = EngineCache(str(tmp_path))
     assert await cache.fill(io, state)
-    pin = cache.held(state)
+    opened = cache.open_present(state)
     reads = Reads(recording=True, max_entries=10**6, max_bytes=2**24)
-    engine = KeyIndex(ObjectIO(None, local=pin.handles, served=reads), None, state, OPTS)
+    engine = KeyIndex(ObjectIO(None, local=opened.handles, served=reads), None, state, OPTS)
     page = await engine.page(None, 300)
     window = await engine.pending(3, 9, None, 300)
     found = await engine.lookup([key(i) for i in range(0, 2100, 9)])
@@ -737,15 +736,15 @@ async def test_a_record_answers_its_calls_and_nothing_else(io, tmp_path):
     assert io.metrics.gets == gets
     await worker.page(page[3], 300)  # not recorded: the store
     assert io.metrics.gets > gets
-    other = state.pinned(3, 9)  # another snapshot: never answered from this one's record
+    other = state.slice(3, 9)  # another snapshot: never answered from this one's record
     gets = io.metrics.gets
     assert await KeyIndex(worker_io, None, other, OPTS).pending(3, 9, None, 300) == window
     assert io.metrics.gets > gets
     small = Reads(recording=True, max_entries=100, max_bytes=2**24)
     with pytest.raises(Full):
-        await KeyIndex(ObjectIO(None, local=pin.handles, served=small), None, state, OPTS).page(None, 300)
+        await KeyIndex(ObjectIO(None, local=opened.handles, served=small), None, state, OPTS).page(None, 300)
     assert len(small) == 0
-    pin.__exit__(None, None, None)
+    opened.close()
 
 
 # -- review round 2 ---------------------------------------------------------------------------
@@ -895,7 +894,7 @@ def _file_stub(path, prefix):
 
 
 async def test_a_local_read_keeps_its_index_active_and_admitted(io, tmp_path):
-    """Round 3: reading local copies — a resolve's pin or a start read's —
+    """Round 3: reading local copies — a resolve's open files or a start read's —
     marks the index active, and admits one recovered after a restart."""
 
     state = await built_index(io, commits=1)
@@ -904,12 +903,12 @@ async def test_a_local_read_keeps_its_index_active_and_admitted(io, tmp_path):
     assert await cache.fill(io, state)
     now[0] = 11.0
     assert state.prefix not in cache._active(now[0])
-    with cache.held(state):
+    with cache.open_present(state):
         pass
     assert state.prefix in cache._active(now[0])
     again = EngineCache(str(tmp_path), window=10, clock=lambda: now[0])
     assert not again.indexes[state.prefix].admitted  # recovered: kept, not admitted
-    with again.held(state):
+    with again.open_present(state):
         assert again.indexes[state.prefix].admitted
 
 
@@ -961,7 +960,7 @@ def test_a_record_refuses_entries_before_encoding(monkeypatch):
 
 async def test_cancelled_work_keeps_what_it_holds_until_its_thread_ends(io, tmp_path, monkeypatch):
     """Round 4: cancelling a resolve — once, or again and again — leaves its
-    semaphore, queued bytes and pin held while its native thread computes;
+    semaphore, queued bytes and open files held while its native thread computes;
     with concurrency 1, one thread computes at a time."""
 
     import threading
@@ -1002,11 +1001,11 @@ async def test_cancelled_work_keeps_what_it_holds_until_its_thread_ends(io, tmp_
             t.cancel()
         await asyncio.sleep(0.05)
     assert running[0] == 1 and resolver._queued > 0  # the one computing still holds its room
-    assert any(f.pins for f in cache.files.values())  # and its pin
+    assert any(f.readers for f in cache.files.values())  # and its open files
     go.set()
     await asyncio.gather(*tasks, return_exceptions=True)
     assert peak[0] == 1 and resolver._queued == 0
-    assert not any(f.pins for f in cache.files.values())
+    assert not any(f.readers for f in cache.files.values())
 
 
 @pytest.mark.skipif(not os.path.exists("/proc/self/status"), reason="reads its peak memory from /proc")
@@ -1053,10 +1052,10 @@ async def test_a_page_reads_one_entry_past_itself(io, tmp_path):
     state = await built_index(io, commits=1)
     cache = EngineCache(str(tmp_path))
     assert await cache.fill(io, state)
-    with cache.held(state) as pin:
+    with cache.open_present(state) as opened:
         reads = Reads(recording=True, max_entries=10**6, max_bytes=2**24)
         spec_pin = {"index": state.to_json(), "batch": {"full": True, "after": None, "limit": 100}}
-        read = await each.read_batch(spec_pin, ObjectIO(None, local=pin.handles, served=reads))
+        read = await each.read_batch(spec_pin, ObjectIO(None, local=opened.handles, served=reads))
     assert len(read.upserted) == 100 and read.after is not None
     assert reads.entries == 101
 
@@ -1181,15 +1180,17 @@ async def test_a_page_the_record_cannot_keep_is_never_read(io, tmp_path, monkeyp
     state = await built_index(io, commits=1)
     cache = EngineCache(str(tmp_path))
     assert await cache.fill(io, state)
-    with cache.held(state) as pin:
+    with cache.open_present(state) as opened:
         reads = Reads(recording=True, max_entries=1000, max_bytes=2**24)
-        idx = KeyIndex(ObjectIO(None, local=pin.handles, served=reads), None, state, OPTS)
+        idx = KeyIndex(ObjectIO(None, local=opened.handles, served=reads), None, state, OPTS)
         with pytest.raises(Full):
             await idx.page(None, 1100)
         assert not scanned
         small = Reads(recording=True, max_entries=10**6, max_bytes=2**24, max_decoded=100)
         with pytest.raises(Full):  # the decoded ceiling: stopped in the scan, not after it
-            await KeyIndex(ObjectIO(None, local=pin.handles, served=small), None, state, OPTS).page(None, 500)
+            await KeyIndex(ObjectIO(None, local=opened.handles, served=small), None, state, OPTS).page(
+                None, 500
+            )
 
 
 async def test_start_reads_are_admitted_and_hold_their_room(io, tmp_path, monkeypatch):

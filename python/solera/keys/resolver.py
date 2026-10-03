@@ -122,14 +122,14 @@ class Limits:
 
 class Resolver:
     """`resolve(attempt, body, prepared)`: `prepared(name)` returns the
-    output's `Prepared`, or None when the attempt does not hold it. `holds`,
-    when given, keeps fills in collection's reader pins: `hold(position)`
-    returns a token for `release`."""
+    output's `Prepared`, or None when the attempt does not hold it. `pins`,
+    when given, keeps fills in collection's reader pins: `pin(position)`
+    returns a token for `unpin`."""
 
     def __init__(
-        self, cache: EngineCache, io: ObjectIO, options: Options | None = None, limits=None, holds=None
+        self, cache: EngineCache, io: ObjectIO, options: Options | None = None, limits=None, pins=None
     ):
-        self.cache, self.io, self.holds = cache, io, holds
+        self.cache, self.io, self.pins = cache, io, pins
         self.o = options or Options()
         self.limits = limits or Limits()
         self._sem = asyncio.Semaphore(self.limits.concurrency)
@@ -254,11 +254,11 @@ class Resolver:
         lim = self.limits
         indexed = sum(f.entries for f in p.index.files)
         most = lim.max_keys if kind == "patch" else lim.max_entries - indexed
-        pin = self.cache.pin(p.index)
-        if pin is None:
+        local = self.cache.open(p.index)
+        if local is None:
             self._background_fill(p.index, p.position)
             return {**declined, "reason": "cold"}, None
-        with pin:
+        with local:
             async with self._sem:
                 if not live():
                     return {**declined, "reason": "not_live"}, None
@@ -277,7 +277,7 @@ class Resolver:
                     return {**declined, "reason": "too_big"}, None
                 if kind == "replace" and run.removes:
                     return {**declined, "reason": "invalid"}, None
-                snap = _native.Snapshot(pin.runs)
+                snap = _native.Snapshot(local.runs)
                 try:
                     files, added, removed, changed = await in_thread(
                         snap.resolve,
@@ -310,7 +310,7 @@ class Resolver:
         collection keeps what it reads (taken now, while the request that
         found it cold still holds its own)."""
 
-        token = self.holds.hold(position) if self.holds is not None else None
+        token = self.pins.pin(position) if self.pins is not None else None
 
         async def fill():
             try:
@@ -319,7 +319,7 @@ class Resolver:
                 log.warning("key cache fill of %s: %s", index.prefix, e)
             finally:
                 if token is not None:
-                    self.holds.release(token)
+                    self.pins.unpin(token)
 
         t = asyncio.ensure_future(fill())
         self._fills.add(t)

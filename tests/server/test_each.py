@@ -30,7 +30,7 @@ async def rows_of(engine, project, output, partition=""):
 
 async def records(engine, asset_name, partition=""):
     index = KeyIndex(
-        ObjectIO(engine.state.objects), None, engine.m.index(f"@{asset_name}", partition).pinned()
+        ObjectIO(engine.state.objects), None, engine.m.index(f"@{asset_name}", partition).slice()
     )
     keys, _, payloads, _ = await index.page(None, 10_000)
     return {key_str(k): Record.decode(p) for k, p in zip(keys, payloads, strict=True)}

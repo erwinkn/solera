@@ -147,7 +147,7 @@ class Journal:
 async def index_entries(state, output: str, partition: str) -> dict[str, tuple[int, bytes | None]]:
     """Every live entry of an output partition's key index: key -> (generation, payload)."""
 
-    index = KeyIndex(ObjectIO(state.objects), None, state.model.index(output, partition).pinned())
+    index = KeyIndex(ObjectIO(state.objects), None, state.model.index(output, partition).slice())
     entries, after = {}, None
     while True:
         keys, generations, payloads, after = await index.page(after, 100_000)

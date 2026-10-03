@@ -422,7 +422,7 @@ against `cache_disk`:
 | Operation | Reserves | Released |
 |---|---|---|
 | fill of a file | its local size: what it built to before, else estimated from its compressed data | when installed, or when the fill fails or is canceled (its temporary file deleted) |
-| compaction | its outputs' estimated size, while its inputs stay pinned by readers | when the outputs are installed and the inputs unpinned and evicted |
+| compaction | its outputs' estimated size, while readers still have its inputs open | when the outputs are installed and the inputs closed and evicted |
 | candidate | its delta's decompressed size (below) | when installed, dropped or evicted |
 
 A reservation that cannot be met evicts first (below). If eviction cannot
@@ -477,7 +477,7 @@ So the cache admits by index and evicts by file, with hysteresis:
   locally, without thrash.
 - Eviction order: candidates past their budget, then files of inactive or
   demoted indexes (least recently used), then superseded files (inputs of
-  a finished compaction, unpinned). Never pinned files, never files of an
+  a finished compaction, no longer open). Never open files, never files of an
   active index.
 - An admitted index whose new snapshot no longer fits after a compaction
   or growth is demoted, as above, and re-admitted under the same rule.
@@ -775,7 +775,7 @@ reports both.
   is installed without a GET at commit, and an evicted one costs one GET;
   fills are deduplicated; failed and canceled fills release their
   reservations; a compaction that cannot reserve demotes its index;
-  pinned files survive eviction and garbage collection.
+  open files survive eviction and garbage collection.
 - **Generations.** Resolver deltas, cold deltas, recorded reads and `Keys`
   carry generations; every superseded object of an immutable output is
   cleaned up — by its commit when the old entry was read, by the
