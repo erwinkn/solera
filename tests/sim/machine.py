@@ -836,11 +836,6 @@ class Simulation(RuleBasedStateMachine):
                 rows = await commit_rows(engine, project, "log")
                 tally = await value_content(engine, project, "tally")
                 if tally != {"rows": len(rows)}:
-                    if tally and tally["rows"] > len(rows):
-                        self._known(
-                            "F8",
-                            f"tally counted {tally['rows']} rows of {len(rows)}: a reset read as a delta",
-                        )
                     raise Violation(f"tally {stage}: {tally} for {len(rows)} rows of log")
 
         self._run(check())
