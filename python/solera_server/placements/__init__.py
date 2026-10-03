@@ -2,7 +2,7 @@
 harness somewhere, report when it stopped. It never reads a spec or a result.
 
     Stage    = {"attempt": str, "run": str, "objects": str}
-    RunHandle = JSON dict, recorded (`AttemptPlaced`) for whichever engine follows the attempt
+    AttemptHandle = JSON dict, recorded (`AttemptPlaced`) for whichever engine follows the attempt
     Exit     = {"code": int | None, "reason": str | None, "meta": dict}
 
 `wait` returns an `Exit` only when the provider says the run ended, and
@@ -41,9 +41,9 @@ class ServerPlacement(Protocol):
 
     async def launch(self, stage: dict) -> dict: ...
 
-    async def wait(self, run: dict, timeout: float) -> dict | None: ...
+    async def wait(self, handle: dict, timeout: float) -> dict | None: ...
 
-    async def cancel(self, run: dict) -> None: ...
+    async def cancel(self, handle: dict) -> None: ...
 
 
 class UnavailablePlacement(ServerPlacement):
@@ -55,10 +55,10 @@ class UnavailablePlacement(ServerPlacement):
     async def launch(self, stage):
         raise RuntimeError(f"{self.kind} placement unavailable: {self.error}")
 
-    async def wait(self, run, timeout):
+    async def wait(self, handle, timeout):
         return None
 
-    async def cancel(self, run):
+    async def cancel(self, handle):
         return None
 
 

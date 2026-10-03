@@ -126,10 +126,10 @@ export const q = {
       retry: false,
     }),
 
-  /** Keyed by revision: a deploy changes the key, and the new manifest loads. */
-  manifest: (project: string, revision: string) =>
+  /** Keyed by deploy: a new one changes the key, and the new manifest loads. */
+  manifest: (project: string, deploy: string) =>
     queryOptions({
-      queryKey: ["manifest", revision],
+      queryKey: ["manifest", deploy],
       queryFn: ({ signal }) => api<Manifest>(`${p(project)}/manifest`, { signal }),
       staleTime: Infinity,
     }),
@@ -455,6 +455,6 @@ export function useProject(): string {
 }
 
 export function useManifest(): Manifest {
-  const { project, revision } = useSuspenseQuery(q.diagnostics()).data;
-  return useSuspenseQuery(q.manifest(project, revision)).data;
+  const { project, deploy } = useSuspenseQuery(q.diagnostics()).data;
+  return useSuspenseQuery(q.manifest(project, deploy)).data;
 }

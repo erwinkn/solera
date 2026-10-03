@@ -122,7 +122,7 @@ async def test_a_loser_without_a_channel_exits_on_a_terminal_gate(tmp_path):
 class Duplicate(Remote):
     """The relaunched handle names a duplicate, which exits at once."""
 
-    async def wait(self, run, timeout):
+    async def wait(self, handle, timeout):
         return {"code": 0, "reason": None, "meta": {}}
 
 
@@ -289,8 +289,8 @@ async def test_a_fenced_store_runs_its_retry_at_once(tmp_path):
             super().__init__()
             self.acquired = []
 
-        async def acquire(self, scope, prior=None):
-            self.acquired.append((scope.generation, scope.invocation))
+        async def acquire(self, context, prior=None):
+            self.acquired.append((context.generation, context.invocation))
 
     live = Fenced()
     writes = [Patch([{"id": "a", "v": 1}, {"id": "b", "v": 1}]), Patch([{"id": "a", "v": 2}])]

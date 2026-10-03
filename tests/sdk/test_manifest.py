@@ -53,17 +53,17 @@ def test_brimstone_manifest_snapshot(monkeypatch):
     assert manifest == json.loads(SNAPSHOT.read_text())
 
 
-def test_brimstone_revision_changes_on_change():
-    """§11: the project revision is a digest of the manifest body."""
+def test_brimstone_deploy_changes_on_change():
+    """§11: the deploy is a digest of the manifest body."""
 
     project = load_brimstone()
-    assert project.manifest["revision"] == project.manifest["revision"]
+    assert project.manifest["deploy"] == project.manifest["deploy"]
 
     def other_asset():
         return 1
 
     other = Project(assets=[asset(other_asset)])
-    assert other.manifest["revision"] != project.manifest["revision"]
+    assert other.manifest["deploy"] != project.manifest["deploy"]
 
 
 def test_input_value_must_be_edge_or_str():
@@ -499,7 +499,7 @@ def test_duplicate_migration_names_rejected():
 class Migrating(FileStore):
     """A store that runs migrations."""
 
-    async def migrate(self, output, migrations, scope=None, prior=None):
+    async def migrate(self, output, migrations, context=None, prior=None):
         return [m.name for m in migrations]
 
 

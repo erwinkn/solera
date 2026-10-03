@@ -20,7 +20,7 @@ import base64
 import json
 
 from .. import _native
-from .._native import SortedRun, encode_file
+from .._native import SortedEntries, encode_file
 
 VERSION = 2
 
@@ -82,7 +82,7 @@ class Reads:
         return max(0, self.max_decoded - self.decoded)
 
     def record(self, identity: str, call: str, args: tuple, result, page=None) -> None:
-        """Keep `result` — from the native `page` (a `SortedRun`) when there is
+        """Keep `result` — from the native `page` (a `SortedEntries`) when there is
         one, encoded as it is; `Full` once it would pass the bounds, its
         entries checked before anything is encoded, its bytes after."""
 
@@ -145,7 +145,7 @@ class Reads:
         if c is None:
             return None
         try:
-            keys, generations, deleted, payloads = SortedRun.decode(c["run"]).entries()
+            keys, generations, deleted, payloads = SortedEntries.decode(c["run"]).entries()
         except ValueError:
             return None  # read from the store instead
         if call == "lookup":

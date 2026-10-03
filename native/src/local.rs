@@ -29,6 +29,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::delta::{Delta, Old};
+use crate::entries::SortedEntries;
 use crate::format::Options;
 use crate::format::{
     decompress_at_most, fmt_err, get_bytes, parse_index, put_bytes, shared_prefix, slice_at, Error,
@@ -36,7 +37,6 @@ use crate::format::{
 };
 use crate::jobs::{Join, Step};
 use crate::rows::Source;
-use crate::run::SortedRun;
 use crate::stream::{read_entry, write_entry, Block, Merge, Next};
 
 pub const MAGIC: &[u8; 4] = b"KXL3";
@@ -518,7 +518,7 @@ impl Snapshot {
     /// block; anything else is the streaming job, fed local blocks.
     pub fn resolve(
         &mut self,
-        run: &Arc<SortedRun>,
+        run: &Arc<SortedEntries>,
         replace: bool,
         generation: u64,
         o: Options,
@@ -585,12 +585,12 @@ impl Snapshot {
         limit: usize,
         drop_deleted: bool,
         max_bytes: u64,
-    ) -> Result<(SortedRun, Option<Vec<u8>>)> {
+    ) -> Result<(SortedEntries, Option<Vec<u8>>)> {
         let mut m = self.merge();
         if let Some(a) = after {
             m.feed.seek(self, a);
         }
-        let mut page = SortedRun::default();
+        let mut page = SortedEntries::default();
         while m.advance()? {
             let e = &m.merge;
             if after.is_some_and(|a| e.key() <= a) || (drop_deleted && e.deleted()) {

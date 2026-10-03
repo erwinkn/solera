@@ -100,7 +100,7 @@ async def test_every_boundary_once(tmp_path):
     await state.durable()
     again = await State.open(url, "test", clock=clock, writer=False)
     live, replayed = json.loads(json.dumps(m.snapshot())), json.loads(json.dumps(again.model.snapshot()))
-    live.pop("writer"), replayed.pop("writer")
+    live.pop("engine"), replayed.pop("engine")
     assert replayed == live
     await engine.stop()
     await state.close()

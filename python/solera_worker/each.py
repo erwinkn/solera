@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 
 from solera import errors
 from solera.failures import REMOVED, UNMATCHED, Outcome, Record, eligible, minima, transition
-from solera.keys import SortedRun
+from solera.keys import SortedEntries
 from solera.keys.index import IndexState, KeyIndex, key_bytes, key_str
 from solera.patterns import Matcher
 from solera.sdk import UNSET, Ref, Result
@@ -176,7 +176,7 @@ async def read_page(spec: dict, pin: dict, keys_io) -> Page:
         for k, p in zip(keys, payloads, strict=True):
             key = key_str(k)
             record = walked[key] = Record.decode(p)
-            if eligible(record, each["now"], int(each["epoch"]), each.get("forced") or {}):
+            if eligible(record, each["now"], int(each["deploy"]), each.get("forced") or {}):
                 due.append(key)
             end = key
             if len(due) >= limit or len(walked) >= WALK * limit:
@@ -453,13 +453,13 @@ async def _failures(spec, each: dict, page: Page, outcomes: dict, keys_io) -> di
     failure index's delta, and report the outcome counts' transitions and
     the bounds the commit lowers or accumulates."""
 
-    epoch, forced = int(each["epoch"]), int(each.get("forced_pos") or 0)
+    deploy, forced = int(each["deploy"]), int(each.get("forced_pos") or 0)
     retries = int(each.get("retries") or 0)
     records, transitions = {}, Counter()
     upsert_keys, upsert_records, removes = [], [], []
     for key, outcome in sorted(outcomes.items()):
         prior = page.priors.get(key)
-        record = transition(prior, outcome, now=time.time(), epoch=epoch, forced=forced, retries=retries)
+        record = transition(prior, outcome, now=time.time(), deploy=deploy, forced=forced, retries=retries)
         records[key] = record
         if prior is not None:
             transitions[prior.name] -= 1
@@ -472,27 +472,27 @@ async def _failures(spec, each: dict, page: Page, outcomes: dict, keys_io) -> di
             removes.append(key_bytes(key))
     index = KeyIndex(keys_io, None, IndexState.from_json(each["failures"]))
     files, _ = await index.resolve(
-        SortedRun.of(upsert_keys, upsert_records, removes),
+        SortedEntries.of(upsert_keys, upsert_records, removes),
         batch=int(each["batch"]),
         attempt=spec["attempt"],
         generation=int(spec.get("generation") or 0),
         exact=True,
     )
-    due, epoch_min = minima(records.values())
+    due, deploy_min = minima(records.values())
     report = {
         "keys": files.to_json(),
         "counts": {k: v for k, v in transitions.items() if v},
         "due": due,
-        "epoch_min": epoch_min,
+        "deploy_min": deploy_min,
         "records": records,
     }
     pass_after = each.get("pass_after")
     if page.kind == "retry":
         # The walked range's records, as this page leaves them: the pass's accumulators (§9).
         walked = [records[k] if k in records else r for k, r in page.walked.items()]
-        report["range"] = dict(zip(("due", "epoch_min"), minima(walked), strict=True))
+        report["range"] = dict(zip(("due", "deploy_min"), minima(walked), strict=True))
     elif pass_after is not None:
         bound = key_bytes(pass_after)
         behind = [r for k, r in records.items() if key_bytes(k) <= bound]
-        report["fold"] = dict(zip(("due", "epoch_min"), minima(behind), strict=True))
+        report["fold"] = dict(zip(("due", "deploy_min"), minima(behind), strict=True))
     return report

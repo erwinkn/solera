@@ -149,9 +149,9 @@ class Model:
         return copy.deepcopy(
             {
                 "applied": self.applied,
-                "writer": self.writer,
-                "revision": self.revision,
-                "epoch": self.epoch,
+                "engine": self.engine,
+                "deploy": self.deploy,
+                "deploy_number": self.deploy_number,
                 "manifest": self.manifest,
                 "project": self.project,
                 "heads": _nest(self.heads, 2),
@@ -173,11 +173,11 @@ class Model:
         snap = copy.deepcopy(snap) if snap else {}
         # durable
         self.applied: int = snap.get("applied") or 0
-        self.writer = snap.get("writer")
-        self.revision = snap.get("revision")
-        # how many project revisions this namespace has served: the revision
-        # epoch, which gives failed keys one try per deploy (per-key §13)
-        self.epoch: int = snap.get("epoch") or 0
+        self.engine = snap.get("engine")
+        self.deploy = snap.get("deploy")
+        # how many deploys this namespace has served: what gives failed keys
+        # one try per deploy (per-key §13)
+        self.deploy_number: int = snap.get("deploy_number") or 0
         self.manifest = snap.get("manifest")
         self.project = snap.get("project")
         self.heads = Grouped(_flatten(snap.get("heads"), 2))
@@ -506,14 +506,14 @@ class Model:
         self.applied += 1
         getattr(self, f"_on_{event['type']}")(event)
 
-    def _on_WriterStarted(self, e):
-        self.writer = e.get("writer")
+    def _on_EngineStarted(self, e):
+        self.engine = e.get("engine")
 
     def _on_ProjectRegistered(self, e):
         manifest = e["manifest"]
-        if e["revision"] != self.revision:
-            self.epoch += 1
-        self.revision, self.manifest, self.project = e["revision"], manifest, e.get("project")
+        if e["deploy"] != self.deploy:
+            self.deploy_number += 1
+        self.deploy, self.manifest, self.project = e["deploy"], manifest, e.get("project")
         self._consumed = self._consumed_outputs(manifest)
         renamed, output_map = self._apply_aliases(manifest)
         self._reconcile_tasks(manifest, renamed, output_map, e["at"])
@@ -528,11 +528,11 @@ class Model:
                     existing = self.automations.get(f"{old}.{rest}")
                     if existing is not None:
                         break
-            record = {**auto, "last_at": None, "last_run": None, "last_revision": None, "pending": []}
+            record = {**auto, "last_at": None, "last_run": None, "last_deploy": None, "pending": []}
             if existing is not None:
                 record["enabled"] = existing["enabled"]
                 if existing["trigger"] == auto["trigger"]:
-                    for field in ("last_at", "last_run", "last_revision", "pending"):
+                    for field in ("last_at", "last_run", "last_deploy", "pending"):
                         record[field] = existing.get(field, record[field])
             automations[name] = record
         self.automations = automations
@@ -777,7 +777,7 @@ class Model:
             task["held"] = held
             self._event(self.runs[task["run"]], "held", e["at"], tid, reason=held[0], name=held[1])
 
-    def _on_EngineRestarted(self, e):
+    def _on_EngineOutage(self, e):
         """The engine was down from `down` (the last time it said it was
         alive) to `at`: every run in progress records the outage, and its
         tasks' wait leaves it out."""
@@ -1039,7 +1039,7 @@ class Model:
             index = self.index(name, scope).committed(f["batch"], DeltaFiles.from_json(keys), keep_log=False)
             self.indexes[(name, scope)] = index
             record["batch"] = f["batch"]
-        for field in ("counts", "due", "epoch_min", "retry", "passes", "done_forced", "last", "config"):
+        for field in ("counts", "due", "deploy_min", "retry", "passes", "done_forced", "last", "config"):
             if field in f:
                 record[field] = f[field]
 
@@ -1370,8 +1370,8 @@ class Model:
         auto["last_at"] = e["at"]
         if e.get("run"):
             auto["last_run"] = e["run"]
-        if "revision" in e:
-            auto["last_revision"] = e["revision"]
+        if "deploy" in e:
+            auto["last_deploy"] = e["deploy"]
         consumed = e.get("consumed") or []
         auto["pending"] = [p for p in auto["pending"] if p not in consumed]
 

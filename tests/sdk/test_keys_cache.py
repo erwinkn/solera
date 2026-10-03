@@ -11,7 +11,7 @@ import zlib
 import pytest
 from obstore.store import MemoryStore
 from solera import _native
-from solera.keys import FOOTER_SIZE, SortedRun, _python
+from solera.keys import FOOTER_SIZE, SortedEntries, _python
 from solera.keys.cache import Corrupt, EngineCache
 from solera.keys.index import FileInfo, IndexState, KeyIndex, Options
 from solera.keys.io import ObjectIO
@@ -40,7 +40,10 @@ async def built_index(io, n=3000, commits=12, seed=1):
         ks = sorted({key(rng.randrange(n)) for _ in range(n if b == 0 else 300)})
         rm = sorted({key(rng.randrange(n)) for _ in range(30)} - set(ks)) if b else []
         files, _ = await KeyIndex(io, None, state, OPTS).resolve(
-            SortedRun.of(ks, [rng.randbytes(8) for _ in ks], rm), batch=b, attempt=f"w{b}", generation=b + 1
+            SortedEntries.of(ks, [rng.randbytes(8) for _ in ks], rm),
+            batch=b,
+            attempt=f"w{b}",
+            generation=b + 1,
         )
         state = state.committed(b, files, keep_log=False)
         while (out := await KeyIndex(io, None, state, OPTS).compact()) is not None:
@@ -53,7 +56,7 @@ def prepared(state, batch=99, generation=100, replace=True):
 
 
 def ask(state, keys, versions, removes=(), kind="patch", batch=99, generation=100):
-    run = SortedRun.of(list(keys), list(versions), list(removes))
+    run = SortedEntries.of(list(keys), list(versions), list(removes))
     return Ask("out", "", kind, batch, generation, state.prefix, 98, run)
 
 
@@ -98,7 +101,7 @@ async def test_engine_and_cold_resolves_agree(io, tmp_path):
             )
         else:
             files, _ = await idx.resolve(
-                SortedRun.of(ks, vs, rm), batch=99, attempt=f"c{step}", generation=100, exact=True
+                SortedEntries.of(ks, vs, rm), batch=99, attempt=f"c{step}", generation=100, exact=True
             )
         cold = decoded([await io.read_whole(state.path(f.name), f.size) for f in files.files])
         if answer["result"] == "empty":
@@ -635,7 +638,10 @@ async def logged_index(io, seed=3):
         ks = sorted({key(rng.randrange(2000)) for _ in range(2000 if b == 0 else 200)})
         rm = sorted({key(rng.randrange(2000)) for _ in range(40)} - set(ks)) if b else []
         files, _ = await KeyIndex(io, None, state, OPTS).resolve(
-            SortedRun.of(ks, [rng.randbytes(8) for _ in ks], rm), batch=b, attempt=f"w{b}", generation=b + 1
+            SortedEntries.of(ks, [rng.randbytes(8) for _ in ks], rm),
+            batch=b,
+            attempt=f"w{b}",
+            generation=b + 1,
         )
         state = state.committed(b, files, keep_log=True)
         while (out := await KeyIndex(io, None, state, OPTS).compact()) is not None:
@@ -761,7 +767,7 @@ async def test_long_paths_make_short_local_names(io, tmp_path):
 
     state = IndexState(prefix=f"keys/out/{'s' * 180}/")
     files, _ = await KeyIndex(io, None, state, OPTS).resolve(
-        SortedRun.of([key(i) for i in range(100)], [b"v"] * 100), batch=0, attempt="0" * 26
+        SortedEntries.of([key(i) for i in range(100)], [b"v"] * 100), batch=0, attempt="0" * 26
     )
     state = state.committed(0, files, keep_log=False)
     cache = EngineCache(str(tmp_path))
@@ -976,7 +982,7 @@ async def test_cancelled_work_keeps_what_it_holds_until_its_thread_ends(io, tmp_
                     running[0] -= 1
 
     monkeypatch.setattr(resolver_module._native, "Snapshot", Gated)
-    runs = [SortedRun.of([key(i)], [b"v%d" % i]) for i in range(3)]
+    runs = [SortedEntries.of([key(i)], [b"v%d" % i]) for i in range(3)]
     tasks = [
         asyncio.ensure_future(resolver.compute(prepared(state), "patch", r, "keys/out/_/x.kx")) for r in runs
     ]

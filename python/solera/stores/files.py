@@ -19,8 +19,8 @@ from . import (
     Keys,
     Patch,
     Prepared,
-    Scope,
     StoreError,
+    WriteContext,
     WriteError,
     Written,
     _segment,
@@ -94,32 +94,32 @@ class FileStore:
 
     # -- writes ---------------------------------------------------------------
 
-    async def store(self, write, prior: Ref | None, scope: Scope) -> Written:
-        output = scope.output
+    async def store(self, write, prior: Ref | None, context: WriteContext) -> Written:
+        output = context.output
         if prior is not None and prior.meta.get("external"):
             raise WriteError(f"{output.name}: cannot write an external source ref")
         patch = isinstance(write, Patch)
         if patch and not output.incremental:
             raise WriteError(f"{output.name}: Patch requires an incremental output")
-        base = self._base(output, scope, prior)
-        if scope.reset:
+        base = self._base(output, context, prior)
+        if context.reset:
             prior = None  # where the content is, but nothing of it is kept
-        generation = int(scope.generation or 0)
+        generation = int(context.generation or 0)
         if output.key is not None:
             if not isinstance(write, KeyedWrite):
                 write = await asyncio.to_thread(KeyedWrite.of, self, write, output, prior)
             if output.is_partition_set:
-                return await self._store_set(write, prior, scope, base, generation)
-            return await self._store_keyed(write, prior, scope, base, generation)
+                return await self._store_set(write, prior, context, base, generation)
+            return await self._store_keyed(write, prior, context, base, generation)
         if output.incremental:
             if not patch:
                 raise WriteError(f"{output.name}: an unkeyed incremental output only accepts Patch writes")
-            return await self._store_batch(write, prior, scope, base, generation)
+            return await self._store_batch(write, prior, context, base, generation)
         name = f"{base}@{generation}"
         await self._put(name, write)
-        return Written(self._ref(scope, {"mode": "value", "path": name, "base": base}))
+        return Written(self._ref(context, {"mode": "value", "path": name, "base": base}))
 
-    async def _store_set(self, write: KeyedWrite, prior, scope, base, generation) -> Written:
+    async def _store_set(self, write: KeyedWrite, prior, context, base, generation) -> Written:
         """A partition set: its element list, as one value."""
 
         elements = write.prepared.take(None)
@@ -128,9 +128,9 @@ class FileStore:
             elements = [e for e in await self._elements(prior) if e not in drop] + elements
         name = f"{base}@{generation}"
         await self._put(name, elements)
-        return Written(self._ref(scope, {"mode": "set", "path": name, "base": base}))
+        return Written(self._ref(context, {"mode": "set", "path": name, "base": base}))
 
-    async def _store_keyed(self, write: KeyedWrite, prior, scope, base, generation) -> Written:
+    async def _store_keyed(self, write: KeyedWrite, prior, context, base, generation) -> Written:
         """One object per key and generation: the keys the write's delta
         writes, each named by the generation the key index will hold, so no
         object goes unnamed — only their groups are read from the write.
@@ -141,16 +141,16 @@ class FileStore:
             key, group = entry
             await self._put(self.key_name(base, key, generation), group)
 
-        async for page in write.pages():
-            await self._many(put, page)
-        return Written(self._ref(scope, {"mode": "keyed", "path": base, "key": scope.output.key}))
+        async for chunk in write.chunks():
+            await self._many(put, chunk)
+        return Written(self._ref(context, {"mode": "keyed", "path": base, "key": context.output.key}))
 
-    async def _store_batch(self, write: Patch, prior, scope, base, generation) -> Written:
+    async def _store_batch(self, write: Patch, prior, context, base, generation) -> Written:
         """An unkeyed incremental write: its items, as one object per batch.
         With no prior (a first write, or a reset) the output starts over at
         this batch; earlier ones are no longer read, and go with `discard`."""
 
-        output = scope.output
+        output = context.output
         if write.remove:
             raise WriteError(f"{output.name}: remove is not allowed on an unkeyed incremental output")
         items = write.rows
@@ -160,20 +160,20 @@ class FileStore:
             raise WriteError(f"{output.name}: a batch is a list, got {type(items).__name__}")
         if not items and prior is not None:
             return Written(prior)
-        if scope.batch is not None:
-            batch = scope.batch
+        if context.batch is not None:
+            batch = context.batch
         else:
             batch = int(prior.handle["batches"][1]) + 1 if prior is not None else 0
         await self._put(f"{base}/{batch:012d}/{generation}", items)
         first = batch if prior is None else int(prior.handle["batches"][0])
         handle = {"mode": "batches", "path": base, "batches": [first, batch]}
-        return Written(self._ref(scope, handle))
+        return Written(self._ref(context, handle))
 
     @staticmethod
     def key_name(base: str, key: str, generation: int) -> str:
         return f"{base}/{_segment(key)}/{int(generation)}"
 
-    async def discard(self, scope: Scope, prior: Ref | None, items: list) -> None:
+    async def discard(self, context: WriteContext, prior: Ref | None, items: list) -> None:
         """Delete objects nothing reads any more (docs/lifecycle.md §9.8):
         superseded ones, and what attempts that never committed wrote.
         `items` name them: `("key", key, generation)`,
@@ -181,7 +181,7 @@ class FileStore:
         or `("batches", lo, hi)` — every object of batches lo..hi. Names are
         never reused, so deleting one twice is no harm."""
 
-        base = self._base(scope.output, scope, prior)
+        base = self._base(context.output, context, prior)
         names, ranges = [], []
         for item in items:
             kind = item[0]
@@ -196,7 +196,7 @@ class FileStore:
             elif kind == "batches":
                 ranges.append((int(item[1]), int(item[2])))
             else:
-                raise StoreError(f"{scope.output.name}: cannot discard {item!r}")
+                raise StoreError(f"{context.output.name}: cannot discard {item!r}")
         if ranges:
             import obstore
 
@@ -304,7 +304,7 @@ class FileStore:
     # -- objects ----------------------------------------------------------------
 
     @staticmethod
-    def _base(output, scope, prior) -> str:
+    def _base(output, context, prior) -> str:
         """Where the scope's content lives: the prior's place, so a renamed
         output keeps its objects where they are (§2)."""
 
@@ -312,7 +312,7 @@ class FileStore:
         if "base" in handle or "path" in handle:
             return handle.get("base") or handle["path"]
         name = _segment(output.name)
-        return f"{name}/{_segment(scope.partition)}" if scope.partition else name
+        return f"{name}/{_segment(context.partition)}" if context.partition else name
 
     async def _put(self, base: str, value) -> None:
         """Create `value` at `base`, once. The same name written again is the
@@ -364,8 +364,8 @@ class FileStore:
         return results
 
     @staticmethod
-    def _ref(scope, handle) -> ObjectRef:
-        return ObjectRef(output=scope.output.name, store="", handle=handle, partition=scope.partition)
+    def _ref(context, handle) -> ObjectRef:
+        return ObjectRef(output=context.output.name, store="", handle=handle, partition=context.partition)
 
 
 def _batch_of(base: str, path: str) -> tuple[int, int] | None:

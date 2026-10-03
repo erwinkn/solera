@@ -233,14 +233,14 @@ pub enum State {
 /// One sorted sequence of entries — a file, or a level's files in key order —
 /// fed a segment at a time. Only the blocks being read are decoded.
 #[derive(Default)]
-pub struct Run {
+pub struct Stream {
     segs: VecDeque<(Segment, usize)>,
     ready: VecDeque<Block>,
     pos: usize,
     ended: bool,
 }
 
-impl Run {
+impl Stream {
     pub fn feed(&mut self, seg: Segment) {
         self.segs.push_back((seg, 0));
     }
@@ -309,7 +309,7 @@ impl Run {
 
 pub enum Next {
     Entry,
-    /// Run `r` needs its next segment (or `end`) before the merge can go on.
+    /// Stream `r` needs its next segment (or `end`) before the merge can go on.
     Need(usize),
     End,
 }
@@ -317,7 +317,7 @@ pub enum Next {
 /// The newest-wins merge of runs, newest first: for each key, the entry of
 /// the lowest-numbered run holding it.
 pub struct Merge {
-    pub runs: Vec<Run>,
+    pub runs: Vec<Stream>,
     heap: Vec<usize>,
     pending: Vec<usize>,
     cur: (usize, usize),
@@ -327,7 +327,7 @@ pub struct Merge {
 impl Merge {
     pub fn new(runs: usize) -> Merge {
         Merge {
-            runs: (0..runs).map(|_| Run::default()).collect(),
+            runs: (0..runs).map(|_| Stream::default()).collect(),
             heap: Vec::with_capacity(runs),
             pending: (0..runs).rev().collect(),
             cur: (usize::MAX, 0),

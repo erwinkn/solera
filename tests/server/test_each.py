@@ -114,7 +114,7 @@ async def test_failures_are_recorded_and_never_block(state):  # noqa: F811
         "slow.csv": RETRYING,
     }
     assert found["bug.csv"].message == "ValueError: unexpected header" and found["bug.csv"].tries == 1
-    assert record["due"] == found["slow.csv"].next_at and record["epoch_min"] == engine.m.epoch
+    assert record["due"] == found["slow.csv"].next_at and record["deploy_min"] == engine.m.deploy_number
     outcomes = await engine.history.query(
         lambda con: con.execute("SELECT key, outcome FROM key_outcomes ORDER BY key").fetchall(),
         ("key_outcomes",),
@@ -194,8 +194,8 @@ async def test_failed_keys_get_one_try_per_deploy(state):  # noqa: F811
     detail = await drive(engine, await engine.submit(["parse"]))
     assert tries["n"] == 1 and task_statuses(detail)["parse"] == "skipped"
     # A new revision: one more try, and only one.
-    manifest = {**engine.manifest, "revision": "next"}
-    engine.state.record({"type": "ProjectRegistered", "revision": "next", "manifest": manifest, "at": 0.0})
+    manifest = {**engine.manifest, "deploy": "next"}
+    engine.state.record({"type": "ProjectRegistered", "deploy": "next", "manifest": manifest, "at": 0.0})
     await drive(engine, await engine.submit(["parse"]))
     assert tries["n"] == 2
     await drive(engine, await engine.submit(["parse"]))
@@ -395,13 +395,13 @@ async def test_a_retry_pass_spans_pages_and_accumulates_its_bounds(state):  # no
     await engine.initialize()
     await drive(engine, await engine.submit(["parse"], upstream=True))
     record = engine.m.scope("parse", "")["failures"]
-    assert record["counts"] == {"failed": 5} and record["epoch_min"] == engine.m.epoch
+    assert record["counts"] == {"failed": 5} and record["deploy_min"] == engine.m.deploy_number
 
     # A deploy fixes the bug; a new file arrives at the same time.
     broken["on"] = False
     content["new"] = {"n": 9}
     engine.state.record(
-        {"type": "ProjectRegistered", "revision": "fixed", "manifest": dict(engine.manifest), "at": 0.0}
+        {"type": "ProjectRegistered", "deploy": "fixed", "manifest": dict(engine.manifest), "at": 0.0}
     )
     detail = await drive(engine, await engine.submit(["parse"], upstream=True))
     task = next(t for t in detail["tasks"] if t["asset"] == "parse")
@@ -409,7 +409,7 @@ async def test_a_retry_pass_spans_pages_and_accumulates_its_bounds(state):  # no
     assert sum(k.get("ok", 0) for k in kinds) == 6
     record = engine.m.scope("parse", "")["failures"]
     assert record["counts"] == {} and record["retry"] is None
-    assert record["due"] is None and record["epoch_min"] is None  # exact once the pass completed
+    assert record["due"] is None and record["deploy_min"] is None  # exact once the pass completed
     assert len(await rows_of(engine, project, "samples")) == 6
 
 

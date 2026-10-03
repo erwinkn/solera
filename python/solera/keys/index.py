@@ -29,10 +29,10 @@ from .. import _native
 from ..ids import ulid
 from . import (
     FOOTER_SIZE,
-    Job,
     LimitError,
+    Merge,
     Rows,
-    SortedRun,
+    SortedEntries,
     check_block,
     jobs,
     merge_page,
@@ -67,7 +67,7 @@ def digest(data: bytes) -> str:
 def delta_keys(data: bytes) -> tuple[list[bytes], list[bytes]]:
     """A delta file's written keys, and its deleted keys."""
 
-    keys, _, deleted, _ = SortedRun.decode(data).entries()
+    keys, _, deleted, _ = SortedEntries.decode(data).entries()
     return [k for k, d in zip(keys, deleted, strict=True) if not d], [
         k for k, d in zip(keys, deleted, strict=True) if d
     ]
@@ -284,16 +284,16 @@ class DeltaKeys:
     prefix: str
     files: tuple[FileInfo, ...]
 
-    async def pages(self, size: int = 100_000):
-        """Pages of the written keys, as `str`."""
+    async def chunks(self, size: int = 100_000):
+        """Chunks of the written keys, as `str`."""
 
         index = KeyIndex(self.io, self.prefix, IndexState(log=((0, self.files),), prefix=self.prefix))
         after = None
         while self.files:
             keys, _, deleted, _, after = await index.pending(0, 0, after, size)
-            page = [key_str(k) for k, d in zip(keys, deleted, strict=True) if not d]
-            if page:
-                yield page
+            chunk = [key_str(k) for k, d in zip(keys, deleted, strict=True) if not d]
+            if chunk:
+                yield chunk
             if after is None:
                 return
 
@@ -483,7 +483,7 @@ class KeyIndex:
 
     async def resolve(
         self,
-        run: SortedRun,
+        run: SortedEntries,
         *,
         batch: int,
         attempt: str,
@@ -510,12 +510,12 @@ class KeyIndex:
         self.route = "sparse"
         return await self.write(batch, attempt, delta), delta.listed
 
-    async def changes(self, run: SortedRun, *, generation: int = 0, exact: bool = False) -> Delta:
+    async def changes(self, run: SortedEntries, *, generation: int = 0, exact: bool = False) -> Delta:
         """A patch's delta through the sparse reader whatever its size, not written."""
 
         return await self._sparse(run, generation, exact=exact, collect=0, switch=False)
 
-    async def _sparse(self, run: SortedRun, generation: int, *, exact: bool, collect: int, switch: bool):
+    async def _sparse(self, run: SortedEntries, generation: int, *, exact: bool, collect: int, switch: bool):
         """The sparse reader's delta; None when `switch` and streaming would read less."""
 
         sparse = await self._find(run, exact=exact, switch=switch)
@@ -537,7 +537,7 @@ class KeyIndex:
         keys = sorted(set(keys))
 
         async def store():
-            run = SortedRun.of(keys)
+            run = SortedEntries.of(keys)
             return (await self._find(run, exact=True, switch=False)).live()
 
         async def local(snap, _ceiling):
@@ -589,12 +589,12 @@ class KeyIndex:
             await in_thread(served.record, self.identity, call, args, out, page)
         return out
 
-    async def _stream(self, run: SortedRun, batch, attempt, generation, collect):
+    async def _stream(self, run: SortedEntries, batch, attempt, generation, collect):
         """The streaming merge-join of a patch with every level."""
 
         self.route = "stream"
         runs = self.state.newest_first()
-        job = Job.patch(run, len(runs), **self._writer(), collect=collect, generation=generation)
+        job = Merge.patch(run, len(runs), **self._writer(), collect=collect, generation=generation)
         files = await self._run(job, runs, lambda n: f"{batch:012d}-{attempt}.{n:04d}", 0)
         return DeltaFiles(files, job.added, job.removed, True), job.collected()
 
@@ -607,7 +607,7 @@ class KeyIndex:
         collect: int = 0,
         key: str | None = None,
         generation: int = 0,
-        overlay: SortedRun | None = None,
+        overlay: SortedEntries | None = None,
     ) -> tuple[DeltaFiles, tuple[list[bytes], list[bytes]] | None]:
         """A full replacement: `rows` is the whole new content — a `Rows`, or
         chunks of keys sorted, pulled as needed (with `key`, rows keyed by
@@ -621,7 +621,7 @@ class KeyIndex:
         patch over the keys a store holds, read back."""
 
         runs = self.state.newest_first()
-        job = Job.replace(
+        job = Merge.replace(
             rows if isinstance(rows, Rows) else None,
             len(runs),
             **self._writer(),
@@ -644,7 +644,7 @@ class KeyIndex:
         }
 
     async def _run(
-        self, job: Job, runs, name=None, level: int = 0, rows=None, on_garbage=None
+        self, job: Merge, runs, name=None, level: int = 0, rows=None, on_garbage=None
     ) -> list[FileInfo]:
         """Drive a streaming job over `runs`; its files are written as `name(n)`, at
         `level`. When the `io`'s local copies hold every file of `runs`, the
@@ -669,7 +669,7 @@ class KeyIndex:
         )
         return [files[n] for n in sorted(files)]
 
-    async def _find(self, run: SortedRun, *, exact: bool, switch: bool):
+    async def _find(self, run: SortedEntries, *, exact: bool, switch: bool):
         """What the index holds for each entry of `run`, as a native `Sparse`
         state — read live or deleted, absent by the key filters, or, for an
         upsert carrying no payload, live by the key and tombstone filters.
@@ -849,7 +849,7 @@ class KeyIndex:
         """Count live keys exactly: one streaming pass over the whole index,
         over the `io`'s local copies when they hold it (`_run`)."""
 
-        job = Job.count(len(runs := self.state.newest_first()))
+        job = Merge.count(len(runs := self.state.newest_first()))
         await self._run(job, runs)
         return job.live
 
@@ -913,7 +913,7 @@ class KeyIndex:
         for lv, group in itertools.groupby(inputs, lambda f: f.level):
             group = list(group)
             runs += [[f] for f in group] if lv == 0 else [group]
-        job = Job.compact(len(runs), drop_deleted=drop, garbage=garbage, **self._writer())
+        job = Merge.compact(len(runs), drop_deleted=drop, garbage=garbage, **self._writer())
         # A level-0 file is as recent as its newest input: level 0 orders by name, and delta
         # names start with their batch.
         stamp = ulid() if out_level else f"{inputs[0].name.split('-', 1)[0]}-c{ulid()}"

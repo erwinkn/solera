@@ -1690,7 +1690,7 @@ class Project:
             # How user errors are classified changes what failures become (per-key §8).
             "errors": describe_errors(self.errors),
         }
-        return {**body, "revision": digest(body)}
+        return {**body, "deploy": digest(body)}
 
     def _executors(self) -> dict[str, dict]:
         """`Project(executors=)`, by name: one kind and environment per name."""

@@ -46,7 +46,7 @@ class Record:
 
     outcome: int
     tries: int
-    epoch: int
+    deploy: int
     forced: int
     since: int
     last: int
@@ -63,7 +63,7 @@ class Record:
         out = bytearray([self.outcome])
         for n in (
             self.tries,
-            self.epoch,
+            self.deploy,
             self.forced,
             self.since,
             self.last,
@@ -102,7 +102,7 @@ class Outcome:
 
 
 def transition(
-    prior: Record | None, outcome: Outcome, *, now: float, epoch: int, forced: int, retries: int
+    prior: Record | None, outcome: Outcome, *, now: float, deploy: int, forced: int, retries: int
 ) -> Record | None:
     """The key's record after `outcome` (§9's transition table): `None` for
     no record — nothing, or a tombstone where `prior` existed. `epoch` and
@@ -116,7 +116,7 @@ def transition(
     counted = 0 if code == CANCELED else 1  # a cancel interrupted the try: it does not count
     tries = counted if fresh else prior.tries + counted
     since = t if fresh else prior.since
-    record = Record(code, tries, epoch, forced, since, t, 0, 0, outcome.upstream, outcome.message)
+    record = Record(code, tries, deploy, forced, since, t, 0, 0, outcome.upstream, outcome.message)
     # Deadlines are computed from the exact time, then rounded up: a budget or a wait
     # is never shortened by the rounding.
     if code == RETRYING:
@@ -135,7 +135,7 @@ def transition(
     return record
 
 
-def eligible(record: Record, now: float, epoch: int, forced: dict[str, int]) -> bool:
+def eligible(record: Record, now: float, deploy: int, forced: dict[str, int]) -> bool:
     """Whether a retry pass takes `record`'s key (§9). Each clause retires
     itself: a retried key's `next_at` moves on, its `epoch` becomes the
     pass's, its `forced` the pass's position. A canceled key matches only a
@@ -143,7 +143,7 @@ def eligible(record: Record, now: float, epoch: int, forced: dict[str, int]) -> 
 
     return (
         (record.outcome in (RETRYING, TIMED_OUT) and record.next_at <= now)
-        or (record.outcome == FAILED and record.epoch < epoch)
+        or (record.outcome == FAILED and record.deploy < deploy)
         or record.forced < int(forced.get(record.name, 0))
     )
 
@@ -153,15 +153,15 @@ def minima(records) -> tuple[int | None, int | None]:
     records, and the lowest `epoch` of failed ones — `None` where there are
     none."""
 
-    due = epoch = None
+    due = deploy = None
     for r in records:
         if r is None:
             continue
         if r.outcome in (RETRYING, TIMED_OUT):
             due = r.next_at if due is None else min(due, r.next_at)
         elif r.outcome == FAILED:
-            epoch = r.epoch if epoch is None else min(epoch, r.epoch)
-    return due, epoch
+            deploy = r.deploy if deploy is None else min(deploy, r.deploy)
+    return due, deploy
 
 
 def lower(a: int | float | None, b: int | float | None):

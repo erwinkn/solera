@@ -146,8 +146,8 @@ class LocalPlacement:
             "host": socket.gethostname(),
         }
 
-    async def wait(self, run: dict, timeout: float) -> dict | None:
-        launch = run.get("launch")
+    async def wait(self, handle: dict, timeout: float) -> dict | None:
+        launch = handle.get("launch")
         done = _exits.get(launch)
         if done is not None:
             # Our own child: its reaper says how it ended.
@@ -160,9 +160,9 @@ class LocalPlacement:
         # Adopted after a restart, so not our child: watch whether it lives.
         deadline = time.monotonic() + timeout
         while True:
-            alive = await _same(run)
+            alive = await _same(handle)
             if alive is None:
-                raise LookupError(f"process {run['pid']} on {run.get('host')} cannot be told from here")
+                raise LookupError(f"process {handle['pid']} on {handle.get('host')} cannot be told from here")
             if not alive:
                 return {"code": None, "reason": "lost", "meta": {}}
             remaining = deadline - time.monotonic()
@@ -177,8 +177,8 @@ class LocalPlacement:
         if done is not None:
             done.add_done_callback(lambda _: _exits.pop(run.get("launch"), None))
 
-    async def cancel(self, run: dict) -> None:
-        launch = run.get("launch")
+    async def cancel(self, handle: dict) -> None:
+        launch = handle.get("launch")
         process = _running.get(launch)
         if process is not None:
             with contextlib.suppress(ProcessLookupError, PermissionError):
@@ -189,16 +189,16 @@ class LocalPlacement:
                 os.killpg(process.pid, signal.SIGKILL)
             return  # its reaper cleans up
         # Adopted: signal only the very process the handle names, checked each time.
-        if not await _same(run):
+        if not await _same(handle):
             return
         with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.kill(run["pid"], signal.SIGTERM)
+            os.kill(handle["pid"], signal.SIGTERM)
         for _ in range(50):
             await asyncio.sleep(0.1)
-            if not await _same(run):
+            if not await _same(handle):
                 return
         with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.kill(run["pid"], signal.SIGKILL)
+            os.kill(handle["pid"], signal.SIGKILL)
 
 
 async def load_manifest(project: str, *, timeout: float = 60):

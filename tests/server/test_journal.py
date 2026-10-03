@@ -25,8 +25,8 @@ class Counter:
         self.writers = list(snap["writers"]) if snap else []
 
     def apply(self, event):
-        if event["type"] == "WriterStarted":
-            self.writers.append(event.get("writer"))
+        if event["type"] == "EngineStarted":
+            self.writers.append(event.get("engine"))
         elif event["type"] == "Add":
             self.counts[event["key"]] = self.counts.get(event["key"], 0) + event["n"]
 

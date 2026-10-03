@@ -268,8 +268,8 @@ class SimPlacement:
         self.world.launch(stage)
         return {"id": stage["attempt"]}
 
-    async def wait(self, run: dict, timeout: float) -> dict | None:
-        workers = self.world.by_attempt.get(run["id"])
+    async def wait(self, handle: dict, timeout: float) -> dict | None:
+        workers = self.world.by_attempt.get(handle["id"])
         if not workers:
             return {"code": None, "reason": "lost", "meta": {}}
         task = workers[0].task  # the process the launch started
@@ -285,8 +285,8 @@ class SimPlacement:
             return {"code": 1, "reason": f"{type(error).__name__}: {error}", "meta": {}}
         return {"code": task.result(), "reason": None, "meta": {}}
 
-    async def cancel(self, run: dict) -> None:
-        for worker in self.world.by_attempt.get(run["id"], ()):
+    async def cancel(self, handle: dict) -> None:
+        for worker in self.world.by_attempt.get(handle["id"], ()):
             await self.world.kill(worker.who)
 
 

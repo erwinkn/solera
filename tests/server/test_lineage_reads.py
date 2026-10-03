@@ -11,7 +11,7 @@ import uuid
 
 import pytest
 from solera.sdk import In, Incremental, Output, Project, Ref, Source, asset
-from solera.stores import Scope
+from solera.stores import WriteContext
 from solera_server.engine import Engine
 from solera_server.placements.inline import InlinePlacement
 from solera_server.state import State
@@ -106,7 +106,7 @@ async def test_lineage_says_what_a_current_read_saw(state):
     await store.store(
         landed,
         Ref.from_json(head),
-        Scope(output=out, partition="", attempt="x", generation=newer, invocation="x"),
+        WriteContext(output=out, partition="", attempt="x", generation=newer, invocation="x"),
     )
     await run(engine, ["report", "changes"])
 

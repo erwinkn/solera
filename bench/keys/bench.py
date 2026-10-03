@@ -69,8 +69,8 @@ def version(rng: random.Random) -> bytes | None:
     return rng.randbytes(PAYLOAD) if PAYLOAD else None
 
 
-def run_of(keys: list[bytes], payloads: list) -> K.SortedRun:
-    return K.SortedRun.of(keys, payloads if PAYLOAD else None)
+def run_of(keys: list[bytes], payloads: list) -> K.SortedEntries:
+    return K.SortedEntries.of(keys, payloads if PAYLOAD else None)
 
 
 def shares() -> tuple[float, ...]:

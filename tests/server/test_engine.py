@@ -51,8 +51,8 @@ class FakePlacement:
         self.script.setdefault(stage["attempt"], {})["launched"] = True
         return {"id": stage["attempt"]}
 
-    async def wait(self, run, timeout):
-        script = self.script.get(run["id"], {})
+    async def wait(self, handle, timeout):
+        script = self.script.get(handle["id"], {})
         waits = script.setdefault("waits", 0)
         script["waits"] = waits + 1
         if script.get("exit_after") is not None and waits > script["exit_after"]:
@@ -62,8 +62,8 @@ class FakePlacement:
         await asyncio.sleep(min(timeout, 0.05))
         return None
 
-    async def cancel(self, run):
-        self.script.setdefault(run["id"], {})["canceled"] = True
+    async def cancel(self, handle):
+        self.script.setdefault(handle["id"], {})["canceled"] = True
 
 
 def inline(project, **env_kw):
@@ -971,7 +971,7 @@ async def test_harness_exit_without_result_fails_retryably(state):
             await self.ctx.state.put_object(path, json.dumps(beat).encode())
             return await super().launch(stage)
 
-        async def wait(self, run, timeout):
+        async def wait(self, handle, timeout):
             return {"code": 0, "reason": None, "meta": {}}
 
     @asset(executor=Fake("fake")(), retries=Retry(0))
@@ -1009,7 +1009,7 @@ async def test_max_concurrent(state):
             in_flight["peak"] = max(in_flight["peak"], in_flight["now"])
             return await super().launch(stage)
 
-        async def wait(self, run, timeout):
+        async def wait(self, handle, timeout):
             await asyncio.sleep(0.05)
             in_flight["now"] -= 1
             return {"code": None, "reason": "lost", "meta": {}}
@@ -1095,7 +1095,7 @@ class MigratingStore(FileStore):
 
         return t is Callable or super().can_store(t, output)
 
-    async def migrate(self, output, migrations, scope=None, prior=None):
+    async def migrate(self, output, migrations, context=None, prior=None):
         self.calls.append(output.name)
         return [m.name for m in migrations]
 
@@ -1153,7 +1153,7 @@ async def test_migration_changes_fingerprint_and_marks_handle(state):
 
 async def test_ondeploy_fires_once_per_revision(state):
     """§9: OnDeploy fires when the served revision differs from
-    last_revision, then records it; further ticks stay quiet."""
+    last_deploy, then records it; further ticks stay quiet."""
     calls = []
 
     @job(automations=Automation(trigger=OnDeploy()))
@@ -1168,13 +1168,13 @@ async def test_ondeploy_fires_once_per_revision(state):
     await engine.run_until(auto["last_run"], 30)
     assert calls == [1]
     auto = state.model.automations["deployed.ondeploy.0"]
-    assert auto["last_revision"] == project.manifest["revision"]
+    assert auto["last_deploy"] == project.manifest["deploy"]
 
     for _ in range(3):
         await engine.tick()
     auto = state.model.automations["deployed.ondeploy.0"]
     assert calls == [1]
-    assert auto["last_revision"] == project.manifest["revision"]
+    assert auto["last_deploy"] == project.manifest["deploy"]
 
 
 async def test_ondeploy_silent_on_restart_same_revision(state):
@@ -1197,7 +1197,7 @@ async def test_ondeploy_silent_on_restart_same_revision(state):
     await engine2.initialize()
     await engine2.tick()
     auto = state.model.automations["deployed.ondeploy.0"]
-    assert auto["last_revision"] == project.manifest["revision"]
+    assert auto["last_deploy"] == project.manifest["deploy"]
     assert calls == [1]
 
 
@@ -1218,7 +1218,7 @@ async def test_ondeploy_two_registrations_fire_latest_once(state):
         calls.append(1)
 
     project_b = Project(assets=[deployed])
-    assert project_b.manifest["revision"] != project_a.manifest["revision"]
+    assert project_b.manifest["deploy"] != project_a.manifest["deploy"]
     engine = make_engine(state, project_b)
     await engine.initialize()
     await engine.tick()
@@ -1226,7 +1226,7 @@ async def test_ondeploy_two_registrations_fire_latest_once(state):
     await engine.run_until(auto["last_run"], 30)
     assert calls == [1]
     auto = state.model.automations["deployed.ondeploy.0"]
-    assert auto["last_revision"] == project_b.manifest["revision"]
+    assert auto["last_deploy"] == project_b.manifest["deploy"]
 
 
 async def test_a_delivery_says_where_each_page_sits(state):

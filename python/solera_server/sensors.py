@@ -94,7 +94,7 @@ class Sensors:
         return name not in self.m.ticks and self.sensor_due.get(name, -math.inf) <= now
 
     async def sensor_next(
-        self, executor: str, revision: str, host: str, slots: int, wait: float, build: str | None = None
+        self, executor: str, deploy: str, host: str, slots: int, wait: float, build: str | None = None
     ) -> dict:
         """Due ticks for a host of `executor` on `revision`, up to `slots`;
         waits up to `wait` seconds for one. A host on another revision gets
@@ -104,21 +104,21 @@ class Sensors:
         self._serving()
         loop = asyncio.get_running_loop()
         known = self.sensor_hosts.get(host) or {}
-        if revision != self.manifest["revision"] and not known.get("warned"):
+        if deploy != self.manifest["deploy"] and not known.get("warned"):
             if note := method_note(self.manifest.get("build"), {"source": build}):
                 log.warning("sensor host %s: %s", host, note)
                 known = {**known, "warned": True}
         self.sensor_hosts[host] = {
             "id": host,
             "executor": executor,
-            "revision": revision,
+            "deploy": deploy,
             "seen_at": self.clock(),
             **({"warned": True} if known.get("warned") else {}),
         }
-        current = self.manifest["revision"]
+        current = self.manifest["deploy"]
         deadline = loop.time() + max(0.0, min(wait, 30.0))
         due: list[str] = []
-        while revision == current and slots > 0:
+        while deploy == current and slots > 0:
             changed, now = self._sensors_changed, loop.time()
             mine = self._sensors(executor)
             due = [n for n in mine if self._due(n, now)][:slots]
@@ -129,7 +129,7 @@ class Sensors:
             )
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(changed.wait(), max(0.0, min(deadline, soonest) - now))
-        return {"revision": current, "ticks": [self._dispatch(name, host) for name in due]}
+        return {"deploy": current, "ticks": [self._dispatch(name, host) for name in due]}
 
     def _dispatch(self, name: str, host: str) -> dict:
         """Claim a tick of `name`, with the snapshot of its sources (§11.3):

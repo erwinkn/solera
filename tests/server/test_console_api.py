@@ -148,7 +148,7 @@ async def test_failures_list_page_and_filter(world, monkeypatch):
     assert [s["scope"] for s in found["scopes"]] == [""]
     [scope] = found["scopes"]
     assert scope["counts"] == {"rejected": 1, "failed": 1} and scope["last"] == "changes"
-    assert found["epoch"] == engine.m.epoch and found["next"] is None
+    assert found["deploy"] == engine.m.deploy_number and found["next"] is None
     by_key = {k["key"]: k for k in found["keys"]}
     assert set(by_key) == {"bad.csv", "bug.csv"}
     bad = by_key["bad.csv"]

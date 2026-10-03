@@ -34,7 +34,7 @@ from obstore.exceptions import AlreadyExistsError
 from solera import lifecycle
 from solera.failures import lower
 from solera.ids import ulid, ulid_time
-from solera.keys import Rows, SortedRun
+from solera.keys import Rows, SortedEntries
 from solera.keys.index import (
     DeltaFiles,
     FileInfo,
@@ -190,16 +190,12 @@ class Engine(Attempts, Sensors, Views):
         if alive is not None and any(run["status"] not in TERMINAL_RUN for run in m.runs.values()):
             now = self.clock()
             down = min(json.loads(alive)["at"], now)
-            self.state.record({"type": "EngineRestarted", "down": down, "at": now})
-        if (
-            m.revision != self.manifest["revision"]
-            or m.manifest != self.manifest
-            or m.project != self.project
-        ):
+            self.state.record({"type": "EngineOutage", "down": down, "at": now})
+        if m.deploy != self.manifest["deploy"] or m.manifest != self.manifest or m.project != self.project:
             self.state.record(
                 {
                     "type": "ProjectRegistered",
-                    "revision": self.manifest["revision"],
+                    "deploy": self.manifest["deploy"],
                     "manifest": self.manifest,
                     "project": self.project,
                     "at": self.clock(),
@@ -1128,11 +1124,11 @@ class Engine(Attempts, Sensors, Views):
 
         if not record:
             return False
-        due, epoch_min = record.get("due"), record.get("epoch_min")
+        due, deploy_min = record.get("due"), record.get("deploy_min")
         return bool(
             record.get("retry")
             or (due is not None and due <= self.clock())
-            or (epoch_min is not None and epoch_min < self.m.epoch)
+            or (deploy_min is not None and deploy_min < self.m.deploy_number)
             or self._forced_pos(record) > int(record.get("done_forced") or 0)
         )
 
@@ -1162,12 +1158,12 @@ class Engine(Attempts, Sensors, Views):
         forced = dict(record.get("forced") or {})
         current = self._forced_pos(record)
         retry = record.get("retry")
-        if retry is not None and (retry["epoch"] != self.m.epoch or retry["forced_pos"] != current):
+        if retry is not None and (retry["deploy"] != self.m.deploy_number or retry["forced_pos"] != current):
             retry = None  # its predicate's inputs moved: the pass starts over (§9)
         each = {
             "kind": kind,
             "concurrency": edge["each"]["concurrency"],
-            "epoch": self.m.epoch,
+            "deploy": self.m.deploy_number,
             "forced": forced,
             "forced_pos": current,
             "now": self.clock(),
@@ -1195,11 +1191,11 @@ class Engine(Attempts, Sensors, Views):
             if retry is None:
                 retry = {
                     "pass": int(record.get("passes") or 0) + 1,
-                    "epoch": self.m.epoch,
+                    "deploy": self.m.deploy_number,
                     "forced_pos": current,
                     "after": None,
                     "due_acc": None,
-                    "epoch_acc": None,
+                    "deploy_acc": None,
                 }
             each["pass_after"] = retry["after"]
             pin = {
@@ -1239,7 +1235,7 @@ class Engine(Attempts, Sensors, Views):
             counts[name] = counts.get(name, 0) + int(delta)
         counts = {k: v for k, v in counts.items() if v}
         due = lower(record.get("due"), report.get("due"))
-        epoch_min = lower(record.get("epoch_min"), report.get("epoch_min"))
+        deploy_min = lower(record.get("deploy_min"), report.get("deploy_min"))
         page = plan["each"]
         commit = {
             "keys": report.get("keys") or {"files": []},
@@ -1270,11 +1266,11 @@ class Engine(Attempts, Sensors, Views):
             retry = {
                 **retry,
                 "due_acc": lower(retry.get("due_acc"), walked.get("due")),
-                "epoch_acc": lower(retry.get("epoch_acc"), walked.get("epoch_min")),
+                "deploy_acc": lower(retry.get("deploy_acc"), walked.get("deploy_min")),
             }
             after = delivered.get("after")
             if after is None:  # the pass is complete: its accumulators are the exact bounds
-                due, epoch_min = retry["due_acc"], retry["epoch_acc"]
+                due, deploy_min = retry["due_acc"], retry["deploy_acc"]
                 commit.update({"passes": retry["pass"], "done_forced": retry["forced_pos"], "retry": None})
                 more = bool(page.get("changes")) or forced_after
             else:
@@ -1286,7 +1282,7 @@ class Engine(Attempts, Sensors, Views):
                 commit["retry"] = {
                     **retry,
                     "due_acc": lower(retry.get("due_acc"), fold.get("due")),
-                    "epoch_acc": lower(retry.get("epoch_acc"), fold.get("epoch_min")),
+                    "deploy_acc": lower(retry.get("deploy_acc"), fold.get("deploy_min")),
                 }
             # Keys this page left due at once are retried in the same run.
             more = (
@@ -1294,7 +1290,7 @@ class Engine(Attempts, Sensors, Views):
                 or (report.get("due") is not None and report["due"] <= self.clock())
                 or forced_after
             )
-        commit.update({"due": due, "epoch_min": epoch_min})
+        commit.update({"due": due, "deploy_min": deploy_min})
         return commit, more, watermark
 
     def _due_discards(self, output: str, scope: str, attempt: str | None) -> list[dict]:
@@ -1584,7 +1580,7 @@ class Engine(Attempts, Sensors, Views):
                 removes, replace = [str(k) for k in remove or [] if str(k) not in new], False
             batch = int((head or {}).get("batch", -1)) + 1
             attempt = ulid(self.clock())
-            sorted_run = SortedRun.of(
+            sorted_run = SortedEntries.of(
                 [key_bytes(k) for k in new], list(new.values()), [key_bytes(k) for k in removes]
             )
             with self.m.reading(self.m.index(name, "").prefix):  # outlives compaction meanwhile
@@ -1749,7 +1745,7 @@ class Engine(Attempts, Sensors, Views):
                 if auto["pending"]:
                     fired.append((auto, "onchange"))
             elif trigger["kind"] == "ondeploy":
-                if auto.get("last_revision") != self.manifest["revision"]:
+                if auto.get("last_deploy") != self.manifest["deploy"]:
                     fired.append((auto, "ondeploy"))
         for auto, why in fired:
             if why == "onchange":
@@ -1857,14 +1853,14 @@ class Engine(Attempts, Sensors, Views):
 
     def _fire_ondeploy(self, auto):
         """§9: fire once for the served revision, then record it. A planning
-        error leaves last_revision unset so the next tick retries."""
+        error leaves last_deploy unset so the next tick retries."""
 
         try:
             run = self._automation_run(auto, auto.get("partitions") or "latest")
         except Exception as error:
             self.last_error = f"automation {auto['name']}: {error}"
             return
-        self._fired(auto, run, revision=self.manifest["revision"])
+        self._fired(auto, run, deploy=self.manifest["deploy"])
 
     def _fire_onchange(self, auto):
         """One run per firing (§9). Each target's scopes are the automation's

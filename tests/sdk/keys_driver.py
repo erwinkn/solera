@@ -1,4 +1,4 @@
-"""Drives a native `Job` synchronously over files held in memory (tests)."""
+"""Drives a native `Merge` synchronously over files held in memory (tests)."""
 
 from solera import _native
 

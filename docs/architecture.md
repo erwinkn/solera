@@ -247,7 +247,7 @@ Batches = (lo: int, hi: int)  # load rows of batches in [lo, hi]
 |---|---|
 | `can_load(t, selection)` | Registration. Can you produce `t`, filtered by `Keys` when `selection` is given? `can_load(R, None)` for a `Ref` subclass `R` means "are your refs `R`". |
 | `can_store(t, output)` | Registration. Can you take values of type `t` for this `Output` declaration, and extract its declared key from them? `t` is `None` when the producer is unannotated. |
-| `store(write, prior, scope)` | Apply the write; return the new ref (the worker stamps its generation, §3). `scope.batch` is the engine-assigned batch number. A keyed output's `write` is a `KeyedWrite`, which a store reads three ways: `whole` (clear the scope first), `removes`, and `pages()` — the keys to write a page at a time, each with its group, only that page taken from the write (`iter_pages()` for a store writing on a thread of its own); `value` is what the producer returned. `prior` is the committed head, where the content is; on a `full` run `scope.reset` says nothing of it is kept. Duplicate keys are a write error. For `partition_column` outputs, stamp the column with `scope.partition` and reject rows that disagree. |
+| `store(write, prior, scope)` | Apply the write; return the new ref (the worker stamps its generation, §3). `scope.batch` is the engine-assigned batch number. A keyed output's `write` is a `KeyedWrite`, which a store reads three ways: `whole` (clear the scope first), `removes`, and `chunks()` — the keys to write a chunk at a time, each with its group, only that chunk taken from the write (`iter_chunks()` for a store writing on a thread of its own); `value` is what the producer returned. `prior` is the committed head, where the content is; on a `full` run `scope.reset` says nothing of it is kept. Duplicate keys are a write error. For `partition_column` outputs, stamp the column with `scope.partition` and reject rows that disagree. |
 | `load(ref, t, selection)` | Materialize `t` from what the store holds now; under `Keys`, only the selected keys; under `Batches`, only batches in the range. |
 | `migrate(output, migrations)` | Optional. Apply, in declared order, every migration not yet in the store's own ledger for this output; return the applied names. Must be safe under concurrent attempts of one output (partitions share tables): take a store-level lock and re-read the ledger inside it. Where the backend is transactional, a migration and its ledger row commit together. A store without `migrate` rejects `migrations=` at registration. |
 
@@ -728,17 +728,17 @@ stopped. It never reads a spec or a result, and it carries all of its own
 configuration, so the methods take none.
 
 ```python
-Stage     = (attempt: str, objects: str)   # objects = object-store URL incl. namespace
-RunHandle = (id: str, meta: Mapping)       # JSON, durable across engine restarts
-Exit      = (code: int | None, reason: str | None, meta: Mapping)
+Stage         = (attempt: str, objects: str)   # objects = object-store URL incl. namespace
+AttemptHandle = (id: str, meta: Mapping)       # JSON, durable across engine restarts
+Exit          = (code: int | None, reason: str | None, meta: Mapping)
 
 class Placement(Protocol):
-    async def launch(self, stage: Stage) -> RunHandle: ...
-    async def wait(self, run: RunHandle, timeout: float) -> Exit | None: ...
-    async def cancel(self, run: RunHandle) -> None: ...
-    resume: Callable[[Stage], Awaitable[RunHandle]]   # optional: `launch`, where it is idempotent
-    max_concurrent: int | None                 # per executor
-    provision_seconds: float | None            # optional: the engine's default, None for no deadline
+    async def launch(self, stage: Stage) -> AttemptHandle: ...
+    async def wait(self, handle: AttemptHandle, timeout: float) -> Exit | None: ...
+    async def cancel(self, handle: AttemptHandle) -> None: ...
+    resume: Callable[[Stage], Awaitable[AttemptHandle]]   # optional: `launch`, where it is idempotent
+    max_concurrent: int | None                     # per executor
+    provision_seconds: float | None                # optional: the engine's default, None for no deadline
 ```
 
 | Method | Contract |

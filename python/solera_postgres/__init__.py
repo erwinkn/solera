@@ -28,9 +28,9 @@ from solera.stores import (
     Keys,
     Patch,
     Prepared,
-    Scope,
     Sql,
     StoreError,
+    WriteContext,
     WriteError,
     Written,
     by_key_type,
@@ -48,9 +48,9 @@ SEQ_COLUMN = "_seq"
 KEY_CHUNK = 100_000  # keys per chunk `keys` reads
 
 
-def _assigned_batch(scope: Scope, prior: Ref | None) -> int:
-    if scope.batch is not None:
-        return scope.batch
+def _assigned_batch(context: WriteContext, prior: Ref | None) -> int:
+    if context.batch is not None:
+        return context.batch
     last = (prior.handle or {}).get("batch") if prior is not None else None
     return int(last) + 1 if last is not None else 0
 
@@ -164,7 +164,7 @@ class PostgresStore:
         output: Output,
         table: str,
         rows: Callable[[], Iterable[dict]] | None = None,
-        scope: Scope | None = None,
+        context: WriteContext | None = None,
         inferred: dict | None = None,
         kinds: Mapping[str, str | None] | None = None,
     ) -> None:
@@ -234,7 +234,7 @@ class PostgresStore:
         for role in self.grants:
             if role in present:
                 cur.execute(f"GRANT SELECT ON {table} TO {_ident(role)}")
-        self._fence(cur, table, scope)  # before this transaction changes any row
+        self._fence(cur, table, context)  # before this transaction changes any row
 
     # -- generations (docs/lifecycle.md §9.7) -------------------------------------
 
@@ -256,7 +256,7 @@ class PostgresStore:
         )
         cur.execute(f"ALTER TABLE {FENCE_TABLE} ADD COLUMN IF NOT EXISTS written bigint")
 
-    def _take(self, cur, relid: int, scope: Scope, write: bool = False) -> None:
+    def _take(self, cur, relid: int, context: WriteContext, write: bool = False) -> None:
         """Take `scope`'s generation for (relid, partition), holding the row's
         lock until the transaction ends. Postgres locks the conflicting row
         even when the `WHERE` refuses the update, so a newer acquisition waits
@@ -270,12 +270,18 @@ class PostgresStore:
             f"WHERE {FENCE_TABLE}.generation < EXCLUDED.generation "
             f"OR ({FENCE_TABLE}.generation = EXCLUDED.generation AND {FENCE_TABLE}.invocation = EXCLUDED.invocation) "
             "RETURNING invocation",
-            (relid, scope.partition, scope.generation, scope.invocation, scope.generation if write else None),
+            (
+                relid,
+                context.partition,
+                context.generation,
+                context.invocation,
+                context.generation if write else None,
+            ),
         ).fetchone()
         if taken is None:
             raise StoreError(
-                f"{scope.output.name}: a newer attempt holds this slice (generation {scope.generation} "
-                f"of {scope.invocation} refused)"
+                f"{context.output.name}: a newer attempt holds this slice (generation {context.generation} "
+                f"of {context.invocation} refused)"
             )
 
     def _domain(self, cur, table: str, exclusive: bool = False) -> None:
@@ -291,37 +297,37 @@ class PostgresStore:
     def _relid(self, cur, table: str) -> int | None:
         return cur.execute("SELECT to_regclass(%s)::oid AS relid", (table,)).fetchone()["relid"]
 
-    def _fence(self, cur, table: str, scope: Scope | None) -> None:
+    def _fence(self, cur, table: str, context: WriteContext | None) -> None:
         """In a write transaction, before it changes anything: the slice must
         still be this attempt's (`_take` is a no-op for its own generation
         and invocation). A slice it never acquired — a table this
         transaction created, a new partition — is acquired here."""
 
-        if scope is None or scope.generation is None:
+        if context is None or context.generation is None:
             return
         self._fence_table(cur)
-        self._take(cur, self._relid(cur, table), scope, write=True)
+        self._take(cur, self._relid(cur, table), context, write=True)
 
-    async def acquire(self, scope: Scope, prior: Ref | None = None) -> None:
+    async def acquire(self, context: WriteContext, prior: Ref | None = None) -> None:
         """Take the attempt's generation for the slice it writes — in the
         table `prior`, the committed head, names — in a transaction of its
         own, before any read of the store: from here on no older attempt can
         change it. A table that does not exist yet is acquired when the
         first write creates it."""
 
-        if scope.generation is None:
+        if context.generation is None:
             return
-        await asyncio.to_thread(self._acquire, scope, prior)
+        await asyncio.to_thread(self._acquire, context, prior)
 
-    def _acquire(self, scope: Scope, prior: Ref | None) -> None:
-        table, _, _ = self._table(scope.output, prior)
+    def _acquire(self, context: WriteContext, prior: Ref | None) -> None:
+        table, _, _ = self._table(context.output, prior)
         with self._connect() as conn, conn.cursor() as cur:
             self._domain(cur, table)
             relid = self._relid(cur, table)
             if relid is None:
                 return
             self._fence_table(cur)
-            self._take(cur, relid, scope)
+            self._take(cur, relid, context)
 
     def _key_text(self, cur, output: Output, schema: str, table_name: str) -> str | None:
         """The name of the index on a keyed table's key as text, which the
@@ -389,7 +395,7 @@ class PostgresStore:
 
     # -- writes ---------------------------------------------------------------
 
-    async def store(self, write, prior: Ref | None, scope: Scope) -> Written:
+    async def store(self, write, prior: Ref | None, context: WriteContext) -> Written:
         """The write, in one transaction on a thread of its own: the worker's
         event loop goes on meanwhile. Canceled, the transaction still ends as
         it would have — under its fence, and counted as uncertain until then."""
@@ -397,24 +403,24 @@ class PostgresStore:
         import psycopg
 
         try:
-            return await asyncio.to_thread(self._store, write, prior, scope)
+            return await asyncio.to_thread(self._store, write, prior, context)
         except psycopg.IntegrityError as e:  # the data breaks the table's constraints (`primary_key`)
-            raise WriteError(f"{scope.output.name}: {e}") from e
+            raise WriteError(f"{context.output.name}: {e}") from e
 
-    def _store(self, write, prior: Ref | None, scope: Scope) -> Written:
-        output = scope.output
+    def _store(self, write, prior: Ref | None, context: WriteContext) -> Written:
+        output = context.output
         table, _, _ = self._table(output, prior)  # where it is, even when a full run starts it over
-        if scope.reset:
+        if context.reset:
             prior = None  # a full run keeps nothing of the content
         with self._connect() as conn, conn.cursor() as cur:
             self._domain(cur, table)
             partition_col = output.config.get("partition_column")
-            slice_where = {partition_col: scope.partition} if partition_col else {}
+            slice_where = {partition_col: context.partition} if partition_col else {}
 
-            batch = _assigned_batch(scope, prior) if output.incremental else None
+            batch = _assigned_batch(context, prior) if output.incremental else None
             keys = None
             if isinstance(write, Sql):
-                self._apply_sql(cur, output, write, scope, table, slice_where)
+                self._apply_sql(cur, output, write, context, table, slice_where)
                 if output.key:  # read once the write has committed
                     keys = self._keys(table, output.key, slice_where, None)
             elif output.key is not None:
@@ -425,16 +431,16 @@ class PostgresStore:
                     write.whole or write.upserts or write.removes or len(write.prepared.rows)
                 ):
                     return Written(None)  # a first write of nothing: no table to make
-                self._apply_keyed(cur, output, write, scope, table, slice_where)
+                self._apply_keyed(cur, output, write, context, table, slice_where)
             elif isinstance(write, Patch):
-                if not self._apply_batch(cur, output, write, scope, table, slice_where, prior, batch):
+                if not self._apply_batch(cur, output, write, context, table, slice_where, prior, batch):
                     return Written(prior)
             else:
                 if output.incremental:
                     raise WriteError(
                         f"{output.name}: an unkeyed incremental output only accepts Patch writes"
                     )
-                self._apply_replace(cur, output, write, scope, table, slice_where)
+                self._apply_replace(cur, output, write, context, table, slice_where)
         batch_mode = output.key is None and output.incremental
         return Written(
             TableRef(
@@ -446,21 +452,21 @@ class PostgresStore:
                     "key": BATCH_COLUMN if batch_mode else output.key,
                     "batch": batch if batch_mode else None,
                 },
-                partition=scope.partition,
+                partition=context.partition,
             ),
             keys,
         )
 
-    def _apply_replace(self, cur, output, write, scope, table, slice_where) -> None:
+    def _apply_replace(self, cur, output, write, context, table, slice_where) -> None:
         """An unkeyed output's whole content."""
 
         rows = frames.rows_of(write, output.name)
         kinds = frames.frame_kinds(write) if frames.is_frame(write) else None
-        self._ensure(cur, output, table, lambda: rows, scope, kinds=kinds)
+        self._ensure(cur, output, table, lambda: rows, context, kinds=kinds)
         self._delete_slice(cur, table, slice_where)
-        self._insert(cur, output, table, rows, self._stamps(output, scope))
+        self._insert(cur, output, table, rows, self._stamps(output, context))
 
-    def _apply_batch(self, cur, output, write: Patch, scope, table, slice_where, prior, batch):
+    def _apply_batch(self, cur, output, write: Patch, context, table, slice_where, prior, batch):
         """An unkeyed incremental output's batch: its rows stamped with the
         batch columns, in place of this batch's (a retry's) — or, with no
         prior (a first write, or a reset), of every batch."""
@@ -473,12 +479,12 @@ class PostgresStore:
         if not rows and prior is not None:
             return False
         rows = [{**row, SEQ_COLUMN: i} for i, row in enumerate(rows)]
-        self._ensure(cur, output, table, lambda: rows, scope)
+        self._ensure(cur, output, table, lambda: rows, context)
         self._delete_slice(cur, table, slice_where if prior is None else {**slice_where, BATCH_COLUMN: batch})
-        self._insert(cur, output, table, rows, {**self._stamps(output, scope), BATCH_COLUMN: batch})
+        self._insert(cur, output, table, rows, {**self._stamps(output, context), BATCH_COLUMN: batch})
         return True
 
-    def _apply_keyed(self, cur, output, write: KeyedWrite, scope, table, slice_where) -> None:
+    def _apply_keyed(self, cur, output, write: KeyedWrite, context, table, slice_where) -> None:
         """Every key is the group of rows that carry it. A whole write is the
         slice's content: cleared, then written; otherwise only the keys it
         writes change — their rows replaced by their groups, a page at a
@@ -487,15 +493,17 @@ class PostgresStore:
         to a repair, whose generation the slice must then read as written
         (docs/versions.md §5)."""
 
-        self._ensure(cur, output, table, lambda: write.prepared.take(None), scope, kinds=write.prepared.kinds)
-        stamps = self._stamps(output, scope)
+        self._ensure(
+            cur, output, table, lambda: write.prepared.take(None), context, kinds=write.prepared.kinds
+        )
+        stamps = self._stamps(output, context)
         if write.whole:
             self._delete_slice(cur, table, slice_where)
-        for page in write.iter_pages():
-            keys = [key for key, _ in page]
+        for chunk in write.iter_chunks():
+            keys = [key for key, _ in chunk]
             if not write.whole:
                 self._delete_keys(cur, output, table, slice_where, keys)
-            self._insert(cur, output, table, [row for _, group in page for row in group], stamps)
+            self._insert(cur, output, table, [row for _, group in chunk for row in group], stamps)
             self._check_keys(cur, output, table, slice_where, keys)
         if write.removes and not write.whole:
             self._delete_keys(cur, output, table, slice_where, sorted(write.removes))
@@ -529,11 +537,11 @@ class PostgresStore:
                 f"{output.name}: key {lost!r} would be stored as another key in column {output.key!r}"
             )
 
-    def _stamps(self, output, scope) -> dict:
+    def _stamps(self, output, context) -> dict:
         """The columns the store sets on every row: the partition's."""
 
         column = output.config.get("partition_column")
-        return {column: scope.partition} if column else {}
+        return {column: context.partition} if column else {}
 
     def _delete_keys(self, cur, output, table, slice_where, keys: list[str]) -> None:
         cur.execute(
@@ -541,7 +549,7 @@ class PostgresStore:
             [slice_where[k] for k in sorted(slice_where)] + [keys],
         )
 
-    def _apply_sql(self, cur, output, write: Sql, scope, table, slice_where) -> None:
+    def _apply_sql(self, cur, output, write: Sql, context, table, slice_where) -> None:
         """Materialize a query into the slice. The query is never a statement
         of its own: the store embeds it in one, `INSERT INTO t SELECT … FROM
         (<query>) _src`, prepared (the extended protocol), so UPDATE, DELETE,
@@ -581,11 +589,11 @@ class PostgresStore:
                 )
             }
             inferred = {name: _inferred(types.get(oid)) for name, oid in described}
-            self._ensure(cur, output, table, scope=scope, inferred=inferred)
+            self._ensure(cur, output, table, context=context, inferred=inferred)
             self._delete_slice(cur, table, slice_where)
             selected = ", ".join(_ident(c) for c in columns)
             into = ", ".join(_ident(c) for c in [*columns, *([partition_col] if partition_col else [])])
-            stamp = f", {sql.Literal(scope.partition).as_string(source)}" if partition_col else ""
+            stamp = f", {sql.Literal(context.partition).as_string(source)}" if partition_col else ""
             if not self.sql_read_only:
                 cur.execute(
                     f"INSERT INTO {table} ({into}) SELECT {selected}{stamp} FROM {query}", prepare=True
@@ -648,7 +656,7 @@ class PostgresStore:
         )
 
     async def migrate(
-        self, output: Output, migrations, scope: Scope | None = None, prior: Ref | None = None
+        self, output: Output, migrations, context: WriteContext | None = None, prior: Ref | None = None
     ) -> list[str]:
         """Apply pending migrations in declared order; each migration and its
         ledger row commit in one transaction under an advisory lock keyed on
@@ -663,9 +671,11 @@ class PostgresStore:
         takes its turn. The table is the committed head's (`prior`), else the
         declaration's."""
 
-        return await asyncio.to_thread(self._migrate, output, migrations, scope, prior)
+        return await asyncio.to_thread(self._migrate, output, migrations, context, prior)
 
-    def _migrate(self, output: Output, migrations, scope: Scope | None, prior: Ref | None) -> list[str]:
+    def _migrate(
+        self, output: Output, migrations, context: WriteContext | None, prior: Ref | None
+    ) -> list[str]:
 
         with self._connect() as conn, conn.cursor() as cur:
             self._ensure_ledger(cur)
@@ -684,9 +694,9 @@ class PostgresStore:
                 if done:
                     applied.append(migration.name)
                     continue
-                if before is not None and scope is not None and scope.generation is not None:
+                if before is not None and context is not None and context.generation is not None:
                     self._fence_table(cur)
-                    self._take(cur, before, scope)
+                    self._take(cur, before, context)
                 if isinstance(migration.payload, str):
                     cur.execute(migration.payload)
                 elif callable(migration.payload):

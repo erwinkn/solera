@@ -69,19 +69,19 @@ def patches(ledger: Ledger, current_actor) -> list[tuple]:
         table, _, _ = self._table(output, prior)
         return table
 
-    def _store(self, write, prior, scope):
-        written = store_real(self, write, prior, scope)
+    def _store(self, write, prior, context):
+        written = store_real(self, write, prior, context)
         ref = written.ref
-        table = (ref.handle or {}).get("table") or table_of(self, scope.output, prior)
+        table = (ref.handle or {}).get("table") or table_of(self, context.output, prior)
         rows = self._load(ref, list[dict], None)
-        ledger.writes[(table, scope.partition)].append(
-            Write(ledger.tick(), scope.generation, frozenset(_pairs(rows)))
+        ledger.writes[(table, context.partition)].append(
+            Write(ledger.tick(), context.generation, frozenset(_pairs(rows)))
         )
         return written
 
-    def _acquire(self, scope, prior):
-        acquire_real(self, scope, prior)
-        ledger.acquired[(table_of(self, scope.output, prior), scope.partition)].add(scope.generation)
+    def _acquire(self, context, prior):
+        acquire_real(self, context, prior)
+        ledger.acquired[(table_of(self, context.output, prior), context.partition)].add(context.generation)
 
     async def load(self, ref, t, selection):
         if not hasattr(self, "_sim_snapshot"):

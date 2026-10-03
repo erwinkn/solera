@@ -44,7 +44,7 @@ from dataclasses import dataclass, field
 
 from ..sdk import Ref
 from ..stores import Batches, KeyedWrite, Keys, Patch, StoreError, prepare_for
-from .stores import Harness, Ledger, scope
+from .stores import Harness, Ledger, context
 
 KEYS = ["a", "b", "c", "d"]
 
@@ -281,7 +281,7 @@ def stateful(make_harness: Callable[[], Harness]):
             self.generation += 1
             batch = model.batch + 1
             rows = [{"id": f"r{batch}-{i}", "v": str(batch)} for i in range(n)]
-            sc = scope(self.batches_out, self.generation, f"i{self.generation}", batch=batch, reset=reset)
+            sc = context(self.batches_out, self.generation, f"i{self.generation}", batch=batch, reset=reset)
             written = None
             for _ in range(2 if retried else 1):
                 written = self.run(self.store.store(Patch(rows), model.head, sc))
@@ -301,7 +301,7 @@ def stateful(make_harness: Callable[[], Harness]):
 
             model = self.batches
             rows, batch = model.last
-            stale = scope(self.batches_out, 0, "stale", batch=batch)
+            stale = context(self.batches_out, 0, "stale", batch=batch)
             junk = Patch([{"id": f"stale-{batch}", "v": "x"}])
             if self.kind == "fenced":
                 with contextlib.suppress(StoreError):
@@ -350,7 +350,7 @@ def stateful(make_harness: Callable[[], Harness]):
         # -- helpers ----------------------------------------------------------------------
 
         def _scope(self, attempt: Attempt):
-            return scope(self.out, attempt.generation, attempt.invocation)
+            return context(self.out, attempt.generation, attempt.invocation)
 
         def _resolve(self, kind: str, rows: list[dict], removes: list[str]):
             """A write as the worker hands it to the store, resolved against

@@ -33,11 +33,11 @@ class Hold:
     async def launch(self, stage):
         return {"id": stage["attempt"]}
 
-    async def wait(self, run, timeout):
+    async def wait(self, handle, timeout):
         await asyncio.sleep(min(timeout, 0.02))
         return None
 
-    async def cancel(self, run):
+    async def cancel(self, handle):
         return None
 
 
@@ -343,7 +343,7 @@ async def test_replay_reproduces_the_live_model(tmp_path, clock):
     )
     assert finished >= 6
     replayed = durable(again.model)
-    live.pop("writer"), replayed.pop("writer")
+    live.pop("engine"), replayed.pop("engine")
     assert replayed == live
 
 
@@ -368,7 +368,7 @@ async def test_the_journal_alone_reproduces_the_live_model(tmp_path, clock):
     await state.durable()
     again = await State.open(tmp_path.as_uri(), "test", clock=clock, writer=False)
     live, replayed = durable(state.model), durable(again.model)
-    live.pop("writer"), replayed.pop("writer")
+    live.pop("engine"), replayed.pop("engine")
     assert replayed == live
     await state.close()
 
@@ -513,7 +513,7 @@ def test_a_rename_moves_a_scopes_record_whole():
         "sources": {},
         "automations": {},
     }
-    m.apply({"type": "ProjectRegistered", "revision": "r2", "manifest": manifest, "at": 3.0})
+    m.apply({"type": "ProjectRegistered", "deploy": "r2", "manifest": manifest, "at": 3.0})
     assert m.scope("new", "x") == {**whole, "watermarks": {"feed": wm}}
     assert m.scope("new", "y") == {"last": {"outcome": "succeeded", "run": "r", "attempt": "b", "at": 2.0}}
     assert m.scope("old", "x") == {} and sorted(m.scopes.of("new")) == ["x", "y"]

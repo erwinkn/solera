@@ -277,11 +277,11 @@ async def test_a_full_delivery_that_takes_no_key_still_starts_over(state):  # no
 
     content = {"rows": [{"id": "a", "v": "1"}]}
 
-    @asset(outputs=Output("items", key="id", revision="v"))
+    @asset(outputs=Output("items", key="id", deploy="v"))
     def items():
         return content["rows"]
 
-    @asset(inputs={"items": Incremental(exclude=["k*"])}, outputs=Output("mirror", key="id", revision="v"))
+    @asset(inputs={"items": Incremental(exclude=["k*"])}, outputs=Output("mirror", key="id", deploy="v"))
     def mirror(ctx, items: list):
         changes = ctx.changes["items"]
         rows = [{"id": r["id"], "v": r["v"]} for r in items]

@@ -17,8 +17,8 @@ class PoolPlacement:
     async def launch(self, stage: dict) -> None:
         return None
 
-    async def wait(self, run: dict, timeout: float) -> dict | None:
+    async def wait(self, handle: dict, timeout: float) -> dict | None:
         return None
 
-    async def cancel(self, run: dict) -> None:
+    async def cancel(self, handle: dict) -> None:
         return None

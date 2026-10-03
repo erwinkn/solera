@@ -48,7 +48,7 @@ async def open_engine(tmp_path, project, *, host=False, **kw) -> tuple[State, En
 
 async def dispatch(engine, name) -> dict:
     engine.sensor_due.pop(name, None)
-    ticks = (await engine.sensor_next("local", engine.manifest["revision"], "test", 8, 0))["ticks"]
+    ticks = (await engine.sensor_next("local", engine.manifest["deploy"], "test", 8, 0))["ticks"]
     return next(t for t in ticks if t["sensor"] == name)
 
 
@@ -247,7 +247,7 @@ async def test_late_and_pre_restart_ticks_get_409(tmp_path, monkeypatch):
     await engine.initialize()
     with pytest.raises(Conflict):
         await engine.sensor_post("watch", tick["tick"], Tick(cursor="c2").to_json())
-    again = (await engine.sensor_next("local", engine.manifest["revision"], "test", 8, 0))["ticks"]
+    again = (await engine.sensor_next("local", engine.manifest["deploy"], "test", 8, 0))["ticks"]
     assert [(t["sensor"], t["cursor"]) for t in again] == [("watch", "c1")]
     await state.close()
 
@@ -290,8 +290,8 @@ async def test_a_host_on_another_revision_gets_no_ticks(tmp_path):
     project = feed_project()
     state, engine = await open_engine(tmp_path, project)
     answer = await engine.sensor_next("local", "old-revision", "test", 8, 0)
-    assert answer == {"revision": project.manifest["revision"], "ticks": []}
-    assert (await engine.sensor_next("sensors", project.manifest["revision"], "test", 8, 0))["ticks"] == []
+    assert answer == {"deploy": project.manifest["deploy"], "ticks": []}
+    assert (await engine.sensor_next("sensors", project.manifest["deploy"], "test", 8, 0))["ticks"] == []
     await state.close()
 
 
@@ -425,8 +425,8 @@ async def test_hosts_reach_the_engine_over_https(tmp_path):
 
     project = feed_project(executor=Pool("sensors"))
     state, engine = await open_engine(tmp_path, project)
-    p, revision = project.manifest["name"], project.manifest["revision"]
-    params = {"executor": "sensors", "revision": revision, "wait": 0, "host": "h1"}
+    p, deploy = project.manifest["name"], project.manifest["deploy"]
+    params = {"executor": "sensors", "deploy": deploy, "wait": 0, "host": "h1"}
     host_token = lifecycle.token(engine.secret, engine_sensors.HOST_TOKEN)
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("SOLERA_POOL_TOKEN", "pool")
@@ -540,7 +540,7 @@ async def test_a_host_on_old_code_waits_then_starts_afresh(tmp_path):
 
     project = feed_project()
     state, engine = await open_engine(tmp_path, project)
-    engine.manifest = {**engine.manifest, "revision": "newer"}
+    engine.manifest = {**engine.manifest, "deploy": "newer"}
     code = await asyncio.wait_for(
         run_sensor_host(LocalSensorChannel(engine), project, "local", stale_wait=0.05), 5
     )
@@ -579,7 +579,7 @@ async def test_a_decision_under_way_keeps_its_claim_and_pin(tmp_path, monkeypatc
     await asyncio.sleep(0.1)
     engine._sensor_sweep()  # past its timeout, but deciding
     engine.sensor_due.pop("watch", None)
-    assert (await engine.sensor_next("local", engine.manifest["revision"], "t", 8, 0))["ticks"] == []
+    assert (await engine.sensor_next("local", engine.manifest["deploy"], "t", 8, 0))["ticks"] == []
     assert state.model.pin_floor() == pin
     duplicate = asyncio.create_task(engine.sensor_post("watch", tick["tick"], outcome))
     await asyncio.sleep(0.05)

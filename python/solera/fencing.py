@@ -24,7 +24,7 @@ renamed table keeps its fence."""
 
 from __future__ import annotations
 
-from .stores import Scope, StoreError
+from .stores import StoreError, WriteContext
 
 FENCE_TABLE = "solera_fences"
 FENCE_DDL = (
@@ -47,7 +47,13 @@ def fence_table(cur, table: str = FENCE_TABLE) -> None:
 
 
 def fence(
-    cur, scope: Scope, domain: str, *, write: bool = False, table: str = FENCE_TABLE, param: str = "%s"
+    cur,
+    context: WriteContext,
+    domain: str,
+    *,
+    write: bool = False,
+    table: str = FENCE_TABLE,
+    param: str = "%s",
 ) -> None:
     """Take `(domain, scope.partition)` for `scope`'s generation and
     invocation, in the caller's transaction, until it ends; raise
@@ -56,10 +62,10 @@ def fence(
     `acquire` — also marks it written by its generation. Outside an attempt
     (no generation) there is nothing to check."""
 
-    if scope.generation is None:
+    if context.generation is None:
         return
     p = param
-    generation = int(scope.generation)
+    generation = int(context.generation)
     cur.execute(
         f"INSERT INTO {table} (domain, part, generation, invocation, written) VALUES ({p}, {p}, {p}, {p}, {p}) "
         f"ON CONFLICT (domain, part) DO UPDATE SET generation = EXCLUDED.generation, "
@@ -67,12 +73,12 @@ def fence(
         f"WHERE {table}.generation < EXCLUDED.generation "
         f"OR ({table}.generation = EXCLUDED.generation AND {table}.invocation = EXCLUDED.invocation) "
         "RETURNING invocation",
-        (domain, scope.partition, generation, scope.invocation or "", generation if write else None),
+        (domain, context.partition, generation, context.invocation or "", generation if write else None),
     )
     if cur.fetchone() is None:
         raise StoreError(
-            f"{scope.output.name}: a newer attempt holds {domain} {scope.partition!r} "
-            f"(generation {scope.generation} of {scope.invocation!r} refused)"
+            f"{context.output.name}: a newer attempt holds {domain} {context.partition!r} "
+            f"(generation {context.generation} of {context.invocation!r} refused)"
         )
 
 

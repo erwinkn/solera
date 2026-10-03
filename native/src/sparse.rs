@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::delta::{Delta, Old, Write};
+use crate::entries::SortedEntries;
 use crate::format::{key_item, may_hold, tomb_item, Options, Result};
-use crate::run::SortedRun;
 use crate::stream::Block;
 
 #[derive(Clone)]
@@ -32,7 +32,7 @@ enum Known {
 pub type Filter<'a> = (u64, u8, &'a [u8]);
 
 pub struct Sparse {
-    pub run: Arc<SortedRun>,
+    pub run: Arc<SortedEntries>,
     known: Vec<Known>,
     tomb: Vec<bool>,
     key: Vec<bool>,
@@ -42,7 +42,7 @@ pub struct Sparse {
 }
 
 impl Sparse {
-    pub fn new(run: Arc<SortedRun>) -> Sparse {
+    pub fn new(run: Arc<SortedEntries>) -> Sparse {
         let n = run.len();
         Sparse {
             run,

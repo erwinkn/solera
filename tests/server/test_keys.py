@@ -70,9 +70,9 @@ class CountingStore(FileStore):
         super().__init__()
         self.stored = 0
 
-    async def store(self, write, prior, scope):
+    async def store(self, write, prior, context):
         self.stored += 1
-        return await super().store(write, prior, scope)
+        return await super().store(write, prior, context)
 
 
 async def test_every_write_is_a_change_and_an_empty_patch_none(state):

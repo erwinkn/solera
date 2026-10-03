@@ -201,7 +201,7 @@ def create_app(
             "objects": runtime.state.objects_url,
             "namespace": runtime.state.namespace,
             "project": runtime.manifest["name"],
-            "revision": runtime.manifest["revision"],
+            "deploy": runtime.manifest["deploy"],
             "inflight": len(runtime.inflight),
             "active_runs": sum(1 for r in runtime.m.runs.values() if r["status"] not in TERMINAL_RUN),
             "postgres": bool(os.environ.get("DATABASE_URL")),
@@ -637,14 +637,14 @@ def create_app(
         p: str,
         request: Request,
         executor: str,
-        revision: str,
+        deploy: str,
         slots: int = Query(4, ge=0, le=64),
         wait: float = Query(30, ge=0, le=30),
         build: str | None = None,
     ):
         runtime = await project_engine(request, p)
         host = request.query_params.get("host") or (request.client.host if request.client else "host")
-        return await runtime.sensor_next(executor, revision, host, slots, wait, build)
+        return await runtime.sensor_next(executor, deploy, host, slots, wait, build)
 
     @app.post("/api/projects/{p}/sensors/{sensor}/ticks/{tick}")
     async def sensor_tick(p: str, sensor: str, tick: str, request: Request):

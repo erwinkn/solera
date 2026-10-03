@@ -28,7 +28,7 @@ class Gated(FileStore):
 
     writes = "fenced"
 
-    async def acquire(self, scope, prior=None):
+    async def acquire(self, context, prior=None):
         pass
 
     def keys(self, ref, among=None):
@@ -48,13 +48,13 @@ class Remote:
         self.launches.append(stage["attempt"])
         return {"id": stage["attempt"], "run": stage["run"]}
 
-    async def wait(self, run, timeout):
-        if await self.ctx.state.attempt_finished(run["run"], run["id"]):
+    async def wait(self, handle, timeout):
+        if await self.ctx.state.attempt_finished(handle["run"], handle["id"]):
             return {"code": 0, "reason": None, "meta": {}}  # the worker exits once it wrote its result
         await asyncio.sleep(min(timeout, 0.05))
         return None
 
-    async def cancel(self, run):
+    async def cancel(self, handle):
         return None
 
 
@@ -157,7 +157,7 @@ async def test_a_restarted_engine_adopts_and_commits_a_launched_attempt(tmp_path
 class Blind(Remote):
     """A placement whose provider cannot be reached: it cannot tell."""
 
-    async def wait(self, run, timeout):
+    async def wait(self, handle, timeout):
         raise ConnectionError("the provider's API is down")
 
 
@@ -196,12 +196,12 @@ class Flaky(Remote):
     errors = 0
     seen: list = []
 
-    async def wait(self, run, timeout):
-        self.seen.append(run)
+    async def wait(self, handle, timeout):
+        self.seen.append(handle)
         if Flaky.errors:
             Flaky.errors -= 1
             raise TimeoutError("DescribeTasks timed out")
-        return await super().wait(run, timeout)
+        return await super().wait(handle, timeout)
 
 
 async def test_a_placement_that_cannot_tell_keeps_its_handle(tmp_path):
@@ -274,9 +274,9 @@ async def test_a_worker_that_never_reports_is_given_up_on(tmp_path):
     class Stuck(Quiet):
         canceled = []
 
-        async def cancel(self, run):
-            Stuck.canceled.append(run["id"])
-            await super().cancel(run)
+        async def cancel(self, handle):
+            Stuck.canceled.append(handle["id"])
+            await super().cancel(handle)
 
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = engine_for(state, REMOTE, worker=Stuck, provision_seconds=0.3)
@@ -374,13 +374,13 @@ class Quiet(Remote):
         super().__init__(ctx)
         self.stopped = asyncio.Event()
 
-    async def wait(self, run, timeout):
+    async def wait(self, handle, timeout):
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(self.stopped.wait(), timeout)
             return {"code": -15, "reason": "stopped", "meta": {}}
         return None
 
-    async def cancel(self, run):
+    async def cancel(self, handle):
         self.stopped.set()
 
 
@@ -412,13 +412,13 @@ class LiveStore(FileStore):
         self.rows: dict[str, dict] = {}
         self.die: int | None = None
 
-    async def acquire(self, scope, prior=None):
+    async def acquire(self, context, prior=None):
         pass
 
     def can_load(self, t, selection):
         return True
 
-    async def store(self, write, prior, scope):
+    async def store(self, write, prior, context):
         if isinstance(write, KeyedWrite):  # written as the producer returned it
             write = write.value
         patch = isinstance(write, Patch)
@@ -434,7 +434,7 @@ class LiveStore(FileStore):
             self.rows[row["id"]] = dict(row)
         for key in write.remove if patch else ():
             self.rows.pop(key, None)
-        return Written(Ref(scope.output.name, "live", {}, scope.partition))
+        return Written(Ref(context.output.name, "live", {}, context.partition))
 
     def keys(self, ref, among=None):
         """The keys it holds, sorted by their bytes: what a repair asks."""
@@ -874,7 +874,7 @@ async def test_an_event_its_reducer_cannot_apply_ends_the_process(tmp_path, worl
         state.record({"type": "NoSuchEvent"})  # no reducer applies it
     assert state.poisoned
     with pytest.raises(Unavailable):
-        state.record({"type": "WriterStarted", "writer": "x"})
+        state.record({"type": "EngineStarted", "engine": "x"})
     for _ in range(100):
         if world.exits:
             break
@@ -896,8 +896,8 @@ async def test_a_replaced_engine_stops_acting(tmp_path):
     class Watching(Remote):
         canceled: list = []
 
-        async def cancel(self, run):
-            self.canceled.append(run["id"])
+        async def cancel(self, handle):
+            self.canceled.append(handle["id"])
 
     @asset(executor=Fake("fake")(), timeout=0.2, retries=Retry(0))
     def brief():

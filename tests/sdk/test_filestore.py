@@ -27,7 +27,7 @@ from solera.stores import (
     prepare,
 )
 
-from tests.conftest import scope
+from tests.conftest import context
 
 # An S3-compatible server to also run against, e.g. http://user:secret@127.0.0.1:9100/bucket
 S3_URL = os.getenv("SOLERA_TEST_S3")
@@ -68,32 +68,32 @@ def at(out, content, generation, keys=None) -> Keys:
 
 async def test_a_value_is_one_object_per_generation(store):
     out = Output("rollup")
-    first = await store.store({"sites": 3}, None, scope(out, generation=7))
+    first = await store.store({"sites": 3}, None, context(out, generation=7))
     assert first.ref.handle == {"mode": "value", "path": "rollup@7", "base": "rollup"}
     assert await store.load(first.ref, None, None) == {"sites": 3}
-    second = await store.store({"sites": 4}, first.ref, scope(out, generation=9))
+    second = await store.store({"sites": 4}, first.ref, context(out, generation=9))
     assert second.ref.handle["path"] != first.ref.handle["path"]
     assert await paths(store) == ["rollup@7.json", "rollup@9.json"]
     assert await store.load(first.ref, None, None) == {"sites": 3}  # a pinned reader reads its version
     assert await store.load(second.ref, None, None) == {"sites": 4}
-    again = await store.store({"sites": 4}, second.ref, scope(out, generation=9))  # the same attempt again
+    again = await store.store({"sites": 4}, second.ref, context(out, generation=9))  # the same attempt again
     assert again.ref == second.ref
 
 
 async def test_what_json_cannot_hold_is_pickled(store):
     out = Output("frame")
     frame = pd.DataFrame({"a": [1, 2]})
-    written = await store.store(frame, None, scope(out, generation=1))
+    written = await store.store(frame, None, context(out, generation=1))
     assert await paths(store) == ["frame@1.pkl"]
     assert (await store.load(written.ref, None, None)).equals(frame)
-    written = await store.store({1: "int keys"}, written.ref, scope(out, generation=2))
+    written = await store.store({1: "int keys"}, written.ref, context(out, generation=2))
     assert await store.load(written.ref, None, None) == {1: "int keys"}
 
 
 async def test_partitions_and_keys_are_escaped_path_segments(store):
     out = Output("status", keyed=True)
     content = {"a/b": 1, "..": 2, "ü": 3}
-    written = await store.store(content, None, scope(out, partition="site|x", generation=4))
+    written = await store.store(content, None, context(out, partition="site|x", generation=4))
     assert written.ref.handle == {"mode": "keyed", "path": "status/site%7Cx", "key": KEYS}
     assert await store.load(written.ref, None, at(out, content, 4)) == content
     assert all(p.startswith("status/site%7Cx/") for p in await paths(store))
@@ -102,22 +102,22 @@ async def test_partitions_and_keys_are_escaped_path_segments(store):
 async def test_a_keyed_output_is_one_object_per_key_and_generation(store):
     out = Output("uploads", keyed=True)
     first = {"u-1": {"bytes": 3}, "u-2": {"bytes": 5}}
-    written = await store.store(first, None, scope(out, generation=5))
+    written = await store.store(first, None, context(out, generation=5))
     names = await paths(store)
     assert names == ["uploads/u-1/5.json", "uploads/u-2/5.json"]
     assert {n.split("/")[1] for n in names} == {"u-1", "u-2"}
     with pytest.raises(StoreError, match="takes Keys"):
         await store.load(written.ref, None, None)  # a whole read goes through the index
     patch = {"u-2": {"bytes": 6}}
-    patched = await store.store(Patch(patch, remove=["u-1"]), written.ref, scope(out, generation=8))
+    patched = await store.store(Patch(patch, remove=["u-1"]), written.ref, context(out, generation=8))
     assert len(await paths(store)) == 3  # nothing overwritten, nothing deleted
     current = at(out, patch, 8)
     assert await store.load(patched.ref, None, current) == {"u-2": {"bytes": 6}}
     assert await store.load(written.ref, None, at(out, first, 5)) == first  # the old version, intact
     old = [("key", k, g) for k, g in at(out, first, 5).generations.items()]
-    await store.discard(scope(out, generation=9), patched.ref, old)
+    await store.discard(context(out, generation=9), patched.ref, old)
     await store.discard(
-        scope(out, generation=9), patched.ref, old
+        context(out, generation=9), patched.ref, old
     )  # names are never reused: twice is no harm
     assert await store.load(patched.ref, None, current) == {"u-2": {"bytes": 6}}
     assert len(await paths(store)) == 1
@@ -128,19 +128,19 @@ async def test_a_keyed_write_touches_only_what_the_harness_says(store):
     content = {"a": 1, "b": 20, "c": 3}
     prepared = prepare(content, out)
     only = KeyedWrite(prepared, frozenset({"b"}), frozenset({"a"}))
-    await store.store(only, None, scope(out, generation=3))
+    await store.store(only, None, context(out, generation=3))
     # `c` is in the write but not in upserts: the harness knows it is there already.
     assert await paths(store) == ["uploads/b/3.json"]
     # A requested key the write does not hold is an error, never a silent skip.
     with pytest.raises(StoreError, match="zzz"):
-        await store.store(KeyedWrite(prepared, frozenset({"b", "zzz"})), None, scope(out, generation=4))
+        await store.store(KeyedWrite(prepared, frozenset({"b", "zzz"})), None, context(out, generation=4))
 
 
 async def test_a_keyed_output_takes_a_dict_of_str(store):
     out = Output("uploads", keyed=True)
     for bad in ([{"id": 1}], {1: "x"}, "text"):
         with pytest.raises(WriteError, match="dict"):
-            await store.store(bad, None, scope(out))
+            await store.store(bad, None, context(out))
 
 
 def test_keyed_registration():
@@ -157,32 +157,32 @@ def test_keyed_registration():
 async def test_rows_by_key_column(store):
     out = Output("files", key="id")
     rows = [{"id": 1, "v": "1"}, {"id": 2, "v": "1"}]
-    first = await store.store(rows, None, scope(out, generation=1))
+    first = await store.store(rows, None, context(out, generation=1))
     assert await paths(store) == ["files/1/1.json", "files/2/1.json"]
     patch = [{"id": 3, "v": "1"}]
-    patched = await store.store(Patch(patch, remove=[1]), first.ref, scope(out, generation=2))
+    patched = await store.store(Patch(patch, remove=[1]), first.ref, context(out, generation=2))
     current = Keys({**at(out, rows, 1, keys={"2"}).generations, **at(out, patch, 2).generations})
     assert await store.load(patched.ref, list[dict], current) == [{"id": 2, "v": "1"}, {"id": 3, "v": "1"}]
     frame = await store.load(patched.ref, pd.DataFrame, at(out, patch, 2))
     assert list(frame["id"]) == [3]
     # Every key holds all its rows: a patch of the key replaces the whole group.
     group = [{"id": 3, "v": "2"}, {"id": 3, "v": "2", "n": 1}]
-    grouped = await store.store(Patch(group), patched.ref, scope(out, generation=3))
+    grouped = await store.store(Patch(group), patched.ref, context(out, generation=3))
     assert await store.load(grouped.ref, list[dict], at(out, group, 3)) == group
     with pytest.raises(WriteError, match="key column"):
-        await store.store([{"v": 1}], None, scope(out, generation=4))
+        await store.store([{"v": 1}], None, context(out, generation=4))
 
 
 async def test_unkeyed_incremental_is_one_object_per_batch(store):
     out = Output("events", incremental=True)
     with pytest.raises(WriteError, match="Patch"):
-        await store.store([{"e": 0}], None, scope(out, batch=0))
-    first = await store.store(Patch([{"e": 1}]), None, scope(out, batch=3, generation=10))
-    second = await store.store(Patch([{"e": 2}, {"e": 3}]), first.ref, scope(out, batch=4, generation=11))
+        await store.store([{"e": 0}], None, context(out, batch=0))
+    first = await store.store(Patch([{"e": 1}]), None, context(out, batch=3, generation=10))
+    second = await store.store(Patch([{"e": 2}, {"e": 3}]), first.ref, context(out, batch=4, generation=11))
     assert second.ref.handle == {"mode": "batches", "path": "events", "batches": [3, 4]}
     assert await store.load(second.ref, None, None) == [{"e": 1}, {"e": 2}, {"e": 3}]
     assert await store.load(second.ref, None, Batches(4, 4)) == [{"e": 2}, {"e": 3}]
-    assert (await store.store(Patch([]), second.ref, scope(out, batch=5, generation=12))).ref is second.ref
+    assert (await store.store(Patch([]), second.ref, context(out, batch=5, generation=12))).ref is second.ref
 
 
 async def test_a_batchs_committed_object_is_its_highest_generation(store):
@@ -191,40 +191,42 @@ async def test_a_batchs_committed_object_is_its_highest_generation(store):
     committed, is the one read. A full run starts over at a later batch."""
 
     out = Output("events", incremental=True)
-    first = await store.store(Patch([{"e": 1}]), None, scope(out, batch=3, generation=10))
-    await store.store(Patch([{"e": "dead"}]), first.ref, scope(out, batch=4, generation=11))
-    retry = await store.store(Patch([{"e": 2}]), first.ref, scope(out, batch=4, generation=12))
+    first = await store.store(Patch([{"e": 1}]), None, context(out, batch=3, generation=10))
+    await store.store(Patch([{"e": "dead"}]), first.ref, context(out, batch=4, generation=11))
+    retry = await store.store(Patch([{"e": 2}]), first.ref, context(out, batch=4, generation=12))
     assert await store.load(retry.ref, None, None) == [{"e": 1}, {"e": 2}]
-    reset = await store.store(Patch([{"e": 9}]), None, scope(out, batch=6, generation=13))
+    reset = await store.store(Patch([{"e": 9}]), None, context(out, batch=6, generation=13))
     assert await store.load(reset.ref, None, None) == [{"e": 9}]
 
 
 async def test_a_partition_set_is_its_element_list(store):
     out = PartitionSet("sites")
-    written = await store.store(["Richmond", "Perth"], None, scope(out, generation=1))
+    written = await store.store(["Richmond", "Perth"], None, context(out, generation=1))
     assert await store.load(written.ref, list, None) == ["Richmond", "Perth"]
     assert await store.load(written.ref, list, Keys({"Perth": 1})) == ["Perth"]
-    patched = await store.store(Patch(["Hobart"], remove=["Perth"]), written.ref, scope(out, generation=2))
+    patched = await store.store(Patch(["Hobart"], remove=["Perth"]), written.ref, context(out, generation=2))
     assert await store.load(patched.ref, list, None) == ["Richmond", "Hobart"]
 
 
 async def test_a_renamed_output_keeps_its_objects(store):
     old = Output("old", keyed=True)
-    written = await store.store({"a": 1}, None, scope(old, generation=1))
-    renamed = await store.store(Patch({"b": 2}), written.ref, scope(Output("new", keyed=True), generation=2))
+    written = await store.store({"a": 1}, None, context(old, generation=1))
+    renamed = await store.store(
+        Patch({"b": 2}), written.ref, context(Output("new", keyed=True), generation=2)
+    )
     assert renamed.ref.handle["path"] == "old"
     both = Keys({**at(old, {"a": 1}, 1).generations, **at(old, {"b": 2}, 2).generations})
     assert await store.load(renamed.ref, None, both) == {"a": 1, "b": 2}
-    value = await store.store(1, None, scope(Output("v1"), generation=3))
-    moved = await store.store(2, value.ref, scope(Output("v2"), generation=4))
+    value = await store.store(1, None, context(Output("v1"), generation=3))
+    moved = await store.store(2, value.ref, context(Output("v2"), generation=4))
     assert moved.ref.handle == {"mode": "value", "path": "v1@4", "base": "v1"}
 
 
 async def test_refs_round_trip_and_gone_values_fail(store):
-    written = await store.store("x", None, scope(Output("v"), generation=1))
+    written = await store.store("x", None, context(Output("v"), generation=1))
     back = Ref.from_json(written.ref.to_json())
     assert type(back).__name__ == "ObjectRef" and back == written.ref
-    await store.discard(scope(Output("v"), generation=2), written.ref, [("value", 1)])
+    await store.discard(context(Output("v"), generation=2), written.ref, [("value", 1)])
     with pytest.raises(StoreError, match="gone"):
         await store.load(back, None, None)
 
@@ -250,7 +252,7 @@ async def test_one_batch_is_read_without_listing_the_history(store, monkeypatch)
     ref = None
     for batch in range(200):
         ref = (
-            await store.store(Patch([{"e": batch}]), ref, scope(out, batch=batch, generation=batch + 1))
+            await store.store(Patch([{"e": batch}]), ref, context(out, batch=batch, generation=batch + 1))
         ).ref
     listed = []
     real = obstore.list
@@ -263,7 +265,7 @@ async def test_one_batch_is_read_without_listing_the_history(store, monkeypatch)
 
         return chunks()
 
-    await store.store(Patch([{"e": "uncommitted"}]), ref, scope(out, batch=200, generation=300))
+    await store.store(Patch([{"e": "uncommitted"}]), ref, context(out, batch=200, generation=300))
     monkeypatch.setattr(obstore, "list", counting)
     for lo, hi, read in ((199, 199, [{"e": 199}]), (0, 0, [{"e": 0}]), (199, 205, [{"e": 199}])):
         listed.clear()
@@ -310,7 +312,7 @@ async def test_a_prepared_write_is_read_once_and_only_its_selection_taken(store,
 
     monkeypatch.setattr(stores, "prepare_for", lambda *a, **k: pytest.fail("the store read the write again"))
     write = KeyedWrite(dataclasses.replace(prepared, take=counting), frozenset({"k7"}))
-    written = await store.store(write, None, scope(out, generation=2))
+    written = await store.store(write, None, context(out, generation=2))
     assert taken == [1]
     assert await store.load(written.ref, None, Keys({"k7": 2})) == [{"id": "k7", "n": 7}]
 
@@ -322,14 +324,14 @@ async def test_a_missing_object_a_commit_names_fails_the_read(store, data):
     import obstore
 
     out = Output("uploads", keyed=True)
-    written = await store.store({"a": 1, "b": 2}, None, scope(out, generation=1))
+    written = await store.store({"a": 1, "b": 2}, None, context(out, generation=1))
     keys = at(out, {"a": 1, "b": 2}, 1)
     gone = FileStore.key_name(written.ref.handle["path"], "a", keys.generations["a"])
     await obstore.delete_async(store._objects(), f"{gone}.json")
     with pytest.raises(StoreError, match="'a'.* is gone"):
         await store.load(written.ref, None, keys)
     events = Output("events", incremental=True)
-    batch = await store.store(Patch([{"e": 1}]), None, scope(events, batch=0, generation=1))
+    batch = await store.store(Patch([{"e": 1}]), None, context(events, batch=0, generation=1))
     names = await store._batches(batch.ref.handle["path"], 0, 0)
     await obstore.delete_async(store._objects(), f"{names[0]}.json")
     with pytest.raises(StoreError, match="is gone"):
@@ -357,7 +359,7 @@ async def test_a_store_reads_its_own_types(store):
 
     store.prepare = prepare
     out = Output("sheet", key="id")
-    written = await store.store(Sheet([("a", 1), ("b", 2)]), None, scope(out, generation=1))
+    written = await store.store(Sheet([("a", 1), ("b", 2)]), None, context(out, generation=1))
     assert await store.load(written.ref, None, Keys({"a": 1, "b": 1})) == [
         {"id": "a", "amount": 1},
         {"id": "b", "amount": 2},
@@ -371,6 +373,6 @@ def test_a_write_with_no_selection_is_paged_natively():
     out = Output("t", key="id")
     rows = [{"id": f"k{i}", "n": i} for i in range(5)]
     write = KeyedWrite(prepare(rows, out), whole=True)
-    pages = list(write.iter_pages(2))
+    pages = list(write.iter_chunks(2))
     assert [len(p) for p in pages] == [2, 2, 1]
     assert [(k, g) for p in pages for k, g in p] == [(r["id"], [r]) for r in rows]

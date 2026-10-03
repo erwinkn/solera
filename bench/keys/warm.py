@@ -38,7 +38,7 @@ import uuid
 from dataclasses import replace
 
 sys.path.insert(0, os.path.dirname(__file__))
-from solera.keys import SortedRun  # noqa: E402
+from solera.keys import SortedEntries  # noqa: E402
 from solera.keys.cache import EngineCache  # noqa: E402
 from solera.keys.index import KeyIndex, Options  # noqa: E402
 from solera.keys.io import ObjectIO  # noqa: E402
@@ -131,7 +131,7 @@ async def run_size(n: int, args) -> list[dict]:
             items = sorted((i, v) for i, (_, v) in rng.sample(list(current.items()), 1000))
             vers = [rng.randbytes(16) for _ in items]
             files, _ = await KeyIndex(setup, None, state, opts).resolve(
-                SortedRun.of([bench.key_of(i) for i, _ in items], vers),
+                SortedEntries.of([bench.key_of(i) for i, _ in items], vers),
                 batch=b + 1,
                 attempt="setup",
                 generation=100 + b,
@@ -144,7 +144,7 @@ async def run_size(n: int, args) -> list[dict]:
                 items = sorted((i, v) for i, (_, v) in rng.sample(list(current.items()), 5000))
                 vers = [rng.randbytes(16) for _ in items]
                 files, _ = await KeyIndex(setup, None, state, opts).resolve(
-                    SortedRun.of([bench.key_of(i) for i, _ in items], vers),
+                    SortedEntries.of([bench.key_of(i) for i, _ in items], vers),
                     batch=b,
                     attempt="setup",
                     generation=100 + b,
@@ -199,7 +199,7 @@ async def run_size(n: int, args) -> list[dict]:
             io = cold()
             (files, _), wall, cpu = await timed(
                 lambda io=io, keys=keys, vers=vers, k=k: KeyIndex(io, None, state, opts).resolve(
-                    SortedRun.of(keys, vers), batch=99, attempt=f"c{k}", generation=1
+                    SortedEntries.of(keys, vers), batch=99, attempt=f"c{k}", generation=1
                 )
             )
             row["cold"] = (wall, cpu, io.metrics.gets, io.metrics.bytes_in / 1e6)
@@ -210,7 +210,7 @@ async def run_size(n: int, args) -> list[dict]:
                 io, spent = cold(), {}
 
                 async def engine_path(io=io, keys=keys, vers=vers, p=p, k=k, label=label, spent=spent):
-                    run = SortedRun.of(keys, vers)
+                    run = SortedEntries.of(keys, vers)
                     body = request("inv", [Ask("out", "", "patch", 100, 1, state.prefix, 99, run)])
                     t = time.perf_counter()
                     out = await resolver.resolve(f"e{k}{label}", body, lambda name: p, lambda: True)

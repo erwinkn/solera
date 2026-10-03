@@ -73,20 +73,20 @@ class AWSECS:
 
     resume = launch
 
-    async def wait(self, run: dict, timeout: float) -> dict | None:
+    async def wait(self, handle: dict, timeout: float) -> dict | None:
         client = self._client()
         deadline = time.monotonic() + timeout
         while True:
             response = await asyncio.to_thread(
                 client.describe_tasks,
                 cluster=self.environment["cluster"],
-                tasks=[run["task_arn"]],
+                tasks=[handle["task_arn"]],
             )
             tasks = response.get("tasks") or []
             if not tasks:
                 # Not shown yet (ECS is eventually consistent after a launch),
                 # or stopped long ago: either way, ECS cannot tell.
-                raise LookupError(f"ECS shows no task {run['task_arn']}")
+                raise LookupError(f"ECS shows no task {handle['task_arn']}")
             task = tasks[0]
             if task.get("lastStatus") == "STOPPED":
                 containers = task.get("containers") or [{}]
@@ -102,13 +102,13 @@ class AWSECS:
                 return None
             await asyncio.sleep(min(5.0, deadline - time.monotonic()))
 
-    async def cancel(self, run: dict) -> None:
+    async def cancel(self, handle: dict) -> None:
         client = self._client()
         with contextlib.suppress(Exception):
             await asyncio.to_thread(
                 client.stop_task,
                 cluster=self.environment["cluster"],
-                task=run["task_arn"],
+                task=handle["task_arn"],
                 reason="canceled by solera",
             )
 
@@ -167,13 +167,13 @@ class K8sJob:
 
     resume = launch
 
-    async def wait(self, run: dict, timeout: float) -> dict | None:
+    async def wait(self, handle: dict, timeout: float) -> dict | None:
         _, api = self._clients()
         deadline = time.monotonic() + timeout
         while True:
             try:
                 job = await asyncio.to_thread(
-                    api.read_namespaced_job, run["job"], self.environment["namespace"]
+                    api.read_namespaced_job, handle["job"], self.environment["namespace"]
                 )
             except Exception as error:
                 if getattr(error, "status", None) == 404:
@@ -188,12 +188,12 @@ class K8sJob:
                 return None
             await asyncio.sleep(min(2.0, deadline - time.monotonic()))
 
-    async def cancel(self, run: dict) -> None:
+    async def cancel(self, handle: dict) -> None:
         _, api = self._clients()
         with contextlib.suppress(Exception):
             await asyncio.to_thread(
                 api.delete_namespaced_job,
-                run["job"],
+                handle["job"],
                 self.environment["namespace"],
                 propagation_policy="Background",
             )
@@ -219,7 +219,7 @@ class Modal:
         )
         return {"call_id": call.object_id}
 
-    async def wait(self, run: dict, timeout: float) -> dict | None:
+    async def wait(self, handle: dict, timeout: float) -> dict | None:
         """An exit only for what Modal says of the call itself: it returned
         (its code), raised, timed out, or failed inside Modal. Modal's own
         client, service and auth errors say nothing of the call: they raise,
@@ -239,7 +239,7 @@ class Modal:
         deadline = time.monotonic() + timeout
         while True:
             try:
-                call = modal.functions.FunctionCall.from_id(run["call_id"])
+                call = modal.functions.FunctionCall.from_id(handle["call_id"])
                 code = await asyncio.to_thread(call.get, timeout=0)
                 return {"code": code if isinstance(code, int) else 0, "reason": None, "meta": {}}
             except TimeoutError:
@@ -255,9 +255,9 @@ class Modal:
             except Exception as error:  # the function itself raised
                 return {"code": 1, "reason": f"{type(error).__name__}: {error}", "meta": {}}
 
-    async def cancel(self, run: dict) -> None:
+    async def cancel(self, handle: dict) -> None:
         import modal
 
         with contextlib.suppress(Exception):
-            call = modal.functions.FunctionCall.from_id(run["call_id"])
+            call = modal.functions.FunctionCall.from_id(handle["call_id"])
             await asyncio.to_thread(call.cancel)

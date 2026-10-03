@@ -5,13 +5,13 @@ appends events to create-only segment objects and periodically writes the
 whole state as a checkpoint. A writer starting up loads the newest
 checkpoint and replays the segments after it.
 
-    {prefix}/journal/{seq:020d}.json      {"seq", "writer", "at", "events": [...]}
-    {prefix}/checkpoints/{seq:020d}.json  {"seq", "writer", "at", "fences", "state": {...}}
+    {prefix}/journal/{seq:020d}.json      {"seq", "engine", "at", "events": [...]}
+    {prefix}/checkpoints/{seq:020d}.json  {"seq", "engine", "at", "fences", "state": {...}}
 
 Only create-only puts and LIST are needed — no compare-and-swap, which
 obstore's local filesystem backend does not implement.
 
-**Fencing.** A writer's first segment is its fence (`WriterStarted`); the
+**Fencing.** A writer's first segment is its fence (`EngineStarted`); the
 segment's seq is the writer id. The fence carries a random nonce: a create
 that finds its segment's exact bytes takes them for its own earlier try,
 and without the nonce two writers fencing at one seq could seal the same
@@ -110,7 +110,7 @@ class Journal:
         self.clock = clock
 
         self.seq = 0  # last segment written (by anyone) and applied
-        self.writer: int | None = None
+        self.engine: int | None = None
         # This writer's own: two writers fencing at one seq in the same instant
         # would otherwise seal the same bytes, each taking the other's for its own.
         self.nonce = secrets.token_hex(8)
@@ -189,7 +189,7 @@ class Journal:
             except _Behind:
                 log.warning("the journal was cleaned up past what this writer had read; opening again")
         self._task = asyncio.create_task(self._run())
-        return OpenResult(seq=self.writer, replayed=replayed, checkpoint=loaded)
+        return OpenResult(seq=self.engine, replayed=replayed, checkpoint=loaded)
 
     async def _load(self, restore) -> int | None:
         """Restore the newest readable checkpoint; its seq, or None."""
@@ -242,8 +242,8 @@ class Journal:
     async def _fence(self, apply) -> None:
         while True:
             seq = self.seq + 1
-            fence = {"type": "WriterStarted", "writer": seq, "nonce": self.nonce}
-            body = {"seq": seq, "writer": seq, "at": self.clock(), "events": [fence]}
+            fence = {"type": "EngineStarted", "engine": seq, "nonce": self.nonce}
+            body = {"seq": seq, "engine": seq, "at": self.clock(), "events": [fence]}
             try:
                 await create(self.store, self._segment(seq), _dumps(body))
             except AlreadyExistsError:
@@ -260,14 +260,14 @@ class Journal:
                 raise
             apply(fence)
             self.seq = seq
-            self.writer = seq
+            self.engine = seq
             self.fences.append(seq)
             return
 
     def _apply_segment(self, seq: int, body: dict, apply) -> None:
         for event in body["events"]:
             apply(event)
-            if event["type"] == "WriterStarted":
+            if event["type"] == "EngineStarted":
                 self.fences.append(seq)
         self.seq = seq
 
@@ -355,7 +355,7 @@ class Journal:
         events = self._buffer
         self._buffer, self._buffer_bytes, self._first_buffered, self._urgent = [], 0, None, False
         seq = self.seq + 1
-        head = {"at": self.clock(), "seq": seq, "writer": self.writer}
+        head = {"at": self.clock(), "seq": seq, "engine": self.engine}
         data = b'{"events":[' + b",".join(events) + b"]," + _dumps(head)[1:]
         # Sealed: memory now reflects exactly segments 1..seq, so a snapshot
         # taken here matches `seq` — before any later event is applied.
@@ -367,7 +367,7 @@ class Journal:
 
     def _checkpoint_body(self, seq: int) -> dict:
         at, fences = self.clock(), list(self.fences)
-        return {"seq": seq, "writer": self.writer, "at": at, "fences": fences, "state": self._snapshot()}
+        return {"seq": seq, "engine": self.engine, "at": at, "fences": fences, "state": self._snapshot()}
 
     async def _put_segment(self, seq: int, data: bytes) -> None:
         for attempt in range(5):
@@ -453,7 +453,7 @@ class Journal:
             except (asyncio.CancelledError, Exception):
                 pass
             self._task = None
-        if self.fenced or self.writer is None:
+        if self.fenced or self.engine is None:
             return
         await self.flush()
         if checkpoint and self._snapshot is not None and self._since_checkpoint:

@@ -118,7 +118,7 @@ export interface AutomationDecl {
 export interface Automation extends AutomationDecl {
   last_at: number | null;
   last_run: string | null;
-  last_revision: string | null;
+  last_deploy: string | null;
   pending: [string | null, string][];
   next_at?: number | null;
 }
@@ -152,7 +152,7 @@ export interface Manifest {
     commit: string | null;
     dirty: boolean;
   } | null;
-  revision: string;
+  deploy: string;
 }
 
 // -- engine --------------------------------------------------------------------
@@ -163,7 +163,7 @@ export interface Diagnostics {
   objects: string;
   namespace: string;
   project: string;
-  revision: string;
+  deploy: string;
   inflight: number;
   active_runs: number;
   postgres: boolean;
@@ -277,7 +277,7 @@ export interface FailureScope {
   scope: string;
   counts: Partial<Record<FailureClass, number>>;
   due: number | null;
-  epoch_min: number | null;
+  deploy_min: number | null;
   passes?: number | null;
   retry: Json;
   forced: Record<string, number>;
@@ -288,7 +288,7 @@ export interface FailureScope {
 export interface Failures {
   asset: string;
   scopes: FailureScope[];
-  epoch: number;
+  deploy: number;
   now: number;
   keys: FailureKey[];
   next: string | null;
@@ -633,7 +633,7 @@ export interface SensorView {
 export interface SensorHost {
   id: string;
   executor: string;
-  revision: string;
+  deploy: string;
   seen_at: number;
 }
 

@@ -53,68 +53,69 @@ class JsonTableStore:
         cur.execute(f"CREATE TABLE IF NOT EXISTS {table} (part text, k text, batch bigint, row jsonb)")
         return conn, cur
 
-    async def acquire(self, scope, prior) -> None:
-        await asyncio.to_thread(self._acquire, scope, prior)
+    async def acquire(self, context, prior) -> None:
+        await asyncio.to_thread(self._acquire, context, prior)
 
-    def _acquire(self, scope, prior) -> None:
-        table = self._table(scope.output, prior)
+    def _acquire(self, context, prior) -> None:
+        table = self._table(context.output, prior)
         conn, cur = self._transaction(table)
         with conn:
-            fence(cur, scope, table)
+            fence(cur, context, table)
 
-    async def store(self, write, prior, scope) -> Written:
-        return await asyncio.to_thread(self._store, write, prior, scope)
+    async def store(self, write, prior, context) -> Written:
+        return await asyncio.to_thread(self._store, write, prior, context)
 
-    def _store(self, write, prior, scope) -> Written:
-        out, table = scope.output, self._table(scope.output, prior)
-        if scope.reset:
+    def _store(self, write, prior, context) -> Written:
+        out, table = context.output, self._table(context.output, prior)
+        if context.reset:
             prior = None  # a full run keeps nothing of the content
         conn, cur = self._transaction(table)
         handle = {"table": table}
         with conn:
-            fence(cur, scope, table, write=True)  # before this transaction changes anything
+            fence(cur, context, table, write=True)  # before this transaction changes anything
             if out.key is None and not out.incremental:  # an unkeyed output: its whole content
                 rows = list(write)
-                cur.execute(f"DELETE FROM {table} WHERE part = %s", (scope.partition,))
+                cur.execute(f"DELETE FROM {table} WHERE part = %s", (context.partition,))
                 cur.executemany(
                     f"INSERT INTO {table} VALUES (%s, NULL, NULL, %s)",
-                    [(scope.partition, Jsonb(r)) for r in rows],
+                    [(context.partition, Jsonb(r)) for r in rows],
                 )
-                return Written(Ref(out.name, "", handle, scope.partition))
+                return Written(Ref(out.name, "", handle, context.partition))
             if out.key is None:  # an unkeyed incremental output: a batch of rows
                 rows = list(write.rows if isinstance(write, Patch) else write)
                 # The batch replaces itself (a retried call writes it again); with no
                 # prior (a first write, or a reset) the batches start over.
                 if prior is None:
-                    cur.execute(f"DELETE FROM {table} WHERE part = %s", (scope.partition,))
+                    cur.execute(f"DELETE FROM {table} WHERE part = %s", (context.partition,))
                 else:
                     cur.execute(
-                        f"DELETE FROM {table} WHERE part = %s AND batch = %s", (scope.partition, scope.batch)
+                        f"DELETE FROM {table} WHERE part = %s AND batch = %s",
+                        (context.partition, context.batch),
                     )
                 cur.executemany(
                     f"INSERT INTO {table} VALUES (%s, NULL, %s, %s)",
-                    [(scope.partition, scope.batch, Jsonb(r)) for r in rows],
+                    [(context.partition, context.batch, Jsonb(r)) for r in rows],
                 )
-                return Written(Ref(out.name, "", {**handle, "batch": scope.batch}, scope.partition))
+                return Written(Ref(out.name, "", {**handle, "batch": context.batch}, context.partition))
             write = KeyedWrite.of(self, write, out, prior)
             if write.whole:  # the scope's whole content: clear it first
-                cur.execute(f"DELETE FROM {table} WHERE part = %s", (scope.partition,))
-            for page in write.iter_pages():  # the keys to write: (key, rows)
-                keys = [k for k, _ in page]
+                cur.execute(f"DELETE FROM {table} WHERE part = %s", (context.partition,))
+            for chunk in write.iter_chunks():  # the keys to write: (key, rows)
+                keys = [k for k, _ in chunk]
                 if not write.whole:
                     cur.execute(
-                        f"DELETE FROM {table} WHERE part = %s AND k = ANY(%s)", (scope.partition, keys)
+                        f"DELETE FROM {table} WHERE part = %s AND k = ANY(%s)", (context.partition, keys)
                     )
                 cur.executemany(
                     f"INSERT INTO {table} VALUES (%s, %s, NULL, %s)",
-                    [(scope.partition, k, Jsonb(dict(r))) for k, group in page for r in group],
+                    [(context.partition, k, Jsonb(dict(r))) for k, group in chunk for r in group],
                 )
             if write.removes:
                 cur.execute(
                     f"DELETE FROM {table} WHERE part = %s AND k = ANY(%s)",
-                    (scope.partition, sorted(write.removes)),
+                    (context.partition, sorted(write.removes)),
                 )
-            return Written(Ref(out.name, "", handle, scope.partition))
+            return Written(Ref(out.name, "", handle, context.partition))
 
     def keys(self, ref, among=None):
         """The keys `ref`'s scope holds — among `among`, or all — sorted by

@@ -34,7 +34,7 @@ from typing import Any
 
 from obstore.exceptions import AlreadyExistsError
 from solera import errors, lifecycle
-from solera.keys import SortedRun
+from solera.keys import SortedEntries
 from solera.keys.index import (
     DeltaFiles,
     DeltaKeys,
@@ -69,9 +69,9 @@ from solera.stores import (
     Keys,
     Patch,
     Prepared,
-    Scope,
     Sql,
     StoreError,
+    WriteContext,
     WriteError,
     prepare_for,
     resolve_env,
@@ -498,7 +498,7 @@ async def _store_outputs(
         store = project.stores[declared[name]["store"]]
         o = outs[name] = _Out(name, decls[name], store, pinned.get(name) or {}, value)
         if o.kind == "fenced":
-            await store.acquire(o.scope(spec, invocation), o.prior)
+            await store.acquire(o.context(spec, invocation), o.prior)
 
     # Prepare and resolve: each keyed write read once, and compared with its key
     # index as pinned in the spec; its changes are the batch's delta file. Small
@@ -550,7 +550,7 @@ async def _store_outputs(
     # Write: nothing reaches a store before the fence is ours.
     for name, o in outs.items():
         output, store, store_name = o.output, o.store, declared[name]["store"]
-        scope = o.scope(spec, invocation)
+        context = o.context(spec, invocation)
         schema = None
         if output.migrations:
             migrate = getattr(store, "migrate", None)
@@ -559,7 +559,9 @@ async def _store_outputs(
                     f"{output.name}: store {store_name!r} has no migrate for declared migrations"
                 )
             try:
-                applied = await writes.call(migrate(output, output.migrations, scope=scope, prior=o.prior))
+                applied = await writes.call(
+                    migrate(output, output.migrations, context=context, prior=o.prior)
+                )
             except StoreError:
                 raise
             except Exception as error:
@@ -570,7 +572,7 @@ async def _store_outputs(
             handle = {**(ref.handle or {}), "schema": schema}
             entries[name] = {"ref": dataclasses.replace(ref, handle=handle).to_json(), "keys": intents[name]}
             continue
-        written = await writes.call(store.store(o.write or o.value, o.prior, scope))
+        written = await writes.call(store.store(o.write or o.value, o.prior, context))
         entry = {}
         if o.index is not None and o.sql:
             if written.keys is None:
@@ -623,7 +625,7 @@ class _Out:
     value: Any
     index: KeyIndex | None = None
     prepared: Prepared | None = None
-    run: SortedRun | None = None
+    run: SortedEntries | None = None
     intended: frozenset[str] = frozenset()  # keys dead attempts meant to change
     files: DeltaFiles | None = None
     changed: tuple | None = None  # ([written key], [removed key]), or None past LISTED
@@ -664,8 +666,8 @@ class _Out:
     def unsettled(self) -> list:
         return self.info.get("unsettled") or []
 
-    def scope(self, spec, invocation) -> Scope:
-        return Scope(
+    def context(self, spec, invocation) -> WriteContext:
+        return WriteContext(
             output=self.output,
             partition=spec["partition"],
             batch=self.info.get("batch"),
@@ -717,7 +719,7 @@ async def _prepare(o: _Out, spec, keys_io) -> None:
         return
     removes = [key_bytes(k) for k in o.prepared.removes]
     try:
-        o.run = await asyncio.to_thread(SortedRun.from_rows, o.prepared.rows, removes)
+        o.run = await asyncio.to_thread(SortedEntries.from_rows, o.prepared.rows, removes)
     except ValueError as e:  # a key both written and removed
         raise WriteError(f"{o.output.name}: {e}") from e
     if any(intent.get("unknown") for intent in o.unsettled):
@@ -788,7 +790,7 @@ def _keyed_write(o: _Out, keys_io) -> KeyedWrite:
 
 
 def _ask_for(o: _Out, spec: dict) -> Ask:
-    run = SortedRun.from_rows(o.prepared.rows) if o.replace else o.run
+    run = SortedEntries.from_rows(o.prepared.rows) if o.replace else o.run
     batch = int(o.info["batch"])
     return Ask(
         o.name,
@@ -847,7 +849,7 @@ async def _intended(info, keys_io, unsettled) -> list[str]:
             return found
 
 
-async def _repair(o: _Out, left: list[str]) -> SortedRun:
+async def _repair(o: _Out, left: list[str]) -> SortedEntries:
     """Take in what dead attempts left in the store (docs/versions.md §5),
     whose fence this attempt holds: they can write nothing more. Keys this
     patch writes or removes end as it says either way; of the others
@@ -865,7 +867,7 @@ async def _repair(o: _Out, left: list[str]) -> SortedRun:
     keys += [key_bytes(k) for k in sorted(held)]
     payloads += [None] * len(held)
     removes = [key_bytes(k) for k in (*o.prepared.removes, *(k for k in left if k not in held))]
-    return SortedRun.of(keys, payloads, removes)
+    return SortedEntries.of(keys, payloads, removes)
 
 
 async def _reconcile(o: _Out, spec):
@@ -1138,9 +1140,9 @@ async def _execute(
     except Exception as error:
         return _failed(error, False)
     timeline.add("imported")
-    if project.manifest["revision"] != spec["revision"]:
+    if project.manifest["deploy"] != spec["deploy"]:
         mismatch = (
-            f"revision mismatch: spec {spec['revision'][:12]} != project {project.manifest['revision'][:12]}"
+            f"revision mismatch: spec {spec['deploy'][:12]} != project {project.manifest['deploy'][:12]}"
         )
         failed = _failed(StoreError(mismatch), False)
         failed["error"]["build"] = project.manifest.get("build")  # how this host computed its revision
@@ -1317,7 +1319,7 @@ async def _discard_due(spec, project, asset, objects, writes) -> dict:
             done.append(entry["id"])
         if not done:
             continue
-        scope = Scope(output=decls[name], partition=spec["partition"], attempt=spec["attempt"])
+        scope = WriteContext(output=decls[name], partition=spec["partition"], attempt=spec["attempt"])
         before = Ref.from_json(info["before"]) if info.get("before") else None  # where its objects live
         await writes.call(store.discard(scope, before, items))
         discarded[name] = done

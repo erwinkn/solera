@@ -316,7 +316,7 @@ def test_demo_postgres_migrations_and_ondeploy(tmp_path):
         def deploy_fired():
             autos = client.get(f"{base}/automations").json()["automations"]
             auto = next((a for a in autos if a.get("targets") == ["deploy_notice"]), None)
-            return bool(auto and auto.get("last_revision"))
+            return bool(auto and auto.get("last_deploy"))
 
         assert wait(deploy_fired, timeout=30), "the OnDeploy job did not fire on boot"
 

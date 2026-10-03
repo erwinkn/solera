@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 import pytest
 from obstore.store import MemoryStore
-from solera.keys import Rows, SortedRun, _python
+from solera.keys import Rows, SortedEntries, _python
 from solera.keys.index import IndexState, KeyIndex, Options
 from solera.keys.io import ObjectIO
 
@@ -32,7 +32,7 @@ class Written:
 
 
 def run(keys, payloads=None, removes=()):
-    return SortedRun.of(list(keys), None if payloads is None else list(payloads), list(removes))
+    return SortedEntries.of(list(keys), None if payloads is None else list(payloads), list(removes))
 
 
 def entries_of(delta):

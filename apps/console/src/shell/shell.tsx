@@ -239,7 +239,7 @@ function EngineStatus() {
       <StatusDot tone={tone} pulse={tone === "ok"} />
       <span className="flex-1">{text}</span>
       {diagnostics && (
-        <span className="font-mono text-2xs text-fg-subtle">{diagnostics.revision.slice(0, 7)}</span>
+        <span className="font-mono text-2xs text-fg-subtle">{diagnostics.deploy.slice(0, 7)}</span>
       )}
     </Link>
   );

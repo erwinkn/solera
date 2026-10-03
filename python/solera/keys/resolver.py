@@ -13,7 +13,7 @@ of the header), `size` bytes long — a `.kx` file. Payloads lie back to back
 in output order, so no byte is two outputs'.
 
 Nothing in a request is taken on its word: a run is decoded once, every
-fact checked (`SortedRun.decode`), and the limits apply to what it holds.
+fact checked (`SortedEntries.decode`), and the limits apply to what it holds.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from .. import _native
-from .._native import LimitError, LocalError, SortedRun
+from .._native import LimitError, LocalError, SortedEntries
 from .cache import EngineCache
 from .index import IndexState, Options
 from .io import ObjectIO
@@ -235,7 +235,7 @@ class Resolver:
             fut.add_done_callback(done)
         return await asyncio.shield(fut)
 
-    async def compute(self, p: Prepared, kind: str, run: SortedRun, path: str):
+    async def compute(self, p: Prepared, kind: str, run: SortedEntries, path: str):
         """One resolve with no request around it — a source commit, in the engine:
         `(answer, delta)` as for an output of a request, under the same limits."""
 
@@ -247,7 +247,7 @@ class Resolver:
             self._release(run.nbytes)
 
     async def _compute(self, p: Prepared, kind: str, run, live, path: str, keys: int | None = None):
-        """The answer for `run` — a `SortedRun`, or a request's `.kx` payload
+        """The answer for `run` — a `SortedEntries`, or a request's `.kx` payload
         claiming `keys` entries, decoded here — against `p`'s index."""
 
         declined = {"result": "declined"}
@@ -265,7 +265,7 @@ class Resolver:
                 if isinstance(run, bytes):
                     try:
                         run = await in_thread(
-                            SortedRun.decode, run, max_entries=max(most, 0), max_bytes=lim.max_decoded
+                            SortedEntries.decode, run, max_entries=max(most, 0), max_bytes=lim.max_decoded
                         )
                     except LimitError:
                         return {**declined, "reason": "too_big"}, None
@@ -350,7 +350,7 @@ class Ask:
     generation: int
     prefix: str
     head_batch: int
-    run: SortedRun
+    run: SortedEntries
 
 
 def request(invocation: str, asks: list[Ask]) -> bytes:

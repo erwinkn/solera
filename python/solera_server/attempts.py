@@ -456,7 +456,7 @@ class Attempts:
         live.fresh = True
         spec = {
             "attempt": attempt,
-            "revision": self.manifest["revision"],
+            "deploy": self.manifest["deploy"],
             "project": self.manifest["name"],
             "asset": task["asset"],
             "partition": task["scope"],

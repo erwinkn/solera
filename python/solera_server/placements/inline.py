@@ -27,14 +27,14 @@ class InlinePlacement:
         self._tasks[stage["attempt"]] = task
         return {"id": stage["attempt"]}
 
-    async def wait(self, run: dict, timeout: float) -> dict | None:
-        task = self._tasks.get(run["id"])
+    async def wait(self, handle: dict, timeout: float) -> dict | None:
+        task = self._tasks.get(handle["id"])
         if task is None:
             return {"code": None, "reason": "lost", "meta": {}}
         done, _ = await asyncio.wait({task}, timeout=timeout)
         if not done:
             return None
-        del self._tasks[run["id"]]
+        del self._tasks[handle["id"]]
         if task.cancelled():
             return {"code": None, "reason": "canceled", "meta": {}}
         error = task.exception()
@@ -50,8 +50,8 @@ class InlinePlacement:
         if task is not None:
             task.add_done_callback(lambda _: self._tasks.pop(run["id"], None))
 
-    async def cancel(self, run: dict) -> None:
-        task = self._tasks.pop(run["id"], None)
+    async def cancel(self, handle: dict) -> None:
+        task = self._tasks.pop(handle["id"], None)
         if task is not None:
             task.cancel()
             try:

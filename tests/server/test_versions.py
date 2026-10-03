@@ -143,13 +143,13 @@ async def _dead_write(state, landed: bool):  # noqa: F811
     if landed:
         live.rows["k"] = {"id": "k", "v": 9}
     # The dead attempt's intent, as its gate left it: its delta file names `k`.
-    from solera.keys import SortedRun
+    from solera.keys import SortedEntries
     from solera.keys.index import KeyIndex
     from solera.keys.io import ObjectIO
 
     index = state.model.index("items", "")
     files, _ = await KeyIndex(ObjectIO(state.objects), None, index.pinned()).resolve(
-        SortedRun.of([b"k"]), batch=1, attempt="dead", generation=12
+        SortedEntries.of([b"k"]), batch=1, attempt="dead", generation=12
     )
     state.model.unsettled[("items", "")] = [{**files.to_json(), "run": "r", "attempt": "dead"}]
     assert status_of(await drive(engine, await engine.submit(["items"]))) == "succeeded"

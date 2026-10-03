@@ -150,7 +150,7 @@ retention (§11).
 ```json
 {
   "seq": 1042,
-  "writer": 1001,
+  "engine": 1001,
   "at": 1790074866.1,
   "events": [
     {"type": "AttemptFinished", "run": "01J8ZC7Q…", "task": "site_feed:alpha",
@@ -175,7 +175,7 @@ status are derived inside `apply`; they are not events.
 
 | Event | Fields | Effect |
 |---|---|---|
-| `WriterStarted` | `writer`, `nonce` | first event of every writer; its segment's `seq` becomes the writer id; `nonce` is random, so no two writers' fences have the same bytes |
+| `EngineStarted` | `writer`, `nonce` | first event of every writer; its segment's `seq` becomes the writer id; `nonce` is random, so no two writers' fences have the same bytes |
 | `ProjectRegistered` | `revision`, `manifest` | replaces the manifest; applies aliases; retires removed names (§2); reconciles automation state |
 | `RunSubmitted` | `run` (id, request, tasks) | adds an active run |
 | `RunControlled` | `run`, `action` (`cancel` \| `pause` \| `resume`) | |
@@ -247,7 +247,7 @@ Example (abridged):
 
 ```json
 {
-  "seq": 1040, "writer": 1001, "revision": "c0ffee…", "manifest": {"…": "…"},
+  "seq": 1040, "engine": 1001, "revision": "c0ffee…", "manifest": {"…": "…"},
   "heads": {"site_files": {"alpha": {
     "ref": {"output": "site_files", "store": "default", "partition": "alpha", "generation": 184467,
             "handle": {"mode": "keyed", "path": "site_files/alpha", "key": "path"}},
@@ -826,7 +826,7 @@ and rewrites the rows a write covers.
 
 **Writer start.** `LIST control/checkpoints/` → `GET` the newest →
 `LIST control/journal/` after its `seq` → `GET` and apply each segment →
-create `journal/{seq+1}` with `[WriterStarted]`. If that create fails,
+create `journal/{seq+1}` with `[EngineStarted]`. If that create fails,
 another writer appended: `GET` it, apply it, retry at the next `seq`.
 Then adopt every launched attempt (§8); tasks that were preparing are
 dispatched again.

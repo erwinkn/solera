@@ -1,4 +1,4 @@
-"""Running a native streaming job (`solera._native.Job`) over an index.
+"""Running a native streaming job (`solera._native.Merge`) over an index.
 
 The job does the per-key work; this module does its I/O. Each run — a
 level-0 file, or a level's files in key order — is read a segment of

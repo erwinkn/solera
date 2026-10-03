@@ -39,10 +39,8 @@ class HttpSensorChannel:
         self.base = f"/api/projects/{project}/sensors"
         self.client = httpx.AsyncClient(base_url=server, headers=headers, timeout=60)
 
-    async def next(
-        self, executor: str, revision: str, host: str, slots: int, build: str | None = None
-    ) -> dict:
-        params = {"executor": executor, "revision": revision, "host": host, "slots": slots, "wait": 30}
+    async def next(self, executor: str, deploy: str, host: str, slots: int, build: str | None = None) -> dict:
+        params = {"executor": executor, "deploy": deploy, "host": host, "slots": slots, "wait": 30}
         if build:
             params["build"] = build  # how this host computed its revision, for the engine's warning
         response = await self.client.get(f"{self.base}/next", params=params)
@@ -66,10 +64,8 @@ class LocalSensorChannel:
     def __init__(self, engine):
         self.engine = engine
 
-    async def next(
-        self, executor: str, revision: str, host: str, slots: int, build: str | None = None
-    ) -> dict:
-        return await self.engine.sensor_next(executor, revision, host, slots, 30, build)
+    async def next(self, executor: str, deploy: str, host: str, slots: int, build: str | None = None) -> dict:
+        return await self.engine.sensor_next(executor, deploy, host, slots, 30, build)
 
     async def post(self, sensor: str, tick: str, outcome: dict) -> dict:
         try:
@@ -104,7 +100,7 @@ async def run_sensor_host(
     looks every `watch` seconds, whatever it waits on — every slot may be
     taken by a sensor that runs for its whole timeout."""
 
-    revision = project.manifest["revision"]
+    deploy = project.manifest["deploy"]
     build = (project.manifest.get("build") or {}).get("source")
     host = host or f"{socket.gethostname()}:{os.getpid()}"
     running: set[asyncio.Task] = set()
@@ -149,7 +145,7 @@ async def run_sensor_host(
             if slots <= 0:
                 await asyncio.wait({*running, stopped}, return_when=asyncio.FIRST_COMPLETED)
                 continue
-            poll = asyncio.create_task(channel.next(executor, revision, host, slots, build))
+            poll = asyncio.create_task(channel.next(executor, deploy, host, slots, build))
             await asyncio.wait({poll, stopped}, return_when=asyncio.FIRST_COMPLETED)
             if not poll.done():  # stopping: stop asking
                 poll.cancel()
@@ -159,7 +155,7 @@ async def run_sensor_host(
             except Exception:
                 await asyncio.wait({stopped}, timeout=1.0)  # the engine may be restarting
                 continue
-            if answer["revision"] != revision:  # the engine serves other code: start afresh, later
+            if answer["deploy"] != deploy:  # the engine serves other code: start afresh, later
                 await asyncio.wait({stopped}, timeout=stale_wait)
                 break
             for tick in answer["ticks"]:

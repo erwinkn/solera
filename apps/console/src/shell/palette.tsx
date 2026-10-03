@@ -79,7 +79,7 @@ function Finder() {
   const [active, setActive] = useState(0);
   const diagnostics = useQuery(q.diagnostics()).data;
   const manifest = useQuery({
-    ...q.manifest(diagnostics?.project ?? "", diagnostics?.revision ?? ""),
+    ...q.manifest(diagnostics?.project ?? "", diagnostics?.deploy ?? ""),
     enabled: !!diagnostics,
   }).data;
 

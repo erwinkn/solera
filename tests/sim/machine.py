@@ -247,8 +247,8 @@ class Simulation(RuleBasedStateMachine):
         (`delay` later; `twice`: the post is retried)."""
 
         self.trace.append(f"sensor_round(delay={delay}, twice={twice})")
-        world, revision = self.world, self.project.manifest["revision"]
-        answer = self._request(lambda e: e.sensor_next("local", revision, "sim-host", 4, 0.0), "sensor poll")
+        world, deploy = self.world, self.project.manifest["deploy"]
+        answer = self._request(lambda e: e.sensor_next("local", deploy, "sim-host", 4, 0.0), "sensor poll")
         for tick in (answer or {}).get("ticks", []):
             value = self.project.sensors[tick["sensor"]].fn(None)
             outcome = value.to_json() if value is not None else {}

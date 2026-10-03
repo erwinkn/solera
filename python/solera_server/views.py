@@ -157,7 +157,7 @@ class Views:
             "until": record.until or None,
             "generation": record.upstream,  # the upstream key's that failed
             "message": record.message,
-            "eligible": eligible(record, self.clock(), self.m.epoch, forced),
+            "eligible": eligible(record, self.clock(), self.m.deploy_number, forced),
         }
 
     async def _failure_entries(self, asset: str, scopes: list[str], start: list | None):
@@ -226,7 +226,7 @@ class Views:
                     "scope": s,
                     "counts": r.get("counts") or {},
                     "due": r.get("due"),
-                    "epoch_min": r.get("epoch_min"),
+                    "deploy_min": r.get("deploy_min"),
                     "passes": r.get("passes") or 0,
                     "retry": r.get("retry"),
                     "forced": r.get("forced") or {},
@@ -235,7 +235,7 @@ class Views:
                 }
                 for s, r in sorted(records.items())
             ],
-            "epoch": self.m.epoch,
+            "deploy": self.m.deploy_number,
             "now": self.clock(),
             "keys": keys,
             "next": json.dumps(nxt) if nxt else None,

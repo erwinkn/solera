@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 from obstore.store import LocalStore
 from solera.sdk import Output
-from solera.stores import Scope
+from solera.stores import WriteContext
 
 
 def pytest_addoption(parser):
@@ -113,8 +113,8 @@ def data(tmp_path, monkeypatch):
     return path
 
 
-def scope(output: Output, partition: str = "", batch=None, **kw) -> Scope:
-    return Scope(output=output, partition=partition, batch=batch, attempt="test", **kw)
+def context(output: Output, partition: str = "", batch=None, **kw) -> WriteContext:
+    return WriteContext(output=output, partition=partition, batch=batch, attempt="test", **kw)
 
 
 async def whole(state, output: str, scope: str = ""):

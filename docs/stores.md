@@ -81,8 +81,8 @@ too, to find the same place.
 - A keyed output's write arrives as a `KeyedWrite`, already resolved
   against the engine's key index. A store reads it three ways: `whole` —
   the write is the scope's entire content, so clear the scope first;
-  `pages()` — the keys to write, a page at a time, each `(key, rows)`,
-  only that page taken from the write (`iter_pages()` for a store
+  `chunks()` — the keys to write, a chunk at a time, each `(key, rows)`,
+  only that chunk taken from the write (`iter_chunks()` for a store
   writing on a thread of its own); and `removes` — the keys to delete.
   Every other key stays as it is. An immutable store writes a key at
   most once per generation (a retried call, the same bytes): the
@@ -309,7 +309,7 @@ parse; only a function the query calls could still write, and
 function can turn back (a `SET ROLE` can: a function may `RESET ROLE`).
 
 Write a keyed output page by page: for `whole`, clear the slice first;
-then for each of `write.pages()`, delete its keys and insert their rows
+then for each of `write.chunks()`, delete its keys and insert their rows
 (or `MERGE`); then delete `removes`. `keys(ref, among)` is a `SELECT
 DISTINCT` of the key column over the slice, through a server-side cursor. A complete
 example, which passes the conformance kit, is

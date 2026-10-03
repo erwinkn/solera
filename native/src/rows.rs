@@ -14,8 +14,8 @@ use std::sync::Arc;
 use rayon::prelude::*;
 
 use crate::delta::Write;
+use crate::entries::SortedEntries;
 use crate::format::{Error, Result};
-use crate::run::SortedRun;
 use crate::sort::{self, Keys};
 use crate::stream::State;
 
@@ -358,13 +358,13 @@ impl Stream {
 /// the keys a store holds, read back a chunk at a time.
 pub struct Overlay {
     pub base: Stream,
-    run: Arc<SortedRun>,
+    run: Arc<SortedEntries>,
     i: usize,
     current: Option<bool>, // Some(true): the run's entry `i`; Some(false): the base's
 }
 
 impl Overlay {
-    pub fn new(base: Stream, run: Arc<SortedRun>) -> Overlay {
+    pub fn new(base: Stream, run: Arc<SortedEntries>) -> Overlay {
         Overlay {
             base,
             run,
@@ -429,7 +429,7 @@ impl Overlay {
 pub enum Source {
     Table(Box<Cursor>),
     Stream(Stream),
-    Run(Arc<SortedRun>, usize),
+    Run(Arc<SortedEntries>, usize),
     Overlay(Box<Overlay>),
 }
 

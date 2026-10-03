@@ -53,50 +53,50 @@ class TableStore:
 
         return (prior.handle or {}).get("table") if prior is not None else f"rows_{output.name}"
 
-    def _fence(self, scope, table: str) -> tuple | None:
+    def _fence(self, context, table: str) -> tuple | None:
         """The fence row this transaction would write, or `StoreError`."""
 
-        if scope.generation is None:
+        if context.generation is None:
             return None
-        key = (table, scope.partition)
+        key = (table, context.partition)
         held = self.db.fences.get(key)
-        mine = (int(scope.generation), scope.invocation or "")
+        mine = (int(context.generation), context.invocation or "")
         if held is not None and not (held[0] < mine[0] or held == mine):
             raise StoreError(
-                f"{scope.output.name}: a newer attempt holds {table} {scope.partition!r} "
-                f"(generation {scope.generation} of {scope.invocation!r} refused)"
+                f"{context.output.name}: a newer attempt holds {table} {context.partition!r} "
+                f"(generation {context.generation} of {context.invocation!r} refused)"
             )
         return mine
 
-    async def _transaction(self, kind: str, scope, prior, body: Callable[[dict], object]):
+    async def _transaction(self, kind: str, context, prior, body: Callable[[dict], object]):
         """Lock the slice, fence, apply `body` to a copy of its rows, commit."""
 
-        table = self._table(scope.output, prior)
-        fate, delay = self.db.fault(kind, scope) if self.db.fault is not None else (None, 0.0)
-        async with self.db.lock(table, scope.partition):
+        table = self._table(context.output, prior)
+        fate, delay = self.db.fault(kind, context) if self.db.fault is not None else (None, 0.0)
+        async with self.db.lock(table, context.partition):
             if fate == "error":
                 raise StoreError(f"injected: the database refused the {kind} transaction")
-            fenced = self._fence(scope, table)  # the fence row is ours until the commit
-            rows = copy.deepcopy(self.db.tables.get(table, {}).get(scope.partition, []))
+            fenced = self._fence(context, table)  # the fence row is ours until the commit
+            rows = copy.deepcopy(self.db.tables.get(table, {}).get(context.partition, []))
             box = {"rows": rows}
             value = body(box)
             if delay:
                 await asyncio.sleep(delay)  # open, holding the fence row
             if fenced is not None:
-                self.db.fences[(table, scope.partition)] = fenced
-            self.db.tables.setdefault(table, {})[scope.partition] = box["rows"]
+                self.db.fences[(table, context.partition)] = fenced
+            self.db.tables.setdefault(table, {})[context.partition] = box["rows"]
             self.db.commits += 1
         if fate == "lost":
             raise StoreError(f"injected: the {kind} transaction committed, its answer was lost")
         return value
 
-    async def acquire(self, scope, prior=None) -> None:
-        await self._transaction("acquire", scope, prior, lambda box: None)
+    async def acquire(self, context, prior=None) -> None:
+        await self._transaction("acquire", context, prior, lambda box: None)
 
-    async def store(self, write, prior, scope) -> Written:
-        out = scope.output
+    async def store(self, write, prior, context) -> Written:
+        out = context.output
         table = self._table(out, prior)  # where the content is, even when it starts over
-        reset = getattr(scope, "reset", False)
+        reset = getattr(context, "reset", False)
         base = None if reset else prior  # what the write builds on
 
         def body(box):
@@ -106,22 +106,22 @@ class TableStore:
                 if base is None:
                     rows.clear()
                 else:
-                    rows[:] = [r for r in rows if r[1] != scope.batch]
-                rows.extend((None, scope.batch, dict(r)) for r in batch)
-                return Written(Ref(out.name, "", {"table": table, "batch": scope.batch}, scope.partition))
+                    rows[:] = [r for r in rows if r[1] != context.batch]
+                rows.extend((None, context.batch, dict(r)) for r in batch)
+                return Written(Ref(out.name, "", {"table": table, "batch": context.batch}, context.partition))
             keyed = KeyedWrite.of(self, write, out, base)
             if keyed.whole or reset:
                 rows.clear()
-            for page in keyed.iter_pages():
-                keys = {k for k, _ in page}
+            for chunk in keyed.iter_chunks():
+                keys = {k for k, _ in chunk}
                 if not keyed.whole:
                     rows[:] = [r for r in rows if r[0] not in keys]
-                rows.extend((k, None, dict(r)) for k, group in page for r in group)
+                rows.extend((k, None, dict(r)) for k, group in chunk for r in group)
             if keyed.removes:
                 rows[:] = [r for r in rows if r[0] not in keyed.removes]
-            return Written(Ref(out.name, "", {"table": table}, scope.partition))
+            return Written(Ref(out.name, "", {"table": table}, context.partition))
 
-        return await self._transaction("store", scope, prior, body)
+        return await self._transaction("store", context, prior, body)
 
     def keys(self, ref, among=None):
         """The keys the slice holds — among `among`, or all — sorted by their

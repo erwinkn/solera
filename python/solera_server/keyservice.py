@@ -27,7 +27,7 @@ import tempfile
 import threading
 from urllib.parse import unquote, urlsplit
 
-from solera.keys import LocalError, SortedRun
+from solera.keys import LocalError, SortedEntries
 from solera.keys.cache import Corrupt, EngineCache
 from solera.keys.index import FileInfo, IndexState, KeyIndex, Options
 from solera.keys.io import ObjectIO
@@ -204,7 +204,7 @@ class KeyService:
             self.release(token)
 
     async def direct(
-        self, index, kind: str, run: SortedRun, generation: int, batch: int, path: str, position: float
+        self, index, kind: str, run: SortedEntries, generation: int, batch: int, path: str, position: float
     ):
         """A resolve of a sorted run against `index` as the engine holds it at
         `position` — a source commit's, in process (docs/resolved-commits.md

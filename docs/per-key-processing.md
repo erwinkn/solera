@@ -312,7 +312,7 @@ resolution, repair and storage:
   sorted, each the group of the rows that carry it — only the key of a
   row is read, never a per-key Python object, which keeps 100M keys under
   1 GB (`key-index-costs.md`). Rows are read, not used up: the
-  resolution's join, the engine's request and a patch's `SortedRun` read
+  resolution's join, the engine's request and a patch's `SortedEntries` read
   the same ones.
 - `take(indices)`: the write's rows as the store persists them, from the
   same reading. Asked to write some keys, a store takes only their groups

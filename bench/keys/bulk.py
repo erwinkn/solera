@@ -28,7 +28,7 @@ import time
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from solera.keys import Rows, SortedRun  # noqa: E402
+from solera.keys import Rows, SortedEntries  # noqa: E402
 from solera.keys.index import IndexState, KeyIndex, Options  # noqa: E402
 from solera.keys.io import ObjectIO  # noqa: E402
 
@@ -160,7 +160,7 @@ async def build(n: int, prefix: str, path: str) -> None:
     files, _ = await idx.replace(Rows.arrow(arrow_table(n, False), "k"), 0, "build", generation=1)
     state = IndexState().committed(0, files, keep_log=False)
     idx = KeyIndex(io, prefix, state, opts)
-    patch = SortedRun.of(key_list(n, False, "k LIKE '%00'"))
+    patch = SortedEntries.of(key_list(n, False, "k LIKE '%00'"))
     files, _ = await idx.resolve(patch, batch=1, attempt="delta", generation=2)
     state = state.committed(1, files, keep_log=False)
     with open(path, "w") as f:

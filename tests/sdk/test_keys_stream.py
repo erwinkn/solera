@@ -37,7 +37,7 @@ def index(entries, max_file_bytes=4096):
 
 
 def replace(rows, runs, max_file_bytes=4096, collect=10**6, stream=(), key=None):
-    job = _native.Job.replace(
+    job = _native.Merge.replace(
         rows, len(runs), max_file_bytes=max_file_bytes, collect=collect, key=key, generation=G, **OPTS
     )
     files = drive(job, runs, stream)
@@ -215,11 +215,11 @@ def test_compact_many_files():
     for e in reversed(levels):
         want.update(e)
     for drop in (False, True):
-        job = _native.Job.compact(len(runs), drop_deleted=drop, max_file_bytes=4096, **OPTS)
+        job = _native.Merge.compact(len(runs), drop_deleted=drop, max_file_bytes=4096, **OPTS)
         files = drive(job, runs, per=2)
         got = content(files)
         assert got == [(k, g, d, p) for k, (g, d, p) in sorted(want.items()) if not (drop and d)]
-    count = _native.Job.count(len(runs))
+    count = _native.Merge.count(len(runs))
     drive(count, runs)
     assert count.live == sum(1 for _, d, _ in want.values() if not d)
 
@@ -253,14 +253,14 @@ def test_one_join_whatever_the_content_comes_as():
     live, written, runs = scenario(seed=5)
     items = sorted(written.items())
     by_rows, files = replace(_native.Rows.pairs(items), runs)
-    run = _native.SortedRun.of([k for k, _ in items], [v for _, v in items])
-    by_run = _native.Job.patch(
+    run = _native.SortedEntries.of([k for k, _ in items], [v for _, v in items])
+    by_run = _native.Merge.patch(
         run, len(runs), replace=True, max_file_bytes=4096, collect=10**6, generation=G, **OPTS
     )
     assert content(drive(by_run, runs, ())) == content(files) == expected(live, written)
     assert (by_run.added, by_run.removed, by_run.changed) == (by_rows.added, by_rows.removed, by_rows.changed)
     assert by_run.collected() == by_rows.collected()
-    patch = _native.Job.patch(run, len(runs), max_file_bytes=4096, generation=G, **OPTS)
+    patch = _native.Merge.patch(run, len(runs), max_file_bytes=4096, generation=G, **OPTS)
     assert content(drive(patch, runs, ())) == [e for e in expected(live, written) if not e[2]]
     assert patch.removed == 0
 
@@ -273,6 +273,6 @@ def test_arrow_columns_named_twice_are_refused():
     table = pa.Table.from_arrays([pa.array(["a"]), pa.array(["b"])], names=["id", "id"])
     with pytest.raises(ValueError, match="appears twice"):
         _native.Rows.arrow(table, "id")
-    job = _native.Job.replace(None, 0, key="id", **OPTS)
+    job = _native.Merge.replace(None, 0, key="id", **OPTS)
     with pytest.raises(ValueError, match="appears twice"):
         job.feed_rows(table)

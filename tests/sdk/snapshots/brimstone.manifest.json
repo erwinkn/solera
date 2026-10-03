@@ -1015,6 +1015,7 @@
     "id": "snapshot",
     "source": "explicit"
   },
+  "deploy": "5b511e7b31082c25eb095b11a99cb1f157ffa7504b80c3c552bb4249e3fa7387",
   "errors": [],
   "executors": {
     "ingest": {
@@ -1349,7 +1350,6 @@
     }
   },
   "retention": null,
-  "revision": "5b511e7b31082c25eb095b11a99cb1f157ffa7504b80c3c552bb4249e3fa7387",
   "sensors": {},
   "sources": {
     "leach_crosswalk": {

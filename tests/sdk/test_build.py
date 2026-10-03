@@ -87,21 +87,21 @@ def test_revision_follows_the_build(monkeypatch):
     one = Project(assets=[a]).manifest
     monkeypatch.setenv("SOLERA_BUILD", "two")
     two = Project(assets=[a]).manifest
-    assert one["revision"] != two["revision"] and "code_hash" not in one["assets"]["a"]
-    assert Project(assets=[a], build="two").manifest["revision"] == two["revision"]
+    assert one["deploy"] != two["deploy"] and "code_hash" not in one["assets"]["a"]
+    assert Project(assets=[a], build="two").manifest["deploy"] == two["deploy"]
 
 
-def test_epoch_counts_served_revisions():
+def test_the_deploy_number_counts_served_deploys():
     from solera_server.model import Model
 
     m = Model()
     manifest = {"automations": {}, "sources": {}, "assets": {}, "outputs": {}}
-    for revision in ("r1", "r1", "r2", "r1"):
-        m.apply({"type": "ProjectRegistered", "revision": revision, "manifest": manifest, "at": 0})
-    assert m.epoch == 3
+    for deploy in ("r1", "r1", "r2", "r1"):
+        m.apply({"type": "ProjectRegistered", "deploy": deploy, "manifest": manifest, "at": 0})
+    assert m.deploy_number == 3
     restored = Model()
     restored.restore(m.snapshot())
-    assert restored.epoch == 3
+    assert restored.deploy_number == 3
 
 
 def test_a_method_mismatch_is_named():
@@ -131,7 +131,7 @@ async def test_the_engine_warns_when_a_worker_computed_its_revision_another_way(
     project = Project(assets=[numbers], build="served")
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = make_engine(state, project)
-    engine.manifest = {**engine.manifest, "build": {"id": "x", "source": "git"}, "revision": "elsewhere"}
+    engine.manifest = {**engine.manifest, "build": {"id": "x", "source": "git"}, "deploy": "elsewhere"}
     await engine.initialize()
     with caplog.at_level(logging.WARNING):
         detail = await engine.run_until((await engine.submit(["numbers"]))["id"], 10)
@@ -184,7 +184,7 @@ def test_the_error_policy_changes_the_revision(monkeypatch):
         retry_for = "3h"
 
     revisions = {
-        Project(assets=[a], errors=mapping).manifest["revision"]
+        Project(assets=[a], errors=mapping).manifest["deploy"]
         for mapping in (
             {ValueError: Failed},
             {ValueError: Rejected},

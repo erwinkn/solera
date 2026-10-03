@@ -212,7 +212,7 @@ from solera.stores import FileStore
 class Ledgered(FileStore):
     \"\"\"Runs callable migrations once each, noting them in a ledger file.\"\"\"
 
-    async def migrate(self, output, migrations, scope=None, prior=None):
+    async def migrate(self, output, migrations, context=None, prior=None):
         path = os.path.join(os.environ["SOLERA_DATA"], "ledger.json")
         applied = json.load(open(path)) if os.path.exists(path) else []
         for m in migrations:

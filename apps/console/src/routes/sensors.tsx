@@ -136,7 +136,7 @@ function OutcomeCounts({ ticks }: { ticks: Tick[] }) {
   );
 }
 
-function Hosts({ hosts }: { hosts: { id: string; executor: string; revision: string; seen_at: number }[] }) {
+function Hosts({ hosts }: { hosts: { id: string; executor: string; deploy: string; seen_at: number }[] }) {
   return (
     <Card>
       <CardHeader
@@ -149,7 +149,7 @@ function Hosts({ hosts }: { hosts: { id: string; executor: string; revision: str
             <tr>
               <Th>Host</Th>
               <Th>Executor</Th>
-              <Th>Revision</Th>
+              <Th>Deploy</Th>
               <Th>Last seen</Th>
             </tr>
           </thead>
@@ -158,7 +158,7 @@ function Hosts({ hosts }: { hosts: { id: string; executor: string; revision: str
               <Tr key={h.id}>
                 <Td className="font-mono text-xs">{h.id}</Td>
                 <Td>{h.executor}</Td>
-                <Td className="font-mono text-xs text-fg-muted">{h.revision.slice(0, 12)}</Td>
+                <Td className="font-mono text-xs text-fg-muted">{h.deploy.slice(0, 12)}</Td>
                 <Td className="text-fg-muted">
                   <Time at={h.seen_at} />
                 </Td>

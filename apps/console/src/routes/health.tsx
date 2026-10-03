@@ -63,10 +63,10 @@ function Engine() {
       <Facts className="px-4 pb-4">
         <Fact label="Project">{d.project}</Fact>
         <Fact label="Namespace">{d.namespace}</Fact>
-        <Fact label="Revision">
+        <Fact label="Deploy">
           <span className="inline-flex items-center gap-1 font-mono text-xs">
-            {d.revision.slice(0, 12)}
-            <CopyButton value={d.revision} />
+            {d.deploy.slice(0, 12)}
+            <CopyButton value={d.deploy} />
           </span>
         </Fact>
         <Fact label="Build">

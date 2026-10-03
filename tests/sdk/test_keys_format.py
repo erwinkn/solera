@@ -170,7 +170,7 @@ def merge(impl, files, **kw):
 
     if impl is _python:
         return _python.merge_files(files, **kw)
-    job = _native.Job.compact(len(files), **kw)
+    job = _native.Merge.compact(len(files), **kw)
     return drive(job, [[f] for f in files])
 
 
@@ -317,7 +317,7 @@ def test_a_compaction_names_every_object_it_drops():
     l2 = _native.encode_file([b"a", b"b", b"c"], [1, 1, 1], b"\x00\x00\x00")
     l1 = _native.encode_file([b"a", b"b"], [2, 2], b"\x00\x01")  # b deleted
     l0 = _native.encode_file([b"a", b"c"], [3, 1], b"\x00\x00")  # c: the same object
-    job = _native.Job.compact(3, drop_deleted=True, garbage=True)
+    job = _native.Merge.compact(3, drop_deleted=True, garbage=True)
     garbage = []
     files = drive(job, [[l0], [l1], [l2]], on_garbage=garbage.append)
     _, k, g, _, _ = decode_all(_native, files[0])
@@ -349,7 +349,7 @@ def test_malformed_input_raises_errors_never_panics():
         lambda b: _native.decode_block(b, 1),
         lambda b: _native.lookup([b], 0, [b"site-1"]),
         lambda b: _native.merge_range([[b]], [0], None, None, False),
-        lambda b: _native.SortedRun.decode(b),
+        lambda b: _native.SortedEntries.decode(b),
         lambda b: _native.parse_index(b, len(b)),
         lambda b: _native.parse_index(b, len(b) // 2),  # a part longer than its file
         lambda b: _native.parse_tail(b, len(b)),
@@ -364,7 +364,7 @@ def test_malformed_input_raises_errors_never_panics():
 
 
 def test_a_sorted_run_round_trips_and_checks_what_it_decodes():
-    run = _native.SortedRun.of([b"c", b"a", b"d"], [b"3", None, b""], [b"b", b"b"])
+    run = _native.SortedEntries.of([b"c", b"a", b"d"], [b"3", None, b""], [b"b", b"b"])
     assert (len(run), run.upserts, run.removes) == (4, 3, 1)
     assert run.entries() == (
         [b"a", b"b", b"c", b"d"],
@@ -373,15 +373,15 @@ def test_a_sorted_run_round_trips_and_checks_what_it_decodes():
         [None, None, b"3", b""],
     )
     data = run.encode()
-    assert _native.SortedRun.decode(data).entries() == run.entries()
+    assert _native.SortedEntries.decode(data).entries() == run.entries()
     with pytest.raises(_native.LimitError):
-        _native.SortedRun.decode(data, max_entries=2)
+        _native.SortedEntries.decode(data, max_entries=2)
     with pytest.raises(_native.LimitError):
-        _native.SortedRun.decode(data, max_bytes=4)
+        _native.SortedEntries.decode(data, max_bytes=4)
     with pytest.raises(ValueError):
-        _native.SortedRun.of([b"a"], None, [b"a"])  # written and removed
+        _native.SortedEntries.of([b"a"], None, [b"a"])  # written and removed
     with pytest.raises(ValueError):
-        _native.SortedRun.of([b"a", b"a"])
+        _native.SortedEntries.of([b"a", b"a"])
 
 
 def test_a_runs_index_is_inside_its_decoding_budget():
@@ -408,7 +408,7 @@ def test_a_runs_index_is_inside_its_decoding_budget():
     bomb = with_index(b"\0\0\0" + bytes(128 * 2**20))
     assert len(bomb) < 2**20
     with pytest.raises(_native.LimitError):
-        _native.SortedRun.decode(bomb, max_bytes=2**20)
+        _native.SortedEntries.decode(bomb, max_bytes=2**20)
     with pytest.raises(_native.FormatError):
-        _native.SortedRun.decode(with_index(b"\0\0\0" + bytes(100)))  # trailing bytes
-    assert len(_native.SortedRun.decode(with_index(b"\0\0\0"))) == 0
+        _native.SortedEntries.decode(with_index(b"\0\0\0" + bytes(100)))  # trailing bytes
+    assert len(_native.SortedEntries.decode(with_index(b"\0\0\0"))) == 0

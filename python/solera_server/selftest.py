@@ -82,7 +82,7 @@ async def selftest(url):
     old = await State.open(url, namespace)
     new = await State.open(url, namespace)
     try:
-        check(new.model.revision == manifest["revision"], "Registration did not survive a restart")
+        check(new.model.deploy == manifest["deploy"], "Registration did not survive a restart")
         new.record({"type": "AutomationChanged", "name": "__probe__", "enabled": True})
         await new.durable()
         try:

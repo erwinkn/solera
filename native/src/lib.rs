@@ -3,7 +3,7 @@
 //! Two kinds of functions. Kernels over byte strings the caller holds —
 //! encoding, decoding, filter checks, lookups, bounded scans — mirror
 //! `solera/keys/_python.py`, the format's reference. Jobs stream over a whole
-//! index — a full replacement, a compaction, a recount: a `Job` asks for the
+//! index — a full replacement, a compaction, a recount: a `Merge` asks for the
 //! file segments it needs and hands back the files it writes, and Python does
 //! the I/O in between. Keys, payloads and file contents cross the boundary
 //! as `bytes` (a payload `None` where an entry carries none), generations
@@ -11,12 +11,12 @@
 
 pub mod arrow;
 pub mod delta;
+pub mod entries;
 pub mod format;
 pub mod garbage;
 pub mod jobs;
 pub mod local;
 pub mod rows;
-pub mod run;
 pub mod sort;
 pub mod sparse;
 pub mod stream;
@@ -634,15 +634,15 @@ fn pack<'py>(
 /// Keys, and their payloads where they carry them, as lists.
 type Entries<'py> = (Bound<'py, PyList>, Bound<'py, PyList>);
 
-/// A pass over `Rows`, a page of keys and payloads at a time (`Rows.pages`).
+/// A pass over `Rows`, a chunk of keys and payloads at a time (`Rows.chunks`).
 #[pyclass(module = "solera._native")]
-struct Pages {
+struct Chunks {
     cursor: Cursor,
     size: usize,
 }
 
 #[pymethods]
-impl Pages {
+impl Chunks {
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
@@ -811,12 +811,12 @@ impl Rows {
     }
 
     /// Every key and its payload, in key order, `size` at a time.
-    fn pages(&self, size: usize) -> PyResult<Pages> {
+    fn chunks(&self, size: usize) -> PyResult<Chunks> {
         guard(|| {
             if size == 0 {
                 return Err(PyValueError::new_err("a page holds at least one key"));
             }
-            Ok(Pages {
+            Ok(Chunks {
                 cursor: Cursor::new(self.table.clone()),
                 size,
             })
@@ -905,18 +905,18 @@ fn chunk(py: Python<'_>, obj: &Bound<'_, PyAny>, key: Option<&str>) -> PyResult<
 /// A write's entries in key order (`run.rs`): upserts, each with its payload
 /// if it carries one, and removes. Immutable once built, so readers share it.
 #[pyclass(module = "solera._native", frozen)]
-struct SortedRun {
-    inner: Arc<run::SortedRun>,
+struct SortedEntries {
+    inner: Arc<entries::SortedEntries>,
 }
 
-fn sorted_run(r: format::Result<run::SortedRun>) -> PyResult<SortedRun> {
-    Ok(SortedRun {
+fn sorted_run(r: format::Result<entries::SortedEntries>) -> PyResult<SortedEntries> {
+    Ok(SortedEntries {
         inner: Arc::new(r.map_err(to_py)?),
     })
 }
 
 #[pymethods]
-impl SortedRun {
+impl SortedEntries {
     /// Upserts of `keys` (any order, each key once), each with its payload
     /// if `payloads` gives one (None for none), and the removes of
     /// `removes`; a key both written and removed is an error.
@@ -927,12 +927,12 @@ impl SortedRun {
         keys: Vec<PyBackedBytes>,
         payloads: Option<Vec<Option<PyBackedBytes>>>,
         removes: Vec<PyBackedBytes>,
-    ) -> PyResult<SortedRun> {
+    ) -> PyResult<SortedEntries> {
         guard(|| {
             sorted_run(py.detach(|| {
                 let payloads: Option<Vec<Option<&[u8]>>> =
                     payloads.as_ref().map(|p| p.iter().map(opt).collect());
-                run::SortedRun::of(&slices(&keys), payloads.as_deref(), &slices(&removes))
+                entries::SortedEntries::of(&slices(&keys), payloads.as_deref(), &slices(&removes))
             }))
         })
     }
@@ -945,10 +945,12 @@ impl SortedRun {
         py: Python<'_>,
         rows: PyRef<'_, Rows>,
         removes: Vec<PyBackedBytes>,
-    ) -> PyResult<SortedRun> {
+    ) -> PyResult<SortedEntries> {
         guard(|| {
             let mut src = Source::Table(Box::new(Cursor::new(rows.table.clone())));
-            sorted_run(py.detach(|| run::SortedRun::from_source(&mut src, &slices(&removes))))
+            sorted_run(
+                py.detach(|| entries::SortedEntries::from_source(&mut src, &slices(&removes))),
+            )
         })
     }
 
@@ -962,8 +964,10 @@ impl SortedRun {
         data: PyBackedBytes,
         max_entries: u64,
         max_bytes: u64,
-    ) -> PyResult<SortedRun> {
-        guard(|| sorted_run(py.detach(|| run::SortedRun::decode(&data, max_entries, max_bytes))))
+    ) -> PyResult<SortedEntries> {
+        guard(|| {
+            sorted_run(py.detach(|| entries::SortedEntries::decode(&data, max_entries, max_bytes)))
+        })
     }
 
     /// The transport form: one `.kx` file.
@@ -1037,7 +1041,7 @@ fn filter_of(f: &(u64, u8, PyBackedBytes)) -> sparse::Filter<'_> {
 #[pymethods]
 impl Sparse {
     #[new]
-    fn new(run: PyRef<'_, SortedRun>) -> PyResult<Sparse> {
+    fn new(run: PyRef<'_, SortedEntries>) -> PyResult<Sparse> {
         guard(|| {
             Ok({
                 Sparse {
@@ -1149,7 +1153,7 @@ impl Sparse {
     }
 
     /// The run's delta over what was read: `.kx` files with added, removed
-    /// and changed, and up to `collect` changed keys (`Job.collected`).
+    /// and changed, and up to `collect` changed keys (`Merge.collected`).
     #[pyo3(signature = (*, generation, collect=0, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864))]
     #[allow(clippy::too_many_arguments)]
     fn delta<'py>(
@@ -1189,7 +1193,7 @@ enum Kind {
 /// `end_rows`, `("file", data)` for each file written, `("garbage", data)`
 /// for each garbage file a compaction writes, and `None` when done.
 #[pyclass(module = "solera._native")]
-struct Job {
+struct Merge {
     kind: Kind,
     /// The column a streamed replacement's chunks of rows are keyed by.
     key: Option<String>,
@@ -1205,7 +1209,7 @@ fn merge_of(kind: &mut Kind) -> &mut stream::Merge {
     }
 }
 
-impl Job {
+impl Merge {
     fn merge(&mut self) -> &mut stream::Merge {
         merge_of(&mut self.kind)
     }
@@ -1227,7 +1231,7 @@ impl Job {
 }
 
 #[pymethods]
-impl Job {
+impl Merge {
     /// The merge-join of the written content (`rows`, or with None a stream
     /// fed sorted chunks of keys, `feed_rows` — with `key`, rows keyed by
     /// that column) against `runs` existing runs, newest first. At most
@@ -1250,8 +1254,8 @@ impl Job {
         collect: usize,
         key: Option<String>,
         generation: u64,
-        overlay: Option<PyRef<'_, SortedRun>>,
-    ) -> PyResult<Job> {
+        overlay: Option<PyRef<'_, SortedEntries>>,
+    ) -> PyResult<Merge> {
         guard(|| {
             let src = match (rows, overlay) {
                 (Some(r), None) => Source::Table(Box::new(Cursor::new(r.table.clone()))),
@@ -1266,7 +1270,7 @@ impl Job {
                 }
             };
             let o = options(block_size, level, bits_per_item, k, codec);
-            Ok(Job {
+            Ok(Merge {
                 kind: Kind::Join(Box::new(
                     Join::new(src, true, runs, o, max_file_bytes, collect, generation)
                         .map_err(to_py)?,
@@ -1285,7 +1289,7 @@ impl Job {
     #[pyo3(signature = (run, runs, *, replace=false, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864, collect=0, generation=0))]
     #[allow(clippy::too_many_arguments)]
     fn patch(
-        run: PyRef<'_, SortedRun>,
+        run: PyRef<'_, SortedEntries>,
         runs: usize,
         replace: bool,
         block_size: usize,
@@ -1296,13 +1300,13 @@ impl Job {
         max_file_bytes: usize,
         collect: usize,
         generation: u64,
-    ) -> PyResult<Job> {
+    ) -> PyResult<Merge> {
         guard(|| {
             let o = options(block_size, level, bits_per_item, k, codec);
             let src = Source::Run(run.inner.clone(), 0);
             let job = Join::new(src, replace, runs, o, max_file_bytes, collect, generation)
                 .map_err(to_py)?;
-            Ok(Job {
+            Ok(Merge {
                 key: None,
                 local: None,
                 kind: Kind::Join(Box::new(job)),
@@ -1326,11 +1330,11 @@ impl Job {
         k: u8,
         codec: u8,
         max_file_bytes: usize,
-    ) -> PyResult<Job> {
+    ) -> PyResult<Merge> {
         guard(|| {
             Ok({
                 let o = options(block_size, level, bits_per_item, k, codec);
-                Job {
+                Merge {
                     key: None,
                     local: None,
                     kind: Kind::Compact(Box::new(Compact::new(
@@ -1347,10 +1351,10 @@ impl Job {
 
     /// Counts the live keys of `runs` (newest first).
     #[staticmethod]
-    fn count(runs: usize) -> PyResult<Job> {
+    fn count(runs: usize) -> PyResult<Merge> {
         guard(|| {
             Ok({
-                Job {
+                Merge {
                     key: None,
                     local: None,
                     kind: Kind::Count(Count::new(runs)),
@@ -1645,14 +1649,14 @@ impl Snapshot {
         self.inner.entries()
     }
 
-    /// The delta of a `SortedRun` against the snapshot, as a patch or a
+    /// The delta of a `SortedEntries` against the snapshot, as a patch or a
     /// `replace`ment: `.kx` files, with added, removed and changed.
     #[pyo3(signature = (run, *, replace, generation, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864))]
     #[allow(clippy::too_many_arguments)]
     fn resolve<'py>(
         &mut self,
         py: Python<'py>,
-        run: PyRef<'_, SortedRun>,
+        run: PyRef<'_, SortedEntries>,
         replace: bool,
         generation: u64,
         block_size: usize,
@@ -1673,7 +1677,7 @@ impl Snapshot {
     }
 
     /// Up to `limit` entries of the merged snapshot past `after` — deletions
-    /// dropped with `drop_deleted` — as a `SortedRun`, and the cursor (None at
+    /// dropped with `drop_deleted` — as a `SortedEntries`, and the cursor (None at
     /// the end); past `max_bytes` of keys and payloads, `LimitError`.
     #[pyo3(signature = (after, limit, *, drop_deleted, max_bytes=u64::MAX))]
     #[allow(clippy::type_complexity)]
@@ -1684,14 +1688,14 @@ impl Snapshot {
         limit: usize,
         drop_deleted: bool,
         max_bytes: u64,
-    ) -> PyResult<(SortedRun, Option<Bound<'py, PyBytes>>)> {
+    ) -> PyResult<(SortedEntries, Option<Bound<'py, PyBytes>>)> {
         guard(|| {
             let inner = &self.inner;
             let (page, next) = py
                 .detach(|| inner.scan(after.as_deref(), limit, drop_deleted, max_bytes))
                 .map_err(to_py)?;
             Ok((
-                SortedRun {
+                SortedEntries {
                     inner: Arc::new(page),
                 },
                 next.map(|n| PyBytes::new(py, &n)),
@@ -1756,7 +1760,7 @@ fn solera_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("FormatError", m.py().get_type::<FormatError>())?;
     m.add("LimitError", m.py().get_type::<LimitError>())?;
     m.add("LocalError", m.py().get_type::<LocalError>())?;
-    m.add_class::<SortedRun>()?;
+    m.add_class::<SortedEntries>()?;
     m.add_class::<Sparse>()?;
     m.add_function(wrap_pyfunction!(encode_file, m)?)?;
     m.add_function(wrap_pyfunction!(write_files, m)?)?;
@@ -1778,7 +1782,7 @@ fn solera_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<LocalFile>()?;
     m.add_class::<Snapshot>()?;
     m.add_class::<Rows>()?;
-    m.add_class::<Pages>()?;
-    m.add_class::<Job>()?;
+    m.add_class::<Chunks>()?;
+    m.add_class::<Merge>()?;
     Ok(())
 }

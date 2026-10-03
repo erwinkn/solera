@@ -34,7 +34,7 @@ def timed(label, n, fn, *args, **kw):
 def compact(files, drop_deleted):
     """The native merge: a compaction job fed each whole file as one segment."""
 
-    job = _native.Job.compact(len(files), drop_deleted=drop_deleted)
+    job = _native.Merge.compact(len(files), drop_deleted=drop_deleted)
     fed, out = set(), []
     while (step := job.step()) is not None:
         kind, x = step

@@ -6,11 +6,11 @@ import uuid
 from decimal import Decimal as D
 
 import pytest
-from solera.keys import SortedRun
+from solera.keys import SortedEntries
 from solera.sdk import Output
 from solera.stores import KeyedWrite, Keys, Patch, Sql, StoreError, WriteError, prepare_for
 
-from tests.conftest import scope
+from tests.conftest import context
 
 pytestmark = pytest.mark.postgres
 
@@ -34,8 +34,8 @@ async def test_bare_replace(store):
     """§3: a bare write replaces the scope: the table keeps its place."""
 
     out = output(key="id")
-    first = await store.store([{"id": "a", "v": "1"}, {"id": "b", "v": "1"}], None, scope(out))
-    second = await store.store([{"id": "a", "v": "2"}], first.ref, scope(out))
+    first = await store.store([{"id": "a", "v": "1"}, {"id": "b", "v": "1"}], None, context(out))
+    second = await store.store([{"id": "a", "v": "2"}], first.ref, context(out))
     assert second.ref == first.ref  # the same table and slice: its generation is the harness's
     assert await store.load(second.ref, list[dict], None) == [{"id": "a", "v": "2"}]
 
@@ -45,12 +45,12 @@ async def test_patch_upsert_and_remove(store):
     whole content. The store reports no keys: the harness derives them."""
 
     out = output(key="id", primary_key=["id"])
-    first = await store.store(Patch([{"id": "a", "v": "1"}, {"id": "b", "v": "1"}]), None, scope(out))
+    first = await store.store(Patch([{"id": "a", "v": "1"}, {"id": "b", "v": "1"}]), None, context(out))
     assert first.keys is None
     second = await store.store(
         Patch([{"id": "b", "v": "2"}, {"id": "c", "v": "9"}], remove=["a"]),
         first.ref,
-        scope(out),
+        context(out),
     )
     rows = await store.load(second.ref, list[dict], None)
     assert sorted((r["id"], r["v"]) for r in rows) == [("b", "2"), ("c", "9")]
@@ -58,9 +58,9 @@ async def test_patch_upsert_and_remove(store):
         await store.store(
             Patch([{"id": "x", "v": "1"}, {"id": "x", "v": "1"}]),
             second.ref,
-            scope(out),
+            context(out),
         )
-    reset = await store.store(Patch([{"id": "z", "v": "1"}]), None, scope(out))
+    reset = await store.store(Patch([{"id": "z", "v": "1"}]), None, context(out))
     assert [r["id"] for r in await store.load(reset.ref, list[dict], None)] == ["z"]
 
 
@@ -78,9 +78,9 @@ async def test_patch_replaces_each_keys_rows(store):
             ]
         ),
         None,
-        scope(out),
+        context(out),
     )
-    second = await store.store(Patch([{"path": "a.csv", "v": "2", "n": 3}]), first.ref, scope(out))
+    second = await store.store(Patch([{"path": "a.csv", "v": "2", "n": 3}]), first.ref, context(out))
     rows = await store.load(second.ref, list[dict], None)
     assert sorted((r["path"], r["n"]) for r in rows) == [("a.csv", 3), ("b.csv", 1)]
 
@@ -91,9 +91,9 @@ async def test_a_lost_commit_does_not_stick_the_slice(store):
     through; reads get what the slice holds now."""
 
     out = output(key="id", primary_key=["id"])
-    first = await store.store([{"id": "a", "v": "1"}], None, scope(out))
-    await store.store([{"id": "a", "v": "2"}], first.ref, scope(out))  # its commit is lost
-    again = await store.store([{"id": "a", "v": "3"}], first.ref, scope(out))
+    first = await store.store([{"id": "a", "v": "1"}], None, context(out))
+    await store.store([{"id": "a", "v": "2"}], first.ref, context(out))  # its commit is lost
+    again = await store.store([{"id": "a", "v": "3"}], first.ref, context(out))
     assert (await store.load(first.ref, list[dict], None))[0]["v"] == "3"
     assert (await store.load(again.ref, list[dict], None))[0]["v"] == "3"
 
@@ -103,8 +103,8 @@ async def test_partition_column_stamping(store):
 
     out = output(key="id", primary_key=["id"], partition_column="site")
     with pytest.raises(WriteError):
-        await store.store([{"id": "a", "v": "1", "site": "Perth"}], None, scope(out, partition="Richmond"))
-    written = await store.store([{"id": "a", "v": "1"}], None, scope(out, partition="Richmond"))
+        await store.store([{"id": "a", "v": "1", "site": "Perth"}], None, context(out, partition="Richmond"))
+    written = await store.store([{"id": "a", "v": "1"}], None, context(out, partition="Richmond"))
     assert written.ref.where == {"site": "Richmond"}
     rows = await store.load(written.ref, list[dict], None)
     assert rows == [{"id": "a", "v": "1", "site": "Richmond"}]
@@ -115,9 +115,9 @@ async def test_sql_materializes_select(store):
     loadable TableRef."""
 
     source = output(key="id", primary_key=["id"])
-    written = await store.store([{"id": "a", "v": "1"}, {"id": "b", "v": "2"}], None, scope(source))
+    written = await store.store([{"id": "a", "v": "1"}, {"id": "b", "v": "2"}], None, context(source))
     derived = output()
-    sql_ref = await store.store(Sql(f"SELECT id, v FROM {written.ref.table}"), None, scope(derived))
+    sql_ref = await store.store(Sql(f"SELECT id, v FROM {written.ref.table}"), None, context(derived))
     assert derived.name in sql_ref.ref.table
     rows = await store.load(sql_ref.ref, list[dict], None)
     assert sorted(r["id"] for r in rows) == ["a", "b"]
@@ -130,8 +130,8 @@ async def test_keyed_sql_reports_its_keys(store):
 
     source = output(key="id")
     rows = [{"id": "b", "v": "2"}, {"id": "a", "v": "1"}, {"id": "b", "v": "3"}]
-    written = await store.store(rows, None, scope(source))
-    sql = await store.store(Sql(f"SELECT id, v FROM {written.ref.table}"), None, scope(output(key="id")))
+    written = await store.store(rows, None, context(source))
+    sql = await store.store(Sql(f"SELECT id, v FROM {written.ref.table}"), None, context(output(key="id")))
     assert [key for chunk in sql.keys for key in chunk] == ["a", "b"]
 
 
@@ -174,8 +174,8 @@ async def test_batch_snapshot_at_pinned_version(store):
     pinned batch, even after later writes."""
 
     out = output(incremental=True, partition_column="site")
-    first = await store.store(Patch([{"e": 1}]), None, scope(out, partition="s1", batch=0))
-    second = await store.store(Patch([{"e": 2}]), first.ref, scope(out, partition="s1", batch=1))
+    first = await store.store(Patch([{"e": 1}]), None, context(out, partition="s1", batch=0))
+    second = await store.store(Patch([{"e": 2}]), first.ref, context(out, partition="s1", batch=1))
     assert first.ref.handle["batch"] == 0 and second.ref.handle["batch"] == 1
     at_first = await store.load(first.ref, list[dict], None)
     assert [r["e"] for r in at_first] == [1]
@@ -187,7 +187,7 @@ async def test_keys_selection(store):
     """§4: load under Keys returns only the selected keys."""
 
     out = output(key="id", primary_key=["id"])
-    written = await store.store([{"id": "a", "v": "1"}, {"id": "b", "v": "2"}], None, scope(out))
+    written = await store.store([{"id": "a", "v": "1"}, {"id": "b", "v": "2"}], None, context(out))
     rows = await store.load(written.ref, list[dict], Keys({"b": 1}))
     assert [r["id"] for r in rows] == ["b"]
 
@@ -198,7 +198,7 @@ async def test_dataframe_round_trip(store):
     pd = pytest.importorskip("pandas")
     out = output(key="id", primary_key=["id"])
     frame = pd.DataFrame([{"id": "a", "v": "1"}])
-    written = await store.store(frame, None, scope(out))
+    written = await store.store(frame, None, context(out))
     loaded = await store.load(written.ref, pd.DataFrame, None)
     assert list(loaded["id"]) == ["a"]
 
@@ -286,7 +286,7 @@ async def test_schema_drift_fails_the_write(store):
     with store._connect() as conn, conn.cursor() as cur:
         cur.execute(f'CREATE TABLE "{out.name}" (id text, v text, PRIMARY KEY (v))')
     with pytest.raises(StoreError, match="does not match the declaration"):
-        await store.store([{"id": "a", "v": "1"}], None, scope(out))
+        await store.store([{"id": "a", "v": "1"}], None, context(out))
     assert StoreError.retryable is False
 
 
@@ -298,7 +298,7 @@ async def test_migration_can_reconcile_drift(store):
     with store._connect() as conn, conn.cursor() as cur:
         cur.execute(f'CREATE TABLE "{out.name}" (id text, v text, PRIMARY KEY (v))')
     with pytest.raises(StoreError, match="does not match"):
-        await store.store([{"id": "a", "v": "1"}], None, scope(out))
+        await store.store([{"id": "a", "v": "1"}], None, context(out))
     out.migrations = (
         Migration(
             "fix_pk",
@@ -306,12 +306,12 @@ async def test_migration_can_reconcile_drift(store):
         ),
     )
     assert await store.migrate(out, out.migrations) == ["fix_pk"]
-    written = await store.store([{"id": "a", "v": "1"}], None, scope(out))
+    written = await store.store([{"id": "a", "v": "1"}], None, context(out))
     assert await store.load(written.ref, list[dict], None) == [{"id": "a", "v": "1"}]
 
 
 def fenced(out, generation, invocation="i", partition=""):
-    return scope(out, partition, generation=generation, invocation=invocation)
+    return context(out, partition, generation=generation, invocation=invocation)
 
 
 async def test_a_newer_generation_fences_older_writers(store):
@@ -416,10 +416,10 @@ async def test_a_patch_refuses_requested_keys_it_does_not_hold(store):
     missing one is an error, never a silent skip."""
 
     out = output(key="id")
-    first = await store.store([{"id": "a", "v": "1"}], None, scope(out))
+    first = await store.store([{"id": "a", "v": "1"}], None, context(out))
     with pytest.raises(StoreError, match="does not hold"):
         patch = prepare_for(store, Patch([{"id": "a", "v": "2"}]), out)
-        await store.store(KeyedWrite(patch, frozenset(["a", "zzz"])), first.ref, scope(out))
+        await store.store(KeyedWrite(patch, frozenset(["a", "zzz"])), first.ref, context(out))
 
 
 async def test_reconciliation_streams_the_slice_s_keys(store, monkeypatch):
@@ -437,7 +437,7 @@ async def test_reconciliation_streams_the_slice_s_keys(store, monkeypatch):
 
     out = output(key="id", partition_column="site")
     rows = [{"id": "a", "x": 1}, {"id": "c", "x": 3}, {"id": "e", "x": 5}]
-    written = await store.store(rows, None, scope(out, partition="oakland"))
+    written = await store.store(rows, None, context(out, partition="oakland"))
     io = ObjectIO(MemoryStore())
     state = IndexState(prefix="keys/")
     files, _ = await KeyIndex(io, None, state).replace(
@@ -466,7 +466,7 @@ async def test_reconciliation_streams_the_slice_s_keys(store, monkeypatch):
         )
         o.index = KeyIndex(io, None, state)
         o.prepared = prepare_for(store, patch, out)
-        o.run = SortedRun.from_rows(o.prepared.rows, [k.encode() for k in o.prepared.removes])
+        o.run = SortedEntries.from_rows(o.prepared.rows, [k.encode() for k in o.prepared.removes])
         g = attempt + 2
         delta, _ = await worker._reconcile(o, {"attempt": f"w{g}", "generation": g})
         got = [
@@ -558,15 +558,17 @@ async def test_a_migration_waits_for_every_slices_open_writer(store):
 
     out = output(key="id", partition_column="site")
     first = await store.store(
-        [{"id": "a", "v": "1"}], None, scope(out, partition="p1", generation=4, invocation="i")
+        [{"id": "a", "v": "1"}], None, context(out, partition="p1", generation=4, invocation="i")
     )
-    await store.store([{"id": "b", "v": "1"}], None, scope(out, partition="p2", generation=3, invocation="i"))
+    await store.store(
+        [{"id": "b", "v": "1"}], None, context(out, partition="p2", generation=3, invocation="i")
+    )
     table, _, _ = store._table(out)
     conn = store._connect()
     cur = conn.cursor()
     store._domain(cur, table)  # p2's writer, open: as every write transaction begins
-    store._fence(cur, table, scope(out, partition="p2", generation=3, invocation="i"))
-    p1 = scope(out, partition="p1", generation=4, invocation="i")
+    store._fence(cur, table, context(out, partition="p2", generation=3, invocation="i"))
+    p1 = context(out, partition="p1", generation=4, invocation="i")
     migrating, migrated, errors = in_thread(
         store.migrate(out, [Migration("all", f"UPDATE {table} SET v = 'm'")], p1)
     )
@@ -632,7 +634,7 @@ async def test_a_read_only_sql_store_refuses_a_query_whose_function_writes():
     store = PostgresStore(DSN, sql_read_only=True)
     out = output(key="id", partition_column="part")
     victim = output(key="id")
-    first = await store.store([{"id": "a", "v": "1"}], None, scope(victim))
+    first = await store.store([{"id": "a", "v": "1"}], None, context(victim))
     table = first.ref.table
     fn = f"writes_{uuid.uuid4().hex[:8]}"
     with store._connect() as conn:
@@ -641,9 +643,9 @@ async def test_a_read_only_sql_store_refuses_a_query_whose_function_writes():
             f"$$ BEGIN UPDATE {table} SET v = 'stale'; RETURN 'x'; END $$"
         )
     with pytest.raises(WriteError, match="must not write"):
-        await store.store(Sql(f"SELECT 'k'::text AS id, {fn}() AS v"), None, scope(out))
+        await store.store(Sql(f"SELECT 'k'::text AS id, {fn}() AS v"), None, context(out))
     assert await store.load(first.ref, list[dict], None) == [{"id": "a", "v": "1"}]
-    written = await store.store(Sql(f"SELECT id, v FROM {table}"), None, scope(out, partition="p"))
+    written = await store.store(Sql(f"SELECT id, v FROM {table}"), None, context(out, partition="p"))
     assert await store.load(written.ref, list[dict], None) == [{"id": "a", "v": "1", "part": "p"}]
 
 
@@ -656,13 +658,13 @@ async def test_by_key_patch_stamps_keys_and_removes_keys_given_no_rows(store):
 
     out = output(key="path")
     first = await store.store(
-        Patch({"a.csv": pd.DataFrame({"n": [1, 2]}), "b.csv": pd.DataFrame({"n": [3]})}), None, scope(out)
+        Patch({"a.csv": pd.DataFrame({"n": [1, 2]}), "b.csv": pd.DataFrame({"n": [3]})}), None, context(out)
     )
     patch = Patch({"b.csv": pd.DataFrame({"n": []}), "c.csv": [{"n": 4}]}, remove=["a.csv"])
     second = await store.store(
         KeyedWrite(prepare_for(store, patch, out), {"c.csv": b""}, frozenset({"a.csv", "b.csv"})),
         first.ref,
-        scope(out),
+        context(out),
     )
     rows = await store.load(second.ref, list[dict], None)
     assert sorted((r["path"], r["n"]) for r in rows) == [("c.csv", 4)]
@@ -672,7 +674,7 @@ async def test_by_key_patch_stamps_keys_and_removes_keys_given_no_rows(store):
     assert groups["c.csv"]["n"].tolist() == [4]
     assert patch_removes(store, patch, out) == ("a.csv", "b.csv")
     with pytest.raises(WriteError, match="carries"):
-        await store.store(Patch({"d.csv": [{"path": "other", "n": 1}]}), second.ref, scope(out))
+        await store.store(Patch({"d.csv": [{"path": "other", "n": 1}]}), second.ref, context(out))
     assert store.can_load(dict[str, pd.DataFrame], Keys) and not store.can_load(dict[str, pd.DataFrame], None)
 
 
@@ -688,7 +690,9 @@ async def test_a_partitions_first_write_waits_for_a_migration(store):
 
     name = f"t_{uuid.uuid4().hex[:12]}"
     out = output(name, key="id", partition_column="site")
-    await store.store([{"id": "a", "v": "1"}], None, scope(out, partition="p1", generation=4, invocation="i"))
+    await store.store(
+        [{"id": "a", "v": "1"}], None, context(out, partition="p1", generation=4, invocation="i")
+    )
     copied, go = threading.Event(), threading.Event()
 
     def swap(cur):
@@ -697,10 +701,10 @@ async def test_a_partitions_first_write_waits_for_a_migration(store):
         assert go.wait(10)
         cur.execute(f'DROP TABLE public."{name}"; ALTER TABLE public."{name}_new" RENAME TO "{name}"')
 
-    p1 = scope(out, partition="p1", generation=4, invocation="i")
+    p1 = context(out, partition="p1", generation=4, invocation="i")
     migrating, migrated, errors = in_thread(store.migrate(out, [Migration("swap", swap)], p1))
     assert copied.wait(10)
-    p2 = scope(out, partition="p2", generation=5, invocation="i")
+    p2 = context(out, partition="p2", generation=5, invocation="i")
 
     async def first_write():
         await store.acquire(p2)
@@ -732,7 +736,7 @@ async def test_a_missing_grant_role_is_skipped_without_aborting_the_write(store)
 
         granting = PostgresStore(DSN, grants=[f"missing_{role}", role])
         out = output(key="id")
-        written = await granting.store([{"id": "a", "n": 1}], None, scope(out))
+        written = await granting.store([{"id": "a", "n": 1}], None, context(out))
         assert await granting.load(written.ref, list[dict], None) == [{"id": "a", "n": 1}]
         with psycopg.connect(DSN) as conn:
             allowed = conn.execute(
@@ -753,14 +757,14 @@ async def test_a_replacement_writes_only_the_keys_it_is_asked_to(store):
     first = await store.store(
         [{"id": "a", "r": "1", "v": 10}, {"id": "b", "r": "1", "v": 20}, {"id": "c", "r": "1", "v": 30}],
         None,
-        scope(out),
+        context(out),
     )
     later = [{"id": "a", "r": "1", "v": 999}, {"id": "b", "r": "2", "v": 21}]
     selected = KeyedWrite(prepare_for(store, later, out), frozenset({"b"}), frozenset({"c"}))
-    written = await store.store(selected, first.ref, scope(out))
+    written = await store.store(selected, first.ref, context(out))
     got = sorted((r["id"], r["v"]) for r in await store.load(written.ref, list[dict], None))
     assert got == [("a", 10), ("b", 21)]  # `a` was not selected: its row stays
-    whole = await store.store(later, written.ref, scope(out))
+    whole = await store.store(later, written.ref, context(out))
     assert sorted((r["id"], r["v"]) for r in await store.load(whole.ref, list[dict], None)) == [
         ("a", 999),
         ("b", 21),
@@ -774,7 +778,7 @@ async def test_a_sql_table_keeps_the_select_s_column_types(store):
 
     out = output(key="id")
     written = await store.store(
-        Sql("SELECT 'a'::text AS id, 42::bigint AS n, 1.5::numeric AS x, 'w' AS w"), None, scope(out)
+        Sql("SELECT 'a'::text AS id, 42::bigint AS n, 1.5::numeric AS x, 'w' AS w"), None, context(out)
     )
     assert [key for chunk in written.keys for key in chunk] == ["a"]
     assert await store.load(written.ref, list[dict], None) == [{"id": "a", "n": 42, "x": D("1.5"), "w": "w"}]
@@ -795,7 +799,7 @@ async def test_rows_first_written_keep_their_types(store):
         "on": dt.date(2026, 1, 2),
         "b": b"\x00\x01",
     }
-    written = await store.store([row], None, scope(out))
+    written = await store.store([row], None, context(out))
     [back] = await store.load(written.ref, list[dict], None)
     assert {k: back[k] for k in row} == {**row, "b": back["b"]} and bytes(back["b"]) == row["b"]
 
@@ -812,15 +816,15 @@ async def test_a_column_s_type_is_every_value_s_not_the_first(store):
 
     out = output(key="id")
     rows = [{"id": "a", "n": None}, {"id": "b", "n": 42}]
-    written = await store.store(rows, None, scope(out))
+    written = await store.store(rows, None, context(out))
     back = sorted(await store.load(written.ref, list[dict], None), key=lambda r: r["id"])
     assert back == rows
     with pytest.raises(WriteError, match="declare its type"):
-        await store.store([{"id": "a", "n": 1}, {"id": "b", "n": "x"}], None, scope(output(key="id")))
+        await store.store([{"id": "a", "n": 1}, {"id": "b", "n": "x"}], None, context(output(key="id")))
     with pytest.raises(WriteError, match="only nulls"):
-        await store.store([{"id": "a", "n": None}], None, scope(output(key="id")))
+        await store.store([{"id": "a", "n": None}], None, context(output(key="id")))
     declared = output(key="id", columns={"n": "text"})
-    written = await store.store([{"id": "a", "n": 42}], None, scope(declared))
+    written = await store.store([{"id": "a", "n": 42}], None, context(declared))
     assert await store.load(written.ref, list[dict], None) == [{"id": "a", "n": "42"}]
 
 
@@ -842,7 +846,7 @@ async def test_a_write_waits_on_a_thread_not_on_the_event_loop(store):
 
     ticking = asyncio.create_task(tick())
     await asyncio.sleep(0)  # the tick is asleep before the write starts
-    await store.store(Sql("SELECT 'a'::text AS id, pg_sleep(0.4)::text AS slept"), None, scope(out))
+    await store.store(Sql("SELECT 'a'::text AS id, pg_sleep(0.4)::text AS slept"), None, context(out))
     await ticking
     assert late[0] < 0.2, late
 
@@ -861,7 +865,7 @@ async def test_a_repair_read_back_waits_off_the_event_loop(store, monkeypatch):
 
     out = output(key="id")
     rows = [{"id": "a", "x": 1}]
-    written = await store.store(rows, None, scope(out))
+    written = await store.store(rows, None, context(out))
     io = ObjectIO(MemoryStore())
     state = IndexState(prefix="keys/")
     files, _ = await KeyIndex(io, None, state).replace(prepare_for(store, rows, out).rows, 0, "w1")
@@ -883,7 +887,7 @@ async def test_a_repair_read_back_waits_off_the_event_loop(store, monkeypatch):
     )
     o.index = KeyIndex(io, None, state)
     o.prepared = prepare_for(store, patch, out)
-    o.run = SortedRun.from_rows(o.prepared.rows)
+    o.run = SortedEntries.from_rows(o.prepared.rows)
     late = []
 
     async def tick():
@@ -912,11 +916,11 @@ async def test_a_dataframe_s_table_is_typed_by_its_dtypes_and_logged(store, capl
     out = output(key="id")
     frame = pd.DataFrame({"id": ["a", "b"], "x": [math.nan, math.nan], "n": [1, 2]})
     with caplog.at_level(logging.WARNING, logger="solera.postgres"):
-        written = await store.store(frame, None, scope(out))
+        written = await store.store(frame, None, context(out))
     [warning] = [r for r in caplog.records if r.name == "solera.postgres"]
     assert "inferred columns" in warning.getMessage() and "columns=" in warning.getMessage()
     later = pd.DataFrame({"id": ["c"], "x": [1.5], "n": [3]})
-    written = await store.store(later, written.ref, scope(out))
+    written = await store.store(later, written.ref, context(out))
     assert await store.load(written.ref, list[dict], None) == [{"id": "c", "x": 1.5, "n": 3}]
 
 
@@ -933,17 +937,17 @@ async def test_a_key_is_stored_as_itself(store):
     lossy = [
         {"id": "a", "d": D("1.234"), "r": 1.234567890123, "at": dt.datetime(2026, 1, 1, 0, 0, 0, 123400)}
     ]
-    written = await store.store(lossy, None, scope(out))
+    written = await store.store(lossy, None, context(out))
     [back] = await store.load(written.ref, list[dict], None)
     assert back["d"] == D("1.23")  # the database's to round
     numbered = output(key="id", columns={"id": "bigint", "v": "text"})
-    written = await store.store([{"id": 1, "v": "x"}, {"id": "2", "v": "y"}], None, scope(numbered))
+    written = await store.store([{"id": 1, "v": "x"}, {"id": "2", "v": "y"}], None, context(numbered))
     assert sorted(r["id"] for r in await store.load(written.ref, list[dict], None)) == [1, 2]
     for bad in ("01", " 3", "+4"):
         with pytest.raises(WriteError, match="stored as another key"):
-            await store.store([{"id": bad, "v": "x"}], None, scope(numbered))
+            await store.store([{"id": bad, "v": "x"}], None, context(numbered))
     with pytest.raises(WriteError, match="stored as another key"):  # in a patch too
-        await store.store(Patch([{"id": "05", "v": "x"}]), written.ref, scope(numbered))
+        await store.store(Patch([{"id": "05", "v": "x"}]), written.ref, context(numbered))
     assert sorted(r["id"] for r in await store.load(written.ref, list[dict], None)) == [1, 2]
 
 
@@ -953,7 +957,7 @@ async def test_an_integer_key_is_read_through_an_index(store):
     index scan, not a scan of the table."""
 
     out = output(key="id", columns={"id": "bigint", "v": "text"})
-    written = await store.store([{"id": i, "v": "x"} for i in range(5000)], None, scope(out))
+    written = await store.store([{"id": i, "v": "x"} for i in range(5000)], None, context(out))
     with store._connect() as conn:
         conn.execute(f"ANALYZE {written.ref.table}")
         plan = "\n".join(

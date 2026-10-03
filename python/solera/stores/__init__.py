@@ -64,7 +64,7 @@ class Batches:
 
 
 @dataclass(frozen=True)
-class Scope:
+class WriteContext:
     """A write scope (§9): `batch` is the engine-assigned batch number for
     incremental outputs, `attempt` the writing attempt's id. `reset` says the write starts the content over
     (a full run): `prior` still says where the content is, but nothing of
@@ -123,7 +123,7 @@ class Store(Protocol):
 
     def can_load(self, t: type | None, selection: type | None) -> bool: ...
     def can_store(self, t: type | None, output: Output) -> bool: ...
-    async def store(self, write: Any, prior: Ref | None, scope: Scope) -> Written: ...
+    async def store(self, write: Any, prior: Ref | None, context: WriteContext) -> Written: ...
     async def load(self, ref: Ref, t: type, selection: Keys | Batches | None) -> Any: ...
 
     # immutable: async def discard(self, scope: Scope, prior: Ref | None, items: list) -> None
@@ -286,7 +286,7 @@ class KeyedWrite:
     """A keyed output's write as its store takes it: read once
     (`prepared`), resolved against the key index (§4, §6). A store needs
     three things of it: whether it is the scope's `whole` content (clear
-    the scope first), its `removes`, and its `pages()` — the keys to write,
+    the scope first), its `removes`, and its `chunks()` — the keys to write,
     each with its group.
 
     `upserts` are the keys to write: a collection of them; a
@@ -316,27 +316,27 @@ class KeyedWrite:
             return cls(prepared, whole=True, value=write)
         return cls(prepared, removes=frozenset(prepared.removes), value=write)
 
-    async def pages(self, size: int = 100_000):
-        """The keys to write, sorted, a page at a time: `(key, group)` each.
-        Only a page's groups are taken from the write at once."""
+    async def chunks(self, size: int = 100_000):
+        """The keys to write, sorted, a chunk at a time: `(key, group)` each.
+        Only a chunk's groups are taken from the write at once."""
 
         if self.upserts is None or isinstance(self.upserts, Collection):
-            pages = self.iter_pages(size)
-            while (page := await asyncio.to_thread(next, pages, None)) is not None:
-                yield page
+            chunks = self.iter_chunks(size)
+            while (chunk := await asyncio.to_thread(next, chunks, None)) is not None:
+                yield chunk
             return
-        async for page in self.upserts.pages(size):
-            yield await asyncio.to_thread(self._grouped, page)
+        async for chunk in self.upserts.chunks(size):
+            yield await asyncio.to_thread(self._grouped, chunk)
 
-    def iter_pages(self, size: int = 100_000):
-        """`pages()`, for a store that writes on a thread of its own. Not for
+    def iter_chunks(self, size: int = 100_000):
+        """`chunks()`, for a store that writes on a thread of its own. Not for
         a `DeltaKeys` selection: only immutable stores get one, and they
-        page it asynchronously."""
+        read it asynchronously."""
 
         if self.upserts is None:
             from ..keys.index import key_str
 
-            for keys, _ in self.prepared.rows.pages(size):
+            for keys, _ in self.prepared.rows.chunks(size):
                 yield self._grouped([key_str(k) for k in keys])
         elif isinstance(self.upserts, Collection):
             keys = sorted(self.upserts)

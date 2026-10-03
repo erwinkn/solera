@@ -15,12 +15,12 @@ from solera.failures import (
 )
 
 
-def step(prior, kind, now=1000, epoch=3, forced=0, retries=2, upstream=11, **kw):
+def step(prior, kind, now=1000, deploy=3, forced=0, retries=2, upstream=11, **kw):
     return transition(
         prior,
         Outcome(kind, upstream, kw.pop("message", ""), **kw),
         now=now,
-        epoch=epoch,
+        deploy=deploy,
         forced=forced,
         retries=retries,
     )
@@ -36,9 +36,9 @@ def test_record_round_trips_and_clips_its_message():
 def test_transition_table():
     assert step(None, "ok") is None  # none → ok: nothing
     fresh = step(None, "failed", message="ValueError: x")
-    assert (fresh.outcome, fresh.tries, fresh.since, fresh.last, fresh.epoch) == (FAILED, 1, 1000, 1000, 3)
-    again = step(fresh, "failed", now=2000, epoch=4)
-    assert (again.tries, again.since, again.last, again.epoch) == (2, 1000, 2000, 4)
+    assert (fresh.outcome, fresh.tries, fresh.since, fresh.last, fresh.deploy) == (FAILED, 1, 1000, 1000, 3)
+    again = step(fresh, "failed", now=2000, deploy=4)
+    assert (again.tries, again.since, again.last, again.deploy) == (2, 1000, 2000, 4)
     assert step(again, "ok") is None and step(again, "removed") is None  # tombstones
     # Another upstream generation — the key written since — is a fresh record.
     assert step(again, "failed", upstream=12).tries == 1
@@ -71,10 +71,10 @@ def test_interruptions():
 def test_eligibility_is_causal():
     retrying = step(None, "transient", retry_for=7200)
     assert not eligible(retrying, 1059, 3, {}) and eligible(retrying, 1060, 3, {})
-    failed = step(None, "failed", epoch=3)
+    failed = step(None, "failed", deploy=3)
     assert not eligible(failed, 10**9, 3, {}) and eligible(failed, 0, 4, {})  # one try per deploy
     # Forced requests are positions: a try under position 4031 satisfies it, whatever the clocks.
-    tried = step(None, "failed", epoch=3, forced=4031, now=10**9)
+    tried = step(None, "failed", deploy=3, forced=4031, now=10**9)
     assert not eligible(tried, 0, 3, {"failed": 4031}) and eligible(tried, 0, 3, {"failed": 4032})
     assert not eligible(tried, 0, 3, {"rejected": 9999})  # another class's request
     canceled = step(None, "canceled", forced=10)
@@ -82,7 +82,7 @@ def test_eligibility_is_causal():
 
 
 def test_minima_and_bounds():
-    records = [step(None, "transient", now=100, retry_for=99999), step(None, "failed", epoch=2), None]
+    records = [step(None, "transient", now=100, retry_for=99999), step(None, "failed", deploy=2), None]
     assert minima(records) == (160, 2)
     assert minima([]) == (None, None)
     assert lower(None, 5) == 5 and lower(3, None) == 3 and lower(3, 5) == 3
@@ -91,13 +91,15 @@ def test_minima_and_bounds():
 def test_deadlines_are_never_shortened_by_rounding():
     """Review 11: a budget or a wait is computed from the exact time, then rounded up."""
 
-    half = transition(None, Outcome("transient", 11, retry_for=0.5), now=1000.5, epoch=0, forced=0, retries=0)
+    half = transition(
+        None, Outcome("transient", 11, retry_for=0.5), now=1000.5, deploy=0, forced=0, retries=0
+    )
     assert half.outcome == RETRYING and half.until == 1001
     soon = transition(
         None,
         Outcome("transient", 11, retry_after=1, retry_for=60),
         now=1000.9,
-        epoch=0,
+        deploy=0,
         forced=0,
         retries=0,
     )
