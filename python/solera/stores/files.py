@@ -278,6 +278,7 @@ class FileStore:
         the one that committed `n` was the last of them."""
 
         import obstore
+        from obstore.store import LocalStore
 
         objects = self._objects()
         best: dict[int, int] = {}
@@ -293,7 +294,7 @@ class FileStore:
                     if commit_number >= lo and generation > best.get(commit_number, -1):
                         best[commit_number] = generation
 
-        if type(objects).__name__ == "LocalStore":
+        if isinstance(objects, LocalStore):
             # A directory lists in any order, to its end: each commit's own, then.
             await self._many(lambda b: scan(f"{base}/{b:012d}/"), range(lo, hi + 1))
         else:

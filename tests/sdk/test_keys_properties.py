@@ -9,8 +9,8 @@ import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 from solera import _native
-from solera.keys import _python
 
+from . import keys_reference as _python
 from .keys_driver import drive
 from .test_keys_format import blocks_of, decode_all
 

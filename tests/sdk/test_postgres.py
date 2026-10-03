@@ -432,10 +432,11 @@ async def test_reconciliation_streams_the_slice_s_keys(store, monkeypatch):
     patch reconciles like any: a key it gives no rows is removed."""
 
     from obstore.store import MemoryStore
-    from solera.keys import _python
     from solera.keys.index import IndexState, KeyIndex
     from solera.keys.io import ObjectIO
     from solera_worker import worker
+
+    from . import keys_reference as _python
 
     out = output(key="id", partition_column="site")
     rows = [{"id": "a", "x": 1}, {"id": "c", "x": 3}, {"id": "e", "x": 5}]

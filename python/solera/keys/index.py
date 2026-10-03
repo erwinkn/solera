@@ -907,7 +907,7 @@ class KeyIndex:
         inputs, out_level = plan
         if out_level > self.state.depth and out_level > 1:
             # The deepest level moves down whole: nothing below it to merge with, and
-            # its files never overlap. Level-0 files do, so level 0 is always merged (F16).
+            # its files never overlap. Level-0 files do, so level 0 is always merged.
             return [replace(f, level=out_level) for f in inputs], [f.name for f in inputs], []
         drop = out_level >= self.state.depth  # nothing older below: tombstones can go
         # Runs, newest first: each level-0 file alone, a deeper level's files together.

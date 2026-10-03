@@ -8,8 +8,8 @@ import duckdb
 import pyarrow as pa
 import pytest
 from solera import _native
-from solera.keys import _python
 
+from . import keys_reference as _python
 from .keys_driver import drive
 
 OPTS = {"block_size": 512}

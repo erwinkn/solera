@@ -125,12 +125,6 @@ def _objects(url: str):
     return obstore.store.from_url(url)
 
 
-async def _put(objects, key: str, value: bytes):
-    import obstore
-
-    await obstore.put_async(objects, key, value, mode="overwrite", use_multipart=False)
-
-
 async def _get(objects, key: str) -> bytes | None:
     import obstore
     from obstore.exceptions import NotFoundError

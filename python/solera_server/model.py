@@ -164,7 +164,7 @@ class Model:
             "partitions": _nest(self.partitions, 2),
             "repairs": _nest(self.repairs, 2),
             "cleanups": _nest(self.cleanups, 2),
-            "reset_at": self.reset_at,
+            "reset_at": _nest(self.reset_at, 2),
             "changed_at": self.changed_at,
             "automations": self.automations,
             "sensors": self.sensors,
@@ -206,10 +206,10 @@ class Model:
         # event counter that let go of it: for the partition's next attempt to clean up
         # once no reader pins it (docs/lifecycle.md §9.8)
         self.cleanups: dict[tuple, list] = _flatten(snap.get("cleanups"), 2)
-        # output, or `@asset` -> the deploy number that last reset it: removed, or
-        # (an output) moved to another store. An attempt launched under an earlier
-        # one commits nothing of it.
-        self.reset_at: dict[str, int] = snap.get("reset_at") or {}
+        # ("output" | "asset", name) -> the deploy number that last reset it:
+        # removed, or (an output) moved to another store. An attempt launched
+        # under an earlier one commits nothing of it.
+        self.reset_at: dict[tuple, int] = _flatten(snap.get("reset_at"), 2)
         # asset -> the event counter of its last change: added (again), renamed,
         # its declaration changed, or reset. A partition caught up before it is
         # stale (`stale`), and the deploy owes its OnChange automations a firing.
@@ -664,25 +664,25 @@ class Model:
         intents go now, with the bookmarks that read it or are its asset's:
         every consumer and its producer start over, with full passes. A
         removed asset's partition records go — cursor, bookmarks, failed
-        keys — a job's included, which has no output (F21). `reset_at` keeps
-        the deploy number, by output name and by `@asset`; an attempt launched
-        before the reset commits nothing of it (`Engine.commit_attempt`), so
-        nothing waits for one in flight. History keeps the records, and
-        pending cleanups stay: their objects are still owed (F12, F13, F17,
-        F19, F21). Returns the assets whose outputs were reset: changed, so
-        the deploy owes their OnChange automations a firing (`FiringsOwed`)."""
+        keys — a job's included, which has no output. `reset_at` keeps the
+        deploy number, by output and by asset; an attempt launched before the
+        reset commits nothing of it (`Engine.commit_attempt`), so nothing
+        waits for one in flight. History keeps the records, and pending
+        cleanups stay: their objects are still owed. Returns the assets whose
+        outputs were reset: changed, so the deploy owes their OnChange
+        automations a firing (`FiringsOwed`)."""
 
         manifest = self.manifest or {}
         outputs, assets = manifest.get("outputs") or {}, manifest.get("assets") or {}
         for asset in assets_before - set(assets):
-            self.reset_at[f"@{asset}"] = self.deploy_number
+            self.reset_at[("asset", asset)] = self.deploy_number
         reset = {
             name
             for name, store in stores.items()
             if name not in outputs or outputs[name].get("store") != store
         }
         for name in reset:
-            self.reset_at[name] = self.deploy_number
+            self.reset_at[("output", name)] = self.deploy_number
         reset |= {k[0] for k in self.heads} - set(outputs)  # any other name no longer declared
         producers = {outputs[name].get("asset") for name in reset if name in outputs} - {None}
 
@@ -901,7 +901,7 @@ class Model:
             self._claimed(run, task, e["attempt"], e["started_at"])
         times = self._attempt_events(run, task, e, launched)
         for output, intent in (e.get("intents") or {}).items():
-            if self.reset_at.get(output, 0) > prepared.get("deploy_number", self.deploy_number):
+            if self.reset_at.get(("output", output), 0) > prepared.get("deploy_number", self.deploy_number):
                 # Reset since it launched: what it meant to write was the old output's,
                 # which owes no repair. Its files go, from where it wrote them.
                 prefix = ((prepared.get("outputs") or {}).get(output) or {}).get("prefix")

@@ -669,7 +669,7 @@ class PostgresStore:
         ledger and the lock are keyed by the schema-qualified table a
         migration changes, never by the output's name: two projects, or a
         staging and a production namespace, writing `orders` into schemas of
-        their own each get it applied (F18).
+        their own each get it applied.
 
         A migration changes the whole table, so it holds the table's write
         domain exclusively (`_domain`): it waits for every partition's open

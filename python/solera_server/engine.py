@@ -209,9 +209,9 @@ class Engine(Attempts, Sensors, Views):
         owing, once: for each target it changed — added (again), renamed,
         its declaration changed, or reset (`Model.changed_at`) — every
         current partition whose inputs have heads, so it is built now, not
-        when its upstream next changes (F22). Decided at the deploy and
+        when its upstream next changes. Decided at the deploy and
         recorded, never re-checked by a tick: a run of it that fails is not
-        resubmitted on every tick (F20). Schedules, OnDeploy and sensors keep
+        resubmitted on every tick. Schedules, OnDeploy and sensors keep
         their own criteria."""
 
         planner, owed = self.planner(), {}
@@ -1433,10 +1433,12 @@ class Engine(Attempts, Sensors, Views):
         upstreams = [
             p["bookmark"]["output"] for p in (prepared.get("plans") or {}).values() if p and "bookmark" in p
         ]
-        for name in [f"@{task['asset']}", *(prepared.get("outputs") or {}), *upstreams]:
-            if self.m.reset_at.get(name, 0) > prepared["deploy_number"]:
-                what = f"asset {name[1:]}" if name.startswith("@") else f"output {name}"
-                raise Conflict(f"{what} was reset since this attempt launched")
+        reset = [("asset", task["asset"])] + [
+            ("output", o) for o in [*(prepared.get("outputs") or {}), *upstreams]
+        ]
+        for kind, name in reset:
+            if self.m.reset_at.get((kind, name), 0) > prepared["deploy_number"]:
+                raise Conflict(f"{kind} {name} was reset since this attempt launched")
         outputs = current_names(prepared, result.get("outputs") or {})
         # Settled under the contract it was launched with, not today's manifest.
         declared = {name: info["contract"] for name, info in (prepared.get("outputs") or {}).items()}
@@ -1823,7 +1825,7 @@ class Engine(Attempts, Sensors, Views):
         asset whose failed keys has keys due again runs for that partition, even
         when nothing upstream changed. An asset run by hand picks them up on
         its next run. A partition whose inputs have no head waits for them: its
-        run could not plan, and would be submitted again every tick (F20)."""
+        run could not plan, and would be submitted again every tick."""
 
         automated = {t for auto in self.m.automations.values() if auto["enabled"] for t in auto["targets"]}
         for (asset, partition), state in list(self.m.partitions.items()):

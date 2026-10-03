@@ -33,6 +33,7 @@ from obstore.exceptions import (
     PreconditionError,
     UnauthenticatedError,
 )
+from obstore.store import LocalStore
 
 ATTEMPTS = 5  # writes of one swap whose outcome reads back as "nothing landed"
 _FINAL = (InvalidPathError, NotSupportedError, PermissionDeniedError, UnauthenticatedError)
@@ -100,7 +101,9 @@ async def _conditional_put(store, path: str, data: bytes, etag: str | None) -> s
 
 
 def _local(store) -> bool:
-    return type(store).__name__ == "LocalStore"
+    """Whether `store` is obstore's local filesystem, which has no `If-Match`."""
+
+    return isinstance(store, LocalStore)
 
 
 def _file(store, path: str) -> str:

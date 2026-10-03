@@ -24,7 +24,7 @@ pub enum Step {
 }
 
 /// The merge-join of written content — rows, a stream of sorted chunks, or
-/// a sorted run — with the live keys of the index, each key as `delta.rs`
+/// sorted entries — with the live keys of the index, each key as `delta.rs`
 /// decides. A patch passes over the index keys it does not mention and
 /// stops reading the index once its content is done; a replacement
 /// (`replace`) is the whole new content, and live keys it omits are deleted.
@@ -48,7 +48,7 @@ impl Join {
         collect: usize,
         generation: u64,
     ) -> Result<Join> {
-        if replace && matches!(&src, Source::Run(run, _) if run.removes() > 0) {
+        if replace && matches!(&src, Source::Entries(sorted, _) if sorted.removes() > 0) {
             return Err(Error::Value("a replacement has no removes".into()));
         }
         Ok(Join {

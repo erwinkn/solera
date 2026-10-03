@@ -56,7 +56,9 @@ pub fn get_varint(buf: &[u8], pos: &mut usize) -> Result<u64> {
             return fmt_err("truncated varint");
         };
         *pos += 1;
-        if shift >= 64 {
+        // A u64 takes ten bytes at most, the tenth holding its top bit alone:
+        // anything past that is another value, never read as this one.
+        if shift >= 64 || (shift == 63 && b > 0x01) {
             return fmt_err("varint too long");
         }
         n |= ((b & 0x7F) as u64) << shift;
@@ -637,6 +639,19 @@ pub fn merge_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_overlong_varint_is_refused_not_read_as_another_value() {
+        let mut max = vec![0xFF; 9];
+        max.push(0x01); // u64::MAX: the tenth byte holds the top bit alone
+        assert_eq!(get_varint(&max, &mut 0).unwrap(), u64::MAX);
+        let mut over = vec![0xFF; 9];
+        over.push(0x7F);
+        assert!(get_varint(&over, &mut 0).is_err());
+        let mut eleven = vec![0xFF; 10];
+        eleven.push(0x00);
+        assert!(get_varint(&eleven, &mut 0).is_err());
+    }
 
     const O: Options = Options {
         block_size: 64,

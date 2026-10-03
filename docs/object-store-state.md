@@ -149,7 +149,7 @@ store holds, is a new one (K10). At that deploy, not later:
 An attempt launched before the reset commits nothing of it: one of a
 reset asset, or that writes a reset output or reads one incrementally, is
 refused at commit, as a stale head is (`reset_at` in the model, the deploy
-number of the last reset, by output name and by `@asset`, against the one
+number of the last reset, by output and by asset, against the one
 the attempt launched under), and its task tries again under the new one. So nothing waits for an attempt in
 flight. History keeps the old records, and pending cleanups stay, still
 owed. Moving away and back with nothing written in between is two
@@ -293,7 +293,7 @@ State
 
 | Type | Fields | Bounded by |
 |---|---|---|
-| `Head` | `ref` (from the store), `run`, `attempt` (may point at a deleted run), `commit_number` (incremental outputs: the last commit that changed it, −1 before any), `base` (the first commit after the last reset of an unkeyed incremental output), `count` (keyed: live keys), `elements?` (dynamic partitions and set dimensions), `complete`, `version` (declared asset version), `asset`, `at` | outputs × partitions |
+| `Head` | `ref` (from the store), `run`, `attempt` (may point at a deleted run), `commit_number` (incremental outputs: the last commit that changed it, −1 before any), `base` (the first commit after the last reset of an unkeyed incremental output), `count` (keyed: live keys), `partitions?` (dynamic partitions: the partitions it lists), `version` (declared asset version), `asset`, `at`, `n?` (a source's: the event counter of its commit) | outputs × partitions |
 | `PartitionRecord` | `cursor?` (json), `last?` (`Outcome`: its last terminal result), `caught_up?` (whether its last commit finished the pass it was on — the partition's completeness, whatever its outputs wrote), `caught_up_at?` (the event counter of the commit that last caught it up: before its asset's `changed_at`, it is `stale`), `bookmarks?` {input: `Bookmark`}, `reset?` (a reset took its bookmarks: `keys=` runs read a full pass until one catches it up), `failures?` (`Failures`: an Each asset's failing keys, per-key-processing.md §9). Registration moves it whole under a rename, drops the bookmarks of inputs the project no longer declares, and those a reset takes (§2). | assets × partitions |
 | `Failures` | `commit_number` (the record's last commit), `counts` {outcome: keys}, `due` and `deploy_min` (lower bounds), `retry?` {`pass`, `deploy`, `forced_pos`, `after`, `due_acc`, `deploy_acc`}, `passes`, `done_forced`, `last` (`changes` or `retry`), `forced` {class: position} — its index is `indexes["@asset"][partition]` (per-key-processing.md §9) | Each assets × partitions |
 | `KeyIndex` | `prefix` (where its files live — kept across renames), `count`, `inexact` (commits since the last recount whose count came from filters; the count is exact at 0), `files` [{`name`, `level`, `min`, `max`, `entries`, `size`, `tail`, `index`}], `log` [[`batch`, [file]], …] — see §6 | a few dozen files per index |

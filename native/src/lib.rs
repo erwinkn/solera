@@ -902,14 +902,14 @@ fn chunk(py: Python<'_>, obj: &Bound<'_, PyAny>, key: Option<&str>) -> PyResult<
 
 // -- sorted runs ------------------------------------------------------------------------
 
-/// A write's entries in key order (`run.rs`): upserts, each with its payload
+/// A write's entries in key order (`entries.rs`): upserts, each with its payload
 /// if it carries one, and removes. Immutable once built, so readers share it.
 #[pyclass(module = "solera._native", frozen)]
 struct SortedEntries {
     inner: Arc<entries::SortedEntries>,
 }
 
-fn sorted_run(r: format::Result<entries::SortedEntries>) -> PyResult<SortedEntries> {
+fn sorted_entries(r: format::Result<entries::SortedEntries>) -> PyResult<SortedEntries> {
     Ok(SortedEntries {
         inner: Arc::new(r.map_err(to_py)?),
     })
@@ -929,7 +929,7 @@ impl SortedEntries {
         removes: Vec<PyBackedBytes>,
     ) -> PyResult<SortedEntries> {
         guard(|| {
-            sorted_run(py.detach(|| {
+            sorted_entries(py.detach(|| {
                 let payloads: Option<Vec<Option<&[u8]>>> =
                     payloads.as_ref().map(|p| p.iter().map(opt).collect());
                 entries::SortedEntries::of(&slices(&keys), payloads.as_deref(), &slices(&removes))
@@ -948,13 +948,13 @@ impl SortedEntries {
     ) -> PyResult<SortedEntries> {
         guard(|| {
             let mut src = Source::Table(Box::new(Cursor::new(rows.table.clone())));
-            sorted_run(
+            sorted_entries(
                 py.detach(|| entries::SortedEntries::from_source(&mut src, &slices(&removes))),
             )
         })
     }
 
-    /// A run from its transport form, a `.kx` file, every fact checked
+    /// Sorted entries from their transport form, a `.kx` file, every fact checked
     /// (`FormatError` when one fails), decoding at most `max_entries`
     /// entries and `max_bytes` bytes (`LimitError` past either).
     #[staticmethod]
@@ -966,7 +966,9 @@ impl SortedEntries {
         max_bytes: u64,
     ) -> PyResult<SortedEntries> {
         guard(|| {
-            sorted_run(py.detach(|| entries::SortedEntries::decode(&data, max_entries, max_bytes)))
+            sorted_entries(
+                py.detach(|| entries::SortedEntries::decode(&data, max_entries, max_bytes)),
+            )
         })
     }
 
@@ -1027,7 +1029,7 @@ impl SortedEntries {
     }
 }
 
-/// The sparse reader's state over a sorted run (`sparse.rs`): Python
+/// The sparse reader's state over sorted entries (`sparse.rs`): Python
 /// fetches what it asks for, entries are named by their position.
 #[pyclass(module = "solera._native")]
 struct Sparse {
@@ -1041,11 +1043,11 @@ fn filter_of(f: &(u64, u8, PyBackedBytes)) -> sparse::Filter<'_> {
 #[pymethods]
 impl Sparse {
     #[new]
-    fn new(run: PyRef<'_, SortedEntries>) -> PyResult<Sparse> {
+    fn new(sorted: PyRef<'_, SortedEntries>) -> PyResult<Sparse> {
         guard(|| {
             Ok({
                 Sparse {
-                    inner: sparse::Sparse::new(run.inner.clone()),
+                    inner: sparse::Sparse::new(sorted.inner.clone()),
                 }
             })
         })
@@ -1069,7 +1071,7 @@ impl Sparse {
         self.inner.inferred
     }
 
-    /// The positions `[lo, hi)` of the run's keys in `[min, max]`.
+    /// The positions `[lo, hi)` of the sorted entries' keys in `[min, max]`.
     fn span(&self, min: &[u8], max: &[u8]) -> PyResult<(usize, usize)> {
         guard(|| Ok(self.inner.span(min, max)))
     }
@@ -1144,7 +1146,7 @@ impl Sparse {
             let out = PyDict::new(py);
             for (p, g, payload) in self.inner.live() {
                 out.set_item(
-                    PyBytes::new(py, self.inner.run.key(p)),
+                    PyBytes::new(py, self.inner.sorted.key(p)),
                     (g, payload.map(|b| PyBytes::new(py, b))),
                 )?;
             }
@@ -1152,7 +1154,7 @@ impl Sparse {
         })
     }
 
-    /// The run's delta over what was read: `.kx` files with added, removed
+    /// The sorted entries' delta over what was read: `.kx` files with added, removed
     /// and changed, and up to `collect` changed keys (`Merge.collected`).
     #[pyo3(signature = (*, generation, collect=0, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864))]
     #[allow(clippy::too_many_arguments)]
@@ -1281,15 +1283,15 @@ impl Merge {
         })
     }
 
-    /// The merge-join of a sorted run against `runs` existing runs, newest
+    /// The merge-join of sorted entries against `runs` existing runs, newest
     /// first: a patch, or with `replace` the whole new content. At most
     /// `collect` changed keys are kept for `collected`. Written entries carry
     /// `generation`.
     #[staticmethod]
-    #[pyo3(signature = (run, runs, *, replace=false, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864, collect=0, generation=0))]
+    #[pyo3(signature = (sorted, runs, *, replace=false, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864, collect=0, generation=0))]
     #[allow(clippy::too_many_arguments)]
     fn patch(
-        run: PyRef<'_, SortedEntries>,
+        sorted: PyRef<'_, SortedEntries>,
         runs: usize,
         replace: bool,
         block_size: usize,
@@ -1303,7 +1305,7 @@ impl Merge {
     ) -> PyResult<Merge> {
         guard(|| {
             let o = options(block_size, level, bits_per_item, k, codec);
-            let src = Source::Run(run.inner.clone(), 0);
+            let src = Source::Entries(sorted.inner.clone(), 0);
             let job = Join::new(src, replace, runs, o, max_file_bytes, collect, generation)
                 .map_err(to_py)?;
             Ok(Merge {
@@ -1651,12 +1653,12 @@ impl Snapshot {
 
     /// The delta of a `SortedEntries` against the snapshot, as a patch or a
     /// `replace`ment: `.kx` files, with added, removed and changed.
-    #[pyo3(signature = (run, *, replace, generation, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864))]
+    #[pyo3(signature = (sorted, *, replace, generation, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864))]
     #[allow(clippy::too_many_arguments)]
     fn resolve<'py>(
         &mut self,
         py: Python<'py>,
-        run: PyRef<'_, SortedEntries>,
+        sorted: PyRef<'_, SortedEntries>,
         replace: bool,
         generation: u64,
         block_size: usize,
@@ -1668,9 +1670,9 @@ impl Snapshot {
     ) -> PyResult<Resolved<'py>> {
         guard(|| {
             let o = options(block_size, level, bits_per_item, k, codec);
-            let (inner, run) = (&mut self.inner, run.inner.clone());
+            let (inner, sorted) = (&mut self.inner, sorted.inner.clone());
             let d = py
-                .detach(|| inner.resolve(&run, replace, generation, o, max_file_bytes))
+                .detach(|| inner.resolve(&sorted, replace, generation, o, max_file_bytes))
                 .map_err(to_py)?;
             Ok(delta_files(py, &d))
         })

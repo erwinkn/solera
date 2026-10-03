@@ -1,4 +1,4 @@
-//! A sorted run: a write's entries in key order — upserts, each with its
+//! Sorted entries: a write's entries in key order — upserts, each with its
 //! payload if it carries one, and removes — as the key index takes them end
 //! to end. Built once (from lists, from rows, or from the `.kx` transport
 //! form, every fact checked), read by every resolver, and encoded only to
@@ -77,7 +77,7 @@ impl SortedEntries {
             + 8 * self.generations.capacity()
     }
 
-    /// Gives back what building over-allocated: a run is held as long as it is read.
+    /// Gives back what building over-allocated: sorted entries are held as long as they are read.
     pub(crate) fn shrink(mut self) -> SortedEntries {
         self.keys.data.shrink_to_fit();
         self.keys.ends.shrink_to_fit();
@@ -150,7 +150,7 @@ impl SortedEntries {
         b.finish()
     }
 
-    /// A run from its transport form, a `.kx` file, after checking every
+    /// Sorted entries from their transport form, a `.kx` file, after checking every
     /// fact a reader relies on: the footer, the index and each block's
     /// checksum, each block's entries against its index entry and the
     /// file's against the footer, keys strictly increasing. Decodes at most
@@ -170,7 +170,7 @@ impl SortedEntries {
         if indexed != declared {
             return fmt_err("the index's entries do not match the footer");
         }
-        let mut run = SortedEntries::default();
+        let mut sorted = SortedEntries::default();
         // One budget: the index decoded, then the blocks, then their keys and payloads.
         let mut budget = max_bytes.saturating_sub(index_bytes(&idx));
         let take = |budget: &mut u64, n: usize| -> Result<()> {
@@ -192,10 +192,10 @@ impl SortedEntries {
             }
             let data = decompress_at_most(raw, idx.footer.codec, budget)?;
             take(&mut budget, data.len())?;
-            let (start, mut pos) = (run.len(), 0usize);
+            let (start, mut pos) = (sorted.len(), 0usize);
             key.clear();
             while pos < data.len() {
-                if run.len() as u64 >= max_entries {
+                if sorted.len() as u64 >= max_entries {
                     return limit(format!("more than {max_entries} entries"));
                 }
                 let f = read_entry(&data, &mut pos)?;
@@ -210,26 +210,27 @@ impl SortedEntries {
                 )?;
                 key.truncate(f.shared);
                 key.extend_from_slice(suffix);
-                run.push(&key, f.generation, f.deleted(), payload)
+                sorted
+                    .push(&key, f.generation, f.deleted(), payload)
                     .map_err(|_| Error::Format("keys out of order".into()))?;
             }
-            if (run.len() - start) as u64 != *entries {
+            if (sorted.len() - start) as u64 != *entries {
                 return fmt_err("a block's entries do not match its index");
             }
-            if run.len() > start && run.key(start) != first.as_slice() {
+            if sorted.len() > start && sorted.key(start) != first.as_slice() {
                 return fmt_err("a block's first key does not match its index");
             }
         }
-        if run.len() as u64 != declared {
+        if sorted.len() as u64 != declared {
             return fmt_err("the entries do not match the footer");
         }
-        if !run.is_empty()
-            && (run.key(0) != idx.min_key.as_slice()
-                || run.key(run.len() - 1) != idx.max_key.as_slice())
+        if !sorted.is_empty()
+            && (sorted.key(0) != idx.min_key.as_slice()
+                || sorted.key(sorted.len() - 1) != idx.max_key.as_slice())
         {
             return fmt_err("the keys do not match the index's range");
         }
-        Ok(run.shrink())
+        Ok(sorted.shrink())
     }
 
     /// The transport form: one `.kx` file.
@@ -251,7 +252,7 @@ impl SortedEntries {
 
 /// Upserts in key order merged with sorted removes.
 struct Builder<'a> {
-    run: SortedEntries,
+    sorted: SortedEntries,
     removes: Vec<&'a [u8]>,
     next: usize,
 }
@@ -261,11 +262,11 @@ impl<'a> Builder<'a> {
         let mut removes = removes.to_vec();
         removes.sort_unstable();
         removes.dedup();
-        let mut run = SortedEntries::default();
-        run.keys.ends.reserve(upserts + removes.len());
-        run.payloads.ends.reserve(upserts + removes.len());
+        let mut sorted = SortedEntries::default();
+        sorted.keys.ends.reserve(upserts + removes.len());
+        sorted.payloads.ends.reserve(upserts + removes.len());
         Builder {
-            run,
+            sorted,
             removes,
             next: 0,
         }
@@ -273,17 +274,17 @@ impl<'a> Builder<'a> {
 
     fn upsert(&mut self, key: &[u8], payload: Option<&[u8]>) -> Result<()> {
         while self.next < self.removes.len() && self.removes[self.next] <= key {
-            self.run.push(self.removes[self.next], 0, true, None)?;
+            self.sorted.push(self.removes[self.next], 0, true, None)?;
             self.next += 1;
         }
-        self.run.push(key, 0, false, payload)
+        self.sorted.push(key, 0, false, payload)
     }
 
     fn finish(mut self) -> Result<SortedEntries> {
         for k in &self.removes[self.next..] {
-            self.run.push(k, 0, true, None)?;
+            self.sorted.push(k, 0, true, None)?;
         }
-        Ok(self.run.shrink())
+        Ok(self.sorted.shrink())
     }
 }
 
@@ -302,30 +303,30 @@ mod tests {
 
     #[test]
     fn of_encode_decode_round_trip() {
-        let run = SortedEntries::of(
+        let sorted = SortedEntries::of(
             &[b"c", b"a", b"e"],
             Some(&[Some(b"3"), None, Some(b"")]),
             &[b"d", b"b", b"d"],
         )
         .unwrap();
-        let keys: Vec<&[u8]> = (0..run.len()).map(|i| run.key(i)).collect();
+        let keys: Vec<&[u8]> = (0..sorted.len()).map(|i| sorted.key(i)).collect();
         assert_eq!(keys, [b"a", b"b", b"c", b"d", b"e"]);
-        assert_eq!(run.removes(), 2);
-        assert!(matches!(run.write(1), Write::Remove));
-        assert!(matches!(run.write(0), Write::Upsert(None)));
-        assert!(matches!(run.write(2), Write::Upsert(Some(b"3"))));
-        assert!(matches!(run.write(4), Write::Upsert(Some(b""))));
-        let back = SortedEntries::decode(&run.encode(O).unwrap(), 5, 1 << 20).unwrap();
-        assert_eq!(back.keys.data, run.keys.data);
-        assert_eq!(back.deleted, run.deleted);
-        assert_eq!(back.has_payload, run.has_payload);
-        assert_eq!(back.payloads.data, run.payloads.data);
+        assert_eq!(sorted.removes(), 2);
+        assert!(matches!(sorted.write(1), Write::Remove));
+        assert!(matches!(sorted.write(0), Write::Upsert(None)));
+        assert!(matches!(sorted.write(2), Write::Upsert(Some(b"3"))));
+        assert!(matches!(sorted.write(4), Write::Upsert(Some(b""))));
+        let back = SortedEntries::decode(&sorted.encode(O).unwrap(), 5, 1 << 20).unwrap();
+        assert_eq!(back.keys.data, sorted.keys.data);
+        assert_eq!(back.deleted, sorted.deleted);
+        assert_eq!(back.has_payload, sorted.has_payload);
+        assert_eq!(back.payloads.data, sorted.payloads.data);
         assert!(matches!(
-            SortedEntries::decode(&run.encode(O).unwrap(), 4, 1 << 20),
+            SortedEntries::decode(&sorted.encode(O).unwrap(), 4, 1 << 20),
             Err(Error::Limit(_))
         ));
         assert!(matches!(
-            SortedEntries::decode(&run.encode(O).unwrap(), 5, 8),
+            SortedEntries::decode(&sorted.encode(O).unwrap(), 5, 8),
             Err(Error::Limit(_))
         ));
         assert!(SortedEntries::of(&[b"a"], None, &[b"a"]).is_err());

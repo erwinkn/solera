@@ -9,7 +9,8 @@ import sys
 import time
 
 from solera import _native
-from solera.keys import _python
+
+from tests.sdk import keys_reference as _python
 
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 1_000_000
 PAYLOAD = int(sys.argv[2]) if len(sys.argv) > 2 else 0

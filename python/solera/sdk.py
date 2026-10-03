@@ -323,7 +323,7 @@ class Source:
     @classmethod
     def _from_dynamic_partitions(cls, ps: DynamicPartitions) -> Source:
         if ps.name is None:
-            raise RegistrationError("A source PartitionSet requires an explicit name")
+            raise RegistrationError("A source DynamicPartitions requires an explicit name")
         source = cls(ps.name, store=ps.store, key="<partitions>", **{})
         source.handle = {"name": ps.name}
         return source
@@ -394,7 +394,7 @@ class Incremental(In):
 
         super().__init__(output, meta=meta)
         if batch_size < 1:
-            raise RegistrationError("Incremental page_size must be positive")
+            raise RegistrationError("Incremental batch_size must be positive")
         self.batch_size = batch_size
         try:
             self.patterns = patterns.spec(include, exclude)
@@ -1226,7 +1226,7 @@ class Project:
                 spec = dim.spec()
             elif isinstance(dim, DynamicPartitions):
                 if dim.name is None and dim_name == "_":
-                    raise RegistrationError(f"{asset_name}: a PartitionSet dimension requires a name")
+                    raise RegistrationError(f"{asset_name}: a DynamicPartitions dimension requires a name")
                 spec = {"kind": "dynamic", "output": dim.name}
                 if dim_name == "_":
                     name = dim.name

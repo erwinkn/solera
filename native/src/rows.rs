@@ -353,21 +353,21 @@ impl Stream {
     }
 }
 
-/// A stream with a sorted run laid over it: the run's upserts in place of
+/// A stream with sorted entries laid over it: their upserts in place of
 /// the stream's entries of their keys, and its removes gone — a patch over
 /// the keys a store holds, read back a chunk at a time.
 pub struct Overlay {
     pub base: Stream,
-    run: Arc<SortedEntries>,
+    sorted: Arc<SortedEntries>,
     i: usize,
-    current: Option<bool>, // Some(true): the run's entry `i`; Some(false): the base's
+    current: Option<bool>, // Some(true): the sorted entry `i`; Some(false): the base's
 }
 
 impl Overlay {
-    pub fn new(base: Stream, run: Arc<SortedEntries>) -> Overlay {
+    pub fn new(base: Stream, sorted: Arc<SortedEntries>) -> Overlay {
         Overlay {
             base,
-            run,
+            sorted,
             i: 0,
             current: None,
         }
@@ -383,23 +383,23 @@ impl Overlay {
                 return Ok(State::Starved);
             }
             let ready = base == State::Ready;
-            if self.i >= self.run.len() {
+            if self.i >= self.sorted.len() {
                 if !ready {
                     return Ok(State::Done);
                 }
                 self.current = Some(false);
                 continue;
             }
-            let key = self.run.key(self.i);
+            let key = self.sorted.key(self.i);
             if ready && self.base.group.key.as_slice() < key {
                 self.current = Some(false);
                 continue;
             }
             if ready && self.base.group.key.as_slice() == key {
-                self.base.ready = false; // the run's entry stands for it
+                self.base.ready = false; // the sorted entry stands for it
                 continue;
             }
-            if matches!(self.run.write(self.i), Write::Remove) {
+            if matches!(self.sorted.write(self.i), Write::Remove) {
                 self.i += 1; // a remove: nothing of the key stays
                 continue;
             }
@@ -409,7 +409,7 @@ impl Overlay {
 
     fn entry(&self) -> (&[u8], Option<&[u8]>) {
         match self.current {
-            Some(true) => (self.run.key(self.i), self.run.payload(self.i)),
+            Some(true) => (self.sorted.key(self.i), self.sorted.payload(self.i)),
             _ => (&self.base.group.key, None),
         }
     }
@@ -424,19 +424,19 @@ impl Overlay {
 }
 
 /// The written side of a merge-join: rows, sorted chunks as they stream
-/// (with a run laid over them, or not), or a sorted run (whose entries may
+/// (with sorted entries laid over them, or not), or sorted entries (which may
 /// be removes).
 pub enum Source {
     Table(Box<Cursor>),
     Stream(Stream),
-    Run(Arc<SortedEntries>, usize),
+    Entries(Arc<SortedEntries>, usize),
     Overlay(Box<Overlay>),
 }
 
 impl Source {
     pub fn state(&mut self) -> Result<State> {
         match self {
-            Source::Run(run, i) => Ok(if *i < run.len() {
+            Source::Entries(sorted, i) => Ok(if *i < sorted.len() {
                 State::Ready
             } else {
                 State::Done
@@ -465,7 +465,7 @@ impl Source {
     #[inline]
     pub fn write(&self) -> Write<'_> {
         match self {
-            Source::Run(run, i) => run.write(*i),
+            Source::Entries(sorted, i) => sorted.write(*i),
             _ => Write::Upsert(self.entry().1),
         }
     }
@@ -475,7 +475,7 @@ impl Source {
         match self {
             Source::Table(t) => t.entry(),
             Source::Stream(s) => (&s.group.key, None),
-            Source::Run(run, i) => (run.key(*i), run.payload(*i)),
+            Source::Entries(sorted, i) => (sorted.key(*i), sorted.payload(*i)),
             Source::Overlay(o) => o.entry(),
         }
     }
@@ -484,7 +484,7 @@ impl Source {
         match self {
             Source::Table(t) => t.ready = false,
             Source::Stream(s) => s.ready = false,
-            Source::Run(_, i) => *i += 1,
+            Source::Entries(_, i) => *i += 1,
             Source::Overlay(o) => o.advance(),
         }
     }
@@ -492,7 +492,7 @@ impl Source {
     /// The stream fed sorted chunks, if this is one.
     pub fn stream(&mut self) -> Option<&mut Stream> {
         match self {
-            Source::Table(_) | Source::Run(..) => None,
+            Source::Table(_) | Source::Entries(..) => None,
             Source::Stream(s) => Some(s),
             Source::Overlay(o) => Some(&mut o.base),
         }

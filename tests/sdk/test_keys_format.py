@@ -5,8 +5,8 @@ import random
 
 import pytest
 from solera import _native
-from solera.keys import _python
 
+from . import keys_reference as _python
 from .keys_driver import drive
 
 _MODULES = {"python": _python, "native": _native}
@@ -412,3 +412,11 @@ def test_a_runs_index_is_inside_its_decoding_budget():
     with pytest.raises(_native.FormatError):
         _native.SortedEntries.decode(with_index(b"\0\0\0" + bytes(100)))  # trailing bytes
     assert len(_native.SortedEntries.decode(with_index(b"\0\0\0"))) == 0
+
+
+def test_an_overlong_varint_is_refused_by_the_reference():
+    """As native: a u64 takes ten bytes at most, the tenth its top bit alone."""
+
+    assert _python.get_varint(b"\xff" * 9 + b"\x01", 0) == (2**64 - 1, 10)
+    with pytest.raises(ValueError, match="too long"):
+        _python.get_varint(b"\xff" * 9 + b"\x7f", 0)

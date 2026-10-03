@@ -512,13 +512,13 @@ impl Snapshot {
         Ok(None)
     }
 
-    /// The delta of `run` against this snapshot: as a patch, or with
+    /// The delta of `sorted` against this snapshot: as a patch, or with
     /// `replace` as the whole new content, live keys it omits deleted. A
     /// patch looks up each of its keys while that reads less than every
     /// block; anything else is the streaming job, fed local blocks.
     pub fn resolve(
         &mut self,
-        run: &Arc<SortedEntries>,
+        sorted: &Arc<SortedEntries>,
         replace: bool,
         generation: u64,
         o: Options,
@@ -526,21 +526,21 @@ impl Snapshot {
     ) -> Result<Delta> {
         // A point lookup reads and checks one small block (~2.5 µs); a merge decodes every entry
         // (~120 ns each, bench/keys/warm.py): points win until about one lookup per 20 entries.
-        if !replace && 16 * run.len() * self.runs.len() < self.entries() as usize {
+        if !replace && 16 * sorted.len() * self.runs.len() < self.entries() as usize {
             let mut d = Delta::new(o, max_file_bytes, 0, generation);
-            for i in 0..run.len() {
-                let hit = self.get(run.key(i))?;
+            for i in 0..sorted.len() {
+                let hit = self.get(sorted.key(i))?;
                 let was = match &hit {
                     Some(h) if !h.deleted => Old::Live(h.generation, h.payload.as_deref()),
                     _ => Old::Absent,
                 };
-                d.apply(run.key(i), run.write(i), was)?;
+                d.apply(sorted.key(i), sorted.write(i), was)?;
             }
             d.finish()?;
             return Ok(d);
         }
         let mut job = Join::new(
-            Source::Run(run.clone(), 0),
+            Source::Entries(sorted.clone(), 0),
             replace,
             self.runs.len(),
             o,
@@ -575,7 +575,7 @@ impl Snapshot {
     }
 
     /// Up to `limit` entries of the merged snapshot past `after` —
-    /// deletions dropped with `drop_deleted` — as a sorted run, and the
+    /// deletions dropped with `drop_deleted` — as sorted entries, and the
     /// cursor to continue from: the last one's key, or None when nothing
     /// lies past it. Each run is read from the block holding `after`; past
     /// `max_bytes` of keys and payloads, an `Error::Limit`.

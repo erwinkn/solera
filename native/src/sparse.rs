@@ -1,6 +1,6 @@
 //! The sparse reader's per-key state (docs/resolved-commits.md §6), kept
 //! native from start to delta. Python chooses files and fetches their tails
-//! and blocks; this decides, for each entry of a sorted run — by its
+//! and blocks; this decides, for each of the sorted entries — by its
 //! position, never a Python object — what the index holds: read from a
 //! block, absent by the key filters, or — for an upsert carrying no payload,
 //! which changes the key whatever its entry — live by the key and tombstone
@@ -32,7 +32,7 @@ enum Known {
 pub type Filter<'a> = (u64, u8, &'a [u8]);
 
 pub struct Sparse {
-    pub run: Arc<SortedEntries>,
+    pub sorted: Arc<SortedEntries>,
     known: Vec<Known>,
     tomb: Vec<bool>,
     key: Vec<bool>,
@@ -42,10 +42,10 @@ pub struct Sparse {
 }
 
 impl Sparse {
-    pub fn new(run: Arc<SortedEntries>) -> Sparse {
-        let n = run.len();
+    pub fn new(sorted: Arc<SortedEntries>) -> Sparse {
+        let n = sorted.len();
         Sparse {
-            run,
+            sorted,
             known: vec![Known::Unknown; n],
             tomb: vec![false; n],
             key: vec![false; n],
@@ -70,9 +70,9 @@ impl Sparse {
             .count()
     }
 
-    /// The positions of the run's keys in `[min, max]`.
+    /// The positions of the sorted entries' keys in `[min, max]`.
     pub fn span(&self, min: &[u8], max: &[u8]) -> (usize, usize) {
-        let keys = &self.run.keys;
+        let keys = &self.sorted.keys;
         let (mut lo, mut hi) = (0, keys.len());
         while lo < hi {
             let mid = (lo + hi) / 2;
@@ -133,7 +133,7 @@ impl Sparse {
         let mut out: Vec<usize> = self
             .targets(file, lo, hi)
             .iter()
-            .filter_map(|&p| Sparse::block_of(firsts, self.run.key(p as usize)))
+            .filter_map(|&p| Sparse::block_of(firsts, self.sorted.key(p as usize)))
             .collect();
         out.dedup();
         out
@@ -156,7 +156,7 @@ impl Sparse {
         // Targets come in key order, so blocks in file order: one decoded at a time.
         let mut current: Option<(usize, Block)> = None;
         for p in targets {
-            let key = self.run.key(p as usize);
+            let key = self.sorted.key(p as usize);
             let Some(b) = Sparse::block_of(firsts, key) else {
                 continue;
             };
@@ -196,7 +196,7 @@ impl Sparse {
             if !matches!(self.known[p], Known::Unknown) {
                 continue;
             }
-            let key = self.run.key(p);
+            let key = self.sorted.key(p);
             key_item(&mut item, key);
             if !may_hold(keys.2, &item, keys.0, keys.1) {
                 continue;
@@ -219,7 +219,7 @@ impl Sparse {
             if !matches!(self.known[p], Known::Unknown) {
                 continue;
             }
-            let bare = matches!(self.run.write(p), Write::Upsert(None));
+            let bare = matches!(self.sorted.write(p), Write::Upsert(None));
             self.known[p] = if !self.key[p] {
                 Known::Absent
             } else if bare && !self.tomb[p] && !exact {
@@ -248,7 +248,7 @@ impl Sparse {
         })
     }
 
-    /// The delta of the run over what was read, by the one rule.
+    /// The delta of the sorted entries over what was read, by the one rule.
     pub fn delta(
         &self,
         o: Options,
@@ -257,8 +257,8 @@ impl Sparse {
         generation: u64,
     ) -> Result<Delta> {
         let mut d = Delta::new(o, max_file_bytes, collect, generation);
-        for p in 0..self.run.len() {
-            d.apply(self.run.key(p), self.run.write(p), self.old(p))?;
+        for p in 0..self.sorted.len() {
+            d.apply(self.sorted.key(p), self.sorted.write(p), self.old(p))?;
         }
         d.finish()?;
         Ok(d)

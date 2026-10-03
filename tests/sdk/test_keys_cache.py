@@ -13,11 +13,13 @@ from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 from obstore.store import MemoryStore
 from solera import _native
-from solera.keys import FOOTER_SIZE, SortedEntries, _python
+from solera.keys import FOOTER_SIZE, SortedEntries
 from solera.keys.cache import Corrupt, EngineCache
 from solera.keys.index import FileInfo, IndexState, KeyIndex, Options
 from solera.keys.io import ObjectIO
 from solera.keys.resolver import Ask, Limits, Malformed, Prepared, Resolver, answers, frame, request, unframe
+
+from . import keys_reference as _python
 
 OPTS = Options(
     block_size=512,

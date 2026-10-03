@@ -583,7 +583,7 @@ async def test_a_move_and_back_with_no_write_between_resets(state, tmp_path):  #
         engine = make_engine(state, project(store))
         await engine.initialize()
     assert ("items", "") not in m.heads and ("items", "") not in m.indexes
-    assert m.reset_at["items"] == m.deploy_number and not m.bookmark("copy", "items", "")
+    assert m.reset_at[("output", "items")] == m.deploy_number and not m.bookmark("copy", "items", "")
     rows["items"] = [{"id": "a"}]  # the new `items` holds no `b`
     assert status_of(await drive(engine, await engine.submit(["copy"], upstream=True))) == "succeeded"
     assert seen[-1] == (True, ["a"])

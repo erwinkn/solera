@@ -2,8 +2,9 @@
 
 The per-key work — encoding, decoding, filter checks, sorting, merging — is
 the `solera._native` extension, following docs/key-index-format.md; Python
-chooses files, fetches bytes, and parses tails through it. `_python` is the
-format's executable reference, which the tests hold the extension to.
+chooses files, fetches bytes, and parses tails through it. The format's
+executable reference, which the tests hold the extension to, is
+`tests/sdk/keys_reference.py`.
 """
 
 from __future__ import annotations

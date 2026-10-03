@@ -12,9 +12,11 @@ import pytest
 from hypothesis import example, given, settings
 from hypothesis import strategies as st
 from obstore.store import MemoryStore
-from solera.keys import Rows, SortedEntries, _python
+from solera.keys import Rows, SortedEntries
 from solera.keys.index import IndexState, KeyIndex, Options
 from solera.keys.io import ObjectIO
+
+from . import keys_reference as _python
 
 
 @dataclass

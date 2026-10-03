@@ -1,7 +1,7 @@
 # Key index file format (`.kx`, version 3)
 
 Byte-level format of a key index file (`object-store-state.md` §6). The
-`solera._native` Rust extension reads and writes it; `solera/keys/_python.py`
+`solera._native` Rust extension reads and writes it; `tests/sdk/keys_reference.py`
 is an executable reference the tests hold the extension to, and each must
 read the other's files. Compressed bytes may differ between them (different
 deflate implementations); decoded content may not.
