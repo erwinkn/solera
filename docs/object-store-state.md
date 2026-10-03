@@ -9,17 +9,48 @@ infrastructure.
 
 ## 0. Constraints
 
-- **Primitives:** `GET` (including range reads), `PUT`, `PUT` create-only,
-  `LIST` (lexicographic, with or without a delimiter), `DELETE`. No
-  compare-and-swap: obstore's `file://` backend does not implement it
-  (verified on 0.11.1), so nothing may depend on it.
+- **Primitives:** `GET` (including range reads), `PUT`, `PUT` create-only
+  (`If-None-Match: *`), `PUT` if-match (`If-Match` on an ETag: a
+  compare-and-swap), `LIST` (lexicographic, with or without a delimiter),
+  `DELETE`. The store holding the engine's state must support `If-Match`:
+  S3 (since November 2024), GCS, R2, MinIO and Railway's buckets do
+  (`bench/keys/results.md`, "A Railway bucket"), and so does obstore's
+  `MemoryStore`. obstore's `file://` backend does not (0.11.1), so
+  `solera.objects` implements it there with a lock (below). Output
+  stores (§9) need none of this.
 - **A create can land unheard.** The object is written, the response is
-  lost, and the retry finds it there. (So two writers must never seal the
-  same bytes for one name: a writer's fence carries a random nonce.) So every create-only write that
-  decides something — a journal segment, a spec, a delta file, a write
-  fence — reads back an object in its way: holding exactly the bytes being
-  written, it is the writer's own earlier try, and the write succeeded
+  lost, and the retry finds it there. So every create-only write that
+  decides something — a spec, a delta file, a write fence — reads back an
+  object in its way: holding exactly the bytes being written, it is the
+  writer's own earlier try, and the write succeeded
   (`solera.objects.create`). Only different bytes are another writer's.
+- **So can a swap.** `solera.objects` has two calls for objects that
+  are overwritten:
+  - `read(store, path) -> (data, etag)`, or `None` if there is no object.
+  - `swap(store, path, data, etag) -> etag` writes `data` only if the
+    object's ETag is still `etag` (`None`: only if there is no object),
+    and returns the new ETag.
+
+  A swap that is refused (412; or 409, which S3 answers to one of two
+  concurrent conditional writes), or whose answer is lost, `read`s the
+  object to find out what happened:
+  - it holds exactly `data`: the write landed, and `swap` returns that
+    ETag;
+  - its ETag is still `etag`: nothing landed, and `swap` writes again;
+  - anything else: `swap` raises `Conflict`, because another writer's
+    write is there.
+
+  So no two writes may produce the same bytes for one object. Every body
+  written by `swap` names its writer, and never repeats (the journal's:
+  §10).
+- **`file://` has no `If-Match`, so `swap` takes a lock.** It takes
+  `fcntl.flock` on `{path}.lock` and compares the file's SHA-256, which
+  serves as the ETag there, with `etag`. Then it writes a temporary file,
+  fsyncs it, `os.replace`s it over the object, and unlocks. The kernel
+  drops the lock when its process dies, so a crash leaves nothing to clean
+  up. A lock file created with `O_EXCL` instead would outlive a crash, and
+  breaking it would need a timeout. This works on one machine only, not
+  over NFS: `file://` is for local development.
 - **One writer per namespace.** The engine's in-memory state is the source
   of truth; storage is written to, and read only when a writer starts.
 - **The engine owns keys; stores own rows.** Every key → generation index,
@@ -37,8 +68,8 @@ Everything lives under `{root}/{namespace}/`.
 
 | Kind | Path | Written by | Mutability | Deleted when |
 |---|---|---|---|---|
-| Journal segment | `control/journal/{seq:020d}.json` | engine | create-only | the checkpoint before the newest covers it; a writer's fence segment never |
-| Checkpoint | `control/checkpoints/{seq:020d}.json` | engine | create-only | two newer checkpoints exist |
+| Journal | `control/journal.json` | engine | swapped (`If-Match`) on every flush | never (one object) |
+| Checkpoint | `control/checkpoints/{engine}-{n:06d}.json` | engine | create-only | once the journal has moved to a newer one (§10) |
 | Key index file | `keys/{output}/{partition}/{name}.kx` | worker (delta files), compaction | create-only | no longer in the index and no consumer needs it (§6) |
 | History file | `history/{table}/{ulid}.parquet` | engine | create-only | merged into a bigger file, or rewritten without deleted runs (§7) |
 | Spec | `runs/{run}/{attempt}.spec` | engine, before `AttemptLaunched` | create-only, immutable | with its run |
@@ -49,11 +80,11 @@ Everything lives under `{root}/{namespace}/`.
 | Attempt log | chunks `runs/{run}/{attempt}.log.{n:06d}`, every 30 s or 1 MB; the end inside the result | worker | create-only, never joined | with its run |
 | Output data | store-defined (FileStore: `{output}/{partition}/{key}/{generation}.json` under `.solera/data`, §9) | the store, inside the worker | FileStore / S3Store: created once, never overwritten; others: store-defined | FileStore / S3Store: superseded or abandoned objects, by the partition's next attempt once no reader pin predates them (§9); never expired |
 
-**Growth.** `control/` is bounded: at most two checkpoints plus the
-journal since the older one — and one fence segment per writer that ever
-started —, and a checkpoint is written whenever that
-journal reaches the size of the last checkpoint (§10) — so `control/`
-stays under about three times the engine's state size. `keys/` is bounded
+**Growth.** `control/` is bounded: the journal, at most
+`max(64 KB, a sixteenth of the checkpoint)`, plus the checkpoint it names
+(§10). A checkpoint left over by an engine that crashed or was fenced
+before its cleanup goes with the next engine's cleanup. So `control/`
+stays a little over the engine's state size. `keys/` is bounded
 by live keys plus unconsumed deltas. What grows over time is `runs/` and
 `history/`, both bounded by retention, and user data, which holds only
 current content.
@@ -61,11 +92,8 @@ current content.
 ```
 {root}/{namespace}/
   control/
-    journal/00000000000000001001.json        ← a writer's fence segment
-    journal/00000000000000001002.json
-    …
-    checkpoints/00000000000000000990.json    ← previous (kept for recovery)
-    checkpoints/00000000000000001040.json    ← newest
+    journal.json                             ← the engine id, the checkpoint, the events since
+    checkpoints/7f3a9c0e5b21d846-000012.json ← the checkpoint the journal names
   keys/
     site_files/alpha/000000000057.kx         ← delta file of commit 57
     site_files/alpha/c01J8ZE2….kx            ← compacted file
@@ -94,8 +122,7 @@ Output data lives wherever its store puts it: FileStore under
 | attempt | `{ulid}` | globally unique; names delta files and attempt files |
 | commit | `(run, attempt)` | no separate commit id or record |
 | commit number | integer per (output, partition) | engine-assigned, starts at 0 |
-| seq | integer per namespace | journal position |
-| writer | the `seq` of that writer's fence segment | no separate epoch object |
+| engine id | 16 random hex characters, per process | names the journal's writer (§10); no two processes share one |
 
 **Renames.** `@asset(aliases=["old_name"])`. On registration the engine
 moves everything held under an alias to the current name: its partition
@@ -118,12 +145,14 @@ the target of a rename, starts over: it never resumes an earlier life
 alias left `mirror`'s first life, which the next rename onto `mirror`
 kept, under a bookmark already past a deletion).
 
-## 3. Journal segment
+## 3. Journal
 
-One object per flush. There is one way to change state:
+One object, `control/journal.json`, rewritten whole by every flush: the
+engine id of its writer, the name of the checkpoint it extends, and
+every event since that checkpoint (§10). There is one way to change state:
 `State.record(*events)` applies the events to the model and buffers them,
 synchronously — the engine never waits on storage. A background flusher
-writes what is buffered as one segment once the oldest event has waited
+appends what is buffered to the journal once the oldest event has waited
 1 s or 1 MB is buffered.
 
 Only what acts on the outside world on the strength of an event waits for
@@ -138,9 +167,9 @@ rather than after the interval:
   a cancel, a claim) is answered only once that is durable — a `503` if
   this writer was replaced meanwhile.
 
-A segment is sealed before it is written: a failed or interrupted write is
-retried with the very same bytes, so a retry that finds its segment
-already there recognizes it as its own rather than another writer's.
+A flush is sealed before it is written: a failed or interrupted write is
+retried with the very same bytes, so a retry that finds them in place
+knows its write landed (`swap`, §0).
 
 Everything else the storage does runs on its own loop, off the engine's:
 the history lake flushes and merges (§7), and `Upkeep` truncates delta
@@ -149,10 +178,11 @@ retention (§11).
 
 ```json
 {
-  "seq": 1042,
-  "engine": 1001,
+  "engine": "7f3a9c0e5b21d846",
+  "checkpoint": "7f3a9c0e5b21d846-000012",
   "at": 1790074866.1,
   "events": [
+    "…every event since checkpoint 000012, then:",
     {"type": "AttemptFinished", "run": "01J8ZC7Q…", "task": "site_feed:alpha",
      "attempt": "01J8ZC7R…", "outcome": "succeeded", "started_at": 1790074865.2, "finished_at": 1790074866.0,
      "commit": {
@@ -175,7 +205,6 @@ status are derived inside `apply`; they are not events.
 
 | Event | Fields | Effect |
 |---|---|---|
-| `EngineStarted` | `writer`, `nonce` | first event of every writer; its segment's `seq` becomes the writer id; `nonce` is random, so no two writers' fences have the same bytes |
 | `ProjectRegistered` | `deploy`, `manifest` | replaces the manifest; applies aliases; retires removed names (§2); reconciles automation state |
 | `RunSubmitted` | `run` (id, request, tasks) | adds an active run |
 | `RunControlled` | `run`, `action` (`cancel` \| `pause` \| `resume`) | |
@@ -203,12 +232,12 @@ its result (§8).
 
 ## 5. State (in memory) — also the checkpoint's content
 
-A checkpoint is this structure serialized as of `seq`. Nested maps rather
+A checkpoint is this structure serialized as of the journal's last flush. Nested maps rather
 than joined string keys, because partition keys may contain `/`.
 
 ```
 State
-  seq, engine, event_counter, deploy, deploy_number, manifest   # event_counter: events applied so far, the model's clock
+  event_counter, deploy, deploy_number, manifest   # event_counter: events applied so far, the model's clock
   heads        {output: {partition: Head}}             # assets and external sources
   indexes      {output: {partition: KeyIndex}}         # keyed outputs and keyed sources (§6)
   partitions   {asset: {partition: PartitionRecord}}   # each asset partition's committed lifecycle
@@ -247,7 +276,7 @@ Example (abridged):
 
 ```json
 {
-  "seq": 1040, "engine": 1001, "deploy": "c0ffee…", "manifest": {"…": "…"},
+  "event_counter": 48211, "deploy": "c0ffee…", "manifest": {"…": "…"},
   "heads": {"site_files": {"alpha": {
     "ref": {"output": "site_files", "store": "default", "partition": "alpha", "generation": 184467,
             "handle": {"mode": "keyed", "path": "site_files/alpha", "key": "path"}},
@@ -688,7 +717,7 @@ the attempt's token and its generation (the claim's event counter).
 
 **Launch and adoption.** The engine writes the spec, then
 `AttemptLaunched`, durable, then starts the placement and records its
-handle as `AttemptPlaced` — lazily, riding the next journal segment. From
+handle as `AttemptPlaced` — lazily, riding the next flush. From
 `AttemptLaunched` on, the attempt's claim and its claim are durable:
 an engine that restarts adopts it — follows its handle, or finds it again
 by name (ECS `clientToken`, the Kubernetes job `solera-{attempt}`), or
@@ -824,97 +853,101 @@ and rewrites the rows a write covers.
 
 ## 10. Lifecycles
 
-**Writer start.** `LIST control/checkpoints/` → `GET` the newest →
-`LIST control/journal/` after its `seq` → `GET` and apply each segment →
-create `journal/{seq+1}` with `[EngineStarted]`. If that create fails,
-another writer appended: `GET` it, apply it, retry at the next `seq`.
-Then adopt every launched attempt (§8); tasks that were preparing are
-dispatched again.
+*The journal is one object, `control/journal.json`, swapped with
+`If-Match` (§0) on every write. It holds three things: the engine id of
+the engine that writes it, the name of the checkpoint it extends, and
+every event since that checkpoint. The journal spec checks the rules
+below (`verification.md`, "Formal model: the journal object"), and
+`journal-object.md` says why it replaced the numbered segments and what
+it costs.*
 
-The writer still running may checkpoint and clean up while the new one
-opens, deleting segments the new one has not read yet. A segment that is
-missing (a gap, or a `GET` that finds nothing) where a checkpoint at or
-past it exists was written, then deleted: cleanup deletes nothing a
-checkpoint does not cover. The new writer opens again from the newer
-checkpoint.
+**Engine start.**
 
-**Fences in holes.** *Findings F14 and F15 (`verification.md`, "Formal
-model: the journal"); the journal spec checks this rule, and
-`Journal._hole` is it.* A fence create can also land in such a hole, and until it is
-deleted another opener can read that fence in place of the event cleanup
-removed. A checkpoint at or past the fence does not tell the two apart:
-it may be a newer writer's that replayed a real fence and moved past it.
-The **hole test** for a fence segment at seq `s`:
+1. `read` the journal. With no journal there, the state is empty.
+2. `GET` the checkpoint the journal names, and apply the journal's
+   events on top of it. If the checkpoint is gone, a running engine has
+   moved the journal to a newer one and cleaned up since: go back to 1.
+3. Fence: `swap` in the same journal under this process's own engine
+   id, a new random one, on the ETag step 1 read (`None` if there was no
+   journal). A `Conflict` means another engine wrote in between: go back
+   to 1.
 
-1. `LIST control/checkpoints/`. Fewer than two at or past `s`: the fence
-   is real.
-2. Otherwise `GET` a listed checkpoint at or past `s`, any of them (every
-   readable one agrees; the newest is the natural choice). Its `fences`
-   lists `s`: the fence is real. It does not: the fence is a hole's.
-3. The `GET` finds nothing (cleanup deleted it since the `LIST`): back to
-   1. The checkpoint cannot be parsed: `GET` another listed one at or past
-   `s`.
+Then adopt every launched attempt (§8). Tasks that were preparing are
+dispatched again. A read-only open (tools that inspect a namespace a
+server may be writing) stops after step 2.
 
-Never decide from a checkpoint below `s`, nor take a checkpoint that is
-gone for one that does not exist. Why it is exact:
+**Fencing.** Every write an engine makes is a `swap` on the ETag of its
+own last write. Its bodies never repeat: each one names its engine id,
+and each write either adds events or names a new checkpoint. So once
+another engine has written, the old engine's next `swap` raises
+`Conflict`. It stops, failing every `durable()` waiter (a `503`).
+Everything the old engine wrote before that was in the journal the new
+engine read, so no acknowledged event is lost. For example:
 
-- A hole at `s` is a cleanup's doing, and cleanup deletes `s` only once
-  two checkpoints at or past `s` exist (the previous one and the newest),
-  and from then on keeps two. So fewer than two means no hole, and with
-  two, at most one of them unreadable (the case the previous checkpoint is
-  kept for), one `GET` in step 2 succeeds.
-- Cleanup never deletes a fence, so a slot cleanup emptied held an
-  ordinary segment, and no checkpoint lists a fence there.
-- Every checkpoint at or past a real fence was written by a writer that
-  replayed it, so it lists it; and no writer applies a hole's fence, so no
-  checkpoint ever lists one.
+1. Engine A serves. The journal is `{a7f3, cp a7f3-000004, [e1, e2]}`,
+   with ETag `X`.
+2. Engine B starts: it reads the journal (`X`), loads `a7f3-000004`,
+   applies `e1` and `e2`, and swaps in `{91c2, cp a7f3-000004, [e1, e2]}`
+   on `X`.
+3. A flushes `e3`, swapping on `X`: `Conflict`, since B's body is there.
+   A stops. `e3` was never acknowledged, and its API call gets a `503`.
 
-Who runs it:
+The engine id is what makes the fence work. Without it, B's fence would
+write A's bytes again, so the ETag would stay `X`, and A's next write would
+still succeed.
 
-- **The writer whose fence create at `s` succeeded**, before it applies
-  its fence. Real, with no checkpoint at or past `s`: it serves. Real,
-  with one or more: a newer writer has replayed the fence, so it keeps the
-  fence, deletes nothing and opens again. A hole's: it deletes the fence
-  and opens again.
-- **Every opener that reads a fence segment** (`EngineStarted`), while
-  replaying or in its fence's way, read-only opens included, before it
-  applies it. Real: it applies it. A hole's: it opens again, without
-  applying it.
+**Flush.** A flush swaps in the whole journal: the engine id, the
+checkpoint, and every event since it, with the new ones appended. Events
+stay encoded in memory, so a flush only joins bytes. A flush whose answer
+is lost is resolved by `swap` (§0): its own bytes are there, so it
+landed.
 
-Should every checkpoint at or past `s` that the `LIST` showed be
-unreadable (two bad checkpoints, beyond what the design survives), the
-engine neither applies nor deletes the fence, and opens again.
+**Checkpoint.** A checkpoint is due once the journal's events reach
+`max(64 KB, a sixteenth of the last checkpoint's size)`, and on a clean
+shutdown. It takes these steps, under the flusher's lock:
 
-**Fencing.** Every segment write is create-only at `seq+1`. A writer
-whose create collides reads the colliding segment: if it has another
-writer id, it has been replaced and shuts down. Segments a replaced
-writer managed to write before the new fence were acknowledged and are
-replayed by the new writer, so no acknowledged work is lost.
+1. `LIST control/checkpoints/`.
+2. `PUT` the state, as of the last flush, under a fresh name:
+   `checkpoints/{engine}-{n:06d}.json`, where `n` counts this engine's
+   checkpoints.
+3. `GET` it back and parse it. If that fails, leave the journal as it
+   is: the next due point tries again, and cleanup deletes the bad
+   checkpoint with the rest.
+4. Move the journal: swap in `{engine, the new checkpoint, no events}`.
+   A `Conflict` means the engine was fenced: it stops and deletes nothing.
+5. Once the move has landed, `DELETE` every checkpoint that step 1 listed.
+
+Besides the engine id, three rules make this safe. Break any one and
+the journal spec finds the failure: an opener that gives up for the
+first, a lost acknowledged event for the other two.
+
+- **An opener whose checkpoint is gone reads the journal again.**
+  Cleanup only deletes checkpoints the journal no longer names, so the
+  journal has moved past it.
+- **No checkpoint is named before it is read back.** Only one checkpoint
+  is kept, so the journal must never name one that nobody can parse.
+- **Cleanup deletes only what it listed before its move.** A checkpoint
+  exists before the journal names it, and listing after the move would
+  catch it in that window. For example: A moves to `a7f3-000005`. B fences
+  A, appends, and writes `91c2-000001`, not yet named. A then LISTs,
+  deletes everything but its own `a7f3-000005`, and so deletes B's
+  checkpoint. B's move then names a checkpoint that is gone. With the
+  rule, this cannot happen. If A's move lands, nobody fenced A before it,
+  so when A listed, no newer engine's checkpoint existed yet.
+
+**Sizes.** A flush writes half the threshold on average: 32 KB at the
+minimum. With a 10 MB state it writes up to 640 KB, about 1.3 ms of upload
+at Railway's 250 MB/s, next to a 12 ms PUT. A checkpoint follows at least
+a sixteenth of its own size in journal, so checkpoints come at most 16
+times as often as under the segments' rule. The measurements are in
+`journal-object.md`.
 
 **A failed event ends the process.** Events are encoded and checked before
 any is applied; should a reducer still raise half-way, the model is no
-longer the fold of the journal. The writer then takes no checkpoint,
+longer the fold of the journal. The engine then takes no checkpoint,
 refuses every later event, writes what it recorded before (the failed
 batch never reached the journal), logs why, and exits with code 70: the
 platform restarts it, and the replay recovers exactly the journal's state.
-
-The slot a replaced writer collides in is always its successor's fence,
-so fence segments are kept for good. Were cleanup to delete one, say
-writer 1001 fenced by 1042 that has since checkpointed past 1042, then
-1001's next create at 1042 would succeed: its events acknowledged,
-replayed by no one. Each checkpoint lists the fences (`fences`), and
-cleanup skips them.
-
-**Checkpoint.** Written when the journal bytes since the last checkpoint
-exceed `max(256 KB, size of the last checkpoint)`, and on clean shutdown.
-Write cost stays proportional to the journal volume; restart replays at
-most about one checkpoint's worth of journal.
-
-**Journal cleanup.** Immediately after writing a checkpoint, delete every
-checkpoint older than the previous one, and every journal segment at or
-below the previous checkpoint's `seq` except fence segments. The previous checkpoint and the
-journal after it are kept so a newest checkpoint that turns out
-unreadable can be recovered from.
 
 **Run lifecycle.** submit → `RunSubmitted` · attempts → `AttemptFinished`
 · terminal → `RunArchived` (its rows join the pending history) · flush →

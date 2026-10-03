@@ -8,8 +8,12 @@
 #   spec/tla/check-journal.sh calibrate    each fix put back out: TLC must find its bug
 #   spec/tla/check-journal.sh ci           small, fixed, live and calibrate
 #   spec/tla/check-journal.sh all          ci and big
+#   spec/tla/check-journal.sh object       the journal as one object (JournalObject.tla):
+#                                          two engines, three, liveness, calibration
+#   spec/tla/check-journal.sh object-big   the same, three engines, six writes
 #
-# Needs Java 11+. Downloads tla2tools.jar into spec/tla/.tools (gitignored).
+# TLC_WORKERS (3) and TLC_HEAP (6g) bound what a run takes of a shared
+# machine. Needs Java 11+. Downloads tla2tools.jar into spec/tla/.tools (gitignored).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -19,12 +23,13 @@ if [ ! -f "$jar" ]; then
     mkdir -p .tools
     curl -fsSL -o "$jar" "https://github.com/tlaplus/tlaplus/releases/download/v$version/tla2tools.jar"
 fi
+module=Journal  # the spec checked: Journal, or JournalObject
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 tlc() {  # tlc CONFIG LOG: run TLC, keep its output
-    java -XX:+UseParallelGC ${TLC_JAVA_OPTS:-} -cp "$jar" tlc2.TLC -workers auto -metadir "$work/states" \
-        -config "$1" Journal.tla > "$2" 2>&1 || true
+    java -XX:+UseParallelGC "-Xmx${TLC_HEAP:-6g}" -cp "$jar" tlc2.TLC -workers "${TLC_WORKERS:-3}" -metadir "$work/states" \
+        -config "$1" "$module.tla" > "$2" 2>&1 || true
     rm -rf "$work/states"
     if [ -n "${TLA_LOGS:-}" ]; then mkdir -p "$TLA_LOGS"; cp "$2" "$TLA_LOGS/"; fi
 }
@@ -33,7 +38,7 @@ tlc() {  # tlc CONFIG LOG: run TLC, keep its output
 # BASE's model, with constants changed and properties left out or added.
 configure() {
     local cfg="$work/$1.cfg" change
-    cp "Journal-$2.cfg" "$cfg"
+    cp "$module-$2.cfg" "$cfg"
     shift 2
     for change in "$@"; do
         case $change in
@@ -112,6 +117,31 @@ live() {
     check live live
 }
 
+# The journal as one object (docs/verification.md, "Formal model: the
+# journal object"): its models, then each of its rules switched off in turn.
+object() {
+    module=JournalObject
+    check object-small small
+    check object-fixed big MaxWrites=5
+    check object-live live
+    echo "== calibrate the journal object"
+    # Without the engine id in the journal, a fence can leave its bytes, so
+    # its ETag, unchanged: the old engine's If-Match still holds.
+    calibrate engine-id small OneWriter EngineId=FALSE
+    # A refused write that does not GET the journal takes its own lost
+    # answer for a newer engine's write: a lone engine stops.
+    calibrate ask live AppendsAlone AskJournal=FALSE -OpensAlone
+    # An opener whose checkpoint was cleaned up since it read the journal
+    # gives up.
+    calibrate re-get small OpensNeverFail ReGet=FALSE
+    # The journal moves to a checkpoint nobody can parse: the state is lost.
+    calibrate verify small NoAckedLoss Verify=FALSE
+    # Cleanup that LISTs after its move deletes a newer engine's checkpoint
+    # before that engine's move names it: the state is lost.
+    calibrate list-first small NoAckedLoss ListFirst=FALSE
+    module=Journal
+}
+
 case ${1:-small} in
     small) check small small ;;
     fixed) check fixed big MaxSeq=4 ;;
@@ -120,5 +150,7 @@ case ${1:-small} in
     calibrate) calibration ;;
     ci) check small small; check fixed big MaxSeq=4; live; calibration ;;
     all) check small small; check fixed big MaxSeq=4; live; calibration; check big big ;;
-    *) echo "usage: $0 [small|fixed|big|live|calibrate|ci|all]" >&2; exit 2 ;;
+    object) object ;;
+    object-big) module=JournalObject; check object-big big ;;
+    *) echo "usage: $0 [small|fixed|big|live|calibrate|ci|all|object|object-big]" >&2; exit 2 ;;
 esac

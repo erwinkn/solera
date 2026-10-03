@@ -343,12 +343,17 @@ Reasons: `user`, `timeout`, `provisioning`.
 One engine writes it at a time.
 
 **engine**. The control-plane process: plans runs, settles attempts,
-runs no user code. A new engine on a namespace fences the previous one.
-*Was:* writer (`WriterStarted`, the segment's `writer` id).
+runs no user code. A new engine on a namespace fences the previous one by
+rewriting the journal under its **engine id**, random per process
+(`object-store-state.md` §10). *Was:* writer (`WriterStarted`, the
+segment's `writer` id).
 
-**journal**. The engine's state as an append-only log of events in
-object-store segments, with periodic checkpoints. State is the fold of the
-events.
+**journal**. The engine's state as a log of events: one object,
+`control/journal.json`, holding the engine id of its writer, the
+checkpoint it extends and the events since. Every flush rewrites it with
+`If-Match`. State is the fold of the events. *Was:* numbered segments
+(`journal/{seq}.json`), until K18; the segment number `seq` went with
+them.
 
 **event**. One entry of the journal: one decision of the engine, applied
 whole. *Example:* `RunSubmitted`, `AttemptLaunched`, `AttemptFinished`
@@ -357,14 +362,7 @@ whole. *Example:* `RunSubmitted`, `AttemptLaunched`, `AttemptFinished`
 
 **event counter**. How many events the engine has applied: its clock, the
 same in every engine that replays the journal. Generations and pins are
-values of it. *Was:* event position, `applied` (code). *Not:* the
-**segment number**.
-
-**segment number** `seq`. The number of a journal segment, the object
-one flush writes: `journal/{seq:020d}.json`, and a checkpoint is named
-by the last segment it covers. A segment holds many events, so it is no
-event counter. `seq` stays as its name in storage and in the journal's
-TLA+ spec. *Example:* segment 1042 is engine 1042's fence.
+values of it. *Was:* event position, `applied` (code).
 
 **commit**. The atomic install of new heads, all in one event: an
 attempt's result (heads, key-index deltas, cursor, bookmarks, failed keys),
@@ -410,8 +408,8 @@ bookmark behind to the head.
 
 **fence**. A newer writer's mark that refuses an older writer's
 writes. A fenced store keeps one per output partition, by generation
-(`Store.acquire`, `solera.fencing`); the journal keeps one per namespace,
-by engine. *Not:* the gate.
+(`Store.acquire`, `solera.fencing`); the journal's engine id is the
+namespace's. *Not:* the gate.
 
 ## Reading inputs
 
@@ -674,7 +672,8 @@ Each line: what goes, what replaces it, and why it does not earn a name.
 an `Incremental` alias) gives way to model change 2, which makes `each`
 a flag for real; and 2.28's `KeyService.hold`/`release` stay, since
 `KeyService` already names its engine-cache pins `pin`/`unpin`. The
-journal's `seq` stays as the segment number's storage name.
+journal's `seq` stayed as the segment number's storage name until the
+journal became one object (K18).
 
 Order matters: phase 1 frees names that phase 2 reuses. Each row is one
 codemod: rename `from` to `to` in the listed places, word-bounded. "User"

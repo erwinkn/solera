@@ -20,8 +20,8 @@ only, and every store is exact: `immutable` or `fenced` (round-2
 decision 2 dropped the `overwrite` kind, its grace and its holds).
 Ticks are sensors (§11), which are not attempts at all.
 
-It assumes what is built: fence segments kept for good and carrying a
-writer nonce, create-only writes that recognize their own bytes
+It assumes the journal's fencing (`object-store-state.md` §10), and what
+is built: create-only writes that recognize their own bytes
 (`solera.objects.create`), results sealed once, durable retirement,
 event-position garbage pins, recorded placement handles, per-placement
 "can't tell", a provisioning deadline, and a timeout that runs from the
@@ -1047,7 +1047,7 @@ synchronous.
 7. **Record everything at once**: the source commits, the run submissions
    (`command = {tick}/{n}`, so the run receipts deduplicate them too),
    `SensorAdvanced {sensor, cursor}` if the cursor moved, and the new
-   accepted-outcome record — one `record()`, so one journal segment holds
+   accepted-outcome record — one `record()`, so one flush holds
    all or none of it — and answer once it is durable. A tick whose
    outcome is nothing records nothing.
 

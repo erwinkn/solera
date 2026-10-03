@@ -445,6 +445,10 @@ it read 1 and 2.
 
 ## Formal model: the journal (`spec/tla/Journal.tla`)
 
+*Decided (K18): the journal becomes one object ("Formal model: the
+journal object", below). This section describes the numbered segments,
+which `journal.py` implements until that is built.*
+
 The journal (`object-store-state.md` §3, §10; `python/solera_server/journal.py`)
 is a protocol between engines that share nothing but the object store: an
 old engine still appending, checkpointing and cleaning up while new ones
@@ -686,6 +690,74 @@ spec/tla/check-journal.sh ci           # small, fixed, live and calibrate
 ```
 
 CI's `journal-spec` job runs `ci`: about ten minutes on a GitHub runner.
+
+## Formal model: the journal object (`spec/tla/JournalObject.tla`)
+
+Decided (K18), not built yet: the journal becomes one object,
+`control/journal.json`, swapped with `If-Match` (`object-store-state.md`
+§0 and §10; why, and what it costs: `journal-object.md`). The object holds
+the engine id of its writer, the name of the current checkpoint and the
+events since that checkpoint. Until it is built, `Journal.tla` (above)
+describes `journal.py`.
+
+**What differs from `Journal.tla`.**
+
+- The store is the journal (a body, or nothing yet), the checkpoints by
+  unique name, and at most one unparseable checkpoint. An ETag is a
+  function of the body, as on S3 and R2 (an MD5), so `If-Match` compares
+  bodies. A store whose ETag is a version counter (GCS, `MemoryStore`, or
+  `file://`'s SHA-256 under its lock) gives at least that.
+- Journal writes are numbered (`writes`), for the properties only. A
+  fence or an acknowledgment records the number of the write that carried
+  it. `OneWriter` and `FencedSeesAcked` order by these numbers where
+  `Journal.tla` uses a segment's `seq`. `MaxWrites` bounds the model, as
+  `MaxSeq` does there.
+- Faults: crashes between any two requests, overlapping and zombie
+  engines, lost answers, 409s (a conditional write refused without
+  landing), one unparseable checkpoint, and cleanup at any time. A
+  checkpoint is due at any point after an append: the cadence does not
+  matter to safety.
+- `JournalResolves` replaces `CleanupCovered`: the journal names a
+  checkpoint that is there and readable. `CountersDense`,
+  `HolesTwiceCovered` and `FencesStay` have no counterpart, since there
+  are no slots and no fences to keep.
+- One step is one request, as in `Journal.tla`. Abstracted the same way:
+  one event per append, a state as the list of events folded into it, a
+  LIST as one snapshot, and checkpoint creates that never lose their
+  answer.
+
+**Calibration.** Each rule of the design is a switch. With it off, TLC
+must find the bug it prevents (`check-journal.sh object`):
+
+| Rule off | TLC finds | Trace |
+|---|---|---|
+| `EngineId`: the journal names its writer | `OneWriter`, 9 steps | A fences, then begins an append. B reads the journal and fences, but without an id its body is A's byte for byte, so the ETag does not change. A's append still matches, and it is acknowledged after B's fence. |
+| `AskJournal`: a refused write reads the journal | `AppendsAlone`, 13 to 15 steps (a liveness trace varies between runs) | A lone engine's append lands, but its answer is lost. The retry is refused, because its own write changed the ETag. The engine takes that for a newer engine's write and stops. |
+| `ReGet`: a gone checkpoint sends the opener back to the journal | `OpensNeverFail`, 25 steps | B reads the journal, which names `cp-A-1`. A moves to `cp-A-2`, and its cleanup deletes `cp-A-1`. B's GET of `cp-A-1` finds nothing, and B gives up. |
+| `Verify`: a checkpoint is read back before the move | `NoAckedLoss`, 11 steps | A appends, writes a checkpoint nobody can parse, and moves the journal to it. An opener can no longer load A's acknowledged event. |
+| `ListFirst`: cleanup deletes only what it listed before its move | `NoAckedLoss`, 24 steps | A moves to `cp-A-1`. B opens, fences, appends and writes `cp-B-1`. A, now a zombie, LISTs for its cleanup and deletes every checkpoint except `cp-A-1`, so `cp-B-1` goes too. B's move then lands, and the journal names a deleted checkpoint. |
+
+**Bounds and cost** (TLC 2.19; `-workers 3`, `-Xmx6g`, on a shared
+8-core VM):
+
+| Model | Engines | Journal writes | Distinct states | Depth | Time |
+|---|---|---|---|---|---|
+| `JournalObject-small.cfg` | 2 | 7 | 766,771 | 53 | 26 s |
+| `fixed` (`JournalObject-big.cfg`, five writes) | 3 | 5 | 4,663,723 | 46 | 2 min 52 s |
+| `JournalObject-big.cfg` | 3 | 6 | 23,642,632 | 53 | 8 min 52 s |
+| `JournalObject-live.cfg`: one engine at a time, no 409s | 3 | 7 | 1,075,329 | 47 | 1 min 57 s |
+
+Liveness leaves out 409s. A store that refuses every conditional write
+forever is an outage, not a fault the journal can outlast.
+
+**Not modeled.** The `file://` lock, which gives one machine the same
+`If-Match`. Flushes that run while a checkpoint is written
+(`journal-object.md`, "A known cost").
+
+```bash
+spec/tla/check-journal.sh object       # two engines, three, liveness, calibration: ~6 min
+spec/tla/check-journal.sh object-big   # three engines, six writes: ~9 min
+```
 
 ## Findings
 
