@@ -48,6 +48,18 @@ class PruneInput(BaseModel):
     dry_run: bool = False
 
 
+class KeysRetryInput(BaseModel):
+    classes: list[str] = Field(default_factory=lambda: ["failed"], max_length=10)
+    partition: str | None = None
+    by: str | None = Field(default=None, max_length=200)
+
+
+class CleanupsClearInput(BaseModel):
+    output: str
+    partition: str = ""
+    by: str | None = Field(default=None, max_length=200)
+
+
 class SourceCommitInput(BaseModel):
     version: str | None = None
     keys: dict | list | None = None
@@ -555,20 +567,16 @@ def create_app(
         return {"cleanups": runtime.cleanups_view()}
 
     @app.post("/api/projects/{p}/cleanups:clear")
-    async def clear_cleanups(p: str, request: Request):
+    async def clear_cleanups(p: str, body: CleanupsClearInput, request: Request):
         runtime = await project_engine(request, p)
-        body = await request.json()
-        return runtime.clear_cleanups(body["output"], body.get("partition", ""), body.get("by") or "api")
+        return runtime.clear_cleanups(body.output, body.partition, body.by or "api")
 
     @app.post("/api/projects/{p}/assets/{name}/keys:retry")
-    async def retry_keys(p: str, name: str, request: Request):
+    async def retry_keys(p: str, name: str, body: KeysRetryInput, request: Request):
         runtime = await project_engine(request, p)
-        body = await request.json()
-        found = runtime.retry_keys(
-            name, body.get("classes") or ["failed"], body.get("partition"), body.get("by") or "api"
-        )
+        found = runtime.retry_keys(name, body.classes, body.partition, body.by or "api")
         if found["partitions"]:
-            await runtime.submit_retries(name, found["partitions"], body.get("by") or "api")
+            await runtime.submit_retries(name, found["partitions"], body.by or "api")
         return found
 
     # -- the worker channel (docs/lifecycle.md §5) ----------------------------------------

@@ -73,7 +73,7 @@ ROUTES = {
     "prune": {"before": 0.0, "keep": 1, "dry_run": True},
     "clear": {"output": "feed", "partition": ""},
 }
-RAW = {"retry", "clear"}  # routes that read the body as raw JSON, not through a model
+RAW = {"retry", "clear"}  # the routes that read their body as raw JSON until F28
 
 
 def _path(base: str, route: str) -> str:
@@ -90,8 +90,6 @@ def _path(base: str, route: str) -> str:
 
 
 def _body(route: str):
-    if route in RAW:  # while F28 is open: their valid body only
-        return st.just(ROUTES[route])
     return st.one_of(_mutate(ROUTES[route]), values)  # a near miss, or anything at all
 
 
@@ -162,7 +160,6 @@ def test_an_integer_past_64_bits_never_wedges_the_journal(route, body, tmp_path)
     asyncio.run(_exchange(tmp_path, [(route, body)]))
 
 
-@pytest.mark.xfail(strict=True, reason="F28: open")
 @pytest.mark.parametrize(
     "route,body",
     [(r, b) for r in sorted(RAW) for b in (None, [], "x", 1)] + [("clear", {"output": []})],
