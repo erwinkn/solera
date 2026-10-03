@@ -1224,3 +1224,58 @@ one, at every size: it reads level 0's files and writes the merged file
 writes, and a few MB, to a compaction that was free. It happens only when
 level 1 is empty: an index's first compaction, or one after a replacement
 by nothing. Peak memory is about 170 bytes per output entry in both cases.
+
+## One tiling of spans (2026-10-04)
+
+`docs/key-index-design.md`: the index as key-sorted spans tiling commit
+time, merged only between observer boundaries. Apple M5 Max.
+
+**The policy replayed** (`tiling.py`, density model as `amplification.py`;
+commits of 1K keys, 90% updates, 5% removes, 5% adds; second half
+measured; 4-way size classes, merge into the oldest span at a quarter of
+it; consumers read every `period` commits). `amplification.py --policies
+now --commits 40000` on the same commits: 16.3× at 1M, 29.8× at 100M.
+
+    uv run python bench/keys/tiling.py --sizes 1e6,1e8 --commits 40000,200000 --policies 4:1000
+
+| Keys | Consumers (periods) | Written per entry committed | Spans, mean (max) | Entries per live key, mean (max) | Catch-up of the slowest, per read |
+|---|---|---|---|---|---|
+| 1,000,000 | 1 | 7.1 | 6.2 (11) | 1.13 (1.25) | 1 span, 1K entries |
+| 1,000,000 | 1, 360 | 8.9 | 4.9 (9) | 1.16 (1.31) | 6 spans, 312K |
+| 1,000,000 | 1, 360, 8,640 | 9.0 | 9.9 (15) | 2.15 (2.54) | 5 spans, 1,237K |
+| 1,000,000 | ten, 1 to 8,640 | 10.0 | 12.0 (16) | 3.43 (4.31) | 12 spans, 2,992K |
+| 1,000,000 | 1, 60,480 | 7.2 | 7.9 (14) | 2.87 (4.11) | 10 spans, 2,696K |
+| 100,000,000 | 1 | 10.3 | 11.3 (21) | 1.12 (1.25) | 1 span, 1K |
+| 100,000,000 | 1, 360 | 15.9 | 13.2 (22) | 1.13 (1.25) | 8 spans, 360K |
+| 100,000,000 | 1, 360, 8,640 | 17.2 | 14.8 (24) | 1.17 (1.33) | 5 spans, 8,297K |
+| 100,000,000 | ten, 1 to 8,640 | 16.8 | 15.1 (20) | 1.16 (1.29) | 12 spans, 8,490K |
+| 100,000,000 | 1, 60,480 | 10.4 | 10.3 (20) | 1.24 (1.49) | 14 spans, 49,449K |
+
+With a storage cap of 2× the live keys (`--cap-ratio 2`): at 1M, ten
+consumers lose 9 positions over 20,000 commits and hold 2.42 (3.00)
+entries per live key; a weekly consumer, 1.80 (3.09); with a cap of 1,
+1.13 (2.05). Nothing at 100M reaches the cap. Commits of 10K keys at 100M
+(20,000 commits): 8.6×, 10.5× and 13.1× for 1, (1, 360, 8,640) and ten
+consumers. Rejected policies: capping spans per group by merging the
+smallest neighbours wrote 540–1,300× at 100M; size classes without the
+"older than a bigger neighbour" rule left 176 spans on average (354 max)
+behind an hourly consumer at 100M.
+
+**Cold reads** (`tiling_reads.py`: real files, `KeyIndex.lookup` exact and
+`KeyIndex.page`, local store with 30 ms per request and 80 MB/s per
+connection, 64 in parallel). "Leveled" is the presence study's steady
+state; "tiling R" is the same base plus 4-way size classes, three spans
+each (R spans).
+
+    uv run python bench/keys/tiling_reads.py --sizes 1e6,1e8 --dir /tmp/tiling
+
+| Keys | Layout | Files | Entries per live key | Size | Tails | 1K lookups, exact | 100K-key page |
+|---|---|---|---|---|---|---|---|
+| 1,000,000 | leveled | 8 | 1.01 | 9 MB | 2 MB | 8 GETs, 9 MB, 0.19 s | 9 GETs, 1 MB, 0.09 s |
+| 1,000,000 | tiling 13 | 13 | 1.25 | 11 MB | 2 MB | 13 GETs, 11 MB, 0.20 s | 14 GETs, 3 MB, 0.10 s |
+| 1,000,000 | tiling 25 | 25 | 1.51 | 14 MB | 3 MB | 25 GETs, 14 MB, 0.21 s | 26 GETs, 6 MB, 0.12 s |
+| 100,000,000 | leveled | 53 | 2.00 | 1,416 MB | 350 MB | 1,851 GETs, 425 MB, 2.74 s | 19 GETs, 4 MB, 0.15 s |
+| 100,000,000 | tiling 22 | 56 | 1.16 | 845 MB | 204 MB | 1,117 GETs, 285 MB, 1.52 s | 37 GETs, 13 MB, 0.13 s |
+| 100,000,000 | tiling 43 | 83 | 1.33 | 985 MB | 233 MB | 1,163 GETs, 343 MB, 1.72 s | 70 GETs, 25 MB, 0.16 s |
+
+The 100M run took 308 s (44 s of it the build) and 5.2 GB peak RSS.
