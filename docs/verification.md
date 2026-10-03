@@ -240,10 +240,11 @@ Known gaps, most valuable first; each says what would close it.
   `day × site` asset in the project.
 - **Migrations** in the simulation: waits for F18's fix, since every run's
   `items` would share one ledger row.
-- **Retention past `gate_days`**: virtual runs last hours, so a gate is
-  never old enough to go.
-- **The key cache under pressure**: its disk budget and evictions run at
-  their defaults, far from their limits.
+- **Retention past `gate_days`**, left out on purpose: past it, a stale
+  worker is stopped by its store's fence alone, which `lifecycle.md` §2.4
+  says and claims no more. Expiring gates within the simulation's hours
+  would mostly replay that concession; the fence itself is what the store
+  kit's stale writers check, against every fenced store.
 
 Closed in this round: the key index format, merges, compactions and
 resolves against a dict (property tests, and F16); glob patterns; resolve
@@ -278,6 +279,8 @@ rules, not invariant checks. `pg`: `items` may also live in Postgres.
 | L3 | a780a55 | 603 | 527 runs, 29,798 steps, 161 h | pg | green; F13 set aside 10 times |
 | L4 | a780a55 | 604 | 435 runs × up to 80 steps, 31,285 steps, 187 h | pg | green; F13 set aside 8 times |
 | T1 | `break_watch` | 701 | 158 runs, 7,293 steps | default | green |
+| C1–C3 | the key cache under pressure | 801–803 | 702 runs, 32,147 steps | default ×2, pg | green; F13 set aside 3 times |
+| J1–J3 | the job `seen` | 811–813 | 668 runs, 33,179 steps | default ×2, pg | green; F13 set aside once |
 
 ## Formal model: execution semantics (`spec/tla/Execution.tla`)
 
