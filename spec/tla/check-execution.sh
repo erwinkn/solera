@@ -2,11 +2,13 @@
 # Model-check the execution spec (docs/verification.md, "Execution spec").
 #
 #   spec/tla/check-execution.sh             the smoke model and the calibrations (CI)
-#   spec/tla/check-execution.sh design      the design with liveness: deploys, faults, each=True
+#   spec/tla/check-execution.sh design      the design with liveness: store moves, patterns and versions, removal (minutes)
+#   spec/tla/check-execution.sh big         every deploy kind, every fault kind, each=True: too large to finish yet
 #   spec/tla/check-execution.sh safety      every kind at once, two deploys and two faults: random behaviours (SAFETY_TRACES)
 #   spec/tla/check-execution.sh calibrate   each fix put back out: TLC must find its bug
 #   spec/tla/check-execution.sh all
 #
+# TLC_WORKERS (3) and TLC_HEAP (6g) bound what a run takes of a shared machine.
 # Needs Java 11+ (else runs TLC in the eclipse-temurin:21-jre image). Downloads
 # tla2tools.jar into spec/tla/.tools (gitignored).
 set -euo pipefail
@@ -24,7 +26,7 @@ trap 'rm -rf "$work"' EXIT
 tlc() {  # tlc CONFIG LOG [TLC options]
     local cfg=$1 log=$2
     shift 2
-    local args=(-XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers auto -deadlock -lncheck final
+    local args=(-XX:+UseParallelGC "-Xmx${TLC_HEAP:-6g}" -cp "$jar" tlc2.TLC -workers "${TLC_WORKERS:-3}" -deadlock -lncheck final
                 -metadir "$work/states" "$@" -config "$cfg" Execution.tla)
     if command -v java >/dev/null; then
         java "${args[@]}" > "$log" 2>&1 || true
@@ -73,9 +75,10 @@ calibration() {
 
 case "${1:-ci}" in
     ci) check smoke; calibration ;;
-    design) check deploys; check faults; check each ;;
+    design) for m in store shape remove; do check $m; done ;;
+    big) for m in deploys faults each; do check $m; done ;;
     safety) check safety -simulate "num=${SAFETY_TRACES:-100000}" -depth 150 ;;
     calibrate) calibration ;;
-    all) check smoke; calibration; check deploys; check faults; check each; check safety -simulate "num=${SAFETY_TRACES:-100000}" -depth 150 ;;
-    *) echo "usage: $0 [ci|design|safety|calibrate|all]" >&2; exit 2 ;;
+    all) check smoke; calibration; for m in store shape remove; do check $m; done; check safety -simulate "num=${SAFETY_TRACES:-100000}" -depth 150 ;;
+    *) echo "usage: $0 [ci|design|big|safety|calibrate|all]" >&2; exit 2 ;;
 esac

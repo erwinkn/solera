@@ -23,6 +23,7 @@ CONSTANTS
     MaxTries,    \* attempts a run's task may fail before it fails
     MaxKeysRuns, \* manual runs of A with keys= (one key, read as given; no bookmark moves)
     Each,        \* B is an each=True asset (reconciled at the end of a full pass)
+    WithB,       \* B is declared at the start (else the chain is S and A, unless B is added)
     Deploys,     \* the deploy kinds explored: subset of {"move","pattern","bump","remove"}
     Faults,      \* the fault kinds explored: subset of {"worker","crash","takeover","timeout","cancel","zombie"}
     FixF6, FixF9, FixF10, FixF13, FixF17
@@ -164,7 +165,7 @@ Init ==
     /\ runs = [r \in 1..MaxRuns |-> [st |-> "free"]]
     /\ nRun = 0
     /\ pending = [c \in Assets |-> c = "A"]
-    /\ man = [storeA |-> "st1", ver |-> [c \in Assets |-> 1], pat |-> Keys, hasB |-> TRUE, lifeB |-> 0]
+    /\ man = [storeA |-> "st1", ver |-> [c \in Assets |-> 1], pat |-> Keys, hasB |-> WithB, lifeB |-> 0]
     /\ eng = [serving |-> TRUE, zombie |-> FALSE]
     /\ used = [src |-> 0, deploy |-> 0, fault |-> 0, keys |-> 0]
 

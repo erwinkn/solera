@@ -291,7 +291,8 @@ not the code: where they differ, the code is the suspect.
 
 ```bash
 spec/tla/check-execution.sh            # smoke and calibrations (CI): about a minute
-spec/tla/check-execution.sh design     # deploys, faults, each=True, with liveness
+spec/tla/check-execution.sh design     # store moves, patterns and versions, removal: minutes, liveness included
+spec/tla/check-execution.sh big        # every deploy kind, every fault kind, each=True: too large to finish yet
 spec/tla/check-execution.sh all
 ```
 
@@ -380,18 +381,67 @@ and TLC must find it (`check-execution.sh calibrate`):
 | `FixF13` | moving a store changes the asset's fingerprint, so its inputs read a full pass | `A`'s full pass commits key 1 into store 1; `A` moves to store 2; the pass's next batch, key 2, starts store 2 over: `A` holds 2 alone, its bookmark says 1 and 2 (`BookmarkHonest`, 17 steps) |
 | `FixF17` | a write that starts the output over (into a store the head is not in) reads a full pass, also for a `keys=` run | `A` holds 1 and 2 in store 1; `A` moves to store 2; a `keys=` run for key 1 starts store 2 over with key 1 alone and moves no bookmark (still store 1's fingerprint): `A` lacks 2 though nothing removed it (`BookmarkHonest`, 25 steps). Moving back makes it permanent: the fingerprint matches again, so nothing reads a full pass (the simulation's F17) |
 
-**Results.** With every fix on, the model passes (TLC 1.7.4, 8 workers):
+**Results.** With every fix on (TLC 1.7.4, 8 workers, shared machine):
 
-| Configuration | Deploys | Faults | States (distinct) | Time |
+| Configuration | What varies | States (distinct) | Time | Verdict |
 |---|---|---|---|---|
-| `smoke` | none | none | 10,852 | 2 s |
-| `deploys` | 2 of every kind, a `keys=` run | none | in progress |  |
-| `faults` | none | 2 of every kind | in progress |  |
-| `each` (`B` is `each=True`) | 1 of every kind | 1 of every kind but takeovers | in progress |  |
+| `smoke` | nothing: the plain pipeline | 10,852 | 2 s | passes, liveness included |
+| `store` | `A` moves away and back, a `keys=` run between (`B` left out) | 16,666 | 5 s | passes |
+| `shape` | two pattern changes or version bumps of `B` | 398,934 | 95 s | passes |
+| `remove` | `B` removed and re-added, twice | 191,388 | 55 s | passes |
+| `deploys` | one deploy of every kind and a `keys=` run | over 4.5 million | capped at 25 min | no invariant violated in what was explored; liveness not reached |
+| `faults` | two faults of every kind | over 2.8 million | capped at 25 min | no invariant violated in what was explored; liveness not reached |
+| `each` | `B` is `each=True`; one deploy and one fault of most kinds | over 2.3 million | capped at 25 min | no invariant violated in what was explored; liveness not reached |
+| `safety` | every kind at once, two of each: random behaviours | 100,000 behaviours of up to 150 steps | minutes | (`check-execution.sh safety`; 2,000 behaviours pass in 7 s) |
 
-One configuration with one deploy and one fault of every kind together
-exceeded 22 million distinct states unfinished; the split above keeps
-each check in reach. Wider combinations are the next step.
+No design bug found so far; one modeling error was (a fingerprint change
+during a full pass must start the pass over, as the engine does).
+
+**Store moves, as decided.** A store move is a full reset: the output is
+new under the same name, its index starts empty, it reads every input in a
+full pass, and its consumers start over. The model has it as three rules:
+a write into a store the head is not in is a reset commit (the index
+starts empty); such a write is planned as a full pass of the asset's
+inputs, also for a `keys=` run (`FixF17`); and a reset upstream commit
+makes every consumer read a full pass (`FixF9`). The move takes effect at
+the asset's next write, not at the deploy. With that rule the store in
+the fingerprint (`FixF13`) is redundant: the model keeps it only as F13's
+calibration.
+
+**F13, in plain words** (for the fix): `items` holds `k10` and `k11` in the
+table store; a deploy moves it to FileStore. Nothing re-reads its input:
+the store is not in the fingerprint, so `items`' next attempt reads only
+the feed's new commits, a delta. But its write lands in a store the head
+is not in, so it starts the output over: the new index holds just that
+delta, and `k10` and `k11` are gone though the feed still has them. A key
+the feed later removes is then removed from nothing, so `copy`, which read
+the reset as an ordinary commit, keeps it. In the model (17 steps): `A`'s
+full pass commits key 1 into store 1; `A` moves; the pass's next batch,
+key 2, starts store 2 over: `A` holds key 2 alone, while its bookmark says
+it read 1 and 2.
+
+**Next** (open choices, what is too big):
+
+- *Too big to exhaust* (`check-execution.sh big`): every deploy kind
+  together (`deploys`, over 4.5 million states unfinished), every fault
+  kind (`faults`, over 2.8 million), `each=True` with deploys and faults
+  (over 2.3 million), and every deploy and fault kind together (over 22
+  million). The ways down: split by kind (as `store`, `shape`,
+  `remove` do), leave out `B` where it plays no part (`WithB`), or check
+  safety on random behaviours (`safety`). TLC's `-simulate` with liveness
+  is not sound; liveness needs the exhaustive splits.
+- *Open modeling choices:* a pattern change's diff pass runs once the
+  bookmark reaches the head (the design says "commits up to the change
+  finish under the old patterns"; the cutover point is simplified); a
+  write lands whole or not at all (no half-written batch); immutable
+  stores, renames, fan-in, `Each`'s failed keys and retry passes, and
+  time partitions are not modelled; runs have one target (no `upstream=`
+  run graph); a deploy of `B`'s version makes it read a full pass only
+  when it next runs (no `OnDeploy`).
+- *What I would do next:* a run graph (`upstream=True`, a task waiting on
+  another) for "every run ends" across tasks; a half-written batch with
+  repair; an immutable store beside the fenced one; and the store move as
+  one rule (drop `FixF13`) once the code follows the decision.
 
 ## Formal model: the journal (`spec/tla/Journal.tla`)
 
