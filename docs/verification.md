@@ -420,10 +420,10 @@ prints them, shortest first, in plain words (A is the old engine):
 | Switch off | Fix | TLC finds | Trace |
 |---|---|---|---|
 | `FixF7` | 3c23397 | `OneWriter`, 23 steps | B replays segment 1. A appends 2 and 3, checkpointing at both, and cleanup deletes 2. B's fence create at 2 lands in the hole: B serves under it without A's acknowledged 2 and 3, and A's next append, at 4, succeeds too. |
-| `FixF7` | 3c23397 | `OpensNeverFail`, 22 steps | The same, but B lists the journal after the cleanup: a gap at 2, "journal corrupt". |
+| `FixF7` | 3c23397 | `OpensNeverFail`, 22 steps | The same, but B listed 1 to 3 before the cleanup: its GET of 2 finds nothing, and opening fails. |
 | `KeepFences` | 0b3e226 | `NoAckedLoss`, 25 steps | B fences at 2. B appends 3 and 4, checkpointing at both; cleanup deletes 2, B's fence. A appends at 2: acknowledged, but checkpoint 4 holds B's fence there. |
 | `FenceNonce` | f300500 | `OneWriter`, 15 steps | A and B both fence at 1 with the same bytes; each takes the other's for its own, and both serve. |
-| `OwnBytes` | none: `_put_segment` always compared bytes | `AppendsAlone`, 17 steps | A lone engine's create lands with its answer lost; the retry takes the segment for another engine's, and the engine stops. |
+| `OwnBytes` | none: `_put_segment` always compared bytes | `AppendsAlone`, about 15 steps (a liveness trace varies between runs) | A lone engine's create lands with its answer lost; the retry takes the segment for another engine's, and the engine stops. |
 
 With every switch on, the small model passes. On three engines the design
 as built fails: F14 in 27 steps, then, with `FixF14`, F15 in 29 steps
@@ -493,7 +493,8 @@ spec/tla/check-journal.sh live         # liveness: ~30 s
 spec/tla/check-journal.sh calibrate    # every fix switched off, and F14, F15: ~1 min
 ```
 
-CI's `journal-spec` job runs `small`, `live` and `calibrate`.
+CI's `journal-spec` job runs `small`, `live` and `calibrate`, in about two
+minutes.
 
 ## Findings
 
