@@ -92,7 +92,7 @@ class TableStore:
             self.db.tables.setdefault(table, {})[context.partition] = box["rows"]
             self.db.commits += 1
             if kind == "store":
-                self.db.writes.append((began, actor.get(), context.generation, context.invocation))
+                self.db.writes.append((began, actor.get(), context.generation, context.worker_id))
         if fate == "lost":
             raise StoreError(f"injected: the {kind} transaction committed, its answer was lost")
         return value

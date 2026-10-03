@@ -31,7 +31,7 @@ class Write:
     generation: int | None
     rows: frozenset  # (id, v) after the transaction
     who: tuple | None = None
-    invocation: str | None = None
+    worker_id: str | None = None
     at: float = 0.0  # when the transaction began
 
 
@@ -87,7 +87,7 @@ def patches(ledger: Ledger, current_actor) -> list[tuple]:
                 context.generation,
                 frozenset(_pairs(rows)),
                 current_actor(),
-                context.invocation,
+                context.worker_id,
                 at,
             )
         )

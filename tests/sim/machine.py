@@ -442,19 +442,19 @@ class Simulation(RuleBasedStateMachine):
         if self.world is None:
             return
         db, pg = getattr(self, "_gates_checked", (0, 0))
-        writes = [(at, who, invocation) for at, who, _, invocation in self.db.writes[db:]]
+        writes = [(at, who, worker_id) for at, who, _, worker_id in self.db.writes[db:]]
         if self.world.pg is not None:
             writes += [
-                (w.at, w.who, w.invocation) for ws in self.world.pg.writes.values() for w in ws if w.seq > pg
+                (w.at, w.who, w.worker_id) for ws in self.world.pg.writes.values() for w in ws if w.seq > pg
             ]
         self._gates_checked = (len(self.db.writes), self.world.pg.seq if self.world.pg is not None else 0)
-        for at, who, invocation in writes:
+        for at, who, worker_id in writes:
             if who is None or who[0] != "worker":
                 continue
             gate = self.journal.gates.get(who[1])
-            if gate is None or gate[0] != "writing" or gate[1] != invocation or gate[2] > at:
+            if gate is None or gate[0] != "writing" or gate[1] != worker_id or gate[2] > at:
                 raise Violation(
-                    f"{who} wrote to a fenced store at t={at:g} (invocation {invocation}); "
+                    f"{who} wrote to a fenced store at t={at:g} (invocation {worker_id}); "
                     f"its gate: {gate and gate[:2]}{f' from t={gate[2]:g}' if gate else ''}"
                 )
 

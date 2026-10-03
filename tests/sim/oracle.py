@@ -41,7 +41,7 @@ class Journal:
         if path.endswith(lifecycle.GATE):
             gate = json.loads(data)
             attempt = path.rsplit("/", 1)[-1].removesuffix(lifecycle.GATE)
-            self.gates.setdefault(attempt, (gate["state"], gate.get("invocation"), self.now()))
+            self.gates.setdefault(attempt, (gate["state"], gate.get("worker_id"), self.now()))
             return
         if "/control/journal/" not in path:
             return
