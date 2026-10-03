@@ -474,7 +474,7 @@ class Simulation(RuleBasedStateMachine):
         held: dict[tuple, str] = {}
         for task_id, claim in list(engine.m.claims.items()):
             task = engine.m.task(task_id)
-            partition = (task["asset"], task["scope"])
+            partition = (task["asset"], task["partition"])
             if partition in held:
                 raise Violation(f"{partition} claimed by {held[partition]} and {claim['attempt']} at once")
             held[partition] = claim["attempt"]
@@ -515,12 +515,12 @@ class Simulation(RuleBasedStateMachine):
         engine = self.world.engine if self.world is not None else None
         if engine is None:
             return
-        for (output, scope), index in list(engine.m.indexes.items()):
+        for (output, partition), index in list(engine.m.indexes.items()):
             for level in range(1, index.depth + 1):
                 files = sorted(index.level(level), key=lambda f: f.min)
                 for a, b in zip(files, files[1:], strict=False):
                     if a.max >= b.min:
-                        detail = f"{output}[{scope!r}] level {level}: {a.name} and {b.name} overlap"
+                        detail = f"{output}[{partition!r}] level {level}: {a.name} and {b.name} overlap"
                         self._known("F16", detail)
 
     @invariant()
