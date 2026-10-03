@@ -3,7 +3,7 @@ Parquet files on the object store, queried with DuckDB.
 
 Eight tables, each row about one:
 
-    run_events        thing that happened to a run, one of its tasks or attempts
+    run_timeline        thing that happened to a run, one of its tasks or attempts
     runs              finished run or source commit: how it was asked for, how it ended
     tasks             task of a finished run: timings, retries, executor
     attempts          attempt of a finished run: its phases, and the outputs it committed
@@ -15,7 +15,7 @@ an output version is `(output, partition, generation)`.
     key_outcomes      key an Each attempt processed: what it came to (per-key-processing.md §10)
     ticks             sensor tick (lifecycle.md §11): buffered, never journaled
 
-`run_events` is the timeline: the engine's events and the worker's, appended
+`run_timeline` is the timeline: the engine's events and the worker's, appended
 as they are applied. The timings in `runs`, `tasks` and `attempts` summarize
 it. Rows are born in the model: `apply` derives them from the events that
 finish things — a run archived, a commit installed, a source committed — and
@@ -40,7 +40,7 @@ BAD_TASK = frozenset({"failed", "blocked", "canceled"})
 
 
 TABLES = {
-    "run_events": Table(
+    "run_timeline": Table(
         "run",
         "at",
         {
@@ -65,7 +65,7 @@ TABLES = {
             "created_at": "DOUBLE",
             "finished_at": "DOUBLE",
             "status": "VARCHAR",  # a run that wrote nothing is "skipped"
-            "trigger": "VARCHAR",  # manual | automation | sensor | commit
+            "origin": "VARCHAR",  # manual | automation | sensor | commit
             "automation": "VARCHAR",
             "by": "VARCHAR",
             "retry_of": "VARCHAR",  # the finished run an explicit retry ran again
@@ -159,7 +159,7 @@ TABLES = {
             "added_keys": "VARCHAR[]",  # a source commit's keys, listed up to 1,000
             "removed_keys": "VARCHAR[]",
             "rows": "BIGINT",
-            "complete": "BOOLEAN",
+            "materialized": "BOOLEAN",
             "metadata": "VARCHAR",  # JSON object; an unkeyed source commit's version is in it
             "generation": "BIGINT",  # its version: the write's (an attempt's, a source commit's)
         },
@@ -234,7 +234,7 @@ def execution(spec: dict) -> dict:
     resources it requested, and its other options verbatim. Unset fields
     are left out: `Local()()` is just `{"executor": "local"}`."""
 
-    options = dict(spec.get("placement") or {})
+    options = dict(spec.get("options") or {})
     cpu, memory, gpu = options.pop("cpu", None), options.pop("memory", None), options.get("gpu")
     if not isinstance(gpu, str):
         options.pop("gpu", None)
@@ -377,7 +377,7 @@ def run_row(run: dict, *, live: bool = False) -> dict:
         "created_at": run["created_at"],
         "finished_at": None if live else run.get("updated_at"),
         "status": status,
-        "trigger": "automation" if run.get("automation") else "sensor" if run.get("sensor") else "manual",
+        "origin": "automation" if run.get("automation") else "sensor" if run.get("sensor") else "manual",
         "automation": run.get("automation"),
         "by": run.get("by"),
         "retry_of": run.get("retry_of"),
@@ -404,7 +404,7 @@ def run_record(rows: dict[str, list[dict]], events: int = 0) -> dict:
     `source_run_row`) backwards — and how many events it has had."""
 
     [row] = rows["runs"]
-    if row["trigger"] == "commit":
+    if row["origin"] == "commit":
         record = {"id": row["id"], "source": row["source"], "by": row["by"]}
         for m in rows.get("commits") or ():
             if m["commit_number"] is None:
@@ -461,7 +461,7 @@ def source_run_row(run: dict, at: float) -> dict:
         "created_at": at,
         "finished_at": at,
         "status": "succeeded",
-        "trigger": "commit",
+        "origin": "commit",
         "automation": None,
         "by": run.get("by"),
         "source": run["source"],
@@ -481,7 +481,7 @@ def source_run_row(run: dict, at: float) -> dict:
 
 
 def commit_row(
-    output, asset, partition, head, *, keys=None, rows=None, metadata=None, listed=None, complete=True
+    output, asset, partition, head, *, keys=None, rows=None, metadata=None, listed=None, materialized=True
 ) -> dict:
     """The row of an output version a commit installed: `head` is the head
     as installed, `keys` the commit's key delta for the output, `listed` a
@@ -506,7 +506,7 @@ def commit_row(
         "added_keys": listed.get("upserted") if isinstance(listed.get("upserted"), list) else None,
         "removed_keys": listed.get("deleted") if isinstance(listed.get("deleted"), list) else None,
         "rows": count if count is not None else rows,
-        "complete": bool(complete),
+        "materialized": bool(materialized),
         "metadata": metadata or None,
         "generation": head["ref"].get("generation"),
     }
@@ -578,7 +578,7 @@ class RunFilter:
     status: list[str] = field(default_factory=list)
     asset: list[str] = field(default_factory=list)
     asset_tag: list[str] = field(default_factory=list)
-    trigger: list[str] = field(default_factory=list)
+    origin: list[str] = field(default_factory=list)
     automation: list[str] = field(default_factory=list)
     by: list[str] = field(default_factory=list)
     source: list[str] = field(default_factory=list)
@@ -590,7 +590,7 @@ class RunFilter:
 
 FACETS = {
     "status": "status",
-    "trigger": "trigger",
+    "origin": "origin",
     "automation": "automation",
     "by": '"by"',
     "source": "source",
@@ -623,7 +623,7 @@ def run_where(f: RunFilter, manifest: dict, skip: str | None = None) -> tuple[st
 
     clauses, params = [], []
     for name, column in (
-        ("trigger", "trigger"),
+        ("origin", "origin"),
         ("automation", "automation"),
         ("by", '"by"'),
         ("source", "source"),
@@ -776,11 +776,11 @@ class History:
                     )
                 )
             [(found["events"],)] = con.execute(
-                "SELECT max(n) FROM run_events WHERE run = ?", [run_id]
+                "SELECT max(n) FROM run_timeline WHERE run = ?", [run_id]
             ).fetchall()
             return found
 
-        found = await self.query(work, ("runs", "tasks", "commits", "run_events"), run=run_id, live=False)
+        found = await self.query(work, ("runs", "tasks", "commits", "run_timeline"), run=run_id, live=False)
         return run_record(found, found.pop("events") or 0) if found["runs"] else None
 
     async def attempts(self, run_id: str) -> dict[str, list[dict]]:
@@ -798,9 +798,9 @@ class History:
         """A run's timeline: its events in the order they happened."""
 
         def work(con):
-            return _dicts(con.execute('SELECT * FROM run_events WHERE run = ? ORDER BY "at", n', [run_id]))
+            return _dicts(con.execute('SELECT * FROM run_timeline WHERE run = ? ORDER BY "at", n', [run_id]))
 
-        return await self.query(work, ("run_events",), run=run_id, live=False)
+        return await self.query(work, ("run_timeline",), run=run_id, live=False)
 
     async def runs(
         self,

@@ -557,7 +557,7 @@ class Simulation(RuleBasedStateMachine):
 
         async def check():
             for (output, partition), head in list(engine.m.heads.items()):
-                if head["ref"].get("meta", {}).get("external") or (output, partition) not in engine.m.indexes:
+                if head["ref"].get("meta", {}).get("source") or (output, partition) not in engine.m.indexes:
                     continue
                 store = self.project.stores.get(head["ref"]["store"])
                 if getattr(store, "writes", None) != "immutable" or output == "sites":
@@ -593,7 +593,7 @@ class Simulation(RuleBasedStateMachine):
                 store = self.project.stores.get(head["ref"]["store"])
                 if getattr(store, "writes", None) != "fenced":
                     continue
-                if (output, partition) in m.repairs or (head.get("asset"), partition) in m.locks:
+                if (output, partition) in m.repairs or (head.get("asset"), partition) in m.claimed_partitions:
                     continue
                 if (output, partition) in m.indexes:
                     await keyed_content(

@@ -9,7 +9,7 @@ from solera.keys.index import Options
 from solera.sdk import Incremental, Output, Project, Retry, asset
 from solera.stores import FileStore, Patch
 from solera_server.engine import Engine
-from solera_server.placements.inline import InlinePlacement
+from solera_server.executors.inline import InlinePlacement
 from solera_server.state import State
 
 from tests.conftest import whole, worker_finished
@@ -100,7 +100,7 @@ async def test_an_abandoned_attempts_objects_go(tmp_path, data, monkeypatch):
     monkeypatch.setattr(FileStore, "_put", dying)
     detail = await run(engine, ["scores"])
     first, _ = detail["attempts"][detail["tasks"][0]["id"]]
-    assert first["status"] == "failed"
+    assert first["outcome"] == "failed"
     assert not (data / f"{puts[0]}.json").exists()  # the retry collected it
     await run(engine, ["scores"])  # and what the retry's commit superseded goes next
     assert objects(data, "scores") == await named(state, "scores")
@@ -171,9 +171,9 @@ async def test_a_reader_pin_holds_collection_back(tmp_path):
     await engine.initialize()
     m = state.model
     m.cleanups[("scores", "")] = [{"n": 10, "id": "10.0", "kind": "items", "items": [["path", "x"]]}]
-    m.claims["reader"] = {"attempt": "r", "pin": 9, "started_at": 0, "status": "running"}
+    m.claims["reader"] = {"attempt": "r", "generation": 9, "started_at": 0, "status": "running"}
     assert engine._due_cleanups("scores", "", "me") == []
-    m.claims["reader"]["pin"] = 10
+    m.claims["reader"]["generation"] = 10
     m._partition("c", "")["bookmarks"] = {
         "e": {
             "kind": "keys",
@@ -289,7 +289,7 @@ async def test_entries_of_one_event_are_acknowledged_one_by_one(tmp_path):
     m = state.model
     prefix = m.indexes[("scores", "")].prefix
     m.cleanups.pop(("scores", ""), None)  # the first commit's own
-    m.applied += 1
+    m.event_counter += 1
     m._collect("scores", "", {"kind": "items", "items": [["path", "x"]]})
     m._collect("scores", "", {"kind": "delta", "prefix": prefix, "files": ["gone"]})
     m._collect("scores", "", {"kind": "items", "items": [["path", "y"]]})
@@ -417,13 +417,17 @@ async def test_a_slow_reader_holds_back_only_what_it_reads(tmp_path):
     garbage = [f"{mine}a.kx", f"{other}b.kx", "history/runs/c.parquet"]
     for path in garbage:
         await state.create_object(path, b"x")
-    m.applied += 1
-    m.garbage += [[path, m.applied] for path in garbage]
-    m.claims["t"] = {"attempt": "r", "pin": m.applied - 1, "domains": (mine,)}  # an attempt reading scores
+    m.event_counter += 1
+    m.garbage += [[path, m.event_counter] for path in garbage]
+    m.claims["t"] = {
+        "attempt": "r",
+        "generation": m.event_counter - 1,
+        "prefixes": (mine,),
+    }  # an attempt reading scores
     await engine.upkeep.collect()
     assert [g[0] for g in m.garbage] == [f"{mine}a.kx"]
-    m.claims["t"]["domains"] = None  # still preparing: it may read anything
-    m.garbage += [[f"{other}d.kx", m.applied]]
+    m.claims["t"]["prefixes"] = None  # still preparing: it may read anything
+    m.garbage += [[f"{other}d.kx", m.event_counter]]
     await state.create_object(f"{other}d.kx", b"x")
     await engine.upkeep.collect()
     assert sorted(g[0] for g in m.garbage) == sorted([f"{mine}a.kx", f"{other}d.kx"])
@@ -447,10 +451,14 @@ async def test_collection_reduces_the_pins_once_per_pass(tmp_path, monkeypatch):
     prefixes = [m.index(f"out{i}", "").prefix for i in range(40)]
     for prefix in prefixes:
         await state.create_object(f"{prefix}a.kx", b"x")
-    m.applied += 1
-    m.garbage += [[f"{prefix}a.kx", m.applied] for prefix in prefixes]
+    m.event_counter += 1
+    m.garbage += [[f"{prefix}a.kx", m.event_counter] for prefix in prefixes]
     for i, prefix in enumerate(prefixes):
-        m.claims[f"t{i}"] = {"attempt": f"a{i}", "pin": m.applied - (i % 2 == 0), "domains": (prefix,)}
+        m.claims[f"t{i}"] = {
+            "attempt": f"a{i}",
+            "generation": m.event_counter - (i % 2 == 0),
+            "prefixes": (prefix,),
+        }
 
     walks = []
 
@@ -487,5 +495,5 @@ async def test_a_pool_job_with_no_inputs_pins_only_its_output(tmp_path):
             break
         await asyncio.sleep(0.02)
     [claim] = state.model.claims.values()
-    assert claim["domains"] == (state.model.index("made", "").prefix,)
+    assert claim["prefixes"] == (state.model.index("made", "").prefix,)
     await state.close()

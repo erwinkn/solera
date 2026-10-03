@@ -241,7 +241,7 @@ def leach(
     xrf: pd.DataFrame,
 ):
     """The resource tier lives on the asset; no job indirection."""
-    max_workers = min(ctx.execution["placement"]["memory"] // int(6e9), os.cpu_count())
+    max_workers = min(ctx.placement["options"]["memory"] // int(6e9), os.cpu_count())
     tables = compute_leach(
         max_workers,
         project_team_map=project_team_map,

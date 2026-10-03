@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 import obstore
 from obstore.exceptions import AlreadyExistsError
 
-from .placements.local import load_manifest
+from .executors.local import load_manifest
 from .state import State, Unavailable
 
 

@@ -6,8 +6,8 @@ listed only when asked for."""
 import pytest
 from solera.sdk import Incremental, Output, Project, Retention, asset
 from solera_server.engine import Engine
+from solera_server.executors.inline import InlinePlacement
 from solera_server.history import RunFilter
-from solera_server.placements.inline import InlinePlacement
 from solera_server.state import State, Unavailable
 
 
@@ -188,15 +188,15 @@ async def test_a_run_retires_for_good_before_its_files_go(tmp_path, state, clock
     successor.delete_run = crash
     with pytest.raises(OSError):
         await later.delete_run(gone)
-    assert successor.model.retired == [gone] and await later.history.run(gone) is None
+    assert successor.model.deleted == [gone] and await later.history.run(gone) is None
     await later.stop()
     await successor.close()
 
     again = await State.open(tmp_path.as_uri(), "test", clock=clock, flush_interval=0.001)
-    assert again.model.retired == [gone]
+    assert again.model.deleted == [gone]
     restarted = engine_for(again, PLAIN, clock)
     await restarted.upkeep.tick()
-    assert again.model.retired == [] and await run_dirs(again) == {kept}
+    assert again.model.deleted == [] and await run_dirs(again) == {kept}
     with pytest.raises(KeyError):
         await restarted.retry(gone)  # a retired run never comes back
     successor.delete_run = delete

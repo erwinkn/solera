@@ -119,7 +119,7 @@ async def write(
         )
     else:
         prepared = prepare_for(store, rows, out)
-        keyed = KeyedWrite(prepared, whole=True, value=rows)
+        keyed = KeyedWrite(prepared, reset=True, value=rows)
     written = await store.store(keyed, prior, context(out, generation, worker_id, partition=partition))
     if not patch:
         ledger.entries.clear()

@@ -13,7 +13,7 @@ import pytest
 from solera.executors import Pool
 from solera.sdk import Project, Retry, asset
 from solera_server.engine import Engine
-from solera_server.placements import PlacementContext
+from solera_server.executors import PlacementContext
 from solera_server.state import State
 from solera_worker.worker import run_attempt
 
@@ -192,7 +192,7 @@ async def test_awsecs_launch_wait_cancel(state, monkeypatch):
     the attempt as the client token, so a second launch starts nothing new;
     wait maps STOPPED to an exit; a task ECS does not show is unknown, not
     lost — it may not show yet."""
-    from solera_server.placements.remote import AWSECS
+    from solera_server.executors.remote import AWSECS
 
     ecs = FakeEcs()
     stub_boto3(monkeypatch, ecs)
@@ -278,7 +278,7 @@ async def test_k8sjob_launch_wait_lost(state, monkeypatch):
     lowercase DNS label — carrying the stage argv; launching it again finds
     that job. Conditions map to Exit; an API error is unknown; a deleted job
     is lost."""
-    from solera_server.placements.remote import K8sJob
+    from solera_server.executors.remote import K8sJob
 
     batch = FakeBatchApi()
     stub_kubernetes(monkeypatch, batch)
@@ -336,7 +336,7 @@ async def test_modal_reports_only_what_modal_says_of_the_call(state, monkeypatch
     returned exits with its code; one that raised or timed out fails; one
     Modal does not know is lost. Modal's own client and service errors say
     nothing of the call: wait raises, so the engine keeps the handle."""
-    from solera_server.placements.remote import Modal
+    from solera_server.executors.remote import Modal
 
     errors, calls = modal_exceptions(), {}
 
@@ -410,8 +410,8 @@ async def test_a_local_handle_is_only_ever_its_own_process(state, monkeypatch):
     import os
     import socket
 
-    from solera_server.placements import local
-    from solera_server.placements.local import LocalPlacement, _start_ticks
+    from solera_server.executors import local
+    from solera_server.executors.local import LocalPlacement, _start_ticks
 
     spawn = asyncio.create_subprocess_exec
 

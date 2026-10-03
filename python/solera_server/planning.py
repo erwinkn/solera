@@ -236,11 +236,11 @@ class Planner:
         heads_of: Callable[[str], Iterable[tuple[str, dict]]],
         now: float,
         projected: Mapping[tuple[str, str], dict] | None = None,
-        drained: Callable[[str, str], bool] = lambda asset, partition: False,
+        caught_up: Callable[[str, str], bool] = lambda asset, partition: False,
     ):
         self.manifest, self.now = manifest, now
         self.projected = dict(projected or {})
-        self._head, self._heads_of, self._drained = head, heads_of, drained
+        self._head, self._heads_of, self._caught_up = head, heads_of, caught_up
         self.time = dt.datetime.fromtimestamp(now, dt.UTC)
         self._groups: dict[tuple, dict] = {}
 
@@ -257,28 +257,28 @@ class Planner:
         heads.update({partition: h for (o, partition), h in self.projected.items() if o == output})
         return heads
 
-    def drained(self, asset: str, partition: str) -> bool:
+    def caught_up(self, asset: str, partition: str) -> bool:
         """Whether the scope's last commit finished its delivery."""
 
-        return self._drained(asset, partition)
+        return self._caught_up(asset, partition)
 
-    def complete(self, asset: str, partition: str) -> bool:
+    def materialized(self, asset: str, partition: str) -> bool:
         """Whether a scope is complete (§7): each of its outputs has a head,
         and its delivery drained — however many of them its last pages wrote.
         A job, which has no output, once a run of it succeeded. The one answer
         for selection, fan-in and the views."""
 
         outputs = self.manifest["assets"][asset]["outputs"]
-        return all(self.head(o["name"], partition) is not None for o in outputs) and self.drained(
+        return all(self.head(o["name"], partition) is not None for o in outputs) and self.caught_up(
             asset, partition
         )
 
-    def head_complete(self, output: str, partition: str) -> bool:
+    def head_materialized(self, output: str, partition: str) -> bool:
         """Whether an output's head at `scope` is of a complete delivery: a
         source's always is."""
 
         owner = self.owner(output)
-        return owner is None or self.drained(owner, partition)
+        return owner is None or self.caught_up(owner, partition)
 
     def dynamic_partitions(self, output: str) -> list[str] | None:
         """A set dimension's current keys: the element list its head carries (§7)."""
@@ -340,7 +340,7 @@ class Planner:
             return True
         inputs = self.manifest["assets"][target]["inputs"].values()
         whole = any(e["kind"] == "all_partitions" and self.owner(e["output"]) == producer for e in inputs)
-        return not whole or self.drained(producer, partition)
+        return not whole or self.caught_up(producer, partition)
 
     def reach(self, producer: str | None, partition: str, target: str) -> list[str]:
         """The target scopes a change of `producer` at `scope` reaches (§7,
@@ -393,7 +393,7 @@ class Planner:
             )
         return out
 
-    def fan_in(self, input: Input, *, complete: bool) -> dict[str, dict]:
+    def fan_in(self, input: Input, *, materialized: bool) -> dict[str, dict]:
         """The heads a fan-in reads, by upstream scope: among those that exist,
         the current partitions — a retired one's head is kept, never read —
         that agree with its shared keys (`complete` ones only, for
@@ -410,7 +410,7 @@ class Planner:
                     groups.setdefault(tuple(parts[n] for n in names), {})[upstream_partition] = head
             self._groups[(input.output, names)] = groups
         heads = groups.get(tuple(input.pinned[n] for n in names)) or {}
-        return {s: h for s, h in heads.items() if not complete or self.head_complete(input.output, s)}
+        return {s: h for s, h in heads.items() if not materialized or self.head_materialized(input.output, s)}
 
     def spread(self, input: Input) -> list[str]:
         """Every upstream scope an edge could read: for a fan-in, the domain
@@ -434,7 +434,7 @@ class Planner:
             if input.fan_in:
                 if any(self._agrees(input, s) for s in built):
                     continue
-                if not self.fan_in(input, complete=input.kind == "all_partitions"):
+                if not self.fan_in(input, materialized=input.kind == "all_partitions"):
                     return True
             elif input.kind != "all_partitions" and input.partition not in built:
                 source = (
@@ -455,7 +455,7 @@ class Planner:
             selection,
             now=self.time,
             partitions=self.dynamic_partitions,
-            missing=lambda partition: not self.complete(asset, partition),
+            missing=lambda partition: not self.materialized(asset, partition),
             what=asset,
         )
 

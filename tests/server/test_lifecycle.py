@@ -207,7 +207,7 @@ async def test_a_timeout_drain_is_retryable(tmp_path):
     detail = await engine.run_until((await engine.submit(["late"]))["id"], 20)
     assert detail["request"]["status"] == "succeeded"
     first, second = detail["attempts"][detail["tasks"][0]["id"]]
-    assert first["status"] == "failed" and first["error"] == "timeout"
+    assert first["outcome"] == "failed" and first["error"] == "timeout"
     result = await state.attempt_result(detail["request"]["id"], first["id"])
     assert result["cancel"]["reason"] == "timeout"
     await engine.stop()
@@ -306,7 +306,7 @@ async def test_a_fenced_store_runs_its_retry_at_once(tmp_path):
     live.die = 1
     detail = await engine.run_until((await engine.submit(["items"]))["id"], 15)
     assert detail["request"]["status"] == "succeeded"
-    assert [a["status"] for a in detail["attempts"][detail["tasks"][0]["id"]]] == ["failed", "succeeded"]
+    assert [a["outcome"] for a in detail["attempts"][detail["tasks"][0]["id"]]] == ["failed", "succeeded"]
     (first, one), (second, other) = live.acquired
     assert second > first and one != other
     await engine.stop()

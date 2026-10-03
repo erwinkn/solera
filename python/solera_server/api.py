@@ -18,8 +18,8 @@ from solera import lifecycle
 from solera.lifecycle import Ended
 
 from .engine import Conflict, Engine
+from .executors.local import load_manifest
 from .history import TERMINAL_RUN, RunFilter
-from .placements.local import load_manifest
 from .sensors import HOST_TOKEN
 from .state import LostOwnership, State, Unavailable
 
@@ -246,8 +246,8 @@ def create_app(
         runtime = await asset_engine(request, p, name)
         return await runtime.asset_inputs(name)
 
-    @app.get("/api/projects/{p}/assets/{name}/failures")
-    async def asset_failures(
+    @app.get("/api/projects/{p}/assets/{name}/failed-keys")
+    async def asset_failed_keys(
         p: str,
         name: str,
         request: Request,
@@ -308,7 +308,7 @@ def create_app(
                     "version": head.get("version"),
                     "key_count": head.get("count"),
                     "commit_number": head.get("commit_number"),
-                    "complete": planner.head_complete(name, partition),
+                    "materialized": planner.head_materialized(name, partition),
                     "cursor": cursor,
                     "at": head["at"],
                     "commit": runtime.head_view(head)["commit"],
@@ -361,7 +361,7 @@ def create_app(
 
         query = request.query_params
         f = RunFilter(q=query.get("q") or None)
-        for name in ("status", "asset", "asset_tag", "trigger", "automation", "by", "source", "tag"):
+        for name in ("status", "asset", "asset_tag", "origin", "automation", "by", "source", "tag"):
             setattr(f, name, [v for v in query.getlist(name) if v])
         for name in ("since", "until"):
             if query.get(name):
@@ -477,7 +477,7 @@ def create_app(
         return await runtime.run_detail(run_id)
 
     @app.get("/api/projects/{p}/runs/{run_id}/events")
-    async def run_events(p: str, run_id: str, request: Request):
+    async def run_timeline(p: str, run_id: str, request: Request):
         runtime = await project_engine(request, p)
         return await runtime.history.events(run_id)
 
@@ -635,7 +635,7 @@ def create_app(
     @app.get("/api/projects/{p}/sensors")
     async def sensors(p: str, request: Request):
         runtime = await project_engine(request, p)
-        return {"sensors": runtime.sensor_views(), "hosts": list(runtime.sensor_hosts.values())}
+        return {"sensors": runtime.sensor_views(), "workers": list(runtime.sensor_hosts.values())}
 
     @app.get("/api/projects/{p}/sensors/next")
     async def sensors_next(
@@ -706,7 +706,7 @@ def create_app(
         runtime = await project_engine(request, p)
 
         def limit(name, executor):
-            placement = runtime.registry.build({"executor": name, **executor, "placement": {}})
+            placement = runtime.registry.build({"executor": name, **executor, "options": {}})
             return getattr(placement, "max_concurrent", None)
 
         return {

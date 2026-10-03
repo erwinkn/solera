@@ -13,7 +13,7 @@ const TONES: Record<string, Tone> = {
   // runs, tasks, attempts
   succeeded: "ok",
   committed: "ok",
-  complete: "ok",
+  materialized: "ok",
   running: "run",
   launched: "run",
   claimed: "run",
@@ -33,8 +33,7 @@ const TONES: Record<string, Tone> = {
   skipped: "idle",
   // partitions
   missing: "idle",
-  retired: "idle",
-  // keys
+  // keys (and removed partitions)
   ok: "ok",
   rejected: "warn",
   retrying: "wait",

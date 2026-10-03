@@ -9,8 +9,8 @@ import pytest
 from solera.sdk import Automation, Every, Incremental, OnChange, Output, Project, asset
 from solera.stores import Patch
 from solera_server.engine import Engine
+from solera_server.executors.inline import InlinePlacement
 from solera_server.model import Model
-from solera_server.placements.inline import InlinePlacement
 from solera_server.state import Conflict, LostOwnership, State
 
 
@@ -112,13 +112,13 @@ async def test_commit_installs_heads_cursor_watermarks_and_pends_onchange(state,
     assert detail["request"]["status"] == "succeeded"
     m = state.model
     assert m.heads[("files", "")]["run"] == detail["request"]["id"]
-    assert m.partition("consumer", "")["drained"] is True
+    assert m.partition("consumer", "")["caught_up"] is True
     assert m.bookmark("consumer", "files", "")["next"] == 1
     # files changed and consumer watches it: the change pended, and the next tick
     # (run_until ticks) fired the OnChange automation and consumed it — without a
     # new run, since this run's consumer task was still pending (§9).
     auto = m.automations["consumer.onchange.0"]
-    assert auto["last_at"] is not None and auto["pending"] == []
+    assert auto["last_fired"] is not None and auto["pending"] == []
 
 
 async def test_content_written_again_is_a_change(state, clock):
@@ -221,7 +221,9 @@ async def test_restart_keeps_launched_claims(tmp_path, clock):
     await state.close()
     again = await State.open(tmp_path.as_uri(), "test", clock=clock, flush_interval=0.001)
     task = again.model.task(task_id)
-    assert again.model.claimed(attempt)["launched"] and again.model.locks == {("polled", ""): attempt}
+    assert again.model.claimed(attempt)["launched"] and again.model.claimed_partitions == {
+        ("polled", ""): attempt
+    }
     assert task["status"] == "running" and task_id not in again.model.queue
     await again.close()
 
@@ -498,7 +500,7 @@ def test_a_rename_moves_a_scopes_record_whole():
     whole = {
         "cursor": "c1",
         "last": {"outcome": "failed", "run": "r", "attempt": "a", "at": 1.0},
-        "drained": True,
+        "caught_up": True,
         "bookmarks": {"feed": wm, "gone": {**wm, "output": "elsewhere"}},
         "failures": {"commit_number": 0, "forced": {}, "counts": {"failed": 1}},
     }
@@ -538,7 +540,7 @@ def test_a_discard_entrys_delta_outlives_the_attempt_holding_it():
         "launched": {
             "attempt": "A2",
             "started_at": 0.0,
-            "pin": 5,
+            "generation": 5,
             "prepared": {"outputs": {"out": {"cleanup": [entry]}}},
         },
     }

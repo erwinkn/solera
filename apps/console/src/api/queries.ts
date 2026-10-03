@@ -13,7 +13,7 @@ import type {
   Executor,
   Explain,
   Facets,
-  Failures,
+  FailedKeys,
   Histogram,
   Repair,
   Cleanup,
@@ -28,7 +28,7 @@ import type {
   RunDetail,
   RunEvent,
   RunPage,
-  SensorHost,
+  SensorWorker,
   SensorView,
   Stats,
   Tick,
@@ -72,13 +72,13 @@ export function runIsLive(detail: RunDetail | undefined): boolean {
   if (!detail) return true;
   return (
     ACTIVE_RUN.has(detail.request.status) ||
-    Object.values(detail.attempts).some((list) => list.some((a) => ACTIVE_ATTEMPT.has(a.status)))
+    Object.values(detail.attempts).some((list) => list.some((a) => ACTIVE_ATTEMPT.has(a.outcome)))
   );
 }
 
 export type RunFilter = {
   status?: string[];
-  trigger?: string[];
+  origin?: string[];
   automation?: string[];
   asset?: string[];
   tag?: string[];
@@ -199,7 +199,7 @@ export const q = {
     infiniteQueryOptions({
       queryKey: ["assets", name, "failures", filter],
       queryFn: ({ signal, pageParam }) =>
-        api<Failures>(`${p(project)}/assets/${enc(name)}/failures`, {
+        api<FailedKeys>(`${p(project)}/assets/${enc(name)}/failed-keys`, {
           signal,
           query: {
             partition: filter.partition,
@@ -343,7 +343,7 @@ export const q = {
   attemptLogs: (project: string, run: string, attempt: Attempt, tail: number | null) =>
     queryOptions({
       // The status is in the key: an attempt that ends gets one last, complete read.
-      queryKey: ["attempts", run, attempt.id, "logs", tail, ACTIVE_ATTEMPT.has(attempt.status)],
+      queryKey: ["attempts", run, attempt.id, "logs", tail, ACTIVE_ATTEMPT.has(attempt.outcome)],
       queryFn: async ({ signal }) =>
         parseLog(
           await apiText(`${p(project)}/runs/${enc(run)}/attempts/${enc(attempt.id)}/logs`, {
@@ -351,8 +351,8 @@ export const q = {
             query: { tail },
           }),
         ),
-      refetchInterval: ACTIVE_ATTEMPT.has(attempt.status) ? SECOND : false,
-      staleTime: ACTIVE_ATTEMPT.has(attempt.status) ? 0 : Infinity,
+      refetchInterval: ACTIVE_ATTEMPT.has(attempt.outcome) ? SECOND : false,
+      staleTime: ACTIVE_ATTEMPT.has(attempt.outcome) ? 0 : Infinity,
     }),
 
   attemptSpec: (project: string, run: string, attempt: string) =>
@@ -387,7 +387,7 @@ export const q = {
     queryOptions({
       queryKey: ["sensors"],
       queryFn: ({ signal }) =>
-        api<{ sensors: SensorView[]; hosts: SensorHost[] }>(`${p(project)}/sensors`, { signal }),
+        api<{ sensors: SensorView[]; workers: SensorWorker[] }>(`${p(project)}/sensors`, { signal }),
       refetchInterval: LIVE,
     }),
 

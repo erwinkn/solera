@@ -49,7 +49,7 @@ export function Logs({
   onFilter: (patch: { level?: Level; text?: string }) => void;
 }) {
   const project = useProject();
-  const live = ACTIVE_ATTEMPT.has(attempt.status);
+  const live = ACTIVE_ATTEMPT.has(attempt.outcome);
   const [all, setAll] = useState(false);
   const [follow, setFollow] = useState(true);
   const tail = all ? null : 2000;

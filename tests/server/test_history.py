@@ -6,8 +6,8 @@ import copy
 import pytest
 from solera.sdk import In, Output, Project, Result, Retry, Source, asset
 from solera_server.engine import Conflict, Engine
+from solera_server.executors.inline import InlinePlacement
 from solera_server.history import History, RunFilter, bucket_for, execution
-from solera_server.placements.inline import InlinePlacement
 from solera_server.state import State
 
 
@@ -382,9 +382,9 @@ def test_an_attempt_records_where_it_ran():
     """The executor and what was asked of it: numbers as columns, the rest
     verbatim; a named GPU type counts one."""
 
-    spec = {"executor": "gpu", "kind": "Modal", "environment": {"app": "a"}, "placement": {"gpu": "A10G"}}
+    spec = {"executor": "gpu", "kind": "Modal", "config": {"app": "a"}, "options": {"gpu": "A10G"}}
     assert execution(spec) == {"executor": "gpu", "gpu": 1, "options": {"gpu": "A10G"}}
-    spec = {"executor": "etl", "placement": {"cpu": 4, "memory": 30 * 10**9, "image": "etl:3"}}
+    spec = {"executor": "etl", "options": {"cpu": 4, "memory": 30 * 10**9, "image": "etl:3"}}
     assert execution(spec) == {
         "executor": "etl",
         "cpu": 4,

@@ -122,9 +122,9 @@ function Row({ a }: { a: Automation }) {
         {Object.entries(a.tags).map(([k, v]) => ` · ${k}=${v}`)}
       </Td>
       <Td className="text-fg-muted">
-        {a.last_at ? (
+        {a.last_fired ? (
           <span className="flex items-center gap-2">
-            <Time at={a.last_at} />
+            <Time at={a.last_fired} />
             {a.last_run && (
               <Link
                 to="/runs/$run"

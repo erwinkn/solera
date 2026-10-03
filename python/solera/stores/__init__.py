@@ -285,15 +285,15 @@ class Prepared:
 class KeyedWrite:
     """A keyed output's write as its store takes it: read once
     (`prepared`), resolved against the key index (§4, §6). A store needs
-    three things of it: whether it is the scope's `whole` content (clear
-    the scope first), its `removes`, and its `chunks()` — the keys to write,
+    three things of it: whether it is a `reset`, the partition's whole
+    content (clear the partition first), its `removes`, and its `chunks()` — the keys to write,
     each with its group.
 
     `upserts` are the keys to write: a collection of them; a
     `solera.keys.index.DeltaKeys` reading them from the commit's delta
     files when there are too many to list; or None, every key of the write.
     `removes` are deleted, and every other key stays as it is — unless the
-    write is `whole`, the scope's whole content: then every key not in it
+    write is a `reset`, the partition's whole content: then every key not in it
     goes, and `upserts`, if given, are only those the delta writes, all a
     store that keeps the others as they are needs to write. `value` is what
     the producer returned, for a store that writes it as it is."""
@@ -301,7 +301,7 @@ class KeyedWrite:
     prepared: Prepared
     upserts: Any = None
     removes: frozenset[str] = frozenset()
-    whole: bool = False
+    reset: bool = False
     value: Any = None
 
     @classmethod
@@ -313,7 +313,7 @@ class KeyedWrite:
             return write
         prepared = prepare_for(store, write, output)
         if not prepared.patch or prior is None:
-            return cls(prepared, whole=True, value=write)
+            return cls(prepared, reset=True, value=write)
         return cls(prepared, removes=frozenset(prepared.removes), value=write)
 
     async def chunks(self, size: int = 100_000):

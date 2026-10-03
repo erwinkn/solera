@@ -148,7 +148,7 @@ class Model:
     def snapshot(self) -> dict:
         return copy.deepcopy(
             {
-                "applied": self.applied,
+                "event_counter": self.event_counter,
                 "engine": self.engine,
                 "deploy": self.deploy,
                 "deploy_number": self.deploy_number,
@@ -157,7 +157,7 @@ class Model:
                 "heads": _nest(self.heads, 2),
                 "indexes": _nest({k: v.to_json() for k, v in self.indexes.items()}, 2),
                 "garbage": self.garbage,
-                "retired": self.retired,
+                "deleted": self.deleted,
                 "partitions": _nest(self.partitions, 2),
                 "repairs": _nest(self.repairs, 2),
                 "cleanups": _nest(self.cleanups, 2),
@@ -172,7 +172,7 @@ class Model:
     def restore(self, snap: dict | None) -> None:
         snap = copy.deepcopy(snap) if snap else {}
         # durable
-        self.applied: int = snap.get("applied") or 0
+        self.event_counter: int = snap.get("event_counter") or 0
         self.engine = snap.get("engine")
         self.deploy = snap.get("deploy")
         # how many deploys this namespace has served: what gives failed keys
@@ -187,7 +187,7 @@ class Model:
         # [path, n]: files nothing references since the n-th event applied
         self.garbage: list[list] = snap.get("garbage") or []
         # deleted runs whose directories are still to be deleted (§11)
-        self.retired: list[str] = snap.get("retired") or []
+        self.deleted: list[str] = snap.get("deleted") or []
         # (asset, scope) -> the scope's record (§5): its `cursor`; `last`, its last
         # terminal outcome; `drained`, whether its last commit finished the delivery
         # it was on — its completeness, whatever its outputs wrote; `watermarks`
@@ -212,7 +212,7 @@ class Model:
         # task id -> {attempt, started_at, pin, status, launched?, reads?}; `pin`: `applied` at the claim
         self.claims: dict[str, dict] = {}
         self.attempts: dict[str, str] = {}  # attempt id -> task id, while claimed
-        self.locks: dict[tuple, str] = {}  # (asset, scope) -> attempt id
+        self.claimed_partitions: dict[tuple, str] = {}  # (asset, partition) -> the attempt that claims it
         self.pool: dict[str, dict] = {}  # attempt id -> pool work
         # sensor -> the tick dispatched and not yet decided: {tick, cursor, snapshot, pin, ...}
         self.ticks: dict[str, dict] = {}
@@ -363,11 +363,11 @@ class Model:
         self.claims[task_id] = {
             "attempt": attempt,
             "started_at": now,
-            "pin": self.applied,
+            "generation": self.event_counter,
             "status": "running",
         }
         self.attempts[attempt] = task_id
-        self.locks[(task["asset"], task["partition"])] = attempt
+        self.claimed_partitions[(task["asset"], task["partition"])] = attempt
         self.queue.pop(task_id, None)
 
     def pins(self, but: str | None = None) -> list[tuple[int, tuple[str, ...] | None]]:
@@ -380,7 +380,9 @@ class Model:
         ticks in flight, by their sources; the engine's own readers."""
 
         out = [
-            (c["pin"], c.get("domains")) for c in self.claims.values() if c["attempt"] != but and "pin" in c
+            (c["generation"], c.get("prefixes"))
+            for c in self.claims.values()
+            if c["attempt"] != but and "generation" in c
         ]
         for wm in self.bookmarks():
             upstream = (self.index(wm["output"], wm["upstream_partition"]).prefix,)
@@ -397,10 +399,10 @@ class Model:
         everything, and per domain the oldest pin of its readers."""
 
         low, by = math.inf, {}
-        for n, domains in self.pins(but):
-            if domains is None:
+        for n, prefixes in self.pins(but):
+            if prefixes is None:
                 low = min(low, n)
-            for domain in domains or ():
+            for domain in prefixes or ():
                 if n < by.get(domain, math.inf):
                     by[domain] = n
         return low, by
@@ -421,14 +423,14 @@ class Model:
         return low
 
     @contextlib.contextmanager
-    def reading(self, *domains: str):
+    def reading(self, *prefixes: str):
         """Pin what the index state holds now — of `domains` (index prefixes,
         `history/`), all of it with none — for as long as the block reads it:
         an engine listing, a source commit's resolution, a history query.
         Memory only, like the reads."""
 
         token = object()
-        self.readers[token] = (self.applied, tuple(domains) or None)
+        self.readers[token] = (self.event_counter, tuple(prefixes) or None)
         try:
             yield
         finally:
@@ -451,11 +453,11 @@ class Model:
         self.claims[task["id"]] = {
             "attempt": attempt,
             "started_at": launched["started_at"],
-            "pin": launched["pin"],
+            "generation": launched["generation"],
             "status": status,
             "launched": True,
             "reads": bookmarks.reads(launched["prepared"].get("plans") or {}),
-            "domains": tuple(launched["prepared"].get("domains") or ()),
+            "prefixes": tuple(launched["prepared"].get("prefixes") or ()),
             "cleanups": _delta_files(
                 d
                 for info in (launched["prepared"].get("outputs") or {}).values()
@@ -463,7 +465,7 @@ class Model:
             ),
         }
         self.attempts[attempt] = task["id"]
-        self.locks[(task["asset"], task["partition"])] = attempt
+        self.claimed_partitions[(task["asset"], task["partition"])] = attempt
         self.queue.pop(task["id"], None)
         if pool is not None:  # discoverable until it ends; its claim is the worker's (§10)
             self.pool[attempt] = {
@@ -485,7 +487,7 @@ class Model:
         if claim is None or claim["attempt"] != attempt:
             return None
         task = self.task(task_id)
-        if task is None or self.locks.get((task["asset"], task["partition"])) != attempt:
+        if task is None or self.claimed_partitions.get((task["asset"], task["partition"])) != attempt:
             return None
         return claim
 
@@ -496,14 +498,14 @@ class Model:
         del self.claims[task_id]
         self.attempts.pop(claim["attempt"], None)
         self.pool.pop(claim["attempt"], None)
-        for key, holder in list(self.locks.items()):
+        for key, holder in list(self.claimed_partitions.items()):
             if holder == claim["attempt"]:
-                del self.locks[key]
+                del self.claimed_partitions[key]
 
     # -- apply -------------------------------------------------------------------------
 
     def apply(self, event: dict) -> None:
-        self.applied += 1
+        self.event_counter += 1
         getattr(self, f"_on_{event['type']}")(event)
 
     def _on_EngineStarted(self, e):
@@ -528,11 +530,11 @@ class Model:
                     existing = self.automations.get(f"{old}.{rest}")
                     if existing is not None:
                         break
-            record = {**auto, "last_at": None, "last_run": None, "last_deploy": None, "pending": []}
+            record = {**auto, "last_fired": None, "last_run": None, "last_deploy": None, "pending": []}
             if existing is not None:
                 record["enabled"] = existing["enabled"]
                 if existing["trigger"] == auto["trigger"]:
-                    for field in ("last_at", "last_run", "last_deploy", "pending"):
+                    for field in ("last_fired", "last_run", "last_deploy", "pending"):
                         record[field] = existing.get(field, record[field])
             automations[name] = record
         self.automations = automations
@@ -546,7 +548,7 @@ class Model:
                     "at": e["at"],
                     "asset": None,
                     "version": None,  # a source has no code version
-                    "n": self.applied,
+                    "n": self.event_counter,
                 }
 
     def _reconcile_tasks(self, manifest: dict, renamed: dict, output_map: dict, at: float) -> None:
@@ -577,8 +579,10 @@ class Model:
                         if not bucket:
                             del self.pending[(old, partition)]
                         self.pending.setdefault((new, partition), set()).add(tid)
-                    if (old, partition) in self.locks:
-                        self.locks[(new, partition)] = self.locks.pop((old, partition))
+                    if (old, partition) in self.claimed_partitions:
+                        self.claimed_partitions[(new, partition)] = self.claimed_partitions.pop(
+                            (old, partition)
+                        )
                     launched = task.get("launched")
                     if launched is not None:
                         outputs = launched["prepared"].get("outputs") or {}
@@ -658,7 +662,7 @@ class Model:
             del self.heads[key]
         for key in [k for k in self.indexes if removed(k)]:
             index = self.indexes.pop(key)
-            self.garbage.extend([index.path(name), self.applied] for name in sorted(index.referenced()))
+            self.garbage.extend([index.path(name), self.event_counter] for name in sorted(index.referenced()))
         for key in [k for k in self.repairs if removed(k)]:
             del self.repairs[key]
         for key in [k for k in self.partitions if gone(k[0])]:
@@ -803,7 +807,7 @@ class Model:
         task = run["tasks"].get(e["task"]) if run else None
         if task is None or task["status"] in TERMINAL_TASK:
             return
-        launched = {k: e[k] for k in ("attempt", "started_at", "pin", "at", "execution", "prepared")}
+        launched = {k: e[k] for k in ("attempt", "started_at", "generation", "at", "execution", "prepared")}
         if e.get("pool"):
             launched["pool"] = e["pool"]
         task["launched"] = launched
@@ -838,7 +842,7 @@ class Model:
         launched = task.get("launched")
         # The generation its writes carried (§9.7), as its launch recorded it: the
         # refs it installs carry it. An attempt never launched wrote nothing.
-        generation = launched["pin"] if (launched or {}).get("attempt") == e["attempt"] else None
+        generation = launched["generation"] if (launched or {}).get("attempt") == e["attempt"] else None
         if (launched or {}).get("attempt") == e["attempt"]:
             del task["launched"]
             prepared = launched["prepared"]
@@ -989,10 +993,10 @@ class Model:
                 # their intent files are no longer needed.
                 index = self.index(name, partition)
                 for intent in self.repairs.pop((name, partition), ()):
-                    self.garbage.extend([index.path(f["name"]), self.applied] for f in intent["files"])
+                    self.garbage.extend([index.path(f["name"]), self.event_counter] for f in intent["files"])
         record = self._partition(asset, partition)
-        if "drained" in commit:
-            record["drained"] = bool(commit["drained"])
+        if "caught_up" in commit:
+            record["caught_up"] = bool(commit["caught_up"])
         if "cursor" in commit:
             if commit["cursor"] is None:
                 record.pop("cursor", None)
@@ -1027,7 +1031,7 @@ class Model:
                     keys=(commit.get("keys") or {}).get(name),
                     rows=(commit.get("rows") or {}).get(name),
                     metadata=(commit.get("metadata") or {}).get(name),
-                    complete=commit.get("drained", True),
+                    materialized=commit.get("caught_up", True),
                 ),
             )
             for row in history.lineage(name, partition, head, reads):
@@ -1060,7 +1064,7 @@ class Model:
         for partition, record in self.partitions.of(e["asset"]).items():
             if "failures" in record and e.get("partition") in (None, partition):
                 for name in e["classes"]:
-                    record["failures"].setdefault("forced", {})[name] = self.applied
+                    record["failures"].setdefault("forced", {})[name] = self.event_counter
 
     def _pend_onchange(self, asset: str | None, partition: str, changed: list[str]) -> None:
         if not changed:
@@ -1102,11 +1106,11 @@ class Model:
             task["queued_at"] = None
 
     def _event(self, run: dict, type_: str, at: float, task=None, attempt=None, *, by="engine", **fields):
-        """Append to the run's timeline (§7): `run_events` rows, in order."""
+        """Append to the run's timeline (§7): `run_timeline` rows, in order."""
 
         run["events"] += 1
         row = {"run": run["id"], "n": run["events"], "at": at, "type": type_, "task": task}
-        self._record("run_events", {**row, "attempt": attempt, "by": by, **fields})
+        self._record("run_timeline", {**row, "attempt": attempt, "by": by, **fields})
 
     def _finished(self, run: dict, task: dict, outcome: str, attempt, at, *, roll_up: bool = True) -> None:
         """A terminal transition: outcome, pending index, dependents, run roll-up."""
@@ -1174,7 +1178,7 @@ class Model:
                 if (output, partition) in self.indexes:
                     self._replace_index((output, partition), fresh)
                 for intent in self.repairs.pop((output, partition), ()):
-                    self.garbage.extend([index.path(f["name"]), self.applied] for f in intent["files"])
+                    self.garbage.extend([index.path(f["name"]), self.event_counter] for f in intent["files"])
                 index = fresh
             elif keys["files"]:
                 index = index.committed(keys["commit_number"], delta, keep_log=keep_log)
@@ -1205,8 +1209,8 @@ class Model:
         attempt acknowledges — one event can let go of several entries."""
 
         entries = self.cleanups.setdefault((output, partition), [])
-        ordinal = sum(1 for d in entries if d["n"] == self.applied)
-        entries.append({"n": self.applied, "id": f"{self.applied}.{ordinal}", **entry})
+        ordinal = sum(1 for d in entries if d["n"] == self.event_counter)
+        entries.append({"n": self.event_counter, "id": f"{self.event_counter}.{ordinal}", **entry})
 
     def _superseded(
         self, output: str, partition: str, before: dict | None, head: dict, keys: dict | None, prefix=None
@@ -1247,7 +1251,7 @@ class Model:
                 entry = {
                     "kind": "abandoned",
                     "attempt": attempt,
-                    "generation": launched["pin"],
+                    "generation": launched["generation"],
                     "commit_number": info.get("commit_number"),
                 }
                 if info.get("prefix") is not None:
@@ -1276,7 +1280,7 @@ class Model:
                         d["stuck"] = True
         for path in e.get("cleaned_files") or ():
             if path in named or any(path.startswith(stem) for stem in named):
-                self.garbage.append([path, self.applied])
+                self.garbage.append([path, self.event_counter])
 
     def _on_CleanupsDone(self, e):
         """A worker discarded data garbage right after its own commit (D8):
@@ -1302,7 +1306,7 @@ class Model:
         before = self.indexes[key]
         self.indexes[key] = index
         for name in sorted(before.referenced() - index.referenced()):
-            self.garbage.append([before.path(name), self.applied])
+            self.garbage.append([before.path(name), self.event_counter])
 
     def _on_IndexCompacted(self, e):
         key = (e["output"], e["partition"])
@@ -1337,13 +1341,13 @@ class Model:
     def _on_SourceCommitted(self, e):
         before = self.heads.get((e["source"], ""))
         head = e["head"]
-        self.heads[(e["source"], "")] = {**head, "at": e["at"], "n": self.applied}
+        self.heads[(e["source"], "")] = {**head, "at": e["at"], "n": self.event_counter}
         self._commit_keys(e["source"], "", e.get("keys"))
         run = e.get("run")
         if run is not None:
             self._record("runs", history.source_run_row(run, e["at"]))
             self._record(
-                "run_events",
+                "run_timeline",
                 {
                     "run": run["id"],
                     "n": 1,
@@ -1376,7 +1380,7 @@ class Model:
         auto = self.automations.get(e["name"])
         if auto is None:
             return
-        auto["last_at"] = e["at"]
+        auto["last_fired"] = e["at"]
         if e.get("run"):
             auto["last_run"] = e["run"]
         if "deploy" in e:
@@ -1414,15 +1418,15 @@ class Model:
         self.history.flushed(e["files"], e["upto"])
 
     def _on_HistoryCompacted(self, e):
-        self.garbage.extend([path, self.applied] for path in self.history.compacted(e["changes"]))
+        self.garbage.extend([path, self.event_counter] for path in self.history.compacted(e["changes"]))
 
     def _on_RunsDeleted(self, e):
         """Runs retire for good: their history goes, and their directories
         are deleted only from here on — `RunsPurged` once they are."""
 
         self.history.forget(set(e["runs"]), e["at"])
-        self.retired.extend(r for r in e.get("files") or () if r not in self.retired)
+        self.deleted.extend(r for r in e.get("files") or () if r not in self.deleted)
 
     def _on_RunsPurged(self, e):
         gone = set(e["runs"])
-        self.retired = [r for r in self.retired if r not in gone]
+        self.deleted = [r for r in self.deleted if r not in gone]

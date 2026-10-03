@@ -96,7 +96,7 @@ class FileStore:
 
     async def store(self, write, prior: Ref | None, context: WriteContext) -> Written:
         output = context.output
-        if prior is not None and prior.meta.get("external"):
+        if prior is not None and prior.meta.get("source"):
             raise WriteError(f"{output.name}: cannot write an external source ref")
         patch = isinstance(write, Patch)
         if patch and not output.incremental:
@@ -123,7 +123,7 @@ class FileStore:
         """A partition set: its element list, as one value."""
 
         partitions = write.prepared.take(None)
-        if not write.whole and prior is not None:
+        if not write.reset and prior is not None:
             drop = set(write.removes) | set(write.prepared.removes) | set(partitions)
             partitions = [e for e in await self._partitions(prior) if e not in drop] + partitions
         name = f"{base}@{generation}"

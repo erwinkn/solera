@@ -79,7 +79,7 @@ export function Run() {
             <Meta label="Trigger">
               <TriggerLabel
                 run={{
-                  trigger: request.source ? "commit" : request.automation ? "automation" : "manual",
+                  origin: request.source ? "commit" : request.automation ? "automation" : "manual",
                   ...request,
                   automation: request.automation ?? null,
                   by: request.by ?? null,
@@ -305,7 +305,7 @@ function TaskPanel({
                   )}
                 >
                   <StatusIcon
-                    status={a.status}
+                    status={a.outcome}
                     className={a.id === attempt?.id ? "text-current" : undefined}
                   />
                   #{a.generation}
@@ -394,14 +394,14 @@ function errorOf(error: Attempt["error"]): AttemptError | null {
 
 function AttemptSummary({ run, attempt, live }: { run: string; attempt: Attempt; live: boolean }) {
   const now = useNow();
-  const end = attempt.finished_at ?? (ACTIVE_ATTEMPT.has(attempt.status) ? now : (attempt.started_at ?? now));
+  const end = attempt.finished_at ?? (ACTIVE_ATTEMPT.has(attempt.outcome) ? now : (attempt.started_at ?? now));
   const error = errorOf(attempt.error);
   const phases = phasesOf(attempt);
   return (
     <div className="flex flex-col gap-5 border-y border-line px-4 py-4">
       <Facts>
         <Fact label="Outcome">
-          <StatusBadge status={attempt.status} />
+          <StatusBadge status={attempt.outcome} />
         </Fact>
         <Fact label="Attempt">
           <Id value={attempt.id} copy />
@@ -413,7 +413,7 @@ function AttemptSummary({ run, attempt, live }: { run: string; attempt: Attempt;
         <Fact label="Duration">
           <Elapsed
             start={attempt.started_at}
-            end={attempt.finished_at ?? (ACTIVE_ATTEMPT.has(attempt.status) ? null : attempt.started_at)}
+            end={attempt.finished_at ?? (ACTIVE_ATTEMPT.has(attempt.outcome) ? null : attempt.started_at)}
           />
         </Fact>
         {attempt.cpu_seconds != null && <Fact label="CPU">{duration(attempt.cpu_seconds)}</Fact>}
@@ -498,7 +498,7 @@ const REASON: Record<string, string> = {
  */
 function CancelNote({ run, attempt, live }: { run: string; attempt: Attempt; live: boolean }) {
   const project = useProject();
-  const ended = ["canceled", "aborted", "timed_out"].includes(attempt.status);
+  const ended = ["canceled", "aborted", "timed_out"].includes(attempt.outcome);
   const result = useQuery({ ...q.attemptResult(project, run, attempt.id), enabled: ended }).data;
   const closing = useQuery({ ...q.runEvents(project, run, live), enabled: ended }).data?.find(
     (e) => e.attempt === attempt.id && (e.type === "aborted" || e.type === "canceled"),
@@ -544,7 +544,7 @@ function ErrorBlock({
   const project = useProject();
   const sealed = useQuery({
     ...q.attemptResult(project, run, attempt.id),
-    enabled: !ACTIVE_ATTEMPT.has(attempt.status),
+    enabled: !ACTIVE_ATTEMPT.has(attempt.outcome),
   }).data?.error;
   const error: AttemptError = sealed ? { ...summary, ...sealed } : summary;
   return (
@@ -574,9 +574,9 @@ function ResultTab({ run, attempt }: { run: string; attempt: Attempt }) {
   const project = useProject();
   const { data, error, isPending } = useQuery({
     ...q.attemptResult(project, run, attempt.id),
-    enabled: !ACTIVE_ATTEMPT.has(attempt.status),
+    enabled: !ACTIVE_ATTEMPT.has(attempt.outcome),
   });
-  if (ACTIVE_ATTEMPT.has(attempt.status))
+  if (ACTIVE_ATTEMPT.has(attempt.outcome))
     return (
       <Empty compact title="Still running">
         The result appears once the worker seals it.

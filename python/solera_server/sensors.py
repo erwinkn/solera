@@ -19,8 +19,8 @@ from solera import lifecycle
 from solera.build import method_note
 from solera.ids import ulid
 
+from .executors.local import _env
 from .model import commit_of
-from .placements.local import _env
 
 log = logging.getLogger(__name__)
 
@@ -149,7 +149,7 @@ class Sensors:
             "tick": ulid(self.clock()),
             "cursor": (self.m.sensors.get(name) or {}).get("cursor"),
             "snapshot": snapshot,
-            "pin": self.m.applied,
+            "pin": self.m.event_counter,
             "host": host,
             "started_at": self.clock(),
             "deadline": now + sensor["timeout"] + POST_GRACE,
@@ -259,7 +259,7 @@ class Sensors:
         if not prepared and not planned and not moved:
             self._tick_row(name, claim, "skipped")
             return {"accepted": True, "runs": [], "commits": {}}
-        now, base = self.clock(), self.m.applied
+        now, base = self.clock(), self.m.event_counter
         for event in prepared:
             event["at"] = now
         accepted = {

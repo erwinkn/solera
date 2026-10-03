@@ -334,7 +334,7 @@ class Source:
             store=self.store or DEFAULT_STORE,
             handle={"name": self.name, **self.handle},
             partition="",
-            meta={"external": True},
+            meta={"source": True},
         )
 
 
@@ -925,10 +925,10 @@ class Sensor:
         self.code = code or fn
 
     def placement(self) -> dict:
-        from .executors import Environment, Local, Placement
+        from .executors import Executor, Local, Placement
 
         executor = self.executor or Local()
-        if isinstance(executor, Environment):
+        if isinstance(executor, Executor):
             executor = executor()
         if not isinstance(executor, Placement) or executor.kind not in ("Local", "Pool"):
             raise RegistrationError(f"Sensor {self.name}: its executor is Local or a Pool")
@@ -1593,7 +1593,7 @@ class Project:
                     f"{name}: executor {placement['executor']!r} of kind {placement['kind']!r} "
                     "is not registered; declare it with Project(executors=[...])"
                 )
-            executor = {"kind": placement["kind"], "environment": placement["environment"]}
+            executor = {"kind": placement["kind"], "config": placement["config"]}
             if declared not in (None, executor):
                 raise RegistrationError(
                     f"{name}: executor {placement['executor']!r} is declared as {declared}, "
@@ -1693,11 +1693,11 @@ class Project:
         return {**body, "deploy": digest(body)}
 
     def _executors(self) -> dict[str, dict]:
-        """`Project(executors=)`, by name: one kind and environment per name."""
+        """`Project(executors=)`, by name: one kind and configuration per name."""
 
         executors: dict[str, dict] = {}
         for e in self.executors:
-            record = {"kind": e.kind, "environment": dict(e.config)}
+            record = {"kind": e.kind, "config": dict(e.config)}
             if executors.setdefault(e.name, record) != record:
                 raise RegistrationError(f"Executor {e.name!r} is declared twice, differently")
         return executors

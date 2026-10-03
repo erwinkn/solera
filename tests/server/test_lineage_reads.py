@@ -13,7 +13,7 @@ import pytest
 from solera.sdk import In, Incremental, Output, Project, Ref, Source, asset
 from solera.stores import WriteContext
 from solera_server.engine import Engine
-from solera_server.placements.inline import InlinePlacement
+from solera_server.executors.inline import InlinePlacement
 from solera_server.state import State
 
 pytestmark = pytest.mark.postgres

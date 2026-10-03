@@ -427,7 +427,7 @@ class PostgresStore:
                     raise WriteError(f"{output.name}: Patch requires an incremental output")
                 write = KeyedWrite.of(self, write, output, prior)
                 if prior is None and not (
-                    write.whole or write.upserts or write.removes or len(write.prepared.rows)
+                    write.reset or write.upserts or write.removes or len(write.prepared.rows)
                 ):
                     return Written(None)  # a first write of nothing: no table to make
                 self._apply_keyed(cur, output, write, context, table, slice_where)
@@ -502,15 +502,15 @@ class PostgresStore:
             cur, output, table, lambda: write.prepared.take(None), context, kinds=write.prepared.kinds
         )
         stamps = self._stamps(output, context)
-        if write.whole:
+        if write.reset:
             self._delete_slice(cur, table, slice_where)
         for chunk in write.iter_chunks():
             keys = [key for key, _ in chunk]
-            if not write.whole:
+            if not write.reset:
                 self._delete_keys(cur, output, table, slice_where, keys)
             self._insert(cur, output, table, [row for _, group in chunk for row in group], stamps)
             self._check_keys(cur, output, table, slice_where, keys)
-        if write.removes and not write.whole:
+        if write.removes and not write.reset:
             self._delete_keys(cur, output, table, slice_where, sorted(write.removes))
 
     def _check_keys(self, cur, output, table, slice_where, keys: list[str]) -> None:

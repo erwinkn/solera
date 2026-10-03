@@ -4,7 +4,7 @@ import { getRouteApi, Link } from "@tanstack/react-router";
 import { ChevronDown, RotateCcw, Search } from "lucide-react";
 import { q, useManifest, useProject } from "@/api/queries";
 import { useRetryKeys } from "@/api/mutations";
-import type { AssetDecl, Explain, FailureClass, FailureKey, Failures, KeyOutcome } from "@/api/types";
+import type { AssetDecl, Explain, FailureClass, FailureKey, FailedKeys, KeyOutcome } from "@/api/types";
 import { PatternList } from "@/features/patterns";
 import { join, list } from "@/router";
 import { useNow } from "@/lib/clock";
@@ -204,7 +204,7 @@ function FailingKeys({ name }: { name: string }) {
   );
 }
 
-function totalsOf(page: Failures | undefined): Partial<Record<FailureClass, number>> {
+function totalsOf(page: FailedKeys | undefined): Partial<Record<FailureClass, number>> {
   const totals: Partial<Record<FailureClass, number>> = {};
   for (const s of page?.partitions ?? []) {
     for (const [c, n] of Object.entries(s.counts) as [FailureClass, number][])
@@ -250,7 +250,7 @@ function ExplainKey({ name, asset }: { name: string; asset: AssetDecl }) {
     enabled: !!asset.partitions,
   }).data;
   const effectivePartition =
-    partition ?? (asset.partitions ? partitions?.find((p) => p.status !== "retired")?.partition : "");
+    partition ?? (asset.partitions ? partitions?.find((p) => p.status !== "removed")?.partition : "");
   const [draft, setDraft] = useState(key ?? "");
   const answer = useQuery({
     ...q.explain(project, name, key ?? "", effectivePartition ?? "", chosenInput),
@@ -555,7 +555,7 @@ function LiveKeys({ name, asset }: { name: string; asset: AssetDecl }) {
     enabled: !!asset.partitions,
   }).data;
   const effectivePartition =
-    partition ?? (asset.partitions ? partitions?.find((p) => p.status === "complete")?.partition : "");
+    partition ?? (asset.partitions ? partitions?.find((p) => p.status === "materialized")?.partition : "");
   const keys = useInfiniteQuery({
     ...q.keys(project, chosen?.name ?? "", effectivePartition ?? ""),
     enabled: !!chosen && effectivePartition !== undefined,

@@ -130,7 +130,7 @@ class Journal:
 
     def generation(self, attempt: str) -> int | None:
         launched = self.launched.get(attempt)
-        return None if launched is None else int(launched.get("pin", -1))
+        return None if launched is None else int(launched.get("generation", -1))
 
     def committed_generations(self) -> set[int]:
         out = set()

@@ -5,7 +5,7 @@ configuration, patterns and aliases."""
 import asyncio
 
 from solera import Failed, Rejected, Transient
-from solera.failures import CANCELED
+from solera.failed_keys import CANCELED
 from solera.sdk import Each, Incremental, Output, Project, asset
 from solera_server.state import State
 

@@ -32,7 +32,7 @@ from zoneinfo import ZoneInfo
 from croniter import croniter
 from obstore.exceptions import AlreadyExistsError
 from solera import lifecycle
-from solera.failures import lower
+from solera.failed_keys import lower
 from solera.ids import ulid, ulid_time
 from solera.keys import Rows, SortedEntries
 from solera.keys.index import (
@@ -50,10 +50,10 @@ from solera.sdk import digest
 
 from . import bookmarks, history, planning
 from .attempts import POOL_OFFERED_GRACE, Attempts, Live, current_names, moved, worker_report
+from .executors import PlacementContext, Registry
 from .history import MAX_METADATA, History, RunFilter
 from .keyservice import KeyService, cache_root
 from .model import TERMINAL_RUN, commit_of
-from .placements import PlacementContext, Registry
 from .sensors import Sensors
 from .state import Conflict, LostOwnership, State
 from .upkeep import ALIVE, Upkeep
@@ -372,7 +372,7 @@ class Engine(Attempts, Sensors, Views):
             self.m.heads_of,
             self.clock(),
             projected,
-            lambda a, s: self.m.partition(a, s).get("drained", False),
+            lambda a, s: self.m.partition(a, s).get("caught_up", False),
         )
 
     def _plan_run(
@@ -482,7 +482,7 @@ class Engine(Attempts, Sensors, Views):
         index = self.m.indexes.get((name, partition))
         if index is not None:
             files = [FileInfo.from_json(f) for f in keys["files"]]
-            self.keys.committed(index.prefix, index.path, files, self.m.applied)
+            self.keys.committed(index.prefix, index.path, files, self.m.event_counter)
 
     # -- dispatch ---------------------------------------------------------------
 
@@ -514,9 +514,9 @@ class Engine(Attempts, Sensors, Views):
             executor = spec["executor"]
             limit = getattr(placement, "max_concurrent", None)
             is_pool = spec["kind"] == "Pool"
-            holder = self.m.locks.get((task["asset"], task["partition"]))
+            holder = self.m.claimed_partitions.get((task["asset"], task["partition"]))
             if holder is not None and self.m.claimed(holder) is not None:
-                held[task_id] = ["lock", holder]
+                held[task_id] = ["claim", holder]
             elif not is_pool and engine_used >= self.concurrency:
                 held[task_id] = ["engine", None]
             elif limit is not None and executor_used.get(executor, 0) >= limit:
@@ -572,7 +572,7 @@ class Engine(Attempts, Sensors, Views):
             self._spawn(task["run"], attempt, execution["kind"] == "Pool", execution["executor"], work)
 
     def _partition_active_claim(self, asset: str, partition: str) -> bool:
-        attempt = self.m.locks.get((asset, partition))
+        attempt = self.m.claimed_partitions.get((asset, partition))
         return attempt is not None and self.m.claimed(attempt) is not None
 
     async def _attempt(self, task_id: str, attempt: str, placement):
@@ -604,7 +604,7 @@ class Engine(Attempts, Sensors, Views):
                 marks = {param: wm for param, wm in advanced.items() if wm is not None}
                 commit = {"bookmarks": marks}
                 if not bookmarks.selects(prepared["plans"]):
-                    commit["drained"] = True
+                    commit["caught_up"] = True
                 self._finish(task, claim, "skipped", commit=commit)
                 return
             stage = await self._launch(task, run, attempt, prepared)
@@ -720,7 +720,7 @@ class Engine(Attempts, Sensors, Views):
                 # Across upstream-only dimensions, a dep pins the heads that exist and
                 # agree with this scope's keys; otherwise its one projected head (§7).
                 if input.fan_in:
-                    refs = {k: h["ref"] for k, h in planner.fan_in(input, complete=False).items()}
+                    refs = {k: h["ref"] for k, h in planner.fan_in(input, materialized=False).items()}
                 else:
                     refs = {input.partition: self._pin_at(output, input.partition)}
                 pins[param] = {"refs": refs}
@@ -759,7 +759,7 @@ class Engine(Attempts, Sensors, Views):
                 fingerprint,
                 run,
                 full,
-                (claim or {}).get("pin"),
+                (claim or {}).get("generation"),
             )
             if input.spec.get("each") is not None:
                 pin, plan, empty = self._each_plan(
@@ -778,7 +778,7 @@ class Engine(Attempts, Sensors, Views):
         more = any(p["kind"] == "commits" and bookmarks.continues(p, None, None) for p in plans.values() if p)
         skip = bool(incremental) and all_empty and not more and not full
         # An Each asset whose keys all failed so far has no head yet: nothing to wait for.
-        if skip and each_page is None and not planner.complete(task["asset"], partition):
+        if skip and each_page is None and not planner.materialized(task["asset"], partition):
             skip = False
         # A full run's write is the whole content. An Each page's is not: it
         # patches by key, and a key that fails keeps its last good output (§5).
@@ -829,7 +829,7 @@ class Engine(Attempts, Sensors, Views):
                 lineage.append([input.output, ref.get("partition") or "", ref.get("generation"), input.param])
         return {
             "version": asset["version"],
-            "domains": self._domains(pins, outputs, task),
+            "prefixes": self._prefixes(pins, outputs, task),
             "inputs": pins,
             "lineage": lineage,
             "plans": plans,
@@ -848,7 +848,7 @@ class Engine(Attempts, Sensors, Views):
             },
         }
 
-    def _domains(self, inputs: dict, outputs: dict, task: dict) -> list[str]:
+    def _prefixes(self, inputs: dict, outputs: dict, task: dict) -> list[str]:
         """What an attempt reads, as reader pins name it: the index prefix of
         every output scope it reads or writes — a value's or a batch
         output's too, whose data its scope's garbage names — and of any index
@@ -890,7 +890,7 @@ class Engine(Attempts, Sensors, Views):
             k: prepared.get(k)
             for k in (
                 "version",
-                "domains",
+                "prefixes",
                 "plans",
                 "more",
                 "full",
@@ -936,13 +936,13 @@ class Engine(Attempts, Sensors, Views):
             head = planner.head(input.output, input.partition)
             return (
                 {"": head["ref"]}
-                if head is not None and planner.head_complete(input.output, input.partition)
+                if head is not None and planner.head_materialized(input.output, input.partition)
                 else {}
             )
-        return {input.key(s): h["ref"] for s, h in planner.fan_in(input, complete=True).items()}
+        return {input.key(s): h["ref"] for s, h in planner.fan_in(input, materialized=True).items()}
 
     def _incremental_plan(
-        self, task, param, input, ref, upstream_partition, fingerprint, run, full, claim_pin=None
+        self, task, param, input, ref, upstream_partition, fingerprint, run, full, claim_generation=None
     ):
         """Plan one Incremental edge's page from its watermark (`delivery`):
         returns the pin for the spec, the plan its commit `advance`s the
@@ -1045,7 +1045,7 @@ class Engine(Attempts, Sensors, Views):
                 "at": head_commit,
                 "generation": latest_generation,
                 "snapshot": index.pinned().to_json(),
-                "pin": claim_pin if claim_pin is not None else self.m.applied,
+                "pin": claim_generation if claim_generation is not None else self.m.event_counter,
             }
         if pattern_change is not None:
             carried["patterns"], carried["pattern_change"] = pattern_change["old"], pattern_change
@@ -1114,7 +1114,7 @@ class Engine(Attempts, Sensors, Views):
             keys = pinned.count if whole else sum(f.entries for _, files in pinned.log for f in files)
             current = {**current, "page": 0, "pages": _pages(keys, limit)}
             if not whole:  # a window paged over attempts holds its first page's reader pin
-                current["pin"] = claim_pin
+                current["pin"] = claim_generation
         window = {"full": whole, "from": current["from"], "after": current["at"]}
         if not whole:
             window["to"] = current["to"]
@@ -1468,7 +1468,7 @@ class Engine(Attempts, Sensors, Views):
                 marks.get(p) or self.m.bookmark(task["asset"], p, task["partition"])
                 for p in prepared.get("plans") or {}
             ]
-            commit["drained"] = not more and not any(bookmarks.outstanding(wm) for wm in after if wm)
+            commit["caught_up"] = not more and not any(bookmarks.outstanding(wm) for wm in after if wm)
         if failures is not None:
             commit["failures"] = failures
             if result.get("key_outcomes"):
@@ -1565,7 +1565,7 @@ class Engine(Attempts, Sensors, Views):
         keyed = source.get("key") is not None
         if not keyed and (keys is not None or upsert is not None or remove is not None):
             raise ValueError(f"Source {name!r} is unkeyed; pass version=")
-        generation = self.m.applied
+        generation = self.m.event_counter
         ref = {**(head["ref"] if head is not None else source["head"]), "generation": generation}
         run_id = ulid(self.clock())
         record = {
@@ -1641,7 +1641,7 @@ class Engine(Attempts, Sensors, Views):
                 shown = keys is not None and len(keys) <= SOURCE_KEYS_RECORDED
                 run[field] = [key_str(k) for k in keys] if shown else count
         meta = dict(ref.get("meta") or {})
-        meta["external"] = True
+        meta["source"] = True
         ref["meta"] = meta
         event["run"] = run
         return event, ref
@@ -1686,7 +1686,7 @@ class Engine(Attempts, Sensors, Views):
             generation,
             commit_number,
             index.path(name),
-            self.m.applied,
+            self.m.event_counter,
         )
         if answer["result"] == "empty":
             return DeltaFiles([], 0, 0, True), ([], [])
@@ -1736,10 +1736,10 @@ class Engine(Attempts, Sensors, Views):
         if not auto["enabled"]:
             return None
         if trigger["kind"] == "every":
-            return -math.inf if auto["last_at"] is None else auto["last_at"] + trigger["seconds"]
+            return -math.inf if auto["last_fired"] is None else auto["last_fired"] + trigger["seconds"]
         if trigger["kind"] == "cron":
             zone = ZoneInfo(trigger.get("timezone") or "UTC")
-            base = dt.datetime.fromtimestamp(auto["last_at"] or 0, zone)
+            base = dt.datetime.fromtimestamp(auto["last_fired"] or 0, zone)
             return croniter(trigger["expression"], base).get_next(dt.datetime).timestamp()
         return None
 
@@ -1815,7 +1815,7 @@ class Engine(Attempts, Sensors, Views):
         `timed_out`, or `all`), every scope or one. Its position in the event
         order is its identity; a retry pass takes each such key once (§9)."""
 
-        from solera.failures import NAMES
+        from solera.failed_keys import NAMES
 
         if not any(
             e.get("each") for e in (self.manifest["assets"].get(asset) or {}).get("inputs", {}).values()
@@ -2072,7 +2072,7 @@ class Engine(Attempts, Sensors, Views):
                 "id": a["id"],
                 "task": task["id"],
                 "generation": n,
-                "status": a["outcome"],
+                "outcome": a["outcome"],
                 "started_at": a.get("started_at"),
                 "finished_at": a.get("finished_at"),
                 **{k: a[k] for k in (*history.PHASES, *history.USAGE, *history.EXECUTION) if k in a},
@@ -2092,7 +2092,7 @@ class Engine(Attempts, Sensors, Views):
                     "id": claim["attempt"],
                     "task": task["id"],
                     "generation": len(out) + 1,
-                    "status": claim["status"],
+                    "outcome": claim["status"],
                     "started_at": claim["started_at"],
                     **(history.execution(task["launched"]["execution"]) if claim.get("launched") else {}),
                 }
@@ -2141,7 +2141,9 @@ class Engine(Attempts, Sensors, Views):
         view = dict(head)
         view["commit"] = f"{head['run']}/{head['attempt']}" if head.get("attempt") else None
         owner = head.get("asset")
-        view["complete"] = owner is None or self.planner().drained(owner, head["ref"].get("partition") or "")
+        view["materialized"] = owner is None or self.planner().caught_up(
+            owner, head["ref"].get("partition") or ""
+        )
         return view
 
     def outcome_view(self, record: dict) -> dict:

@@ -100,7 +100,7 @@ export function assetTone(status: AssetStatus | undefined): Tone {
   if (Object.entries(status.failures ?? {}).some(([k, n]) => k !== "canceled" && (n ?? 0) > 0))
     tones.push("warn");
   if (p.running) tones.push("run");
-  if (p.complete) tones.push("ok");
+  if (p.materialized) tones.push("ok");
   if (!tones.length) tones.push("idle");
   return worst(tones);
 }
@@ -264,7 +264,7 @@ function Node({ node, status }: { node: GraphNode; status: AssetStatus | undefin
         <SegmentBar
           className="h-1.5"
           parts={[
-            { tone: "ok", value: p.complete, label: "complete" },
+            { tone: "ok", value: p.materialized, label: "materialized" },
             { tone: "run", value: p.running, label: "running" },
             { tone: "fail", value: p.failed, label: "failed" },
             { tone: "idle", value: p.missing, label: "missing" },
@@ -278,7 +278,7 @@ function Node({ node, status }: { node: GraphNode; status: AssetStatus | undefin
               ? "running"
               : p.failed
                 ? "failed"
-                : p.complete
+                : p.materialized
                   ? "materialized"
                   : node.kind === "job"
                     ? "not run yet"
@@ -288,7 +288,7 @@ function Node({ node, status }: { node: GraphNode; status: AssetStatus | undefin
       <span className="flex items-center gap-2 text-2xs text-fg-subtle">
         <span className="truncate">
           {KIND_LABEL[node.kind]}
-          {p && status?.partitioned && ` · ${p.complete}/${p.total} partitions`}
+          {p && status?.partitioned && ` · ${p.materialized}/${p.total} partitions`}
         </span>
         <span className="ml-auto flex shrink-0 items-center gap-1.5">
           {failing > 0 && (

@@ -361,14 +361,14 @@ function AttentionAssets({ status }: { status: Record<string, AssetStatus> | und
                   <span className="flex flex-col gap-1">
                     <SegmentBar
                       parts={[
-                        { tone: "ok", value: s.partitions.complete, label: "complete" },
+                        { tone: "ok", value: s.partitions.materialized, label: "materialized" },
                         { tone: "run", value: s.partitions.running, label: "running" },
                         { tone: "fail", value: s.partitions.failed, label: "failed" },
                         { tone: "idle", value: s.partitions.missing, label: "missing" },
                       ]}
                     />
                     <span className="text-2xs text-fg-subtle tabular">
-                      {s.partitions.complete}/{s.partitions.total} partitions complete
+                      {s.partitions.materialized}/{s.partitions.total} partitions materialized
                     </span>
                   </span>
                 ) : (

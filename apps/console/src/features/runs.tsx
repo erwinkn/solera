@@ -15,19 +15,19 @@ import { Table, TableScroll, Td, Th, Tr } from "@/ui/table";
 export function TriggerLabel({
   run,
 }: {
-  run: Pick<RunRow, "trigger" | "automation" | "by" | "source" | "tags" | "retry_of">;
+  run: Pick<RunRow, "origin" | "automation" | "by" | "source" | "tags" | "retry_of">;
 }) {
   const sensor = run.tags?.sensor;
   let icon: ReactNode;
   let text: ReactNode;
-  if (run.trigger === "commit") {
+  if (run.origin === "commit") {
     icon = <GitCommitHorizontal />;
     text = (
       <>
         commit <span className="text-fg">{run.source}</span>
       </>
     );
-  } else if (sensor || run.trigger === "sensor") {
+  } else if (sensor || run.origin === "sensor") {
     icon = <Radar />;
     text = <span className="text-fg">{sensor ?? run.by}</span>;
   } else if (run.retry_of) {

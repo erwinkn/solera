@@ -29,7 +29,7 @@ from solera.sdk import (
 from solera_server import sensors as engine_sensors
 from solera_server.api import create_app
 from solera_server.engine import Conflict, Engine
-from solera_server.placements.inline import InlinePlacement
+from solera_server.executors.inline import InlinePlacement
 from solera_server.state import State
 from solera_worker.sensors import ORPHANED, OVERRAN, LocalSensorChannel, run_sensor_host
 
@@ -451,7 +451,7 @@ async def test_hosts_reach_the_engine_over_https(tmp_path):
         listed = (
             await client.get(f"/api/projects/{p}/sensors", headers={"Authorization": "Bearer admin"})
         ).json()
-        assert listed["sensors"][0]["cursor"] == "c" and listed["hosts"][0]["id"] == "h1"
+        assert listed["sensors"][0]["cursor"] == "c" and listed["workers"][0]["id"] == "h1"
         history = await client.get(
             f"/api/projects/{p}/sensors/watch/ticks", headers={"Authorization": "Bearer admin"}
         )
@@ -528,7 +528,7 @@ def test_a_served_engine_keeps_its_own_sensor_host(tmp_path, monkeypatch):
             except (httpx.HTTPError, KeyError):
                 pass
             time.sleep(0.2)
-        assert listed["hosts"][0]["executor"] == "local"
+        assert listed["workers"][0]["executor"] == "local"
     finally:
         server.should_exit = True
         thread.join(timeout=20)

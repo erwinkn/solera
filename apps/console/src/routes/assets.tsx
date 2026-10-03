@@ -157,8 +157,8 @@ function AssetTable({
                           parts={[
                             {
                               tone: "ok",
-                              value: p.complete,
-                              label: "complete",
+                              value: p.materialized,
+                              label: "materialized",
                             },
                             { tone: "run", value: p.running, label: "running" },
                             { tone: "fail", value: p.failed, label: "failed" },
@@ -171,8 +171,8 @@ function AssetTable({
                         />
                         <span className="text-xs text-fg-muted tabular">
                           {s.partitioned
-                            ? `${p.complete}/${p.total}`
-                            : p.complete
+                            ? `${p.materialized}/${p.total}`
+                            : p.materialized
                               ? "done"
                               : p.running
                                 ? "running"

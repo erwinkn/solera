@@ -320,7 +320,7 @@ class Upkeep:
         before any of their files go, so a replaced engine deletes nothing."""
 
         async with self.retiring:
-            runs = [(r, s) for r, s in runs if r not in self.m.runs and r not in self.m.retired]
+            runs = [(r, s) for r, s in runs if r not in self.m.runs and r not in self.m.deleted]
             # Every run's directory: a skipped run may have launched (an attempt
             # whose patterns took no key), and listing an empty one costs a LIST.
             self.history.delete([r for r, _ in runs], [r for r, _ in runs])
@@ -330,10 +330,10 @@ class Upkeep:
         """Delete the directories of retired runs: their attempt files and logs."""
 
         async with self._purging:
-            if not self.m.retired:
+            if not self.m.deleted:
                 return
             await self.state.durable()
-            for run_id in list(self.m.retired):
+            for run_id in list(self.m.deleted):
                 gates = await self.state.delete_run(run_id)
                 if gates:  # tombstones outlive the run (docs/lifecycle.md §2.4): note where
                     day = time.strftime("%Y-%m-%d", time.gmtime(self.clock()))

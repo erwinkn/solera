@@ -5,7 +5,7 @@ import asyncio
 import json
 
 import pytest
-from solera.executors import Environment
+from solera.executors import Executor
 from solera.sdk import (
     AllPartitions,
     Automation,
@@ -28,11 +28,11 @@ from solera.sdk import (
 )
 from solera.stores import FileStore, Patch
 from solera_server.engine import Engine
-from solera_server.placements.inline import InlinePlacement
+from solera_server.executors.inline import InlinePlacement
 from solera_server.state import State
 
 
-class Fake(Environment):
+class Fake(Executor):
     """A test-only placement kind registered through `executors=` (§10)."""
 
     kind = "Fake"
@@ -132,7 +132,7 @@ async def test_bare_return_and_commit(state):
     assert status_of(detail) == "succeeded"
     installed = head(state, "numbers")
     assert installed["ref"]["output"] == "numbers" and installed["ref"]["generation"]
-    assert state.model.partition("numbers", "")["drained"] is True
+    assert state.model.partition("numbers", "")["caught_up"] is True
     assert installed["run"] == run["id"] and installed["attempt"]
 
 
@@ -366,7 +366,7 @@ async def test_incremental_batching_and_more(state):
     detail = await drive(engine, await engine.submit(["consumer"], upstream=True))
     assert status_of(detail) == "succeeded"
     assert commits == [["k0", "k1"], ["k2", "k3"], ["k4"]]
-    assert state.model.partition("consumer", "")["drained"] is True
+    assert state.model.partition("consumer", "")["caught_up"] is True
     task = [t for t in detail["tasks"] if t["asset"] == "consumer"][0]
     assert len(detail["attempts"][task["id"]]) == 3  # three batches, three attempts
 
@@ -421,20 +421,20 @@ async def test_a_selection_reads_its_keys_and_moves_nothing(state):
     detail = await drive(engine, await engine.submit(["consumer"], keys={"files": {"keys": ["b"]}}))
     assert status_of(detail) == "succeeded" and calls == [["b"]]  # the selection, and nothing else
     assert state.model.bookmark("consumer", "files", "") is None
-    assert "drained" not in state.model.partition("consumer", "")
+    assert "caught_up" not in state.model.partition("consumer", "")
     calls.clear()
     await drive(engine, await engine.submit(["consumer"]))  # a full delivery, stopped after `a`
     stopped = state.model.bookmark("consumer", "files", "")
     assert calls == [["a"]] and stopped["pass"]["at"] == "a"
-    assert state.model.partition("consumer", "")["drained"] is False
+    assert state.model.partition("consumer", "")["caught_up"] is False
     calls.clear()
     await drive(engine, await engine.submit(["consumer"], keys={"files": {"keys": ["c"]}}))
     assert calls == [["c"]] and state.model.bookmark("consumer", "files", "") == stopped
-    assert state.model.partition("consumer", "")["drained"] is False  # `b` is still owed
+    assert state.model.partition("consumer", "")["caught_up"] is False  # `b` is still owed
     broken["page"] = None
     calls.clear()
     await drive(engine, await engine.submit(["consumer"]))
-    assert calls == [["b"], ["c"]] and state.model.partition("consumer", "")["drained"] is True
+    assert calls == [["b"], ["c"]] and state.model.partition("consumer", "")["caught_up"] is True
     with pytest.raises(ValueError, match="cannot be a full run"):
         await engine.submit(["consumer"], mode="full", keys={"files": {"keys": ["a"]}})
 
@@ -727,7 +727,7 @@ async def test_retry_with_backoff_and_nonretryable(state):
     assert status_of(detail) == "succeeded"
     assert calls["n"] == 3
     attempts = detail["attempts"][detail["tasks"][0]["id"]]
-    assert [a["status"] for a in attempts] == ["failed", "failed", "succeeded"]
+    assert [a["outcome"] for a in attempts] == ["failed", "failed", "succeeded"]
 
 
 async def test_cancel_run(state):
@@ -774,7 +774,7 @@ async def test_every_and_cron_fire(state):
     await engine.initialize()
     await engine.tick()
     auto = state.model.automations["polled.every.0"]
-    assert auto["last_at"] is not None and auto["last_run"]
+    assert auto["last_fired"] is not None and auto["last_run"]
     await engine.run_until(auto["last_run"], 10)
 
 
@@ -817,7 +817,7 @@ async def test_automation_toggle_and_run_now(state):
     await engine.initialize()
     await engine.set_automation("polled.every.0", False)
     await engine.tick()
-    assert state.model.automations["polled.every.0"]["last_at"] is None
+    assert state.model.automations["polled.every.0"]["last_fired"] is None
     await engine.run_automation("polled.every.0")
     run_id = state.model.automations["polled.every.0"]["last_run"]
     await engine.run_until(run_id, 10)
@@ -841,7 +841,7 @@ async def test_an_automation_can_skip_until_its_inputs_are_written(state):
     await engine.initialize()
     await engine.tick()
     auto = state.model.automations["digest.every.0"]
-    assert auto["last_at"] is not None and auto["last_run"] is None and not state.model.runs
+    assert auto["last_fired"] is not None and auto["last_run"] is None and not state.model.runs
     run = await engine.submit(["digest"], upstream=True, skip_missing_inputs=True)
     assert run is not None and sorted(run["targets"]) == ["digest", "index"]
     await engine.run_until(run["id"], 10)
@@ -863,7 +863,7 @@ async def test_every_skips_active_scope(state):
     await engine.initialize()
     await engine.tick()  # fires, dispatches into forever-wait
     await asyncio.sleep(0.1)
-    state.model.automations["polled.every.0"]["last_at"] = 0  # make the interval due on the next tick
+    state.model.automations["polled.every.0"]["last_fired"] = 0  # make the interval due on the next tick
     await engine.tick()  # would fire again but the scope is active
     runs = (await engine.list_runs(limit=10))["runs"]
     assert len([r for r in runs if r.get("automation") == "polled.every.0"]) == 1
@@ -1077,7 +1077,7 @@ async def test_job_commits_lineage_only(state):
     assert status_of(detail) == "succeeded"
     task = next(t for t in detail["tasks"] if t["asset"] == "vacuum")
     [attempt] = detail["attempts"][task["id"]]
-    assert attempt["status"] == "succeeded" and not attempt.get("outputs")  # no outputs, no heads
+    assert attempt["outcome"] == "succeeded" and not attempt.get("outputs")  # no outputs, no heads
     spec = await state.attempt_spec(detail["request"]["id"], attempt["id"])
     assert spec["inputs"]["feed"]["ref"]["output"] == "feed"  # lineage is the spec
 
@@ -1392,7 +1392,7 @@ async def test_a_page_looks_ahead_a_bounded_way(state, monkeypatch):
     detail = await drive(engine, await engine.submit(["sparse"], upstream=True))
     assert status_of(detail) == "succeeded"
     assert calls == [([f"k0{i}" for i in range(5)], False), ([f"k0{i}" for i in range(5, 10)], False)]
-    assert state.model.partition("sparse", "")["drained"] is True  # the empty rest, skipped
+    assert state.model.partition("sparse", "")["caught_up"] is True  # the empty rest, skipped
 
 
 async def test_an_unchanged_keyed_write_still_applies_its_migrations(state):

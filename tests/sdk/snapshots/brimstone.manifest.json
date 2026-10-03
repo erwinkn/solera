@@ -31,10 +31,10 @@
       ],
       "partitions": null,
       "placement": {
-        "environment": {},
+        "config": {},
         "executor": "local",
         "kind": "Local",
-        "placement": {}
+        "options": {}
       },
       "retention": null,
       "retries": {
@@ -105,10 +105,10 @@
         }
       },
       "placement": {
-        "environment": {},
+        "config": {},
         "executor": "local",
         "kind": "Local",
-        "placement": {}
+        "options": {}
       },
       "retention": null,
       "retries": {
@@ -168,10 +168,10 @@
         }
       },
       "placement": {
-        "environment": {},
+        "config": {},
         "executor": "local",
         "kind": "Local",
-        "placement": {}
+        "options": {}
       },
       "retention": null,
       "retries": {
@@ -263,13 +263,13 @@
       ],
       "partitions": null,
       "placement": {
-        "environment": {
+        "config": {
           "cluster": "lab",
           "region": "us-east-1"
         },
         "executor": "lab",
         "kind": "AWSECS",
-        "placement": {
+        "options": {
           "cpu": 4,
           "memory": 30000000000
         }
@@ -339,10 +339,10 @@
         }
       },
       "placement": {
-        "environment": {},
+        "config": {},
         "executor": "ingest",
         "kind": "Pool",
-        "placement": {
+        "options": {
           "cpu": 1,
           "memory": 4000000000
         }
@@ -416,10 +416,10 @@
       ],
       "partitions": null,
       "placement": {
-        "environment": {},
+        "config": {},
         "executor": "local",
         "kind": "Local",
-        "placement": {}
+        "options": {}
       },
       "retention": null,
       "retries": {
@@ -494,10 +494,10 @@
         }
       },
       "placement": {
-        "environment": {},
+        "config": {},
         "executor": "local",
         "kind": "Local",
-        "placement": {}
+        "options": {}
       },
       "retention": null,
       "retries": {
@@ -569,10 +569,10 @@
         }
       },
       "placement": {
-        "environment": {},
+        "config": {},
         "executor": "local",
         "kind": "Local",
-        "placement": {}
+        "options": {}
       },
       "retention": null,
       "retries": {
@@ -641,10 +641,10 @@
         }
       },
       "placement": {
-        "environment": {},
+        "config": {},
         "executor": "local",
         "kind": "Local",
-        "placement": {}
+        "options": {}
       },
       "retention": null,
       "retries": {
@@ -689,10 +689,10 @@
       ],
       "partitions": null,
       "placement": {
-        "environment": {},
+        "config": {},
         "executor": "local",
         "kind": "Local",
-        "placement": {}
+        "options": {}
       },
       "retention": null,
       "retries": {
@@ -738,10 +738,10 @@
       "outputs": [],
       "partitions": null,
       "placement": {
-        "environment": {},
+        "config": {},
         "executor": "local",
         "kind": "Local",
-        "placement": {}
+        "options": {}
       },
       "retention": null,
       "retries": {
@@ -1015,22 +1015,22 @@
     "id": "snapshot",
     "source": "explicit"
   },
-  "deploy": "052a43eec69a8aeb7eafb135303c347bac0f5413b918f4ed16ee9d8208705059",
+  "deploy": "c389e7dc92d447355a9f1fbdd33766f8be020a794a961c4f79ff83b4e6750e29",
   "errors": [],
   "executors": {
     "ingest": {
-      "environment": {},
+      "config": {},
       "kind": "Pool"
     },
     "lab": {
-      "environment": {
+      "config": {
         "cluster": "lab",
         "region": "us-east-1"
       },
       "kind": "AWSECS"
     },
     "local": {
-      "environment": {},
+      "config": {},
       "kind": "Local"
     }
   },
@@ -1363,7 +1363,7 @@
           "schema": "datasmart"
         },
         "meta": {
-          "external": true
+          "source": true
         },
         "output": "leach_crosswalk",
         "partition": "",
@@ -1384,7 +1384,7 @@
           "schema": "datasmart"
         },
         "meta": {
-          "external": true
+          "source": true
         },
         "output": "pmpt_project_matrix",
         "partition": "",
@@ -1405,7 +1405,7 @@
           "schema": "datasmart"
         },
         "meta": {
-          "external": true
+          "source": true
         },
         "output": "project_team_map",
         "partition": "",
@@ -1426,7 +1426,7 @@
           "schema": "datasmart"
         },
         "meta": {
-          "external": true
+          "source": true
         },
         "output": "psa_data",
         "partition": "",
@@ -1447,7 +1447,7 @@
           "schema": "datasmart"
         },
         "meta": {
-          "external": true
+          "source": true
         },
         "output": "psa_samples",
         "partition": "",
@@ -1468,7 +1468,7 @@
           "schema": "datasmart"
         },
         "meta": {
-          "external": true
+          "source": true
         },
         "output": "sample_id_crosswalk",
         "partition": "",
@@ -1488,7 +1488,7 @@
           "name": "uploads"
         },
         "meta": {
-          "external": true
+          "source": true
         },
         "output": "uploads",
         "partition": "",
@@ -1506,7 +1506,7 @@
           "name": "usgs_3dep_tiles"
         },
         "meta": {
-          "external": true
+          "source": true
         },
         "output": "usgs_3dep_tiles",
         "partition": "",
@@ -1527,7 +1527,7 @@
           "schema": "datasmart"
         },
         "meta": {
-          "external": true
+          "source": true
         },
         "output": "xrd_profex",
         "partition": "",
@@ -1548,7 +1548,7 @@
           "schema": "datasmart"
         },
         "meta": {
-          "external": true
+          "source": true
         },
         "output": "xrf",
         "partition": "",

@@ -20,7 +20,7 @@ const route = getRouteApi("/runs");
 export function filterOf(search: RunSearch): RunFilter {
   return {
     status: list(search.status),
-    trigger: list(search.trigger),
+    origin: list(search.origin),
     automation: list(search.automation),
     asset: list(search.asset),
     tag: list(search.tag),
@@ -94,11 +94,11 @@ export function Runs() {
             ]}
           />
           <FacetSelect
-            label="Trigger"
-            field="trigger"
-            facet={facets?.trigger}
-            value={search.trigger}
-            onChange={(v) => set({ trigger: v })}
+            label="Origin"
+            field="origin"
+            facet={facets?.origin}
+            value={search.origin}
+            onChange={(v) => set({ origin: v })}
           />
           <FacetSelect
             label="Automation"

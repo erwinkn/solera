@@ -13,7 +13,7 @@ import { Tooltip } from "@/ui/overlay";
 import { StatusBadge, StatusIcon } from "@/ui/status";
 
 const route = getRouteApi("/assets/$asset/partitions");
-const ORDER: PartitionStatus[] = ["failed", "running", "missing", "complete", "retired"];
+const ORDER: PartitionStatus[] = ["failed", "running", "missing", "materialized", "removed"];
 
 /** `day=2026-09-01,site=alpha` → {day: …, site: …}; a one-dimension key is itself. */
 function parse(partition: string, dims: string[]): Record<string, string> {
@@ -39,7 +39,7 @@ export function AssetPartitions() {
       <Card>
         <CardHeader
           title="Partitions"
-          description={`${plural(rows.length - counts.retired, "current key")}${counts.retired ? `, ${counts.retired} retired` : ""} · select one for its heads and last attempt`}
+          description={`${plural(rows.length - counts.removed, "current key")}${counts.removed ? `, ${counts.removed} retired` : ""} · select one for its heads and last attempt`}
           actions={
             <div className="flex flex-wrap gap-1.5">
               {ORDER.filter((s) => counts[s]).map((s) => (
@@ -103,7 +103,7 @@ function Cell({ row, selected, compact }: { row: PartitionRow; selected: boolean
           row.status === "missing"
             ? "border-theme border-dashed border-line-strong bg-surface"
             : toneSolid[t],
-          row.status === "retired" && "opacity-40",
+          row.status === "removed" && "opacity-40",
           row.status === "running" && "animate-[pulse-dot_1.6s_ease-in-out_infinite]",
           selected && "ring-2 ring-fg ring-offset-2 ring-offset-surface",
         )}

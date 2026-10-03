@@ -116,7 +116,7 @@ export interface AutomationDecl {
 }
 
 export interface Automation extends AutomationDecl {
-  last_at: number | null;
+  last_fired: number | null;
   last_run: string | null;
   last_deploy: string | null;
   pending: [string | null, string][];
@@ -173,7 +173,7 @@ export interface Diagnostics {
 
 export interface Head {
   ref: Ref;
-  complete: boolean;
+  materialized: boolean;
   asset?: string | null;
   version?: string;
   commit_number?: number;
@@ -206,7 +206,7 @@ export interface AssetStatus {
   updated_at: number | null;
 }
 
-export type PartitionStatus = "complete" | "missing" | "failed" | "running" | "retired";
+export type PartitionStatus = "materialized" | "missing" | "failed" | "running" | "removed";
 
 export interface PartitionOutcome {
   last_outcome: string;
@@ -239,7 +239,7 @@ export interface OutputHead {
   version: string | null;
   key_count: number | null;
   commit_number: number | null;
-  complete: boolean;
+  materialized: boolean;
   cursor: boolean;
   at: number;
   commit: string | null;
@@ -285,7 +285,7 @@ export interface FailurePartition {
   has_retries?: boolean;
 }
 
-export interface Failures {
+export interface FailedKeys {
   asset: string;
   partitions: FailurePartition[];
   deploy: number;
@@ -396,7 +396,7 @@ export interface Commit {
   added_keys: string[] | null;
   removed_keys: string[] | null;
   rows: number | null;
-  complete: boolean | null;
+  materialized: boolean | null;
   metadata: Json;
   generation: number;
 }
@@ -435,7 +435,7 @@ export interface RunRow {
   created_at: number;
   finished_at: number | null;
   status: RunStatus;
-  trigger: "manual" | "automation" | "sensor" | "commit" | string;
+  origin: "manual" | "automation" | "sensor" | "commit" | string;
   automation: string | null;
   by: string | null;
   source: string | null;
@@ -467,7 +467,7 @@ export interface Facet {
   count: number;
 }
 
-export type Facets = Record<"status" | "trigger" | "automation" | "by" | "source" | "asset" | "tag", Facet[]>;
+export type Facets = Record<"status" | "origin" | "automation" | "by" | "source" | "asset" | "tag", Facet[]>;
 
 export interface Histogram {
   bucket: number;
@@ -533,7 +533,7 @@ export interface Attempt extends Partial<Record<Phase, number>> {
   id: string;
   task: string;
   generation: number;
-  status: string;
+  outcome: string;
   started_at: number | null;
   finished_at?: number | null;
   error?: AttemptError | string | null;
@@ -630,7 +630,7 @@ export interface SensorView {
   due_in: number;
 }
 
-export interface SensorHost {
+export interface SensorWorker {
   id: string;
   executor: string;
   deploy: string;

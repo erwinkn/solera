@@ -9,7 +9,7 @@ import asyncio
 import json
 from collections import Counter
 
-from solera.failures import GONE, NAMES, OK, Record, eligible
+from solera.failed_keys import GONE, NAMES, OK, Record, eligible
 from solera.keys.index import KeyIndex, key_bytes, key_str
 from solera.patterns import Matcher
 
@@ -59,11 +59,11 @@ class Views:
             for partition in sorted(partitions):
                 head, record = scoped.get(partition), recorded.get(partition)
                 last = (record or {}).get("outcome")
-                done = planner.complete(asset, partition)
+                done = planner.materialized(asset, partition)
                 status = (
-                    "retired"
+                    "removed"
                     if not current(partition)
-                    else "complete"
+                    else "materialized"
                     if done
                     else "running"
                     if partition in pending
@@ -84,7 +84,7 @@ class Views:
 
     async def asset_statuses(self) -> dict[str, dict]:
         """One rollup per asset, for the console's graph and list: its scopes
-        by status — `total` counts the current ones, `retired` those past
+        by status — `total` counts the current ones, `removed` those past
         them — its newest outcome, an `Each` asset's failing keys by class
         (null for any other), its held scopes, the scopes of its outputs a
         dead writer left unsettled, and when an output last changed. Counted
@@ -99,12 +99,12 @@ class Views:
         for name in names:
             counts = Counter(row["status"] for row in statuses[name])
             total = planning.size(planner.dims(name), planner.time, planner.dynamic_partitions)
-            missing = total - counts["complete"] - counts["failed"] - counts["running"]
+            missing = total - counts["materialized"] - counts["failed"] - counts["running"]
             out[name] = {
                 "partitions": {
                     "total": total,
                     "missing": missing,
-                    **{s: counts[s] for s in ("complete", "failed", "running", "retired")},
+                    **{s: counts[s] for s in ("materialized", "failed", "running", "removed")},
                 },
                 "partitioned": bool(planner.dims(name)),
                 "last": None,

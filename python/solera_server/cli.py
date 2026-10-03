@@ -65,7 +65,7 @@ async def _local_engine(args):
     manifest persisted by the last registration."""
 
     from .engine import Engine
-    from .placements.local import load_manifest
+    from .executors.local import load_manifest
     from .state import State
 
     state = await State.open(args.state_url, args.namespace)
@@ -253,7 +253,7 @@ def _main():
 
 async def _dispatch(args, parser):
     if args.command == "manifest":
-        from .placements.local import load_manifest
+        from .executors.local import load_manifest
 
         print(json.dumps(await load_manifest(args.project), indent=2))
         return

@@ -195,7 +195,7 @@ def test_an_empty_fan_in_is_missing():
             lambda o, s: heads.get((o, s)),
             lambda o: [(s, h) for (out, s), h in heads.items() if out == o],
             now,
-            drained=lambda a, s: drained.get((a, s), False),
+            caught_up=lambda a, s: drained.get((a, s), False),
         )
         run = planner.plan_run([target], partitions="all", **kw)
         return (
@@ -373,7 +373,7 @@ async def test_a_source_change_fans_out_over_a_partitioned_consumer(state):  # n
 
 
 async def test_a_change_during_a_run_is_kept_for_after_it(state):  # noqa: F811
-    from solera_server.placements.inline import InlinePlacement
+    from solera_server.executors.inline import InlinePlacement
 
     release, calls = asyncio.Event(), []
 

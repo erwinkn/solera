@@ -100,11 +100,11 @@ class JsonTableStore:
                     Ref(out.name, "", {**handle, "commit_number": context.commit_number}, context.partition)
                 )
             write = KeyedWrite.of(self, write, out, prior)
-            if write.whole:  # the scope's whole content: clear it first
+            if write.reset:  # the scope's whole content: clear it first
                 cur.execute(f"DELETE FROM {table} WHERE part = %s", (context.partition,))
             for chunk in write.iter_chunks():  # the keys to write: (key, rows)
                 keys = [k for k, _ in chunk]
-                if not write.whole:
+                if not write.reset:
                     cur.execute(
                         f"DELETE FROM {table} WHERE part = %s AND k = ANY(%s)", (context.partition, keys)
                     )

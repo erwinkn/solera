@@ -190,7 +190,7 @@ function RunForm({
               {partitions && (
                 <div className="flex max-h-24 flex-wrap gap-1 overflow-y-auto">
                   {partitions
-                    .filter((p) => p.status !== "retired")
+                    .filter((p) => p.status !== "removed")
                     .map((p) => (
                       <button
                         key={p.partition}

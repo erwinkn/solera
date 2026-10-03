@@ -14,8 +14,8 @@ from solera.keys.index import DeltaFiles, IndexState, KeyIndex, Options
 from solera.sdk import DynamicPartitions, Incremental, Output, Project, Ref, Source, asset
 from solera.stores import FileStore, Patch
 from solera_server.engine import Engine
+from solera_server.executors.inline import InlinePlacement
 from solera_server.keyservice import KeyService
-from solera_server.placements.inline import InlinePlacement
 from solera_server.state import State
 
 from tests.conftest import whole
@@ -709,11 +709,11 @@ async def test_collection_waits_for_the_engines_own_readers(state):
     await run(engine, ["items"])
     path = "keys/items/_/gone.kx"
     await state.put_object(path, b"x")
-    state.model.garbage.append([path, state.model.applied])
+    state.model.garbage.append([path, state.model.event_counter])
 
     class Reading:
         def floor(self):
-            return state.model.applied - 1  # a fill that read the index before the file was let go of
+            return state.model.event_counter - 1  # a fill that read the index before the file was let go of
 
     engine.upkeep.keys, keys = Reading(), engine.upkeep.keys
     await engine.upkeep.collect()

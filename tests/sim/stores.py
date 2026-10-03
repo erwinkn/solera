@@ -124,11 +124,11 @@ class TableStore:
                     )
                 )
             keyed = KeyedWrite.of(self, write, out, base)
-            if keyed.whole or reset:
+            if keyed.reset or reset:
                 rows.clear()
             for chunk in keyed.iter_chunks():
                 keys = {k for k, _ in chunk}
-                if not keyed.whole:
+                if not keyed.reset:
                     rows[:] = [r for r in rows if r[0] not in keys]
                 rows.extend((k, None, dict(r)) for k, group in chunk for r in group)
             if keyed.removes:

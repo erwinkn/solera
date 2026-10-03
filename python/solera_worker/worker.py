@@ -232,11 +232,11 @@ class Ctx:
         self.batch = batch
         self.run_id = spec["run"]["id"]
         self.config = spec["run"].get("config") or {}
-        self.execution = spec.get("execution") or {
+        self.placement = spec.get("placement") or {
             "executor": "local",
             "kind": "Local",
-            "environment": {},
-            "placement": {},
+            "config": {},
+            "options": {},
         }
         self._stores = project.stores
         self._outputs = [o.name or asset.name for o in asset.outputs]
@@ -772,12 +772,12 @@ def _keyed_write(o: _Out, keys_io) -> KeyedWrite:
         # collects it: exactly the keys the delta writes, paged from its files
         # when there are too many to list (docs/lifecycle.md §9.8).
         if changed is None:
-            return KeyedWrite(p, DeltaKeys(keys_io, o.index.prefix, tuple(o.files.files)), whole=o.replace)
-        return KeyedWrite(p, upserted, deleted, whole=o.replace)
+            return KeyedWrite(p, DeltaKeys(keys_io, o.index.prefix, tuple(o.files.files)), reset=o.replace)
+        return KeyedWrite(p, upserted, deleted, reset=o.replace)
     if o.reset or (o.replace and (changed is None or o.repairs)):
         # A first write, or a replacement with more changes than it lists, or with
         # dead attempts': the scope rewritten.
-        return KeyedWrite(p, whole=True)
+        return KeyedWrite(p, reset=True)
     if o.replace:
         return KeyedWrite(p, upserted, deleted)
     # A patch: its own keys — not those a repair found in the store, which are

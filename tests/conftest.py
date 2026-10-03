@@ -75,7 +75,7 @@ async def worker_finished() -> None:
     """Every in-process worker done — past its commit, its discards too
     (docs/lifecycle.md §9.8): a run is settled before its worker ends."""
 
-    from solera_server.placements.inline import InlinePlacement
+    from solera_server.executors.inline import InlinePlacement
 
     while running := [t for t in InlinePlacement._tasks.values() if not t.done()]:
         await asyncio.wait(running)

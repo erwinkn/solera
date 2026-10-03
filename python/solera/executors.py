@@ -38,19 +38,19 @@ class Placement:
 
     executor: str
     kind: str
-    environment: dict
+    config: dict
     options: dict
 
     def serialized(self) -> dict:
         return {
             "executor": self.executor,
             "kind": self.kind,
-            "environment": self.environment,
-            "placement": self.options,
+            "config": self.config,
+            "options": self.options,
         }
 
 
-class Environment:
+class Executor:
     kind = "?"
     allowed: frozenset[str] = frozenset()
 
@@ -76,7 +76,7 @@ class Environment:
         return self._placement(self._check(options, set(self.allowed)))
 
 
-class Local(Environment):
+class Local(Executor):
     """In-process/subprocess on the engine host, always named `local`. No options."""
 
     kind = "Local"
@@ -88,7 +88,7 @@ class Local(Environment):
         return self._placement(self._check(options, set()))
 
 
-class AWSECS(Environment):
+class AWSECS(Executor):
     kind = "AWSECS"
 
     def __init__(self, name: str, *, cluster: str, region: str):
@@ -103,7 +103,7 @@ class AWSECS(Environment):
         )
 
 
-class K8sJob(Environment):
+class K8sJob(Executor):
     kind = "K8sJob"
 
     def __init__(self, name: str, *, cluster: str, namespace: str = "default"):
@@ -115,7 +115,7 @@ class K8sJob(Environment):
         )
 
 
-class Modal(Environment):
+class Modal(Executor):
     kind = "Modal"
 
     def __init__(self, name: str, *, app: str):
@@ -125,7 +125,7 @@ class Modal(Environment):
         return self._placement(self._check({"gpu": gpu}, {"gpu"}))
 
 
-class Pool(Environment):
+class Pool(Executor):
     """Pull path: external workers claim stages through the API (§10). The
     executor's name is the pool's."""
 

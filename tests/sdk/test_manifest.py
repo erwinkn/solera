@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 import pytest
-from solera.executors import Environment
+from solera.executors import Executor
 from solera.sdk import (
     Automation,
     Cron,
@@ -402,7 +402,7 @@ def test_unregistered_placement_kind():
     """§10/§11: a custom kind's executor must be registered, and a name
     means one executor."""
 
-    class Custom(Environment):
+    class Custom(Executor):
         kind = "Custom"
         allowed = frozenset({"cpu"})
 
@@ -415,7 +415,7 @@ def test_unregistered_placement_kind():
     with pytest.raises(RegistrationError, match="kind"):
         Project(assets=[a])
     project = Project(assets=[a], executors=[custom])
-    assert project.manifest["executors"] == {"custom": {"kind": "Custom", "environment": {"zone": "a"}}}
+    assert project.manifest["executors"] == {"custom": {"kind": "Custom", "config": {"zone": "a"}}}
     with pytest.raises(RegistrationError, match="custom"):
         Project(assets=[a], executors=[Custom("custom", zone="b")])
 
@@ -441,7 +441,7 @@ def test_source_synthesized_head():
 
     project = Project(sources=[Source("ext", key="id", region="us")])
     head = project.manifest["sources"]["ext"]["head"]
-    assert head["meta"]["external"] is True
+    assert head["meta"]["source"] is True
     assert head["handle"]["region"] == "us"
     assert head["generation"] == 0  # no commit wrote it yet
 

@@ -70,7 +70,7 @@ async def test_a_failure_record_lives_in_its_entry_across_a_restart(state, tmp_p
 
     import time
 
-    from solera.failures import RETRYING
+    from solera.failed_keys import RETRYING
     from solera.keys.index import KeyIndex, key_str
     from solera.keys.io import ObjectIO
 
@@ -110,7 +110,7 @@ async def test_a_failure_record_lives_in_its_entry_across_a_restart(state, tmp_p
     await engine.initialize()
     index = KeyIndex(ObjectIO(again.objects), None, again.model.index("@parse", "").pinned())
     found = await index.lookup([b"a.csv"])
-    from solera.failures import Record
+    from solera.failed_keys import Record
 
     assert {key_str(k): Record.decode(p) for k, (_, p) in found.items()} == {"a.csv": record}
     skew["seconds"] = 7200.0  # two hours on: its retry is due

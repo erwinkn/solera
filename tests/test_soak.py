@@ -28,7 +28,7 @@ import pytest
 from solera.ids import ulid_time
 from solera.sdk import Ref
 from solera_server.engine import Engine
-from solera_server.placements.inline import InlinePlacement
+from solera_server.executors.inline import InlinePlacement
 from solera_server.state import State
 
 from tests.conftest import whole

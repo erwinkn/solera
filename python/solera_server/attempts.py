@@ -273,7 +273,7 @@ class Attempts:
         spec, live.reads = live.reads, None  # answered once: a retried start reads the store
         if spec is not None and self.keys is not None:
             # The attempt's input reads, from the engine's cache (docs/resolved-commits.md §7).
-            reads = await self.keys.reads(spec, self.m.applied)
+            reads = await self.keys.reads(spec, self.m.event_counter)
             if reads is not None:
                 answer["reads"] = reads
         return answer
@@ -379,11 +379,11 @@ class Attempts:
             return Prepared(
                 partition,
                 int(info["commit_number"]),
-                int(launched["pin"]),
+                int(launched["generation"]),
                 index,
                 int(head.get("commit_number", -1)),
                 True,
-                self.m.applied,  # the index as of now: what a fill of it reads
+                self.m.event_counter,  # the index as of now: what a fill of it reads
             )
 
         def still_live():
@@ -395,7 +395,7 @@ class Attempts:
             launched.get("prepared") or {}, {o["name"]: o["name"] for o, _ in outputs_asked}
         )
         resolved = {name: prepared(current) for current, name in asked.items()}  # by the worker's names
-        return await self.keys.resolve(attempt, body, resolved.get, still_live, self.m.applied)
+        return await self.keys.resolve(attempt, body, resolved.get, still_live, self.m.event_counter)
 
     def attempt_lines(self, attempt: str) -> list[str] | None:
         live = self.live.get(attempt)
@@ -463,11 +463,11 @@ class Attempts:
             "run": {"id": task["run"], "config": run.get("config") or {}},
             "outputs": {name: worker_output(info) for name, info in prepared["outputs"].items()},
             "inputs": prepared["inputs"],
-            "execution": self.manifest["assets"][task["asset"]]["placement"],
+            "placement": self.manifest["assets"][task["asset"]]["placement"],
             "heartbeat": self.heartbeat_seconds,
             "engine": self.engine_url,
             "token": lifecycle.token(await self._load_secret(), attempt),
-            "generation": claim["pin"],  # chosen before the spec (§9.7)
+            "generation": claim["generation"],  # chosen before the spec (§9.7)
         }
         if prepared["cursor"] is not None:
             spec["cursor"] = prepared["cursor"]
@@ -478,22 +478,20 @@ class Attempts:
         claim = self.m.claimed(attempt)
         if claim is None:
             raise LostOwnership(attempt)  # canceled while the spec was written
-        execution = spec["execution"]
+        execution = spec["placement"]
         event = {
             "type": "AttemptLaunched",
             "run": task["run"],
             "task": task["id"],
             "attempt": attempt,
             "started_at": claim["started_at"],
-            "pin": claim["pin"],
+            "generation": claim["generation"],
             "at": self.clock(),
             "execution": execution,
             "prepared": self._durable(prepared),
         }
         if execution["kind"] == "Pool":
-            needs = {
-                k: v for k in ("cpu", "memory", "gpu") if (v := execution["placement"].get(k)) is not None
-            }
+            needs = {k: v for k in ("cpu", "memory", "gpu") if (v := execution["options"].get(k)) is not None}
             event["pool"] = {"name": execution["executor"], "needs": needs}
         self.state.record(event)
         # Launch only what a restarted engine would adopt, never an orphan.
@@ -638,7 +636,7 @@ class Attempts:
             else:
                 continue
             phase = "requested" if live.started and now < forced_by else "forced"
-            record = lifecycle.latch(live.cancel, Cancel(phase, reason, self.m.applied))
+            record = lifecycle.latch(live.cancel, Cancel(phase, reason, self.m.event_counter))
             if record != live.cancel:
                 live.cancel = record
                 if record.phase == "requested" and forced_by == math.inf:
@@ -646,7 +644,7 @@ class Attempts:
                     continue
             if live.cancel.phase == "requested" and now < forced_by:
                 continue
-            live.cancel = lifecycle.latch(live.cancel, Cancel("forced", reason, self.m.applied))
+            live.cancel = lifecycle.latch(live.cancel, Cancel("forced", reason, self.m.event_counter))
             result = await self.state.attempt_result(run_id, attempt)
             if result is not None:  # published before the force: it stands
                 return await self._settle(

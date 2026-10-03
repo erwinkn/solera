@@ -6,7 +6,7 @@ import copy
 
 import pytest
 from solera import Abort, Rejected, Transient
-from solera.failures import FAILED, REJECTED, RETRYING, Record
+from solera.failed_keys import FAILED, REJECTED, RETRYING, Record
 from solera.keys.index import KeyIndex, key_str
 from solera.keys.io import ObjectIO
 from solera.sdk import Each, Output, Project, Ref, RegistrationError, Result, Retry, asset
@@ -330,7 +330,7 @@ async def test_a_user_cancel_commits_finished_keys_and_leaves_the_rest_dormant(t
     watermark past the whole page (§5); canceled keys never come due by
     themselves (§9)."""
 
-    from solera.failures import CANCELED
+    from solera.failed_keys import CANCELED
     from solera_server.state import State
 
     from .test_fence import engine_for, until
@@ -360,7 +360,7 @@ async def test_a_user_cancel_commits_finished_keys_and_leaves_the_rest_dormant(t
     detail = await engine.run_until(run["id"], 15)
     assert detail["request"]["status"] == "canceled"
     [attempt] = detail["attempts"][detail["tasks"][0]["id"]]
-    assert attempt["status"] == "canceled" and attempt["keys"] == {"ok": 1, "canceled": 2}
+    assert attempt["outcome"] == "canceled" and attempt["keys"] == {"ok": 1, "canceled": 2}
     assert set(await rows_of(engine, project, "rows")) == {"a"}
     found = await records(engine, "parse")
     assert {k: r.outcome for k, r in found.items()} == {"b": CANCELED, "c": CANCELED}
@@ -449,7 +449,7 @@ async def test_the_retry_clock_runs_automated_assets(state):  # noqa: F811
 
 
 async def test_a_timeout_drain_counts_a_try_and_comes_due(tmp_path):
-    from solera.failures import TIMED_OUT
+    from solera.failed_keys import TIMED_OUT
     from solera_server.state import State
 
     from .test_fence import engine_for
@@ -477,8 +477,8 @@ async def test_a_timeout_drain_counts_a_try_and_comes_due(tmp_path):
     await engine.run_until((await engine.submit(["files"]))["id"], 10)
     detail = await engine.run_until((await engine.submit(["parse"]))["id"], 15)
     attempt, *rest = detail["attempts"][detail["tasks"][0]["id"]]
-    assert attempt["status"] == "failed" and attempt["keys"] == {"ok": 1, "timed_out": 1}
-    assert [a["status"] for a in rest] == ["skipped"]  # the retry finds nothing due yet
+    assert attempt["outcome"] == "failed" and attempt["keys"] == {"ok": 1, "timed_out": 1}
+    assert [a["outcome"] for a in rest] == ["skipped"]  # the retry finds nothing due yet
     assert set(await rows_of(engine, project, "rows")) == {"a"}
     record = (await records(engine, "parse"))["b"]
     assert record.outcome == TIMED_OUT and record.tries == 1 and record.next_at >= record.last + 60
@@ -593,14 +593,14 @@ async def test_a_rescope_pins_its_snapshot_between_attempts(state):  # noqa: F81
     await engine.initialize()
     path = "keys/files/_/old.kx"
     await state.put_object(path, b"x")
-    engine.m.garbage.append([path, engine.m.applied + 5])  # let go of after the pin below
+    engine.m.garbage.append([path, engine.m.event_counter + 5])  # let go of after the pin below
     engine.m._partition("parse", "")["bookmarks"] = {
         "file": {
             "kind": "keys",
             "output": "files",
             "upstream_partition": "",
             "next": 3,
-            "pattern_change": {"pin": engine.m.applied, "at": 2},
+            "pattern_change": {"pin": engine.m.event_counter, "at": 2},
             "pass": {"mode": "diff", "at": "k", "page": 1, "pages": 2},
         }
     }
@@ -663,8 +663,8 @@ async def test_a_last_page_that_writes_nothing_still_completes_the_scope(state):
     written = engine.m.heads[("samples", "")]
     task = next(t for t in detail["tasks"] if t["asset"] == "parse")
     assert written["attempt"] == detail["attempts"][task["id"]][0]["id"]  # a's page wrote it
-    assert engine.m.partition("parse", "")["drained"] is True
+    assert engine.m.partition("parse", "")["caught_up"] is True
     planner = engine.planner()
-    assert planner.complete("parse", "") and planner.partitions("parse", "missing") == []
-    assert engine.head_view(written)["complete"] is True
+    assert planner.materialized("parse", "") and planner.partitions("parse", "missing") == []
+    assert engine.head_view(written)["materialized"] is True
     assert (await records(engine, "parse"))["b.csv"].outcome == FAILED

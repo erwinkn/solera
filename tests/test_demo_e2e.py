@@ -146,11 +146,11 @@ def test_demo_end_to_end(demo, pool_worker):
     # Every output has a complete head for every planned scope.
     def all_complete():
         all_heads = {o: heads(o) for o in OUTPUTS}
-        return all(hs and all(h["complete"] for h in hs) for hs in all_heads.values())
+        return all(hs and all(h["materialized"] for h in hs) for hs in all_heads.values())
 
     assert wait(all_complete), {o: heads(o) for o in OUTPUTS}
     for h in heads("upload_record"):
-        assert h["complete"], "pool task staged, claimed, and completed"
+        assert h["materialized"], "pool task staged, claimed, and completed"
 
     # The pool worker registered itself (§10 pull protocol).
     workers = client.get(f"{base}/workers").json()["workers"]
@@ -220,7 +220,7 @@ def test_demo_end_to_end(demo, pool_worker):
             continue
         assert task["attempt_count"] >= 2, "page_size=2 over 4 files must continue with more"
         for attempt in detail["attempts"][task["id"]]:
-            if attempt["status"] != "succeeded":
+            if attempt["outcome"] != "succeeded":
                 continue
             result = client.get(f"{base}/runs/{delta}/attempts/{attempt['id']}/result").json()
             page = result["delivered"]["site_files"]

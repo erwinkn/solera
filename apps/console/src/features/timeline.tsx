@@ -44,7 +44,7 @@ function PhaseTip({ attempt, end }: { attempt: Attempt; end: number }) {
     <div className="flex min-w-44 flex-col gap-1">
       <span className="flex items-center justify-between gap-4 font-medium">
         <span>
-          Attempt {attempt.generation} · {label(attempt.status)}
+          Attempt {attempt.generation} · {label(attempt.outcome)}
         </span>
         <span className="tabular">{duration(total)}</span>
       </span>
@@ -66,7 +66,7 @@ function PhaseTip({ attempt, end }: { attempt: Attempt; end: number }) {
 export function PhaseBar({ attempt, end, className }: { attempt: Attempt; end: number; className?: string }) {
   const phases = phasesOf(attempt);
   const total = phases.reduce((sum, p) => sum + p.seconds, 0);
-  const live = ACTIVE.has(attempt.status);
+  const live = ACTIVE.has(attempt.outcome);
   const span = Math.max(total, end - (attempt.started_at ?? end));
   return (
     <div className={cn("flex h-full w-full gap-[2px] overflow-hidden rounded-mark", className)}>
@@ -87,7 +87,7 @@ export function PhaseBar({ attempt, end, className }: { attempt: Attempt; end: n
             "h-full min-w-[3px] flex-1",
             live
               ? "bg-[repeating-linear-gradient(135deg,var(--run)_0_4px,var(--run-soft)_4px_8px)] bg-[length:16px_100%] animate-[march_0.8s_linear_infinite]"
-              : toneSolid[tone(attempt.status)],
+              : toneSolid[tone(attempt.outcome)],
           )}
           style={{
             flexGrow: live ? Math.max(0.02, (span - total) / (span || 1)) : 1,
@@ -142,7 +142,7 @@ export function Waterfall({
     ...Object.values(attempts)
       .flat()
       .map(
-        (a) => a.finished_at ?? (a.started_at != null && ACTIVE.has(a.status) ? now : (a.started_at ?? 0)),
+        (a) => a.finished_at ?? (a.started_at != null && ACTIVE.has(a.outcome) ? now : (a.started_at ?? 0)),
       ),
   );
   const span = Math.max(0.001, latest - start);
@@ -151,7 +151,7 @@ export function Waterfall({
     .filter((a) => a.started_at != null)
     .map(
       (a) =>
-        [a.started_at!, a.finished_at ?? (ACTIVE.has(a.status) ? now : a.started_at!)] as [number, number],
+        [a.started_at!, a.finished_at ?? (ACTIVE.has(a.outcome) ? now : a.started_at!)] as [number, number],
     );
   const scale = timeScale(start, start + span, intervals);
   const pos = (t: number) => scale.at(t);
@@ -294,7 +294,7 @@ export function Waterfall({
                 })}
                 {list.map((attempt) => {
                   if (attempt.started_at == null) return null;
-                  const stop = attempt.finished_at ?? (ACTIVE.has(attempt.status) ? now : attempt.started_at);
+                  const stop = attempt.finished_at ?? (ACTIVE.has(attempt.outcome) ? now : attempt.started_at);
                   const left = pos(attempt.started_at);
                   const width = Math.max(0.6, pos(stop) - left);
                   const active =
@@ -311,7 +311,7 @@ export function Waterfall({
                           attempt: attempt.id,
                         })}
                         replace
-                        aria-label={`${task.asset} ${task.partition} attempt ${attempt.generation}: ${label(attempt.status)}, ${duration(stop - attempt.started_at)}`}
+                        aria-label={`${task.asset} ${task.partition} attempt ${attempt.generation}: ${label(attempt.outcome)}, ${duration(stop - attempt.started_at)}`}
                         className={cn(
                           "absolute top-1/2 h-3.5 -translate-y-1/2 rounded-mark p-[1.5px]",
                           active ? "ring-2 ring-fg" : "hover:ring-2 hover:ring-line-strong",

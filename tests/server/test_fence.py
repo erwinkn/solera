@@ -8,17 +8,17 @@ import json
 import pytest
 from obstore.exceptions import AlreadyExistsError
 from solera import lifecycle
-from solera.executors import Environment
+from solera.executors import Executor
 from solera.sdk import Output, Project, Ref, Result, Retry, asset
 from solera.stores import FileStore, KeyedWrite, Keys, Patch, Written
 from solera_server.engine import Engine
-from solera_server.placements.inline import InlinePlacement
+from solera_server.executors.inline import InlinePlacement
 from solera_server.state import State
 
 from tests.conftest import whole
 
 
-class Fake(Environment):
+class Fake(Executor):
     kind = "Fake"
 
 
@@ -261,7 +261,7 @@ async def test_an_attempt_whose_launch_was_cut_short_is_resumed(tmp_path):
     await finish_as_worker(state, run["id"], attempt, "remote")
     detail = await engine.run_until(run["id"], 10)
     assert detail["request"]["status"] == "succeeded"
-    assert [a["status"] for a in detail["attempts"][detail["tasks"][0]["id"]]] == ["succeeded"]
+    assert [a["outcome"] for a in detail["attempts"][detail["tasks"][0]["id"]]] == ["succeeded"]
     await engine.stop()
     await state.close()
 
@@ -555,7 +555,7 @@ async def test_a_dead_immutable_write_leaves_nothing_to_repair(tmp_path, data, m
     detail = await engine.run_until((await engine.submit(["scores"]))["id"], 20)
     assert detail["request"]["status"] == "succeeded", detail
     first, second = detail["attempts"][detail["tasks"][0]["id"]]
-    assert first["status"] == "failed" and second["status"] == "succeeded"
+    assert first["outcome"] == "failed" and second["outcome"] == "succeeded"
     assert state.model.repairs == {}
     ref = Ref.from_json(state.model.heads[("scores", "")]["ref"])
     assert await project.stores["default"].load(ref, None, await whole(state, "scores")) == {"a": 1, "b": 1}
@@ -640,14 +640,14 @@ async def test_a_result_that_fails_to_publish_stays_what_it_was(tmp_path, monkey
     await engine.initialize()
     detail = await engine.run_until((await engine.submit(["scores"]))["id"], 10)
     [attempt] = detail["attempts"][detail["tasks"][0]["id"]]
-    assert attempt["status"] == "succeeded" and len(puts) == 2 and puts[0] == puts[1]
+    assert attempt["outcome"] == "succeeded" and len(puts) == 2 and puts[0] == puts[1]
     result = await state.attempt_result(detail["request"]["id"], attempt["id"])
     assert result["status"] == "succeeded" and result["log"]["tail"]
     assert b"scoring" in await state.attempt_log(detail["request"]["id"], attempt["id"])
 
     detail = await engine.run_until((await engine.submit(["scores"]))["id"], 20)
     first, second = detail["attempts"][detail["tasks"][0]["id"]]
-    assert "without a result" in first["error"] and second["status"] == "succeeded"
+    assert "without a result" in first["error"] and second["outcome"] == "succeeded"
     await engine.stop()
     await state.close()
 
@@ -670,7 +670,7 @@ async def test_garbage_waits_for_attempts_claimed_before_it_whatever_the_clocks(
     path = f"{state.model.index('remote', '').prefix}merged-away.kx"  # a file of what it writes
     await state.put_object(path, b"entries")
     state.record({"type": "AutomationChanged", "name": "none", "enabled": True})  # a later position
-    state.model.garbage.append([path, state.model.applied])
+    state.model.garbage.append([path, state.model.event_counter])
     await engine.upkeep.collect()
     assert await state.get_object(path) is not None  # the attempt may still read it
     await finish_as_worker(state, run["id"], attempt, "remote")
@@ -849,10 +849,10 @@ async def test_a_malformed_discard_report_is_refused(tmp_path, world, body):
     engine = engine_for(state, REMOTE)
     await engine.initialize()
     _, attempt = await launched(engine, ["remote"])
-    applied = state.model.applied
+    applied = state.model.event_counter
     with pytest.raises(ValueError):
         await engine.attempt_cleaned_up(attempt, body)
-    assert state.model.applied == applied and not state.poisoned and world.exits == []
+    assert state.model.event_counter == applied and not state.poisoned and world.exits == []
     await engine.stop()
     await state.close()
 
@@ -881,7 +881,9 @@ async def test_an_event_its_reducer_cannot_apply_ends_the_process(tmp_path, worl
         await asyncio.sleep(0.01)
     assert world.exits == [EXIT_BROKEN]
     replayed = await State.open(url, "test", writer=False)  # what the restart replays
-    assert replayed.model.applied == state.model.applied - 1  # all but the failed event: it was never written
+    assert (
+        replayed.model.event_counter == state.model.event_counter - 1
+    )  # all but the failed event: it was never written
     assert state.journal.written == state.journal.appended
 
 
@@ -996,7 +998,7 @@ async def test_a_rename_moves_a_launched_attempt_with_its_scope(tmp_path):
     for _ in range(10):
         await engine.tick()
         await asyncio.sleep(0.02)
-    assert Remote.launches == [attempt] and list(state.model.locks) == [("renamed", "")]
+    assert Remote.launches == [attempt] and list(state.model.claimed_partitions) == [("renamed", "")]
     await finish_as_worker(state, run["id"], attempt, "remote")
     assert (await engine.run_until(run["id"], 10))["request"]["status"] == "succeeded"
     assert list(state.model.heads) == [("renamed", "")]

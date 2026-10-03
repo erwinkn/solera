@@ -59,7 +59,7 @@ export function AssetLayout() {
   const kind = kindOf(asset);
   const tabs = tabsOf(asset);
   const tone = assetTone(status);
-  const partitions = (rows ?? []).filter((p) => p.status !== "retired").map((p) => p.partition);
+  const partitions = (rows ?? []).filter((p) => p.status !== "removed").map((p) => p.partition);
 
   return (
     <Page>
@@ -135,8 +135,8 @@ export function AssetLayout() {
             {status && (
               <span>
                 {status.partitioned
-                  ? `${status.partitions.complete}/${status.partitions.total} partitions complete`
-                  : status.partitions.complete
+                  ? `${status.partitions.materialized}/${status.partitions.total} partitions materialized`
+                  : status.partitions.materialized
                     ? "materialized"
                     : "not materialized"}
               </span>
@@ -337,8 +337,8 @@ function Heads({
                   <Td className="text-right">{head.count != null ? count(head.count) : "—"}</Td>
                   <Td className="text-right text-fg-muted">{head.commit_number ?? "—"}</Td>
                   <Td>
-                    {head.complete ? (
-                      <StatusBadge status="complete" />
+                    {head.materialized ? (
+                      <StatusBadge status="materialized" />
                     ) : (
                       <Tooltip content="An incremental delivery is still paging: more attempts will complete this head.">
                         <span>
@@ -511,7 +511,7 @@ export function AutomationsCard({ automations }: { automations: Automation[] }) 
                   {a.partitions && typeof a.partitions === "string" && ` · ${a.partitions}`}
                 </span>
                 <span className="text-2xs text-fg-subtle">
-                  last {a.last_at ? <Time at={a.last_at} /> : "never"}
+                  last {a.last_fired ? <Time at={a.last_fired} /> : "never"}
                   {a.next_at != null && a.enabled && ` · next ${until(a.next_at, now)}`}
                   {a.pending.length > 0 && ` · ${plural(a.pending.length, "change")} pending`}
                 </span>

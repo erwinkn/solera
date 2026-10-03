@@ -23,7 +23,7 @@ from solera.sdk import (
 from solera_server import views
 from solera_server.api import create_app
 from solera_server.engine import Engine
-from solera_server.placements.inline import InlinePlacement
+from solera_server.executors.inline import InlinePlacement
 from solera_server.state import State
 
 
@@ -118,11 +118,11 @@ async def test_assets_status_rolls_up_every_asset(world):
     parse = status["parse"]
     assert parse["partitions"] == {
         "total": 1,
-        "complete": 1,
+        "materialized": 1,
         "missing": 0,
         "failed": 0,
         "running": 0,
-        "retired": 0,
+        "removed": 0,
     }
     assert parse["partitioned"] is False and parse["failures"] == {"rejected": 1, "failed": 1}
     assert parse["last"]["outcome"] == "succeeded" and parse["last"]["attempt"].count("/") == 1
@@ -130,21 +130,21 @@ async def test_assets_status_rolls_up_every_asset(world):
     assert status["files"]["failures"] is None  # no Each edge
     consume = status["consume"]
     assert consume["partitioned"] and consume["partitions"]["total"] == 2
-    assert (consume["partitions"]["complete"], consume["partitions"]["missing"]) == (1, 1)
+    assert (consume["partitions"]["materialized"], consume["partitions"]["missing"]) == (1, 1)
     # A job has no head: it is complete once it succeeded.
-    assert status["notify"]["partitions"]["complete"] == 1 and status["notify"]["updated_at"] is None
+    assert status["notify"]["partitions"]["materialized"] == 1 and status["notify"]["updated_at"] is None
 
     # The rollup is not an asset name, and /partitions reads the same statuses.
     assert (await client.get(f"{base}/assets/assets:status")).status_code == 404
     parts = (await client.get(f"{base}/partitions/consume")).json()["partitions"]
-    assert {p["partition"]: p["status"] for p in parts} == {"x": "complete", "y": "missing"}
+    assert {p["partition"]: p["status"] for p in parts} == {"x": "materialized", "y": "missing"}
 
 
 async def test_failures_list_page_and_filter(world, monkeypatch):
     engine, client, base, *_ = world
     await run(engine, ["parse"], upstream=True)
 
-    found = (await client.get(f"{base}/assets/parse/failures")).json()
+    found = (await client.get(f"{base}/assets/parse/failed-keys")).json()
     assert [s["partition"] for s in found["partitions"]] == [""]
     [partition] = found["partitions"]
     assert partition["counts"] == {"rejected": 1, "failed": 1} and partition["last"] == "changes"
@@ -159,32 +159,34 @@ async def test_failures_list_page_and_filter(world, monkeypatch):
     assert bad["generation"] == rows["outcomes"][0]["generation"]
     assert by_key["bug.csv"]["message"] == "ValueError: unexpected header"
 
-    first = (await client.get(f"{base}/assets/parse/failures", params={"limit": 1})).json()
+    first = (await client.get(f"{base}/assets/parse/failed-keys", params={"limit": 1})).json()
     assert [k["key"] for k in first["keys"]] == ["bad.csv"] and json.loads(first["next"]) == ["", "bad.csv"]
     second = (
-        await client.get(f"{base}/assets/parse/failures", params={"limit": 1, "after": first["next"]})
+        await client.get(f"{base}/assets/parse/failed-keys", params={"limit": 1, "after": first["next"]})
     ).json()
     assert [k["key"] for k in second["keys"]] == ["bug.csv"] and second["next"] is None
 
-    failed = (await client.get(f"{base}/assets/parse/failures", params={"outcome": "failed"})).json()
+    failed = (await client.get(f"{base}/assets/parse/failed-keys", params={"outcome": "failed"})).json()
     assert [k["key"] for k in failed["keys"]] == ["bug.csv"] and len(failed["partitions"]) == 1
-    retrying = (await client.get(f"{base}/assets/parse/failures", params={"outcome": "retrying"})).json()
+    retrying = (await client.get(f"{base}/assets/parse/failed-keys", params={"outcome": "retrying"})).json()
     assert retrying["keys"] == [] and retrying["partitions"][0]["counts"]["rejected"] == 1
 
     # A page reads a bounded number of entries: a rare class comes back short, with a `next`.
     monkeypatch.setattr(views, "SCAN", 1)
     params = {"outcome": "failed", "limit": 1}
-    short = (await client.get(f"{base}/assets/parse/failures", params=params)).json()
+    short = (await client.get(f"{base}/assets/parse/failed-keys", params=params)).json()
     assert short["keys"] == [] and json.loads(short["next"]) == ["", "bad.csv"]
     rest = (
-        await client.get(f"{base}/assets/parse/failures", params={**params, "after": short["next"]})
+        await client.get(f"{base}/assets/parse/failed-keys", params={**params, "after": short["next"]})
     ).json()
     assert [k["key"] for k in rest["keys"]] == ["bug.csv"] and rest["next"] is None
     monkeypatch.undo()
 
-    assert (await client.get(f"{base}/assets/files/failures")).status_code == 400  # no Each edge
-    assert (await client.get(f"{base}/assets/parse/failures", params={"outcome": "odd"})).status_code == 400
-    assert (await client.get(f"{base}/assets/ghost/failures")).status_code == 404
+    assert (await client.get(f"{base}/assets/files/failed-keys")).status_code == 400  # no Each edge
+    assert (
+        await client.get(f"{base}/assets/parse/failed-keys", params={"outcome": "odd"})
+    ).status_code == 400
+    assert (await client.get(f"{base}/assets/ghost/failed-keys")).status_code == 404
 
 
 async def test_key_outcomes_page_newest_first(world):
@@ -369,11 +371,11 @@ async def test_a_domain_too_big_to_list_still_rolls_up(tmp_path):
         for name in ("rows", "cells"):
             assert response.json()["assets"][name]["partitions"] == {
                 "total": 1_000_000,
-                "complete": 1,
+                "materialized": 1,
                 "missing": 999_999,
                 "failed": 0,
                 "running": 0,
-                "retired": 0,
+                "removed": 0,
             }
         explained = await client.get(
             f"{base}/assets/cells/explain", params={"key": "k1", "partition": partition}
@@ -433,7 +435,7 @@ async def test_automations_say_when_they_next_fire(tmp_path):
             assert (await client.post(f"{base}/automations/{name}/run-now")).status_code == 202
         auto = engine.m.automations
         due = await next_at()
-        assert due["hourly"] == auto["hourly"]["last_at"] + 3600
+        assert due["hourly"] == auto["hourly"]["last_fired"] + 3600
         assert due["weekly"] == engine._due_at(auto["weekly"]) > engine.clock()
         assert "next_at" not in auto["hourly"]  # a copy: the model's record is untouched
 

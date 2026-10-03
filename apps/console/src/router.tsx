@@ -126,7 +126,7 @@ export type Range = (typeof RANGES)[number];
 export const runSearch = (s: Record<string, unknown>) =>
   optional({
     status: str(s.status),
-    trigger: str(s.trigger),
+    origin: str(s.origin),
     automation: str(s.automation),
     asset: str(s.asset),
     tag: str(s.tag),

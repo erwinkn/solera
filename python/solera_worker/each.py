@@ -5,7 +5,7 @@ A page is either the changes of the edge's window (`changes`) or the
 failure index's keys that are due again (`retry`). Each key is one call,
 `concurrency` at a time; its outcome is classified (`solera.errors`), the
 outputs of the keys that succeeded become one `Patch({key: value})` per
-output, and every key's outcome moves its failure record (`solera.failures`)
+output, and every key's outcome moves its failure record (`solera.failed_keys`)
 — all of it committed together.
 """
 
@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from solera import errors
-from solera.failures import REMOVED, UNMATCHED, Outcome, Record, eligible, minima, transition
+from solera.failed_keys import REMOVED, UNMATCHED, Outcome, Record, eligible, minima, transition
 from solera.keys import SortedEntries
 from solera.keys.index import IndexState, KeyIndex, key_bytes, key_str
 from solera.patterns import Matcher

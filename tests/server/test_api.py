@@ -19,7 +19,7 @@ from solera.sdk import (
 )
 from solera_server.api import create_app
 from solera_server.engine import Engine
-from solera_server.placements.inline import InlinePlacement
+from solera_server.executors.inline import InlinePlacement
 from solera_server.state import State
 
 
@@ -183,7 +183,7 @@ async def test_heads_keys_and_partitions(client, base, engine):
     await engine.run_until((await engine.submit(["daily"], partitions=["2026-09-18"]))["id"])
 
     heads = (await client.get(f"{base}/outputs/feed/heads")).json()["heads"]
-    assert heads[0]["version"] and heads[0]["key_count"] == 2 and heads[0]["complete"]
+    assert heads[0]["version"] and heads[0]["key_count"] == 2 and heads[0]["materialized"]
 
     keys = (await client.get(f"{base}/outputs/feed/keys")).json()
     assert keys["total"] == 2 and set(keys["keys"]) == {"a", "b"}
@@ -192,7 +192,7 @@ async def test_heads_keys_and_partitions(client, base, engine):
 
     parts = (await client.get(f"{base}/partitions/daily")).json()["partitions"]
     by_partition = {p["partition"]: p["status"] for p in parts}
-    assert by_partition == {"2026-09-18": "complete", "2026-09-19": "missing"}
+    assert by_partition == {"2026-09-18": "materialized", "2026-09-19": "missing"}
     assert (await client.get(f"{base}/outputs/ghost/heads")).status_code == 404
     assert (await client.get(f"{base}/partitions/feed")).status_code == 400
 
@@ -433,7 +433,7 @@ async def test_partitions_read_scope_records_not_task_history(client, base, engi
     monkeypatch.undo()
 
     assert {p["partition"]: p["status"] for p in daily} == {
-        "2026-09-18": "complete",
+        "2026-09-18": "materialized",
         "2026-09-19": "running",
     }
     assert {p["partition"]: p["status"] for p in flaky} == {
@@ -444,7 +444,7 @@ async def test_partitions_read_scope_records_not_task_history(client, base, engi
     assert flaky_done["last_outcome"] == "failed" and flaky_done["last_attempt"]
     complete = next(p for p in daily if p["partition"] == "2026-09-18")
     assert complete["last_outcome"] == "succeeded" and complete["last_attempt"]
-    assert {p["partition"]: p["status"] for p in by_site} == {"a": "retired", "b": "running"}
+    assert {p["partition"]: p["status"] for p in by_site} == {"a": "removed", "b": "running"}
     assert reads == []
 
 
@@ -461,7 +461,7 @@ async def test_failed_scope_reports_complete_after_success(client, base, engine)
     await engine.run_until((await engine.submit(["flaky"], partitions=["2026-09-19"]))["id"])
     parts = (await client.get(f"{base}/partitions/flaky")).json()["partitions"]
     done = next(p for p in parts if p["partition"] == "2026-09-19")
-    assert done["status"] == "complete" and done["last_outcome"] == "succeeded"
+    assert done["status"] == "materialized" and done["last_outcome"] == "succeeded"
 
 
 POOLED = """

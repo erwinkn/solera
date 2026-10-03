@@ -260,7 +260,7 @@ async def test_a_local_attempt_ends_its_process_once_published(state, tmp_path, 
     """D5: a thread the attempt left running does not keep its process
     alive: the worker exits as soon as the result is published."""
 
-    from solera_server.placements import local
+    from solera_server.executors import local
 
     pids, launch = [], local.LocalPlacement.launch
 
@@ -534,7 +534,7 @@ def test_a_served_engine_keeps_nothing_of_finished_local_workers(tmp_path, monke
     import httpx
     import uvicorn
     from solera_server.api import create_app
-    from solera_server.placements import local
+    from solera_server.executors import local
 
     (tmp_path / "served.py").write_text(SERVED)
     sock = socket.socket()

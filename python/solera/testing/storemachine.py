@@ -367,7 +367,7 @@ def stateful(make_harness: Callable[[], Harness]):
             upserts = {r["id"]: r["v"] for r in rows}
             if kind == "replace" or self.head is None:
                 prepared = prepare_for(self.store, rows, self.out)
-                return KeyedWrite(prepared, whole=True, value=rows), upserts, set(), True
+                return KeyedWrite(prepared, reset=True, value=rows), upserts, set(), True
             if kind == "patch":
                 prepared = prepare_for(self.store, Patch(rows, remove=removes), self.out)
                 gone = {k for k in removes if k in entries}

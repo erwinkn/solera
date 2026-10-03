@@ -12,8 +12,8 @@ from solera.keys.index import Options
 from solera.sdk import Incremental, Output, Project, Retention, asset
 from solera.stores import Patch
 from solera_server.engine import Engine
+from solera_server.executors.inline import InlinePlacement
 from solera_server.history import History
-from solera_server.placements.inline import InlinePlacement
 from solera_server.state import State
 
 

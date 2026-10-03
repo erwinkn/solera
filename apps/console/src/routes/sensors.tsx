@@ -30,7 +30,7 @@ export function Sensors() {
         meta={
           <>
             <span>{plural(data.sensors.length, "sensor")}</span>
-            <span>{plural(data.hosts.length, "host")} polling</span>
+            <span>{plural(data.workers.length, "worker")} polling</span>
           </>
         }
       />
@@ -45,7 +45,7 @@ export function Sensors() {
           ))}
         </div>
       )}
-      {data.hosts.length > 0 && <Hosts hosts={data.hosts} />}
+      {data.workers.length > 0 && <Workers workers={data.workers} />}
     </Page>
   );
 }
@@ -136,25 +136,25 @@ function OutcomeCounts({ ticks }: { ticks: Tick[] }) {
   );
 }
 
-function Hosts({ hosts }: { hosts: { id: string; executor: string; deploy: string; seen_at: number }[] }) {
+function Workers({ workers }: { workers: { id: string; executor: string; deploy: string; seen_at: number }[] }) {
   return (
     <Card>
       <CardHeader
-        title="Sensor hosts"
+        title="Sensor workers"
         description="Long-lived processes that poll for due ticks and run them"
       />
       <TableScroll className="border-t border-line">
         <Table>
           <thead>
             <tr>
-              <Th>Host</Th>
+              <Th>Worker</Th>
               <Th>Executor</Th>
               <Th>Deploy</Th>
               <Th>Last seen</Th>
             </tr>
           </thead>
           <tbody>
-            {hosts.map((h) => (
+            {workers.map((h) => (
               <Tr key={h.id}>
                 <Td className="font-mono text-xs">{h.id}</Td>
                 <Td>{h.executor}</Td>
@@ -239,7 +239,7 @@ export function Sensor() {
                     <Th>Started</Th>
                     <Th>Outcome</Th>
                     <Th className="text-right">Took</Th>
-                    <Th>Host</Th>
+                    <Th>Worker</Th>
                     <Th>Runs</Th>
                     <Th>Error</Th>
                   </tr>
