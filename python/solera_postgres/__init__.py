@@ -41,7 +41,7 @@ from solera.stores import (
 
 log = logging.getLogger("solera.postgres")
 
-LEDGER_TABLE = "public.solera_migrations"
+LEDGER_TABLE = "public.solera_migration_ledger"  # (relation, name): what ran on which table
 FENCE_TABLE = "public.solera_generations"
 COMMIT_COLUMN = "_commit"
 SEQ_COLUMN = "_seq"
@@ -656,16 +656,20 @@ class PostgresStore:
     def _ensure_ledger(self, cur):
         cur.execute(
             f"CREATE TABLE IF NOT EXISTS {LEDGER_TABLE} ("
-            "output text NOT NULL, name text NOT NULL, "
-            "at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (output, name))"
+            "relation text NOT NULL, name text NOT NULL, "
+            "at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (relation, name))"
         )
 
     async def migrate(
         self, output: Output, migrations, context: WriteContext | None = None, prior: Ref | None = None
     ) -> list[str]:
         """Apply pending migrations in declared order; each migration and its
-        ledger row commit in one transaction under an advisory lock keyed on
-        the output, so concurrent attempts apply each exactly once (§4).
+        ledger row commit in one transaction under the table's locks, so
+        concurrent attempts apply each exactly once (§4). The
+        ledger and the lock are keyed by the schema-qualified table a
+        migration changes, never by the output's name: two projects, or a
+        staging and a production namespace, writing `orders` into schemas of
+        their own each get it applied (F18).
 
         A migration changes the whole table, so it holds the table's write
         domain exclusively (`_domain`): it waits for every partition's open
@@ -688,13 +692,14 @@ class PostgresStore:
         table, _, _ = self._table(output, prior)
         for migration in migrations:
             with self._connect() as conn, conn.cursor() as cur:
-                cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (output.name,))
+                # The table's write domain, then the table lock, as a writer takes them
+                # (`_store`, `_ensure`): the exclusive domain also serializes migrations.
                 self._domain(cur, table, exclusive=True)
                 cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (table,))
                 before = self._relid(cur, table)
                 done = cur.execute(
-                    f"SELECT 1 FROM {LEDGER_TABLE} WHERE output = %s AND name = %s",
-                    (output.name, migration.name),
+                    f"SELECT 1 FROM {LEDGER_TABLE} WHERE relation = %s AND name = %s",
+                    (table, migration.name),
                 ).fetchone()
                 if done:
                     applied.append(migration.name)
@@ -717,8 +722,8 @@ class PostgresStore:
                     self._fence_table(cur)
                     cur.execute(f"UPDATE {FENCE_TABLE} SET relid = %s WHERE relid = %s", (after, before))
                 cur.execute(
-                    f"INSERT INTO {LEDGER_TABLE} (output, name) VALUES (%s, %s)",
-                    (output.name, migration.name),
+                    f"INSERT INTO {LEDGER_TABLE} (relation, name) VALUES (%s, %s)",
+                    (table, migration.name),
                 )
                 applied.append(migration.name)
         return applied

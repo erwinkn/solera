@@ -270,7 +270,8 @@ which a repair and an unknown `Sql` write's reconciliation ask (`versions.md` §
 `Migration(name, payload)` is schema, not data: DDL for a table store, a
 callable over its prefix for an object store. FileStore and S3Store have
 no `migrate` and reject the argument. The ledger of applied names lives next
-to the data (`solera_migrations(output, name, at)` in Postgres), never in
+to the data (`solera_migration_ledger(relation, name, at)` in Postgres, keyed by
+the schema-qualified table a migration changes), never in
 engine state, so the store is the only source of truth about its own
 shape. The worker calls `migrate` before the first `store()` to an output
 in an attempt, so a write can never precede its own migration; `solera

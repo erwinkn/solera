@@ -238,7 +238,7 @@ def test_demo_end_to_end(demo, pool_worker):
 def test_demo_postgres_migrations_and_ondeploy(tmp_path):
     """§8 gate: with DATABASE_URL the demo's relational outputs land in
     PostgresStore — each declares one migration, `solera migrate` applies
-    them into the solera_migrations ledger, written heads carry the applied
+    them into the solera_migration_ledger, written heads carry the applied
     migration as `schema`, and the OnDeploy job fires once on boot.
 
     The server runs as a real `solera serve` subprocess so the module-level
@@ -265,7 +265,7 @@ def test_demo_postgres_migrations_and_ondeploy(tmp_path):
             "site_files",
             "file_index",
             "demo_migrations",
-            "solera_migrations",
+            "solera_migration_ledger",
         ):
             conn.execute(f'DROP TABLE IF EXISTS "{name}"')
 
@@ -282,11 +282,11 @@ def test_demo_postgres_migrations_and_ondeploy(tmp_path):
     migrated = subprocess.run([solera, "migrate"], env=env, capture_output=True, text=True, timeout=60)
     assert migrated.returncode == 0, migrated.stderr
     with psycopg.connect(dsn) as conn:
-        applied = set(conn.execute("SELECT output, name FROM solera_migrations").fetchall())
+        applied = set(conn.execute("SELECT relation, name FROM solera_migration_ledger").fetchall())
     expected = {
         o for o in ("site_events", "site_files", "file_index", "file_checks", "fleet_status", "site_status")
     }
-    assert {o for o, name in applied if name == "baseline"} == expected
+    assert {r.split(".")[-1].strip('"') for r, name in applied if name == "baseline"} == expected
     with psycopg.connect(dsn) as conn:
         logged = {r[0] for r in conn.execute("SELECT output FROM demo_migrations").fetchall()}
     assert {"site_events", "site_files", "file_index"} <= logged

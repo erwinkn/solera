@@ -203,18 +203,20 @@ async def test_dataframe_round_trip(store):
     assert list(loaded["id"]) == ["a"]
 
 
-def _ledger(store, output_name):
+def _ledger(store, output):
+    """The migrations the ledger says ran on `output`'s table."""
+
     with store._connect() as conn, conn.cursor() as cur:
         rows = cur.execute(
-            "SELECT name FROM public.solera_migrations WHERE output = %s ORDER BY at, name",
-            (output_name,),
+            "SELECT name FROM public.solera_migration_ledger WHERE relation = %s ORDER BY at, name",
+            (store._table(output)[0],),
         ).fetchall()
         return [r["name"] for r in rows]
 
 
 async def test_migrations_apply_in_order_and_record(store):
     """§4: pending migrations apply in declared order and land in the
-    solera_migrations ledger."""
+    solera_migration_ledger."""
     from solera.sdk import Migration
 
     out = output()
@@ -225,7 +227,7 @@ async def test_migrations_apply_in_order_and_record(store):
     )
     applied = await store.migrate(out, out.migrations)
     assert applied == ["m1", "m2"]
-    assert _ledger(store, out.name) == ["m1", "m2"]
+    assert _ledger(store, out) == ["m1", "m2"]
     second = await store.migrate(out, out.migrations)
     assert second == ["m1", "m2"]  # ledger names; nothing re-applied
 
@@ -253,7 +255,7 @@ async def test_concurrent_migrate_applies_each_once(store):
     with store._connect() as conn, conn.cursor() as cur:
         n = cur.execute(f"SELECT count(*) AS c FROM {runs}").fetchone()["c"]
     assert n == 1
-    assert _ledger(store, out.name) == ["once"]
+    assert _ledger(store, out) == ["once"]
 
 
 async def test_failed_migration_leaves_no_ledger_row(store):
@@ -275,7 +277,7 @@ async def test_failed_migration_leaves_no_ledger_row(store):
             (f"{out.name}_ghost",),
         ).fetchone()
     assert ghost is None
-    assert _ledger(store, out.name) == []
+    assert _ledger(store, out) == []
 
 
 async def test_schema_drift_fails_the_write(store):
@@ -982,7 +984,6 @@ async def test_a_migration_it_cannot_run_is_refused_when_it_runs(store):
         await store.migrate(out, out.migrations)
 
 
-@pytest.mark.xfail(strict=True, reason="F18: the migration ledger is keyed by output name, not by table")
 async def test_a_migration_applies_to_each_schemas_table_of_one_name(store):
     """F18: two projects (or a staging and a production namespace) on one
     database each write an output `orders`, in schemas of their own. A

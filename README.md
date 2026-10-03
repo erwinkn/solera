@@ -244,10 +244,11 @@ payload is a SQL string or a callable taking a cursor. Registration rejects
 migrations on a store without `migrate` (FileStore has none), duplicate
 names, and payloads that fail `can_store`.
 
-PostgresStore keeps a `solera_migrations(output, name, at)` ledger and runs
-each pending migration plus its ledger row in one transaction under an
-advisory lock keyed on the output, so concurrent workers apply each exactly
-once. A table that already exists must match the declaration —
+PostgresStore keeps a `solera_migration_ledger(relation, name, at)` ledger,
+keyed by the schema-qualified table, and runs each pending migration plus
+its ledger row in one transaction under an advisory lock keyed on the
+table, so concurrent workers apply each exactly once — and two schemas'
+tables of one name each get it. A table that already exists must match the declaration —
 drift fails non-retryably instead of triggering a silent `ALTER`. The
 worker migrates before the first write in an attempt, and the output's
 head carries the last applied name as `schema`.
