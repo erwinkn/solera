@@ -199,7 +199,7 @@ async def test_soak(tmp_path, monkeypatch):
             if spec is None:
                 continue
             planned += 1
-            assert spec["inputs"]["site_files"]["changes"]["full"] is False
+            assert spec["inputs"]["site_files"]["batch"]["full"] is False
     assert planned, "file_index planned no incremental attempts"
 
     # Every head loads through its store, including after a restart.
