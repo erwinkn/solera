@@ -466,14 +466,15 @@ class Simulation(RuleBasedStateMachine):
 
         if self.world is None:
             return
-        if clash := self.journal.two_attempts_at_once(_renamed):
+        if clash := self.journal.two_attempts_at_once():
             raise Violation(f"two attempts at once: {clash}")
         engine = self.world.engine
         if engine is None:
             return
-        held: dict[str, str] = {}
+        held: dict[tuple, str] = {}
         for task_id, claim in list(engine.m.claims.items()):
-            partition = _renamed(task_id.split("/", 1)[1])
+            task = engine.m.task(task_id)
+            partition = (task["asset"], task["scope"])
             if partition in held:
                 raise Violation(f"{partition} claimed by {held[partition]} and {claim['attempt']} at once")
             held[partition] = claim["attempt"]
@@ -734,12 +735,6 @@ class Simulation(RuleBasedStateMachine):
                 raise Violation(f"replaying the journal gives another state: {diff}")
 
         self._run(check())
-
-
-def _renamed(partition: str) -> str:
-    """An asset partition under the name a rename keeps (`mirror` is `copy`)."""
-
-    return partition.replace("mirror:", "copy:", 1) if partition.startswith("mirror:") else partition
 
 
 def _normal(snapshot: dict) -> dict:

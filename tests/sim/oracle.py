@@ -83,23 +83,39 @@ class Journal:
             for event in self.segments[seq]["events"]:
                 yield seq, event
 
-    def two_attempts_at_once(self, same=lambda partition: partition) -> str | None:
+    def two_attempts_at_once(self) -> str | None:
         """The first durable launch of an attempt on an asset partition
-        another launched attempt still holds (`same` names a partition the
-        way a rename keeps it), or None."""
+        another launched attempt still holds, or None. A task follows its
+        asset through a rename (an alias); a name removed and declared again
+        is another asset."""
 
-        holder: dict[str, str] = {}
+        asset_of: dict[str, str] = {}  # task -> its asset now
+        holder: dict[tuple, str] = {}
         for seq, event in self.events():
-            if event["type"] not in ("AttemptLaunched", "AttemptFinished"):
-                continue
-            partition = same(event["task"].split("/", 1)[1])
-            if event["type"] == "AttemptFinished":
-                if holder.get(partition) == event["attempt"]:
-                    del holder[partition]
-            elif holder.get(partition, event["attempt"]) != event["attempt"]:
-                return f"{event['attempt']} launched on {partition} at seq {seq}, held by {holder[partition]}"
-            else:
-                holder[partition] = event["attempt"]
+            kind = event["type"]
+            if kind == "RunSubmitted":
+                asset_of.update({t: task["asset"] for t, task in event["run"]["tasks"].items()})
+            elif kind == "ProjectRegistered":
+                assets = event["manifest"]["assets"]
+                renamed = {
+                    old: new
+                    for new, a in assets.items()
+                    for old in a.get("aliases") or ()
+                    if old not in assets
+                }
+                asset_of = {t: renamed.get(a, a) for t, a in asset_of.items()}
+                holder = {(renamed.get(a, a), p): h for (a, p), h in holder.items()}
+            elif kind in ("AttemptLaunched", "AttemptFinished"):
+                task = event["task"]
+                partition = (
+                    asset_of.get(task, task.split("/", 1)[1].split(":", 1)[0]),
+                    task.rsplit(":", 1)[1],
+                )
+                if kind == "AttemptFinished":
+                    if holder.get(partition) == event["attempt"]:
+                        del holder[partition]
+                elif holder.setdefault(partition, event["attempt"]) != event["attempt"]:
+                    return f"{event['attempt']} launched on {partition} at seq {seq}, held by {holder[partition]}"
         return None
 
     def generation(self, attempt: str) -> int | None:
