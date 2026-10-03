@@ -52,12 +52,13 @@ STATS = {
 
 KEYS = ["k0", "k1", "k2", "k3", "k10", "k11"]
 SITES = ["east", "west", "north"]
-TARGETS = ["items", "copy", "per_site", "log", "tally", "summary", "checks", "split"]
+TARGETS = ["items", "copy", "per_site", "log", "tally", "summary", "checks", "split", "seen"]
 KEYED_INPUT = {
     "items": "feed",
     "copy": "items",
     "checks": "items",
     "split": "items",
+    "seen": "items",
 }  # what a run's `keys=` overrides
 TERMINAL = {"succeeded", "failed", "canceled", "skipped"}
 # Key cache budgets, (disk, candidates) bytes: the default, or room for a few
@@ -757,6 +758,10 @@ class Simulation(RuleBasedStateMachine):
                 self._moved_upstream_kept(output, got, want_split)
                 if got != want_split:
                     raise Violation(f"{output} {stage}: {got} != {want_split}")
+            seen = engine.m.partition("seen", "").get("cursor") or {}
+            self._moved_upstream_kept("seen", seen, want)
+            if seen != want:
+                raise Violation(f"the job seen's cursor {stage}: {seen} != {want}")
             checks = await keyed_content(engine, project, "checks", whole=True, column="w")
             if checks != expected_checks(want):
                 raise Violation(f"checks {stage}: {checks} != {expected_checks(want)}")

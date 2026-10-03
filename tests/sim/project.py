@@ -8,6 +8,7 @@ output from the sources alone.
     knob ──dep──▶ log (batches) ──Incremental──▶ tally
     items ──Each(page 2)──▶ checks (fails while a key is flaky, by error class)
     items ──Incremental(page 2)──▶ split ──▶ odd (table store), even (FileStore); on a pool
+    items ──Incremental(page 2)──▶ seen (a job: its cursor holds what it read)
     outside (keyed source) ◀── watch (a sensor over an external map; runs per_site when it changed)
 
 Variants (`Variant`): `items` on a FileStore or the simulation's fenced
@@ -39,6 +40,7 @@ from solera.sdk import (
     Source,
     Tick,
     asset,
+    job,
     sensor,
 )
 from solera.stores import FileStore, Keys, Patch
@@ -178,6 +180,18 @@ def build(variant: Variant, data_root, db: Database, outside: External, pg: str 
     def log(ctx):
         return Patch([{"site": "*", "n": 1}])
 
+    @job(inputs={"items": Incremental(batch_size=2)}, automations=AutoRefresh(), retries=Retry(3, delay=1.0))
+    def seen(ctx, items: list):
+        """A job: no output, its cursor its only state — `items`' content as
+        its batches tell it, rebuilt from scratch on a full pass."""
+
+        batch = ctx.batch["items"]
+        held = {} if (batch.full and batch.first) or ctx.cursor is None else dict(ctx.cursor)
+        held.update({r["id"]: r["v"] for r in items})
+        for key in batch.removed:
+            held.pop(key, None)
+        return Result(outputs={}, cursor=held)
+
     @asset(inputs={"log": Incremental()})
     def tally(ctx, log: list):
         changes = ctx.batch["log"]
@@ -223,7 +237,7 @@ def build(variant: Variant, data_root, db: Database, outside: External, pg: str 
             }
         )
 
-    assets = [items, copy, per_site, log, tally, checks, split]
+    assets = [items, copy, per_site, log, tally, checks, split, seen]
     if variant.summary:
 
         @asset(inputs={"per_site": AllPartitions()}, automations=AutoRefresh())

@@ -53,6 +53,7 @@ stop where they are, and their `finally` blocks find the store gone.
 feed (keyed source) ──Incremental──▶ items ──Incremental(page 2)──▶ copy
 items ──Each(page 2)──▶ checks              (fails while a key is "flaky")
 items ──Incremental(page 2)──▶ split ──▶ odd (table store), even (FileStore); on a pool
+items ──Incremental(page 2)──▶ seen (a job: no output, its cursor holds what it read)
 knob (version) ──dep──▶ per_site[site ∈ sites] ──AllPartitions──▶ summary
 knob ──dep──▶ log (batches) ──Incremental──▶ tally
 outside (keyed source) ◀── watch (a sensor over an external map; runs per_site when it changed)
@@ -232,7 +233,8 @@ Known gaps, most valuable first; each says what would close it.
   dimensions, windows and `all_partitions=` are untested together. Waits
   for the input kinds of the model changes (`glossary.md`), then a
   `day × site` asset in the project.
-- **Jobs** (assets with no output) and **migrations**.
+- **Migrations** in the simulation: waits for F18's fix, since every run's
+  `items` would share one ledger row.
 - **Retention past `gate_days`**: virtual runs last hours, so a gate is
   never old enough to go.
 - **The key cache under pressure**: its disk budget and evictions run at
@@ -244,7 +246,8 @@ framing; claims (one attempt per asset partition); the gate under worker
 death, pause and duplicates; rolling deploys with three or more engines;
 `Each` errors by class and forced retries; runs with `keys=`; an asset
 with two outputs on two kinds of store; a `Pool` with racing hosts; a
-sensor that requests runs, and one that fails.
+sensor that requests runs, and one that fails; a job; the key cache
+under tight budgets and with its files deleted or corrupted under it.
 
 ## Sweeps
 
