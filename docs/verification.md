@@ -286,6 +286,8 @@ rules, not invariant checks. `pg`: `items` may also live in Postgres.
 | T1 | `break_watch` | 701 | 158 runs, 7,293 steps | default | green |
 | C1–C3 | the key cache under pressure | 801–803 | 702 runs, 32,147 steps | default ×2, pg | green; F13 set aside 3 times |
 | J1–J3 | the job `seen` | 811–813 | 668 runs, 33,179 steps | default ×2, pg | green; F13 set aside once |
+| X1–X3 | 33fa183 (F10 fixed, `exclude` back) | 901–903 | 853 runs, 46,600 steps | default ×2, pg | green |
+| Y1–Y3 | the reset rule's rules (off), `a_life_is_its_own` | 911–913 | 682 runs, 37,174 steps | default ×2, pg | green; F19 set aside once (rules off: a rename back without an alias) |
 
 ## Formal model: execution semantics (`spec/tla/Execution.tla`)
 
