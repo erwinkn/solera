@@ -331,7 +331,7 @@ class Simulation(RuleBasedStateMachine):
     def round_trip(self, between, clean):
         """`items` moves to its other store and back (st1 -> st2 -> st1):
         with nothing written on st2, only a `keys=` run (which moves no
-        bookmark, F17), or a feed change its automation writes. Its steps
+        bookmark), or a feed change its automation writes. Its steps
         are rules of their own: the trace replays them."""
 
         self.redeploy("table", clean)
@@ -511,9 +511,8 @@ class Simulation(RuleBasedStateMachine):
 
     @invariant()
     def a_life_is_its_own(self):
-        """F12's rule: an asset removed and added back starts over; no
-        attempt launched in its first life installs a commit into the
-        second (F19)."""
+        """An asset removed and added back starts over: no attempt launched
+        in its first life installs a commit into the second."""
 
         if self.world is not None and (crossed := self.journal.a_life_crossed()):
             raise Violation(f"a first life's attempt committed into the second: {crossed}")
@@ -578,8 +577,7 @@ class Simulation(RuleBasedStateMachine):
     def index_levels_never_overlap(self):
         """docs/key-index-format.md: an index's level 0 holds one file per
         commit, overlapping; within each deeper level, files cover disjoint
-        key ranges, so a read takes one file per level (F16: level 0 moved
-        down unmerged)."""
+        key ranges, so a read takes one file per level."""
 
         engine = self.world.engine if self.world is not None else None
         if engine is None:

@@ -946,7 +946,7 @@ async def test_an_adopted_attempt_fails_under_the_contract_it_was_launched_with(
     immutable store. Its failure is still a fenced one: the partition is
     released, and the intents its gate lists stay owing a repair for repair —
     unless `remote` is gone: settled, a removed name holds no state, and
-    if it comes back its first write is whole, clearing what this left (F12)."""
+    if it comes back its first write is whole, clearing what this left."""
 
     url = tmp_path.as_uri()
     state = await State.open(url, "test", flush_interval=0.001)

@@ -90,8 +90,8 @@ class Journal:
 
     def a_life_crossed(self) -> str | None:
         """The first commit an attempt installed into an asset added back
-        after it was launched (F12's rule: a name that comes back starts
-        over), or None. A rename (an alias) continues a life."""
+        after it was launched (a name that comes back starts over), or
+        None. A rename (an alias) continues a life."""
 
         declared: set[str] | None = None
         born: dict[str, int] = {}  # asset -> seq of the deploy that added it back

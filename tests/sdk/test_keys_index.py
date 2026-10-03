@@ -291,7 +291,7 @@ _steps = st.lists(
 
 @settings(max_examples=150, deadline=None)
 @given(steps=_steps)
-@example(  # F16: a removed key comes back
+@example(
     steps=[
         ("patch", [key(0)], []),
         ("patch", [key(0)], []),
@@ -308,7 +308,8 @@ def test_any_workload_of_a_few_keys_matches_a_dict(steps):
     the background in the engine: one `late` is applied after the next
     commit, unless another took its inputs meanwhile (upkeep then drops it).
     After every step the index pages back the dict, and levels 1+ never
-    overlap."""
+    overlap. The explicit example is F16's regression: a removed key came
+    back when level 0 moved into an empty level 1 unmerged."""
 
     async def workload():
         h = Harness(small_options(l0_max_files=2))

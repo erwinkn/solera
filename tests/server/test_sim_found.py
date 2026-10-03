@@ -453,8 +453,8 @@ async def test_a_key_a_moved_output_dropped_leaves_its_consumer(state, tmp_path,
 @pytest.mark.parametrize("ends", ["succeeds", "fails", "lost"])
 @pytest.mark.parametrize("when", ["before", "during"])
 async def test_an_attempt_of_a_removed_and_readded_asset_stays_in_its_life(state, monkeypatch, ends, when):
-    """Execution spec review: an asset removed and added back under its name
-    starts a new life (F12), and an attempt of its first life, launched
+    """F19: an asset removed and added back under its name starts a new
+    life, and an attempt of its first life, launched
     before the removal, ends after the re-add — committing, failing or
     lost, before the new life's first run or while it waits. It must not
     write into the new `copy`, settle into it, nor hold its claim: no head
@@ -466,7 +466,7 @@ async def test_an_attempt_of_a_removed_and_readded_asset_stays_in_its_life(state
 
 
 async def test_a_name_removed_while_its_attempt_runs_and_added_back_starts_over(state, monkeypatch):
-    """F19, F12's rule across a live attempt: removing `copy` resets it at
+    """F19, across a live attempt: removing `copy` resets it at
     that deploy, though its attempt still runs — nothing waits for it, as it
     can commit nothing — so adding it back starts it over: no head, no
     bookmarks of the first life."""
@@ -789,7 +789,7 @@ async def test_a_reset_output_is_due_for_a_rebuild(state, tmp_path):
 
 
 async def test_a_job_added_back_does_not_take_its_first_lifes_commit(state, monkeypatch):
-    """F19 for a job: `seen` has no output, so no output's reset covers it.
+    """F21: `seen` has no output, so no output's reset covers it.
     Removed while its attempt runs and added back before that attempt
     succeeds, it must not take that attempt's commit — its cursor and
     bookmarks belong to the first life."""
