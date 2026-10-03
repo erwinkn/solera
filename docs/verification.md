@@ -339,6 +339,8 @@ New sweeps since that summary:
 | Z6 | as Z5 | 952 | 265 runs, 16,102 steps, 64 h | pg | green |
 | Z7 | the control file (9c2343d) | 961 | 271 runs, 14,774 steps, 67 h | default | green |
 | Z8 | as Z7 | 962 | 250 runs × 50 steps | pg | F31 |
+| Z9 | K45 read-ahead, K46 reasons (35c0766) | 971 | 266 runs, 14,913 steps, 74 h | default | green |
+| Z10 | as Z9 | 972 | 263 runs, 14,304 steps, 58 h | pg | green |
 
 ## Formal model: execution semantics (`spec/tla/Execution.tla`)
 
