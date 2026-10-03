@@ -168,7 +168,7 @@ export interface Diagnostics {
   active_runs: number;
   postgres: boolean;
   last_error: string | null;
-  stuck_discards: { output: string; scope: string; id: string }[];
+  stuck_cleanups: { output: string; partition: string; id: string }[];
 }
 
 export interface Head {
@@ -196,7 +196,7 @@ export interface AssetStatus {
   partitions: Record<PartitionStatus, number> & { total: number };
   partitioned: boolean;
   last: {
-    scope: string;
+    partition: string;
     outcome: string;
     at: number;
     attempt: string | null;
@@ -208,7 +208,7 @@ export interface AssetStatus {
 
 export type PartitionStatus = "complete" | "missing" | "failed" | "running" | "retired";
 
-export interface ScopeOutcome {
+export interface PartitionOutcome {
   last_outcome: string;
   last_attempt: string | null;
   at: number;
@@ -221,19 +221,19 @@ export interface AssetDetail {
   watermarks: Record<string, Watermark | null>;
   current_keys: string[][];
   unsettled: Record<string, string[]>;
-  scopes: Record<string, ScopeOutcome>;
+  partitions: Record<string, PartitionOutcome>;
   automations: Automation[];
 }
 
 export interface PartitionRow {
-  scope: string;
+  partition: string;
   status: PartitionStatus;
   last_outcome: string | null;
   last_attempt: string | null;
 }
 
 export interface OutputHead {
-  scope: string;
+  partition: string;
   ref: Ref;
   /** The asset's code version; a source's own version, as its last commit gave it. */
   version: string | null;
@@ -243,12 +243,12 @@ export interface OutputHead {
   cursor: boolean;
   at: number;
   commit: string | null;
-  discards: { output: string; scope: string; pending: number; stuck: Json[] };
+  cleanups: { output: string; partition: string; pending: number; stuck: Json[] };
 }
 
 export interface KeyPage {
   output: string;
-  scope: string;
+  partition: string;
   total: number;
   exact: boolean;
   /** Each key, and the generation that last wrote it: its version. */
@@ -259,7 +259,7 @@ export interface KeyPage {
 export type FailureClass = "rejected" | "failed" | "retrying" | "canceled" | "timed_out";
 
 export interface FailureKey {
-  scope: string;
+  partition: string;
   key: string;
   outcome: FailureClass;
   tries: number;
@@ -273,8 +273,8 @@ export interface FailureKey {
   eligible: boolean;
 }
 
-export interface FailureScope {
-  scope: string;
+export interface FailurePartition {
+  partition: string;
   counts: Partial<Record<FailureClass, number>>;
   due: number | null;
   deploy_min: number | null;
@@ -287,7 +287,7 @@ export interface FailureScope {
 
 export interface Failures {
   asset: string;
-  scopes: FailureScope[];
+  partitions: FailurePartition[];
   deploy: number;
   now: number;
   keys: FailureKey[];
@@ -300,7 +300,7 @@ export interface KeyOutcome {
   run: string;
   attempt: string;
   asset: string;
-  scope: string;
+  partition: string;
   key: string;
   /** The generation of the upstream key it processed. */
   generation: number | null;
@@ -312,12 +312,12 @@ export interface KeyOutcome {
 
 export interface Explain {
   asset: string;
-  scope: string;
+  partition: string;
   key: string;
   edge: string;
   upstream: string;
   upstream_asset: string | null;
-  up_scope: string;
+  upstream_partition: string;
   upstream_generation: number | null;
   edge_state: EdgeState;
   outputs: Record<string, { present: boolean; generation: number | null }>;
@@ -361,9 +361,9 @@ export interface Watermark {
   reconcile?: { after: string | null };
 }
 
-export interface EdgeScope {
-  scope: string;
-  up_scope: string;
+export interface InputPartition {
+  partition: string;
+  upstream_partition: string;
   watermark: Watermark | null;
   head_commit: number | null;
   lag: number | null;
@@ -379,13 +379,13 @@ export interface Edge {
   page_size: number | null;
   concurrency: number | null;
   patterns: Patterns | null;
-  scopes: EdgeScope[];
+  partitions: InputPartition[];
 }
 
 export interface Materialization {
   output: string;
   asset: string | null;
-  scope: string;
+  partition: string;
   store: string;
   run: string;
   attempt: string | null;
@@ -403,7 +403,7 @@ export interface Materialization {
 
 export interface LineageNode {
   output: string;
-  scope: string;
+  partition: string;
   generation: number;
   asset: string | null;
   run: string | null;
@@ -414,12 +414,12 @@ export interface LineageNode {
 }
 
 export interface Lineage {
-  root: { output: string; scope: string; generation: number };
+  root: { output: string; partition: string; generation: number };
   direction: "upstream" | "downstream";
   nodes: LineageNode[];
   edges: {
-    from: { output: string; scope: string; generation: number };
-    to: { output: string; scope: string; generation: number };
+    from: { output: string; partition: string; generation: number };
+    to: { output: string; partition: string; generation: number };
     param: string;
     run: string;
   }[];
@@ -452,7 +452,7 @@ export interface RunRow {
   error: string | null;
 }
 
-/** A run's selection: a named one, a list of scopes, or each asset's own (an
+/** A run's selection: a named one, a list of partitions, or each asset's own (an
  * OnChange firing, a retry). Its JSON text, from the history. */
 export type Partitions = string | string[] | Record<string, string[]>;
 
@@ -503,7 +503,7 @@ export interface Task {
   id: string;
   run: string;
   asset: string;
-  scope: string;
+  partition: string;
   status: string;
   deps: string[];
   max_attempts: number;
@@ -589,7 +589,7 @@ export interface AttemptResult {
   write?: "none" | "writing" | "complete";
   outputs?: Record<string, { ref?: Ref; unchanged?: boolean; keys?: Json }>;
   delivered?: Record<string, Json>;
-  key_outcomes?: Omit<KeyOutcome, "run" | "attempt" | "asset" | "scope" | "at">[];
+  key_outcomes?: Omit<KeyOutcome, "run" | "attempt" | "asset" | "partition" | "at">[];
   keys?: Partial<Record<KeyOutcomeKind, number>>;
   error?: AttemptError;
   cancel?: { phase: string; reason: string; since: number } | null;
@@ -654,12 +654,12 @@ export interface Worker {
 export interface Holds {
   unsettled: {
     output: string;
-    scope: string;
+    partition: string;
     intents: { run: string; attempt: string; files?: string[] }[];
   }[];
-  discards: {
+  cleanups: {
     output: string;
-    scope: string;
+    partition: string;
     pending: number;
     stuck: { id: string; [key: string]: Json }[];
   }[];

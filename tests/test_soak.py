@@ -170,14 +170,14 @@ async def test_soak(tmp_path, monkeypatch):
     assert max(keys[len(keys) // 2 :]) <= 2 * max(keys[: len(keys) // 2]) + 64 * 1024, keys
     await asyncio.gather(*engine.upkeep.jobs.values())
     await engine.upkeep.tick()  # the last garbage goes
-    for (output, scope), index in state.model.indexes.items():
-        assert len(index.files) <= 2 * engine.key_options.l0_max_files, (output, scope, len(index.files))
+    for (output, partition), index in state.model.indexes.items():
+        assert len(index.files) <= 2 * engine.key_options.l0_max_files, (output, partition, len(index.files))
         referenced = {index.path(n) for n in index.referenced()}
         referenced |= {
-            p for p in state.model.discard_reads() if p.startswith(index.prefix)
+            p for p in state.model.cleanup_reads() if p.startswith(index.prefix)
         }  # pending discards
         on_disk = {str(p.relative_to(root)) for p in (root / index.prefix).glob("*.kx")}
-        assert on_disk == referenced, (output, scope, sorted(on_disk - referenced)[:5])
+        assert on_disk == referenced, (output, partition, sorted(on_disk - referenced)[:5])
     assert _count(root, "deltas") == 0, "delta files live in the key index (§6)"
     assert state.model.heads[("site_events", "alpha")]["commit_number"] == BATCHES - 1
     # The index agrees with what the store holds.

@@ -327,7 +327,7 @@ async def test_a_renamed_asset_keeps_what_its_scope_owes(tmp_path):
     await engine.initialize()
     m = state.model
     m.unsettled[("items", "")] = [{"files": [], "run": "r", "attempt": "dead"}]
-    m.discards[("items", "")] = [{"n": 1, "id": "1.0", "kind": "items", "items": [["path", "x"]]}]
+    m.cleanups[("items", "")] = [{"n": 1, "id": "1.0", "kind": "items", "items": [["path", "x"]]}]
 
     @asset(outputs=Output(key="id"), aliases=["items"])
     def catalog():
@@ -336,5 +336,5 @@ async def test_a_renamed_asset_keeps_what_its_scope_owes(tmp_path):
     engine = engine_for(state, Project(assets=[catalog]), placement="inline")
     await engine.initialize()
     assert m.unsettled[("catalog", "")][0]["attempt"] == "dead" and ("items", "") not in m.unsettled
-    assert [d["n"] for d in m.discards[("catalog", "")]] == [1] and ("items", "") not in m.discards
+    assert [d["n"] for d in m.cleanups[("catalog", "")]] == [1] and ("items", "") not in m.cleanups
     await state.close()

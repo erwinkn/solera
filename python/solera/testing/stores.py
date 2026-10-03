@@ -298,7 +298,7 @@ async def discarding_never_takes_what_is_read(h: Harness) -> None:
     second = await write(h, out, [{"id": "a", "v": "2"}], 9, ledger, first)
     items = [("key", "a", 5), ("key", "b", 7), ("key", "z", 8)]
     for _ in range(2):
-        await h.store.discard(context(out, 10), second, items)
+        await h.store.cleanup(context(out, 10), second, items)
     assert await now(h, second, ledger) == [("a", "2")]
 
 

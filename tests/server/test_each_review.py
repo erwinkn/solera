@@ -119,7 +119,7 @@ async def test_3_retries_run_under_the_scopes_configuration(state):  # noqa: F81
     await drive(engine, await engine.submit(["parse"], config={"factor": 10}))
     for _ in range(100):  # the retry clock, nothing upstream changes
         await engine.tick()
-        if len(calls) >= 3 and not engine.m.scope("parse", "")["failures"].get("counts"):
+        if len(calls) >= 3 and not engine.m.partition("parse", "")["failures"].get("counts"):
             break
         await asyncio.sleep(0.05)
     assert calls == [("a", 10), ("b", 10), ("b", 10)]  # a not redelivered, b under factor 10
@@ -157,11 +157,11 @@ async def test_5_a_user_cancel_during_a_timeout_drain_makes_its_keys_canceled(tm
     stored, release = asyncio.Event(), asyncio.Event()
     real = FileStore.store
 
-    async def blocked(self, write, prior, scope):
-        if scope.output.name == "rows":
+    async def blocked(self, write, prior, partition):
+        if partition.output.name == "rows":
             stored.set()
             await release.wait()
-        return await real(self, write, prior, scope)
+        return await real(self, write, prior, partition)
 
     monkeypatch.setattr(FileStore, "store", blocked)
 
@@ -268,9 +268,9 @@ async def test_8_a_renamed_asset_keeps_its_failures(state):  # noqa: F811
     two = Project(assets=[files, renamed], build="a fix")
     engine = make_engine(state, two)
     await engine.initialize()
-    assert "failures" in engine.m.scope("parsed", "") and ("@parsed", "") in engine.m.indexes
+    assert "failures" in engine.m.partition("parsed", "") and ("@parsed", "") in engine.m.indexes
     await drive(engine, await engine.submit(["parsed"]))
-    assert calls == [1, 1] and engine.m.scope("parsed", "")["failures"]["counts"] == {}
+    assert calls == [1, 1] and engine.m.partition("parsed", "")["failures"]["counts"] == {}
 
 
 async def test_a_full_run_pages_through_every_key_once(state):  # noqa: F811

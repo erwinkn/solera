@@ -56,7 +56,7 @@ export function Overview() {
   const failing = status ? Object.entries(status).filter(([, s]) => failingKeys(s) > 0) : [];
   const keys = failing.reduce((sum, [, s]) => sum + failingKeys(s), 0);
   const starved = useStarvedPools();
-  const operator = holds ? holds.unsettled.length + holds.discards.length + starved.length : undefined;
+  const operator = holds ? holds.unsettled.length + holds.cleanups.length + starved.length : undefined;
   const failedTotal = failed?.pages[0]?.total;
   const navigate = useNavigate();
 
@@ -126,7 +126,7 @@ export function Overview() {
               ? operator
                 ? [
                     holds.unsettled.length && `${holds.unsettled.length} unsettled`,
-                    holds.discards.length && `${holds.discards.length} stuck`,
+                    holds.cleanups.length && `${holds.cleanups.length} stuck`,
                     starved.length && plural(starved.length, "idle pool"),
                   ]
                     .filter(Boolean)

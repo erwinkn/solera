@@ -16,14 +16,14 @@ const route = getRouteApi("/assets/$asset/partitions");
 const ORDER: PartitionStatus[] = ["failed", "running", "missing", "complete", "retired"];
 
 /** `day=2026-09-01,site=alpha` → {day: …, site: …}; a one-dimension key is itself. */
-function parse(scope: string, dims: string[]): Record<string, string> {
-  if (dims.length < 2) return { [dims[0] ?? ""]: scope };
-  return Object.fromEntries(scope.split(",").map((part) => part.split("=") as [string, string]));
+function parse(partition: string, dims: string[]): Record<string, string> {
+  if (dims.length < 2) return { [dims[0] ?? ""]: partition };
+  return Object.fromEntries(partition.split(",").map((part) => part.split("=") as [string, string]));
 }
 
 export function AssetPartitions() {
   const { asset: name } = route.useParams();
-  const { scope } = route.useSearch();
+  const { partition } = route.useSearch();
   const project = useProject();
   const manifest = useManifest();
   const { data: rows } = useSuspenseQuery(q.partitions(project, name));
@@ -32,7 +32,7 @@ export function AssetPartitions() {
   const counts = Object.fromEntries(
     ORDER.map((s) => [s, rows.filter((r) => r.status === s).length]),
   ) as Record<PartitionStatus, number>;
-  const selected = rows.find((r) => r.scope === scope);
+  const selected = rows.find((r) => r.partition === partition);
 
   return (
     <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_22rem]">
@@ -63,13 +63,13 @@ export function AssetPartitions() {
               The partition set this asset is bound to has no keys.
             </Empty>
           ) : dims.length === 2 ? (
-            <Matrix rows={rows} dims={dims} selected={scope} />
+            <Matrix rows={rows} dims={dims} selected={partition} />
           ) : (
-            <Strip rows={rows} selected={scope} />
+            <Strip rows={rows} selected={partition} />
           )}
         </div>
       </Card>
-      <ScopePanel name={name} row={selected} detail={detail} />
+      <PartitionPanel name={name} row={selected} detail={detail} />
     </div>
   );
 }
@@ -80,7 +80,7 @@ function Cell({ row, selected, compact }: { row: PartitionRow; selected: boolean
     <Tooltip
       content={
         <span className="flex flex-col">
-          <span className="font-mono">{row.scope}</span>
+          <span className="font-mono">{row.partition}</span>
           <span>
             {label(row.status)}
             {row.last_outcome &&
@@ -93,9 +93,9 @@ function Cell({ row, selected, compact }: { row: PartitionRow; selected: boolean
       <Link
         from="/assets/$asset/partitions"
         to="."
-        search={(s) => ({ ...s, scope: selected ? undefined : row.scope })}
+        search={(s) => ({ ...s, partition: selected ? undefined : row.partition })}
         replace
-        aria-label={`${row.scope}: ${label(row.status)}`}
+        aria-label={`${row.partition}: ${label(row.status)}`}
         aria-pressed={selected}
         className={cn(
           "block rounded-xs motion-1 transition-transform hover:scale-110",
@@ -108,7 +108,7 @@ function Cell({ row, selected, compact }: { row: PartitionRow; selected: boolean
           selected && "ring-2 ring-fg ring-offset-2 ring-offset-surface",
         )}
       >
-        {!compact && <span className="sr-only">{row.scope}</span>}
+        {!compact && <span className="sr-only">{row.partition}</span>}
       </Link>
     </Tooltip>
   );
@@ -118,15 +118,15 @@ function Strip({ rows, selected }: { rows: PartitionRow[]; selected?: string }) 
   return (
     <ul className="grid grid-cols-[repeat(auto-fill,minmax(7.5rem,1fr))] gap-2">
       {rows.map((row) => (
-        <li key={row.scope} className="flex flex-col gap-1">
-          <Cell row={row} selected={row.scope === selected} />
+        <li key={row.partition} className="flex flex-col gap-1">
+          <Cell row={row} selected={row.partition === selected} />
           <span
             className={cn(
               "truncate font-mono text-2xs",
-              row.scope === selected ? "text-fg" : "text-fg-subtle",
+              row.partition === selected ? "text-fg" : "text-fg-subtle",
             )}
           >
-            {row.scope}
+            {row.partition}
           </span>
         </li>
       ))}
@@ -136,7 +136,7 @@ function Strip({ rows, selected }: { rows: PartitionRow[]; selected?: string }) 
 
 /** Two dimensions: the smaller one down the side, the other across. */
 function Matrix({ rows, dims, selected }: { rows: PartitionRow[]; dims: string[]; selected?: string }) {
-  const parsed = rows.map((row) => ({ row, keys: parse(row.scope, dims) }));
+  const parsed = rows.map((row) => ({ row, keys: parse(row.partition, dims) }));
   const values = dims.map((d) => [...new Set(parsed.map((p) => p.keys[d] ?? ""))].sort());
   const [down, across] = values[0]!.length <= values[1]!.length ? [0, 1] : [1, 0];
   const downDim = dims[down]!;
@@ -173,7 +173,7 @@ function Matrix({ rows, dims, selected }: { rows: PartitionRow[]; dims: string[]
                 return (
                   <td key={c}>
                     {row ? (
-                      <Cell row={row} selected={row.scope === selected} compact />
+                      <Cell row={row} selected={row.partition === selected} compact />
                     ) : (
                       <span className="block size-4" />
                     )}
@@ -188,7 +188,7 @@ function Matrix({ rows, dims, selected }: { rows: PartitionRow[]; dims: string[]
   );
 }
 
-function ScopePanel({ name, row, detail }: { name: string; row?: PartitionRow; detail: AssetDetail }) {
+function PartitionPanel({ name, row, detail }: { name: string; row?: PartitionRow; detail: AssetDetail }) {
   if (!row) {
     return (
       <Card className="self-start">
@@ -199,14 +199,14 @@ function ScopePanel({ name, row, detail }: { name: string; row?: PartitionRow; d
     );
   }
   const heads = Object.entries(detail.heads).flatMap(([output, list]) =>
-    list.filter(([s]) => s === row.scope).map(([, head]) => ({ output, head })),
+    list.filter(([s]) => s === row.partition).map(([, head]) => ({ output, head })),
   );
   const [run, attempt] = row.last_attempt?.split("/") ?? [];
   return (
     <Card className="self-start">
       <CardHeader
         ident
-        title={<span className="font-mono text-sm">{row.scope}</span>}
+        title={<span className="font-mono text-sm">{row.partition}</span>}
         actions={<StatusBadge status={row.status} />}
       />
       <div className="flex flex-col gap-4 px-4 pb-4">
@@ -245,7 +245,7 @@ function ScopePanel({ name, row, detail }: { name: string; row?: PartitionRow; d
         )}
         <MaterializeButton
           targets={[name]}
-          scope={row.scope}
+          partition={row.partition}
           icon={<Play />}
           label="Materialize this partition"
           variant="secondary"

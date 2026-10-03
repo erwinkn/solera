@@ -37,13 +37,13 @@ export function tabsOf(asset: AssetDecl) {
 
 export function AssetLayout() {
   const { asset: name } = route.useParams();
-  const { scope } = route.useSearch();
+  const { partition } = route.useSearch();
   const navigate = route.useNavigate();
   const manifest = useManifest();
   const project = useProject();
   const asset = manifest.assets[name];
   const status = useQuery(q.assetStatus(project)).data?.[name];
-  const partitions = useQuery({
+  const rows = useQuery({
     ...q.partitions(project, name),
     enabled: !!asset?.partitions,
   }).data;
@@ -59,7 +59,7 @@ export function AssetLayout() {
   const kind = kindOf(asset);
   const tabs = tabsOf(asset);
   const tone = assetTone(status);
-  const scopes = (partitions ?? []).filter((p) => p.status !== "retired").map((p) => p.scope);
+  const partitions = (rows ?? []).filter((p) => p.status !== "retired").map((p) => p.partition);
 
   return (
     <Page>
@@ -95,20 +95,22 @@ export function AssetLayout() {
               <Select
                 aria-label="Partition"
                 className="w-auto max-w-64 font-mono text-xs"
-                value={scope ?? ""}
+                value={partition ?? ""}
                 onChange={(e) =>
                   navigate({
                     search: (s) => ({
                       ...s,
-                      scope: e.target.value || undefined,
+                      partition: e.target.value || undefined,
                     }),
                     replace: true,
                   })
                 }
               >
                 <option value="">All partitions</option>
-                {scope && !scopes.includes(scope) && <option value={scope}>{scope}</option>}
-                {scopes.map((s) => (
+                {partition && !partitions.includes(partition) && (
+                  <option value={partition}>{partition}</option>
+                )}
+                {partitions.map((s) => (
                   <option key={s} value={s}>
                     {s}
                   </option>
@@ -117,9 +119,9 @@ export function AssetLayout() {
             )}
             <MaterializeButton
               targets={[name]}
-              scope={scope}
+              partition={partition}
               icon={<Play />}
-              label={scope ? "Materialize partition" : "Materialize"}
+              label={partition ? "Materialize partition" : "Materialize"}
             />
           </>
         }
@@ -205,7 +207,7 @@ function Tab({
     <Link
       to={to}
       params={{ asset: name }}
-      search={(s: { scope?: string }) => ({ scope: s.scope })}
+      search={(s: { partition?: string }) => ({ partition: s.partition })}
       activeOptions={{ exact: !!exact, includeSearch: false }}
       className={cn(
         "-mb-px flex shrink-0 items-center gap-1.5 border-b-2 border-transparent px-3 py-2 text-sm text-fg-muted motion-1 transition-colors hover:text-fg",
@@ -229,7 +231,7 @@ function Count({ tone, children }: { tone: "fail" | "warn"; children: ReactNode 
 
 export function AssetOverview() {
   const { asset: name } = route.useParams();
-  const { scope } = route.useSearch();
+  const { partition } = route.useSearch();
   const project = useProject();
   const manifest = useManifest();
   const { data } = useSuspenseQuery(q.asset(project, name));
@@ -239,7 +241,7 @@ export function AssetOverview() {
   return (
     <div className="grid gap-4 xl:grid-cols-[minmax(0,2fr)_minmax(18rem,1fr)]">
       <div className="flex min-w-0 flex-col gap-4">
-        <Heads heads={data.heads} scope={scope} asset={name} />
+        <Heads heads={data.heads} partition={partition} asset={name} />
         <Declaration asset={asset} manifest={manifest} />
       </div>
       <div className="flex min-w-0 flex-col gap-4">
@@ -267,10 +269,7 @@ export function AssetOverview() {
         )}
         {data.cursor != null && (
           <Card>
-            <CardHeader
-              title="Cursor"
-              description="Unpartitioned scope; per-partition cursors show on each head"
-            />
+            <CardHeader title="Cursor" description="Unpartitioned; per-partition cursors show on each head" />
             <div className="px-4 pb-4">
               <JsonView value={data.cursor as Json} />
             </div>
@@ -283,15 +282,17 @@ export function AssetOverview() {
 
 function Heads({
   heads,
-  scope,
+  partition,
   asset,
 }: {
   heads: Record<string, [string, Head][]>;
-  scope?: string;
+  partition?: string;
   asset: string;
 }) {
   const rows = Object.entries(heads).flatMap(([output, list]) =>
-    list.filter(([s]) => scope === undefined || s === scope).map(([s, head]) => ({ output, scope: s, head })),
+    list
+      .filter(([s]) => partition === undefined || s === partition)
+      .map(([s, head]) => ({ output, partition: s, head })),
   );
   return (
     <Card>
@@ -315,7 +316,7 @@ function Heads({
               </tr>
             </thead>
             <tbody>
-              {rows.map(({ output, scope: s, head }) => (
+              {rows.map(({ output, partition: s, head }) => (
                 <Tr key={`${output}/${s}`}>
                   <Td className="font-medium">{output}</Td>
                   <Td className="font-mono text-xs text-fg-muted">{s || "—"}</Td>
@@ -326,7 +327,7 @@ function Heads({
                       search={{
                         generation: String(head.ref.generation),
                         vout: output,
-                        vscope: s || undefined,
+                        vpartition: s || undefined,
                       }}
                       className="hover:underline"
                     >

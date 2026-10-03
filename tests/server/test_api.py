@@ -191,8 +191,8 @@ async def test_heads_keys_and_partitions(client, base, engine):
     assert len(paged["keys"]) == 1
 
     parts = (await client.get(f"{base}/partitions/daily")).json()["partitions"]
-    by_scope = {p["scope"]: p["status"] for p in parts}
-    assert by_scope == {"2026-09-18": "complete", "2026-09-19": "missing"}
+    by_partition = {p["partition"]: p["status"] for p in parts}
+    assert by_partition == {"2026-09-18": "complete", "2026-09-19": "missing"}
     assert (await client.get(f"{base}/outputs/ghost/heads")).status_code == 404
     assert (await client.get(f"{base}/partitions/feed")).status_code == 400
 
@@ -432,19 +432,19 @@ async def test_partitions_read_scope_records_not_task_history(client, base, engi
     by_site = (await client.get(f"{base}/partitions/by_site")).json()["partitions"]
     monkeypatch.undo()
 
-    assert {p["scope"]: p["status"] for p in daily} == {
+    assert {p["partition"]: p["status"] for p in daily} == {
         "2026-09-18": "complete",
         "2026-09-19": "running",
     }
-    assert {p["scope"]: p["status"] for p in flaky} == {
+    assert {p["partition"]: p["status"] for p in flaky} == {
         "2026-09-18": "failed",
         "2026-09-19": "missing",
     }
-    flaky_done = next(p for p in flaky if p["scope"] == "2026-09-18")
+    flaky_done = next(p for p in flaky if p["partition"] == "2026-09-18")
     assert flaky_done["last_outcome"] == "failed" and flaky_done["last_attempt"]
-    complete = next(p for p in daily if p["scope"] == "2026-09-18")
+    complete = next(p for p in daily if p["partition"] == "2026-09-18")
     assert complete["last_outcome"] == "succeeded" and complete["last_attempt"]
-    assert {p["scope"]: p["status"] for p in by_site} == {"a": "retired", "b": "running"}
+    assert {p["partition"]: p["status"] for p in by_site} == {"a": "retired", "b": "running"}
     assert reads == []
 
 
@@ -456,11 +456,11 @@ async def test_failed_scope_reports_complete_after_success(client, base, engine)
         (await engine.submit(["flaky"], partitions=["2026-09-19"], config={"fail": True}))["id"]
     )
     parts = (await client.get(f"{base}/partitions/flaky")).json()["partitions"]
-    assert {p["scope"]: p["status"] for p in parts}["2026-09-19"] == "failed"
+    assert {p["partition"]: p["status"] for p in parts}["2026-09-19"] == "failed"
 
     await engine.run_until((await engine.submit(["flaky"], partitions=["2026-09-19"]))["id"])
     parts = (await client.get(f"{base}/partitions/flaky")).json()["partitions"]
-    done = next(p for p in parts if p["scope"] == "2026-09-19")
+    done = next(p for p in parts if p["partition"] == "2026-09-19")
     assert done["status"] == "complete" and done["last_outcome"] == "succeeded"
 
 

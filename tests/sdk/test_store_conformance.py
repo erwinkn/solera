@@ -47,16 +47,16 @@ def postgres_harness(tmp_path):
     store = PostgresStore(DSN)
 
     @contextlib.asynccontextmanager
-    async def hold(scope):
+    async def hold(partition):
         """The older writer's write transaction, open: its fence row held."""
 
         import asyncio
 
-        table, _, _ = store._table(scope.output)
+        table, _, _ = store._table(partition.output)
         conn = store._connect()
         cur = conn.cursor()
         store._domain(cur, table)
-        store._fence(cur, table, scope)
+        store._fence(cur, table, partition)
         try:
             yield
         finally:
@@ -87,14 +87,14 @@ def example_harness(tmp_path, store=None):
     store = store or example_store()
 
     @contextlib.asynccontextmanager
-    async def hold(scope):
+    async def hold(partition):
         import asyncio
 
         from solera.fencing import fence
 
-        table = store._table(scope.output, None)
+        table = store._table(partition.output, None)
         conn, cur = store._transaction(table)
-        fence(cur, scope, table)
+        fence(cur, partition, table)
         try:
             yield
         finally:

@@ -60,8 +60,8 @@ export function TriggerLabel({
   );
 }
 
-/** A run's selection as a name or a list of scopes; each asset's own read
- * as `asset scope`, or unpartitioned when none has a scope. */
+/** A run's selection as a name or a list of partitions; each asset's own read
+ * as `asset partition`, or unpartitioned when none has a partition. */
 export function partitionsOf(partitions: RunRow["partitions"]): string[] | string {
   if (typeof partitions === "string" && (partitions.startsWith("[") || partitions.startsWith("{"))) {
     try {
@@ -72,8 +72,8 @@ export function partitionsOf(partitions: RunRow["partitions"]): string[] | strin
   }
   if (Array.isArray(partitions)) return partitions;
   if (partitions && typeof partitions === "object") {
-    const scoped = Object.entries(partitions).flatMap(([asset, scopes]) =>
-      scopes.filter((scope) => scope !== "").map((scope) => `${asset} ${scope}`),
+    const scoped = Object.entries(partitions).flatMap(([asset, partitions]) =>
+      partitions.filter((partition) => partition !== "").map((partition) => `${asset} ${partition}`),
     );
     return scoped.length > 0 ? scoped : [""];
   }

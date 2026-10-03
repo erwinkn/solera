@@ -5,7 +5,7 @@ Each (asset, edge, scope) keeps a **watermark**:
 
     {
       "kind": "keys" | "batches",   # a keyed upstream, read by key; or batch by batch
-      "output", "up",               # the upstream output and scope it reads
+      "output", "upstream_partition", # the upstream output and partition it reads
       "fingerprint",                # the interpretation it was delivered under (§6)
       "reset_by": run id,           # the run whose reset began the current pass
       "next": int,                  # the first upstream batch not yet delivered
@@ -138,7 +138,7 @@ def reads(plans: dict) -> list[tuple]:
     — kept until its claim goes (§6)."""
 
     return [
-        (p["watermark"]["output"], p["watermark"]["up"], p["delivery"]["from"])
+        (p["watermark"]["output"], p["watermark"]["upstream_partition"], p["delivery"]["from"])
         for p in plans.values()
         if p and p["kind"] == "keys" and p["delivery"].get("from") is not None
     ]

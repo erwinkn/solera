@@ -86,7 +86,7 @@ async def test_lineage_says_what_a_current_read_saw(state):
     edge = (await edges(engine, state, "report"))["sites"]
     assert edge["from"] == {
         "output": name,
-        "scope": "",
+        "partition": "",
         "generation": head["ref"]["generation"],
         "run": head["run"],
         "attempt": head["attempt"],
@@ -122,7 +122,7 @@ async def test_lineage_says_what_a_current_read_saw(state):
 
     summary = {"id": "late", "outcome": "failed", "started_at": 1.0, "finished_at": 2.0, "generation": newer}
     state.model._record(
-        "attempts", attempt_row("r-late", {"id": "t", "asset": "sites", "scope": ""}, summary, 1)
+        "attempts", attempt_row("r-late", {"id": "t", "asset": "sites", "partition": ""}, summary, 1)
     )
     edge = (await edges(engine, state, "report"))["sites"]
     assert edge["uncommitted"] == {"attempt": "late", "run": "r-late"}

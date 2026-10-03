@@ -247,7 +247,7 @@ async def test_compaction_truncation_and_garbage(state):
     watermark = state.model.watermark("mirror", "items", "")
     assert watermark["next"] == head_commit + 1
     assert all(commit_number >= watermark["next"] for commit_number, _ in index.log)  # truncated behind it
-    read = state.model.discard_reads()  # kept for the discards still pending (docs/lifecycle.md §9.8)
+    read = state.model.cleanup_reads()  # kept for the discards still pending (docs/lifecycle.md §9.8)
     assert {path for path, _ in state.model.garbage} <= read
     assert on_disk(state, index) == {index.path(n) for n in index.referenced()} | read
     assert sorted((await engine.list_keys("items"))["keys"]) == sorted(truth)
@@ -344,7 +344,7 @@ async def test_a_consumer_without_a_log_starts_over(state):
     await run(engine, ["mirror"], upstream=True)
     engine.upkeep.truncate()
     wm = state.model.watermark("mirror", "items", "")
-    state.model.scope("mirror", "")["watermarks"]["items"] = {**wm, "next": 0}  # behind the (empty) log
+    state.model.partition("mirror", "")["watermarks"]["items"] = {**wm, "next": 0}  # behind the (empty) log
     await run(engine, ["mirror"])
     assert deliveries == [(True, ["a", "b"]), (True, ["a", "b"])]
 

@@ -15,13 +15,13 @@ const route = getRouteApi("/assets/$asset/history");
 
 export function AssetHistory() {
   const { asset: name } = route.useParams();
-  const { scope, output, generation, vout, vscope } = route.useSearch();
+  const { partition, output, generation, vout, vpartition } = route.useSearch();
   const navigate = route.useNavigate();
   const project = useProject();
   const manifest = useManifest();
   const outputs = manifest.assets[name]?.outputs ?? [];
   const history = useInfiniteQuery({
-    ...q.history(project, name, { output, scope }),
+    ...q.history(project, name, { output, partition }),
     placeholderData: keepPreviousData,
   });
   const rows = history.data?.pages.flatMap((p) => p.materializations) ?? [];
@@ -29,13 +29,13 @@ export function AssetHistory() {
   const selectedOutput = vout ?? output ?? only;
   const selected =
     generation && selectedOutput
-      ? { output: selectedOutput, scope: vscope ?? scope ?? "", generation: Number(generation) }
+      ? { output: selectedOutput, partition: vpartition ?? partition ?? "", generation: Number(generation) }
       : undefined;
   const isSelected = (m: Materialization) =>
     !!selected &&
     m.generation === selected.generation &&
     m.output === selected.output &&
-    m.scope === selected.scope;
+    m.partition === selected.partition;
 
   if (outputs.length === 0) {
     return (
@@ -84,7 +84,7 @@ export function AssetHistory() {
           <Skeleton className="mx-4 mb-4 h-40" />
         ) : rows.length === 0 ? (
           <Empty compact title="No versions yet">
-            Nothing has been committed{scope ? " for this partition" : ""}.
+            Nothing has been committed{partition ? " for this partition" : ""}.
           </Empty>
         ) : (
           <TableScroll className="border-t border-line">
@@ -93,7 +93,7 @@ export function AssetHistory() {
                 <tr>
                   <Th>Committed</Th>
                   {outputs.length > 1 && !output && <Th>Output</Th>}
-                  {!scope && <Th>Partition</Th>}
+                  {!partition && <Th>Partition</Th>}
                   <Th>Version</Th>
                   <Th className="text-right">Changed</Th>
                   <Th className="text-right">Rows</Th>
@@ -104,11 +104,11 @@ export function AssetHistory() {
               <tbody>
                 {rows.map((m) => (
                   <VersionRow
-                    key={`${m.output}/${m.scope}/${m.generation}/${m.at}`}
+                    key={`${m.output}/${m.partition}/${m.generation}/${m.at}`}
                     m={m}
                     selected={isSelected(m)}
                     showOutput={outputs.length > 1 && !output}
-                    showScope={!scope}
+                    showPartition={!partition}
                   />
                 ))}
               </tbody>
@@ -132,12 +132,12 @@ function VersionRow({
   m,
   selected,
   showOutput,
-  showScope,
+  showPartition,
 }: {
   m: Materialization;
   selected: boolean;
   showOutput: boolean;
-  showScope: boolean;
+  showPartition: boolean;
 }) {
   const metadata =
     m.metadata && typeof m.metadata === "object" && !Array.isArray(m.metadata)
@@ -153,7 +153,7 @@ function VersionRow({
             ...s,
             generation: selected ? undefined : String(m.generation),
             vout: selected ? undefined : m.output,
-            vscope: selected ? undefined : m.scope || undefined,
+            vpartition: selected ? undefined : m.partition || undefined,
           })}
           replace
           className="after:absolute after:inset-0 after:content-['']"
@@ -162,7 +162,7 @@ function VersionRow({
         </Link>
       </Td>
       {showOutput && <Td>{m.output}</Td>}
-      {showScope && <Td className="font-mono text-xs text-fg-muted">{m.scope || "—"}</Td>}
+      {showPartition && <Td className="font-mono text-xs text-fg-muted">{m.partition || "—"}</Td>}
       <Td>
         <Generation value={m.generation} />
       </Td>
@@ -198,14 +198,30 @@ function VersionRow({
   );
 }
 
-function LineagePanel({ selected }: { selected?: { output: string; scope: string; generation: number } }) {
+function LineagePanel({
+  selected,
+}: {
+  selected?: { output: string; partition: string; generation: number };
+}) {
   const project = useProject();
   const up = useQuery({
-    ...q.lineage(project, selected?.output ?? "", selected?.scope ?? "", selected?.generation, "upstream"),
+    ...q.lineage(
+      project,
+      selected?.output ?? "",
+      selected?.partition ?? "",
+      selected?.generation,
+      "upstream",
+    ),
     enabled: !!selected,
   });
   const down = useQuery({
-    ...q.lineage(project, selected?.output ?? "", selected?.scope ?? "", selected?.generation, "downstream"),
+    ...q.lineage(
+      project,
+      selected?.output ?? "",
+      selected?.partition ?? "",
+      selected?.generation,
+      "downstream",
+    ),
     enabled: !!selected,
   });
   if (!selected) {
@@ -224,7 +240,7 @@ function LineagePanel({ selected }: { selected?: { output: string; scope: string
         description={
           <>
             {selected.output}
-            {selected.scope && ` · ${selected.scope}`} @{" "}
+            {selected.partition && ` · ${selected.partition}`} @{" "}
             <span className="font-mono">g{selected.generation}</span>
           </>
         }
@@ -239,8 +255,8 @@ function LineagePanel({ selected }: { selected?: { output: string; scope: string
 
 function LineageList({ title, icon, lineage }: { title: string; icon: React.ReactNode; lineage?: Lineage }) {
   if (!lineage) return <Skeleton className="h-16" />;
-  const root = `${lineage.root.output}|${lineage.root.scope}|${lineage.root.generation}`;
-  const nodes = lineage.nodes.filter((n) => `${n.output}|${n.scope}|${n.generation}` !== root);
+  const root = `${lineage.root.output}|${lineage.root.partition}|${lineage.root.generation}`;
+  const nodes = lineage.nodes.filter((n) => `${n.output}|${n.partition}|${n.generation}` !== root);
   return (
     <div className="flex flex-col gap-1.5">
       <h3 className="flex items-center gap-1.5 text-2xs font-medium tracking-wide text-fg-subtle uppercase [&_svg]:size-3">
@@ -253,7 +269,7 @@ function LineageList({ title, icon, lineage }: { title: string; icon: React.Reac
         <ul className="flex flex-col divide-y divide-line rounded-md border-theme border-line">
           {nodes.map((n) => (
             <li
-              key={`${n.output}/${n.scope}/${n.generation}`}
+              key={`${n.output}/${n.partition}/${n.generation}`}
               className="flex flex-wrap items-center gap-x-2 gap-y-0.5 px-3 py-1.5 text-xs"
             >
               {n.asset ? (
@@ -263,7 +279,7 @@ function LineageList({ title, icon, lineage }: { title: string; icon: React.Reac
                   search={{
                     generation: String(n.generation),
                     vout: n.output,
-                    vscope: n.scope || undefined,
+                    vpartition: n.partition || undefined,
                   }}
                   className="font-medium text-fg hover:underline"
                 >
@@ -272,7 +288,7 @@ function LineageList({ title, icon, lineage }: { title: string; icon: React.Reac
               ) : (
                 <span className="font-medium">{n.output}</span>
               )}
-              {n.scope && <span className="font-mono text-fg-subtle">{n.scope}</span>}
+              {n.partition && <span className="font-mono text-fg-subtle">{n.partition}</span>}
               <Generation value={n.generation} />
               {!n.current && (
                 <span className="rounded-full bg-idle-soft px-1.5 text-2xs text-idle-fg">superseded</span>

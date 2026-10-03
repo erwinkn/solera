@@ -32,7 +32,7 @@ class Observed:
         # One moment reads a slice once: the first read of it is what lineage records.
         self.read.setdefault(
             (ref.output, ref.partition or ""),
-            {"output": ref.output, "scope": ref.partition or "", "generation": generation},
+            {"output": ref.output, "partition": ref.partition or "", "generation": generation},
         )
         return value
 

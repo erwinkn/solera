@@ -112,7 +112,7 @@ async def test_commit_installs_heads_cursor_watermarks_and_pends_onchange(state,
     assert detail["request"]["status"] == "succeeded"
     m = state.model
     assert m.heads[("files", "")]["run"] == detail["request"]["id"]
-    assert m.scope("consumer", "")["drained"] is True
+    assert m.partition("consumer", "")["drained"] is True
     assert m.watermark("consumer", "files", "")["next"] == 1
     # files changed and consumer watches it: the change pended, and the next tick
     # (run_until ticks) fired the OnChange automation and consumed it — without a
@@ -248,7 +248,7 @@ def test_finishing_a_task_touches_only_its_dependents():
             "id": tid,
             "run": "r",
             "asset": "a",
-            "scope": str(i),
+            "partition": str(i),
             "status": "queued",
             "deps": [],
             "max_attempts": 1,
@@ -262,7 +262,7 @@ def test_finishing_a_task_touches_only_its_dependents():
         "id": "r/b:",
         "run": "r",
         "asset": "b",
-        "scope": "",
+        "partition": "",
         "status": "waiting",
         "deps": ["r/a:0"],
         "max_attempts": 1,
@@ -451,7 +451,7 @@ async def test_a_recount_meanwhile_does_not_refuse_a_commit(state, clock):
         {
             "type": "IndexRecounted",
             "output": "files",
-            "scope": "",
+            "partition": "",
             "live": count + 1,
             "pinned_count": state.model.indexes[("files", "")].count,
             "pinned_inexact": 0,
@@ -494,7 +494,7 @@ def test_a_rename_moves_a_scopes_record_whole():
     that already has a record keeps its own: two assets' states never mix.
     A watermark of an edge the project no longer declares goes."""
 
-    wm = {"kind": "keys", "output": "feed", "up": "", "next": 3}
+    wm = {"kind": "keys", "output": "feed", "upstream_partition": "", "next": 3}
     whole = {
         "cursor": "c1",
         "last": {"outcome": "failed", "run": "r", "attempt": "a", "at": 1.0},
@@ -503,9 +503,9 @@ def test_a_rename_moves_a_scopes_record_whole():
         "failures": {"commit_number": 0, "forced": {}, "counts": {"failed": 1}},
     }
     m = Model()
-    m.scopes[("old", "x")] = copy.deepcopy(whole)
-    m.scopes[("old", "y")] = {"cursor": "old's"}
-    m.scopes[("new", "y")] = {"last": {"outcome": "succeeded", "run": "r", "attempt": "b", "at": 2.0}}
+    m.partitions[("old", "x")] = copy.deepcopy(whole)
+    m.partitions[("old", "y")] = {"cursor": "old's"}
+    m.partitions[("new", "y")] = {"last": {"outcome": "succeeded", "run": "r", "attempt": "b", "at": 2.0}}
     edge = {"kind": "incremental", "output": "feed"}
     manifest = {
         "assets": {"new": {"aliases": ["old"], "inputs": {"feed": edge}, "outputs": []}},
@@ -514,9 +514,11 @@ def test_a_rename_moves_a_scopes_record_whole():
         "automations": {},
     }
     m.apply({"type": "ProjectRegistered", "deploy": "r2", "manifest": manifest, "at": 3.0})
-    assert m.scope("new", "x") == {**whole, "watermarks": {"feed": wm}}
-    assert m.scope("new", "y") == {"last": {"outcome": "succeeded", "run": "r", "attempt": "b", "at": 2.0}}
-    assert m.scope("old", "x") == {} and sorted(m.scopes.of("new")) == ["x", "y"]
+    assert m.partition("new", "x") == {**whole, "watermarks": {"feed": wm}}
+    assert m.partition("new", "y") == {
+        "last": {"outcome": "succeeded", "run": "r", "attempt": "b", "at": 2.0}
+    }
+    assert m.partition("old", "x") == {} and sorted(m.partitions.of("new")) == ["x", "y"]
 
 
 def test_a_discard_entrys_delta_outlives_the_attempt_holding_it():
@@ -528,21 +530,21 @@ def test_a_discard_entrys_delta_outlives_the_attempt_holding_it():
     m = Model()
     entry = {"n": 1, "id": "1.0", "kind": "delta", "prefix": "keys/out/_/", "files": ["000000000003-a"]}
     path = "keys/out/_/000000000003-a.kx"
-    m.discards[("out", "")] = [entry]
+    m.cleanups[("out", "")] = [entry]
     task = {
         "id": "t1",
         "asset": "out",
-        "scope": "",
+        "partition": "",
         "launched": {
             "attempt": "A2",
             "started_at": 0.0,
             "pin": 5,
-            "prepared": {"outputs": {"out": {"discard": [entry]}}},
+            "prepared": {"outputs": {"out": {"cleanup": [entry]}}},
         },
     }
     m._hold(task)
-    assert path in m.discard_reads()
-    m._drop_discards("out", "", ["1.0"])  # acknowledged by the attempt before
-    assert path in m.discard_reads()  # A2 still reads it
+    assert path in m.cleanup_reads()
+    m._drop_cleanups("out", "", ["1.0"])  # acknowledged by the attempt before
+    assert path in m.cleanup_reads()  # A2 still reads it
     del m.claims["t1"]  # A2 ended
-    assert path not in m.discard_reads()
+    assert path not in m.cleanup_reads()

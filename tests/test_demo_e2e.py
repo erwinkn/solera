@@ -169,8 +169,8 @@ def test_demo_end_to_end(demo, pool_worker):
     # not skip. Drain the log first so every watermark sits at head.
     drain = submit(["file_index"], partitions="all", upstream=False)
     assert wait(lambda: run_done(drain)) and run_status(drain) == "succeeded"
-    site_files = {h["scope"]: h["ref"]["generation"] for h in heads("site_files")}
-    file_index_heads = {h["scope"]: h["commit"] for h in heads("file_index")}
+    site_files = {h["partition"]: h["ref"]["generation"] for h in heads("site_files")}
+    file_index_heads = {h["partition"]: h["commit"] for h in heads("file_index")}
     poll_run = submit(
         ["site_feed"],
         partitions="all",
@@ -178,18 +178,18 @@ def test_demo_end_to_end(demo, pool_worker):
         config={"feed_tick_seconds": 3600},
     )
     assert wait(lambda: run_done(poll_run)) and run_status(poll_run) == "succeeded"
-    assert {h["scope"]: h["ref"]["generation"] for h in heads("site_files")} == site_files
+    assert {h["partition"]: h["ref"]["generation"] for h in heads("site_files")} == site_files
 
     # The Incremental consumer over unchanged upstream state skips every
     # scope — the delta log holds nothing past its watermark.
     again = submit(["file_index"], partitions=sorted(site_files), upstream=False)
     assert wait(lambda: run_done(again)) and run_status(again) == "succeeded"
     detail = client.get(f"{base}/runs/{again}").json()
-    status = {f"{t['asset']}:{t['scope']}": t["status"] for t in detail["tasks"]}
+    status = {f"{t['asset']}:{t['partition']}": t["status"] for t in detail["tasks"]}
     for site in site_files:
         assert status.get(f"file_index:{site}") == "skipped", detail["tasks"]
     assert {
-        h["scope"]: h["commit"] for h in heads("file_index") if h["scope"] in file_index_heads
+        h["partition"]: h["commit"] for h in heads("file_index") if h["partition"] in file_index_heads
     } == file_index_heads
 
     # -- the changed-keys pass (§6, Incremental) -----------------------------
@@ -199,8 +199,10 @@ def test_demo_end_to_end(demo, pool_worker):
     def site_file_keys():
         out = {}
         for h in heads("site_files"):
-            out[h["scope"]] = set(
-                client.get(f"{base}/outputs/site_files/keys", params={"scope": h["scope"]}).json()["keys"]
+            out[h["partition"]] = set(
+                client.get(f"{base}/outputs/site_files/keys", params={"partition": h["partition"]}).json()[
+                    "keys"
+                ]
             )
         return out
 
@@ -222,13 +224,13 @@ def test_demo_end_to_end(demo, pool_worker):
                 continue
             result = client.get(f"{base}/runs/{delta}/attempts/{attempt['id']}/result").json()
             page = result["delivered"]["site_files"]
-            seen = delivered.setdefault(task["scope"], [set(), set()])
+            seen = delivered.setdefault(task["partition"], [set(), set()])
             seen[0] |= set(page["upserted"])
             seen[1] |= set(page["deleted"])
     assert delivered, "file_index should have run on the new tick"
-    for scope, (upserted, deleted) in delivered.items():
-        assert upserted <= current_keys[scope]
-        assert deleted <= prior_keys.get(scope, set()) - current_keys[scope]
+    for partition, (upserted, deleted) in delivered.items():
+        assert upserted <= current_keys[partition]
+        assert deleted <= prior_keys.get(partition, set()) - current_keys[partition]
         assert upserted or deleted
 
 

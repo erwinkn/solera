@@ -130,7 +130,7 @@ export function Run() {
             <p className="font-medium">
               {plural(failed.length, "task")} failed
               {failed.length === 1
-                ? `: ${failed[0]!.asset}${failed[0]!.scope ? ` · ${failed[0]!.scope}` : ""}`
+                ? `: ${failed[0]!.asset}${failed[0]!.partition ? ` · ${failed[0]!.partition}` : ""}`
                 : ""}
             </p>
             {failed[0]?.error && <p className="mt-0.5 truncate opacity-90">{firstLine(failed[0].error)}</p>}
@@ -143,7 +143,7 @@ export function Run() {
           <Empty title={request.source ? "A source commit" : "No tasks"}>
             {request.source
               ? `This run records a commit to ${request.source}; it planned no tasks.`
-              : "This run planned nothing: every target scope was already current or running."}
+              : "This run planned nothing: every target partition was already current or running."}
           </Empty>
         </Card>
       ) : (
@@ -265,12 +265,12 @@ function TaskPanel({
             <Link
               to="/assets/$asset"
               params={{ asset: task.asset }}
-              search={{ scope: task.scope || undefined }}
+              search={{ partition: task.partition || undefined }}
               className="hover:underline"
             >
               {task.asset}
             </Link>
-            {task.scope && <span className="font-mono text-sm text-fg-muted">{task.scope}</span>}
+            {task.partition && <span className="font-mono text-sm text-fg-muted">{task.partition}</span>}
             <StatusBadge status={task.status} className="font-sans" />
           </span>
         }

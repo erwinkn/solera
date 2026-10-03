@@ -118,7 +118,7 @@ def stateful(make_harness: Callable[[], Harness]):
             self.generation += 1
             self.current = Attempt(self.generation, f"i{self.generation}")
             if self.kind == "fenced":
-                self.run(self.store.acquire(self._scope(self.current), self.head))
+                self.run(self.store.acquire(self._context(self.current), self.head))
                 if self.exists:  # a slice not written yet is acquired by its first write
                     self.current.fenced, self.fence = True, self.generation
 
@@ -142,7 +142,7 @@ def stateful(make_harness: Callable[[], Harness]):
             if not upserts and not gone and not (whole and self.ledger.entries):
                 return  # nothing changes against the index: the worker stores nothing
             prior = self.head
-            written = self.run(self.store.store(keyed, prior, self._scope(attempt)))
+            written = self.run(self.store.store(keyed, prior, self._context(attempt)))
             self.exists, attempt.fenced, self.fence = True, True, max(self.fence, attempt.generation)
             attempt.last = (keyed, prior, written.ref)
             touched = set(upserts) | set(gone) | (set(self.ledger.entries) if whole else set())
@@ -170,7 +170,7 @@ def stateful(make_harness: Callable[[], Harness]):
             the same ref."""
 
             keyed, prior, first = self.current.last
-            again = self.run(self.store.store(keyed, prior, self._scope(self.current)))
+            again = self.run(self.store.store(keyed, prior, self._context(self.current)))
             if again.ref != first:
                 raise AssertionError(f"a retried write gave {again.ref}, the first {first}")
 
@@ -187,7 +187,7 @@ def stateful(make_harness: Callable[[], Harness]):
             attempt = self.stale[which % len(self.stale)]
             if attempt.last is not None and self.kind == "immutable":
                 keyed, prior, _ = attempt.last  # it wrote already: the same call, late
-                self.run(self.store.store(keyed, prior, self._scope(attempt)))
+                self.run(self.store.store(keyed, prior, self._context(attempt)))
                 return
             rows = [{"id": k, "v": version} for k in KEYS[:2]]
             keyed, upserts, _, _ = self._resolve("patch" if patch else "replace", rows, [])
@@ -195,16 +195,16 @@ def stateful(make_harness: Callable[[], Harness]):
             if self.kind == "fenced":
                 if attempt.generation < self.fence:
                     with _refused("a stale writer"):
-                        self.run(self.store.store(keyed, self.head, self._scope(attempt)))
+                        self.run(self.store.store(keyed, self.head, self._context(attempt)))
                     return
                 try:  # nothing holds the slice yet: refusing early is as good
-                    self.run(self.store.store(keyed, self.head, self._scope(attempt)))
+                    self.run(self.store.store(keyed, self.head, self._context(attempt)))
                 except StoreError:
                     return
                 self.exists, attempt.fenced, self.fence = True, True, attempt.generation
                 self.dirty |= set(upserts)
                 return
-            self.run(self.store.store(keyed, self.head, self._scope(attempt)))
+            self.run(self.store.store(keyed, self.head, self._context(attempt)))
             self.written |= {(key, attempt.generation) for key in upserts}
 
         @precondition(lambda self: self.kind == "fenced" and self.current is not None and self.current.fenced)
@@ -215,11 +215,11 @@ def stateful(make_harness: Callable[[], Harness]):
 
             twin = Attempt(self.current.generation, self.current.worker_id + "-twin")
             with _refused("a duplicate invocation's acquire"):
-                self.run(self.store.acquire(self._scope(twin), self.head))
+                self.run(self.store.acquire(self._context(twin), self.head))
             rows = [{"id": "a", "v": "0"}]
             keyed, _, _, _ = self._resolve("patch", rows, [])
             with _refused("a duplicate invocation's write"):
-                self.run(self.store.store(keyed, self.head, self._scope(twin)))
+                self.run(self.store.store(keyed, self.head, self._context(twin)))
 
         # -- readers and collection ---------------------------------------------------
 
@@ -237,7 +237,7 @@ def stateful(make_harness: Callable[[], Harness]):
 
         @precondition(lambda self: self.kind == "immutable" and self.head is not None)
         @rule(take=st.integers(0, 2**16), twice=st.booleans())
-        def discard(self, take, twice):
+        def cleanup(self, take, twice):
             """Collection: names no index and no pinned reader references —
             superseded, abandoned or never written — are discarded."""
 
@@ -249,7 +249,7 @@ def stateful(make_harness: Callable[[], Harness]):
             items = [("key", k, g) for k, g in chosen] + [("key", "zz", 99_999)]
             for _ in range(2 if twice else 1):
                 self.run(
-                    self.store.discard(self._scope(Attempt(self.generation + 1, "gc")), self.head, items)
+                    self.store.cleanup(self._context(Attempt(self.generation + 1, "gc")), self.head, items)
                 )
 
         @precondition(lambda self: self.head is not None and self.ledger.entries)
@@ -355,7 +355,7 @@ def stateful(make_harness: Callable[[], Harness]):
 
         # -- helpers ----------------------------------------------------------------------
 
-        def _scope(self, attempt: Attempt):
+        def _context(self, attempt: Attempt):
             return context(self.out, attempt.generation, attempt.worker_id)
 
         def _resolve(self, kind: str, rows: list[dict], removes: list[str]):

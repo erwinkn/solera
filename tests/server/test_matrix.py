@@ -20,7 +20,7 @@ from solera.sdk import (
     asset,
 )
 from solera.stores import Patch
-from solera_server.planning import select_scopes
+from solera_server.planning import select_partitions
 
 from .test_engine import drive, make_engine, state, status_of, task_statuses  # noqa: F401
 
@@ -257,7 +257,7 @@ def test_an_explicit_selection_is_linear():
     keys = [f"k{i}" for i in range(80_000)]
     dims = {"k": {"kind": "static", "keys": keys}}
     start = time.perf_counter()
-    picked = select_scopes(
+    picked = select_partitions(
         dims,
         keys + keys[:10],
         now=dt.datetime(2026, 10, 2, tzinfo=dt.UTC),
@@ -297,7 +297,7 @@ async def test_a_removed_consumer_lets_go_of_its_upstreams_log(state):  # noqa: 
 
     engine = make_engine(state, Project(assets=[feed, keep]))
     await engine.initialize()
-    assert sorted(a for (a, _), r in state.model.scopes.items() if r.get("watermarks")) == ["keep"]
+    assert sorted(a for (a, _), r in state.model.partitions.items() if r.get("watermarks")) == ["keep"]
     for key in ("b", "c", "d"):
         rows.append({"id": key})
         await drive(engine, await engine.submit(["keep"], upstream=True))
@@ -386,4 +386,4 @@ async def test_an_each_delivery_resumed_by_a_firing_takes_its_change(state):  # 
             break
         await asyncio.sleep(0.01)
     assert ("a", "2") in calls and ("b", "2") in calls
-    assert state.model.scope("out", "")["drained"] is True
+    assert state.model.partition("out", "")["drained"] is True

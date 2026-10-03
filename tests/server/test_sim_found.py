@@ -89,7 +89,7 @@ async def test_a_removed_assets_last_attempt_ends_its_run(state, monkeypatch):  
         tasks = state.model.runs[run["id"]]["tasks"].values()
         raise AssertionError(f"the run never ends: {[(t['status'], t.get('held')) for t in tasks]}") from None
     assert status_of(detail) in {"succeeded", "failed", "canceled"}
-    assert not state.model.scope("pages", "").get("watermarks")  # its delivery ends with it
+    assert not state.model.partition("pages", "").get("watermarks")  # its delivery ends with it
 
 
 async def test_an_attempt_launched_before_a_rename_settles(state, monkeypatch):  # noqa: F811
@@ -260,7 +260,7 @@ async def test_a_batch_upstream_reset_right_after_a_delivery_is_delivered_in_ful
     await drive(engine, await engine.submit(["tally"]))
     assert state.model.heads[("log", "")]["base"] == 1
     assert seen[-1][0], f"the reset was delivered as a delta: {seen}"
-    assert state.model.scope("tally", "")["cursor"] == 1
+    assert state.model.partition("tally", "")["cursor"] == 1
 
 
 @pytest.mark.xfail(
@@ -331,7 +331,7 @@ async def test_a_name_removed_and_added_back_starts_over(state):  # noqa: F811
     engine = make_engine(state, project("copy"))  # `mirror` removed: no alias carries it over
     await engine.initialize()
     assert ("mirror", "") not in m.heads and ("mirror", "") not in m.indexes
-    assert not m.scope("mirror", "")
+    assert not m.partition("mirror", "")
     assert files <= {path for path, _ in m.garbage}
     assert status_of(await drive(engine, await engine.submit(["copy"]))) == "succeeded"
     copied = m.heads[("copy", "")]["ref"]["generation"]

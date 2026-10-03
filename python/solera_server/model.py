@@ -158,9 +158,9 @@ class Model:
                 "indexes": _nest({k: v.to_json() for k, v in self.indexes.items()}, 2),
                 "garbage": self.garbage,
                 "retired": self.retired,
-                "scopes": _nest(self.scopes, 2),
+                "partitions": _nest(self.partitions, 2),
                 "unsettled": _nest(self.unsettled, 2),
-                "discards": _nest(self.discards, 2),
+                "cleanups": _nest(self.cleanups, 2),
                 "automations": self.automations,
                 "sensors": self.sensors,
                 "runs": self.runs,
@@ -194,13 +194,13 @@ class Model:
         # {edge: Watermark}; and an Each asset's `failures` record
         # (docs/per-key-processing.md §9), whose index lives in `indexes` under
         # ("@asset", scope). A rename moves it, retirement trims it: one record.
-        self.scopes = Grouped(_flatten(snap.get("scopes"), 2))
+        self.partitions = Grouped(_flatten(snap.get("partitions"), 2))
         # (output, scope) -> intents of attempts that died while writing it (§8)
         self.unsettled: dict[tuple, list] = _flatten(snap.get("unsettled"), 2)
         # (output, scope) -> data garbage of an immutable store, each entry at the
         # event position that let go of it: for the scope's next attempt to discard
         # once no reader pins it (docs/lifecycle.md §9.8)
-        self.discards: dict[tuple, list] = _flatten(snap.get("discards"), 2)
+        self.cleanups: dict[tuple, list] = _flatten(snap.get("cleanups"), 2)
         self.automations: dict[str, dict] = snap.get("automations") or {}
         # sensor -> {cursor, accepted}: the last tick that changed something (docs/lifecycle.md §11.4)
         self.sensors: dict[str, dict] = snap.get("sensors") or {}
@@ -246,7 +246,7 @@ class Model:
                 bad += status in BAD_OUTCOME
                 continue
             left += 1
-            self.pending.setdefault((task["asset"], task["scope"]), set()).add(tid)
+            self.pending.setdefault((task["asset"], task["partition"]), set()).add(tid)
             if status == "queued":
                 self.queue[tid] = task["ready_at"]
             elif status == "waiting":
@@ -271,11 +271,11 @@ class Model:
             self.dependents.pop(tid, None)
             self.unfinished.pop(tid, None)
             self._release_claim(tid)
-            bucket = self.pending.get((task["asset"], task["scope"]))
+            bucket = self.pending.get((task["asset"], task["partition"]))
             if bucket:
                 bucket.discard(tid)
                 if not bucket:
-                    del self.pending[(task["asset"], task["scope"])]
+                    del self.pending[(task["asset"], task["partition"])]
         self.run_left.pop(run_id, None)
         self.archivable.discard(run_id)
 
@@ -303,50 +303,50 @@ class Model:
         claim = self.claims.get(task["id"])
         return claim["status"] if claim else task["status"]
 
-    def index(self, output: str, scope: str) -> IndexState:
+    def index(self, output: str, partition: str) -> IndexState:
         """The output's key index, or an empty one where a new index would go."""
 
-        found = self.indexes.get((output, scope))
-        return found if found is not None else IndexState(prefix=index_prefix(output, scope))
+        found = self.indexes.get((output, partition))
+        return found if found is not None else IndexState(prefix=index_prefix(output, partition))
 
     def heads_of(self, output: str) -> list[tuple[str, dict]]:
         return sorted(self.heads.of(output).items())
 
-    def scope(self, asset: str, scope: str) -> dict:
+    def partition(self, asset: str, partition: str) -> dict:
         """An asset scope's record, empty where it has none: to read."""
 
-        return self.scopes.get((asset, scope)) or {}
+        return self.partitions.get((asset, partition)) or {}
 
-    def watermark(self, asset: str, edge: str, scope: str) -> dict | None:
-        return (self.scope(asset, scope).get("watermarks") or {}).get(edge)
+    def watermark(self, asset: str, edge: str, partition: str) -> dict | None:
+        return (self.partition(asset, partition).get("watermarks") or {}).get(edge)
 
     def watermarks(self):
         """Every Incremental edge's watermark, of every scope."""
 
-        for record in self.scopes.values():
+        for record in self.partitions.values():
             yield from (record.get("watermarks") or {}).values()
 
-    def _scope(self, asset: str, scope: str) -> dict:
+    def _partition(self, asset: str, partition: str) -> dict:
         """An asset scope's record, to change: made if it has none."""
 
-        key = (asset, scope)
-        if key not in self.scopes:
-            self.scopes[key] = {}
-        return self.scopes[key]
+        key = (asset, partition)
+        if key not in self.partitions:
+            self.partitions[key] = {}
+        return self.partitions[key]
 
     def _ended(self, task: dict, outcome: str, run: str, attempt: str | None, at: float) -> None:
-        self._scope(task["asset"], task["scope"])["last"] = {
+        self._partition(task["asset"], task["partition"])["last"] = {
             "outcome": outcome,
             "run": run,
             "attempt": attempt,
             "at": at,
         }
 
-    def pending_scopes(self, asset: str) -> set[str]:
-        return {scope for (a, scope), ids in self.pending.items() if a == asset and ids}
+    def pending_partitions(self, asset: str) -> set[str]:
+        return {partition for (a, partition), ids in self.pending.items() if a == asset and ids}
 
-    def is_pending(self, asset: str, scope: str) -> bool:
-        return bool(self.pending.get((asset, scope)))
+    def is_pending(self, asset: str, partition: str) -> bool:
+        return bool(self.pending.get((asset, partition)))
 
     def due(self, now: float) -> list[str]:
         """Queued, unclaimed tasks ready by `now`, oldest first."""
@@ -367,7 +367,7 @@ class Model:
             "status": "running",
         }
         self.attempts[attempt] = task_id
-        self.locks[(task["asset"], task["scope"])] = attempt
+        self.locks[(task["asset"], task["partition"])] = attempt
         self.queue.pop(task_id, None)
 
     def pins(self, but: str | None = None) -> list[tuple[int, tuple[str, ...] | None]]:
@@ -383,7 +383,7 @@ class Model:
             (c["pin"], c.get("domains")) for c in self.claims.values() if c["attempt"] != but and "pin" in c
         ]
         for wm in self.watermarks():
-            upstream = (self.index(wm["output"], wm["up"]).prefix,)
+            upstream = (self.index(wm["output"], wm["upstream_partition"]).prefix,)
             out += [(pin, upstream) for pin in delivery.pins(wm)]
         for tick in self.ticks.values():
             out.append(
@@ -456,14 +456,14 @@ class Model:
             "launched": True,
             "reads": delivery.reads(launched["prepared"].get("plans") or {}),
             "domains": tuple(launched["prepared"].get("domains") or ()),
-            "discards": _delta_files(
+            "cleanups": _delta_files(
                 d
                 for info in (launched["prepared"].get("outputs") or {}).values()
-                for d in info.get("discard") or ()
+                for d in info.get("cleanup") or ()
             ),
         }
         self.attempts[attempt] = task["id"]
-        self.locks[(task["asset"], task["scope"])] = attempt
+        self.locks[(task["asset"], task["partition"])] = attempt
         self.queue.pop(task["id"], None)
         if pool is not None:  # discoverable until it ends; its claim is the worker's (§10)
             self.pool[attempt] = {
@@ -471,7 +471,7 @@ class Model:
                 "task": task["id"],
                 "run": self.task_run[task["id"]],
                 "asset": task["asset"],
-                "scope": task["scope"],
+                "partition": task["partition"],
                 "pool": pool["name"],
                 "needs": pool.get("needs") or {},
                 "created_at": launched["at"],
@@ -485,7 +485,7 @@ class Model:
         if claim is None or claim["attempt"] != attempt:
             return None
         task = self.task(task_id)
-        if task is None or self.locks.get((task["asset"], task["scope"])) != attempt:
+        if task is None or self.locks.get((task["asset"], task["partition"])) != attempt:
             return None
         return claim
 
@@ -568,17 +568,17 @@ class Model:
             for tid, task in sorted(run["tasks"].items()):
                 if task["status"] in TERMINAL_TASK:
                     continue
-                old, scope = task["asset"], task["scope"]
+                old, partition = task["asset"], task["partition"]
                 if old in new_name:
                     new = task["asset"] = new_name[old]
-                    bucket = self.pending.get((old, scope))
+                    bucket = self.pending.get((old, partition))
                     if bucket is not None and tid in bucket:
                         bucket.discard(tid)
                         if not bucket:
-                            del self.pending[(old, scope)]
-                        self.pending.setdefault((new, scope), set()).add(tid)
-                    if (old, scope) in self.locks:
-                        self.locks[(new, scope)] = self.locks.pop((old, scope))
+                            del self.pending[(old, partition)]
+                        self.pending.setdefault((new, partition), set()).add(tid)
+                    if (old, partition) in self.locks:
+                        self.locks[(new, partition)] = self.locks.pop((old, partition))
                     launched = task.get("launched")
                     if launched is not None:
                         outputs = launched["prepared"].get("outputs") or {}
@@ -611,7 +611,7 @@ class Model:
         spec = ((self.manifest or {}).get("assets") or {}).get(asset, {}).get("inputs", {}).get(edge) or {}
         return spec.get("kind") == "incremental" and spec.get("output") == wm.get("output")
 
-    def _unsubscribe(self, asset: str | None = None, scope: str | None = None) -> None:
+    def _unsubscribe(self, asset: str | None = None, partition: str | None = None) -> None:
         """Retire the delivery obligations of edges the project no longer
         declares (a removed consumer, a renamed parameter, another
         upstream): their watermarks, which would keep the upstream's delta
@@ -619,16 +619,16 @@ class Model:
         keeps them until it settles: that attempt still reads them. With
         `asset` and `scope`, only that scope's — one whose attempt ended."""
 
-        live = {(t["asset"], t["scope"]) for tid in self.claims if (t := self.task(tid)) is not None}
-        keys = list(self.scopes) if asset is None else [(asset, scope)]
+        live = {(t["asset"], t["partition"]) for tid in self.claims if (t := self.task(tid)) is not None}
+        keys = list(self.partitions) if asset is None else [(asset, partition)]
         for key in keys:
-            marks = self.scopes.get(key, {}).get("watermarks")
+            marks = self.partitions.get(key, {}).get("watermarks")
             if not marks or key in live:
                 continue
             for edge in [edge for edge, wm in marks.items() if not self._subscribed(key[0], edge, wm)]:
                 del marks[edge]
             if not marks:
-                del self.scopes[key]["watermarks"]
+                del self.partitions[key]["watermarks"]
 
     def _retire_removed(self) -> None:
         """Live state of names the project no longer declares goes: heads,
@@ -661,8 +661,8 @@ class Model:
             self.garbage.extend([index.path(name), self.applied] for name in sorted(index.referenced()))
         for key in [k for k in self.unsettled if removed(k)]:
             del self.unsettled[key]
-        for key in [k for k in self.scopes if gone(k[0])]:
-            del self.scopes[key]
+        for key in [k for k in self.partitions if gone(k[0])]:
+            del self.partitions[key]
 
     def _apply_aliases(self, manifest) -> tuple[dict[str, list[str]], dict[str, str]]:
         """Move everything held under an asset's former names to its current
@@ -698,11 +698,11 @@ class Model:
         move(self.heads, output_map, 0)
         move(self.indexes, output_map, 0)
         # A scope's record goes whole: a name that already has one keeps its own.
-        move(self.scopes, asset_map, 0)
+        move(self.partitions, asset_map, 0)
         # An Each asset's failure index (`@asset`), whose files stay under their prefix.
         move(self.indexes, {f"@{old}": f"@{new}" for old, new in asset_map.items()}, 0)
         move(self.unsettled, output_map, 0, merge=list)
-        move(self.discards, output_map, 0, merge=_renumbered)
+        move(self.cleanups, output_map, 0, merge=_renumbered)
         for head in self.heads.values():
             if head.get("asset") in asset_map:
                 head["asset"] = asset_map[head["asset"]]
@@ -832,7 +832,7 @@ class Model:
         if task is None:
             return None
         self._release_claim(task["id"], e["attempt"])
-        self._unsubscribe(task["asset"], task["scope"])  # what it read under an edge since removed
+        self._unsubscribe(task["asset"], task["partition"])  # what it read under an edge since removed
         outcome, at = e["outcome"], e["finished_at"]
         prepared, execution = {}, {}
         launched = task.get("launched")
@@ -850,11 +850,11 @@ class Model:
             self._claimed(run, task, e["attempt"], e["started_at"])
         times = self._attempt_events(run, task, e, launched)
         for output, intent in (e.get("unsettled") or {}).items():
-            intents = self.unsettled.setdefault((output, task["scope"]), [])
+            intents = self.unsettled.setdefault((output, task["partition"]), [])
             intents.append({**intent, "run": e["run"], "attempt": e["attempt"]})
-        self._discarded(task["scope"], e)
+        self._cleaned_up(task["partition"], e)
         if launched is not None and not e.get("commit"):
-            self._abandoned(task["scope"], e["attempt"], launched)
+            self._abandoned(task["partition"], e["attempt"], launched)
         usage = (e.get("worker") or {}).get("usage") or {}
         summary = {
             "id": e["attempt"],
@@ -971,26 +971,26 @@ class Model:
         enters the history, with what it was built from (its `lineage`, with
         what its reads saw: `history.read_lineage`)."""
 
-        asset, scope, at = task["asset"], task["scope"], e["finished_at"]
+        asset, partition, at = task["asset"], task["partition"], e["finished_at"]
         reads = history.read_lineage(prepared.get("lineage"), e.get("read"))
         contracts = prepared.get("outputs") or {}
         changed = []
         for name, head in commit.get("heads", {}).items():
-            before, keys = self.heads.get((name, scope)), (commit.get("keys") or {}).get(name)
+            before, keys = self.heads.get((name, partition)), (commit.get("keys") or {}).get(name)
             prefix = contracts[name].get("prefix")  # where its delta files are
             if before is None or before["ref"].get("generation") != head["ref"].get("generation"):
                 changed.append(name)
             if contracts[name]["contract"]["writes"] == "immutable":
-                self._superseded(name, scope, before, head, keys, prefix)
-            self.heads[(name, scope)] = {**head, "run": e["run"], "attempt": e["attempt"], "at": at}
-            self._commit_keys(name, scope, keys, prefix)
+                self._superseded(name, partition, before, head, keys, prefix)
+            self.heads[(name, partition)] = {**head, "run": e["run"], "attempt": e["attempt"], "at": at}
+            self._commit_keys(name, partition, keys, prefix)
             if name in commit.get("settled", ()):
                 # The commit's delta took in what the dead attempts left (§8):
                 # their intent files are no longer needed.
-                index = self.index(name, scope)
-                for intent in self.unsettled.pop((name, scope), ()):
+                index = self.index(name, partition)
+                for intent in self.unsettled.pop((name, partition), ()):
                     self.garbage.extend([index.path(f["name"]), self.applied] for f in intent["files"])
-        record = self._scope(asset, scope)
+        record = self._partition(asset, partition)
         if "drained" in commit:
             record["drained"] = bool(commit["drained"])
         if "cursor" in commit:
@@ -1002,20 +1002,27 @@ class Model:
             if self._subscribed(asset, edge, wm):  # an edge removed while it ran keeps no delivery
                 record.setdefault("watermarks", {})[edge] = wm
         if "failures" in commit:
-            self._failures(asset, scope, commit["failures"])
+            self._failures(asset, partition, commit["failures"])
         for row in commit.get("key_outcomes") or ():
             self._record(
                 "key_outcomes",
-                {**row, "run": e["run"], "attempt": e["attempt"], "asset": asset, "scope": scope, "at": at},
+                {
+                    **row,
+                    "run": e["run"],
+                    "attempt": e["attempt"],
+                    "asset": asset,
+                    "partition": partition,
+                    "at": at,
+                },
             )
         for name in changed:
-            head = self.heads[(name, scope)]
+            head = self.heads[(name, partition)]
             self._record(
                 "materializations",
                 history.materialization(
                     name,
                     asset,
-                    scope,
+                    partition,
                     head,
                     keys=(commit.get("keys") or {}).get(name),
                     rows=(commit.get("rows") or {}).get(name),
@@ -1023,23 +1030,23 @@ class Model:
                     complete=commit.get("drained", True),
                 ),
             )
-            for row in history.lineage(name, scope, head, reads):
+            for row in history.lineage(name, partition, head, reads):
                 self._record("lineage", row)
-        self._pend_onchange(asset, scope, changed)
+        self._pend_onchange(asset, partition, changed)
 
-    def _failures(self, asset: str, scope: str, f: dict) -> None:
+    def _failures(self, asset: str, partition: str, f: dict) -> None:
         """An Each page's commit to its failure record: the failure index's
         delta, and the counts, bounds and retry-pass state the engine worked
         out from it (docs/per-key-processing.md §9)."""
 
-        record = self._scope(asset, scope).setdefault("failures", {"commit_number": -1, "forced": {}})
+        record = self._partition(asset, partition).setdefault("failures", {"commit_number": -1, "forced": {}})
         keys = f.get("keys") or {}
         if keys.get("files"):
             name = f"@{asset}"
-            index = self.index(name, scope).committed(
+            index = self.index(name, partition).committed(
                 f["commit_number"], DeltaFiles.from_json(keys), keep_log=False
             )
-            self.indexes[(name, scope)] = index
+            self.indexes[(name, partition)] = index
             record["commit_number"] = f["commit_number"]
         for field in ("counts", "due", "deploy_min", "retry", "passes", "done_forced", "last", "config"):
             if field in f:
@@ -1050,12 +1057,12 @@ class Model:
         position in the event order, for each class it names
         (docs/per-key-processing.md §9)."""
 
-        for scope, record in self.scopes.of(e["asset"]).items():
-            if "failures" in record and e.get("scope") in (None, scope):
+        for partition, record in self.partitions.of(e["asset"]).items():
+            if "failures" in record and e.get("partition") in (None, partition):
                 for name in e["classes"]:
                     record["failures"].setdefault("forced", {})[name] = self.applied
 
-    def _pend_onchange(self, asset: str | None, scope: str, changed: list[str]) -> None:
+    def _pend_onchange(self, asset: str | None, partition: str, changed: list[str]) -> None:
         if not changed:
             return
         for auto in self.automations.values():
@@ -1064,7 +1071,7 @@ class Model:
                 continue
             watched = set(auto.get("watched") or trigger.get("outputs") or [])
             if watched & set(changed):
-                entry = [asset, scope]
+                entry = [asset, partition]
                 if entry not in auto["pending"]:
                     auto["pending"].append(entry)
 
@@ -1106,11 +1113,11 @@ class Model:
 
         tid = task["id"]
         self.queue.pop(tid, None)
-        bucket = self.pending.get((task["asset"], task["scope"]))
+        bucket = self.pending.get((task["asset"], task["partition"]))
         if bucket:
             bucket.discard(tid)
             if not bucket:
-                del self.pending[(task["asset"], task["scope"])]
+                del self.pending[(task["asset"], task["partition"])]
         self._ended(task, outcome, run["id"], attempt, at)
         self._event(run, outcome, at, tid)
         stats = self.run_left.setdefault(run["id"], [0, 0])
@@ -1150,13 +1157,13 @@ class Model:
         else:
             run["status"] = "running"
 
-    def _commit_keys(self, output: str, scope: str, keys: dict | None, prefix: str | None = None) -> None:
+    def _commit_keys(self, output: str, partition: str, keys: dict | None, prefix: str | None = None) -> None:
         """Add a commit's delta files to the output's key index (§6): into the
         levels, and into the delta log if anything reads it incrementally.
         The head carries the index's live key count."""
 
         if keys is not None:
-            index, delta = self.index(output, scope), DeltaFiles.from_json(keys)
+            index, delta = self.index(output, partition), DeltaFiles.from_json(keys)
             keep_log = output in self._consumed
             if prefix is not None and prefix != index.prefix:
                 # Delta files under a prefix of their own: the output moved to another
@@ -1164,17 +1171,17 @@ class Model:
                 # and the intents of what dead attempts meant to write in the old
                 # store — goes once no reader pins it.
                 fresh = IndexState(prefix=prefix).committed(keys["commit_number"], delta, keep_log=keep_log)
-                if (output, scope) in self.indexes:
-                    self._replace_index((output, scope), fresh)
-                for intent in self.unsettled.pop((output, scope), ()):
+                if (output, partition) in self.indexes:
+                    self._replace_index((output, partition), fresh)
+                for intent in self.unsettled.pop((output, partition), ()):
                     self.garbage.extend([index.path(f["name"]), self.applied] for f in intent["files"])
                 index = fresh
             elif keys["files"]:
                 index = index.committed(keys["commit_number"], delta, keep_log=keep_log)
-            self.indexes[(output, scope)] = index
-        index = self.indexes.get((output, scope))
+            self.indexes[(output, partition)] = index
+        index = self.indexes.get((output, partition))
         if index is not None:
-            self.heads[(output, scope)]["count"] = index.count
+            self.heads[(output, partition)]["count"] = index.count
 
     # -- data garbage of immutable stores (docs/lifecycle.md §9.8) -----------------------
 
@@ -1183,26 +1190,26 @@ class Model:
         record = (manifest.get("outputs") or {}).get(output) or {}
         return ((manifest.get("stores") or {}).get(record.get("store")) or {}).get("writes") == "immutable"
 
-    def discard_reads(self) -> set[str]:
+    def cleanup_reads(self) -> set[str]:
         """The index files discard entries still read (their delta files name
         the predecessors): kept while an entry is pending, and while a live
         attempt holds it in its spec — acknowledged by another meanwhile, it
         is still being read — even once the index lets go of them."""
 
-        pending = _delta_files(d for entries in self.discards.values() for d in entries)
-        return pending.union(*(claim.get("discards") or () for claim in self.claims.values()))
+        pending = _delta_files(d for entries in self.cleanups.values() for d in entries)
+        return pending.union(*(claim.get("cleanups") or () for claim in self.claims.values()))
 
-    def _collect(self, output: str, scope: str, entry: dict) -> None:
+    def _collect(self, output: str, partition: str, entry: dict) -> None:
         """Queue data garbage let go of now: `n`, the event position, is
         when it may be collected; `id`, unique in its scope, is what an
         attempt acknowledges — one event can let go of several entries."""
 
-        entries = self.discards.setdefault((output, scope), [])
+        entries = self.cleanups.setdefault((output, partition), [])
         ordinal = sum(1 for d in entries if d["n"] == self.applied)
         entries.append({"n": self.applied, "id": f"{self.applied}.{ordinal}", **entry})
 
     def _superseded(
-        self, output: str, scope: str, before: dict | None, head: dict, keys: dict | None, prefix=None
+        self, output: str, partition: str, before: dict | None, head: dict, keys: dict | None, prefix=None
     ) -> None:
         """What a commit on an immutable store let go of: each changed key's
         predecessor (named in its delta files, under `prefix`), a value's
@@ -1210,10 +1217,10 @@ class Model:
         earlier batches."""
 
         if keys and keys.get("files"):
-            prefix = prefix or self.index(output, scope).prefix
+            prefix = prefix or self.index(output, partition).prefix
             self._collect(
                 output,
-                scope,
+                partition,
                 {"kind": "delta", "prefix": prefix, "files": [f["name"] for f in keys["files"]]},
             )
         old, new = (
@@ -1221,17 +1228,17 @@ class Model:
             (head.get("ref") or {}).get("handle") or {},
         )
         if old.get("mode") in ("value", "set") and old.get("path") != new.get("path"):
-            self._collect(output, scope, {"kind": "items", "items": [["path", old["path"]]]})
+            self._collect(output, partition, {"kind": "items", "items": [["path", old["path"]]]})
         if old.get("mode") == "commits" and new.get("mode") == "commits":
             first, last = old["commits"]
             if int(new["commits"][0]) > int(first):
                 self._collect(
                     output,
-                    scope,
+                    partition,
                     {"kind": "items", "items": [["commits", int(first), int(new["commits"][0]) - 1]]},
                 )
 
-    def _abandoned(self, scope: str, attempt: str, launched: dict) -> None:
+    def _abandoned(self, partition: str, attempt: str, launched: dict) -> None:
         """An attempt that ended without committing: whatever it wrote on an
         immutable store carries its generation, which no other attempt uses."""
 
@@ -1245,49 +1252,49 @@ class Model:
                 }
                 if info.get("prefix") is not None:
                     entry["prefix"] = info["prefix"]
-                self._collect(name, scope, entry)
+                self._collect(name, partition, entry)
 
-    def _discarded(self, scope: str, e: dict) -> None:
+    def _cleaned_up(self, partition: str, e: dict) -> None:
         """A worker discarded data garbage: its entries go, and the index-side
         files they were read from become garbage themselves. An entry whose
         names it could not read counts a miss; at `STUCK_AFTER` it is
         `stuck`: kept, and shown, but no longer handed out."""
 
         named = set()  # the index-side files the acknowledged entries read: only those become garbage
-        for output, done in (e.get("discarded") or {}).items():
-            for d in self.discards.get((output, scope), []):
+        for output, done in (e.get("cleaned_up") or {}).items():
+            for d in self.cleanups.get((output, partition), []):
                 if d["id"] in done and d["kind"] == "sidecar":
                     named |= {f"{d['prefix']}{f}.kg" for f in d["files"]}
                 elif d["id"] in done and d["kind"] == "abandoned" and "prefix" in d:
                     named.add(f"{d['prefix']}{int(d['commit_number']):012d}-{d['attempt']}")
-            self._drop_discards(output, scope, done)
-        for output, missed in (e.get("discard_unresolved") or {}).items():
-            for d in self.discards.get((output, scope), []):
+            self._drop_cleanups(output, partition, done)
+        for output, missed in (e.get("cleanup_unresolved") or {}).items():
+            for d in self.cleanups.get((output, partition), []):
                 if d["id"] in missed:
                     d["misses"] = d.get("misses", 0) + 1
                     if d["misses"] >= STUCK_AFTER:
                         d["stuck"] = True
-        for path in e.get("discarded_files") or ():
+        for path in e.get("cleaned_files") or ():
             if path in named or any(path.startswith(stem) for stem in named):
                 self.garbage.append([path, self.applied])
 
-    def _on_DiscardsDone(self, e):
+    def _on_CleanupsDone(self, e):
         """A worker discarded data garbage right after its own commit (D8):
         as the scope's next attempt would have."""
 
-        self._discarded(e["scope"], e)
+        self._cleaned_up(e["partition"], e)
 
-    def _drop_discards(self, output: str, scope: str, ids) -> None:
-        left = [d for d in self.discards.get((output, scope), []) if d["id"] not in set(ids)]
+    def _drop_cleanups(self, output: str, partition: str, ids) -> None:
+        left = [d for d in self.cleanups.get((output, partition), []) if d["id"] not in set(ids)]
         if left:
-            self.discards[(output, scope)] = left
+            self.cleanups[(output, partition)] = left
         else:
-            self.discards.pop((output, scope), None)
+            self.cleanups.pop((output, partition), None)
 
-    def _on_DiscardsCleared(self, e):
+    def _on_CleanupsCleared(self, e):
         """An operator gave up on stuck entries: their objects stay."""
 
-        self._drop_discards(e["output"], e["scope"], e["ids"])
+        self._drop_cleanups(e["output"], e["partition"], e["ids"])
 
     def _replace_index(self, key: tuple, index: IndexState) -> None:
         """Swap in a new index state; files it no longer references await deletion."""
@@ -1298,7 +1305,7 @@ class Model:
             self.garbage.append([before.path(name), self.applied])
 
     def _on_IndexCompacted(self, e):
-        key = (e["output"], e["scope"])
+        key = (e["output"], e["partition"])
         if key not in self.indexes:
             return
         if e.get("garbage"):  # the entries the merge dropped: their objects (§9.8)
@@ -1310,7 +1317,7 @@ class Model:
         self._replace_index(key, index)
 
     def _on_IndexRecounted(self, e):
-        key = (e["output"], e["scope"])
+        key = (e["output"], e["partition"])
         if key in self.indexes:
             index = self.indexes[key] = self.indexes[key].recounted(
                 e["live"], e["pinned_count"], e["pinned_inexact"]
@@ -1319,11 +1326,11 @@ class Model:
                 self.heads[key]["count"] = index.count
 
     def _on_IndexTruncated(self, e):
-        key = (e["output"], e["scope"])
+        key = (e["output"], e["partition"])
         if key in self.indexes:
             self._replace_index(key, self.indexes[key].truncated(e["below"]))
 
-    def _on_GarbageDeleted(self, e):
+    def _on_FilesCleanedUp(self, e):
         gone = set(e["paths"])
         self.garbage = [g for g in self.garbage if g[0] not in gone]
 

@@ -237,13 +237,13 @@ class Lake:
             for table, rows in batches.items():
                 files[table] = await self._write(table, rows)
         except BaseException:
-            await self._discard([f["path"] for f in files.values()])
+            await self._cleanup([f["path"] for f in files.values()])
             raise
         # Rows forgotten meanwhile must not come back with this file.
         for table, rows in pending.items():
             left = sum(1 for seq, _ in self.held().rows.get(table, ()) if seq <= upto[table])
             if left != len(rows):
-                await self._discard([f["path"] for f in files.values()])
+                await self._cleanup([f["path"] for f in files.values()])
                 return
         self.state.record({"type": f"{self.name}Flushed", "files": files, "upto": upto})
         for table, rows in volatile.items():
@@ -296,7 +296,7 @@ class Lake:
         stats = {"rows": rows, "at": [lo, hi], "keys": [first, last]}
         return Path(target).read_bytes(), stats
 
-    async def _discard(self, paths: list[str]) -> None:
+    async def _cleanup(self, paths: list[str]) -> None:
         with contextlib.suppress(Exception):
             await self.state.delete_objects(paths)
         for path in paths:
@@ -375,7 +375,7 @@ class Lake:
                 for f in group:
                     now = current.get(f["path"])
                     if now is None or len(now.get("hidden") or ()) != len(f.get("hidden") or ()):
-                        await self._discard(created)
+                        await self._cleanup(created)
                         return
             # The files replaced stay cached as long as they exist: a pinned
             # query may still read them. Collection evicts them as it deletes them.

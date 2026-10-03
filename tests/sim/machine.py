@@ -116,7 +116,7 @@ class Simulation(RuleBasedStateMachine):
     def _build(self):
         return build(self.variant, self.data_root, self.db, self.outside, self.schema)
 
-    def _db_fault(self, kind, scope):
+    def _db_fault(self, kind, partition):
         if not self.world.plan.enabled:
             return None, 0.0
         fate, delay = self.world.plan.decide()
@@ -232,8 +232,8 @@ class Simulation(RuleBasedStateMachine):
     def _retry(self, classes) -> dict | None:
         async def retry(e):
             found = e.retry_keys("checks", classes, by="sim")
-            if found["scopes"]:
-                await e.submit_retries("checks", found["scopes"], "sim")
+            if found["partitions"]:
+                await e.submit_retries("checks", found["partitions"], "sim")
             return found
 
         return self._request(retry, "retry")
@@ -426,7 +426,7 @@ class Simulation(RuleBasedStateMachine):
             elif op.who[0] == "engine" and world.slots[op.who[1]] is not world.slot:
                 continue  # a zombie engine
             when, by = op.gone
-            if op.who[0] == "worker" and self._handed_to_discard(op.who[1], op.path):
+            if op.who[0] == "worker" and self._handed_to_cleanup(op.who[1], op.path):
                 self._known("F11", f"{op.who} read a delta its discard entry names, deleted at t={when:g}")
             raise Violation(
                 f"{op.who} read {op.path.removeprefix(str(self.tmp))} at t={op.at:g}, "
@@ -444,7 +444,7 @@ class Simulation(RuleBasedStateMachine):
             return
         self._pg_checked = postgres.check(world.pg, self._pg_checked)
 
-    def _handed_to_discard(self, attempt: str, path: str) -> bool:
+    def _handed_to_cleanup(self, attempt: str, path: str) -> bool:
         """F11's signature: the file is named by a discard entry of the attempt's spec."""
 
         launched = self.journal.launched.get(attempt)
@@ -455,7 +455,7 @@ class Simulation(RuleBasedStateMachine):
         return any(
             name in entry.get("files", ())
             for out in (spec.get("outputs") or {}).values()
-            for entry in out.get("discard") or ()
+            for entry in out.get("cleanup") or ()
         )
 
     @invariant()
@@ -535,19 +535,19 @@ class Simulation(RuleBasedStateMachine):
         engine = world.engine
 
         async def check():
-            for (output, scope), head in list(engine.m.heads.items()):
-                if head["ref"].get("meta", {}).get("external") or (output, scope) not in engine.m.indexes:
+            for (output, partition), head in list(engine.m.heads.items()):
+                if head["ref"].get("meta", {}).get("external") or (output, partition) not in engine.m.indexes:
                     continue
                 store = self.project.stores.get(head["ref"]["store"])
                 if getattr(store, "writes", None) != "immutable" or output == "sites":
                     continue
-                await keyed_content(engine, self.project, output, scope, column=None)
-                entries = await index_entries(engine.state, output, scope)
+                await keyed_content(engine, self.project, output, partition, column=None)
+                entries = await index_entries(engine.state, output, partition)
                 committed = self.journal.committed_generations()  # after the reads: commits land meanwhile
                 for key, (generation, _) in entries.items():
                     if generation and generation not in committed:
                         raise Violation(
-                            f"{output}[{scope!r}] key {key}: its object was written by generation "
+                            f"{output}[{partition!r}] key {key}: its object was written by generation "
                             f"{generation}, which never committed"
                         )
 
@@ -568,21 +568,23 @@ class Simulation(RuleBasedStateMachine):
         m = world.engine.m
 
         async def check():
-            for (output, scope), head in list(m.heads.items()):
+            for (output, partition), head in list(m.heads.items()):
                 store = self.project.stores.get(head["ref"]["store"])
                 if getattr(store, "writes", None) != "fenced":
                     continue
-                if (output, scope) in m.unsettled or (head.get("asset"), scope) in m.locks:
+                if (output, partition) in m.unsettled or (head.get("asset"), partition) in m.locks:
                     continue
-                if (output, scope) in m.indexes:
-                    await keyed_content(world.engine, self.project, output, scope, whole=True, column=None)
+                if (output, partition) in m.indexes:
+                    await keyed_content(
+                        world.engine, self.project, output, partition, whole=True, column=None
+                    )
                 if head["ref"]["store"] == "pg":
                     ref = Ref.from_json(head["ref"])
                     with store._connect() as conn, conn.cursor() as cur:
                         written = store._written(cur, ref)
                     if written is not None and written != ref.generation:
                         raise Violation(
-                            f"{output}[{scope!r}] reads as written by generation {written}; "
+                            f"{output}[{partition!r}] reads as written by generation {written}; "
                             f"its head is generation {ref.generation}"
                         )
 

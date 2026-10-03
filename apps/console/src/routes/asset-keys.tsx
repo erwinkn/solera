@@ -44,21 +44,21 @@ export function AssetKeys() {
 // -- the failure index ---------------------------------------------------------------
 
 function FailingKeys({ name }: { name: string }) {
-  const { scope, outcome } = route.useSearch();
+  const { partition, outcome } = route.useSearch();
   const navigate = route.useNavigate();
   const project = useProject();
   const now = useNow();
   const classes = list(outcome);
   const failures = useInfiniteQuery({
-    ...q.failures(project, name, { scope, outcome: classes }),
+    ...q.failures(project, name, { partition, outcome: classes }),
     placeholderData: keepPreviousData,
   });
   const retry = useRetryKeys(name);
   const first = failures.data?.pages[0];
   const keys = failures.data?.pages.flatMap((p) => p.keys) ?? [];
   const totals = totalsOf(first);
-  const due = first?.scopes.filter((s) => s.has_retries).length ?? 0;
-  const pass = first?.scopes.find((s) => s.retry);
+  const due = first?.partitions.filter((s) => s.has_retries).length ?? 0;
+  const pass = first?.partitions.find((s) => s.retry);
 
   return (
     <Card>
@@ -68,10 +68,10 @@ function FailingKeys({ name }: { name: string }) {
           <>
             The failure index: keys whose last call didn't succeed. They keep their previous output and are
             retried by their class
-            {scope ? (
+            {partition ? (
               <>
                 {" "}
-                · partition <span className="font-mono">{scope}</span>
+                · partition <span className="font-mono">{partition}</span>
               </>
             ) : (
               " · every partition"
@@ -88,11 +88,11 @@ function FailingKeys({ name }: { name: string }) {
             }
           >
             {(["failed", "rejected", "canceled", "timed_out", "retrying"] as const).map((c) => (
-              <MenuItem key={c} onClick={() => retry.mutate({ classes: [c], scope })}>
+              <MenuItem key={c} onClick={() => retry.mutate({ classes: [c], partition })}>
                 Retry {label(c)} keys{totals[c] ? ` (${totals[c]})` : ""}
               </MenuItem>
             ))}
-            <MenuItem onClick={() => retry.mutate({ classes: ["all"], scope })}>
+            <MenuItem onClick={() => retry.mutate({ classes: ["all"], partition })}>
               Retry every failing key
             </MenuItem>
           </Menu>
@@ -146,7 +146,7 @@ function FailingKeys({ name }: { name: string }) {
             <thead>
               <tr>
                 <Th>Key</Th>
-                {!scope && <Th>Partition</Th>}
+                {!partition && <Th>Partition</Th>}
                 <Th>Class</Th>
                 <Th className="text-right">Tries</Th>
                 <Th>Since</Th>
@@ -157,9 +157,9 @@ function FailingKeys({ name }: { name: string }) {
             </thead>
             <tbody>
               {keys.map((k) => (
-                <Tr key={`${k.scope}/${k.key}`}>
+                <Tr key={`${k.partition}/${k.key}`}>
                   <Td className="max-w-72 truncate font-mono text-xs">{k.key}</Td>
-                  {!scope && <Td className="font-mono text-xs text-fg-muted">{k.scope || "—"}</Td>}
+                  {!partition && <Td className="font-mono text-xs text-fg-muted">{k.partition || "—"}</Td>}
                   <Td>
                     <StatusBadge status={k.outcome} />
                   </Td>
@@ -180,7 +180,7 @@ function FailingKeys({ name }: { name: string }) {
                       search={(s) => ({
                         ...s,
                         key: k.key,
-                        scope: k.scope || undefined,
+                        partition: k.partition || undefined,
                       })}
                       className="text-xs text-link hover:underline"
                     >
@@ -206,7 +206,7 @@ function FailingKeys({ name }: { name: string }) {
 
 function totalsOf(page: Failures | undefined): Partial<Record<FailureClass, number>> {
   const totals: Partial<Record<FailureClass, number>> = {};
-  for (const s of page?.scopes ?? []) {
+  for (const s of page?.partitions ?? []) {
     for (const [c, n] of Object.entries(s.counts) as [FailureClass, number][])
       totals[c] = (totals[c] ?? 0) + n;
   }
@@ -240,7 +240,7 @@ function explainable(asset: AssetDecl): string[] {
 }
 
 function ExplainKey({ name, asset }: { name: string; asset: AssetDecl }) {
-  const { key, scope, edge } = route.useSearch();
+  const { key, partition, edge } = route.useSearch();
   const edges = explainable(asset);
   const chosenEdge = edge ?? edges[0];
   const navigate = route.useNavigate();
@@ -249,12 +249,12 @@ function ExplainKey({ name, asset }: { name: string; asset: AssetDecl }) {
     ...q.partitions(project, name),
     enabled: !!asset.partitions,
   }).data;
-  const effectiveScope =
-    scope ?? (asset.partitions ? partitions?.find((p) => p.status !== "retired")?.scope : "");
+  const effectivePartition =
+    partition ?? (asset.partitions ? partitions?.find((p) => p.status !== "retired")?.partition : "");
   const [draft, setDraft] = useState(key ?? "");
   const answer = useQuery({
-    ...q.explain(project, name, key ?? "", effectiveScope ?? "", chosenEdge),
-    enabled: !!key && effectiveScope !== undefined,
+    ...q.explain(project, name, key ?? "", effectivePartition ?? "", chosenEdge),
+    enabled: !!key && effectivePartition !== undefined,
   });
 
   return (
@@ -268,7 +268,7 @@ function ExplainKey({ name, asset }: { name: string; asset: AssetDecl }) {
             search: (s) => ({
               ...s,
               key: draft.trim() || undefined,
-              scope: s.scope ?? effectiveScope ?? undefined,
+              partition: s.partition ?? effectivePartition ?? undefined,
             }),
             replace: true,
           });
@@ -297,7 +297,7 @@ function ExplainKey({ name, asset }: { name: string; asset: AssetDecl }) {
         )}
         {asset.partitions && (
           <span className="text-xs text-fg-subtle">
-            in <span className="font-mono">{effectiveScope ?? "…"}</span>
+            in <span className="font-mono">{effectivePartition ?? "…"}</span>
           </span>
         )}
         <Button type="submit" icon={<Search />}>
@@ -350,7 +350,7 @@ function Answer({ explain: e }: { explain: Explain }) {
     absent: (
       <>
         Unknown: {e.upstream}
-        {e.up_scope && ` (${e.up_scope})`} has never had this key
+        {e.upstream_partition && ` (${e.upstream_partition})`} has never had this key
       </>
     ),
   };
@@ -364,7 +364,7 @@ function Answer({ explain: e }: { explain: Explain }) {
       <ul className="flex flex-col gap-1.5 pl-6 text-xs text-fg-muted">
         <li>
           Upstream <span className="text-fg">{e.upstream}</span>
-          {e.up_scope && <span className="font-mono"> · {e.up_scope}</span>}:{" "}
+          {e.upstream_partition && <span className="font-mono"> · {e.upstream_partition}</span>}:{" "}
           {e.upstream_generation != null ? (
             <>
               has it at <Generation value={e.upstream_generation} />
@@ -446,11 +446,11 @@ function Answer({ explain: e }: { explain: Explain }) {
 // -- key outcomes ------------------------------------------------------------------
 
 function KeyOutcomes({ name }: { name: string }) {
-  const { scope, q: text } = route.useSearch();
+  const { partition, q: text } = route.useSearch();
   const navigate = route.useNavigate();
   const project = useProject();
   const outcomes = useInfiniteQuery({
-    ...q.keyOutcomes(project, name, { scope, q: text }),
+    ...q.keyOutcomes(project, name, { partition, q: text }),
     placeholderData: keepPreviousData,
   });
   const rows = outcomes.data?.pages.flatMap((p) => p.outcomes) ?? [];
@@ -490,7 +490,7 @@ function KeyOutcomes({ name }: { name: string }) {
             <thead className="sticky top-0 bg-surface">
               <tr>
                 <Th>Key</Th>
-                {!scope && <Th>Partition</Th>}
+                {!partition && <Th>Partition</Th>}
                 <Th>Outcome</Th>
                 <Th>Generation</Th>
                 <Th>Error</Th>
@@ -502,7 +502,7 @@ function KeyOutcomes({ name }: { name: string }) {
               {rows.map((o: KeyOutcome, i) => (
                 <Tr key={`${o.attempt}/${o.key}/${i}`}>
                   <Td className="max-w-72 truncate font-mono text-xs">{o.key}</Td>
-                  {!scope && <Td className="font-mono text-xs text-fg-muted">{o.scope || "—"}</Td>}
+                  {!partition && <Td className="font-mono text-xs text-fg-muted">{o.partition || "—"}</Td>}
                   <Td>
                     <StatusBadge status={o.outcome} />
                   </Td>
@@ -545,7 +545,7 @@ function KeyOutcomes({ name }: { name: string }) {
 // -- live keys ---------------------------------------------------------------------
 
 function LiveKeys({ name, asset }: { name: string; asset: AssetDecl }) {
-  const { scope, output } = route.useSearch();
+  const { partition, output } = route.useSearch();
   const navigate = route.useNavigate();
   const project = useProject();
   const keyed = asset.outputs.filter((o) => o.key);
@@ -554,11 +554,11 @@ function LiveKeys({ name, asset }: { name: string; asset: AssetDecl }) {
     ...q.partitions(project, name),
     enabled: !!asset.partitions,
   }).data;
-  const effectiveScope =
-    scope ?? (asset.partitions ? partitions?.find((p) => p.status === "complete")?.scope : "");
+  const effectivePartition =
+    partition ?? (asset.partitions ? partitions?.find((p) => p.status === "complete")?.partition : "");
   const keys = useInfiniteQuery({
-    ...q.keys(project, chosen?.name ?? "", effectiveScope ?? ""),
-    enabled: !!chosen && effectiveScope !== undefined,
+    ...q.keys(project, chosen?.name ?? "", effectivePartition ?? ""),
+    enabled: !!chosen && effectivePartition !== undefined,
     placeholderData: keepPreviousData,
   });
   if (!chosen) return null;
@@ -571,10 +571,10 @@ function LiveKeys({ name, asset }: { name: string; asset: AssetDecl }) {
         description={
           <>
             What the key index holds now
-            {effectiveScope ? (
+            {effectivePartition ? (
               <>
                 {" "}
-                for <span className="font-mono">{effectiveScope}</span>
+                for <span className="font-mono">{effectivePartition}</span>
               </>
             ) : (
               ""
@@ -611,7 +611,7 @@ function LiveKeys({ name, asset }: { name: string; asset: AssetDecl }) {
             ? "This output has no head for this partition yet."
             : keys.error.message}
         </Empty>
-      ) : effectiveScope === undefined && partitions ? (
+      ) : effectivePartition === undefined && partitions ? (
         <Empty compact title="No complete partition yet">
           Pick a partition above to read what its index holds.
         </Empty>

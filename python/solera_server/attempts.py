@@ -58,16 +58,16 @@ def _names(value) -> dict[str, list[str]]:
     return {str(k): [str(i) for i in v] for k, v in value.items() if isinstance(v, list)}
 
 
-def discard_report(body) -> dict:
+def cleanup_report(body) -> dict:
     """A worker's discard acknowledgement as the model applies it: its
     `scope`, and by output the entry ids it discarded (`discarded`) or
     could not read the names of (`discard_unresolved`), and the index files
     it deleted (`discarded_files`)."""
 
-    if not isinstance(body, dict) or not isinstance(body.get("scope"), str):
-        raise ValueError("a discard report names its scope")
-    out = {"scope": body["scope"]}
-    for name in ("discarded", "discard_unresolved"):
+    if not isinstance(body, dict) or not isinstance(body.get("partition"), str):
+        raise ValueError("a discard report names its partition")
+    out = {"partition": body["partition"]}
+    for name in ("cleaned_up", "cleanup_unresolved"):
         value = body.get(name)
         if value is None:
             continue
@@ -76,11 +76,11 @@ def discard_report(body) -> dict:
         ):
             raise ValueError(f"{name}: entry ids by output")
         out[name] = value
-    files = body.get("discarded_files")
+    files = body.get("cleaned_files")
     if files is not None:
         if not isinstance(files, list) or not all(isinstance(f, str) for f in files):
             raise ValueError("discarded_files: a list of paths")
-        out["discarded_files"] = files
+        out["cleaned_files"] = files
     return out
 
 
@@ -139,12 +139,12 @@ def worker_report(worker: dict | None) -> dict:
     usage = {k: _number(v) for k, v in usage.items() if isinstance(k, str)}
     if usage := {k: v for k, v in usage.items() if v is not None}:
         out["usage"] = usage
-    for name in ("discarded", "discard_unresolved"):
+    for name in ("cleaned_up", "cleanup_unresolved"):
         if found := _names(worker.get(name)):
             out[name] = found
-    files = worker.get("discarded_files")
+    files = worker.get("cleaned_files")
     if isinstance(files, list) and (files := [str(f) for f in files]):
-        out["discarded_files"] = files
+        out["cleaned_files"] = files
     keys = worker.get("keys")
     if isinstance(keys, dict) and (
         keys := {str(k): int(v) for k, v in keys.items() if _number(v) is not None}
@@ -165,7 +165,7 @@ def _read(entry) -> dict | None:
     generation = entry.get("generation")
     return {
         "output": entry["output"],
-        "scope": str(entry.get("scope") or ""),
+        "partition": str(entry.get("partition") or ""),
         "generation": int(generation) if _number(generation) is not None else None,
     }
 
@@ -326,22 +326,22 @@ class Attempts:
         await self.state.durable()  # never delete what a replay would still name
         due = {}
         for output in self.manifest["assets"].get(task["asset"], {}).get("outputs") or ():
-            name, head = output["name"], self.m.heads.get((output["name"], task["scope"]))
+            name, head = output["name"], self.m.heads.get((output["name"], task["partition"]))
             if self.m.immutable(name) and head is not None:
-                entries = self._due_discards(name, task["scope"], None)
+                entries = self._due_cleanups(name, task["partition"], None)
                 if entries:
-                    due[name] = {"discard": entries, "before": head["ref"]}
-        return {"discard": due, "scope": task["scope"]} if due else {}
+                    due[name] = {"cleanup": entries, "before": head["ref"]}
+        return {"cleanup": due, "partition": task["partition"]} if due else {}
 
-    async def attempt_discarded(self, attempt: str, body) -> None:
+    async def attempt_cleaned_up(self, attempt: str, body) -> None:
         """A worker's acknowledgement of what it discarded after its commit,
         checked whole before anything is recorded: one that is malformed is
         refused (`ValueError`), and no reducer ever sees it."""
 
         self._serving()
-        report = discard_report(body)
-        if report.get("discarded") or report.get("discard_unresolved"):
-            self.state.record({"type": "DiscardsDone", **report})
+        report = cleanup_report(body)
+        if report.get("cleaned_up") or report.get("cleanup_unresolved"):
+            self.state.record({"type": "CleanupsDone", **report})
 
     async def attempt_resolve(self, attempt: str, body: bytes) -> bytes | None:
         """A small write's delta from the engine's cache (docs/resolved-commits.md
@@ -364,20 +364,20 @@ class Attempts:
             return None
         task = self.m.task(self.m.attempts[attempt])
         launched = task.get("launched") or {}
-        scope, outputs = task["scope"], (launched.get("prepared") or {}).get("outputs") or {}
+        partition, outputs = task["partition"], (launched.get("prepared") or {}).get("outputs") or {}
 
         def prepared(name):
             info = outputs.get(name)
             if not info or "prefix" not in info or "commit_number" not in info:
                 return None
-            index = self.m.indexes.get((name, scope))
-            head = self.m.heads.get((name, scope)) or {}
+            index = self.m.indexes.get((name, partition))
+            head = self.m.heads.get((name, partition)) or {}
             if index is None and int(info["commit_number"]) == 0:
-                index = self.m.index(name, scope)  # the first write of the output
+                index = self.m.index(name, partition)  # the first write of the output
             if index is None or index.prefix != info["prefix"]:
                 return None
             return Prepared(
-                scope,
+                partition,
                 int(info["commit_number"]),
                 int(launched["pin"]),
                 index,
@@ -459,7 +459,7 @@ class Attempts:
             "deploy": self.manifest["deploy"],
             "project": self.manifest["name"],
             "asset": task["asset"],
-            "partition": task["scope"],
+            "partition": task["partition"],
             "run": {"id": task["run"], "config": run.get("config") or {}},
             "outputs": {name: worker_output(info) for name, info in prepared["outputs"].items()},
             "inputs": prepared["inputs"],
@@ -773,28 +773,33 @@ class Attempts:
             info["contract"]["writes"] == "fenced" for info in (prepared.get("outputs") or {}).values()
         )
 
-    def scope_discards(self, output: str, scope: str) -> dict:
+    def partition_cleanups(self, output: str, partition: str) -> dict:
         """An output scope's data garbage awaiting its next attempt (§9.8):
         how much is pending, and the entries stuck — their names could not
         be read three times — for an operator to see and clear."""
 
-        entries = self.m.discards.get((output, scope)) or []
+        entries = self.m.cleanups.get((output, partition)) or []
         stuck = [
             {k: e[k] for k in ("id", "kind", "misses", "attempt", "files") if k in e}
             for e in entries
             if e.get("stuck")
         ]
-        return {"output": output, "scope": scope, "pending": len(entries) - len(stuck), "stuck": stuck}
+        return {
+            "output": output,
+            "partition": partition,
+            "pending": len(entries) - len(stuck),
+            "stuck": stuck,
+        }
 
-    def clear_discards(self, output: str, scope: str, by: str) -> dict:
+    def clear_cleanups(self, output: str, partition: str, by: str) -> dict:
         """An operator's `solera scopes discards --clear`: forget the stuck
         entries. Their objects stay where they are."""
 
-        stuck = [e["id"] for e in self.m.discards.get((output, scope)) or [] if e.get("stuck")]
+        stuck = [e["id"] for e in self.m.cleanups.get((output, partition)) or [] if e.get("stuck")]
         if stuck:
-            event = {"output": output, "scope": scope, "ids": stuck, "by": by, "at": self.clock()}
-            self.state.record({"type": "DiscardsCleared", **event})
-        return {"output": output, "scope": scope, "cleared": stuck}
+            event = {"output": output, "partition": partition, "ids": stuck, "by": by, "at": self.clock()}
+            self.state.record({"type": "CleanupsCleared", **event})
+        return {"output": output, "partition": partition, "cleared": stuck}
 
     async def _gate(self, run_id: str, attempt: str, state: str) -> tuple[str, dict | None]:
         """Create the attempt's gate as `state` (`aborted` or `closed`), or
@@ -869,13 +874,13 @@ class Attempts:
             write=write,
             retry_for=retry_for,
         )
-        await self._discard(attempt, prepared, keep=set(unsettled))
+        await self._cleanup(attempt, prepared, keep=set(unsettled))
 
     def _last_report(self, attempt: str) -> dict:
         live = self.live.get(attempt)
         return dict(live.report) if live is not None else {}
 
-    async def _discard(self, attempt: str, prepared: dict, keep=()):
+    async def _cleanup(self, attempt: str, prepared: dict, keep=()):
         """Delete the delta files an attempt wrote but never committed, except
         the intents of outputs it left unsettled. They are named after the
         attempt, so nothing else can hold them (§6)."""

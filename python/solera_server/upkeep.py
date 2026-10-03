@@ -115,22 +115,22 @@ class Upkeep:
 
         needed: dict[tuple, int] = {}
         for wm in self.m.watermarks():
-            key = (wm["output"], wm["up"])
+            key = (wm["output"], wm["upstream_partition"])
             needed[key] = min(needed.get(key, math.inf), delivery.needs(wm))
         for claim in self.m.claims.values():
             for output, up, first in claim.get("reads") or ():
                 needed[(output, up)] = min(needed.get((output, up), math.inf), int(first))
         truncations = []
-        for (output, scope), index in self.m.indexes.items():
+        for (output, partition), index in self.m.indexes.items():
             if not index.log:
                 continue
-            below = needed.get((output, scope), index.log[-1][0] + 1)
+            below = needed.get((output, partition), index.log[-1][0] + 1)
             if index.log[0][0] < below:
                 truncations.append(
                     {
                         "type": "IndexTruncated",
                         "output": output,
-                        "scope": scope,
+                        "partition": partition,
                         "below": below,
                         "at": self.clock(),
                     }
@@ -197,7 +197,7 @@ class Upkeep:
             log.exception("key index maintenance failed for %s", key)
             self._recounted[key] = self.clock()
             return
-        output, scope = key
+        output, partition = key
         current = self.m.indexes.get(key)
         if recount:
             # Exact for the state it pinned; commits since add their `added - removed`.
@@ -207,7 +207,7 @@ class Upkeep:
                     {
                         "type": "IndexRecounted",
                         "output": output,
-                        "scope": scope,
+                        "partition": partition,
                         "live": result,
                         "pinned_count": index.count,
                         "pinned_inexact": index.inexact,
@@ -226,7 +226,7 @@ class Upkeep:
         event = {
             "type": "IndexCompacted",
             "output": output,
-            "scope": scope,
+            "partition": partition,
             "added": [f.to_json() for f in added],
             "removed": removed,
             "at": self.clock(),
@@ -250,7 +250,7 @@ class Upkeep:
 
         if not self.m.garbage:
             return
-        floors, read = self.m.floors(), self.m.discard_reads()  # pending discards still read them
+        floors, read = self.m.floors(), self.m.cleanup_reads()  # pending discards still read them
         # The engine's own fills and fetches of index files hold back index files only.
         cache = self.keys.floor() if self.keys is not None else math.inf
 
@@ -265,7 +265,7 @@ class Upkeep:
         await self.state.durable()  # a replay must never reference them again
         await self._delete(due)
         self.history.lake.evict(due)  # their cached copies live exactly as long
-        self.state.record({"type": "GarbageDeleted", "paths": due})
+        self.state.record({"type": "FilesCleanedUp", "paths": due})
         if self.keys is not None:  # what the engine's cache held of them goes too
             self.keys.retired(due)
 

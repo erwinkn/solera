@@ -137,7 +137,7 @@ async def test_assets_status_rolls_up_every_asset(world):
     # The rollup is not an asset name, and /partitions reads the same statuses.
     assert (await client.get(f"{base}/assets/assets:status")).status_code == 404
     parts = (await client.get(f"{base}/partitions/consume")).json()["partitions"]
-    assert {p["scope"]: p["status"] for p in parts} == {"x": "complete", "y": "missing"}
+    assert {p["partition"]: p["status"] for p in parts} == {"x": "complete", "y": "missing"}
 
 
 async def test_failures_list_page_and_filter(world, monkeypatch):
@@ -145,9 +145,9 @@ async def test_failures_list_page_and_filter(world, monkeypatch):
     await run(engine, ["parse"], upstream=True)
 
     found = (await client.get(f"{base}/assets/parse/failures")).json()
-    assert [s["scope"] for s in found["scopes"]] == [""]
-    [scope] = found["scopes"]
-    assert scope["counts"] == {"rejected": 1, "failed": 1} and scope["last"] == "changes"
+    assert [s["partition"] for s in found["partitions"]] == [""]
+    [partition] = found["partitions"]
+    assert partition["counts"] == {"rejected": 1, "failed": 1} and partition["last"] == "changes"
     assert found["deploy"] == engine.m.deploy_number and found["next"] is None
     by_key = {k["key"]: k for k in found["keys"]}
     assert set(by_key) == {"bad.csv", "bug.csv"}
@@ -167,9 +167,9 @@ async def test_failures_list_page_and_filter(world, monkeypatch):
     assert [k["key"] for k in second["keys"]] == ["bug.csv"] and second["next"] is None
 
     failed = (await client.get(f"{base}/assets/parse/failures", params={"outcome": "failed"})).json()
-    assert [k["key"] for k in failed["keys"]] == ["bug.csv"] and len(failed["scopes"]) == 1
+    assert [k["key"] for k in failed["keys"]] == ["bug.csv"] and len(failed["partitions"]) == 1
     retrying = (await client.get(f"{base}/assets/parse/failures", params={"outcome": "retrying"})).json()
-    assert retrying["keys"] == [] and retrying["scopes"][0]["counts"]["rejected"] == 1
+    assert retrying["keys"] == [] and retrying["partitions"][0]["counts"]["rejected"] == 1
 
     # A page reads a bounded number of entries: a rare class comes back short, with a `next`.
     monkeypatch.setattr(views, "SCAN", 1)
@@ -236,7 +236,12 @@ async def test_explain_says_why_a_key_is_or_is_not_there(world):
         return response.json()
 
     ok = await explain("a.csv")
-    assert (ok["verdict"], ok["edge"], ok["upstream"], ok["up_scope"]) == ("ok", "file", "files", "")
+    assert (ok["verdict"], ok["edge"], ok["upstream"], ok["upstream_partition"]) == (
+        "ok",
+        "file",
+        "files",
+        "",
+    )
     assert ok["outputs"] == {
         "samples": {"present": True, "generation": ok["outputs"]["samples"]["generation"]}
     }
@@ -268,10 +273,12 @@ async def test_explain_says_why_a_key_is_or_is_not_there(world):
     assert (await explain("a.csv"))["verdict"] == "ok"
 
     assert (await client.get(f"{base}/assets/files/explain", params={"key": "a.csv"})).status_code == 400
-    bad_scope = await client.get(f"{base}/assets/parse/explain", params={"key": "a.csv", "scope": "x"})
-    assert bad_scope.status_code == 404
+    bad_partition = await client.get(
+        f"{base}/assets/parse/explain", params={"key": "a.csv", "partition": "x"}
+    )
+    assert bad_partition.status_code == 404
     await run(engine, ["parted"], partitions=["y"])  # a plain Incremental edge never delivered
-    consume = await client.get(f"{base}/assets/consume/explain", params={"key": "k1", "scope": "y"})
+    consume = await client.get(f"{base}/assets/consume/explain", params={"key": "k1", "partition": "y"})
     assert consume.json()["verdict"] == "pending" and consume.json()["edge_state"] == "never"
     assert consume.json()["last"] is None and consume.json()["outputs"] == {}
 
@@ -309,13 +316,13 @@ async def test_edges_report_every_scope_and_its_lag(world):
     edges = {e["param"]: e for e in found["edges"]}
     assert (edges["parts"]["kind"], edges["files"]["kind"]) == ("incremental", "dep")
     assert edges["parts"]["upstream_asset"] == "parted" and edges["parts"]["page_size"] == 1
-    assert edges["files"]["scopes"] == [] and edges["files"]["source"] is False
-    scopes = {s["scope"]: s for s in edges["parts"]["scopes"]}
-    assert scopes["x"]["state"] == "caught_up" and scopes["x"]["lag"] == 0
-    assert scopes["x"]["watermark"]["next"] == scopes["x"]["head_commit"] + 1
-    assert scopes["y"] == {
-        "scope": "y",
-        "up_scope": "y",
+    assert edges["files"]["partitions"] == [] and edges["files"]["source"] is False
+    partitions = {s["partition"]: s for s in edges["parts"]["partitions"]}
+    assert partitions["x"]["state"] == "caught_up" and partitions["x"]["lag"] == 0
+    assert partitions["x"]["watermark"]["next"] == partitions["x"]["head_commit"] + 1
+    assert partitions["y"] == {
+        "partition": "y",
+        "upstream_partition": "y",
         "watermark": None,
         "head_commit": 0,
         "lag": 1,
@@ -327,14 +334,15 @@ async def test_edges_report_every_scope_and_its_lag(world):
     parts["x"]["k1"] = 9
     await run(engine, ["parted"], partitions=["x"])
     behind = {
-        s["scope"]: s for s in (await client.get(f"{base}/assets/consume/edges")).json()["edges"][0]["scopes"]
+        s["partition"]: s
+        for s in (await client.get(f"{base}/assets/consume/edges")).json()["edges"][0]["partitions"]
     }
     assert (behind["x"]["state"], behind["x"]["lag"]) == ("behind", 2)
 
     each = {e["param"]: e for e in (await client.get(f"{base}/assets/parse/edges")).json()["edges"]}["file"]
     assert each["kind"] == "each" and each["concurrency"] == 16
     assert each["patterns"]["exclude"] == [["drafts", {"glob": "draft-*"}]]
-    assert [s["state"] for s in each["scopes"]] == ["never"]
+    assert [s["state"] for s in each["partitions"]] == ["never"]
 
 
 async def test_a_domain_too_big_to_list_still_rolls_up(tmp_path):
@@ -352,9 +360,9 @@ async def test_a_domain_too_big_to_list_still_rolls_up(tmp_path):
     app = create_app(engine=engine, insecure=True)
     app.state.engine = engine
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-        base, scope = "/api/projects/grid", "a=a7,b=b9"
-        await run(engine, ["rows"], partitions=[scope])
-        await run(engine, ["cells"], partitions=[scope])
+        base, partition = "/api/projects/grid", "a=a7,b=b9"
+        await run(engine, ["rows"], partitions=[partition])
+        await run(engine, ["cells"], partitions=[partition])
 
         response = await client.get(f"{base}/assets:status")
         assert response.status_code == 200, response.text
@@ -367,12 +375,14 @@ async def test_a_domain_too_big_to_list_still_rolls_up(tmp_path):
                 "running": 0,
                 "retired": 0,
             }
-        explained = await client.get(f"{base}/assets/cells/explain", params={"key": "k1", "scope": scope})
+        explained = await client.get(
+            f"{base}/assets/cells/explain", params={"key": "k1", "partition": partition}
+        )
         assert explained.status_code == 200, explained.text
         assert explained.json()["verdict"] == "ok"
-        other = {"key": "k1", "scope": "a=a8,b=b9"}  # a current scope, never run
+        other = {"key": "k1", "partition": "a=a8,b=b9"}  # a current scope, never run
         assert (await client.get(f"{base}/assets/cells/explain", params=other)).json()["verdict"] == "absent"
-        ghost = {"key": "k1", "scope": "a=a7,b=b1000"}
+        ghost = {"key": "k1", "partition": "a=a7,b=b1000"}
         assert (await client.get(f"{base}/assets/cells/explain", params=ghost)).status_code == 404
         # Listing every scope stays bounded: refused, as an `all` run would be.
         assert (await client.get(f"{base}/partitions/rows")).status_code == 400
@@ -381,7 +391,7 @@ async def test_a_domain_too_big_to_list_still_rolls_up(tmp_path):
 
 async def test_what_an_operator_may_clear_starts_empty(world):
     engine, client, base, *_ = world
-    assert (await client.get(f"{base}/holds")).json() == {"unsettled": [], "discards": []}
+    assert (await client.get(f"{base}/holds")).json() == {"unsettled": [], "cleanups": []}
 
 
 async def test_automations_say_when_they_next_fire(tmp_path):

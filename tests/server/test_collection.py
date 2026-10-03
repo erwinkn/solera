@@ -68,7 +68,7 @@ async def test_superseded_versions_go_right_after_the_commit(tmp_path, data):
         await run(engine, ["scores", "total"])
     assert objects(data, "scores") == await named(state, "scores")  # the old `a` already gone
     assert len(list(data.glob("total@*"))) == 1
-    assert ("scores", "") not in state.model.discards
+    assert ("scores", "") not in state.model.cleanups
     await engine.stop()
     await state.close()
 
@@ -142,7 +142,7 @@ async def test_compaction_garbage_is_collected(tmp_path, data):
         engine.upkeep.maintain()
         for job in list(engine.upkeep.jobs.values()):
             await job
-        compacted += sum(1 for d in state.model.discards.get(("items", ""), []) if d["kind"] == "sidecar")
+        compacted += sum(1 for d in state.model.cleanups.get(("items", ""), []) if d["kind"] == "sidecar")
     assert compacted, "no compaction listed garbage"
     pending["rows"] = {}
     for _ in range(4):  # unchanged runs: each collects what is due
@@ -170,23 +170,23 @@ async def test_a_reader_pin_holds_collection_back(tmp_path):
     engine = engine_for(state, project)
     await engine.initialize()
     m = state.model
-    m.discards[("scores", "")] = [{"n": 10, "id": "10.0", "kind": "items", "items": [["path", "x"]]}]
+    m.cleanups[("scores", "")] = [{"n": 10, "id": "10.0", "kind": "items", "items": [["path", "x"]]}]
     m.claims["reader"] = {"attempt": "r", "pin": 9, "started_at": 0, "status": "running"}
-    assert engine._due_discards("scores", "", "me") == []
+    assert engine._due_cleanups("scores", "", "me") == []
     m.claims["reader"]["pin"] = 10
-    m._scope("c", "")["watermarks"] = {
+    m._partition("c", "")["watermarks"] = {
         "e": {
             "kind": "keys",
             "output": "scores",
-            "up": "",
+            "upstream_partition": "",
             "next": 0,
             "delivery": {"mode": "delta", "from": 0, "to": 1, "at": "k", "page": 1, "pages": 2, "pin": 8},
         }
     }
-    assert engine._due_discards("scores", "", "me") == []
-    del m.scopes[("c", "")]
-    assert [d["n"] for d in engine._due_discards("scores", "", "me")] == [10]
-    assert [d["n"] for d in engine._due_discards("scores", "", "r")] == [10]  # its own claim reads none of it
+    assert engine._due_cleanups("scores", "", "me") == []
+    del m.partitions[("c", "")]
+    assert [d["n"] for d in engine._due_cleanups("scores", "", "me")] == [10]
+    assert [d["n"] for d in engine._due_cleanups("scores", "", "r")] == [10]  # its own claim reads none of it
     await state.close()
 
 
@@ -208,14 +208,14 @@ async def test_a_delta_a_pending_discard_reads_outlives_its_index(tmp_path, data
     prefix = m.indexes[("scores", "")].prefix
     path = f"{prefix}held.kx"
     await state.create_object(path, b"delta")
-    m.discards[("scores", "")] = [{"n": 1, "id": "1.0", "kind": "delta", "prefix": prefix, "files": ["held"]}]
+    m.cleanups[("scores", "")] = [{"n": 1, "id": "1.0", "kind": "delta", "prefix": prefix, "files": ["held"]}]
     m.garbage.append([path, 1])  # the index let go of it
     await engine.upkeep.collect()
     assert await state.get_object(path) == b"delta" and [path, 1] in m.garbage
-    m.discards[("scores", "")][0]["files"] = ["gone"]  # its names cannot be read
+    m.cleanups[("scores", "")][0]["files"] = ["gone"]  # its names cannot be read
     await run(engine, ["scores"])
-    assert [d["files"] for d in m.discards[("scores", "")]] == [["gone"]]  # still pending
-    del m.discards[("scores", "")]
+    assert [d["files"] for d in m.cleanups[("scores", "")]] == [["gone"]]  # still pending
+    del m.cleanups[("scores", "")]
     await engine.upkeep.collect()
     assert await state.get_object(path) is None
     await engine.stop()
@@ -244,24 +244,24 @@ async def test_an_entry_whose_names_cannot_be_read_gets_stuck_and_is_shown(tmp_p
     await run(engine, ["scores"])
     m = state.model
     prefix = m.indexes[("scores", "")].prefix
-    m.discards[("scores", "")] = [{"n": 1, "id": "1.0", "kind": "delta", "prefix": prefix, "files": ["gone"]}]
+    m.cleanups[("scores", "")] = [{"n": 1, "id": "1.0", "kind": "delta", "prefix": prefix, "files": ["gone"]}]
     for misses in (1, 2, 3):
         await run(engine, ["scores"])
-        [entry] = m.discards[("scores", "")]
+        [entry] = m.cleanups[("scores", "")]
         assert entry["misses"] == misses and entry.get("stuck", False) == (misses == 3)
-    assert engine._due_discards("scores", "", None) == []
+    assert engine._due_cleanups("scores", "", None) == []
     app = create_app(engine=engine, insecure=True)
     app.state.engine = engine
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-        assert (await client.get("/api/diagnostics")).json()["stuck_discards"] == [
-            {"output": "scores", "scope": "", "id": "1.0"}
+        assert (await client.get("/api/diagnostics")).json()["stuck_cleanups"] == [
+            {"output": "scores", "partition": "", "id": "1.0"}
         ]
         base = f"/api/projects/{project.manifest['name']}"
         [head] = (await client.get(f"{base}/outputs/scores/heads")).json()["heads"]
-        assert head["discards"]["pending"] == 0 and [e["id"] for e in head["discards"]["stuck"]] == ["1.0"]
-        cleared = await client.post(f"{base}/scopes:clear-discards", json={"output": "scores", "by": "ops"})
+        assert head["cleanups"]["pending"] == 0 and [e["id"] for e in head["cleanups"]["stuck"]] == ["1.0"]
+        cleared = await client.post(f"{base}/cleanups:clear", json={"output": "scores", "by": "ops"})
         assert cleared.json()["cleared"] == ["1.0"]
-    assert ("scores", "") not in m.discards
+    assert ("scores", "") not in m.cleanups
     await engine.stop()
     await state.close()
 
@@ -288,21 +288,21 @@ async def test_entries_of_one_event_are_acknowledged_one_by_one(tmp_path):
     await run(engine, ["scores"])
     m = state.model
     prefix = m.indexes[("scores", "")].prefix
-    m.discards.pop(("scores", ""), None)  # the first commit's own
+    m.cleanups.pop(("scores", ""), None)  # the first commit's own
     m.applied += 1
     m._collect("scores", "", {"kind": "items", "items": [["path", "x"]]})
     m._collect("scores", "", {"kind": "delta", "prefix": prefix, "files": ["gone"]})
     m._collect("scores", "", {"kind": "items", "items": [["path", "y"]]})
-    entries = m.discards[("scores", "")]
+    entries = m.cleanups[("scores", "")]
     assert len({d["n"] for d in entries}) == 1 and len({d["id"] for d in entries}) == 3
     engine_module.DISCARDS, limit = 1, engine_module.DISCARDS
     try:
         await run(engine, ["scores"])  # delivers the first alone
     finally:
         engine_module.DISCARDS = limit
-    assert [d["kind"] for d in m.discards[("scores", "")]] == ["delta", "items"]
+    assert [d["kind"] for d in m.cleanups[("scores", "")]] == ["delta", "items"]
     await run(engine, ["scores"])  # the unresolved delta and its resolved sibling
-    [left] = m.discards[("scores", "")]
+    [left] = m.cleanups[("scores", "")]
     assert left["kind"] == "delta" and left["misses"] == 1
     await engine.stop()
     await state.close()
@@ -339,18 +339,18 @@ async def test_without_the_channel_the_next_attempt_discards(tmp_path, data, mon
 
     monkeypatch.setattr(LocalChannel, "finished", unreachable)
     await run(engine, ["scores"])  # supersedes `a`, cannot discard
-    assert objects(data, "scores") != await named(state, "scores") and state.model.discards
+    assert objects(data, "scores") != await named(state, "scores") and state.model.cleanups
     monkeypatch.setattr(LocalChannel, "finished", finished)
 
     async def gone(self, body):
         raise OSError("the worker died before it acknowledged")
 
-    monkeypatch.setattr(LocalChannel, "discarded", gone)
+    monkeypatch.setattr(LocalChannel, "cleaned_up", gone)
     await run(engine, ["scores"])  # supersedes `a` again: discards it, cannot acknowledge
-    assert objects(data, "scores") == await named(state, "scores") and state.model.discards
+    assert objects(data, "scores") == await named(state, "scores") and state.model.cleanups
     monkeypatch.undo()
     await run(engine, ["scores"])  # deletes them again, harmlessly, and acknowledges
-    assert ("scores", "") not in state.model.discards
+    assert ("scores", "") not in state.model.cleanups
     await engine.stop()
     await state.close()
 
@@ -367,25 +367,25 @@ async def test_a_reader_pin_at_commit_keeps_the_garbage_queued(tmp_path, data):
     with state.model.reading():  # a reader of the index as it is before the commit
         await run(engine, ["scores"])
         assert objects(data, "scores") != await named(state, "scores")
-        assert [d["kind"] for d in state.model.discards[("scores", "")]] == ["delta"]
+        assert [d["kind"] for d in state.model.cleanups[("scores", "")]] == ["delta"]
     await run(engine, ["scores"])
     assert objects(data, "scores") == await named(state, "scores")
     await engine.stop()
     await state.close()
 
 
-async def test_a_run_is_settled_before_its_worker_has_discarded(tmp_path, data, monkeypatch):
+async def test_a_run_is_settled_before_its_worker_has_cleaned_up(tmp_path, data, monkeypatch):
     """Review round 3, S2: the worker discards after its commit, so a run
     reads settled while its discards are still under way; tests wait for
     the worker, never for a while."""
 
-    discard, go = FileStore.discard, asyncio.Event()
+    cleanup, go = FileStore.cleanup, asyncio.Event()
 
     async def held(self, *args, **kw):
         await go.wait()
-        await discard(self, *args, **kw)
+        await cleanup(self, *args, **kw)
 
-    monkeypatch.setattr(FileStore, "discard", held)
+    monkeypatch.setattr(FileStore, "cleanup", held)
     project = scores_project()
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = engine_for(state, project)

@@ -44,8 +44,8 @@ class HttpChannel:
         # The answer waits for the commit, to name what is due for discarding.
         return await asyncio.to_thread(self._post, "finished", body, 30.0)
 
-    async def discarded(self, body: dict) -> None:
-        await asyncio.to_thread(self._post, "discarded", body)
+    async def cleaned_up(self, body: dict) -> None:
+        await asyncio.to_thread(self._post, "cleaned_up", body)
 
     def _resolve(self, body: bytes) -> bytes:
         from solera.keys.resolver import CONTENT_TYPE
@@ -88,8 +88,8 @@ class LocalChannel:
     async def finished(self, body: dict) -> dict:
         return await self.engine.attempt_finished(self.attempt, body)
 
-    async def discarded(self, body: dict) -> None:
-        await self.engine.attempt_discarded(self.attempt, body)
+    async def cleaned_up(self, body: dict) -> None:
+        await self.engine.attempt_cleaned_up(self.attempt, body)
 
     async def resolve(self, body: bytes) -> bytes:
         return await self.engine.attempt_resolve(self.attempt, body)

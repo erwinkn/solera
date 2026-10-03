@@ -181,27 +181,27 @@ export const q = {
       refetchInterval: LIST,
     }),
 
-  keys: (project: string, output: string, scope: string) =>
+  keys: (project: string, output: string, partition: string) =>
     infiniteQueryOptions({
-      queryKey: ["outputs", output, "keys", scope],
+      queryKey: ["outputs", output, "keys", partition],
       queryFn: ({ signal, pageParam }) =>
         api<KeyPage>(`${p(project)}/outputs/${enc(output)}/keys`, {
           signal,
-          query: { scope, after: pageParam, limit: 200 },
+          query: { partition, after: pageParam, limit: 200 },
         }),
       initialPageParam: undefined as string | undefined,
       getNextPageParam: (page) => page.next ?? undefined,
       refetchInterval: LIST,
     }),
 
-  failures: (project: string, name: string, filter: { scope?: string; outcome?: string[] }) =>
+  failures: (project: string, name: string, filter: { partition?: string; outcome?: string[] }) =>
     infiniteQueryOptions({
       queryKey: ["assets", name, "failures", filter],
       queryFn: ({ signal, pageParam }) =>
         api<Failures>(`${p(project)}/assets/${enc(name)}/failures`, {
           signal,
           query: {
-            scope: filter.scope,
+            partition: filter.partition,
             outcome: filter.outcome,
             after: pageParam,
             limit: 100,
@@ -215,7 +215,7 @@ export const q = {
   keyOutcomes: (
     project: string,
     name: string,
-    filter: { scope?: string; q?: string; outcome?: string[]; key?: string },
+    filter: { partition?: string; q?: string; outcome?: string[]; key?: string },
   ) =>
     infiniteQueryOptions({
       queryKey: ["assets", name, "key-outcomes", filter],
@@ -232,13 +232,13 @@ export const q = {
       refetchInterval: LIST,
     }),
 
-  explain: (project: string, name: string, key: string, scope: string, edge?: string) =>
+  explain: (project: string, name: string, key: string, partition: string, edge?: string) =>
     queryOptions({
-      queryKey: ["assets", name, "explain", scope, key, edge ?? null],
+      queryKey: ["assets", name, "explain", partition, key, edge ?? null],
       queryFn: ({ signal }) =>
         api<Explain>(`${p(project)}/assets/${enc(name)}/explain`, {
           signal,
-          query: { key, scope, edge },
+          query: { key, partition, edge },
         }),
       refetchInterval: LIST,
     }),
@@ -251,7 +251,7 @@ export const q = {
       refetchInterval: LIST,
     }),
 
-  history: (project: string, name: string, filter: { output?: string; scope?: string }) =>
+  history: (project: string, name: string, filter: { output?: string; partition?: string }) =>
     infiniteQueryOptions({
       queryKey: ["assets", name, "history", filter],
       queryFn: ({ signal, pageParam }) =>
@@ -270,16 +270,16 @@ export const q = {
   lineage: (
     project: string,
     output: string,
-    scope: string,
+    partition: string,
     generation: number | undefined,
     direction: "upstream" | "downstream",
   ) =>
     queryOptions({
-      queryKey: ["outputs", output, "lineage", scope, generation ?? "head", direction],
+      queryKey: ["outputs", output, "lineage", partition, generation ?? "head", direction],
       queryFn: ({ signal }) =>
         api<Lineage>(`${p(project)}/outputs/${enc(output)}/lineage`, {
           signal,
-          query: { scope, generation, direction, depth: 4 },
+          query: { partition, generation, direction, depth: 4 },
         }),
     }),
 

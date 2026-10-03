@@ -94,7 +94,7 @@ async def test_every_boundary_once(tmp_path):
     index = m.indexes[("items", "")]
     root = Path(state.objects_url.removeprefix("file://"))
     on_disk = {str(p.relative_to(root)) for p in (root / index.prefix).glob("*.kx")}
-    assert on_disk <= {index.path(n) for n in index.referenced()} | m.discard_reads() | {
+    assert on_disk <= {index.path(n) for n in index.referenced()} | m.cleanup_reads() | {
         g[0] for g in m.garbage
     }
     await state.durable()

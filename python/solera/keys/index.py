@@ -73,11 +73,11 @@ def delta_keys(data: bytes) -> tuple[list[bytes], list[bytes]]:
     ]
 
 
-def index_prefix(output: str, scope: str) -> str:
+def index_prefix(output: str, partition: str) -> str:
     """Where a new index's files go: `keys/{output}/{scope}/` (`_` for the
     unpartitioned scope). An index keeps its prefix when its output is renamed."""
 
-    return f"keys/{output}/{quote(scope or '_', safe='')}/"
+    return f"keys/{output}/{quote(partition or '_', safe='')}/"
 
 
 @dataclass(frozen=True)

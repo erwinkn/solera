@@ -26,12 +26,12 @@ def table_harness(_tmp):
     store = TableStore(Database())
 
     @contextlib.asynccontextmanager
-    async def hold(scope):
+    async def hold(partition):
         """The older writer's transaction, open: the slice's lock held, its fence taken."""
 
-        table = store._table(scope.output, None)
-        async with store.db.lock(table, scope.partition):
-            store.db.fences[(table, scope.partition)] = store._fence(scope, table)
+        table = store._table(partition.output, None)
+        async with store.db.lock(table, partition.partition):
+            store.db.fences[(table, partition.partition)] = store._fence(partition, table)
             yield
 
     return Harness(store, fresh("db"), hold)

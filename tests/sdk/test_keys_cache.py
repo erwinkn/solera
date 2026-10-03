@@ -53,7 +53,7 @@ async def built_index(io, n=3000, commits=12, seed=1):
 
 def prepared(state, commit_number=99, generation=100, replace=True):
     return Prepared(
-        scope="",
+        partition="",
         commit_number=commit_number,
         generation=generation,
         index=state,

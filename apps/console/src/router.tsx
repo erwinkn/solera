@@ -61,7 +61,7 @@ const assets = createRoute({
 const asset = createRoute({
   getParentRoute: () => root,
   path: "/assets/$asset",
-  validateSearch: (s: Record<string, unknown>) => optional({ scope: str(s.scope) }),
+  validateSearch: (s: Record<string, unknown>) => optional({ partition: str(s.partition) }),
   component: lazyRouteComponent(() => import("@/routes/asset"), "AssetLayout"),
 });
 
@@ -101,13 +101,13 @@ const assetHistory = createRoute({
   getParentRoute: () => asset,
   path: "/history",
   validateSearch: (s: Record<string, unknown>) =>
-    // `output` and the asset's `scope` filter the list; `generation` with `vout` and
-    // `vscope` names the version whose lineage shows, wherever it is in the list.
+    // `output` and the asset's `partition` filter the list; `generation` with `vout` and
+    // `vpartition` names the version whose lineage shows, wherever it is in the list.
     optional({
       output: str(s.output),
       generation: str(s.generation),
       vout: str(s.vout),
-      vscope: str(s.vscope),
+      vpartition: str(s.vpartition),
     }),
   component: lazyRouteComponent(() => import("@/routes/asset-history"), "AssetHistory"),
 });

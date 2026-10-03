@@ -22,11 +22,11 @@ from solera.sdk import (
 )
 from solera_server.api import create_app
 from solera_server.planning import (
-    MAX_SCOPES,
+    MAX_PARTITIONS,
     Planner,
-    enumerate_scopes,
+    enumerate_partitions,
     membership,
-    select_scopes,
+    select_partitions,
     size,
 )
 
@@ -61,21 +61,21 @@ def test_one_explicit_scope_never_enumerates_the_domain():
         "b": {"kind": "static", "keys": [f"b{i}" for i in range(1000)]},
     }
     now = dt.datetime(2026, 10, 2, tzinfo=UTC)
-    pick = select_scopes(dims, ["a=a7,b=b9"], now=now, elements=lambda o: None, missing=lambda s: True)
+    pick = select_partitions(dims, ["a=a7,b=b9"], now=now, elements=lambda o: None, missing=lambda s: True)
     start = time.perf_counter()
     for _ in range(100):
-        select_scopes(
+        select_partitions(
             dims, ["a=a7,b=b9", "a=nope,b=b9"], now=now, elements=lambda o: None, missing=lambda s: True
         )
     assert time.perf_counter() - start < 1.0  # 1,000,000 possible scopes, none listed
     assert len(pick) == 1
-    with pytest.raises(ValueError, match=f"more than {MAX_SCOPES}"):
-        select_scopes(dims, "all", now=now, elements=lambda o: None, missing=lambda s: True)
+    with pytest.raises(ValueError, match=f"more than {MAX_PARTITIONS}"):
+        select_partitions(dims, "all", now=now, elements=lambda o: None, missing=lambda s: True)
     hourly = {"t": {"kind": "time", "start": "2020-01-01", "every": "1h", "format": "%Y-%m-%dT%H:00"}}
-    assert select_scopes(hourly, "latest", now=now, elements=lambda o: None, missing=lambda s: True) == [
+    assert select_partitions(hourly, "latest", now=now, elements=lambda o: None, missing=lambda s: True) == [
         "2026-10-01T23:00"
     ]
-    assert select_scopes(
+    assert select_partitions(
         hourly, ["2026-10-01T22:00"], now=now, elements=lambda o: None, missing=lambda s: True
     )
 
@@ -87,7 +87,7 @@ def test_membership_and_size_agree_with_the_enumeration():
         "tier": {"kind": "static", "keys": ["a,b", "c"]},
     }
     now, elements = dt.datetime(2026, 10, 2, tzinfo=UTC), {"sites": ["Richmond", "Oslo"]}.get
-    listed = enumerate_scopes(dims, now, elements)
+    listed = enumerate_partitions(dims, now, elements)
     member = membership(dims, now, elements)
     assert size(dims, now, elements) == len(listed) == 4 * 2 * 2 and all(member(s) for s in listed)
     assert member("day=2026-09-28,site=Oslo,tier=a%2Cb")
@@ -98,7 +98,7 @@ def test_membership_and_size_agree_with_the_enumeration():
     assert membership({}, now, elements)("") and not membership({}, now, elements)("x")
     assert size({}, now, elements) == 1
     big = {d: {"kind": "static", "keys": [f"{d}{i}" for i in range(1000)]} for d in "ab"}
-    assert size(big, now, elements) == 1_000_000 > MAX_SCOPES  # counted, not listed
+    assert size(big, now, elements) == 1_000_000 > MAX_PARTITIONS  # counted, not listed
 
 
 async def test_a_fan_in_reads_the_heads_that_exist(state):  # noqa: F811
@@ -134,7 +134,7 @@ async def test_a_fan_in_reads_the_heads_that_exist(state):  # noqa: F811
     )
     assert time.perf_counter() - start < 5.0
     assert seen == {"rollup": ["a=a7,b=b9", "a=a8,b=b1"], "a7": ["b9"]}  # keyed by the collapsed dims
-    with pytest.raises(ValueError, match=f"more than {MAX_SCOPES}"):
+    with pytest.raises(ValueError, match=f"more than {MAX_PARTITIONS}"):
         await engine.submit(["rollup"], upstream=True)  # a build lists the domain: bounded
 
 
@@ -161,7 +161,7 @@ def test_the_planner_takes_its_view_as_arguments():
     assert planner().plan_run(["daily"], skip_missing_inputs=True) is None  # `raw` was never written
     projected = {("raw", ""): {"ref": {"version": "v1"}}}
     run = planner(projected).plan_run(["daily"], skip_missing_inputs=True, sensor="watch")
-    assert [t["scope"] for t in run["tasks"].values()] == ["2026-10-01"]  # `latest` at `now`
+    assert [t["partition"] for t in run["tasks"].values()] == ["2026-10-01"]  # `latest` at `now`
     assert run["sensor"] == "watch" and run["created_at"] == now
     assert not heads  # a projection is read, never installed
 
@@ -199,7 +199,9 @@ def test_an_empty_fan_in_is_missing():
         )
         run = planner.plan_run([target], partitions="all", **kw)
         return (
-            None if run is None else sorted(t["scope"] for t in run["tasks"].values() if t["asset"] == target)
+            None
+            if run is None
+            else sorted(t["partition"] for t in run["tasks"].values() if t["asset"] == target)
         )
 
     for target in ("report", "rollup"):
@@ -269,9 +271,9 @@ def test_latest_and_changes_are_counted_before_they_are_listed():
     planner = Planner(manifest, lambda o, s: None, lambda o: [], now)
     start = time.perf_counter()
     for selection in ("all", "latest"):
-        with pytest.raises(ValueError, match=f"160000 partitions, more than {MAX_SCOPES}"):
+        with pytest.raises(ValueError, match=f"160000 partitions, more than {MAX_PARTITIONS}"):
             planner.plan_run(["grid"], partitions=selection)
-    with pytest.raises(ValueError, match=f"more than {MAX_SCOPES}"):
+    with pytest.raises(ValueError, match=f"more than {MAX_PARTITIONS}"):
         planner.reach(None, "", "grid")  # a source change reaches every scope
     assert time.perf_counter() - start < 1.0  # refused before listing
     assert len(planner.reach("grid", "a=k1,b=k2", "daily")) == 31  # `a` pinned, every day listed
@@ -313,7 +315,7 @@ async def test_an_onchange_firing_is_one_run_in_order(state):  # noqa: F811
     await engine.commit_source("feed", version="v2")
     await engine.tick()
     run = state.model.runs[state.model.automations["only_a"]["last_run"]]
-    assert sorted(t["scope"] for t in run["tasks"].values()) == ["a"]
+    assert sorted(t["partition"] for t in run["tasks"].values()) == ["a"]
 
 
 def test_linking_a_run_is_linear():
@@ -364,8 +366,10 @@ async def test_a_source_change_fans_out_over_a_partitioned_consumer(state):  # n
     await engine.initialize()
     await engine.commit_source("prices", version="v2")
     await engine.tick()
-    scopes = sorted(t["scope"] for t in state.model.runs[next(iter(state.model.runs))]["tasks"].values())
-    assert scopes == ["a", "b"] and not state.model.automations["report.onchange.0"]["pending"]
+    partitions = sorted(
+        t["partition"] for t in state.model.runs[next(iter(state.model.runs))]["tasks"].values()
+    )
+    assert partitions == ["a", "b"] and not state.model.automations["report.onchange.0"]["pending"]
 
 
 async def test_a_change_during_a_run_is_kept_for_after_it(state):  # noqa: F811

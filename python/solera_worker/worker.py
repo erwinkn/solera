@@ -1017,7 +1017,7 @@ async def run_attempt(
         if channel is not None:
             with contextlib.suppress(Exception):
                 answer = await channel.finished({"worker_id": worker_id})
-                await _discard_after(answer, spec, control.get("project"), objects, channel, worker_id)
+                await _cleanup_after(answer, spec, control.get("project"), objects, channel, worker_id)
         return 1 if result["status"] == "failed" else 0
     except asyncio.CancelledError:
         if control["forced"] and not asyncio.current_task().cancelling():
@@ -1213,7 +1213,7 @@ async def _execute(
                 result["cancel"] = cancel.to_json()
             if ran["skipped"]:
                 result["skipped"] = True
-        result.update(await _discard_due(spec, project, asset, objects, writes))
+        result.update(await _cleanup_due(spec, project, asset, objects, writes))
         if cursor is not UNSET:
             result["cursor"] = cursor
         return result
@@ -1230,18 +1230,18 @@ async def _execute(
             await observed.close()
 
 
-async def _discard_after(answer, spec, project, objects, channel, worker_id) -> None:
+async def _cleanup_after(answer, spec, project, objects, channel, worker_id) -> None:
     """Discard what the engine says is due in this attempt's scope now that
     its commit is durable (docs/lifecycle.md §9.8), and say so. Anything
     that fails here leaves the entries queued for the scope's next attempt:
     deleting a name twice is no harm."""
 
-    if not (answer or {}).get("discard") or project is None:
+    if not (answer or {}).get("cleanup") or project is None:
         return
-    due = {"outputs": answer["discard"], "partition": spec["partition"], "attempt": spec["attempt"]}
-    done = await _discard_due(due, project, project.assets[spec["asset"]], objects, Writes())
+    due = {"outputs": answer["cleanup"], "partition": spec["partition"], "attempt": spec["attempt"]}
+    done = await _cleanup_due(due, project, project.assets[spec["asset"]], objects, Writes())
     if done:
-        await channel.discarded({"worker_id": worker_id, "scope": answer["scope"], **done})
+        await channel.cleaned_up({"worker_id": worker_id, "partition": answer["partition"], **done})
 
 
 def _file_entries(data: bytes):
@@ -1257,7 +1257,7 @@ def _file_entries(data: bytes):
         yield from zip(*decode_block(block, index["codec"]), strict=True)
 
 
-async def _discard_due(spec, project, asset, objects, writes) -> dict:
+async def _cleanup_due(spec, project, asset, objects, writes) -> dict:
     """Discard the data garbage the engine handed this attempt (docs/
     lifecycle.md §9.8): the objects a commit or a compaction let go of, and
     what attempts that never committed wrote — all past every reader pin.
@@ -1269,17 +1269,17 @@ async def _discard_due(spec, project, asset, objects, writes) -> dict:
 
     declared = {o["name"]: o for o in project.manifest["assets"][asset.name]["outputs"]}
     decls = {o.name or asset.name: o for o in asset.outputs}
-    discarded, unresolved, files = {}, {}, []
+    cleaned_up, unresolved, files = {}, {}, []
 
     async def read(path: str) -> bytes | None:
         return await _get(objects, path)
 
     for name, info in (spec.get("outputs") or {}).items():
         store = project.stores[declared[name]["store"]]
-        if not info.get("discard") or store.writes != "immutable":
+        if not info.get("cleanup") or store.writes != "immutable":
             continue
         items, done = [], []
-        for entry in info["discard"]:
+        for entry in info["cleanup"]:
             kind, prefix = entry["kind"], entry.get("prefix") or ""
             if kind in ("delta", "sidecar"):  # what a commit's delta, or a compaction, let go of
                 found = [
@@ -1319,15 +1319,15 @@ async def _discard_due(spec, project, asset, objects, writes) -> dict:
             done.append(entry["id"])
         if not done:
             continue
-        scope = WriteContext(output=decls[name], partition=spec["partition"], attempt=spec["attempt"])
+        partition = WriteContext(output=decls[name], partition=spec["partition"], attempt=spec["attempt"])
         before = Ref.from_json(info["before"]) if info.get("before") else None  # where its objects live
-        await writes.call(store.discard(scope, before, items))
-        discarded[name] = done
-    out = {"discarded": discarded} if discarded else {}
+        await writes.call(store.cleanup(partition, before, items))
+        cleaned_up[name] = done
+    out = {"cleaned_up": cleaned_up} if cleaned_up else {}
     if unresolved:
-        out["discard_unresolved"] = unresolved
+        out["cleanup_unresolved"] = unresolved
     if files:
-        out["discarded_files"] = files
+        out["cleaned_files"] = files
     return out
 
 

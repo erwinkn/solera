@@ -1,7 +1,7 @@
 import { useSuspenseQuery } from "@tanstack/react-query";
 import { getRouteApi, Link } from "@tanstack/react-router";
 import { q, useProject } from "@/api/queries";
-import type { Edge, EdgeScope, EdgeState } from "@/api/types";
+import type { Edge, InputPartition, EdgeState } from "@/api/types";
 import { PatternList } from "@/features/patterns";
 import { cn } from "@/lib/cn";
 import { count, plural } from "@/lib/format";
@@ -50,7 +50,7 @@ const STATE_HINT: Record<EdgeState, string> = {
 
 export function AssetEdges() {
   const { asset: name } = route.useParams();
-  const { scope } = route.useSearch();
+  const { partition } = route.useSearch();
   const project = useProject();
   const { data: edges } = useSuspenseQuery(q.edges(project, name));
   if (edges.length === 0)
@@ -62,16 +62,16 @@ export function AssetEdges() {
   return (
     <div className="flex flex-col gap-4">
       {edges.map((edge) => (
-        <EdgeCard key={edge.param} edge={edge} scope={scope} />
+        <EdgeCard key={edge.param} edge={edge} partition={partition} />
       ))}
     </div>
   );
 }
 
-function EdgeCard({ edge, scope }: { edge: Edge; scope?: string }) {
+function EdgeCard({ edge, partition }: { edge: Edge; partition?: string }) {
   const kind = KIND[edge.kind];
-  const scopes = edge.scopes.filter((s) => scope === undefined || s.scope === scope);
-  const behind = edge.scopes.filter((s) => (s.lag ?? 0) > 0).length;
+  const partitions = edge.partitions.filter((s) => partition === undefined || s.partition === partition);
+  const behind = edge.partitions.filter((s) => (s.lag ?? 0) > 0).length;
   return (
     <Card>
       <CardHeader
@@ -107,7 +107,7 @@ function EdgeCard({ edge, scope }: { edge: Edge; scope?: string }) {
           <div className="flex flex-wrap items-center gap-2 text-xs text-fg-muted">
             {edge.page_size != null && <span>{edge.page_size} keys a page</span>}
             {edge.concurrency != null && <span>· {edge.concurrency} at a time</span>}
-            {edge.scopes.length > 0 && <span>· {behind ? `${behind} behind` : "all caught up"}</span>}
+            {edge.partitions.length > 0 && <span>· {behind ? `${behind} behind` : "all caught up"}</span>}
           </div>
         }
       />
@@ -116,7 +116,7 @@ function EdgeCard({ edge, scope }: { edge: Edge; scope?: string }) {
           Keys taken: <PatternList patterns={edge.patterns} />
         </div>
       )}
-      {scopes.length > 0 && (
+      {partitions.length > 0 && (
         <TableScroll className="border-t border-line">
           <Table>
             <thead>
@@ -130,8 +130,8 @@ function EdgeCard({ edge, scope }: { edge: Edge; scope?: string }) {
               </tr>
             </thead>
             <tbody>
-              {scopes.map((s) => (
-                <ScopeRow key={s.scope} s={s} />
+              {partitions.map((s) => (
+                <PartitionRow key={s.partition} s={s} />
               ))}
             </tbody>
           </Table>
@@ -141,7 +141,7 @@ function EdgeCard({ edge, scope }: { edge: Edge; scope?: string }) {
   );
 }
 
-function ScopeRow({ s }: { s: EdgeScope }) {
+function PartitionRow({ s }: { s: InputPartition }) {
   const wm = s.watermark;
   const delivered = wm ? wm.next - 1 : null;
   const lag = s.lag ?? 0;
@@ -154,8 +154,10 @@ function ScopeRow({ s }: { s: EdgeScope }) {
   return (
     <Tr>
       <Td className="font-mono text-xs">
-        {s.scope || "—"}
-        {s.up_scope !== s.scope && <span className="text-fg-subtle"> ← {s.up_scope || "unpartitioned"}</span>}
+        {s.partition || "—"}
+        {s.upstream_partition !== s.partition && (
+          <span className="text-fg-subtle"> ← {s.upstream_partition || "unpartitioned"}</span>
+        )}
       </Td>
       <Td>
         <Tooltip content={STATE_HINT[s.state]}>

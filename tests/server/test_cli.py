@@ -281,7 +281,7 @@ async def test_local_reads_leave_the_running_writer_alone(project_file, state_ur
         ("logs", run_id, attempt),
         ("automations",),
         ("runs", "prune", "--dry-run"),
-        ("scopes", "discards", "feed"),
+        ("cleanups", "feed"),
     ):
         await asyncio.to_thread(run, *argv)
     coordinator.record({"type": "AutomationChanged", "name": "none", "enabled": True})

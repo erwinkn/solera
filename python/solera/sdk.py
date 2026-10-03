@@ -1656,7 +1656,7 @@ class Project:
             # every write checks the attempt's generation — and says which keys a
             # slice holds, for a repair (docs/versions.md §5).
             writes = getattr(store, "writes", None)
-            needs = {"immutable": ("discard",), "fenced": ("acquire", "keys")}.get(writes)
+            needs = {"immutable": ("cleanup",), "fenced": ("acquire", "keys")}.get(writes)
             if needs is None:
                 raise RegistrationError(
                     f"store {name!r}: writes must be 'immutable' or 'fenced' (docs/stores.md)"

@@ -206,10 +206,10 @@ def create_app(
             "active_runs": sum(1 for r in runtime.m.runs.values() if r["status"] not in TERMINAL_RUN),
             "postgres": bool(os.environ.get("DATABASE_URL")),
             "last_error": runtime.failing,
-            # data garbage whose names could not be read: see and clear with `solera scopes discards`
-            "stuck_discards": [
-                {"output": output, "scope": scope, "id": e["id"]}
-                for (output, scope), entries in runtime.m.discards.items()
+            # data garbage whose names could not be read: see and clear with `solera cleanups`
+            "stuck_cleanups": [
+                {"output": output, "partition": partition, "id": e["id"]}
+                for (output, partition), entries in runtime.m.cleanups.items()
                 for e in entries
                 if e.get("stuck")
             ],
@@ -251,7 +251,7 @@ def create_app(
         p: str,
         name: str,
         request: Request,
-        scope: str | None = None,
+        partition: str | None = None,
         after: str | None = None,
         limit: int = Query(default=100, ge=1, le=1000),
     ):
@@ -260,14 +260,14 @@ def create_app(
 
         runtime = await asset_engine(request, p, name)
         outcomes = [v for v in request.query_params.getlist("outcome") if v]
-        return await runtime.key_failures(name, scope, outcomes=outcomes, after=after, limit=limit)
+        return await runtime.key_failures(name, partition, outcomes=outcomes, after=after, limit=limit)
 
     @app.get("/api/projects/{p}/assets/{name}/key-outcomes")
     async def asset_key_outcomes(
         p: str,
         name: str,
         request: Request,
-        scope: str | None = None,
+        partition: str | None = None,
         key: str | None = None,
         q: str | None = None,
         run: str | None = None,
@@ -280,16 +280,16 @@ def create_app(
         runtime = await asset_engine(request, p, name)
         outcomes = [v for v in request.query_params.getlist("outcome") if v]
         page = await runtime.history.key_outcomes(
-            name, scope=scope, key=key, q=q, outcomes=outcomes, run=run, before=before, limit=limit
+            name, partition=partition, key=key, q=q, outcomes=outcomes, run=run, before=before, limit=limit
         )
         return {"asset": name, **page}
 
     @app.get("/api/projects/{p}/assets/{name}/explain")
     async def asset_explain(
-        p: str, name: str, request: Request, key: str, scope: str = "", edge: str | None = None
+        p: str, name: str, request: Request, key: str, partition: str = "", edge: str | None = None
     ):
         runtime = await asset_engine(request, p, name)
-        return await runtime.explain(name, key, scope, edge)
+        return await runtime.explain(name, key, partition, edge)
 
     @app.get("/api/projects/{p}/outputs/{name}/heads")
     async def output_heads(p: str, name: str, request: Request):
@@ -298,21 +298,21 @@ def create_app(
             raise KeyError(name)
         out = []
         planner = runtime.planner()
-        for scope, head in runtime.m.heads_of(name):
+        for partition, head in runtime.m.heads_of(name):
             owner = head.get("asset")
-            cursor = owner is not None and runtime.m.scope(owner, scope).get("cursor") is not None
+            cursor = owner is not None and runtime.m.partition(owner, partition).get("cursor") is not None
             out.append(
                 {
-                    "scope": scope,
+                    "partition": partition,
                     "ref": head["ref"],
                     "version": head.get("version"),
                     "key_count": head.get("count"),
                     "commit_number": head.get("commit_number"),
-                    "complete": planner.head_complete(name, scope),
+                    "complete": planner.head_complete(name, partition),
                     "cursor": cursor,
                     "at": head["at"],
                     "commit": runtime.head_view(head)["commit"],
-                    "discards": runtime.scope_discards(name, scope),
+                    "cleanups": runtime.partition_cleanups(name, partition),
                 }
             )
         return {"output": name, "heads": out}
@@ -322,14 +322,14 @@ def create_app(
         p: str,
         name: str,
         request: Request,
-        scope: str = Query(default=""),
+        partition: str = Query(default=""),
         after: str | None = Query(default=None),
         offset: int = Query(default=0, ge=0, le=100000),
         limit: int = Query(default=1000, ge=1, le=100000),
     ):
         runtime = await project_engine(request, p)
-        page = await runtime.list_keys(name, scope, after=after, offset=offset, limit=limit)
-        return {"output": name, "scope": scope, **page}
+        page = await runtime.list_keys(name, partition, after=after, offset=offset, limit=limit)
+        return {"output": name, "partition": partition, **page}
 
     @app.get("/api/projects/{p}/partitions/{name}")
     async def partitions(p: str, name: str, request: Request):
@@ -340,7 +340,7 @@ def create_app(
             raise KeyError(name) from None
         if not runtime.planner().dims(asset):
             raise ValueError(f"{asset} is unpartitioned")
-        return {"asset": asset, "partitions": (await runtime.scope_statuses([asset]))[asset]}
+        return {"asset": asset, "partitions": (await runtime.partition_statuses([asset]))[asset]}
 
     # -- runs -------------------------------------------------------------------
 
@@ -397,7 +397,7 @@ def create_app(
         p: str,
         request: Request,
         asset: str | None = None,
-        scope: str | None = None,
+        partition: str | None = None,
         run: str | None = None,
         since: float | None = None,
         until: float | None = None,
@@ -408,7 +408,7 @@ def create_app(
         status = [v for v in request.query_params.getlist("status") if v]
         return await runtime.history.tasks(
             asset=asset,
-            scope=scope,
+            partition=partition,
             status=status,
             run=run,
             since=since,
@@ -424,10 +424,10 @@ def create_app(
         since: float | None = None,
         until: float | None = None,
         asset: str | None = None,
-        scope: str | None = None,
+        partition: str | None = None,
     ):
         runtime = await project_engine(request, p)
-        return await runtime.history.stats(since=since, until=until, asset=asset, scope=scope)
+        return await runtime.history.stats(since=since, until=until, asset=asset, partition=partition)
 
     @app.get("/api/projects/{p}/assets/{name}/history")
     async def asset_history(
@@ -435,7 +435,7 @@ def create_app(
         name: str,
         request: Request,
         output: str | None = None,
-        scope: str | None = None,
+        partition: str | None = None,
         before: str | None = None,
         limit: int = Query(default=200, ge=1, le=5000),
     ):
@@ -448,7 +448,9 @@ def create_app(
             if output not in names:
                 raise KeyError(output)
             names = [output]
-        page = await runtime.history.materializations(outputs=names, scope=scope, before=before, limit=limit)
+        page = await runtime.history.materializations(
+            outputs=names, partition=partition, before=before, limit=limit
+        )
         return {"asset": name, **page}
 
     @app.get("/api/projects/{p}/outputs/{name}/lineage")
@@ -456,19 +458,19 @@ def create_app(
         p: str,
         name: str,
         request: Request,
-        scope: str = "",
+        partition: str = "",
         generation: int | None = None,
         direction: str = Query(default="upstream", pattern="^(upstream|downstream)$"),
         depth: int = Query(default=5, ge=1, le=50),
     ):
         runtime = await project_engine(request, p)
         if generation is None:
-            head = runtime.m.heads.get((name, scope))
+            head = runtime.m.heads.get((name, partition))
             if head is None:
                 raise KeyError(name)
             generation = head["ref"].get("generation")
         return await runtime.history.lineage(
-            name, scope, generation, downstream=direction == "downstream", depth=depth
+            name, partition, generation, downstream=direction == "downstream", depth=depth
         )
 
     @app.get("/api/projects/{p}/runs/{run_id}")
@@ -549,21 +551,21 @@ def create_app(
         runtime = await project_engine(request, p)
         return runtime.holds_view()
 
-    @app.post("/api/projects/{p}/scopes:clear-discards")
-    async def clear_discards(p: str, request: Request):
+    @app.post("/api/projects/{p}/cleanups:clear")
+    async def clear_cleanups(p: str, request: Request):
         runtime = await project_engine(request, p)
         body = await request.json()
-        return runtime.clear_discards(body["output"], body.get("scope", ""), body.get("by") or "api")
+        return runtime.clear_cleanups(body["output"], body.get("partition", ""), body.get("by") or "api")
 
     @app.post("/api/projects/{p}/assets/{name}/keys:retry")
     async def retry_keys(p: str, name: str, request: Request):
         runtime = await project_engine(request, p)
         body = await request.json()
         found = runtime.retry_keys(
-            name, body.get("classes") or ["failed"], body.get("scope"), body.get("by") or "api"
+            name, body.get("classes") or ["failed"], body.get("partition"), body.get("by") or "api"
         )
-        if found["scopes"]:
-            await runtime.submit_retries(name, found["scopes"], body.get("by") or "api")
+        if found["partitions"]:
+            await runtime.submit_retries(name, found["partitions"], body.get("by") or "api")
         return found
 
     # -- the worker channel (docs/lifecycle.md §5) ----------------------------------------
@@ -612,9 +614,9 @@ def create_app(
         return await runtime.attempt_finished(attempt, await request.json())
 
     @app.post("/api/projects/{p}/attempts/{attempt}/discarded", status_code=204)
-    async def attempt_discarded(p: str, attempt: str, request: Request):
+    async def attempt_cleaned_up(p: str, attempt: str, request: Request):
         runtime = await project_engine(request, p)
-        await runtime.attempt_discarded(attempt, await request.json())
+        await runtime.attempt_cleaned_up(attempt, await request.json())
         return Response(status_code=204)
 
     @app.get("/api/projects/{p}/pools/{pool}/work")

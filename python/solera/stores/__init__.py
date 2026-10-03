@@ -126,7 +126,7 @@ class Store(Protocol):
     async def store(self, write: Any, prior: Ref | None, context: WriteContext) -> Written: ...
     async def load(self, ref: Ref, t: type, selection: Keys | Commits | None) -> Any: ...
 
-    # immutable: async def discard(self, scope: Scope, prior: Ref | None, items: list) -> None
+    # immutable: async def cleanup(self, context: WriteContext, prior: Ref | None, items: list) -> None
     # fenced:    async def acquire(self, scope: Scope, prior: Ref | None) -> None
     #            def keys(self, ref: Ref, among: list[str] | None) -> Iterable[list[str]]
 

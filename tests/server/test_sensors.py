@@ -641,7 +641,7 @@ async def test_requested_runs_see_the_ticks_own_commits(tmp_path):
     outcome = Tick(commits=[Commit("sites", keys=["new"])], runs=[RunRequest("per_site", partitions="all")])
     answer = await engine.sensor_post("discover", tick["tick"], outcome.to_json())
     [run] = answer["runs"]
-    assert [t["scope"] for t in state.model.runs[run]["tasks"].values()] == ["new"]
+    assert [t["partition"] for t in state.model.runs[run]["tasks"].values()] == ["new"]
     assert state.model.heads[("sites", "")]["elements"] == ["new"]
     await state.close()
 

@@ -831,11 +831,11 @@ async def test_a_malformed_worker_result_is_settled_without_its_bad_parts(tmp_pa
 @pytest.mark.parametrize(
     "body",
     [
-        {"scope": "", "discarded": ["not-a-map"]},
-        {"scope": "", "discarded": {"remote": "1.0"}},
-        {"scope": "", "discard_unresolved": {"remote": [1]}},
-        {"scope": "", "discarded": {"remote": ["1.0"]}, "discarded_files": "x"},
-        {"discarded": {"remote": ["1.0"]}},
+        {"partition": "", "cleaned_up": ["not-a-map"]},
+        {"partition": "", "cleaned_up": {"remote": "1.0"}},
+        {"partition": "", "cleanup_unresolved": {"remote": [1]}},
+        {"partition": "", "cleaned_up": {"remote": ["1.0"]}, "cleaned_files": "x"},
+        {"cleaned_up": {"remote": ["1.0"]}},
         ["not", "a", "report"],
     ],
 )
@@ -851,7 +851,7 @@ async def test_a_malformed_discard_report_is_refused(tmp_path, world, body):
     _, attempt = await launched(engine, ["remote"])
     applied = state.model.applied
     with pytest.raises(ValueError):
-        await engine.attempt_discarded(attempt, body)
+        await engine.attempt_cleaned_up(attempt, body)
     assert state.model.applied == applied and not state.poisoned and world.exits == []
     await engine.stop()
     await state.close()

@@ -173,7 +173,7 @@ class FileStore:
     def key_name(base: str, key: str, generation: int) -> str:
         return f"{base}/{_segment(key)}/{int(generation)}"
 
-    async def discard(self, context: WriteContext, prior: Ref | None, items: list) -> None:
+    async def cleanup(self, context: WriteContext, prior: Ref | None, items: list) -> None:
         """Delete objects nothing reads any more (docs/lifecycle.md §9.8):
         superseded ones, and what attempts that never committed wrote.
         `items` name them: `("key", key, generation)`,

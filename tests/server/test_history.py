@@ -410,8 +410,8 @@ async def test_stats(state, clock):
     assert by["orders"]["p50"] is not None and by["orders"]["hours"] >= 0
     assert [row["executor"] for row in stats["executors"]] == ["local"]
     # Unpartitioned tasks have the empty scope; a partition narrows to its own.
-    assert (await engine.history.stats(asset="orders", scope=""))["assets"] == [by["orders"]]
-    assert (await engine.history.stats(asset="orders", scope="2026-01-01"))["assets"] == []
+    assert (await engine.history.stats(asset="orders", partition=""))["assets"] == [by["orders"]]
+    assert (await engine.history.stats(asset="orders", partition="2026-01-01"))["assets"] == []
 
 
 async def test_a_retry_asks_for_the_work_it_selects(state, clock):
@@ -468,7 +468,7 @@ async def test_a_retry_is_a_new_run_and_the_old_one_stays_as_it_ended(state, clo
     failed = await run(engine, clock, ["revenue"], upstream=True, config={"fail": True}, tags={"env": "prod"})
     before = await engine.run_detail(failed["id"])
     assert failed["id"] not in state.model.runs  # archived
-    owed = {(t["asset"], t["scope"]) for t in before["tasks"] if t["status"] in ("failed", "blocked")}
+    owed = {(t["asset"], t["partition"]) for t in before["tasks"] if t["status"] in ("failed", "blocked")}
     assert owed
     clock.now += 60
     retried = await engine.retry(failed["id"], by="ops")
@@ -479,7 +479,7 @@ async def test_a_retry_is_a_new_run_and_the_old_one_stays_as_it_ended(state, clo
         and again["config"] == {"fail": True}
         and again["tags"] == {"env": "prod"}
     )
-    assert {(t["asset"], t["scope"]) for t in again["tasks"].values()} == owed
+    assert {(t["asset"], t["partition"]) for t in again["tasks"].values()} == owed
     with pytest.raises(Conflict, match="not finished"):
         await engine.retry(retried["id"])
     await engine.run_until(retried["id"], 60)

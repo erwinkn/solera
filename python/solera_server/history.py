@@ -11,7 +11,7 @@ Eight tables, each row about one:
     lineage           input version an output version was built from, and what its read saw
 
 A version is the generation of the write that made it (docs/versions.md):
-an output version is `(output, scope, generation)`.
+an output version is `(output, partition, generation)`.
     key_outcomes      key an Each attempt processed: what it came to (per-key-processing.md §10)
     ticks             sensor tick (lifecycle.md §11): buffered, never journaled
 
@@ -74,7 +74,7 @@ TABLES = {
             "assets": "VARCHAR[]",
             "committed": "VARCHAR[]",
             "mode": "VARCHAR",
-            "partitions": "VARCHAR",  # a named selection, or JSON: a list of scopes, or each asset's
+            "partitions": "VARCHAR",  # a named selection, or JSON: a list of partitions, or each asset's
             "upstream": "BOOLEAN",
             "tags": "MAP(VARCHAR, VARCHAR)",
             "task_count": "INTEGER",
@@ -91,7 +91,7 @@ TABLES = {
             "id": "VARCHAR",
             "run": "VARCHAR",
             "asset": "VARCHAR",
-            "scope": "VARCHAR",
+            "partition": "VARCHAR",
             "status": "VARCHAR",
             "created_at": "DOUBLE",
             "started_at": "DOUBLE",
@@ -115,7 +115,7 @@ TABLES = {
             "run": "VARCHAR",
             "task": "VARCHAR",
             "asset": "VARCHAR",
-            "scope": "VARCHAR",
+            "partition": "VARCHAR",
             "n": "INTEGER",
             "outcome": "VARCHAR",
             "started_at": "DOUBLE",
@@ -148,7 +148,7 @@ TABLES = {
         {
             "output": "VARCHAR",
             "asset": "VARCHAR",
-            "scope": "VARCHAR",
+            "partition": "VARCHAR",
             "store": "VARCHAR",
             "run": "VARCHAR",
             "attempt": "VARCHAR",
@@ -169,13 +169,13 @@ TABLES = {
         "at",
         {
             "output": "VARCHAR",
-            "scope": "VARCHAR",
+            "partition": "VARCHAR",
             "generation": "BIGINT",  # the output version's
             "run": "VARCHAR",
             "attempt": "VARCHAR",
             "at": "DOUBLE",
             "input": "VARCHAR",
-            "input_scope": "VARCHAR",
+            "input_partition": "VARCHAR",
             "input_generation": "BIGINT",  # what was pinned: the head, or the delivery's snapshot
             "param": "VARCHAR",
             # What a read of a store that reads the current rows saw (docs/stores.md,
@@ -211,7 +211,7 @@ TABLES["key_outcomes"] = Table(
         "run": "VARCHAR",
         "attempt": "VARCHAR",  # attempts.id
         "asset": "VARCHAR",
-        "scope": "VARCHAR",
+        "partition": "VARCHAR",
         "key": "VARCHAR",
         "generation": "BIGINT",  # the upstream key's it processed: its version
         "outcome": "VARCHAR",  # ok, removed, unmatched, rejected, failed, retrying, canceled, timed_out
@@ -285,7 +285,7 @@ def attempt_row(run_id: str, task: dict, summary: dict, n: int) -> dict:
         "run": run_id,
         "task": task["id"],
         "asset": task["asset"],
-        "scope": task["scope"],
+        "partition": task["partition"],
         "n": n,
         "outcome": summary["outcome"],
         "started_at": summary.get("started_at"),
@@ -340,7 +340,7 @@ def task_rows(run: dict) -> list[dict]:
                 "id": tid,
                 "run": run["id"],
                 "asset": task["asset"],
-                "scope": task["scope"],
+                "partition": task["partition"],
                 "status": task["status"],
                 "created_at": run["created_at"],
                 "started_at": task.get("first_at"),
@@ -420,7 +420,7 @@ def run_record(rows: dict[str, list[dict]], events: int = 0) -> dict:
             "id": t["id"],
             "run": row["id"],
             "asset": t["asset"],
-            "scope": t["scope"],
+            "partition": t["partition"],
             "status": t["status"],
             "deps": list(t["deps"] or ()),
             "max_attempts": t["max_attempts"],
@@ -481,12 +481,12 @@ def commit_row(run: dict, at: float) -> dict:
 
 
 def materialization(
-    output, asset, scope, head, *, keys=None, rows=None, metadata=None, listed=None, complete=True
+    output, asset, partition, head, *, keys=None, rows=None, metadata=None, listed=None, complete=True
 ) -> dict:
     """The row of an output version a commit installed: `head` is the head
     as installed, `keys` the commit's key delta for the output, `listed` a
     source commit's record, which lists the keys it changed; `complete`
-    whether the commit drained its scope's delivery."""
+    whether the commit drained its partition's delivery."""
 
     listed = listed or {}
 
@@ -494,7 +494,7 @@ def materialization(
     return {
         "output": output,
         "asset": asset,
-        "scope": scope,
+        "partition": partition,
         "store": head["ref"].get("store"),
         "run": head.get("run"),
         "attempt": head.get("attempt"),
@@ -520,13 +520,13 @@ def _edge(row, nodes) -> dict:
     """A lineage edge, as `History.lineage` gives it: what was read first."""
 
     i, i_s, read, o, s, g, param, run, pinned, read_generation, committed, writer, writer_run, writer_at = row
-    source = {"output": i, "scope": i_s, "generation": read}
+    source = {"output": i, "partition": i_s, "generation": read}
     if committed or writer is None:  # its materialization says who made it
         made = nodes.get((i, i_s, read)) or {}
         source |= {"run": made.get("run"), "attempt": made.get("attempt"), "at": made.get("at")}
     else:
         source |= {"run": writer_run, "attempt": writer, "at": writer_at}
-    edge = {"from": source, "to": {"output": o, "scope": s, "generation": g}, "param": param, "run": run}
+    edge = {"from": source, "to": {"output": o, "partition": s, "generation": g}, "param": param, "run": run}
     if read_generation is not None and not committed:
         # The read saw a write no commit installed (docs/versions.md §6).
         edge["uncommitted"] = {"attempt": writer, "run": writer_run}
@@ -535,28 +535,31 @@ def _edge(row, nodes) -> dict:
 
 
 def read_lineage(pinned, read) -> list[list]:
-    """What an attempt was built from: its spec's pins, `[output, scope,
+    """What an attempt was built from: its spec's pins, `[output, partition,
     generation, param]` (§8), each with the generation the worker's read of
     it saw (`read`, from a store that reads the current rows) — or None."""
 
-    seen = {(r["output"], r["scope"]): r.get("generation") for r in read or ()}
-    return [[output, scope, g, param, seen.get((output, scope))] for output, scope, g, param in pinned or ()]
+    seen = {(r["output"], r["partition"]): r.get("generation") for r in read or ()}
+    return [
+        [output, partition, g, param, seen.get((output, partition))]
+        for output, partition, g, param in pinned or ()
+    ]
 
 
-def lineage(output, scope, head, reads) -> list[dict]:
+def lineage(output, partition, head, reads) -> list[dict]:
     """One row per input version the attempt behind `head` read: `reads`
     as `read_lineage` gives them."""
 
     base = {
         "output": output,
-        "scope": scope,
+        "partition": partition,
         "generation": head["ref"].get("generation"),
         "run": head.get("run"),
         "attempt": head.get("attempt"),
         "at": head["at"],
     }
     return [
-        {**base, "input": i, "input_scope": s, "input_generation": g, "param": p, "read_generation": r}
+        {**base, "input": i, "input_partition": s, "input_generation": g, "param": p, "read_generation": r}
         for i, s, g, p, r in reads or ()
     ]
 
@@ -906,7 +909,7 @@ class History:
         self,
         *,
         asset: str | None = None,
-        scope: str | None = None,
+        partition: str | None = None,
         status: list[str] | None = None,
         run: str | None = None,
         since: float | None = None,
@@ -915,7 +918,7 @@ class History:
         limit: int = 100,
     ) -> dict:
         clauses, params = ["true"], []
-        for column, value in (("asset", asset), ("scope", scope), ("run", run)):
+        for column, value in (("asset", asset), ("partition", partition), ("run", run)):
             if value is not None:
                 clauses.append(f"{column} = ?")
                 params.append(value)
@@ -951,13 +954,13 @@ class History:
         since: float | None = None,
         until: float | None = None,
         asset: str | None = None,
-        scope: str | None = None,
+        partition: str | None = None,
     ) -> dict:
         """Operations at a glance, from finished tasks: per asset and per
         executor, how many ran and failed, how long they took and waited
         (p50, p95), and the compute their attempts requested. A task counts
         under the executor of its last attempt; compute, under each
-        attempt's. `scope` narrows to one partition of `asset`."""
+        attempt's. `partition` narrows to one partition of `asset`."""
 
         clauses, params = ["status NOT IN ('waiting', 'queued', 'running')"], []
         if since is not None:
@@ -969,9 +972,9 @@ class History:
         if asset is not None:
             clauses.append("asset = ?")
             params.append(asset)
-        if scope is not None:
-            clauses.append("scope = ?")
-            params.append(scope)
+        if partition is not None:
+            clauses.append("partition = ?")
+            params.append(partition)
         where = " AND ".join(clauses)
         measures = """
             count(*) FILTER (WHERE status <> 'skipped') AS tasks,
@@ -1015,33 +1018,33 @@ class History:
         self,
         *,
         outputs: list[str] | None = None,
-        scope: str | None = None,
+        partition: str | None = None,
         before: str | None = None,
         limit: int = 200,
     ) -> dict:
         """Output versions, newest first, with their metadata. `next` is the
-        `before` cursor of the following page: `[at, output, scope]` as JSON,
+        `before` cursor of the following page: `[at, output, partition]` as JSON,
         since one commit makes several versions at the same moment."""
 
         clauses, params = ["true"], []
         if outputs is not None:
             clauses.append("list_contains(?::VARCHAR[], output)")
             params.append(list(outputs))
-        if scope is not None:
-            clauses.append("scope = ?")
-            params.append(scope)
+        if partition is not None:
+            clauses.append("partition = ?")
+            params.append(partition)
         until = None
         if before:
-            at, output, at_scope = json.loads(before)
-            clauses.append('("at" < ? OR ("at" = ? AND (output > ? OR (output = ? AND scope > ?))))')
-            params.extend([at, at, output, output, at_scope])
+            at, output, at_partition = json.loads(before)
+            clauses.append('("at" < ? OR ("at" = ? AND (output > ? OR (output = ? AND partition > ?))))')
+            params.extend([at, at, output, output, at_partition])
             until = math.nextafter(at, math.inf)
         where = " AND ".join(clauses)
 
         def work(con):
             return _dicts(
                 con.execute(
-                    f'SELECT * FROM materializations WHERE {where} ORDER BY "at" DESC, output, scope LIMIT ?',
+                    f'SELECT * FROM materializations WHERE {where} ORDER BY "at" DESC, output, partition LIMIT ?',
                     [*params, limit + 1],
                 )
             )
@@ -1053,14 +1056,14 @@ class History:
             if isinstance(row["metadata"], str):
                 row["metadata"] = json.loads(row["metadata"])
         last = found[-1] if more and found else None
-        cursor = json.dumps([last["at"], last["output"], last["scope"]]) if last else None
+        cursor = json.dumps([last["at"], last["output"], last["partition"]]) if last else None
         return {"materializations": found, "next": cursor}
 
     async def key_outcomes(
         self,
         asset: str,
         *,
-        scope: str | None = None,
+        partition: str | None = None,
         key: str | None = None,
         q: str | None = None,
         outcomes: list[str] | None = None,
@@ -1072,10 +1075,10 @@ class History:
         newest first: `key` exactly, or keys containing `q` (any case). Rows
         are appended when a page commits, so a run in progress shows the pages
         it has committed. `next` is the `before` cursor of the following
-        page: `[at, scope, key]` as JSON."""
+        page: `[at, partition, key]` as JSON."""
 
         clauses, params = ["asset = ?"], [asset]
-        for column, value in (("scope", scope), ("key", key), ("run", run)):
+        for column, value in (("partition", partition), ("key", key), ("run", run)):
             if value is not None:
                 clauses.append(f'"{column}" = ?')
                 params.append(value)
@@ -1087,16 +1090,16 @@ class History:
             params.append(list(outcomes))
         until = None
         if before:
-            at, at_scope, at_key = json.loads(before)
-            clauses.append('("at" < ? OR ("at" = ? AND (scope > ? OR (scope = ? AND key > ?))))')
-            params.extend([at, at, at_scope, at_scope, at_key])
+            at, at_partition, at_key = json.loads(before)
+            clauses.append('("at" < ? OR ("at" = ? AND (partition > ? OR (partition = ? AND key > ?))))')
+            params.extend([at, at, at_partition, at_partition, at_key])
             until = math.nextafter(at, math.inf)
         where = " AND ".join(clauses)
 
         def work(con):
             return _dicts(
                 con.execute(
-                    f'SELECT * FROM key_outcomes WHERE {where} ORDER BY "at" DESC, scope, key LIMIT ?',
+                    f'SELECT * FROM key_outcomes WHERE {where} ORDER BY "at" DESC, partition, key LIMIT ?',
                     [*params, limit + 1],
                 )
             )
@@ -1105,13 +1108,13 @@ class History:
         more = len(found) > limit
         found = found[:limit]
         last = found[-1] if more and found else None
-        cursor = json.dumps([last["at"], last["scope"], last["key"]]) if last else None
+        cursor = json.dumps([last["at"], last["partition"], last["key"]]) if last else None
         return {"outcomes": found, "next": cursor}
 
     async def lineage(
-        self, output: str, scope: str, generation: int, *, downstream: bool = False, depth: int = 5
+        self, output: str, partition: str, generation: int, *, downstream: bool = False, depth: int = 5
     ) -> dict:
-        """The versions `output@scope`, generation `generation`, was built from
+        """The versions `output@partition`, generation `generation`, was built from
         (or, with `downstream`, those built from it), `depth` steps out:
         `edges` go from input to output, and `nodes` say when and by which
         run each version was made (docs/versions.md §6).
@@ -1130,61 +1133,61 @@ class History:
                 m.generation IS NOT NULL AS committed,
                 a.id AS writer, a.run AS writer_run, a.finished_at AS writer_at
             FROM lineage l
-            LEFT JOIN (SELECT DISTINCT output, scope, generation FROM materializations) m
-                ON m.output = l.input AND m.scope = l.input_scope
+            LEFT JOIN (SELECT DISTINCT output, partition, generation FROM materializations) m
+                ON m.output = l.input AND m.partition = l.input_partition
                 AND m.generation = coalesce(l.read_generation, l.input_generation)
             LEFT JOIN attempts a
                 ON l.read_generation IS NOT NULL AND m.generation IS NULL
-                AND a.generation = l.read_generation AND a.scope = l.input_scope
+                AND a.generation = l.read_generation AND a.partition = l.input_partition
         """
-        made, read = ("output", "scope", "generation"), ("input", "input_scope", "read")
+        made, read = ("output", "partition", "generation"), ("input", "input_partition", "read")
         near, far = (read, made) if downstream else (made, read)
         join = " AND ".join(f"e.{c} = w.{w}" for c, w in zip(near, made, strict=True))
         sql = f"""
             WITH RECURSIVE edges AS ({edges_sql}),
-            walk(output, scope, generation, depth) AS (
+            walk(output, partition, generation, depth) AS (
                 SELECT ?::VARCHAR, ?::VARCHAR, ?::BIGINT, 0
                 UNION
                 SELECT e.{far[0]}, e.{far[1]}, e.{far[2]}, w.depth + 1
                 FROM edges e JOIN walk w ON {join}
                 WHERE w.depth < ? AND e.{far[2]} IS NOT NULL
             )
-            SELECT DISTINCT e.input, e.input_scope, e.read, e.output, e.scope, e.generation, e.param, e.run,
+            SELECT DISTINCT e.input, e.input_partition, e.read, e.output, e.partition, e.generation, e.param, e.run,
                 e.input_generation, e.read_generation, e.committed, e.writer, e.writer_run, e.writer_at
             FROM edges e JOIN walk w ON {join}
             WHERE w.depth < ?
         """
 
         def work(con):
-            edges = con.execute(sql, [output, scope, generation, depth, depth]).fetchall()
-            keys = {(output, scope, generation)}
+            edges = con.execute(sql, [output, partition, generation, depth, depth]).fetchall()
+            keys = {(output, partition, generation)}
             for i, i_s, i_g, o, s, g, *_ in edges:
                 keys.add((o, s, g))
                 if i_g is not None:
                     keys.add((i, i_s, i_g))
             nodes = {}
             if keys:
-                con.execute("CREATE TEMP TABLE wanted (output VARCHAR, scope VARCHAR, generation BIGINT)")
+                con.execute("CREATE TEMP TABLE wanted (output VARCHAR, partition VARCHAR, generation BIGINT)")
                 con.executemany("INSERT INTO wanted VALUES (?, ?, ?)", sorted(keys, key=_node_order))
                 for row in _dicts(
                     con.execute(
-                        "SELECT m.output, m.scope, m.generation, m.asset, m.run, m.attempt, m.at, m.rows "
-                        "FROM materializations m JOIN wanted USING (output, scope, generation)"
+                        "SELECT m.output, m.partition, m.generation, m.asset, m.run, m.attempt, m.at, m.rows "
+                        "FROM materializations m JOIN wanted USING (output, partition, generation)"
                     )
                 ):
-                    nodes[(row["output"], row["scope"], row["generation"])] = row
+                    nodes[(row["output"], row["partition"], row["generation"])] = row
             return edges, keys, nodes
 
         edges, keys, nodes = await self.query(work, ("lineage", "materializations", "attempts"), live=False)
         m = self.m
         out_nodes = []
         for key in sorted(keys, key=_node_order):
-            node = dict(nodes.get(key) or {"output": key[0], "scope": key[1], "generation": key[2]})
+            node = dict(nodes.get(key) or {"output": key[0], "partition": key[1], "generation": key[2]})
             head = m.heads.get((key[0], key[1]))
             node["current"] = head is not None and head["ref"].get("generation") == key[2]
             out_nodes.append(node)
         return {
-            "root": {"output": output, "scope": scope, "generation": generation},
+            "root": {"output": output, "partition": partition, "generation": generation},
             "direction": "downstream" if downstream else "upstream",
             "nodes": out_nodes,
             "edges": [_edge(e, nodes) for e in edges],

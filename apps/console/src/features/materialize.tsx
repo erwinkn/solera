@@ -12,13 +12,13 @@ type Selection = "latest" | "missing" | "all" | "pick";
 /** "Materialize" opens a run form, prefilled with the assets in view. */
 export function MaterializeButton({
   targets = [],
-  scope,
+  partition,
   icon,
   label = "Materialize",
   variant = "primary",
 }: {
   targets?: string[];
-  scope?: string;
+  partition?: string;
   icon?: ReactNode;
   label?: string;
   variant?: "primary" | "secondary";
@@ -36,19 +36,27 @@ export function MaterializeButton({
       title="Materialize"
       description="Submit a run. Inputs are pinned to their current heads unless you also build upstream."
     >
-      {open && <RunForm initial={targets} scope={scope} onDone={() => setOpen(false)} />}
+      {open && <RunForm initial={targets} partition={partition} onDone={() => setOpen(false)} />}
     </Dialog>
   );
 }
 
-function RunForm({ initial, scope, onDone }: { initial: string[]; scope?: string; onDone: () => void }) {
+function RunForm({
+  initial,
+  partition,
+  onDone,
+}: {
+  initial: string[];
+  partition?: string;
+  onDone: () => void;
+}) {
   const manifest = useManifest();
   const project = useProject();
   const submit = useSubmitRun();
   const [targets, setTargets] = useState<string[]>(initial);
   const [filter, setFilter] = useState("");
-  const [selection, setSelection] = useState<Selection>(scope !== undefined ? "pick" : "latest");
-  const [picked, setPicked] = useState(scope ?? "");
+  const [selection, setSelection] = useState<Selection>(partition !== undefined ? "pick" : "latest");
+  const [picked, setPicked] = useState(partition ?? "");
   const [mode, setMode] = useState<"incremental" | "full">("incremental");
   const [upstream, setUpstream] = useState(false);
   const [config, setConfig] = useState("");
@@ -185,23 +193,23 @@ function RunForm({ initial, scope, onDone }: { initial: string[]; scope?: string
                     .filter((p) => p.status !== "retired")
                     .map((p) => (
                       <button
-                        key={p.scope}
+                        key={p.partition}
                         type="button"
                         onClick={() =>
                           setPicked(
-                            keys.includes(p.scope)
-                              ? keys.filter((k) => k !== p.scope).join("\n")
-                              : [...keys, p.scope].join("\n"),
+                            keys.includes(p.partition)
+                              ? keys.filter((k) => k !== p.partition).join("\n")
+                              : [...keys, p.partition].join("\n"),
                           )
                         }
                         className={cn(
                           "rounded-full border-theme px-2 py-0.5 font-mono text-2xs",
-                          keys.includes(p.scope)
+                          keys.includes(p.partition)
                             ? "border-fg bg-fg text-fg-inverse"
                             : "border-line-strong text-fg-muted hover:text-fg",
                         )}
                       >
-                        {p.scope}
+                        {p.partition}
                       </button>
                     ))}
                 </div>

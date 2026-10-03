@@ -39,7 +39,7 @@ export function useSubmitRun() {
       if ("id" in run) {
         notify("Run submitted", `${run.targets.join(", ")} · ${shortId(run.id)}`);
         navigate({ to: "/runs/$run", params: { run: run.id } });
-      } else notify("Nothing submitted", "Every target scope is already running.");
+      } else notify("Nothing submitted", "Every target partition is already running.");
     },
     onError: (error) => complain("Couldn't submit the run", error),
   });
@@ -171,21 +171,21 @@ export function useCommitSource() {
   });
 }
 
-export function useClearDiscards() {
+export function useClearCleanups() {
   const project = useProject();
   const client = useQueryClient();
   return useMutation({
-    mutationFn: ({ output, scope }: { output: string; scope: string }) =>
-      api(`/projects/${enc(project)}/scopes:clear-discards`, {
-        body: { output, scope, by: "console" },
+    mutationFn: ({ output, partition }: { output: string; partition: string }) =>
+      api(`/projects/${enc(project)}/cleanups:clear`, {
+        body: { output, partition, by: "console" },
       }),
-    onSuccess: (_, { output, scope }) => {
-      notify("Stuck discards cleared", scope ? `${output} · ${scope}` : output);
+    onSuccess: (_, { output, partition }) => {
+      notify("Stuck cleanups cleared", partition ? `${output} · ${partition}` : output);
       client.invalidateQueries({ queryKey: ["holds"] });
       client.invalidateQueries({ queryKey: ["diagnostics"] });
       client.invalidateQueries({ queryKey: ["outputs", output] });
     },
-    onError: (error) => complain("Couldn't clear the discards", error),
+    onError: (error) => complain("Couldn't clear the cleanups", error),
   });
 }
 
@@ -193,18 +193,18 @@ export function useRetryKeys(asset: string) {
   const project = useProject();
   const client = useQueryClient();
   return useMutation({
-    mutationFn: ({ classes, scope }: { classes: string[]; scope?: string }) =>
-      api<{ classes: string[]; scopes: string[] }>(
+    mutationFn: ({ classes, partition }: { classes: string[]; partition?: string }) =>
+      api<{ classes: string[]; partitions: string[] }>(
         `/projects/${enc(project)}/assets/${enc(asset)}/keys:retry`,
         {
-          body: { classes, scope, by: "console" },
+          body: { classes, partition, by: "console" },
         },
       ),
     onSuccess: (found) => {
       notify(
-        found.scopes.length ? "Retry requested" : "Nothing to retry",
-        found.scopes.length
-          ? `${found.classes.join(", ")} keys in ${found.scopes.length} scope(s)`
+        found.partitions.length ? "Retry requested" : "Nothing to retry",
+        found.partitions.length
+          ? `${found.classes.join(", ")} keys in ${found.partitions.length} partition(s)`
           : undefined,
       );
       client.invalidateQueries({ queryKey: ["assets", asset] });

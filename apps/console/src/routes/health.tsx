@@ -3,7 +3,7 @@ import { useQuery, useSuspenseQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { Eraser } from "lucide-react";
 import { q, useManifest, useProject } from "@/api/queries";
-import { useClearDiscards } from "@/api/mutations";
+import { useClearCleanups } from "@/api/mutations";
 import { plural, shortId } from "@/lib/format";
 import { Button } from "@/ui/button";
 import { CopyButton, Empty } from "@/ui/data";
@@ -14,13 +14,13 @@ import { Table, TableScroll, Td, Th, Tr } from "@/ui/table";
 
 /**
  * The engine's own state, and what writers that died left behind
- * (docs/lifecycle.md §9): unsettled writes, which the scope's next attempt
- * repairs, and stuck discards, garbage whose names couldn't be read.
+ * (docs/lifecycle.md §9): unsettled writes, which the partition's next attempt
+ * repairs, and stuck cleanups, garbage whose names couldn't be read.
  */
 export function Health() {
   const project = useProject();
   const { data: holds } = useSuspenseQuery(q.holds(project));
-  const total = holds.unsettled.length + holds.discards.length;
+  const total = holds.unsettled.length + holds.cleanups.length;
   return (
     <Page>
       <PageHeader
@@ -31,7 +31,7 @@ export function Health() {
       <Engine />
       <div className="grid gap-4 lg:grid-cols-2">
         <Unsettled rows={holds.unsettled} />
-        <Discards rows={holds.discards} />
+        <Cleanups rows={holds.cleanups} />
       </div>
       <Stores />
     </Page>
@@ -100,7 +100,7 @@ function Unsettled({
 }: {
   rows: {
     output: string;
-    scope: string;
+    partition: string;
     intents: { run: string; attempt: string; files?: string[] }[];
   }[];
 }) {
@@ -108,17 +108,17 @@ function Unsettled({
     <Card>
       <CardHeader
         title="Unsettled writes"
-        description="Outputs an attempt died writing. The next attempt of the scope reads the keys back and folds what landed into its commit."
+        description="Outputs an attempt died writing. The next attempt of the partition reads the keys back and folds what landed into its commit."
       />
       {rows.length === 0 ? (
         <Empty compact title="Nothing unsettled" />
       ) : (
         <ul className="flex flex-col divide-y divide-line border-t border-line">
           {rows.map((r) => (
-            <li key={`${r.output}/${r.scope}`} className="flex flex-col gap-1 px-4 py-2.5 text-sm">
+            <li key={`${r.output}/${r.partition}`} className="flex flex-col gap-1 px-4 py-2.5 text-sm">
               <span>
                 <span className="font-medium">{r.output}</span>
-                {r.scope && <span className="ml-2 font-mono text-xs text-fg-muted">{r.scope}</span>}
+                {r.partition && <span className="ml-2 font-mono text-xs text-fg-muted">{r.partition}</span>}
               </span>
               <span className="text-xs text-fg-muted">
                 {r.intents.map((i) => (
@@ -142,32 +142,32 @@ function Unsettled({
   );
 }
 
-function Discards({
+function Cleanups({
   rows,
 }: {
   rows: {
     output: string;
-    scope: string;
+    partition: string;
     pending: number;
     stuck: { id: string }[];
   }[];
 }) {
-  const clear = useClearDiscards();
+  const clear = useClearCleanups();
   return (
     <Card>
       <CardHeader
-        title="Stuck discards"
+        title="Stuck cleanups"
         description="Data garbage whose names couldn't be read after three tries. It stays on storage; clearing only stops the engine trying."
       />
       {rows.length === 0 ? (
-        <Empty compact title="No stuck discards" />
+        <Empty compact title="No stuck cleanups" />
       ) : (
         <ul className="flex flex-col divide-y divide-line border-t border-line">
           {rows.map((r) => (
-            <li key={`${r.output}/${r.scope}`} className="flex items-center gap-3 px-4 py-2.5 text-sm">
+            <li key={`${r.output}/${r.partition}`} className="flex items-center gap-3 px-4 py-2.5 text-sm">
               <span className="min-w-0 flex-1">
                 <span className="font-medium">{r.output}</span>
-                {r.scope && <span className="ml-2 font-mono text-xs text-fg-muted">{r.scope}</span>}
+                {r.partition && <span className="ml-2 font-mono text-xs text-fg-muted">{r.partition}</span>}
                 <span className="block text-xs text-fg-subtle">
                   {plural(r.stuck.length, "stuck entry", "stuck entries")}
                   {r.pending ? `, ${r.pending} pending` : ""}
@@ -179,10 +179,10 @@ function Discards({
                     Clear
                   </Button>
                 }
-                title={`Clear stuck discards of ${r.output}?`}
-                description="The engine forgets these entries; their objects stay where they are. Same as `solera scopes discards OUTPUT SCOPE --clear`."
+                title={`Clear stuck cleanups of ${r.output}?`}
+                description="The engine forgets these entries; their objects stay where they are. Same as `solera partitions cleanups OUTPUT SCOPE --clear`."
                 action="Clear"
-                onConfirm={() => clear.mutate({ output: r.output, scope: r.scope })}
+                onConfirm={() => clear.mutate({ output: r.output, partition: r.partition })}
               />
             </li>
           ))}
@@ -193,7 +193,7 @@ function Discards({
 }
 
 const KIND_RULE: Record<string, ReactNode> = {
-  immutable: "Writes only new names, so an abandoned write is unreferenced garbage, discarded later.",
+  immutable: "Writes only new names, so an abandoned write is unreferenced, and cleaned up later.",
   fenced: "Every write checks a generation: the next attempt's acquisition fences the old writer out.",
 };
 

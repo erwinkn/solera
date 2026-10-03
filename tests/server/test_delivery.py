@@ -4,7 +4,7 @@ plan until its last page, then `next` moves past it."""
 
 from solera_server.delivery import advance, continues, needs, pins
 
-CARRIED = {"output": "log", "up": "", "fingerprint": "f", "reset_by": "r1"}
+CARRIED = {"output": "log", "upstream_partition": "", "fingerprint": "f", "reset_by": "r1"}
 
 
 def test_a_batch_delivery_keeps_its_mode_to_its_boundary():

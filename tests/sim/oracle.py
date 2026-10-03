@@ -134,10 +134,10 @@ class Journal:
         return out
 
 
-async def index_entries(state, output: str, scope: str) -> dict[str, tuple[int, bytes | None]]:
+async def index_entries(state, output: str, partition: str) -> dict[str, tuple[int, bytes | None]]:
     """Every live entry of an output scope's key index: key -> (generation, payload)."""
 
-    index = KeyIndex(ObjectIO(state.objects), None, state.model.index(output, scope).pinned())
+    index = KeyIndex(ObjectIO(state.objects), None, state.model.index(output, partition).pinned())
     entries, after = {}, None
     while True:
         keys, generations, payloads, after = await index.page(after, 100_000)
@@ -147,7 +147,7 @@ async def index_entries(state, output: str, scope: str) -> dict[str, tuple[int, 
 
 
 async def keyed_content(
-    engine, project, output: str, scope: str = "", *, whole=False, column: str | None = "v"
+    engine, project, output: str, partition: str = "", *, whole=False, column: str | None = "v"
 ) -> dict[str, str | None]:
     """A keyed output's content as a reader of its head gets it: every key
     its index holds, loaded through its store at the generation the index
@@ -157,10 +157,10 @@ async def keyed_content(
     unsettled). Returns each key's `column`, None without one."""
 
     m = engine.state.model
-    head = m.heads.get((output, scope))
+    head = m.heads.get((output, partition))
     if head is None:
         return {}
-    entries = await index_entries(engine.state, output, scope)
+    entries = await index_entries(engine.state, output, partition)
     store_name = head["ref"]["store"]
     store = project.stores[store_name]
     ref = Ref.from_json(head["ref"])
@@ -168,32 +168,34 @@ async def keyed_content(
         rows = await store.load(ref, list[dict], Keys({k: g for k, (g, _) in entries.items()}))
     except Exception as error:
         raise Violation(
-            f"{output}[{scope!r}]: its committed keys cannot be read: {type(error).__name__}: {error}"
+            f"{output}[{partition!r}]: its committed keys cannot be read: {type(error).__name__}: {error}"
         ) from error
     got: dict[str, str | None] = {}
     for row in rows:
         k = str(row["id"])
         if k in got:
-            raise Violation(f"{output}[{scope!r}]: key {k} read twice")
+            raise Violation(f"{output}[{partition!r}]: key {k} read twice")
         got[k] = str(row[column]) if column is not None else None
     if set(got) != set(entries):
         missing = sorted(set(entries) - set(got))
         extra = sorted(set(got) - set(entries))
         raise Violation(
-            f"{output}[{scope!r}] ({store_name}): the store does not hold what the index says: "
+            f"{output}[{partition!r}] ({store_name}): the store does not hold what the index says: "
             f"missing {missing[:5]}, extra {extra[:5]}"
         )
     if whole and getattr(store, "writes", None) == "fenced":
         rows = await store.load(ref, list[dict], None)
         extra = sorted({str(r["id"]) for r in rows} - set(entries))
         if extra or len(rows) != len(entries):
-            raise Violation(f"{output}[{scope!r}] ({store_name}): rows nobody committed remain: {extra[:5]}")
+            raise Violation(
+                f"{output}[{partition!r}] ({store_name}): rows nobody committed remain: {extra[:5]}"
+            )
     return got
 
 
-async def value_content(engine, project, output: str, scope: str = ""):
+async def value_content(engine, project, output: str, partition: str = ""):
     m = engine.state.model
-    head = m.heads.get((output, scope))
+    head = m.heads.get((output, partition))
     if head is None:
         return None
     ref = Ref.from_json(head["ref"])
@@ -202,12 +204,12 @@ async def value_content(engine, project, output: str, scope: str = ""):
         return await store.load(ref, object, None)
     except Exception as error:
         raise Violation(
-            f"{output}[{scope!r}]: its head cannot be read: {type(error).__name__}: {error}"
+            f"{output}[{partition!r}]: its head cannot be read: {type(error).__name__}: {error}"
         ) from error
 
 
-async def commit_rows(engine, project, output: str, scope: str = "") -> list:
-    head = engine.state.model.heads.get((output, scope))
+async def commit_rows(engine, project, output: str, partition: str = "") -> list:
+    head = engine.state.model.heads.get((output, partition))
     if head is None:
         return []
     ref = Ref.from_json(head["ref"])
@@ -216,5 +218,5 @@ async def commit_rows(engine, project, output: str, scope: str = "") -> list:
         return await store.load(ref, list[dict], None)
     except Exception as error:
         raise Violation(
-            f"{output}[{scope!r}]: its batches cannot be read: {type(error).__name__}: {error}"
+            f"{output}[{partition!r}]: its batches cannot be read: {type(error).__name__}: {error}"
         ) from error

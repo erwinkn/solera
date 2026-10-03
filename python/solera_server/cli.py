@@ -39,8 +39,8 @@ def _reads(args) -> bool:
     command, action = args.command, getattr(args, "runs_command", None)
     if command == "runs":
         return action is None or (action == "prune" and args.dry_run)
-    if command == "scopes":
-        return args.scopes_command == "discards" and not args.clear
+    if command == "cleanups":
+        return not args.clear
     if command == "automations":
         return not args.action
     return command in ("run-show", "logs")
@@ -157,12 +157,12 @@ def _main():
     runs_prune.add_argument("--asset", help="Only runs of this asset")
     runs_prune.add_argument("--keep", type=int, help="Keep the N newest matching runs")
     runs_prune.add_argument("--dry-run", action="store_true")
-    scopes = commands.add_parser("scopes", help="An output scope's data garbage (docs/lifecycle.md §9.8)")
-    scopes_sub = scopes.add_subparsers(dest="scopes_command", required=True)
-    discards = scopes_sub.add_parser("discards", help="An output scope's data garbage, and the stuck entries")
-    discards.add_argument("output")
-    discards.add_argument("scope", nargs="?", default="")
-    discards.add_argument("--clear", action="store_true", help="Forget the stuck entries; their objects stay")
+    cleanups = commands.add_parser(
+        "cleanups", help="An output partition's pending cleanups, and the stuck ones (docs/lifecycle.md §9.8)"
+    )
+    cleanups.add_argument("output")
+    cleanups.add_argument("partition", nargs="?", default="")
+    cleanups.add_argument("--clear", action="store_true", help="Forget the stuck entries; their objects stay")
 
     keys = commands.add_parser(
         "keys", help="An Each asset's failing keys (per-key-processing.md §9)", parents=[common]
@@ -170,7 +170,7 @@ def _main():
     keys_sub = keys.add_subparsers(dest="keys_command", required=True)
     keys_retry = keys_sub.add_parser("retry", help="Retry an Each asset's failing keys now")
     keys_retry.add_argument("asset")
-    keys_retry.add_argument("--partition", default=None, help="One scope only")
+    keys_retry.add_argument("--partition", default=None, help="One partition only")
     for name in ("failed", "rejected", "canceled", "retrying", "timed-out", "all"):
         keys_retry.add_argument(f"--{name}", action="store_true")
 
@@ -411,18 +411,18 @@ async def _remote(args, parser):
             print(json.dumps(detail, indent=2))
             if detail["request"]["status"] != "succeeded":
                 raise SystemExit(1)
-        elif args.command == "scopes" and args.scopes_command == "discards" and args.clear:
-            body = {"output": args.output, "scope": args.scope, "by": "cli"}
-            response = await client.post(f"{base}/scopes:clear-discards", json=body)
+        elif args.command == "cleanups" and args.clear:
+            body = {"output": args.output, "partition": args.partition, "by": "cli"}
+            response = await client.post(f"{base}/cleanups:clear", json=body)
             response.raise_for_status()
             print(json.dumps(response.json(), indent=2))
-        elif args.command == "scopes" and args.scopes_command == "discards":
+        elif args.command == "cleanups":
             response = await client.get(f"{base}/outputs/{args.output}/heads")
             response.raise_for_status()
-            heads = [h for h in response.json()["heads"] if h["scope"] == args.scope]
-            print(json.dumps(heads[0]["discards"] if heads else None, indent=2))
+            heads = [h for h in response.json()["heads"] if h["partition"] == args.partition]
+            print(json.dumps(heads[0]["cleanups"] if heads else None, indent=2))
         elif args.command == "keys":
-            body = {"classes": _key_classes(args), "scope": args.partition, "by": "cli"}
+            body = {"classes": _key_classes(args), "partition": args.partition, "by": "cli"}
             response = await client.post(f"{base}/assets/{args.asset}/keys:retry", json=body)
             response.raise_for_status()
             print(json.dumps(response.json(), indent=2))
@@ -491,17 +491,21 @@ async def _local(args, parser):
             print(json.dumps(detail, indent=2))
             if detail["request"]["status"] != "succeeded":
                 raise SystemExit(1)
-        elif args.command == "scopes" and args.scopes_command == "discards":
-            done = runtime.clear_discards if args.clear else None
+        elif args.command == "cleanups":
+            done = runtime.clear_cleanups if args.clear else None
             view = (
-                done(args.output, args.scope, "cli")
+                done(args.output, args.partition, "cli")
                 if done
-                else runtime.scope_discards(args.output, args.scope)
+                else runtime.partition_cleanups(args.output, args.partition)
             )
             print(json.dumps(view, indent=2))
         elif args.command == "keys":
             found = runtime.retry_keys(args.asset, _key_classes(args), args.partition, "cli")
-            runs = await runtime.submit_retries(args.asset, found["scopes"], "cli") if found["scopes"] else []
+            runs = (
+                await runtime.submit_retries(args.asset, found["partitions"], "cli")
+                if found["partitions"]
+                else []
+            )
             found["runs"] = [(await runtime.run_until(r["id"]))["request"]["status"] for r in runs]
             print(json.dumps(found, indent=2))
         elif args.command == "runs" and args.runs_command == "delete":

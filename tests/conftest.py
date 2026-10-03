@@ -117,7 +117,7 @@ def context(output: Output, partition: str = "", commit_number=None, **kw) -> Wr
     return WriteContext(output=output, partition=partition, commit_number=commit_number, attempt="test", **kw)
 
 
-async def whole(state, output: str, scope: str = ""):
+async def whole(state, output: str, partition: str = ""):
     """A whole keyed read's selection, as the harness builds it for an
     immutable store: every live entry of the output's key index, with the
     generation that wrote it (docs/lifecycle.md §9.8)."""
@@ -126,7 +126,7 @@ async def whole(state, output: str, scope: str = ""):
     from solera.keys.io import ObjectIO
     from solera.stores import Keys
 
-    index = KeyIndex(ObjectIO(state.objects), None, state.model.index(output, scope).pinned())
+    index = KeyIndex(ObjectIO(state.objects), None, state.model.index(output, partition).pinned())
     entries, after = {}, None
     while True:
         keys, generations, _, after = await index.page(after, 100_000)

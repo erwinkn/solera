@@ -244,7 +244,9 @@ export function Waterfall({
                 <StatusIcon status={task.status} />
                 <span className="truncate">
                   <span className="text-fg">{task.asset}</span>
-                  {task.scope && <span className="font-mono text-xs text-fg-subtle"> · {task.scope}</span>}
+                  {task.partition && (
+                    <span className="font-mono text-xs text-fg-subtle"> · {task.partition}</span>
+                  )}
                 </span>
               </Link>
               <div className="relative mr-4 h-8">
@@ -309,7 +311,7 @@ export function Waterfall({
                           attempt: attempt.id,
                         })}
                         replace
-                        aria-label={`${task.asset} ${task.scope} attempt ${attempt.generation}: ${label(attempt.status)}, ${duration(stop - attempt.started_at)}`}
+                        aria-label={`${task.asset} ${task.partition} attempt ${attempt.generation}: ${label(attempt.status)}, ${duration(stop - attempt.started_at)}`}
                         className={cn(
                           "absolute top-1/2 h-3.5 -translate-y-1/2 rounded-mark p-[1.5px]",
                           active ? "ring-2 ring-fg" : "hover:ring-2 hover:ring-line-strong",

@@ -32,7 +32,7 @@ export function Automations() {
     <Page>
       <PageHeader
         title="Automations"
-        description="A trigger says when; the automation says what run to submit. Schedules skip scopes still running."
+        description="A trigger says when; the automation says what run to submit. Schedules skip partitions still running."
         meta={
           <>
             <span>{plural(data.length, "automation")}</span>
@@ -114,7 +114,7 @@ function Row({ a }: { a: Automation }) {
           : Array.isArray(a.partitions)
             ? plural(a.partitions.length, "partition")
             : a.trigger.kind === "onchange"
-              ? "changed scopes"
+              ? "changed partitions"
               : "latest"}
         {a.mode === "full" && " · full"}
         {a.upstream && " · upstream"}

@@ -133,7 +133,7 @@ function useAttention() {
         (a) => a.partitions.failed > 0 || Object.values(a.failures ?? {}).some((n) => (n ?? 0) > 0),
       ).length
     : 0;
-  const leftover = holds ? holds.unsettled.length + holds.discards.length : 0;
+  const leftover = holds ? holds.unsettled.length + holds.cleanups.length : 0;
   return { running: diagnostics?.active_runs ?? 0, failing, leftover };
 }
 

@@ -101,7 +101,7 @@ class Prepared:
     """What the engine prepared for one output of a live attempt: the
     request is checked against it, never trusted."""
 
-    scope: str
+    partition: str
     commit_number: int
     generation: int
     index: IndexState  # the index the engine holds for the scope now
@@ -188,7 +188,7 @@ class Resolver:
             return {**declined, "reason": "not_live"}, None
         kind, keys = o.get("kind"), o.get("keys")
         if (
-            o.get("scope") != p.scope
+            o.get("partition") != p.partition
             or o.get("commit_number") != p.commit_number
             or o.get("generation") != p.generation
             or (o.get("base") or {}).get("prefix") != p.index.prefix
@@ -209,7 +209,7 @@ class Resolver:
             attempt,
             worker_id,
             o["name"],
-            p.scope,
+            p.partition,
             kind,
             p.commit_number,
             p.generation,
@@ -344,7 +344,7 @@ class Ask:
     """One output to resolve: its sorted entries, sent as a `.kx` file."""
 
     name: str
-    scope: str
+    partition: str
     kind: str  # "patch" or "replace"
     commit_number: int
     generation: int
@@ -361,7 +361,7 @@ def request(worker_id: str, asks: list[Ask]) -> bytes:
         outputs.append(
             {
                 "name": a.name,
-                "scope": a.scope,
+                "partition": a.partition,
                 "kind": a.kind,
                 "commit_number": a.commit_number,
                 "generation": a.generation,
