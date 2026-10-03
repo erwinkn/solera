@@ -62,7 +62,9 @@ TERMINAL = {"succeeded", "failed", "canceled", "skipped"}
 # Key cache budgets, (disk, candidates) bytes: the default, or room for a few
 # of the simulation's index files, or for none of them.
 CACHE = {None: None, "tight": (6 * 1024, 2 * 1024), "starved": (2 * 1024, 512)}
-STORES = ["file", "table"] + (["pg"] if postgres.DSN else [])  # where `items` lives
+# Where `items` lives. Always the same three, so a seed draws the same runs with or
+# without Postgres: without SOLERA_TEST_DATABASE_URL, "pg" runs on the table store.
+STORES = ["file", "table", "pg"]
 CHANGES = sorted(VARIANTS)  # re-registrations the rules make
 
 
@@ -91,6 +93,9 @@ class Simulation(RuleBasedStateMachine):
     @initialize(seed=st.integers(0, 2**16), store=st.sampled_from(STORES), cache=st.sampled_from(list(CACHE)))
     def boot(self, seed, store="file", cache=None):
         self.trace.append(f"boot(seed={seed}, store={store!r}" + (f", cache={cache!r})" if cache else ")"))
+        if store == "pg" and not postgres.DSN:
+            store = "table"
+            self.trace.append("  # no Postgres: 'pg' runs on the table store")
         self.world = world = World(self.tmp, seed, key_options=Options(l0_max_files=2))
         world.cache_budget = CACHE[cache]
         self.journal = Journal(now=world.now)

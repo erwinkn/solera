@@ -137,7 +137,9 @@ SOLERA_SIM_EXAMPLES=2000 SOLERA_SIM_STEPS=60 uv run pytest tests/sim -q --slow
 SOLERA_SIM_TRACE=1 uv run pytest tests/sim -q -s # print every run's trace
 ```
 
-The CI budget is derandomized: the same runs every time. `--slow` draws new
+The CI budget is derandomized: the same runs every time, with or without
+Postgres (without it, a run drawn for `pg` uses the table store, and says
+so in its trace). `--slow` draws new
 ones on every worker and reports throughput, e.g. `simulation: 400 runs,
 15,880 steps, 61.2 h virtual in 8.5 min (112,000 steps/hour)`.
 
