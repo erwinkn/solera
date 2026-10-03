@@ -87,10 +87,10 @@ arguments, up to 40 per run.
 | `round_trip(between, clean)` | `round_trip('keys', clean=True)` | `items` moved to its other store and back, with nothing, a `keys=` run or a feed change in between; off until the reset rule (F13, F17) |
 | `readd_live(clean, ends)` | `readd_live(clean=False, ends='succeeds')` | the job `seen` removed and added back while its attempt runs, which then succeeds or dies; off until the reset rule (F19) |
 | `break_watch(broken)` | `break_watch(True)` | the sensor raising on every tick (the host posts the error), then working again |
-| `pool_hosts(hosts)` | `pool_hosts(2)` | how many pool hosts poll `split`'s `Pool`: none (its attempts wait for one), one, or two racing for each claim (`lifecycle.md` §10) |
+| `pool_hosts(hosts)` | `pool_hosts(2)` | how many pool hosts poll `split`'s `Pool`: none (its attempts wait for one), one, or two racing to own each attempt (`lifecycle.md` §10) |
 | `cancel(newest)` | | a user cancel of a live run |
 | `wait(seconds)` | `wait(700)` | time passing: retries, timeouts, schedules |
-| `doom_next_worker(fate)` | `doom_next_worker(Fate('die', 'gate', 'after'))` | the next launched worker dies or pauses before or after its claim, start, delta upload, gate, store write, result or `finished`; is muted (cannot reach the engine); or is started twice |
+| `doom_next_worker(fate)` | `doom_next_worker(Fate('die', 'gate', 'after'))` | the next launched worker dies or pauses before or after owning its attempt (point `claim`), start, delta upload, gate, store write, result or `finished`; is muted (cannot reach the engine); or is started twice |
 | `store_weather(error, lost, delay)` | `store_weather(error=0.1, lost=0.02, delay=15)` | the fault plan from now on |
 | `restart(clean, down)` | `restart(clean=False, down=120)` | a crash or a clean restart, and an outage |
 | `takeover(zombie, change)` | `takeover(zombie=600, change='bump')` | a new engine while the old one still runs (a rolling deploy), optionally on a new variant; two takeovers within `zombie` seconds leave three engines running |
@@ -276,7 +276,7 @@ rules, not invariant checks. `pg`: `items` may also live in Postgres.
 | P1 | a6dcc0e (F16 set aside) | 201 | 157 runs, 6,312 steps | default | green |
 | P2 | a6dcc0e | 202 | 158 runs, 6,177 steps | default | green |
 | P3 | a6dcc0e | 203 | 106 runs, 4,060 steps | pg | green |
-| Q1–Q3 | `split` on a `Pool` | 301–303 | 542 runs, 23,897 steps | default ×2, pg | a pool host never took an attempt again after its worker died before the claim (a simulation bug, fixed); F16 set aside twice |
+| Q1–Q3 | `split` on a `Pool` | 301–303 | 542 runs, 23,897 steps | default ×2, pg | a pool host never took an attempt again after its worker died before owning it (a simulation bug, fixed); F16 set aside twice |
 | R1–R3 | `Pool` (fixed), `watch` requests runs | 511–513 | 503 runs, 23,744 steps | default ×2, pg | F17; F13 by a takeover; F16 set aside once |
 | S1–S3 | cb3367b (F13, F17 set aside) | 521–523 | 572 runs, 26,112 steps, 121 h | default ×2, pg | green; F13 set aside 3 times |
 | L1 | a780a55 (main) | 601 | 1,059 runs, 73,668 steps, 323 h virtual | default | green; F16 set aside 6 times |
@@ -298,7 +298,7 @@ not the code: where they differ, the code is the suspect.
 
 ```bash
 spec/tla/check-execution.sh            # smoke and calibrations (CI): about a minute
-spec/tla/check-execution.sh design     # store moves, patterns and versions, removal: minutes, liveness included
+spec/tla/check-execution.sh design     # store moves (with and without B), patterns and versions, removal, a zombie: ~15 min, liveness included
 spec/tla/check-execution.sh big        # every deploy kind, every fault kind, each=True: too large to finish yet
 spec/tla/check-execution.sh all
 ```
@@ -307,16 +307,17 @@ spec/tla/check-execution.sh all
 
 - Three output partitions in a chain: a keyed **source** `S` (holding
   keys 1 and 2), an asset `A` reading it incrementally, an asset `B`
-  reading `A` incrementally (with patterns; `each=True` in one
-  configuration). Each has a **commit log**, `[up, rm, reset]` per commit
+  reading `A` incrementally (with patterns; `B` is `each=True` in one
+  configuration, `A` never). Each has a **commit log**, `[up, rm, reset]` per commit
   over a set of keys: its content is the log's fold, and a prefix's fold
   is what a bookmark at that commit number has read.
 - Per incremental input, a **bookmark**: `next`, the **pass** under way (a
   `full` pass's position and the head it resumes deltas from; `delta` and
   `diff` passes are one batch each), and the **fingerprint** and
-  **patterns** it reads under. The fingerprint is a value of the
-  declaration (the asset's version and its output's store), so moving a
-  store back restores the old one, as a digest does.
+  **patterns** it reads under, and whether a **reset** took it (no full
+  pass has caught it up since). The fingerprint is the asset's version:
+  which store holds the output is not in it, since a move resets the
+  output instead.
 - Per output, two **fenced stores** (`A` can move between them) holding
   rows, a **fence** generation per store, the store the head is in, and
   the **repair** intents owed.
@@ -325,7 +326,9 @@ spec/tla/check-execution.sh all
   worker progress, **gate** (`none`, `writing`, `aborted`) and **cancel**
   request. Claims are the attempts `prep`ared or launched.
 - The **manifest** (`A`'s store, versions, `B`'s patterns, whether `B` is
-  declared) and the **engines**: one serving (none after a crash) and
+  declared, and how many times each output was reset: a move of `A` or
+  the re-adding of `B` makes it a new output under the same name) and
+  the **engines**: one serving (none after a crash) and
   possibly a zombie (a rolling deploy).
 
 **Actions.** The environment: commits to `S`; deploys (move `A`'s store,
@@ -339,9 +342,13 @@ requested cancel), write (checking the fence), seal. A worker runs on
 after the engine gave up on it. A zombie engine can only take gates
 (`aborted`), and only of the attempts it created before it was fenced
 (with `zombie` among the faults explored): its journal writes are fenced.
-A `keys=` run whose write starts the output over reads a full pass, and
-from then on is a run of the whole asset: it goes on until the pass
-ends. Everything but the last
+A move resets `A` at the deploy: its head and repair intents go, and so
+do its own bookmarks and `B`'s on it. An attempt launched before a reset
+of its output, or of the output it reads, is refused at commit and its
+run carries on; what it wrote is owed a repair unless its own output was
+reset. A `keys=` run of a partition a reset took bookmarks from reads a
+full pass, and from then on is a run of the whole asset: it goes on until
+the pass ends. Everything but the last
 commit to `S` happens before it, so "after quiescence" is a state the
 model reaches.
 
@@ -390,50 +397,87 @@ and TLC must find it (`check-execution.sh calibrate`):
 | `FixF6` | a pass that ends behind the head goes on to it | `A` reads keys 1 and 2 in a full pass; key 1 commits; a cancel stops the run; `S` drops key 1; the firing resumes the pass, delivers key 2, and the task ends behind the head: `A` keeps 1 for good (`Quiesces`, 36 steps) |
 | `FixF9` | a reset upstream commit makes its consumers read a full pass | (needed by the others; F9's own bug is the simulation's) |
 | `FixF10` | a full pass reaches the consumer even when its patterns take no key; `each` reconciles at its end | `B` holds 1 and 2; `B` excludes key 2 and its version is bumped; `S` drops key 1, so `A` holds 2 alone; `B`'s full pass takes no key and is skipped: `B` keeps 1 (`BookmarkHonest`, 41 steps) |
-| `FixF13` | moving a store changes the asset's fingerprint, so its inputs read a full pass | `A`'s full pass commits key 1 into store 1; `A` moves to store 2; the pass's next batch, key 2, starts store 2 over: `A` holds 2 alone, its bookmark says 1 and 2 (`BookmarkHonest`, 17 steps) |
-| `FixSelection` | a `keys=` run made a full pass (`FixF17`) reads the pass to its end | `A`'s first run is `keys=(1)`; its write starts the output over, so it reads a full pass, but ends after the first batch: `A` holds key 1 alone, a pass under way, and no run to finish it (`RunsEndCaughtUp`, 9 steps). Found by the spec's review (finding 1): the older properties needed a later source change to see it |
-| `FixF17` | a write that starts the output over (into a store the head is not in) reads a full pass, also for a `keys=` run | `A` holds 1 and 2 in store 1; `A` moves to store 2; a `keys=` run for key 1 starts store 2 over with key 1 alone and moves no bookmark (still store 1's fingerprint): `A` lacks 2 though nothing removed it (`BookmarkHonest`, 25 steps). Moving back makes it permanent: the fingerprint matches again, so nothing reads a full pass (the simulation's F17) |
+| `ResetOnMove` (with `FixF17`: calibration `move`) | a move resets the output at the deploy (K10; b7d8ae7). With both off, a move only changes where `A`'s next write goes, and that write starts the store over without a full pass | `A`'s full pass commits key 1 into store 1; `A` moves to store 2; the pass's next batch, key 2, starts store 2 over: `A` holds 2 alone, its bookmark says 1 and 2 (`BookmarkHonest`, 17 steps). F13's mechanism as W15 described it; F13's replays turned out to take F10's route |
+| `FixSelection` | a `keys=` run made a full pass (`FixF17`) reads the pass to its end | `A`'s first run is `keys=(1)`; its write starts the output over, so it reads a full pass, but ends after the first batch: `A` holds key 1 alone, a pass under way, and no run to finish it (`RunsEndCaughtUp`, 9 to 11 steps). Found by the spec's review (finding 1): the older properties needed a later source change to see it |
+| `FixF17` | a `keys=` run of a partition a reset took bookmarks from reads that full pass (without `ResetOnMove`: a write that starts the output over reads a full pass) | `A` moves, which resets it; a `keys=` run for key 1 writes key 1 alone into the new, empty output and succeeds: `A` lacks key 2, though nothing removed it (`RunsEndCaughtUp`, 10 steps). Before the reset rule, moving back made it permanent (the simulation's F17) |
 
-**Results.** With every fix on (TLC 1.7.4; the first four rows and
-`zombie` re-run after the review's fixes with 3 workers, the others as
-as first run, with 8 workers; a shared machine):
+**Results.** With every fix on (TLC 1.7.4; the first six rows re-run
+after the review's fixes and the reset rule, with 2 workers under a 5 GB,
+1.5-CPU cap; the others as first run, with 8 workers; a shared machine):
 
 | Configuration | What varies | States (distinct) | Time | Verdict |
 |---|---|---|---|---|
-| `smoke` | nothing: the plain pipeline | 10,852 | 5 s | passes, liveness included |
-| `store` | `A` moves away and back, a `keys=` run between (`B` left out) | 36,810 | 13 s | passes |
-| `shape` | two pattern changes or version bumps of `B` | 398,934 | 3 min 39 s | passes |
-| `remove` | `B` removed and re-added, twice | 217,957 | 1 min 57 s | passes |
-| `zombie` | a takeover, the zombie taking gates (`B` left out) | 1,368 | 2 s | passes; with the zombie free to take any attempt's gate, `Quiesces` fails (the review's finding 2) |
-| `deploys` | one deploy of every kind and a `keys=` run | over 4.5 million | capped at 25 min | no invariant violated in what was explored; liveness not reached |
-| `faults` | two faults of every kind | over 2.8 million | capped at 25 min | no invariant violated in what was explored; liveness not reached |
-| `each` | `B` is `each=True`; one deploy and one fault of most kinds | over 2.3 million | capped at 25 min | no invariant violated in what was explored; liveness not reached |
-| `safety` | every kind at once, two of each: random behaviours | 100,000 behaviours of up to 150 steps | minutes | (`check-execution.sh safety`; 2,000 behaviours pass in 7 s) |
+| `smoke` | nothing: the plain pipeline | 10,852 | 9 s | passes, liveness included |
+| `store` | `A` moves away and back, a `keys=` run between (`B` left out) | 45,983 | 24 s | passes |
+| `reset` | `A` moved once while `B` reads it | 395,549 | 5 min 2 s | passes; without the repair a refused `B` attempt owes, `StoreMatchesJournal` fails |
+| `shape` | two pattern changes or version bumps of `B`, in any mix | 398,934 | 5 min 20 s | passes |
+| `remove` | `B` removed and re-added (two deploys: one pair) | 243,354 | 3 min 25 s | passes |
+| `zombie` | a takeover, the zombie taking gates (`B` left out) | 1,368 | 3 s | passes; with the zombie free to take any attempt's gate, `Quiesces` fails (the review's finding 2) |
+| `deploys` | one deploy, of any one kind, and a `keys=` run | over 4.5 million | capped at 25 min | no invariant violated in what was explored; liveness not reached (before the review's fixes) |
+| `faults` | two faults in all, of any kinds | over 2.8 million | capped at 25 min | the same (before the review's fixes) |
+| `each` | `B` is `each=True`; one deploy of any kind and one fault of any of four kinds | over 2.3 million | capped at 25 min | the same (before the review's fixes; then `A` was `each=True` too, finding 4) |
+| `safety` | two deploys and two faults in all, of any kinds, and a `keys=` run: random behaviours | configured: 100,000 behaviours of up to 150 steps; run so far: 2,000 | 7 s for the 2,000 | passed what ran (`check-execution.sh safety` runs the configured target) |
+
+The budgets are shared across kinds: `MaxDeploy` and `MaxFault` count
+deploys and faults of any kind, so a configuration listing every kind
+explores every *choice* of them within the budget, not every kind at
+once. The bounds, exactly:
+
+| Configuration | Keys | Source commits after the first | Deploys (budget: kinds) | Faults (budget: kinds) | `keys=` runs | `B` | `each` | Attempts, runs, tries |
+|---|---|---|---|---|---|---|---|---|
+| `smoke` | 2 | 1 | 0 | 0 | 0 | declared | — | 8, 6, 2 |
+| `store` | 2 | 1 | 2: move | 0 | 1 | left out | — | 12, 10, 3 |
+| `reset` | 2 | 1 | 1: move | 0 | 0 | declared | — | 12, 10, 3 |
+| `shape` | 2 | 1 | 2: pattern, bump | 0 | 0 | declared | — | 12, 10, 3 |
+| `remove` | 2 | 1 | 2: remove (a removal and a re-adding each spend one) | 0 | 0 | declared | — | 12, 10, 3 |
+| `zombie` | 2 | 1 | 0 | 1: takeover (the zombie's aborts spend none) | 0 | left out | — | 12, 10, 3 |
+| `deploys` | 2 | 1 | 1: move, pattern, bump, remove | 0 | 1 | declared | — | 12, 10, 3 |
+| `faults` | 2 | 1 | 0 | 2: worker, crash, takeover, timeout, cancel, zombie | 0 | declared | — | 12, 10, 3 |
+| `each` | 2 | 1 | 1: move, pattern, bump, remove | 1: worker, crash, timeout, cancel | 0 | declared | `B` | 12, 10, 3 |
+| `safety` | 2 | 1 | 2: move, pattern, bump, remove | 2: worker, crash, takeover, timeout, cancel, zombie | 1 | declared | — | 14, 10, 4 |
 
 No design bug found so far. Modeling errors found: a fingerprint change
 during a full pass must start the pass over, as the engine does; and,
 from an independent review of the spec, a promoted `keys=` run ended after one batch
 (finding 1, now `FixSelection` and `RunsEndCaughtUp`) and a zombie could
 abort attempts its successor created, exhausting their retries (finding
-2). Still open from the review: `FixF13` restores a synthetic store-move
-bug rather than F13's real mechanism (3), `Each` applies to `A` as well as
-`B` (4), a move back and forth without a write restores the old state
-where K10 makes each move a new output (5), the results table's budgets
-are shared across kinds (6), and the fairness argument must be redone
-once attempts are swaps on a control file, whose retries are loops.
+2). The review's other findings are addressed. `FixF13` (the store in
+the fingerprint) was not F13's mechanism; the store is out of the
+fingerprint now, as built, and `ResetOnMove` with `FixF17` off restores
+the mechanism (3). `each` applies to `B` alone (4). A move resets the
+output at the deploy, as built in b7d8ae7, so a move away and back is
+two resets, and attempts in flight are refused (5). The tables above
+give the exact, shared budgets (6). The
+fairness argument with a control file, whose swap retries are loops, is
+in "Formal model: the attempt control file".
 
-**Store moves, as decided.** A store move is a full reset: the output is
-new under the same name, its index starts empty, it reads every input in a
-full pass, and its consumers start over. The model has it as three rules:
-a write into a store the head is not in is a reset commit (the index
-starts empty); such a write is planned as a full pass of the asset's
-inputs, also for a `keys=` run (`FixF17`); and a reset upstream commit
-makes every consumer read a full pass (`FixF9`). The move takes effect at
-the asset's next write, not at the deploy. With that rule the store in
-the fingerprint (`FixF13`) is redundant: the model keeps it only as F13's
-calibration.
+**Store moves, as built** (b7d8ae7, `object-store-state.md` §2). A
+deploy that moves an output, or removes it, resets it: the output under
+the name is new (K10). In the model, at the move:
+- `A`'s head and repair intents go;
+- `A`'s own bookmarks and `B`'s bookmark on `A` go, marked `reset`.
+  `A` reads `S` in a full pass, and `B` re-reads `A` from scratch. A
+  bookmark marked `reset` claims nothing (`BookmarkHonest`) until a full
+  pass catches it up.
+- A move away and back is two resets.
 
-**F13, in plain words** (for the fix): `items` holds `k10` and `k11` in the
+Every attempt records which reset of its output, and of the output it
+reads, it launched under. One launched before a later reset is refused at
+commit, and its run carries on with a fresh attempt. What it wrote is
+owed a repair if its own output was not reset (a `B` attempt refused
+because `A` was reset), and dropped with the output if it was. TLC found
+the need for that repair: without it, `B`'s refused attempt leaves rows in
+`B`'s store that no commit records (`StoreMatchesJournal`, check `reset`).
+The code does record it (`_fail` takes a refused result's gate intents).
+The first write after a reset is a reset commit (its index starts
+empty), planned as a full pass, also for a `keys=` run of a partition the
+reset took bookmarks from (`FixF17`), which then runs to the pass's end
+(`FixSelection`); a reset upstream commit makes every consumer read a
+full pass (`FixF9`).
+
+**F13, in plain words** (the store-move mechanism the decision removes;
+the two F13 replays turned out to take F10's route, and pass since F10's
+fix): `items` holds `k10` and `k11` in the
 table store; a deploy moves it to FileStore. Nothing re-reads its input:
 the store is not in the fingerprint, so `items`' next attempt reads only
 the feed's new commits, a delta. But its write lands in a store the head
@@ -465,8 +509,7 @@ it read 1 and 2.
   when it next runs (no `OnDeploy`).
 - *What I would do next:* a run graph (`upstream=True`, a task waiting on
   another) for "every run ends" across tasks; a half-written batch with
-  repair; an immutable store beside the fenced one; and the store move as
-  one rule (drop `FixF13`) once the code follows the decision.
+  repair; and an immutable store beside the fenced one.
 
 ## Formal model: the journal (`spec/tla/Journal.tla`)
 
@@ -787,7 +830,7 @@ spec/tla/check-journal.sh object-big   # three engines, six writes: ~9 min
 ## Formal model: the attempt control file (`spec/tla/Attempt.tla`)
 
 Decided (K18), not built yet: one control file per attempt, swapped with
-`If-Match`, replaces the claim (`.worker`), the gate (`.writing`) and the
+`If-Match`, replaces ownership (`.worker`), the gate (`.writing`) and the
 result (`.result`) (`lifecycle.md` §2.4). The model is the protocol at the
 level of requests. The durable state is apart from each actor's view of
 it: the object store (the control files, the fenced store's generation
@@ -871,14 +914,15 @@ a real one: an engine that keeps crashing ends nothing.
   result but not who may write.
 
 **Calibration.** Each rule is a switch, and with it off TLC must find the
-bug (`check-attempt.sh`):
+bug (`check-attempt.sh`; with several TLC workers, a trace's length varies
+by a step between runs):
 
 | Rule off | TLC finds | Trace |
 |---|---|---|
-| `PreCreate`: the engine creates the file before the launch, and nobody else creates it | `NoWriteAfterNone`, 12 steps | The create-if-absent gate with nothing retained, the case the old design kept gates `gate_days` for. The engine ends A before its worker reports, creating the file `ended` (`none`), and settles. A's worker boots and reads its spec, and retention deletes A's files. The worker finds no file, creates it `owned`, acquires (no later attempt has), marks `writing` and writes. |
-| `TakeWriting`: the worker marks `writing` before its first write | `NoWriteAfterNone`, 10 steps | The worker owns A and acquires; the engine ends A from `owned` (`none`); the worker writes anyway |
+| `PreCreate`: the engine creates the file before the launch, and nobody else creates it | `NoWriteAfterNone`, 11 to 12 steps | The create-if-absent gate with nothing retained, the case the old design kept gates `gate_days` for. The engine ends A before its worker reports, creating the file `ended` (`none`), and settles. A's worker boots and reads its spec, and retention deletes A's files. The worker finds no file, creates it `owned`, acquires (no later attempt has), marks `writing` and writes. |
+| `TakeWriting`: the worker marks `writing` before its first write | `NoWriteAfterNone`, 10 to 11 steps | The worker owns A and acquires; the engine ends A from `owned` (`none`); the worker writes anyway |
 | `EngineSwaps`: the engine ends with `If-Match`, not a blind PUT | `NoWriteAfterNone`, 11 to 12 steps | The engine reads `open`. The worker owns A, acquires and marks `writing`. The engine's blind PUT replaces `writing` with `ended` (`none`, from the `open` it read), and the worker's write lands. With `OneOutcome` also checked, TLC finds that first (5 steps): a blind end overwrites the zombie's. |
-| `Classify`: ended from `writing`, the evidence is `writing` | `NoWriteAfterNone`, 10 steps | The worker marks `writing` and writes; the engine ends from `writing` but records `none` |
+| `Classify`: ended from `writing`, the evidence is `writing` | `NoWriteAfterNone`, 10 to 11 steps | The worker marks `writing` and writes; the engine ends from `writing` but records `none` |
 
 **Bounds and cost** (TLC 2.19; 3 workers, 6 GB, on a shared 8-core VM;
 one engine restart, the zombie, lost answers):

@@ -63,7 +63,7 @@ class Reader(Protocol):                                        # what `reads()` 
 | `reset` | the write starts the content over (a `full` run): keep nothing of `prior` |
 | `attempt` | the writing attempt's id |
 | `generation` | a number the engine assigns each attempt on a partition, larger for every later attempt; `None` outside an attempt |
-| `worker_id` | which process runs the attempt: an attempt started twice has one generation and two workers, and only the first to claim it may write |
+| `worker_id` | which process runs the attempt: an attempt started twice has one generation and two workers, and only the one that owns it may write |
 
 **`store(write, prior, context) -> Written(ref)`** applies a write and
 returns a ref to the new content; the worker stamps the ref with the

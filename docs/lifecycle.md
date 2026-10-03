@@ -3,10 +3,10 @@
 Status: **built** (milestones 1, 2 and 5), but for the §9.8 sweep of what a
 worker writes after its attempt ended, sensors' host-side resolution
 of bigger maps (§11.7), and the control file (§2.4: decided in K18, not
-built yet), which replaces `.worker`'s claim, the gate object `.writing`
+built yet), which replaces `.worker` (ownership), the gate object `.writing`
 and `.result`; this doc describes it as the target. Where the build departs from the text, it says so
 in place. In order: the records of §2 (`solera/lifecycle.py`), attempt
-objects and claims (§2–§4), the channel (§5: `solera_server/attempts.py`,
+objects and ownership (§2–§4), the channel (§5: `solera_server/attempts.py`,
 `solera_worker/channel.py`), heartbeats as evidence (§6), the two-phase
 cancel (§7), the clocks (§8), Pool (§10), store
 kinds (§9.5–§9.6; `stores.md`), PostgresStore generation
@@ -93,7 +93,7 @@ writes anything but the spec and the control file's `open` and `ended`
 
 Gone: the two-write `{attempt}.json`, the fence-reading `.beat` and its
 done marker, the joined `.log`, chunk deletion, `AttemptClaimed`; with
-the control file, `.worker` as a claim, `.writing` and `.result`.
+the control file, `.worker`, `.writing` and `.result`.
 
 **The result**, sealed into the control file, carries today's result,
 plus the worker, the timeline, usage, the log index, and what is known of
@@ -256,7 +256,7 @@ the two decisions could cross.
 
 **What it removes:** keeping gates when a run is deleted, the notes under
 `control/gates/`, the scan that expired them, `gate_days`, the `closed`
-gate, `.worker` as a claim, and the separate `.writing` and `.result`
+gate, the `.worker` object, and the separate `.writing` and `.result`
 objects.
 
 **What stays:**
@@ -363,7 +363,7 @@ All under `/api/projects/{p}/`, over HTTPS.
 
 | Route | Body → answer | From |
 |---|---|---|
-| `POST attempts/{a}/start` | `{worker, host, pid}` → `{cancel}` · `409 {reason}` | the claim's winner, once |
+| `POST attempts/{a}/start` | `{worker, host, pid}` → `{cancel}` · `409 {reason}` | the owner, once |
 | `POST attempts/{a}/beat` | `{worker, seq, events[], usage, progress?}` → `{cancel}` · `409` | worker, every 10 s |
 | `POST attempts/{a}/logs` | `{worker, offset, lines[]}` → `{offset}` | worker, every 1 s while it logs |
 | `POST attempts/{a}/resolve` | binary, versioned: `resolved-commits.md` §4 | worker, small keyed writes |
@@ -399,7 +399,7 @@ Gone: `POST /api/workers/register`, `/api/tasks/claim`,
   it, so tokens in specs written before a restart stay valid.
 - **Pool token.** `pools/{pool}/work` takes a per-pool secret configured
   on the server and on that pool's workers. It reveals which attempts
-  wait; claiming still takes the object store. (Built: one
+  wait; owning one still takes the object store. (Built: one
   `SOLERA_POOL_TOKEN` for every pool, or the admin token.)
 - The admin API keeps its own token; a worker's token reaches nothing else.
 - The engine's URL is a stable HTTPS name (load balancer or DNS), so an
@@ -971,15 +971,15 @@ control file:
 | State | Evidence | Leaves it by |
 |---|---|---|
 | **waiting** | launched, the control file `open` | an owner (`start`, or `owned` observed); the executor's `provision` deadline, if set (none by default) |
-| **owned** | the control file `owned`, no report yet | `start`, a beat or a change of `.beat` → running; none within `claim_timeout` (60 s) of the engine first observing `owned` → lost |
+| **owned** | the control file `owned`, no report yet | `start`, a beat or a change of `.beat` → running; none within the ownership timeout (60 s) of the engine first observing `owned` → lost |
 | **running** | `start`, beats, or `.beat` changing | a result, silence, cancel or timeout (§7) |
 | **ended** | `AttemptFinished` | — |
 
 - **Discovery** returns waiting attempts that fit the worker's capacity,
   oldest first. It is a hint: two workers may get the same attempt, and the
   swap to `owned` decides. The engine reads the control file (one GET) for an
-  attempt it offered and has not seen start within 10 s, so a claim whose
-  worker died before `start` is noticed.
+  attempt it offered and has not seen start within 10 s, so an owner that
+  died before `start` is noticed.
 - **A dead owner expires into a new attempt id**, never a new owner of
   the old attempt: the attempt ends lost, and the retry policy launches a
   fresh attempt, with its own spec and control file. Its writes are
@@ -992,10 +992,10 @@ control file:
 - **The runtime clock** starts at ownership when HTTP is unavailable: an
   owner that computes through an outage, reporting by `.beat`, is
   running, not provisioning.
-- **No registration, no leases, no claim event.** A pool worker's liveness
+- **No registration, no leases, no ownership event.** A pool worker's liveness
   is its attempt's heartbeat, like any worker's.
 - **Engine down:** pool workers finish their attempts and get no new ones.
-- The handle is `{attempt, pool}`. A cancel before the claim withdraws the
+- The handle is `{attempt, pool}`. A cancel before a worker owns it withdraws the
   attempt from discovery and ends it; after it, cancel is §7.
 - **One process per attempt.** A pool worker runs each attempt it gets in
   a child forked from a forkserver that imported the framework and nothing
@@ -1182,7 +1182,7 @@ replacement every five minutes.
 Compared with the spec-less tick attempt of the previous draft:
 
 - no launch path without a spec, and no attempt that is not journaled;
-- no per-launch bootstrap credential, no in-memory worker claim per
+- no per-launch bootstrap credential, no in-memory worker ownership per
   tick, no tick result route;
 - no process start per check: a 300-second sensor on `Local` cost a
   subprocess and an import every tick;

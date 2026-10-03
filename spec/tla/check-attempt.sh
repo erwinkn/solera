@@ -6,7 +6,7 @@
 #   spec/tla/check-attempt.sh big          two attempts with a duplicate worker each (too large to finish)
 #   spec/tla/check-attempt.sh all
 #
-# TLC_WORKERS (3) and TLC_HEAP (6g) bound what a run takes of a shared
+# TLC_WORKERS (2) and TLC_HEAP (4g) bound what a run takes of a shared
 # machine. Needs Java 11+. Downloads tla2tools.jar into spec/tla/.tools
 # (gitignored).
 set -euo pipefail
@@ -22,7 +22,7 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 tlc() {  # tlc CONFIG LOG
-    java -XX:+UseParallelGC "-Xmx${TLC_HEAP:-6g}" -cp "$jar" tlc2.TLC -workers "${TLC_WORKERS:-3}" \
+    java -XX:+UseParallelGC "-Xmx${TLC_HEAP:-4g}" -cp "$jar" tlc2.TLC -workers "${TLC_WORKERS:-2}" \
         -metadir "$work/states" -config "$1" Attempt.tla > "$2" 2>&1 || true
     rm -rf "$work/states"
     if [ -n "${TLA_LOGS:-}" ]; then mkdir -p "$TLA_LOGS"; cp "$2" "$TLA_LOGS/"; fi

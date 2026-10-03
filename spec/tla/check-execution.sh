@@ -8,7 +8,7 @@
 #   spec/tla/check-execution.sh calibrate   each fix put back out: TLC must find its bug
 #   spec/tla/check-execution.sh all
 #
-# TLC_WORKERS (3) and TLC_HEAP (6g) bound what a run takes of a shared machine.
+# TLC_WORKERS (2) and TLC_HEAP (4g) bound what a run takes of a shared machine.
 # Needs Java 11+ (else runs TLC in the eclipse-temurin:21-jre image). Downloads
 # tla2tools.jar into spec/tla/.tools (gitignored).
 set -euo pipefail
@@ -26,7 +26,7 @@ trap 'rm -rf "$work"' EXIT
 tlc() {  # tlc CONFIG LOG [TLC options]
     local cfg=$1 log=$2
     shift 2
-    local args=(-XX:+UseParallelGC "-Xmx${TLC_HEAP:-6g}" -cp "$jar" tlc2.TLC -workers "${TLC_WORKERS:-3}" -deadlock -lncheck final
+    local args=(-XX:+UseParallelGC "-Xmx${TLC_HEAP:-4g}" -cp "$jar" tlc2.TLC -workers "${TLC_WORKERS:-2}" -deadlock -lncheck final
                 -metadir "$work/states" "$@" -config "$cfg" Execution.tla)
     if command -v java >/dev/null; then
         java "${args[@]}" > "$log" 2>&1 || true
@@ -70,17 +70,17 @@ calibration() {
     echo "== calibrate"
     calibrate F6 Quiesces          # 1cad0bd: a pass that ends behind the head ends the task
     calibrate F10 BookmarkHonest   # a full pass its patterns take nothing from never reaches B
-    calibrate F13 BookmarkHonest   # a store move leaves the fingerprint: the moved write starts over with one batch
-    calibrate F17 BookmarkHonest   # moved and back with a keys= run between: the old fingerprint matches, the index started over
+    calibrate move BookmarkHonest  # synthetic: a store move that changes neither the fingerprint nor the plan
+    calibrate F17 RunsEndCaughtUp  # after a move resets A, a keys= run reads only its key into the new output, and succeeds
     calibrate selection RunsEndCaughtUp  # a keys= run made a full pass ends after its first batch
 }
 
 case "${1:-ci}" in
     ci) check smoke; calibration ;;
-    design) for m in store shape remove zombie; do check $m; done ;;
+    design) for m in store reset shape remove zombie; do check $m; done ;;
     big) for m in deploys faults each; do check $m; done ;;
     safety) check safety -simulate "num=${SAFETY_TRACES:-100000}" -depth 150 ;;
     calibrate) calibration ;;
-    all) check smoke; calibration; for m in store shape remove zombie; do check $m; done; check safety -simulate "num=${SAFETY_TRACES:-100000}" -depth 150 ;;
+    all) check smoke; calibration; for m in store reset shape remove zombie; do check $m; done; check safety -simulate "num=${SAFETY_TRACES:-100000}" -depth 150 ;;
     *) echo "usage: $0 [ci|design|big|safety|calibrate|all]" >&2; exit 2 ;;
 esac

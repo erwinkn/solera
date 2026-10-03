@@ -12,7 +12,7 @@
 #                                          two engines, three, liveness, calibration
 #   spec/tla/check-journal.sh object-big   the same, three engines, six writes
 #
-# TLC_WORKERS (3) and TLC_HEAP (6g) bound what a run takes of a shared
+# TLC_WORKERS (2) and TLC_HEAP (4g) bound what a run takes of a shared
 # machine. Needs Java 11+. Downloads tla2tools.jar into spec/tla/.tools (gitignored).
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -28,7 +28,7 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 tlc() {  # tlc CONFIG LOG: run TLC, keep its output
-    java -XX:+UseParallelGC "-Xmx${TLC_HEAP:-6g}" -cp "$jar" tlc2.TLC -workers "${TLC_WORKERS:-3}" -metadir "$work/states" \
+    java -XX:+UseParallelGC "-Xmx${TLC_HEAP:-4g}" -cp "$jar" tlc2.TLC -workers "${TLC_WORKERS:-2}" -metadir "$work/states" \
         -config "$1" "$module.tla" > "$2" 2>&1 || true
     rm -rf "$work/states"
     if [ -n "${TLA_LOGS:-}" ]; then mkdir -p "$TLA_LOGS"; cp "$2" "$TLA_LOGS/"; fi

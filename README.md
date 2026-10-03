@@ -192,7 +192,7 @@ toggle per automation; `weekly_digest.cron.0` runs Mondays at 07:00.
 ### 9. The pool worker
 
 `manual_ingest` is placed on `Pool("ingest")` — submitted work waits queued
-until an external worker claims it. In a second terminal:
+until an external worker takes it. In a second terminal:
 
 ```bash
 export SOLERA_SERVER_URL=http://127.0.0.1:8000
@@ -202,8 +202,8 @@ uv run solera worker pool ingest
 
 Commit a couple of uploads (step 2), then `uv run solera run manual_ingest
 --partitions all`. Watch the worker log `[pool] claimed …` / `[pool] completed
-…`, and the **Executors** page shows the registered worker and its claimed
-task. Pool tasks carry `cpu`/`memory`/`gpu` needs and are only offered to
+…`, and the **Executors** page shows the registered worker and the task
+it owns. Pool tasks carry `cpu`/`memory`/`gpu` needs and are only offered to
 workers whose capacity fits.
 
 ## Postgres

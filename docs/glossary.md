@@ -324,7 +324,7 @@ or the engine's end. The engine creates it `open` before the launch;
 after that it is only swapped (`If-Match`): `open` → `owned` → `writing`
 → `sealed` by the owner, or → `ended` by the engine, and exactly one of a
 seal and an end lands. A worker that finds it gone stops and never
-creates it (`lifecycle.md` §2.4). *Was:* `{attempt}.worker` (the claim),
+creates it (`lifecycle.md` §2.4). *Was:* `{attempt}.worker` (ownership),
 `{attempt}.writing` (the gate) and `{attempt}.result`, until K18.
 
 **attempt handle**. An executor's identifier for the worker it started
@@ -798,7 +798,8 @@ Docs, README, docstrings and comments, after phases 1–2:
   §0) → gate where it means `.writing`; "the `{attempt}.writing` fence"
   (`per-key-processing.md` intro) → gate.
 - "scope lock" → claim; "the claim `.worker`" → the `.worker` object, which
-  the worker that owns the attempt creates.
+  the worker that owns the attempt creates (since K18, the control file's
+  `owned`). A worker never "claims" an attempt: it owns it.
 - "key set", "key-set output", "partition set" → dynamic partitions;
   "lists the domain" → lists every partition.
 - "invocation", "invocation token" → worker, worker id.

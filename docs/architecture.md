@@ -880,7 +880,7 @@ the gate. `manifest` mode runs through `Local` only, at server start.
 | `AWSECS(name, cluster, region)(cpu, memory, gpu, image)` | `run_task` with container overrides carrying the stage, `clientToken` = attempt | `{task_arn}` | describes until `STOPPED`; `Exit.meta.log_url`; a task not shown: can't tell | `stop_task` |
 | `Modal(name, app)(gpu)` | spawns the worker function | `{call_id}` | polls the call: its return, raise or timeout is an exit; Modal's client and service errors: can't tell | cancels it |
 | `K8sJob(name, cluster, namespace)(cpu, memory, image)` | creates the job `solera-{attempt}` (lowercased); an existing one is its own | `{job}` | watches conditions; deleted: lost | deletes the job |
-| `Pool(name)(cpu, memory, gpu)` | nothing: the launched attempt is discoverable | none | — (the worker's reports) | — (a cancel before the claim ends it) |
+| `Pool(name)(cpu, memory, gpu)` | nothing: the launched attempt is discoverable | none | — (the worker's reports) | — (a cancel before a worker owns it ends it) |
 
 `Pool` is the pull path (`lifecycle.md` §10). Workers are external
 processes (`solera worker pool NAME`): they long-poll `GET

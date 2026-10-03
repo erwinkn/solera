@@ -2,7 +2,7 @@
 (***************************************************************************)
 (* The attempt control file (docs/lifecycle.md §2): one object per        *)
 (* attempt, `runs/{run}/{attempt}.control`, swapped with If-Match, in     *)
-(* place of the claim (`.worker`), the gate (`.writing`) and the result   *)
+(* place of ownership (`.worker`), the gate (`.writing`) and the result  *)
 (* (`.result`). The engine creates it `open` before the launch; the first *)
 (* worker to swap it `owned` owns the attempt, marks it `writing` before  *)
 (* its first store mutation, and seals its result in it; the engine ends  *)
@@ -195,7 +195,7 @@ Boot(w) ==
     /\ wpc' = Set(wpc, w, IF Att(w) \in purged THEN "stopped" ELSE "read")
     /\ UNCHANGED <<control, purged, fence, fenceBy, engine, wseen, wrote, ghost>>
 
-\* GET the control file. `open`: claim it. Missing: stop, never create it
+\* GET the control file. `open`: own it. Missing: stop, never create it
 \* (without PreCreate, create it). Anything else: another worker owns the
 \* attempt (wait for it, writing nothing), or it is over.
 ReadControl(w) ==
@@ -222,7 +222,7 @@ Swap(w, body, then) ==
            /\ wpc' = Set(wpc, w, then)
            /\ UNCHANGED control
       [] OTHER ->
-           \* `ended`, missing, or another worker's claim: it stops.
+           \* `ended`, missing, or another worker's `owned`: it stops.
            /\ wpc' = Set(wpc, w, "stopped")
            /\ UNCHANGED <<control, wseen>>
 

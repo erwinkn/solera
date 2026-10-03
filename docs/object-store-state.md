@@ -234,7 +234,7 @@ status are derived inside `apply`; they are not events.
 | `ProjectRegistered` | `deploy`, `manifest` | replaces the manifest; applies aliases; retires removed names (§2); reconciles automation state |
 | `RunSubmitted` | `run` (id, request, tasks) | adds an active run |
 | `RunControlled` | `run`, `action` (`cancel` \| `pause` \| `resume`) | |
-| `AttemptLaunched` | `run`, `task`, `attempt`, `started_at`, `pin`, `at`, `execution`, `prepared`, `pool?` | the attempt file exists and a placement is about to start it: its claim and claim become durable (§8) |
+| `AttemptLaunched` | `run`, `task`, `attempt`, `started_at`, `pin`, `at`, `execution`, `prepared`, `pool?` | the attempt file exists and a placement is about to start it: its claim becomes durable (§8) |
 | `AttemptPlaced` | `attempt`, `handle` | the placement started it: where it runs, for whichever engine follows it (§8) |
 | `AttemptFinished` | `run`, `task`, `attempt`, `outcome` (`succeeded` \| `failed` \| `skipped` \| `canceled`), `started_at`, `finished_at`, `error?`, `retryable?`, `commit?`, `owing a repair?`, `writes?` | records the attempt; on commit, installs heads, the partition's record (cursor, bookmarks, completeness), and each keyed output's new delta file; `repairs` keeps the intents of a writer that died (§8) |
 | `SourceCommitted` | `source`, `head`, `keys?`, `at`, `run?` | installs a source head and its delta file; a commit that changed something records `run` in the history (§7) |
@@ -289,7 +289,7 @@ State
 | `File` | `path`, `rows`, `bytes`, `at` [lo, hi] (time column), `runs` [first, last], `deleted?` [run] (hidden until rewritten), `deleted_at?` | files per table: ~log(rows) after merging |
 | `Intent` | `added`, `removed`, `exact`, `files` (the dead attempt's delta files), `run`, `attempt` | writers that died mid-write, until the next commit of that output |
 
-**Derived, rebuilt at start:** the claims and claims of launched
+**Derived, rebuilt at start:** the claims of launched
 attempts (from `Task.launched`), the pool queue, the ready queue and the
 dependents index.
 
@@ -752,7 +752,7 @@ the attempt's token and its generation (the claim's event counter).
 **Launch and adoption.** The engine writes the spec, then
 `AttemptLaunched`, durable, then starts the placement and records its
 handle as `AttemptPlaced` — lazily, riding the next flush. From
-`AttemptLaunched` on, the attempt's claim and its claim are durable:
+`AttemptLaunched` on, the attempt's claim is durable:
 an engine that restarts adopts it — follows its handle, or finds it again
 by name (ECS `clientToken`, the Kubernetes job `solera-{attempt}`), or
 follows its worker's reports — and settles it as the first engine would
