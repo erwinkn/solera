@@ -21,12 +21,20 @@ from tests.sim.project import External, SourceStore, rebuild
 from .engines import drive, make_engine
 
 KEYS = ["k1", "k2", "k3", "x1"]  # `x*`: what `checks` and `copy` exclude
-pending = pytest.mark.xfail(
-    not staleness.LANDED,
-    strict=True,
-    raises=(staleness.NotBuilt, AssertionError, pytest.fail.Exception),
-    reason="K43, K45, K46: not built",
-)
+
+
+def pending(why: str):
+    """A strict xfail for what the build (8666748, 3c4ade0) does not have yet."""
+
+    return pytest.mark.xfail(
+        strict=True, raises=(staleness.NotBuilt, AssertionError, pytest.fail.Exception), reason=why
+    )
+
+
+per_key = pending("each=True per-key records: not built (W22: next)")
+net_delta = pending("the net delta: over-reports until K44's range scan (W22)")
+k44 = pending("K44: added/updated/removed and ctx.load(): not built")
+ruling = pending("reasons during a full pass after an asset change: awaiting a ruling")
 
 
 def taken(key: str) -> bool:
@@ -303,7 +311,7 @@ Staleness.TestCase.settings = settings(
 )
 
 
-@pending
+@per_key
 def test_staleness_matches_the_reference_over_any_history():
     Staleness.TestCase().runTest()
 
@@ -326,7 +334,7 @@ async def _built(state, tmp_path, keys, **decl):
     return engine, outside
 
 
-@pending
+@per_key
 async def test_keys_runs_after_an_upstream_reset_merge_and_together_catch_up(state, tmp_path):
     """The coordinator's example (R2, R4): `items` is reset; `checks` holds
     k1, k2, k3. keys=(k1, k2) updates those two, leaves k3 untouched and
@@ -356,7 +364,7 @@ async def test_keys_runs_after_an_upstream_reset_merge_and_together_catch_up(sta
     assert await index_entries(state, "checks", "") == settled, "the next default run writes nothing"
 
 
-@pending
+@per_key
 async def test_a_reset_output_holds_only_what_keys_runs_wrote_until_a_default_run(state, tmp_path):
     """R6: `checks` itself reset (moved) starts empty; keys=(k1) leaves k1
     alone in it, stale keys {k2, k3} (missing); a default run converges."""
@@ -391,7 +399,7 @@ async def test_an_unkeyed_partition_stays_stale_until_it_reruns(state, tmp_path)
     assert not await staleness.asset_stale(engine, "count")
 
 
-@pending
+@per_key
 async def test_a_commit_of_excluded_keys_alone_leaves_their_consumers_fresh(state, tmp_path):
     """K39's calibration: `items` commits only `x1`, which `checks` and `copy`
     exclude: neither is stale (the plain "position behind" rule says both
@@ -413,7 +421,7 @@ async def test_a_commit_of_excluded_keys_alone_leaves_their_consumers_fresh(stat
     assert await staleness.partition_stale(engine, "copy")
 
 
-@pending
+@per_key
 async def test_a_shared_input_change_makes_every_key_stale(state, tmp_path):
     """`knob`, a dep every key of `checks` shares, changes: every key is
     stale, though no upstream key changed; keys= runs covering them all
@@ -458,7 +466,6 @@ async def test_a_keys_run_on_an_incremental_asset_delivers_each_change_once(stat
     assert outside.delivered == set(), "the next default run has nothing new"
 
 
-@pending
 async def test_keys_runs_past_the_read_ahead_cap_are_refused_until_a_default_run(state, tmp_path):
     """K45's bound, at a cap of 2: a plain incremental partition takes two
     keys= runs, of any number of keys; a third is refused ("run the
@@ -483,7 +490,7 @@ async def test_keys_runs_past_the_read_ahead_cap_are_refused_until_a_default_run
     await drive(engine, await engine.submit(["copy"], keys={"items": {"keys": ["k1"]}}))
 
 
-@pending
+@k44
 async def test_a_count_kept_from_its_batches_stays_exact_through_a_keys_run(state, tmp_path):
     """K44's example through a keys= run (K45): `tally` = what it held +
     added - removed. k4 added and k1 removed; keys=(k4) delivers k4 as added;
@@ -523,7 +530,7 @@ async def test_a_non_each_keyed_outputs_keys_go_stale_together(state, tmp_path):
     assert not await staleness.partition_stale(engine, "copy")
 
 
-@pending
+@ruling
 @pytest.mark.parametrize("then", ["keys", "default"])
 async def test_a_full_pass_after_an_asset_change_may_take_several_runs(state, tmp_path, then):
     """The full pass (Erwin's correction to K45): `copy` holds k1, k2, k3;
@@ -553,7 +560,7 @@ async def test_a_full_pass_after_an_asset_change_may_take_several_runs(state, tm
     assert await run() == (set(), False)
 
 
-@pending
+@per_key
 async def test_staleness_is_transitive_down_a_chain(state, tmp_path):
     """K46, three levels: `feed` commits k2 and `items` has not rerun.
     `items` is stale ("input changed"); `copy`, `count` and every key of
@@ -575,7 +582,6 @@ async def test_staleness_is_transitive_down_a_chain(state, tmp_path):
     assert await staleness.stale_keys(engine, "checks") == {"k2"}
 
 
-@pending
 async def test_a_stale_status_carries_every_reason_that_holds(state, tmp_path):
     """K46: `copy`'s version is bumped and `feed` commits, `items` not yet
     rerun: `copy` is stale for its definition and its upstream at once."""
@@ -589,7 +595,7 @@ async def test_a_stale_status_carries_every_reason_that_holds(state, tmp_path):
     assert await staleness.stale_reasons(engine, "copy") == {staleness.DEFINITION, staleness.UPSTREAM}
 
 
-@pending
+@net_delta
 async def test_a_key_added_and_removed_past_the_read_changes_nothing(state, tmp_path):
     """The net delta, through `items`: k4 is added and removed again past
     what `copy`, `count` and `checks` read. None of them is stale, and a
@@ -609,7 +615,7 @@ async def test_a_key_added_and_removed_past_the_read_changes_nothing(state, tmp_
     assert outside.delivered == set()
 
 
-@pending
+@net_delta
 async def test_a_key_updated_and_reverted_changes_nothing(state, tmp_path):
     """The net delta, at a versioned source: `feed`'s k1 goes from version 1
     to 2 and back to 1 before anyone reads it. Neither `items` (plain

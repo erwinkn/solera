@@ -241,7 +241,10 @@ with Hypothesis drawing the inputs (in CI, a few seconds each):
   default runs; after each step the engine's stale keys and its partition
   and asset statuses must equal a reference model's (K43, K45), and a plain
   incremental asset is delivered exactly what its record lacks, nothing
-  twice. Strict xfails until the design is built. One part runs now: on FileStore, PostgresStore
+  twice. On the build (8666748, 3c4ade0) the read-ahead, its cap, full
+  passes, transitive reasons and R2 on every store pass; what waits for
+  each=True per-key records, the net delta and K44 is a strict xfail naming
+  it. One part runs now: on FileStore, PostgresStore
   and S3Store, a `keys=` run never touches a key it does not name.
 
 ## Kani: tried, then dropped

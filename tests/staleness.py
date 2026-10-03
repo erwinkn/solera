@@ -56,7 +56,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-LANDED = False  # W22's K43/K45/K46 build; True turns the tests on
+LANDED = False  # every piece of K43–K46 built: True also shrinks their failures
 
 
 class NotBuilt(NotImplementedError):
@@ -122,17 +122,11 @@ async def asset_stale(engine, asset: str) -> bool:
 
 def engine_with_read_ahead_cap(state, project, cap: int):
     """An engine whose partitions take at most `cap` keys= runs between two
-    default runs: the cap's option, placeholder name `max_read_ahead`."""
-
-    import inspect
-
-    from solera_server.engine import Engine
+    default runs."""
 
     from tests.server.engines import make_engine
 
-    if "max_read_ahead" not in inspect.signature(Engine.__init__).parameters:
-        raise NotBuilt("Engine(max_read_ahead=) (K45)")
-    return make_engine(state, project, max_read_ahead=cap)
+    return make_engine(state, project, read_ahead_cap=cap)
 
 
 # -- the reference -------------------------------------------------------------------
