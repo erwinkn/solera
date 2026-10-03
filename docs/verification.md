@@ -142,8 +142,8 @@ ones on every worker and reports throughput, e.g. `simulation: 400 runs,
 **Open findings are set aside.** A run that trips a finding still open (its
 signature is recognized in `machine.py`, `_known`) is cleaned up rather than
 failed, and counted, so the simulation keeps looking for new bugs; a
-re-registration that trips one on almost every run is left out (`KNOWN`:
-`copy`'s `exclude`, F10). Signatures today: F13 (a consumer of `items` keeps
+re-registration that trips one on almost every run is left out (`KNOWN`,
+empty since F10's fix brought `copy`'s `exclude` back). Signatures today: F13 (a consumer of `items` keeps
 extra keys in a run where `items` moved store), F16 (overlapping index
 levels), F17 (`items` lacks a key after two store moves). A signature is
 coarser than its bug and can hide another; each goes with its fix.
