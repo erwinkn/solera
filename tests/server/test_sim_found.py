@@ -1014,3 +1014,39 @@ async def test_an_asset_change_is_built_by_its_automation_or_marked_stale(state,
     assert await status(engine, name) == [expected]  # nothing ran: shown, for a run by hand
     assert status_of(await drive(engine, await engine.submit([name]))) == "succeeded"
     assert await status(engine, name) == ["materialized"]  # the marker clears
+
+
+@pytest.mark.xfail(strict=True, reason="F26: open")
+async def test_a_pool_attempt_is_offered_only_once_its_launch_is_durable(state, monkeypatch):
+    """F26: a pool attempt was offered to pool workers from the model, where
+    `AttemptLaunched` is applied before it is durable. An engine replaced in
+    between handed out an attempt no journal holds: it ran, wrote rows into
+    a fenced store, and no engine ever committed or repaired them
+    (simulation: `odd` kept a row nobody committed)."""
+
+    from solera.executors import Pool
+
+    @asset(outputs=Output("trained"), executor=Pool("gpu")(cpu=1))
+    def trained():
+        return {"w": 1}
+
+    engine = make_engine(state, Project(assets=[trained]), placements={})
+    await engine.initialize()
+    hold, real = asyncio.Event(), state.durable
+
+    async def held():  # the launch's flush, not landed yet
+        await hold.wait()
+        await real()
+
+    await engine.submit(["trained"])
+    monkeypatch.setattr(state, "durable", held)
+    ticking = asyncio.create_task(engine.tick())
+    for _ in range(100):
+        if state.model.pool:
+            break
+        await asyncio.sleep(0.01)
+    assert state.model.pool, "the launch was recorded"
+    offered = await engine.pool_work("gpu", {"cpu": 8}, "host", 0)
+    hold.set()
+    await ticking
+    assert offered == [], "a launch that is not durable is offered to pool workers"
