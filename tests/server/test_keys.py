@@ -645,6 +645,10 @@ async def test_too_many_changes_to_list_still_write_only_what_the_delta_names(
     await run(engine, ["items"])
     if patch:
         rows["a"] = 1
+    for _ in range(500):  # the worker deletes what the commit superseded after it (§9.8), and says so
+        if not engine.m.cleanups.get(("items", "")):
+            break
+        await asyncio.sleep(0.01)
     objects = {p.parent.name: [] for p in data.rglob("*.json") if "items" in p.parts}
     for p in data.rglob("*.json"):
         if "items" in p.parts:
