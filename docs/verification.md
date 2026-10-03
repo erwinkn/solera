@@ -188,6 +188,87 @@ TestMyStore = stateful(lambda: Harness(MyStore(dsn), fresh_output)).TestCase
 the example SQL store, S3Store and the simulation's table store (30 runs
 each; ten times that with `--slow`).
 
+## Formal model: execution semantics (`spec/tla/Execution.tla`)
+
+The simulation samples interleavings of the real code; the model checker
+TLC explores **every** interleaving of the design, at small bounds. The
+model is the design as decided (`glossary.md`, including its model
+changes), not the code: where they differ, the code is the suspect.
+
+**State.**
+
+- Three output partitions in a chain: a keyed **source** `S`, an asset `A`
+  reading it incrementally, an asset `B` reading `A` incrementally (with
+  patterns, optionally `each=True`). Each has a **commit log**: one entry
+  per commit, `[up, rm, reset]` over a set of keys. Its content is the
+  log's fold; a prefix's fold is what a bookmark at that commit number has
+  read.
+- Per incremental input, a **bookmark**: `next` (commits read), the
+  **pass** under way (`full` with its position and the head it resumes
+  deltas from, `delta`, or a pattern change's `diff`), the **fingerprint**
+  and **patterns** it reads under.
+- Per output, two **fenced stores** (`A` can move between them) holding
+  rows, a **fence** generation per store, and the **repair** intents owed.
+- **Runs** (one target, as an automation submits), **attempts** with their
+  **generation**, planned **batch**, worker progress, **gate**
+  (`none`/`writing`/`aborted`) and **cancel** request. Claims are the
+  attempts in `prepared` or `launched`.
+- The **manifest**: `A`'s store, each asset's fingerprint, `B`'s patterns
+  and whether `B` is declared. **Engines**: one serving (or none, after a
+  crash), and possibly a zombie (rolling deploy).
+
+**Actions.** The environment: commits to `S`; deploys (move `A`'s store,
+change `B`'s patterns, bump `B`'s version, remove or re-add `B`); worker
+crashes; engine crash, restart and takeover; timeouts; user cancels.
+The engine: automations firing (`OnChange`), preparing an attempt (claim,
+pin, plan the batch), launching, settling (commit, cancel, or lost: take
+the gate, owe a repair). Workers: start, acquire the fence and read back
+owed repairs, take the gate (or drain on a requested cancel), write, seal.
+A zombie engine can only take gates (`aborted`): its journal writes are
+fenced. Every action of the environment but the last commit to `S` happens
+before it, so that "after quiescence" is a state the model reaches.
+
+**Properties.**
+
+- *One attempt per partition:* at most one prepared or launched attempt
+  per asset partition.
+- *Bookmarks are honest:* with no pass under way, an output's content is
+  what its bookmark says it read: its upstream's content at `next`, under
+  its patterns. (A bookmark never passes a change it did not deliver.)
+- *Stores match the journal:* with no attempt in flight, no repair owed
+  and no stale writer holding its gate, a store holds exactly its
+  output's committed content.
+- *Every run ends* (under weak fairness for workers and the engine, strong
+  for claims and automations).
+- *Convergence:* eventually and forever, `A` holds `S`'s keys and `B`
+  holds `A`'s under its patterns.
+
+**Abstracted, and why.**
+
+- *One partition per asset:* claims, bookmarks and passes are per asset
+  partition and do not interact; fan-in reads committed heads only.
+- *Key sets, not versions:* the properties are about which keys an output
+  holds; a re-upsert of a present key is a no-op here.
+- *One key per full-pass batch, one batch per delta pass:* enough to
+  interrupt a full pass between batches (F6) and to pin a delta.
+- *Fenced stores only:* an immutable store's stale write is unreferenced
+  by construction; the fenced kind is where the gate, fence and repair
+  interact.
+- *Renames:* a rename moves state wholesale; its risks (F5, F12) were in
+  how code looks names up, which the simulation covers. Removal and
+  re-adding are modelled.
+- *Time:* no clocks; a timeout or a silent worker is an action the
+  engine may take at any moment, bounded in number.
+- *Retries exhausted:* the retry budget exceeds the fault budget, so a run
+  fails only by design choice the model does not explore.
+
+**Calibration.** Each known bug is a switch restoring its pre-fix rule; the
+model must find it: `FixF6` (a pass that ends behind the head goes on to
+it), `FixF9` (a reset upstream commit makes its consumers read a full
+pass), `FixF10` (a full pass reaches the consumer even when its patterns
+take no key; `each` reconciles), `FixF13` (moving an output's store
+changes its asset's fingerprint, so its inputs read a full pass).
+
 ## Findings
 
 | # | Finding | Severity | Status |
