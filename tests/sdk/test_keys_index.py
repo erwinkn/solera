@@ -4,10 +4,13 @@ Every step of a random workload — patches, removals, full replacements,
 compactions — must produce the delta a dict says it should, and the index
 must page back exactly the dict's content."""
 
+import asyncio
 import random
 from dataclasses import dataclass
 
 import pytest
+from hypothesis import example, given, settings
+from hypothesis import strategies as st
 from obstore.store import MemoryStore
 from solera.keys import Rows, SortedEntries, _python
 from solera.keys.index import IndexState, KeyIndex, Options
@@ -271,6 +274,58 @@ async def test_random_workload_matches_a_dict(options, exact):
         assert set(h.routes) == {"stream"}
     if options.stream_reads == 0:
         assert {"sparse", "stream"} <= set(h.routes)  # filters cleared some patches, others streamed
+
+
+_small_keys = st.sets(st.sampled_from([key(i) for i in range(6)]), max_size=4).map(sorted)
+_steps = st.lists(
+    st.one_of(
+        st.tuples(st.just("patch"), _small_keys, _small_keys),
+        st.tuples(st.just("replace"), _small_keys, st.just([])),
+        st.tuples(st.sampled_from(["compact", "compact late"]), st.just([]), st.just([])),
+    ),
+    max_size=14,
+)
+
+
+@pytest.mark.xfail(strict=True, reason="F16: level-0 files moved into level 1 unmerged, overlapping")
+@settings(max_examples=150, deadline=None)
+@given(steps=_steps)
+@example(  # F16: a removed key comes back
+    steps=[
+        ("patch", [key(0)], []),
+        ("patch", [key(0)], []),
+        ("replace", [], []),
+        ("compact late", [], []),
+        ("patch", [key(0), key(1)], []),
+        ("patch", [], [key(1)]),
+        ("compact", [], []),
+    ]
+)
+def test_any_workload_of_a_few_keys_matches_a_dict(steps):
+    """Patches, removals, replacements (empty ones too) and compactions
+    over six keys, level 0 compacting at two files. A compaction runs in
+    the background in the engine: one `late` is applied after the next
+    commit. After every step the index pages back the dict, and levels 1+
+    never overlap."""
+
+    async def workload():
+        h = Harness(small_options(l0_max_files=2))
+        late = None  # a compaction's outcome, applied after the next commit
+        for op, ks, rm in steps:
+            if op == "compact":
+                await h._compact()
+            elif op == "compact late":
+                late = late or await h.index().compact()
+            else:
+                if op == "patch":
+                    await h.commit(ks, None, sorted(set(rm) - set(ks)))
+                else:
+                    await h.commit(ks, replace=True)
+                if late is not None:
+                    h.state, late = h.state.compacted(*late[:2]), None
+            await h.check()
+
+    asyncio.run(workload())
 
 
 async def test_a_rewrite_is_a_change_unless_at_its_version():
