@@ -20,18 +20,18 @@ that use this module are strict xfails or off):
   partition -> asset.
 - Runs (K45, amending K43): `keys=` on an each=True asset makes each named
   key its patterns take match its upstream, and never touches a key it
-  does not name (R2). On a plain incremental input it delivers the changes
-  past the snapshot, filtered to the named keys; the partition then records
-  "snapshot at N, plus these keys at the versions read" (the read-ahead,
-  at most 10,000 keys: more is refused with "too many explicit keys for an
-  incremental asset; rerun the partition"). A default run delivers only
-  what that record does not cover: nothing is delivered twice. Once the
-  read-ahead covers every change past the snapshot under the patterns, it
-  collapses into a new snapshot.
+  does not name (R2). On a plain incremental input it delivers the named
+  keys' changes past the snapshot, all read as of one upstream commit; the
+  partition's record becomes "snapshot N, plus (commit, attempt) per keys=
+  run since", the attempt's spec listing the keys. A default run skips a
+  changed key that an entry names at a commit at or after its last change,
+  and collapses the record into its own snapshot: nothing is delivered
+  twice. At most a configured number of entries (10,000) per partition: a
+  keys= run past it is refused with "run the partition first"; one run may
+  name any number of keys.
 - A plain incremental partition is stale while some change past its
-  snapshot, under the patterns, is not in its read-ahead at its current
-  version, or its asset changed (cleared by a default run); its keys share
-  the partition's answer.
+  snapshot, under the patterns, is covered by no entry, or its asset
+  changed (cleared by a default run); its keys share the partition's answer.
 - An output reset itself starts empty: a `keys=` run leaves just its keys;
   the next default run converges (R6).
 - Positions are derived from what each attempt read; nothing here asserts one.
@@ -95,6 +95,21 @@ async def asset_stale(engine, asset: str) -> bool:
     return bool(rollup["stale"])
 
 
+def engine_with_read_ahead_cap(state, project, cap: int):
+    """An engine whose partitions take at most `cap` keys= runs between two
+    default runs: the cap's option, placeholder name `max_read_ahead`."""
+
+    import inspect
+
+    from solera_server.engine import Engine
+
+    from tests.server.engines import make_engine
+
+    if "max_read_ahead" not in inspect.signature(Engine.__init__).parameters:
+        raise NotBuilt("Engine(max_read_ahead=) (K45)")
+    return make_engine(state, project, max_read_ahead=cap)
+
+
 # -- the reference -------------------------------------------------------------------
 
 
@@ -120,14 +135,14 @@ class ByPartition:
     """A plain incremental output: whether it has a head; its record, a
     snapshot (the counter through which it read every change; None after a
     reset or an asset change: the next default run reads a full pass) and
-    the read-ahead (key -> the version a `keys=` run read); its last
-    catch-up by a default run and its asset's last change; the keys its
+    one entry per keys= run since (the commit it read at, the keys it
+    named); its last default run and its asset's last change; the keys its
     input's patterns take, and, keyed, the keys it holds."""
 
     takes: Callable[[str], bool] = everything
     built: bool = False
     snapshot: int | None = None
-    ahead: dict[str, int] = field(default_factory=dict)
+    entries: list[tuple[int, frozenset[str]]] = field(default_factory=list)
     caught_up_at: int = 0
     changed_at: int = 0
     keys: set[str] = field(default_factory=set)
@@ -141,7 +156,8 @@ class Reference:
     changes, the each=True output's own resets, asset changes, `keys=` runs
     and default runs."""
 
-    def __init__(self, takes: Callable[[str], bool] = everything):
+    def __init__(self, takes: Callable[[str], bool] = everything, cap: int = 10_000):
+        self.cap = cap  # keys= runs a plain incremental partition takes between default runs
         self.now = 0
         self.up: dict[str, int] = {}  # key -> the counter of its last write
         self.changed: dict[str, int] = {}  # key -> the counter of its last change, a removal too
@@ -176,7 +192,7 @@ class Reference:
         self.changed.update(dict.fromkeys(self.up, t))
         self.last_commit = t
         for o in self.others.values():
-            o.snapshot, o.ahead = None, {}
+            o.snapshot, o.entries = None, []
 
     def change_knob(self) -> None:
         self.knob = self._tick()
@@ -193,13 +209,13 @@ class Reference:
             self.checks.changed_at = t
         else:
             o = self.others[name]
-            o.changed_at, o.snapshot, o.ahead = t, None, {}
+            o.changed_at, o.snapshot, o.entries = t, None, []
 
-    def run_keys(self, keys: set[str], name: str = "checks") -> set[str] | None:
+    def run_keys(self, keys: set[str], name: str = "checks") -> set[str] | str | None:
         """A keys= run. On `checks` (each=True), R2: the named keys its
         patterns take are fresh after. On a plain incremental asset: what it
-        delivers, the named keys among the changes its record lacks; they
-        join the read-ahead, which collapses once it covers them all."""
+        delivers, the named keys among the changes its record lacks, read as
+        of the newest commit, and an entry for it; "refused" past the cap."""
 
         t = self._tick()
         if name == "checks":
@@ -213,13 +229,13 @@ class Reference:
                     self.checks.held.pop(k, None)
             return None
         o = self.others[name]
+        if len(o.entries) >= self.cap:
+            return "refused"
         delivered = keys & self.pending(name)
         o.built = True
+        o.entries.append((self.last_commit, frozenset(keys)))
         for k in delivered:
-            o.ahead[k] = self.changed[k]
             (o.keys.add if k in self.up else o.keys.discard)(k)
-        if not self.pending(name):
-            o.snapshot, o.ahead = self.last_commit, {}
         return delivered
 
     def run_default(self, name: str) -> set[str] | None:
@@ -235,7 +251,7 @@ class Reference:
             return None
         o = self.others[name]
         delivered = None if o.snapshot is None else self.pending(name)
-        o.built, o.snapshot, o.ahead, o.caught_up_at = True, self.last_commit, {}, t
+        o.built, o.snapshot, o.entries, o.caught_up_at = True, self.last_commit, [], t
         o.keys = {k for k in self.up if o.takes(k)} if name == "copy" else set()
         return delivered
 
@@ -264,12 +280,16 @@ class Reference:
 
     def pending(self, name: str) -> set[str]:
         """The changes a plain incremental asset's record lacks: past its
-        snapshot (all of them without one), under its patterns, not in its
-        read-ahead at their current version."""
+        snapshot (all of them without one), under its patterns, named by no
+        entry read at or after the change."""
 
         o = self.others[name]
         since = -1 if o.snapshot is None else o.snapshot
-        return {k for k, t in self.changed.items() if t > since and o.takes(k) and o.ahead.get(k) != t}
+        return {
+            k
+            for k, t in self.changed.items()
+            if t > since and o.takes(k) and not any(k in named and at >= t for at, named in o.entries)
+        }
 
     def stale(self, name: str) -> bool:
         if name == "checks":

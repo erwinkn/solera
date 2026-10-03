@@ -419,20 +419,28 @@ async def test_a_keys_run_on_an_incremental_asset_delivers_each_change_once(stat
 
 
 @pending
-async def test_too_many_explicit_keys_for_an_incremental_asset_are_refused(state, tmp_path):
-    """K45's bound: a partition's read-ahead holds at most 10,000 keys; a
-    keys= run past it is refused and nothing is submitted. each=True assets
-    have no such cap."""
+async def test_keys_runs_past_the_read_ahead_cap_are_refused_until_a_default_run(state, tmp_path):
+    """K45's bound, at a cap of 2: a plain incremental partition takes two
+    keys= runs, of any number of keys; a third is refused ("run the
+    partition first") and nothing is submitted; a default run collapses the
+    record, and keys= runs are taken again. each=True assets have no cap."""
 
-    engine, _ = await _built(state, tmp_path, {"k1": "1"})
+    outside = External()
+    engine = staleness.engine_with_read_ahead_cap(state, project(tmp_path, outside), cap=2)
+    await engine.initialize()
+    await boot(engine, outside, {"k1": "1"})
+    await drive(engine, await engine.submit(["checks", "copy", "count"]))
+    many = {"items": {"keys": [f"k{i:05d}" for i in range(20_000)]}}  # no cap on a run's keys
+    for _ in range(2):
+        await drive(engine, await engine.submit(["copy"], keys=many))
     runs = len(state.model.runs)
-    many = [f"k{i:05d}" for i in range(10_001)]
-    with pytest.raises(
-        ValueError, match="too many explicit keys for an incremental asset; rerun the partition"
-    ):
-        await engine.submit(["copy"], keys={"items": {"keys": many}})
+    with pytest.raises(ValueError, match="run the partition first"):
+        await engine.submit(["copy"], keys={"items": {"keys": ["k1"]}})
     assert len(state.model.runs) == runs
-    await engine.submit(["checks"], keys={"items": {"keys": many}})  # each=True: accepted
+    for _ in range(3):
+        await drive(engine, await engine.submit(["checks"], keys=many))  # each=True: no cap
+    await drive(engine, await engine.submit(["copy"]))
+    await drive(engine, await engine.submit(["copy"], keys={"items": {"keys": ["k1"]}}))
 
 
 @pending
@@ -525,8 +533,21 @@ def test_the_reference_reads_the_worked_examples():
     assert ref.run_default("copy") == {"k3"}  # never k2 again
     ref.commit({"k2", "k3"}, set())
     assert ref.run_keys({"k2", "x1"}, "copy") == {"k2"}
-    assert ref.run_keys({"k3"}, "copy") == {"k3"} and not ref.stale("copy")  # collapsed
-    assert ref.others["copy"].ahead == {} and ref.run_default("copy") == set()
+    assert ref.run_keys({"k3"}, "copy") == {"k3"} and not ref.stale("copy")  # covered
+    assert len(ref.others["copy"].entries) == 2
+    assert ref.run_default("copy") == set() and ref.others["copy"].entries == []  # collapsed
+    ref.commit({"k2"}, set())  # an entry covers a key only up to the commit it read at
+    assert ref.run_keys({"k2"}, "copy") == {"k2"}
+    ref.commit({"k2"}, set())
+    assert ref.pending("copy") == {"k2"} and ref.run_default("copy") == {"k2"}
+
+    capped = staleness.Reference(takes=taken, cap=2)  # the cap counts keys= runs
+    capped.commit({"k1"}, set())
+    capped.run_default("copy")
+    assert capped.run_keys({"k1"}, "copy") == set() and capped.run_keys({"k1", "k2"}, "copy") == set()
+    assert capped.run_keys({"k1"}, "copy") == "refused"
+    capped.run_default("copy")
+    assert capped.run_keys({"k1"}, "copy") == set()
 
 
 # -- the keyed merge on every built-in store (R2) ----------------------------------------
