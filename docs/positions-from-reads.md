@@ -1,8 +1,8 @@
-# Positions from what was read (design note, K43)
+# Positions from what was read (design note, K43, K45)
 
-Status: **approved** by Erwin (K43). Not built yet: it follows the
-attempt control file. It supersedes K36–K42's read-ahead and K40's
-wording.
+Status: **approved** by Erwin (K43, amended by K45 and its read-ahead
+entries). The plain incremental read-ahead is built; per-key records and
+staleness are being built. It supersedes K36–K42 and K40's wording.
 
 ## Units
 
@@ -47,12 +47,56 @@ for incremental reads: not a second source of truth.
 |---|---|---|---|
 | upstream key (`each=True`) | the generation of the input key the output key was built from | the output key index entry's payload (v3 has one) | no: the one new datum |
 | upstream partition, incremental input | the position: `next`, the pass under way, the patterns | partition record | yes, but moved by the plan (below) |
+| upstream partition, incremental input, keys read ahead | the read-ahead: `[commit, run, attempt]` per `keys=` run since the last pass (K45) | the position, capped at 10,000 entries | yes |
 | upstream partition, whole or dep input | the head generation read (a digest of the refs, for a fan-in) | partition record | folded into the fingerprint's digest today |
 | the declaration | the asset change it last caught up to | partition record | yes: `caught_up_at`, against `changed_at` |
 
-There is **no read-ahead** anywhere: no capped set, no new engine state
-beyond the per-key payload for `each=True`. None is needed, because
-`keys=` only exists where the input unit is a key (below).
+**The read-ahead** (K45 and its amendment). A `keys=` run of a plain
+incremental input is delivered the delta past `next`, filtered to the keys
+it names and to what the read-ahead lacks, as of one upstream commit, the
+head its attempt pinned; its attempt's immutable spec already lists the
+keys. So the position records only `[commit, run, attempt]` (the run
+locates the spec), and stores no per-key version. The record is snapshot
+`next` plus that list:
+
+- The next pass reads the delta past `next`. A changed key is skipped if
+  an entry read it at or after its last change; one that changed again
+  since is delivered. Planning reads the listed specs only when the list
+  is not empty, together, into one map of key to the latest upstream
+  generation an entry read it at (an output partition's generations rise
+  with its commit numbers).
+- Once a pass moves `next`, the entries read before it collapse into the
+  snapshot: after a default run the list is empty. A `keys=` run that
+  leaves nothing past `next` uncovered collapses it at once: `next`
+  moves to the head it read, and the list empties.
+- The cap counts entries, `keys=` runs since the last pass, not keys:
+  10,000 per partition, past which a `keys=` run is refused with "run the
+  partition first". One run may name any number of keys.
+- Retention keeps a run whose attempt an entry names, until it collapses.
+  A run deleted by hand loses its entry: its keys are delivered again.
+- **A full pass due runs across runs** (Erwin's correction). After an
+  asset change or a reset (no position, a fingerprint change, a log that
+  no longer holds the delta), a full pass is due, and any mix of runs may
+  complete it. Its first delivery starts over, whether a `keys=` run or a
+  default run: its first batch is full and first, so the consumer
+  rebuilds (a count restarts from 0). Later `keys=` runs continue the same
+  pass with their named keys, recorded like any read-ahead entry, with the
+  pass as their base instead of a snapshot. A default run delivers only
+  the keys the pass has not delivered and finishes it, never starting over
+  again, so nothing earlier `keys=` runs wrote is dropped. Once every key
+  under the patterns has been delivered within the pass at its current
+  version, the asset is fresh, whichever run delivered the last piece, and
+  the record collapses to a snapshot. Nothing is delivered twice within a
+  pass, and K44's added, updated and removed are relative to its start:
+  everything is added. *Example:* `copy` holds k1, k2, k3, and its version
+  is bumped. keys=(k1) starts over with k1; keys=(k2, k3) continues, and
+  `copy` is fresh. Or, after keys=(k1), a default run delivers k2 and k3
+  and finishes.
+- **A pattern change under way** decides membership first: a `keys=` run
+  meanwhile merges the keys it names and records nothing.
+
+`each=True` keeps per-key records in its output's key index instead, with
+no cap.
 
 An `each=True` key's shared whole or dep inputs need no payload: they
 are pinned at the claim, and the key's own generation `g` is the event
@@ -67,9 +111,8 @@ it, so comparing the two generations would miss the change.
 ## Runs target only what input units allow
 
 - `partitions=` always: a partition is an output unit or holds them.
-- `keys=` only on `each=True` assets, the only ones whose input unit is a
-  key. Elsewhere it is refused at submission: "keys= needs an each=True
-  input; rerun the partition".
+- `keys=` on any keyed incremental input: per key for `each=True`; for a
+  plain input, through the read-ahead above (K45 replaced K43's refusal).
 
 ## How runs update records, and positions follow
 
@@ -89,7 +132,13 @@ Position at 56, upstream head at 60. Commits 56–60 touched `k1`, `k2`,
 - **Not `each`, `partitions=("P1",)`.** A partition rerun reads its input
   unit whole, so P1's records update as any default run's do, and P1 is
   current. Today already works this way.
-- **Not `each`, `keys=…`.** Refused at submission.
+- **Not `each`, `keys=("k1",)`.** The run is delivered `k1` as of 60 and
+  commits; the position becomes snapshot 56 plus `[60, run, attempt]`. The
+  next default run delivers `k2` and `k3`, skipping `k1` (unless it changed
+  again after 60), and collapses the list. Had the run named `k1`, `k2` and
+  `k3`, nothing would be left past 56, and the record would collapse at
+  once to snapshot 61. A named key that did not change past 56 is not
+  delivered at all.
 - **A default run** reads `from..to` in full, and the position moves to
   `to + 1`, as today.
 

@@ -731,8 +731,6 @@ class Model:
             ]
             for input in dropped:
                 del positions[input]
-            if dropped:
-                self.partitions[key]["reset"] = True  # until a full pass catches it up
             if not positions:
                 del self.partitions[key]["positions"]
         return producers
@@ -1074,7 +1072,6 @@ class Model:
             record["caught_up"] = bool(commit["caught_up"])
             if record["caught_up"]:
                 record["caught_up_at"] = self.event_counter  # against its asset's `changed_at`: `stale`
-                record.pop("reset", None)
         if "cursor" in commit:
             if commit["cursor"] is None:
                 record.pop("cursor", None)

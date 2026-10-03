@@ -304,7 +304,9 @@ class Upkeep:
         horizons = {name: self._horizon(p, nth.get(name)) for name, p in policies.items()}
         default = self._horizon(self.m.policy(None), None)
         finite = {name: h for name, h in horizons.items() if h is not None}
-        await self.delete_runs(await self.history.expired(finite, default))
+        # A run whose attempt a read-ahead names is kept: its spec lists the keys (K45).
+        named = {run for position in self.m.positions() for _, run, _ in position.get("ahead", ())}
+        await self.delete_runs([r for r in await self.history.expired(finite, default) if r[0] not in named])
 
     async def delete_runs(self, runs: list[tuple[str, str | None]]) -> None:
         """Delete finished runs, `(id, status)`. Retirement comes first and

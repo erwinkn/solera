@@ -627,11 +627,12 @@ async def test_an_attempt_launched_before_its_output_moved_commits_nothing(state
     assert head["attempt"] != held and head["ref"]["store"] == "other"
 
 
-async def test_a_keys_run_after_a_move_reads_a_whole_full_pass(state, tmp_path):
-    """K10, the review's example: `copy` holds {a, b}, moves, and runs
-    keys=(a). A move takes its positions, so the run reads a full pass —
-    every batch of it before it succeeds — not the one key: the new store
-    holds {a, b}, and no pass is left half way."""
+async def test_a_keys_run_after_a_move_starts_the_full_pass_a_default_run_finishes(state, tmp_path):
+    """K10, the review's example, under K45 and Erwin's correction: `copy`
+    holds {a, b}, moves, and runs keys=(a). The move reset it: a full pass
+    is due, and the keys= run starts it over with `a` alone. The next
+    default run continues that pass with `b`, never `a` again, and
+    converges to {a, b}."""
 
     @asset(outputs=Output("items", key="id"))
     def items():
@@ -653,10 +654,12 @@ async def test_a_keys_run_after_a_move_reads_a_whole_full_pass(state, tmp_path):
     await engine.initialize()
     detail = await drive(engine, await engine.submit(["copy"], keys={"items": {"keys": ["a"]}}))
     assert status_of(detail) == "succeeded"
-    assert sorted((await engine.list_keys("copy"))["keys"]) == ["a", "b"]
+    assert sorted((await engine.list_keys("copy"))["keys"]) == ["a"]
     assert state.model.heads[("copy", "")]["ref"]["store"] == "other"
+    assert state.model.position("copy", "items", "")["pass"]["mode"] == "full"  # under way
+    assert status_of(await drive(engine, await engine.submit(["copy"]))) == "succeeded"
+    assert sorted((await engine.list_keys("copy"))["keys"]) == ["a", "b"]
     assert "pass" not in state.model.position("copy", "items", "")
-    assert "reset" not in state.model.partition("copy", "")
 
 
 async def test_an_earlier_lifes_objects_are_never_read(state, tmp_path):

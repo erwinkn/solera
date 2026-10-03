@@ -670,16 +670,8 @@ MERGE_SETTINGS = settings(
 )
 
 
-def _no_reset_merge(kind):
-    """Without a reset R2 already holds; after one, it waits for K36."""
-
-    return [
-        pytest.param(kind, False, id=f"{kind}"),
-        pytest.param(kind, True, id=f"{kind}-after-reset", marks=pending),
-    ]
-
-
-@pytest.mark.parametrize("kind,reset", [p for k in STORES for p in _no_reset_merge(k)])
+@pytest.mark.parametrize("reset", [False, True], ids=["", "after-reset"])
+@pytest.mark.parametrize("kind", STORES)
 def test_a_keys_run_never_touches_a_key_it_does_not_name(kind, reset, tmp_path):
     """R2, on every built-in store: a keys= run's write is a merge. Every
     key it does not name keeps its entry (generation and payload) and its
@@ -703,7 +695,6 @@ def test_a_keys_run_never_touches_a_key_it_does_not_name(kind, reset, tmp_path):
     check()
 
 
-@pending
 @pytest.mark.parametrize("kind", STORES)
 def test_a_keys_run_makes_each_named_key_match_its_upstream(kind, tmp_path):
     """R2's other half: each named key the upstream has is written at its

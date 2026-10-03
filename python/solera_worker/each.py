@@ -49,6 +49,7 @@ class Batch:
     kind: str = "changes"
     walked: dict[str, Record] = field(default_factory=dict)  # retry: every record walked
     priors: dict[str, Record] = field(default_factory=dict)  # the touched keys' failure records
+    covers: bool = False  # a keys= selection past `next`: nothing it did not name is left (K45)
 
 
 class _Abort(Exception):
@@ -126,18 +127,71 @@ async def read_batch(pin: dict, keys_io) -> Batch:
         unmatched = [key_str(e[0]) for kind, e in page if kind == "delete"]
         return Batch(upserted, [], after, read, unmatched=unmatched)
     taken = Matcher(pin.get("patterns"))
-    if "keys" in ch:  # a run's keys= override: a one-off selection, of the keys that exist
-        found = await index.lookup([key_bytes(str(k)) for k in ch["keys"]])
+    # What keys= runs read past `next` (K45): key -> the latest upstream generation
+    # one read it at. A key read at or after its last change is not delivered again.
+    ahead = pin.get("ahead") or {}
+    if "keys" in ch and "from" in ch:
+        # A keys= selection of a plain input past its snapshot: the named keys' changes
+        # past `next` its read-ahead lacks, and whether any it did not name are left.
+        named, upserted, deleted, left, read = {str(k) for k in ch["keys"]}, {}, [], False, 0
+        after = None
+        while int(ch["from"]) <= int(ch["to"]):
+            keys, generations, flags, _, after = await index.pending(
+                int(ch["from"]), int(ch["to"]), after, 1000
+            )
+            for k, generation, gone in zip(keys, generations, flags, strict=True):
+                key, read = key_str(k), read + 1
+                if not taken(key) or ahead.get(key, -1) >= generation:
+                    continue
+                if key not in named:
+                    left = True
+                elif gone:
+                    deleted.append(key)
+                else:
+                    upserted[key] = generation
+            if after is None:
+                break
+        return Batch(upserted, deleted, None, read, covers=not left)
+    if "keys" in ch:  # a run's keys= override: each named key as the upstream holds it, or removed (R2)
+        named = sorted({str(k) for k in ch["keys"]})
+        found = await index.lookup([key_bytes(k) for k in named])
         upserted = {key_str(k): generation for k, (generation, _) in found.items()}
-        return Batch({k: e for k, e in upserted.items() if taken(k)}, [], None, len(upserted))
+        gone = [k for k in named if k not in upserted and taken(k)]
+        batch = Batch({k: e for k, e in upserted.items() if taken(k)}, gone, None, len(named))
+        if ch.get("scan"):  # a full pass's delivery: whether it leaves any key undelivered (K45)
+            batch.covers = await _covers(index, taken, set(named), ahead, ch.get("walked"))
+        return batch
 
     def kind(entry):
-        return ("delete" if entry[2] else "upsert") if taken(key_str(entry[0])) else None
+        key = key_str(entry[0])
+        if not taken(key) or ahead.get(key, -1) >= entry[1]:
+            return None
+        return "delete" if entry[2] else "upsert"
 
     page, after, read = await _fill(whole if ch.get("full") else delta, start, limit, kind)
     upserted = {key_str(e[0]): e[1] for k, e in page if k == "upsert"}
     deleted = [key_str(e[0]) for k, e in page if k == "delete"]
     return Batch(upserted, deleted, after, read)
+
+
+async def _covers(index, taken, named: set[str], ahead: dict, walked: dict | None) -> bool:
+    """Whether every key under the patterns has been delivered within a full
+    pass at its current version: named now, read ahead at or after it, or
+    walked by the pass's own batches (at or before `at`, at a generation
+    they read)."""
+
+    after = None
+    while True:
+        keys, generations, _, after = await index.page(after, 1000)
+        for k, generation in zip(keys, generations, strict=True):
+            key = key_str(k)
+            if not taken(key) or key in named or ahead.get(key, -1) >= generation:
+                continue
+            if walked is not None and key <= walked["at"] and generation <= walked["generation"]:
+                continue
+            return False
+        if after is None:
+            return True
 
 
 async def read_each_batch(spec: dict, pin: dict, keys_io) -> Batch:

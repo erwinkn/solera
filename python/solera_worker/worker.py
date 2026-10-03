@@ -387,6 +387,8 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
                 upstream=Upstream(ref.output),
             )
             delivered[param] = {"after": after, "upserted": sorted(upserted), "deleted": list(deleted)}
+            if read.covers:
+                delivered[param]["covers"] = True
             timeline.add("loaded", param, _rows(args[param]))
             continue
         if pin.get("load", "data") == "ref":  # decided at registration, as the engine read for it

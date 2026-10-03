@@ -20,6 +20,7 @@ Each (asset, input, partition) keeps a **position**:
       "patterns": ...,              # keys: the patterns it delivers under (per-key §11)
       "pattern_change": {"old", "new", "at", "snapshot", "pin"},
       "reconcile": {"after": key},  # an Each output's cleanup after a full pass
+      "ahead": [[commit, run, attempt], ...],  # keys: the read-ahead (below)
     }
 
 The modes:
@@ -37,8 +38,15 @@ kept until its last batch; `next` then moves past it. An attempt is given a
 its batch is on (`hi`, for commits: the batch's last commit); a `held` plan,
 a batch that moves no position of its own (an Each retry or reconcile
 batch); or a `selection`, a run's `keys=` selection, which reads the keys it
-names and moves neither the position nor the partition's progress, whatever
-they are.
+names as of one upstream commit and moves neither `next` nor the
+partition's progress.
+
+**The read-ahead** (docs/positions-from-reads.md, K45). A selection of a
+plain incremental input adds `[commit, run, attempt]` to `ahead`: it read
+every key the attempt's spec names as of upstream commit `commit`. The
+next pass skips a changed key some entry read at or after its last change,
+and the entries a new `next` passes collapse into the snapshot. An `Each`
+input keeps per-key records in its output's key index instead.
 """
 
 from __future__ import annotations
@@ -50,7 +58,19 @@ def advance(plan: dict, after: str | None = None) -> dict | None:
     none."""
 
     if plan["kind"] == "selection":
-        return None
+        position = plan.get("position")
+        if position is None or plan.get("per_key"):  # no snapshot to be ahead of, or per-key records
+            return None
+        if plan.get("covers"):  # nothing is left undelivered: the record collapses to a new snapshot
+            done = {k: v for k, v in position.items() if k not in ("pass", "ahead")}
+            return {**done, "next": max(int(position["next"]), int(plan["head"]) + 1)}
+        entry = [plan["head"], plan["run"], plan["attempt"]]
+        position = {**position, "ahead": [*position.get("ahead", ()), entry]}
+        if (
+            "pass" in position
+        ):  # a full pass this run started or continued: its next delivery is not its first
+            position["pass"] = {**position["pass"], "batch": position["pass"]["batch"] + 1}
+        return position
     if plan["kind"] == "held":
         return plan["position"]
     position, d = dict(plan["position"]), plan["pass"]
@@ -78,6 +98,17 @@ def advance(plan: dict, after: str | None = None) -> dict | None:
             position["reconcile"] = {"after": None}
     else:
         position["next"] = max(d["from"], d["to"] + 1)
+    return collapse(position)
+
+
+def collapse(position: dict) -> dict:
+    """The read-ahead entries the snapshot does not cover yet: one read as
+    of a commit before `next` says nothing the snapshot does not."""
+
+    ahead = [e for e in position.get("ahead", ()) if int(e[0]) >= int(position["next"])]
+    if ahead:
+        return {**position, "ahead": ahead}
+    position.pop("ahead", None)
     return position
 
 

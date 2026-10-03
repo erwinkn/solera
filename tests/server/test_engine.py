@@ -353,8 +353,10 @@ async def test_incremental_batching_and_more(state):
 
 
 async def test_run_keys_override(state):
-    """§8: `keys=` explicit list is a one-off selection that never moves the
-    position; 'full' drains the folded key map as a reset."""
+    """§8: a `keys=` list is a selection that moves no pass; on a plain input
+    it is delivered only the named keys' changes past the position (K45), so
+    with nothing changed it is skipped. 'full' drains the folded key map as
+    a reset."""
     seen = []
 
     @asset(outputs=Output("files", key="id"))
@@ -372,17 +374,19 @@ async def test_run_keys_override(state):
     await drive(engine, await engine.submit(["consumer"], upstream=True))
     detail = await drive(engine, await engine.submit(["consumer"], keys={"files": {"keys": ["b"]}}))
     assert status_of(detail) == "succeeded", [t.get("error") for t in detail["tasks"]]
-    assert seen[-1] == ["b"]
+    assert seen == [["a", "b"]]  # b did not change past the position: nothing to deliver
     await drive(engine, await engine.submit(["consumer"], keys={"files": "full"}))
     assert seen[-1] == ["a", "b"]
 
 
-async def test_a_selection_reads_its_keys_and_moves_nothing(state):
-    """Review round 5 (system #3, engine #2): a keys= selection reads the keys
-    it names — on a consumer never run, or one whose full pass stopped
-    half-way — and moves neither its position nor its partition's progress: the
-    interrupted pass still owes `b`, and resumes."""
-    calls, broken = [], {"batch": 1}
+async def test_a_selection_on_a_full_pass_due_starts_it_or_continues_it(state):
+    """Review round 5 (system #3, engine #2), under K45 and Erwin's
+    correction: on a consumer never run, a full pass is due, and keys=(b)
+    starts it over with b alone. A default run continues it, never
+    delivering b again, and stops half-way (after a); keys=(c) then
+    delivers the last key, and the pass is done: the partition is caught
+    up and its record collapses."""
+    calls, broken = [], {"batch": 2}
 
     @asset(outputs=Output("files", key="id"))
     def files():
@@ -392,7 +396,7 @@ async def test_a_selection_reads_its_keys_and_moves_nothing(state):
     def consumer(ctx, files: list):
         if ctx.batch["files"].index == broken["batch"]:
             raise RuntimeError("stopped half-way")
-        calls.append(sorted(r["id"] for r in files))
+        calls.append((sorted(r["id"] for r in files), ctx.batch["files"].first))
         return []
 
     project = Project(assets=[files, consumer])
@@ -400,22 +404,20 @@ async def test_a_selection_reads_its_keys_and_moves_nothing(state):
     await engine.initialize()
     await drive(engine, await engine.submit(["files"]))
     detail = await drive(engine, await engine.submit(["consumer"], keys={"files": {"keys": ["b"]}}))
-    assert status_of(detail) == "succeeded" and calls == [["b"]]  # the selection, and nothing else
-    assert state.model.position("consumer", "files", "") is None
-    assert "caught_up" not in state.model.partition("consumer", "")
+    assert status_of(detail) == "succeeded" and calls == [(["b"], True)]  # the start-over
+    assert state.model.position("consumer", "files", "")["pass"]["mode"] == "full"
+    assert not state.model.partition("consumer", "").get("caught_up")
     calls.clear()
-    await drive(engine, await engine.submit(["consumer"]))  # a full pass, stopped after `a`
-    stopped = state.model.position("consumer", "files", "")
-    assert calls == [["a"]] and stopped["pass"]["at"] == "a"
+    await drive(engine, await engine.submit(["consumer"]))  # continues; stops before `c`
+    assert calls == [(["a"], False)], "b is not delivered again, and nothing starts over"
     assert state.model.partition("consumer", "")["caught_up"] is False
     calls.clear()
-    await drive(engine, await engine.submit(["consumer"], keys={"files": {"keys": ["c"]}}))
-    assert calls == [["c"]] and state.model.position("consumer", "files", "") == stopped
-    assert state.model.partition("consumer", "")["caught_up"] is False  # `b` is still owed
     broken["batch"] = None
-    calls.clear()
-    await drive(engine, await engine.submit(["consumer"]))
-    assert calls == [["b"], ["c"]] and state.model.partition("consumer", "")["caught_up"] is True
+    await drive(engine, await engine.submit(["consumer"], keys={"files": {"keys": ["c"]}}))
+    assert calls == [(["c"], False)]
+    position = state.model.position("consumer", "files", "")
+    assert "pass" not in position and "ahead" not in position and position["next"] == 1
+    assert state.model.partition("consumer", "")["caught_up"] is True
     with pytest.raises(ValueError, match="cannot be a full run"):
         await engine.submit(["consumer"], mode="full", keys={"files": {"keys": ["a"]}})
 

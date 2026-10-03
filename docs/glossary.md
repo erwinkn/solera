@@ -447,6 +447,17 @@ past it. *Not:* a cursor (the user's state). *Was:* bookmark, watermark.
 *Example:* `file_index`/`alpha`'s position on `site_files` is at commit
 56: commits 56 onwards are next.
 
+**read-ahead**. What `keys=` runs of a plain incremental input read past
+its position, kept on the position until the next pass: one entry per
+run, the upstream commit it read at and the attempt whose spec names the
+keys. The next pass skips a key an entry read at or after its last change,
+then the entries collapse into the snapshot. Capped at 10,000 entries per
+partition: past it, run the partition first. *Edge case:* nothing is
+delivered twice, though one run may name any number of keys; an `each`
+input needs none, its output keys record what they were built from.
+*Example:* position 56, then `keys=("k1",)` at head 60: the position is
+56 plus `[60, run, attempt]`, and the next pass delivers `k2` and `k3`.
+
 **pass**. One read of an upstream, fixed when it starts, done in batches
 over one or more attempts:
 
